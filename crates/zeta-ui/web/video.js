@@ -7,7 +7,8 @@
 // line and a strip of every running feed on every source (`thumb` sockets; the selected cell is
 // drawn from the main socket); leaving it closes them and reopens the tags'.
 //
-// Exports: stats {drawn, sockets} (window.zetaVideo, e2e) and
+// Exports: stats (window.zetaVideo, e2e): {drawn, sockets} and sockets_main, sockets_thumb,
+// sockets_events (the pane's per-radio feeds; `sockets` counts the pictures') and
 //   mountVideo(api, {panes, view, el, jobs, shownSource}) -> Video   jobs(): every source's
 //       job_list; shownSource(): the waterfall's (overlays.js hands over its lock events;
 //       while shown, each other source with a video job has its event feed subscribed)
@@ -27,12 +28,12 @@ import { parseEnvelopeRaw } from "./audio.js";
 
 export const STRIP_W = 120;
 export const STRIP_H = 90;
-// A job runs before its streams exist: a picture looks its stream up this many times, this
-// far apart (as audio.js), then again at each sync() until it has one.
+// A job runs before its streams exist: a picture looks its stream up this many times this far
+// apart (as audio.js), then again at each sync() until it has one.
 export const STREAM_LOOKUPS = 20;
 export const STREAM_LOOKUP_MS = 250;
 
-export const stats = { drawn: 0, sockets: 0 };
+export const stats = { drawn: 0, sockets: 0, sockets_main: 0, sockets_thumb: 0, sockets_events: 0 };
 window.zetaVideo = stats;
 
 const isVideo = (j) => !!(j && j.kind === "video_decode" && j.state && j.state.status === "running");
@@ -49,30 +50,54 @@ async function streamWhere(api, kind, match) {
 const videoOf = (api, jobId) => streamWhere(api, "video", (p) => p.job === jobId);
 const feedOf = (api, source) => streamWhere(api, "event", (p) => p.job === null && p.source === source);
 
-// One video socket of `jobId` at `profile`, each frame drawn on every canvas of `canvases()`.
+// One video socket of `jobId` at `profile`, each frame drawn on every canvas of `canvases()`,
+// only while `alive()` (its job runs). A stream that ended (`closed`) is let go and never
+// subscribed again (GET /streams may list it a while after); the next sync() looks again, for
+// a new stream of a job that still runs (a restarted graph's).
 class Picture {
-  constructor(api, jobId, profile, canvases, onFrame = () => {}) {
-    Object.assign(this, { api, jobId, profile, canvases, onFrame });
-    Object.assign(this, { sub: null, looking: false, closed: false, busy: false, waiting: null });
+  constructor(api, jobId, profile, canvases, { onFrame = () => {}, alive = () => true } = {}) {
+    Object.assign(this, { api, jobId, profile, canvases, onFrame, alive });
+    this.kind = profile === "thumb" ? "sockets_thumb" : "sockets_main";
+    Object.assign(this, { sub: null, id: null, ended: new Set(), looking: false, closed: false });
+    Object.assign(this, { busy: false, waiting: null });
     this.open();
   }
 
   // Looks the stream up and subscribes; a no-op while subscribed or looking.
   async open() {
-    if (this.closed || this.sub || this.looking) return;
+    if (this.closed || this.sub || this.looking || !this.alive()) return;
     this.looking = true;
     let id = null;
     for (let i = 0; i < STREAM_LOOKUPS && id === null && !this.closed; i++) {
       if (i) await sleep(STREAM_LOOKUP_MS);
-      id = await videoOf(this.api, this.jobId).catch(() => null);
+      id = await this.look();
     }
     this.looking = false;
-    if (this.closed || id === null) return;
+    if (this.closed || id === null || !this.alive()) return;
     stats.sockets++;
+    stats[this.kind]++;
+    this.id = id;
     this.sub = this.api.streamBinary(id, (buf) => this.frame(buf), {
       video: this.profile,
-      onReconnect: () => videoOf(this.api, this.jobId),
+      onText: (msg) => msg && msg.type === "closed" && this.ended.add(this.id) && this.letGo(),
+      onReconnect: async () => (this.id = await this.look()) ?? this.letGo(),
     });
+  }
+
+  // The running job's video stream id, unless it is one that ended; null.
+  async look() {
+    const id = this.alive() ? await videoOf(this.api, this.jobId).catch(() => null) : null;
+    return id !== null && !this.ended.has(id) ? id : null;
+  }
+
+  // Closes the socket for good (the stream is gone); null, for onReconnect.
+  letGo() {
+    if (!this.sub) return null;
+    this.sub.close();
+    this.sub = null;
+    stats.sockets--;
+    stats[this.kind]--;
+    return null;
   }
 
   frame(buf) {
@@ -108,14 +133,11 @@ class Picture {
       });
   }
 
+  // Closes it for good; null (`pic = pic?.close() ?? null`).
   close() {
-    if (this.closed) return;
     this.closed = true;
     this.waiting = null;
-    if (this.sub) {
-      this.sub.close();
-      stats.sockets--;
-    }
+    return this.letGo();
   }
 }
 
@@ -125,17 +147,12 @@ export function mountVideo(api, opts) {
 
 class Video {
   constructor(api, { panes, view, el, jobs = () => [], shownSource = () => null }) {
-    Object.assign(this, { api, panes, view, el, jobs, shownSource });
-    this.thumbs = new Map(); // jobId -> {canvas, pic | null}: the tags'
-    this.locks = new Map(); // jobId -> the last video event
-    this.cells = new Map(); // jobId -> {cell, canvas, pic}: the strip's
-    this.feeds = new Map(); // source -> its event feed subscription, while shown
-    this.selected = null;
-    this.main = null; // the main Picture
-    this.shown = false;
-    this.polled = false;
-    this.frames = 0; // received by the main socket in the current second
-    Object.assign(this, { fps: 0, timer: null });
+    // thumbs: jobId -> {canvas, pic | null} (the tags'); locks: jobId -> the last video event;
+    // cells: jobId -> {cell, canvas, pic} (the strip's); feeds: radio -> its event feed while
+    // shown; main: the main Picture; frames: received by it in the current second.
+    Object.assign(this, { api, panes, view, el, jobs, shownSource, selected: null, main: null });
+    Object.assign(this, { thumbs: new Map(), locks: new Map(), cells: new Map(), feeds: new Map() });
+    Object.assign(this, { shown: false, polled: false, frames: 0, fps: 0, timer: null });
     this.build();
     Object.assign(this, {
       eligible: () => this.running().length > 0,
@@ -167,6 +184,8 @@ class Video {
   }
 
   running = () => (this.jobs() || []).filter(isVideo);
+  picture = (id, profile, canvases, onFrame) =>
+    new Picture(this.api, id, profile, canvases, { onFrame, alive: () => isVideo(this.job(id)) });
   job = (id) => (this.jobs() || []).find((j) => j.id === id) || null;
 
   openThumb(jobId, canvas) {
@@ -178,9 +197,7 @@ class Video {
   }
 
   closeThumb(jobId) {
-    const t = this.thumbs.get(jobId);
-    if (!t) return;
-    if (t.pic) t.pic.close();
+    this.thumbs.get(jobId)?.pic?.close();
     this.thumbs.delete(jobId);
   }
 
@@ -189,15 +206,9 @@ class Video {
   syncThumbs() {
     for (const [id, t] of this.thumbs) {
       const want = !this.shown && t.canvas.isConnected && t.canvas.offsetParent !== null;
-      if (want && !t.pic) {
-        const canvas = t.canvas;
-        t.pic = new Picture(this.api, id, "thumb", () => [canvas]);
-      } else if (!want && t.pic) {
-        t.pic.close();
-        t.pic = null;
-      } else if (t.pic) {
-        t.pic.open();
-      }
+      if (want && t.pic) t.pic.open();
+      else if (want) t.pic = this.picture(id, "thumb", () => [t.canvas]);
+      else t.pic = t.pic?.close() ?? null;
     }
   }
 
@@ -210,22 +221,17 @@ class Video {
   paintLock(jobId) {
     const ev = this.locks.get(jobId);
     const off = !!ev && ev.locked === false;
-    const t = this.thumbs.get(jobId);
-    const c = this.cells.get(jobId);
+    const [t, c] = [this.thumbs.get(jobId), this.cells.get(jobId)];
     for (const x of [t?.canvas, c?.cell, c?.canvas]) x?.classList.toggle("nolock", off);
   }
-
-  // ---- the pane -----------------------------------------------------------------------
 
   onShow() {
     this.shown = true;
     this.syncThumbs(); // the waterfall is hidden: its tags' sockets close
     if (!isVideo(this.job(this.selected))) this.selected = this.running()[0]?.id ?? null;
-    this.fps = 0;
-    this.frames = 0;
+    this.fps = this.frames = 0;
     this.timer = setInterval(() => {
-      this.fps = this.frames;
-      this.frames = 0;
+      [this.fps, this.frames] = [this.frames, 0];
       this.paintStatus();
     }, 1000);
     this.openMain();
@@ -236,7 +242,7 @@ class Video {
     this.shown = false;
     clearInterval(this.timer);
     this.timer = null;
-    if (this.main) this.main.close();
+    this.main?.close();
     this.main = null;
     for (const id of [...this.cells.keys()]) this.dropCell(id);
     this.syncFeeds();
@@ -251,7 +257,7 @@ class Video {
   }
 
   openMain() {
-    if (this.main) this.main.close();
+    this.main?.close();
     this.main = null;
     this.canvas.dataset.job = this.selected ?? "";
     this.canvas.getContext("2d").clearRect(0, 0, this.canvas.width, this.canvas.height);
@@ -259,7 +265,7 @@ class Video {
     if (!this.selected) return;
     const id = this.selected;
     const canvases = () => [this.fitMain(), this.cells.get(id)?.canvas];
-    this.main = new Picture(this.api, id, this.view.get("video"), canvases, () => this.frames++);
+    this.main = this.picture(id, this.view.get("video"), canvases, () => this.frames++);
   }
 
   // The main canvas at the largest 4:3 that fits the stage (device pixels).
@@ -277,10 +283,7 @@ class Video {
     this.profileBtn.textContent = profile === "smooth" ? "sharp" : "smooth";
     this.profileBtn.title = `view set video ${this.profileBtn.textContent}`;
     const job = this.job(this.selected);
-    if (!job) {
-      this.statusText.textContent = "no video feed";
-      return;
-    }
+    if (!job) return void (this.statusText.textContent = "no video feed");
     const ev = this.locks.get(job.id) || {};
     const lock = ev.lock ?? (ev.locked === true ? "locked" : ev.locked === false ? "no lock" : "waiting");
     const snr = Number.isFinite(ev.snr_db) ? `${ev.snr_db} dB` : "? dB";
@@ -294,8 +297,8 @@ class Video {
     const ids = new Set(this.running().map((j) => j.id));
     for (const id of [...this.locks.keys()]) if (!ids.has(id)) this.locks.delete(id);
     this.syncThumbs();
-    if (this.main) this.main.open();
-    for (const c of this.cells.values()) if (c.pic) c.pic.open();
+    this.main?.open();
+    for (const c of this.cells.values()) c.pic?.open();
     this.reconcile();
   }
 
@@ -311,16 +314,9 @@ class Video {
     const run = this.running();
     const ids = new Set(run.map((j) => j.id));
     if (!this.selected || !ids.has(this.selected)) {
-      const next = run[0]?.id ?? null;
-      if (next !== null) {
-        this.select(next);
-        return;
-      }
+      if (run.length) return this.select(run[0].id);
       this.selected = null;
-      if (this.polled) {
-        this.panes.select(null); // runs onHide
-        return;
-      }
+      if (this.polled) return this.panes.select(null); // runs onHide
     }
     for (const id of [...this.cells.keys()]) if (!ids.has(id)) this.dropCell(id);
     for (const j of run) this.cellFor(j);
@@ -345,20 +341,14 @@ class Video {
     const selected = job.id === this.selected;
     c.canvas.classList.toggle("selected", selected);
     // The selected feed's cell is drawn by the main socket; every other one has its own.
-    if (selected && c.pic) {
-      c.pic.close();
-      c.pic = null;
-    } else if (!selected && !c.pic) {
-      const canvas = c.canvas;
-      c.pic = new Picture(this.api, job.id, "thumb", () => [canvas]);
-    }
+    if (selected) c.pic = c.pic?.close() ?? null;
+    else c.pic ??= this.picture(job.id, "thumb", () => [c.canvas]);
   }
 
   dropCell(id) {
     const c = this.cells.get(id);
-    if (!c) return;
-    if (c.pic) c.pic.close();
-    c.cell.remove();
+    c?.pic?.close();
+    c?.cell.remove();
     this.cells.delete(id);
   }
 
@@ -367,16 +357,18 @@ class Video {
   syncFeeds() {
     const here = this.shownSource();
     const want = new Set(this.shown ? this.running().map((j) => j.source).filter((s) => s !== here) : []);
-    for (const [src, sub] of [...this.feeds]) {
-      if (want.has(src)) continue;
-      sub.close();
-      this.feeds.delete(src);
-    }
+    for (const src of [...this.feeds.keys()]) if (!want.has(src)) this.dropFeed(src);
     for (const src of want) {
       if (this.feeds.has(src)) continue;
-      const sub = { inner: null, closed: false, close: () => (sub.closed = true) && sub.inner?.close() };
+      const sub = { inner: null, closed: false };
+      sub.close = () => {
+        if (sub.inner && !sub.closed) stats.sockets_events--;
+        sub.closed = true;
+        sub.inner?.close();
+      };
       this.feeds.set(src, sub);
       const onMessage = (msg) => {
+        if (msg && msg.type === "closed") return this.feeds.get(src) === sub && this.dropFeed(src);
         const p = msg && msg.type === "frame" ? msg.payload : null;
         if (p && p.protocol === "video" && typeof p.locked === "boolean" && msg.job) this.lock(msg.job, p);
       };
@@ -386,9 +378,17 @@ class Video {
           if (sub.closed) return;
           // No feed listed (yet): forgotten, so the next sync looks again.
           if (sid === null) this.feeds.delete(src);
-          else sub.inner = this.api.streamText(sid, onMessage, null, { onReconnect: () => feedOf(this.api, src) });
+          else {
+            stats.sockets_events++;
+            sub.inner = this.api.streamText(sid, onMessage, null, { onReconnect: () => feedOf(this.api, src) });
+          }
         });
     }
+  }
+
+  dropFeed(src) {
+    this.feeds.get(src)?.close();
+    this.feeds.delete(src);
   }
 
   destroy() {
