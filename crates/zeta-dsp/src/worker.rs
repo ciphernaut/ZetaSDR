@@ -17,9 +17,11 @@ pub const VIDEO_QUEUE_DEPTH: usize = 8;
 
 /// [`crate::run_map`] with `f` on a thread of its own (named `zeta-<kind>`): the async
 /// side receives frames from `inputs[0]`, counts broadcast lag through [`note_lag`], and
-/// queues each input for the thread in a queue of `depth`. A full queue drops the input,
-/// counts it in `dropped` and passes the next input that fits as [`Input::Lagged`] with
-/// the inputs missed (broadcast lag and drops together) before it. The thread publishes
+/// queues each input for the thread in a queue of `depth`. A full queue drops the input
+/// and counts it in `dropped`; the next input that fits carries the count of inputs
+/// missed before it (broadcast lag and drops together), and the thread hands `f` an
+/// [`Input::Lagged`] with that count just before the frame, so a marker never takes a
+/// queue slot of its own. The thread publishes
 /// every frame `f` returns. Cancellation stops the thread before its next input and
 /// returns `Cancelled`; a closed input lets the thread finish what is queued and returns
 /// `Ok(())`; a thread that panics fails the stage.
@@ -39,7 +41,7 @@ where
         return Err(StageError::Failed("expected 1 input".into()));
     }
     let mut rx = inputs.remove(0);
-    let (tx, queue) = sync_channel::<Input>(depth.max(1));
+    let (tx, queue) = sync_channel::<Queued>(depth.max(1));
     let stop = Arc::new(AtomicBool::new(false));
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let thread_stop = stop.clone();
@@ -48,11 +50,16 @@ where
         .spawn(move || {
             // Said when the thread ends, however it ends.
             let _done = DoneGuard(Some(done_tx));
-            while let Ok(input) = queue.recv() {
+            while let Ok(Queued { missed, frame }) = queue.recv() {
                 if thread_stop.load(Ordering::Relaxed) {
                     break;
                 }
-                for out in f(input) {
+                if missed > 0 {
+                    for out in f(Input::Lagged { missed }) {
+                        bus.publish(out);
+                    }
+                }
+                for out in f(Input::Frame(frame)) {
                     bus.publish(out);
                 }
             }
@@ -100,23 +107,24 @@ impl Drop for DoneGuard {
     }
 }
 
-/// Queue `frame` for the thread, preceded by [`Input::Lagged`] when `missed` inputs were
-/// lost since the last one queued. A full queue drops the frame (and the marker), counts
-/// it in `dropped` and in `missed`. False when the thread has gone.
-fn offer(tx: &SyncSender<Input>, missed: &mut u64, dropped: &AtomicU64, frame: Frame) -> bool {
-    if *missed > 0 {
-        match tx.try_send(Input::Lagged { missed: *missed }) {
-            Ok(()) => *missed = 0,
-            Err(TrySendError::Full(_)) => {
-                dropped.fetch_add(1, Ordering::Relaxed);
-                *missed += 1;
-                return true;
-            }
-            Err(TrySendError::Disconnected(_)) => return false,
+/// A queued input: the frame and the inputs missed just before it.
+struct Queued {
+    missed: u64,
+    frame: Frame,
+}
+
+/// Queue `frame` for the thread with the `missed` inputs lost since the last one queued.
+/// A full queue drops the frame, counts it in `dropped` and in `missed`. False when the
+/// thread has gone.
+fn offer(tx: &SyncSender<Queued>, missed: &mut u64, dropped: &AtomicU64, frame: Frame) -> bool {
+    match tx.try_send(Queued {
+        missed: *missed,
+        frame,
+    }) {
+        Ok(()) => {
+            *missed = 0;
+            true
         }
-    }
-    match tx.try_send(Input::Frame(frame)) {
-        Ok(()) => true,
         Err(TrySendError::Full(_)) => {
             dropped.fetch_add(1, Ordering::Relaxed);
             *missed += 1;
@@ -198,6 +206,62 @@ mod tests {
             .expect("stage ended within 1 s")
             .unwrap();
         assert!(matches!(r, Err(StageError::Cancelled)), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn a_lagged_marker_comes_with_a_frame_and_takes_no_slot() {
+        let (tx, rx) = broadcast::channel(64);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let task = tokio::spawn(run_map_threaded(
+            "worker_test",
+            vec![rx],
+            Arc::new(StreamBus::new(4)),
+            CancellationToken::new(),
+            1,
+            dropped.clone(),
+            move |input| {
+                match input {
+                    Input::Lagged { missed } => log.lock().unwrap().push(Some(missed)),
+                    Input::Frame(_) => {
+                        log.lock().unwrap().push(None);
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                Vec::new()
+            },
+        ));
+        let sent = 40u64;
+        for i in 0..sent {
+            tx.send(event(i)).unwrap();
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        drop(tx);
+        let r = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stage ended")
+            .unwrap();
+        assert!(r.is_ok(), "{r:?}");
+        let seen = seen.lock().unwrap();
+        let frames = seen.iter().filter(|s| s.is_none()).count() as u64;
+        let markers: Vec<u64> = seen.iter().filter_map(|s| *s).collect();
+        assert!(!markers.is_empty(), "no Lagged input seen");
+        // Every marker is followed at once by the frame it came with.
+        for (i, s) in seen.iter().enumerate() {
+            if s.is_some() {
+                assert_eq!(
+                    seen.get(i + 1),
+                    Some(&None),
+                    "marker without a frame: {seen:?}"
+                );
+            }
+        }
+        // Every input is a frame handed over or a drop, and every drop is in a marker but
+        // the trailing ones no frame came after.
+        let dropped = dropped.load(Ordering::Relaxed);
+        assert_eq!(frames + dropped, sent);
+        assert!(markers.iter().sum::<u64>() <= dropped);
     }
 
     #[tokio::test]

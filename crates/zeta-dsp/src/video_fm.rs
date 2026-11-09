@@ -3,7 +3,8 @@
 //! stage.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use num_complex::Complex;
@@ -428,6 +429,40 @@ impl VideoFmDemod {
     }
 }
 
+/// When `video_fm_demod` notes its dropped inputs: when the count changed since the last
+/// note, at most once per `every`.
+#[derive(Clone, Debug)]
+pub struct DropNote {
+    noted: u64,
+    at: Option<Instant>,
+    every: Duration,
+}
+
+impl DropNote {
+    pub fn new(every: Duration) -> Self {
+        DropNote {
+            noted: 0,
+            at: None,
+            every,
+        }
+    }
+
+    /// Whether `dropped` (the count at `now`) is to be noted; true marks it noted.
+    pub fn due(&mut self, dropped: u64, now: Instant) -> bool {
+        if dropped == self.noted || self.at.is_some_and(|a| now.duration_since(a) < self.every) {
+            return false;
+        }
+        self.mark(dropped, now);
+        true
+    }
+
+    /// `dropped` was noted at `now` (with something else).
+    pub fn mark(&mut self, dropped: u64, now: Instant) {
+        self.noted = dropped;
+        self.at = Some(now);
+    }
+}
+
 /// Demodulates a wideband FM video carrier to composite video (an audio-kind stream at
 /// the composite rate), with the DSP on a thread of its own behind a drop-on-full queue.
 pub struct VideoFmDemodStage {
@@ -486,6 +521,9 @@ impl Stage for VideoFmDemodStage {
             return Err(StageError::Failed("expected 1 output".into()));
         };
         let mut noted: Option<u64> = None;
+        let mut drops = DropNote::new(Duration::from_secs(1));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let seen = dropped.clone();
         let mut complained = false;
         let f = move |input| {
             let frame = match input {
@@ -511,9 +549,17 @@ impl Stage for VideoFmDemodStage {
                     return Vec::new();
                 }
             };
-            if noted != Some(comp) {
+            // The rate once per rate, the drops when they grew (at most once a second),
+            // always together in the one object.
+            let n = seen.load(Ordering::Relaxed);
+            let now = Instant::now();
+            let rate_new = noted != Some(comp);
+            if rate_new {
                 noted = Some(comp);
-                ctx.note(json!({"video_fm": {"composite_rate_hz": comp}}));
+                drops.mark(n, now);
+            }
+            if rate_new || drops.due(n, now) {
+                ctx.note(json!({"video_fm": {"composite_rate_hz": comp, "dropped": n}}));
             }
             if samples.is_empty() {
                 return Vec::new();
@@ -530,15 +576,27 @@ impl Stage for VideoFmDemodStage {
                 },
             )]
         };
-        run_map_threaded(
-            kind,
-            inputs,
-            bus,
-            cancel,
-            VIDEO_QUEUE_DEPTH,
-            Arc::new(AtomicU64::new(0)),
-            f,
-        )
-        .await
+        run_map_threaded(kind, inputs, bus, cancel, VIDEO_QUEUE_DEPTH, dropped, f).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drops_are_noted_when_they_change_at_most_once_a_second() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs(1);
+        let mut d = DropNote::new(s);
+        assert!(!d.due(0, t0), "nothing dropped yet");
+        assert!(d.due(3, t0));
+        assert!(!d.due(3, t0 + 2 * s), "unchanged");
+        assert!(!d.due(5, t0 + s / 2), "within the second");
+        assert!(d.due(5, t0 + s));
+        d.mark(9, t0 + 2 * s);
+        assert!(!d.due(9, t0 + 4 * s), "noted with the rate");
+        assert!(!d.due(10, t0 + 2 * s + s / 4));
+        assert!(d.due(10, t0 + 3 * s));
     }
 }
