@@ -2,25 +2,26 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A request to the agent that names no radio runs on the radio the operator is looking at (the shown tab, or the kept one while the Map is shown), under a selection policy the operator sets (`focus`, `focus-strict`, `free-first`, `ask`, plus a preference list); the default radio's tab is marked, a run on another radio is noted, and the selection record is the seam later access levels plug into.
+**Goal:** A request to the agent that names no radio runs on the radio the operator is looking at (the shown tab, or the kept one while the Map is shown), under a selection policy the operator sets (`focus`, the default: that radio only, else stop and ask; `focus-fallback`; `free-first`; `ask`; plus a preference list kept in the browser); the default radio's tab is marked, a run on another radio is noted, and the selection record is the seam later access levels plug into.
 
-**Architecture:** A new `zeta-agent/src/radio.rs` owns the mechanism: the policy, the context, `resolve` (precedence: a named radio, then the policy, then no context) over one `source_list` read before the first completion, the `## This request` paragraph appended to the one system message, and `Selection::admit`, the gate beside `gate(op, allow)` that refuses another radio under `focus-strict` with the agent-only error word `policy` and records `off_default` otherwise. `AskRequest` gains an optional `context`; `zeta ask` gains `--radio`, `--radio-policy`, `--radio-prefer`. The page sends its focus and policy with each ask, keeps two new view policies, names the box menu's radio in its text, notes a run off the default, and marks the default tab with an accent dot.
+**Architecture:** A new `zeta-agent/src/radio.rs` owns the mechanism: the policy, the context, `resolve` (precedence: a named radio, then the policy, then no context) over one `source_list` read before the first completion, the `## This request` paragraph appended to the one system message, and `Selection::admit`, the gate beside `gate(op, allow)` that refuses another radio under `focus` with the agent-only error word `policy` and records `off_default` otherwise. `AskRequest` gains an optional `context`; `zeta ask` gains `--radio`, `--radio-policy`, `--radio-prefer`. The page sends its focus and policy with each ask, keeps two new view policies, names the box menu's radio in its text, notes a run off the default, and marks the default tab with an accent dot.
 
 **Tech Stack:** Rust (serde, tokio, axum, clap), vanilla JS page, the fake OpenAI-compatible model (`zeta-agent` feature `test-fake`), the Playwright e2e suite in `crates/zeta-ui/tests/e2e/ui.py`.
 
-**Spec:** `docs/superpowers/specs/2026-11-09-radio-selection-design.md` (all of it; the calls are section 10, the operator's questions section 11, the builder check section 9).
+**Spec:** `docs/superpowers/specs/2026-11-09-radio-selection-design.md` (all of it; the calls are section 10, the operator's decisions section 11, the builder check section 9).
 
 ## Global Constraints
 
 - The plan executes on `main` after the digital-modes sprint branch (plans 19.3, 29, 30, 32) merged into it; plans 28.1 and 28.2 are already there. Re-check every named line against the tree before editing; the names below are from both.
 - No op changes: `source` stays required on every op; `Op`, `OpResult` and the schema are untouched, so `agents-md --check` changes only through the guide's prose (Task 6).
-- The policy words are exactly `focus`, `focus-strict`, `free-first`, `ask`; the default is `focus`. Serde and `FromStr`/`Display` use these words (`kebab-case`).
-- Precedence, first that applies: (1) a source id in the request as a whole word, case-insensitive (one named radio becomes the default with reason `named`; several keep the policy's default; a named radio is never refused); (2) the policy over the context; (3) no context: `focus` with no focus, which behaves as `free-first` in id order.
+- The policy words are exactly `focus`, `focus-fallback`, `free-first`, `ask`; the default is `focus` (the operator chose stop-and-ask: the focused radio only, the gate refuses another unnamed radio, and when it cannot take the band the agent says why, names the free radios and asks, starting nothing); `focus-fallback` is the opt-in that uses the first free radio and says which and why. Serde and `FromStr`/`Display` use these words (`kebab-case`).
+- Precedence, first that applies: (1) a source id in the request as a whole word, case-insensitive (one named radio becomes the default with reason `named`; several keep the policy's default; a named radio is never refused); (2) the policy over the context; (3) no context at all (`RadioContext::default()`, a page-less `/ask`, `zeta ask` with none of the three radio flags or variables): policy `free-first` in id order, today's behaviour, kept for compatibility. A context that omits `radio_policy` means `focus` when it gives a focus, else `free-first`; a context whose focus is unusable has no default radio, and `focus` then behaves as `ask`, `focus-fallback` as `free-first`.
 - `RADIO_OPS = ["job_start", "plan_start", "source_ensure", "source_pin", "source_set_gain"]`, read through each op's `source` field. Nothing else is gated by the radio policy.
-- The policy refusal is `{"error": "policy", "field": "source", "policy": "focus-strict", "default": "<id>", "message": "radio policy focus-strict: <src> is not the default radio <id>; the operator names another radio in the request"}`. Never `not_allowed`: the page's unlock offer keys on that word.
+- The policy refusal is `{"error": "policy", "field": "source", "policy": "focus", "default": "<id>", "message": "radio policy focus: <src> is not the default radio <id>; the operator names another radio in the request"}`. Never `not_allowed`: the page's unlock offer keys on that word.
 - Per-request context goes at the end of the one system message under `## This request`; the user message stays exactly the request (the e2e's fake model matches on it). No second system message.
 - `radio_policy` and `radio_prefer` never join `AGENT_VIEW_KEYS` (`view.js`) or `VIEW_KEYS` (`crates/zeta-agent/src/page.rs`), and have no theme default.
-- The agent never stops or replaces a job to free a radio; the fallback is a free radio only.
+- The agent never stops or replaces a job to free a radio; the fallback (`focus-fallback` only) is a free radio only.
+- `radio_policy` and `radio_prefer` persist in the browser (operator decision, spec section 11): `localStorage` key `zeta.radio_prefs` (a JSON object of the keys set), read and written in `view.js` beside `loadStored`/`saveStored` with the same try/catch (storage unavailable: the defaults, held for the page load); every other view policy and `state.selected` stay per tab in `sessionStorage`. Once users exist the preference moves to the user's record on the node, keyed by the caller (spec section 5).
 - New theme hooks are documented in `docs/themes.md` and listed in the e2e's `THEME_HOOKS`; CSP is unchanged; `wait_for_function` takes a function body (`() => ...`).
 - The e2e suite runs about 474 s under the 690 s deadline (`crates/zeta/tests/ui.rs DEADLINE`): this plan adds one scenario (under 20 s) and extends two; each has explicit timeouts and restores the view in `finally`. One scenario: `ZETA_UI_ONLY=<name> cargo test -p zeta --test ui -- --nocapture`.
 - `AGENTS.md` and `skills/zetasdr/SKILL.md` are generated: regenerate (`cargo run -q -p zeta -- agents-md > AGENTS.md`, `cargo run -q -p zeta -- agents-md --skill > skills/zetasdr/SKILL.md`) and commit them with any prose change in `agents_md.rs` or `docs/agents/field-craft.md`.
@@ -49,9 +50,9 @@ Inputs the spec implies but no obvious test exercises; each gets a test in the t
 
 1. A page whose stored `zeta.source` names a radio no longer attached (restarted without it) must not send a dead default: the resolver drops it with the note `focus <id> is not a source` and the page's note says so. (Task 1: `an_unlisted_focus_is_dropped_with_a_note`; Task 4: the note line, asserted in `scenario_radio_default_mark_and_policy` by setting `sessionStorage["zeta.source"]` to `gone` before a reload.)
 2. A request that mentions a source id as part of another word (`b2100`, `cbx`) or inside a frequency must not count as naming it; a capitalised one (`CB`) must. (Task 1: `naming_is_whole_word_and_case_insensitive`.)
-3. A `focus-strict` refusal must not trigger the page's "allow and retry" offer. (Task 4: in the new scenario, `expect(page.locator("#transcript button", has_text="allow")).to_have_count(0)` after the refusal.)
+3. A `focus` refusal must not trigger the page's "allow and retry" offer. (Task 4: in the new scenario, `expect(page.locator("#transcript button", has_text="allow")).to_have_count(0)` after the refusal.)
 4. The pre-read `source_list` is one more agent-tagged ops record at the start of every run: existing tests counting ops-stream records or the page's op lines after an ask must be updated to expect it, never loosened to ignore counts. (Task 2: `ask_runs_the_agent_and_its_calls_appear_on_the_ops_stream` in `crates/zeta-ws/tests/ask.rs` asserts the first agent record is `source_list`; the ask scenarios in `ui.py` are rerun in Task 4.)
-5. `ask` and `focus-strict` end with prose; a run whose model asks without any call would fail `NoToolCall`. The guide makes `source_free` the first call, and the loop's rule is unchanged. (Task 2: `ask_policy_answers_after_source_free`; and a scripted prose-only reply to a command under `ask` still fails `NoToolCall`, `ask_policy_does_not_relax_the_prose_rule`.)
+5. `ask` and `focus` (when it asks) end with prose; a run whose model asks without any call would fail `NoToolCall`. The guide makes `source_free` the first call, and the loop's rule is unchanged. (Task 2: `ask_policy_answers_after_source_free`; and a scripted prose-only reply to a command under `ask` still fails `NoToolCall`, `ask_policy_does_not_relax_the_prose_rule`.)
 
 ---
 
@@ -65,7 +66,7 @@ Inputs the spec implies but no obvious test exercises; each gets a test in the t
 **Interfaces:**
 - Consumes: `zeta_core::types::SourceId`, `zeta_core::ops::SourceInfo` (its `id` and `fault`), `serde_json::Value`.
 - Produces:
-  - `#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "kebab-case")] pub enum RadioPolicy { #[default] Focus, FocusStrict, FreeFirst, Ask }` with `FromStr` (error `unknown radio policy <w> (allowed: focus, focus-strict, free-first, ask)`) and `Display` in the same words; `pub const RADIO_POLICIES: &[&str]`.
+  - `#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "kebab-case")] pub enum RadioPolicy { #[default] Focus, FocusFallback, FreeFirst, Ask }` with `FromStr` (error `unknown radio policy <w> (allowed: focus, focus-fallback, free-first, ask)`) and `Display` in the same words; `pub const RADIO_POLICIES: &[&str]`.
   - `#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)] #[serde(rename_all = "snake_case")] pub enum FocusFrom { Shown, Kept, Flag, #[default] None }`.
   - `#[derive(Clone, Debug, Default, PartialEq, Eq)] pub struct RadioContext { pub focus: Option<SourceId>, pub focus_from: FocusFrom, pub policy: RadioPolicy, pub prefer: Vec<SourceId> }` (the default is precedence step 3).
   - `#[derive(Clone, Debug, PartialEq, Eq, Serialize)] pub struct Caller { pub transport: String }` with `Caller::page()`, `Caller::http()`, `Caller::cli()` (`"page"`, `"http"`, `"cli"`).
@@ -81,7 +82,7 @@ Inputs the spec implies but no obvious test exercises; each gets a test in the t
 
 ```rust
 fn src(id: &str, fault: Option<&str>) -> SourceInfo { /* minimal SourceInfo with the id and fault, file-source capabilities */ }
-#[test] fn policy_words_round_trip() { /* every RADIO_POLICIES word parses and displays back; serde json "focus-strict" <-> FocusStrict; "nearest" errors naming the four words */ }
+#[test] fn policy_words_round_trip() { /* every RADIO_POLICIES word parses and displays back; serde json "focus-fallback" <-> FocusFallback; "nearest" errors naming the four words */ }
 #[test] fn naming_is_whole_word_and_case_insensitive() { /* ids [b210, cb, hackrf]: "start APRS on B210" -> [b210]; "on b2100" -> []; "cbx and cb-2" -> []; "use CB, then hackrf" -> [cb, hackrf]; "144.8 b210:" -> [b210] */ }
 #[test] fn a_named_radio_wins_under_every_policy() { /* for each policy with focus cb: request naming hackrf -> radio Some(hackrf), reason Named */ }
 #[test] fn two_named_radios_keep_the_policy_default() { /* focus cb, policy focus, request naming b210 and hackrf -> radio Some(cb), reason Shown, named [b210, hackrf] */ }
@@ -90,13 +91,14 @@ fn src(id: &str, fault: Option<&str>) -> SourceInfo { /* minimal SourceInfo with
 #[test] fn a_faulted_focus_stays_the_default_with_a_note() { /* cb faulted "usb gone" -> radio Some(cb), note Some("focus cb is faulted: usb gone") */ }
 #[test] fn free_first_and_ask_have_no_default() { /* radio None, reason None, under both, focus set */ }
 #[test] fn candidates_follow_prefer_then_id_order() { /* sources [tone, cb, hackrf, b210], prefer [hackrf, gone, cb] -> [hackrf, cb, b210, tone] */ }
-#[test] fn no_context_is_focus_without_a_focus() { /* RadioContext::default() -> policy Focus, radio None, reason None, note None */ }
-#[test] fn strict_refuses_another_radio_on_every_radio_op() { /* FocusStrict, radio cb: each RADIO_OPS tool with {"source": "tone"} -> Some(json) equal to the constraint's object with src tone, default cb; with {"source": "cb"} -> None */ }
+#[test] fn no_context_is_free_first() { /* RadioContext::default() -> policy FreeFirst, radio None, reason None, note None; a context that omits the policy: with a focus -> Focus, without -> FreeFirst */ }
+#[test] fn focus_without_a_usable_focus_asks() { /* a context with policy Focus and focus None or unlisted: radio None and the paragraph says "No default radio (no radio in focus)" and tells the model to ask which radio; under FocusFallback the same context behaves as free-first */ }
+#[test] fn strict_refuses_another_radio_on_every_radio_op() { /* Focus, radio cb: each RADIO_OPS tool with {"source": "tone"} -> Some(json) equal to the constraint's object with src tone, default cb; with {"source": "cb"} -> None */ }
 #[test] fn strict_admits_a_named_radio() { /* request names tone -> admit job_start tone is None */ }
-#[test] fn reads_and_releases_are_never_checked() { /* FocusStrict: source_list, source_free, source_unpin, classify, job_stop with a "source" or selection on tone -> None, off_default empty */ }
-#[test] fn focus_admits_and_records_off_default() { /* Focus, radio cb: job_start tone -> None; off_default == [OffDefault{tool: "job_start", source: tone}]; job_start cb adds nothing */ }
+#[test] fn reads_and_releases_are_never_checked() { /* Focus: source_list, source_free, source_unpin, classify, job_stop with a "source" or selection on tone -> None, off_default empty */ }
+#[test] fn focus_fallback_admits_and_records_off_default() { /* FocusFallback, radio cb: job_start tone -> None; off_default == [OffDefault{tool: "job_start", source: tone}]; job_start cb adds nothing */ }
 #[test] fn no_default_records_nothing() { /* FreeFirst: job_start tone -> None, off_default empty */ }
-#[test] fn the_paragraph_names_the_default_and_the_rule() { /* prompt_section() starts "## This request"; Focus/Kept contains "Default radio: cb (policy focus: the radio last shown on the page; the Map is shown)" and "use the first free radio `source_free` gives"; FocusStrict contains "do not use another radio" and "ask which radio to use"; FreeFirst contains "No default radio (policy free-first)"; Ask contains "call `source_free` for the band, then ask which"; Named contains "the request names hackrf"; no context contains "No default radio (no radio in focus)"; every variant lists "Radios in preference order:" with the candidates and none contains "replace" except as "never `replace`" */ }
+#[test] fn the_paragraph_names_the_default_and_the_rule() { /* prompt_section() starts "## This request"; Focus/Kept contains "Default radio: cb (policy focus: the radio last shown on the page; the Map is shown)", "work on cb only" and "ask which to use"; FocusFallback contains "use the first free radio `source_free` gives" and "say in your answer which radio you used"; FreeFirst contains "No default radio (policy free-first)"; Ask contains "call `source_free` for the band, then ask which"; Named contains "the request names hackrf"; no context contains "No default radio (no radio in focus)"; every variant lists "Radios in preference order:" with the candidates and none contains "replace" except as "never `replace`" */ }
 ```
 
 - [ ] **Step 2: Run to verify they fail** — `cargo test -p zeta-agent radio::` — Expected: FAIL to compile (`radio` module missing).
@@ -106,7 +108,7 @@ fn src(id: &str, fault: Option<&str>) -> SourceInfo { /* minimal SourceInfo with
 
 ```bash
 git add crates/zeta-agent/src/radio.rs crates/zeta-agent/src/lib.rs
-git commit -m "Agent: radio selection (radio.rs): the policy, the context, resolve with a named radio first, the focus-strict gate and the request's paragraph"
+git commit -m "Agent: radio selection (radio.rs): the policy, the context, resolve with a named radio first, the focus gate and the request's paragraph"
 ```
 
 ---
@@ -128,15 +130,16 @@ git commit -m "Agent: radio selection (radio.rs): the policy, the context, resol
 // (both the tone recording, tune_range Some((100_000_000, 200_000_000)))
 #[tokio::test] async fn the_system_message_ends_with_this_request() { /* cfg.radio = focus cb Shown; scripted text answer to a question; requests(&fake)[0] messages: one system message whose content ends with a "## This request" section naming "Default radio: cb"; the user message == the request exactly */ }
 #[tokio::test] async fn one_source_list_is_read_before_the_first_completion() { /* a recording executor wrapper: its first applied op is {"op":"source_list"} and it is applied before the fake saw a request; transcript.calls does not contain it */ }
-#[tokio::test] async fn strict_refuses_job_start_on_another_radio() { /* FocusStrict, focus cb; script: job_start measure on tone, then text; the second chat request's tool message content has "error":"policy" and "default":"cb"; job_list is empty; transcript.calls[0].ok == false */ }
-#[tokio::test] async fn focus_starts_it_and_records_off_default() { /* Focus, focus cb; same script: the job runs on tone; transcript.selection.off_default == [{tool: job_start, source: tone}]; stop the job at the end */ }
+#[tokio::test] async fn strict_refuses_job_start_on_another_radio() { /* Focus, focus cb; script: job_start measure on tone, then text; the second chat request's tool message content has "error":"policy" and "default":"cb"; job_list is empty; transcript.calls[0].ok == false */ }
+#[tokio::test] async fn focus_fallback_starts_it_and_records_off_default() { /* FocusFallback, focus cb; same script: the job runs on tone; transcript.selection.off_default == [{tool: job_start, source: tone}]; stop the job at the end */ }
+#[tokio::test] async fn focus_asks_when_the_focus_is_held() { /* Focus (the default), focus cb, a measure on cb holding the band, tone free; script: source_free then text "cb is held; tone is free: use it?"; Ok with the answer; job_list unchanged; nothing started */ }
 #[tokio::test] async fn ask_policy_answers_after_source_free() { /* Ask; script: source_free, then text "Which radio: tone or cb?"; request "start a measure on 150 MHz" -> Ok, answer set */ }
 #[tokio::test] async fn ask_policy_does_not_relax_the_prose_rule() { /* Ask; script: text only; request "start a measure on 150 MHz" -> Err NoToolCall */ }
-#[tokio::test] async fn no_free_radio_starts_nothing() { /* Focus, focus cb, a measure on tone holding it; script: source_free (empty free for a band only tone's range holds) then text "Nothing free: tone is held by measure <id>."; Ok with the answer; job_list unchanged; no call carried a non-empty replace */ }
+#[tokio::test] async fn no_free_radio_starts_nothing() { /* FocusFallback, focus cb, a measure on tone holding it; script: source_free (empty free for a band only tone's range holds) then text "Nothing free: tone is held by measure <id>."; Ok with the answer; job_list unchanged; no call carried a non-empty replace */ }
 #[tokio::test] async fn a_run_without_context_states_no_radio_in_focus() { /* AgentConfig::new default radio; system message contains "No default radio (no radio in focus)" */ }
 // crates/zeta-ws/tests/ask.rs
 // ask_runs_the_agent_and_its_calls_appear_on_the_ops_stream: the first record tagged "agent" is source_list (the pre-read), then the scripted calls as before
-#[tokio::test] async fn ask_answer_carries_the_selection() { /* POST /ask without context: 200, body["selection"]["policy"] == "focus", ["caller"]["transport"] == "http", ["radio"] null */ }
+#[tokio::test] async fn ask_answer_carries_the_selection() { /* POST /ask without context: 200, body["selection"]["policy"] == "free-first", ["caller"]["transport"] == "http", ["radio"] null */ }
 ```
 
 - [ ] **Step 2: Run to verify they fail** — `cargo test -p zeta-agent --features test-fake --test agent && cargo test -p zeta-ws --test ask` — Expected: FAIL (no `radio` on `AgentConfig`, no `selection`).
@@ -146,7 +149,7 @@ git commit -m "Agent: radio selection (radio.rs): the policy, the context, resol
 
 ```bash
 git add crates/zeta-agent crates/zeta-ws crates/zeta/src/ask.rs
-git commit -m "Agent: every run reads the radios once, states its default radio in the system message, holds focus-strict to it and reports the selection in the transcript"
+git commit -m "Agent: every run reads the radios once, states its default radio in the system message, holds focus to it and reports the selection in the transcript"
 ```
 
 ---
@@ -159,7 +162,7 @@ git commit -m "Agent: every run reads the radios once, states its default radio 
 
 **Interfaces:**
 - Consumes: Task 1's `RadioPolicy` (`FromStr`), `RadioContext`, `FocusFrom`; Task 2's `build_agent`.
-- Produces: `#[derive(Deserialize, Default)] #[serde(deny_unknown_fields)] struct AskContext { focus: Option<String>, main: Option<String>, radio_policy: Option<RadioPolicy>, #[serde(default)] radio_prefer: Vec<String> }`; `main` must be `rf` or `map` when given (else 422 `invalid ask request: context.main must be rf or map`); `focus_from` is `Kept` for `map`, else `Shown`, `None` without a focus. `AskArgs`: `--radio ID` (`env = "ZETA_RADIO"`), `--radio-policy P` (`env = "ZETA_RADIO_POLICY"`, `value_parser` over `RadioPolicy::from_str`, default `focus`), `--radio-prefer IDS` (`env = "ZETA_RADIO_PREFER"`, comma-separated, `value_delimiter = ','`); `--radio` gives `FocusFrom::Flag`.
+- Produces: `#[derive(Deserialize, Default)] #[serde(deny_unknown_fields)] struct AskContext { focus: Option<String>, main: Option<String>, radio_policy: Option<RadioPolicy>, #[serde(default)] radio_prefer: Vec<String> }`; `main` must be `rf` or `map` when given (else 422 `invalid ask request: context.main must be rf or map`); `focus_from` is `Kept` for `map`, else `Shown`, `None` without a focus. `AskArgs`: `--radio ID` (`env = "ZETA_RADIO"`), `--radio-policy P` (`env = "ZETA_RADIO_POLICY"`, `value_parser` over `RadioPolicy::from_str`, no clap default: with none of the three given there is no context and the run is `free-first`), `--radio-prefer IDS` (`env = "ZETA_RADIO_PREFER"`, comma-separated, `value_delimiter = ','`); `--radio` gives `FocusFrom::Flag`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -170,8 +173,8 @@ git commit -m "Agent: every run reads the radios once, states its default radio 
 #[tokio::test] async fn ask_context_refuses_an_unknown_policy() { /* radio_policy "nearest": 422 whose message contains "nearest" */ }
 #[tokio::test] async fn ask_context_refuses_a_bad_main() { /* main "spectrum": 422 "context.main must be rf or map" */ }
 // crates/zeta/tests/cli.rs
-#[test] fn ask_radio_policy_refuses_an_unknown_word() { /* `zeta ask --llm-url http://127.0.0.1:9 --llm-model m --radio-policy nearest hi` exits 2, stderr names focus-strict */ }
-#[test] fn ask_radio_flags_parse_and_read_the_environment() { /* Cli::try_parse_from with --radio b210 --radio-policy focus-strict --radio-prefer b210,hackrf; and with ZETA_RADIO_POLICY=ask set on the parse, radio_policy == Ask */ }
+#[test] fn ask_radio_policy_refuses_an_unknown_word() { /* `zeta ask --llm-url http://127.0.0.1:9 --llm-model m --radio-policy nearest hi` exits 2, stderr names focus-fallback */ }
+#[test] fn ask_radio_flags_parse_and_read_the_environment() { /* Cli::try_parse_from with --radio b210 --radio-policy focus-fallback --radio-prefer b210,hackrf; with ZETA_RADIO_POLICY=ask set on the parse, radio_policy == Ask; with none of the flags or variables, no context is built (precedence step 3); with only --radio b210, the policy is Focus */ }
 ```
 
 - [ ] **Step 2: Run to verify they fail** — `cargo test -p zeta-ws --test ask && cargo test -p zeta --test cli ask_radio` — Expected: FAIL.
@@ -189,12 +192,12 @@ git commit -m "Ask: /ask takes the page's context (focus, main, radio_policy, ra
 ### Task 4: The page: the context, the two policies, the off-default note, the menu names its radio
 
 **Files:**
-- Modify: `crates/zeta-ui/web/api.js` (`ask(text, maxTurns, allow, context)` and the header comment), `crates/zeta-ui/web/view.js` (`POLICIES` entries `radio_policy`, `radio_prefer`; the header list), `crates/zeta-ui/web/app.js` (`askContext()`, `askAgent` sends it, the notes after the answer), `crates/zeta-ui/web/menu.js` (the `ask` action's text and the header table), `crates/zeta/tests/ui.rs` (`fake_llm_scripts` gains "radio fallback probe"), `crates/zeta-ui/tests/e2e/ui.py`
+- Modify: `crates/zeta-ui/web/api.js` (`ask(text, maxTurns, allow, context)` and the header comment), `crates/zeta-ui/web/view.js` (`POLICIES` entries `radio_policy`, `radio_prefer`; `RADIO_PREFS_KEY = "zeta.radio_prefs"`, `loadPrefs`/`savePrefs` beside `loadStored`/`saveStored`, both try/catch; the two keys are read from and written to `localStorage` instead of `VIEW_KEY`'s `sessionStorage`; `view reset` clears them; the header list), `crates/zeta-ui/web/app.js` (`askContext()`, `askAgent` sends it, the notes after the answer), `crates/zeta-ui/web/menu.js` (the `ask` action's text and the header table), `crates/zeta/tests/ui.rs` (`fake_llm_scripts` gains "radio fallback probe"), `crates/zeta-ui/tests/e2e/ui.py`
 - Test: `crates/zeta-ui/tests/e2e/ui.py`
 
 **Interfaces:**
 - Consumes: Task 3's body shape `context: {focus, main, radio_policy, radio_prefer}`; Task 2's `selection` on the answer (`radio`, `policy`, `note`, `off_default`).
-- Produces: `askContext() -> {focus: state.selected ?? null, main: view.get("main"), radio_policy: view.get("radio_policy"), radio_prefer: [ids]}`; `view.get("radio_prefer")` returns the stored text (`none` or `a,b`), split by `askContext`; `defaultRadio() -> id | null` in `app.js` (`state.selected` under `focus`/`focus-strict`, else `null`) for Task 5.
+- Produces: `askContext() -> {focus: state.selected ?? null, main: view.get("main"), radio_policy: view.get("radio_policy"), radio_prefer: [ids]}`; `view.get("radio_prefer")` (read from `localStorage` on every call, defaults when unavailable) returns the stored text (`none` or `a,b`), split by `askContext`; `defaultRadio() -> id | null` in `app.js` (`state.selected` under `focus`/`focus-fallback`, else `null`) for Task 5.
 - The menu text: `` `Look at ${s.centerHz} Hz, ${s.bandwidthHz} Hz wide, on ${s.sourceId}, from ${s.startNs} to ${s.endNs}: what is it?` ``.
 - The notes (one transcript note line each, after the answer line): `ran on <src> (<tool>), not the default radio <radio> (<policy>)` per distinct off-default source (tools joined by `, `); `<note>; no default radio` when `selection.note` is set and `selection.radio` is null.
 - `radio_prefer`'s parse: `none`, or comma-separated `SOURCE_ID` matches with no repeats; describe `none, a comma-separated list of source ids`.
@@ -203,8 +206,10 @@ git commit -m "Ask: /ask takes the page's context (focus, main, radio_policy, ra
   - `fake_llm_scripts`: `{"match": "radio fallback probe", "replies": [tool_call_response(&[("job_start", <measure on tone, center 100_000_000, bandwidth 12_500, nulls, replace []>)]), text_response("Started it on tone.", "stop")]}`; the ui.py comment above `llm_url` lists it.
   - `scenario_ask_sends_32_turns_and_the_allowance`: `assert asks[0]["context"] == {"focus": "cb", "main": "rf", "radio_policy": "focus", "radio_prefer": []}`.
   - new `scenario_radio_default_mark_and_policy` (on `llm_url()`, after `select_source(..., "cb")`, view reset and every job it started stopped in `finally`):
-    - click the Map tab, run `radio fallback probe`: the ask's `context` has `main` `map`, `focus` `cb`; a note line `ran on tone (job_start), not the default radio cb (focus)` shows.
-    - `view set radio_policy focus-strict`, run it again: the turn shows `→ job_start` with `policy` in its result; `expect(page.locator("#transcript button", has_text="allow")).to_have_count(0)`; polling `job_list` shows one measure on `tone` (the first run's), not two.
+    - click the Map tab, run `radio fallback probe` under the default `focus`: the ask's `context` has `main` `map`, `focus` `cb`; the turn shows `→ job_start` with `policy` in its result; `expect(page.locator("#transcript button", has_text="allow")).to_have_count(0)`; polling `job_list` shows no measure on `tone`.
+    - `view set radio_policy focus-fallback` and the same request: a note line `ran on tone (job_start), not the default radio cb (focus-fallback)` shows.
+    - `view set radio_policy focus-fallback`, run it again: the note line shows and polling `job_list` shows one measure on `tone` (started by this run).
+    - persistence (the operator's decision): after `view set radio_policy focus-fallback` and `view set radio_prefer tone,cb`, open a second page in the same browser context: `view show` there reads both, its next ask posts `radio_policy: "focus-fallback"` and `radio_prefer: ["tone", "cb"]`, and its shown radio is its own (`zeta.source` stays per tab); a reload keeps them; `view reset` clears both (checked in the second page). With `Storage.prototype.getItem`/`setItem` replaced by throwing functions (`add_init_script` on a fresh page) the page boots with the defaults and `view set radio_policy ask` still answers ok. `localStorage.removeItem("zeta.radio_prefs")` in `finally`.
     - `view set radio_prefer cb,cb` answers the not-allowed error; `view set radio_prefer tone,cb` then an ask posts `radio_prefer: ["tone", "cb"]`.
     - `sessionStorage["zeta.source"] = "gone"` is not reachable through the tabs: instead post `/ask` from the test (`http_json`) with `context.focus` `gone` and assert `selection.note == "focus gone is not a source"` (the page's note formatting is covered by a unit-style `page.evaluate` of the note helper, exported on `window.zetaTest.selectionNotes(selection)`).
   - The existing menu "Send to agent" coverage (find it under `# ---- context menu (Task 9)`; else add to the new scenario through the box menu on `cb`): the user line contains `on cb,`.
@@ -233,7 +238,7 @@ git commit -m "UI: each ask carries the shown radio and the radio policy (view s
 - [ ] **Step 1: Write the failing assertions** in `scenario_radio_default_mark_and_policy`, before the asks:
   - `expect(page.locator(".src-tab.default")).to_have_count(1)`; its `data-id` is `cb`; its title contains `default radio for the agent (policy focus)`; `.src-tab.default .default-mark` is visible.
   - after the Map tab: the `cb` tab has classes `kept` and `default`.
-  - after `view set radio_policy free-first`: `.src-tab.default` count 0; after `ask`: 0; after `focus-strict`: 1, title says `(policy focus-strict)`.
+  - after `view set radio_policy free-first`: `.src-tab.default` count 0; after `ask`: 0; after `focus-fallback`: 1, title says `(policy focus-fallback)`; under the default `focus` the title says `(policy focus)`.
   - after selecting `tone`'s tab: the mark moves to `tone`.
   - `THEME_HOOKS` gains `".src-tab.default"` and `".src-tab .default-mark"`.
 - [ ] **Step 2: Run to verify they fail** — `ZETA_UI_ONLY=radio_default_mark_and_policy,theme_hooks cargo test -p zeta --test ui -- --nocapture` — Expected: FAIL.
@@ -251,7 +256,7 @@ git commit -m "UI: the default radio's tab carries an accent dot and says so on 
 ### Task 6: The guide
 
 **Files:**
-- Modify: `crates/zeta/src/agents_md.rs` (`RULES`: the radios rule after the ids rule, spec 4.7 verbatim; the `source_free` note gains "Its `free` list is in id order, which is no preference: the request's default radio and preference order (`## This request`) come first."), `docs/agents/field-craft.md` (the page paragraph: the dot, `view set radio_policy focus|focus-strict|free-first|ask`, `radio_prefer`, the box menu names its radio, the page's note), `docs/guide.md` (the view-policy table rows `radio_policy` and `radio_prefer`; the `zeta ask` flags `--radio`, `--radio-policy`, `--radio-prefer` with their environment variables), `AGENTS.md`, `skills/zetasdr/SKILL.md`
+- Modify: `crates/zeta/src/agents_md.rs` (`RULES`: the radios rule after the ids rule, spec 4.7 verbatim; the `source_free` note gains "Its `free` list is in id order, which is no preference: the request's default radio and preference order (`## This request`) come first."), `docs/agents/field-craft.md` (the page paragraph: the dot, `view set radio_policy focus|focus-fallback|free-first|ask` (default `focus`: the focused radio only, ask when it cannot take the band; saved in the browser across tabs and restarts), and the guide's rule text for `focus` (use only the default radio; when it cannot take the band, say why, name the free radios and ask which; never start on another unnamed radio, the gate answers `policy`) and for `focus-fallback` (use the first free radio and say which and why), `radio_prefer`, the box menu names its radio, the page's note), `docs/guide.md` (the view-policy table rows `radio_policy` and `radio_prefer`; the `zeta ask` flags `--radio`, `--radio-policy`, `--radio-prefer` with their environment variables), `AGENTS.md`, `skills/zetasdr/SKILL.md`
 - Test: `crates/zeta/tests/agents_md.rs` (existing)
 
 - [ ] **Step 1: Write the prose.**
@@ -272,7 +277,7 @@ git commit -m "Guide: radios: a named radio, else the request's default, else th
 
 - [ ] **Step 1: TODO.md** — Under "Access: ACLs on restricted rows" add the radio seam: `Selection.candidates` filtered per caller in `resolve`, `Selection::admit` the agent's check and the same check in `Node::apply_from` for direct ops, transmit ops joining `RADIO_OPS` as transmit and requiring the caller's TX level (and, likely, a named radio: `focus` never implies a transmit radio), `Capabilities.tx` the radio's flag, the selection appended to `ops.log` with the caller. Add a gist "Radio selection: later": `radio_prefer` by driver or role (needs a driver in `SourceInfo`), a node-stored per-caller policy, and the answers to the spec's operator questions if they change anything.
 - [ ] **Step 2: UAT.md** — "Plan 33: radio selection policy" with spec 6.5's seven checks as checkboxes.
-- [ ] **Step 3: Plan series** — row 33 ("Radio selection policy: the agent's default radio follows the page's focus under a user-set policy (`focus`, `focus-strict`, `free-first`, `ask`, `radio_prefer`); the default tab's mark; the selection record as the access seam; spec `docs/superpowers/specs/2026-11-09-radio-selection-design.md`, plan `docs/superpowers/plans/2026-11-09-radio-selection.md`") and a "Plan 33 status" section listing what shipped, what the gate proved, the calls (spec section 10) and what waits for the field host.
+- [ ] **Step 3: Plan series** — row 33 ("Radio selection policy: the agent's default radio follows the page's focus under a user-set policy (`focus` by default: the focused radio only, else stop and ask; `focus-fallback`; `free-first`; `ask`; `radio_prefer`; both settings kept in the browser); the default tab's mark; the selection record as the access seam; spec `docs/superpowers/specs/2026-11-09-radio-selection-design.md`, plan `docs/superpowers/plans/2026-11-09-radio-selection.md`") and a "Plan 33 status" section listing what shipped, what the gate proved, the calls (spec section 10) and what waits for the field host.
 - [ ] **Step 4: Regenerate and gate** — regenerate both generated files, then every gate in Global Constraints. Expected: all green, the generated files unchanged by the regeneration.
 - [ ] **Step 5: Commit**
 
@@ -289,7 +294,7 @@ git commit -m "Docs: plan 33 (radio selection policy) in TODO, UAT and the plan 
 2. A word boundary for naming is any character other than ASCII alphanumerics, `-` and `_`.
 3. `Caller` is `page` when `page_tools` is true, `http` for any other `/ask`, `cli` for `zeta ask`.
 4. The page's note for a dropped focus is tested through `window.zetaTest.selectionNotes` rather than a stale `sessionStorage` reload, because `renderTabs` replaces a stale stored id with the first source before any ask could carry it; the node's resolver is the real guard and is tested on the wire.
-5. The two view keys use the view's existing per-tab storage (spec call 5); if the operator answers spec question 2 with "persist", Task 4 gains a local-storage path for exactly these two keys before it starts.
+5. The two view keys persist in `localStorage` (the operator's decision, spec section 11; the page's other stores are Web Storage with try/catch, none is a cookie); the other view policies stay in per-tab `sessionStorage`. `view.get` reads these keys from storage on every call, so a second tab sees a change at its next ask or repaint without a `storage` listener.
 6. `radio_prefer`'s view value is stored as the text the operator typed (`none` or `a,b`) and split when sent, like `home`.
 
 ## Self-review notes

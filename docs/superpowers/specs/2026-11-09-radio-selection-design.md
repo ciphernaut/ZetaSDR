@@ -11,7 +11,7 @@ after the digital-modes sprint branch (plans 19.3, 29, 30, 32) has merged into i
 
 A reviewer read this document as the builder before hand-over; its questions are folded in
 (section 9 lists them and where each went). The shape is the author's: each call is listed in
-section 10 and is open to correction; the operator's questions are section 11.
+section 10 and is open to correction; the operator's decisions of 2026-11-09 are section 11.
 
 ## 1. Intent and why
 
@@ -54,7 +54,8 @@ when a run used another one. The same record is the seam a later access-level de
 1. A request from the page that names no radio runs on the radio the operator is looking at: the
    shown tab, or while the Map (or any later non-radio main view) is shown, the radio last shown.
 2. The rule is a named **selection policy**, a user setting, not a hard-coded behaviour: `focus`
-   (default), `focus-strict`, `free-first` (today's behaviour), `ask`; plus an optional ordered
+   (default: the focused radio only, else stop and ask), `focus-fallback` (the opt-in fall-back
+   to a free radio), `free-first` (today's behaviour), `ask`; plus an optional ordered
    preference list of radios used wherever a policy picks among several.
 3. A radio named in the request always wins over the policy.
 4. When a run works on a radio other than the default, the operator is told, in the agent's
@@ -133,12 +134,12 @@ when a run used another one. The same record is the seam a later access-level de
 ### 4.1 The policies
 
 A **selection policy** says which radio is the default for a request that names none, and what
-the agent may do when the default cannot take the band. Four named policies:
+the agent may do when the default cannot take the band. Four named policies (the operator chose stop-and-ask as the default, section 11):
 
 | Policy | Default radio | When the default cannot take the band |
 |---|---|---|
-| `focus` (the default) | the focus: the shown radio, or the kept one while the Map is shown | use the first free radio (`source_free`, in preference order) and say which and why |
-| `focus-strict` | the focus | use no other radio: say why and ask which to use; the gate refuses another radio the request did not name |
+| `focus` (the default) | the focus: the shown radio, or the kept one while the Map is shown | use no other radio: say why and ask which to use, starting nothing; the gate refuses another radio the request did not name |
+| `focus-fallback` (opt-in) | the focus | use the first free radio (`source_free`, in preference order) and say which and why |
 | `free-first` | none | (today's behaviour) the first free radio in preference order |
 | `ask` | none | when the request names no radio: call `source_free`, then ask which of the free radios to use; start nothing |
 
@@ -146,13 +147,14 @@ the agent may do when the default cannot take the band. Four named policies:
 a measured cap with `why` on `main`), a rigid holder or a pin holds it elsewhere (a `conflict`),
 or it is faulted. When no free radio can take the band either, every policy ends the same way:
 start nothing, report why (the conflict's holders, or that no radio covers the band) and never
-`replace`. Under `focus` a request with no focus at all (a stale id, no page) behaves as
-`free-first` and says "no radio in focus".
+`replace`. A request with a context but no usable focus (a stale id, nothing listed yet) has no
+default radio: under `focus` it behaves as `ask` (list the free radios, ask which, start nothing)
+and says "no radio in focus"; under `focus-fallback` it behaves as `free-first` and says so.
 
 **The preference list**, `radio_prefer`, is an ordered list of source ids or `none`. It orders the
-candidates wherever a policy picks among several (the `focus` fallback, `free-first`, the radios
-`ask` offers); ids not in `source_list` are skipped (radios come and go); radios not listed follow
-in id order. It never picks the default under `focus`. It is a list rather than a fifth policy so
+candidates wherever a policy picks among several (the `focus-fallback` fall-back, `free-first`, the
+radios `ask` offers and the radios `focus` lists when it asks); ids not in `source_list` are skipped (radios come and go); radios not listed follow
+in id order. It never picks the default under `focus` or `focus-fallback`. It is a list rather than a fifth policy so
 it composes with each of the four.
 
 **Precedence**, first that applies:
@@ -162,8 +164,11 @@ it composes with each of the four.
    with reason `named`; several named radios leave the policy's default in place and the model
    picks among the named ones. A named radio is never refused by the policy gate.
 2. The policy, applied to the request's context.
-3. Without context (a page-less `/ask`, `zeta ask` without flags): policy `focus` with no focus,
-   that is `free-first` in id order.
+3. Without context (a page-less `/ask`, `zeta ask` without any radio flag or variable): policy
+   `free-first` in id order, today's behaviour, kept for compatibility. This is the one place the
+   default policy does not apply: `focus` is the default for a request that carries a context
+   (the page always does), and a context that omits `radio_policy` means `focus` when it gives a
+   focus, else `free-first`.
 
 ### 4.2 What "the previously used radio" is
 
@@ -181,12 +186,25 @@ and an MCP client is its own agent with its own memory.
 ### 4.3 Where the setting lives
 
 **On the page**, two view policies in `POLICIES` (`view.js`), set with `view set`, shown by
-`view show`, reset by `view reset`, kept in the view's storage like every other policy:
+`view show`, reset by `view reset`:
 
-- `radio_policy`: `focus | focus-strict | free-first | ask` (default `focus`);
+- `radio_policy`: `focus | focus-fallback | free-first | ask` (default `focus`);
 - `radio_prefer`: `none` or a comma-separated list of source ids (`b210,hackrf`; each matching
   `SOURCE_ID`, no repeats; default `none`). The page does not check the ids against
   `source_list`: a radio that is absent today may be attached tomorrow.
+
+**Persistence (operator's decision, section 11).** These two keys persist for the user across
+tabs and browser restarts; every other view policy stays per tab in `sessionStorage` (`VIEW_KEY`),
+and so does the shown radio (`state.selected`, `zeta.source`). The page has no cookie code and
+every existing store is Web Storage wrapped in try/catch, so the choice is `localStorage`: one
+key (`RADIO_PREFS_KEY = "zeta.radio_prefs"`, a JSON object holding only the keys set), read and
+written beside `loadStored`/`saveStored` in `view.js` with the same try/catch. With storage
+unavailable the defaults apply and a value set holds for the page load. A cookie would add
+nothing (it would ride every request to the node), and the node has no users yet, so the
+browser is the store. `view.get` reads these two keys from storage on each call (so another tab's
+change shows at the next ask or repaint), `view set` writes it and `view reset` clears both keys.
+When users exist the preference moves to the user's record on the node, keyed by the caller
+(section 5).
 
 Neither joins `AGENT_VIEW_KEYS` (page) or `VIEW_KEYS` (`crates/zeta-agent/src/page.rs`): the agent
 never sets its own selection policy. Neither has a theme default: a theme is presentation, and a
@@ -196,7 +214,9 @@ policy is not.
 unit can make it standing:
 
 - `--radio ID` (`ZETA_RADIO`): the focus, as the page's shown radio; reason `flag`;
-- `--radio-policy P` (`ZETA_RADIO_POLICY`, default `focus`);
+- `--radio-policy P` (`ZETA_RADIO_POLICY`; no clap default: with none of the three given there is
+  no context and precedence step 3 applies, and with any given an absent policy follows the rule
+  in 4.1);
 - `--radio-prefer IDS` (`ZETA_RADIO_PREFER`).
 
 An unknown policy word is a usage error (clap's exit 2, naming the allowed words). An unknown `--radio` id is
@@ -225,7 +245,7 @@ A bad policy word is a 422 naming the field, as a bad `max_turns` is.
 
 In `zeta-agent`, a new module `radio.rs` owns the mechanism:
 
-- `RadioPolicy` (`focus | focus-strict | free-first | ask`, serde `kebab-case`, `Default` focus,
+- `RadioPolicy` (`focus | focus-fallback | free-first | ask`, serde `kebab-case`, `Default` focus,
   `FromStr` and `Display` with the same words, so `zeta`'s clap flag parses it with
   `value_parser` and `zeta-agent` takes no clap dependency).
 - `RadioContext { focus: Option<SourceId>, focus_from: FocusFrom, policy: RadioPolicy, prefer:
@@ -234,7 +254,9 @@ In `zeta-agent`, a new module `radio.rs` owns the mechanism:
 - `resolve(request: &str, ctx: &RadioContext, sources: &[SourceInfo], caller: Caller) ->
   Selection`: precedence 4.1 over a fresh `source_list`. A focus that is not listed is dropped with
   the note `focus <id> is not a source`; a faulted focus stays the default (the model will see the
-  fault and fall back under `focus`) and the note says `faulted`.
+  fault and fall back under `focus-fallback`, or report it and ask under `focus`) and the note says
+  `faulted`. `RadioContext::default()` (no context at all) has policy `free-first` (precedence
+  step 3).
 - `Selection` (section 5) is recorded on the `Transcript` and rendered into the system prompt.
 
 `Agent::run` applies one `source_list` through its executor before the first completion, resolves
@@ -250,10 +272,13 @@ run as any node error does; an op error leaves `selection` empty and the step-3 
 
 Default radio: b210 (policy focus: the radio last shown on the page; the Map is shown).
 Radios in preference order: b210, hackrf.
-When the request names no radio, work on b210. If b210 cannot take the band (it does not cover it,
-a job or a pin holds it, or it is faulted), use the first free radio `source_free` gives in the
-order above, never `replace`, and say in your answer which radio you used and why b210 was not.
+When the request names no radio, work on b210 only. If b210 cannot take the band (it does not
+cover it, a job or a pin holds it, or it is faulted), start nothing: say why, name the free radios
+`source_free` gives in the order above, and ask which to use. Never `replace`.
 ```
+
+Under `focus-fallback` the last two sentences read: use the first free radio `source_free` gives in
+the order above, never `replace`, and say in your answer which radio you used and why b210 was not.
 
 with one fixed paragraph per policy and reason (the four policies, plus "no radio in focus" and
 "the request names b210"); the texts are constants in `radio.rs` and pinned by unit tests. A run
@@ -268,12 +293,12 @@ its default, and `zeta ask` against a remote node (`RemoteExecutor`) works the s
 field). Ops that only read (`source_list`, `source_free`, `classify`, `iq_read`) or release
 (`source_unpin`, `job_stop`) are never checked; `bits_start` and `graph_start` take no radio.
 
-- Under `focus-strict` with a default radio, an op on another radio that the request did not name
-  is refused, not applied: `{"error": "policy", "field": "source", "policy": "focus-strict",
-  "default": "b210", "message": "radio policy focus-strict: hackrf is not the default radio b210;
+- Under `focus` with a default radio, an op on another radio that the request did not name
+  is refused, not applied: `{"error": "policy", "field": "source", "policy": "focus",
+  "default": "b210", "message": "radio policy focus: hackrf is not the default radio b210;
   the operator names another radio in the request"}`. The model sees it as the call's result, as
   it sees an op error, and reports it.
-- Under every other policy the gate admits the op and records it in `selection.off_default` when
+- Under every other policy (`focus-fallback`, `free-first`, `ask`) the gate admits the op and records it in `selection.off_default` when
   its radio is not the default (with no default, nothing is off it).
 
 `error: "policy"` is a word only the agent gate produces (never `Node::apply`), so the page's
@@ -295,9 +320,11 @@ where an access check plugs in later (section 5).
 
 - A new rule in `RULES` (`agents_md.rs`), after the ids rule: "Radios: when the request names a
   radio, use it. Otherwise use the default radio the request's context names (`## This request`
-  in the system prompt); with none, the first free id `source_free` gives. When you work on any
-  other radio, say which and why the default was not used (it does not cover the band, a job or a
-  pin holds it, it is faulted). Never stop or replace a job to free a radio."
+  in the system prompt); with none, the first free id `source_free` gives. When the default
+  cannot take the band (it does not cover it, a job or a pin holds it, it is faulted), follow the
+  policy paragraph: under the default `focus`, start nothing, say why and ask which radio to use;
+  under `focus-fallback`, use the first free radio and say which and why. Never stop or replace a
+  job to free a radio."
 - `source_free`'s note: its `free` list is in id order, which is no preference; the request's
   default and preference order come first.
 - `docs/agents/field-craft.md`, the page paragraph: the default radio's mark, `view set
@@ -309,13 +336,13 @@ where an access check plugs in later (section 5).
 
 `Transcript` gains `selection` (section 5), so `/ask`'s answer and `zeta ask`'s output carry it.
 After the answer line the page adds one note when `selection.off_default` is not empty:
-`ran on hackrf (job_start), not the default radio b210 (focus)`; and, when the run's `selection`
+`ran on hackrf (job_start), not the default radio b210 (focus-fallback)`; and, when the run's `selection`
 note says the focus was dropped, `focus b210 is not a source; no default radio`. A `policy`
 refusal shows as the call's result inside its turn, as other call results do, with no button.
 
 ### 4.9 The default radio's mark
 
-The page computes the default it would send: under `focus` and `focus-strict`, `state.selected`;
+The page computes the default it would send: under `focus` and `focus-fallback`, `state.selected`;
 under `free-first` and `ask`, none. The tab of that radio gets class `default` and, first in the
 tab, a `span.default-mark` (a small dot, `aria-hidden`), with the tab's title extended by
 `default radio for the agent (policy focus)`. It is redrawn by `select`, by `syncMainTabs`, by a
@@ -364,6 +391,10 @@ pub struct Selection {
   caller's transmit level for it and for any radio whose `tx` is true when the op transmits.
   `focus` never makes a transmit op's radio implicit: the TX design decides whether a transmit
   request must always name its radio (the likely answer, noted in the TODO gist).
+- **(d) Whose preference.** `radio_policy` and `radio_prefer` live in the browser today (4.3,
+  decision 2). Once users exist they move to the user's record on the node, keyed by the caller,
+  and the page's context becomes an override of it; the node's value is applied on the node side
+  like the ACL.
 - **(c) Who selected what.** The `Selection` is on every transcript today. With caller identity,
   `Caller` gains the identity and the level, and the selection is appended to `ops.log` beside the
   ops it led to (`ops.log` already tags `transport: "agent"`).
@@ -378,13 +409,14 @@ pub struct Selection {
 - `resolve` table: a named radio wins under every policy; two named keep the policy's default;
   a whole-word match only (`b2100` does not name `b210`), case-insensitive; `focus` with `main`
   rf gives `shown`, with map `kept`; a focus not listed is dropped with the note and behaves as
-  `free-first`; a faulted focus stays the default with the note; `free-first` and `ask` have no
-  default; `candidates` follow `prefer` then id order, skipping unknown ids; no context gives
-  `focus` with no focus.
-- `admit`: `focus-strict` refuses `job_start`, `plan_start`, `source_ensure`, `source_pin` and
+  `free-first` (under `focus`: as `ask`); a faulted focus stays the default with the note; `free-first` and `ask` have no
+  default; `candidates` follow `prefer` then id order, skipping unknown ids; no context
+  gives policy `free-first` (`RadioContext::default()`); a context that omits the policy means
+  `focus` with a focus and `free-first` without.
+- `admit`: `focus` refuses `job_start`, `plan_start`, `source_ensure`, `source_pin` and
   `source_set_gain` on another radio not named (the error shape above), admits the default and a
-  named radio; never checks `source_list`, `source_free`, `source_unpin`, `classify`; `focus`
-  admits and records `off_default`; no default records nothing.
+  named radio; never checks `source_list`, `source_free`, `source_unpin`, `classify`;
+  `focus-fallback` admits and records `off_default`; no default records nothing.
 - The prompt paragraphs: one per policy and reason, each naming the radio and the fallback rule.
 
 ### 6.2 `zeta-agent` with the fake model (`tests/agent.rs`, feature `test-fake`)
@@ -394,12 +426,13 @@ On a node with two file sources given tune ranges (the existing `tone_node` help
 - the first chat request's system message ends with `## This request` naming the default and the
   user message is exactly the request;
 - one `source_list` is applied before the first completion (the executor's log);
-- under `focus-strict` a scripted `job_start` on the other source comes back as the `policy`
+- under `focus` (the default) a scripted `job_start` on the other source comes back as the `policy`
   error in the next request's tool message, and nothing started (`job_list` empty);
-- under `focus` the same call starts the job and the transcript's `selection.off_default` names it;
+- under `focus-fallback` the same call starts the job and the transcript's `selection.off_default`
+  names it;
 - `ask` with a scripted `source_free` then prose ends with an answer (the loop's rule holds);
-- a run without a context states the step-3 paragraph;
-- under `focus`, with the other source held and the default not covering the band, a scripted
+- a run without a context states the step-3 paragraph (policy `free-first`);
+- under `focus-fallback`, with the other source held and the default not covering the band, a scripted
   `source_free` (empty `free`) then prose ends with an answer and nothing started.
 
 ### 6.3 `zeta-ws` (`tests/ask.rs`) and `zeta` (`tests/cli.rs`)
@@ -415,17 +448,25 @@ On a node with two file sources given tune ranges (the existing `tone_node` help
 Sparingly, on the LLM node (`tone`, `cb`):
 
 - extend `scenario_ask_sends_32_turns_and_the_allowance`: the posted body's `context` is
-  `{"focus": "cb", "main": "rf", "radio_policy": "focus", "radio_prefer": []}`;
+  `{"focus": "cb", "main": "rf", "radio_policy": "focus", "radio_prefer": []}` (the defaults, with
+  storage empty);
 - one new scenario, `scenario_radio_default_mark_and_policy`:
   - with `cb` selected, `.src-tab.default` is the `cb` tab with the hover title; after the Map
     tab, the `kept` `cb` tab still carries it and the next ask's `context.main` is `map`,
     `focus` `cb`;
-  - a request scripted to `job_start` on `tone` ("radio fallback probe") shows the note `ran on
-    tone (job_start), not the default radio cb (focus)`;
-  - `view set radio_policy focus-strict` and the same request: the call's result in the turn is
-    the `policy` refusal, no unlock button shows, no job started on `tone`;
+  - with the default `focus`, a request scripted to `job_start` on `tone` ("radio fallback
+    probe") comes back as the `policy` refusal in the turn, no unlock button shows, no job started
+    on `tone`;
+  - `view set radio_policy focus-fallback` and the same request: the note `ran on tone
+    (job_start), not the default radio cb (focus-fallback)` shows;
+  - persistence: after `view set radio_policy focus-fallback` and `view set radio_prefer
+    tone,cb`, a second page in the same browser context (a new tab) reads both in `view show`
+    and its next ask posts them, while its shown radio is its own (`zeta.source` is per tab); a
+    reload keeps them; `view reset` clears both. With `localStorage` made to throw
+    (`add_init_script` replacing `Storage.prototype.getItem` and `setItem` for that page) the page
+    boots with the defaults and `view set` still answers ok;
   - `view set radio_policy free-first`: no tab carries `.default`;
-  - `view reset` in `finally`.
+  - `view reset` and `localStorage.removeItem("zeta.radio_prefs")` in `finally`.
 - the box menu's "Send to agent" text names the radio: one assertion added to the existing
   menu-ask coverage (the scenario that sends a selection to the agent), else to the new scenario.
 - `THEME_HOOKS` gains `.src-tab.default` and `.src-tab .default-mark`; `scenario_theme_hooks`
@@ -441,12 +482,15 @@ Sparingly, on the LLM node (`tone`, `cb`):
    carries the dot.
 2. Switch to the Map tab and ask the same for 145.175: it runs on the B210 (the `kept` tab with
    the dot).
-3. With the B210 held by a watch, ask for a band both radios cover: under `focus` the agent uses
-   the HackRF and says why, and the page notes it; under `focus-strict` it starts nothing and asks.
-   Then ask for a band only the B210 covers: under `focus` it starts nothing and names the watch.
+3. With the B210 held by a watch, ask for a band both radios cover: under the default `focus` the
+   agent starts nothing, says the B210 is held and asks which radio to use; after `view set
+   radio_policy focus-fallback` it uses the HackRF and says why, and the page notes it. Then ask
+   for a band only the B210 covers: under either it starts nothing and names the watch.
 4. "start APRS on 144.8 on the hackrf" runs on the HackRF under every policy.
 5. `view set radio_policy ask`: "start APRS on 144.8" lists the free radios and asks.
 6. Box menu "Send to agent" on the HackRF's waterfall: the request text names `hackrf`.
+   Persistence: set `radio_policy focus-fallback`, open a second tab and restart the browser; both
+   keep it, and each tab keeps its own shown radio.
 7. A theme with its own accent shows the dot in that accent.
 
 ## 7. Docs, TODO and UAT
@@ -458,7 +502,8 @@ Sparingly, on the LLM node (`tone`, `cb`):
 - `TODO.md`: extend "Access: ACLs on restricted rows" with the radio seam (candidates filtered,
   `admit` the check, transmit requires a level and probably a named radio, selections in
   `ops.log`); a gist for matching radios by driver or role in `radio_prefer` and a node-stored
-  per-caller policy.
+  per-caller policy (the browser's stored `radio_policy` and `radio_prefer` move to the user's
+  record on the node when users exist).
 - `UAT.md`: "Plan 33: radio selection policy" with 6.5's checks.
 - The plan series: row 33 and a status section.
 
@@ -473,10 +518,9 @@ assertion.
 A reviewer read the first draft as the builder. Its questions, most important first, and where
 each went:
 
-1. *Are the operator questions answered, the storage one above all?* Not yet; they stay in
-   section 11. The plan builds the per-tab storage as written (call 5); a "persist" answer is a
-   follow-up change to the page task (a second, local storage path for the two keys, `view reset`
-   clearing them, the e2e's `finally` clearing local storage), not a change to the node side.
+1. *Are the operator questions answered, the storage one above all?* Yes, both, on 2026-11-09
+   (section 11): stop and ask by default (`focus`), and the two keys persist in the browser
+   (`localStorage`, 4.3). The page task builds the persist branch; the node side is unchanged.
 2. *Is the pre-read `source_list` visible to the model, in `calls`, in `ops.log`?* Answered in
    4.4: hidden from the model and from `calls`, applied through the executor and so logged.
 3. *Section 9 was empty in the draft.* This list.
@@ -495,32 +539,41 @@ whole-word rule; that request already runs on `cb`, so nothing changes.
 
 1. Four policies plus an orthogonal preference list, not a fifth `prefer` policy: the list
    composes with each policy.
-2. `focus` falls back to a free radio and says so; `focus-strict` refuses and asks. The default
-   is `focus` (question 1 in section 11).
+2. `focus` uses the focused radio only, else stops and asks, and the gate refuses another radio;
+   `focus-fallback` is the opt-in fall-back to a free radio, said aloud. The default is `focus`
+   (decision 1 in section 11). No context at all stays `free-first`.
 3. A named radio is a whole-word, case-insensitive source id in the request text; one named
    radio becomes the default, several leave the default and are all admitted.
 4. No node-wide "last used radio" (4.2); `zeta ask --radio` stands in for the CLI.
-5. The policy is page view state with no theme default and no agent key; `zeta ask` has flags
+5. The policy is page view state, persisted in the browser's `localStorage` (decision 2) with no
+   theme default and no agent key; `zeta ask` has flags
    with environment variables; no `zeta serve` default.
 6. The context is appended to the one system message as `## This request`, not a second system
    message and not a prefix to the user message.
 7. The default is resolved by code before the first completion, from one `source_list`; the band
-   fallback under `focus` is the model's, made visible by `off_default` and the page's note.
-8. The gate refuses only under `focus-strict`, with the agent-only error word `policy`, so the
+   fallback under `focus-fallback` is the model's, made visible by `off_default` and the page's note.
+8. The gate refuses only under `focus`, with the agent-only error word `policy`, so the
    page's unlock flow never mistakes it for an allowance.
 9. The box menu names its radio in the request text rather than in a separate context field: the
    named-radio rule already covers it, and the transcript shows it.
 10. The mark is an accent dot (`span.default-mark`) with a hover title, two theme tokens.
-11. A faulted focus stays the default (the model sees the fault and falls back, or under
-    `focus-strict` reports it); an unlisted focus is dropped.
+11. A faulted focus stays the default (the model sees the fault and falls back under
+    `focus-fallback`, or under `focus` reports it and asks); an unlisted focus is dropped.
 12. `radio_prefer` ids are not checked against `source_list` on the page; unknown ids are skipped
     by the resolver.
 
-## 11. Questions for the operator
+## 11. The operator's decisions (2026-11-09)
 
-1. When the radio in focus cannot take the band (a watch holds it, or it does not cover the
-   band), should the default policy fall back to a free radio and say so (`focus`, as written),
-   or stop and ask (`focus-strict`)?
-2. The view policies live per browser tab (a new tab starts from the defaults). Should
-   `radio_policy` and `radio_prefer` instead persist across tabs and restarts of the browser
-   (local storage), as a standing preference?
+1. *When the focused radio cannot take the band, fall back or stop and ask?* **Stop and ask.** The
+   default policy `focus` is therefore the strict behaviour: the focused radio only; when it
+   cannot take the band the agent says why, names the free radios and asks which to use, starting
+   nothing, and the agent-side gate (error word `policy`) refuses an op on an unnamed other radio.
+   The fall-back (the focus, else the first free radio, saying which and why) stays available as
+   the opt-in policy `focus-fallback`. A request with no context at all (a page-less `/ask`,
+   `zeta ask` without radio flags) keeps today's `free-first`, for compatibility (4.1).
+2. *Per tab, or persist?* **Persist for the user or session; there are no users yet, so a browser
+   cookie for now.** `radio_policy` and `radio_prefer` persist across tabs and browser restarts in
+   the browser. The page's conventions are Web Storage with try/catch rather than cookies, so the
+   store is `localStorage` (4.3); the effect the operator asked for is the same. The shown radio
+   stays per tab. Once users exist the preference moves to the user's record on the node, keyed by
+   the caller (section 5).
