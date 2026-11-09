@@ -15,8 +15,7 @@ attach one.
   generated from the operation schema and [agents/field-craft.md](agents/field-craft.md) by
   `zeta agents-md`; a node also serves it at `GET /agents-md`. The same text, as a Claude Code
   skill, is [skills/zetasdr/SKILL.md](../skills/zetasdr/SKILL.md).
-- [RECIPES.md](../RECIPES.md): named job setups (all ACARS channels on one radio, ADS-B on a
-  second radio, UHF CB listeners with transcription, a radiosonde watch, your own theme) as the
+- [RECIPES.md](../RECIPES.md): named job setups (airband data links as a set, UHF CB listeners with transcription, a radiosonde watch, your own theme) as the
   operations to send, in order.
 - [speech.md](speech.md): transcribing a channel. Installing a speech daemon on a node's host,
   writing your own, sharing one between nodes, and source separation.

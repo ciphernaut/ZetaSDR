@@ -8,7 +8,7 @@
   "members": [
     {"id": "watch", "radio": "radio", "op": "job_start", "kind": "watch",
      "center_hz": 148500000, "bandwidth_hz": 1000000, "deviation_hz": null, "sideband": null,
-     "params": {"modes": ["pocsag_decode"], "persist_ms": 500, "width_hz": [6000, 20000],
+     "params": {"modes": ["pocsag_decode"], "persist_ms": 500, "width_hz": [6000, 25000],
                 "gone_ms": 60000, "hold_ms": 600000, "cooldown_ms": 120000, "confirm_ms": 180000}}
   ]
 }

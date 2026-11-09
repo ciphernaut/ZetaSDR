@@ -177,7 +177,7 @@ ZETA_SECRET=... python3 -I examples/python/cb_watch.py --node http://field-host:
   --secret-env ZETA_SECRET --source b210 --dry-run
 ```
 
-[RECIPES.md](../RECIPES.md) holds the named job setups (all ACARS channels, ADS-B, the UHF CB plan with transcribers, the sonde watch) as the JSON ops to send in order, for an operator or an agent to copy rather than re-derive. [AGENTS.md](../AGENTS.md) is generated from the operation schema by `zeta agents-md`; `zeta agents-md --check`
+[RECIPES.md](../RECIPES.md) holds the named job setups (airband data links as a set, the UHF CB plan with transcribers, the sonde watch) as the JSON ops to send in order, for an operator or an agent to copy rather than re-derive. [AGENTS.md](../AGENTS.md) is generated from the operation schema by `zeta agents-md`; `zeta agents-md --check`
 fails if the committed file has drifted.
 
 ## DSP
