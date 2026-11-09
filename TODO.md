@@ -330,6 +330,20 @@ From the operator, 2026-11-06. Pager events and the rows that produce them (`poc
 
 Until then the README's Legal paragraph is the guard.
 
+The radio seam (plan 33, `docs/superpowers/specs/2026-11-09-radio-selection-design.md` section 5) is where this lands for radios:
+- `Selection.candidates` filtered per caller in `resolve`;
+- `Selection::admit` is the agent's check, and the same check in `Node::apply_from` covers direct ops;
+- transmit ops join `RADIO_OPS` as transmit and require the caller's TX level, and likely a named radio: `focus` never implies a transmit radio;
+- `Capabilities.tx` is the radio's flag;
+- the selection is appended to `ops.log` with the caller.
+
+## Radio selection: later
+
+From plan 33. Not built:
+- `radio_prefer` by driver or role, which needs a driver in `SourceInfo`;
+- a node-stored per-caller policy, replacing the browser's `zeta.radio_prefs` once users exist;
+- the answers to the spec's operator questions, if they change anything.
+
 ## Bug: `--then-tail` on a program row with a squelched demod tails the squelch events first
 
 Found in plan 17 task 7. `--then-tail` now tails the first event output of the job; for an audio-input program row whose `nbfm_demod` keeps its squelch on, that is the demod's `squelch` event stream, which publishes before the decoder's events, so the tail shows `squelch` frames and the decode may land after `max_frames`. The sonde rows run the squelch off, so they are unaffected; an operator audio row that keeps it on is not. Tail the last event output (the decoder's) or the one whose frames carry `protocol`, and test it with a squelched audio row.
