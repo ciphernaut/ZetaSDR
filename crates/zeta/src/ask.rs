@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use zeta_agent::{
-    Allow, Caller, Executor, LlmConfig, LocalExecutor, RadioContext, RemoteExecutor, build_agent,
+    Allow, Caller, Executor, FocusFrom, LlmConfig, LocalExecutor, RadioContext, RemoteExecutor,
+    build_agent,
 };
 use zeta_client::NodeClient;
 use zeta_speech::SpeechBackend;
@@ -48,6 +49,7 @@ pub async fn run(
     };
     let max_turns = args.max_turns;
     let allow = allow_of(&args);
+    let radio = radio_context(&args);
     match remote {
         Some(client) => {
             let (schema, md) = match (client.schema().await, client.agents_md().await) {
@@ -61,6 +63,7 @@ pub async fn run(
                 &md,
                 max_turns,
                 allow,
+                radio,
                 &request,
             )
             .await
@@ -98,6 +101,7 @@ pub async fn run(
                 &md,
                 max_turns,
                 allow,
+                radio,
                 &request,
             )
             .await;
@@ -117,6 +121,28 @@ pub fn allow_of(args: &AskArgs) -> Allow {
     }
 }
 
+/// The agent's radio context from `--radio`, `--radio-policy` and `--radio-prefer`: none
+/// of the three is no context (`free-first`); an omitted policy is `focus` with a radio.
+pub fn radio_context(args: &AskArgs) -> RadioContext {
+    if args.radio.is_none() && args.radio_policy.is_none() && args.radio_prefer.is_empty() {
+        return RadioContext::default();
+    }
+    let focus = args.radio.clone().map(zeta_core::types::SourceId);
+    let from = if focus.is_some() {
+        FocusFrom::Flag
+    } else {
+        FocusFrom::None
+    };
+    let prefer = args
+        .radio_prefer
+        .iter()
+        .cloned()
+        .map(zeta_core::types::SourceId)
+        .collect();
+    RadioContext::from_parts(focus, from, args.radio_policy, prefer)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn drive<E: Executor>(
     cfg: LlmConfig,
     exec: E,
@@ -124,6 +150,7 @@ async fn drive<E: Executor>(
     md: &str,
     max_turns: u32,
     allow: Allow,
+    radio: RadioContext,
     request: &str,
 ) -> ExitCode {
     let agent = match build_agent(
@@ -134,7 +161,7 @@ async fn drive<E: Executor>(
         max_turns,
         allow,
         None,
-        RadioContext::default(),
+        radio,
         Caller::cli(),
     ) {
         Ok(a) => a,
@@ -202,6 +229,59 @@ fn fail(msg: &str) -> ExitCode {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    use zeta_agent::{FocusFrom, RadioPolicy};
+
+    fn parse(flags: &[&str]) -> AskArgs {
+        let mut args = vec!["zeta", "ask", "--llm-url", "http://llm", "--llm-model", "m"];
+        args.extend_from_slice(flags);
+        args.push("what sources?");
+        match crate::cli::Cli::try_parse_from(args).unwrap().command {
+            crate::cli::Command::Ask(a) => a,
+            c => panic!("ask: {c:?}"),
+        }
+    }
+
+    fn id(s: &str) -> zeta_core::types::SourceId {
+        zeta_core::types::SourceId(s.into())
+    }
+
+    #[test]
+    fn ask_radio_flags_parse_and_read_the_environment() {
+        // No flag, no variable: no context, today's free-first run.
+        assert_eq!(radio_context(&parse(&[])), RadioContext::default());
+        // Only --radio: the policy is focus, the focus comes from the flag.
+        let c = radio_context(&parse(&["--radio", "b210"]));
+        assert_eq!(c.policy, RadioPolicy::Focus);
+        assert_eq!(c.focus, Some(id("b210")));
+        assert_eq!(c.focus_from, FocusFrom::Flag);
+        // All three flags.
+        let c = radio_context(&parse(&[
+            "--radio",
+            "b210",
+            "--radio-policy",
+            "focus-fallback",
+            "--radio-prefer",
+            "b210,hackrf",
+        ]));
+        assert_eq!(c.policy, RadioPolicy::FocusFallback);
+        assert_eq!(c.prefer, vec![id("b210"), id("hackrf")]);
+        // The variables are read at parse time. Only this test touches them, and it
+        // runs them in sequence after the flag cases above.
+        // SAFETY: no other test in this binary reads or writes ZETA_RADIO*.
+        unsafe {
+            std::env::set_var("ZETA_RADIO_POLICY", "ask");
+            std::env::set_var("ZETA_RADIO_PREFER", "hackrf,b210");
+        }
+        let c = radio_context(&parse(&[]));
+        unsafe {
+            std::env::remove_var("ZETA_RADIO_POLICY");
+            std::env::remove_var("ZETA_RADIO_PREFER");
+        }
+        assert_eq!(c.policy, RadioPolicy::Ask);
+        assert_eq!(c.focus, None);
+        assert_eq!(c.prefer, vec![id("hackrf"), id("b210")]);
+    }
 
     fn allow(flags: &[&str]) -> Allow {
         let mut args = vec!["zeta", "ask", "--llm-url", "http://llm", "--llm-model", "m"];

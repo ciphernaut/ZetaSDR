@@ -3541,3 +3541,38 @@ fn source_position_flag_shows_in_source_list_and_refuses_unknown_ids() {
     .code(1)
     .stderr(contains("--source-position: lat out of range"));
 }
+
+#[test]
+fn ask_radio_policy_refuses_an_unknown_word() {
+    zeta_bin()
+        .args([
+            "ask",
+            "--llm-url",
+            "http://127.0.0.1:9",
+            "--llm-model",
+            "m",
+            "--radio-policy",
+            "nearest",
+            "hi",
+        ])
+        .assert()
+        .code(1)
+        .stderr(contains("focus-fallback"));
+}
+
+#[test]
+fn ask_radio_policy_environment_variable_is_checked_too() {
+    zeta_bin()
+        .env("ZETA_RADIO_POLICY", "nearest")
+        .args([
+            "ask",
+            "--llm-url",
+            "http://127.0.0.1:9",
+            "--llm-model",
+            "m",
+            "hi",
+        ])
+        .assert()
+        .code(1)
+        .stderr(contains("focus-fallback"));
+}

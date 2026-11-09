@@ -458,3 +458,81 @@ async fn ask_page_tools_default_off_and_on_offers_view_set_with_the_ready_themes
     }
     ts.stop().await;
 }
+
+/// One `/ask` with a context, against a server whose model answers at once.
+async fn ask_ctx(page_tools: bool, context: Value) -> (StatusCode, Value) {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = scripted(vec![]).await;
+    let ts = with_llm(
+        dir.path(),
+        llm(&fake, false, Duration::from_millis(10)),
+        Limits::default(),
+    )
+    .await;
+    let resp = ask(
+        &ts,
+        Some(BEARER),
+        &json!({"request": "what sources?", "page_tools": page_tools, "context": context}),
+    )
+    .await;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap();
+    ts.stop().await;
+    (status, body)
+}
+
+#[tokio::test]
+async fn ask_with_context_resolves_the_focus() {
+    let (status, body) = ask_ctx(
+        true,
+        json!({"focus": "tone", "main": "map", "radio_policy": "focus", "radio_prefer": []}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let s = &body["selection"];
+    assert_eq!(s["radio"], "tone", "{body}");
+    assert_eq!(s["reason"], "kept", "{body}");
+    assert_eq!(s["policy"], "focus", "{body}");
+    assert_eq!(s["caller"]["transport"], "page", "{body}");
+}
+
+#[tokio::test]
+async fn ask_context_without_main_shows_the_focus() {
+    let (status, body) = ask_ctx(false, json!({"focus": "tone"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["selection"]["reason"], "shown", "{body}");
+    assert_eq!(body["selection"]["policy"], "focus", "{body}");
+}
+
+#[tokio::test]
+async fn ask_context_refuses_an_unknown_field() {
+    let (status, body) = ask_ctx(false, json!({"focus": "tone", "colour": 1})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.to_string().contains("colour"), "{body}");
+}
+
+#[tokio::test]
+async fn ask_context_refuses_an_unknown_policy() {
+    let (status, body) = ask_ctx(false, json!({"radio_policy": "nearest"})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let text = body.to_string();
+    assert!(text.contains("nearest"), "{body}");
+    assert!(text.contains("radio_policy"), "{body}");
+}
+
+#[tokio::test]
+async fn ask_context_refuses_a_bad_main() {
+    let (status, body) = ask_ctx(false, json!({"focus": "tone", "main": "spectrum"})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body.to_string().contains("context.main must be rf or map"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn ask_context_refuses_an_empty_id() {
+    let (status, body) = ask_ctx(false, json!({"radio_prefer": ["b210", ""]})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.to_string().contains("context.radio_prefer"), "{body}");
+}

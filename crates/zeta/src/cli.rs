@@ -880,6 +880,28 @@ pub struct AskArgs {
     /// `signature_reject`)
     #[arg(long)]
     pub allow_signatures: bool,
+    /// The radio a request that names none uses (the default radio); the policy then
+    /// defaults to `focus`
+    #[arg(long, env = "ZETA_RADIO", value_name = "ID")]
+    pub radio: Option<String>,
+    /// How the agent picks a radio: focus (the default radio only), focus-fallback
+    /// (the first free radio when it cannot take the band), free-first, ask
+    #[arg(
+        long,
+        env = "ZETA_RADIO_POLICY",
+        value_name = "POLICY",
+        value_parser = <zeta_agent::RadioPolicy as std::str::FromStr>::from_str
+    )]
+    pub radio_policy: Option<zeta_agent::RadioPolicy>,
+    /// Radios tried first, in this order, when the policy falls back to a free radio
+    /// (comma-separated)
+    #[arg(
+        long,
+        env = "ZETA_RADIO_PREFER",
+        value_name = "IDS",
+        value_delimiter = ','
+    )]
+    pub radio_prefer: Vec<String>,
 }
 
 /// The usage error for `--stt-socket` with `--stt-node`.

@@ -6,8 +6,11 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use zeta_agent::{Allow, Caller, LocalExecutor, PageTools, RadioContext, build_agent};
+use zeta_agent::{
+    Allow, Caller, FocusFrom, LocalExecutor, PageTools, RadioContext, RadioPolicy, build_agent,
+};
 use zeta_core::ops::OpError;
+use zeta_core::types::SourceId;
 
 use crate::http::{Shared, error_response, other};
 
@@ -26,6 +29,72 @@ struct AskRequest {
     /// Offer the page-only tools (`view_set`): the web page sets it, `zeta ask` never does.
     #[serde(default)]
     page_tools: bool,
+    /// The radio the operator has in front of them; absent for a caller with no page.
+    context: Option<AskContext>,
+}
+
+/// What the page tells the agent about the operator's view.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct AskContext {
+    /// The radio shown.
+    focus: Option<String>,
+    /// The page's main view, `rf` or `map`: a focus kept while the map is shown is `kept`.
+    main: Option<String>,
+    /// One of `focus`, `focus-fallback`, `free-first`, `ask`; checked by `radio_context`.
+    radio_policy: Option<String>,
+    #[serde(default)]
+    radio_prefer: Vec<String>,
+}
+
+fn invalid(msg: String) -> Response {
+    error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        other(format!("invalid ask request: {msg}")),
+    )
+}
+
+fn source_id(field: &str, id: &str) -> Result<SourceId, String> {
+    if id.trim().is_empty() {
+        return Err(format!("{field} is empty"));
+    }
+    Ok(SourceId(id.to_string()))
+}
+
+/// The agent's radio context from the request's; no context is today's `free-first`.
+fn radio_context(ctx: Option<AskContext>) -> Result<RadioContext, String> {
+    let Some(ctx) = ctx else {
+        return Ok(RadioContext::default());
+    };
+    let focus_from = match ctx.main.as_deref() {
+        None | Some("rf") => FocusFrom::Shown,
+        Some("map") => FocusFrom::Kept,
+        Some(_) => return Err("context.main must be rf or map".into()),
+    };
+    let policy = ctx
+        .radio_policy
+        .as_deref()
+        .map(|w| {
+            w.parse::<RadioPolicy>()
+                .map_err(|e| format!("context.radio_policy: {e}"))
+        })
+        .transpose()?;
+    let focus = ctx
+        .focus
+        .as_deref()
+        .map(|f| source_id("context.focus", f))
+        .transpose()?;
+    let prefer = ctx
+        .radio_prefer
+        .iter()
+        .map(|p| source_id("context.radio_prefer", p))
+        .collect::<Result<Vec<_>, _>>()?;
+    let focus_from = if focus.is_some() {
+        focus_from
+    } else {
+        FocusFrom::None
+    };
+    Ok(RadioContext::from_parts(focus, focus_from, policy, prefer))
 }
 
 pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
@@ -73,6 +142,10 @@ pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
             },
         );
     };
+    let radio = match radio_context(req.context) {
+        Ok(r) => r,
+        Err(e) => return invalid(e),
+    };
     let Ok(_running) = st.ask_lock.try_lock() else {
         return error_response(StatusCode::CONFLICT, other("an agent run is in progress"));
     };
@@ -100,7 +173,7 @@ pub(crate) async fn ask(State(st): State<Shared>, body: Body) -> Response {
         max_turns,
         req.allow.unwrap_or_default(),
         page,
-        RadioContext::default(),
+        radio,
         caller,
     ) {
         Ok(a) => a,
