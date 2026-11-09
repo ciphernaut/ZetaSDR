@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -16,7 +16,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus, VideoFormat};
-use zeta_core::types::{StreamId, StreamKind, Timestamp};
+use zeta_core::types::{Span, StreamId, StreamKind, Timestamp};
 
 use crate::Input;
 use crate::util::{event, lowpass_taps};
@@ -1075,11 +1075,7 @@ impl State {
         let y: Vec<f32> = (a..=b)
             .map(|c| {
                 let i0 = (c - half - self.base as i64) as usize;
-                self.taps
-                    .iter()
-                    .zip(&self.buf[i0..])
-                    .map(|(h, s)| h * s)
-                    .sum()
+                dot(&self.taps, &self.buf[i0..i0 + self.taps.len()])
             })
             .collect();
         for k in 0..width {
@@ -1178,8 +1174,67 @@ impl Reporter {
     }
 }
 
+/// `Σ a[i]·b[i]` over equal-length slices, in eight running sums side by side so the loop
+/// vectorises (a plain iterator sum must add in order).
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    const L: usize = 8;
+    let mut acc = [0.0f32; L];
+    let (ca, cb) = (a.chunks_exact(L), b.chunks_exact(L));
+    let tail: f32 = ca
+        .remainder()
+        .iter()
+        .zip(cb.remainder())
+        .map(|(x, y)| x * y)
+        .sum();
+    for (x, y) in ca.zip(cb) {
+        for k in 0..L {
+            acc[k] += x[k] * y[k];
+        }
+    }
+    acc.iter().sum::<f32>() + tail
+}
+
+/// What the decoder lost of its input: the event's `dropped`.
+#[derive(Clone, Debug, Default)]
+struct Losses {
+    /// Inputs lost: those this stage's queue dropped and its input's broadcast lag (each
+    /// counted when the next input arrives with its [`Input::Lagged`] marker), plus one
+    /// per gap in the composite's time line from a loss upstream.
+    dropped: u64,
+    /// The end of the last input's span, ns; `None` after a marker (its gap is counted).
+    end_ns: Option<u64>,
+}
+
+impl Losses {
+    /// `missed` inputs were lost just before the next.
+    fn lagged(&mut self, missed: u64) {
+        self.dropped = self.dropped.saturating_add(missed);
+        self.end_ns = None;
+    }
+
+    /// Whether the input spanning `span` (at `rate_hz`) starts later than the last one
+    /// ended, by more than a sample period (and a nanosecond of rounding): a block lost
+    /// upstream, by the `channel` stage's or the demodulator's queue or a radio overflow,
+    /// which reaches this stage as a jump in time with no marker. Counts it.
+    fn jumped(&mut self, span: &Span, rate_hz: u64) -> bool {
+        let slack = 1_000_000_000u64.div_ceil(rate_hz.max(1)) + 1;
+        let jump = self
+            .end_ns
+            .is_some_and(|end| span.start_ns.0 > end.saturating_add(slack));
+        if jump {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        self.end_ns = Some(span.end_ns.0);
+        jump
+    }
+}
+
 /// Decodes composite video to `gray8` fields (output 0) and a `video` lock event
-/// (output 1), with the DSP on a thread of its own behind a drop-on-full queue.
+/// (output 1), with the DSP on a thread of its own behind a drop-on-full queue. Lost
+/// input, whether this stage's queue dropped it, its input lagged, or a block was lost
+/// before the demodulator (seen as a jump in the input spans' time), voids the field in
+/// progress and keeps the lock; the event's `dropped` counts the inputs this stage lost
+/// plus one per upstream gap.
 pub struct CompositeDecodeStage {
     spec: StageSpec,
 }
@@ -1238,12 +1293,13 @@ impl Stage for CompositeDecodeStage {
         let mut dec = CompositeDecoder::new(&p);
         let mut reporter = Reporter::new(p.report_s);
         let dropped = Arc::new(AtomicU64::new(0));
-        let seen = dropped.clone();
+        let mut losses = Losses::default();
         let mut complained = false;
         let f = move |input| {
             let frame = match input {
                 Input::Frame(f) => f,
-                Input::Lagged { .. } => {
+                Input::Lagged { missed } => {
+                    losses.lagged(missed);
                     dec.gap();
                     return Vec::new();
                 }
@@ -1269,6 +1325,9 @@ impl Stage for CompositeDecodeStage {
                 &mono
             };
             let t0 = frame.provenance.span.start_ns.0;
+            if losses.jumped(&frame.provenance.span, rate) {
+                dec.gap();
+            }
             let mut out = Vec::new();
             let fields = dec.push(x, rate, t0);
             let field_ns = dec.lock().standard.map_or(20_000_000, field_ns);
@@ -1294,12 +1353,7 @@ impl Stage for CompositeDecodeStage {
             });
             let l = dec.lock();
             if reporter.due(&l, t0, now) {
-                let v = event(
-                    &ctx,
-                    t0,
-                    "video",
-                    lock_fields(&l, seen.load(Ordering::Relaxed)),
-                );
+                let v = event(&ctx, t0, "video", lock_fields(&l, losses.dropped));
                 out.push(Frame::new(
                     event_out.clone(),
                     frame.provenance.clone(),
@@ -1348,6 +1402,34 @@ mod tests {
         assert!(!r.due(&lock(false, pal), 3 * S, 4 * S));
         assert!(r.due(&lock(false, pal), 7 * S, 8 * S));
         assert!(r.due(&lock(false, Some(VideoStandard::Ntsc)), 8 * S, 8 * S + 1));
+    }
+
+    fn span(start_ns: u64, end_ns: u64) -> Span {
+        Span {
+            start_ns: Timestamp(start_ns),
+            end_ns: Timestamp(end_ns),
+        }
+    }
+
+    #[test]
+    fn a_jump_in_the_input_time_is_one_loss_and_a_marker_is_not_counted_twice() {
+        let mut l = Losses::default();
+        // 1 ms blocks at 8 MHz: a sample is 125 ns.
+        assert!(!l.jumped(&span(0, 1_000_000), 8_000_000));
+        assert!(!l.jumped(&span(1_000_000, 2_000_000), 8_000_000));
+        assert!(
+            !l.jumped(&span(2_000_126, 3_000_000), 8_000_000),
+            "rounding"
+        );
+        assert!(!l.jumped(&span(2_999_000, 4_000_000), 8_000_000), "overlap");
+        assert!(l.jumped(&span(5_000_000, 6_000_000), 8_000_000));
+        assert_eq!(l.dropped, 1);
+        l.lagged(3);
+        assert!(
+            !l.jumped(&span(9_000_000, 10_000_000), 8_000_000),
+            "counted"
+        );
+        assert_eq!(l.dropped, 4);
     }
 
     #[test]

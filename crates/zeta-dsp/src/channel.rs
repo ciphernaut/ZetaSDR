@@ -1,6 +1,8 @@
 //! Channel stage: shift a channel to baseband, low-pass it and decimate.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use num_complex::Complex;
@@ -14,6 +16,8 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{ChannelId, Hz, Provenance, StreamId, StreamKind, Timestamp};
 
 use crate::util::lowpass_taps;
+use crate::video_fm::DropNote;
+use crate::worker::{VIDEO_QUEUE_DEPTH, run_map_threaded};
 use crate::{Input, frame_span, note_lag, run_map};
 
 /// Fewest and most taps of the channel low-pass filter.
@@ -135,6 +139,110 @@ pub fn extract_offset_streaming(
     state.next = state.next + out.len() * state.decim - iq.len();
     state.history.copy_from_slice(&ext[ext.len() - h..]);
     Ok((out, out_rate_hz))
+}
+
+/// Whether a band of `bandwidth_hz` cut at `out_rate_hz` from `rate_hz` skips the
+/// low-pass: no decimation and a band of at least three quarters of the rate, where the
+/// filter would pass nearly all of the block anyway and cost a 63-tap complex FIR per
+/// sample at the full rate (a video job's 24 MHz band at 30.72 Msps).
+pub fn skips_filter(rate_hz: u64, bandwidth_hz: u64, out_rate_hz: u64) -> bool {
+    rate_hz > 0 && out_rate_hz == rate_hz && u128::from(bandwidth_hz) * 4 >= u128::from(rate_hz) * 3
+}
+
+/// Samples between exact re-seeds of [`shift_into`]'s phasors.
+const SHIFT_SEED: usize = 1024;
+/// Phasors [`shift_into`] steps side by side (independent, so the loop vectorises).
+const SHIFT_LANES: usize = 8;
+
+/// Multiply `iq` by `exp(j2π·(phase + n·step))` (`phase` and `step` in cycles) into `out`
+/// (as long as `iq`) and advance `phase` past the block. A phasor recurrence:
+/// [`SHIFT_LANES`] phasors step by `exp(j2π·LANES·step)` side by side, and every
+/// [`SHIFT_SEED`] samples they are re-seeded from an exact `sin_cos`, so the error stays near
+/// f32 rounding however long the run.
+fn shift_into(iq: &[Complex<f32>], phase: &mut f64, step: f64, out: &mut [Complex<f32>]) {
+    let at = |cycles: f64| {
+        let (s, c) = (std::f64::consts::TAU * cycles.rem_euclid(1.0)).sin_cos();
+        Complex::new(c as f32, s as f32)
+    };
+    let w = at(SHIFT_LANES as f64 * step);
+    for (chunk, dst) in iq.chunks(SHIFT_SEED).zip(out.chunks_mut(SHIFT_SEED)) {
+        let mut p: [Complex<f32>; SHIFT_LANES] =
+            std::array::from_fn(|k| at(*phase + k as f64 * step));
+        let mut src = chunk.chunks_exact(SHIFT_LANES);
+        let mut dsts = dst.chunks_exact_mut(SHIFT_LANES);
+        for (g, d) in (&mut src).zip(&mut dsts) {
+            for k in 0..SHIFT_LANES {
+                d[k] = g[k] * p[k];
+                p[k] *= w;
+            }
+        }
+        for ((x, d), p) in src.remainder().iter().zip(dsts.into_remainder()).zip(&p) {
+            *d = x * p;
+        }
+        *phase = (*phase + chunk.len() as f64 * step).rem_euclid(1.0);
+    }
+}
+
+/// A block of IQ samples, shared.
+pub type Samples = Arc<[Complex<f32>]>;
+
+/// Streaming state of the direct path: the low-pass's ([`ChannelState`]), or the shift's
+/// phase when [`skips_filter`].
+#[derive(Debug, Default)]
+pub struct DirectChannel {
+    fir: ChannelState,
+    /// `(rate, offset)` the shift's phase belongs to, and the phase in cycles.
+    shift: Option<((u64, i64), f64)>,
+}
+
+impl DirectChannel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// [`extract_offset_streaming`] on one block, except where [`skips_filter`]: then the
+/// block itself at offset 0 (the same samples, not a copy), else the block shifted to
+/// baseband with no filter. Returns the samples and the output rate.
+pub fn extract_direct(
+    state: &mut DirectChannel,
+    iq: &Samples,
+    rate_hz: u64,
+    offset_hz: i64,
+    bandwidth_hz: u64,
+    out_rate_hz: u64,
+) -> Result<(Samples, u64), ChannelError> {
+    if !skips_filter(rate_hz, bandwidth_hz, out_rate_hz) || bandwidth_hz > out_rate_hz {
+        state.shift = None;
+        let (v, r) = extract_offset_streaming(
+            &mut state.fir,
+            iq,
+            rate_hz,
+            offset_hz,
+            bandwidth_hz,
+            out_rate_hz,
+        )?;
+        return Ok((v.into(), r));
+    }
+    state.fir = ChannelState::new();
+    if offset_hz == 0 {
+        state.shift = None;
+        return Ok((iq.clone(), out_rate_hz));
+    }
+    let key = (rate_hz, offset_hz);
+    let mut phase = match state.shift {
+        Some((k, p)) if k == key => p,
+        _ => 0.0,
+    };
+    let mut out = vec![Complex::new(0.0, 0.0); iq.len()];
+    shift_into(
+        iq,
+        &mut phase,
+        -(offset_hz as f64) / rate_hz as f64,
+        &mut out,
+    );
+    state.shift = Some((key, phase));
+    Ok((out.into(), out_rate_hz))
 }
 
 /// One-shot [`extract_offset_streaming`] from fresh state.
@@ -261,7 +369,10 @@ impl Stage for ChannelStage {
     /// `{"channel": {"path": "direct", "reason": R}}` saying why not the bank. A `wide_hz`
     /// is judged first (on the bank's band, or on each block of the direct path) and the
     /// bank's width rule on the band actually cut; a `wide_hz` not cut adds `"wide": "off:
-    /// <why>"` to that object.
+    /// <why>"` to that object. Where the direct path skips the low-pass ([`skips_filter`]:
+    /// no decimation, a band of three quarters of the rate or more) it adds `"filter":
+    /// "none"`. From an input rate of [`THREADED_RATE_HZ`] the direct path runs on a thread
+    /// of its own and adds `"dropped": N` once its queue has dropped inputs.
     async fn run(
         &self,
         params: serde_json::Value,
@@ -280,7 +391,9 @@ impl Stage for ChannelStage {
             channel: ChannelId(format!("{}/{}", p.center_hz, p.bandwidth_hz)),
             p,
             out,
-            state: ChannelState::new(),
+            state: DirectChannel::new(),
+            unfiltered: false,
+            dropped: None,
             path: serde_json::Value::Null,
             within: None,
             wide_off: None,
@@ -333,23 +446,85 @@ impl Stage for ChannelStage {
             }
             Err(reason) => chan.set_path(serde_json::json!({"path": "direct", "reason": reason})),
         }
-        run_map(kind, inputs, bus, cancel, move |input| {
-            let frame = match input {
-                Input::Frame(f) => f,
-                Input::Lagged { .. } => {
-                    chan.state = ChannelState::new();
-                    return Ok(Vec::new());
-                }
-            };
-            let Payload::Iq(block) = &frame.payload else {
-                return Err(StageError::Failed("channel stage expects iq frames".into()));
-            };
-            Ok(chan
-                .process(block, &frame.provenance)?
-                .into_iter()
-                .collect())
-        })
-        .await
+        let mut inputs = inputs;
+        if inputs.len() != 1 {
+            return Err(StageError::Failed("expected 1 input".into()));
+        }
+        // The first frame tells the input rate: a wide capture's direct path runs on a
+        // thread of its own, a narrower one on the runtime as [`run_map`] runs it.
+        let first = loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                r = inputs[0].recv() => match r {
+                    Ok(frame) => break frame,
+                    Err(broadcast::error::RecvError::Lagged(n)) => note_lag(kind, n),
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
+            }
+        };
+        let threaded =
+            matches!(&first.payload, Payload::Iq(b) if b.sample_rate_hz.0 >= THREADED_RATE_HZ);
+        for f in chan.direct(Input::Frame(first))? {
+            bus.publish(f);
+        }
+        if !threaded {
+            return run_map(kind, inputs, bus, cancel, move |input| chan.direct(input)).await;
+        }
+        run_direct_threaded(kind, chan, inputs, bus, cancel).await
+    }
+}
+
+/// Input rates from which the direct path runs on a thread of its own (a video job's
+/// capture), so a full-rate block holds no runtime worker.
+pub const THREADED_RATE_HZ: u64 = 10_000_000;
+
+/// The direct path on a thread of its own ([`run_map_threaded`], drop-on-full queue of
+/// [`VIDEO_QUEUE_DEPTH`]): the thread's drops are noted in the job's `channel` context
+/// as `"dropped": N` when they grow, at most once a second. An error from a block (the
+/// capture left the channel) ends the stage with that error.
+async fn run_direct_threaded(
+    kind: &'static str,
+    mut chan: Channel,
+    inputs: Vec<broadcast::Receiver<Frame>>,
+    bus: Arc<StreamBus>,
+    cancel: CancellationToken,
+) -> Result<(), StageError> {
+    let dropped = Arc::new(AtomicU64::new(0));
+    let seen = dropped.clone();
+    let failed = Arc::new(Mutex::new(None::<StageError>));
+    let fail = failed.clone();
+    let stop = cancel.child_token();
+    let stopping = stop.clone();
+    let mut drops = DropNote::new(Duration::from_secs(1));
+    let r = run_map_threaded(
+        kind,
+        inputs,
+        bus,
+        stop,
+        VIDEO_QUEUE_DEPTH,
+        dropped,
+        move |input| {
+            if stopping.is_cancelled() {
+                return Vec::new();
+            }
+            let n = seen.load(Ordering::Relaxed);
+            if drops.due(n, Instant::now()) {
+                chan.dropped = Some(n);
+                chan.note();
+            }
+            chan.direct(input).unwrap_or_else(|e| {
+                *fail.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                stopping.cancel();
+                Vec::new()
+            })
+        },
+    )
+    .await;
+    let failed = failed.lock().unwrap_or_else(|p| p.into_inner()).take();
+    match failed {
+        Some(e) => Err(e),
+        None => r,
     }
 }
 
@@ -358,7 +533,11 @@ struct Channel {
     p: ChannelParams,
     channel: ChannelId,
     out: StreamId,
-    state: ChannelState,
+    state: DirectChannel,
+    /// The block is passed through or only shifted, unfiltered ([`skips_filter`]).
+    unfiltered: bool,
+    /// Inputs the direct path's thread dropped, when it runs on one.
+    dropped: Option<u64>,
     /// The path fields of the job's `channel` context, as last noted.
     path: serde_json::Value,
     /// `(rate, center)` of the band `wide_hz` is judged on; `None`: each block's own.
@@ -377,8 +556,16 @@ impl Channel {
 
     fn note(&self) {
         let mut v = self.path.clone();
-        if let (Some(why), Some(o)) = (&self.wide_off, v.as_object_mut()) {
-            o.insert("wide".into(), format!("off: {why}").into());
+        if let Some(o) = v.as_object_mut() {
+            if let Some(why) = &self.wide_off {
+                o.insert("wide".into(), format!("off: {why}").into());
+            }
+            if self.unfiltered {
+                o.insert("filter".into(), "none".into());
+            }
+            if let Some(n) = self.dropped {
+                o.insert("dropped".into(), n.into());
+            }
         }
         self.ctx.note(serde_json::json!({"channel": v}));
     }
@@ -419,6 +606,25 @@ impl Channel {
         cut
     }
 
+    /// The direct path on one input: a frame's block filtered, or a lost input forgetting
+    /// the streaming state.
+    fn direct(&mut self, input: Input) -> Result<Vec<Frame>, StageError> {
+        let frame = match input {
+            Input::Frame(f) => f,
+            Input::Lagged { .. } => {
+                self.state = DirectChannel::new();
+                return Ok(Vec::new());
+            }
+        };
+        let Payload::Iq(block) = &frame.payload else {
+            return Err(StageError::Failed("channel stage expects iq frames".into()));
+        };
+        Ok(self
+            .process(block, &frame.provenance)?
+            .into_iter()
+            .collect())
+    }
+
     /// Filter one input block (the source's, or a bank bin's) into an output
     /// frame with `prov`'s source and job; `None` when it yields no sample.
     fn process(&mut self, block: &IqBlock, prov: &Provenance) -> Result<Option<Frame>, StageError> {
@@ -428,8 +634,9 @@ impl Channel {
         check_in_band(rate, block.center_hz.0, p.center_hz, p.bandwidth_hz)
             .map_err(|e| StageError::Failed(e.to_string()))?;
         // Time of the first output sample: the decimation phase carried in.
-        let lead = self.state.next;
-        let (samples, out_rate) = extract_offset_streaming(
+        let lead = self.state.fir.next;
+        let unfiltered = skips_filter(rate, cut, p.out_rate_hz);
+        let (samples, out_rate) = extract_direct(
             &mut self.state,
             &block.samples,
             rate,
@@ -438,6 +645,10 @@ impl Channel {
             p.out_rate_hz,
         )
         .map_err(|e| StageError::Failed(e.to_string()))?;
+        if unfiltered != self.unfiltered {
+            self.unfiltered = unfiltered;
+            self.note();
+        }
         if samples.is_empty() {
             return Ok(None);
         }
@@ -452,7 +663,7 @@ impl Channel {
                 t0,
                 sample_rate_hz: Hz(out_rate),
                 center_hz: Hz(p.center_hz),
-                samples: samples.into(),
+                samples,
             }),
         )))
     }
@@ -491,7 +702,7 @@ async fn run_bin(
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     note_lag(kind, n);
-                    chan.state = ChannelState::new();
+                    chan.state = DirectChannel::new();
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     return Err(StageError::Failed(
@@ -877,5 +1088,108 @@ mod tests {
             notes.last().unwrap(),
             &serde_json::json!({"channel": {"path": "direct", "reason": "no bank"}})
         );
+    }
+
+    const VIDEO_RATE: u64 = 30_720_000;
+
+    fn noise_iq(n: usize) -> Vec<Complex<f32>> {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        (0..n).map(|_| Complex::new(next(), next())).collect()
+    }
+
+    #[test]
+    fn a_wide_band_at_decimation_1_passes_the_block_through() {
+        assert!(skips_filter(VIDEO_RATE, 24_000_000, VIDEO_RATE));
+        assert!(!skips_filter(VIDEO_RATE, 22_000_000, VIDEO_RATE));
+        assert!(!skips_filter(VIDEO_RATE, 24_000_000, VIDEO_RATE / 2));
+        let iq: Arc<[Complex<f32>]> = noise_iq(65_536).into();
+        let mut st = DirectChannel::new();
+        let (out, rate) =
+            extract_direct(&mut st, &iq, VIDEO_RATE, 0, 24_000_000, VIDEO_RATE).unwrap();
+        assert_eq!(rate, VIDEO_RATE);
+        assert!(Arc::ptr_eq(&out, &iq), "offset 0 hands the same samples on");
+    }
+
+    #[test]
+    fn a_wide_band_off_centre_is_shifted_accurately_over_a_million_samples() {
+        const N: usize = 1 << 20;
+        let offset: i64 = 1_234_567;
+        let iq = noise_iq(N);
+        let mut st = DirectChannel::new();
+        let mut got = Vec::with_capacity(N);
+        // Uneven blocks, so the phase carried between blocks is exercised too.
+        let mut at = 0;
+        for len in [65_536usize, 1, 4_095, 65_537].iter().cycle() {
+            if at >= N {
+                break;
+            }
+            let end = (at + len).min(N);
+            let block: Arc<[Complex<f32>]> = iq[at..end].into();
+            let (out, _) =
+                extract_direct(&mut st, &block, VIDEO_RATE, offset, 24_000_000, VIDEO_RATE)
+                    .unwrap();
+            got.extend_from_slice(&out);
+            at = end;
+        }
+        assert_eq!(got.len(), N);
+        let worst = iq
+            .iter()
+            .zip(&got)
+            .enumerate()
+            .map(|(n, (x, y))| {
+                let cycles = (-(offset as f64) * n as f64 / VIDEO_RATE as f64).rem_euclid(1.0);
+                let (s, c) = (2.0 * PI * cycles).sin_cos();
+                let want = Complex::new(
+                    x.re as f64 * c - x.im as f64 * s,
+                    x.re as f64 * s + x.im as f64 * c,
+                );
+                let d = Complex::new(y.re as f64, y.im as f64) - want;
+                d.norm()
+            })
+            .fold(0.0f64, f64::max);
+        assert!(worst < 1e-4, "worst error {worst}");
+    }
+
+    #[tokio::test]
+    async fn a_video_rate_channel_runs_unfiltered_on_its_thread_and_says_so() {
+        let iq = noise_iq(65_536);
+        let center = 1_300_000_000;
+        let p = serde_json::json!({
+            "center_hz": center, "bandwidth_hz": 24_000_000, "out_rate_hz": VIDEO_RATE,
+        });
+        let frames = (0..3)
+            .map(|_| frame_at(iq.clone(), VIDEO_RATE, center))
+            .collect();
+        let (got, notes) = run_noted(p, frames).await;
+        assert_eq!(got.len(), 3 * iq.len());
+        assert_eq!(&got[..iq.len()], &iq[..]);
+        assert_eq!(
+            notes.last().unwrap(),
+            &serde_json::json!({"channel": {
+                "path": "direct", "reason": "no bank", "filter": "none",
+            }})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_threaded_channel_fails_when_the_capture_leaves_it() {
+        let iq = noise_iq(4_096);
+        let p = serde_json::json!({
+            "center_hz": 1_300_000_000u64, "bandwidth_hz": 24_000_000, "out_rate_hz": VIDEO_RATE,
+        });
+        let (tx, _out, _rx, h) = spawn(p, CancellationToken::new());
+        tx.send(frame_at(iq.clone(), VIDEO_RATE, 1_300_000_000))
+            .unwrap();
+        tx.send(frame_at(iq, VIDEO_RATE, 1_400_000_000)).unwrap();
+        match h.await.unwrap() {
+            Err(StageError::Failed(m)) => assert!(m.contains("center_hz"), "{m}"),
+            r => panic!("expected Failed, got {r:?}"),
+        }
     }
 }

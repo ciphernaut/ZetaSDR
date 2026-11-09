@@ -258,23 +258,56 @@ impl Deemphasis {
     }
 }
 
+/// `atan2(y, x)` in f32 without branches, so a loop of it vectorises: an odd degree-11
+/// polynomial for `atan` on `[0, 1]` (worst error about 2e-6 rad; the tests hold it to
+/// 1e-5), folded into the right octant. `(0, 0)` and non-finite inputs give NaN or a
+/// non-finite value the caller replaces.
+#[inline(always)]
+fn atan2_fast(y: f32, x: f32) -> f32 {
+    let (ax, ay) = (x.abs(), y.abs());
+    let a = ax.min(ay) / ax.max(ay);
+    let s = a * a;
+    let mut r = ((((-0.011_721_2 * s + 0.052_653_32) * s - 0.116_432_87) * s + 0.193_543_46) * s
+        - 0.332_623_47)
+        * s
+        * a
+        + 0.999_977_26 * a;
+    r = if ay > ax {
+        std::f32::consts::FRAC_PI_2 - r
+    } else {
+        r
+    };
+    r = if x < 0.0 { std::f32::consts::PI - r } else { r };
+    if y < 0.0 { -r } else { r }
+}
+
 /// FM discriminator: `arg(x · conj(prev)) · rate / (2π · deviation)` per sample,
 /// unclamped (a sync tip below the nominal deviation must keep its depth); a
-/// non-finite result gives 0. `prev` carries the last sample across blocks.
+/// non-finite result (no signal: a zero sample) gives 0. `prev` carries the last sample
+/// across blocks. The angle is [`atan2_fast`], so the loop runs a vector of samples at a
+/// time.
 fn discriminate(
     iq: &[Complex<f32>],
     prev: &mut Complex<f32>,
     rate_hz: u64,
     deviation_hz: u64,
 ) -> Vec<f32> {
-    let scale = rate_hz as f64 / (std::f64::consts::TAU * deviation_hz as f64);
-    iq.iter()
-        .map(|&x| {
-            let v = (f64::from((x * prev.conj()).arg()) * scale) as f32;
-            *prev = x;
-            if v.is_finite() { v } else { 0.0 }
-        })
-        .collect()
+    let scale = (rate_hz as f64 / (std::f64::consts::TAU * deviation_hz as f64)) as f32;
+    let one = |x: Complex<f32>, p: Complex<f32>| {
+        let z = x * p.conj();
+        let v = atan2_fast(z.im, z.re) * scale;
+        if v.is_finite() { v } else { 0.0 }
+    };
+    let Some(&first) = iq.first() else {
+        return Vec::new();
+    };
+    let mut out = vec![0.0f32; iq.len()];
+    out[0] = one(first, *prev);
+    for (o, w) in out[1..].iter_mut().zip(iq.windows(2)) {
+        *o = one(w[1], w[0]);
+    }
+    *prev = iq[iq.len() - 1];
+    out
 }
 
 /// A streaming real FIR decimator: carries its last `taps - 1` inputs and the phase of
@@ -305,6 +338,14 @@ impl Decimator {
     }
 
     fn process(&mut self, x: &[f32]) -> Vec<f32> {
+        if self.decim == 2 {
+            return self.process_halfband(x);
+        }
+        self.process_general(x)
+    }
+
+    /// Any decimation: every tap of every kept output.
+    fn process_general(&mut self, x: &[f32]) -> Vec<f32> {
         let h = self.history.len();
         let mut buf = std::mem::take(&mut self.history);
         buf.extend_from_slice(x);
@@ -325,6 +366,71 @@ impl Decimator {
         self.history = buf.split_off(buf.len() - h);
         out
     }
+
+    /// [`Decimator::process`] by 2 with half-band taps (every other tap from the centre
+    /// zero, see [`halfband_taps`]): the window's even taps and its centre only, the
+    /// window split into its even and odd samples so each tap is one unit-stride pass
+    /// over the outputs (which vectorises), symmetric taps paired.
+    fn process_halfband(&mut self, x: &[f32]) -> Vec<f32> {
+        let h = self.history.len();
+        let n_taps = self.taps.len();
+        let centre = n_taps / 2;
+        let mut buf = std::mem::take(&mut self.history);
+        buf.extend_from_slice(x);
+        // Outputs at n = phase, phase + 2, ... < x.len(); output m's window is
+        // buf[n..n + n_taps] with n = phase + 2m.
+        let first = self.phase;
+        let m = if first < x.len() {
+            (x.len() - first).div_ceil(2)
+        } else {
+            0
+        };
+        let tail = &buf[first..];
+        let even: Vec<f32> = tail.iter().step_by(2).copied().collect();
+        let odd: Vec<f32> = tail.iter().skip(1).step_by(2).copied().collect();
+        let mut out = vec![0.0f32; m];
+        if m > 0 {
+            // The centre tap sits on an odd offset: odd[m + centre / 2].
+            let c = self.taps[centre];
+            let oc = &odd[centre / 2..centre / 2 + m];
+            for (o, &v) in out.iter_mut().zip(oc) {
+                *o = c * v;
+            }
+            // Even offsets j and n_taps - 1 - j: even[m + j / 2] and even[m + (n_taps - 1 - j) / 2].
+            for j in (0..centre).step_by(2) {
+                let t = self.taps[j];
+                let (a, b) = (j / 2, (n_taps - 1 - j) / 2);
+                let (ea, eb) = (&even[a..a + m], &even[b..b + m]);
+                for ((o, &u), &v) in out.iter_mut().zip(ea).zip(eb) {
+                    *o += t * (u + v);
+                }
+            }
+        }
+        let n = first + 2 * m;
+        self.phase = n - x.len();
+        self.history = buf.split_off(buf.len() - h);
+        out
+    }
+}
+
+/// Taps for decimation by 2: a Hann-windowed sinc cut at a quarter of the rate (the
+/// half-band point), `n` taps with `n / 2` odd, so every tap an even distance from the
+/// centre but the centre itself is zero (set exactly, not left to rounding).
+fn halfband_taps(n: usize) -> Vec<f32> {
+    assert!(
+        n % 2 == 1 && (n / 2) % 2 == 1,
+        "halfband_taps: n / 2 must be odd, got {n}"
+    );
+    let mut taps = lowpass_taps(0.25, 1.0, n);
+    let centre = n / 2;
+    for (j, t) in taps.iter_mut().enumerate() {
+        if j != centre && j.abs_diff(centre) % 2 == 0 {
+            *t = 0.0;
+        }
+    }
+    let sum: f32 = taps.iter().sum();
+    taps.iter_mut().for_each(|t| *t /= sum);
+    taps
 }
 
 /// The input-rate-dependent part of [`VideoFmDemod`], rebuilt on a rate change.
@@ -338,7 +444,8 @@ struct RateState {
 }
 
 /// Streaming wideband FM video demodulator: discriminator at the input rate, FIR
-/// decimation to [`composite_rate_hz`] (none at decimation 1), then de-emphasis. Output
+/// decimation to [`composite_rate_hz`] (none at decimation 1; a half-band filter at
+/// decimation 2), then de-emphasis. Output
 /// is composite volts (`Δf / deviation_hz`), unclamped.
 #[derive(Clone, Debug)]
 pub struct VideoFmDemod {
@@ -372,7 +479,12 @@ impl VideoFmDemod {
     fn rebuild(&mut self, in_rate_hz: u64) {
         let comp = composite_rate_hz(in_rate_hz, self.composite_max_hz).unwrap_or(in_rate_hz);
         let decim = (in_rate_hz / comp) as usize;
+        // By 2 (a 30.72 Msps capture to 15.36 Msps) a half-band filter, whose zero taps
+        // the decimator skips; other factors a low-pass at 0.45 of the composite rate.
         let decimator = (decim > 1).then(|| {
+            if decim == 2 {
+                return Decimator::new(halfband_taps(63), 2);
+            }
             let n = (8 * decim + 1).clamp(63, 1025) | 1;
             Decimator::new(
                 lowpass_taps(0.45 * comp as f64, in_rate_hz as f64, n),
@@ -588,6 +700,74 @@ impl Stage for VideoFmDemodStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fast_angle_is_within_1e_5_rad_everywhere() {
+        let mut worst = 0.0f64;
+        for k in 0..100_000 {
+            let th = -std::f64::consts::PI + std::f64::consts::TAU * k as f64 / 100_000.0;
+            for r in [1e-6f64, 0.3, 1.0, 1e4] {
+                let (y, x) = ((r * th.sin()) as f32, (r * th.cos()) as f32);
+                let want = f64::from(y).atan2(f64::from(x));
+                let got = f64::from(atan2_fast(y, x));
+                let mut d = (got - want).abs();
+                // -π and π are the same angle.
+                if d > std::f64::consts::PI {
+                    d = std::f64::consts::TAU - d;
+                }
+                worst = worst.max(d);
+            }
+        }
+        assert!(worst < 1e-5, "worst {worst} rad");
+        for (y, x) in [(0.0f32, 1.0f32), (1.0, 0.0), (0.0, -1.0), (-1.0, 0.0)] {
+            assert!((atan2_fast(y, x) - y.atan2(x)).abs() < 1e-6, "({y}, {x})");
+        }
+    }
+
+    #[test]
+    fn a_zero_or_non_finite_sample_discriminates_to_0() {
+        let z = Complex::new(0.0f32, 0.0);
+        let one = Complex::new(1.0f32, 0.0);
+        let nan = Complex::new(f32::NAN, 0.0);
+        let mut prev = z;
+        let d = discriminate(&[z, one, one, nan, one], &mut prev, 1_000_000, 100_000);
+        assert_eq!(d, vec![0.0; 5]);
+        assert_eq!(prev, one);
+    }
+
+    #[test]
+    fn the_half_band_decimator_matches_the_plain_one_on_its_taps() {
+        let taps = halfband_taps(63);
+        let centre = 31;
+        assert!((taps.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        for (j, t) in taps.iter().enumerate() {
+            if j != centre && j.abs_diff(centre) % 2 == 0 {
+                assert_eq!(*t, 0.0, "tap {j}");
+            }
+        }
+        let x: Vec<f32> = (0..10_007)
+            .map(|i| ((i as f32) * 0.37).sin() + ((i as f32) * 1.9).cos() * 0.3)
+            .collect();
+        // The plain loop on the same taps, fed in the same uneven blocks.
+        let mut plain = Decimator::new(taps.clone(), 2);
+        let mut half = Decimator::new(taps, 2);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut at = 0;
+        for len in [1usize, 2, 333, 4_096, 7].iter().cycle() {
+            if at >= x.len() {
+                break;
+            }
+            let end = (at + len).min(x.len());
+            a.extend(plain.process_general(&x[at..end]));
+            b.extend(half.process(&x[at..end]));
+            at = end;
+        }
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.len(), x.len().div_ceil(2));
+        for (u, v) in a.iter().zip(&b) {
+            assert!((u - v).abs() < 1e-5, "{u} vs {v}");
+        }
+    }
 
     #[test]
     fn drops_are_noted_when_they_change_at_most_once_a_second() {

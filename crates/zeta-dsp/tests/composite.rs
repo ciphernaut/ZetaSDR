@@ -664,3 +664,122 @@ fn the_served_chain_decodes_every_field() {
     // Measured 98: the fields before the lock (about 2) and one or two at the IQ loop.
     assert!(fields >= 96, "{fields} fields of 104");
 }
+
+/// What [`run_lossy`] saw: the events and the number of fields.
+struct Lossy {
+    events: Vec<serde_json::Value>,
+    fields: usize,
+}
+
+/// The stage over 1.2 s of the PAL card in 1 ms blocks into an 8-deep input, a block every
+/// 2 ms so nothing is lost but: the blocks in `skip` (never sent: a gap in the spans' time,
+/// as a block lost upstream arrives), and the ten blocks from `burst` sent at once (the
+/// input lags by two: a real `Lagged`).
+async fn run_lossy(skip: &[usize], burst: Option<usize>) -> Lossy {
+    let bus = Arc::new(StreamBus::new(256));
+    let v_out = bus.register(StreamKind::Video, prov(0, 0, RATE));
+    let e_out = bus.register(StreamKind::Event, prov(0, 0, RATE));
+    let mut rx_v = bus.subscribe(&v_out).unwrap();
+    let mut rx_e = bus.subscribe(&e_out).unwrap();
+    let (tx, rx_in) = broadcast::channel(8);
+    let outs = vec![v_out, e_out];
+    let stage_bus = bus.clone();
+    let h = tokio::spawn(async move {
+        CompositeDecodeStage::new()
+            .run(
+                json!({"standard": "pal", "report_s": 1}),
+                vec![rx_in],
+                outs,
+                stage_bus,
+                CancellationToken::new(),
+                StageContext::new(SourceId("s".into())),
+            )
+            .await
+    });
+    let card = composite_test_card(VideoStandard::Pal, RATE, 60);
+    let block = (RATE / 1000) as usize;
+    let (mut events, mut fields) = (Vec::new(), 0);
+    for (i, c) in card.chunks(block).enumerate() {
+        if skip.contains(&i) {
+            continue;
+        }
+        let t0 = ns(i * block, RATE);
+        tx.send(Frame::new(
+            StreamId::new(),
+            prov(t0, c.len(), RATE),
+            Payload::Audio {
+                sample_rate_hz: Hz(u64::from(RATE)),
+                channels: 1,
+                samples: c.to_vec().into(),
+            },
+        ))
+        .unwrap();
+        if burst.is_none_or(|b| !(b..b + 9).contains(&i)) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        while let Ok(f) = rx_v.try_recv() {
+            assert!(matches!(f.payload, Payload::Video { .. }));
+            fields += 1;
+        }
+    }
+    drop(tx);
+    let r = tokio::time::timeout(Duration::from_secs(30), h)
+        .await
+        .expect("stage ended")
+        .unwrap();
+    assert!(r.is_ok(), "{r:?}");
+    fields += std::iter::from_fn(|| rx_v.try_recv().ok()).count();
+    while let Ok(f) = rx_e.try_recv() {
+        let Payload::Event(v) = f.payload else {
+            panic!("expected an event")
+        };
+        events.push(v);
+    }
+    Lossy { events, fields }
+}
+
+/// Every event from the first lock on is locked, and the last says `dropped` is at least
+/// `min`.
+fn assert_kept_lock(run: &Lossy, min: u64, what: &str) {
+    let first = run
+        .events
+        .iter()
+        .position(|e| e["locked"] == true)
+        .unwrap_or_else(|| panic!("{what}: no lock in {:?}", run.events));
+    assert!(
+        run.events[first..].iter().all(|e| e["locked"] == true),
+        "{what}: the lock went: {:?}",
+        run.events
+    );
+    let last = run.events.last().unwrap();
+    assert!(
+        last["dropped"].as_u64().unwrap() >= min,
+        "{what}: {:?}",
+        run.events
+    );
+}
+
+#[tokio::test]
+async fn a_lagged_input_keeps_the_lock_costs_a_field_and_counts() {
+    let clean = run_lossy(&[], None).await;
+    assert_kept_lock(&clean, 0, "clean");
+    assert_eq!(
+        clean.events.last().unwrap()["dropped"],
+        0,
+        "{:?}",
+        clean.events
+    );
+    let lagged = run_lossy(&[], Some(400)).await;
+    eprintln!("lagged: {} fields, clean {}", lagged.fields, clean.fields);
+    assert_kept_lock(&lagged, 2, "lagged");
+    assert!(lagged.fields < clean.fields, "{} fields", lagged.fields);
+}
+
+#[tokio::test]
+async fn a_gap_in_the_input_time_keeps_the_lock_costs_a_field_and_counts() {
+    let clean = run_lossy(&[], None).await;
+    let gap = run_lossy(&[400, 401, 402], None).await;
+    eprintln!("gap: {} fields, clean {}", gap.fields, clean.fields);
+    assert_kept_lock(&gap, 1, "gap");
+    assert!(gap.fields < clean.fields, "{} fields", gap.fields);
+}
