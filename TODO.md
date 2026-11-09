@@ -700,11 +700,11 @@ The luma path's 3 MHz low-pass stands in for a chroma notch, and colour is not d
 
 ## Video: fixtures of the four bench transmitters
 
-0.5 s IQ cuts at 15.36 Msps cf32 (about 31 MB each) of each bench transmitter (a 5.8 GHz reverse camera, an FPV VTX, an HDMI sender, a 1.3 GHz VTX), kept out of the repository under a private path. The composite tests skip when they are absent, as `bits_chain.rs` does for private captures.
+0.5 s IQ cuts at 15.36 Msps cf32 (about 61 MB each as cf32, which the tests read) of each bench transmitter (a 5.8 GHz reverse camera, an FPV VTX, an HDMI sender, a 1.3 GHz VTX), kept out of the repository under a private path. The composite tests skip when they are absent, as `bits_chain.rs` does for private captures.
 
 ## Video: thumbnails in the narrow footprint
 
-A live thumbnail rides a video job's tag on the waterfall, but not in the narrow footprint, where rail tags are thin. Give it a place there (the tab's strip, or a taller tag).
+A live thumbnail rides a video job's tag on the waterfall, but not in the narrow footprint: there every rail tag is `.thin`, and the rule `#rail .job-tag.thin > *` (in the page's `style.css`) hides a thin tag's children, so the thumbnail canvas is hidden (and holds no socket). The Video tab and the full view still work. Give the thumbnail a place there (the tab's strip, or a taller tag).
 
 ## Video: PAL line numbering
 
