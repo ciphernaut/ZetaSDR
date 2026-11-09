@@ -36,6 +36,13 @@ pub enum ClientError {
     Decode(String),
     #[error("stream {url}: {detail}")]
     Stream { url: String, detail: String },
+    /// A video subscription to a stream of another kind.
+    #[error("stream {url}: stream {} is {}, not video", .stream.0, crate::ws::kind_name(*.kind))]
+    NotVideo {
+        url: String,
+        stream: StreamId,
+        kind: zeta_core::types::StreamKind,
+    },
 }
 
 #[derive(Clone)]

@@ -156,9 +156,8 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     }
 }
 
-/// `stream save`: write the stream's next video frame to `path` as a PNG. The body is
-/// saved as it arrives; a node that still sends the frame's raw pixels gets them encoded
-/// here at full size.
+/// `stream save`: write the stream's next video frame to `path` as the PNG the node sends
+/// under the `sharp` profile (full width).
 async fn stream_save(
     client: &NodeClient,
     stream: &str,
@@ -168,7 +167,6 @@ async fn stream_save(
 ) -> ExitCode {
     use std::time::Duration;
     use zeta_client::Received;
-    use zeta_core::stream::VideoFormat;
     use zeta_core::types::{StreamId, StreamKind};
 
     let mut sub = match client
@@ -176,7 +174,7 @@ async fn stream_save(
         .await
     {
         Ok(s) => s,
-        Err(e @ zeta_client::ClientError::Stream { .. }) if e.to_string().contains("not video") => {
+        Err(e @ zeta_client::ClientError::NotVideo { .. }) => {
             return usage(&format!(
                 "{e}; IQ is saved with `zeta iq read`, audio has no still"
             ));
@@ -195,36 +193,13 @@ async fn stream_save(
             }
         }
     };
-    let (header, body) = match tokio::time::timeout(Duration::from_millis(timeout_ms), wait).await {
+    let (header, png) = match tokio::time::timeout(Duration::from_millis(timeout_ms), wait).await {
         Err(_) => return usage(&format!("no video frame in {timeout_ms} ms")),
         Ok(Err(e)) => return usage(&e),
         Ok(Ok(got)) => got,
     };
     let dim = |k: &str| header.payload[k].as_u64().unwrap_or(0) as u32;
-    let (mut width, mut height) = (dim("width"), dim("height"));
-    let png = match header.payload["format"].as_str() {
-        Some("gray8") | Some("rgb8") => {
-            let format = if header.payload["format"] == "gray8" {
-                VideoFormat::Gray8
-            } else {
-                VideoFormat::Rgb8
-            };
-            match zeta_vrt::video::encode_frame(
-                width,
-                height,
-                format,
-                &body,
-                &zeta_vrt::video::SHARP,
-            ) {
-                Ok((png, w, h)) => {
-                    (width, height) = (w, h);
-                    png
-                }
-                Err(e) => return usage(&e),
-            }
-        }
-        _ => body,
-    };
+    let (width, height) = (dim("width"), dim("height"));
     if let Err(e) = std::fs::write(path, &png) {
         return usage(&format!("{}: {e}", path.display()));
     }

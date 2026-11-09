@@ -30,7 +30,6 @@ zeta-source-vrt = { path = "../zeta-source-vrt" }
 zeta-plugin = { path = "../zeta-plugin" }
 zeta-ext = { path = "../zeta-ext" }
 zeta-source-worker = { path = "../zeta-source-worker" }
-zeta-vrt = { path = "../zeta-vrt" }
 
 # The real SoapySDR driver links libSoapySDR (needs libsoapysdr-dev), so it is
 # behind a cfg, not a feature: `--all-features` must never build it. Build with
@@ -60,3 +59,4 @@ zeta-source-file = { path = "../zeta-source-file", features = ["test-fixtures"] 
 zeta-agent = { path = "../zeta-agent", features = ["test-fake"] }
 zeta-source-kiwi = { path = "../zeta-source-kiwi", features = ["test-fake"] }
 zeta-ext = { path = "../zeta-ext", features = ["test-fake"] }
+zeta-vrt = { path = "../zeta-vrt" }

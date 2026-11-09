@@ -86,7 +86,7 @@ impl NodeClient {
 
     /// As [`NodeClient::subscribe`] for a video stream, asking for delivery `profile`
     /// (`smooth`, `sharp` or `thumb`): the bodies are PNG. A stream that is not video is
-    /// `ClientError::Stream`.
+    /// `ClientError::NotVideo`.
     pub async fn subscribe_video(
         &self,
         stream: &StreamId,
@@ -116,9 +116,10 @@ impl NodeClient {
             });
         };
         if video && kind != StreamKind::Video {
-            return Err(ClientError::Stream {
+            return Err(ClientError::NotVideo {
                 url: self.url().to_string(),
-                detail: format!("stream {} is {}, not video", stream.0, kind_name(kind)),
+                stream: stream.clone(),
+                kind,
             });
         }
         let url = self.ws_url(stream, query)?;
@@ -298,7 +299,7 @@ impl Subscription {
     }
 }
 
-fn kind_name(kind: StreamKind) -> &'static str {
+pub(crate) fn kind_name(kind: StreamKind) -> &'static str {
     match kind {
         StreamKind::Iq => "iq",
         StreamKind::Audio => "audio",

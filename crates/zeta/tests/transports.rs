@@ -393,6 +393,44 @@ fn stream_save_without_node_is_a_usage_error() {
         .stderr(contains("use --node"));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_save_on_an_audio_stream_says_it_has_no_still() {
+    use zeta_core::types::{Provenance, SourceId, Span, StreamKind, Timestamp};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ts = zeta_ws::testing::spawn(dir.path()).await;
+    let id = ts.node.bus().register(
+        StreamKind::Audio,
+        Provenance {
+            source: SourceId("tone".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(0),
+            },
+        },
+    );
+    let (url, stream) = (ts.url.clone(), id.0.clone());
+    let path = dir.path().join("x.png").to_string_lossy().into_owned();
+    tokio::task::spawn_blocking(move || {
+        zeta_remote(
+            &url,
+            "s3cret",
+            &["stream", "save", "--stream", &stream, "--path", &path],
+        )
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(contains(format!(
+            "stream {stream} is audio, not video; IQ is saved with `zeta iq read`, audio has no still"
+        )));
+    })
+    .await
+    .unwrap();
+    ts.stop().await;
+}
+
 /// The real CLI path against an in-process server: `zeta_ws`'s test server, whose bus the
 /// test feeds, because no stage a served node can start today publishes a video frame.
 #[tokio::test(flavor = "multi_thread")]
@@ -415,7 +453,8 @@ async fn stream_save_writes_the_first_video_frame() {
     };
     let bus = ts.node.bus();
     let id = bus.register(StreamKind::Video, prov.clone());
-    let pixels: Vec<u8> = (0..16 * 8).map(|i| i as u8).collect();
+    // 720 wide: the node, not the CLI, encodes the PNG, and `sharp` keeps the full width.
+    let pixels: Vec<u8> = (0..720 * 8).map(|i| i as u8).collect();
     let feeder = tokio::spawn({
         let (bus, id) = (bus.clone(), id.clone());
         async move {
@@ -424,7 +463,7 @@ async fn stream_save_writes_the_first_video_frame() {
                     id.clone(),
                     prov.clone(),
                     Payload::Video {
-                        width: 16,
+                        width: 720,
                         height: 8,
                         format: VideoFormat::Gray8,
                         frame: Arc::from(pixels.clone()),
@@ -458,10 +497,14 @@ async fn stream_save_writes_the_first_video_frame() {
     let saved = json(&stdout);
     assert_eq!(
         (saved["width"].as_u64(), saved["height"].as_u64()),
-        (Some(16), Some(8))
+        (Some(720), Some(8))
     );
     let png = std::fs::read(&out).unwrap();
-    assert_eq!(&png[..4], b"\x89PNG");
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    // The IHDR chunk: width and height, big-endian, after the signature and chunk header.
+    assert_eq!(&png[12..16], b"IHDR");
+    let be = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+    assert_eq!((be(16), be(20)), (720, 8));
     assert_eq!(saved["bytes"].as_u64(), Some(png.len() as u64));
     ts.stop().await;
 }

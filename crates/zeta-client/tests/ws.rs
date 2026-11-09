@@ -189,9 +189,17 @@ async fn subscribe_video_refuses_an_audio_stream() {
     );
     let c = NodeClient::new(&ts.url, "s3cret").unwrap();
     match c.subscribe_video(&id, "sharp").await {
-        Err(ClientError::Stream { detail, .. }) => {
-            assert_eq!(detail, format!("stream {} is audio, not video", id.0));
+        Err(e @ ClientError::NotVideo { .. }) => {
+            let ClientError::NotVideo { stream, kind, .. } = &e else {
+                unreachable!()
+            };
+            assert_eq!((stream, *kind), (&id, StreamKind::Audio));
+            assert!(
+                e.to_string()
+                    .ends_with(&format!("stream {} is audio, not video", id.0)),
+                "{e}"
+            );
         }
-        other => panic!("expected a stream error, got {other:?}"),
+        other => panic!("expected not video, got {other:?}"),
     }
 }
