@@ -16,8 +16,9 @@ use zeta_core::node::{Node, NodeConfig, load_source};
 use zeta_core::ops::{Op, OpResult, SourceInfo};
 use zeta_core::port::{Port, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::{Hz, JobId, SourceId, Timestamp};
+use zeta_core::types::{Claim, Hz, JobId, SourceId, Timestamp};
 use zeta_source_worker::port::{Attach, Timings, WorkerConfig, WorkerPort};
+use zeta_source_worker::ring::{DEFAULT_RING_BYTES, MIN_SLOTS, SLOT_SAMPLES};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_zeta-fake-worker");
 
@@ -106,6 +107,7 @@ fn cfg(script: &str, record: &Path, env: &str) -> WorkerConfig {
         program: PathBuf::from("/bin/sh"),
         args,
         timings: timings(),
+        ring_bytes: DEFAULT_RING_BYTES,
     }
 }
 
@@ -317,6 +319,40 @@ async fn a_heal_before_the_port_is_attached_ends_the_held_fault() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cap_measured_on_a_respawn_reaches_the_source_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let rec = dir.path().join("record");
+    // The first spawn asserts the mock's cap and crashes once; the respawn (the crash
+    // marker beside the record now there) measures one.
+    let env = format!(
+        "export ZETA_FAKE_CRASH_ONCE=1; [ -e '{}.crashed' ] && export ZETA_FAKE_MEASURED_CAP=20480000;",
+        rec.display()
+    );
+    let (port, attach) = WorkerPort::open(cfg("crash-after-ms 500", &rec, &env), None)
+        .await
+        .unwrap();
+    assert_eq!(attach, Attach::Hello);
+    let node = node_over(&state_dir, port).await;
+    let cap = || {
+        load_source(&state_dir.join("sources"), &f())
+            .and_then(|r| r.capabilities)
+            .map(|c| c.max_bandwidth_hz)
+    };
+    assert_eq!(cap(), Some(Claim::Asserted(Hz(20_000_000))));
+    until(
+        "the measured cap reaches sources/f.json",
+        Duration::from_secs(10),
+        || cap() == Some(Claim::Measured(Hz(20_480_000))),
+    )
+    .await;
+    assert_eq!(
+        source(&node).await.capabilities.max_bandwidth_hz,
+        Claim::Measured(Hz(20_480_000))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn startup_with_the_device_absent_attaches_faulted_when_seen_before() {
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("state");
@@ -367,4 +403,53 @@ async fn a_one_shot_source_list_leaves_no_worker_behind() {
         || !alive(pid),
     )
     .await;
+}
+
+/// A child that outruns the node's reader drops blocks for a full ring, and the count
+/// reaches `source_list` without faulting the source. The node copies each block out and
+/// releases its slot at once, so nothing the node's subscribers do holds the ring; the
+/// child is made to outrun the reader instead: the smallest ring (4 slots) at 20 Msps in
+/// blocks of 256 samples, about 78 000 descriptors a second in bursts of a millisecond.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drops_reach_source_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = dir.path().join("record");
+    let mut c = cfg("stream", &rec, "ZETA_FAKE_READ_SAMPLES=256");
+    c.ring_bytes = MIN_SLOTS * SLOT_SAMPLES * 8 + 64;
+    let (port, _) = WorkerPort::open(c, None).await.unwrap();
+    let node = node_over(&dir.path().join("state"), port).await;
+    let op = Op::SourcePin {
+        source: f(),
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(20_000_000),
+        replace: vec![],
+    };
+    assert!(node.apply(op).await.is_ok());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let info = loop {
+        let info = source(&node).await;
+        let w = info.worker.clone().unwrap();
+        if w.transport_dropped > 0 {
+            break info;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no drops in 5 s: {w:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let w = info.worker.unwrap();
+    let transport = w.transport.unwrap();
+    assert_eq!(transport.path, zeta_core::port::TransportPath::Shm);
+    assert_eq!(
+        transport.ring_bytes,
+        (MIN_SLOTS * SLOT_SAMPLES * 8 + 64) as u64
+    );
+    assert_eq!(info.fault, None);
+    let json = serde_json::to_value(source(&node).await).unwrap();
+    assert!(
+        json["worker"]["transport_dropped"].as_u64().unwrap() > 0,
+        "{json}"
+    );
+    assert_eq!(json["worker"]["transport"]["path"], "shm");
 }

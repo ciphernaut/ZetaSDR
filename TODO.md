@@ -432,7 +432,7 @@ For an operator, not blocking: the burst gate's `on` reference is the 15th-perce
 
 ## Lease: cap a Soapy source's capture at the rate the device can stream
 
-Seen on the field host 2026-11-03 01:17 (plan 19.1 deploy): the page's zoom-out retuned the B210 from the watch's 12.288 Msps to 61.44 Msps (the lease allows any width that holds the rigid holders' bands, and the B210's `max_bandwidth_hz` is unset); the device delivered 56 Msps with `stats.overflows` climbing by thousands, so every job inside the capture saw gaps (a `measure` discarded 381 windows in 8 s, the watch's rows and identify trials ran on gappy data). The earlier plan-8 note put the B210's reliable ceiling near 16-24 Msps over USB 3. Wanted: a per-device capture ceiling (a `max_rate_hz=N` item in `--source-soapy` args, or a measured one: the clock guard already knows when samples run short) that the lease applies as the source's `max_bandwidth_hz`, so a zoom beyond it is refused with `out_of_range` and `suggested`, and the page clamps its zoom to it; meanwhile the operator pins the capture (UAT 19.1.C).
+Done by plan 28.1: the worker probes the rate ladder at open, `max_rate_hz=` asserts a cap, and a request wider than a measured cap is refused `insufficient bandwidth`.
 
 ## Calibration: a set of receiver and antenna calibration tools
 
@@ -562,3 +562,24 @@ From the 2026-11-08 live acceptance. An ACARS `3L` message carried "S 27.751/E15
 ## AIS: not yet proven on air
 
 From the 2026-11-08 live acceptance: 15 min on the HackRF (indoor antenna) and 11 min on the B210 at 161.975/162.025 MHz gave no events; a ring cut showed one 25 ms burst about 12 dB over the floor in 9.5 s, which did not decode. The channels are nearly empty at the field host, so this says little about the decoder. Decode the kept cut with another AIS decoder offline, and retry from a site in view of shipping.
+
+## Feature: SatNOGS support
+
+From the operator, 2026-11-07. SatNOGS (Libre Space Foundation) is the open network of satellite ground stations. SatNOGS DB holds the transmitters (frequency, mode, baud) and the TLEs. SatNOGS Network schedules observations onto stations, and `satnogs-client` with its `gr-satnogs` flowgraphs records each pass and uploads the waterfall, the audio and the decoded frames. Three layers, smallest first:
+- **The DB as a catalogue.** Read transmitters and TLEs the way the register is read (`knowledge_lookup`), predict passes for the station, and run a pass job that follows Doppler by retuning its channel inside a held capture. Nothing tracks a moving carrier today; the lease already lets a channel move within its band.
+- **Decoders as rows.** The common amateur downlinks: AFSK1200 and G3RUH 9600 AX.25 beside the APRS decoder, GMSK, CW beacons, and NOAA APT from the digital-modes gist, fed by the pass job.
+- **The node as a SatNOGS station.** Either take scheduled observations from the Network API and upload the artefacts and frames (an API token and the station id in config, like the SondeHub feed), or run `satnogs-client` against the node's source as an external program.
+
+Antenna caveat: the field host's 2 m / 70 cm vertical hears strong LEO passes only. Spec first; layer 1 is a plan on its own.
+
+## Worker: `sc16` on the ring
+
+The ring's hello declares `format: "cf32"`. A compact format (`sc16`, converted at the node) halves the memory bandwidth and is the natural next step for a 61.44 Msps or FPGA front end; not needed while the ring is a memcpy.
+
+## Worker: pack small blocks into one ring slot
+
+Each block takes a whole 2 MiB slot, so a B210's 10 ms blocks fill the 64 MiB ring in about 155 ms at 30.72 Msps; packing several small blocks into one slot (or sizing slots to the block) would buffer the full ring's worth of samples.
+
+## Test: `ops::too_old_carries_the_rings_earliest_ns` flaked once with a subtract overflow
+
+Seen 2026-11-07 during plan 28.1, passed on rerun. Likely a timing assumption between the ring's `earliest_ns` and now.

@@ -2,16 +2,21 @@
 //!
 //! [`serve`] writes the hello, then answers requests read line by line from
 //! stdin while two tasks run beside it: a block pump that forwards every block
-//! of the port's broadcast as an IQ frame, and a status task that reports the
-//! port's health every [`STATUS_TICK`] and after every reply. A fault on the
-//! port is published and the worker exits [`EXIT_FAULTED`]: reopening the
-//! device is the parent's job, and a fresh process leaves nothing of the old
-//! driver behind.
+//! of the port's broadcast, and a status task that reports the port's health
+//! every [`STATUS_TICK`] and after every reply. With a [`Ring`] the pump copies
+//! each block into the ring, in pieces of at most [`SLOT_SAMPLES`], and sends
+//! a descriptor per piece; a piece that finds the ring full is dropped. Without
+//! one it sends each block whole on the pipe, as a protocol-1 worker did. A
+//! fault on the port is published and the worker exits [`EXIT_FAULTED`]:
+//! reopening the device is the parent's job, and a fresh process leaves
+//! nothing of the old driver behind.
 //!
 //! Every frame goes through one writer thread that owns the buffered stdout
 //! and flushes per frame, so control messages and blocks keep one order and a
 //! parent that reads slowly never blocks the status task's fault check (blocks
-//! beyond [`MAX_QUEUED_BLOCKS`] are dropped and counted as lost instead).
+//! beyond [`MAX_QUEUED_BLOCKS`] are dropped and counted as lost instead). Both
+//! kinds of drop, and blocks the pump lost to a lagging broadcast, add up in
+//! the status's `transport_dropped`.
 //!
 //! [`requests_until_signal`] is the stdin a worker hands `serve`: SIGTERM and
 //! SIGINT become a `shutdown` request, and a watchdog ends the process if the
@@ -21,19 +26,20 @@ use std::io::{self, BufWriter, Write};
 use std::os::fd::RawFd;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Notify, broadcast, oneshot};
-use zeta_core::port::{Port, Tuning};
+use zeta_core::port::{IqBlock, Port, TransportInfo, TransportPath, Tuning};
 use zeta_core::types::Hz;
 
+use crate::ring::{Ring, SLOT_SAMPLES};
 use crate::wire::{
-    Cmd, Control, Frame, Hello, PROTOCOL, Reply, Request, Status, parse_request, write_frame,
-    write_request,
+    Cmd, Control, Descriptor, Frame, Hello, PROTOCOL, Reply, Request, Status, parse_request,
+    write_frame, write_request,
 };
 
 /// Exit code of a worker that found no device to open: the parent polls.
@@ -117,8 +123,9 @@ impl Writer {
         let _ = self.tx.send(Out::Frame(Frame::Control(c)));
     }
 
-    /// Queue a block unless the writer is too far behind; false when dropped.
-    fn block(&self, b: zeta_core::port::IqBlock) -> bool {
+    /// Queue a block for the pipe unless the writer is too far behind; false
+    /// when dropped.
+    fn block(&self, b: IqBlock) -> bool {
         if self.queued_blocks.load(Ordering::Relaxed) >= MAX_QUEUED_BLOCKS {
             return false;
         }
@@ -129,26 +136,36 @@ impl Writer {
         }
         true
     }
+
+    /// Queue the descriptor of a block written into the ring. Not bounded like
+    /// blocks: the ring's slots already bound how many can be outstanding.
+    fn descriptor(&self, d: Descriptor) {
+        let _ = self.tx.send(Out::Frame(Frame::Descriptor(d)));
+    }
 }
 
-/// The port's health as the status message carries it.
-fn status_of(port: &dyn Port) -> Status {
+/// The port's health as the status message carries it, with the transport's
+/// drops so far.
+fn status_of(port: &dyn Port, transport_dropped: u64) -> Status {
     Status {
         fault: port.fault(),
         current: port.current(),
         gain: port.gain(),
         stats: port.stats(),
+        transport_dropped,
     }
 }
 
 /// Serve `port` over `stdin` and `stdout` until stdin closes, a `shutdown`
 /// arrives (both exit 0) or the port faults ([`EXIT_FAULTED`]). `driver` is the
-/// driver key the hello names.
+/// driver key the hello names. Blocks go through `ring` when there is one (the
+/// hello says `shm`), on the pipe otherwise (`pipe`).
 pub async fn serve(
     port: Arc<dyn Port>,
     driver: &str,
     stdin: impl AsyncRead + Unpin + Send,
     stdout: impl Write + Send + 'static,
+    ring: Option<Ring>,
 ) -> ExitCode {
     let (writer, done) = match Writer::start(stdout) {
         Ok(w) => w,
@@ -162,9 +179,24 @@ pub async fn serve(
         capabilities: port.capabilities().clone(),
         gain: port.gain(),
         driver: driver.to_string(),
+        transport: Some(TransportInfo {
+            path: if ring.is_some() {
+                TransportPath::Shm
+            } else {
+                TransportPath::Pipe
+            },
+            format: "cf32".into(),
+            ring_bytes: ring.as_ref().map_or(0, |r| r.bytes() as u64),
+        }),
     }));
 
-    let pump = tokio::spawn(pump(port.subscribe(), writer.clone()));
+    let dropped = Arc::new(AtomicU64::new(0));
+    let pump = tokio::spawn(pump(
+        port.subscribe(),
+        writer.clone(),
+        ring,
+        dropped.clone(),
+    ));
     let replied = Arc::new(Notify::new());
     let (faulted_tx, mut faulted) = oneshot::channel();
     let status = tokio::spawn(status_loop(
@@ -172,6 +204,7 @@ pub async fn serve(
         writer.clone(),
         replied.clone(),
         faulted_tx,
+        dropped,
     ));
 
     let mut lines = BufReader::new(stdin).lines();
@@ -228,20 +261,38 @@ pub async fn serve(
     code
 }
 
-/// Forward every block of `rx` to the writer. Blocks lost to a lagging
-/// broadcast or a full writer queue are counted and logged at most every
-/// [`LOST_LOG_EVERY`].
-async fn pump(mut rx: broadcast::Receiver<zeta_core::port::IqBlock>, writer: Writer) {
+/// Forward every block of `rx`: into `ring` as descriptors when there is one,
+/// whole on the pipe otherwise. Blocks (or ring pieces) dropped for a full
+/// ring or a full writer queue, and blocks lost to a lagging broadcast (the
+/// pump fell behind the port, so they never reached the node either), are
+/// added to `dropped` and logged at most every [`LOST_LOG_EVERY`].
+async fn pump(
+    mut rx: broadcast::Receiver<IqBlock>,
+    writer: Writer,
+    ring: Option<Ring>,
+    dropped: Arc<AtomicU64>,
+) {
     let mut lost: u64 = 0;
     let mut logged: Option<Instant> = None;
+    // The ring's next block number: advanced per piece written, not per piece
+    // dropped, since the reader releases blocks in order.
+    let mut seq: u64 = 0;
     loop {
         match rx.recv().await {
             Ok(b) => {
-                if !writer.block(b) {
-                    lost += 1;
+                let n = match &ring {
+                    Some(ring) => to_ring(ring, &mut seq, &b, &writer),
+                    None => u64::from(!writer.block(b)),
+                };
+                if n > 0 {
+                    lost += n;
+                    dropped.fetch_add(n, Ordering::Relaxed);
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(n)) => lost += n,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                lost += n;
+                dropped.fetch_add(n, Ordering::Relaxed);
+            }
             Err(broadcast::error::RecvError::Closed) => return,
         }
         if lost > 0 && logged.is_none_or(|t| t.elapsed() >= LOST_LOG_EVERY) {
@@ -252,13 +303,49 @@ async fn pump(mut rx: broadcast::Receiver<zeta_core::port::IqBlock>, writer: Wri
     }
 }
 
-/// Write the status every [`STATUS_TICK`] and after every reply. A fault is
-/// written, then after [`FAULT_EXIT_GRACE`] `faulted` fires and the loop ends.
+/// Write `b` into `ring` in pieces of at most [`SLOT_SAMPLES`], each under the
+/// next `seq`, and queue a descriptor per piece written; the number of pieces
+/// dropped for a full ring is returned.
+///
+/// A piece starting `offset` samples into the block starts at `t0 + offset ·
+/// 1e9 / rate` ns, rounded down, computed in `u128` so `offset · 1e9` cannot
+/// overflow.
+fn to_ring(ring: &Ring, seq: &mut u64, b: &IqBlock, writer: &Writer) -> u64 {
+    let rate = b.sample_rate_hz.0;
+    let mut dropped = 0;
+    for (i, piece) in b.samples.chunks(SLOT_SAMPLES).enumerate() {
+        let offset = (i * SLOT_SAMPLES) as u128;
+        let offset_ns = (offset * 1_000_000_000)
+            .checked_div(u128::from(rate))
+            .unwrap_or(0) as u64;
+        match ring.try_write(*seq, piece) {
+            Ok(slot) => {
+                writer.descriptor(Descriptor {
+                    seq: *seq,
+                    slot,
+                    t0_ns: b.t0.0 + offset_ns,
+                    sample_rate_hz: rate,
+                    center_hz: b.center_hz.0,
+                    // At most `SLOT_SAMPLES`, which fits.
+                    n: piece.len() as u32,
+                });
+                *seq += 1;
+            }
+            Err(_full) => dropped += 1,
+        }
+    }
+    dropped
+}
+
+/// Write the status every [`STATUS_TICK`] and after every reply, with the
+/// transport's drops so far from `dropped`. A fault is written, then after
+/// [`FAULT_EXIT_GRACE`] `faulted` fires and the loop ends.
 async fn status_loop(
     port: Arc<dyn Port>,
     writer: Writer,
     replied: Arc<Notify>,
     faulted: oneshot::Sender<()>,
+    dropped: Arc<AtomicU64>,
 ) {
     let mut tick = tokio::time::interval(STATUS_TICK);
     loop {
@@ -266,7 +353,7 @@ async fn status_loop(
             _ = tick.tick() => {}
             _ = replied.notified() => {}
         }
-        let status = status_of(port.as_ref());
+        let status = status_of(port.as_ref(), dropped.load(Ordering::Relaxed));
         let fault = status.fault.is_some();
         writer.control(Control::Status(status));
         if fault {

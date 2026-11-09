@@ -13,9 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use zeta_core::port::{Port, PortError, Tuning};
+use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, TransportPath, Tuning};
 use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, SourceId};
-use zeta_source_worker::port::{Attach, Timings, WorkerConfig, WorkerPort};
+use zeta_source_worker::port::{Attach, Timings, WorkerConfig, WorkerPort, worker_args};
+use zeta_source_worker::ring::{DEFAULT_RING_BYTES, Ring};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_zeta-fake-worker");
 
@@ -36,6 +37,7 @@ fn cfg(script: &str) -> WorkerConfig {
         program: PathBuf::from(FAKE),
         args: ["--id", "f", "--script", script].map(String::from).to_vec(),
         timings: timings(),
+        ring_bytes: DEFAULT_RING_BYTES,
     }
 }
 
@@ -71,6 +73,7 @@ fn cfg_wrapped(dir: &Path, body: &str) -> (WorkerConfig, PathBuf) {
             rec.display().to_string(),
         ],
         timings: timings(),
+        ring_bytes: DEFAULT_RING_BYTES,
     };
     (cfg, rec)
 }
@@ -138,6 +141,44 @@ fn within(gap: u64, want: u64) -> bool {
 
 fn alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// The command line of process `pid`.
+fn cmdline(pid: u32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect()
+}
+
+/// The `--ring-fd` value on process `pid`'s command line, if any.
+fn ring_fd_arg(pid: u32) -> Option<String> {
+    let args = cmdline(pid);
+    let at = args.iter().position(|a| a == "--ring-fd")?;
+    args.get(at + 1).cloned()
+}
+
+/// The next block on `rx`, within 5 s.
+async fn next_block(rx: &mut IqReceiver) -> IqBlock {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a block within 5 s")
+        {
+            Ok(b) => return b,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(e) => panic!("the block broadcast ended: {e}"),
+        }
+    }
+}
+
+/// Whether `b` holds the mock's samples: `v - jv` for a running count `v`.
+fn mock_samples(b: &IqBlock) -> bool {
+    !b.samples.is_empty()
+        && b.samples.iter().all(|s| s.im == -s.re)
+        && b.samples.windows(2).all(|w| w[1].re == w[0].re + 1.0)
 }
 
 async fn open(cfg: WorkerConfig, cached: Option<Capabilities>) -> (Arc<WorkerPort>, Attach) {
@@ -592,13 +633,13 @@ async fn a_hello_of_another_protocol_is_refused_and_the_child_reaped() {
     let (cfg, _rec) = cfg_wrapped(
         dir.path(),
         &format!(
-            "echo $$ > '{}'\nZETA_FAKE_PROTOCOL=99 exec \"$FAKE\" --script stream \"$@\"",
+            "echo $$ > '{}'\nZETA_FAKE_PROTOCOL=3 exec \"$FAKE\" --script stream \"$@\"",
             pidfile.display()
         ),
     );
     let t0 = Instant::now();
     let err = WorkerPort::open(cfg, None).await.err().expect("refused");
-    assert_eq!(err, "soapy worker for f: protocol 99, expected 1");
+    assert_eq!(err, "soapy worker for f: protocol 3, expected 1 or 2");
     assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
     let pid: u32 = std::fs::read_to_string(&pidfile)
         .unwrap()
@@ -664,4 +705,355 @@ async fn close_ends_a_worker_whose_runtime_waits_on_stdin_before_the_grace() {
     assert!(!alive(pid), "worker {pid} outlived the close");
     let text = std::fs::read_to_string(&rec).unwrap();
     assert!(text.lines().any(|l| l == "served"), "{text}");
+}
+
+#[tokio::test]
+async fn blocks_arrive_through_the_ring_and_the_worker_info_says_shm() {
+    let (port, _) = open(cfg("stream"), None).await;
+    let w = port.worker().unwrap();
+    let transport = w
+        .transport
+        .expect("a protocol-2 worker names its transport");
+    assert_eq!(transport.path, TransportPath::Shm);
+    assert_eq!(transport.format, "cf32");
+    // The header and as many whole slots as fit.
+    let ring_bytes = Ring::create(DEFAULT_RING_BYTES).unwrap().bytes();
+    assert_eq!(transport.ring_bytes, ring_bytes as u64);
+    assert_eq!(w.transport_dropped, 0);
+    assert_eq!(ring_fd_arg(w.pid.unwrap()).as_deref(), Some("3"));
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    let mut last: Option<IqBlock> = None;
+    for _ in 0..3 {
+        let b = next_block(&mut rx).await;
+        assert_eq!(b.sample_rate_hz, Hz(2_000_000));
+        assert_eq!(b.center_hz, Hz(100_000_000));
+        assert!(
+            mock_samples(&b),
+            "{:?}",
+            &b.samples[..4.min(b.samples.len())]
+        );
+        if let Some(prev) = &last {
+            assert!(b.t0.0 > prev.t0.0, "{:?} after {:?}", b.t0, prev.t0);
+        }
+        last = Some(b);
+    }
+    assert_eq!(port.fault(), None);
+}
+
+#[tokio::test]
+async fn each_spawn_gets_its_own_ring() {
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "ZETA_FAKE_CRASH_ONCE=1 exec \"$FAKE\" --script 'crash-after-ms 500' \"$@\"",
+    );
+    let (port, _) = open(cfg, None).await;
+    let first = port.worker().unwrap();
+    let first_ino = port.ring_ino().expect("a live ring");
+    assert_eq!(ring_fd_arg(first.pid.unwrap()).as_deref(), Some("3"));
+    let healed = port.healed().unwrap();
+    assert!(
+        wait_for(Duration::from_secs(5), || *healed.borrow() > 0).await,
+        "no heal"
+    );
+    let second = port.worker().unwrap();
+    assert_eq!(second.restarts, 1);
+    assert_ne!(second.pid, first.pid);
+    assert!(
+        second.since_ns > first.since_ns,
+        "{second:?} after {first:?}"
+    );
+    assert_eq!(ring_fd_arg(second.pid.unwrap()).as_deref(), Some("3"));
+    assert_eq!(second.transport.unwrap().path, TransportPath::Shm);
+    let second_ino = port.ring_ino().expect("a live ring");
+    assert_ne!(second_ino, first_ino, "the respawn reused the old memfd");
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    assert!(mock_samples(&next_block(&mut rx).await));
+}
+
+#[tokio::test]
+async fn a_descriptor_outside_the_ring_is_a_bad_frame() {
+    let dir = tempdir();
+    // Only the first spawn names a slot the ring does not have.
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "[ \"$N\" = 0 ] && export ZETA_FAKE_BAD_SLOT=1\nexec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (port, _) = open(cfg, None).await;
+    let healed = port.healed().unwrap();
+    // The first descriptor follows the tune; its reply may or may not get in
+    // before the worker is ended for it.
+    let _ = port.tune(tuning(100_000_000, 2_000_000)).await;
+    assert!(
+        wait_for(Duration::from_secs(3), || port
+            .fault()
+            .is_some_and(|f| f.contains("bad frame")))
+        .await,
+        "fault: {:?}",
+        port.fault()
+    );
+    let fault = port.fault().unwrap();
+    assert!(fault.contains("slot 9999"), "{fault}");
+    assert!(
+        wait_for(Duration::from_secs(5), || *healed.borrow() > 0).await,
+        "no heal"
+    );
+    port.heal_settled();
+    assert_eq!(port.worker().unwrap().restarts, 1);
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    assert!(mock_samples(&next_block(&mut rx).await));
+    assert_eq!(port.fault(), None);
+}
+
+#[tokio::test]
+async fn a_descriptor_out_of_order_is_a_bad_frame() {
+    let dir = tempdir();
+    // Only the first spawn repeats seq 1 as its third descriptor, a slot the
+    // ring's own checks would let through.
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "[ \"$N\" = 0 ] && export ZETA_FAKE_STALE_SEQ=1\nexec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (port, _) = open(cfg, None).await;
+    let healed = port.healed().unwrap();
+    let _ = port.tune(tuning(100_000_000, 2_000_000)).await;
+    assert!(
+        wait_for(Duration::from_secs(3), || port
+            .fault()
+            .is_some_and(|f| f.contains("bad frame")))
+        .await,
+        "fault: {:?}",
+        port.fault()
+    );
+    let fault = port.fault().unwrap();
+    assert!(
+        fault.contains("bad frame: descriptor seq 1, expected 2"),
+        "{fault}"
+    );
+    assert!(
+        wait_for(Duration::from_secs(5), || *healed.borrow() > 0).await,
+        "no heal"
+    );
+    port.heal_settled();
+    assert_eq!(port.worker().unwrap().restarts, 1);
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    assert!(mock_samples(&next_block(&mut rx).await));
+    assert_eq!(port.fault(), None);
+}
+
+#[tokio::test]
+async fn without_a_ring_the_child_streams_on_the_pipe() {
+    let mut c = cfg("stream");
+    c.ring_bytes = 0;
+    let (port, _) = open(c, None).await;
+    let w = port.worker().unwrap();
+    assert_eq!(ring_fd_arg(w.pid.unwrap()), None);
+    let transport = w
+        .transport
+        .expect("a protocol-2 worker names its transport");
+    assert_eq!(transport.path, TransportPath::Pipe);
+    assert_eq!(transport.ring_bytes, 0);
+    assert_eq!(port.ring_ino(), None);
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    let b = next_block(&mut rx).await;
+    assert_eq!(b.sample_rate_hz, Hz(2_000_000));
+    assert!(mock_samples(&b));
+}
+
+#[tokio::test]
+async fn a_protocol_1_child_is_still_accepted() {
+    // A worker of an older build: it ignores `--ring-fd`, says hello with
+    // protocol 1 and no transport, and sends its blocks on the pipe.
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "ZETA_FAKE_PROTOCOL=1 exec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (port, attach) = open(cfg, None).await;
+    assert!(matches!(attach, Attach::Hello), "{attach:?}");
+    let w = port.worker().unwrap();
+    assert_eq!(w.transport, None);
+    assert_eq!(w.transport_dropped, 0);
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    let b = next_block(&mut rx).await;
+    assert_eq!(b.center_hz, Hz(100_000_000));
+    assert!(mock_samples(&b));
+    assert_eq!(port.fault(), None);
+}
+
+/// The `arg` lines the wrapper recorded for each spawn, split at its `start`.
+fn spawn_args(rec: &Path) -> Vec<Vec<String>> {
+    let mut spawns = vec![vec![]];
+    for l in std::fs::read_to_string(rec).unwrap_or_default().lines() {
+        if let Some(a) = l.strip_prefix("arg ") {
+            spawns.last_mut().unwrap().push(a.to_string());
+        } else if l.starts_with("start ") {
+            spawns.push(vec![]);
+        }
+    }
+    spawns.pop();
+    spawns
+}
+
+/// How often `--rate-cap-hz 20480000` is among a spawn's arguments.
+fn caps_passed(args: &[String]) -> usize {
+    args.windows(2)
+        .filter(|w| w == &["--rate-cap-hz", "20480000"])
+        .count()
+}
+
+/// A config whose wrapper records each spawn's arguments as `arg` lines, then
+/// runs the fake: spawn 0 with `first` (shell before the exec, e.g. an env
+/// assignment) and `crash-after-ms 300`, every later spawn streaming. `args`
+/// are what the node would spawn `zeta` with.
+fn cfg_recording_args(dir: &Path, first: &str, args: Vec<String>) -> (WorkerConfig, PathBuf) {
+    let rec = dir.join("record");
+    let wrapper = dir.join("wrapper.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "REC='{}'\nN=$(grep -c '^start' \"$REC\" 2>/dev/null || true)\n\
+             for a in \"$@\"; do echo \"arg $a\" >> \"$REC\"; done\n\
+             case \"${{N:-0}}\" in\n\
+             0) {first} exec '{FAKE}' --id f --script 'crash-after-ms 300' --record \"$REC\";;\n\
+             *) exec '{FAKE}' --id f --script stream --record \"$REC\";;\n\
+             esac\n",
+            rec.display()
+        ),
+    )
+    .unwrap();
+    let mut wrapped = vec![wrapper.display().to_string()];
+    wrapped.extend(args);
+    let cfg = WorkerConfig {
+        id: SourceId("f".into()),
+        program: PathBuf::from("/bin/sh"),
+        args: wrapped,
+        timings: timings(),
+        ring_bytes: 0,
+    };
+    (cfg, rec)
+}
+
+/// The arguments of each spawn of `cfg`, once there are two.
+async fn two_spawns(
+    cfg: WorkerConfig,
+    rec: &Path,
+    cached: Option<Capabilities>,
+) -> Vec<Vec<String>> {
+    let (port, _) = open(cfg, cached).await;
+    assert!(
+        wait_for(Duration::from_secs(5), || starts(rec).len() >= 2).await,
+        "spawns: {:?}",
+        starts(rec)
+    );
+    drop(port);
+    let spawns = spawn_args(rec);
+    assert!(spawns.len() >= 2, "{spawns:?}");
+    spawns
+}
+
+#[tokio::test]
+async fn a_cached_measured_cap_is_passed_to_the_respawn() {
+    let mut measured = cached_caps();
+    measured.max_bandwidth_hz = Claim::Measured(Hz(20_480_000));
+    let base = ["soapy-worker", "--id", "f", "--args", "driver=fake"];
+    assert_eq!(worker_args("f", "driver=fake", None), base);
+    assert_eq!(
+        worker_args("f", "driver=fake", Some(&cached_caps())),
+        base,
+        "an asserted cap is probed again"
+    );
+    let args = worker_args("f", "driver=fake", Some(&measured));
+    assert_eq!(args[..5], base);
+    assert_eq!(args[5..], ["--rate-cap-hz", "20480000"]);
+
+    // Cached at start: every spawn carries the cap once, the supervisor adding
+    // no second copy.
+    let dir = tempdir();
+    let (cfg, rec) = cfg_recording_args(dir.path(), "", args);
+    let spawns = two_spawns(cfg, &rec, Some(measured)).await;
+    for args in &spawns[..2] {
+        assert_eq!(caps_passed(args), 1, "{args:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_cap_learned_from_the_hello_is_passed_to_the_respawn() {
+    // Nothing cached: spawn 0 probes (its hello says Measured 20.48 MHz) and
+    // crashes; the respawn is told the cap instead of probing again.
+    let dir = tempdir();
+    let (cfg, rec) = cfg_recording_args(
+        dir.path(),
+        "ZETA_FAKE_MEASURED_CAP=20480000",
+        worker_args("f", "driver=fake", None),
+    );
+    let spawns = two_spawns(cfg, &rec, None).await;
+    assert_eq!(caps_passed(&spawns[0]), 0, "{:?}", spawns[0]);
+    assert_eq!(caps_passed(&spawns[1]), 1, "{:?}", spawns[1]);
+}
+
+#[tokio::test]
+async fn a_cap_measured_on_a_respawn_replaces_the_asserted_one() {
+    // Spawn 0 could not measure (its hello asserts the mock's 20 MHz) and
+    // crashes; spawn 1 measures 20.48 MHz and crashes too; spawn 2 streams,
+    // handed the `--rate-cap-hz` it was spawned with as the real worker is.
+    let dir = tempdir();
+    let rec = dir.path().join("record");
+    let wrapper = dir.path().join("wrapper.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "REC='{}'\nN=$(grep -c '^start' \"$REC\" 2>/dev/null || true)\n\
+             CAP=; prev=\n\
+             for a in \"$@\"; do\n\
+               echo \"arg $a\" >> \"$REC\"\n\
+               [ \"$prev\" = --rate-cap-hz ] && CAP=\"--rate-cap-hz $a\"\n\
+               prev=$a\n\
+             done\n\
+             case \"${{N:-0}}\" in\n\
+             0) exec '{FAKE}' --id f --script 'crash-after-ms 300' --record \"$REC\";;\n\
+             1) ZETA_FAKE_MEASURED_CAP=20480000 exec '{FAKE}' --id f --script 'crash-after-ms 300' --record \"$REC\";;\n\
+             *) exec '{FAKE}' --id f --script stream --record \"$REC\" $CAP;;\n\
+             esac\n",
+            rec.display()
+        ),
+    )
+    .unwrap();
+    let mut args = vec![wrapper.display().to_string()];
+    args.extend(worker_args("f", "driver=fake", None));
+    let cfg = WorkerConfig {
+        id: SourceId("f".into()),
+        program: PathBuf::from("/bin/sh"),
+        args,
+        timings: timings(),
+        ring_bytes: 0,
+    };
+    let (port, _) = open(cfg, None).await;
+    let attached = port.capabilities().clone();
+    assert_eq!(attached.max_bandwidth_hz, Claim::Asserted(Hz(20_000_000)));
+    assert!(
+        wait_for(Duration::from_secs(10), || starts(&rec).len() >= 3
+            && port.worker().is_some_and(|w| w.pid.is_some()))
+        .await,
+        "spawns: {:?}",
+        starts(&rec)
+    );
+    assert_eq!(
+        port.capabilities().max_bandwidth_hz,
+        Claim::Measured(Hz(20_480_000))
+    );
+    // The rest of the record is unchanged.
+    let mut want = attached;
+    want.max_bandwidth_hz = Claim::Measured(Hz(20_480_000));
+    assert_eq!(port.capabilities(), &want);
+    let spawns = spawn_args(&rec);
+    assert_eq!(caps_passed(&spawns[0]), 0, "{:?}", spawns[0]);
+    assert_eq!(caps_passed(&spawns[1]), 0, "{:?}", spawns[1]);
+    assert_eq!(caps_passed(&spawns[2]), 1, "{:?}", spawns[2]);
 }

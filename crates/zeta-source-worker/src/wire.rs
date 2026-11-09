@@ -6,17 +6,27 @@
 //! 1 IQ block), a payload length (`u32`, little endian) and the payload. A
 //! control payload is JSON; a block payload is a 28-byte [`BlockHeader`]
 //! followed by `n` complex samples as little-endian `f32` pairs.
+//!
+//! Protocol 2 adds a third kind, 2: a 40-byte [`Descriptor`] that names a
+//! block's slot in the shared-memory ring of `ring.rs` instead of carrying the
+//! samples, so only the descriptor crosses the pipe. The [`Hello`]'s
+//! `transport` says which path the child uses (`shm` or `pipe`), its format
+//! and the ring's size; the [`Status`]'s `transport_dropped` counts, since the
+//! child started, the blocks it dropped because the ring (or the pipe queue)
+//! was full. A protocol-1 child has no `transport` and no `transport_dropped`
+//! (both read as their defaults) and sends every block on the pipe as a kind-1
+//! frame.
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 use num_complex::Complex;
 use serde::{Deserialize, Serialize};
-use zeta_core::port::{GainInfo, IqBlock, PortError, PortStats, Tuning};
+use zeta_core::port::{GainInfo, IqBlock, PortError, PortStats, TransportInfo, Tuning};
 use zeta_core::types::{Capabilities, Hz, Timestamp};
 
 /// The protocol version the child announces in its [`Hello`].
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// The largest payload `read_frame` accepts (64 MiB), so a corrupt length
 /// cannot make the reader allocate without bound.
@@ -24,6 +34,7 @@ const MAX_PAYLOAD: u32 = 64 << 20;
 
 const KIND_CONTROL: u8 = 0;
 const KIND_BLOCK: u8 = 1;
+const KIND_DESCRIPTOR: u8 = 2;
 
 /// What the node asks of the child.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -72,6 +83,9 @@ pub struct Hello {
     pub capabilities: Capabilities,
     pub gain: Option<GainInfo>,
     pub driver: String,
+    /// How blocks reach the node; `None` from a protocol-1 child.
+    #[serde(default)]
+    pub transport: Option<TransportInfo>,
 }
 
 /// The child's health, sent whenever it changes and periodically.
@@ -82,6 +96,10 @@ pub struct Status {
     pub current: Option<Tuning>,
     pub gain: Option<GainInfo>,
     pub stats: Option<PortStats>,
+    /// Blocks the child dropped for a full ring (or a full pipe queue),
+    /// cumulative.
+    #[serde(default)]
+    pub transport_dropped: u64,
 }
 
 /// A successful answer to a request: the band after a tune, the gain after a
@@ -223,11 +241,54 @@ impl BlockHeader {
     }
 }
 
+/// A block named by its slot in the ring, 40 bytes little endian in this
+/// order: `seq` is the block's sequence number, `slot` its ring slot, then the
+/// same `t0_ns`, `sample_rate_hz`, `center_hz` and sample count `n` as a
+/// [`BlockHeader`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Descriptor {
+    pub seq: u64,
+    pub slot: u32,
+    pub t0_ns: u64,
+    pub sample_rate_hz: u64,
+    pub center_hz: u64,
+    pub n: u32,
+}
+
+const DESCRIPTOR_LEN: usize = 40;
+
+impl Descriptor {
+    fn to_bytes(self) -> [u8; DESCRIPTOR_LEN] {
+        let mut b = [0u8; DESCRIPTOR_LEN];
+        b[0..8].copy_from_slice(&self.seq.to_le_bytes());
+        b[8..12].copy_from_slice(&self.slot.to_le_bytes());
+        b[12..20].copy_from_slice(&self.t0_ns.to_le_bytes());
+        b[20..28].copy_from_slice(&self.sample_rate_hz.to_le_bytes());
+        b[28..36].copy_from_slice(&self.center_hz.to_le_bytes());
+        b[36..40].copy_from_slice(&self.n.to_le_bytes());
+        b
+    }
+
+    fn from_bytes(b: &[u8; DESCRIPTOR_LEN]) -> Self {
+        let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        Descriptor {
+            seq: u64_at(0),
+            slot: u32_at(8),
+            t0_ns: u64_at(12),
+            sample_rate_hz: u64_at(20),
+            center_hz: u64_at(28),
+            n: u32_at(36),
+        }
+    }
+}
+
 /// One frame of the child's stdout.
 #[derive(Clone, Debug)]
 pub enum Frame {
     Control(Control),
     Block(IqBlock),
+    Descriptor(Descriptor),
 }
 
 fn bad(msg: impl Into<String>) -> io::Error {
@@ -257,6 +318,7 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
             }
             (KIND_BLOCK, p)
         }
+        Frame::Descriptor(d) => (KIND_DESCRIPTOR, d.to_bytes().to_vec()),
     };
     let len = u32::try_from(payload.len()).map_err(|_| bad("frame too long"))?;
     w.write_all(&[kind])?;
@@ -281,7 +343,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
     }
     let kind = head[0];
     let len = u32::from_le_bytes(head[1..5].try_into().unwrap());
-    if kind != KIND_CONTROL && kind != KIND_BLOCK {
+    if !matches!(kind, KIND_CONTROL | KIND_BLOCK | KIND_DESCRIPTOR) {
         return Err(bad(format!("unknown frame kind {kind}")));
     }
     if len > MAX_PAYLOAD {
@@ -292,6 +354,15 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
     if kind == KIND_CONTROL {
         let c = serde_json::from_slice(&payload).map_err(|e| bad(e.to_string()))?;
         return Ok(Some(Frame::Control(c)));
+    }
+    if kind == KIND_DESCRIPTOR {
+        let b: &[u8; DESCRIPTOR_LEN] = payload.as_slice().try_into().map_err(|_| {
+            bad(format!(
+                "descriptor of {} bytes, expected {DESCRIPTOR_LEN}",
+                payload.len()
+            ))
+        })?;
+        return Ok(Some(Frame::Descriptor(Descriptor::from_bytes(b))));
     }
     let Some((h, body)) = payload.split_first_chunk::<HEADER_LEN>() else {
         return Err(bad("block shorter than its header"));
