@@ -54,7 +54,9 @@ pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
 pub(crate) use launch::AfterGate;
 use launch::{feed_bank, feed_ring};
 pub(crate) use persist::now;
-use persist::{io, load, load_instances, persist, persist_instance, remove_instance};
+use persist::{
+    SET_INSTANCES_DIR, io, load, load_instances, persist, persist_instance, remove_instance,
+};
 pub use sources::{GainSetting, SOURCE_RECORD_FORMAT, SourceRecord, load_source};
 use sources::{load_sources, persist_source};
 
@@ -313,8 +315,9 @@ struct Inner {
     reloading: Mutex<()>,
     /// The named sets, loaded at `open` from `NodeConfig.sets_dir` over the embedded ones.
     sets: Arc<crate::sets::SetRegistry>,
-    /// `state_dir/sets`: one [`crate::sets::SetInstance`] file per running set.
-    sets_dir: PathBuf,
+    /// `state_dir/set-instances` ([`SET_INSTANCES_DIR`]): one [`crate::sets::SetInstance`]
+    /// file per running set, apart from an operator `--sets-dir` of set files.
+    instances_dir: PathBuf,
     /// The running sets' instances by set id, read back at `open` and written through by
     /// `set_start` and `set_stop`.
     set_instances: Mutex<BTreeMap<String, crate::sets::SetInstance>>,
@@ -962,8 +965,8 @@ impl Node {
         ));
         // The running sets' instances: an unreadable file is a persist error, never a
         // failure to open.
-        let sets_dir = cfg.state_dir.join("sets");
-        let (instances, instance_errors) = load_instances(&sets_dir);
+        let instances_dir = cfg.state_dir.join(SET_INSTANCES_DIR);
+        let (instances, instance_errors) = load_instances(&instances_dir);
         let set_instances = instances.into_iter().map(|i| (i.set.clone(), i)).collect();
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
         // Registered before jobs resume; their internal applies bypass
@@ -993,7 +996,7 @@ impl Node {
                 modes_dir: cfg.modes_dir.clone(),
                 reloading: Mutex::new(()),
                 sets,
-                sets_dir,
+                instances_dir,
                 set_instances: Mutex::new(set_instances),
                 set_gate: tokio::sync::Mutex::new(()),
                 themes: RwLock::new(Arc::new(crate::themes::ThemeRegistry::load(None))),
@@ -1188,7 +1191,7 @@ impl Node {
         self.inner.sets.clone()
     }
 
-    /// The running sets' instances by set id (`state_dir/sets`, read back at `open`).
+    /// The running sets' instances by set id (`state_dir/set-instances`, read back at `open`).
     pub fn set_instances(&self) -> BTreeMap<String, crate::sets::SetInstance> {
         self.inner.set_instances.lock().unwrap().clone()
     }
@@ -1198,11 +1201,11 @@ impl Node {
         self.inner.set_gate.lock().await
     }
 
-    /// Keep `inst` as its set's running instance and write it to `state_dir/sets`. A
+    /// Keep `inst` as its set's running instance and write it to `state_dir/set-instances`. A
     /// write that fails is returned; the instance is kept in memory all the same, so a
     /// `set_stop` in this run still finds it.
     pub(crate) fn put_set_instance(&self, inst: crate::sets::SetInstance) -> Result<(), NodeError> {
-        let written = persist_instance(&self.inner.sets_dir, &inst);
+        let written = persist_instance(&self.inner.instances_dir, &inst);
         self.inner
             .set_instances
             .lock()
@@ -1214,7 +1217,7 @@ impl Node {
     /// Forget set `set`'s instance and remove its file.
     pub(crate) fn drop_set_instance(&self, set: &str) -> Result<(), NodeError> {
         self.inner.set_instances.lock().unwrap().remove(set);
-        remove_instance(&self.inner.sets_dir, set)
+        remove_instance(&self.inner.instances_dir, set)
     }
 
     /// Drop every instance none of whose jobs still runs (each stopped, failed or
@@ -1243,7 +1246,7 @@ impl Node {
                     .persist_errors
                     .lock()
                     .unwrap()
-                    .push(format!("sets/{id}.json: {e}"));
+                    .push(format!("{SET_INSTANCES_DIR}/{id}.json: {e}"));
             }
         }
     }

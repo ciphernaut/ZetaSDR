@@ -461,7 +461,7 @@ Three ops, in `ops.rs` with doc text that becomes AGENTS.md:
    capture: a member's own failure is its `refused` entry (`{member, channel?, error}`) and the rest
    go on; a `plan_start` member's per-channel results are flattened under it (`started[].member`,
    `started[].channel`).
-8. **The instance** is written: `state_dir/sets/<set id>.json` with `radios`, `since_ns`, `members:
+8. **The instance** is written: `state_dir/set-instances/<set id>.json` with `radios`, `since_ns`, `members:
    [{id, jobs: [ids]}]` (an `attach`ed job beside its demodulator). One instance per set at a time: a
    `set_start` of a set that runs with a different `radios` mapping is `other` ("set airband runs on
    {...}; set_stop it first"); with the same mapping it is the idempotent re-run of step 4.

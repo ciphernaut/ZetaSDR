@@ -28,6 +28,10 @@ pub(super) fn persist(dir: &Path, rec: &JobRecord) -> Result<(), NodeError> {
     std::fs::rename(&tmp, &path).map_err(io)
 }
 
+/// The state directory's subdirectory of the running sets' instances: apart from
+/// `sets`, where an operator may point `--sets-dir` at their own set files.
+pub(super) const SET_INSTANCES_DIR: &str = "set-instances";
+
 /// Write the set instance as `<dir>/<set id>.json` atomically (temp file, then
 /// rename), creating `dir` when missing.
 pub(super) fn persist_instance(
@@ -51,7 +55,7 @@ pub(super) fn remove_instance(dir: &Path, set: &str) -> Result<(), NodeError> {
 }
 
 /// Every set instance in `dir` (none when it is missing), and one line per file that
-/// cannot be read as one (`sets/<file>: <error>`), whose id is not its file's name, or
+/// cannot be read as one (`set-instances/<file>: <error>`), whose id is not its file's name, or
 /// whose format is newer than [`crate::sets::SETS_INSTANCE_FORMAT`]. Leftover
 /// `*.json.tmp` files are removed.
 pub(super) fn load_instances(dir: &Path) -> (Vec<crate::sets::SetInstance>, Vec<String>) {
@@ -92,7 +96,7 @@ pub(super) fn load_instances(dir: &Path) -> (Vec<crate::sets::SetInstance>, Vec<
             });
         match parsed {
             Ok(i) => found.push(i),
-            Err(e) => errors.push(format!("sets/{name}: {e}")),
+            Err(e) => errors.push(format!("{SET_INSTANCES_DIR}/{name}: {e}")),
         }
     }
     (found, errors)

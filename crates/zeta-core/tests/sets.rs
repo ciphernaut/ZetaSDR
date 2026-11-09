@@ -618,7 +618,9 @@ fn running_jobs(node: &Node) -> Vec<JobId> {
 }
 
 fn instance_file(dir: &Path, set: &str) -> std::path::PathBuf {
-    dir.join("state").join("sets").join(format!("{set}.json"))
+    dir.join("state")
+        .join("set-instances")
+        .join(format!("{set}.json"))
 }
 
 fn band(center_hz: u64, bandwidth_hz: u64) -> Tuning {
@@ -1189,7 +1191,7 @@ async fn a_restart_keeps_the_instance() {
 async fn an_unreadable_instance_is_a_persist_error_not_a_failure() {
     let dir = tempfile::tempdir().unwrap();
     let a = Radio::new("a");
-    let sets = dir.path().join("state").join("sets");
+    let sets = dir.path().join("state").join("set-instances");
     std::fs::create_dir_all(&sets).unwrap();
     std::fs::write(sets.join("two_radio.json"), "nope").unwrap();
     let node = open_radios(dir.path(), &[&a], registry()).await;
