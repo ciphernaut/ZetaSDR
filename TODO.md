@@ -342,7 +342,6 @@ The radio seam (plan 33, `docs/superpowers/specs/2026-11-09-radio-selection-desi
 From plan 33. Not built:
 - `radio_prefer` by driver or role, which needs a driver in `SourceInfo`;
 - a node-stored per-caller policy, replacing the browser's `zeta.radio_prefs` once users exist;
-- the answers to the spec's operator questions, if they change anything.
 
 ## Bug: `--then-tail` on a program row with a squelched demod tails the squelch events first
 

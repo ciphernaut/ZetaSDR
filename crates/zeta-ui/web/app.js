@@ -821,7 +821,8 @@ export function selectionNotes(selection) {
         `(${selection.policy})`,
     );
   }
-  if (selection.note && selection.radio == null) lines.push(`${selection.note}; no default radio`);
+  if (selection.note && selection.radio == null && selection.note.endsWith("is not a source"))
+    lines.push(`${selection.note}; no default radio`);
   return lines;
 }
 

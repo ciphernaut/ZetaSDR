@@ -4703,6 +4703,10 @@ def scenario_radio_default_mark_and_policy(page, url, secret):
             off_default: []})""")
         assert notes == ["focus gone is not a source; no default radio"], notes
         notes = page.evaluate("""() => window.zetaTest.selectionNotes({
+            radio: null, policy: 'free-first', note: 'focus cb is faulted: usb gone',
+            off_default: []})""")
+        assert notes == [], notes
+        notes = page.evaluate("""() => window.zetaTest.selectionNotes({
             radio: 'cb', policy: 'focus-fallback', note: null, off_default: [
               {tool: 'job_start', source: 'tone'}, {tool: 'source_pin', source: 'tone'},
               {tool: 'job_start', source: 'tone'}, {tool: 'job_start', source: 'hackrf'}]})""")

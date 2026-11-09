@@ -245,12 +245,30 @@ pub fn named_in(request: &str, ids: &[SourceId]) -> Vec<SourceId> {
         .collect()
 }
 
+/// What [`resolve`] reads of a `source_list` entry: the id and the fault. Lean and
+/// tolerant of extra fields, so a newer remote node's `SourceInfo` still parses.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RadioInfo {
+    pub id: SourceId,
+    #[serde(default)]
+    pub fault: Option<String>,
+}
+
+impl From<&SourceInfo> for RadioInfo {
+    fn from(s: &SourceInfo) -> Self {
+        RadioInfo {
+            id: s.id.clone(),
+            fault: s.fault.clone(),
+        }
+    }
+}
+
 /// Resolve the request's selection over a fresh `source_list` (precedence in the
 /// module doc).
 pub fn resolve(
     request: &str,
     ctx: &RadioContext,
-    sources: &[SourceInfo],
+    sources: &[RadioInfo],
     caller: Caller,
 ) -> Selection {
     let mut ids: Vec<SourceId> = sources.iter().map(|s| s.id.clone()).collect();
@@ -452,41 +470,19 @@ impl Selection {
 mod tests {
     use super::*;
     use serde_json::json;
-    use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat};
 
     fn id(s: &str) -> SourceId {
         SourceId(s.into())
     }
 
-    fn src(id_: &str, fault: Option<&str>) -> SourceInfo {
-        SourceInfo {
+    fn src(id_: &str, fault: Option<&str>) -> RadioInfo {
+        RadioInfo {
             id: id(id_),
-            capabilities: Capabilities {
-                tune_min_hz: Claim::Asserted(Hz(100_000_000)),
-                tune_max_hz: Claim::Asserted(Hz(200_000_000)),
-                max_bandwidth_hz: Claim::Asserted(Hz(2_048_000)),
-                formats: vec![SampleFormat::Cf32],
-                channels: 1,
-                rx: true,
-                tx: false,
-                remote: false,
-                push: false,
-            },
-            current: None,
-            holders: vec![],
-            elastic: vec![],
-            pin: None,
             fault: fault.map(str::to_string),
-            bank: None,
-            gain: None,
-            stats: None,
-            worker: None,
-            ring: None,
-            position: None,
         }
     }
 
-    fn three() -> Vec<SourceInfo> {
+    fn three() -> Vec<RadioInfo> {
         vec![src("b210", None), src("cb", None), src("hackrf", None)]
     }
 
@@ -1026,5 +1022,15 @@ mod tests {
             assert!(replace_only_as_never(p), "{p}");
             assert!(p.to_lowercase().contains("never `replace`"), "{p}");
         }
+    }
+
+    #[test]
+    fn unknown_extra_fields_still_parse() {
+        let v = json!([{"id": "cb", "fault": "usb gone", "future_field": {"x": 1}}, {"id": "tone", "newer": 2}]);
+        let infos: Vec<RadioInfo> = serde_json::from_value(v).unwrap();
+        assert_eq!(infos, vec![src("cb", Some("usb gone")), src("tone", None)]);
+        let c = ctx(Some("cb"), FocusFrom::Shown, RadioPolicy::Focus);
+        let s = resolve("x", &c, &infos, Caller::cli());
+        assert!(s.prompt_section().contains("faulted"));
     }
 }

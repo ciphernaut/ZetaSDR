@@ -3,13 +3,13 @@
 use crate::exec::{Executor, to_json, trim_result};
 use crate::llm::{AgentError, LlmClient, LlmConfig};
 use crate::page::{PageTools, VIEW_SET, view_set, view_set_tool};
-use crate::radio::{Caller, RadioContext, Selection, resolve};
+use crate::radio::{Caller, RadioContext, RadioInfo, Selection, resolve};
 use crate::wire::{ChatMessage, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use zeta_client::{ToolDef, op_from_call, op_tools, system_prompt};
-use zeta_core::ops::{OpError, SourceInfo};
+use zeta_core::ops::OpError;
 
 /// What a run may do beyond reading and starting: stopping jobs is the
 /// operator's call, as are deleting captures and answering signature proposals, so
@@ -371,7 +371,7 @@ impl<E: Executor> Agent<E> {
     /// leaves `selection` `None` and the no-context paragraph.
     async fn select(&self, t: &mut Transcript) -> Result<String, AgentError> {
         let sources = match self.exec.apply(json!({"op": "source_list"})).await? {
-            Ok(result) => serde_json::from_value::<Vec<SourceInfo>>(result["value"].clone()).ok(),
+            Ok(result) => serde_json::from_value::<Vec<RadioInfo>>(result["value"].clone()).ok(),
             Err(_) => None,
         };
         let Some(sources) = sources else {

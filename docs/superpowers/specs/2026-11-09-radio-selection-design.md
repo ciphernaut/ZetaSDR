@@ -219,7 +219,7 @@ unit can make it standing:
   in 4.1);
 - `--radio-prefer IDS` (`ZETA_RADIO_PREFER`).
 
-An unknown policy word is a usage error (clap's exit 2, naming the allowed words). An unknown `--radio` id is
+An unknown policy word is a usage error (exit 1, naming the allowed words: the repo's `try_parse_checked` maps usage errors to 1; 2 is `OpError`). An unknown `--radio` id is
 not an error: the resolver reports it as `focus <id> is not a source` and continues with no
 focus, as for the page.
 
@@ -440,7 +440,7 @@ On a node with two file sources given tune ranges (the existing `tone_node` help
 - `/ask` with `context` runs and the answer carries `selection`; with an unknown field inside
   `context` it is a 422 naming it; with `radio_policy: "nearest"` a 422 naming `radio_policy`;
   without `context` it runs as before.
-- `zeta ask --radio-policy nearest` exits 2 naming the allowed words; `--radio`, `--radio-policy`
+- `zeta ask --radio-policy nearest` exits 1 (usage error) naming the allowed words; `--radio`, `--radio-policy`
   and `--radio-prefer` parse, and their environment variables are read.
 
 ### 6.4 The page (`crates/zeta-ui/tests/e2e/ui.py`)
