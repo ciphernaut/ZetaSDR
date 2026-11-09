@@ -312,6 +312,7 @@ pub fn learned_row(rec: &SignatureRecord, mode_id: &str) -> crate::modes::ModeRo
         position: None,
         time: None,
         subject: None,
+        derive: vec![],
         access: None,
     }
 }

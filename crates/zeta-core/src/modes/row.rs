@@ -84,6 +84,10 @@ pub struct ModeRow {
     /// page tabulates and folds them; `null` keeps one ribbon per event.
     #[serde(default)]
     pub subject: Option<Subject>,
+    /// Fields filled from another field's text by a named extractor, only on events
+    /// matching `when` and only when none of the `into` targets is set; empty for none.
+    #[serde(default)]
+    pub derive: Vec<Derive>,
     /// `restricted` marks a row whose events carry content a deployment may show to fewer
     /// people than the spectrum (pager text); copied onto every event as `access`; `null`
     /// for the rest. Nothing gates on it yet.
@@ -253,6 +257,49 @@ pub struct PositionMap {
     /// The unit of the `alt_m` field (`m` when left out); `position.alt_m` is metres.
     #[serde(default)]
     pub alt_unit: AltUnit,
+}
+
+/// One `derive` entry: on an event matching `when`, `extract` reads the string field
+/// `from` and its outputs are written to the event fields `into` names, unless one of
+/// those fields already holds a value.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModeDerive", transform = require_all)]
+pub struct Derive {
+    /// Field = value pairs, every one of which an event must match for the entry to run;
+    /// empty for every event.
+    #[serde(default)]
+    pub when: BTreeMap<String, serde_json::Value>,
+    /// The event field whose string value the extractor reads.
+    pub from: String,
+    pub extract: Extractor,
+    /// Extractor output = event field it is written to; an output left out is dropped.
+    pub into: BTreeMap<String, String>,
+}
+
+/// The extractors a `derive` entry may name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "ModeExtractor")]
+pub enum Extractor {
+    // No variant doc, as on `Access`: it would turn the schema into a `oneOf`.
+    AcarsPosition,
+}
+
+impl Extractor {
+    /// The word as the row file spells it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Extractor::AcarsPosition => "acars_position",
+        }
+    }
+
+    /// The outputs the extractor may yield, the keys `into` may name.
+    pub fn outputs(self) -> &'static [&'static str] {
+        match self {
+            Extractor::AcarsPosition => &["lat", "lon", "alt_ft"],
+        }
+    }
 }
 
 /// The channel a mode's decoder expects.
@@ -751,7 +798,8 @@ pub fn parse(text: &str) -> Result<ModeRow, RowError> {
 }
 
 /// The field whose value is not one of its allowed words (`subject.waterfall`,
-/// `subject.columns[<i>].unit`, `position.alt_unit`, `access`), read from the row's JSON.
+/// `subject.columns[<i>].unit`, `position.alt_unit`, `access`, `derive[<i>].extract`),
+/// read from the row's JSON.
 fn bad_word_field(text: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let word = |x: &serde_json::Value, ok: &[&str]| x.as_str().is_none_or(|w| !ok.contains(&w));
@@ -765,6 +813,20 @@ fn bad_word_field(text: &str) -> Option<String> {
         && word(a, &["m", "ft"])
     {
         return Some("position.alt_unit".into());
+    }
+    let extractors = [Extractor::AcarsPosition.word()];
+    for (i, d) in v
+        .get("derive")
+        .and_then(|d| d.as_array())
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if let Some(x) = d.get("extract")
+            && word(x, &extractors)
+        {
+            return Some(format!("derive[{i}].extract"));
+        }
     }
     let subject = v.get("subject")?;
     if let Some(w) = subject.get("waterfall")
@@ -943,6 +1005,31 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             }
         }
     }
+    for (i, d) in row.derive.iter().enumerate() {
+        let absent = |field: String| RowError::new(field, "not in event.schema.properties");
+        if let Some(k) = d.when.keys().find(|k| !properties.contains_key(*k)) {
+            return Err(absent(format!("derive[{i}].when.{k}")));
+        }
+        if !properties.contains_key(&d.from) {
+            return Err(absent(format!("derive[{i}].from")));
+        }
+        let outputs = d.extract.outputs();
+        for (key, target) in &d.into {
+            if !outputs.contains(&key.as_str()) {
+                return Err(RowError::new(
+                    format!("derive[{i}].into.{key}"),
+                    format!(
+                        "not an output of {} ({})",
+                        d.extract.word(),
+                        outputs.join(", ")
+                    ),
+                ));
+            }
+            if !properties.contains_key(target) {
+                return Err(absent(format!("derive[{i}].into.{key}")));
+            }
+        }
+    }
     if let Decoder::Program(ProgramBlock {
         output: ProgramOutput {
             fields: Some(fields),
@@ -960,8 +1047,13 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             }
             path.check(key)?;
         }
+        // A property a derive entry writes is mapped by it.
+        let derived: Vec<&String> = row.derive.iter().flat_map(|d| d.into.values()).collect();
         for name in properties.keys() {
-            if !ENVELOPE_FIELDS.contains(&name.as_str()) && !fields.contains_key(name) {
+            if !ENVELOPE_FIELDS.contains(&name.as_str())
+                && !fields.contains_key(name)
+                && !derived.contains(&name)
+            {
                 return Err(RowError::new(
                     format!("event.schema.properties.{name}"),
                     "not mapped by decoder.output.fields",
@@ -1965,6 +2057,140 @@ mod tests {
             RowError::new(
                 "subject.merge_skip.addr_type",
                 "not in event.schema.properties"
+            ),
+            "{e}"
+        );
+    }
+
+    /// `ADSB` with `text`, `downlink` and `alt_ft` in its schema (it has `lat` and `lon`)
+    /// and one derive entry, `entry`.
+    fn with_derive(entry: serde_json::Value) -> String {
+        edited(ADSB, |v| {
+            let props = &mut v["event"]["schema"]["properties"];
+            props["text"] = serde_json::json!({"type": ["string", "null"]});
+            props["downlink"] = serde_json::json!({"type": ["boolean", "null"]});
+            props["alt_ft"] = serde_json::json!({"type": ["integer", "null"]});
+            v["derive"] = serde_json::json!([entry]);
+        })
+    }
+
+    /// The derive entry of the design: a downlink's text read by `acars_position`.
+    fn acars_entry() -> serde_json::Value {
+        serde_json::json!({
+            "when": {"downlink": true}, "from": "text", "extract": "acars_position",
+            "into": {"lat": "lat", "lon": "lon", "alt_ft": "alt_ft"}
+        })
+    }
+
+    #[test]
+    fn derive_round_trips_and_defaults_empty() {
+        let row = parse(ADSB).unwrap();
+        assert!(row.derive.is_empty());
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["derive"], serde_json::json!([]));
+        let row = parse(&with_derive(acars_entry())).unwrap();
+        validate(&row, &no_stages()).unwrap();
+        let s = |x: &str| x.to_string();
+        assert_eq!(
+            row.derive,
+            [Derive {
+                when: BTreeMap::from([(s("downlink"), true.into())]),
+                from: s("text"),
+                extract: Extractor::AcarsPosition,
+                into: BTreeMap::from([
+                    (s("alt_ft"), s("alt_ft")),
+                    (s("lat"), s("lat")),
+                    (s("lon"), s("lon")),
+                ]),
+            }]
+        );
+        assert_eq!(parse(&serde_json::to_string(&row).unwrap()).unwrap(), row);
+        assert_eq!(Extractor::AcarsPosition.word(), "acars_position");
+        assert_eq!(Extractor::AcarsPosition.outputs(), ["lat", "lon", "alt_ft"]);
+        // `when` may be left out: the entry runs on every event.
+        let mut entry = acars_entry();
+        entry.as_object_mut().unwrap().remove("when");
+        let row = parse(&with_derive(entry)).unwrap();
+        assert!(row.derive[0].when.is_empty());
+        // The rest is required, and nothing else is allowed.
+        for missing in ["from", "extract", "into"] {
+            let mut entry = acars_entry();
+            entry.as_object_mut().unwrap().remove(missing);
+            assert_eq!(parse(&with_derive(entry)).unwrap_err().field, missing);
+        }
+        let mut entry = acars_entry();
+        entry["extra"] = 1.into();
+        assert_eq!(parse(&with_derive(entry)).unwrap_err().field, "extra");
+    }
+
+    #[test]
+    fn an_unknown_extractor_is_broken_at_its_field() {
+        let mut entry = acars_entry();
+        entry["extract"] = "cubits".into();
+        let e = parse(&with_derive(entry.clone())).unwrap_err();
+        assert_eq!(e.field, "derive[0].extract", "{e}");
+        // A row with no subject still names the field.
+        let text = edited(&with_derive(entry), |v| {
+            v["subject"] = serde_json::Value::Null
+        });
+        assert_eq!(parse(&text).unwrap_err().field, "derive[0].extract");
+    }
+
+    #[test]
+    fn derive_names_schema_fields() {
+        let broken = |edit: fn(&mut serde_json::Value)| {
+            let mut entry = acars_entry();
+            edit(&mut entry);
+            validate(&parse(&with_derive(entry)).unwrap(), &no_stages()).unwrap_err()
+        };
+        let e = broken(|e| e["when"]["nope"] = true.into());
+        assert_eq!(
+            e,
+            RowError::new("derive[0].when.nope", "not in event.schema.properties"),
+            "{e}"
+        );
+        let e = broken(|e| e["from"] = "nope".into());
+        assert_eq!(
+            e,
+            RowError::new("derive[0].from", "not in event.schema.properties"),
+            "{e}"
+        );
+        let e = broken(|e| e["into"]["lat"] = "nope".into());
+        assert_eq!(
+            e,
+            RowError::new("derive[0].into.lat", "not in event.schema.properties"),
+            "{e}"
+        );
+        let e = broken(|e| e["into"]["speed"] = "lat".into());
+        assert_eq!(
+            e,
+            RowError::new(
+                "derive[0].into.speed",
+                "not an output of acars_position (lat, lon, alt_ft)"
+            ),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_derived_property_counts_as_mapped() {
+        // `lat` is in the schema, written by derive and by no pointer.
+        let text = edited(&with_fields(|m| drop(m.remove("lat"))), |v| {
+            v["derive"] = serde_json::json!([{
+                "from": "callsign", "extract": "acars_position", "into": {"lat": "lat"}
+            }]);
+        });
+        validate(&parse(&text).unwrap(), &no_stages()).unwrap();
+        // `wind`, mapped by neither, still fails.
+        let text = edited(&text, |v| {
+            v["event"]["schema"]["properties"]["wind"] = serde_json::json!({"type": "number"})
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new(
+                "event.schema.properties.wind",
+                "not mapped by decoder.output.fields"
             ),
             "{e}"
         );
