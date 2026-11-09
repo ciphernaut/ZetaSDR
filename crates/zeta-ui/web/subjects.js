@@ -45,9 +45,9 @@
 //     A subject past view `subject_dim_s` of silence is dim, past `subject_drop_s` dropped
 //     (checked each second, from this page's clock, so a longer `subject_dim_s` un-dims it at
 //     the next check); a selection goes with its subject.
-//   A subject: {job, group, heard, key, state, position, first_seen, last_seen, count, dim, row}.
-//     `job` is the id of the job first heard on, `group` its group's id, `heard` the job last
-//     heard on, `state` a null-prototype object of every field heard, whose last non-null, non-blank value
+//   A subject: {job, group, heard, center_hz, key, state, position, first_seen, last_seen, count,
+//     dim, row}. `job` is the id of the job first heard on, `group` its group's id, `heard` the
+//     job last heard on and `center_hz` its tuning's centre then (when it had one), `state` a null-prototype object of every field heard, whose last non-null, non-blank value
 //     stands, `position` {lat, lon, alt_m} or null, the altitude surviving a fix without one.
 //   subjectLabel(subject) -> state[row.subject.label] when present, else the key
 //   subjectSummary(subject) -> the row's summary template filled from the merged state
@@ -59,8 +59,10 @@
 //     A watch's kept decoders draw one `section.subject-job[data-job=<watch id>]` at the first
 //     one's place (plan 31 spec 4.7), headed `<watch kind> <id tail> · <subject name>`, its
 //     columns the key, `Channel` (`th[data-col="channel"]`: the centre, in MHz to 4 places, of
-//     the decoder the subject was last heard on), the first decoder row's columns and the
-//     usual tail; it goes when its watch stops.
+//     the decoder the subject was last heard on, its last known centre once that decoder is
+//     gone), the first decoder row's columns (a subject's row when no decoder runs) and the
+//     usual tail. It stays while its watch runs and holds subjects, every decoder lost or not,
+//     and goes when the watch stops.
 //     One `section.subject-job[data-job]` per other running job with subjects or whose row has table
 //     columns, so a job heard nothing from yet says `0 aircraft` (an `h3` and a table of
 //     `tr.subject[data-job][data-key]`, classes `dim` and `selected`), and one for a subject job
@@ -90,8 +92,10 @@
 //     Cells are written only when they differ, so a tooltip outlives a redraw. All text by
 //     textContent.
 //     pane.render()   draws now, unless hidden
-//     pane.eligible() -> bool   a running job's row has table columns, a trial's not counting
-//         (app.js shows the pane)
+//     pane.eligible() -> bool   a running job's row has table columns, a trial's not counting,
+//         or a running watch holds subjects (app.js shows the pane)
+//     pane.groupIds() -> the ids of the groups the pane lists: the running subject jobs' groups
+//         and the running watches holding subjects (app.js counts their subjects)
 //     pane.destroy()
 
 import { groupOf as watchGroupOf } from "./agent.js";
@@ -305,6 +309,7 @@ class SubjectStore {
     }
     subjects.set(k.key, s);
     s.heard = job.id;
+    if (typeof job.tuning?.center_hz === "number") s.center_hz = job.tuning.center_hz;
     for (const [field, v] of Object.entries(p)) {
       if (v === null || v === undefined) continue;
       if (typeof v === "string" && v.trim() === "") continue;
@@ -637,8 +642,28 @@ class SubjectsPane {
     });
   }
 
+  // The running watches holding subjects (a merged section stays while its watch runs, its
+  // decoders lost or not: spec 4.7).
+  heldWatches() {
+    return (this.jobs() || []).filter(
+      (j) => isRunning(j) && j.context?.watch && this.store.groupId(j.id) === j.id && this.store.size(j.id) > 0,
+    );
+  }
+
   eligible() {
-    return this.subjectJobs().some((j) => this.store.rowOf(j.kind).subject.columns.length > 0);
+    return (
+      this.subjectJobs().some((j) => this.store.rowOf(j.kind).subject.columns.length > 0) ||
+      this.heldWatches().length > 0
+    );
+  }
+
+  groupIds() {
+    return [
+      ...new Set([
+        ...this.subjectJobs().map((j) => this.store.groupId(j.id)),
+        ...this.heldWatches().map((j) => j.id),
+      ]),
+    ];
   }
 
   schedule() {
@@ -744,9 +769,15 @@ class SubjectsPane {
   // A watch's merged section (spec 4.7): its decoders' subjects keyed (watch, key), with the
   // `Channel` column after the key (the decoder the subject was last heard on).
   drawWatchSection(sec, { id, watch, members }) {
-    const row = this.store.rowOf(members[0].job.kind);
+    const list = this.store.list(id);
+    // No decoder running (every one lost): a subject's own row.
+    const row = members.length > 0 ? this.store.rowOf(members[0].job.kind) : list[list.length - 1].row;
     const byId = new Map((this.jobs() || []).map((j) => [j.id, j]));
-    const centre = (s) => byId.get(s.heard ?? s.job)?.tuning?.center_hz ?? null;
+    const centre = (s) => {
+      const live = byId.get(s.heard ?? s.job);
+      const hz = isRunning(live) ? live.tuning?.center_hz : undefined;
+      return typeof hz === "number" ? hz : (s.center_hz ?? null);
+    };
     const channel = {
       col: "channel",
       label: "Channel",
@@ -757,7 +788,7 @@ class SubjectsPane {
       value: centre,
     };
     const cols = this.columns(row, { afterKey: [channel] });
-    const subjects = this.held(sec, this.sorted(id, this.store.list(id).reverse(), cols));
+    const subjects = this.held(sec, this.sorted(id, list.reverse(), cols));
     this.drawSection(
       sec,
       `${watch.kind} ${id.slice(-6)} · ${row.subject.name}`,
@@ -1001,6 +1032,10 @@ class SubjectsPane {
         members.sort((a, b) => order.get(a.job.id) - order.get(b.job.id));
         parts.push({ id: mergedId(name), name, members });
       }
+    }
+    // A running watch whose decoders are all gone keeps its section while it holds subjects.
+    for (const watch of this.heldWatches()) {
+      if (!watches.has(watch.id)) parts.push({ id: watch.id, watch, members: [], group: true });
     }
     return parts;
   }

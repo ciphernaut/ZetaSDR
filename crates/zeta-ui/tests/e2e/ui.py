@@ -3631,7 +3631,7 @@ def scenario_decode_across_entry_starts_a_watch_with_modes(page, url, secret):
 
         watch = wait_until(detected, 10.0, "a watch on pocsag with modes [pocsag_decode]")
         p = detect_params(url, secret, watch)
-        assert p["persist_ms"] == 500 and p["width_hz"] == [6250, 18750], p
+        assert p["persist_ms"] == 500 and p["width_hz"] == [6250, 25000], p
         expect(page.locator("#transcript .line", has_text="graph_put")).not_to_have_count(0)
         # The fixture's page sits on the capture centre, which `detect` masks (a real radio's DC
         # spike), and its clean FSK reads as two sub-kHz tones under the 0.5x width floor: the
@@ -5368,6 +5368,44 @@ def scenario_subjects_store_merge_units_and_fill(page, url, secret):
           out.dropped = drops.length;
           out.selectedAfter = store.selected();
           out.selectEvents = events;
+          // A watch's merged section (plan 31 spec 4.7) goes with the watch, not its decoders.
+          const { mountSubjectsPane } = await import('./subjects.js');
+          const el = document.createElement("div");
+          document.body.append(el);
+          let jobsNow = [];
+          const pane = mountSubjectsPane(el, store, view, {jobs: () => jobsNow});
+          const watch = (decoding, status = "running") => ({
+            id: "W0123456", kind: "watch", state: {status},
+            context: {watch: {decoding: decoding.map((j) => ({job: j, mode: "k"}))}}});
+          const dec = {id: "D", kind: "k", state: {status: "running"},
+                       tuning: {center_hz: 148637500, bandwidth_hz: 12500}};
+          const look = () => {
+            pane.render();
+            const sec = el.querySelector('section.subject-job[data-job="W0123456"]');
+            return sec && {
+              h3: sec.querySelector("h3").textContent,
+              channel: sec.querySelector('tr.subject[data-key="Z"] td[data-col="channel"]')
+                ?.textContent ?? null,
+              decoderSection: !!el.querySelector('section.subject-job[data-job="D"]'),
+            };
+          };
+          jobsNow = [watch(["D"]), dec];
+          store.sync(jobsNow);
+          store.event(dec, {icao: "Z", callsign: "Q"});
+          out.watchLive = look();
+          jobsNow = [watch([]), {...dec, state: {status: "stopped"}}];
+          store.sync(jobsNow);
+          out.decoderGone = look();
+          out.decoderGoneEligible = pane.eligible();
+          jobsNow = [watch([])];
+          store.sync(jobsNow);
+          out.decoderAged = look();
+          jobsNow = [watch([], "stopped")];
+          store.sync(jobsNow);
+          out.watchStopped = look();
+          out.watchStoppedSize = store.size("W0123456");
+          pane.destroy();
+          el.remove();
           store.destroy();
           out.windowStore = window.zetaSubjects;
           return out;
@@ -5411,6 +5449,15 @@ def scenario_subjects_store_merge_units_and_fill(page, url, secret):
     assert r["selectedAfter"] is None, r
     assert r["selectEvents"][-1] is None, r
     assert r["windowStore"] is None, r
+    live = {"h3": "watch 123456 · aircraft", "channel": "148.6375", "decoderSection": False}
+    assert r["watchLive"] == live, r["watchLive"]
+    # The decoder lost (stopped, then gone from the list) while the watch runs: the section
+    # stays, its Channel the decoder's last centre, and the tab stays eligible.
+    assert r["decoderGone"] == live, r["decoderGone"]
+    assert r["decoderGoneEligible"] is True, r
+    assert r["decoderAged"] == live, r["decoderAged"]
+    # The watch stopped: its subjects and section go.
+    assert r["watchStopped"] is None and r["watchStoppedSize"] == 0, r
 
 
 def scenario_subjects_table_merges_three_aircraft(page, url, secret):

@@ -1459,8 +1459,7 @@ function paintDockHead() {
   let count = "";
   if (pane === "subjects" && state.subjects && state.subjectsPane) {
     // Per group: a watch's decoders share one set of subjects.
-    const groups = new Set(state.subjectsPane.subjectJobs().map((j) => state.subjects.groupId(j.id)));
-    const n = [...groups].reduce((sum, g) => sum + state.subjects.size(g), 0);
+    const n = state.subjectsPane.groupIds().reduce((sum, g) => sum + state.subjects.size(g), 0);
     count = String(n);
   }
   const countEl = head.querySelector(".count");

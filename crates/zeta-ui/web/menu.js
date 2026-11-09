@@ -78,7 +78,9 @@
 //                                             its `detect` node with modes [<id>], persist_ms
 //                                             DECODE_ACROSS_PERSIST_MS and width_hz
 //                                             DECODE_ACROSS_WIDTH_FIT × the row's width
-//                                             (plan 31 spec 4.7: two ops, one click)
+//                                             ([0.5, 2]: the node's span fit, so the detector's
+//                                             ceiling admits every signal the watch would
+//                                             decode; plan 31 spec 4.7: two ops, one click)
 //   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
 //   pocsag_decode  Decode › POCSAG            job_start kind=pocsag_decode, deviation_hz null,
 //                                             bandwidth_hz at least POCSAG_MIN_BANDWIDTH_HZ
@@ -237,9 +239,9 @@ export const FIT_NOISE_SNR_DB = 6;
 // zeta_core::ops::MEASURE_DC_MASK_HZ is the source of truth; this copy only words the note.
 export const MEASURE_DC_MASK_HZ = 25000;
 // "Decode across this band…" (plan 31 spec 4.7): the `detect` params its watch gets, the
-// widths as fractions of the chosen row's band.bandwidth_hz.
+// widths as fractions of the chosen row's band.bandwidth_hz, the node's span fit (0.5-2x).
 export const DECODE_ACROSS_PERSIST_MS = 500;
-export const DECODE_ACROSS_WIDTH_FIT = [0.5, 1.5];
+export const DECODE_ACROSS_WIDTH_FIT = [0.5, 2];
 
 const OUTLINE_ENTRIES = [
   ["fit", "Fit to signal"],
