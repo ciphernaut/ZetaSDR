@@ -26,6 +26,7 @@ pub mod capture_in;
 pub mod catalogue;
 pub mod channel;
 pub mod clock;
+pub mod composite;
 pub mod correlate;
 pub mod crc;
 pub mod denoise;
@@ -81,6 +82,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(nbfm::NbfmDemodStage::new()));
     reg.register(Arc::new(wfm::WfmDemodStage::new()));
     reg.register(Arc::new(video_fm::VideoFmDemodStage::new()));
+    reg.register(Arc::new(composite::CompositeDecodeStage::new()));
     reg.register(Arc::new(am::AmDemodStage::new()));
     reg.register(Arc::new(am::SsbDemodStage::new()));
     reg.register(Arc::new(aprs::AprsDecodeStage::new()));

@@ -682,6 +682,14 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.loop_bw: number (optional, default 0.01)
 - params.max_ppm: integer (optional, default 2000)
 
+### composite_decode
+
+- inputs: audio
+- outputs: video, event
+- params.report_s: integer (optional, default 5)
+- params.scale: string (Scale: full|half|quarter) (optional, default "full")
+- params.standard: string (StandardChoice: auto|pal|ntsc) (optional, default "auto")
+
 ### correlate
 
 - inputs: event
