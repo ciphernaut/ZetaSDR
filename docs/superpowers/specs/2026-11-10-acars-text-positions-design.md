@@ -170,9 +170,11 @@ A new optional row field:
   `bad_word_field` (`row.rs`), which knows four fields today, so it learns to walk
   `derive[i].extract`.
 - `into`: extractor output → event field. Each extractor documents its outputs
-  (`acars_position`: `lat`, `lon`, `alt_ft`). An output left out of `into` is dropped; a
-  target field already holding a non-null value is left alone (the decoder's structured value
-  wins over the text). `into` is required, so a row says what it takes.
+  (`acars_position`: `lat`, `lon`, `alt_ft`). An output left out of `into` is dropped. When
+  any `into` target already holds a non-null value the whole entry is skipped (the decoder's
+  structured fix wins over the text, and a fix is never assembled half from each: an ADS-C
+  latitude is never paired with a text longitude). `into` is required, so a row says what it
+  takes.
 - Several entries run in order; a later one sees the earlier one's fields.
 
 Applied by `envelope` before anything else it does. `fields` must be an object (it always is
