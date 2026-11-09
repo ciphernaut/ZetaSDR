@@ -36,6 +36,7 @@ pub const GATED_REPLACE_OPS: &[&str] = &[
     "source_ensure",
     "source_pin",
     "plan_start",
+    "set_start",
 ];
 
 /// `Some(error)` when `op` would stop jobs and the run is not allowed to:
@@ -68,7 +69,7 @@ pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
             "message": "accepting or rejecting a signature is the operator's decision: report the proposal to the operator; they unlock it by allowing signatures for the run",
         }));
     }
-    let field = if name == "job_stop" || name == "jobs_stop" {
+    let field = if matches!(name, "job_stop" | "jobs_stop" | "set_stop") {
         if allow.stop_jobs {
             return None;
         }
@@ -102,13 +103,20 @@ pub struct OwnJobs {
     jobs: HashSet<String>,
     /// The own `identify` jobs, whose context names the job that proved.
     identifies: HashSet<String>,
+    /// The sets a successful `set_start` of this run started.
+    sets: HashSet<String>,
 }
 
 impl OwnJobs {
-    /// Whether `op` is a `job_stop` of one of this run's own jobs. `jobs_stop` never is,
-    /// and a `job_stop` has no `replace`, which stays with [`gate`].
+    /// Whether `op` is a `job_stop` of one of this run's own jobs, or a `set_stop` of a set
+    /// this run started. `jobs_stop` never is, and neither has a `replace`, which stays
+    /// with [`gate`].
     pub fn allows_stop(&self, op: &Value) -> bool {
-        op["op"] == "job_stop" && op["job"].as_str().is_some_and(|j| self.jobs.contains(j))
+        match op["op"].as_str() {
+            Some("job_stop") => op["job"].as_str().is_some_and(|j| self.jobs.contains(j)),
+            Some("set_stop") => op["set"].as_str().is_some_and(|s| self.sets.contains(s)),
+            _ => false,
+        }
     }
 
     /// Note what a call that succeeded gave this run; `result` is `{"result", "value"}`
@@ -124,7 +132,10 @@ impl OwnJobs {
                     }
                 }
             }
-            "plan_start" => {
+            "plan_start" | "set_start" => {
+                if let (true, Some(set)) = (tool == "set_start", value["set"].as_str()) {
+                    self.sets.insert(set.to_string());
+                }
                 for s in value["started"].as_array().into_iter().flatten() {
                     for key in ["job", "attached"] {
                         if let Some(id) = s[key].as_str() {
