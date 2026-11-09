@@ -57,6 +57,8 @@
 //                          none): the agent's preference order among the free radios; the ids
 //                          are not checked against source_list (a radio absent today may be
 //                          attached tomorrow)
+//         video            smooth | sharp (default smooth): the full video view's picture
+//                          (video.js): every field at 360 wide, or full width 5 a second
 //       radio_policy and radio_prefer persist for the browser: they live in `localStorage`
 //       under RADIO_PREFS_KEY (`local: true` in the table), read on every `get` so another
 //       tab's change shows at the next ask; every other key stays per tab in VIEW_KEY.
@@ -115,6 +117,7 @@ export const AGENT_VIEW_KEYS = [
   "follow",
   "origin_fade_s",
   "map_tiles",
+  "video",
 ];
 
 const SOURCE_ID = /^[A-Za-z0-9_.:-]+$/;
@@ -312,6 +315,12 @@ export const POLICIES = [
     default_: "none",
     describe: "none, a comma-separated list of source ids",
     local: true,
+  },
+  {
+    key: "video",
+    values: ["smooth", "sharp"],
+    default_: "smooth",
+    describe: "video picture: smooth (every field, 360 wide) or sharp (full width, 5 a second)",
   },
 ];
 

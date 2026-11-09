@@ -5,6 +5,8 @@
 //       One binary stream message (ArrayBuffer): `u32LE header_len | FrameSummary JSON |
 //       u32LE body_len | body`, the body f32 little-endian PCM for audio. Throws on a
 //       truncated envelope.
+//   parseEnvelopeRaw(buf) -> {header, body: Uint8Array}
+//       The same envelope with the body as bytes (a video frame's PNG).
 //   splitChannels(samples, channels) -> Float32Array[]
 //       De-interleaves audio into at most two channels: mono stays one, stereo is two, and
 //       anything above 2 keeps only the first two (a downmix by dropping the rest). A trailing
@@ -48,7 +50,8 @@ window.zetaAudio = {
   lastChannels: null,
 };
 
-export function parseEnvelope(buf) {
+// The header and the body's offset and length of an envelope.
+function envelope(buf) {
   const view = new DataView(buf);
   if (buf.byteLength < 4) throw new Error("envelope ended inside the header length");
   const hlen = view.getUint32(0, true);
@@ -57,6 +60,16 @@ export function parseEnvelope(buf) {
   const blen = view.getUint32(4 + hlen, true);
   const at = 8 + hlen;
   if (buf.byteLength < at + blen) throw new Error("envelope ended inside the body");
+  return { view, header, at, blen };
+}
+
+export function parseEnvelopeRaw(buf) {
+  const { header, at, blen } = envelope(buf);
+  return { header, body: new Uint8Array(buf, at, blen) };
+}
+
+export function parseEnvelope(buf) {
+  const { view, header, at, blen } = envelope(buf);
   const n = Math.floor(blen / 4);
   const samples = new Float32Array(n);
   // The body need not be 4-byte aligned in the message, so read it through the DataView.

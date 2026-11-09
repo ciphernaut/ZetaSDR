@@ -11,11 +11,13 @@
 //       el         the strip (<nav id="panes" role="tablist">)
 //       host       the pane area (#pane), shown while a pane is
 //       footprint  () -> "wide" | "narrow"
-//     panes.register(id, label, {eligible, el, onShow, onHide})
+//     panes.register(id, label, {eligible, el, onShow, onHide, full = false})
 //         a tab `button.pane-tab[role=tab][data-pane=<id>]` named `label`; `eligible()` says
 //         whether the tab shows unselected, `el` is the pane's element in #pane (shown only
 //         while it is the pane on screen), `onShow()` runs when it comes on screen and
-//         `onHide()` just before it goes. A registered id may be registered again (replaced).
+//         `onHide()` just before it goes. A `full` pane takes the whole main area in both
+//         footprints (<html data-full="<id>"> while it is on screen). A registered id may be
+//         registered again (replaced).
 //     panes.unregister(id)
 //     panes.select(id | null)    the view's `pane` set to `id` (`none` for null)
 //     panes.current() -> id | null   the selected pane (null when none or not registered)
@@ -28,7 +30,9 @@
 // pane is selected in the wide footprint (style.css gives it the bottom of #main). In the
 // narrow footprint a pane is shown in the main area's place (over the waterfall or the map)
 // only while <html data-pane> names it: a click on its tab selects it and sets data-pane, a
-// click on the one shown clears both.
+// click on the one shown clears both. <html data-full="<id>"> is set, in both footprints and
+// beside data-strip or data-pane, while a `full` pane is the one on screen (style.css: #pane
+// over the whole of #main, the waterfall and the map hidden but kept running).
 
 let live = null;
 
@@ -58,7 +62,7 @@ class Panes {
     el.addEventListener("click", this.onClick);
   }
 
-  register(id, label, { eligible = () => false, el = null, onShow = null, onHide = null } = {}) {
+  register(id, label, { eligible = () => false, el = null, onShow = null, onHide = null, full = false } = {}) {
     this.unregister(id);
     const tab = document.createElement("button");
     tab.type = "button";
@@ -69,7 +73,7 @@ class Panes {
     tab.hidden = true;
     tab.setAttribute("aria-selected", "false");
     this.el.append(tab);
-    this.panes.set(id, { tab, eligible, el, onShow, onHide, shown: false });
+    this.panes.set(id, { tab, eligible, el, onShow, onHide, full, shown: false });
     this.render();
   }
 
@@ -119,6 +123,9 @@ class Panes {
     if (sel && !narrow) root.dataset.strip = sel;
     else delete root.dataset.strip;
     const onScreen = narrow ? (sel && root.dataset.pane === sel ? sel : null) : sel;
+    // Only while on screen: a narrow pane selected but not shown leaves the waterfall be.
+    if (onScreen && this.panes.get(onScreen).full) root.dataset.full = onScreen;
+    else delete root.dataset.full;
     const showing = [];
     for (const [id, p] of this.panes) {
       const selected = id === sel;
@@ -141,6 +148,7 @@ class Panes {
     this.el.removeEventListener("click", this.onClick);
     if (this.host) this.host.hidden = true;
     delete this.root.dataset.strip;
+    delete this.root.dataset.full;
     if (live === this) live = null;
   }
 }

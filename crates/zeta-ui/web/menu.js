@@ -93,6 +93,11 @@
 //                                             out_of_range, shown in the transcript)
 //   acars_decode  Decode › ACARS              job_start kind=acars_decode, deviation_hz null,
 //                                             bandwidth_hz at least ACARS_MIN_BANDWIDTH_HZ
+//   video      Decode video                   job_start kind=video_decode at the box's centre
+//                                             and width as drawn (never fitted, never a grid);
+//                                             greyed (aria-disabled, its title the lease's
+//                                             words, videoRefusal) when the shown source's
+//                                             max_bandwidth_hz is under the box's width
 //   fm_demod   Decode › NBFM audio            job_start kind=fm_demod, deviation_hz 5000
 //                                             (fitted first: see Fitting)
 //   wfm_demod  Decode › FM broadcast audio    job_start kind=wfm_demod, deviation_hz 75000,
@@ -211,6 +216,7 @@
 // as for #ctx.
 
 import { bandText, mhzText, originSummary, registerText } from "./units.js";
+import { capHz } from "./waterfall.js";
 
 // How far past the ring's earliest sample a `too_old` retry starts, as the front moves on.
 const RING_FRONT_MARGIN_NS = 300_000_000;
@@ -300,6 +306,7 @@ const ENTRIES = [
   ["rds_decode", "Decode › RDS (FM station data)"],
   ["adsb_decode", "Decode › ADS-B (dump1090)"],
   ["acars_decode", "Decode › ACARS"],
+  ["video", "Decode video"],
   ["fm_demod", "Decode › NBFM audio"],
   ["wfm_demod", "Decode › FM broadcast audio"],
   ["am_demod", "Decode › AM"],
@@ -327,6 +334,7 @@ const JOBS = {
   rds_decode: { kind: "rds_decode", deviation: null, sideband: null },
   adsb_decode: { kind: "adsb_decode", deviation: null, sideband: null },
   acars_decode: { kind: "acars_decode", deviation: null, sideband: null },
+  video: { kind: "video_decode", deviation: null, sideband: null },
   fm_demod: { kind: "fm_demod", deviation: 5000, sideband: null },
   wfm_demod: { kind: "wfm_demod", deviation: 75000, sideband: null },
   am_demod: { kind: "am_demod", deviation: null, sideband: null },
@@ -344,6 +352,17 @@ const TRANSCRIBE = {
 };
 // The JOBS entry an action starts (a Transcribe entry's twin's), or undefined.
 const jobOf = (action) => JOBS[TRANSCRIBE[action] ?? action];
+
+// Why "Decode video" cannot start on `src` (a source_list record) for a box `bandwidthHz`
+// wide: the lease's refusal, `insufficient bandwidth: <id> delivers at most <cap> Hz`, with
+// ` (measured at open)` for a measured cap; null when the radio carries it or says nothing.
+export function videoRefusal(src, bandwidthHz) {
+  const claim = src && src.capabilities ? src.capabilities.max_bandwidth_hz : null;
+  const cap = capHz(claim);
+  if (cap === null || !(cap < bandwidthHz)) return null;
+  const measured = claim && typeof claim === "object" && "measured" in claim;
+  return `insufficient bandwidth: ${src.id} delivers at most ${cap} Hz${measured ? " (measured at open)" : ""}`;
+}
 
 // The tuning a job entry uses for a selection: {centerHz, bandwidthHz}. SSB tunes the dial; FM
 // broadcast and RDS widen the band to at least WFM_MIN_BANDWIDTH_HZ, POCSAG to at least
@@ -678,6 +697,16 @@ class Menu {
     // `Start set…` only when set_list has a ready set.
     this.el.querySelector('[data-action="set"]').hidden = this.readySets().length === 0;
     this.fillSub(this.sel);
+    const video = this.el.querySelector('[data-action="video"]');
+    const src = (this.sources() || []).find((x) => x.id === this.sel.sourceId);
+    const refusal = videoRefusal(src, this.sel.bandwidthHz);
+    if (refusal) {
+      video.setAttribute("aria-disabled", "true");
+      video.title = refusal;
+    } else {
+      video.removeAttribute("aria-disabled");
+      video.removeAttribute("title");
+    }
     this.el.hidden = false;
     // Keep it inside the viewport.
     const w = this.el.offsetWidth;
@@ -933,6 +962,7 @@ class Menu {
   async choose(action) {
     // A fit in progress ignores further choices (a double click starts one job).
     if (!this.sel || this.fitting !== null) return;
+    if (action === "video" && this.el.querySelector('[data-action="video"]').title) return;
     if (action === "decode_across") {
       // Shown, never toggled: the pointer reaching the entry already showed it.
       this.showSub(true);

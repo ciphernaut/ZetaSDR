@@ -1733,9 +1733,9 @@ def scenario_view_set_show_reset(page, url, secret):
                  "home none",
                  "subjects auto", "subject_dim_s 60", "subject_drop_s 300",
                  "origin_fade_s 300", "pane none", "theme console", "side both", "dock auto",
-                 "map_tiles auto", "radio_policy focus", "radio_prefer none"):
+                 "map_tiles auto", "radio_policy focus", "radio_prefer none", "video smooth"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 19, f"view show: {shown!r}"
+    assert shown.count("\n") == 20, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")

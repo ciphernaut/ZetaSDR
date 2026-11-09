@@ -169,6 +169,7 @@ import { mountSubjects, mountSubjectsPane } from "./subjects.js";
 import { mountPanes } from "./panes.js";
 import { mountExplorePane } from "./explore.js";
 import { mountBitsPane } from "./bits.js";
+import { mountVideo } from "./video.js";
 import { originSummary } from "./units.js";
 
 export const NARROW_MAX_PX = 700;
@@ -188,6 +189,7 @@ export const state = {
   panes: null,
   explore: null,
   bits: null, // bits.js: the Bits pane
+  video: null, // video.js: the Video pane and the tags' thumbnails
   ov: null,
   map: null, // map.js: the positions of decoded events
   menu: null,
@@ -1090,6 +1092,29 @@ function start(api) {
     jobs: () => state.lastJobs,
     onOrigins: (id) => askOrigins(id),
   });
+  // The Video pane (video.js): the whole of #main while shown; the tags' live thumbnails.
+  const video = mountVideo(api, {
+    panes: state.panes,
+    view: state.view,
+    el: $("#video"),
+    jobs: () => state.lastJobs,
+    shownSource: () => state.selected ?? null,
+  });
+  state.video = video;
+  state.panes.register("video", "video", {
+    eligible: video.eligible,
+    el: $("#video"),
+    onShow: video.show,
+    onHide: video.hide,
+    full: true,
+  });
+  state.ov.onTagMedia = (id, canvas, on) => (on ? video.openThumb(id, canvas) : video.closeThumb(id));
+  state.ov.onVideoLock = video.onLock;
+  state.ov.onThumbClick = (id) => {
+    const on = document.documentElement.dataset.full === "video";
+    video.select(id);
+    if (!on) state.panes?.click("video");
+  };
   state.subjects.onLearn(applyPanes);
   loadStationHome(api);
   loadThemes(api);
@@ -1156,6 +1181,7 @@ function start(api) {
       state.subjects?.sync(jobs);
       if (state.ov) state.ov.sync(jobs, shown());
       applyPanes();
+      state.video?.sync();
       if (state.wf) state.wf.syncJobs(jobs);
       pollSources(api);
       stopAudioUnlessRunning(jobs);
@@ -1495,7 +1521,8 @@ function applyDock() {
   if (!pane || dock !== "right") state.dockCollapsed = false;
   let sec = document.getElementById("pane-dock");
   const app = document.getElementById("app");
-  if (dock !== "right" || !pane || footprint() === "narrow") {
+  // A full pane (the Video pane) takes #main whatever the dock.
+  if (dock !== "right" || !pane || footprint() === "narrow" || root.dataset.full) {
     if (host.parentElement !== main) main.append(host);
     sec?.remove();
     delete app?.dataset.dockOpen;
@@ -1655,6 +1682,8 @@ function logout(api) {
   if (state.explore) state.explore.destroy();
   if (state.bits) state.bits.destroy();
   if (state.panes) state.panes.destroy();
+  if (state.video) state.video.destroy();
+  state.video = null;
   if (state.subjectsPane) state.subjectsPane.destroy();
   if (state.subjects) state.subjects.destroy();
   if (state.coarse) state.coarse.destroy();

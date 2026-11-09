@@ -27,6 +27,7 @@ pub const VIEW_KEYS: &[&str] = &[
     "follow",
     "origin_fade_s",
     "map_tiles",
+    "video",
 ];
 
 /// What a run with page tools knows about the page it serves.

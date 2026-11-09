@@ -32,7 +32,13 @@
 //       outline, tag and row, styled apart from `hot`; `ov.speaking` is re-applied after each
 //       sync and whenever an outline or tag is made, as `hotJob`). The pin, the capture and
 //       the ghost keep a plain `.outline-label`; job outlines have none. Each tag also has a
-//       `.centre` (the tuning centre in MHz, three decimals).
+//       `.centre` (the tuning centre in MHz, three decimals). A `video_decode` job's tag also
+//       holds a `canvas.video-thumb[data-job]` (64x48) for its live picture: made with the tag,
+//       it is handed to `ov.onTagMedia(id, canvas, true)` and taken back with
+//       `ov.onTagMedia(id, null, false)` when the tag goes (video.js draws it); a click on it
+//       calls `ov.onThumbClick(id)` instead of the tag's. Its `video` events (a boolean
+//       `locked`) are the tag's snippet (their `summary`) and go to `ov.onVideoLock(id, event)`,
+//       never a ribbon.
 //   The rail: ov.setRail(el) (app.js hands it wf.rail in the console theme, null in plain)
 //       moves every tag out of its outline into `el` at once (null moves them back), and new
 //       tags are made there. A rail tag's top is its outline's vertical centre less half its
@@ -885,6 +891,15 @@ class Overlays {
         return;
       }
       if (p.protocol === "vad") return;
+      if (p.protocol === "video" && typeof p.locked === "boolean") {
+        // A lock report: the tag's snippet and the video view's, never a ribbon.
+        if (typeof p.summary === "string") {
+          this.snippets.set(job.id, p.summary.slice(0, SNIPPET_CHARS));
+          this.refreshTag(this.outlines.get(job.id));
+        }
+        this.onVideoLock?.(job.id, p);
+        return;
+      }
       if (p.protocol === "signal" && typeof p.center_hz === "number") {
         const key = `${job.id}:${Math.round(p.center_hz)}`;
         if (p.state === "gone") this.unmark(key);
@@ -1267,7 +1282,7 @@ class Overlays {
       el.dataset.key = key;
       o = { el, labelEl: null, tag: null, parts: null, lo, hi, job: null, handles: null };
       if (job) {
-        this.tag(o, key);
+        this.tag(o, key, job);
       } else {
         o.labelEl = document.createElement("span");
         o.labelEl.className = "outline-label";
@@ -1362,7 +1377,7 @@ class Overlays {
 
   // The tag of a job's outline `o`: kind, short id, [squelch dot], channel, centre, [snippet];
   // in the rail when there is one, else in the outline.
-  tag(o, key) {
+  tag(o, key, job = null) {
     const el = document.createElement("div");
     el.className = "job-tag";
     el.dataset.job = key;
@@ -1378,11 +1393,26 @@ class Overlays {
       centre: span("centre"),
       dot: null,
       snippet: null,
+      thumb: null,
     };
     el.append(o.parts.kind, " ", o.parts.short, " ", o.parts.channel, " ", o.parts.centre, " ");
+    if (job && job.kind === "video_decode") {
+      const c = document.createElement("canvas");
+      c.className = "video-thumb";
+      c.width = 64;
+      c.height = 48;
+      c.dataset.job = key;
+      c.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        this.onThumbClick?.(key);
+      });
+      el.append(c);
+      o.parts.thumb = c;
+    }
     el.dataset.colour = o.el.dataset.colour = String(channelColour(key));
     (this.rail ?? o.el).append(el);
     o.tag = el;
+    if (o.parts.thumb) this.onTagMedia?.(key, o.parts.thumb, true);
     // Narrow: a tap expands the thin segment into its label for RAIL_EXPAND_MS. It only adds a
     // class, so the long press (listenPress) on the same tag is untouched.
     el.addEventListener("pointerdown", () => {
@@ -1406,6 +1436,7 @@ class Overlays {
 
   untag(o, key) {
     if (!o.tag) return;
+    if (o.parts && o.parts.thumb) this.onTagMedia?.(key, null, false);
     this.snippets.delete(key);
     if (this.hotJob === key) this.hotJob = null;
     clearTimeout(o.expandTimer);
@@ -1894,7 +1925,7 @@ class Overlays {
     this.ro.disconnect();
     this.closeFeed();
     for (const id of [...this.positioned.keys()]) this.unwatchPositioned(id);
-    for (const o of this.outlines.values()) if (o.tag) o.tag.remove(); // the rail's
+    for (const [key, o] of this.outlines) if (o.tag) this.untag(o, key); // the rail's
     this.layer.remove();
   }
 }

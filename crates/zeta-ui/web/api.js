@@ -43,8 +43,9 @@
 //         callers re-resolve by provenance with `streams()`. `onOpen()` runs on every open: the
 //         node subscribes before it answers the upgrade, so what is published after it arrives.
 //     api.streamBinary(id, onFrame, {credits = 256, topup = 128, onText, onClose,
-//                      reconnect = true, onReconnect}) -> {close}
-//         Binary websocket /stream/{id}?format=binary. Grants `credits` on open with
+//                      reconnect = true, onReconnect, video}) -> {close}
+//         Binary websocket /stream/{id}?format=binary (`&video=<video>` when `video` names a
+//         picture profile: smooth, sharp or thumb, for a video stream). Grants `credits` on open with
 //         {"type":"credit","packets":N} and `topup` more each time `topup` binary messages
 //         have been consumed, as zeta-client does. onFrame(ArrayBuffer) per binary message;
 //         text messages (lagged, closed) go to onText(msg).
@@ -277,12 +278,12 @@ export class Api {
   }
 
   streamBinary(id, onFrame, opts = {}) {
-    const { credits = 256, topup = 128, onText, ...rest } = opts;
+    const { credits = 256, topup = 128, onText, video = null, ...rest } = opts;
     let sinceGrant = 0;
     const grant = (ws, n) => ws.send(JSON.stringify({ type: "credit", packets: n }));
     return this.#resilient(
       id,
-      "?format=binary",
+      video ? `?format=binary&video=${encodeURIComponent(video)}` : "?format=binary",
       true,
       {
         open(ws) {
