@@ -131,7 +131,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (10 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (12 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -223,7 +223,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 3, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (10 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (12 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -248,7 +248,7 @@ BRIGHT_AT_RIGHT_JS = """() => {
 def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
-    for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet"):
+    for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -543,7 +543,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (10 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (12 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -7561,6 +7561,156 @@ def scenario_allow_signatures_switch(page, url, secret):
     run_cmd(page, "allow signatures off")
     expect(page.locator("#transcript .line.note:not(.error)",
                         has_text="allow signatures: off")).to_have_count(1)
+
+
+# ---- video (plan 28.2) -----------------------------------------------------------------
+# The `video` and `video2` sources each loop one synthesised PAL recording (ui.rs
+# `video_fixture`, 8 MHz at 100 MHz); a video_decode needs a couple of seconds to lock, and the
+# page polls the jobs every 2 s, so every check below polls for its end state.
+
+VIDEO_CENTER_HZ = 100_000_000
+VIDEO_BAND_HZ = 7_680_000
+
+# Whether the centre of the thumbnail canvas `sel` has a bar (a pixel brighter than 20).
+THUMB_PIXEL_JS = """(sel) => {
+  const c = document.querySelector(sel);
+  if (!c || !c.width || !c.height) return false;
+  const d = c.getContext('2d').getImageData(c.width >> 1, c.height >> 1, 1, 1).data;
+  return Math.max(d[0], d[1], d[2]) > 20;
+}"""
+
+
+def start_video(url, secret, source):
+    return start_job(url, secret, "video_decode", source, VIDEO_CENTER_HZ, VIDEO_BAND_HZ)
+
+
+def stop_videos(url, secret):
+    for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]:
+        if j["kind"] == "video_decode":
+            stop_job(url, secret, j["id"])
+
+
+def open_video_pane(page, job):
+    """Click the tag's thumbnail (once it locks) and wait for the full view."""
+    thumb = page.locator(f'#waterfall .job-tag[data-job="{job}"] canvas.video-thumb')
+    page.evaluate("window.zetaTest.poll()")
+    expect(thumb).to_be_visible(timeout=10_000)
+    expect(thumb).not_to_have_class(re.compile("nolock"), timeout=10_000)
+    thumb.click()
+    expect(page.locator("html")).to_have_attribute("data-full", "video")
+
+
+def scenario_video_thumbnail_rides_the_tag(page, url, secret):
+    errors = page_errors(page)
+    select_source(page, url, secret, "video")
+    stop_videos(url, secret)
+    job = start_video(url, secret, "video")
+    try:
+        page.evaluate("window.zetaTest.poll()")
+        tag = page.locator(f'#waterfall .job-tag[data-job="{job}"]')
+        thumb = tag.locator("canvas.video-thumb")
+        expect(thumb).to_be_visible(timeout=10_000)
+        expect(thumb).not_to_have_class(re.compile("nolock"), timeout=10_000)
+        expect(tag.locator(".snippet")).to_contain_text("locked", timeout=10_000)
+        page.wait_for_function(THUMB_PIXEL_JS, arg=f'.job-tag[data-job="{job}"] canvas.video-thumb',
+                               timeout=10_000)
+        assert not errors, f"page errors {errors}"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_video_pane_fills_main_and_switches_profile(page, url, secret):
+    errors = page_errors(page)
+    select_source(page, url, secret, "video")
+    stop_videos(url, secret)
+    job = start_video(url, secret, "video")
+    try:
+        open_video_pane(page, job)
+        root = page.locator("html")
+        expect(root).to_have_attribute("data-strip", "video")
+        pane, main = page.locator("#pane").bounding_box(), page.locator("#main").bounding_box()
+        for k in ("x", "y", "width", "height"):
+            assert abs(pane[k] - main[k]) <= 1, f"#pane {pane} vs #main {main}"
+        assert page.evaluate("getComputedStyle(document.getElementById('waterfall')).visibility") \
+            == "hidden"
+        status = page.locator("#video .video-status .text")
+        expect(status).to_contain_text("locked", timeout=10_000)
+        expect(status).to_contain_text("smooth", timeout=10_000)
+        run_cmd(page, "view set video sharp")
+        expect(status).to_contain_text("sharp", timeout=10_000)
+        assert view_value(page, "video") == "video sharp"
+        assert not errors, f"page errors {errors}"
+    finally:
+        run_cmd(page, "view set video smooth")
+        stop_job(url, secret, job)
+
+
+def scenario_video_pane_returns_the_waterfall_when_left(page, url, secret):
+    errors = page_errors(page)
+    select_source(page, url, secret, "video")
+    stop_videos(url, secret)
+    job = start_video(url, secret, "video")
+    try:
+        open_video_pane(page, job)
+        pane_tab(page, "video").click()
+        expect(page.locator("html")).not_to_have_attribute("data-full", "video")
+        expect(page.locator("#waterfall")).to_be_visible()
+        assert page.evaluate("getComputedStyle(document.getElementById('waterfall')).visibility") \
+            != "hidden"
+        assert not errors, f"page errors {errors}"
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_video_feed_stopping_falls_back_to_the_next(page, url, secret):
+    select_source(page, url, secret, "video")
+    stop_videos(url, secret)
+    first = start_video(url, secret, "video")
+    second = start_video(url, secret, "video2")
+    try:
+        open_video_pane(page, first)
+        expect(page.locator("#video .video-strip canvas")).to_have_count(2, timeout=10_000)
+        main = page.locator("#video canvas.video-main")
+        expect(main).to_have_attribute("data-job", first)
+        stop_job(url, secret, first)
+        page.evaluate("window.zetaTest.poll()")
+        status = page.locator("#video .video-status .text")
+        expect(status).to_contain_text("video2 ·", timeout=8_000)
+        expect(main).to_have_attribute("data-job", second, timeout=8_000)
+        stop_job(url, secret, second)
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator("html")).not_to_have_attribute("data-strip", "video", timeout=8_000)
+        expect(pane_tab(page, "video")).to_be_hidden(timeout=8_000)
+    finally:
+        stop_videos(url, secret)
+
+
+def scenario_decode_video_greys_when_the_box_is_too_wide(page, url, secret):
+    # The waterfall shows at most the capture's own width, so a real box is never wider than
+    # the file's cap (asserted: its rate, 8 MHz); the page is told a 4 MHz cap instead.
+    def route(r):
+        if '"source_list"' not in (r.request.post_data or ""):
+            return r.continue_()
+        resp = r.fetch()
+        data = resp.json()
+        for src in data.get("value") or []:
+            src.setdefault("capabilities", {})["max_bandwidth_hz"] = {"asserted": 4_000_000}
+        return r.fulfill(response=resp, body=json.dumps(data))
+
+    page.route("**/op", route)
+    select_source(page, url, secret, "video")
+    wait_span(page, MENU_SPAN_S)
+    item = page.locator('#ctx .ctx-item[data-action="video"]')
+    drag_menu(page, 0.02, 0.98)  # about 7.7 MHz
+    expect(item).to_have_attribute("aria-disabled", "true", timeout=10_000)
+    title = item.get_attribute("title")
+    assert title.startswith("insufficient bandwidth") and "(measured at open)" not in title, title
+    page.keyboard.press("Escape")
+    drag_menu(page, 0.40, 0.60)  # about 1.6 MHz
+    expect(item).not_to_have_attribute("aria-disabled", "true")
+    assert item.get_attribute("title") is None
+    page.keyboard.press("Escape")
+    page.unroute("**/op", route)
 
 
 def scenarios():

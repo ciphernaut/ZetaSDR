@@ -301,6 +301,28 @@ fn fsk_fixture(dir: &Path) -> PathBuf {
 /// about 310 s pinned to two CPUs (`taskset -c 0,1`, as on CI's runners). 450 s is about
 /// 1.45 times the pinned run, room for a few more scenarios before SHARD_STARTS or SHARDS
 /// needs a look.
+/// An analog PAL video recording, as gen_video writes it: 26 fields (13 whole frames, so the
+/// file loops without a seam) of the test card, FM at 1.5 MHz per volt, 8 MHz at 100 MHz,
+/// noise 25 dB under the carrier (about 33 MB in `dir`).
+fn video_fixture(dir: &Path) -> PathBuf {
+    use zeta_dsp::synth::{Impairments, SynthSpec, synthesise};
+    use zeta_dsp::video_fm::VideoStandard;
+    let spec = SynthSpec::Video {
+        standard: VideoStandard::Pal,
+        deviation_hz: 1.5e6,
+        subcarrier_hz: None,
+        rate_hz: 8_000_000,
+        fields: 26,
+        preemphasis: true,
+    };
+    let imp = Impairments {
+        snr_db: Some(25.0),
+        ..Impairments::default()
+    };
+    let iq = synthesise(&spec, &imp, 8_000_000, 100_000_000);
+    zeta_dsp::fixtures::write_fixture(dir, "video", &iq, 8_000_000, 100_000_000)
+}
+
 const DEADLINE: Duration = Duration::from_secs(450);
 
 /// The shards run at once by default (ui.py's `SHARD_STARTS` says where each begins), each
@@ -923,6 +945,10 @@ impl Nodes {
         let quiet = format!("quiet={}", quiet_fixture(dir.path()).display());
         // Framed 2-FSK at 433.92 MHz: the Bits pane's stream, hypotheses and sync hits.
         let fsk = format!("fsk={}", fsk_fixture(dir.path()).display());
+        // Two sources carry the same analog video recording (the video scenarios).
+        let video_meta = video_fixture(dir.path());
+        let video = format!("video={}", video_meta.display());
+        let video2 = format!("video2={}", video_meta.display());
         let sock_dir = socket_dir();
         let sock = sock_dir.path().join("voiced.sock");
         let _voiced = fake_voiced(&sock);
@@ -970,6 +996,10 @@ impl Nodes {
                 &quiet,
                 "--source-file",
                 &fsk,
+                "--source-file",
+                &video,
+                "--source-file",
+                &video2,
             ],
             &["--stt-socket", sock],
             &[
