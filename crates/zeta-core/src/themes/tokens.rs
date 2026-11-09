@@ -33,6 +33,8 @@ pub const TOKENS: &[&str] = &[
     "--tint-outline",
     "--tint-speaking",
     "--label-bg",
+    "--default-mark",
+    "--default-mark-size",
     "--map-mark",
     "--map-sel",
     "--map-dim",

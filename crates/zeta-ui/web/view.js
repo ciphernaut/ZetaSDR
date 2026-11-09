@@ -350,12 +350,15 @@ function loadPrefs() {
   }
 }
 
+// True when the write took; false when storage refused it (the values then hold for this
+// page load, in the caller's held copy).
 function savePrefs(prefs) {
   try {
     if (Object.keys(prefs).length) localStorage.setItem(RADIO_PREFS_KEY, JSON.stringify(prefs));
     else localStorage.removeItem(RADIO_PREFS_KEY);
+    return true;
   } catch {
-    /* storage unavailable: the values hold for this page load */
+    return false;
   }
 }
 
@@ -364,7 +367,10 @@ export function mountView() {
   const values = {};
   // The `local` keys as last set on this page, used while localStorage is unavailable.
   let heldPrefs = {};
-  const prefs = () => loadPrefs() ?? heldPrefs;
+  // Once a write has failed the held copy is the truth for the rest of the page load (a
+  // read that still works would give back the value from before).
+  let storageFailed = false;
+  const prefs = () => (storageFailed ? heldPrefs : (loadPrefs() ?? heldPrefs));
   for (const [k, v] of Object.entries(loadStored())) {
     const p = byKey.get(k);
     if (!p || p.local) continue;
@@ -386,7 +392,7 @@ export function mountView() {
       if (v === byKey.get(key).default_) delete next[key];
       else next[key] = v;
       heldPrefs = next;
-      savePrefs(next);
+      if (!savePrefs(next)) storageFailed = true;
     } else {
       if (v === byKey.get(key).default_) delete values[key];
       else values[key] = v;
@@ -394,6 +400,12 @@ export function mountView() {
     }
     fire(key);
   };
+  // Another tab of this browser changed the radio preferences: the local keys read anew, so
+  // tell the page (a null key is storage cleared).
+  window.addEventListener("storage", (e) => {
+    if (e.key !== null && e.key !== RADIO_PREFS_KEY) return;
+    for (const p of POLICIES) if (p.local) fire(p.key);
+  });
   const view = {
     get(key) {
       const p = byKey.get(key);
@@ -429,7 +441,7 @@ export function mountView() {
       for (const k of Object.keys(values)) delete values[k];
       saveStored(values);
       heldPrefs = {};
-      savePrefs(heldPrefs);
+      if (!savePrefs(heldPrefs)) storageFailed = true;
       for (const p of POLICIES) fire(p.key);
     },
     clear() {

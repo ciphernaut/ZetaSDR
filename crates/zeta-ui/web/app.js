@@ -37,6 +37,8 @@
 // source S (source_unpin)` option and offers `unpin S and retry` (`source_unpin`, then the
 // same op).
 //
+// The default radio (spec 4.9, paintDefault): the tab of the radio a request naming none runs
+// on carries class `default` and a `.default-mark` dot, and says so in its title.
 // Tabs: a pinned source's tab carries a `pin` tag after its range and the title `pin
 // <lo>–<hi> MHz; gain <db> dB` (`gain automatic`; no gain part without adjustable gain),
 // kept up to date by each `source_list` poll.
@@ -321,6 +323,7 @@ function select(id) {
   state.selected = id;
   store(SOURCE_KEY, id);
   syncMainTabs();
+  paintDefault();
   const src = state.sources.find((s) => s.id === id) || null;
   for (const fn of sourceListeners) fn(src);
 }
@@ -335,6 +338,25 @@ function syncMainTabs() {
     tab.setAttribute("aria-selected", String(isMap ? map : shownTab && !map));
     if (!isMap) tab.classList.toggle("kept", shownTab && map);
   }
+  paintDefault();
+}
+
+// The default radio's mark (spec 4.9): class `default` and a title suffix on the tab of the
+// radio the agent would take for a request that names none (defaultRadio), on the RF view and
+// the Map alike (the shown source's tab is the `kept` one there). decorateTab calls paintTab
+// too, since each poll rewrites the title.
+const DEFAULT_TITLE = "default radio for the agent";
+
+function paintTab(tab) {
+  if (tab.classList.contains("map-tab") || !state.view) return;
+  const on = tab.dataset.id === defaultRadio();
+  tab.classList.toggle("default", on);
+  const base = tab.dataset.baseTitle ?? tab.title;
+  tab.title = on ? `${base}; ${DEFAULT_TITLE} (policy ${state.view.get("radio_policy")})` : base;
+}
+
+function paintDefault() {
+  for (const tab of document.querySelectorAll("#tabs .src-tab")) paintTab(tab);
 }
 
 // The Map tab: not a source (source_list never lists it, syncTabs never touches it).
@@ -391,7 +413,9 @@ function decorateTab(tab, s) {
   else if (s.pin) title = pinTitle(s);
   else title = rangeText(s);
   const pairs = healthPairs(s);
-  tab.title = `${title}; ${pairs.map(([k, v]) => `${k} ${v}`).join(" ")}`;
+  tab.dataset.baseTitle = `${title}; ${pairs.map(([k, v]) => `${k} ${v}`).join(" ")}`;
+  tab.title = tab.dataset.baseTitle;
+  paintTab(tab);
   let health = tab.querySelector(".health");
   if (!health) {
     health = document.createElement("span");
@@ -436,6 +460,9 @@ function renderTabs(sources) {
       tab.className = "src-tab";
       tab.setAttribute("role", "tab");
       tab.dataset.id = s.id;
+      const mark = document.createElement("span");
+      mark.className = "default-mark";
+      mark.setAttribute("aria-hidden", "true");
       const name = document.createElement("span");
       name.className = "name";
       name.textContent = s.id;
@@ -445,7 +472,7 @@ function renderTabs(sources) {
       const centre = document.createElement("span");
       centre.className = "centre";
       centre.textContent = centreText(s);
-      tab.append(name, range, centre);
+      tab.append(mark, name, range, centre);
       decorateTab(tab, s);
       tab.onclick = () => {
         select(s.id);
@@ -1067,6 +1094,7 @@ function start(api) {
     if (key === "pane") applyPanes();
     if (key === "dock") applyDock();
     if (key === "map_tiles") applyMapTiles();
+    if (key === "radio_policy") paintDefault();
   });
   state.ov.setSource(state.selected);
   state.menu = mountMenu(state.wf, {

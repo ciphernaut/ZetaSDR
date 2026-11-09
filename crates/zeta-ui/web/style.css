@@ -31,6 +31,8 @@
   --tint-outline: rgba(255, 255, 255, 0.03);  /* a job outline's fill */
   --tint-speaking: color-mix(in srgb, var(--ok) 8%, transparent);
   --label-bg: rgba(0, 0, 0, 0.65);            /* map label ground */
+  --default-mark: var(--accent);              /* the default radio's dot on its tab */
+  --default-mark-size: 6px;
   --map-mark: #ff7a1a;                        /* map position and track */
   --map-sel: #2aa1ff;                         /* map selection and home */
   --map-dim: #666;                            /* map popup age */
@@ -149,6 +151,16 @@ input:focus { border-color: var(--accent); }
 .src-tab .centre { display: none; }
 .src-tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
 .src-tab[aria-selected="true"] .name { color: var(--accent); }
+.src-tab .default-mark { display: none; }
+.src-tab.default .default-mark {
+  display: inline-block;
+  flex: none;
+  width: var(--default-mark-size);
+  height: var(--default-mark-size);
+  border-radius: 50%;
+  background: var(--default-mark);
+  margin-right: -4px;
+}
 .src-tab.fault .name { color: var(--error); }
 /* The Map tab (app.js mapTab): after the source tabs; the shown source's tab keeps its colour
    (`kept`) while the map is shown, so the page shows which source it returns to. */

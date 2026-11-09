@@ -1665,6 +1665,7 @@ THEME_HOOKS = [
     ".outline", ".graph-node.selected", ".job-tag.hot", ".job-tag.speaking",
     ".job-tag .dot.closed", "html[data-theme]", "html[data-rail]", "html[data-footprint]",
     ".map-tab", "html[data-main]", "html[data-dock]", "section.pane.dock",
+    ".src-tab.default", ".src-tab .default-mark",
     "html[data-map-tiles]", "#map .map-tile-note",
 ]
 
@@ -4620,6 +4621,16 @@ Storage.prototype.setItem = function () { throw new Error('storage unavailable')
 """
 
 
+# Only the radio prefs' writes throw (reads work): a held value must not be re-read away.
+THROWING_SET_JS = """
+const realSet = Storage.prototype.setItem;
+Storage.prototype.setItem = function (k, v) {
+  if (k === 'zeta.radio_prefs') throw new Error('storage full');
+  return realSet.call(this, k, v);
+};
+"""
+
+
 def scenario_radio_default_mark_and_policy(page, url, secret):
     url = llm_url()
     select_source(page, url, secret, "cb")
@@ -4627,11 +4638,39 @@ def scenario_radio_default_mark_and_policy(page, url, secret):
     others = []
     try:
         asks = capture_asks(page)
+        # The default radio's mark (spec 4.9): the shown radio's tab under `focus`.
+        dflt = page.locator(".src-tab.default")
+        expect(dflt).to_have_count(1)
+        expect(dflt).to_have_attribute("data-id", "cb")
+        expect(dflt).to_have_attribute(
+            "title", re.compile(r"default radio for the agent \(policy focus\)"))
+        expect(page.locator(".src-tab.default .default-mark")).to_be_visible()
+        expect(page.locator('.src-tab[data-id="tone"] .default-mark')).to_be_hidden()
+        # Another tab selected: the mark moves with it.
+        page.click('.src-tab[data-id="tone"]')
+        expect(page.locator('.src-tab[data-id="tone"]')).to_have_class(re.compile(r"\bdefault\b"))
+        expect(dflt).to_have_count(1)
+        page.click('.src-tab[data-id="cb"]')
+        expect(dflt).to_have_attribute("data-id", "cb")
+        # `free-first` and `ask` have no default radio; `focus-fallback` has the shown one.
+        for pol, n in (("free-first", 0), ("ask", 0), ("focus-fallback", 1)):
+            run_cmd(page, f"view set radio_policy {pol}")
+            expect(view_line(page, f"radio_policy = {pol}")).to_be_visible()
+            expect(dflt).to_have_count(n)
+        expect(dflt).to_have_attribute(
+            "title", re.compile(r"default radio for the agent \(policy focus-fallback\)"))
+        run_cmd(page, "view set radio_policy focus")
+        expect(view_line(page, "radio_policy = focus")).to_be_visible()
+        expect(dflt).to_have_attribute(
+            "title", re.compile(r"default radio for the agent \(policy focus\)"))
         # The Map tab keeps `cb` as the focus; the default `focus` refuses another radio,
         # as the call's result in its turn, with no unlock button and nothing started.
         page.locator("#tabs .src-tab.map-tab").click()
         page.wait_for_function("() => document.documentElement.dataset.main === 'map'",
                                timeout=5_000)
+        kept = page.locator('.src-tab[data-id="cb"]')
+        expect(kept).to_have_class(re.compile(r"\bkept\b"))
+        expect(kept).to_have_class(re.compile(r"\bdefault\b"))
         run_cmd(page, "radio fallback probe")
         answer = page.locator("#transcript .line.assistant", has_text="Started it on tone.")
         expect(answer).to_have_count(1, timeout=10_000)
@@ -4639,7 +4678,9 @@ def scenario_radio_default_mark_and_policy(page, url, secret):
         assert asks[0]["context"] == {"focus": "cb", "main": "map", "radio_policy": "focus",
                                       "radio_prefer": []}, asks[0]
         turn = page.locator("#transcript details.turn", has_text="→ job_start").last
-        expect(turn).to_contain_text("policy")
+        expect(turn).to_contain_text("radio policy focus")
+        # A refused run is not a run: no "ran on" note.
+        expect(page.locator("#transcript .line.note", has_text="ran on tone")).to_have_count(0)
         expect(page.locator("#transcript button", has_text="allow")).to_have_count(0)
         for _ in range(5):
             assert not tone_measures(), "the focus policy started nothing on tone"
@@ -4703,6 +4744,14 @@ def scenario_radio_default_mark_and_policy(page, url, secret):
             "aria-selected", "true")
         assert view_value(second, "radio_policy") == "radio_policy focus-fallback"
         assert view_value(second, "radio_prefer") == "radio_prefer tone,cb"
+        # The first page hears the storage event: its default mark goes with the policy.
+        expect(dflt).to_have_count(1)
+        run_cmd(second, "view set radio_policy free-first")
+        expect(view_line(second, "radio_policy = free-first")).to_be_visible()
+        expect(dflt).to_have_count(0, timeout=5_000)
+        run_cmd(second, "view set radio_policy focus-fallback")
+        expect(view_line(second, "radio_policy = focus-fallback")).to_be_visible()
+        expect(dflt).to_have_count(1, timeout=5_000)
         asks2 = capture_asks(second)
         run_cmd(second, "think")
         expect(second.locator("#transcript .line.assistant", has_text="one source")
@@ -4734,6 +4783,16 @@ def scenario_radio_default_mark_and_policy(page, url, secret):
         run_cmd(third, "view set radio_policy ask")
         expect(view_line(third, "radio_policy = ask")).to_be_visible()
         assert view_value(third, "radio_policy") == "radio_policy ask"
+        # Only a write that throws (reads work): the value still holds for the page load.
+        fourth = page.context.new_page()
+        others.append(fourth)
+        fourth.add_init_script(THROWING_SET_JS)
+        fourth.set_viewport_size(WIDE)
+        login(fourth, url, secret)
+        expect(fourth.locator('.src-tab[data-id="cb"]')).to_be_visible()
+        run_cmd(fourth, "view set radio_policy ask")
+        expect(view_line(fourth, "radio_policy = ask")).to_be_visible()
+        assert view_value(fourth, "radio_policy") == "radio_policy ask"
     finally:
         for p in others:
             p.close()
