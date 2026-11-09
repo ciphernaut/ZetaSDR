@@ -232,6 +232,7 @@ fn op_error_name_matches_the_serialised_tag() {
             value: 1,
             min: 0,
             max: 0,
+            why: None,
             suggested: None,
         },
         OpError::Conflict {

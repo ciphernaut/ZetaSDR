@@ -408,9 +408,17 @@ pub struct SoapyWorkerArgs {
     /// The source id the device serves as
     #[arg(long)]
     pub id: String,
-    /// SoapySDR device arguments, zeta's own gain= and ppm= included
+    /// SoapySDR device arguments, zeta's own gain=, ppm= and max_rate_hz= included
     #[arg(long)]
     pub args: String,
+    /// The rate cap an earlier open measured, reported again without probing the
+    /// device's rates
+    #[arg(long, value_name = "HZ")]
+    pub rate_cap_hz: Option<u64>,
+    /// The inherited descriptor of the node's shared-memory ring; blocks go through
+    /// it rather than the stdout pipe
+    #[arg(long, value_name = "FD")]
+    pub ring_fd: Option<i32>,
 }
 
 #[derive(Debug, Subcommand)]

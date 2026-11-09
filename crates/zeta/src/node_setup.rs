@@ -227,7 +227,9 @@ const NEVER_SEEN: &str = "never seen on this host; plug it in once";
 /// A device absent at startup, or whose worker crashes opening it, attaches faulted
 /// (and is polled for, or respawned with backoff) when the source
 /// record in `state_dir` holds the capabilities an earlier open cached; never seen, it
-/// is refused. `in_process` (`--soapy-in-process`) opens the driver here instead, the
+/// is refused. A rate cap those capabilities hold as measured is passed to the worker
+/// ([`worker_args`](zeta_source_worker::port::worker_args)), which then skips its rate
+/// probe. `in_process` (`--soapy-in-process`) opens the driver here instead, the
 /// path before workers existed, for diagnosis. The worker port is also returned on its
 /// own, to be closed before the process exits.
 #[cfg(soapy)]
@@ -237,7 +239,8 @@ async fn open_soapy(
     in_process: bool,
     state_dir: &Path,
 ) -> Result<(Arc<dyn Port>, Option<Arc<WorkerPort>>), String> {
-    use zeta_source_worker::port::{Timings, WorkerConfig};
+    use zeta_source_worker::port::{Timings, WorkerConfig, worker_args};
+    use zeta_source_worker::ring::DEFAULT_RING_BYTES;
     if in_process {
         return zeta_source_soapy_driver::open(SourceId(id.to_owned()), args)
             .map(|s| (Arc::new(s) as Arc<dyn Port>, None))
@@ -251,10 +254,9 @@ async fn open_soapy(
     let cfg = WorkerConfig {
         id: source,
         program,
-        args: ["soapy-worker", "--id", id, "--args", args]
-            .map(String::from)
-            .to_vec(),
+        args: worker_args(id, args, cached.as_ref()),
         timings: Timings::default(),
+        ring_bytes: DEFAULT_RING_BYTES,
     };
     match WorkerPort::open(cfg, cached).await {
         // A hello, or a device seen before that was not found or whose worker crashed

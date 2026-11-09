@@ -37,7 +37,8 @@ impl Driver {
 /// is open it is applied as `source_set_gain` applies a gain
 /// ([`SoapySource::set_gain_now`]: automatic gain off, the overall receive gain
 /// set to it, a value outside the device's range refused). A `ppm=N` key is
-/// zeta's too: [`SoapySource::with_ppm`].
+/// zeta's too: [`SoapySource::with_ppm`]. So is `max_rate_hz=N`, removed here and
+/// read by the worker (the rate cap it reports).
 pub fn open(id: SourceId, args: &str) -> Result<SoapySource, PortError> {
     let (args, zeta) = zeta_source_soapy::split_zeta_args(args).map_err(PortError::Io)?;
     let d = Driver::new(&args).map_err(PortError::Io)?;

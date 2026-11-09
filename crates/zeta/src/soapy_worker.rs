@@ -1,5 +1,12 @@
-//! `zeta soapy-worker --id ID --args ARGS`: one SoapySDR device served over stdin and
-//! stdout to the node that spawned it.
+//! `zeta soapy-worker --id ID --args ARGS [--rate-cap-hz N] [--ring-fd N]`: one SoapySDR device
+//! served over stdin and stdout to the node that spawned it.
+//!
+//! Once the device opens, the worker sets its rate cap (`max_bandwidth_hz`) before
+//! serving: `max_rate_hz=N` in the args asserts it; `--rate-cap-hz N` (a cap an earlier
+//! open measured, passed back by the node) reports it as measured; otherwise the device's
+//! rates are probed from the top ([`zeta_source_soapy::probe`]) and the first that
+//! streams cleanly is the measured cap. A probe that finds no rate clean measures
+//! nothing: the device's own asserted cap stays, and the respawn probes again.
 //!
 //! A node attaches every `--source-soapy` device through this child (see
 //! `node_setup::open_soapy`), so a driver that crashes, hangs or leaks takes down a
@@ -54,12 +61,15 @@ mod imp {
 #[cfg(soapy)]
 mod imp {
     use std::fs::File;
-    use std::os::fd::FromRawFd;
+    use std::os::fd::{FromRawFd, OwnedFd};
     use std::process::ExitCode;
     use std::sync::Arc;
 
     use zeta_core::port::Port;
-    use zeta_core::types::SourceId;
+    use zeta_core::types::{Claim, Hz, SourceId};
+    use zeta_source_soapy::SoapySource;
+    use zeta_source_soapy::probe::probe_rate;
+    use zeta_source_worker::ring::Ring;
     use zeta_source_worker::serve::{
         EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, requests_until_signal, serve,
     };
@@ -89,9 +99,14 @@ mod imp {
         };
         // Enumerate first, on the driver's keys alone: an absent device is exit 3, which
         // the node polls on, not an open failure.
-        let found = match zeta_source_soapy::split_zeta_args(&args.args)
-            .and_then(|(rest, _)| zeta_source_soapy_driver::find(&rest))
-        {
+        let (driver_args, own) = match zeta_source_soapy::split_zeta_args(&args.args) {
+            Ok(split) => split,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(EXIT_OPEN_FAILED);
+            }
+        };
+        let found = match zeta_source_soapy_driver::find(&driver_args) {
             Ok(found) => found,
             Err(e) => {
                 eprintln!("{e}");
@@ -106,15 +121,83 @@ mod imp {
             .get("driver")
             .cloned()
             .unwrap_or_else(|| "soapy".into());
-        let port = match zeta_source_soapy_driver::open(SourceId(args.id.clone()), &args.args) {
-            Ok(src) => Arc::new(src) as Arc<dyn Port>,
+        let mut src = match zeta_source_soapy_driver::open(SourceId(args.id.clone()), &args.args) {
+            Ok(src) => src,
             Err(e) => {
                 // The last stderr line is the reason the node reports.
                 eprintln!("{e}");
                 return ExitCode::from(EXIT_OPEN_FAILED);
             }
         };
-        serve(port, &driver, requests, frames).await
+        set_rate_cap(&mut src, &args.id, own.max_rate_hz, args.rate_cap_hz).await;
+        let port = Arc::new(src) as Arc<dyn Port>;
+        // After the device: a ring that will not open costs the speed, not the device.
+        let ring = args.ring_fd.and_then(open_ring);
+        serve(port, &driver, requests, frames, ring).await
+    }
+
+    /// Set the source's rate cap before it is served: `asserted` (`max_rate_hz=`) as
+    /// asserted; else `cached` (`--rate-cap-hz`) as measured; else the cap the rate
+    /// probe measures at the centre of the tune range, logged in one stderr line. Only
+    /// a clean rate is a measurement: a probe that found none leaves the device's own
+    /// asserted cap, and its line names the slowest rate that streamed as the
+    /// `max_rate_hz=` to pin (a measured cap would be cached by the node and replayed
+    /// on every start, so a bad probe must not become one). A probe that cannot tune
+    /// any rate, or that lost the device, leaves the asserted cap too, with a stderr
+    /// line saying why: `serve` then reports a lost device's fault and exits, and the
+    /// respawn probes again.
+    async fn set_rate_cap(
+        src: &mut SoapySource,
+        id: &str,
+        asserted: Option<u64>,
+        cached: Option<u64>,
+    ) {
+        let claim = match (asserted, cached) {
+            (Some(hz), _) => Claim::Asserted(Hz(hz)),
+            (None, Some(hz)) => Claim::Measured(Hz(hz)),
+            (None, None) => {
+                let caps = src.capabilities();
+                let center = (caps.tune_min_hz.value().0 + caps.tune_max_hz.value().0) / 2;
+                match probe_rate(src, center).await {
+                    Ok(p) if p.clean => {
+                        let (cap, tried) = (p.cap_hz, p.tried);
+                        eprintln!(
+                            "zeta-soapy-worker[{id}]: rate cap {cap} Hz measured ({tried} rungs tried)"
+                        );
+                        Claim::Measured(Hz(cap))
+                    }
+                    Ok(p) => {
+                        // `cap_hz` is the slowest rate that streamed when none was
+                        // clean.
+                        let (lowest, tried) = (p.cap_hz, p.tried);
+                        eprintln!(
+                            "zeta-soapy-worker[{id}]: rate cap not measured: no rung clean ({tried} rungs tried, lowest {lowest} Hz); set max_rate_hz={lowest} to pin one"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("zeta-soapy-worker[{id}]: {e}; keeping the asserted cap");
+                        return;
+                    }
+                }
+            }
+        };
+        src.set_max_bandwidth(claim);
+    }
+
+    /// The node's ring, inherited on `fd`; a ring that will not open is one stderr line,
+    /// and the worker serves on the pipe.
+    fn open_ring(fd: i32) -> Option<Ring> {
+        // SAFETY: the node put the ring on `fd` for this process (`--ring-fd`), and
+        // nothing else here owns that descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        match Ring::open(owned) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("zeta-soapy-worker: ring fd {fd}: {e}; serving on the pipe");
+                None
+            }
+        }
     }
 
     /// Ask the kernel to send SIGTERM when the parent goes, so a node killed with

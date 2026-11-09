@@ -314,6 +314,7 @@ export function errorText(e) {
     parts.push(`value=${e.value}`);
   }
   if (e.suggested !== undefined && e.suggested !== null) parts.push(`suggested=${e.suggested}`);
+  if (e.why) parts.push(e.why);
   if (e.message) parts.push(e.message);
   if (e.detail !== undefined) parts.push(typeof e.detail === "string" ? e.detail : JSON.stringify(e.detail));
   return parts.join(" ");

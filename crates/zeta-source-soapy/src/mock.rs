@@ -1,8 +1,14 @@
 //! Scriptable in-memory device for tests (feature `test-mock`).
+//!
+//! Reads follow a script ([`MockDevice::with_reads`], [`MockDevice::push_reads`]);
+//! an empty script reads as timeouts, or with [`MockDevice::with_paced_reads`]
+//! as a real-time stream at the rate set, which [`MockDevice::pace_at`] can make
+//! short or overflowing at a given rate (for the rate probe).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use num_complex::Complex;
 
@@ -56,7 +62,10 @@ pub struct MockDevice {
     /// Control calls in progress, and how often one started while another ran.
     in_flight: AtomicUsize,
     overlaps: AtomicUsize,
-    rate: Mutex<f64>,
+    rate: Arc<Mutex<f64>>,
+    /// With paced reads: `(rate, delivered, overflow_every)` per rate set by
+    /// [`MockDevice::pace_at`].
+    paced: Option<Arc<Vec<Pace>>>,
     fails: Arc<Mutex<Vec<(String, String)>>>,
     delays: Mutex<Vec<(String, u64)>>,
     /// `(floor, ceiling)`: the reported rate range's maximum follows the last
@@ -99,7 +108,8 @@ impl MockDevice {
             threads: Mutex::default(),
             in_flight: AtomicUsize::new(0),
             overlaps: AtomicUsize::new(0),
-            rate: Mutex::new(0.0),
+            rate: Arc::new(Mutex::new(0.0)),
+            paced: None,
             fails: Arc::default(),
             delays: Mutex::default(),
             follow: None,
@@ -117,6 +127,74 @@ impl MockDevice {
     /// true. The gain range is always 0 to 76 dB.
     pub fn with_gain_mode(mut self, available: bool) -> Self {
         self.gain_mode_available = available;
+        self
+    }
+
+    /// Once the read script is empty, a read is not a timeout but blocks until
+    /// its buffer's samples are due at the rate set, then returns them (the
+    /// buffer left as it was), so the stream delivers in real time. The pace
+    /// restarts with each stream and each rate change. See
+    /// [`MockDevice::pace_at`].
+    pub fn with_paced_reads(mut self) -> Self {
+        self.paced.get_or_insert_with(Arc::default);
+        self
+    }
+
+    /// With paced reads, while the rate set is `rate_hz`: a read returns
+    /// `delivered` of its samples (a device that falls short of its rate), and
+    /// every `overflow_every`-th read overflows instead (0: none).
+    pub fn pace_at(mut self, rate_hz: f64, delivered: f64, overflow_every: u32) -> Self {
+        let paces = self.paced.get_or_insert_with(Arc::default);
+        Arc::make_mut(paces).push(Pace {
+            rate_hz,
+            delivered,
+            overflow_every,
+            overflow_reads: Vec::new(),
+            short_reads: Vec::new(),
+        });
+        self
+    }
+
+    /// With paced reads, while the rate set is `rate_hz`: the reads numbered
+    /// in `reads` (from 1, counted from when the pace last restarted) overflow
+    /// at once and the rest deliver in full, so a test places single overflows
+    /// in time (a read is a hundredth of a second of samples for rates above
+    /// 1.6 MHz). Such an overflow is an event between full reads: it costs no
+    /// samples, so the delivered rate stays whole and only the overflow count
+    /// says anything.
+    pub fn overflow_reads_at(mut self, rate_hz: f64, reads: &[u64]) -> Self {
+        let paces = self.paced.get_or_insert_with(Arc::default);
+        Arc::make_mut(paces).push(Pace {
+            rate_hz,
+            delivered: 1.0,
+            overflow_every: 0,
+            overflow_reads: reads.to_vec(),
+            short_reads: Vec::new(),
+        });
+        self
+    }
+
+    /// With paced reads, while the rate set is `rate_hz`: the reads numbered
+    /// in `reads` (as for [`MockDevice::overflow_reads_at`]) return only
+    /// `delivered` of their samples and the rest deliver in full, so a test
+    /// places a stretch of lost samples in time. The reads in `overflows`
+    /// overflow as for [`MockDevice::overflow_reads_at`], so a stumble can
+    /// both drop samples and overflow.
+    pub fn short_reads_at(
+        mut self,
+        rate_hz: f64,
+        reads: &[u64],
+        delivered: f64,
+        overflows: &[u64],
+    ) -> Self {
+        let paces = self.paced.get_or_insert_with(Arc::default);
+        Arc::make_mut(paces).push(Pace {
+            rate_hz,
+            delivered,
+            overflow_every: 0,
+            overflow_reads: overflows.to_vec(),
+            short_reads: reads.to_vec(),
+        });
         self
     }
 
@@ -330,6 +408,11 @@ impl SoapyDevice for MockDevice {
             fails: self.fails.clone(),
             gone: self.gone.clone(),
             next: 0,
+            paced: self.paced.clone().map(|paces| Paced {
+                rate: self.rate.clone(),
+                paces,
+                clock: None,
+            }),
         }))
     }
     fn gain_range(&self) -> Result<(f64, f64), String> {
@@ -375,12 +458,65 @@ fn take_fail(f: &Mutex<Vec<(String, String)>>, op: &str) -> Result<(), String> {
     }
 }
 
+/// How a paced stream behaves at one rate ([`MockDevice::pace_at`]).
+#[derive(Clone, Debug)]
+struct Pace {
+    rate_hz: f64,
+    delivered: f64,
+    overflow_every: u32,
+    overflow_reads: Vec<u64>,
+    /// When not empty, `delivered` applies to these reads only.
+    short_reads: Vec<u64>,
+}
+
+/// A stream's pacing: the device's rate, the per-rate behaviour, and
+/// `(rate, start, samples due, reads)` since the pace last restarted.
+struct Paced {
+    rate: Arc<Mutex<f64>>,
+    paces: Arc<Vec<Pace>>,
+    clock: Option<(f64, Instant, u64, u64)>,
+}
+
+impl Paced {
+    /// A read of `len` samples at the rate set: block until they are due, then
+    /// the samples it returns, or an overflow. `None` before any rate is set.
+    fn read(&mut self, len: usize) -> Option<Result<usize, ReadError>> {
+        let rate = *self.rate.lock().unwrap();
+        if rate <= 0.0 {
+            return None;
+        }
+        let pace = self.paces.iter().find(|p| (p.rate_hz - rate).abs() < 0.5);
+        let (delivered, every) = pace.map_or((1.0, 0), |p| (p.delivered, p.overflow_every));
+        let clock = match &mut self.clock {
+            Some(c) if c.0 == rate => c,
+            c => c.insert((rate, Instant::now(), 0, 0)),
+        };
+        clock.3 += 1;
+        if pace.is_some_and(|p| p.overflow_reads.contains(&clock.3)) {
+            return Some(Err(ReadError::Overflow));
+        }
+        clock.2 += len as u64;
+        let due = clock.1 + Duration::from_secs_f64(clock.2 as f64 / rate);
+        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        if every > 0 && clock.3.is_multiple_of(u64::from(every)) {
+            return Some(Err(ReadError::Overflow));
+        }
+        let short =
+            pace.is_some_and(|p| p.short_reads.is_empty() || p.short_reads.contains(&clock.3));
+        let delivered = if short { delivered } else { 1.0 };
+        Some(Ok((len as f64 * delivered).round() as usize))
+    }
+}
+
 struct MockRx {
     reads: Arc<Mutex<VecDeque<MockRead>>>,
     calls: Arc<Mutex<Vec<String>>>,
     fails: Arc<Mutex<Vec<(String, String)>>>,
     gone: Arc<Gone>,
     next: u64,
+    paced: Option<Paced>,
 }
 
 impl Drop for MockRx {
@@ -408,19 +544,23 @@ impl SoapyRx for MockRx {
         // As the driver: leak the stream, so its drop never runs.
         std::mem::forget(self);
     }
-    /// An empty script reads as `Timeout` forever. A `Timeout` step blocks for
+    /// An empty script reads as `Timeout` forever (paced samples with
+    /// [`MockDevice::with_paced_reads`]). A `Timeout` step blocks for
     /// `timeout_us`, as a real device does.
     fn read(&mut self, out: &mut [Complex<f32>], timeout_us: i64) -> Result<usize, ReadError> {
         if let Some(m) = self.gone.msg.lock().unwrap().clone() {
             self.gone.after.lock().unwrap().push("read".into());
             return Err(ReadError::Fatal(m));
         }
-        let step = self
-            .reads
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(MockRead::Timeout);
+        let step = self.reads.lock().unwrap().pop_front();
+        let step = match (step, &mut self.paced) {
+            (Some(step), _) => step,
+            (None, Some(p)) => match p.read(out.len()) {
+                Some(r) => return r,
+                None => MockRead::Timeout,
+            },
+            (None, None) => MockRead::Timeout,
+        };
         match step {
             MockRead::Slow(n, ms) => {
                 std::thread::sleep(std::time::Duration::from_millis(ms));

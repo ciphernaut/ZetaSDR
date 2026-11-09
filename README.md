@@ -103,7 +103,7 @@ RUSTFLAGS="--cfg soapy" cargo build --release -p zeta
 ```
 
 The device runs in a worker process the node supervises, so an unplugged cable or a driver crash
-faults the source and the node waits for it to come back. With no hardware at all, a KiwiSDR
+faults the source and the node waits for it to come back. The worker hands its samples to the node through a shared-memory ring, so control never queues behind IQ. At open it probes the device's rates and caps the source at the highest one it streams cleanly (`max_rate_hz=N` in the arguments sets a cap by hand). With no hardware at all, a KiwiSDR
 receiver gives 12 kHz of HF (0-30 MHz) over the network (put a receiver you may use in place of
 `kiwisdr.example`):
 
