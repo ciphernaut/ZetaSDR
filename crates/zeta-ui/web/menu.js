@@ -3,7 +3,8 @@
 // or asks the agent.
 //
 // Exports:
-//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command, muteFor, onOrigins})
+//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command, muteFor, onOrigins,
+//                  sets, sources})
 //       -> Menu   (`onOrigins(key, answer)`: What is this's classification `origins`, keyed
 //       `classify:<t_ns>`, and the Origins entry's band-form answer, keyed
 //       `band:<source>:<centre Hz>` and noted in the transcript as units.js originSummary
@@ -121,6 +122,21 @@
 //                                             (mountMenu's `plan()`); puts `plan start <plan>
 //                                             fm_demod transcribe` in the command line
 //                                             (`command(text)`) and focuses it
+//   set        Start set…                     shown only when `sets()` (mountMenu's: set_list's
+//                                             entries, read with the jobs) has a `ready` set;
+//                                             opens #ctx-set where the menu stood (plan 31
+//                                             spec 5.5): `select.set-pick` of the ready sets
+//                                             (the first chosen), then per role of the chosen
+//                                             set (in its members' order) a
+//                                             `select[data-role=<role>]` of every source of
+//                                             `sources()` (source_list's records) plus
+//                                             "pick" (value "", sent as null), the first
+//                                             role on the shown source, the rest "pick";
+//                                             Start (`button.start`) sends set_start {set,
+//                                             radios, members: null, replace: []} (its line
+//                                             counts started, existing, refused and warnings;
+//                                             each refusal and warning is noted), Cancel,
+//                                             Escape or a press outside close it
 //   iq_read    Save selection as SigMF        iq_read {selection}; the transcript shows the path
 //   ask        Send to agent                  /ask "Look at <c> Hz, <bw> Hz wide, from <start>
 //                                             to <end>: what is it?"
@@ -295,6 +311,7 @@ const ENTRIES = [
   ["ssb_lsb_transcribe", "Transcribe › SSB (LSB)"],
   ["measure", "Start background job › measure"],
   ["plan", "Start plan…"],
+  ["set", "Start set…"],
   ["scan", "Scan this span"],
   ["iq_read", "Save selection as SigMF"],
   ["ask", "Send to agent"],
@@ -469,9 +486,11 @@ export function clampSpan(startNs, endNs, newest) {
 class Menu {
   constructor(
     wf,
-    { applyOp, attachOp, ask, transcript, ov, plan = () => null, ringSeconds = () => null, command = () => {}, muteFor = () => null, onOrigins = () => {} },
+    { applyOp, attachOp, ask, transcript, ov, plan = () => null, ringSeconds = () => null, command = () => {}, muteFor = () => null, onOrigins = () => {}, sets = () => [], sources = () => [] },
   ) {
     this.wf = wf;
+    this.sets = sets;
+    this.sources = sources;
     this.onOrigins = onOrigins;
     this.muteFor = muteFor;
     this.applyOp = applyOp;
@@ -549,6 +568,40 @@ class Menu {
     this.outlineEl.append(this.outlineFooter);
     document.body.append(this.outlineEl);
 
+    // "Start set…"'s role → source picker (#ctx-set).
+    this.setEl = document.createElement("form");
+    this.setEl.id = "ctx-set";
+    this.setEl.setAttribute("role", "dialog");
+    this.setEl.setAttribute("aria-label", "Start set");
+    this.setEl.hidden = true;
+    const pickLabel = document.createElement("label");
+    pickLabel.textContent = "Set ";
+    this.setPick = document.createElement("select");
+    this.setPick.className = "set-pick";
+    pickLabel.append(this.setPick);
+    this.setRoles = document.createElement("div");
+    this.setRoles.className = "set-roles";
+    const buttons = document.createElement("div");
+    buttons.className = "set-buttons";
+    const start = document.createElement("button");
+    start.type = "submit";
+    start.className = "start";
+    start.textContent = "Start";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "cancel";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => this.closeSet());
+    buttons.append(start, cancel);
+    this.setEl.append(pickLabel, this.setRoles, buttons);
+    this.setPick.addEventListener("change", () => this.fillRoles());
+    this.setEl.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      this.startSet();
+    });
+    this.setSource = null; // the source shown when the picker opened (its first role's)
+    document.body.append(this.setEl);
+
     // The pointer position of the drag's end: pointerup reaches the document (capture) before
     // the waterfall's own handler calls onSelect.
     this.onPointerUp = (ev) => {
@@ -557,8 +610,14 @@ class Menu {
     this.onPointerDown = (ev) => {
       if (!this.el.hidden && !this.el.contains(ev.target)) this.close();
       if (!this.outlineEl.hidden && !this.outlineEl.contains(ev.target)) this.closeOutline();
+      if (!this.setEl.hidden && !this.setEl.contains(ev.target)) this.closeSet();
     };
     this.onKey = (ev) => {
+      if (!this.setEl.hidden && ev.key === "Escape") {
+        ev.preventDefault();
+        this.closeSet();
+        return;
+      }
       const outline = !this.outlineEl.hidden;
       const menu = outline ? this.outlineEl : this.el;
       if (menu.hidden) return;
@@ -615,6 +674,8 @@ class Menu {
     this.showFooter(this.current());
     // `Start plan…` only where the view's plan policy names a plan.
     this.el.querySelector('[data-action="plan"]').hidden = this.plan() === null;
+    // `Start set…` only when set_list has a ready set.
+    this.el.querySelector('[data-action="set"]').hidden = this.readySets().length === 0;
     this.fillSub(this.sel);
     this.el.hidden = false;
     // Keep it inside the viewport.
@@ -940,6 +1001,8 @@ class Menu {
     } else if (action === "plan") {
       const plan = this.plan();
       if (plan !== null) this.command(`plan start ${plan} fm_demod transcribe`);
+    } else if (action === "set") {
+      this.openSet(s.sourceId);
     } else if (action === "scan") {
       await this.scan(s);
     } else if (jobOf(action)) {
@@ -1081,11 +1144,100 @@ class Menu {
     });
   }
 
+  // set_list's ready sets (the page reads set_list with each job poll).
+  readySets() {
+    return (this.sets() || []).filter((s) => s && s.state === "ready");
+  }
+
+  // Opens #ctx-set where the menu stood: the ready sets, the first chosen, and its roles.
+  openSet(sourceId) {
+    const ready = this.readySets();
+    if (ready.length === 0) return;
+    this.setSource = sourceId;
+    this.setPick.replaceChildren(
+      ...ready.map((s) => {
+        const o = document.createElement("option");
+        o.value = s.id;
+        o.textContent = s.name;
+        o.title = s.notes || "";
+        return o;
+      }),
+    );
+    this.setPick.value = ready[0].id;
+    this.fillRoles();
+    this.setEl.hidden = false;
+    const w = this.setEl.offsetWidth;
+    const h = this.setEl.offsetHeight;
+    const x = parseFloat(this.el.style.left) || 0;
+    const y = parseFloat(this.el.style.top) || 0;
+    this.setEl.style.left = `${Math.max(0, Math.min(x, window.innerWidth - w))}px`;
+    this.setEl.style.top = `${Math.max(0, Math.min(y, window.innerHeight - h))}px`;
+    this.setPick.focus({ preventScroll: true });
+  }
+
+  // One row per role of the chosen set (in the order its members first use them), each a
+  // select of every attached source plus "pick" (null: the node picks a free one); the first
+  // role defaults to the source shown when the picker opened, the rest to "pick".
+  fillRoles() {
+    const set = this.readySets().find((s) => s.id === this.setPick.value);
+    if (!set) {
+      this.setRoles.replaceChildren();
+      return;
+    }
+    const roles = [];
+    for (const m of set.members || []) if (!roles.includes(m.radio)) roles.push(m.radio);
+    for (const r of Object.keys(set.radios || {})) if (!roles.includes(r)) roles.push(r);
+    const ids = (this.sources() || []).map((s) => s.id);
+    if (this.setSource && !ids.includes(this.setSource)) ids.unshift(this.setSource);
+    this.setRoles.replaceChildren(
+      ...roles.map((role, i) => {
+        const label = document.createElement("label");
+        label.className = "set-role";
+        label.title = set.radios?.[role]?.note || "";
+        label.append(`${role} `);
+        const sel = document.createElement("select");
+        sel.dataset.role = role;
+        const pick = document.createElement("option");
+        pick.value = "";
+        pick.textContent = "pick";
+        sel.append(pick);
+        for (const id of ids) {
+          const o = document.createElement("option");
+          o.value = id;
+          o.textContent = id;
+          sel.append(o);
+        }
+        sel.value = i === 0 && this.setSource ? this.setSource : "";
+        label.append(sel);
+        return label;
+      }),
+    );
+  }
+
+  // Start: set_start of the chosen set with each role's source (null for "pick"), every
+  // member, replacing nothing; its line (and any refusal) reaches the transcript through
+  // applyOp.
+  async startSet() {
+    const set = this.setPick.value;
+    const radios = {};
+    for (const sel of this.setRoles.querySelectorAll("select[data-role]")) {
+      radios[sel.dataset.role] = sel.value === "" ? null : sel.value;
+    }
+    this.closeSet();
+    if (!set) return;
+    await this.applyOp({ op: "set_start", set, radios, members: null, replace: [] });
+  }
+
+  closeSet() {
+    this.setEl.hidden = true;
+  }
+
   destroy() {
     document.removeEventListener("pointerup", this.onPointerUp, true);
     document.removeEventListener("pointerdown", this.onPointerDown, true);
     document.removeEventListener("keydown", this.onKey);
     this.el.remove();
     this.outlineEl.remove();
+    this.setEl.remove();
   }
 }

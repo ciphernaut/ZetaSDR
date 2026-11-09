@@ -493,7 +493,11 @@ function notApplied(e) {
 function noteRefusals(v) {
   if (!v) return;
   for (const r of v.refused || []) {
-    state.transcript.note(`ch${r.channel}: ${errorText(r.error)}`, true);
+    // A set_start's refusal names its member (and the channel of a plan member).
+    const what = r.member === undefined
+      ? `ch${r.channel}`
+      : `${r.member}${r.channel === null || r.channel === undefined ? "" : ` ch${r.channel}`}`;
+    state.transcript.note(`${what}: ${errorText(r.error)}`, true);
   }
   for (const w of v.warnings || []) state.transcript.note(w);
 }
@@ -512,7 +516,7 @@ async function applyOp(op, { errors = false } = {}) {
   try {
     result = await state.api.op(op);
     if (QUIET_OPS.has(op.op)) t.reply(op, result);
-    if (op.op === "plan_start") noteRefusals(result && result.value);
+    if (op.op === "plan_start" || op.op === "set_start") noteRefusals(result && result.value);
   } catch (e) {
     if (notApplied(e)) t.note(`${op.op}: ${e.message}`, true);
     else if (e.json && e.json.error === "conflict") await offerReplace(op, e.json);
@@ -1035,6 +1039,8 @@ function start(api) {
     ov: state.ov,
     ringSeconds: (id) => state.sources.find((x) => x.id === id)?.ring?.seconds ?? null,
     plan: () => resolvePlan(state.view.get("plan")),
+    sets: () => state.jobs?.sets() ?? [],
+    sources: () => state.sources,
     onOrigins: (key, answer) => state.map?.origin(key, answer),
     command: (text) => {
       const cmd = $("#cmd");
@@ -1055,6 +1061,7 @@ function start(api) {
   state.jobs = startJobs(api, $("#jobs"), state.transcript, {
     audioKind: (kind) => state.subjects?.rowOf(kind) ?? null,
     view: state.view,
+    shownSource: () => state.selected ?? null,
     countEl: $(".pane.jobs h2 .count"),
     onJobs: (jobs) => {
       state.lastJobs = jobs;

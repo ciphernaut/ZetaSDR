@@ -3673,6 +3673,86 @@ def scenario_decode_across_entry_starts_a_watch_with_modes(page, url, secret):
                    "no pocsag_decode left after the watch stopped")
 
 
+def set_running(url, secret, set_id):
+    """`set_id`'s running instance from `set_list` (null when it does not run)."""
+    sets = http_json(url, secret, "/op", {"op": "set_list"})["value"]
+    return next(s for s in sets if s["id"] == set_id)["running"]
+
+
+def scenario_set_menu_starts_a_set_and_groups_its_jobs(page, url, secret):
+    # Plan 31 spec 5.5, 7.3: "Start set…" opens a role → source picker and sends set_start;
+    # the set's jobs fold under one group titled by the set's name, the members on the shown
+    # source listed and the others counted; the group's Stop is set_stop after a confirm.
+    menu = open_menu_on_tone(page, url, secret)
+    entry = page.locator('#ctx .ctx-item[data-action="set"]')
+    expect(entry).to_have_text("Start set…")
+    entry.click()
+    expect(menu).to_be_hidden()
+    form = page.locator("#ctx-set")
+    expect(form).to_be_visible()
+    form.locator("select.set-pick").select_option("two_sources")
+    expect(form.locator('select[data-role="a"]')).to_have_value("tone")
+    expect(form.locator('select[data-role="b"]')).to_have_value("")
+    form.locator('select[data-role="b"]').select_option("cb")
+    try:
+        with page.expect_request(lambda r: r.method == "POST" and r.url.endswith("/op")
+                                 and (r.post_data or "").find('"set_start"') >= 0) as req:
+            form.locator("button.start").click()
+        body = json.loads(req.value.post_data)
+        assert body == {"op": "set_start", "set": "two_sources",
+                        "radios": {"a": "tone", "b": "cb"}, "members": None,
+                        "replace": []}, f"set_start {body}"
+        expect(form).to_be_hidden()
+
+        def running():
+            r = set_running(url, secret, "two_sources")
+            ms = (r or {}).get("members", [])
+            return r if len(ms) == 2 and all(m["state"] == "running" for m in ms) else None
+
+        inst = wait_until(running, 10.0, "two_sources running with 2 members")
+        assert inst["radios"] == {"a": "tone", "b": "cb"}, inst
+        job_of = {m["id"]: m["job"] for m in inst["members"]}
+        line = page.locator("#transcript .line.op", has_text="set_start")
+        expect(line.first).to_contain_text(
+            "ok (2 started, 0 existing, 0 refused, 0 warnings)")
+        page.evaluate("window.zetaTest.poll()")
+        group = page.locator('#jobs .job-group[data-plan="two_sources"][data-kind="set"]')
+        expect(group).to_have_count(1)
+        expect(group.locator("> summary .group-text")).to_have_text(
+            re.compile(r"Two sources \(UI tests\) · 1 on tone, \+1 on cb"))
+        expect(group.locator(f'.job[data-id="{job_of["m"]}"]')).to_have_count(1)
+        expect(group.locator(f'.job[data-id="{job_of["cb20"]}"]')).to_have_count(0)
+        expect(page.locator(f'#jobs .job[data-id="{job_of["cb20"]}"]')).to_have_count(0)
+        # On cb the same group lists the CB channel and counts the measure.
+        page.click('.src-tab[data-id="cb"]')
+        expect(page.locator('.src-tab[data-id="cb"]')).to_have_attribute("aria-selected", "true")
+        page.evaluate("window.zetaTest.poll()")
+        group = page.locator('#jobs .job-group[data-plan="two_sources"][data-kind="set"]')
+        expect(group.locator("> summary .group-text")).to_have_text(
+            re.compile(r"Two sources \(UI tests\) · 1 on cb, \+1 on tone"))
+        expect(group.locator(f'.job[data-id="{job_of["cb20"]}"]')).to_have_count(1)
+        expect(group.locator(f'.job[data-id="{job_of["m"]}"]')).to_have_count(0)
+        # The group's Stop asks first, then sends set_stop.
+        stop = group.locator("> summary button.stop")
+        expect(stop).to_have_text("Stop")
+        stop.click()
+        expect(stop).to_have_text("Stop set?")
+        assert set_running(url, secret, "two_sources") is not None, "stopped on one click"
+        stop.click()
+        wait_until(lambda: set_running(url, secret, "two_sources") is None, 10.0,
+                   "two_sources no longer running")
+        wait_until(lambda: not running_jobs(url, secret, "measure", "tone")
+                   and not running_jobs(url, secret, "fm_demod", "cb"), 10.0,
+                   "no measure on tone and no fm_demod on cb after set_stop")
+        expect(page.locator("#transcript .line.op", has_text="set_stop").first).to_contain_text(
+            "ok (2 stopped, 0 ended, 0 failed)")
+    finally:
+        try:
+            http_json(url, secret, "/op", {"op": "set_stop", "set": "two_sources"})
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+
+
 def scenario_adsb_entry_asks_for_2400_khz(page, url, secret):
     # ADS-B always asks for 2.4 MHz, whatever was selected; the 48 kHz tone cannot serve it,
     # so the node refuses with out_of_range naming bandwidth_hz and the transcript says so.
