@@ -486,7 +486,7 @@ async fn modes_list_and_show_carry_the_subject() {
 }
 
 /// The rows a sonde band must never try live where their signals are: FLEX on the
-/// catalogue's 151.837-153.363 MHz, AIS on its two channels, APRS on 2 m. Out of range
+/// catalogue's 151.837-153.363 MHz, AIS on its two channels, APRS around its centres. Out of range
 /// (on the sonde band) a row is not `in_range` and never fits.
 #[test]
 fn flex_ais_and_aprs_are_tried_only_where_they_live() {
@@ -518,6 +518,17 @@ fn flex_ais_and_aprs_are_tried_only_where_they_live() {
     // Out of the US 929-932 MHz band too (the row has one range: the catalogue's VHF one).
     assert_eq!(fit(931_000_000, "flex_decode"), (false, false));
     assert_eq!(fit(156_800_000, "ais_decode"), (false, false));
+    // APRS lives on its centres (144.390, 144.800 and the AU 145.175 MHz), not all of
+    // 2 m: an FM or M17 signal elsewhere on the band gets no centre credit from it.
+    for center in [146_500_000, 147_000_000, 144_200_000] {
+        assert_eq!(
+            fit(center, "aprs_decode"),
+            (false, false),
+            "aprs at {center} Hz"
+        );
+    }
+    let aprs = reg.get("aprs_decode").unwrap();
+    assert!(aprs.row.band.centers_hz.contains(&145_175_000));
 }
 
 #[test]

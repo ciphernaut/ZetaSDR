@@ -41,7 +41,7 @@ const NARROW_RATE_HZ: u32 = 48_000;
 const NARROW_TONE_HZ: u64 = 2_000;
 /// A radiosonde frequency in 400.05-406 MHz, where an operator's sonde watch runs.
 const SONDE_HZ: u64 = 403_025_000;
-/// The rows that live elsewhere (pagers above 151.8 MHz, AIS at 162 MHz, APRS on 2 m):
+/// The rows that live elsewhere (pagers above 151.8 MHz, AIS at 162 MHz, APRS at 144.39-145.175 MHz):
 /// identify never tries them on the sonde band.
 const NOT_ON_THE_SONDE_BAND: [&str; 3] = ["flex_decode", "ais_decode", "aprs_decode"];
 
@@ -1116,7 +1116,7 @@ async fn identify_reports_a_learned_signal_in_its_unknown_verdict() {
 
 /// An unproven sonde-like signal at 403 MHz (an operator's sonde watch's band): identify
 /// tries the sonde rows and the rows found anywhere, but never starts FLEX (pagers on
-/// 151.8-153.4 MHz), AIS (162 MHz) or APRS (2 m); each is skipped as out of its range.
+/// 151.8-153.4 MHz), AIS (162 MHz) or APRS (144.39-145.175 MHz); each is skipped as out of its range.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identify_on_the_sonde_band_never_tries_the_pager_ais_or_aprs_rows() {
     let _one = SERIAL.lock().await;

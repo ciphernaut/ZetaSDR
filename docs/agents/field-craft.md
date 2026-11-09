@@ -3,7 +3,7 @@ Measured facts first, then method. Verify against the node's `knowledge lookup` 
 ### Where to look
 
 - Radiosondes: 400-406 MHz. RS41 is GFSK at 4800 baud, about 10 kHz wide.
-- APRS: 144.800 MHz in AU and EU, 144.390 MHz in the US. AFSK at 1200 baud. Identify tries `aprs_decode` only on 2 m (144-148 MHz, its `band.range_hz`).
+- APRS: 145.175 MHz in AU, 144.800 MHz in EU, 144.390 MHz in the US. AFSK at 1200 baud. Identify tries `aprs_decode` only in 144.38375-145.18125 MHz (its `band.range_hz`: the centres ± half its 12.5 kHz channel), not on the rest of 2 m.
 - POCSAG: the preamble is 576 bits of alternating 1/0, then the 32-bit sync word 0x7CD215D8. Common rates are 512, 1200 and 2400 baud.
 - ADS-B: 1090 MHz, PPM at 1 Mbaud, 112-bit extended squitter.
 - AIS: 161.975 MHz (channel A, 87B) and 162.025 MHz (channel B, 88B), worldwide. GMSK at 9600 baud, 25 kHz channels; HDLC frames with a CRC-16.
