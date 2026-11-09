@@ -7655,12 +7655,14 @@ def scenario_video_pane_returns_the_waterfall_when_left(page, url, secret):
     try:
         open_video_pane(page, job)
         # Shown: the main picture's socket (the tag's is paused).
-        page.wait_for_function("() => window.zetaVideo.sockets >= 1", timeout=10_000)
+        page.wait_for_function("() => window.zetaVideo.sockets_main === 1", timeout=10_000)
         pane_tab(page, "video").click()
         expect(page.locator("html")).not_to_have_attribute("data-full", "video")
         expect(page.locator("#waterfall")).to_be_visible()
-        # Left: the full view's sockets close and the tag's thumbnail is the one socket left.
-        page.wait_for_function("() => window.zetaVideo.sockets === 1", timeout=10_000)
+        # Left: the main socket closes and the tag's thumbnail is the one socket left.
+        page.wait_for_function(
+            "() => window.zetaVideo.sockets_main === 0 && window.zetaVideo.sockets_thumb === 1",
+            timeout=10_000)
         assert page.evaluate("getComputedStyle(document.getElementById('waterfall')).visibility") \
             != "hidden"
         assert not errors, f"page errors {errors}"
@@ -7679,6 +7681,11 @@ def scenario_video_feed_stopping_falls_back_to_the_next(page, url, secret):
         expect(page.locator("#video .video-strip canvas")).to_have_count(2, timeout=10_000)
         main = page.locator("#video canvas.video-main")
         expect(main).to_have_attribute("data-job", first)
+        # Stopping before the main socket opens can still log one 404 (no operator is that quick).
+        # (the selected cell is drawn from the main socket; the other feed's cell has its own)
+        page.wait_for_function(
+            "() => window.zetaVideo.sockets_main === 1 && window.zetaVideo.sockets_thumb === 1",
+            timeout=10_000)
         stop_job(url, secret, first)
         page.evaluate("window.zetaTest.poll()")
         status = page.locator("#video .video-status .text")
@@ -7688,10 +7695,7 @@ def scenario_video_feed_stopping_falls_back_to_the_next(page, url, secret):
         page.evaluate("window.zetaTest.poll()")
         expect(page.locator("html")).not_to_have_attribute("data-strip", "video", timeout=8_000)
         expect(pane_tab(page, "video")).to_be_hidden(timeout=8_000)
-        # A stopped job's sockets reconnect to its vanished stream once (the page's resilient
-        # reconnect), and Chromium logs each 404 as a console error: those are expected here.
-        other = [e for e in errors if not ("/stream/" in e and "404" in e)]
-        assert not other, f"page errors {other}"
+        assert not errors, f"page errors {errors}"
     finally:
         stop_videos(url, secret)
 
