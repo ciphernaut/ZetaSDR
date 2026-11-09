@@ -58,20 +58,37 @@ fn assert_parity(standard: VideoStandard, fields: &[Field]) {
 struct Run {
     fields: Vec<Field>,
     locked_at: Option<usize>,
+    /// The end of the first block after which the decoder was not locked.
+    unlocked_at: Option<usize>,
+    /// The slowest block's `push`.
+    slowest: Duration,
 }
 
 fn feed(dec: &mut CompositeDecoder, x: &[f32], rate: u32, t0_ns: u64) -> Run {
     let block = (rate / 1000) as usize;
     let mut fields = Vec::new();
     let mut locked_at = None;
+    let mut unlocked_at = None;
+    let mut slowest = Duration::ZERO;
     for (i, c) in x.chunks(block).enumerate() {
         let t = t0_ns + (i * block) as u64 * 1_000_000_000 / u64::from(rate);
+        let started = Instant::now();
         fields.extend(dec.push(c, u64::from(rate), t));
-        if locked_at.is_none() && dec.lock().locked {
+        slowest = slowest.max(started.elapsed());
+        let locked = dec.lock().locked;
+        if locked_at.is_none() && locked {
             locked_at = Some(i * block + c.len());
         }
+        if unlocked_at.is_none() && !locked {
+            unlocked_at = Some(i * block + c.len());
+        }
     }
-    Run { fields, locked_at }
+    Run {
+        fields,
+        locked_at,
+        unlocked_at,
+        slowest,
+    }
 }
 
 fn decode(standard: StandardChoice, x: &[f32], rate: u32) -> (CompositeDecoder, Run) {
@@ -103,6 +120,7 @@ fn pal_card_locks_within_three_fields() {
         "locked at {at}"
     );
     assert_parity(VideoStandard::Pal, &run.fields);
+    eprintln!("pal: slowest 1 ms block {:?}", run.slowest);
     assert!(run.fields.len() >= 3, "{} fields", run.fields.len());
     for f in &run.fields {
         assert_eq!((f.width, f.height), (720, 288));
@@ -414,4 +432,78 @@ async fn the_stage_emits_a_lock_event_and_fields() {
     assert!(lock["snr_db"].is_i64());
     // The first event is the lock.
     assert_eq!(events[0]["locked"], true, "{events:?}");
+}
+
+/// The time of sample `n` at `rate`, ns.
+fn ns(n: usize, rate: u32) -> u64 {
+    n as u64 * 1_000_000_000 / u64::from(rate)
+}
+
+/// A decoder locked on 4 fields of the PAL card: it and the time the card ended.
+fn locked_on_pal() -> (CompositeDecoder, u64) {
+    let mut dec = CompositeDecoder::new(&params(StandardChoice::Pal));
+    let card = composite_test_card(VideoStandard::Pal, RATE, 4);
+    feed(&mut dec, &card, RATE, 0);
+    assert!(dec.lock().locked, "{:?}", dec.lock());
+    (dec, ns(card.len(), RATE))
+}
+
+#[test]
+fn flat_input_after_lock_unlocks() {
+    let (mut dec, t0) = locked_on_pal();
+    let flat = vec![0.2f32; 3 * RATE as usize];
+    let run = feed(&mut dec, &flat, RATE, t0);
+    let fl = field_len(VideoStandard::Pal, RATE);
+    let at = run.unlocked_at.expect("unlocked");
+    eprintln!("flat: unlocked after {:.2} fields", at as f64 / fl as f64);
+    assert!(at <= 3 * fl, "unlocked at {at}");
+    assert!(!dec.lock().locked, "{:?}", dec.lock());
+    assert!(
+        run.fields.iter().all(|f| f.start_ns < t0),
+        "a field from the flat input"
+    );
+}
+
+#[test]
+fn a_dc_step_after_lock_relocks() {
+    for step in [0.4f32, -0.4] {
+        let (mut dec, t0) = locked_on_pal();
+        let mut card = composite_test_card(VideoStandard::Pal, RATE, 5);
+        card.iter_mut().for_each(|v| *v += step);
+        let run = feed(&mut dec, &card, RATE, t0);
+        let l = dec.lock();
+        eprintln!(
+            "dc step {step:+}: {l:?}, {} fields after the step",
+            run.fields.iter().filter(|f| f.start_ns >= t0).count()
+        );
+        assert!(l.locked, "step {step}: {l:?}");
+        let f = run
+            .fields
+            .iter()
+            .rfind(|f| f.start_ns >= t0)
+            .unwrap_or_else(|| panic!("step {step}: no field after the step"));
+        assert_bars(f, 24.0, &format!("dc step {step:+}"));
+    }
+}
+
+#[test]
+fn a_job_started_on_noise_locks_when_the_card_appears() {
+    let mut x = gaussian(RATE as usize, 0.1, 11);
+    let start = x.len();
+    let mut card = composite_test_card(VideoStandard::Pal, RATE, 8);
+    card.iter_mut().for_each(|v| *v += 0.3);
+    x.extend(card);
+    let (dec, run) = decode(StandardChoice::Auto, &x, RATE);
+    let fl = field_len(VideoStandard::Pal, RATE);
+    let at = run.locked_at.expect("locked");
+    eprintln!(
+        "noise then card: locked {:.2} fields after the card began, {:?}",
+        (at - start) as f64 / fl as f64,
+        dec.lock()
+    );
+    assert!(at > start, "locked on noise");
+    assert!(at - start <= 8 * fl);
+    assert_eq!(dec.lock().standard, Some(VideoStandard::Pal));
+    assert!(run.fields.iter().all(|f| f.start_ns >= ns(start, RATE)));
+    assert!(!run.fields.is_empty());
 }

@@ -118,8 +118,15 @@ const GLITCH_SYNC: f64 = 0.25;
 /// A line-sync pulse lasts between these fractions of `sync_s`.
 const SYNC_MIN: f64 = 0.6;
 const SYNC_MAX: f64 = 1.6;
-/// A broad pulse is held low for more than this fraction of a line.
+/// A broad pulse is held low for more than this fraction of a line, and less than
+/// [`BROAD_MAX`] (half a line less a sync width is 0.43 of one); longer runs are a
+/// level the slicer has not caught up with, not a pulse.
 const BROAD_LINE: f64 = 0.4;
+const BROAD_MAX: f64 = 0.6;
+/// Lines without an equalising, line-sync or broad pulse after which the levels are
+/// re-seeded from the signal (a DC step, or a signal appearing after noise): longer than
+/// a vertical interval's run of equalising and broad pulses with no line sync.
+const RESEED_LINES: f64 = 12.0;
 /// The PLL accepts an edge this close to its prediction, seconds.
 const PLL_WINDOW_S: f64 = 2e-6;
 /// The PLL corrects its period by this fraction of each accepted edge's error.
@@ -256,9 +263,8 @@ impl Tracker {
             Some(mut pred) => {
                 let mut lost = false;
                 while fall > pred + win {
-                    self.push(pred, false);
+                    self.missed_line(pred);
                     pred += self.period;
-                    self.misses += 1;
                     if self.misses >= PLL_LOST {
                         lost = true;
                         break;
@@ -284,8 +290,46 @@ impl Tracker {
                 }
             }
         }
-        if dur_s > BROAD_LINE * self.t.line_s {
+        if (BROAD_LINE * self.t.line_s..BROAD_MAX * self.t.line_s).contains(&dur_s) {
             self.broad_rise = Some(rise);
+        }
+    }
+
+    /// A line passed at `t` with no edge. A whole field of them in a row is no signal:
+    /// the lock goes, and the field in progress with it.
+    fn missed_line(&mut self, t: f64) {
+        self.push(t, false);
+        self.misses += 1;
+        if u64::from(self.misses) >= self.max_field_lines() {
+            self.locked = false;
+            self.goods = 0;
+            self.field_line1 = None;
+            self.pending = None;
+            self.broad_rise = None;
+        }
+    }
+
+    /// No pulse can still arrive that fell before `limit` (absolute samples): count the
+    /// lines passed since without an edge, on the PLL's prediction or, once it has lost
+    /// the signal, on from the last line at the period. So a signal that stops (no
+    /// pulses at all) still misses lines, closes fields and loses the lock.
+    fn advance(&mut self, limit: f64) {
+        let win = PLL_WINDOW_S * self.rate;
+        loop {
+            match self.pred {
+                Some(p) if p + win < limit => {
+                    self.missed_line(p);
+                    self.pred = (self.misses < PLL_LOST).then_some(p + self.period);
+                }
+                Some(_) => break,
+                None => match self.lines.back() {
+                    Some(l) if l.t + self.period + win < limit => {
+                        let t = l.t + self.period;
+                        self.missed_line(t);
+                    }
+                    _ => break,
+                },
+            }
         }
     }
 
@@ -412,6 +456,10 @@ impl Tracker {
         let Some(rows) = rows else {
             return Some(None);
         };
+        // A field mostly without sync (the signal went) is not a picture.
+        if 2 * self.accepted_in(first, last + 1) < rows.len() as u64 {
+            return Some(None);
+        }
         let line1_t = match self.line_t(line1) {
             Some(t) => t,
             None => rows[0] - (first - line1) as f64 * self.period,
@@ -468,6 +516,8 @@ struct State {
     fall: f64,
     /// Falls of line-sync pulses whose back porch is still to be measured.
     porch: VecDeque<f64>,
+    /// The fall of the last equalising, line-sync or broad pulse (absolute samples).
+    last_good: f64,
     porch_var: f64,
     porch_n: u64,
     porch_lines: u32,
@@ -540,6 +590,7 @@ impl CompositeDecoder {
             cand: None,
             fall: 0.0,
             porch: VecDeque::new(),
+            last_good: 0.0,
             porch_var: 0.0,
             porch_n: 0,
             porch_lines: 0,
@@ -569,6 +620,7 @@ impl CompositeDecoder {
         st.block_start = st.base + st.buf.len() as u64;
         st.buf.extend_from_slice(x);
         st.slice(x.len());
+        st.advance();
         st.measure_porches();
         let fields = self.collect(&mut st);
         st.trim();
@@ -589,14 +641,15 @@ impl CompositeDecoder {
                 continue;
             };
             let t = st.trackers[i].t;
+            if sel != Some(i) || !st.trackers[i].locked {
+                st.trackers[i].consume(plan.even);
+                continue;
+            }
             match st.field(t, &plan, self.width) {
                 Some(None) => continue, // samples still to come
                 done => {
                     let index = st.trackers[i].consume(plan.even);
-                    if let Some(Some(luma)) = done
-                        && sel == Some(i)
-                        && st.trackers[i].locked
-                    {
+                    if let Some(Some(luma)) = done {
                         self.fields += 1;
                         out.push(Field {
                             width: self.width,
@@ -711,6 +764,9 @@ impl State {
                 self.chunk_max = f32::MIN;
             }
             let py = std::mem::replace(&mut self.prev, y);
+            if (s as f64 - self.last_good) > RESEED_LINES * self.chunk_len as f64 {
+                self.reseed(s as f64);
+            }
             let Some(tip) = self.tip else {
                 continue;
             };
@@ -743,11 +799,41 @@ impl State {
         }
     }
 
+    /// No pulse the slicer can trust for [`RESEED_LINES`]: the levels are stale (a DC
+    /// step moved the signal off the slice). Forget them; the next line's minimum and
+    /// maximum seed the tip and the bootstrap blanking level again, and the porches
+    /// refine it. Wait as long again before the next re-seed.
+    fn reseed(&mut self, now: f64) {
+        self.tip = None;
+        self.blank = None;
+        self.low = false;
+        self.cand = None;
+        self.chunk_pos = 0;
+        self.chunk_min = f32::MAX;
+        self.chunk_max = f32::MIN;
+        self.last_good = now;
+    }
+
+    /// The trackers count the lines passed with no pulse up to the newest sample.
+    fn advance(&mut self) {
+        let now = (self.base + self.buf.len() as u64) as f64 - self.delay;
+        let limit = if self.low { self.fall.min(now) } else { now };
+        for t in &mut self.trackers {
+            t.advance(limit);
+        }
+    }
+
     fn pulse(&mut self, fall: f64, rise: f64) {
         let dur_s = (rise - fall) / self.rate;
         let sync_s = self.trackers[0].t.sync_s;
         if dur_s < GLITCH_SYNC * sync_s {
             return;
+        }
+        let line_s = self.trackers[0].t.line_s;
+        let eq_like = dur_s < 0.75 * sync_s;
+        let broad = (BROAD_LINE * line_s..BROAD_MAX * line_s).contains(&dur_s);
+        if eq_like || broad || (SYNC_MIN * sync_s..=SYNC_MAX * sync_s).contains(&dur_s) {
+            self.last_good = fall;
         }
         if (SYNC_MIN * sync_s..=SYNC_MAX * sync_s).contains(&dur_s) {
             self.porch.push_back(fall);
