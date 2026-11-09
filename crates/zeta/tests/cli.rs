@@ -3072,7 +3072,11 @@ fn zeta_sets_prints_the_two_builtin_sets() {
     assert_eq!(v["result"], "sets", "{v}");
     let rows = v["value"].as_array().expect("sets array");
     let ids: Vec<&str> = rows.iter().filter_map(|s| s["id"].as_str()).collect();
-    assert_eq!(ids, ["airband", "pagers_au"], "{v}");
+    assert_eq!(
+        ids,
+        ["airband", "airband_vhf", "airband_vhf_and_sos", "pagers_au"],
+        "{v}"
+    );
     assert!(rows.iter().all(|s| s["state"] == "ready"), "{v}");
     assert!(rows.iter().all(|s| s["running"].is_null()), "{v}");
 }

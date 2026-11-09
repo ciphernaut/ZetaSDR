@@ -1,0 +1,14 @@
+{
+  "id": "airband_vhf",
+  "name": "VHF airband data links",
+  "notes": "ACARS on every VHF channel and VDL Mode 2 in one capture of one radio: the airband set without its ADS-B member, for a node with no second radio for 1090 MHz. Start this one for aircraft telemetry on VHF, or when airband's `second` role has no radio; add ADS-B later as its own job when a radio for 1090 MHz is free. airband_vhf_and_sos is the same with the 121.5 MHz distress channel to listen to.",
+  "radios": {
+    "wide": {"note": "a radio that captures 130.0-137.0 MHz at once (8 MHz)"}
+  },
+  "members": [
+    {"id": "acars", "radio": "wide", "op": "plan_start", "plan": "acars_vhf", "channels": null,
+     "kind": "acars_decode", "deviation_hz": null, "sideband": null, "attach": null, "language": null},
+    {"id": "vdl2", "radio": "wide", "op": "job_start", "kind": "vdl2_decode",
+     "center_hz": 136975000, "bandwidth_hz": 25000, "deviation_hz": null, "sideband": null}
+  ]
+}

@@ -362,7 +362,7 @@ pub enum Command {
     /// The themes the page can use
     #[command(subcommand)]
     Themes(ThemesCmd),
-    /// The named sets the node knows (airband, pagers_au, the operator's own)
+    /// The named sets the node knows (airband, airband_vhf, airband_vhf_and_sos, pagers_au, the operator's own)
     Sets,
     /// Start or stop a named set
     #[command(subcommand)]

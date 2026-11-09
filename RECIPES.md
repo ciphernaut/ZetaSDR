@@ -50,7 +50,11 @@ The set puts the ACARS channels and VDL2 under one lease decision for the band t
 (about 129.7-137.0 MHz, inside the b210's capture), so nothing retunes between members; ADS-B tunes
 the second radio itself. With one radio only, map `second` to the same source and the set is
 refused `other` naming both roles, since 130-137 MHz and 1090 MHz do not share a capture: use
-`members` to start `acars` and `vdl2`, and `adsb` later on its own.
+`members` to start `acars` and `vdl2`, and `adsb` later on its own. The named set `airband_vhf`
+(`sets/airband_vhf.json`) is that one-radio form stored: the same two members on one role, `wide`, so one `set_start`
+with `members: null` starts it and `set_stop airband_vhf` takes it down. `airband_vhf_and_sos`
+(`sets/airband_vhf_and_sos.json`) adds a `guard` member, `am_demod` on 121.5 MHz with 10 kHz to
+listen to, in a 16 MHz capture instead of 8.
 
 **Verify.** `set_list`: `running` names the sources and each job `running`. `source_list`: the
 wide radio's holders are the seven `acars_decode` jobs and the `vdl2_decode` job, `bank.dropped`

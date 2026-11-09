@@ -1,0 +1,16 @@
+{
+  "id": "airband_vhf_and_sos",
+  "name": "VHF airband data links and distress",
+  "notes": "airband_vhf plus the 121.5 MHz distress (guard) channel in AM, in one capture of one radio: ACARS on every VHF channel, VDL Mode 2, and the guard channel to listen to (play its audio, or `job_attach` a transcriber); it is voice, not a data link, so nothing from it reaches the map. The capture is 121.5-137.0 MHz, twice airband_vhf's: start airband_vhf instead when the radio's CPU budget is tight or the guard channel is not wanted.",
+  "radios": {
+    "wide": {"note": "a radio that captures 121.5-137.0 MHz at once (16 MHz)"}
+  },
+  "members": [
+    {"id": "acars", "radio": "wide", "op": "plan_start", "plan": "acars_vhf", "channels": null,
+     "kind": "acars_decode", "deviation_hz": null, "sideband": null, "attach": null, "language": null},
+    {"id": "vdl2", "radio": "wide", "op": "job_start", "kind": "vdl2_decode",
+     "center_hz": 136975000, "bandwidth_hz": 25000, "deviation_hz": null, "sideband": null},
+    {"id": "guard", "radio": "wide", "op": "job_start", "kind": "am_demod",
+     "center_hz": 121500000, "bandwidth_hz": 10000, "deviation_hz": null, "sideband": null}
+  ]
+}
