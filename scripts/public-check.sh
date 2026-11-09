@@ -142,7 +142,8 @@ while IFS= read -r f; do
 done <"$tmp/files"
 
 # gitleaks scans the directory; keep what git tracks and is not excluded.
-cfgtoml="$root/.gitleaks.toml"
+cfgtoml="$root/.gitleaks-tree.toml"
+[ -f "$cfgtoml" ] || cfgtoml="$root/.gitleaks.toml"
 [ -f "$cfgtoml" ] || cfgtoml="$here/../.gitleaks.toml"
 if ! "$gl" dir --no-banner --redact -c "$cfgtoml" -r "$tmp/gl.json" --exit-code 0 "$root" \
   >"$tmp/gl.out" 2>&1; then
