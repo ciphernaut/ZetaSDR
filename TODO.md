@@ -87,7 +87,7 @@ Found in the whole-branch review of plan 27 (2026-11-05); none blocks the feed, 
 - Test nits: no test that `unregister` clears the feed table and the unfed set; a bare `panic!()` in ops_stream's `a_port_added_after_open_has_a_feed`; attach.rs's feed drain stops on `Lagged`; no websocket test of `lagged` on a feed socket; `node_source_frames_are_not_fed` uses a fake mix provenance rather than a real mix job.
 ## Aircraft data links: done in plan 30
 
-Done in plan 30 (`docs/superpowers/specs/2026-11-06-aircraft-links-design.md`, `docs/superpowers/plans/2026-11-06-aircraft-links.md`); the airband named set (ACARS and VDL2 on one radio, ADS-B on another, started as one `plan_start`) is plan 31's.
+Done in plan 30 (`docs/superpowers/specs/2026-11-06-aircraft-links-design.md`, `docs/superpowers/plans/2026-11-06-aircraft-links.md`); the airband named set is `sets/airband.json` (plan 31): its `vdl2` member is live now that `vdl2_decode` exists, and needs `dumpvdl2` on the host (refused `unavailable` without it).
 
 ## Aircraft links: deferred minors from plan 30
 
@@ -237,7 +237,7 @@ Open work left from plan 16's mode registry (delivered; see the plan series):
 
 - **Feeds.** `sink` stage kinds for the standard feeds (APRS-IS, SBS/Beast, AIS NMEA, PSK Reporter, WSPRnet, KISS TNC) so results leave the node the way other tools expect.
 - **Time.** UTC-slotted modes (FT8/FT4 15 s, WSPR 2 min, JT65 1 min) and TDMA (DMR, TETRA) need true block timestamps. The HackRF timestamp bug is fixed (plan 14); the 2 h clock run that would clear the WSJT family is still outstanding (plan series, "Outcome").
-- **Span decoders and trunking.** OnAir and OpenWebRX+ decode every POCSAG/APRS/VDL2 channel in a capture at once. On a pin that is one job per channel on the bank today; a decoder that finds its own channels would take the whole capture. Trunking (P25, DMR Tier III, MPT1327) needs a follower that starts voice jobs from control-channel events inside the pin.
+- **Trunking.** Span decoding is plan 31's (a watch with `modes`). Trunking (P25, DMR Tier III, MPT1327) needs a control-channel follower that starts voice jobs from control-channel events inside the capture; it plugs into the watch's known-channels seam.
 - **Vocoders.** Codec 2 (M17, FreeDV) runs as the external `c2dec` (the operator's decision, plan 29; no copyleft dependency in-crate); AMBE/IMBE only through a handler on an external `mbelib` build, never shipped; HD Radio HDC off.
 - **UI.** A flat menu of 100+ modes is unusable: pick modes through `knowledge_lookup` by band (what is plausible here) with a search fallback.
 - **Wideband modes** (DVB-T 8 MHz, DAB 1.5 MHz, LTE) run the direct path at full rate and want the GPU FFT; park them behind the HackRF-first set.
@@ -276,7 +276,7 @@ Operator-visible nits from the plan 24 reviews, none blocking. The rail's label 
 
 Plan 23 delivered the ADS-B request: a row names its subject (`key`, columns, `waterfall`, `heading`, `label`), the page folds by key, the Subjects tab lists one row per aircraft, the waterfall shows one line, and the map tracks per subject (`adsb_decode` has a `position`; plan 32 gave the map its own tab and the dock took the pane host, so the map half of this note is done). Left from the original note:
 
-- POCSAG has no subject (each page is its own message); an address list in the Subjects tab would need a key on the pager's address.
+- ~~POCSAG has no subject~~ (done in plan 31: `pocsag_decode` has an addresses table keyed by address).
 - AIS vessels (MMSI as key) when the AIS row lands; it needs only a row.
 - The node-side half is a separate gist ("Subjects: a running job keeps its tables on the node").
 
@@ -302,7 +302,7 @@ Scope estimate: 50-100 lines in `crates/zeta-ext/src/proc.rs` and `node_setup.rs
 Plan 29 shipped AIS, FLEX, M17, M20 synthesis and APRS positions (see "Decoder wave 2: leftovers from plan 29"). What stays:
 
 - **DMR voice** (4FSK, AMBE+2 through the vocoder libraries, see the install-script gist above): an audio-output row on the shape of `m17_decode` with a `vocoder` handler.
-- **Whole-span POCSAG and APRS** (now plan 31's) as a `watch` with `decode_on: capture`: the detect stage finds the channels in a pin and the watch starts one decoder per signal, instead of one hand-started job per channel.
+- ~~**Whole-span POCSAG and APRS**~~ (done in plan 31: a `watch` with `modes`, and the `pagers_au` set).
 - **Stereo** for `wfm_demod` (see the stereo gist above) now that audio rows exist to consume it.
 - **DFM serial.** `dfm_decode` keeps `test: null` (it prints `skipped: no test`, and `--strict` fails it). Plan 29 task 9 built `crates/zeta-dsp/src/dfm_frame.rs` and the `dfm` family, and `dfm09mod --json --ecc` decodes their position, climb, time and satellites through the row's own chain, but the id stays `DFM-xxxxxxxx`: the serial's place in the sensor (configuration) field is not settled (channels 4-15, half layouts `half << 8 | index` and others, sequential or fixed-plus-alternating sensor sequences and runs up to 1200 frames all left the placeholder). The operator's ruling at the fallback was to leave `test: null` rather than a position-only test. Next: a public description of the DFM-09 configuration channels (the TH Koeln thesis's appendix A "From a Frame to a Data Packet" was not in the published excerpt), then set the row's `test` (`expect {id, lat}`, `within_ms` about 15000).
 
@@ -323,10 +323,13 @@ Plan 29 shipped AIS, FLEX, M17, M20 synthesis and APRS positions (see "Decoder w
 
 From the operator, 2026-11-06. Pager events and the rows that produce them (`pocsag_decode`, `flex_decode`) carry `access: "restricted"` now, and nothing reads it. The design to come:
 
-- an access level per transport caller (the secret is one level today);
+- an access level per transport caller (the secret is one level today), or per secret;
 - `events.log`, `--then-tail` and `stream_tail` of a `restricted` row gated to the higher level;
 - the page's ribbons and the agent's view likewise;
-- the level stated in `GET /health`.
+- the level stated in `GET /health`;
+- the Subjects tab's text column, which shows pager text today (plan 31's `pocsag_decode` addresses table).
+
+Plan 31 added the marker's second carrier (`pocsag_decode` and `flex_decode` both carry it; `summary::envelope` inserts it on every event of a marked row). Still nothing reads it.
 
 Until then the README's Legal paragraph is the guard.
 
@@ -516,6 +519,12 @@ Wanted: a plan carries named `groups`, each `{id, name, channels}` expanded like
 
 From the operator, 2026-11-02. A job setup (all ACARS channels on one radio, the CB plan with transcribers, the sonde watch with a pre-placed decoder) is reproduced from text each time: field craft prose, the scratch scripts on the field host, now `RECIPES.md`. The node cannot tell "the ACARS set" from seven unrelated jobs, and an agent re-derives the ops every run. A recipe should be a thing the node stores next to pins and plans (one JSON file each, `recipes/*.json` built in plus an operator directory as for mode rows): a name, the preconditions, the ops in order, and a start, a status and a stop by name (`recipe_start`, `recipe_status`, `recipe_stop`), with `plan_start` as the one-step special case it generalises. `RECIPES.md` is the stop-gap and the spec material: its JSON blocks are the ops a loader would lift unchanged.
 
+Plan 31 delivered the named set (`set_start`, `set_stop`, `set_list`; `sets/airband.json`, `sets/pagers_au.json`, `--sets-dir`), which covers what this gist asked for in the way of starting and stopping a group of members across radios. What stays: pins, mixes, waits, verify steps and ordered arbitrary ops in one stored recipe, with `set_start` as one step of it.
+
+## Architecture: long-running jobs on narrowband tuners
+
+From the operator, 2026-11-07. Long-running jobs (the airband set's ACARS, a pager watch) move to additional narrowband tuners (HackRF, LimeSDR), freeing the wideband radio for exploring. The long-term goal is a tap off an FPGA polyphase channel bank over a very wide band. Sets already name roles, not radios, so a set file does not change when the radios do.
+
 ## Node: a baseline of the host's capabilities
 
 From the operator, 2026-11-06, raised while scoping plan 28 (analog video): a video job wants the B210's 30.72 Msps rung, a demodulator at that rate and a frame encoder, and whether the host can carry that beside 39 CB transcribers, the speech daemon and the agent's model is known only by trying. Wanted: the node measures and reports the host it runs on, once at startup and on request (an op, `zeta host`, `/health`): CPU model, cores and threads, memory, the state directory's storage (free space and a short read/write speed probe), a spare GPU and what already uses it, the attached radios and how each is connected (USB 2 or 3, the rung that bus can sustain, network for a KiwiSDR or another node), the speech backend's resource use and how many transcribers it can run at once, LLM inference (which model, where, tokens a second), and the network reach to off-host components (the speech daemon, the LLM, the register, another node, latency and bandwidth); the RF LLM and FPGA hardware when they are folded in. The point is a capability table the lease, the watch, `plan_start` and the agent can consult before committing ("this host can run N transcribers and one video job"), and a line the operator can read before a deploy. Spec first; it touches every crate that owns a resource.
@@ -550,3 +559,21 @@ Plan 32 (origins from the register lit on a Map tab, the dock, a Kiwi's position
 - The console theme's kept tab is only un-dimmed, not restyled as the other themes do.
 - The dock-head Subjects count is the store count (every subject held), not the rows the table shows after its filters.
 - The RF thumbnail (spec 4.12, Task 12, dropped because the e2e suite ran about 570 s against its 690 s deadline): a small live RF view in the map's corner (`RF_THUMB_W` 240 x `RF_THUMB_H` 120, `RF_THUMB_FPS` 2) drawn from the source's spectrum feed, a click returning to the RF view. It wants its own scenario and a timer, so it waits for a faster suite or a deadline change.
+
+## Watch: deferred minors from plan 31
+
+Field risks:
+- A clean FSK pager may read as two narrow tones under the span width floor, and a single tone of about 3 kHz fits nothing until its next `new`. A strong page reads 19-25 kHz, which the tolerant 0.5-2x fit now takes; a fit over the widest or median width across the persist window would be steadier.
+- The detector's DC mask hides a carrier on the capture centre.
+- A seeded decoder that decodes but never gets a detector `new` is lost at `hold_ms` (spec-faithful).
+
+Small:
+- `known.register` cannot say `unreachable`: `KnowledgeProvider::allocations` has no error channel, so `job_context.watch.known` holds counts only.
+- The ACMA provider caps a query at 200 rows before `band_assignments` dedupes.
+- `cooled[]` is pruned per tick.
+- A seeded decoder's centre is the known centre until the first `new`.
+- A set file's `radios` order is the file's order on the node, but `set_list`'s JSON is a BTreeMap, so the page's picker orders roles by first use.
+- `pick_source` never considers `replace`: a source held only by a `replace` job counts as busy.
+- The menu's `modes_list` is cached per page load.
+- Set -> watch -> decoders nesting on the page has no automated test (UAT with `pagers_au`).
+- The watch row sits inside `<summary>`, so it toggles on click and nests buttons in a summary (accessibility).
