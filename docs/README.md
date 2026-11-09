@@ -21,6 +21,8 @@ attach one.
 - [speech.md](speech.md): transcribing a channel. Installing a speech daemon on a node's host,
   writing your own, sharing one between nodes, and source separation.
 - [themes.md](themes.md): the web page's themes, and how to write one.
+- [uat/pager-span-watch.md](uat/pager-span-watch.md): a standalone acceptance-test handout for
+  the pager span watch, for an outside tester on a busier pager band.
 - [deploy/README.md](../deploy/README.md): running a node as a service, with the Raspberry Pi
   example in [deploy/pi](../deploy/pi/README.md).
 
