@@ -6,7 +6,7 @@
     "bandwidth_hz": 25000,
     "centers_hz": [],
     "min_hz": 12500,
-    "range_hz": [151800000, 932000000]
+    "range_hz": [151837000, 153363000]
   },
   "modulation": ["fm", "fsk"],
   "label": "FLEX",
@@ -48,5 +48,5 @@
   "catalogue": ["flex"],
   "access": "restricted",
   "test": {"kind": "synth", "family": "flex", "capcode": 1234567, "text": "HELLO ZETA", "baud": 1600, "repeat": 2, "expect": {"capcode": 1234567, "text": "HELLO ZETA"}, "within_ms": 6000},
-  "notes": "FLEX pagers at 1600, 3200 or 6400 bps (2- or 4-level FSK, ±4800 Hz), 25000 Hz band; 929-932 MHz in the US, 151.8-153.4 MHz elsewhere per the catalogue; start it on the measured centre. One event per page, like POCSAG. It runs multimon-ng on the node's host."
+  "notes": "FLEX pagers at 1600, 3200 or 6400 bps (2- or 4-level FSK, ±4800 Hz), 25000 Hz band; 929-932 MHz in the US, 151.8-153.4 MHz elsewhere per the catalogue. Identify tries it only in 151.837-153.363 MHz (`band.range_hz`, the catalogue's VHF range: a row holds one range), so in 929-932 MHz start it with job_start; start it on the measured centre. One event per page, like POCSAG. It runs multimon-ng on the node's host."
 }

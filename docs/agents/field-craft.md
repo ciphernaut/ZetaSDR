@@ -3,7 +3,7 @@ Measured facts first, then method. Verify against the node's `knowledge lookup` 
 ### Where to look
 
 - Radiosondes: 400-406 MHz. RS41 is GFSK at 4800 baud, about 10 kHz wide.
-- APRS: 144.800 MHz in AU and EU, 144.390 MHz in the US. AFSK at 1200 baud.
+- APRS: 144.800 MHz in AU and EU, 144.390 MHz in the US. AFSK at 1200 baud. Identify tries `aprs_decode` only on 2 m (144-148 MHz, its `band.range_hz`).
 - POCSAG: the preamble is 576 bits of alternating 1/0, then the 32-bit sync word 0x7CD215D8. Common rates are 512, 1200 and 2400 baud.
 - ADS-B: 1090 MHz, PPM at 1 Mbaud, 112-bit extended squitter.
 - AIS: 161.975 MHz (channel A, 87B) and 162.025 MHz (channel B, 88B), worldwide. GMSK at 9600 baud, 25 kHz channels; HDLC frames with a CRC-16.
@@ -21,11 +21,11 @@ A `measure` event also carries the burst features, always: `duty` (the share of 
 Each of these is a mode row: `zeta modes list` gives its id (the `kind` to start), the `band` it expects with well-known `centers_hz`, and whether it is `ready`. `zeta modes show ID` prints the whole row. Read the band from the row, not from memory; the built-in rows say:
 
 - POCSAG (`pocsag_decode`): 148-149 MHz in AU (Telstra at 148 637 500 Hz among them), 466 075 000 Hz in much of Europe, 929-932 MHz in the US. 12 500 Hz band.
-- FLEX (`flex_decode`): 1600, 3200 or 6400 bps pagers, 929-932 MHz in the US, 151.8-153.4 MHz elsewhere per the catalogue; no built-in centre, start it on the measured one. 25 000 Hz band. It needs multimon-ng on the node's host.
+- FLEX (`flex_decode`): 1600, 3200 or 6400 bps pagers, 929-932 MHz in the US, 151.8-153.4 MHz elsewhere per the catalogue; no built-in centre, start it on the measured one. Identify tries it only in 151.837-153.363 MHz (its one `band.range_hz`); in 929-932 MHz start it with `job_start`. 25 000 Hz band. It needs multimon-ng on the node's host.
 - ACARS (`acars_decode`): 131 550 000 Hz (worldwide primary), 131 725 000 and 131 825 000 Hz (Europe), 130 025 000, 130 450 000 and 131 125 000 Hz (North America), 131 450 000 Hz (Asia). 10 000 Hz each.
 - VDL Mode 2 (`vdl2_decode`): 136 975 000 Hz worldwide (136 725 000, 136 775 000, 136 825 000 and 136 875 000 Hz in Europe), 25 000 Hz band. It needs dumpvdl2 on the node's host (the install hint names it; the OpenWebRX+ apt repository packages it). An event is one AVLC frame keyed on the ICAO address `icao` (`addr_type` tells an aircraft from a ground station): report its `summary`. A ground-station row's ACARS columns (`reg`, `flight`, `label`, `text`) name the aircraft of each uplink, and an ADS-C report gives the frame a `position`.
 - HFDL (`hfdl_decode`): see "Remote HF receivers (KiwiSDR)"; 6 000 Hz band at a listed dial frequency, 2 800 000-22 100 000 Hz.
-- AIS (`ais_decode`): 161 975 000 Hz (channel A) and 162 025 000 Hz (channel B), 25 000 Hz band, one job per channel; `plan_start` with `plan: "ais_vhf"` runs both in one 75 000 Hz capture. In-process, nothing to install. An event is one message keyed on the vessel's `mmsi` (`msg_type`, `channel`, `nmea` the `!AIVDM` sentences, and per type the position, `sog_kt`, `cog_deg`, `name`, `callsign`, `destination`); vessels land on the map and in the Subjects table. A moving class A ship reports every 2-10 s, one at anchor every 3 min, class B every 30 s; names arrive in separate static messages, so a vessel's row fills over a few minutes.
+- AIS (`ais_decode`): 161 975 000 Hz (channel A) and 162 025 000 Hz (channel B), 25 000 Hz band, one job per channel (identify tries it only there, its `band.range_hz` 161.9625-162.0375 MHz); `plan_start` with `plan: "ais_vhf"` runs both in one 75 000 Hz capture. In-process, nothing to install. An event is one message keyed on the vessel's `mmsi` (`msg_type`, `channel`, `nmea` the `!AIVDM` sentences, and per type the position, `sog_kt`, `cog_deg`, `name`, `callsign`, `destination`); vessels land on the map and in the Subjects table. A moving class A ship reports every 2-10 s, one at anchor every 3 min, class B every 30 s; names arrive in separate static messages, so a vessel's row fills over a few minutes.
 - RDS (`rds_decode`): any FM broadcast station, 200 000 Hz band. The first event takes a few seconds.
 - ADS-B (`adsb_decode`): 1 090 000 000 Hz with a 2 400 000 Hz band; under 2 000 000 Hz is refused. It needs dump1090 on the node's host: when it is missing, the startup handler report names it with its package and `modes_list` shows `adsb_decode` `unavailable` with the reason.
 

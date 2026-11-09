@@ -485,6 +485,41 @@ async fn modes_list_and_show_carry_the_subject() {
     assert_eq!(v["row"]["subject"]["track_min_m"], 500.0);
 }
 
+/// The rows a sonde band must never try live where their signals are: FLEX on the
+/// catalogue's 151.837-153.363 MHz, AIS on its two channels, APRS on 2 m. Out of range
+/// (on the sonde band) a row is not `in_range` and never fits.
+#[test]
+fn flex_ais_and_aprs_are_tried_only_where_they_live() {
+    let mut reg = ModeRegistry::load(&stages(), None);
+    for id in ["flex_decode", "ais_decode", "aprs_decode"] {
+        reg.set_program(id, Some("/stand-in".into()), None);
+    }
+    let fit = |center_hz: u64, id: &str| {
+        let scored =
+            zeta_core::modes::score::score_rows(&reg, center_hz, 25_000, "fsk", &|_| 0.0, &|_| 0.0);
+        let s = scored.iter().find(|s| s.mode.row.id.0 == id).unwrap();
+        (s.in_range, s.fits_band)
+    };
+    for center in [401_776_000, 403_025_000, 404_026_000] {
+        for id in ["flex_decode", "ais_decode", "aprs_decode"] {
+            assert_eq!(fit(center, id), (false, false), "{id} at {center} Hz");
+        }
+    }
+    for (center, id) in [
+        (152_000_000, "flex_decode"),
+        (161_975_000, "ais_decode"),
+        (162_025_000, "ais_decode"),
+        (144_800_000, "aprs_decode"),
+        (144_390_000, "aprs_decode"),
+        (145_175_000, "aprs_decode"),
+    ] {
+        assert_eq!(fit(center, id), (true, true), "{id} at {center} Hz");
+    }
+    // Out of the US 929-932 MHz band too (the row has one range: the catalogue's VHF one).
+    assert_eq!(fit(931_000_000, "flex_decode"), (false, false));
+    assert_eq!(fit(156_800_000, "ais_decode"), (false, false));
+}
+
 #[test]
 fn only_the_pager_rows_are_restricted() {
     let reg = ModeRegistry::load(&stages(), None);

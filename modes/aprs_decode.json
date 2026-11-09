@@ -4,7 +4,8 @@
   "family": "amateur_digital",
   "band": {
     "bandwidth_hz": 12500,
-    "centers_hz": [144800000, 144390000]
+    "centers_hz": [144800000, 144390000],
+    "range_hz": [144000000, 148000000]
   },
   "modulation": ["fm", "fsk"],
   "label": "APRS",
