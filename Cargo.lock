@@ -4102,6 +4102,7 @@ dependencies = [
  "base64 0.23.1",
  "futures-util",
  "num-complex",
+ "png",
  "reqwest",
  "schemars",
  "serde",

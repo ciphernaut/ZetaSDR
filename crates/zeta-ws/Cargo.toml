@@ -34,6 +34,7 @@ zeta-vrt = { path = "../zeta-vrt" }
 [dev-dependencies]
 futures-util = "0.3"
 num-complex = "0.4.6"
+png = "0.17"
 reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30.0"

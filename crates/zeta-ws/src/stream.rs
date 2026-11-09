@@ -1,5 +1,6 @@
 //! Stream routes: the `/stream/{id}` websocket push loop and `/streams/{id}/tail`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
@@ -12,11 +13,13 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::broadcast::{self, error::RecvError};
-use tokio::time::timeout;
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, sleep_until, timeout};
 use tokio_util::task::task_tracker::TaskTrackerToken;
 use zeta_core::ops::{Op, OpError};
-use zeta_core::stream::{Frame, Payload, StreamBus};
-use zeta_core::types::StreamId;
+use zeta_core::stream::{Frame, Payload, StreamBus, VideoFormat};
+use zeta_core::types::{StreamId, StreamKind};
+use zeta_vrt::video::{SMOOTH, VideoProfile, encode_frame, profile};
 use zeta_vrt::{IqMeta, VrtEncoder, stream_id_of};
 
 use crate::http::{Shared, StatsHandle, error_response, other};
@@ -65,21 +68,32 @@ pub(crate) async fn tail_route(
 #[derive(Deserialize)]
 pub(crate) struct FormatQuery {
     format: Option<String>,
+    /// `smooth`, `sharp` or `thumb`: the delivery profile of a video stream in binary mode.
+    video: Option<String>,
 }
 
-/// `GET /stream/{id}?format=text|binary`: 400, 404 and 503 are answered before upgrading.
-/// `text` (or no `format`) pushes JSON text messages; `binary` pushes VRT packets for IQ and
-/// typed envelopes for the rest, paced by the client's credits.
+/// How one connection delivers its stream.
+enum Mode {
+    Text,
+    Binary,
+    Video(&'static VideoProfile),
+}
+
+/// `GET /stream/{id}?format=text|binary[&video=smooth|sharp|thumb]`: 400, 404 and 503 are
+/// answered before upgrading. `text` (or no `format`) pushes JSON text messages and ignores
+/// `video`; `binary` pushes VRT packets for IQ and typed envelopes for the rest, paced by
+/// the client's credits. A video stream in binary mode is always sent as PNG under a
+/// profile (`smooth` when `video` is absent); `video` on any other stream is 400.
 pub(crate) async fn ws(
     State(st): State<Shared>,
     Path(id): Path<String>,
     query: Result<Query<FormatQuery>, QueryRejection>,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    let binary = match query {
+    let (binary, asked) = match query {
         Ok(Query(q)) => match q.format.as_deref() {
-            None | Some("text") => false,
-            Some("binary") => true,
+            None | Some("text") => (false, None),
+            Some("binary") => (true, q.video),
             Some(_) => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -89,10 +103,35 @@ pub(crate) async fn ws(
         },
         Err(e) => return error_response(e.status(), other(e.body_text())),
     };
+    let asked = match asked.as_deref().map(profile) {
+        None => None,
+        Some(Some(p)) => Some(p),
+        Some(None) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                other("video must be smooth, sharp or thumb"),
+            );
+        }
+    };
     let bus = st.node.bus();
     let id = StreamId(id);
     let Some(rx) = bus.subscribe(&id) else {
         return error_response(StatusCode::NOT_FOUND, unknown_stream(&bus, &id));
+    };
+    let video = bus
+        .list()
+        .into_iter()
+        .any(|i| i.id == id && i.kind == StreamKind::Video);
+    let mode = match (binary, video, asked) {
+        (false, _, _) => Mode::Text,
+        (true, true, p) => Mode::Video(p.unwrap_or(&SMOOTH)),
+        (true, false, None) => Mode::Binary,
+        (true, false, Some(_)) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                other("video= applies to a video stream"),
+            );
+        }
     };
     let Ok(permit) = st.ws_slots.clone().try_acquire_owned() else {
         return error_response(
@@ -112,10 +151,10 @@ pub(crate) async fn ws(
         .protocols(["zeta"])
         .max_message_size(st.limits.ws_max_message_bytes)
         .on_upgrade(move |socket| async move {
-            if binary {
-                connection_binary(socket, rx, st, id, permit, tracked).await;
-            } else {
-                connection(socket, rx, st, permit, tracked).await;
+            match mode {
+                Mode::Text => connection(socket, rx, st, permit, tracked).await,
+                Mode::Binary => connection_binary(socket, rx, st, id, permit, tracked).await,
+                Mode::Video(p) => connection_video(socket, rx, st, p, permit, tracked).await,
             }
         })
 }
@@ -305,6 +344,117 @@ async fn connection_binary(
                     st.stats.ws_credit_skipped();
                 }
             }
+        }
+    }
+}
+
+/// One video frame as the binary message `profile` sends: a PNG body (scaled to the
+/// profile's width) in the typed envelope, keeping the frame's stream and provenance.
+fn video_message(f: &Frame, profile: &VideoProfile) -> Result<Vec<u8>, String> {
+    let Payload::Video {
+        width,
+        height,
+        format,
+        frame,
+    } = &f.payload
+    else {
+        return Err("not a video frame".to_string());
+    };
+    let (png, width, height) = encode_frame(*width, *height, *format, frame, profile)?;
+    envelope(&Frame::new(
+        f.stream.clone(),
+        f.provenance.clone(),
+        Payload::Video {
+            width,
+            height,
+            format: VideoFormat::Png,
+            frame: Arc::from(png),
+        },
+    ))
+}
+
+/// The binary-mode loop for a video stream: credits as in [`connection_binary`], but only
+/// the newest frame is kept. A frame that waits, for credit or for the profile's
+/// `min_interval_ms` since the last send, is replaced by the next one to arrive, which
+/// counts as missed and as `video_frames_skipped`. A due frame is encoded off the runtime,
+/// one at a time and only when it is sent, so a skipped frame costs nothing; one that cannot
+/// be encoded counts as missed. The count goes out as `{"type":"lagged","missed":K}` just
+/// before the next frame sent.
+async fn connection_video(
+    mut socket: WebSocket,
+    mut rx: broadcast::Receiver<Frame>,
+    st: Shared,
+    profile: &'static VideoProfile,
+    _permit: OwnedSemaphorePermit,
+    _tracked: TaskTrackerToken,
+) {
+    let _live = Live::new(&st.stats);
+    let limit = st.limits.ws_send_timeout;
+    let interval = Duration::from_millis(profile.min_interval_ms);
+    let mut credit: u32 = 0;
+    let mut missed: u64 = 0;
+    let mut latest: Option<Frame> = None;
+    let mut due_at = Instant::now();
+    let mut encoding: Option<JoinHandle<Result<Vec<u8>, String>>> = None;
+    loop {
+        if encoding.is_none()
+            && credit > 0
+            && Instant::now() >= due_at
+            && let Some(frame) = latest.take()
+        {
+            encoding = Some(tokio::task::spawn_blocking(move || {
+                video_message(&frame, profile)
+            }));
+        }
+        // A frame waits only for the interval: sleep until it is due.
+        let waiting = encoding.is_none() && credit > 0 && latest.is_some();
+        tokio::select! {
+            biased;
+            () = st.ws_shutdown.cancelled() => {
+                close(&mut socket, "node shutting down", close_code::AWAY, limit).await;
+                return;
+            }
+            inbound = socket.recv() => match inbound {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(Message::Text(t))) => credit = granted(credit, &t),
+                Some(Ok(_)) => {}
+            },
+            done = async { encoding.as_mut().expect("guarded").await }, if encoding.is_some() => {
+                encoding = None;
+                let Ok(Ok(message)) = done else {
+                    missed = missed.saturating_add(1);
+                    continue;
+                };
+                if missed > 0 {
+                    if !send_json(&mut socket, &WsMessage::Lagged { missed }, limit).await {
+                        st.stats.ws_dropped_slow();
+                        return;
+                    }
+                    missed = 0;
+                }
+                if !send(&mut socket, Message::Binary(message.into()), limit).await {
+                    st.stats.ws_dropped_slow();
+                    return;
+                }
+                // Credit only grows while an encode runs, so the one it started with is here.
+                credit -= 1;
+                due_at = Instant::now() + interval;
+                st.stats.video_frame_sent();
+            }
+            next = rx.recv() => match next {
+                Ok(frame) => {
+                    if latest.replace(frame).is_some() {
+                        missed = missed.saturating_add(1);
+                        st.stats.video_frame_skipped();
+                    }
+                }
+                Err(RecvError::Lagged(n)) => missed = missed.saturating_add(n),
+                Err(RecvError::Closed) => {
+                    close(&mut socket, "stream ended", close_code::NORMAL, limit).await;
+                    return;
+                }
+            },
+            () = sleep_until(due_at), if waiting => {}
         }
     }
 }

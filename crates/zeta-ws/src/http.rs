@@ -88,6 +88,10 @@ pub struct ServerStats {
     pub ws_dropped_slow: u64,
     /// Frames a binary-mode socket skipped because it had no credit.
     pub ws_credit_skipped: u64,
+    /// PNG frames the video profiles sent.
+    pub video_frames_sent: u64,
+    /// Video frames replaced by a newer one before they could be sent.
+    pub video_frames_skipped: u64,
 }
 
 #[derive(Default)]
@@ -95,6 +99,8 @@ struct Counters {
     ws_connections: AtomicUsize,
     ws_dropped_slow: AtomicU64,
     ws_credit_skipped: AtomicU64,
+    video_frames_sent: AtomicU64,
+    video_frames_skipped: AtomicU64,
 }
 
 /// A cheap handle on the server's live counters.
@@ -107,6 +113,8 @@ impl StatsHandle {
             ws_connections: self.0.ws_connections.load(Ordering::Relaxed),
             ws_dropped_slow: self.0.ws_dropped_slow.load(Ordering::Relaxed),
             ws_credit_skipped: self.0.ws_credit_skipped.load(Ordering::Relaxed),
+            video_frames_sent: self.0.video_frames_sent.load(Ordering::Relaxed),
+            video_frames_skipped: self.0.video_frames_skipped.load(Ordering::Relaxed),
         }
     }
 
@@ -124,6 +132,14 @@ impl StatsHandle {
 
     pub(crate) fn ws_credit_skipped(&self) {
         self.0.ws_credit_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn video_frame_sent(&self) {
+        self.0.video_frames_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn video_frame_skipped(&self) {
+        self.0.video_frames_skipped.fetch_add(1, Ordering::Relaxed);
     }
 }
 
