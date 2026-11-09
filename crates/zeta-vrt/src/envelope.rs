@@ -1,6 +1,6 @@
 //! The typed envelope for non-IQ binary frames, the plugin wire's data-frame framing reused:
 //! `u32LE header_len | FrameSummary JSON | u32LE body_len | body`. The body is `f32` LE PCM
-//! for audio, UTF-8 for text, and empty for event, sink and video (an event's payload is in
+//! for audio, UTF-8 for text, the frame's bytes for video, and empty for event and sink (an event's payload is in
 //! the header). IQ goes as VRT packets, never in an envelope.
 
 use zeta_core::ops::FrameSummary;
@@ -17,7 +17,16 @@ pub fn envelope(f: &Frame) -> Result<Vec<u8>, String> {
         Payload::Iq(_) => return Err("iq frames are sent as vrt packets".to_string()),
         Payload::Audio { samples, .. } => samples.iter().flat_map(|s| s.to_le_bytes()).collect(),
         Payload::Text(t) => t.as_bytes().to_vec(),
-        Payload::Event(_) | Payload::Sink(_) | Payload::Video { .. } => Vec::new(),
+        Payload::Video {
+            width,
+            height,
+            format,
+            frame,
+        } => {
+            format.check_body(*width, *height, frame.len())?;
+            frame.to_vec()
+        }
+        Payload::Event(_) | Payload::Sink(_) => Vec::new(),
     };
     let header = serde_json::to_vec(&FrameSummary::from_frame(f)).map_err(|e| e.to_string())?;
     if header.len() > MAX_HEADER {

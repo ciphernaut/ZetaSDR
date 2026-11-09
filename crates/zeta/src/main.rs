@@ -55,6 +55,12 @@ async fn main() -> ExitCode {
         Ok(code) => return code,
         Err(cli) => cli,
     };
+    if matches!(
+        cli.command,
+        cli::Command::Stream(cli::StreamCmd::Save { .. })
+    ) {
+        return fail(cli::STREAM_SAVE_NEEDS_NODE);
+    }
     let (sources, plugins) = (cli.sources(), cli.plugins.clone());
     let source_positions = cli.source_positions();
     let mut burst_policy = cli.burst_policy();

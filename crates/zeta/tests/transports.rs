@@ -382,3 +382,86 @@ fn remote_job_retune_moves_a_running_job() {
     assert_eq!(rec["tuning"]["center_hz"], 100_010_000u64, "{rec}");
     assert_eq!(rec["tuning"]["bandwidth_hz"], 10_000u64, "{rec}");
 }
+
+#[test]
+fn stream_save_without_node_is_a_usage_error() {
+    plain()
+        .args(["stream", "save", "--stream", "s1", "--path", "x.png"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(contains("use --node"));
+}
+
+/// The real CLI path against an in-process server: `zeta_ws`'s test server, whose bus the
+/// test feeds, because no stage a served node can start today publishes a video frame.
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_save_writes_the_first_video_frame() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use zeta_core::stream::{Frame, Payload, VideoFormat};
+    use zeta_core::types::{Provenance, SourceId, Span, StreamKind, Timestamp};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ts = zeta_ws::testing::spawn(dir.path()).await;
+    let prov = Provenance {
+        source: SourceId("tone".into()),
+        job: None,
+        channel: None,
+        span: Span {
+            start_ns: Timestamp(0),
+            end_ns: Timestamp(0),
+        },
+    };
+    let bus = ts.node.bus();
+    let id = bus.register(StreamKind::Video, prov.clone());
+    let pixels: Vec<u8> = (0..16 * 8).map(|i| i as u8).collect();
+    let feeder = tokio::spawn({
+        let (bus, id) = (bus.clone(), id.clone());
+        async move {
+            loop {
+                bus.publish(Frame::new(
+                    id.clone(),
+                    prov.clone(),
+                    Payload::Video {
+                        width: 16,
+                        height: 8,
+                        format: VideoFormat::Gray8,
+                        frame: Arc::from(pixels.clone()),
+                    },
+                ));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    });
+    let out = dir.path().join("still.png");
+    let (url, path, stream) = (
+        ts.url.clone(),
+        out.to_string_lossy().into_owned(),
+        id.0.clone(),
+    );
+    let stdout = tokio::task::spawn_blocking(move || {
+        zeta_remote(
+            &url,
+            "s3cret",
+            &["stream", "save", "--stream", &stream, "--path", &path],
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone()
+    })
+    .await
+    .unwrap();
+    feeder.abort();
+    let saved = json(&stdout);
+    assert_eq!(
+        (saved["width"].as_u64(), saved["height"].as_u64()),
+        (Some(16), Some(8))
+    );
+    let png = std::fs::read(&out).unwrap();
+    assert_eq!(&png[..4], b"\x89PNG");
+    assert_eq!(saved["bytes"].as_u64(), Some(png.len() as u64));
+    ts.stop().await;
+}

@@ -68,3 +68,32 @@ fn parse_checks_lengths_before_allocating() {
     let e = parse_envelope(&big_body).unwrap_err();
     assert!(e.contains("16777216-byte limit"), "{e}");
 }
+
+fn video(width: u32, height: u32, format: zeta_core::stream::VideoFormat, body: Vec<u8>) -> Frame {
+    frame(Payload::Video {
+        width,
+        height,
+        format,
+        frame: Arc::from(body),
+    })
+}
+
+#[test]
+fn a_video_frame_roundtrips_with_its_body() {
+    use zeta_core::stream::VideoFormat;
+    let px: Vec<u8> = (0..8).collect();
+    let bytes = envelope(&video(4, 2, VideoFormat::Gray8, px.clone())).unwrap();
+    let (h, body) = parse_envelope(&bytes).unwrap();
+    assert_eq!(
+        h.payload,
+        json!({"width":4,"height":2,"format":"gray8","bytes":8})
+    );
+    assert_eq!(body, px);
+}
+
+#[test]
+fn a_video_body_over_max_body_is_refused() {
+    use zeta_core::stream::VideoFormat;
+    let f = video(4096, 1366, VideoFormat::Rgb8, vec![0; 4096 * 1366 * 3]);
+    assert!(envelope(&f).is_err());
+}

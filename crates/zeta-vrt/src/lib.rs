@@ -5,6 +5,7 @@ mod context;
 pub mod envelope;
 mod packet;
 mod stream;
+pub mod video;
 
 pub use context::{CONTEXT_INTERVAL_NS, ContextPacket, IqMeta};
 pub use envelope::{envelope, parse_envelope};

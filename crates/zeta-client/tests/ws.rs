@@ -170,3 +170,28 @@ async fn server_stop_ends_subscription_with_reason() {
     assert!(sub.next().await.is_none(), "stays ended");
     stopper.await.unwrap();
 }
+
+#[tokio::test]
+async fn subscribe_video_refuses_an_audio_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let id = ts.node.bus().register(
+        StreamKind::Audio,
+        Provenance {
+            source: SourceId("tone".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(0),
+            },
+        },
+    );
+    let c = NodeClient::new(&ts.url, "s3cret").unwrap();
+    match c.subscribe_video(&id, "sharp").await {
+        Err(ClientError::Stream { detail, .. }) => {
+            assert_eq!(detail, format!("stream {} is audio, not video", id.0));
+        }
+        other => panic!("expected a stream error, got {other:?}"),
+    }
+}

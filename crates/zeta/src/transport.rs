@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use zeta_speech::{NodeBackend, SocketBackend, SpeechBackend};
 
-use crate::cli::{Cli, Command, ModesCmd, SPEECH_EXCLUSIVE, ServeArgs, SpeechArgs};
+use crate::cli::{Cli, Command, ModesCmd, SPEECH_EXCLUSIVE, ServeArgs, SpeechArgs, StreamCmd};
 use crate::{agents_md, ask, node_setup};
 
 const MIN_SECRET_LEN: usize = 12;
@@ -125,6 +125,14 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
         )
         .await;
     }
+    if let Command::Stream(StreamCmd::Save {
+        stream,
+        path,
+        timeout_ms,
+    }) = cli.command
+    {
+        return stream_save(&client, &stream, &path, timeout_ms, cli.json).await;
+    }
     let plan = cli.command.plan_filter();
     let mut op = match cli.command.into_op() {
         Ok(Some(op)) => op,
@@ -145,6 +153,95 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
         }
         Ok(Err(e)) => print(serde_json::to_string_pretty(&e), 2),
         Err(e) => usage(&e.to_string()),
+    }
+}
+
+/// `stream save`: write the stream's next video frame to `path` as a PNG. The body is
+/// saved as it arrives; a node that still sends the frame's raw pixels gets them encoded
+/// here at full size.
+async fn stream_save(
+    client: &NodeClient,
+    stream: &str,
+    path: &Path,
+    timeout_ms: u64,
+    json: bool,
+) -> ExitCode {
+    use std::time::Duration;
+    use zeta_client::Received;
+    use zeta_core::stream::VideoFormat;
+    use zeta_core::types::{StreamId, StreamKind};
+
+    let mut sub = match client
+        .subscribe_video(&StreamId(stream.to_string()), "sharp")
+        .await
+    {
+        Ok(s) => s,
+        Err(e @ zeta_client::ClientError::Stream { .. }) if e.to_string().contains("not video") => {
+            return usage(&format!(
+                "{e}; IQ is saved with `zeta iq read`, audio has no still"
+            ));
+        }
+        Err(e) => return usage(&e.to_string()),
+    };
+    let wait = async {
+        loop {
+            match sub.next().await {
+                Some(Ok(Received::Frame { header, body })) if header.kind == StreamKind::Video => {
+                    return Ok((header, body));
+                }
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e.to_string()),
+                None => return Err("the stream ended before a video frame".to_string()),
+            }
+        }
+    };
+    let (header, body) = match tokio::time::timeout(Duration::from_millis(timeout_ms), wait).await {
+        Err(_) => return usage(&format!("no video frame in {timeout_ms} ms")),
+        Ok(Err(e)) => return usage(&e),
+        Ok(Ok(got)) => got,
+    };
+    let dim = |k: &str| header.payload[k].as_u64().unwrap_or(0) as u32;
+    let (mut width, mut height) = (dim("width"), dim("height"));
+    let png = match header.payload["format"].as_str() {
+        Some("gray8") | Some("rgb8") => {
+            let format = if header.payload["format"] == "gray8" {
+                VideoFormat::Gray8
+            } else {
+                VideoFormat::Rgb8
+            };
+            match zeta_vrt::video::encode_frame(
+                width,
+                height,
+                format,
+                &body,
+                &zeta_vrt::video::SHARP,
+            ) {
+                Ok((png, w, h)) => {
+                    (width, height) = (w, h);
+                    png
+                }
+                Err(e) => return usage(&e),
+            }
+        }
+        _ => body,
+    };
+    if let Err(e) = std::fs::write(path, &png) {
+        return usage(&format!("{}: {e}", path.display()));
+    }
+    if json {
+        print(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "saved": path, "width": width, "height": height, "bytes": png.len()
+            })),
+            0,
+        )
+    } else {
+        println!(
+            "saved {} ({width}x{height}, {} bytes)",
+            path.display(),
+            png.len()
+        );
+        ExitCode::SUCCESS
     }
 }
 

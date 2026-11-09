@@ -81,6 +81,27 @@ impl NodeClient {
     /// initial credit. The stream's kind is looked up first; an unknown stream is
     /// `ClientError::Stream` naming the known ids.
     pub async fn subscribe(&self, stream: &StreamId) -> Result<Subscription, ClientError> {
+        self.open(stream, "format=binary", false).await
+    }
+
+    /// As [`NodeClient::subscribe`] for a video stream, asking for delivery `profile`
+    /// (`smooth`, `sharp` or `thumb`): the bodies are PNG. A stream that is not video is
+    /// `ClientError::Stream`.
+    pub async fn subscribe_video(
+        &self,
+        stream: &StreamId,
+        profile: &str,
+    ) -> Result<Subscription, ClientError> {
+        self.open(stream, &format!("format=binary&video={profile}"), true)
+            .await
+    }
+
+    async fn open(
+        &self,
+        stream: &StreamId,
+        query: &str,
+        video: bool,
+    ) -> Result<Subscription, ClientError> {
         let streams = self.streams().await?;
         let Some(kind) = streams.iter().find(|i| &i.id == stream).map(|i| i.kind) else {
             let mut known: Vec<&str> = streams.iter().map(|i| i.id.0.as_str()).collect();
@@ -94,7 +115,13 @@ impl NodeClient {
                 ),
             });
         };
-        let url = self.ws_url(stream)?;
+        if video && kind != StreamKind::Video {
+            return Err(ClientError::Stream {
+                url: self.url().to_string(),
+                detail: format!("stream {} is {}, not video", stream.0, kind_name(kind)),
+            });
+        }
+        let url = self.ws_url(stream, query)?;
         let bad = || ClientError::BadUrl(self.url().to_string());
         let mut req = url.as_str().into_client_request().map_err(|_| bad())?;
         let mut bearer =
@@ -151,15 +178,15 @@ impl NodeClient {
         Ok(sub)
     }
 
-    /// The node's URL with `ws` for `http`, at `/stream/{id}?format=binary`.
-    fn ws_url(&self, stream: &StreamId) -> Result<Url, ClientError> {
+    /// The node's URL with `ws` for `http`, at `/stream/{id}?{query}`.
+    fn ws_url(&self, stream: &StreamId, query: &str) -> Result<Url, ClientError> {
         let bad = || ClientError::BadUrl(self.url().to_string());
         let mut url = Url::parse(self.url()).map_err(|_| bad())?;
         url.set_scheme("ws").map_err(|()| bad())?;
         url.path_segments_mut()
             .map_err(|()| bad())?
             .extend(["stream", stream.0.as_str()]);
-        url.query_pairs_mut().append_pair("format", "binary");
+        url.set_query(Some(query));
         Ok(url)
     }
 }
@@ -268,5 +295,16 @@ impl Subscription {
             let (header, body) = parse_envelope(bytes).map_err(|e| format!("envelope: {e}"))?;
             Ok(Some(Received::Frame { header, body }))
         }
+    }
+}
+
+fn kind_name(kind: StreamKind) -> &'static str {
+    match kind {
+        StreamKind::Iq => "iq",
+        StreamKind::Audio => "audio",
+        StreamKind::Video => "video",
+        StreamKind::Text => "text",
+        StreamKind::Event => "event",
+        StreamKind::Sink => "sink",
     }
 }

@@ -1191,7 +1191,23 @@ pub enum StreamCmd {
         #[arg(long, value_name = "MS")]
         timeout_ms: u32,
     },
+    /// Save the next video frame of a stream as a PNG (reads the node's websocket: needs
+    /// --node)
+    Save {
+        /// Stream id from `stream list`
+        #[arg(long, value_name = "ID")]
+        stream: String,
+        /// File to write the PNG to
+        #[arg(long, value_name = "FILE")]
+        path: PathBuf,
+        /// Longest wait for a frame, milliseconds
+        #[arg(long, value_name = "MS", default_value_t = 10_000)]
+        timeout_ms: u64,
+    },
 }
+
+/// The usage error for `stream save` without `--node`.
+pub const STREAM_SAVE_NEEDS_NODE: &str = "stream save reads the node's websocket: use --node";
 
 /// `--then-tail MAX_FRAMES,TIMEOUT_MS` on `job start`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1677,7 +1693,8 @@ impl Command {
             | Command::Ops(_)
             | Command::Modes(ModesCmd::Check { .. })
             | Command::Transcripts(_)
-            | Command::Events(_) => {
+            | Command::Events(_)
+            | Command::Stream(StreamCmd::Save { .. }) => {
                 return Ok(None);
             }
         }))
