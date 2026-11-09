@@ -1,7 +1,7 @@
 {
   "id": "pagers_au",
   "name": "Australian POCSAG pagers",
-  "notes": "One watch over 148.0-149.0 MHz starts a POCSAG decoder on each pager carrier it finds and keeps it through the gaps between pages.",
+  "notes": "One watch over 148.0-149.0 MHz starts a POCSAG decoder on each pager carrier it finds and keeps it through the gaps between pages. The b210 shows a steady spur at exactly 148.500 MHz, a fixed RF: centred on it, the capture's DC mask hides it from the watch; an offset centre would expose it as a steady signal the watch would keep starting a decoder on.",
   "radios": {
     "radio": {"note": "a radio that captures 148.0-149.0 MHz (1 MHz)"}
   },

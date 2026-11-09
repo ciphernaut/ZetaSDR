@@ -175,6 +175,21 @@ fn the_two_builtin_sets_parse_validate_and_are_ready() {
     assert_eq!(roles, ["wide", "second"], "the file's order");
 }
 
+/// pagers_au stays centred on 148.5 MHz, and its notes name the steady spur there (the
+/// capture centre's DC mask hides it; an offset centre would expose it to the watch).
+#[test]
+fn pagers_au_stays_on_148_5_mhz_and_names_the_spur() {
+    let sets = load(None);
+    let pagers = sets.get("pagers_au").unwrap();
+    let watch = serde_json::to_value(&pagers.set.members[0]).unwrap();
+    assert_eq!(watch["center_hz"], 148_500_000, "{watch}");
+    let notes = &pagers.set.notes;
+    assert!(
+        notes.contains("148.500 MHz") && notes.contains("spur") && notes.contains("b210"),
+        "{notes}"
+    );
+}
+
 #[test]
 fn an_operator_set_replaces_a_builtin_and_a_broken_one_is_listed_broken() {
     let dir = tempfile::tempdir().unwrap();
