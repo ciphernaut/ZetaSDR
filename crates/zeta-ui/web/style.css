@@ -843,6 +843,8 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
    the waterfall and the map hidden but running underneath (their sockets and ring stay). */
 html[data-full] #pane { top: 0; height: auto; border-top: 0; z-index: 5; }
 html[data-full] #waterfall, html[data-full] #map { visibility: hidden; }
+/* A theme with the rail (console) keeps its spine, the rail's start border, beside the pane. */
+html[data-full][data-rail="on"]:not([data-footprint="narrow"]) #pane { border-inline-start: 12px solid var(--c-frame); }
 #video { height: 100%; display: grid; grid-template-rows: auto 1fr auto; background: var(--bg); }
 #video[hidden] { display: none; }
 #video .video-status { display: flex; align-items: center; gap: 8px; padding: 2px 6px; font-family: var(--font-mono); font-size: 12px; color: var(--dim); white-space: nowrap; overflow: hidden; }
@@ -858,4 +860,4 @@ canvas.video-main { width: 100%; height: 100%; object-fit: contain; image-render
 .video-thumb.nolock { filter: grayscale(1) brightness(0.6); }
 /* A canvas has no ::after: the strip's "no lock" label sits on the thumb's cell. */
 #video .video-strip .thumb-cell.nolock::after { content: "no lock"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); font-size: 11px; color: var(--text); pointer-events: none; }
-.ctx-item[aria-disabled="true"] { opacity: .45; pointer-events: none; }
+.ctx-item[aria-disabled="true"] { opacity: .45; cursor: default; }

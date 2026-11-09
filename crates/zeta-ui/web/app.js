@@ -2028,6 +2028,8 @@ function boot() {
       state.ov.setSource(src ? src.id : null);
       state.jobs?.refresh();
     }
+    // The video pane's feeds: another radio's lock events come from its own event feed.
+    state.video?.refresh();
   });
   wireCommandLine();
   window.addEventListener("resize", applyFootprint);

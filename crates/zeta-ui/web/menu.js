@@ -524,6 +524,7 @@ class Menu {
     this.sel = null;
     // The fit in progress (its generation token) or null; close() bumps fitGen.
     this.fitting = null;
+    this.videoRefused = null; // why "Decode video" cannot start on the open box (videoRefusal)
     this.fitGen = 0;
     this.labelKeys = [];
     this.boxLabel = null; // the last classification's top layer-1 label {centerHz, bandwidthHz, name}
@@ -697,16 +698,9 @@ class Menu {
     // `Start set…` only when set_list has a ready set.
     this.el.querySelector('[data-action="set"]').hidden = this.readySets().length === 0;
     this.fillSub(this.sel);
-    const video = this.el.querySelector('[data-action="video"]');
     const src = (this.sources() || []).find((x) => x.id === this.sel.sourceId);
-    const refusal = videoRefusal(src, this.sel.bandwidthHz);
-    if (refusal) {
-      video.setAttribute("aria-disabled", "true");
-      video.title = refusal;
-    } else {
-      video.removeAttribute("aria-disabled");
-      video.removeAttribute("title");
-    }
+    this.videoRefused = videoRefusal(src, this.sel.bandwidthHz);
+    this.paintVideoEntry();
     this.el.hidden = false;
     // Keep it inside the viewport.
     const w = this.el.offsetWidth;
@@ -941,6 +935,20 @@ class Menu {
       if (token === null) item.removeAttribute("aria-disabled");
       else item.setAttribute("aria-disabled", "true");
     }
+    if (token === null) this.paintVideoEntry();
+  }
+
+  // "Decode video" greyed, its title the lease's words, while this.videoRefused (open()) says
+  // the shown radio cannot carry the box; choose() refuses it on the same value.
+  paintVideoEntry() {
+    const item = this.el.querySelector('[data-action="video"]');
+    if (this.videoRefused) {
+      item.setAttribute("aria-disabled", "true");
+      item.title = this.videoRefused;
+    } else {
+      if (this.fitting === null) item.removeAttribute("aria-disabled");
+      item.removeAttribute("title");
+    }
   }
 
   // The ring no longer holds the span (`too_old`): once, on the latest span of the same
@@ -962,7 +970,7 @@ class Menu {
   async choose(action) {
     // A fit in progress ignores further choices (a double click starts one job).
     if (!this.sel || this.fitting !== null) return;
-    if (action === "video" && this.el.querySelector('[data-action="video"]').title) return;
+    if (action === "video" && this.videoRefused) return;
     if (action === "decode_across") {
       // Shown, never toggled: the pointer reaching the entry already showed it.
       this.showSub(true);
