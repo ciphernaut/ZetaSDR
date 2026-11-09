@@ -7,6 +7,9 @@
 *:-27\.3842, ?153\.1175([^0-9]|$)
 # Synthesised test values: a sonde fix in the rs41 CLI test and its plan.
 *:S1234567 -27\.4000,153\.1000
+# The demo station in the APRS position test before b3ff63b7 named the tolerance: the
+# latitude or longitude followed by the 0.0001 tolerance reads as a pair (history only).
+crates/zeta-dsp/src/aprs_info.rs:near\(i\.l(at|on), (-27\.3842|153\.1175), 0\.0001\);
 # Public data: iNTERCEPT catalogue descriptions, the dump1090 SBS sample position.
 crates/zeta-dsp/data/signals.json:"description":
 crates/zeta-ext/tests/adsb.rs:,52\.25720,3\.91937,
