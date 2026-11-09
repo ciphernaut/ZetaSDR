@@ -640,3 +640,26 @@ Seen 2026-11-07 during plan 28.1, passed on rerun. Likely a timing assumption be
 ## Test: `modes_check::a_bad_synth_block_fails_its_row_and_the_rest_still_run` flaked once on a leftover scratch dir
 
 Seen 2026-11-09 in a full workspace run (the suite in parallel), six single reruns passed. The checker's `remove_dir_all` of `check-<pid>-pocsag_decode` has its result ignored (`modes_check.rs`, after `run_test`), so a node still writing its state dir as it shuts down leaves the directory for the test to find. Wait for the node to finish, or retry the removal, before reporting the row.
+
+## Page: pointer movement over the page is costly
+
+From the operator, 2026-11-09: the desktop mouse lags, worst while the pointer is over the node's page in the browser (the browser held about a third of a core with the page open; the host itself was idle). Profile the page's pointer handlers and waterfall redraws (hover readouts, tooltips, the box menu's tracking): coalesce pointer events to one per animation frame, skip redraws when nothing under the pointer changed, and make sure the canvas path is GPU-friendly. Check with the browser's performance panel on a page with several live jobs.
+
+## Origins: which site sent this burst
+
+From the operator, 2026-11-09: when several licensed sites share one channel, the map lights every candidate and nothing says which one sent a given burst. Options, cheapest first:
+- **Per-burst strength against each candidate.** Compare a burst's received level with each candidate site's expected level (power, antenna height, distance, a simple path-loss model) and rank the sites per burst, not per band. Uses only what the register and the detector already give.
+- **Bearing from a two-channel coherent receiver** (the B210 has two). Two antennas half a wavelength apart give an angle of arrival per burst from the phase difference; front/back ambiguity is resolved against the register's candidates. The map draws one bearing line per burst. Needs a phase-calibration step and a second antenna.
+- **Time difference of arrival with a second synchronised receiver.** A fix without directional antennas; needs GPS-disciplined clocks on both (see "Station: discipline the B210 to its GPS module") and a federated node.
+- **A directional antenna**, swept or fixed, judged by burst strength.
+- **An identity in the frame** (station ID), only where the protocol is a clear, standards-based one the node may decode; never for payloads the field craft says to report, not decode.
+
+Keep live examples out of the repository: no site names, frequencies, distances or bearings from real observations of infrastructure.
+
+## Plans: a `pocsag_au` channel plan
+
+From the operator, 2026-11-09: there is no POCSAG channel plan, only the `pagers_au` set (a span watch that starts decoders on carriers it detects). An always-on plan (one pocsag_decode per register-assigned pager channel in the region, as `acars_vhf` does for ACARS) would decode a quiet channel's first page without waiting for detection. Build it from the register's assignments rather than a hand list, and keep the set as the default.
+
+## Station: USB 3 noise near a 2.4 GHz mouse receiver
+
+Field note, 2026-11-09: the desktop's wireless mouse receiver shares the room with the B210's USB 3 link (5 Gbps), a known 2.4 GHz noise source. If drop-outs return with the B210 streaming, move the receiver onto an extension lead away from USB 3 cables, or put the B210 on a ferrite-clipped or USB 2 cable. Not a node change; recorded so the cause is known.
