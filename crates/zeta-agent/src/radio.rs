@@ -361,8 +361,8 @@ fn join(ids: &[SourceId]) -> String {
 impl Selection {
     /// Check one tool call. Returns the `policy` refusal for a radio op on another radio
     /// than the default under `focus` that the request did not name; otherwise admits it
-    /// (`None`), recording it in `off_default` when its radio is not the default.
-    pub fn admit(&mut self, tool: &str, args: &Value) -> Option<Value> {
+    /// (`None`). Records nothing: [`Selection::record_applied`] does, once the op applied.
+    pub fn admit(&self, tool: &str, args: &Value) -> Option<Value> {
         if !RADIO_OPS.contains(&tool) {
             return None;
         }
@@ -384,11 +384,26 @@ impl Selection {
                 ),
             }));
         }
-        self.off_default.push(OffDefault {
-            tool: tool.to_string(),
-            source: SourceId(src.to_string()),
-        });
         None
+    }
+
+    /// Note a radio op that was admitted and applied successfully: recorded in
+    /// `off_default` when its radio is not the default (with no default, nothing is off
+    /// it). A call that failed never reaches here, so it is never reported as run.
+    pub fn record_applied(&mut self, tool: &str, args: &Value) {
+        if !RADIO_OPS.contains(&tool) {
+            return;
+        }
+        let (Some(src), Some(radio)) = (args.get("source").and_then(Value::as_str), &self.radio)
+        else {
+            return;
+        };
+        if src != radio.0 {
+            self.off_default.push(OffDefault {
+                tool: tool.to_string(),
+                source: SourceId(src.to_string()),
+            });
+        }
     }
 
     /// The `## This request` section appended to the system message: the default radio,
@@ -552,7 +567,7 @@ mod tests {
 
         // Under focus, a named dotted radio is admitted, not refused.
         let sources = vec![src("cb", None), src("kiwi.1", None)];
-        let mut s = resolve(
+        let s = resolve(
             "start a measure on kiwi.1",
             &ctx(Some("cb"), FocusFrom::Shown, RadioPolicy::Focus),
             &sources,
@@ -752,7 +767,7 @@ mod tests {
     #[test]
     fn strict_refuses_another_radio_on_every_radio_op() {
         let sources = vec![src("cb", None), src("tone", None)];
-        let mut s = resolve(
+        let s = resolve(
             "start a measure",
             &ctx(Some("cb"), FocusFrom::Shown, RadioPolicy::Focus),
             &sources,
@@ -780,7 +795,7 @@ mod tests {
     fn strict_admits_a_named_radio() {
         let sources = vec![src("cb", None), src("tone", None), src("hackrf", None)];
         // One named radio becomes the default.
-        let mut s = resolve(
+        let s = resolve(
             "start a measure on tone",
             &ctx(Some("cb"), FocusFrom::Shown, RadioPolicy::Focus),
             &sources,
@@ -788,7 +803,7 @@ mod tests {
         );
         assert_eq!(s.admit("job_start", &json!({"source": "tone"})), None);
         // Two named radios: the focus stays the default, and both named are admitted.
-        let mut s = resolve(
+        let s = resolve(
             "compare tone and hackrf",
             &ctx(Some("cb"), FocusFrom::Shown, RadioPolicy::Focus),
             &sources,
@@ -820,6 +835,7 @@ mod tests {
                 None,
                 "{tool}"
             );
+            s.record_applied(tool, &json!({"source": "tone"}));
         }
         assert!(s.off_default.is_empty());
     }
@@ -833,7 +849,10 @@ mod tests {
             &sources,
             Caller::page(),
         );
+        // Admitting records nothing: only an applied op is recorded.
         assert_eq!(s.admit("job_start", &json!({"source": "tone"})), None);
+        assert!(s.off_default.is_empty());
+        s.record_applied("job_start", &json!({"source": "tone"}));
         assert_eq!(
             s.off_default,
             vec![OffDefault {
@@ -842,6 +861,9 @@ mod tests {
             }]
         );
         assert_eq!(s.admit("job_start", &json!({"source": "cb"})), None);
+        s.record_applied("job_start", &json!({"source": "cb"}));
+        // Reads are never recorded, applied or not.
+        s.record_applied("source_free", &json!({"source": "tone"}));
         assert_eq!(s.off_default.len(), 1);
         assert_eq!(
             serde_json::to_value(&s.off_default).unwrap(),
@@ -859,6 +881,7 @@ mod tests {
             Caller::http(),
         );
         assert_eq!(s.admit("job_start", &json!({"source": "tone"})), None);
+        s.record_applied("job_start", &json!({"source": "tone"}));
         assert!(s.off_default.is_empty());
     }
 

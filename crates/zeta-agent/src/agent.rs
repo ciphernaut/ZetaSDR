@@ -397,7 +397,8 @@ impl<E: Executor> Agent<E> {
     /// Apply one tool call. Bad arguments and unknown tools are the model's
     /// fault: they become the call's result and never reach the node. A
     /// page-only tool is answered here, never gated and never applied.
-    /// A radio op the selection refuses is recorded `ok: false` and never applied.
+    /// A radio op the selection refuses is recorded `ok: false` and never applied; one
+    /// that applied successfully off the default radio goes into `off_default`.
     async fn call(
         &self,
         call: &ToolCall,
@@ -434,7 +435,10 @@ impl<E: Executor> Agent<E> {
         let result = match outcome {
             Ok(op) => match gate(&op, self.cfg.allow) {
                 Some(refusal) if !own.allows_stop(&op) => Err(refusal),
-                _ => match selection.and_then(|s| s.admit(&f.name, &arguments)) {
+                _ => match selection
+                    .as_deref()
+                    .and_then(|s| s.admit(&f.name, &arguments))
+                {
                     Some(refusal) => Err(refusal),
                     None => self.exec.apply(op).await?,
                 },
@@ -443,6 +447,9 @@ impl<E: Executor> Agent<E> {
         };
         if let Ok(value) = &result {
             own.record(&f.name, &arguments, value);
+            if let Some(s) = selection {
+                s.record_applied(&f.name, &arguments);
+            }
         }
         let ok = result.is_ok();
         let mut result = result.unwrap_or_else(|e| e);

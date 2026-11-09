@@ -1389,3 +1389,32 @@ async fn a_run_without_context_states_no_radio_in_focus() {
     assert_eq!(sel.policy, RadioPolicy::FreeFirst);
     assert_eq!(sel.caller, Caller::cli());
 }
+
+#[tokio::test]
+async fn a_refused_fallback_start_is_not_off_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = two_source_node(dir.path()).await;
+    // 50 MHz is below tone's 100..200 MHz: the node refuses the start.
+    let start = tool_call_response(&[(
+        "job_start",
+        json!({"kind": "passthrough", "source": "tone", "center_hz": 50_000_000u64,
+               "bandwidth_hz": 20_000, "deviation_hz": null, "sideband": null,
+               "elastic": false, "replace": []}),
+    )]);
+    let fake = fake(vec![
+        start,
+        text_response("tone cannot tune 50 MHz.", "stop"),
+    ])
+    .await;
+    let agent = Agent::new(
+        llm(&fake),
+        LocalExecutor::new(node.clone()),
+        radio_cfg(RadioPolicy::FocusFallback, "cb"),
+    );
+    let t = agent.run("start a passthrough on 50 MHz").await.unwrap();
+    assert!(!t.calls[0].ok, "{:?}", t.calls[0]);
+    assert_ne!(t.calls[0].result["error"], "policy", "{:?}", t.calls[0]);
+    assert!(job_ids(&node).await.is_empty());
+    let sel = t.selection.expect("selection");
+    assert!(sel.off_default.is_empty(), "{:?}", sel.off_default);
+}
