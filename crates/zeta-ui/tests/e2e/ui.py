@@ -3595,6 +3595,84 @@ def scenario_owned_jobs_are_hidden_from_the_jobs_pane(page, url, secret):
                 stop_job(url, secret, j["id"])
 
 
+def detect_params(url, secret, job):
+    """The params of `job`'s `detect` node (graph_get)."""
+    graph = http_json(url, secret, "/op", {"op": "graph_get", "job": job})["value"]
+    detect = [n for n in graph["nodes"] if n["kind"] == "detect"]
+    return detect[0]["params"] if len(detect) == 1 else None
+
+
+def scenario_decode_across_entry_starts_a_watch_with_modes(page, url, secret):
+    # Plan 31 spec 4.7, 7.3: the box menu's "Decode across this band…" lists the ready rows
+    # that fit the box; one click starts a watch with `modes` on its `detect` node, whose
+    # decoder folds under the watch's row and whose subjects merge into one table per watch.
+    select_source(page, url, secret, "pocsag")
+    wait_span(page, 1.2)
+    menu = drag_menu(page, 0.25, 0.75)
+    entry = page.locator('#ctx .ctx-item[data-action="decode_across"]')
+    expect(entry).to_have_text("Decode across this band…")
+    sub = page.locator('#ctx .ctx-sub[data-for="decode_across"]')
+    expect(sub).to_be_hidden()
+    entry.click()
+    item = sub.locator('.ctx-item[data-mode="pocsag_decode"]')
+    expect(item).to_have_text("Decode POCSAG pagers across this band")
+    # A ready row wider than the box (RDS's 200 kHz) is not offered.
+    expect(sub.locator('.ctx-item[data-mode="rds_decode"]')).to_have_count(0)
+    item.click()
+    expect(menu).to_be_hidden()
+    watch = None
+    try:
+        def detected():
+            ws = running_watch_jobs(url, secret, "pocsag")
+            if len(ws) != 1:
+                return None
+            p = detect_params(url, secret, ws[0]["id"])
+            return ws[0]["id"] if p and p.get("modes") == ["pocsag_decode"] else None
+
+        watch = wait_until(detected, 10.0, "a watch on pocsag with modes [pocsag_decode]")
+        p = detect_params(url, secret, watch)
+        assert p["persist_ms"] == 500 and p["width_hz"] == [6250, 18750], p
+        expect(page.locator("#transcript .line", has_text="graph_put")).not_to_have_count(0)
+        # The fixture's page sits on the capture centre, which `detect` masks (a real radio's DC
+        # spike), and its clean FSK reads as two sub-kHz tones under the 0.5x width floor: the
+        # test seeds the row's known channel (148.6375 MHz) instead of waiting for a detection.
+        graph = http_json(url, secret, "/op", {"op": "graph_get", "job": watch})["value"]
+        next(n for n in graph["nodes"] if n["kind"] == "detect")["params"]["seed_known"] = True
+        http_json(url, secret, "/op", {"op": "graph_put", "job": watch, "graph": graph})
+
+        def decoder():
+            jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            w = next((j for j in jobs if j["id"] == watch), None)
+            kept = [d["job"] for d in (((w or {}).get("context") or {}).get("watch") or {})
+                    .get("decoding", [])]
+            return next((j["id"] for j in jobs if j["kind"] == "pocsag_decode"
+                         and j["source"] == "pocsag" and j["state"]["status"] == "running"
+                         and j["id"] in kept), None)
+
+        dec = wait_until(decoder, 20.0, "a pocsag_decode the watch keeps")
+        page.evaluate("window.zetaTest.poll()")
+        group = page.locator(f'#jobs .job-group[data-plan="{watch}"][data-kind="watch"]')
+        expect(group).to_have_count(1)
+        expect(group.locator(f'.job[data-id="{dec}"]')).to_have_count(1)
+        expect(group.locator("> summary")).to_have_text(
+            re.compile(r"pocsag_decode × 1 decoding, 0 waiting"))
+        expect(group.locator(f'> summary .job[data-id="{watch}"]')).to_have_count(1)
+        open_subjects(page)
+        sec = page.locator(f'#subjects section.subject-job[data-job="{watch}"]')
+        expect(sec).to_have_count(1)
+        expect(sec.locator("h3")).to_have_text(f"watch {watch[-6:]} · addresses")
+        expect(sec.locator('th[data-col="channel"]')).to_have_count(1)
+        row = sec.locator('tr.subject[data-key="1234567"]')
+        expect(row).to_have_count(1, timeout=20_000)
+        expect(row.locator('td[data-col="channel"]')).to_have_text("148.6375")
+        expect(page.locator(f'#subjects section.subject-job[data-job="{dec}"]')).to_have_count(0)
+    finally:
+        for w in running_watch_jobs(url, secret, "pocsag"):
+            stop_job(url, secret, w["id"])
+        wait_until(lambda: not running_jobs(url, secret, "pocsag_decode", "pocsag"), 10.0,
+                   "no pocsag_decode left after the watch stopped")
+
+
 def scenario_adsb_entry_asks_for_2400_khz(page, url, secret):
     # ADS-B always asks for 2.4 MHz, whatever was selected; the 48 kHz tone cannot serve it,
     # so the node refuses with out_of_range naming bandwidth_hz and the transcript says so.
@@ -5327,7 +5405,8 @@ def scenario_subjects_store_merge_units_and_fill(page, url, secret):
     assert r["looked"] == 5, r  # subjectOf neither merges nor counts
     assert r["held"] is True and r["heldAny"] is True and r["heldNone"] is False, r
     assert r["selectedFirst"] is None, r
-    assert r["selected"] == {"job": "J", "key": "A"}, r
+    # A job no watch keeps is its own group (plan 31 spec 4.7).
+    assert r["selected"] == {"job": "J", "group": "J", "key": "A"}, r
     assert r["afterSync"] == 0 and r["lastAfterSync"] is None and r["dropped"] == 3, r
     assert r["selectedAfter"] is None, r
     assert r["selectEvents"][-1] is None, r

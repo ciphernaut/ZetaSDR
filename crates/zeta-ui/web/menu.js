@@ -66,6 +66,19 @@
 //                                             `candidate`), held by the feed until a poll
 //                                             lists the job
 //   watch      Watch this band                job_start kind=watch on the selection as is
+//   decode_across  Decode across this band…   opens its submenu `.ctx-sub[data-for=
+//                                             "decode_across"]` (a click, or the pointer on
+//                                             it): one `.ctx-item[data-mode=<id>]` per `ready`
+//                                             row of `modes_list` (read once per page, then
+//                                             cached) whose band.bandwidth_hz is no wider than
+//                                             the selection, `Decode <row name> across this
+//                                             band`; the entry is hidden when none fits.
+//                                             Choosing a row: job_start kind=watch on the
+//                                             selection as is, then graph_get and graph_put of
+//                                             its `detect` node with modes [<id>], persist_ms
+//                                             DECODE_ACROSS_PERSIST_MS and width_hz
+//                                             DECODE_ACROSS_WIDTH_FIT × the row's width
+//                                             (plan 31 spec 4.7: two ops, one click)
 //   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
 //   pocsag_decode  Decode › POCSAG            job_start kind=pocsag_decode, deviation_hz null,
 //                                             bandwidth_hz at least POCSAG_MIN_BANDWIDTH_HZ
@@ -223,6 +236,10 @@ export const FIT_NOISE_SNR_DB = 6;
 // spike) unmeasured when its band holds the centre off-centre. The node's
 // zeta_core::ops::MEASURE_DC_MASK_HZ is the source of truth; this copy only words the note.
 export const MEASURE_DC_MASK_HZ = 25000;
+// "Decode across this band…" (plan 31 spec 4.7): the `detect` params its watch gets, the
+// widths as fractions of the chosen row's band.bandwidth_hz.
+export const DECODE_ACROSS_PERSIST_MS = 500;
+export const DECODE_ACROSS_WIDTH_FIT = [0.5, 1.5];
 
 const OUTLINE_ENTRIES = [
   ["fit", "Fit to signal"],
@@ -258,6 +275,7 @@ const ENTRIES = [
   ["capture", "Capture bursts"],
   ["identify", "Identify (thorough)"],
   ["watch", "Watch this band"],
+  ["decode_across", "Decode across this band…"],
   ["aprs_decode", "Decode › APRS"],
   ["pocsag_decode", "Decode › POCSAG"],
   ["rds_decode", "Decode › RDS (FM station data)"],
@@ -491,7 +509,19 @@ class Menu {
         item.addEventListener("pointerleave", hide);
       }
       this.el.append(item);
+      if (action === "decode_across") {
+        item.setAttribute("aria-haspopup", "true");
+        item.addEventListener("pointerenter", () => this.showSub(true));
+        this.sub = document.createElement("div");
+        this.sub.className = "ctx-sub";
+        this.sub.dataset.for = action;
+        this.sub.setAttribute("role", "group");
+        this.sub.hidden = true;
+        this.el.append(this.sub);
+      }
     }
+    // The ready mode rows (a promise of modes_list's entries), read once per page.
+    this.readyRows = null;
     this.footer = document.createElement("div");
     this.footer.id = "ctx-footer";
     this.el.append(this.footer);
@@ -536,7 +566,9 @@ class Menu {
         else this.close();
       } else if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
         ev.preventDefault();
-        const items = [...menu.querySelectorAll(".ctx-item:not([hidden])")];
+        const items = [...menu.querySelectorAll(".ctx-item")].filter(
+          (i) => i.closest("[hidden]") === null,
+        );
         const at = items.indexOf(document.activeElement);
         const step = ev.key === "ArrowDown" ? 1 : -1;
         items[(at + step + items.length) % items.length].focus();
@@ -581,6 +613,7 @@ class Menu {
     this.showFooter(this.current());
     // `Start plan…` only where the view's plan policy names a plan.
     this.el.querySelector('[data-action="plan"]').hidden = this.plan() === null;
+    this.fillSub(this.sel);
     this.el.hidden = false;
     // Keep it inside the viewport.
     const w = this.el.offsetWidth;
@@ -592,6 +625,7 @@ class Menu {
 
   close() {
     this.el.hidden = true;
+    this.showSub(false);
     this.wf.clearSelection();
     // A fit in progress is cancelled: its result no longer belongs to an open menu.
     this.fitGen += 1;
@@ -716,6 +750,86 @@ class Menu {
     }
   }
 
+  // The ready rows of `modes_list`, read on first use and cached (a failure is tried again
+  // at the next opening).
+  modeRows() {
+    if (!this.readyRows) {
+      this.readyRows = this.ov.api
+        .op({ op: "modes_list", family: null, state: "ready" })
+        .then((r) => ((r && r.value && r.value.modes) || []).filter((m) => m.state === "ready"))
+        .catch(() => {
+          this.readyRows = null;
+          return [];
+        });
+    }
+    return this.readyRows;
+  }
+
+  // The "Decode across" submenu for selection `sel`: the ready rows no wider than it; the
+  // entry hidden when none fits. Hidden until asked for.
+  async fillSub(sel) {
+    this.showSub(false);
+    const rows = await this.modeRows();
+    if (this.sel !== sel) return;
+    const fit = rows.filter(
+      (r) => typeof r.band?.bandwidth_hz === "number" && r.band.bandwidth_hz <= sel.bandwidthHz,
+    );
+    this.sub.replaceChildren(
+      ...fit.map((row) => {
+        const item = document.createElement("button");
+        item.className = "ctx-item";
+        item.dataset.mode = row.id;
+        item.setAttribute("role", "menuitem");
+        item.textContent = `Decode ${row.name} across this band`;
+        item.addEventListener("click", () => this.decodeAcross(row));
+        return item;
+      }),
+    );
+    this.el.querySelector('[data-action="decode_across"]').hidden = fit.length === 0;
+  }
+
+  // Shows (`on`) or hides the "Decode across" submenu; an empty one stays hidden.
+  showSub(on) {
+    if (!this.sub) return;
+    this.sub.hidden = !on || this.sub.childElementCount === 0;
+    this.el
+      .querySelector('[data-action="decode_across"]')
+      .setAttribute("aria-expanded", String(!this.sub.hidden));
+  }
+
+  // A watch on the selection that decodes `row` directly (plan 31 spec 4.7, call 5.1: the
+  // page keeps the two-op form): job_start, then its `detect` node's modes, persist_ms and
+  // width_hz by graph_put.
+  async decodeAcross(row) {
+    if (!this.sel || this.fitting !== null) return;
+    const s = this.current();
+    this.close();
+    const r = await this.startJob("watch", s);
+    if (!r || r.result !== "job" || !r.value) return;
+    const id = r.value;
+    let graph;
+    try {
+      graph = (await this.ov.api.op({ op: "graph_get", job: id })).value;
+    } catch (e) {
+      this.t.note(`graph_get: ${e.message}`, true);
+      return;
+    }
+    const detect = ((graph && graph.nodes) || []).find((n) => n.kind === "detect");
+    if (!detect) {
+      this.t.note(`watch ${id}: no detect node`, true);
+      return;
+    }
+    const bw = row.band.bandwidth_hz;
+    const [lo, hi] = DECODE_ACROSS_WIDTH_FIT;
+    detect.params = {
+      ...(detect.params || {}),
+      modes: [row.id],
+      persist_ms: DECODE_ACROSS_PERSIST_MS,
+      width_hz: [Math.round(lo * bw), Math.round(hi * bw)],
+    };
+    await this.applyOp({ op: "graph_put", job: id, graph });
+  }
+
   // The last `source_list` record overlays.js holds for source `id` (null when it holds
   // another source's or none).
   sourceRec(id) {
@@ -755,6 +869,12 @@ class Menu {
   async choose(action) {
     // A fit in progress ignores further choices (a double click starts one job).
     if (!this.sel || this.fitting !== null) return;
+    if (action === "decode_across") {
+      // Shown, never toggled: the pointer reaching the entry already showed it.
+      this.showSub(true);
+      this.sub.querySelector(".ctx-item")?.focus({ preventScroll: true });
+      return;
+    }
     const s = this.current();
     this.showFooter(s, action);
     const job = jobOf(action);

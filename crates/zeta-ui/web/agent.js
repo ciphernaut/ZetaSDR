@@ -100,6 +100,16 @@
 //       mix (watchedMix(): its id) running and covering its source, and that mix not to have
 //       heard it for JOBS_FOLD_IDLE_MS (activity(id): {watched, speaking, hot}, overlays.js);
 //       a `speaking` row never folds, nor a `hot` one unless the hot is its own row's hover.
+//       A watch's decoders fold under the watch first (groupOf, plan 31 spec 4.7, 9.22): a
+//       membership fold, drawn from one member, whatever their activity. The watch's own row
+//       becomes the summary of a `details.job-group[data-plan=<watch id>][data-kind="watch"]`
+//       standing where the watch's row stood, its `.group-text` reading `<watch kind> <id
+//       tail> · <mode> × <n>[, <mode> × <n>] decoding, <m> waiting` (m: the watch's
+//       context.watch.cap.waiting), its decoders' rows (and the rows attached to them) under
+//       it. Plan groups carry data-kind "plan". A decoder's Stop is its own job_stop.
+//   groupOf(job, jobs) -> {key, kind: "watch", title} | null
+//       the watch `job` decodes for: a running, unowned job named in some running watch's
+//       context.watch.decoding[].job (`key` the watch id, `title` `<watch kind> <id tail>`)
 import { channelColour } from "./overlays.js";
 import { mixCovering } from "./mix.js";
 import { channelLabel } from "./plans.js";
@@ -113,6 +123,20 @@ export const JOBS_POLL_MS = 2000;
 export const JOBS_FOLD_MIN = 8;
 export const JOBS_FOLD_IDLE_MS = 60_000;
 export const JOB_FOLD_KEY = "zeta.jobfold."; // + plan id: "open" | "closed", the operator's fold
+// A watch's kept decoder (plan 31 spec 4.7): a running, unowned job that a running watch's
+// `context.watch.decoding` names; its group, or null.
+export function groupOf(j, jobs) {
+  if (!j || j.owner || j.state?.status !== "running") return null;
+  for (const w of jobs || []) {
+    if (w.id === j.id || w.state?.status !== "running") continue;
+    const decoding = w.context?.watch?.decoding;
+    if (Array.isArray(decoding) && decoding.some((d) => d && d.job === j.id)) {
+      return { key: w.id, kind: "watch", title: `${w.kind} ${w.id.slice(-6)}` };
+    }
+  }
+  return null;
+}
+
 // The row spans whose full text is their title (line two cuts them with an ellipsis).
 const TITLED = ["band", "source", "events"];
 export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod", "mix"];
@@ -648,10 +672,11 @@ function storedOpen(plan) {
 // The group row of a plan's idle channels, made once per plan and kept across renders (so a
 // focused summary stays focused); open unless the operator folded it this session. Only a
 // change of the fold is written (opening a fresh group queues a `toggle` too).
-function jobGroup(plan) {
+function jobGroup(plan, kind = "plan") {
   const g = document.createElement("details");
   g.className = "job-group";
   g.dataset.plan = plan;
+  g.dataset.kind = kind;
   g.open = storedOpen(plan);
   g.addEventListener("toggle", () => {
     if (g.open === storedOpen(plan)) return;
@@ -663,8 +688,32 @@ function jobGroup(plan) {
   });
   const summary = document.createElement("summary");
   summary.dir = "auto";
+  if (kind === "watch") {
+    const text = document.createElement("span");
+    text.className = "group-text";
+    text.dir = "auto";
+    summary.append(text);
+  }
   g.append(summary);
   return g;
+}
+
+// A watch group's text: `<watch kind> <id tail> · <mode> × <n> decoding, <m> waiting`, the
+// modes those of `list` (its decoders) by the watch's `decoding` entries.
+function watchGroupText(watch, list) {
+  const w = watch.context?.watch || {};
+  const modeOf = new Map((w.decoding || []).map((d) => [d.job, d.mode]));
+  const modes = new Map();
+  for (const j of list) {
+    const m = modeOf.get(j.id) ?? j.kind;
+    modes.set(m, (modes.get(m) || 0) + 1);
+  }
+  const waiting = w.cap?.waiting ?? 0;
+  return (
+    `${watch.kind} ${watch.id.slice(-6)} · ` +
+    [...modes].map(([m, n]) => `${m} × ${n}`).join(", ") +
+    ` decoding, ${waiting} waiting`
+  );
 }
 
 // `<n> idle <kinds> on <plan>`, plus `, <m> <kind>` for each kind attached to them.
@@ -844,9 +893,21 @@ export function startJobs(
       if (!runningSince.has(j.id)) runningSince.set(j.id, now);
       if (activity && activity(j.id).speaking) lastSpeaking.set(j.id, now);
     }
+    // A watch's decoders first (groupOf), under a watch whose own row is shown.
+    const shownIds = new Set(shown.map((j) => j.id));
+    const watchOf = new Map(); // decoder id -> watch id
+    const decoders = new Map(); // watch id -> its decoders (not the attached ones)
+    for (const j of shown) {
+      const g = groupOf(j, jobs);
+      if (!g || !shownIds.has(g.key)) continue;
+      watchOf.set(j.id, g.key);
+      if (!decoders.has(g.key)) decoders.set(g.key, []);
+      decoders.get(g.key).push(j);
+    }
     const planOf = new Map();
     const members = new Map(); // plan -> its foldable jobs (not the attached ones)
     for (const j of shown) {
+      if (watchOf.has(j.id)) continue;
       const plan = foldPlan(j, now, jobs);
       if (!plan) continue;
       planOf.set(j.id, plan);
@@ -854,17 +915,33 @@ export function startJobs(
       members.get(plan).push(j);
     }
     for (const [plan, list] of members) if (list.length <= JOBS_FOLD_MIN) members.delete(plan);
-    for (const plan of [...groupEls.keys()]) if (!members.has(plan)) groupEls.delete(plan);
+    for (const key of [...groupEls.keys()]) {
+      if (!members.has(key) && !decoders.has(key)) groupEls.delete(key);
+    }
     const inside = new Map(); // plan -> its rows, in list order
+    const watchRows = new Map(); // watch id -> {watch, row}: its own row
+    const decoderRows = new Map(); // watch id -> its decoders' rows, in list order
     const out = [];
     shown.forEach((j, i) => {
+      if (decoders.has(j.id)) {
+        if (groupEls.get(j.id)?.dataset.kind !== "watch") groupEls.set(j.id, jobGroup(j.id, "watch"));
+        watchRows.set(j.id, { watch: j, row: rows[i] });
+        out.push(groupEls.get(j.id));
+        return;
+      }
+      const watch = watchOf.get(j.input ?? j.id);
+      if (watch) {
+        if (!decoderRows.has(watch)) decoderRows.set(watch, []);
+        decoderRows.get(watch).push(rows[i]);
+        return;
+      }
       const plan = planOf.get(j.input ?? j.id);
       if (!plan || !members.has(plan)) {
         out.push(rows[i]);
         return;
       }
       if (!inside.has(plan)) {
-        if (!groupEls.has(plan)) groupEls.set(plan, jobGroup(plan));
+        if (groupEls.get(plan)?.dataset.kind !== "plan") groupEls.set(plan, jobGroup(plan));
         inside.set(plan, []);
         out.push(groupEls.get(plan));
       }
@@ -875,6 +952,18 @@ export function startJobs(
       const summary = g.querySelector("summary");
       const text = groupText(plan, members.get(plan), shown);
       if (summary.textContent !== text) summary.textContent = text;
+      placeChildren(g, [summary, ...list]);
+    }
+    // A watch's group: the watch's row as its summary, its decoders under it.
+    for (const [id, { watch, row }] of watchRows) {
+      const list = decoderRows.get(id) || [];
+      const g = groupEls.get(id);
+      const summary = g.querySelector("summary");
+      const text = summary.querySelector(".group-text");
+      const t = watchGroupText(watch, decoders.get(id));
+      if (text.textContent !== t) text.textContent = t;
+      text.title = t;
+      placeChildren(summary, [row, text]);
       placeChildren(g, [summary, ...list]);
     }
     return out;

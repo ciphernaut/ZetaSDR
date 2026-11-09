@@ -20,23 +20,34 @@
 //         current trial (`context.identify.current`, as of the last `sync`), or the key is not a
 //         string, number or boolean, or is blank: such an event is unkeyed. The key is trimmed.
 //     store.subjectOf(job, payload) -> subject | null   the same test and lookup, no merge
-//     store.sync(jobs)   drops the subjects of jobs not `running`; notes the running identifies'
-//         current trials
+//     Subjects are kept per group (plan 31 spec 4.7): a watch's kept decoders (agent.js groupOf,
+//     as of the last `sync`) share their watch's, keyed (watch id, key); any other job is its own
+//     group, keyed (job id, key). Every call below taking a `jobId` takes a group id or a job id
+//     (resolved to its group).
+//     store.groupOf(job, jobs = the last sync's) -> {key, kind, title} | null   agent.js groupOf
+//     store.groupId(jobId) -> the group id of a job id (the watch's for a kept decoder, else
+//         itself), as of the last `sync`
+//     store.sync(jobs)   regroups (a decoder heard before its watch named it moves its subjects
+//         under the watch, the newer of two on one key standing), drops the subjects of groups
+//         whose job (the watch, for a merged group) is not `running`; notes the running
+//         identifies' current trials
 //     store.isTrial(jobId) -> bool   a running identify's current trial
 //     store.list(jobId) -> subject[]   least recently heard first, a copy (never per message)
 //     store.size(jobId) -> number
-//     store.lastHeard(jobId) -> subject | null
-//     store.held(jobId, key | null) -> bool   the subject (with null, any of the job's) is not dim
-//     store.select(jobId, key), store.selected() -> {job, key} | null
+//     store.lastHeard(jobId) -> subject | null   the last subject that job itself was heard on
+//     store.held(jobId, key | null) -> bool   the subject (with null, any of the group's) is not dim
+//     store.select(jobId, key), store.selected() -> {job, group, key} | null (`job` the subject's)
 //     store.onChange(cb)   any merge, dim or drop, and a row learned
 //     store.onLearn(cb)   a row learned, after onChange's
 //     store.onTick(cb)   each second, after dim and drop are checked
-//     store.onDrop(cb(jobId, key)), store.onSelect(cb(sel)), store.destroy()
+//     store.onDrop(cb(jobId, key)) (`jobId` the subject's `job`), store.onSelect(cb(sel)),
+//     store.destroy()
 //     A subject past view `subject_dim_s` of silence is dim, past `subject_drop_s` dropped
 //     (checked each second, from this page's clock, so a longer `subject_dim_s` un-dims it at
 //     the next check); a selection goes with its subject.
-//   A subject: {job, key, state, position, first_seen, last_seen, count, dim, row}. `job` is the
-//     job id, `state` a null-prototype object of every field heard, whose last non-null, non-blank value
+//   A subject: {job, group, heard, key, state, position, first_seen, last_seen, count, dim, row}.
+//     `job` is the id of the job first heard on, `group` its group's id, `heard` the job last
+//     heard on, `state` a null-prototype object of every field heard, whose last non-null, non-blank value
 //     stands, `position` {lat, lon, alt_m} or null, the altitude surviving a fix without one.
 //   subjectLabel(subject) -> state[row.subject.label] when present, else the key
 //   subjectSummary(subject) -> the row's summary template filled from the merged state
@@ -45,7 +56,12 @@
 //     the separators before it), `{a?b}`, each with an optional `:.N` or `:+.N`; trimmed at
 //     both ends
 //   mountSubjectsPane(el, store, view, {jobs, watching, footprint}) -> pane
-//     One `section.subject-job[data-job]` per running job with subjects or whose row has table
+//     A watch's kept decoders draw one `section.subject-job[data-job=<watch id>]` at the first
+//     one's place (plan 31 spec 4.7), headed `<watch kind> <id tail> · <subject name>`, its
+//     columns the key, `Channel` (`th[data-col="channel"]`: the centre, in MHz to 4 places, of
+//     the decoder the subject was last heard on), the first decoder row's columns and the
+//     usual tail; it goes when its watch stops.
+//     One `section.subject-job[data-job]` per other running job with subjects or whose row has table
 //     columns, so a job heard nothing from yet says `0 aircraft` (an `h3` and a table of
 //     `tr.subject[data-job][data-key]`, classes `dim` and `selected`), and one for a subject job
 //     `watching(id)` denies, with `.not-watched`, after the watched ones. The default order is
@@ -78,6 +94,7 @@
 //         (app.js shows the pane)
 //     pane.destroy()
 
+import { groupOf as watchGroupOf } from "./agent.js";
 import { MAX_POSITIONED } from "./overlays.js";
 import { distanceBearing, positionOf } from "./map.js";
 import { metricText } from "./units.js";
@@ -179,10 +196,11 @@ class SubjectStore {
     this.rows = new Map(); // job kind -> row | null
     this.rowIds = null; // the mode-row ids (`modes_list`), once looked up
     this.lookingUp = false;
-    // job id -> key -> subject. Each merge moves its subject to the end, so the last entry
+    // group id -> key -> subject. Each merge moves its subject to the end, so the last entry
     // is the last heard even when two events share a millisecond.
     this.jobs = new Map();
-    this.lastBy = new Map(); // job id -> its last heard subject
+    this.groups = new Map(); // a kept decoder's id -> its watch's id, as of the last sync
+    this.lastJobs = [];
     this.trials = new Set(); // the running identifies' current trials
     this.sel = null;
     this.changeCbs = [];
@@ -244,19 +262,28 @@ class SubjectStore {
     return key === "" ? null : { row, key };
   }
 
+  groupOf(job, jobs = this.lastJobs) {
+    return watchGroupOf(job, jobs);
+  }
+
+  groupId(jobId) {
+    return this.groups.get(jobId) ?? jobId;
+  }
+
   subjectOf(job, p) {
     const k = this.keyed(job, p);
-    return k ? (this.jobs.get(job.id)?.get(k.key) ?? null) : null;
+    return k ? (this.jobs.get(this.groupId(job.id))?.get(k.key) ?? null) : null;
   }
 
   event(job, p) {
     if (this.destroyed) return null;
     const k = this.keyed(job, p);
     if (!k) return null;
-    let subjects = this.jobs.get(job.id);
+    const group = this.groupId(job.id);
+    let subjects = this.jobs.get(group);
     if (!subjects) {
       subjects = new Map();
-      this.jobs.set(job.id, subjects);
+      this.jobs.set(group, subjects);
     }
     const now = Date.now();
     let s = subjects.get(k.key);
@@ -264,6 +291,8 @@ class SubjectStore {
     else {
       s = {
         job: job.id,
+        group,
+        heard: job.id,
         key: k.key,
         state: Object.create(null),
         position: null,
@@ -275,7 +304,7 @@ class SubjectStore {
       };
     }
     subjects.set(k.key, s);
-    this.lastBy.set(job.id, s);
+    s.heard = job.id;
     for (const [field, v] of Object.entries(p)) {
       if (v === null || v === undefined) continue;
       if (typeof v === "string" && v.trim() === "") continue;
@@ -304,21 +333,54 @@ class SubjectStore {
         .filter((j) => j.kind === "identify" && j.context?.identify?.current)
         .map((j) => j.context.identify.current),
     );
+    this.lastJobs = jobs || [];
+    this.groups = new Map();
+    for (const j of live) {
+      const g = watchGroupOf(j, live);
+      if (g) this.groups.set(j.id, g.key);
+    }
     let dropped = false;
-    for (const [jobId, subjects] of [...this.jobs]) {
-      if (running.has(jobId)) continue;
-      for (const key of [...subjects.keys()]) this.drop(jobId, key);
+    // A decoder heard before its watch named it: its subjects move under the watch.
+    for (const [jobId, group] of this.groups) {
+      const own = this.jobs.get(jobId);
+      if (!own) continue;
+      this.jobs.delete(jobId);
+      let into = this.jobs.get(group);
+      if (!into) {
+        into = new Map();
+        this.jobs.set(group, into);
+      }
+      for (const s of own.values()) {
+        const other = into.get(s.key);
+        if (other && other.last_seen > s.last_seen) {
+          for (const cb of this.dropCbs) cb(s.job, s.key);
+          continue;
+        }
+        if (other) for (const cb of this.dropCbs) cb(other.job, other.key);
+        into.delete(s.key);
+        s.group = group;
+        into.set(s.key, s);
+      }
+      // The last heard stays last.
+      const order = [...into.values()].sort((a, b) => a.last_seen - b.last_seen);
+      into.clear();
+      for (const s of order) into.set(s.key, s);
+      dropped = true;
+    }
+    for (const [group, subjects] of [...this.jobs]) {
+      if (running.has(group)) continue;
+      for (const key of [...subjects.keys()]) this.drop(group, key);
       dropped = true;
     }
     if (dropped) this.changed();
   }
 
   list(jobId) {
-    return [...(this.jobs.get(jobId)?.values() ?? [])];
+    return [...(this.jobs.get(this.groupId(jobId))?.values() ?? [])];
   }
 
   size(jobId) {
-    return this.jobs.get(jobId)?.size ?? 0;
+    return this.jobs.get(this.groupId(jobId))?.size ?? 0;
   }
 
   isTrial(jobId) {
@@ -326,11 +388,15 @@ class SubjectStore {
   }
 
   lastHeard(jobId) {
-    return this.lastBy.get(jobId) ?? null;
+    const subjects = [...(this.jobs.get(this.groupId(jobId))?.values() ?? [])];
+    for (let i = subjects.length - 1; i >= 0; i--) {
+      if (subjects[i].heard === jobId) return subjects[i];
+    }
+    return null;
   }
 
   held(jobId, key) {
-    const subjects = this.jobs.get(jobId);
+    const subjects = this.jobs.get(this.groupId(jobId));
     if (!subjects) return false;
     if (key !== null && key !== undefined) {
       const s = subjects.get(key);
@@ -343,8 +409,9 @@ class SubjectStore {
   }
 
   select(jobId, key) {
-    const s = this.jobs.get(jobId)?.get(key);
-    this.setSelected(s ? { job: jobId, key } : null);
+    const group = this.groupId(jobId);
+    const s = this.jobs.get(group)?.get(key);
+    this.setSelected(s ? { job: s.job, group, key } : null);
   }
 
   selected() {
@@ -381,18 +448,14 @@ class SubjectStore {
   }
 
   drop(jobId, key) {
-    const subjects = this.jobs.get(jobId);
-    if (!subjects || !subjects.delete(key)) return;
-    if (subjects.size === 0) {
-      this.jobs.delete(jobId);
-      this.lastBy.delete(jobId);
-    } else if (this.lastBy.get(jobId)?.key === key) {
-      let last = null;
-      for (const s of subjects.values()) last = s;
-      this.lastBy.set(jobId, last);
-    }
-    if (this.sel && this.sel.job === jobId && this.sel.key === key) this.setSelected(null);
-    for (const cb of this.dropCbs) cb(jobId, key);
+    const group = this.groupId(jobId);
+    const subjects = this.jobs.get(group);
+    const s = subjects?.get(key);
+    if (!s) return;
+    subjects.delete(key);
+    if (subjects.size === 0) this.jobs.delete(group);
+    if (this.sel && this.sel.group === group && this.sel.key === key) this.setSelected(null);
+    for (const cb of this.dropCbs) cb(s.job, key);
   }
 
   tick() {
@@ -420,7 +483,7 @@ class SubjectStore {
     this.destroyed = true;
     clearInterval(this.timer);
     this.jobs.clear();
-    this.lastBy.clear();
+    this.groups.clear();
     this.sel = null;
     this.changeCbs = [];
     this.learnCbs = [];
@@ -616,7 +679,7 @@ class SubjectsPane {
 
   // The table's columns for a row: {col, label, text(s, values), value(s)}. `key` replaces the
   // key column and `extra` goes after the row's own columns (the merged section's).
-  columns(row, { key = null, extra = [] } = {}) {
+  columns(row, { key = null, extra = [], afterKey = [] } = {}) {
     const sub = row.subject;
     key ??= { col: sub.key, label: sub.key, text: (s) => s.key, value: (s) => s.key };
     const lastSeen = {
@@ -633,10 +696,11 @@ class SubjectsPane {
     });
     if (this.footprint() === "narrow") {
       const at = sub.columns.findIndex((c) => c.unit === "ft" || c.unit === "m");
-      return [key, ...(at < 0 ? [] : [ofColumn(sub.columns[at], at)]), lastSeen];
+      return [key, ...afterKey, ...(at < 0 ? [] : [ofColumn(sub.columns[at], at)]), lastSeen];
     }
     const cols = [
       key,
+      ...afterKey,
       ...sub.columns.map(ofColumn),
       ...extra,
       {
@@ -675,6 +739,32 @@ class SubjectsPane {
     const key = { col: merge[0], label: merge.join(" / "), text: (g) => g.keyText, value: (g) => g.keyText };
     const via = { col: "via", label: "Via", text: (g) => g.via, value: (g) => g.via };
     return this.columns(row, { key, extra: [via] });
+  }
+
+  // A watch's merged section (spec 4.7): its decoders' subjects keyed (watch, key), with the
+  // `Channel` column after the key (the decoder the subject was last heard on).
+  drawWatchSection(sec, { id, watch, members }) {
+    const row = this.store.rowOf(members[0].job.kind);
+    const byId = new Map((this.jobs() || []).map((j) => [j.id, j]));
+    const centre = (s) => byId.get(s.heard ?? s.job)?.tuning?.center_hz ?? null;
+    const channel = {
+      col: "channel",
+      label: "Channel",
+      text: (s) => {
+        const hz = centre(s);
+        return typeof hz === "number" ? (hz / 1e6).toFixed(4) : "";
+      },
+      value: centre,
+    };
+    const cols = this.columns(row, { afterKey: [channel] });
+    const subjects = this.held(sec, this.sorted(id, this.store.list(id).reverse(), cols));
+    this.drawSection(
+      sec,
+      `${watch.kind} ${id.slice(-6)} · ${row.subject.name}`,
+      subjects,
+      cols,
+      members.every((x) => x.watched),
+    );
   }
 
   // The rows of the merged section: the subjects of `jobs` (rows with a `merge`, one
@@ -876,15 +966,34 @@ class SubjectsPane {
   // members keep `subjectJobs()`'s order.
   parts(wanted, jobs) {
     const order = new Map(jobs.map((j, i) => [j.id, i]));
+    // A watch's kept decoders (the watch listed): one section per watch, at the first one's
+    // place, never in a merge across rows.
+    const all = new Map((this.jobs() || []).map((j) => [j.id, j]));
+    const watchOf = (x) => {
+      const id = this.store.groupId(x.job.id);
+      return id !== x.job.id && all.has(id) ? all.get(id) : null;
+    };
     const byName = new Map(); // subject.name -> the merging jobs' entries
     for (const x of wanted) {
+      if (watchOf(x)) continue;
       const sub = this.store.rowOf(x.job.kind).subject;
       if ((sub.merge ?? []).length === 0) continue;
       if (!byName.has(sub.name)) byName.set(sub.name, []);
       byName.get(sub.name).push(x);
     }
     const parts = [];
+    const watches = new Map(); // watch id -> its part
     for (const x of wanted) {
+      const watch = watchOf(x);
+      if (watch) {
+        if (!watches.has(watch.id)) {
+          const part = { id: watch.id, watch, members: [], group: true };
+          watches.set(watch.id, part);
+          parts.push(part);
+        }
+        watches.get(watch.id).members.push(x);
+        continue;
+      }
       const name = this.store.rowOf(x.job.kind).subject.name;
       const members = byName.get(name);
       if (!members || members.length < 2 || !members.includes(x)) parts.push({ id: x.job.id, ...x });
@@ -922,7 +1031,8 @@ class SubjectsPane {
     }
     parts.forEach((part, i) => {
       const sec = this.section(part.id, part.name ?? null);
-      if (part.members) this.drawMergedSection(sec, part);
+      if (part.group) this.drawWatchSection(sec, part);
+      else if (part.members) this.drawMergedSection(sec, part);
       else this.drawJobSection(sec, part);
       if (this.el.children[i] !== sec.el) this.el.insertBefore(sec.el, this.el.children[i] || null);
     });

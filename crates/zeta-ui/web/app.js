@@ -971,6 +971,10 @@ function start(api) {
   state.map.onChange(paintMapCount);
   state.ov.onEvent((job, p) => {
     state.subjects?.event(job, p);
+    // A watch starting or dropping a decoder moves its row between polls (plan 31 spec 4.7).
+    if (p && p.protocol === "watch" && p.job && (p.state === "decoding" || p.state === "lost")) {
+      if (!pollPaused && state.jobs) state.jobs.refresh();
+    }
     state.map?.event(job, p);
     if (p && p.protocol === "origin") state.map?.origin(job.id, p);
     const line = verdictLine(job, p);
@@ -1454,9 +1458,9 @@ function paintDockHead() {
   if (labelEl.textContent !== label) labelEl.textContent = label;
   let count = "";
   if (pane === "subjects" && state.subjects && state.subjectsPane) {
-    const n = state.subjectsPane
-      .subjectJobs()
-      .reduce((sum, j) => sum + state.subjects.size(j.id), 0);
+    // Per group: a watch's decoders share one set of subjects.
+    const groups = new Set(state.subjectsPane.subjectJobs().map((j) => state.subjects.groupId(j.id)));
+    const n = [...groups].reduce((sum, g) => sum + state.subjects.size(g), 0);
     count = String(n);
   }
   const countEl = head.querySelector(".count");

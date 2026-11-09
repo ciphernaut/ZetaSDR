@@ -555,6 +555,25 @@ details.turn > pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 2px
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* A watch's decoders under its row (plan 31 spec 4.7): the watch's row is the summary, the
+   group's text a dim line under it carrying the fold's marker. */
+.job-group[data-kind="watch"] > summary {
+  display: block;
+  list-style: none;
+  color: inherit;
+  white-space: normal;
+}
+.job-group[data-kind="watch"] > summary::-webkit-details-marker { display: none; }
+.job-group[data-kind="watch"] > summary > .group-text {
+  display: block;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.job-group[data-kind="watch"] > summary > .group-text::before { content: "▾ "; }
+.job-group[data-kind="watch"]:not([open]) > summary > .group-text::before { content: "▸ "; }
+.job-group[data-kind="watch"] > .job { padding-inline-start: 12px; }
 /* Buttons offered after a transcript line (a conflict's "stop … and retry"). */
 .line button.action { margin-left: 6px; padding: 0 6px; font-style: normal; }
 
@@ -630,6 +649,14 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   border-color: var(--accent);
   color: var(--accent);
   outline: none;
+}
+/* "Decode across this band…"'s rows (menu.js), indented under the entry. */
+#ctx .ctx-sub {
+  display: flex;
+  flex-direction: column;
+  margin-inline-start: 8px;
+  padding-inline-start: 4px;
+  border-inline-start: 1px solid var(--border);
 }
 #ctx-footer, #ctx-outline-footer {
   margin-top: 4px;
