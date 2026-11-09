@@ -1,10 +1,10 @@
 //! A decoded event's envelope: `protocol`, `summary` and `t_ns` on top of the
-//! decoder's own fields, the summary filled from the mode row's template, plus a
-//! normalised `position` when the row maps one.
+//! decoder's own fields (after the row's `derive` entries), the summary filled from the
+//! mode row's template, plus a normalised `position` when the row maps one.
 
 use serde_json::Value;
 
-use super::{AltUnit, ModeRow};
+use super::{AltUnit, ModeRow, derive};
 
 /// Metres in a foot.
 const FT_M: f64 = 0.3048;
@@ -105,13 +105,17 @@ pub fn fill(template: &str, event: &Value) -> String {
     out.trim().to_string()
 }
 
-/// `fields` with `protocol` (the row's), `summary` (its template filled from `fields`)
-/// and `t_ns` set; every field is kept. `t_ns` is the time in the row's `time` field
+/// `fields` with the row's `derive` entries applied first (see [`derive::apply`]), then
+/// `protocol` (the row's), `summary` (its template filled from `fields`) and `t_ns`
+/// set; every field is kept. `t_ns` is the time in the row's `time` field
 /// when the event carries a well-formed one, else `start_ns`. With a row `position`
 /// map and its `lat` and `lon` fields both numbers, `position` is
 /// `{lat, lon, alt_m}` (`alt_m` `null` unless its field is a number, converted from feet
 /// when the map's `alt_unit` is `ft`).
 pub fn envelope(row: &ModeRow, start_ns: u64, mut fields: Value) -> Value {
+    if let Value::Object(m) = &mut fields {
+        derive::apply(&row.derive, m);
+    }
     let summary = fill(&row.event.summary, &fields);
     let t_ns = row
         .time
@@ -418,6 +422,117 @@ mod tests {
             ev["position"],
             json!({"lat": -27.4, "lon": 153.1, "alt_m": null})
         );
+    }
+
+    /// The H1 report of the design, at the demo station.
+    const H1: &str = "#M1BPOSS27231E153071,ALPHA,025131,165,BRAVO,025351";
+
+    /// The ADS-B row with `text`, `downlink` and `alt_ft` in its schema, a position map
+    /// in feet on `lat`, `lon`, `alt_ft`, and the design's derive entry with `into`.
+    fn deriving_into(into: Value) -> ModeRow {
+        row(|v| {
+            let props = &mut v["event"]["schema"]["properties"];
+            props["text"] = json!({"type": ["string", "null"]});
+            props["downlink"] = json!({"type": ["boolean", "null"]});
+            props["alt_ft"] = json!({"type": ["integer", "null"]});
+            v["position"] =
+                json!({"lat": "lat", "lon": "lon", "alt_m": "alt_ft", "alt_unit": "ft"});
+            v["derive"] = json!([{
+                "when": {"downlink": true}, "from": "text", "extract": "acars_position",
+                "into": into,
+            }]);
+        })
+    }
+
+    fn deriving() -> ModeRow {
+        deriving_into(json!({"lat": "lat", "lon": "lon", "alt_ft": "alt_ft"}))
+    }
+
+    #[test]
+    fn a_downlink_text_with_a_fix_gets_lat_lon_and_position() {
+        let ev = envelope(&deriving(), 7, json!({"downlink": true, "text": H1}));
+        assert_eq!(ev["lat"], -27.385);
+        assert_eq!(ev["lon"], 153.11833);
+        assert_eq!(ev["alt_ft"], 16_500);
+        assert_eq!(ev["position"]["lat"], -27.385);
+        assert_eq!(ev["position"]["lon"], 153.11833);
+        let alt = ev["position"]["alt_m"].as_f64().unwrap();
+        assert!((alt - 16_500.0 * 0.3048).abs() < 0.001, "{alt}");
+        assert_eq!(ev["text"], H1, "the text is kept");
+    }
+
+    #[test]
+    fn a_text_without_a_fix_adds_no_keys() {
+        let ev = envelope(
+            &deriving(),
+            7,
+            json!({"downlink": true, "text": "FOB 133.7 POSRPT 0054/09"}),
+        );
+        for key in ["lat", "lon", "alt_ft", "position"] {
+            assert!(ev.get(key).is_none(), "{key} in {ev}");
+        }
+    }
+
+    #[test]
+    fn when_not_holding_skips_the_entry() {
+        for ev in [
+            json!({"downlink": false, "text": H1}),
+            json!({"text": H1}),
+            json!({"downlink": null, "text": H1}),
+        ] {
+            let ev = envelope(&deriving(), 7, ev);
+            for key in ["lat", "lon", "alt_ft", "position"] {
+                assert!(ev.get(key).is_none(), "{key} in {ev}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_structured_fix_is_never_overwritten_or_completed() {
+        let ev = envelope(
+            &deriving(),
+            7,
+            json!({"downlink": true, "text": H1, "lat": -27.38, "lon": 153.12}),
+        );
+        assert_eq!(ev["lat"], -27.38);
+        assert_eq!(ev["lon"], 153.12);
+        assert!(ev.get("alt_ft").is_none(), "{ev}");
+        assert_eq!(ev["position"]["lat"], -27.38);
+        // One axis set: the text never supplies the other, nor the altitude.
+        let ev = envelope(
+            &deriving(),
+            7,
+            json!({"downlink": true, "text": H1, "lat": -27.38, "lon": null}),
+        );
+        assert_eq!(ev["lat"], -27.38);
+        assert_eq!(ev["lon"], Value::Null);
+        assert!(ev.get("alt_ft").is_none(), "{ev}");
+        assert!(ev.get("position").is_none(), "{ev}");
+        // Null targets are free: the entry runs.
+        let ev = envelope(
+            &deriving(),
+            7,
+            json!({"downlink": true, "text": H1, "lat": null, "lon": null, "alt_ft": null}),
+        );
+        assert_eq!(ev["lat"], -27.385);
+        assert_eq!(ev["alt_ft"], 16_500);
+    }
+
+    #[test]
+    fn into_leaving_alt_out_never_writes_it() {
+        let row = deriving_into(json!({"lat": "lat", "lon": "lon"}));
+        let ev = envelope(&row, 7, json!({"downlink": true, "text": H1}));
+        assert_eq!(ev["lat"], -27.385);
+        assert!(ev.get("alt_ft").is_none(), "{ev}");
+        assert_eq!(ev["position"]["alt_m"], Value::Null);
+    }
+
+    #[test]
+    fn summary_sees_the_derived_field() {
+        let mut row = deriving();
+        row.event.summary = "{lat?:.3}".into();
+        let ev = envelope(&row, 7, json!({"downlink": true, "text": H1}));
+        assert_eq!(ev["summary"], "-27.385");
     }
 
     #[test]

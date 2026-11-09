@@ -11,6 +11,7 @@
 //! accepted signature's row written, say): every reader takes the registry from the
 //! handle at each use, so it sees the old rows or the new ones, never a mix.
 
+pub mod derive;
 pub mod handlers;
 mod row;
 pub mod score;
