@@ -506,6 +506,8 @@ Calls made (rulings): a detected width fits a listed row within 0.5-2x of its ch
 
 What waits for the field host: `UAT.md` "Plan 31" (spec 6 a-c, a strong pager carrier through the tolerant fit, the set, watch, decoders fold on the page). Deferred minors and field risks are a gist in `TODO.md` ("Watch: deferred minors from plan 31").
 
+Post-deploy fix wave (deployed 2026-11-09 as plan31-zeta at 0234b999; `UAT.md` "Plan 31" has the run): identify no longer tries `flex_decode`, `ais_decode` or `aprs_decode` on the sonde band (each row now carries the `band.range_hz` it lives in), a pin over a role's whole band admits a set's pick and `source_free`, a refused pick is a structured `conflict`, `zeta set start` without `--radio` sends every role as null, and `pagers_au`'s notes name the b210's spur at 148.500 MHz.
+
 ## Plan 29 status
 
 Built on the plan 29 branch. Spec `docs/superpowers/specs/2026-11-06-decoder-wave2-design.md`, plan `docs/superpowers/plans/2026-11-06-decoder-wave2.md`.
