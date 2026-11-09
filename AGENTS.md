@@ -882,6 +882,15 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.min_speech_ms: integer (optional, default 200)
 - params.threshold_db: number (optional, default 6.0)
 
+### video_fm_demod
+
+- inputs: iq
+- outputs: audio
+- params.composite_max_hz: integer (optional, default 16000000)
+- params.deemphasis: string (optional, default "ccir405")
+- params.deviation_hz: integer (optional, default 8000000)
+- params.standard: any (optional, default null)
+
 ### wfm_demod
 
 - inputs: iq

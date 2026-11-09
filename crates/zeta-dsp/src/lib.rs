@@ -63,6 +63,7 @@ pub mod util;
 pub mod vad;
 pub mod video_fm;
 pub mod wfm;
+pub mod worker;
 
 #[cfg(feature = "test-fixtures")]
 pub mod fixtures;
@@ -79,6 +80,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     }
     reg.register(Arc::new(nbfm::NbfmDemodStage::new()));
     reg.register(Arc::new(wfm::WfmDemodStage::new()));
+    reg.register(Arc::new(video_fm::VideoFmDemodStage::new()));
     reg.register(Arc::new(am::AmDemodStage::new()));
     reg.register(Arc::new(am::SsbDemodStage::new()));
     reg.register(Arc::new(aprs::AprsDecodeStage::new()));
@@ -210,12 +212,9 @@ pub fn note_lag(kind: &'static str, n: u64) {
 
 /// What a stage's closure sees: a frame, or a marker that `missed` frames were
 /// skipped before the next one, so stateful stages must reset.
-pub(crate) enum Input {
+pub enum Input {
     Frame(Frame),
-    #[allow(dead_code)] // reported for stages that want the count
-    Lagged {
-        missed: u64,
-    },
+    Lagged { missed: u64 },
 }
 
 /// The loop every single-input stage runs: map each frame on `inputs[0]` through
