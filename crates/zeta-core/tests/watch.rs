@@ -3462,7 +3462,7 @@ async fn a_decoder_that_keeps_failing_stops_being_restarted_after_its_tries() {
     let src = file_source("rx", &fixtures().pocsag);
     let node = node_over(dir.path(), vec![(src.clone() as _, src)], Some(&modes)).await;
     assert_eq!(
-        node.modes().get(FAIL_ROW).map(|m| m.state.clone()),
+        node.modes().get(FAIL_ROW).map(|m| m.state),
         Some(zeta_core::modes::ModeState::Ready)
     );
     let node = Arc::new(node);
