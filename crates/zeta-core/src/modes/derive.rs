@@ -120,8 +120,9 @@ fn in_range(lat_sign: f64, lat: f64, lon_sign: f64, lon: f64) -> Option<(f64, f6
 
 /// Form 1 at `i`: `POS`, at most one space, `N|S` `dd` `mmm`, at most one space,
 /// `E|W` `ddd` `mmm` (minutes times ten, under 600). The altitude is the H1 report's
-/// third comma field after the fix when it is three digits, else the label 80
-/// report's `/ALT <n>` (two or three digits), both flight levels.
+/// third comma field after the fix when it is three digits, else, when the anchor is
+/// `/POS`, the label 80 report's `/ALT <n>` (two or three digits) before the next
+/// `POS`; both are flight levels.
 fn compact(b: &[u8], i: usize) -> Option<Fix> {
     if !b[i..].starts_with(b"POS") {
         return None;
@@ -150,14 +151,21 @@ fn compact(b: &[u8], i: usize) -> Option<Fix> {
             .nth(2)
             .filter(|f| f.len() == 3 && f.iter().all(u8::is_ascii_digit))
             .and_then(|f| digits(f, 0, 3)),
-        None => slash_alt(rest),
+        None if i > 0 && b[i - 1] == b'/' => slash_alt(rest),
+        None => None,
     }
     .map(|fl| i64::from(fl) * FT_PER_FL);
     Some(Fix { lat, lon, alt_ft })
 }
 
-/// The flight level of the first `/ALT <n>` in `rest`, `n` two or three digits.
+/// The flight level of the first `/ALT <n>` in `rest` before its next `POS` token (a
+/// later report's), `n` two or three digits.
 fn slash_alt(rest: &[u8]) -> Option<u32> {
+    let report = rest
+        .windows(3)
+        .position(|w| w == b"POS")
+        .unwrap_or(rest.len());
+    let rest = &rest[..report];
     let at = rest.windows(4).position(|w| w == b"/ALT")? + 4;
     let at = if rest.get(at) == Some(&b' ') {
         at + 1
@@ -324,6 +332,22 @@ mod tests {
             153.11833,
             Some(25_500),
         );
+    }
+
+    #[test]
+    fn two_reports_the_first_without_alt() {
+        // The second report's `/ALT` is never the first fix's altitude.
+        assert_fix(
+            "POSS27231E153071 REPORT /POS N10000W020000/ALT 300",
+            -27.385,
+            153.11833,
+            None,
+        );
+    }
+
+    #[test]
+    fn alt_without_the_slash_pos_anchor_is_ignored() {
+        assert_fix("POSS27231E153071 TEXT /ALT 12", -27.385, 153.11833, None);
     }
 
     #[test]
