@@ -615,6 +615,8 @@ mod tests {
         // multimon-ng reads 22 050 Hz, where 1200 baud is 18.375 samples a
         // bit; rounding to 18 (1225 baud, 2 % fast) is more than it tracks.
         // Modulate at 48 kHz (exactly 40 a bit) and resample instead.
+        // Ubuntu's multimon-ng (1.3.0) reads one polarity, the standard one
+        // pocsag_modulate emits; 1.5.0 and later detect either.
         let bits = pocsag_encode(&[(1234567, 3, "HELLO ZETA")], 1200);
         let mut audio = vec![0.0f32; 12_000];
         audio.extend(pocsag_modulate(&bits, 1200, 48_000));

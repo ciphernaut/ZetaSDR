@@ -583,3 +583,7 @@ Each block takes a whole 2 MiB slot, so a B210's 10 ms blocks fill the 64 MiB ri
 ## Test: `ops::too_old_carries_the_rings_earliest_ns` flaked once with a subtract overflow
 
 Seen 2026-11-07 during plan 28.1, passed on rerun. Likely a timing assumption between the ring's `earliest_ns` and now.
+
+## Test: `modes_check::a_bad_synth_block_fails_its_row_and_the_rest_still_run` flaked once on a leftover scratch dir
+
+Seen 2026-11-09 in a full workspace run (the suite in parallel), six single reruns passed. The checker's `remove_dir_all` of `check-<pid>-pocsag_decode` has its result ignored (`modes_check.rs`, after `run_test`), so a node still writing its state dir as it shuts down leaves the directory for the test to find. Wait for the node to finish, or retry the removal, before reporting the row.

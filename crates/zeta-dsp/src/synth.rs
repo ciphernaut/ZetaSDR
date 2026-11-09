@@ -404,7 +404,9 @@ pub fn pocsag_encode(messages: &[(u32, u8, &str)], baud: u32) -> Vec<u8> {
     bits
 }
 
-/// NRZ audio for POCSAG `bits`: `+0.8` for 1, `-0.8` for 0, each held for
+/// NRZ audio for POCSAG `bits` in the standard polarity, a 1 the lower
+/// frequency: `-0.8` for 1, `+0.8` for 0 (what multimon-ng before 1.5.0 reads,
+/// its later versions and our decoder take either), each held for
 /// `audio_rate_hz / baud` samples rounded to nearest. At 48 kHz, 512 baud is
 /// 93.75 samples a bit, rounded to 94: the fixture then runs at 510.6 baud,
 /// 0.3 % slow, well inside what [`BitSync`](crate::pocsag::BitSync) tracks.
@@ -412,7 +414,7 @@ pub fn pocsag_modulate(bits: &[u8], baud: u32, audio_rate_hz: u32) -> Vec<f32> {
     let spb = (audio_rate_hz as f64 / baud as f64).round() as usize;
     assert!(spb > 0, "pocsag_modulate: audio rate below the baud rate");
     bits.iter()
-        .flat_map(|&b| std::iter::repeat_n(if b != 0 { 0.8 } else { -0.8 }, spb))
+        .flat_map(|&b| std::iter::repeat_n(if b != 0 { -0.8 } else { 0.8 }, spb))
         .collect()
 }
 
