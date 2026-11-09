@@ -11,6 +11,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::framing::Framing;
+use crate::video_fm::{BLANK_V, SYNC_V, Shelf, VideoStandard, WHITE_V};
 
 /// Frequency-modulate real `audio` (nominally within ±1) onto a unit-magnitude
 /// carrier at `offset_hz` from centre. Audio is resampled to `iq_rate_hz` by
@@ -1260,6 +1261,118 @@ fn default_order() -> u8 {
     2
 }
 
+fn default_video_fields() -> u32 {
+    25
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The luma fractions of the test card's eight bars, left to right.
+pub const TEST_CARD_BAR_LEVELS: [f32; 8] = [
+    1.0,
+    6.0 / 7.0,
+    5.0 / 7.0,
+    4.0 / 7.0,
+    3.0 / 7.0,
+    2.0 / 7.0,
+    1.0 / 7.0,
+    0.0,
+];
+
+/// Add a 0.1 V FM sound subcarrier at `subcarrier_hz` (a 1 kHz tone at 50 kHz deviation).
+fn add_fm_subcarrier(composite: &mut [f32], rate_hz: u32, subcarrier_hz: f64) {
+    let (tone_hz, dev_hz) = (1000.0, 50_000.0);
+    for (n, v) in composite.iter_mut().enumerate() {
+        let t = n as f64 / f64::from(rate_hz);
+        let phase = 2.0 * PI * (subcarrier_hz * t).fract()
+            - (dev_hz / tone_hz) * (2.0 * PI * tone_hz * t).cos();
+        *v += 0.1 * phase.sin() as f32;
+    }
+}
+
+/// The composite level of one sample: `field` (0-based, counted from the start), `line`
+/// (1-based within the field), `tau` seconds into the line.
+fn card_level(
+    t: &crate::video_fm::StandardTable,
+    rate_hz: u32,
+    field: u64,
+    line: u32,
+    tau: f64,
+) -> f32 {
+    let half = if tau < 0.5 * t.line_s { 0 } else { 1 };
+    let h = 2.0 * f64::from(line - 1) + f64::from(half);
+    let (eq, broad) = (2.0 * t.eq_lines, 2.0 * t.broad_lines);
+    let in_half = if half == 0 { tau } else { tau - 0.5 * t.line_s };
+    let low = if h < eq || (h >= eq + broad && h < 2.0 * eq + broad) {
+        Some(0.5 * t.sync_s)
+    } else if h < eq + broad {
+        Some(0.5 * t.line_s - t.sync_s)
+    } else {
+        None
+    };
+    if let Some(l) = low {
+        return if in_half < l { SYNC_V } else { BLANK_V };
+    }
+    let vi_lines = (2.0 * t.eq_lines + t.broad_lines).ceil() as u32;
+    if line <= vi_lines {
+        return BLANK_V;
+    }
+    if tau < t.sync_s {
+        return SYNC_V;
+    }
+    let row = line.wrapping_sub(t.first_active_line);
+    if line < t.first_active_line || row >= t.active_lines {
+        return BLANK_V;
+    }
+    let x = ((tau - t.active_start_s) * f64::from(rate_hz) + 1e-6).floor();
+    let width = (t.active_s * f64::from(rate_hz)).round();
+    if x < 0.0 || x >= width {
+        return BLANK_V;
+    }
+    let top = t.active_lines * 3 / 4;
+    if row < top {
+        let k = ((x * 8.0 / width) as usize).min(7);
+        return TEST_CARD_BAR_LEVELS[k] * WHITE_V;
+    }
+    let quarter = t.active_lines - top;
+    let block_h = t.active_lines / 8;
+    let block_top = top + (quarter - block_h) / 2;
+    let left = (field * 16) as f64 % width;
+    let bw = (width / 8.0).round();
+    if row >= block_top && row < block_top + block_h && (x - left).rem_euclid(width) < bw {
+        return WHITE_V;
+    }
+    BLANK_V
+}
+
+/// `fields` consecutive fields of an analog television test card at `rate_hz`, composite
+/// volts, from field 0 line 1: eight luma bars `(7 - k) / 7` over the top three quarters
+/// of the active lines, a black bottom quarter with a white block one eighth of the active
+/// width and height that steps 16 samples right each field. The vertical interval is
+/// equalising, broad, equalising pulses, then blanked lines with normal sync.
+pub fn composite_test_card(standard: VideoStandard, rate_hz: u32, fields: u32) -> Vec<f32> {
+    let t = standard.table();
+    let [l0, l1] = t.lines_per_field;
+    let pair = u64::from(l0 + l1);
+    let total_lines =
+        (u64::from(fields) / 2) * pair + if fields % 2 == 1 { u64::from(l0) } else { 0 };
+    let len = (total_lines as f64 * t.line_s * f64::from(rate_hz)).round() as usize;
+    let mut out = Vec::with_capacity(len);
+    for n in 0..len {
+        let time = n as f64 / f64::from(rate_hz);
+        let g = ((time / t.line_s) + 1e-9).floor() as u64;
+        let tau = (time - g as f64 * t.line_s).max(0.0);
+        let rem = g % pair;
+        let (field_pair, in_second) = (g / pair, rem >= u64::from(l0));
+        let field = field_pair * 2 + u64::from(in_second);
+        let line0 = if in_second { rem - u64::from(l0) } else { rem };
+        out.push(card_level(t, rate_hz, field, line0 as u32 + 1, tau));
+    }
+    out
+}
+
 /// Most body bytes in all the frames of a `framing` spec.
 const MAX_FRAMING_BYTES: u64 = 65_536;
 
@@ -1373,6 +1486,20 @@ pub enum SynthSpec {
     },
     /// A tone frequency-modulated onto a carrier: one second of `tone_hz`.
     NbfmTone { tone_hz: f64, deviation_hz: f64 },
+    /// An analog television test card (8 luma bars over a moving white block),
+    /// frequency-modulated: `deviation_hz` is hertz per volt of composite, so sync
+    /// sits at `-0.3 * deviation_hz`. `subcarrier_hz`, when set, adds a 0.1 V FM sound
+    /// subcarrier; `preemphasis` applies the CCIR 405 shelf to the picture.
+    Video {
+        standard: VideoStandard,
+        deviation_hz: f64,
+        subcarrier_hz: Option<f64>,
+        rate_hz: u32,
+        #[serde(default = "default_video_fields")]
+        fields: u32,
+        #[serde(default = "default_true")]
+        preemphasis: bool,
+    },
     /// Gaussian FSK (BT 0.5) of `bits` (hex, or `pattern:<hex>` repeated to one
     /// second), `order` 2 or 4, in `repeat` bursts `gap_ms` apart (50 by default).
     Fsk {
@@ -1808,6 +1935,28 @@ impl SynthSpec {
                     return Err(format!("frames: 1..={M17_FRAMES_MAX}"));
                 }
             }
+            SynthSpec::Video {
+                deviation_hz,
+                subcarrier_hz,
+                rate_hz,
+                fields,
+                ..
+            } => {
+                if *rate_hz < 2_000_000 {
+                    return Err("rate_hz: at least 2000000".into());
+                }
+                if !(*deviation_hz > 0.0 && deviation_hz.is_finite()) {
+                    return Err("deviation_hz: above 0".into());
+                }
+                if *fields < 1 {
+                    return Err("fields: at least 1".into());
+                }
+                if let Some(sc) = subcarrier_hz
+                    && !(*sc > 0.0 && *sc < f64::from(*rate_hz) / 2.0)
+                {
+                    return Err("subcarrier_hz: above 0 and below half of rate_hz".into());
+                }
+            }
             SynthSpec::Rds { .. } | SynthSpec::Acars { .. } | SynthSpec::NbfmTone { .. } => {}
         }
         Ok(())
@@ -1818,6 +1967,7 @@ impl SynthSpec {
     /// down; RDS at 240 kHz; Mode S at 2.4 MHz; a bare NBFM tone at 48 kHz).
     pub fn rate_hz(&self) -> u32 {
         match self {
+            SynthSpec::Video { rate_hz, .. } => *rate_hz,
             SynthSpec::Aprs { .. } | SynthSpec::Pocsag { .. } | SynthSpec::Acars { .. } => 48_000,
             SynthSpec::Rds { .. } => 240_000,
             SynthSpec::ModesIdent { .. } => 2_400_000,
@@ -2030,6 +2180,25 @@ pub fn synthesise(
         } => {
             let mut iq = m17_iq(src, dst, *can, *frames, rate_hz);
             shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Video {
+            standard,
+            deviation_hz,
+            subcarrier_hz,
+            rate_hz: video_rate,
+            fields,
+            preemphasis,
+        } => {
+            let mut composite = composite_test_card(*standard, *video_rate, *fields);
+            if *preemphasis {
+                Shelf::ccir405(*standard, f64::from(*video_rate)).pre(&mut composite);
+            }
+            if let Some(sc) = subcarrier_hz {
+                add_fm_subcarrier(&mut composite, *video_rate, *sc);
+            }
+            let mut iq = wfm_modulate_composite(&composite, *video_rate, *deviation_hz);
+            shift(&mut iq, off, *video_rate);
             iq
         }
     };
