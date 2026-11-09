@@ -54,7 +54,8 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// The fixtures, written once: the POCSAG page centred on [`APRS_HZ`] and on
 /// [`POCSAG_HZ`], one second of a 1 kHz tone on [`APRS_HZ`], and one second of random
 /// 2400-baud GFSK (no row proves it) on [`APRS_HZ`], and one second sampled at
-/// [`NARROW_RATE_HZ`] on [`APRS_HZ`] holding a tone [`NARROW_TONE_HZ`] above it.
+/// [`NARROW_RATE_HZ`] on [`APRS_HZ`] holding a tone [`NARROW_TONE_HZ`] above it, and one
+/// second of RS41-like 4800-baud GFSK (the same random symbols) on [`SONDE_HZ`].
 struct Fixtures {
     _dir: tempfile::TempDir,
     pocsag_on_aprs: PathBuf,
