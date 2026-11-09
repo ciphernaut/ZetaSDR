@@ -10,7 +10,7 @@ use tokio::sync::OwnedMutexGuard;
 use tokio_util::sync::CancellationToken;
 
 use crate::port::{Port, PortError, Tuning};
-use crate::types::{Capabilities, JobId, SourceId};
+use crate::types::{Capabilities, Hz, JobId, SourceId};
 
 #[derive(Debug)]
 pub enum LeaseError {
@@ -722,23 +722,30 @@ impl LeaseManager {
     }
 
     /// The ports of `ports`, in the given order, that could take the band now: each
-    /// [`covers`] it and has no rigid holder, no pin and no fault. Elastic jobs never
-    /// make a port busy. A suggestion, not a reservation: nothing is leased.
+    /// [`covers`] it and has no rigid holder, no fault, and no pin unless the pin's
+    /// band holds the whole band (a pin admits jobs inside it, as `plan_start` inside a
+    /// pin does). Elastic jobs never make a port busy. A suggestion, not a
+    /// reservation: nothing is leased.
     pub fn free_sources(
         &self,
         ports: &[Arc<dyn Port>],
         center_hz: u64,
         bandwidth_hz: u64,
     ) -> Vec<SourceId> {
+        let want = Tuning {
+            center_hz: Hz(center_hz),
+            bandwidth_hz: Hz(bandwidth_hz),
+        };
         let leases = self.leases.lock().unwrap();
         ports
             .iter()
             .filter(|p| covers(p.capabilities(), center_hz, bandwidth_hz))
             .filter(|p| p.fault().is_none())
             .filter(|p| {
-                leases
-                    .get(p.id())
-                    .is_none_or(|v| v.iter().all(|l| l.elastic))
+                leases.get(p.id()).is_none_or(|v| {
+                    v.iter()
+                        .all(|l| l.elastic || (l.pin && fits(&want, &l.band)))
+                })
             })
             .map(|p| p.id().clone())
             .collect()
@@ -1178,6 +1185,39 @@ mod tests {
         assert_eq!(m.holders(p.id()).len(), 1);
     }
 
+    /// A pin admits jobs inside it: a source pinned over the whole band is free, one
+    /// pinned beside it (or over part of it) is not, and a rigid holder inside a
+    /// covering pin still makes it busy.
+    #[tokio::test]
+    async fn free_sources_takes_a_pin_that_covers_the_band() {
+        let m = LeaseManager::new();
+        let covering = Arc::new(FakePort::named("covering"));
+        let beside = Arc::new(FakePort::named("beside"));
+        let partial = Arc::new(FakePort::named("partial"));
+        let held = Arc::new(FakePort::named("held"));
+        m.pin(covering.as_ref(), t(130_925_000, 18_100_000))
+            .await
+            .unwrap();
+        m.pin(beside.as_ref(), t(148_000_000, 8_000_000))
+            .await
+            .unwrap();
+        m.pin(partial.as_ref(), t(132_000_000, 2_000_000))
+            .await
+            .unwrap();
+        m.pin(held.as_ref(), t(130_925_000, 18_100_000))
+            .await
+            .unwrap();
+        m.ensure(held.as_ref(), JobId::new(), t(131_550_000, 10_000), false)
+            .await
+            .unwrap();
+        let ports: Vec<Arc<dyn Port>> = vec![covering, beside, partial, held];
+        let ids = |v: Vec<SourceId>| v.into_iter().map(|s| s.0).collect::<Vec<_>>();
+        assert_eq!(
+            ids(m.free_sources(&ports, 133_503_750, 6_967_500)),
+            ["covering"]
+        );
+    }
+
     #[tokio::test]
     async fn free_sources_skips_held_pinned_faulted_and_uncovering_ports() {
         let m = LeaseManager::new();
@@ -1193,7 +1233,10 @@ mod tests {
         m.ensure(held.as_ref(), JobId::new(), want, false)
             .await
             .unwrap();
-        m.pin(pinned.as_ref(), want).await.unwrap();
+        // Pinned beside the band: busy (a pin over the band is free, the test above).
+        m.pin(pinned.as_ref(), t(401_000_000, 20_000))
+            .await
+            .unwrap();
         m.ensure(elastic.as_ref(), JobId::new(), want, true)
             .await
             .unwrap();

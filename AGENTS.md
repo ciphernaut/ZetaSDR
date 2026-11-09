@@ -104,7 +104,7 @@ Release the pin; the source idles if nothing else holds it.
 
 ### source_free
 
-The sources that could take the band now: `free` lists, in id order, every source whose `tune_min_hz..=tune_max_hz` holds both edges of the band and whose `max_bandwidth_hz` its width, with no rigid holder, no pin and no fault (elastic jobs never make a source busy); `busy` lists every other source that covers the band with why: `holders`, `elastic`, `pin` and `fault` as `source_list` gives them. A source that cannot cover the band is in neither list. Takes no lease.
+The sources that could take the band now: `free` lists, in id order, every source whose `tune_min_hz..=tune_max_hz` holds both edges of the band and whose `max_bandwidth_hz` its width, with no rigid holder, no fault, and no pin unless the pin's band holds the whole band (a pin admits jobs inside it; elastic jobs never make a source busy); `busy` lists every other source that covers the band with why: `holders`, `elastic`, `pin` and `fault` as `source_list` gives them. A source that cannot cover the band is in neither list. Takes no lease.
 
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
@@ -1102,7 +1102,7 @@ The web page's own `spectrum` job is elastic (`job start --elastic`, `spectrum` 
 
 To keep many channels running on one radio, pin the capture instead of letting each job retune it: `source pin --source S --center-hz C --bandwidth-hz B` (add `--replace ID` for the jobs in the way). Centre the pin between the channels you want, not on one of them, so no channel sits on the DC spike. Example: UHF CB (80 channels) is held by `--center-hz 476918750 --bandwidth-hz 1000000`; the lease may round up (1 024 000 Hz) and every channel fits. The pin retunes the radio to its band, even one inside a wider capture the page's spectrum holds (the spectrum follows); only when a decoder already holds the source inside the band does the pin join the current capture instead. Jobs started inside the pin run on it without a retune; the pin and the gain (`source gain --source S --db N`, or `--auto`) are saved and come back after a restart, and one-shot commands, read-only ones included, restore the pins and the gain of the sources they attach.
 
-A start outside the pin is a `conflict` offering `unpin source S (source_unpin)` (and `stop one of the holders` only when jobs hold the source). A pin is not a holder and is not in `--replace`. Unpinning frees the radio for other work and does not stop the jobs that were inside it; they conflict with the next retune. Read the conflict, and unpin only when the user wants the pinned channels given up.
+A pin admits jobs inside it: `source_free` lists a pinned source free for a band the pin holds whole (with no job holding it), and a set's `null` role may pick it. A start outside the pin is a `conflict` offering `unpin source S (source_unpin)` (and `stop one of the holders` only when jobs hold the source). A pin is not a holder and is not in `--replace`. Unpinning frees the radio for other work and does not stop the jobs that were inside it; they conflict with the next retune. Read the conflict, and unpin only when the user wants the pinned channels given up.
 
 ### Channel plans
 

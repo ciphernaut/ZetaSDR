@@ -1346,6 +1346,105 @@ async fn no_free_source_is_other_naming_the_role() {
     assert!(running_of(&node, TWO).await.is_none());
 }
 
+/// Pin `source` at `t`.
+async fn pin(node: &Node, source: &str, t: Tuning) {
+    let op = Op::SourcePin {
+        source: SourceId(source.into()),
+        center_hz: t.center_hz,
+        bandwidth_hz: t.bandwidth_hz,
+        replace: vec![],
+    };
+    match node.apply(op).await {
+        Ok(OpResult::Tuning(_)) => {}
+        other => panic!("pin refused: {other:?}"),
+    }
+}
+
+/// `source_free` over `t`: the free ids and the busy ids.
+async fn free_and_busy(node: &Node, t: Tuning) -> (Vec<String>, Vec<String>) {
+    let op = Op::SourceFree {
+        center_hz: t.center_hz,
+        bandwidth_hz: t.bandwidth_hz,
+    };
+    match node.apply(op).await {
+        Ok(OpResult::SourceFree { free, busy }) => (
+            free.into_iter().map(|s| s.0).collect(),
+            busy.into_iter().map(|b| b.id.0).collect(),
+        ),
+        other => panic!("source_free: {other:?}"),
+    }
+}
+
+/// A pin admits jobs inside it, as `plan_start` inside a pin does: a `null` role picks
+/// a radio pinned over its whole band (no tune: the pin's capture holds it), and
+/// `source_free` lists it free.
+#[tokio::test]
+async fn a_null_radio_picks_a_source_pinned_over_its_band() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = Radio::new("b");
+    let node = open_radios(dir.path(), &[&b], registry()).await;
+    let watch = band(300_000_000, 1_000_000);
+    pin(&node, "b", band(300_500_000, 4_000_000)).await;
+    assert_eq!(
+        free_and_busy(&node, watch).await,
+        (vec!["b".into()], vec![])
+    );
+    let tunes = b.tunes();
+    let r = started_set(&node, set_op(TWO, &[("b", None)], Some(&["w"]), &[])).await;
+    assert_eq!(r.radios["b"].source.0, "b");
+    assert_eq!(r.started_members(), [("w", None)]);
+    assert_eq!(b.tunes(), tunes, "inside the pin: no tune");
+    assert_eq!(
+        node.pinned(&SourceId("b".into())),
+        Some(band(300_500_000, 4_000_000))
+    );
+}
+
+/// A pin that does not cover the whole band keeps the source busy, for `source_free`
+/// and for a `null` role alike.
+#[tokio::test]
+async fn a_pin_that_does_not_cover_the_band_stays_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = Radio::new("b");
+    let node = open_radios(dir.path(), &[&b], registry()).await;
+    let watch = band(300_000_000, 1_000_000);
+    // 299.8-300.2 MHz: inside the watch's band, not over it.
+    pin(&node, "b", band(300_000_000, 400_000)).await;
+    assert_eq!(
+        free_and_busy(&node, watch).await,
+        (vec![], vec!["b".into()])
+    );
+    let r = node
+        .apply(set_op(TWO, &[("b", None)], Some(&["w"]), &[]))
+        .await;
+    assert!(r.is_err(), "{r:?}");
+    assert!(running_jobs(&node).is_empty());
+}
+
+/// A rigid holder inside a covering pin still makes the source busy.
+#[tokio::test]
+async fn a_held_source_inside_a_covering_pin_stays_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = Radio::new("b");
+    let node = open_radios(dir.path(), &[&b], registry()).await;
+    let watch = band(300_000_000, 1_000_000);
+    pin(&node, "b", band(300_000_000, 4_000_000)).await;
+    let holder = job(
+        &node,
+        job_start("b", JobKind::Measure, band(301_000_000, 20_000)),
+    )
+    .await;
+    assert_eq!(
+        free_and_busy(&node, watch).await,
+        (vec![], vec!["b".into()])
+    );
+    let r = node
+        .apply(set_op(TWO, &[("b", None)], Some(&["w"]), &[]))
+        .await;
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(running_jobs(&node), vec![holder]);
+}
+
 #[tokio::test]
 async fn a_watch_member_on_a_band_another_watch_holds_is_other_unless_the_policy_matches() {
     let dir = tempfile::tempdir().unwrap();

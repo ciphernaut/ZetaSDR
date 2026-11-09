@@ -115,8 +115,9 @@ pub enum Op {
     },
     /// The sources that could take the band now: `free` lists, in id order, every
     /// source whose `tune_min_hz..=tune_max_hz` holds both edges of the band and whose
-    /// `max_bandwidth_hz` its width, with no rigid holder, no pin and no fault (elastic
-    /// jobs never make a source busy); `busy` lists every other source that covers the
+    /// `max_bandwidth_hz` its width, with no rigid holder, no fault, and no pin unless
+    /// the pin's band holds the whole band (a pin admits jobs inside it; elastic jobs
+    /// never make a source busy); `busy` lists every other source that covers the
     /// band with why: `holders`, `elastic`, `pin` and `fault` as `source_list` gives
     /// them. A source that cannot cover the band is in neither list. Takes no lease.
     SourceFree {
@@ -2521,7 +2522,7 @@ impl From<&crate::themes::LoadedTheme> for ThemeInfo {
 pub enum OpResult {
     Sources(Vec<SourceInfo>),
     /// `source_free`: the sources that could take the band now, and those that
-    /// cover it but are held, pinned or faulted.
+    /// cover it but are held, pinned beside it or faulted.
     SourceFree {
         free: Vec<SourceId>,
         busy: Vec<BusySource>,
