@@ -60,6 +60,9 @@ struct Fixtures {
     /// Three pages at [`SPAN_OFFSETS_HZ`] in a [`SPAN_LOOP`] loop, each every 2 s, the
     /// third only in the loop's seconds 6-14.
     pocsag3: PathBuf,
+    /// `pocsag3`'s loop with its pages at [`KNOWN_OFFSETS_HZ`]: none on `pocsag_decode`'s
+    /// listed centre, the third (the register's channel) only in the loop's seconds 6-14.
+    known3: PathBuf,
     /// The page at [`OFFSET_HZ`] beside the GFSK burst at [`FSK_BESIDE_HZ`], every 2 s.
     pocsag_fsk: PathBuf,
     /// A GFSK burst about 60 kHz wide at [`FSK_BESIDE_HZ`] every 2 s, at the suite's noise.
@@ -72,6 +75,10 @@ struct Fixtures {
 
 /// The span tests' pages, above the capture's centre.
 const SPAN_OFFSETS_HZ: [u64; 3] = [200_000, 300_000, 400_000];
+/// The known-rank test's pages, above the capture's centre: two unknown pages below
+/// [`OFFSET_HZ`] (`pocsag_decode`'s listed centre, where no page sits) and the register's
+/// channel above it, which comes on air only after the slot is taken.
+const KNOWN_OFFSETS_HZ: [u64; 3] = [150_000, 200_000, 400_000];
 /// The span fixture's loop (20 s): ten page cycles.
 const SPAN_LOOP: usize = 10 * CYCLE;
 /// The cycles of [`SPAN_LOOP`] the third page is in (seconds 6-14).
@@ -140,6 +147,8 @@ fn fixtures() -> &'static Fixtures {
         let burst = fsk_burst(OFFSET_HZ, FSK_BAUD, FSK_DEVIATION_HZ);
         let fsk = write(dir.path(), "fsk", &cycle(burst, 2), CENTER_HZ);
         let pocsag3 = write(dir.path(), "pocsag3", &span_loop(), CENTER_HZ);
+        let known3 = span_loop_at(KNOWN_OFFSETS_HZ);
+        let known3 = write(dir.path(), "known3", &known3, CENTER_HZ);
         let narrow = fsk_burst(FSK_BESIDE_HZ, NARROW_FSK_BAUD, NARROW_FSK_DEVIATION_HZ);
         let beside = cycle_at(sum(&[&page, &narrow]), 4, SPAN_FSK_SNR_DB);
         let pocsag_fsk = write(dir.path(), "pocsag_fsk", &beside, CENTER_HZ);
@@ -183,6 +192,7 @@ fn fixtures() -> &'static Fixtures {
             framed,
             frame_modes,
             pocsag3,
+            known3,
             pocsag_fsk,
             wide,
             noise12k,
@@ -272,7 +282,12 @@ const SPAN_ADDRESS_STEP: u32 = 8;
 /// The `pocsag3` loop: a page at each of [`SPAN_OFFSETS_HZ`] (its own address) at the
 /// start of every cycle, the third only in [`SPAN_THIRD_CYCLES`], white noise over all.
 fn span_loop() -> Vec<Complex<f32>> {
-    let pages: Vec<Vec<Complex<f32>>> = SPAN_OFFSETS_HZ
+    span_loop_at(SPAN_OFFSETS_HZ)
+}
+
+/// [`span_loop`] with its pages at `offsets_hz`.
+fn span_loop_at(offsets_hz: [u64; 3]) -> Vec<Complex<f32>> {
+    let pages: Vec<Vec<Complex<f32>>> = offsets_hz
         .iter()
         .enumerate()
         .map(|(n, off)| {
@@ -3480,17 +3495,15 @@ async fn a_span_watch_is_readopted_with_the_hold() {
     stop_all(&node).await;
 }
 
-/// The known-channel tests' register: one 12.5 kHz data transmitter licensed at the
-/// second page of `pocsag3` (which is also `pocsag_decode`'s listed centre).
+/// The seeding test's register: one 12.5 kHz data transmitter licensed at the second
+/// page of `pocsag3` (which is also `pocsag_decode`'s listed centre).
 fn telco() -> Allocation {
-    assignment(
-        CENTER_HZ + SPAN_OFFSETS_HZ[1],
-        12_500,
-        "12K5F1D",
-        "Telco",
-        "Mount X",
-        3.0,
-    )
+    telco_at(CENTER_HZ + SPAN_OFFSETS_HZ[1])
+}
+
+/// A 12.5 kHz data transmitter licensed at `center_hz` to Telco, Mount X, 3 km away.
+fn telco_at(center_hz: u64) -> Allocation {
+    assignment(center_hz, 12_500, "12K5F1D", "Telco", "Mount X", 3.0)
 }
 
 /// The `watch.known` record.
@@ -3515,23 +3528,29 @@ fn known_channels(node: &Node, watch: &JobId) -> Vec<(u64, String)> {
         .collect()
 }
 
+/// The known-rank test's cooldown: the stopped decoder's channel stays out of the race
+/// for the freed slot.
+const RANK_COOLDOWN_MS: u64 = 30_000;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn known_channels_rank_first_and_name_the_licensee() {
     let _one = SERIAL.lock().await;
     zeta_core::node::watch::test_timing(0, 0);
     let dir = tempfile::tempdir().unwrap();
-    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
-    node.add_knowledge(Arc::new(Register::with(vec![telco()])));
+    let (node, _port) = node_on(dir.path(), &fixtures().known3, false).await;
+    let licensed = CENTER_HZ + KNOWN_OFFSETS_HZ[2];
+    node.add_knowledge(Arc::new(Register::with(vec![telco_at(licensed)])));
     let node = Arc::new(node);
     let mut params = span_params(&["pocsag_decode"]);
     params["max_decoders"] = 1.into();
+    params["cooldown_ms"] = RANK_COOLDOWN_MS.into();
     let watch = start_watch(&node, params).await;
     let events = Events::of(&node, &watch);
     until("the known channels", Duration::from_secs(5), || {
         known_channels(&node, &watch)
             == [
                 (POCSAG_HZ, "row".to_string()),
-                (CENTER_HZ + SPAN_OFFSETS_HZ[1], "register".to_string()),
+                (licensed, "register".to_string()),
             ]
     })
     .await;
@@ -3545,19 +3564,49 @@ async fn known_channels_rank_first_and_name_the_licensee() {
     assert_eq!(register["sites"], 1, "{k}");
     assert_eq!(register["bandwidth_hz"], POCSAG_WIDTH_HZ, "{k}");
     assert_eq!(k["channels"][0]["sites"], 0, "{k}");
-    until("a decoding event", SPAN_ALL_THREE, || {
-        !events.watch("decoding").is_empty()
+    // An unknown page takes the one slot; the other unknown page and, once on air, the
+    // register's channel wait.
+    let on = |s: &Value, off: u64| s["center_hz"].as_u64().is_some_and(|hz| on_page(hz, off));
+    until("one decoding and two waiting", SPAN_ALL_THREE, || {
+        let waiting = waiting_signals(&node, &watch);
+        decoder_ids(&node, &watch).len() == 1
+            && waiting.len() == 2
+            && waiting.iter().any(|s| on(s, KNOWN_OFFSETS_HZ[2]))
     })
     .await;
-    // The one slot goes to the known channel, not the page below it.
-    let e = &events.watch("decoding")[0];
-    let hz = e["signal"]["center_hz"].as_u64().unwrap();
-    assert!(on_page(hz, SPAN_OFFSETS_HZ[1]), "{e}");
+    let first = decoder_ids(&node, &watch);
+    let running = decoder_center(&node, &first[0]);
+    assert!(
+        on_page(running, KNOWN_OFFSETS_HZ[0]) || on_page(running, KNOWN_OFFSETS_HZ[1]),
+        "an unknown page decodes first: {running}"
+    );
+    // The freed slot goes to the known channel over the unknown page that waited longer.
+    node.job_stop(&first[0]).await.unwrap();
+    until(
+        "the register's channel takes the freed slot",
+        Duration::from_secs(5),
+        || {
+            let ids = decoder_ids(&node, &watch);
+            ids.len() == 1 && on_page(decoder_center(&node, &ids[0]), KNOWN_OFFSETS_HZ[2])
+        },
+    )
+    .await;
+    let e = events
+        .watch("decoding")
+        .into_iter()
+        .find(|e| on(&e["signal"], KNOWN_OFFSETS_HZ[2]))
+        .unwrap_or_else(|| panic!("{:#?}", events.all()));
     let summary = e["summary"].as_str().unwrap();
     assert!(
         summary.contains("; register says 12K5F1D (12.5 kHz FM data) Telco, Mount X, 3 km"),
         "{e}"
     );
+    // The unknown page still waits.
+    until("the unknown page waits", Duration::from_secs(5), || {
+        let waiting = waiting_signals(&node, &watch);
+        waiting.len() == 1 && !on(&waiting[0], KNOWN_OFFSETS_HZ[2])
+    })
+    .await;
     stop_all(&node).await;
 }
 
