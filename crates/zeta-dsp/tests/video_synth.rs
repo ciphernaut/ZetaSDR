@@ -62,7 +62,8 @@ fn the_block_moves_between_fields() {
             .find(|&x| c[base + x] > 0.35)
             .expect("a white block on the row")
     };
-    let (e0, e1) = (edge(0), edge(312));
+    // Field 1's first whole line is frame line 314 (index 313).
+    let (e0, e1) = (edge(0), edge(313));
     assert_eq!((e1 + w - e0) % w, 16, "edges {e0} {e1}");
 }
 
@@ -89,4 +90,93 @@ fn ccir405_pre_then_de_is_identity() {
     for (n, (got, want)) in x.iter().zip(&ramp).enumerate().skip(50) {
         assert!((got - want).abs() < 1e-3, "n={n}");
     }
+}
+
+/// Runs of samples below -0.25 V as (start, length) in samples.
+fn low_runs(c: &[f32]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (i, &v) in c.iter().enumerate() {
+        match (v < -0.25, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                runs.push((s, i - s));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    runs
+}
+
+fn us(samples: usize) -> f64 {
+    samples as f64 / 8.0
+}
+
+fn long_runs(standard: VideoStandard, fields: u32) -> Vec<(usize, usize)> {
+    let t = standard.table();
+    let c = composite_test_card(standard, RATE, fields);
+    let min = (0.4 * t.line_s * 8e6) as usize;
+    low_runs(&c)
+        .into_iter()
+        .filter(|&(_, len)| len > min)
+        .collect()
+}
+
+#[test]
+fn broad_pulses_are_long_and_sit_in_the_vbi() {
+    for standard in [VideoStandard::Pal, VideoStandard::Ntsc] {
+        let t = standard.table();
+        let runs = long_runs(standard, 1);
+        assert_eq!(runs.len(), (2.0 * t.broad_lines) as usize, "{standard:?}");
+        let vbi = ((2.0 * t.eq_lines + t.broad_lines) * t.line_s * 8e6) as usize;
+        assert!(runs.iter().all(|&(s, l)| s + l <= vbi), "{standard:?}");
+    }
+}
+
+#[test]
+fn every_line_outside_the_vbi_has_a_sync_tip() {
+    for standard in [VideoStandard::Pal, VideoStandard::Ntsc] {
+        let t = standard.table();
+        let c = composite_test_card(standard, RATE, 2);
+        // Field 0: whole lines from line 10 up to the field end (312.5 / 262.5 lines).
+        let end = (t.lines_per_field[0] + t.lines_per_field[1]) as f64 / 2.0;
+        let mut g = 9;
+        while (g as f64) < end - 0.5 {
+            let t0 = g as f64 * t.line_s;
+            let a = (t0 * 8e6).ceil() as usize + 1;
+            let b = ((t0 + 0.8 * t.sync_s) * 8e6).floor() as usize - 1;
+            assert!(
+                c[a..b].iter().all(|&v| v < -0.25),
+                "{standard:?} line {}",
+                g + 1
+            );
+            let after = ((t0 + t.sync_s + 1e-6) * 8e6).ceil() as usize + 1;
+            assert!(c[after] > -0.05, "{standard:?} line {}", g + 1);
+            g += 1;
+        }
+    }
+}
+
+#[test]
+fn field_one_starts_half_a_line_later() {
+    // Layout: eq_lines (2.5) of equalising half-lines, then broad_lines (2.5) of broad,
+    // so a field's first broad pulse starts eq_lines after the field's start. Field 0
+    // starts at 0; field 1 at half a frame (312.5 lines).
+    let t = VideoStandard::Pal.table();
+    let runs = long_runs(VideoStandard::Pal, 2);
+    let first0 = us(runs[0].0);
+    let want0 = t.eq_lines * t.line_s * 1e6;
+    assert!((first0 - want0).abs() < 1.0, "{first0} vs {want0}");
+    let first1 = runs
+        .iter()
+        .map(|&(s, _)| us(s))
+        .find(|&u| u > 1000.0)
+        .expect("field 1 broad pulses");
+    let want1 = (312.5 + t.eq_lines) * t.line_s * 1e6;
+    assert!((first1 - want1).abs() < 1.0, "{first1} vs {want1}");
+    // Field 0's run starts on a half line only because eq_lines is 2.5; field 1's is a
+    // whole line off from that, i.e. on a whole-line boundary.
+    assert!(((first1 / (t.line_s * 1e6)) % 1.0 - 0.0).abs() < 0.02);
+    assert!(((first0 / (t.line_s * 1e6)) % 1.0 - 0.5).abs() < 0.02);
 }

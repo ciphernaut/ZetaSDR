@@ -1292,40 +1292,18 @@ fn add_fm_subcarrier(composite: &mut [f32], rate_hz: u32, subcarrier_hz: f64) {
     }
 }
 
-/// The composite level of one sample: `field` (0-based, counted from the start), `line`
-/// (1-based within the field), `tau` seconds into the line.
-fn card_level(
-    t: &crate::video_fm::StandardTable,
-    rate_hz: u32,
-    field: u64,
-    line: u32,
-    tau: f64,
-) -> f32 {
-    let half = if tau < 0.5 * t.line_s { 0 } else { 1 };
-    let h = 2.0 * f64::from(line - 1) + f64::from(half);
-    let (eq, broad) = (2.0 * t.eq_lines, 2.0 * t.broad_lines);
-    let in_half = if half == 0 { tau } else { tau - 0.5 * t.line_s };
-    let low = if h < eq || (h >= eq + broad && h < 2.0 * eq + broad) {
-        Some(0.5 * t.sync_s)
-    } else if h < eq + broad {
-        Some(0.5 * t.line_s - t.sync_s)
-    } else {
-        None
-    };
-    if let Some(l) = low {
-        return if in_half < l { SYNC_V } else { BLANK_V };
-    }
-    let vi_lines = (2.0 * t.eq_lines + t.broad_lines).ceil() as u32;
-    if line <= vi_lines {
+/// The picture level of whole line `g` of the frame grid at `tau` seconds into it, or
+/// blanking: the line's field is the one holding its first half-line, and its row is its
+/// position among that field's whole lines.
+fn card_picture(t: &crate::video_fm::StandardTable, rate_hz: u32, g: u64, tau: f64) -> f32 {
+    let frame_lines = u64::from(t.lines_per_field[0] + t.lines_per_field[1]);
+    let field = (2 * g) / frame_lines;
+    let first = (field * frame_lines).div_ceil(2);
+    let n = (g - first) as u32 + 1;
+    if n < t.first_active_line || n >= t.first_active_line + t.active_lines {
         return BLANK_V;
     }
-    if tau < t.sync_s {
-        return SYNC_V;
-    }
-    let row = line.wrapping_sub(t.first_active_line);
-    if line < t.first_active_line || row >= t.active_lines {
-        return BLANK_V;
-    }
+    let row = n - t.first_active_line;
     let x = ((tau - t.active_start_s) * f64::from(rate_hz) + 1e-6).floor();
     let width = (t.active_s * f64::from(rate_hz)).round();
     if x < 0.0 || x >= width {
@@ -1347,28 +1325,64 @@ fn card_level(
     BLANK_V
 }
 
+/// The composite level at frame half-line `half_line` (counted from the start), `in_half`
+/// seconds into it: the vertical interval's pulses at the start of each field, a normal
+/// sync tip at the start of every other whole line, then blanking or the picture.
+fn card_level(
+    t: &crate::video_fm::StandardTable,
+    rate_hz: u32,
+    half_line: u64,
+    in_half: f64,
+) -> f32 {
+    let frame_lines = u64::from(t.lines_per_field[0] + t.lines_per_field[1]);
+    let h = (half_line % frame_lines) as f64;
+    let (eq, broad) = (2.0 * t.eq_lines, 2.0 * t.broad_lines);
+    let low = if h < eq || (h >= eq + broad && h < 2.0 * eq + broad) {
+        Some(0.5 * t.sync_s)
+    } else if h < eq + broad {
+        Some(0.5 * t.line_s - t.sync_s)
+    } else {
+        None
+    };
+    if let Some(l) = low {
+        return if in_half < l { SYNC_V } else { BLANK_V };
+    }
+    let tau = in_half
+        + if half_line % 2 == 1 {
+            0.5 * t.line_s
+        } else {
+            0.0
+        };
+    if half_line.is_multiple_of(2) && tau < t.sync_s {
+        return SYNC_V;
+    }
+    card_picture(t, rate_hz, half_line / 2, tau)
+}
+
 /// `fields` consecutive fields of an analog television test card at `rate_hz`, composite
-/// volts, from field 0 line 1: eight luma bars `(7 - k) / 7` over the top three quarters
-/// of the active lines, a black bottom quarter with a white block one eighth of the active
-/// width and height that steps 16 samples right each field. The vertical interval is
-/// equalising, broad, equalising pulses, then blanked lines with normal sync.
+/// volts, from field 0 line 1, as one interlaced frame grid: a continuous run of whole
+/// lines (625 per frame for PAL, 525 for NTSC) each opening with a sync tip, except where
+/// a vertical interval's pulses replace it. The synth's fields are 312.5 (PAL) and 262.5
+/// (NTSC) lines long, not the table's `lines_per_field` counts: field `k` starts at frame
+/// half-line `k * frame_lines`, so odd fields start mid-line. Each field opens with
+/// `eq_lines` of equalising, `broad_lines` of broad and `eq_lines` of equalising
+/// half-line pulses. The picture is eight luma bars `(7 - k) / 7` over the top three
+/// quarters of the active lines, a black bottom quarter with a white block one eighth of
+/// the active width and height that steps 16 samples right each field. A field's active
+/// rows count from its first whole line at or after its start. The length is
+/// `round(fields * frame_lines / 2 * line_s * rate_hz)`.
 pub fn composite_test_card(standard: VideoStandard, rate_hz: u32, fields: u32) -> Vec<f32> {
     let t = standard.table();
-    let [l0, l1] = t.lines_per_field;
-    let pair = u64::from(l0 + l1);
-    let total_lines =
-        (u64::from(fields) / 2) * pair + if fields % 2 == 1 { u64::from(l0) } else { 0 };
-    let len = (total_lines as f64 * t.line_s * f64::from(rate_hz)).round() as usize;
+    let frame_lines = f64::from(t.lines_per_field[0] + t.lines_per_field[1]);
+    let len =
+        (f64::from(fields) * frame_lines / 2.0 * t.line_s * f64::from(rate_hz)).round() as usize;
+    let half_s = 0.5 * t.line_s;
     let mut out = Vec::with_capacity(len);
     for n in 0..len {
         let time = n as f64 / f64::from(rate_hz);
-        let g = ((time / t.line_s) + 1e-9).floor() as u64;
-        let tau = (time - g as f64 * t.line_s).max(0.0);
-        let rem = g % pair;
-        let (field_pair, in_second) = (g / pair, rem >= u64::from(l0));
-        let field = field_pair * 2 + u64::from(in_second);
-        let line0 = if in_second { rem - u64::from(l0) } else { rem };
-        out.push(card_level(t, rate_hz, field, line0 as u32 + 1, tau));
+        let half_line = (time / half_s + 1e-9).floor() as u64;
+        let in_half = (time - half_line as f64 * half_s).max(0.0);
+        out.push(card_level(t, rate_hz, half_line, in_half));
     }
     out
 }
@@ -1948,8 +1962,8 @@ impl SynthSpec {
                 if !(*deviation_hz > 0.0 && deviation_hz.is_finite()) {
                     return Err("deviation_hz: above 0".into());
                 }
-                if *fields < 1 {
-                    return Err("fields: at least 1".into());
+                if !(1..=500).contains(fields) {
+                    return Err("fields: 1..=500".into());
                 }
                 if let Some(sc) = subcarrier_hz
                     && !(*sc > 0.0 && *sc < f64::from(*rate_hz) / 2.0)
@@ -2023,6 +2037,11 @@ pub fn synthesise(
     rate_hz: u32,
     _center_hz: u64,
 ) -> Vec<Complex<f32>> {
+    // A video spec carries its own rate; every step below runs at it.
+    let rate_hz = match spec {
+        SynthSpec::Video { rate_hz: r, .. } => *r,
+        _ => rate_hz,
+    };
     let off = imp.offset_hz;
     let mut iq = match spec {
         SynthSpec::Aprs { src, dst, info } => aprs_packet_iq(src, dst, info, rate_hz, off),
@@ -2186,19 +2205,19 @@ pub fn synthesise(
             standard,
             deviation_hz,
             subcarrier_hz,
-            rate_hz: video_rate,
             fields,
             preemphasis,
+            ..
         } => {
-            let mut composite = composite_test_card(*standard, *video_rate, *fields);
+            let mut composite = composite_test_card(*standard, rate_hz, *fields);
             if *preemphasis {
-                Shelf::ccir405(*standard, f64::from(*video_rate)).pre(&mut composite);
+                Shelf::ccir405(*standard, f64::from(rate_hz)).pre(&mut composite);
             }
             if let Some(sc) = subcarrier_hz {
-                add_fm_subcarrier(&mut composite, *video_rate, *sc);
+                add_fm_subcarrier(&mut composite, rate_hz, *sc);
             }
-            let mut iq = wfm_modulate_composite(&composite, *video_rate, *deviation_hz);
-            shift(&mut iq, off, *video_rate);
+            let mut iq = wfm_modulate_composite(&composite, rate_hz, *deviation_hz);
+            shift(&mut iq, off, rate_hz);
             iq
         }
     };
