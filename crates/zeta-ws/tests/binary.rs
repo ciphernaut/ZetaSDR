@@ -362,7 +362,8 @@ async fn a_video_frame_arrives_as_a_png_envelope_under_smooth() {
     let bytes = binary(&mut ws).await;
     let (header, _) = parse_envelope(&bytes).unwrap();
     assert_eq!(header.stream, id);
-    assert_eq!(png_envelope(&bytes), (360, 144, 77));
+    // Every line of the field: it is already anamorphic.
+    assert_eq!(png_envelope(&bytes), (360, 288, 77));
     assert_eq!(ts.stats.get().video_frames_sent, 1);
     drop(ws);
     ts.stop().await;
@@ -442,7 +443,7 @@ async fn thumb_is_120_wide() {
     credit(&mut ws, 1).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     ts.node.bus().publish(gray_frame(&id, 720, 288, 200));
-    assert_eq!(png_envelope(&binary(&mut ws).await), (120, 48, 200));
+    assert_eq!(png_envelope(&binary(&mut ws).await), (120, 96, 200));
     drop(ws);
     ts.stop().await;
 }
@@ -527,6 +528,7 @@ async fn an_unencodable_frame_counts_as_missed() {
     assert_eq!(missed, 1);
     assert_eq!(png_envelope(&bytes), (16, 8, 9));
     assert_eq!(ts.stats.get().video_frames_sent, 1);
+    assert_eq!(ts.stats.get().video_frames_skipped, 1);
     drop(ws);
     ts.stop().await;
 }

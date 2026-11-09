@@ -3,29 +3,40 @@
 
 use zeta_core::stream::VideoFormat;
 
-/// A delivery profile: the width a frame is scaled down to (never up) and the shortest
-/// interval between frames sent.
+/// A delivery profile: the width a frame is scaled down to (never up), the factor its
+/// height is divided by when it is, and the shortest interval between frames sent.
+///
+/// The height is not scaled with the width: a decoded field (720 x 288 for PAL) is
+/// already anamorphic, its lines twice as far apart as its samples (the page stretches it
+/// to 4:3), so keeping its aspect would halve its lines and blur on-screen text. `smooth`
+/// keeps every line (360 x 288); `thumb` keeps a third (120 x 96, still taller than its
+/// 4:3 display needs).
 #[derive(Debug, PartialEq, Eq)]
 pub struct VideoProfile {
     pub name: &'static str,
     /// `None` keeps the frame's own width.
     pub width: Option<u32>,
+    /// The height of a frame scaled to `width` is its own divided by this (1 keeps it).
+    pub height_div: u32,
     pub min_interval_ms: u64,
 }
 
 pub const SMOOTH: VideoProfile = VideoProfile {
     name: "smooth",
     width: Some(360),
+    height_div: 1,
     min_interval_ms: 0,
 };
 pub const SHARP: VideoProfile = VideoProfile {
     name: "sharp",
     width: None,
+    height_div: 1,
     min_interval_ms: 200,
 };
 pub const THUMB: VideoProfile = VideoProfile {
     name: "thumb",
     width: Some(120),
+    height_div: 3,
     min_interval_ms: 500,
 };
 
@@ -46,21 +57,22 @@ pub fn gray8_of_rgb8(rgb: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Box-filter downscale to `out_width`, keeping the aspect: `out_height` is
-/// `max(1, height * out_width / width)`. `channels` is 1 (gray8) or 3 (rgb8). A target
-/// at least as wide as the source returns it unchanged.
-pub fn scale_to_width(
+/// Box-filter downscale to `out_width` by `out_height` (each clamped to the source's, never
+/// up). `channels` is 1 (gray8) or 3 (rgb8). A target no smaller either way returns the
+/// source unchanged.
+pub fn scale_to(
     src: &[u8],
     width: u32,
     height: u32,
     channels: u8,
     out_width: u32,
+    out_height: u32,
 ) -> (Vec<u8>, u32, u32) {
-    if out_width >= width || width == 0 || height == 0 || out_width == 0 {
+    let (out_width, out_height) = (out_width.min(width), out_height.min(height));
+    if (out_width, out_height) == (width, height) || out_width == 0 || out_height == 0 {
         return (src.to_vec(), width, height);
     }
     let ch = usize::from(channels);
-    let out_height = ((u64::from(height) * u64::from(out_width) / u64::from(width)) as u32).max(1);
     let (w, h, ow, oh) = (
         width as usize,
         height as usize,
@@ -114,7 +126,8 @@ pub fn encode_png(bytes: &[u8], width: u32, height: u32, channels: u8) -> Result
 }
 
 /// A frame as a PNG body for `profile`: a png input passes through unscaled; gray8 and
-/// rgb8 are scaled to the profile's width (when smaller) and encoded. Returns the body and
+/// rgb8 wider than the profile's width are scaled to it (the height divided by its
+/// `height_div`) and encoded. Returns the body and
 /// its dimensions.
 pub fn encode_frame(
     width: u32,
@@ -130,8 +143,11 @@ pub fn encode_frame(
         VideoFormat::Rgb8 => 3,
     };
     let (px, w, h) = match profile.width {
-        Some(ow) => scale_to_width(body, width, height, channels, ow),
-        None => (body.to_vec(), width, height),
+        Some(ow) if ow < width => {
+            let oh = (height / profile.height_div.max(1)).max(1);
+            scale_to(body, width, height, channels, ow, oh)
+        }
+        _ => (body.to_vec(), width, height),
     };
     Ok((encode_png(&px, w, h, channels)?, w, h))
 }

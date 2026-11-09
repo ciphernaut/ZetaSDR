@@ -378,7 +378,8 @@ fn video_message(f: &Frame, profile: &VideoProfile) -> Result<Vec<u8>, String> {
 /// `min_interval_ms` since the last send, is replaced by the next one to arrive, which
 /// counts as missed and as `video_frames_skipped`. A due frame is encoded off the runtime,
 /// one at a time and only when it is sent, so a skipped frame costs nothing; one that cannot
-/// be encoded counts as missed. The count goes out as `{"type":"lagged","missed":K}` just
+/// be encoded, and the bus's lag, count as missed and as `video_frames_skipped` too, so the
+/// counter is the sum of what the sockets report as missed. The count goes out as `{"type":"lagged","missed":K}` just
 /// before the next frame sent.
 async fn connection_video(
     mut socket: WebSocket,
@@ -423,6 +424,7 @@ async fn connection_video(
                 encoding = None;
                 let Ok(Ok(message)) = done else {
                     missed = missed.saturating_add(1);
+                    st.stats.video_frames_skipped(1);
                     continue;
                 };
                 if missed > 0 {
@@ -445,10 +447,13 @@ async fn connection_video(
                 Ok(frame) => {
                     if latest.replace(frame).is_some() {
                         missed = missed.saturating_add(1);
-                        st.stats.video_frame_skipped();
+                        st.stats.video_frames_skipped(1);
                     }
                 }
-                Err(RecvError::Lagged(n)) => missed = missed.saturating_add(n),
+                Err(RecvError::Lagged(n)) => {
+                    missed = missed.saturating_add(n);
+                    st.stats.video_frames_skipped(n);
+                }
                 Err(RecvError::Closed) => {
                     close(&mut socket, "stream ended", close_code::NORMAL, limit).await;
                     return;

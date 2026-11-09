@@ -517,7 +517,7 @@ else it gets 401.
 
 | Route | |
 |---|---|
-| `GET /health` | status, version, `build` (the build the node runs: `ZETA_BUILD_ID` if set, else version plus the executable's modification time; the web page reloads itself when it changes or the uptime goes backwards), uptime, websocket connections |
+| `GET /health` | status, version, `build` (the build the node runs: `ZETA_BUILD_ID` if set, else version plus the executable's modification time; the web page reloads itself when it changes or the uptime goes backwards), uptime, websocket connections, `stages_running`, and the websocket counters since start: `ws_dropped_slow` (sockets closed for a slow reader), `ws_credit_skipped` (binary frames skipped for want of credit), `video_frames_sent` and `video_frames_skipped` (video frames not sent: a newer one first, lag or unencodable; the sum of the sockets' `lagged.missed`) |
 | `POST /op` | apply one operation (`{"op": ...}` JSON) |
 | `GET /schema` | the operation schema |
 | `GET /streams` | live streams |

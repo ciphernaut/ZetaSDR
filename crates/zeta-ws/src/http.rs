@@ -90,7 +90,9 @@ pub struct ServerStats {
     pub ws_credit_skipped: u64,
     /// PNG frames the video profiles sent.
     pub video_frames_sent: u64,
-    /// Video frames replaced by a newer one before they could be sent.
+    /// Video frames a socket did not send: replaced by a newer one before they could be,
+    /// lost to the socket's broadcast lag, or unencodable (the `lagged.missed` the sockets
+    /// reported, summed).
     pub video_frames_skipped: u64,
 }
 
@@ -138,8 +140,8 @@ impl StatsHandle {
         self.0.video_frames_sent.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn video_frame_skipped(&self) {
-        self.0.video_frames_skipped.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn video_frames_skipped(&self, n: u64) {
+        self.0.video_frames_skipped.fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -155,6 +157,18 @@ pub struct Health {
     /// Tasks running for jobs' stages ([`Node::debug_stage_count`]): it falls back
     /// when jobs stop, so one that only grows is a run left behind.
     pub stages_running: usize,
+    /// Websockets closed because a send timed out (a slow reader), since the node started.
+    #[serde(default)]
+    pub ws_dropped_slow: u64,
+    /// Frames binary-mode sockets skipped for want of credit.
+    #[serde(default)]
+    pub ws_credit_skipped: u64,
+    /// PNG frames the video sockets sent.
+    #[serde(default)]
+    pub video_frames_sent: u64,
+    /// Video frames the sockets did not send (newer one first, lag, unencodable).
+    #[serde(default)]
+    pub video_frames_skipped: u64,
 }
 
 /// State shared by every route and middleware.
@@ -249,13 +263,18 @@ async fn require_auth(
 }
 
 async fn health(State(st): State<Shared>) -> Json<Health> {
+    let stats = st.stats.get();
     Json(Health {
         status: "ok".to_string(),
         version: zeta_core::VERSION.to_string(),
         build: crate::build_id().to_string(),
         uptime_s: st.started.elapsed().as_secs(),
-        ws_connections: st.stats.get().ws_connections,
+        ws_connections: stats.ws_connections,
         stages_running: st.node.debug_stage_count(),
+        ws_dropped_slow: stats.ws_dropped_slow,
+        ws_credit_skipped: stats.ws_credit_skipped,
+        video_frames_sent: stats.video_frames_sent,
+        video_frames_skipped: stats.video_frames_skipped,
     })
 }
 

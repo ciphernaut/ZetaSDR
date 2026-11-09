@@ -50,9 +50,24 @@ async fn health_with_secret_is_ok() {
     let ts = spawn(dir.path()).await;
     let resp = get(&ts, "/health").await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let h: Health = resp.json().await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let h: Health = serde_json::from_value(body.clone()).unwrap();
     assert_eq!(h.status, "ok");
     assert_eq!(h.version, zeta_core::VERSION);
+    // The websocket counters, from the server's own.
+    for k in [
+        "ws_dropped_slow",
+        "ws_credit_skipped",
+        "video_frames_sent",
+        "video_frames_skipped",
+    ] {
+        assert_eq!(body[k], 0, "{k} in {body}");
+    }
+    // An older node's body, without them, still reads.
+    let old = json!({"status": "ok", "version": "0", "build": "b", "uptime_s": 1,
+        "ws_connections": 0, "stages_running": 0});
+    let h: Health = serde_json::from_value(old).unwrap();
+    assert_eq!(h.video_frames_sent, 0);
     ts.stop().await;
 }
 

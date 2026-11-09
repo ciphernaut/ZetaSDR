@@ -28,3 +28,17 @@ opt-level = 3
 
 [profile.dev.package.nnnoiseless]
 opt-level = 3
+
+# The video websocket scales and PNG-encodes every field it sends: unoptimised, a 360 x 288
+# smooth field costs about 20 ms (a core at 50 fields a second); optimised, about 1 ms.
+[profile.dev.package.zeta-vrt]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3
