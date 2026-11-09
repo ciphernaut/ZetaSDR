@@ -611,8 +611,11 @@ pub enum Op {
     /// (`radios.<role>: no free source covers <center> Hz ± <half> Hz; busy: <id>
     /// (holders [...]), ...`); a member whose kind is a mode row that is not ready
     /// (`refused` `other`, `<state>: <reason>`), or a kind this node does not know
-    /// (`refused` `unknown` on `members[<i>].kind`), is set aside and the rest go on (a
-    /// role left with no member is neither tuned nor in the result); a `plan_start`
+    /// (`refused` `unknown` on `members[<i>].kind`), or a `watch` member whose
+    /// `params.modes` names a row this node cannot run or one wider than its band
+    /// (`refused` `other`, `members[<i>].params.modes[<j>]: ...`), is set aside and the
+    /// rest go on (a role left with no member is neither tuned nor in the result); a
+    /// `plan_start`
     /// member whose `attach` stage is not ready starts without it and a warning says so
     /// (`members[<i>]: <attach>: <reason>; started without attach`); (2) the band
     /// bounding each source's members is checked against the source's ranges
@@ -4657,6 +4660,28 @@ fn member_kind_refusal(kind: &JobKind, index: usize, modes: &ModeRegistry) -> Op
     )))
 }
 
+/// A set's `watch` member's `params.modes`, when not `null`, against `modes` for its
+/// band `bandwidth_hz` ([`crate::node::watch::check_modes_list`], as `job_start` checks
+/// a watch's policy); any other member passes.
+fn set_watch_modes(
+    kind: &JobKind,
+    params: Option<&serde_json::Value>,
+    modes: &ModeRegistry,
+    bandwidth_hz: Hz,
+) -> Result<(), String> {
+    let list = params
+        .and_then(|p| p.get("modes"))
+        .and_then(|m| m.as_array());
+    let (JobKind::Watch, Some(list)) = (kind, list) else {
+        return Ok(());
+    };
+    let list: Vec<String> = list
+        .iter()
+        .filter_map(|s| s.as_str().map(str::to_string))
+        .collect();
+    crate::node::watch::check_modes_list(modes, &list, bandwidth_hz.0)
+}
+
 /// A `set_start` member once checked: what it starts and on which source.
 struct SetMember<'a> {
     /// Its index in the set file's `members`.
@@ -4942,7 +4967,14 @@ async fn set_start(
                 sideband,
                 params,
                 ..
-            } => match check_start_params(kind, *deviation_hz, *sideband) {
+            } => match check_start_params(kind, *deviation_hz, *sideband).and_then(|d| {
+                // A watch's `modes`, checked here as `job_start` checks them, so a row
+                // this node lacks is refused before its radio is held or tuned.
+                match set_watch_modes(kind, params.as_ref(), &modes, *bandwidth_hz) {
+                    Err(reason) => Err(other(format!("members[{index}].params.{reason}"))),
+                    Ok(()) => Ok(d),
+                }
+            }) {
                 Ok(deviation) => SetMemberStart::Job {
                     kind: kind.clone(),
                     tuning: Tuning {

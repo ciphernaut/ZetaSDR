@@ -1560,6 +1560,43 @@ async fn a_member_of_a_kind_this_node_does_not_know_is_refused_and_the_rest_star
     }
 }
 
+/// A watch member whose `modes` names a row this node lacks is refused in the checks,
+/// before any gate: its radio, which has no other member, is never tuned.
+#[tokio::test]
+async fn a_watch_member_naming_a_row_this_node_lacks_is_refused_before_any_tune() {
+    let dir = tempfile::tempdir().unwrap();
+    write_set(
+        &dir.path().join("sets"),
+        "lacks.json",
+        r#"{"id": "lacks", "name": "lacks", "notes": "",
+            "radios": {"r1": {"note": "any"}, "r2": {"note": "any"}},
+            "members": [
+              {"id": "m", "radio": "r1", "op": "job_start", "kind": "measure",
+               "center_hz": 300000000, "bandwidth_hz": 20000, "deviation_hz": null,
+               "sideband": null},
+              {"id": "w", "radio": "r2", "op": "job_start", "kind": "watch",
+               "center_hz": 148500000, "bandwidth_hz": 1000000, "deviation_hz": null,
+               "sideband": null, "params": {"modes": ["pocsag_decode", "no_such_row"]}}]}"#,
+    );
+    let (a, b) = (Radio::new("a"), Radio::new("b"));
+    let node = open_two(dir.path(), &a, &b).await;
+    let mapping: &[(&str, Option<&str>)] = &[("r1", Some("a")), ("r2", Some("b"))];
+    let r = started_set(&node, set_op("lacks", mapping, None, &[])).await;
+    assert_eq!(r.started_members(), [("m", None)], "{:?}", r.refused);
+    assert_eq!(r.refused.len(), 1, "{:?}", r.refused);
+    assert_eq!(r.refused[0].member, "w");
+    match &r.refused[0].error {
+        OpError::Other { message } => assert_eq!(
+            message,
+            "members[1].params.modes[1]: unknown mode no_such_row"
+        ),
+        e => panic!("expected other, got {e:?}"),
+    }
+    assert_eq!((a.tunes(), b.tunes()), (1, 0));
+    assert_eq!(r.radios.keys().collect::<Vec<_>>(), ["r1"]);
+    assert!(holders(&node, "b").await.is_empty());
+}
+
 #[tokio::test]
 async fn an_unready_attach_starts_the_member_without_it_and_warns() {
     let dir = tempfile::tempdir().unwrap();
