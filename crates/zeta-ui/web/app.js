@@ -541,13 +541,15 @@ function holderText(id, err) {
 }
 
 // `conflict: source S held by …`, with the node's `unpin source S (source_unpin)` option
-// after it when the source is pinned (a pin is never among the holders).
+// after it when the source is pinned (a pin is never among the holders). A set_start's
+// conflict leads its options with the role's own line (`radios.<role> …`), shown first.
 function conflictText(err) {
   const holders = Array.isArray(err.holders) ? err.holders : [];
   const who = holders.length ? holders.map((h) => holderText(h, err)).join(", ") : "nobody";
   const options = Array.isArray(err.options) ? err.options : [];
   const unpin = options.find((o) => typeof o === "string" && o.startsWith("unpin source "));
-  return `conflict: source ${err.source ?? "?"} held by ${who}${unpin ? `; ${unpin}` : ""}`;
+  const role = typeof options[0] === "string" && options[0].startsWith("radios.") ? `${options[0]}; ` : "";
+  return `conflict: ${role}source ${err.source ?? "?"} held by ${who}${unpin ? `; ${unpin}` : ""}`;
 }
 
 // Whether the last `source_list` shows a pin on source `id`.

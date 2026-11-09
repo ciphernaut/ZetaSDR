@@ -608,9 +608,11 @@ pub enum Op {
     /// it first); a role mapped to `null` gets, roles in the file's order, the first
     /// source in `source_list` order that `source_free` lists for the band bounding the
     /// role's members and no other role of the request names (while the set runs, the
-    /// source it runs that role on), none being `other`
-    /// (`radios.<role>: no free source covers <center> Hz ± <half> Hz; busy: <id>
-    /// (holders [...]), ...`); a member whose kind is a mode row that is not ready
+    /// source it runs that role on), none being a `conflict` (`source` the first source
+    /// covering the band, `holders` every covering source's holders, `options` first
+    /// `radios.<role>: no free source covers <center> Hz ± <half> Hz; busy: <id>
+    /// (holders [...]), ...`, then `unpin source <id> (source_unpin)` for each pinned
+    /// one), or `other` with that text when no source covers the band at all; a member whose kind is a mode row that is not ready
     /// (`refused` `other`, `<state>: <reason>`), or a kind this node does not know
     /// (`refused` `unknown` on `members[<i>].kind`), or a `watch` member whose
     /// `params.modes` names a row this node cannot run or one wider than its band
@@ -4732,8 +4734,11 @@ impl SetMemberStart {
 
 /// The source for `role`, mapped to `null` in a `set_start`: the first of
 /// `source_free`'s free sources (id order, `source_list`'s) for `band` that no role of
-/// `roles` names and no role picked before it (`picked`) took. None: `other` naming the
-/// role, the band and the busy sources as `source_free` gives them.
+/// `roles` names and no role picked before it (`picked`) took. None: a `conflict` on the
+/// first source (id order) covering the band, `holders` every covering source's holders,
+/// `current` that source's capture (else its pin, else `band`), and `options` the prose
+/// naming the role, the band and the busy sources as `source_free` gives them, then an
+/// unpin for each pinned one; `other` with that prose when no source covers the band.
 fn pick_source(
     node: &Node,
     role: &str,
@@ -4780,11 +4785,39 @@ fn pick_source(
     } else {
         why.join(", ")
     };
-    Err(other(format!(
+    let prose = format!(
         "radios.{role}: no free source covers {} Hz ± {} Hz; busy: {why}",
         band.center_hz.0,
         band.bandwidth_hz.0 / 2
-    )))
+    );
+    let mut covering: Vec<&SourceId> = busy.iter().map(|b| &b.id).chain(&free).collect();
+    covering.sort();
+    let Some(source) = covering.first().map(|s| (*s).clone()) else {
+        return Err(other(prose));
+    };
+    let mut holders: Vec<JobId> = Vec::new();
+    for h in busy.iter().flat_map(|b| &b.holders) {
+        if !holders.contains(h) {
+            holders.push(h.clone());
+        }
+    }
+    let current = node
+        .port(&source)
+        .and_then(|p| p.current())
+        .or_else(|| busy.iter().find(|b| b.id == source).and_then(|b| b.pin))
+        .unwrap_or(band);
+    let mut options = vec![prose];
+    options.extend(
+        busy.iter()
+            .filter(|b| b.pin.is_some())
+            .map(|b| format!("unpin source {} (source_unpin)", b.id.0)),
+    );
+    Err(OpError::Conflict {
+        source,
+        holders,
+        current,
+        options,
+    })
 }
 
 impl SetMember<'_> {

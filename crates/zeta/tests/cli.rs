@@ -3102,6 +3102,103 @@ fn zeta_set_start_and_stop_answer_as_the_ops() {
     .stdout(contains("radios.second: unmapped"));
 }
 
+/// `zeta set start --set X` without `--radio` reads `set_list` and sends every role of
+/// the set as `null`, so the node picks: airband's roles are sent, and the answer names
+/// the first role the node cannot fill (the tone file covers no airband band), not
+/// `unmapped`.
+#[test]
+fn zeta_set_start_without_radio_sends_every_role_as_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(dir.path(), &["set", "start", "--set", "airband"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "other", "{v}");
+    let m = v["message"].as_str().unwrap();
+    assert!(m.starts_with("radios.wide: no free source covers"), "{v}");
+    let op = last_logged_op(dir.path());
+    assert_eq!(
+        op["radios"],
+        serde_json::json!({"wide": null, "second": null}),
+        "{op}"
+    );
+    // An unknown set is still the op's own answer.
+    zeta(dir.path(), &["set", "start", "--set", "nope"])
+        .assert()
+        .code(2)
+        .stdout(contains("airband").and(contains("pagers_au")));
+}
+
+/// A role the node cannot fill on a source that covers its band is a structured
+/// `conflict`: here a source pinned beside the role's band, with the pin's way out.
+#[test]
+fn zeta_set_start_pick_failure_is_a_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = write_tone(dir.path());
+    let flag = format!(
+        "retune={},tune_min_hz=50000000,tune_max_hz=150000000",
+        meta.display()
+    );
+    let sets = dir.path().join("sets");
+    std::fs::create_dir_all(&sets).unwrap();
+    std::fs::write(
+        sets.join("one.json"),
+        r#"{"id": "one", "name": "one", "notes": "", "radios": {"r": {"note": "any"}},
+            "members": [{"id": "m", "radio": "r", "op": "job_start", "kind": "measure",
+              "center_hz": 100000000, "bandwidth_hz": 20000, "deviation_hz": null,
+              "sideband": null}]}"#,
+    )
+    .unwrap();
+    let sets_dir = sets.display().to_string();
+    let run = |args: &[&str]| {
+        let mut cmd = zeta_bin();
+        cmd.arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .arg("--source-file")
+            .arg(&flag)
+            .arg("--sets-dir")
+            .arg(&sets_dir)
+            .arg("--json")
+            .args(args);
+        cmd
+    };
+    run(&[
+        "source",
+        "pin",
+        "--source",
+        "retune",
+        "--center-hz",
+        "120000000",
+        "--bandwidth-hz",
+        "12500",
+    ])
+    .assert()
+    .success();
+    let out = run(&["set", "start", "--set", "one"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "conflict", "{v}");
+    assert_eq!(v["source"], "retune", "{v}");
+    assert_eq!(v["holders"], serde_json::json!([]), "{v}");
+    let options = v["options"].as_array().unwrap();
+    let first = options[0].as_str().unwrap();
+    assert!(
+        first.starts_with("radios.r: no free source covers 100000000 Hz ± 10000 Hz"),
+        "{v}"
+    );
+    assert!(
+        options.contains(&serde_json::json!("unpin source retune (source_unpin)")),
+        "{v}"
+    );
+}
+
 /// A theme folder that does not validate is logged at startup and listed as broken; the
 /// node runs.
 #[test]

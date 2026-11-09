@@ -126,11 +126,18 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
         .await;
     }
     let plan = cli.command.plan_filter();
-    let op = match cli.command.into_op() {
+    let mut op = match cli.command.into_op() {
         Ok(Some(op)) => op,
         Ok(None) => return usage("this command cannot run on a remote node"),
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
     };
+    // A `set start` without `--radio`: every role of the set, read from the node, as null.
+    if crate::cli::wants_roles(&op)
+        && let Ok(Ok(zeta_core::ops::OpResult::Sets(sets))) =
+            client.apply(&zeta_core::ops::Op::SetList {}).await
+    {
+        crate::cli::null_roles(&mut op, &sets);
+    }
     match client.apply(&op).await {
         Ok(Ok(mut r)) => {
             crate::cli::narrow_plans(&mut r, plan.as_deref());

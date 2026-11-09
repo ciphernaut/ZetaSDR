@@ -700,7 +700,8 @@ pub enum SetCmd {
         #[arg(long, value_name = "ID")]
         set: String,
         /// Role to source, e.g. wide=b210,second=hackrf; repeatable. `ROLE=` with
-        /// nothing after it sends the role as `null`
+        /// nothing after it sends the role as `null`; with no `--radio` at all every
+        /// role of the set (read from `zeta sets`) is sent as `null`, for the node to pick
         #[arg(long = "radio", value_name = "ROLE=SOURCE[,ROLE=SOURCE]", value_parser = parse_radios)]
         radios: Vec<Radios>,
         /// Member ids to start, comma-separated; absent = every member
@@ -715,6 +716,27 @@ pub enum SetCmd {
         #[arg(long, value_name = "ID")]
         set: String,
     },
+}
+
+/// Whether `op` is a `set_start` sent without `--radio`, whose roles the command line
+/// fills from `set_list` ([`null_roles`]) before sending it.
+pub fn wants_roles(op: &Op) -> bool {
+    matches!(op, Op::SetStart { radios, .. } if radios.is_empty())
+}
+
+/// Map every role of `op`'s set in `sets` (`set_list`'s answer) to `null`, so the node
+/// picks each, when `op` is a `set_start` with no roles; an unknown set is left for the
+/// op to refuse.
+pub fn null_roles(op: &mut Op, sets: &[zeta_core::ops::SetInfo]) {
+    let Op::SetStart { set, radios, .. } = op else {
+        return;
+    };
+    if !radios.is_empty() {
+        return;
+    }
+    if let Some(info) = sets.iter().find(|s| &s.id == set) {
+        radios.extend(info.radios.keys().map(|r| (r.clone(), None)));
+    }
 }
 
 /// The role-to-source pairs of one `--radio`; a source `None` is `ROLE=` (pick one).
@@ -1913,6 +1935,62 @@ mod cli_set_tests {
             let args = ["zeta", "set", "start", "--set", "airband", "--radio", bad];
             assert!(Cli::try_parse_from(args).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_set_start_without_radio_fills_every_role_as_null() {
+        let set = |id: &str, roles: &[&str]| zeta_core::ops::SetInfo {
+            id: id.into(),
+            name: id.into(),
+            notes: String::new(),
+            state: zeta_core::sets::SetState::Ready,
+            reason: None,
+            file: String::new(),
+            radios: roles
+                .iter()
+                .map(|r| {
+                    let radio = zeta_core::sets::Radio {
+                        note: String::new(),
+                    };
+                    (r.to_string(), radio)
+                })
+                .collect(),
+            members: vec![],
+            running: None,
+        };
+        let sets = [
+            set("pagers_au", &["radio"]),
+            set("airband", &["wide", "second"]),
+        ];
+        let mut bare = op(&["zeta", "set", "start", "--set", "airband"]);
+        assert!(wants_roles(&bare));
+        null_roles(&mut bare, &sets);
+        let Op::SetStart { radios, .. } = &bare else {
+            panic!("{bare:?}");
+        };
+        let want: std::collections::BTreeMap<String, Option<SourceId>> =
+            [("second".into(), None), ("wide".into(), None)]
+                .into_iter()
+                .collect();
+        assert_eq!(radios, &want);
+        assert!(!wants_roles(&bare));
+        // Named roles are sent as given; an unknown set is left for the op to refuse.
+        let named = [
+            "zeta",
+            "set",
+            "start",
+            "--set",
+            "airband",
+            "--radio",
+            "wide=b210",
+        ];
+        let mut given = op(&named);
+        assert!(!wants_roles(&given));
+        null_roles(&mut given, &sets);
+        assert_eq!(given, op(&named));
+        let mut unknown = op(&["zeta", "set", "start", "--set", "nope"]);
+        null_roles(&mut unknown, &sets);
+        assert!(wants_roles(&unknown));
     }
 }
 

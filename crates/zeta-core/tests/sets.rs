@@ -1320,7 +1320,7 @@ async fn a_null_radio_picks_the_first_free_source_in_role_order() {
 }
 
 #[tokio::test]
-async fn no_free_source_is_other_naming_the_role() {
+async fn no_free_source_is_a_conflict_naming_the_role() {
     let dir = tempfile::tempdir().unwrap();
     let b = Radio::new("b");
     let node = open_radios(dir.path(), &[&b], registry()).await;
@@ -1330,12 +1330,23 @@ async fn no_free_source_is_other_naming_the_role() {
     )
     .await;
     let tunes = b.tunes();
-    let m = other_message(
-        node.apply(set_op(TWO, &[("b", None)], Some(&["w"]), &[]))
-            .await,
-    );
+    let r = node
+        .apply(set_op(TWO, &[("b", None)], Some(&["w"]), &[]))
+        .await;
+    let Err(OpError::Conflict {
+        source,
+        holders,
+        current,
+        options,
+    }) = r
+    else {
+        panic!("expected a conflict, got {r:?}");
+    };
+    assert_eq!(source.0, "b");
+    assert_eq!(holders, vec![holder.clone()]);
+    assert_eq!(current, band(900_000_000, 20_000));
     assert_eq!(
-        m,
+        options[0],
         format!(
             "radios.b: no free source covers 300000000 Hz ± 500000 Hz; busy: b (holders [{}])",
             holder.0
@@ -1417,8 +1428,60 @@ async fn a_pin_that_does_not_cover_the_band_stays_busy() {
     let r = node
         .apply(set_op(TWO, &[("b", None)], Some(&["w"]), &[]))
         .await;
-    assert!(r.is_err(), "{r:?}");
+    // A conflict with no holder: the pin, and the way out of it.
+    let Err(OpError::Conflict {
+        source,
+        holders,
+        options,
+        ..
+    }) = r
+    else {
+        panic!("expected a conflict, got {r:?}");
+    };
+    assert_eq!(source.0, "b");
+    assert!(holders.is_empty());
+    assert!(
+        options[0].starts_with("radios.b: no free source covers") && options[0].contains("pinned"),
+        "{options:?}"
+    );
+    assert!(
+        options.contains(&"unpin source b (source_unpin)".to_string()),
+        "{options:?}"
+    );
     assert!(running_jobs(&node).is_empty());
+}
+
+/// Every covering source busy: the conflict names the first and the holders of all.
+#[tokio::test]
+async fn a_pick_conflict_names_every_covering_sources_holders() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (Radio::new("a"), Radio::new("b"));
+    let node = open_two(dir.path(), &a, &b).await;
+    let on_a = job(
+        &node,
+        job_start("a", JobKind::Measure, band(900_000_000, 20_000)),
+    )
+    .await;
+    let on_b = job(
+        &node,
+        job_start("b", JobKind::Measure, band(800_000_000, 20_000)),
+    )
+    .await;
+    let r = node
+        .apply(set_op(TWO, &[("b", None)], Some(&["w"]), &[]))
+        .await;
+    let Err(OpError::Conflict {
+        source,
+        holders,
+        options,
+        ..
+    }) = r
+    else {
+        panic!("expected a conflict, got {r:?}");
+    };
+    assert_eq!(source.0, "a");
+    assert_eq!(holders, vec![on_a, on_b]);
+    assert!(options[0].starts_with("radios.b: "), "{options:?}");
 }
 
 /// A rigid holder inside a covering pin still makes the source busy.
