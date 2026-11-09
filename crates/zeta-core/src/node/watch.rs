@@ -282,12 +282,7 @@ impl Policy {
     /// silence constant, or a test's override of it), `cooldown_ms`, `confirm_ms` and
     /// `seed_known`.
     fn of(graph: &Graph) -> Policy {
-        let p = graph
-            .nodes
-            .iter()
-            .find(|n| n.kind == DETECT_STAGE)
-            .map(|n| n.params.clone())
-            .unwrap_or_default();
+        let p = policy_of(graph);
         Policy {
             free: p["decode_on"] == "free",
             prefer: p["prefer"]
@@ -320,6 +315,63 @@ impl Policy {
             confirm_ms: p["confirm_ms"].as_u64().unwrap_or(WATCH_CONFIRM_MS_DEFAULT),
             seed_known: p["seed_known"].as_bool().unwrap_or(false),
         }
+    }
+}
+
+/// The params of `graph`'s `detect` node, where a watch's policy lives (`{}` without
+/// one): what a set's `watch` member is compared with for `existing`.
+pub(crate) fn policy_of(graph: &Graph) -> serde_json::Value {
+    graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == DETECT_STAGE)
+        .map(|n| n.params.clone())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Whether the `detect` params `a` and `b` are one policy: every key of either is
+/// compared, a key one of them leaves out at its default in `schema` (the `detect`
+/// stage's params schema), numbers by value (`6` is `6.0`).
+pub(crate) fn same_policy(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> bool {
+    let defaults = schema["properties"].as_object();
+    let value = |p: &serde_json::Value, k: &str| -> serde_json::Value {
+        match p.get(k) {
+            Some(v) => v.clone(),
+            None => defaults
+                .and_then(|d| d.get(k))
+                .and_then(|s| s.get("default"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        }
+    };
+    let keys = |p: &serde_json::Value| {
+        p.as_object()
+            .map(|o| o.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let mut all = keys(a);
+    all.extend(keys(b));
+    all.iter().all(|k| json_same(&value(a, k), &value(b, k)))
+}
+
+/// `a == b`, numbers compared by value.
+fn json_same(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value as V;
+    match (a, b) {
+        (V::Number(x), V::Number(y)) => x == y || x.as_f64() == y.as_f64(),
+        (V::Array(x), V::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| json_same(x, y))
+        }
+        (V::Object(x), V::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| json_same(v, w)))
+        }
+        _ => a == b,
     }
 }
 

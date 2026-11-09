@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use zeta_core::job::JobState;
 use zeta_core::modes::ModeRegistry;
+use zeta_core::modes::handlers::find_handler;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult, SetInfo};
 use zeta_core::ops::{SetExisting, SetRadio, SetRefused, SetStarted};
@@ -888,7 +889,7 @@ async fn members_narrows_and_unmapped_roles_may_be_omitted() {
     }
 }
 
-/// A stand-in for an audio-in stage of the given kind and readiness.
+/// A stand-in for a stage of the given kind, stream kinds and readiness.
 struct Stand {
     spec: StageSpec,
     readiness: Readiness,
@@ -896,10 +897,19 @@ struct Stand {
 
 impl Stand {
     fn new(kind: &'static str, outputs: &[StreamKind], readiness: Readiness) -> Arc<Self> {
+        Self::with_inputs(kind, &[StreamKind::Audio], outputs, readiness)
+    }
+
+    fn with_inputs(
+        kind: &'static str,
+        inputs: &[StreamKind],
+        outputs: &[StreamKind],
+        readiness: Readiness,
+    ) -> Arc<Self> {
         Arc::new(Self {
             spec: StageSpec {
                 kind,
-                inputs: vec![StreamKind::Audio],
+                inputs: inputs.to_vec(),
                 outputs: outputs.to_vec(),
                 params_schema: schemars::json_schema!({"type": "object"}),
             },
@@ -1256,4 +1266,320 @@ fn a_truncated_set_result_keeps_its_counts() {
         serde_json::json!({"started": 2000, "existing": 0, "refused": 0})
     );
     assert_eq!(v["warnings"], serde_json::json!([warning]));
+}
+
+// ---- members: `null` radios, watch members, rows this host lacks, unready attaches ----
+
+/// The `ops.log` entries naming `op`.
+fn logged(dir: &Path, op: &str) -> usize {
+    std::fs::read_to_string(dir.join("state").join("ops.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|l| l["op"]["op"] == op)
+        .count()
+}
+
+/// The job `id`'s record.
+fn record(node: &Node, id: &JobId) -> zeta_core::job::JobRecord {
+    node.job_list()
+        .into_iter()
+        .find(|r| &r.id == id)
+        .unwrap_or_else(|| panic!("{id:?} listed"))
+}
+
+#[tokio::test]
+async fn a_null_radio_picks_the_first_free_source_in_role_order() {
+    let dir = tempfile::tempdir().unwrap();
+    // `narrow` (1 MHz at once) sorts before `wide` (20 MHz): role `a`, first in the
+    // file, takes `narrow` for its CB channels; role `b`'s 1 MHz band then takes `wide`.
+    let (narrow, wide) = (Radio::with_max("narrow", 1_000_000), Radio::new("wide"));
+    let node = open_two(dir.path(), &narrow, &wide).await;
+    let r = started_set(&node, set_op(TWO, &[("a", None), ("b", None)], None, &[])).await;
+    assert!(r.refused.is_empty(), "{:?}", r.refused);
+    assert_eq!(r.radios["a"].source.0, "narrow");
+    assert_eq!(r.radios["b"].source.0, "wide");
+    assert_eq!(r.started.len(), 5, "{:?}", r.started_members());
+    assert_eq!((narrow.tunes(), wide.tunes()), (1, 1));
+    let running = running_of(&node, TWO).await.expect("an instance");
+    assert_eq!(running.radios["a"].0, "narrow");
+    assert_eq!(running.radios["b"].0, "wide");
+    // The same mapping named explicitly is the idempotent re-run.
+    let picked: &[(&str, Option<&str>)] = &[("a", Some("narrow")), ("b", Some("wide"))];
+    let again = started_set(&node, set_op(TWO, picked, None, &[])).await;
+    assert!(again.started.is_empty(), "{:?}", again.started_members());
+    assert_eq!(again.existing.len(), 5);
+    // So is the `null` request again: while the set runs, its roles keep their sources.
+    let nulls = started_set(&node, set_op(TWO, &[("a", None), ("b", None)], None, &[])).await;
+    assert!(nulls.started.is_empty(), "{:?}", nulls.started_members());
+    assert_eq!(nulls.existing.len(), 5);
+    assert_eq!(nulls.radios["a"].source.0, "narrow");
+    assert_eq!((narrow.tunes(), wide.tunes()), (1, 1));
+}
+
+#[tokio::test]
+async fn no_free_source_is_other_naming_the_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = Radio::new("b");
+    let node = open_radios(dir.path(), &[&b], registry()).await;
+    let holder = job(
+        &node,
+        job_start("b", JobKind::Measure, band(900_000_000, 20_000)),
+    )
+    .await;
+    let tunes = b.tunes();
+    let m = other_message(
+        node.apply(set_op(TWO, &[("b", None)], Some(&["w"]), &[]))
+            .await,
+    );
+    assert_eq!(
+        m,
+        format!(
+            "radios.b: no free source covers 300000000 Hz ± 500000 Hz; busy: b (holders [{}])",
+            holder.0
+        )
+    );
+    assert_eq!(b.tunes(), tunes, "nothing tuned");
+    assert_eq!(running_jobs(&node), vec![holder]);
+    assert!(running_of(&node, TWO).await.is_none());
+}
+
+#[tokio::test]
+async fn a_watch_member_on_a_band_another_watch_holds_is_other_unless_the_policy_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = Radio::new("b");
+    let node = open_radios(dir.path(), &[&b], registry()).await;
+    let only_b: &[(&str, Option<&str>)] = &[("b", Some("b"))];
+    let hand = job(
+        &node,
+        job_start("b", JobKind::Watch, band(300_000_000, 1_000_000)),
+    )
+    .await;
+    let m = other_message(node.apply(set_op(TWO, only_b, Some(&["w"]), &[])).await);
+    assert_eq!(
+        m,
+        format!(
+            "watch {} holds this band with other policy; stop it or graph_put it",
+            hand.0
+        )
+    );
+    assert_eq!(running_jobs(&node), vec![hand.clone()], "nothing started");
+    assert!(running_of(&node, TWO).await.is_none());
+    // The member's policy with some of the keys it leaves out spelled at their
+    // defaults is the same policy: the hand watch is the member.
+    let mut graph = record(&node, &hand).graph;
+    for n in graph.nodes.iter_mut().filter(|n| n.kind == "detect") {
+        n.params = serde_json::json!({
+            "modes": ["pocsag_decode"], "max_decoders": 16, "cooldown_ms": 30000,
+            "threshold_db": 6, "edge_mask": 0.05
+        });
+    }
+    node.apply(Op::GraphPut {
+        job: hand.clone(),
+        graph,
+    })
+    .await
+    .unwrap();
+    let r = started_set(&node, set_op(TWO, only_b, Some(&["w"]), &[])).await;
+    assert!(r.started.is_empty(), "{:?}", r.started_members());
+    assert_eq!(r.existing.len(), 1);
+    assert_eq!(
+        (r.existing[0].member.as_str(), &r.existing[0].job),
+        ("w", &hand)
+    );
+    // The hand watch is not the set's to stop: `set_stop` leaves it.
+    stopped_set(&node, TWO).await;
+    assert_eq!(running_jobs(&node), vec![hand.clone()]);
+    node.apply(Op::JobStop { job: hand }).await.unwrap();
+    until("the hand watch ends", || running_jobs(&node).is_empty()).await;
+
+    // Started by the set, a second start finds it and restarts nothing.
+    let first = started_set(&node, set_op(TWO, only_b, Some(&["w"]), &[])).await;
+    let w = first.job("w");
+    let created = record(&node, &w).created_ns;
+    let puts = logged(dir.path(), "graph_put");
+    let second = started_set(&node, set_op(TWO, only_b, Some(&["w"]), &[])).await;
+    assert!(second.started.is_empty(), "{:?}", second.started_members());
+    assert_eq!(second.existing.len(), 1);
+    assert_eq!(second.existing[0].job, w);
+    assert_eq!(record(&node, &w).created_ns, created);
+    assert_eq!(logged(dir.path(), "graph_put"), puts, "no restart");
+    assert_eq!(running_jobs(&node), vec![w]);
+}
+
+#[tokio::test]
+async fn a_watch_member_runs_with_its_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = Radio::new("b");
+    let node = open_radios(dir.path(), &[&b], registry()).await;
+    let r = started_set(&node, set_op(TWO, &[("b", Some("b"))], Some(&["w"]), &[])).await;
+    let w = r.job("w");
+    let graph = match node.apply(Op::GraphGet { job: w.clone() }).await {
+        Ok(OpResult::Graph(g)) => g,
+        other => panic!("graph_get: {other:?}"),
+    };
+    let detect = graph.nodes.iter().find(|n| n.kind == "detect").unwrap();
+    assert_eq!(detect.params["modes"], serde_json::json!(["pocsag_decode"]));
+    until("the watch runs its loop", || {
+        node.job_context(&w)
+            .is_some_and(|c| c["watch"]["cap"]["max"] == 16)
+    })
+    .await;
+    // One launch: the params went on the graph before the start, not by a restart.
+    assert_eq!(logged(dir.path(), "job_start"), 0);
+    assert_eq!(logged(dir.path(), "graph_put"), 0);
+    assert_eq!(logged(dir.path(), "set_start"), 1);
+    assert_eq!(record(&node, &w).state, JobState::Running);
+}
+
+/// A program for a row that must be ready on every host: it reads its input and exits
+/// when the input closes.
+fn stand_in_program(dir: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("zeta-test-stand-in");
+    std::fs::write(&p, "#!/bin/sh\nexec cat >/dev/null\n").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+#[tokio::test]
+async fn the_airband_set_starts_what_this_host_has_and_refuses_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    // The operator's rows: `vdl2_decode` on a program every host has, `adsb_decode` on
+    // one no host has, so the answer is the same whatever is installed.
+    let modes_dir = dir.path().join("modes");
+    std::fs::create_dir_all(&modes_dir).unwrap();
+    let program = stand_in_program(dir.path());
+    let builtin_vdl2 = include_str!("../../../modes/vdl2_decode.json");
+    let vdl2 = builtin_vdl2.replace(
+        r#""programs": ["dumpvdl2"]"#,
+        &format!(r#""programs": ["{}"]"#, program.display()),
+    );
+    assert_ne!(vdl2, builtin_vdl2);
+    std::fs::write(modes_dir.join("vdl2_decode.json"), vdl2).unwrap();
+    let builtin_adsb = include_str!("../../../modes/adsb_decode.json");
+    let adsb = builtin_adsb.replace(
+        r#""programs": ["dump1090", "dump1090-fa", "dump1090-mutability", "readsb"]"#,
+        r#""programs": ["zeta-test-missing-decoder"]"#,
+    );
+    assert_ne!(adsb, builtin_adsb);
+    std::fs::write(modes_dir.join("adsb_decode.json"), adsb).unwrap();
+
+    // A stand-in for zeta-ext's program runner, and the rows probed as the CLI probes
+    // them at startup (`find_handler`): the stand-in is found, the missing decoder not.
+    let mut stages = registry();
+    stages.register(Stand::with_inputs(
+        "external_decode",
+        &[StreamKind::Iq, StreamKind::Audio],
+        &[StreamKind::Event],
+        Readiness::always(),
+    ));
+    let mut modes = ModeRegistry::load(&stages, Some(&modes_dir));
+    let found = find_handler(&[program.display().to_string()]);
+    assert_eq!(found.as_deref(), Some(program.as_path()));
+    modes.set_program("vdl2_decode", found, None);
+    let missing = "zeta-test-missing-decoder".to_string();
+    assert_eq!(find_handler(std::slice::from_ref(&missing)), None);
+    modes.set_program(
+        "adsb_decode",
+        None,
+        Some(format!("{missing}: missing — modes: adsb_decode")),
+    );
+    let (a, b) = (Radio::new("a"), Radio::new("b"));
+    let ports: Vec<Arc<dyn Port>> = vec![a.clone(), b.clone()];
+    let node = Node::open_with_modes(cfg(dir.path(), None), stages, ports, Some(Arc::new(modes)))
+        .await
+        .unwrap();
+    let mapping: &[(&str, Option<&str>)] = &[("wide", Some("a")), ("second", Some("b"))];
+    let r = started_set(&node, set_op("airband", mapping, None, &[])).await;
+    assert_eq!(
+        r.started_members(),
+        [
+            ("acars", Some(1)),
+            ("acars", Some(2)),
+            ("acars", Some(3)),
+            ("acars", Some(4)),
+            ("acars", Some(5)),
+            ("acars", Some(6)),
+            ("acars", Some(7)),
+            ("vdl2", None),
+        ],
+        "{:?}",
+        r.refused
+    );
+    assert_eq!(r.refused.len(), 1, "{:?}", r.refused);
+    assert_eq!(r.refused[0].member, "adsb");
+    match &r.refused[0].error {
+        OpError::Other { message } => assert!(message.starts_with("unavailable"), "{message}"),
+        e => panic!("expected other, got {e:?}"),
+    }
+    // The second radio's only member was refused: it is neither tuned nor reported.
+    assert_eq!(b.tunes(), 0);
+    assert_eq!(a.tunes(), 1);
+    assert_eq!(r.radios.keys().collect::<Vec<_>>(), ["wide"]);
+    assert!(holders(&node, "b").await.is_empty());
+    let running = running_of(&node, "airband").await.expect("an instance");
+    assert_eq!(running.radios.keys().collect::<Vec<_>>(), ["wide"]);
+}
+
+#[tokio::test]
+async fn a_member_of_a_kind_this_node_does_not_know_is_refused_and_the_rest_start() {
+    let dir = tempfile::tempdir().unwrap();
+    write_set(
+        &dir.path().join("sets"),
+        "odd.json",
+        r#"{"id": "odd", "name": "odd", "notes": "", "radios": {"r": {"note": "any"}},
+            "members": [
+              {"id": "m", "radio": "r", "op": "job_start", "kind": "measure",
+               "center_hz": 300000000, "bandwidth_hz": 20000, "deviation_hz": null,
+               "sideband": null},
+              {"id": "x", "radio": "r", "op": "job_start", "kind": "no_such_decoder",
+               "center_hz": 300010000, "bandwidth_hz": 20000, "deviation_hz": null,
+               "sideband": null}]}"#,
+    );
+    let a = Radio::new("a");
+    let node = open_radios(dir.path(), &[&a], registry()).await;
+    let r = started_set(&node, set_op("odd", &[("r", Some("a"))], None, &[])).await;
+    assert_eq!(r.started_members(), [("m", None)]);
+    assert_eq!(r.refused.len(), 1, "{:?}", r.refused);
+    assert_eq!(r.refused[0].member, "x");
+    match &r.refused[0].error {
+        OpError::Unknown {
+            field,
+            value,
+            known,
+        } => {
+            assert_eq!(
+                (field.as_str(), value.as_str()),
+                ("members[1].kind", "no_such_decoder")
+            );
+            assert!(known.iter().any(|k| k == "acars_decode"), "{known:?}");
+            assert!(known.iter().any(|k| k == "vdl2_decode"), "{known:?}");
+        }
+        e => panic!("expected unknown, got {e:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_unready_attach_starts_the_member_without_it_and_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Radio::new("a");
+    let stages = attach_registry(Readiness::unready("no speech backend"));
+    let node = open_radios(dir.path(), &[&a], stages).await;
+    let r = started_set(&node, set_op("talk", &[("a", Some("a"))], None, &[])).await;
+    assert!(r.refused.is_empty(), "{:?}", r.refused);
+    assert_eq!(
+        r.started_members(),
+        [("cb", Some(1)), ("cb", Some(2)), ("cb", Some(3))]
+    );
+    assert!(
+        r.started.iter().all(|s| s.attached.is_none()),
+        "{:?}",
+        r.started
+    );
+    assert_eq!(
+        r.warnings,
+        ["members[0]: transcribe: no speech backend; started without attach"]
+    );
+    assert_eq!(running_jobs(&node).len(), 3);
 }

@@ -2162,6 +2162,19 @@ impl Node {
         Ok(())
     }
 
+    /// The running watch `graph` has the policy `params` (a set's `watch` member's): its
+    /// `detect` params ([`watch::policy_of`]) equal them, a key either leaves out
+    /// compared at the `detect` stage's default ([`watch::same_policy`]).
+    pub(crate) fn watch_has_policy(&self, graph: &Graph, params: &serde_json::Value) -> bool {
+        let schema = self
+            .inner
+            .registry
+            .spec(crate::ops::DETECT_STAGE)
+            .and_then(|s| serde_json::to_value(&s.params_schema).ok())
+            .unwrap_or_default();
+        watch::same_policy(&watch::policy_of(graph), params, &schema)
+    }
+
     /// A watch's `detect` node names only this node's sources in `prefer`
     /// (`bad params on node <id>: prefer[<i>]: unknown source <id>` otherwise), and its
     /// `modes`, when not `null`, only loaded, ready rows no wider than the watch's band

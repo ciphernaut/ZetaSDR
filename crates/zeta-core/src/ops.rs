@@ -599,13 +599,26 @@ pub enum Op {
     /// (`radios.<role>: unmapped`), or two roles on one source whose members that source
     /// cannot capture at once are `other`; an unknown source is `unknown` on
     /// `radios.<role>`; a set that already runs on another mapping is `other`: `set_stop`
-    /// it first); a member whose kind is a mode row that is not ready, or a kind this node
-    /// does not know, is `refused` and the rest go on; a `plan_start` member whose
-    /// `attach` stage is not ready starts without it and a warning says so; (2) the band
+    /// it first); a role mapped to `null` gets, roles in the file's order, the first
+    /// source in `source_list` order that `source_free` lists for the band bounding the
+    /// role's members and no other role of the request names (while the set runs, the
+    /// source it runs that role on), none being `other`
+    /// (`radios.<role>: no free source covers <center> Hz ± <half> Hz; busy: <id>
+    /// (holders [...]), ...`); a member whose kind is a mode row that is not ready
+    /// (`refused` `other`, `<state>: <reason>`), or a kind this node does not know
+    /// (`refused` `unknown` on `members[<i>].kind`), is set aside and the rest go on (a
+    /// role left with no member is neither tuned nor in the result); a `plan_start`
+    /// member whose `attach` stage is not ready starts without it and a warning says so
+    /// (`members[<i>]: <attach>: <reason>; started without attach`); (2) the band
     /// bounding each source's members is checked against the source's ranges
     /// (`out_of_range` on `radios.<role>`); (3) the gates of every source in use are taken
     /// in source-id order and held to the end; (4) a member (a `plan_start` member's
-    /// channel) whose identical rigid job already runs is `existing`; (5) the `replace`
+    /// channel) whose identical rigid job already runs is `existing`, a `watch` member
+    /// only when that watch's `detect` params are the member's `params` (a key either
+    /// leaves out compared at its default), a watch on its band with another policy
+    /// being `other` (`watch <id> holds this band with other policy; stop it or
+    /// graph_put it`) with nothing started; a `watch` member starts with its `params`
+    /// on its `detect` node, with no restart; (5) the `replace`
     /// jobs, each holding one of the sources in use, are stopped; (6) every source is
     /// decided before any is tuned: a `conflict` on any source is the whole answer, naming
     /// the role and the source (`radios.<role> (<source>) is held by [...]`), with nothing
@@ -621,7 +634,8 @@ pub enum Op {
     SetStart {
         /// A set id from `set_list`.
         set: String,
-        /// Every role the chosen members use, mapped to a source id from `source list`.
+        /// Every role the chosen members use, mapped to a source id from `source list`,
+        /// or to `null` for the node to pick a free one.
         radios: BTreeMap<String, Option<SourceId>>,
         /// Member ids of the set to start; `null` for every member.
         #[serde(deserialize_with = "crate::modes::nullable")]
@@ -4651,13 +4665,77 @@ enum SetMemberStart {
     },
 }
 
-impl SetMember<'_> {
+impl SetMemberStart {
     /// The band the member needs: its own, or its channels' bounding band.
     fn band(&self) -> Tuning {
-        match &self.what {
+        match self {
             SetMemberStart::Job { tuning, .. } => *tuning,
             SetMemberStart::Plan { pc, .. } => pc.bounding(&pc.numbers),
         }
+    }
+}
+
+/// The source for `role`, mapped to `null` in a `set_start`: the first of
+/// `source_free`'s free sources (id order, `source_list`'s) for `band` that no role of
+/// `roles` names and no role picked before it (`picked`) took. None: `other` naming the
+/// role, the band and the busy sources as `source_free` gives them.
+fn pick_source(
+    node: &Node,
+    role: &str,
+    band: Tuning,
+    roles: &[(&str, Option<SourceId>)],
+    picked: &[(&str, SourceId)],
+) -> Result<SourceId, OpError> {
+    let taken_by = |s: &SourceId| {
+        roles
+            .iter()
+            .find(|(_, t)| t.as_ref() == Some(s))
+            .map(|(r, _)| *r)
+            .or_else(|| picked.iter().find(|(_, t)| t == s).map(|(r, _)| *r))
+    };
+    let (free, busy) = node.source_free(band.center_hz.0, band.bandwidth_hz.0);
+    if let Some(s) = free.iter().find(|s| taken_by(s).is_none()) {
+        return Ok(s.clone());
+    }
+    let mut why: Vec<String> = busy
+        .iter()
+        .map(|b| {
+            let held: Vec<&str> = b.holders.iter().map(|j| j.0.as_str()).collect();
+            let mut s = format!("{} (holders [{}]", b.id.0, held.join(", "));
+            if let Some(pin) = b.pin {
+                s.push_str(&format!(
+                    ", pinned at {} Hz ± {} Hz",
+                    pin.center_hz.0,
+                    pin.bandwidth_hz.0 / 2
+                ));
+            }
+            if let Some(fault) = &b.fault {
+                s.push_str(&format!(", fault: {fault}"));
+            }
+            s.push(')');
+            s
+        })
+        .collect();
+    why.extend(
+        free.iter()
+            .filter_map(|s| taken_by(s).map(|r| format!("{} (named by radios.{r})", s.0))),
+    );
+    let why = if why.is_empty() {
+        "none".to_string()
+    } else {
+        why.join(", ")
+    };
+    Err(other(format!(
+        "radios.{role}: no free source covers {} Hz ± {} Hz; busy: {why}",
+        band.center_hz.0,
+        band.bandwidth_hz.0 / 2
+    )))
+}
+
+impl SetMember<'_> {
+    /// The band the member needs: its own, or its channels' bounding band.
+    fn band(&self) -> Tuning {
+        self.what.band()
     }
 
     /// The band of what is left to start, `None` when nothing is.
@@ -4787,55 +4865,35 @@ async fn set_start(
             });
         }
     }
-    // The source of every role a chosen member uses, in the file's role order.
-    let mut role_source: Vec<(&str, SourceId)> = Vec::new();
+    // The source of every role a chosen member uses, in the file's role order; a role
+    // mapped to `null` is picked once the members are checked (its band is theirs).
+    let mut role_map: Vec<(&str, Option<SourceId>)> = Vec::new();
     for (role, _) in &file.radios {
         if !chosen.iter().any(|(_, m)| m.radio() == role) {
             continue;
         }
         let source = match radios.get(role) {
             None => return Err(other(format!("radios.{role}: unmapped"))),
-            Some(None) => {
-                return Err(other(format!(
-                    "radios.{role}: null: name a source from source_list"
-                )));
-            }
-            Some(Some(s)) => s.clone(),
+            Some(s) => s.clone(),
         };
-        if node.port(&source).is_none() {
-            let mut e = unknown_source(node, &source);
+        if let Some(source) = &source
+            && node.port(source).is_none()
+        {
+            let mut e = unknown_source(node, source);
             if let OpError::Unknown { field, .. } = &mut e {
                 *field = format!("radios.{role}");
             }
             return Err(e);
         }
-        role_source.push((role, source));
+        role_map.push((role, source));
     }
-    let source_of = |role: &str| {
-        role_source
-            .iter()
-            .find(|(r, _)| *r == role)
-            .map(|(_, s)| s.clone())
-            .expect("every chosen member's role is mapped")
-    };
-    // One instance per set: another mapping of a role it runs is refused.
     node.prune_set_instances(&set_gate);
     let previous = node.set_instances().remove(&set);
-    if let Some(inst) = &previous
-        && role_source
-            .iter()
-            .any(|(role, s)| inst.radios.get(*role).is_some_and(|t| t != s))
-    {
-        return Err(other(format!(
-            "set {set} runs on {}; set_stop it first",
-            mapping_text(&inst.radios)
-        )));
-    }
     // Each member: refused (and set aside) when its kind cannot start here, else
     // checked as its op checks it.
     let modes = node.modes();
     let (mut refused, mut warnings) = (Vec::new(), Vec::new());
-    let mut checked: Vec<SetMember> = Vec::new();
+    let mut passed: Vec<(usize, &crate::sets::Member, SetMemberStart)> = Vec::new();
     for (index, m) in chosen {
         let refuse = |error| SetRefused {
             member: m.id().to_string(),
@@ -4926,7 +4984,55 @@ async fn set_start(
                 }
             }
         };
-        checked.push(SetMember {
+        passed.push((index, m, what));
+    }
+    // A role mapped to `null` (5.4), roles in the file's order: the first source, in
+    // `source_list` order, free for the band bounding the role's members and named by
+    // no other role of this request. While the set runs, the instance's source for the
+    // role is kept, so the same request run twice is the idempotent re-run. A role
+    // whose every member was refused is left out.
+    let mut role_source: Vec<(&str, SourceId)> = Vec::new();
+    for (role, source) in &role_map {
+        let source = match source {
+            Some(s) => s.clone(),
+            None => {
+                let bands: Vec<Tuning> = passed
+                    .iter()
+                    .filter(|(_, m, _)| m.radio() == *role)
+                    .map(|(_, _, what)| what.band())
+                    .collect();
+                if bands.is_empty() {
+                    continue;
+                }
+                match previous.as_ref().and_then(|i| i.radios.get(*role)) {
+                    Some(s) if node.port(s).is_some() => s.clone(),
+                    _ => pick_source(node, role, bounding_of(bands), &role_map, &role_source)?,
+                }
+            }
+        };
+        role_source.push((role, source));
+    }
+    let source_of = |role: &str| {
+        role_source
+            .iter()
+            .find(|(r, _)| *r == role)
+            .map(|(_, s)| s.clone())
+            .expect("every chosen member's role is mapped")
+    };
+    // One instance per set: another mapping of a role it runs is refused.
+    if let Some(inst) = &previous
+        && role_source
+            .iter()
+            .any(|(role, s)| inst.radios.get(*role).is_some_and(|t| t != s))
+    {
+        return Err(other(format!(
+            "set {set} runs on {}; set_stop it first",
+            mapping_text(&inst.radios)
+        )));
+    }
+    let mut checked: Vec<SetMember> = passed
+        .into_iter()
+        .map(|(index, m, what)| SetMember {
             index,
             id: m.id(),
             role: m.radio(),
@@ -4937,8 +5043,8 @@ async fn set_start(
             plan_left: Vec::new(),
             started_job: None,
             plan_started: Vec::new(),
-        });
-    }
+        })
+        .collect();
     // The sources in use (source-id order): those with a member left after the checks.
     // A source whose every member was refused is left out.
     let mut in_use: BTreeMap<SourceId, Vec<&str>> = BTreeMap::new();
@@ -4999,7 +5105,8 @@ async fn set_start(
             }
         }
     }
-    // 4. What already runs.
+    // 4. What already runs. A watch on a `watch` member's band is that member only
+    // with the member's policy; with another it is the answer, before anything starts.
     for c in &mut checked {
         match &c.what {
             SetMemberStart::Job {
@@ -5007,7 +5114,7 @@ async fn set_start(
                 tuning,
                 deviation,
                 sideband,
-                ..
+                params,
             } => {
                 c.existing_job = node
                     .duplicate_of(
@@ -5018,6 +5125,22 @@ async fn set_start(
                         *sideband,
                     )
                     .filter(|j| !replace.contains(j));
+                if *kind == JobKind::Watch
+                    && let Some(j) = &c.existing_job
+                {
+                    let want = params.clone().unwrap_or_else(|| serde_json::json!({}));
+                    let same = node
+                        .job_list()
+                        .into_iter()
+                        .find(|r| &r.id == j)
+                        .is_some_and(|r| node.watch_has_policy(&r.graph, &want));
+                    if !same {
+                        return Err(other(format!(
+                            "watch {} holds this band with other policy; stop it or graph_put it",
+                            j.0
+                        )));
+                    }
+                }
             }
             SetMemberStart::Plan { pc, attach, .. } => {
                 let (existing, left) = plan_existing(node, pc, &c.source, &replace, attach);
@@ -5136,8 +5259,11 @@ async fn set_start(
         since_ns: crate::node::now(),
         members: Vec::new(),
     });
+    // A role is in use when a member of it is left after the checks (call 8).
+    let role_in_use =
+        |role: &str, source: &SourceId| in_use.get(source).is_some_and(|r| r.contains(&role));
     for (role, source) in &role_source {
-        if in_use.contains_key(source) {
+        if role_in_use(role, source) {
             inst.radios.insert(role.to_string(), source.clone());
         }
     }
@@ -5299,7 +5425,7 @@ async fn set_start(
     // The answer, in the file's role order then member order.
     let mut result_radios = BTreeMap::new();
     for (role, source) in &role_source {
-        if !in_use.contains_key(source) {
+        if !role_in_use(role, source) {
             continue;
         }
         let capture = granted.get(source).copied().unwrap_or_else(|| {
