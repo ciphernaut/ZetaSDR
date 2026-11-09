@@ -24,6 +24,9 @@
 // on the shown source the same way (runSourceCommand: `source_pin` at its `current` capture or
 // the band given, `source_unpin`, `source_set_gain`), their reply or error a transcript line;
 // anything else (other text starting "view " or "source " included) goes to `api.ask`.
+// Every ask carries askContext() (the shown radio, `main`, `radio_policy`, `radio_prefer`);
+// after the answer, selectionNotes(selection) adds a note per source a radio op ran on off
+// the default radio, and one when the shown radio was dropped as the focus.
 //
 // Conflicts (spec 4.5): a `conflict` reply to an op this page applied (command line, menu,
 // a dragged outline's `job_retune`), or one the ops stream shows for another caller, adds a
@@ -752,6 +755,49 @@ export async function runPlanCommand(st, words) {
   return { text: null, error: false };
 }
 
+// The radio context every ask carries (spec 4.4): the shown radio (kept while the Map tab
+// is selected), what #main shows, and the view's radio_policy and radio_prefer (the list
+// split into ids; `none` is no preference).
+export function askContext() {
+  const prefer = state.view.get("radio_prefer");
+  return {
+    focus: state.selected ?? null,
+    main: state.view.get("main"),
+    radio_policy: state.view.get("radio_policy"),
+    radio_prefer: prefer === "none" ? [] : prefer.split(","),
+  };
+}
+
+// The radio the agent takes as its default for a request that names none: the shown radio
+// under `focus` and `focus-fallback`, none under `free-first` and `ask`.
+export function defaultRadio() {
+  const policy = state.view.get("radio_policy");
+  return policy === "focus" || policy === "focus-fallback" ? (state.selected ?? null) : null;
+}
+
+// The note lines an answer's `selection` adds after it: one per source a radio op ran on
+// off the default radio (`ran on <src> (<tools>), not the default radio <radio> (<policy>)`,
+// the tools distinct and in call order), and `<note>; no default radio` when the context's
+// focus was dropped.
+export function selectionNotes(selection) {
+  if (!selection) return [];
+  const lines = [];
+  const bySource = new Map();
+  for (const o of selection.off_default || []) {
+    if (!bySource.has(o.source)) bySource.set(o.source, []);
+    const tools = bySource.get(o.source);
+    if (!tools.includes(o.tool)) tools.push(o.tool);
+  }
+  for (const [src, tools] of bySource) {
+    lines.push(
+      `ran on ${src} (${tools.join(", ")}), not the default radio ${selection.radio} ` +
+        `(${selection.policy})`,
+    );
+  }
+  if (selection.note && selection.radio == null) lines.push(`${selection.note}; no default radio`);
+  return lines;
+}
+
 // Sends `text` to /ask and shows the answer (or the error, e.g. no LLM configured). The
 // allowance is the session's `allow` switches unless `allowOverride` gives one for this
 // request only (the unlock button's re-run); the switches are never changed here.
@@ -767,12 +813,13 @@ async function askAgent(text, allowOverride = null) {
       delete_captures: state.allowDeletes,
       accept_signatures: state.allowSignatures,
     };
-    const r = await state.api.ask(text, 32, allow);
+    const r = await state.api.ask(text, 32, allow, askContext());
     let may = "";
     if (r.allow && (r.allow.stop_jobs || r.allow.replace)) may += " [may stop jobs]";
     if (r.allow && r.allow.delete_captures) may += " [may delete captures]";
     if (r.allow && r.allow.accept_signatures) may += " [may accept signatures]";
     t.assistant((r.answer ?? "(no answer)") + may, false, r.turn_log || [], r.calls || []);
+    for (const line of selectionNotes(r.selection)) t.note(line);
     // The agent's page-only `view_set` calls are this tab's to apply, as if typed.
     for (const c of r.calls || []) {
       if (c.tool !== "view_set" || !c.ok || !c.arguments) continue;
@@ -1868,6 +1915,10 @@ window.zetaTest = {
   // The shown source's id (state.selected; unchanged while the Map tab is selected).
   shown() {
     return state.selected ?? null;
+  },
+  // The note lines an answer's `selection` adds (selectionNotes).
+  selectionNotes(selection) {
+    return selectionNotes(selection);
   },
   // The waterfall: {sourceId, jobId, painted, badge, coarsePainted, coarseMasked, easing, view
   // (the band shown, {lo, hi} or null), band (the capture)}, or null without one.

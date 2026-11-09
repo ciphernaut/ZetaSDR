@@ -107,8 +107,9 @@
 //                                             fm_demod transcribe` in the command line
 //                                             (`command(text)`) and focuses it
 //   iq_read    Save selection as SigMF        iq_read {selection}; the transcript shows the path
-//   ask        Send to agent                  /ask "Look at <c> Hz, <bw> Hz wide, from <start>
-//                                             to <end>: what is it?"
+//   ask        Send to agent                  /ask "Look at <c> Hz, <bw> Hz wide, on <source>,
+//                                             from <start> to <end>: what is it?" (naming
+//                                             the radio makes it the agent's default)
 // The jobs use the selection's centre and bandwidth on the source the waterfall shows (the
 // SSB entries their dial frequency and SSB_BANDWIDTH_HZ instead; FM broadcast and RDS widen
 // the bandwidth, ADS-B replaces it, see jobTuning).
@@ -812,7 +813,7 @@ class Menu {
       }
     } else if (action === "ask") {
       await this.ask(
-        `Look at ${s.centerHz} Hz, ${s.bandwidthHz} Hz wide, ` +
+        `Look at ${s.centerHz} Hz, ${s.bandwidthHz} Hz wide, on ${s.sourceId}, ` +
           `from ${s.startNs} to ${s.endNs}: what is it?`,
       );
     } else if (action === "plan") {
