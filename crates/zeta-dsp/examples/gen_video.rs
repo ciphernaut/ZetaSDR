@@ -1,5 +1,6 @@
 //! Writes an analog video fixture (video-pal-8m.sigmf-meta/-data) into the given directory
-//! (`scratch` by default): 25 fields of the PAL test card, frequency-modulated at 1.5 MHz per
+//! (`scratch` by default): 26 fields (13 whole frames, so the capture loops without a seam)
+//! of the PAL test card, frequency-modulated at 1.5 MHz per
 //! volt, at 8 MHz centred on 100 MHz, with noise 25 dB under the carrier.
 use std::path::PathBuf;
 
@@ -18,7 +19,7 @@ fn main() {
         deviation_hz: 1.5e6,
         subcarrier_hz: None,
         rate_hz: RATE_HZ,
-        fields: 25,
+        fields: 26,
         preemphasis: true,
     };
     let imp = Impairments {

@@ -40,7 +40,7 @@
   "notes": "Analog FM video (FPV, reverse cameras, analog HDMI senders): luma only; sync negative; a digital link (OFDM, no line structure) never locks and is reported as not yet decodable.",
   "test": {
     "kind": "synth", "family": "video", "standard": "pal", "deviation_hz": 1500000.0, "subcarrier_hz": null,
-    "rate_hz": 8000000, "fields": 25, "snr_db": 25, "bandwidth_hz": 8000000,
+    "rate_hz": 8000000, "fields": 26, "snr_db": 25, "bandwidth_hz": 8000000,
     "expect": { "locked": true, "standard": "pal" }, "within_ms": 6000
   }
 }

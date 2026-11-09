@@ -20,7 +20,7 @@ use zeta_core::types::{StreamId, StreamKind, Timestamp};
 
 use crate::Input;
 use crate::util::{event, lowpass_taps};
-use crate::video_fm::{StandardTable, VideoStandard, WHITE_V};
+use crate::video_fm::{BLANK_V, SYNC_V, StandardTable, VideoStandard, WHITE_V};
 use crate::worker::{VIDEO_QUEUE_DEPTH, run_map_threaded};
 
 /// Which line standard to decode; `auto` tells PAL from NTSC by the lines between
@@ -145,6 +145,10 @@ const BLANK_TAU_S: f64 = 2e-3;
 const PORCH_MARGIN_S: f64 = 0.5e-6;
 /// The sync path's two boxcars are each this long, seconds.
 const SYNC_BOXCAR_S: f64 = 0.8e-6;
+/// Margin inside a line-sync pulse when its floor is measured, seconds.
+const SYNC_EDGE_S: f64 = 1.0e-6;
+/// Fields a tracker holds for decoding at once.
+const PENDING_FIELDS: usize = 2;
 /// Taps of the luma low-pass.
 const LUMA_TAPS: usize = 63;
 /// The back porch's noise is measured over this many lines.
@@ -184,11 +188,25 @@ struct LineRec {
     accepted: bool,
 }
 
-/// A field whose active lines are all on the grid: its rows' edges.
-struct Plan {
-    line1_t: f64,
-    rows: Vec<f64>,
-    even: bool,
+/// The field being decoded, row by row as its lines come in, so the luma low-pass of a
+/// field is spread over the field rather than run in the block that completes it.
+#[derive(Clone, Debug)]
+struct Partial {
+    line1: u64,
+    /// Rows done.
+    next: u32,
+    /// Of them, rows whose line had a sync edge.
+    accepted: u32,
+    luma: Vec<u8>,
+}
+
+/// Where one row's luma stands.
+enum Row {
+    Done,
+    /// Its samples are still to come.
+    Later,
+    /// Its samples are gone.
+    Gone,
 }
 
 /// Horizontal and vertical lock for one standard, fed the sync pulses.
@@ -214,8 +232,10 @@ struct Tracker {
     locked: bool,
     /// When (absolute samples) a field last closed with this standard's line count.
     matched_at: Option<f64>,
-    /// The latest field's line 1 and parity, until its active lines are decoded.
-    pending: Option<(u64, bool)>,
+    /// The line 1 and parity of the fields whose active lines are still to decode,
+    /// oldest first (at most [`PENDING_FIELDS`]): a block may hold the end of one field
+    /// and the next one's vertical interval.
+    pending: VecDeque<(u64, bool)>,
     field_counter: u64,
 }
 
@@ -240,7 +260,7 @@ impl Tracker {
             bads: 0,
             locked: false,
             matched_at: None,
-            pending: None,
+            pending: VecDeque::new(),
             field_counter: 0,
         }
     }
@@ -304,7 +324,7 @@ impl Tracker {
             self.locked = false;
             self.goods = 0;
             self.field_line1 = None;
-            self.pending = None;
+            self.pending.clear();
             self.broad_rise = None;
         }
     }
@@ -404,7 +424,10 @@ impl Tracker {
         }
         self.field_line1 = Some(line1);
         self.last_close = Some(line1);
-        self.pending = Some((line1, even));
+        self.pending.push_back((line1, even));
+        while self.pending.len() > PENDING_FIELDS {
+            self.pending.pop_front();
+        }
     }
 
     /// The field just ended had `n` lines, `acc` of them with an edge; `vi` when its
@@ -443,37 +466,39 @@ impl Tracker {
         }
     }
 
-    /// The pending field once all its active lines are on the grid; `Some(None)` when
-    /// they never will be (a gap in the grid), to drop it.
-    fn plan(&self) -> Option<Option<Plan>> {
-        let (line1, even) = self.pending?;
-        let first = line1 + u64::from(self.t.first_active_line) - 1;
-        let last = first + u64::from(self.t.active_lines) - 1;
-        if self.lines.back()?.idx <= last {
-            return None;
+    fn line_rec(&self, idx: u64) -> Option<LineRec> {
+        let first = self.lines.front()?;
+        let guess = idx.checked_sub(first.idx)? as usize;
+        match self.lines.get(guess) {
+            Some(l) if l.idx == idx => Some(*l),
+            _ => self.lines.iter().find(|l| l.idx == idx).copied(),
         }
-        let rows: Option<Vec<f64>> = (first..=last).map(|i| self.line_t(i)).collect();
-        let Some(rows) = rows else {
-            return Some(None);
-        };
-        // A field mostly without sync (the signal went) is not a picture.
-        if 2 * self.accepted_in(first, last + 1) < rows.len() as u64 {
-            return Some(None);
+    }
+
+    /// The edge of line `idx`: its record, or extrapolated back from the first line
+    /// after it (line 1 can precede the grid's start).
+    fn line1_t(&self, idx: u64) -> Option<f64> {
+        if let Some(t) = self.line_t(idx) {
+            return Some(t);
         }
-        let line1_t = match self.line_t(line1) {
-            Some(t) => t,
-            None => rows[0] - (first - line1) as f64 * self.period,
-        };
-        Some(Some(Plan {
-            line1_t,
-            rows,
-            even,
-        }))
+        let l = self.lines.iter().find(|l| l.idx > idx)?;
+        Some(l.t - (l.idx - idx) as f64 * self.period)
+    }
+
+    /// Input was lost: the grid and the field in progress are void, the levels and the
+    /// lock are kept (the next fields judge the lock).
+    fn gap(&mut self) {
+        self.pred = None;
+        self.misses = 0;
+        self.broad_rise = None;
+        self.field_line1 = None;
+        self.last_close = None;
+        self.pending.clear();
     }
 
     /// Take the pending field: its index.
     fn consume(&mut self, even: bool) -> u64 {
-        self.pending = None;
+        self.pending.pop_front();
         if self.field_counter.is_multiple_of(2) != even {
             self.field_counter += 1;
         }
@@ -511,6 +536,9 @@ struct State {
     tip: Option<f32>,
     peak: f32,
     blank: Option<f32>,
+    /// The mean level inside line-sync pulses (an IIR like `blank`): with `blank`, the
+    /// sync depth that scales luma.
+    sync_level: Option<f32>,
     low: bool,
     cand: Option<f64>,
     fall: f64,
@@ -523,6 +551,8 @@ struct State {
     porch_lines: u32,
     sigma: Option<f64>,
     trackers: Vec<Tracker>,
+    /// Each tracker's field in progress.
+    partial: Vec<Option<Partial>>,
     taps: Vec<f32>,
     /// Samples a field needs kept behind the newest.
     keep: usize,
@@ -571,7 +601,9 @@ impl CompositeDecoder {
             .map(|t| t.t.luma_lowpass_hz)
             .fold(f64::MAX, f64::min)
             .min(0.45 * rate);
+        let partial = vec![None; trackers.len()];
         State {
+            partial,
             rate,
             buf: Vec::new(),
             base: 0,
@@ -586,6 +618,7 @@ impl CompositeDecoder {
             tip: None,
             peak: 0.0,
             blank: None,
+            sync_level: None,
             low: false,
             cand: None,
             fall: 0.0,
@@ -628,41 +661,116 @@ impl CompositeDecoder {
         fields
     }
 
-    /// Decode the fields whose active lines are all in.
+    /// Decode the rows whose lines are in, of the selected tracker's field while it is
+    /// locked; the fields completed.
     fn collect(&mut self, st: &mut State) -> Vec<Field> {
         let sel = st.selected(self.choice);
         let mut out = Vec::new();
         for i in 0..st.trackers.len() {
-            let Some(plan) = st.trackers[i].plan() else {
-                continue;
-            };
-            let Some(plan) = plan else {
-                st.trackers[i].pending = None;
-                continue;
-            };
-            let t = st.trackers[i].t;
-            if sel != Some(i) || !st.trackers[i].locked {
-                st.trackers[i].consume(plan.even);
-                continue;
+            if st.trackers[i].pending.is_empty() {
+                st.partial[i] = None;
             }
-            match st.field(t, &plan, self.width) {
-                Some(None) => continue, // samples still to come
-                done => {
-                    let index = st.trackers[i].consume(plan.even);
-                    if let Some(Some(luma)) = done {
-                        self.fields += 1;
-                        out.push(Field {
-                            width: self.width,
-                            height: t.active_lines,
-                            luma,
-                            start_ns: st.t_ns(plan.line1_t),
-                            index,
-                        });
-                    }
+            while self.collect_one(st, i, sel == Some(i), &mut out) {}
+        }
+        out
+    }
+
+    /// Work on tracker `i`'s oldest pending field: true when it was finished or passed
+    /// (so the next one may be ready too), false when it waits for more input.
+    fn collect_one(
+        &mut self,
+        st: &mut State,
+        i: usize,
+        selected: bool,
+        out: &mut Vec<Field>,
+    ) -> bool {
+        let Some(&(line1, even)) = st.trackers[i].pending.front() else {
+            return false;
+        };
+        let w = self.width as usize;
+        let t = st.trackers[i].t;
+        let rows = t.active_lines;
+        let first = line1 + u64::from(t.first_active_line) - 1;
+        let newest = st.trackers[i].lines.back().map(|l| l.idx);
+        if !selected || !st.trackers[i].locked {
+            // Not shown: no low-pass; the field is passed once its lines are.
+            st.partial[i] = None;
+            if newest.is_some_and(|b| b >= first + u64::from(rows)) {
+                st.trackers[i].consume(even);
+                return true;
+            }
+            return false;
+        }
+        let Some((blank, gain)) = st.levels() else {
+            return false;
+        };
+        let mut p = match st.partial[i].take() {
+            Some(p) if p.line1 == line1 => p,
+            _ => Partial {
+                line1,
+                next: 0,
+                accepted: 0,
+                luma: Vec::with_capacity(w * rows as usize),
+            },
+        };
+        while p.next < rows {
+            let idx = first + u64::from(p.next);
+            let Some(rec) = st.trackers[i].line_rec(idx) else {
+                // A gap in the grid: the row never comes.
+                if newest.is_some_and(|b| b > idx) {
+                    st.trackers[i].consume(even);
+                    return true;
+                }
+                st.partial[i] = Some(p);
+                return false;
+            };
+            match st.row(t, rec.t, w, blank, gain, &mut p.luma) {
+                Row::Done => {
+                    p.next += 1;
+                    p.accepted += u32::from(rec.accepted);
+                }
+                Row::Later => {
+                    st.partial[i] = Some(p);
+                    return false;
+                }
+                Row::Gone => {
+                    st.trackers[i].consume(even);
+                    return true;
                 }
             }
         }
-        out
+        let index = st.trackers[i].consume(even);
+        // A field mostly without sync (the signal went) is not a picture.
+        if 2 * p.accepted < rows {
+            return true;
+        }
+        let Some(t1) = st.trackers[i].line1_t(line1) else {
+            return true;
+        };
+        self.fields += 1;
+        out.push(Field {
+            width: self.width,
+            height: rows,
+            luma: p.luma,
+            start_ns: st.t_ns(t1),
+            index,
+        });
+        true
+    }
+
+    /// Input was lost before the next block (the stage's queue dropped some): the line
+    /// grid restarts on the next sync, the field in progress is void, and the levels and
+    /// the lock are kept, so a lost block or a loop seam costs a field, not the lock.
+    pub fn gap(&mut self) {
+        if let Some(st) = &mut self.st {
+            st.low = false;
+            st.cand = None;
+            st.porch.clear();
+            st.partial.iter_mut().for_each(|p| *p = None);
+            for t in &mut st.trackers {
+                t.gap();
+            }
+        }
     }
 
     pub fn lock(&self) -> Lock {
@@ -806,6 +914,7 @@ impl State {
     fn reseed(&mut self, now: f64) {
         self.tip = None;
         self.blank = None;
+        self.sync_level = None;
         self.low = false;
         self.cand = None;
         self.chunk_pos = 0;
@@ -863,6 +972,23 @@ impl State {
                 break;
             }
             self.porch.pop_front();
+            // The pulse's floor, clear of its edges.
+            let (sa, sb) = (
+                (fall + SYNC_EDGE_S * self.rate).ceil(),
+                (fall + (t.sync_s - SYNC_EDGE_S) * self.rate).floor(),
+            );
+            if sa >= self.base as f64 && sb > sa {
+                let (sa, sb) = (
+                    (sa as u64 - self.base) as usize,
+                    (sb as u64 - self.base) as usize,
+                );
+                let w = &self.buf[sa..=sb];
+                let mean = (w.iter().map(|&v| f64::from(v)).sum::<f64>() / w.len() as f64) as f32;
+                self.sync_level = Some(match self.sync_level {
+                    None => mean,
+                    Some(l) => l + (mean - l) * alpha,
+                });
+            }
             if a < self.base as f64 || b <= a {
                 continue;
             }
@@ -907,50 +1033,64 @@ impl State {
         (20.0 * (amp / sigma).log10()).round().clamp(0.0, 60.0) as i32
     }
 
-    /// The luma of `plan`'s rows: `None` when its samples are gone, `Some(None)` when
-    /// they are still to come.
-    fn field(&self, t: &StandardTable, plan: &Plan, width: u32) -> Option<Option<Vec<u8>>> {
-        let w = width as usize;
-        let half = (self.taps.len() / 2) as i64;
-        let step = t.active_s * self.rate / w as f64;
-        let end_abs = (self.base + self.buf.len() as u64) as i64;
-        let last = plan.rows.last()? + t.active_start_s * self.rate + w as f64 * step;
-        if last.ceil() as i64 + half + 2 >= end_abs {
-            return Some(None);
-        }
+    /// The blanking level and the luma gain (255 per white level), `None` before the
+    /// levels are known. White is referenced to the measured sync depth by the
+    /// standard's 0.3 : 0.7 ratio, so brightness does not depend on the demodulator's
+    /// deviation setting (on air a transmitter's deviation is unknown).
+    fn levels(&self) -> Option<(f32, f32)> {
         let blank = self.blank.or(self.tip.map(|tip| self.blank_level(tip)))?;
-        let gain = 255.0 / WHITE_V;
-        let mut luma = Vec::with_capacity(w * plan.rows.len());
-        let mut y = Vec::new();
-        for &edge in &plan.rows {
-            let x0 = edge + t.active_start_s * self.rate;
-            let a = (x0 + 0.5 * step).floor() as i64;
-            let b = (x0 + (w as f64 - 0.5) * step).floor() as i64 + 1;
-            if a - half < self.base as i64 {
-                return None;
-            }
-            // The luma low-pass, centred, at samples a..=b.
-            y.clear();
-            for c in a..=b {
+        let floor = self.sync_level.or(self.tip)?;
+        let depth = blank - floor;
+        if depth <= 0.0 {
+            return None;
+        }
+        let white = depth * (WHITE_V - BLANK_V) / (BLANK_V - SYNC_V);
+        Some((blank, 255.0 / white))
+    }
+
+    /// Append the luma of the row whose sync edge is at `edge` (absolute samples):
+    /// `width` samples over the active line after the luma low-pass.
+    fn row(
+        &self,
+        t: &StandardTable,
+        edge: f64,
+        width: usize,
+        blank: f32,
+        gain: f32,
+        out: &mut Vec<u8>,
+    ) -> Row {
+        let half = (self.taps.len() / 2) as i64;
+        let step = t.active_s * self.rate / width as f64;
+        let end_abs = (self.base + self.buf.len() as u64) as i64;
+        let x0 = edge + t.active_start_s * self.rate;
+        let a = (x0 + 0.5 * step).floor() as i64;
+        let b = (x0 + (width as f64 - 0.5) * step).floor() as i64 + 1;
+        if b + half + 1 >= end_abs {
+            return Row::Later;
+        }
+        if a - half < self.base as i64 {
+            return Row::Gone;
+        }
+        // The luma low-pass, centred, at samples a..=b.
+        let y: Vec<f32> = (a..=b)
+            .map(|c| {
                 let i0 = (c - half - self.base as i64) as usize;
-                let v: f32 = self
-                    .taps
+                self.taps
                     .iter()
                     .zip(&self.buf[i0..])
                     .map(|(h, s)| h * s)
-                    .sum();
-                y.push(v);
-            }
-            for k in 0..w {
-                let x = x0 + (k as f64 + 0.5) * step;
-                let i = x.floor();
-                let f = (x - i) as f32;
-                let j = (i as i64 - a) as usize;
-                let v = y[j] * (1.0 - f) + y[j + 1] * f;
-                luma.push(((v - blank) * gain).round().clamp(0.0, 255.0) as u8);
-            }
+                    .sum()
+            })
+            .collect();
+        for k in 0..width {
+            let x = x0 + (k as f64 + 0.5) * step;
+            let i = x.floor();
+            let f = (x - i) as f32;
+            let j = (i as i64 - a) as usize;
+            let v = y[j] * (1.0 - f) + y[j + 1] * f;
+            out.push(((v - blank) * gain).round().clamp(0.0, 255.0) as u8);
         }
-        Some(Some(luma))
+        Row::Done
     }
 
     /// The time of absolute sample `s`, ns.
@@ -1104,7 +1244,7 @@ impl Stage for CompositeDecodeStage {
             let frame = match input {
                 Input::Frame(f) => f,
                 Input::Lagged { .. } => {
-                    dec.reset();
+                    dec.gap();
                     return Vec::new();
                 }
             };

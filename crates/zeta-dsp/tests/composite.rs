@@ -507,3 +507,160 @@ fn a_job_started_on_noise_locks_when_the_card_appears() {
     assert!(run.fields.iter().all(|f| f.start_ns >= ns(start, RATE)));
     assert!(!run.fields.is_empty());
 }
+
+#[test]
+fn brightness_does_not_depend_on_the_demod_deviation() {
+    for demod_dev in [1_500_000u64, 8_000_000] {
+        let (x, rate) = fm_chain(
+            json!({"family":"video","standard":"pal","deviation_hz":1.5e6,"subcarrier_hz":null,
+                "rate_hz":8_000_000,"fields":6,"preemphasis":true,"snr_db":25}),
+            VideoFmParams {
+                deviation_hz: demod_dev,
+                deemphasis: "ccir405".into(),
+                composite_max_hz: 16_000_000,
+                standard: Some(VideoStandard::Pal),
+            },
+        );
+        let (dec, run) = decode(StandardChoice::Pal, &x, rate);
+        assert!(dec.lock().locked, "demod {demod_dev}: {:?}", dec.lock());
+        let f = run.fields.last().expect("a field");
+        assert_bars(f, 24.0, &format!("demod deviation {demod_dev}"));
+        let white = bar_errors(f, 100)[0] + 255.0;
+        assert!(white >= 230.0, "demod {demod_dev}: white bar {white}");
+    }
+}
+
+/// How many times the lock changed over `run`'s blocks, from unlocked.
+fn lock_changes(dec: &mut CompositeDecoder, x: &[f32]) -> (usize, usize) {
+    let block = (RATE / 1000) as usize;
+    let (mut changes, mut was, mut fields) = (0, false, 0);
+    for (i, c) in x.chunks(block).enumerate() {
+        fields += dec.push(c, u64::from(RATE), ns(i * block, RATE)).len();
+        let now = dec.lock().locked;
+        if now != was {
+            changes += 1;
+            was = now;
+        }
+    }
+    (changes, fields)
+}
+
+#[test]
+fn a_loop_seam_does_not_unlock() {
+    // 25 fields is not whole frames: each repeat starts half a line off the grid and
+    // with the wrong field parity, as a looped capture of that length does.
+    let card = composite_test_card(VideoStandard::Pal, RATE, 25);
+    let x: Vec<f32> = card.iter().copied().cycle().take(4 * card.len()).collect();
+    let mut dec = CompositeDecoder::new(&params(StandardChoice::Pal));
+    let (changes, fields) = lock_changes(&mut dec, &x);
+    eprintln!("loop of 25 fields x4: {changes} lock changes, {fields} fields of 100");
+    assert_eq!(changes, 1, "the lock changed {changes} times");
+    assert!(fields >= 90, "{fields} fields");
+}
+
+/// The served fixture's signal (`gen_video`: PAL, 1.5 MHz deviation, CCIR 405, 25 dB)
+/// of `fields` fields, its IQ looped `loops` times as a node loops a capture, through
+/// `video_fm_demod` at its defaults as the `video_decode` row runs it.
+fn looped_fixture(fields: u32, loops: usize) -> Vec<f32> {
+    let synth = json!({"family":"video","standard":"pal","deviation_hz":1.5e6,
+        "subcarrier_hz":null,"rate_hz":8_000_000,"fields":fields,"preemphasis":true,
+        "snr_db":25});
+    let (spec, imp) = parse_params(synth.as_object().unwrap().clone()).expect("synth params");
+    let iq: Vec<Complex<f32>> = synthesise(&spec, &imp, spec.rate_hz(), 0);
+    let looped: Vec<Complex<f32>> = iq.iter().copied().cycle().take(loops * iq.len()).collect();
+    let mut d = VideoFmDemod::new(&VideoFmParams {
+        deviation_hz: 8_000_000,
+        deemphasis: "ccir405".into(),
+        composite_max_hz: 16_000_000,
+        standard: None,
+    })
+    .expect("demod params");
+    let mut out = Vec::new();
+    for c in looped.chunks(8_000) {
+        out.extend(d.process(c, 8_000_000).expect("demod").0);
+    }
+    out
+}
+
+#[test]
+fn the_looped_fixture_holds_its_lock() {
+    for fields in [25u32, 26] {
+        let x = looped_fixture(fields, 4);
+        let mut dec = CompositeDecoder::new(&params(StandardChoice::Auto));
+        let (changes, got) = lock_changes(&mut dec, &x);
+        eprintln!(
+            "fixture of {fields} fields looped x4: {changes} lock changes, {got} fields of {}",
+            4 * fields
+        );
+        assert_eq!(
+            changes, 1,
+            "{fields} fields: the lock changed {changes} times"
+        );
+        assert!(
+            got as u32 >= 4 * fields - 10,
+            "{fields} fields: {got} fields"
+        );
+    }
+}
+
+#[test]
+fn lost_input_costs_a_field_not_the_lock() {
+    let (mut dec, _) = locked_on_pal();
+    // The next card, with 3 ms lost every 50 ms: each loss is a stage queue drop.
+    let card = composite_test_card(VideoStandard::Pal, RATE, 25);
+    let block = (RATE / 1000) as usize;
+    let t0 = ns(4 * field_len(VideoStandard::Pal, RATE), RATE);
+    let (mut fields, mut unlocked) = (0, 0);
+    for (i, c) in card.chunks(block).enumerate() {
+        if i % 50 < 3 {
+            if i % 50 == 2 {
+                dec.gap();
+            }
+            continue;
+        }
+        fields += dec.push(c, u64::from(RATE), t0 + ns(i * block, RATE)).len();
+        unlocked += usize::from(!dec.lock().locked);
+    }
+    eprintln!("3 ms lost every 50 ms: {fields} fields of 25, {unlocked} blocks unlocked");
+    assert_eq!(unlocked, 0, "the lock went");
+    assert!(fields >= 12, "{fields} fields");
+}
+
+/// The node's path for the served fixture: 4800-sample blocks (the file radio's), the
+/// `channel` stage's direct filter at the job's 7.68 MHz, `video_fm_demod` at its
+/// defaults, the decoder in the same blocks.
+#[test]
+fn the_served_chain_decodes_every_field() {
+    use zeta_dsp::channel::{ChannelState, extract_offset_streaming};
+    let synth = json!({"family":"video","standard":"pal","deviation_hz":1.5e6,
+        "subcarrier_hz":null,"rate_hz":8_000_000,"fields":26,"preemphasis":true,
+        "snr_db":25});
+    let (spec, imp) = parse_params(synth.as_object().unwrap().clone()).expect("synth params");
+    let iq: Vec<Complex<f32>> = synthesise(&spec, &imp, spec.rate_hz(), 0);
+    let looped: Vec<Complex<f32>> = iq.iter().copied().cycle().take(4 * iq.len()).collect();
+    let mut ch = ChannelState::new();
+    let mut demod = VideoFmDemod::new(&VideoFmParams {
+        deviation_hz: 8_000_000,
+        deemphasis: "ccir405".into(),
+        composite_max_hz: 16_000_000,
+        standard: None,
+    })
+    .expect("demod params");
+    let mut dec = CompositeDecoder::new(&params(StandardChoice::Auto));
+    let (mut fields, mut changes, mut was) = (0usize, 0usize, false);
+    for (i, c) in looped.chunks(4800).enumerate() {
+        let (y, r) = extract_offset_streaming(&mut ch, c, 8_000_000, 0, 7_680_000, 8_000_000)
+            .expect("channel");
+        let (x, comp) = demod.process(&y, r).expect("demod");
+        fields += dec.push(&x, comp, ns(i * 4800, RATE)).len();
+        let now = dec.lock().locked;
+        if now != was {
+            changes += 1;
+            was = now;
+        }
+    }
+    eprintln!("served chain: {fields} fields of 104, {changes} lock changes");
+    assert_eq!(changes, 1);
+    // Measured 98: the fields before the lock (about 2) and one or two at the IQ loop.
+    assert!(fields >= 96, "{fields} fields of 104");
+}
