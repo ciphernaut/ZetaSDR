@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use zeta_core::graph::GraphError;
+use zeta_core::graph::{Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use zeta_core::job::{JobRecord, JobState};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult, SourceInfo};
@@ -748,4 +748,87 @@ async fn a_mix_started_by_graph_start_is_not_mixed() {
         assert_eq!(mix_ctx(&node, id)["inputs"], 1, "{id:?}");
     }
     assert!(hears(&node, &m, &ch).await);
+}
+
+/// A demodulator stand-in with audio-kind outputs carrying `roles`.
+struct RoleOut {
+    spec: StageSpec,
+    roles: Vec<Option<&'static str>>,
+}
+
+#[async_trait]
+impl Stage for RoleOut {
+    fn spec(&self) -> &StageSpec {
+        &self.spec
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    fn output_roles(&self, _params: &Value) -> Vec<Option<&'static str>> {
+        self.roles.clone()
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        _inputs: Vec<broadcast::Receiver<Frame>>,
+        _outputs: Vec<StreamId>,
+        _bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        cancel.cancelled().await;
+        Err(StageError::Cancelled)
+    }
+}
+
+fn role_out(kind: &'static str, roles: Vec<Option<&'static str>>) -> Arc<RoleOut> {
+    Arc::new(RoleOut {
+        spec: StageSpec {
+            kind,
+            inputs: vec![StreamKind::Iq],
+            outputs: vec![StreamKind::Audio; roles.len()],
+            params_schema: schemars::json_schema!({"type": "object"}),
+        },
+        roles,
+    })
+}
+
+async fn role_job(node: &Node, kind: &str, center_hz: u64) -> JobId {
+    let graph = Graph {
+        id: GraphId::new(),
+        nodes: vec![GraphNode {
+            id: NodeId("n".into()),
+            kind: kind.into(),
+            params: json!({}),
+        }],
+        edges: vec![],
+    };
+    node.job_start(kind, src("a"), band(center_hz, WIDTH), graph, None, false)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_mix_never_sums_a_composite() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = attach_registry();
+    reg.register(role_out("comp_then_audio", vec![Some("composite"), None]));
+    reg.register(role_out("comp_only", vec![Some("composite")]));
+    let ports: Vec<Arc<dyn Port>> = vec![Radio::new("a")];
+    let node = Node::open(cfg(dir.path()), reg, ports).await.unwrap();
+
+    // Only a composite: the job is no input of the mix.
+    let only = role_job(&node, "comp_only", CH).await;
+    let m = mix(&node, None).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(mix_ctx(&node, &m)["inputs"], 0);
+    node.job_stop(&only).await.unwrap();
+
+    // A composite then audio: the mix's input is the second, role-less stream.
+    let both = role_job(&node, "comp_then_audio", CH + 100_000).await;
+    until_inputs(&node, &m, 1).await;
+    let outs = node.job_outputs(&both);
+    assert_eq!(outs.len(), 2);
+    assert_eq!(node.job_audio_stream(&both).unwrap(), outs[1].1);
+    assert!(hears(&node, &m, &both).await);
 }

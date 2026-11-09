@@ -266,29 +266,43 @@ impl Inner {
         // One stream per edge; a node with no incoming edge whose stage takes input
         // reads the job's IQ stream (a job on the radio only). Each node's outputs get
         // streams by `node_outputs`.
-        let edge_streams: Vec<_> = graph
+        // An edge takes the output slot `node_outputs` gives it (the n-th edge of a kind
+        // leaving a node takes the n-th slot of that kind), and with it the slot's role.
+        let edge_roles: Vec<Option<&'static str>> = graph
             .edges
             .iter()
-            .map(|e| {
-                let from = graph.nodes.iter().find(|n| n.id == e.from);
-                // The edge carries a role when the slot of its kind on the stage it leaves does.
-                let role = graph
+            .enumerate()
+            .map(|(i, e)| {
+                let (n, st) = graph
                     .nodes
                     .iter()
                     .zip(&stages)
-                    .find(|(n, _)| n.id == e.from)
-                    .and_then(|(n, st)| {
-                        let at = st
-                            .outputs_for(&n.params)
-                            .iter()
-                            .position(|k| *k == e.kind)?;
-                        st.output_roles(&n.params).get(at).copied().flatten()
-                    });
+                    .find(|(n, _)| n.id == e.from)?;
+                let nth = graph.edges[..i]
+                    .iter()
+                    .filter(|o| o.from == e.from && o.kind == e.kind)
+                    .count();
+                let at = st
+                    .outputs_for(&n.params)
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, k)| **k == e.kind)
+                    .nth(nth)?
+                    .0;
+                st.output_roles(&n.params).get(at).copied().flatten()
+            })
+            .collect();
+        let edge_streams: Vec<_> = graph
+            .edges
+            .iter()
+            .zip(&edge_roles)
+            .map(|(e, role)| {
+                let from = graph.nodes.iter().find(|n| n.id == e.from);
                 register_event_stream(
                     &self.bus,
                     from.map_or("", |n| n.kind.as_str()),
                     e.kind,
-                    role,
+                    *role,
                     prov.clone(),
                 )
             })
@@ -322,22 +336,17 @@ impl Inner {
             let roles = stage.output_roles(&n.params);
             // This node's job outputs: its edges into a sink, then its own streams.
             let first_output = job_outputs.len();
-            for (e, sid) in graph.edges.iter().zip(&edge_streams) {
+            for ((e, sid), role) in graph.edges.iter().zip(&edge_streams).zip(&edge_roles) {
                 if e.to == n.id {
                     inputs.push(self.bus.subscribe(sid).expect("registered"));
                 }
                 if e.from == n.id {
                     leaving.push((e.kind, sid.clone()));
                     if sinks.contains(&e.to) {
-                        let role = stage
-                            .outputs_for(&n.params)
-                            .iter()
-                            .position(|k| *k == e.kind)
-                            .and_then(|at| roles.get(at).copied().flatten());
                         job_outputs.push(JobOutput {
                             kind: e.kind,
                             id: sid.clone(),
-                            role,
+                            role: *role,
                         });
                     }
                 }

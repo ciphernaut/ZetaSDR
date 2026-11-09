@@ -29,7 +29,9 @@
 //         `Content-Type: audio/wav`; throws OpError (503 when serve has no speech daemon)
 //     api.health() -> Promise<{status, version, build, uptime_s, ws_connections}>
 //     api.build, api.uptimeS  the `build` and `uptime_s` connect() saw (null on an older node)
-//     api.streams() -> Promise<[{id, kind, provenance}]>   GET /streams (not an op)
+//     api.streams() -> Promise<[{id, kind, provenance, role}]>   GET /streams (not an op);
+//         `role` is null, or "composite" on a video demodulator's audio-kind stream, which is
+//         not for ears (never pick it as a job's audio)
 //     api.streamText(id, onMessage, onClose, {reconnect = true, onReconnect, onOpen}) -> {close}
 //         Text websocket /stream/{id}; onMessage(msg) per parsed message
 //         ({"type":"frame",...}, {"type":"lagged","missed":n}, {"type":"closed","reason":s});
