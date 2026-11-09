@@ -1,0 +1,46 @@
+{
+  "id": "video_decode",
+  "name": "Analog FM video",
+  "family": "tv",
+  "band": { "bandwidth_hz": 24000000, "centers_hz": [], "min_hz": 6000000 },
+  "modulation": ["fm"],
+  "label": "Video",
+  "protocol": "video",
+  "decoder": {
+    "kind": "graph",
+    "nodes": [
+      { "id": "channel", "kind": "channel", "params": { "center_hz": "$center_hz", "bandwidth_hz": "$bandwidth_hz", "out_rate_hz": "$out_rate_hz" } },
+      { "id": "demod", "kind": "video_fm_demod", "params": {} },
+      { "id": "decode", "kind": "composite_decode", "params": {} }
+    ],
+    "edges": [
+      { "from": "channel", "to": "demod", "kind": "iq" },
+      { "from": "demod", "to": "decode", "kind": "audio" }
+    ]
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "system": { "type": "string" },
+        "lock": { "type": "string" },
+        "standard": { "type": ["string", "null"] },
+        "locked": { "type": "boolean" },
+        "line_hz": { "type": "integer" },
+        "fields": { "type": "integer" },
+        "snr_db": { "type": "integer" },
+        "dropped": { "type": "integer" }
+      }
+    },
+    "summary": "{system?} {lock} · {snr_db?} dB"
+  },
+  "identify": { "proof": "field", "field": "locked", "min_events": 1, "dwell_ms": 4000, "min_span_ms": 0, "quick": null },
+  "catalogue": [],
+  "notes": "Analog FM video (FPV, reverse cameras, analog HDMI senders): luma only; sync negative; a digital link (OFDM, no line structure) never locks and is reported as not yet decodable.",
+  "test": {
+    "kind": "synth", "family": "video", "standard": "pal", "deviation_hz": 1500000.0, "subcarrier_hz": null,
+    "rate_hz": 8000000, "fields": 25, "snr_db": 25, "bandwidth_hz": 8000000,
+    "expect": { "locked": true, "standard": "pal" }, "within_ms": 6000
+  }
+}

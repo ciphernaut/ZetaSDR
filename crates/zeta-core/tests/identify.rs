@@ -1176,3 +1176,17 @@ async fn identify_on_the_sonde_band_proves_the_rs41_row() {
     assert_eq!(ctx["identify"]["verdict"]["mode"], "rs41_decode", "{ctx}");
     stop_all(&node).await;
 }
+
+/// The video row needs 6 MHz at least: a 200 kHz box skips it, never starts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identify_skips_video_decode_on_a_narrow_band() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &fixtures().pocsag_on_aprs).await;
+    let (id, events) = identify(&node, APRS_HZ).await;
+    let events = ended(&node, &id, events, Duration::from_secs(60)).await;
+    let video = outcome(&events, "video_decode").expect("video_decode listed");
+    assert_eq!(video["outcome"], "skipped_band", "{video}");
+    assert!(video["job"].is_null(), "{video}");
+    stop_all(&node).await;
+}

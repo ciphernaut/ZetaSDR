@@ -648,6 +648,10 @@ pub struct RowTest {
     /// The event (or the subset of its fields) the decoder must emit.
     pub expect: serde_json::Value,
     pub within_ms: u64,
+    /// The job's band for the check, when the row's own `band.bandwidth_hz` is wider than
+    /// the signal to synthesise (a video row's 24 MHz band, an 8 MHz carrier).
+    #[serde(default)]
+    pub bandwidth_hz: Option<u64>,
 }
 
 /// Make every property of an object schema required, without a `default`: a field a row

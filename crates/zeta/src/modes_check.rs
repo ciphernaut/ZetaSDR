@@ -238,7 +238,7 @@ async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> 
         kind: JobKind::from_name(&m.row.id.0).expect("a row id is a job kind name"),
         source: SourceId(SOURCE.into()),
         center_hz: Hz(center_hz),
-        bandwidth_hz: Hz(m.row.band.bandwidth_hz),
+        bandwidth_hz: Hz(test.bandwidth_hz.unwrap_or(m.row.band.bandwidth_hz)),
         deviation_hz: None,
         sideband: None,
         elastic: false,

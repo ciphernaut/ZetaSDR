@@ -722,3 +722,13 @@ fn a_graph_row_with_its_handler_found_records_its_pass() {
     assert!(checked["pocsag_voc"].is_u64(), "{text}");
     assert!(checked.get("pocsag_decode").is_none(), "{text}");
 }
+
+#[test]
+fn video_decode_check_passes_on_the_synth() {
+    let dir = tempfile::tempdir().unwrap();
+    let (out, _) = stdout(&mut check(dir.path(), &["video_decode"]));
+    assert!(
+        out.lines().any(|l| l.starts_with("video_decode: ok")),
+        "{out}"
+    );
+}

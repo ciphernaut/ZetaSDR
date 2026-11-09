@@ -352,15 +352,16 @@ mod tests {
     #[test]
     fn equal_scores_order_by_family_then_id() {
         let modes = registry();
-        // Nothing matches but rds's and m17's empty centre lists.
+        // Nothing matches but the empty centre lists of video, rds and m17.
         let got = ids(&score_rows(&modes, 1, 1, "noise", &|_| 0.0, &|_| 0.0));
         let order: Vec<&str> = got.iter().map(|g| g.0.as_str()).collect();
-        // rds and m17 at 0.4 (broadcast, then amateur_voice); then at 0 rs41 (priority 1),
+        // video, rds and m17 at 0.4 (tv, broadcast, then amateur_voice); then at 0 rs41 (priority 1),
         // then aviation (acars, adsb, hfdl, vdl2), maritime (ais), pagers (flex, pocsag),
         // weather_science (dfm, m20), amateur_digital.
         assert_eq!(
             order,
             [
+                "video_decode",
                 "rds_decode",
                 "m17_decode",
                 "rs41_decode",

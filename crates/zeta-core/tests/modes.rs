@@ -21,7 +21,7 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 13] = [
+const EMBEDDED: [&str; 14] = [
     "acars_decode",
     "adsb_decode",
     "ais_decode",
@@ -35,6 +35,7 @@ const EMBEDDED: [&str; 13] = [
     "rds_decode",
     "rs41_decode",
     "vdl2_decode",
+    "video_decode",
 ];
 
 fn cfg(dir: &Path, modes_dir: &Path) -> NodeConfig {
@@ -980,6 +981,8 @@ fn every_embedded_row_emits_events_today() {
         let want: &[StreamKind] = match m.row.id.0.as_str() {
             // M17's speech is ordinary job audio beside its events.
             "m17_decode" => &[StreamKind::Event, StreamKind::Audio],
+            // Video is its own stream kind, the fields and the lock events beside it.
+            "video_decode" => &[StreamKind::Video, StreamKind::Event],
             _ => &[StreamKind::Event],
         };
         assert_eq!(m.outputs, want, "{}", m.row.id.0);
@@ -1049,4 +1052,28 @@ fn outputs_of_a_graph_row_are_its_terminal_stages_kinds() {
     let m = reg.get("pocsag_voice").unwrap();
     assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
     assert_eq!(m.outputs, [StreamKind::Event, StreamKind::Audio]);
+}
+
+#[test]
+fn video_decode_is_embedded_and_validates() {
+    let reg = ModeRegistry::load(&stages(), None);
+    let m = reg
+        .all()
+        .iter()
+        .find(|m| m.row.id.0 == "video_decode")
+        .expect("video_decode is embedded");
+    assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
+    assert_eq!(format!("{:?}", m.row.family), "Tv");
+    assert_eq!(m.row.test.as_ref().unwrap().bandwidth_hz, Some(8_000_000));
+}
+
+#[test]
+fn a_row_test_without_bandwidth_hz_still_parses() {
+    let reg = ModeRegistry::load(&stages(), None);
+    let m = reg
+        .all()
+        .iter()
+        .find(|m| m.row.id.0 == "pocsag_decode")
+        .unwrap();
+    assert_eq!(m.row.test.as_ref().unwrap().bandwidth_hz, None);
 }

@@ -990,7 +990,7 @@ fn lock_fields(l: &Lock, dropped: u64) -> serde_json::Value {
         "lock": if l.locked { "locked" } else { "no lock" },
         "standard": l.standard,
         "locked": l.locked,
-        "line_hz": l.line_hz,
+        "line_hz": l.line_hz.round() as i64,
         "fields": l.fields,
         "snr_db": l.snr_db,
         "dropped": dropped,

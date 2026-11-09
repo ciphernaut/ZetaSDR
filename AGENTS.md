@@ -131,7 +131,7 @@ Set the source's overall receive gain live (`gain_db` in dB within `source list`
 
 ### job_start
 
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|rs41_decode|vdl2_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|rs41_decode|vdl2_decode|video_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
@@ -150,7 +150,7 @@ CLI: `zeta job start --kind passthrough --source <id> --center-hz 144800000 --ba
 
 Attach a job of an attachable `kind` (`transcribe`) to the running job `job`, a job whose kind emits audio: the voice demodulators and any mode row whose `outputs` lists `audio`. It reads that job's audio output stream (the last one in its graph order when it has several; audio passed between two of its stages does not count) instead of the radio, holds no lease, copies the job's `source` and `tuning`, and records it as its `input`. It follows its input through a `job_retune` or a `graph_put` restart: it is relaunched under its own id on the input's new stream once the input runs again (`failed` with the reason when it cannot be). It ends `stopped` when the input job stops or fails for its own reason. On a node restart it resumes after its input, or is `failed` with `input job <id> not running` when the input does not run.
 
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|rs41_decode|vdl2_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|rs41_decode|vdl2_decode|video_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - job: string; an id from `job list`
 - language: string or null
 
@@ -336,7 +336,7 @@ Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or o
 
 - plan: string; an id from `channel_plans`
 - channels: array or null; channel numbers of the plan (integers), `null` for all
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|rs41_decode|vdl2_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|rs41_decode|vdl2_decode|video_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - source: string; an id from `source list`
 - deviation_hz: integer or null (Hz)
 - sideband: string or null
@@ -919,6 +919,7 @@ The built-in decoder rows with notes (`modes_show` has every row in full; an ope
 - `m20_decode`: Meteomodem M20 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde. m20mod 1.8.1 (sonde-decoders) takes --json only: it has no --ecc or --crc (an unknown option is read as the input file, error: open).
 - `rs41_decode`: Vaisala RS41 radiosondes (GFSK, 4800 baud, one frame a second) anywhere in 400.05-406 MHz; the frequency varies by flight, so start the job on the measured centre, not a raster. One job decodes one sonde.
 - `vdl2_decode`: VDL Mode 2 (D8PSK, 10.5 kbaud) in 25 kHz channels at 136.725-136.975 MHz, decoded by dumpvdl2; every AVLC frame is an event keyed on its source address, and an ADS-C report riding an ACARS downlink carries the aircraft's position. A ground station gets its own row, whose ACARS columns name the aircraft of each uplink. Beside ACARS on one radio the order matters, because a running capture cannot widen: pin the radio at 133 500 000 Hz with 8 000 000 Hz first, then start the ACARS plan, then the VDL2 job (136 975 000 Hz, 25 000 Hz); started the other way round, VDL2 is a conflict naming the ACARS jobs. Neither dumpvdl2 nor dumphfdl is in Debian or Ubuntu: the OpenWebRX+ apt repository packages dumpvdl2, dumphfdl and libacars2, and both build from source in a few minutes (libacars first).
+- `video_decode`: Analog FM video (FPV, reverse cameras, analog HDMI senders): luma only; sync negative; a digital link (OFDM, no line structure) never locks and is reported as not yet decodable.
 
 ## Field craft
 
