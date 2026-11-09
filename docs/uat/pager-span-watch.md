@@ -150,8 +150,18 @@ $Z set start --set pagers_au --radio radio=sdr
 ```
 
 This starts one watch over 148.0-149.0 MHz (centre 148.500 MHz) with the policy described in the
-next step. The answer lists the watch under `started`. If it shows a `conflict`, something else
-already holds the radio: stop it, or ask us.
+next step. The answer lists the watch under `started`, with its job id, and `refused` is empty:
+
+```json
+{"result":"set_start","value":{"set":"pagers_au","radios":{"radio":{"source":"sdr","capture":{"center_hz":148500000,"bandwidth_hz":1024000}}},"started":[{"member":"watch","channel":null,"center_hz":148500000,"job":"01M6...","attached":null,"attach_error":null}],"existing":[],"refused":[],"warnings":[]}}
+```
+
+If it shows a `conflict`, something else already holds the radio: stop it, or ask us.
+
+From revision `79ff0826` on, `pagers_au` keeps its 148.500 MHz centre (on the developers' radio a
+steady spur sits exactly there, and the centre's DC mask hides it), and a narrow carrier that
+the detector reads at its 6 kHz width floor now fits POCSAG and gets a decoder. Before that
+revision such a carrier was skipped with `no listed mode fits 6 kHz`.
 
 ### 4b. Anywhere else: your own copy of the set
 
@@ -192,7 +202,9 @@ captures that much). Leave the `params` exactly as they are: they are the policy
 - `modes` lists the decoder the watch may start (POCSAG).
 - `persist_ms` 500 means a carrier must be seen for 0.5 s before it counts.
 - `width_hz` is the range of carrier widths, 6-25 kHz, that the watch considers at all. A carrier
-  whose measured width is 0.5x to 2x of POCSAG's 12.5 kHz channel gets a decoder.
+  whose measured width is 0.5x to 2x of POCSAG's 12.5 kHz channel gets a decoder. A carrier read
+  at the 6 kHz floor itself (up to about 6.6 kHz) fits from 0.4x, so it gets a decoder too: a
+  clean FSK pager often reads that narrow.
 - `hold_ms` 600000 keeps a decoder through up to 10 minutes of silence once its carrier is gone.
 - `cooldown_ms` 120000 rests a channel for 2 minutes after its decoder is dropped.
 - `confirm_ms` 180000 drops a decoder that decodes nothing in 3 minutes while its carrier is
@@ -205,8 +217,11 @@ If the set file is refused (`broken`), send us the `reason` line. Do not work ro
 
 ```bash
 W=$($Z job list | jq -r '.value[] | select(.kind=="watch" and .state.status=="running") | .id')
-echo "$W"
+echo "$W"            # one job id, such as 01M6ZKW9ZBJJ1CPEGZYQBNFFYY
 ```
+
+The same id is the `job` under `started` in the `set start` answer. If `echo` prints nothing,
+the watch is not running: look at `$Z job list | jq -r '.value[] | "\(.id) \(.kind) \(.state.status)"'`.
 
 On the page, the watch appears as an outline over your slice. Its decoders appear as smaller
 outlines on each carrier, folded under the watch's row in the jobs list.
@@ -217,27 +232,82 @@ Paste this block into terminal 2 once at the start (minute 0), then again at 10,
 and 60 minutes. The event counts are running totals since the start. None of these commands print
 message text or addresses.
 
+The event counts read the node's event log straight from its state directory, with
+`zeta events tail`. That command is local: it must run on the machine that runs the node, with
+the same `--state-dir` as `serve`, and it refuses to run while `ZETA_NODE` is set
+(`events tail reads the state directory: not supported with --node`). The function `L` below
+does both. Define it once in terminal 2:
+
+```bash
+L() { env -u ZETA_NODE "$Z" --state-dir "$HOME/zeta-uat" events tail --lines 1000000 "$@"; }
+```
+
+Then the snapshot block:
+
 ```bash
 date +%H:%M
-# The watch: decoders now, waiting, the cap, channels in cooldown
+# The watch: decoders now and waiting against the cap, channels in cooldown, carriers tracked
 $Z job context --job "$W" | jq -c '.value.watch | {cap, cooled: (.cooled | length), signals: (.signals | length)}'
-# POCSAG decoders running now (must never exceed 16)
+# POCSAG decoders running now (must never exceed 16; a decoder you started by hand counts too)
 $Z job list | jq '[.value[] | select(.kind=="pocsag_decode" and .state.status=="running")] | length'
-# Events so far. These read the node's log file directly, so ZETA_NODE is unset for them.
-L="env -u ZETA_NODE $Z --state-dir $HOME/zeta-uat events tail --lines 1000000"
-echo "watch events (state, via/why):"; $L --protocol watch  | jq -r '"\(.event.state) \(.event.via // "") \(.event.why // "")"' | sort | uniq -c
-echo "pages per channel (MHz, kind):"; $L --protocol pocsag | jq -r '"\(.center_hz / 1e6) \(.event.kind)"' | sort | uniq -c
-echo "access marker on pages:"; $L --protocol pocsag | jq -r '.event.access // "MISSING"' | sort | uniq -c
-echo "distinct addresses heard:"; $L --protocol pocsag | jq -r '.event.address' | sort -u | wc -l
+# Events so far
+echo "watch events (state, via/why):"; L --job "$W" --protocol watch | jq -r '"\(.event.state) \(.event.via // "") \(.event.why // "")"' | sort | uniq -c
+echo "pages per channel (MHz, kind):"; L --protocol pocsag | jq -r '"\(.center_hz / 1e3 | round / 1e3) \(.event.kind)"' | sort | uniq -c
+echo "access marker on pages:"; L --protocol pocsag | jq -r '.event.access // "MISSING"' | sort | uniq -c
+echo "distinct addresses heard:"; L --protocol pocsag | jq -r '.event.address' | sort -u | wc -l
 ```
+
+On a quiet band (no carrier seen yet) a snapshot reads:
+
+```text
+17:48
+{"cap":{"decoding":0,"max":16,"waiting":0},"cooled":0,"signals":0}
+0
+watch events (state, via/why):
+pages per channel (MHz, kind):
+access marker on pages:
+distinct addresses heard:
+0
+```
+
+On a busy band the lists fill in, for example (the numbers are made up):
+
+```text
+{"cap":{"decoding":3,"max":16,"waiting":0},"cooled":1,"signals":4}
+3
+watch events (state, via/why):
+      4 decoding modes
+      1 lost  gone and silent
+pages per channel (MHz, kind):
+     12 148.638 alpha
+      5 148.638 tone
+access marker on pages:
+     17 restricted
+distinct addresses heard:
+9
+```
+
+`cap.decoding` is the number of decoders the watch runs now, `cap.waiting` the carriers held back
+by the cap, `cooled` the channels resting after a drop and `signals` the carriers the watch is
+tracking. The watch and signal lines are kept to this watch with `--job "$W"`. The page lines
+come from the decoders, each a job of its own, so they are counted over the whole log: run the
+test in a fresh `--state-dir`, as step 1 does. A page line's `center_hz` is its decoder's
+channel, rounded here to the kHz.
 
 These two are also useful, at any time:
 
 ```bash
 # What the watch did, in time order (no message content: frequencies, widths, reasons)
-$L --protocol watch | jq -r '"\(.t_ns / 1e9 | floor | strflocaltime("%H:%M:%S")) \(.event.summary)"' | tail -30
+L --job "$W" --protocol watch | jq -r '"\(.t_ns / 1e9 | floor | strflocaltime("%H:%M:%S")) \(.event.summary)"' | tail -30
 # Carriers the detector saw appear, with the width it measured
-$L --protocol signal | jq -r 'select(.event.state=="new") | "\(.t_ns / 1e9 | floor | strflocaltime("%H:%M:%S")) new \(.event.center_hz / 1e6) MHz \(.event.bandwidth_hz / 1000) kHz"' | tail -30
+L --job "$W" --protocol signal | jq -r 'select(.event.state=="new") | "\(.t_ns / 1e9 | floor | strflocaltime("%H:%M:%S")) new \(.event.center_hz / 1e6) MHz \(.event.bandwidth_hz / 1000) kHz"' | tail -30
+```
+
+They print lines like these:
+
+```text
+16:43:38 decoding pocsag_decode at 148.6376 MHz on sdr (capture, modes)
+16:43:38 new 148.637612 MHz 6 kHz
 ```
 
 To time how fast a decoder starts, compare a carrier's first `new` line with the watch's
@@ -258,6 +328,15 @@ Look at the page now and then, without screenshotting message text:
 $Z set stop --set pagers_au        # or pagers_local
 $Z job list | jq '[.value[] | select((.kind=="pocsag_decode" or .kind=="watch") and .state.status=="running")] | length'   # must be 0
 ```
+
+`set stop` answers with the watch's id under `stopped` and nothing under `failed`:
+
+```json
+{"result":"set_stopped","value":{"set":"pagers_au","stopped":["01M6..."],"ended":[],"failed":[]}}
+```
+
+The watch stops its own decoders with it. A decoder you started by hand is not part of the set:
+stop it with `$Z job stop --job "$D"` first, or the count above stays at 1.
 
 Then Ctrl-C the node, close the page, and do the clean-up under
 [Privacy and the law](#privacy-and-the-law).
@@ -362,23 +441,32 @@ Log folder deleted after the test (rm -rf ~/zeta-uat): yes / no
   ignored. Move the centre: edit `center_hz` in your set file, restart the node and start the
   set again. (In AU, use a copy of `pagers_au` named `pagers_local`.)
 - A watch event `unknown at <MHz>: no listed mode fits <width> kHz` means the carrier was seen
-  but its measured width was outside 6.25-25 kHz. See the next two items.
+  but its measured width did not fit POCSAG. From revision `79ff0826` on, every width from the
+  6 kHz floor to 25 kHz fits, so this should only name widths over 25 kHz. If it names
+  `6 kHz` or anything else under 25 kHz, your build is older than that: report it with the build.
+  See the next two items.
 
 **A strong carrier is read too wide.** A strong pager can measure 19-25 kHz, and that still fits
 (the fit goes up to 2x of 12.5 kHz). Wider than 25 kHz is ignored or reported "no listed mode
 fits". Lower the gain a few dB. Report the widths you saw.
 
-**A clean pager reads as a narrow tone of about 3 kHz.** This is a known field risk. A clean FSK
-carrier can measure as one or two narrow tones rather than a 12.5 kHz block. That is under the
-6 kHz floor, so the watch skips it until a later burst measures wider. Report the frequency and
-the widths from the `signal` lines. To check that the channel decodes at all, start a decoder on
-it by hand (the watch leaves a hand-started decoder alone):
+**A clean pager reads narrow.** This is a known field risk. A clean FSK carrier can measure as
+one or two narrow tones rather than a 12.5 kHz block. The detector drops anything narrower than
+its 6 kHz floor, so such a carrier shows up in the `signal` lines at about 6 kHz. From revision
+`79ff0826` on, a carrier read at the floor fits POCSAG and gets a decoder (on older builds it was
+skipped with `no listed mode fits 6 kHz`). Report the frequency and the widths from the `signal`
+lines. If a carrier you can see paging never shows in the `signal` lines at all, or to check
+that a channel decodes at all, start a decoder on it by hand (the watch leaves a hand-started
+decoder alone). The answer is `{"result":"job","value":"<id>"}`, so keep the id:
 
 ```bash
-$Z job start --kind pocsag_decode --source sdr --center-hz <carrier Hz> --bandwidth-hz 12500
+D=$($Z job start --kind pocsag_decode --source sdr --center-hz <carrier Hz> --bandwidth-hz 12500 | jq -r .value)
+echo "$D"
 ```
 
-Stop it with `$Z job stop --job <id>` when you are done, and count its pages separately in your
+The carrier must lie inside the watch's slice: the watch holds the radio on it. Stop the decoder
+with `$Z job stop --job "$D"` (it answers `{"result":"ok"}`) when you are done. Its pages land in
+the same `pocsag` counts as the watch's decoders, so note its channel and subtract them in your
 report.
 
 **A decoder keeps starting on a line that never pages, then is dropped `unproven`.** That is a
