@@ -10,6 +10,9 @@ use std::time::Duration;
 
 use num_complex::Complex;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::job::JobState;
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
@@ -17,9 +20,11 @@ use zeta_core::modes::score::score_rows;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::port::{IqReceiver, Port, PortError, Tuning};
-use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::stream::Payload;
-use zeta_core::types::{Capabilities, Hz, JobId, SourceId, StreamKind, Timestamp};
+use zeta_core::stage::{
+    Backend, PassthroughStage, Stage, StageContext, StageError, StageRegistry, StageSpec,
+};
+use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::types::{Capabilities, Hz, JobId, SourceId, StreamId, StreamKind, Timestamp};
 use zeta_source_file::{FileOpts, FileSource};
 
 const RATE_HZ: u32 = 2_048_000;
@@ -34,6 +39,14 @@ const TONE_HZ: u64 = APRS_HZ + 1_000;
 const NARROW_RATE_HZ: u32 = 48_000;
 /// The narrow fixture's tone, above its centre.
 const NARROW_TONE_HZ: u64 = 2_000;
+/// A radiosonde frequency in 400.05-406 MHz, where an operator's sonde watch runs.
+const SONDE_HZ: u64 = 403_025_000;
+/// The rows that live elsewhere (pagers above 151.8 MHz, AIS at 162 MHz, APRS at 144.39-145.175 MHz):
+/// identify never tries them on the sonde band.
+const NOT_ON_THE_SONDE_BAND: [&str; 3] = ["flex_decode", "ais_decode", "aprs_decode"];
+
+/// Whether the `external_decode` stand-in answers for `rs41_decode` with a sonde frame.
+static PROVE_RS41: AtomicBool = AtomicBool::new(false);
 
 /// Each node runs a 2.048 MHz source in real time: the tests run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -41,7 +54,8 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// The fixtures, written once: the POCSAG page centred on [`APRS_HZ`] and on
 /// [`POCSAG_HZ`], one second of a 1 kHz tone on [`APRS_HZ`], and one second of random
 /// 2400-baud GFSK (no row proves it) on [`APRS_HZ`], and one second sampled at
-/// [`NARROW_RATE_HZ`] on [`APRS_HZ`] holding a tone [`NARROW_TONE_HZ`] above it.
+/// [`NARROW_RATE_HZ`] on [`APRS_HZ`] holding a tone [`NARROW_TONE_HZ`] above it, and one
+/// second of RS41-like 4800-baud GFSK (the same random symbols) on [`SONDE_HZ`].
 struct Fixtures {
     _dir: tempfile::TempDir,
     pocsag_on_aprs: PathBuf,
@@ -49,6 +63,7 @@ struct Fixtures {
     tone: PathBuf,
     gfsk: PathBuf,
     narrow: PathBuf,
+    sonde: PathBuf,
 }
 
 fn fixtures() -> &'static Fixtures {
@@ -78,6 +93,10 @@ fn fixtures() -> &'static Fixtures {
         let mut gfsk = zeta_dsp::synth::gfsk_modulate(&symbols, 2, 2400, 3_000.0, RATE_HZ);
         zeta_dsp::synth::awgn(&mut gfsk, 20.0, 1);
         let gfsk = write(dir.path(), "gfsk", &gfsk, RATE_HZ, APRS_HZ);
+        // RS41-like: 4800-baud GFSK, ±2.4 kHz, on the sonde band.
+        let mut sonde = zeta_dsp::synth::gfsk_modulate(&symbols, 2, 4800, 2_400.0, RATE_HZ);
+        zeta_dsp::synth::awgn(&mut sonde, 20.0, 3);
+        let sonde = write(dir.path(), "sonde", &sonde, RATE_HZ, SONDE_HZ);
         let n = NARROW_RATE_HZ as usize;
         let mut narrow: Vec<Complex<f32>> = (0..n)
             .map(|k| {
@@ -94,6 +113,7 @@ fn fixtures() -> &'static Fixtures {
             tone,
             gfsk,
             narrow,
+            sonde,
         }
     })
 }
@@ -113,7 +133,58 @@ fn registry() -> StageRegistry {
     let mut r = StageRegistry::new();
     r.register(Arc::new(PassthroughStage::new()));
     zeta_dsp::register_all(&mut r);
+    // Stands in for the program rows' stage (zeta-ext's), so they start as trials.
+    r.register(Arc::new(ExternalStandIn(StageSpec {
+        kind: "external_decode",
+        inputs: vec![StreamKind::Iq, StreamKind::Audio],
+        outputs: vec![StreamKind::Event],
+        params_schema: schemars::json_schema!({"type": "object"}),
+    })));
     r
+}
+
+/// Stands in for `external_decode`: it drains its input, and for `rs41_decode` while
+/// [`PROVE_RS41`] is set publishes a sonde frame per input frame.
+struct ExternalStandIn(StageSpec);
+
+#[async_trait]
+impl Stage for ExternalStandIn {
+    fn spec(&self) -> &StageSpec {
+        &self.0
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        params: Value,
+        mut inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        let prove = params["mode"] == "rs41_decode" && PROVE_RS41.load(Ordering::SeqCst);
+        let Some(rx) = inputs.first_mut() else {
+            return Err(StageError::Failed("expected 1 input".into()));
+        };
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                r = rx.recv() => match r {
+                    Ok(frame) => {
+                        if prove && let Some(out) = outputs.first() {
+                            let ev = serde_json::json!({"protocol": "rs41", "frame": 1, "id": "S1234567"});
+                            let f = Frame::new(out.clone(), frame.provenance.clone(), Payload::Event(ev));
+                            bus.publish(f);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
+            }
+        }
+    }
 }
 
 /// A node over a looping, real-time file source `rx` on `meta`, with the node's
@@ -142,6 +213,7 @@ async fn node_unstarted(
 ) -> (Node, Arc<FileSource>) {
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 4.0,
@@ -348,16 +420,17 @@ async fn identify_on_pocsag_ends_with_a_verdict_and_one_running_child() {
     assert_eq!(aprs["outcome"], "no_frame", "{aprs}");
     assert_eq!(pocsag["outcome"], "proved", "{pocsag}");
     // The attempts (those with a child job) in score order: APRS scores over POCSAG here,
-    // M17 (its empty centre list scores anywhere) ties APRS and goes after it, and AIS
-    // (an `fm` row too, family maritime) ties POCSAG and goes before it.
+    // M17 (its empty centre list scores anywhere) ties APRS and goes after it; AIS lives
+    // on its two channels at 162 MHz, so it is skipped here, never tried.
     let tried: Vec<&Value> = events.iter().filter(|e| !e["job"].is_null()).collect();
-    assert_eq!(tried.len(), 4, "{events:#?}");
+    assert_eq!(tried.len(), 3, "{events:#?}");
     assert_eq!(tried[0]["mode"], "aprs_decode");
     assert_eq!(tried[1]["mode"], "m17_decode");
     assert_eq!(tried[1]["outcome"], "no_frame");
-    assert_eq!(tried[2]["mode"], "ais_decode");
-    assert_eq!(tried[2]["outcome"], "no_frame");
-    assert!(tried[0]["score"].as_f64() >= tried[3]["score"].as_f64());
+    assert_eq!(tried[2]["mode"], "pocsag_decode");
+    assert!(tried[0]["score"].as_f64() >= tried[2]["score"].as_f64());
+    let ais = outcome(&events, "ais_decode").expect("ais_decode listed");
+    assert_eq!(ais["outcome"], "skipped_band", "{ais}");
     assert!(
         pocsag["evidence"]
             .as_str()
@@ -371,7 +444,7 @@ async fn identify_on_pocsag_ends_with_a_verdict_and_one_running_child() {
     assert_eq!(verdict["mode"], "pocsag_decode", "{ctx}");
     assert_eq!(verdict["label"], "POCSAG", "{ctx}");
     assert_eq!(verdict["job"], pocsag["job"], "{ctx}");
-    assert_eq!(ctx["identify"]["attempts"], 4, "{ctx}");
+    assert_eq!(ctx["identify"]["attempts"], 3, "{ctx}");
     let child = verdict["job"].as_str().unwrap().to_string();
     assert_eq!(running(&node), [(child.clone(), "pocsag_decode".into())]);
     let holders: Vec<String> = node
@@ -393,14 +466,9 @@ async fn identify_on_a_tone_ends_unknown_with_a_label() {
     eprintln!("{events:#?}");
     let tried: Vec<&Value> = events.iter().filter(|e| !e["job"].is_null()).collect();
     let modes: Vec<&str> = tried.iter().map(|e| e["mode"].as_str().unwrap()).collect();
-    assert_eq!(modes.len(), 5, "{events:#?}");
-    for m in [
-        "aprs_decode",
-        "m17_decode",
-        "pocsag_decode",
-        "acars_decode",
-        "ais_decode",
-    ] {
+    // AIS (162 MHz only) is not tried at 144.8 MHz.
+    assert_eq!(modes.len(), 4, "{events:#?}");
+    for m in ["aprs_decode", "m17_decode", "pocsag_decode", "acars_decode"] {
         assert!(modes.contains(&m), "{m} not tried: {events:#?}");
     }
     for e in &tried {
@@ -412,7 +480,7 @@ async fn identify_on_a_tone_ends_unknown_with_a_label() {
     let label = verdict["label"].as_str().unwrap();
     assert!(label == "carrier" || label == "fm", "{ctx}");
     assert!(verdict["features"]["bandwidth_hz"].is_u64(), "{ctx}");
-    assert_eq!(ctx["identify"]["attempts"], 5, "{ctx}");
+    assert_eq!(ctx["identify"]["attempts"], 4, "{ctx}");
     assert!(running(&node).is_empty(), "{:?}", running(&node));
     assert!(node.lease_holders(&rx()).is_empty());
 }
@@ -1045,4 +1113,66 @@ async fn identify_reports_a_learned_signal_in_its_unknown_verdict() {
     let after = node.signatures().get(&sig.id).unwrap();
     assert!(after.matches >= 1, "{after:?}");
     assert!(running(&node).is_empty(), "{:?}", running(&node));
+}
+
+/// An unproven sonde-like signal at 403 MHz (an operator's sonde watch's band): identify
+/// tries the sonde rows and the rows found anywhere, but never starts FLEX (pagers on
+/// 151.8-153.4 MHz), AIS (162 MHz) or APRS (144.39-145.175 MHz); each is skipped as out of its range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identify_on_the_sonde_band_never_tries_the_pager_ais_or_aprs_rows() {
+    let _one = SERIAL.lock().await;
+    PROVE_RS41.store(false, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let node = Arc::new(node_over(dir.path(), &fixtures().sonde).await);
+    let (id, events) = identify(&node, SONDE_HZ).await;
+    // Every kind the run starts as a child, sampled while it runs.
+    let seen = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+    let sampler = {
+        let (node, seen) = (node.clone(), seen.clone());
+        tokio::spawn(async move {
+            loop {
+                for (_, kind) in running(&node) {
+                    seen.lock().unwrap().insert(kind);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+    let events = ended(&node, &id, events, Duration::from_secs(150)).await;
+    sampler.abort();
+    let seen = seen.lock().unwrap().clone();
+    for m in NOT_ON_THE_SONDE_BAND {
+        assert!(!seen.contains(m), "{m} ran on the sonde band: {seen:?}");
+        if let Some(e) = outcome(&events, m) {
+            assert_eq!(e["outcome"], "skipped_band", "{e}");
+            assert!(e["job"].is_null(), "{e}");
+            let evidence = e["evidence"].as_str().unwrap_or_default();
+            assert!(evidence.contains("outside the row's range"), "{e}");
+        }
+    }
+    // The sonde rows are tried there.
+    for m in ["rs41_decode", "m20_decode", "dfm_decode"] {
+        let e = outcome(&events, m).unwrap_or_else(|| panic!("{m}: {events:#?}"));
+        assert_eq!(e["outcome"], "no_frame", "{e}");
+    }
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+}
+
+/// The same band with the RS41 row answering: it is tried first and proves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identify_on_the_sonde_band_proves_the_rs41_row() {
+    let _one = SERIAL.lock().await;
+    PROVE_RS41.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &fixtures().sonde).await;
+    let (id, events) = identify(&node, SONDE_HZ).await;
+    let events = ended(&node, &id, events, Duration::from_secs(30)).await;
+    PROVE_RS41.store(false, Ordering::SeqCst);
+    let tried: Vec<&Value> = events.iter().filter(|e| !e["job"].is_null()).collect();
+    assert_eq!(tried.len(), 1, "{events:#?}");
+    assert_eq!(tried[0]["mode"], "rs41_decode");
+    assert_eq!(tried[0]["outcome"], "proved");
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(ctx["identify"]["verdict"]["mode"], "rs41_decode", "{ctx}");
+    stop_all(&node).await;
 }

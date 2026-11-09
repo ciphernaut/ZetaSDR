@@ -1071,20 +1071,24 @@ fn scan_kind_is_accepted_and_lists_as_running() {
     assert_eq!(listed(dir.path())["state"]["status"], "stopped");
 }
 
-/// `identify` on the tone: `rs41_decode`, out of its range, is `skipped_band` at once,
-/// then the first row tried (`ais_decode`) is `no_frame` after its dwell; the job is
-/// still trying the next when the tail ends, so it is stopped (and its child with it).
+/// The dwell of the POCSAG copy the identify tail test runs, well inside the tail's cap.
+const POCSAG_TAIL_DWELL_MS: u64 = 2_000;
+
+/// `identify` on the tone: `m17_decode` is `unavailable` (c2dec pinned missing), the rows
+/// out of their range (`rs41_decode`, `ais_decode`, `flex_decode`) are `skipped_band` at
+/// once, then the first row tried (`pocsag_decode`) is `no_frame` after its dwell; the
+/// job is still trying the next when the tail ends, so it is stopped (and its child with
+/// it).
 #[test]
 fn job_start_identify_then_tail_prints_candidates() {
     let dir = tempfile::tempdir().unwrap();
-    // `ais_decode` (an `fm` row like POCSAG and APRS, family maritime) is tried first on
-    // the tone and dwells 10 s, longer than a tail may wait: an operator copy dwells 5 s.
+    // POCSAG dwells 5 s; an operator copy dwells 2 s, well inside the tail's 10 s.
     let modes = dir.path().join("modes");
     std::fs::create_dir_all(&modes).unwrap();
-    let mut ais: Value =
-        serde_json::from_str(include_str!("../../../modes/ais_decode.json")).unwrap();
-    ais["identify"]["dwell_ms"] = 5000.into();
-    std::fs::write(modes.join("ais_decode.json"), ais.to_string()).unwrap();
+    let mut pocsag: Value =
+        serde_json::from_str(include_str!("../../../modes/pocsag_decode.json")).unwrap();
+    pocsag["identify"]["dwell_ms"] = POCSAG_TAIL_DWELL_MS.into();
+    std::fs::write(modes.join("pocsag_decode.json"), pocsag.to_string()).unwrap();
     let modes_dir = modes.display().to_string();
     let out = zeta(
         dir.path(),
@@ -1101,9 +1105,10 @@ fn job_start_identify_then_tail_prints_candidates() {
             "100000000",
             "--bandwidth-hz",
             "12500",
-            // `stream_tail` waits at most 10 000 ms: one second's measure and a 5 s dwell.
+            // `stream_tail` waits at most 10 000 ms: one second's measure and the POCSAG
+            // copy's 2 s dwell, the first row tried (AIS and APRS live elsewhere: skipped).
             "--then-tail",
-            "4,10000",
+            "6,10000",
         ],
     )
     .assert()
@@ -1118,8 +1123,9 @@ fn job_start_identify_then_tail_prints_candidates() {
         .iter()
         .partition(|f| f["payload"]["protocol"] == "origin");
     assert_eq!(origin.len(), 1, "{v}");
-    // The tried one, a sonde row out of range, and the FLEX row (unavailable: multimon-ng is pinned missing).
-    assert_eq!(frames.len(), 3, "{v}");
+    // M17 (unavailable: c2dec is pinned missing), the rows out of range (a sonde row,
+    // AIS, FLEX) and the tried one (POCSAG).
+    assert_eq!(frames.len(), 5, "{v}");
     for f in &frames {
         let p = &f["payload"];
         assert_eq!(p["protocol"], "candidate", "{v}");
@@ -3047,6 +3053,156 @@ fn themes_list_prints_the_builtins() {
     let ids: Vec<&str> = rows.iter().filter_map(|t| t["id"].as_str()).collect();
     assert!(ids.contains(&"console") && ids.contains(&"plain"), "{v}");
     assert!(rows.iter().all(|t| t["state"] == "ready"), "{v}");
+}
+
+/// `zeta sets` prints the two built-in sets, ready, with no running instance.
+#[test]
+fn zeta_sets_prints_the_two_builtin_sets() {
+    let dir = tempfile::tempdir().unwrap();
+    let sets = dir.path().join("sets");
+    std::fs::create_dir_all(&sets).unwrap();
+    let sets_dir = sets.display().to_string();
+    let out = zeta(dir.path(), &["--sets-dir", &sets_dir, "sets"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "sets", "{v}");
+    let rows = v["value"].as_array().expect("sets array");
+    let ids: Vec<&str> = rows.iter().filter_map(|s| s["id"].as_str()).collect();
+    assert_eq!(ids, ["airband", "pagers_au"], "{v}");
+    assert!(rows.iter().all(|s| s["state"] == "ready"), "{v}");
+    assert!(rows.iter().all(|s| s["running"].is_null()), "{v}");
+}
+
+/// `zeta set stop` of a set that does not run stops nothing; `zeta set start` of an
+/// unknown set names the known ones and of an unmapped role names it.
+#[test]
+fn zeta_set_start_and_stop_answer_as_the_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(dir.path(), &["set", "stop", "--set", "airband"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["result"], "set_stopped", "{v}");
+    assert_eq!(v["value"]["stopped"], serde_json::json!([]), "{v}");
+    assert_eq!(v["value"]["ended"], serde_json::json!([]), "{v}");
+    zeta(
+        dir.path(),
+        &["set", "start", "--set", "nope", "--radio", "wide=tone"],
+    )
+    .assert()
+    .failure()
+    .stdout(contains("airband").and(contains("pagers_au")));
+    zeta(
+        dir.path(),
+        &["set", "start", "--set", "airband", "--radio", "wide=tone"],
+    )
+    .assert()
+    .failure()
+    .stdout(contains("radios.second: unmapped"));
+}
+
+/// `zeta set start --set X` without `--radio` reads `set_list` and sends every role of
+/// the set as `null`, so the node picks: airband's roles are sent, and the answer names
+/// the first role the node cannot fill (the tone file covers no airband band), not
+/// `unmapped`.
+#[test]
+fn zeta_set_start_without_radio_sends_every_role_as_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(dir.path(), &["set", "start", "--set", "airband"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "other", "{v}");
+    let m = v["message"].as_str().unwrap();
+    assert!(m.starts_with("radios.wide: no free source covers"), "{v}");
+    let op = last_logged_op(dir.path());
+    assert_eq!(
+        op["radios"],
+        serde_json::json!({"wide": null, "second": null}),
+        "{op}"
+    );
+    // An unknown set is still the op's own answer.
+    zeta(dir.path(), &["set", "start", "--set", "nope"])
+        .assert()
+        .code(2)
+        .stdout(contains("airband").and(contains("pagers_au")));
+}
+
+/// A role the node cannot fill on a source that covers its band is a structured
+/// `conflict`: here a source pinned beside the role's band, with the pin's way out.
+#[test]
+fn zeta_set_start_pick_failure_is_a_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = write_tone(dir.path());
+    let flag = format!(
+        "retune={},tune_min_hz=50000000,tune_max_hz=150000000",
+        meta.display()
+    );
+    let sets = dir.path().join("sets");
+    std::fs::create_dir_all(&sets).unwrap();
+    std::fs::write(
+        sets.join("one.json"),
+        r#"{"id": "one", "name": "one", "notes": "", "radios": {"r": {"note": "any"}},
+            "members": [{"id": "m", "radio": "r", "op": "job_start", "kind": "measure",
+              "center_hz": 100000000, "bandwidth_hz": 20000, "deviation_hz": null,
+              "sideband": null}]}"#,
+    )
+    .unwrap();
+    let sets_dir = sets.display().to_string();
+    let run = |args: &[&str]| {
+        let mut cmd = zeta_bin();
+        cmd.arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .arg("--source-file")
+            .arg(&flag)
+            .arg("--sets-dir")
+            .arg(&sets_dir)
+            .arg("--json")
+            .args(args);
+        cmd
+    };
+    run(&[
+        "source",
+        "pin",
+        "--source",
+        "retune",
+        "--center-hz",
+        "120000000",
+        "--bandwidth-hz",
+        "12500",
+    ])
+    .assert()
+    .success();
+    let out = run(&["set", "start", "--set", "one"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "conflict", "{v}");
+    assert_eq!(v["source"], "retune", "{v}");
+    assert_eq!(v["holders"], serde_json::json!([]), "{v}");
+    let options = v["options"].as_array().unwrap();
+    let first = options[0].as_str().unwrap();
+    assert!(
+        first.starts_with("radios.r: no free source covers 100000000 Hz ± 10000 Hz"),
+        "{v}"
+    );
+    assert!(
+        options.contains(&serde_json::json!("unpin source retune (source_unpin)")),
+        "{v}"
+    );
 }
 
 /// A theme folder that does not validate is logged at startup and listed as broken; the

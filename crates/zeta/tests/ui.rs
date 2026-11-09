@@ -12,7 +12,7 @@
 //! 20 MHz, which `measure` labels `noise`; see [`quiet_fixture`]), `fsk` (framed 2-FSK at
 //! 433.92 MHz, the Bits pane's; see [`fsk_fixture`]), and `--modes-dir` holding the
 //! `fake_pos` program row (zeta-ext's `fake_lines`, printing two fixes of one sonde 2 s into a
-//! job; see [`fake_pos_row`]); the node's state directory is passed to ui.py in
+//! job; see [`fake_pos_row`]) and `--sets-dir` holding [`fake_sets`]' `two_sources`; the node's state directory is passed to ui.py in
 //! `ZETA_UI_STATE_DIR`. That node's station is the demo station ([`DEMO_STATION`],
 //! `station_set` once it is up), and its `--knowledge-acma` is zeta-ext's register stub
 //! (`testing::acma_stub`) on 127.0.0.1 answering [`fake_register_rows`] (the tone's band
@@ -743,6 +743,36 @@ fn fake_themes(dir: &Path) -> PathBuf {
     themes
 }
 
+/// A sets directory under `dir` holding `two_sources` (plan 31 spec 7.3): role `a` runs a
+/// `measure` at the tone recording's centre, 20 kHz wide, and role `b` a `plan_start` of
+/// `uhf_cb_au` channel 20 (`fm_demod`, 2500 Hz deviation), the `cb` fixture's channel; its
+/// path.
+fn fake_sets(dir: &Path) -> PathBuf {
+    use serde_json::json;
+    let sets = dir.join("sets");
+    std::fs::create_dir_all(&sets).expect("create sets dir");
+    let set = json!({
+        "id": "two_sources",
+        "name": "Two sources (UI tests)",
+        "notes": "A measure on one radio and CB channel 20 on another.",
+        "radios": {
+            "a": {"note": "a radio holding the tone recording's centre"},
+            "b": {"note": "a radio holding UHF CB channel 20"}
+        },
+        "members": [
+            {"id": "m", "radio": "a", "op": "job_start", "kind": "measure",
+             "center_hz": TONE_HZ, "bandwidth_hz": 20_000, "deviation_hz": null,
+             "sideband": null},
+            {"id": "cb20", "radio": "b", "op": "plan_start", "plan": "uhf_cb_au",
+             "channels": [20], "kind": "fm_demod", "deviation_hz": 2500, "sideband": null,
+             "attach": null, "language": null}
+        ]
+    });
+    let text = serde_json::to_string_pretty(&set).unwrap();
+    std::fs::write(sets.join("two_sources.json"), text).expect("write two_sources.json");
+    sets
+}
+
 /// The fake model's scripts, in `zeta-fake-llm --scripts` form, keyed by a substring of the
 /// request: a refused stop, a refused capture delete, a fan-out through `plan_start`, a
 /// page-only `view_set`, and a turn with reasoning and content.
@@ -889,6 +919,8 @@ impl Nodes {
         let modes = modes.to_str().expect("modes path is UTF-8");
         let themes = fake_themes(dir.path());
         let themes = themes.to_str().expect("themes path is UTF-8");
+        let sets = fake_sets(dir.path());
+        let sets = sets.to_str().expect("sets path is UTF-8");
         let fake_lines = repo_root().join("crates/zeta-ext/tests/fake_lines");
         let fake_lines = fake_lines.to_str().expect("fake_lines path is UTF-8");
         // adsb_decode's program pinned to the test stand-in, so the mode is ready whether or
@@ -906,6 +938,8 @@ impl Nodes {
                 modes,
                 "--themes-dir",
                 themes,
+                "--sets-dir",
+                sets,
                 "--source-file",
                 &aprs,
                 "--source-file",

@@ -2,7 +2,7 @@
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
-use zeta_agent::agent::{Allow, GATED_REPLACE_OPS, gate};
+use zeta_agent::agent::{Allow, GATED_REPLACE_OPS, OwnJobs, gate};
 use zeta_agent::fake::{
     FakeLlm, RecordingExecutor, text_response, tool_call_response, tool_call_response_with,
 };
@@ -55,6 +55,7 @@ async fn tone_node(dir: &std::path::Path) -> Arc<Node> {
     registry.register(Arc::new(PassthroughStage::new()));
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 10.0,
@@ -440,6 +441,88 @@ fn gate_covers_every_replace_taking_op() {
         )
         .is_none()
     );
+}
+
+#[test]
+fn set_start_with_a_replace_needs_replace_allowed() {
+    let op = |replace: Value| json!({"op": "set_start", "set": "airband", "radios": {}, "members": null, "replace": replace});
+    let refused = gate(&op(json!(["01X"])), Allow::default()).expect("refused");
+    assert_eq!(refused["error"], "not_allowed");
+    assert_eq!(refused["field"], "replace");
+    let allowed = Allow {
+        replace: true,
+        ..Allow::default()
+    };
+    assert!(gate(&op(json!(["01X"])), allowed).is_none());
+    assert!(gate(&op(json!([])), Allow::default()).is_none());
+}
+
+#[test]
+fn set_stop_needs_stops_allowed_unless_the_run_started_the_set() {
+    let stop = json!({"op": "set_stop", "set": "airband"});
+    assert_eq!(
+        gate(&stop, Allow::default()).expect("refused")["error"],
+        "not_allowed"
+    );
+    let allowed = Allow {
+        stop_jobs: true,
+        ..Allow::default()
+    };
+    assert!(gate(&stop, allowed).is_none());
+
+    let mut own = OwnJobs::default();
+    assert!(!own.allows_stop(&stop));
+    own.record(
+        "set_start",
+        &json!({"set": "airband"}),
+        &json!({"result": "set_start", "value": {"set": "airband", "started": [
+            {"job": "01A", "attached": null},
+            {"job": "01B", "attached": "01C"}
+        ], "existing": []}}),
+    );
+    assert!(own.allows_stop(&stop));
+    assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01A"})));
+    assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01C"})));
+    assert!(!own.allows_stop(&json!({"op": "job_stop", "job": "01OLD"})));
+    assert!(!own.allows_stop(&json!({"op": "set_stop", "set": "pagers_au"})));
+}
+
+#[test]
+fn a_set_with_existing_members_is_not_the_runs_to_stop() {
+    let stop = json!({"op": "set_stop", "set": "airband"});
+    let mut own = OwnJobs::default();
+    own.record(
+        "set_start",
+        &json!({"set": "airband"}),
+        &json!({"result": "set_start", "value": {"set": "airband",
+            "started": [{"job": "01A", "attached": null}],
+            "existing": [{"job": "01OLD"}]}}),
+    );
+    assert!(!own.allows_stop(&stop));
+    assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01A"})));
+    assert!(!own.allows_stop(&json!({"op": "job_stop", "job": "01OLD"})));
+}
+
+#[test]
+fn a_narrowed_set_start_is_not_the_runs_set_to_stop() {
+    // `members` narrows the call: the operator's instance may run the other members,
+    // and the `existing` answer only covers the members named.
+    let stop = json!({"op": "set_stop", "set": "airband"});
+    let mut own = OwnJobs::default();
+    own.record(
+        "set_start",
+        &json!({"set": "airband", "members": ["vdl2"]}),
+        &json!({"result": "set_start", "value": {"set": "airband",
+            "started": [{"job": "01V", "attached": null}],
+            "existing": []}}),
+    );
+    assert!(!own.allows_stop(&stop));
+    assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01V"})));
+}
+
+#[test]
+fn set_list_passes_the_gate() {
+    assert!(gate(&json!({"op": "set_list"}), Allow::default()).is_none());
 }
 
 #[tokio::test]

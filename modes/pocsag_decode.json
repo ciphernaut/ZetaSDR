@@ -54,6 +54,17 @@
   },
   "catalogue": ["pocsag", "pocsag-2", "pager-pocsag-1200"],
   "access": "restricted",
+  "subject": {
+    "key": "address",
+    "name": "addresses",
+    "waterfall": "summary",
+    "columns": [
+      { "field": "kind", "label": "Kind", "unit": null },
+      { "field": "text", "label": "Text", "unit": null }
+    ],
+    "heading": null,
+    "label": null
+  },
   "test": {
     "kind": "synth",
     "family": "pocsag",

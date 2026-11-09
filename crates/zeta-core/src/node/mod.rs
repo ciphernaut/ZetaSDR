@@ -35,7 +35,7 @@ use crate::classify::{Classifier, ClassifierSet};
 use crate::graph::{self, Graph, GraphError};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
-use crate::lease::{LeaseError, LeaseManager};
+use crate::lease::{Decision, LeaseError, LeaseManager};
 use crate::modes::{MODES_CHECKED_FILE, ModeRegistry, ModesHandle};
 use crate::ops::{
     FM_DEVIATION_DEFAULT_HZ, JobKind, Op, OpError, OpResult, Sideband, WFM_DEVIATION_DEFAULT_HZ,
@@ -53,7 +53,10 @@ pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
 
 pub(crate) use launch::AfterGate;
 use launch::{feed_bank, feed_ring};
-use persist::{io, load, now, persist};
+pub(crate) use persist::now;
+use persist::{
+    SET_INSTANCES_DIR, io, load, load_instances, persist, persist_instance, remove_instance,
+};
 pub use sources::{GainSetting, SOURCE_RECORD_FORMAT, SourceRecord, load_source};
 use sources::{load_sources, persist_source};
 
@@ -102,6 +105,11 @@ pub struct NodeConfig {
     /// resolves the default, [`crate::modes::default_operator_dir`]). A missing
     /// directory reads as empty.
     pub modes_dir: Option<PathBuf>,
+    /// The operator's named sets (`--sets-dir`), read after the embedded ones at `open`
+    /// and validated against the mode rows; `None` is no operator directory: only the
+    /// embedded sets (the CLI resolves the default, [`crate::sets::default_operator_dir`]).
+    /// A missing directory reads as empty.
+    pub sets_dir: Option<PathBuf>,
     /// What the burst store (`state_dir/bursts`) keeps; `BurstPolicy::default()` is
     /// 256 MiB and 7 days.
     pub burst_policy: crate::bursts::BurstPolicy,
@@ -305,6 +313,17 @@ struct Inner {
     modes_dir: Option<PathBuf>,
     /// Held across [`Node::reload_modes`] (no await inside).
     reloading: Mutex<()>,
+    /// The named sets, loaded at `open` from `NodeConfig.sets_dir` over the embedded ones.
+    sets: Arc<crate::sets::SetRegistry>,
+    /// `state_dir/set-instances` ([`SET_INSTANCES_DIR`]): one [`crate::sets::SetInstance`]
+    /// file per running set, apart from an operator `--sets-dir` of set files.
+    instances_dir: PathBuf,
+    /// The running sets' instances by set id, read back at `open` and written through by
+    /// `set_start` and `set_stop`.
+    set_instances: Mutex<BTreeMap<String, crate::sets::SetInstance>>,
+    /// Held across `set_start` and `set_stop`, so two of them never update one instance
+    /// at once. Taken before any source's gate, and no other operation takes it.
+    set_gate: tokio::sync::Mutex<()>,
     /// The page themes: the built-in ones until the caller sets its own with `set_themes`.
     themes: RwLock<Arc<crate::themes::ThemeRegistry>>,
     /// The `capture` jobs' windows, opened (and expired) at `open`.
@@ -802,6 +821,11 @@ fn resume_capture(
     elastic.into_iter().find(|t| contains(t))
 }
 
+/// Whether a job in `state` has ended: stopped or failed.
+pub(crate) fn job_ended(state: &JobState) -> bool {
+    matches!(state, JobState::Stopped | JobState::Failed { .. })
+}
+
 /// A job's failure caused by its source's port, `source <id>: <error>`: the reason every
 /// fault-caused failure carries (a stage that saw the fault, a launch whose tune the port
 /// refused), so the node's recovery of the source can find the jobs it should relaunch.
@@ -934,6 +958,16 @@ impl Node {
                 cfg.modes_dir.as_deref(),
             )));
         }
+        let sets = Arc::new(crate::sets::SetRegistry::load(
+            &modes.get().unwrap_or_default(),
+            &registry,
+            cfg.sets_dir.as_deref(),
+        ));
+        // The running sets' instances: an unreadable file is a persist error, never a
+        // failure to open.
+        let instances_dir = cfg.state_dir.join(SET_INSTANCES_DIR);
+        let (instances, instance_errors) = load_instances(&instances_dir);
+        let set_instances = instances.into_iter().map(|i| (i.set.clone(), i)).collect();
         let bus = Arc::new(StreamBus::new(BUS_CAPACITY));
         // Registered before jobs resume; their internal applies bypass
         // `Node::apply` and are never logged.
@@ -961,6 +995,10 @@ impl Node {
                 modes,
                 modes_dir: cfg.modes_dir.clone(),
                 reloading: Mutex::new(()),
+                sets,
+                instances_dir,
+                set_instances: Mutex::new(set_instances),
+                set_gate: tokio::sync::Mutex::new(()),
                 themes: RwLock::new(Arc::new(crate::themes::ThemeRegistry::load(None))),
                 bursts,
                 signatures,
@@ -975,7 +1013,7 @@ impl Node {
                 jobs: Mutex::new(HashMap::new()),
                 knowledge: RwLock::new(vec![learned_knowledge]),
                 classifiers: RwLock::new(classifiers),
-                persist_errors: Mutex::new(Vec::new()),
+                persist_errors: Mutex::new(instance_errors),
                 ops_log: jsonlog::JsonLog::new(cfg.state_dir.join("ops.log")),
                 transcripts_log: jsonlog::JsonLog::new(cfg.state_dir.join("transcripts.log")),
                 events_log: jsonlog::JsonLog::with_max_bytes(
@@ -1146,6 +1184,71 @@ impl Node {
     /// Use `themes` as the page themes (`themes_list`, the served theme files).
     pub fn set_themes(&self, themes: Arc<crate::themes::ThemeRegistry>) {
         *self.inner.themes.write().unwrap() = themes;
+    }
+
+    /// The named sets (`set_list`): the embedded ones and the operator's `sets_dir`.
+    pub fn sets(&self) -> Arc<crate::sets::SetRegistry> {
+        self.inner.sets.clone()
+    }
+
+    /// The running sets' instances by set id (`state_dir/set-instances`, read back at `open`).
+    pub fn set_instances(&self) -> BTreeMap<String, crate::sets::SetInstance> {
+        self.inner.set_instances.lock().unwrap().clone()
+    }
+
+    /// Hold the node's set gate until the guard drops (see `Inner::set_gate`).
+    pub(crate) async fn set_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.set_gate.lock().await
+    }
+
+    /// Keep `inst` as its set's running instance and write it to `state_dir/set-instances`. A
+    /// write that fails is returned; the instance is kept in memory all the same, so a
+    /// `set_stop` in this run still finds it.
+    pub(crate) fn put_set_instance(&self, inst: crate::sets::SetInstance) -> Result<(), NodeError> {
+        let written = persist_instance(&self.inner.instances_dir, &inst);
+        self.inner
+            .set_instances
+            .lock()
+            .unwrap()
+            .insert(inst.set.clone(), inst);
+        written
+    }
+
+    /// Forget set `set`'s instance and remove its file.
+    pub(crate) fn drop_set_instance(&self, set: &str) -> Result<(), NodeError> {
+        self.inner.set_instances.lock().unwrap().remove(set);
+        remove_instance(&self.inner.instances_dir, set)
+    }
+
+    /// Drop every instance none of whose jobs still runs (each stopped, failed or
+    /// forgotten from the history); a file that cannot be removed is a persist error.
+    /// It writes the state dir, so only a mutating op calls it, under the set gate
+    /// (`set_start`); `set_list` computes the same in memory.
+    pub(crate) fn prune_set_instances(&self, _set_gate: &tokio::sync::MutexGuard<'_, ()>) {
+        let live: std::collections::HashSet<JobId> = self
+            .job_list()
+            .into_iter()
+            .filter(|r| !job_ended(&r.state))
+            .map(|r| r.id)
+            .collect();
+        let ended: Vec<String> = self
+            .inner
+            .set_instances
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, i)| !i.jobs().any(|j| live.contains(j)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ended {
+            if let Err(e) = self.drop_set_instance(&id) {
+                self.inner
+                    .persist_errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("{SET_INSTANCES_DIR}/{id}.json: {e}"));
+            }
+        }
     }
 
     /// The page themes (the built-in ones unless `set_themes` replaced them).
@@ -1609,7 +1712,7 @@ impl Node {
         capture_rate_hz: Option<Hz>,
         elastic: bool,
     ) -> Result<JobId, NodeError> {
-        self.check_prefer(&graph)?;
+        self.check_watch_policy(&graph, tuning)?;
         let rec = JobRecord {
             format: JOB_RECORD_FORMAT,
             id: JobId::new(),
@@ -2062,17 +2165,53 @@ impl Node {
         Ok(())
     }
 
-    /// A watch's `detect` node names only this node's sources in `prefer`:
-    /// `bad params on node <id>: prefer[<i>]: unknown source <id>` otherwise. Checked
-    /// at `job_start` and `graph_put` only, so a resume on a node started without one of
-    /// them still runs (the watch then skips it).
-    fn check_prefer(&self, graph: &Graph) -> Result<(), NodeError> {
-        let ports = self.inner.ports.read().unwrap();
-        for n in graph
+    /// The running watch `graph` has the policy `params` (a set's `watch` member's): its
+    /// `detect` params ([`watch::policy_of`]) equal them, a key either leaves out
+    /// compared at the `detect` stage's default ([`watch::same_policy`]).
+    pub(crate) fn watch_has_policy(&self, graph: &Graph, params: &serde_json::Value) -> bool {
+        let schema = self
+            .inner
+            .registry
+            .spec(crate::ops::DETECT_STAGE)
+            .and_then(|s| serde_json::to_value(&s.params_schema).ok())
+            .unwrap_or_default();
+        watch::same_policy(&watch::policy_of(graph), params, &schema)
+    }
+
+    /// A watch's `detect` node names only this node's sources in `prefer`
+    /// (`bad params on node <id>: prefer[<i>]: unknown source <id>` otherwise), and its
+    /// `modes`, when not `null`, only loaded, ready rows no wider than the watch's band
+    /// `tuning` (see [`watch::check_modes_list`]). Checked at `job_start` and `graph_put`
+    /// only, so a resume on a node started without one of them still runs (the watch
+    /// then skips it).
+    pub(crate) fn check_watch_policy(
+        &self,
+        graph: &Graph,
+        tuning: Tuning,
+    ) -> Result<(), NodeError> {
+        let detects = graph
             .nodes
             .iter()
-            .filter(|n| n.kind == crate::ops::DETECT_STAGE)
-        {
+            .filter(|n| n.kind == crate::ops::DETECT_STAGE);
+        let modes = self.inner.modes();
+        for n in detects.clone() {
+            let Some(list) = n.params.get("modes").and_then(|m| m.as_array()) else {
+                continue;
+            };
+            let list: Vec<String> = list
+                .iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect();
+            if let Err(reason) = watch::check_modes_list(&modes, &list, tuning.bandwidth_hz.0) {
+                return Err(GraphError::BadParams {
+                    node: n.id.clone(),
+                    reason,
+                }
+                .into());
+            }
+        }
+        let ports = self.inner.ports.read().unwrap();
+        for n in detects {
             let Some(prefer) = n.params.get("prefer").and_then(|p| p.as_array()) else {
                 continue;
             };
@@ -2105,7 +2244,7 @@ impl Node {
         elastic: bool,
         guard: Option<&OwnedMutexGuard<()>>,
     ) -> (Result<JobId, NodeError>, AfterGate) {
-        if let Err(e) = self.check_prefer(&graph) {
+        if let Err(e) = self.check_watch_policy(&graph, tuning) {
             return (Err(e), AfterGate::Nothing);
         }
         let rec = JobRecord {
@@ -2211,7 +2350,6 @@ impl Node {
         let mut graph = graph;
         crate::ops::fill_squelch_params(&mut graph);
         graph::validate(&graph, &self.inner.registry)?;
-        self.check_prefer(&graph)?;
         let current = {
             let jobs = self.inner.jobs.lock().unwrap();
             let entry = jobs
@@ -2219,6 +2357,7 @@ impl Node {
                 .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
             entry.record.clone()
         };
+        self.check_watch_policy(&graph, current.tuning)?;
         let running = current.state == JobState::Running;
         // An operator's put of the node's graph with only carried params changed keeps
         // the record's rate (and so stays re-expandable).
@@ -2326,6 +2465,18 @@ impl Node {
             self.inner.note_fault_if_faulted(port.id());
         }
         tuned
+    }
+
+    /// What [`Node::hold_band`] of `want` on `port` would do, under the source's gate
+    /// the caller holds, with nothing leased or tuned; see [`LeaseManager::decide`].
+    // `set_start` decides every source in use before it tunes any.
+    pub(crate) fn decide(
+        &self,
+        port: &dyn Port,
+        want: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Decision {
+        self.inner.leases.decide(port, want, guard)
     }
 
     /// Lease `want` on `port` as a rigid request under the source's gate the caller
@@ -2527,9 +2678,9 @@ impl Node {
     }
 
     /// `source_free`: the sources, in id order, that could take the band now
-    /// ([`LeaseManager::free_sources`]), and every other source that covers it with
-    /// its holders, elastic jobs, pin and fault. Sources that cannot cover the band
-    /// are in neither list.
+    /// ([`LeaseManager::free_sources`]: a pin over the whole band admits it), and every
+    /// other source that covers it with its holders, elastic jobs, pin and fault.
+    /// Sources that cannot cover the band are in neither list.
     pub fn source_free(
         &self,
         center_hz: u64,

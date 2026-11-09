@@ -3,6 +3,7 @@
 //! (unknown fields rejected, every field required, one unit per field) and
 //! corrective on error (errors name the field and range and propose a value).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use num_complex::Complex;
@@ -15,7 +16,7 @@ use crate::classify::{Band, Classification, Label, Tried};
 use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::{JobRecord, JobState};
 use crate::knowledge::{Allocation, DEFAULT_REGION, Signature, nearest_allocations};
-use crate::lease::LeaseError;
+use crate::lease::{Decision, LeaseError};
 use crate::modes::{
     Access, Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow,
     ModeState, Subject, is_mode_id, template,
@@ -23,6 +24,7 @@ use crate::modes::{
 use crate::node::{AfterGate, Node, NodeError};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
 use crate::ring::RingError;
+use crate::stage::Readiness;
 use crate::station::Station;
 use crate::stream::{Frame, Payload, StreamInfo};
 use crate::types::{
@@ -113,8 +115,9 @@ pub enum Op {
     },
     /// The sources that could take the band now: `free` lists, in id order, every
     /// source whose `tune_min_hz..=tune_max_hz` holds both edges of the band and whose
-    /// `max_bandwidth_hz` its width, with no rigid holder, no pin and no fault (elastic
-    /// jobs never make a source busy); `busy` lists every other source that covers the
+    /// `max_bandwidth_hz` its width, with no rigid holder, no fault, and no pin unless
+    /// the pin's band holds the whole band (a pin admits jobs inside it; elastic jobs
+    /// never make a source busy); `busy` lists every other source that covers the
     /// band with why: `holders`, `elastic`, `pin` and `fault` as `source_list` gives
     /// them. A source that cannot cover the band is in neither list. Takes no lease.
     SourceFree {
@@ -581,6 +584,88 @@ pub enum Op {
     /// The themes the page can use, one row each (built-ins, then the operator's
     /// `--themes-dir`), sorted by id.
     ThemesList {},
+    /// The named sets the node knows (`sets/*.json` built in, then the operator's
+    /// `--sets-dir`), sorted by id. A set names the jobs of a daily setup by radio role
+    /// (`radios`: each role with a `note` saying what radio it needs), never by source:
+    /// each `members` entry is a `job_start` or `plan_start` (`op`) of a `kind` on a role,
+    /// with a one-line `summary`. A set that does not parse or validate is `broken` with
+    /// its `reason` (`<field>: <error>`, e.g. `members[0].params.hold_ms: ...`) and never
+    /// stops the node; an operator set with a built-in's `id` replaces it, and a broken
+    /// one that meant to is listed as `<id>@<file name>`, the built-in staying in force.
+    /// A member's kind need not be a ready row here (a set may name a decoder this host
+    /// lacks). `running` is the set's running instance, `null` when it does not run:
+    /// `radios` (the source each role runs on), `since_ns`, and one `members` entry per
+    /// job it started (`id` the member, `job`, `state`: the job's state, `ended` once it
+    /// no longer runs). An instance none of whose jobs runs reads `null`.
+    SetList {},
+    /// Start a named set from `set_list`: each member on the source its role is mapped
+    /// to, as `plan_start` does for one source, under one lease decision per source. In
+    /// this order: (1) everything is checked first (an unknown `set` or member id is
+    /// `unknown`; a broken set, a role a chosen member uses left out of `radios`
+    /// (`radios.<role>: unmapped`), or two roles on one source whose members that source
+    /// cannot capture at once are `other`; an unknown source is `unknown` on
+    /// `radios.<role>`; a set that already runs on another mapping is `other`: `set_stop`
+    /// it first); a role mapped to `null` gets, roles in the file's order, the first
+    /// source in `source_list` order that `source_free` lists for the band bounding the
+    /// role's members and no other role of the request names (while the set runs, the
+    /// source it runs that role on), none being a `conflict` (`source` the first source
+    /// covering the band, `holders` every covering source's holders, `options` first
+    /// `radios.<role>: no free source covers <center> Hz ± <half> Hz; busy: <id>
+    /// (holders [...]), ...`, then `unpin source <id> (source_unpin)` for each pinned
+    /// one), or `other` with that text when no source covers the band at all; a member
+    /// whose kind is a mode row that is not ready (`refused` `other`, `<state>: <reason>`), or a kind this node does not know
+    /// (`refused` `unknown` on `members[<i>].kind`), or a `watch` member whose
+    /// `params.modes` names a row this node cannot run or one wider than its band
+    /// (`refused` `other`, `members[<i>].params.modes[<j>]: ...`), is set aside and the
+    /// rest go on (a role left with no member is neither tuned nor in the result); a
+    /// `plan_start`
+    /// member whose `attach` stage is not ready starts without it and a warning says so
+    /// (`members[<i>]: <attach>: <reason>; started without attach`); (2) the band
+    /// bounding each source's members is checked against the source's ranges
+    /// (`out_of_range` on `radios.<role>`); (3) the gates of every source in use are taken
+    /// in source-id order and held to the end; (4) a member (a `plan_start` member's
+    /// channel) whose identical rigid job already runs is `existing`, a `watch` member
+    /// only when that watch's `detect` params are the member's `params` (a key either
+    /// leaves out compared at its default), a watch on its band with another policy
+    /// being `other` (`watch <id> holds this band with other policy; stop it or
+    /// graph_put it`) with nothing started; a `watch` member starts with its `params`
+    /// on its `detect` node, with no restart; (5) the `replace`
+    /// jobs, each holding one of the sources in use, are stopped; (6) every source is
+    /// decided before any is tuned: a `conflict` on any source is the whole answer, naming
+    /// the role and the source (`radios.<role> (<source>) is held by [...]`), with nothing
+    /// tuned or started anywhere; then each source is leased (and tuned when needed) for
+    /// its bounding band; (7) the members start source by source in the set's role order,
+    /// each inside its capture, a member's own failure being its `refused` entry; (8) the
+    /// instance is recorded (`set_list.running`), and `attach` follows each started
+    /// channel. The result: `radios` (each role's `source` and `capture`), `started`
+    /// (`member`, `channel` for a plan member, `center_hz`, `job`, `attached`,
+    /// `attach_error`), `existing` (`member`, `channel`, `center_hz`, `job`, `attached`),
+    /// `refused` (`member`, `channel`, `error`) and `warnings`. Running the same request
+    /// twice starts only what is missing.
+    SetStart {
+        /// A set id from `set_list`.
+        set: String,
+        /// Every role the chosen members use, mapped to a source id from `source list`,
+        /// or to `null` for the node to pick a free one.
+        radios: BTreeMap<String, Option<SourceId>>,
+        /// Member ids of the set to start; `null` for every member.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<Vec<String>>")]
+        members: Option<Vec<String>>,
+        /// As on `job_start`: rigid holders of the sources in use that may be stopped to
+        /// make room.
+        replace: Vec<JobId>,
+    },
+    /// Stop the jobs of a set's running instance that still run, those on a radio first
+    /// and then those attached to them, and drop the instance. Jobs the instance did not
+    /// start are left alone. The result lists `stopped`, `ended` (jobs that no longer ran
+    /// when asked, such as one stopped by hand) and `failed` (`job`, `error`; the others go
+    /// on). When a stop fails the instance is kept, so a second `set_stop` can finish it. A set
+    /// that does not run stops nothing.
+    SetStop {
+        /// A set id from `set_list`.
+        set: String,
+    },
     /// One mode's row as loaded, with its `state` and `reason`.
     ModesShow {
         id: String,
@@ -1769,7 +1854,9 @@ pub fn fill_squelch_params(graph: &mut Graph) -> bool {
 }
 
 /// The stage kind of a `watch`'s detector (registered by `zeta-dsp`); its params carry
-/// the watch's policy too (`decode_on`, `prefer`, `sondehub`), see `node::watch`.
+/// the watch's policy too (`decode_on`, `prefer`, `sondehub`, `on_unknown`, `capture`,
+/// `modes`, `max_decoders`, `hold_ms`, `cooldown_ms`, `confirm_ms`, `seed_known`), see
+/// `node::watch`.
 pub const DETECT_STAGE: &str = "detect";
 
 /// The stage kind of the sonde feed a watch appends to its decoders when its `detect`
@@ -1797,6 +1884,21 @@ pub const BITS_KIND: &str = "bits";
 /// The `detect` stage's default `gone_ms`: an announced signal unmatched this long is
 /// `gone`. The watch re-adopts a decoder only when its signal reappears within it.
 pub const DETECT_GONE_MS_DEFAULT: u64 = 30_000;
+
+/// A watch's default `max_decoders`: kept decoders at once, those on free sources
+/// included.
+pub const WATCH_MAX_DECODERS_DEFAULT: u32 = 16;
+/// A watch's default `hold_ms`: how long a kept decoder whose signal is `gone` may stay
+/// silent before it is `lost`.
+pub const WATCH_HOLD_MS_DEFAULT: u64 = 120_000;
+/// A watch's default `cooldown_ms`: after a decoder on a channel is `lost` or
+/// `unproven`, how long no new decoder starts on a signal overlapping it.
+pub const WATCH_COOLDOWN_MS_DEFAULT: u64 = 30_000;
+/// A watch's default `confirm_ms` (off): how long a decoder started without identify has
+/// to publish an event while its signal is present.
+pub const WATCH_CONFIRM_MS_DEFAULT: u64 = 0;
+/// The refusal of a watch's `modes: []`, from the `detect` stage's check and the node's.
+pub const WATCH_MODES_EMPTY: &str = "modes: empty list (null lets identify decide)";
 
 /// The params [`JobKind::reexpand`] carries from a stored graph to the node of the same
 /// stage kind: what an operator may set with `graph_put` and still have the node's graph.
@@ -1966,6 +2068,61 @@ pub struct PlanExisting {
 pub struct PlanRefused {
     pub channel: u32,
     pub center_hz: Hz,
+    pub error: OpError,
+}
+
+/// A role of a `set_start`: the source it runs on and that source's capture.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetRadio {
+    pub source: SourceId,
+    pub capture: Tuning,
+}
+
+/// A job `set_start` started for a member (one per channel of a `plan_start` member).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetStarted {
+    pub member: String,
+    /// The plan's channel number for a `plan_start` member; `null` otherwise.
+    #[schemars(required, schema_with = "crate::types::nullable::<u32>")]
+    pub channel: Option<u32>,
+    pub center_hz: Hz,
+    pub job: JobId,
+    /// The job attached to `job`; `null` without `attach` or when it failed.
+    #[schemars(required, schema_with = "crate::types::nullable::<JobId>")]
+    pub attached: Option<JobId>,
+    /// Why the attach failed (the job is kept); `null` otherwise.
+    #[schemars(required, schema_with = "nullable_op_error")]
+    pub attach_error: Option<OpError>,
+}
+
+/// A member (or a `plan_start` member's channel) `set_start` skipped because an
+/// identical rigid job already runs there.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetExisting {
+    pub member: String,
+    #[schemars(required, schema_with = "crate::types::nullable::<u32>")]
+    pub channel: Option<u32>,
+    pub center_hz: Hz,
+    pub job: JobId,
+    /// The running job of the member's `attach` kind reading `job`; `null` for none.
+    #[schemars(required, schema_with = "crate::types::nullable::<JobId>")]
+    pub attached: Option<JobId>,
+}
+
+/// A member (or a `plan_start` member's channel) `set_start` could not start, with why.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetRefused {
+    pub member: String,
+    #[schemars(required, schema_with = "crate::types::nullable::<u32>")]
+    pub channel: Option<u32>,
     pub error: OpError,
 }
 
@@ -2212,6 +2369,98 @@ impl From<&LoadedMode> for ModeInfo {
     }
 }
 
+/// One set as `set_list` reports it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetInfo {
+    pub id: String,
+    /// The set's display name; a broken file's id when nothing parsed.
+    pub name: String,
+    pub notes: String,
+    pub state: crate::sets::SetState,
+    /// Why the set is broken (`<field>: <error>`); `null` when ready.
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub reason: Option<String>,
+    /// `sets/<id>.json` for a built-in set, the path for an operator set.
+    pub file: String,
+    /// The roles, each with a note saying what radio it needs.
+    pub radios: BTreeMap<String, crate::sets::Radio>,
+    /// The members in the file's order.
+    pub members: Vec<SetMemberInfo>,
+    /// The set's running instance; `null` when it does not run.
+    #[schemars(required, schema_with = "crate::types::nullable::<SetRunning>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub running: Option<SetRunning>,
+}
+
+/// One member of a set as `set_list` reports it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetMemberInfo {
+    pub id: String,
+    /// The role it runs on.
+    pub radio: String,
+    /// `job_start` or `plan_start`.
+    pub op: String,
+    pub kind: String,
+    /// One line: `vdl2_decode at 136.975 MHz, 25 kHz wide`.
+    pub summary: String,
+}
+
+/// A set's running instance.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetRunning {
+    /// The source each role runs on.
+    pub radios: BTreeMap<String, SourceId>,
+    pub since_ns: Timestamp,
+    /// One entry per job the instance started.
+    pub members: Vec<SetRunningMember>,
+}
+
+/// One job of a set's running instance.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SetRunningMember {
+    /// The member id.
+    pub id: String,
+    pub job: JobId,
+    /// The job's state, or `ended` when it no longer runs.
+    pub state: String,
+}
+
+impl From<&crate::sets::LoadedSet> for SetInfo {
+    fn from(s: &crate::sets::LoadedSet) -> Self {
+        SetInfo {
+            id: s.set.id.0.clone(),
+            name: s.set.name.clone(),
+            notes: s.set.notes.clone(),
+            state: s.state,
+            reason: s.reason.clone(),
+            file: s.file.clone(),
+            radios: s.set.radios.iter().cloned().collect(),
+            members: s
+                .set
+                .members
+                .iter()
+                .map(|m| SetMemberInfo {
+                    id: m.id().to_string(),
+                    radio: m.radio().to_string(),
+                    op: m.op_name().to_string(),
+                    kind: m.kind().name().to_string(),
+                    summary: m.summary(),
+                })
+                .collect(),
+            running: None,
+        }
+    }
+}
+
 /// One theme as `themes_list` reports it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -2275,7 +2524,7 @@ impl From<&crate::themes::LoadedTheme> for ThemeInfo {
 pub enum OpResult {
     Sources(Vec<SourceInfo>),
     /// `source_free`: the sources that could take the band now, and those that
-    /// cover it but are held, pinned or faulted.
+    /// cover it but are held, pinned beside it or faulted.
     SourceFree {
         free: Vec<SourceId>,
         busy: Vec<BusySource>,
@@ -2323,6 +2572,8 @@ pub enum OpResult {
     Themes {
         themes: Vec<ThemeInfo>,
     },
+    /// `set_list`: one entry per set, sorted by id.
+    Sets(Vec<SetInfo>),
     /// `modes_show`: the row as loaded.
     Mode {
         mode: Box<LoadedMode>,
@@ -2359,6 +2610,24 @@ pub enum OpResult {
         existing: Vec<PlanExisting>,
         refused: Vec<PlanRefused>,
         warnings: Vec<String>,
+    },
+    /// `set_start`: each role's source and capture, what started, what already ran,
+    /// what was refused, and warnings to repeat to the operator.
+    SetStart {
+        set: String,
+        radios: BTreeMap<String, SetRadio>,
+        started: Vec<SetStarted>,
+        existing: Vec<SetExisting>,
+        refused: Vec<SetRefused>,
+        warnings: Vec<String>,
+    },
+    /// `set_stop`: the instance's jobs stopped, those that had already ended, and those
+    /// that could not be stopped.
+    SetStopped {
+        set: String,
+        stopped: Vec<JobId>,
+        ended: Vec<JobId>,
+        failed: Vec<JobStopFailed>,
     },
     /// `jobs_stop`: the jobs stopped and those that could not be.
     JobsStopped {
@@ -2428,6 +2697,9 @@ impl Op {
             Op::ChannelPlans {} => "channel_plans",
             Op::ModesList { .. } => "modes_list",
             Op::ThemesList {} => "themes_list",
+            Op::SetList {} => "set_list",
+            Op::SetStart { .. } => "set_start",
+            Op::SetStop { .. } => "set_stop",
             Op::ModesShow { .. } => "modes_show",
             Op::Classify { .. } => "classify",
             Op::Schema {} => "schema",
@@ -2451,6 +2723,7 @@ impl Op {
                 | Op::ChannelPlans {}
                 | Op::ModesList { .. }
                 | Op::ThemesList {}
+                | Op::SetList {}
                 | Op::ModesShow { .. }
                 | Op::StationGet {}
                 | Op::CaptureList { .. }
@@ -2507,10 +2780,13 @@ impl OpResult {
             OpResult::ChannelPlans { .. } => "channel_plans",
             OpResult::Modes { .. } => "modes",
             OpResult::Themes { .. } => "themes",
+            OpResult::Sets(_) => "sets",
             OpResult::Mode { .. } => "mode",
             OpResult::Classification { .. } => "classification",
             OpResult::Gain(_) => "gain",
             OpResult::PlanStart { .. } => "plan_start",
+            OpResult::SetStart { .. } => "set_start",
+            OpResult::SetStopped { .. } => "set_stopped",
             OpResult::JobsStopped { .. } => "jobs_stopped",
             OpResult::Ok => "ok",
             OpResult::Schema(_) => "schema",
@@ -2526,13 +2802,40 @@ impl OpResult {
     /// The result as JSON for the `ops` stream: the full value when it fits
     /// in [`OPS_RESULT_LIMIT_BYTES`], otherwise
     /// `{"result": <variant>, "truncated": true, "bytes": n}`. A value that
-    /// fails to serialise is summarised with `bytes: 0`. A truncated `plan_start` or
-    /// `jobs_stop` keeps what its reader needs: `counts`, and `plan_start`'s `warnings`.
+    /// fails to serialise is summarised with `bytes: 0`. A truncated `plan_start`,
+    /// `set_start`, `jobs_stop` or `set_stop` keeps what its reader needs: `counts`, and
+    /// the starts' `warnings`.
     pub fn summary_json(&self) -> serde_json::Value {
         let mut v = bounded_json(self, "result", self.variant_name());
         if v.get("truncated").is_some() {
             match self {
                 OpResult::PlanStart {
+                    started,
+                    existing,
+                    refused,
+                    warnings,
+                    ..
+                } => {
+                    v["counts"] = serde_json::json!({
+                        "started": started.len(),
+                        "existing": existing.len(),
+                        "refused": refused.len(),
+                    });
+                    v["warnings"] = serde_json::json!(warnings);
+                }
+                OpResult::SetStopped {
+                    stopped,
+                    ended,
+                    failed,
+                    ..
+                } => {
+                    v["counts"] = serde_json::json!({
+                        "stopped": stopped.len(),
+                        "ended": ended.len(),
+                        "failed": failed.len(),
+                    });
+                }
+                OpResult::SetStart {
                     started,
                     existing,
                     refused,
@@ -3002,7 +3305,7 @@ async fn reconcile_rate(
 
 /// `job_start`'s checks of `sideband` (only `ssb_demod` takes one) and `deviation_hz`
 /// (only `fm_demod` and `wfm_demod`, within 100..=75000 Hz); the deviation as `Hz`.
-fn check_start_params(
+pub(crate) fn check_start_params(
     kind: &JobKind,
     deviation_hz: Option<u64>,
     sideband: Option<Sideband>,
@@ -3024,6 +3327,155 @@ fn check_start_params(
             Ok(Some(Hz(d)))
         }
     }
+}
+
+/// An op error with the request field it is about (`plan`, `channels`, `kind`,
+/// `deviation_hz`, `sideband`, `attach`, `language`), for a caller that names fields
+/// itself (a set file's member).
+#[derive(Debug)]
+pub(crate) struct FieldError {
+    pub field: &'static str,
+    pub error: OpError,
+}
+
+impl FieldError {
+    fn new(field: &'static str, error: OpError) -> Self {
+        Self { field, error }
+    }
+}
+
+/// `job_start`'s refusal of a kind that does not start on the radio (see
+/// [`JobKind::startable`]).
+pub(crate) fn check_startable(kind: &JobKind) -> Result<(), OpError> {
+    match kind.startable() {
+        true => Ok(()),
+        false => Err(kind.start_refusal()),
+    }
+}
+
+/// [`check_start_params`] with the field its error is about.
+pub(crate) fn check_start_fields(
+    kind: &JobKind,
+    deviation_hz: Option<u64>,
+    sideband: Option<Sideband>,
+) -> Result<Option<Hz>, FieldError> {
+    check_start_params(kind, deviation_hz, sideband).map_err(|e| {
+        let field = match &e {
+            OpError::Other { message } if message.starts_with("sideband") => "sideband",
+            _ => "deviation_hz",
+        };
+        FieldError::new(field, e)
+    })
+}
+
+/// What [`check_plan_start_fields`] resolved: the plan, the channel numbers to start
+/// (sorted), the deviation and the attach language.
+pub(crate) struct PlanFields {
+    pub plan: &'static crate::plans::ChannelPlan,
+    pub numbers: Vec<u32>,
+    pub deviation: Option<Hz>,
+    pub language: String,
+}
+
+/// `plan_start`'s checks of its own fields, in order, touching nothing: the plan known,
+/// each channel known and listed once (`null` for all), a kind that runs per channel,
+/// `deviation_hz` and `sideband` as `job_start` checks them, an attachable `attach`,
+/// and `language` only with `attach` and a BCP-47 code. Each error names its field.
+pub(crate) fn check_plan_start_fields(
+    plan: &str,
+    channels: Option<&[u32]>,
+    kind: &JobKind,
+    (deviation_hz, sideband): (Option<u64>, Option<Sideband>),
+    (attach, language): (Option<&JobKind>, Option<&str>),
+) -> Result<PlanFields, FieldError> {
+    let Some(p) = crate::plans::plan(plan) else {
+        return Err(FieldError::new(
+            "plan",
+            OpError::Unknown {
+                field: "plan".into(),
+                value: plan.into(),
+                known: crate::plans::PLANS.iter().map(|p| p.id.into()).collect(),
+            },
+        ));
+    };
+    let all = crate::plans::channels(p);
+    let mut known: Vec<u32> = all.iter().map(|&(n, _)| n).collect();
+    known.sort_unstable();
+    let numbers: Vec<u32> = match channels {
+        None => known,
+        Some(listed) => {
+            let mut seen = Vec::with_capacity(listed.len());
+            for &n in listed {
+                if !known.contains(&n) {
+                    return Err(FieldError::new(
+                        "channels",
+                        OpError::Unknown {
+                            field: "channels".into(),
+                            value: n.to_string(),
+                            known: known.iter().map(u32::to_string).collect(),
+                        },
+                    ));
+                }
+                if seen.contains(&n) {
+                    return Err(FieldError::new(
+                        "channels",
+                        other(format!("channels: {n} is listed twice")),
+                    ));
+                }
+                seen.push(n);
+            }
+            seen.sort_unstable();
+            seen
+        }
+    };
+    if !kind.startable()
+        || matches!(
+            kind,
+            JobKind::Spectrum | JobKind::Scan | JobKind::Watch | JobKind::Identify
+        )
+    {
+        return Err(FieldError::new(
+            "kind",
+            other(format!("{} cannot be started per channel", kind.name())),
+        ));
+    }
+    let deviation = check_start_fields(kind, deviation_hz, sideband)?;
+    let language = check_attach_fields(attach, language)?;
+    Ok(PlanFields {
+        plan: p,
+        numbers,
+        deviation,
+        language,
+    })
+}
+
+/// `plan_start`'s checks of `attach` and `language`: an attachable `attach`, and
+/// `language` only with `attach` and a BCP-47 code; the language (`en` for `null`).
+fn check_attach_fields(
+    attach: Option<&JobKind>,
+    language: Option<&str>,
+) -> Result<String, FieldError> {
+    if let Some(a) = attach
+        && !a.attachable()
+    {
+        return Err(FieldError::new(
+            "attach",
+            other(format!("{} is not attachable", a.name())),
+        ));
+    }
+    if language.is_some() && attach.is_none() {
+        return Err(FieldError::new("language", other("language needs attach")));
+    }
+    let language = language.unwrap_or(ATTACH_LANGUAGE_DEFAULT).to_string();
+    if !is_bcp47(&language) {
+        return Err(FieldError::new(
+            "language",
+            other(format!(
+                "language {language:?} is not a BCP-47 code such as en, de or pt-BR; pass null for en"
+            )),
+        ));
+    }
+    Ok(language)
 }
 
 /// Stop the `replace` holders under `guard` (see [`Node::replace_holders`]);
@@ -3173,9 +3625,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             elastic,
             replace,
         } => {
-            if !kind.startable() {
-                return Err(kind.start_refusal());
-            }
+            check_startable(&kind)?;
             if elastic && !kind.elastic_capable() {
                 return Err(OpError::Other {
                     message: format!("{} cannot be elastic", kind.name()),
@@ -3548,6 +3998,14 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
         Op::ThemesList {} => Ok(OpResult::Themes {
             themes: node.themes().all().iter().map(ThemeInfo::from).collect(),
         }),
+        Op::SetList {} => Ok(OpResult::Sets(set_list(node))),
+        Op::SetStart {
+            set,
+            radios,
+            members,
+            replace,
+        } => set_start(node, set, radios, members, replace).await,
+        Op::SetStop { set } => set_stop(node, set).await,
         Op::ModesShow { id } => {
             let modes = node.modes();
             match modes.get(&id) {
@@ -3676,10 +4134,311 @@ fn load_warning(n: usize, kind: &JobKind, capacity: u32) -> String {
     )
 }
 
+/// What [`plan_check`] resolved: the plan, the channel numbers to start (sorted), the
+/// kind and its start params.
+pub(crate) struct PlanChannels {
+    pub plan: &'static crate::plans::ChannelPlan,
+    pub numbers: Vec<u32>,
+    pub kind: JobKind,
+    pub deviation: Option<Hz>,
+    pub sideband: Option<Sideband>,
+}
+
+impl PlanChannels {
+    /// Channel `n`'s band: its centre (0 Hz for a number the plan lacks) and the
+    /// plan's channel width.
+    pub(crate) fn channel_band(&self, n: u32) -> Tuning {
+        let centre = crate::plans::channels(self.plan)
+            .into_iter()
+            .find(|&(m, _)| m == n)
+            .map_or(0, |(_, hz)| hz);
+        Tuning {
+            center_hz: Hz(centre),
+            bandwidth_hz: Hz(self.plan.bandwidth_hz),
+        }
+    }
+
+    /// The band bounding the channels `numbers` (see [`crate::plans::bounding`]).
+    pub(crate) fn bounding(&self, numbers: &[u32]) -> Tuning {
+        crate::plans::bounding(self.plan, numbers)
+    }
+}
+
+/// `plan_start`'s step 1 without `attach`, `language` and the source: the plan's
+/// fields as [`check_plan_start_fields`] checks them, then the kind's mode row ready.
+/// Nothing has happened yet.
+// `set_start` checks a member's channels apart from its attach.
+pub(crate) fn plan_check(
+    node: &Node,
+    plan: &str,
+    channels: Option<Vec<u32>>,
+    kind: JobKind,
+    deviation_hz: Option<u64>,
+    sideband: Option<Sideband>,
+) -> Result<PlanChannels, OpError> {
+    plan_check_as(
+        node,
+        plan,
+        channels,
+        kind,
+        (deviation_hz, sideband),
+        (None, None),
+    )
+    .map(|(pc, _)| pc)
+}
+
+/// [`plan_check`] with `plan_start`'s `attach` and `language` checked in their place
+/// among the fields (before the mode row); also the attach language.
+fn plan_check_as(
+    node: &Node,
+    plan: &str,
+    channels: Option<Vec<u32>>,
+    kind: JobKind,
+    (deviation_hz, sideband): (Option<u64>, Option<Sideband>),
+    (attach, language): (Option<&JobKind>, Option<&str>),
+) -> Result<(PlanChannels, String), OpError> {
+    let PlanFields {
+        plan,
+        numbers,
+        deviation,
+        language,
+        ..
+    } = check_plan_start_fields(
+        plan,
+        channels.as_deref(),
+        &kind,
+        (deviation_hz, sideband),
+        (attach, language),
+    )
+    .map_err(|e| e.error)?;
+    kind.mode_row(&node.modes())?;
+    let pc = PlanChannels {
+        plan,
+        numbers,
+        kind,
+        deviation,
+        sideband,
+    };
+    Ok((pc, language))
+}
+
+/// `plan_start`'s checks of `attach` and `language` (attachable, a language only with
+/// an attach, BCP-47) and of the attached stage's readiness: the language (`en` for
+/// `null`) and the stage's readiness (`None` without `attach`). A stage that is not
+/// ready is refused as `plan_start` refuses it.
+// `set_start` checks a member's attach apart from its channels.
+pub(crate) fn plan_attach_check(
+    node: &Node,
+    attach: &Option<JobKind>,
+    language: &Option<String>,
+) -> Result<(String, Option<Readiness>), OpError> {
+    let language =
+        check_attach_fields(attach.as_ref(), language.as_deref()).map_err(|e| e.error)?;
+    Ok((language, attach_readiness(node, attach.as_ref())?))
+}
+
+/// The readiness of the stage `attach` names (`None` without one, or for a stage
+/// that reports none); a stage that is not ready is refused, nothing done.
+fn attach_readiness(node: &Node, attach: Option<&JobKind>) -> Result<Option<Readiness>, OpError> {
+    let readiness = attach.and_then(|a| node.stage_readiness(a.name()));
+    if let (Some(a), Some(r)) = (attach, &readiness)
+        && !r.ready
+    {
+        return Err(other(format!(
+            "{}: {}; start without attach",
+            a.name(),
+            r.reason.as_deref().unwrap_or("not ready")
+        )));
+    }
+    Ok(readiness)
+}
+
+/// `plan_start`'s step 2: the channels of `pc` an identical rigid job already runs on
+/// `source` (with the running job of the `attach` kind reading it), and the channels
+/// left to start. A job `replace` names is about to stop, so its channel is started
+/// again.
+pub(crate) fn plan_existing(
+    node: &Node,
+    pc: &PlanChannels,
+    source: &SourceId,
+    replace: &[JobId],
+    attach: &Option<JobKind>,
+) -> (Vec<PlanExisting>, Vec<u32>) {
+    let mut existing = Vec::new();
+    let mut to_start = Vec::new();
+    for &n in &pc.numbers {
+        let band = pc.channel_band(n);
+        let dup = node
+            .duplicate_of(
+                source,
+                pc.kind.name(),
+                band,
+                pc.deviation.map(|d| d.0),
+                pc.sideband,
+            )
+            .filter(|j| !replace.contains(j));
+        match dup {
+            Some(job) => existing.push(PlanExisting {
+                channel: n,
+                center_hz: band.center_hz,
+                attached: attach.as_ref().and_then(|a| attached_to(node, &job, a)),
+                job,
+            }),
+            None => to_start.push(n),
+        }
+    }
+    (existing, to_start)
+}
+
+/// Two [`AfterGate`]s on `source` as one: either alone, or a relaunch of every
+/// elastic job when both ask for something.
+fn merge_after(source: &SourceId, a: AfterGate, b: AfterGate) -> AfterGate {
+    match (a, b) {
+        (AfterGate::Nothing, b) => b,
+        (a, AfterGate::Nothing) => a,
+        _ => AfterGate::Relaunch {
+            source: source.clone(),
+            except: None,
+        },
+    }
+}
+
+/// `plan_start`'s step 6: start each channel `to_start` of `pc` on `source` inside the
+/// capture `granted`, which the caller already holds under the source's gate (`guard`),
+/// in the order given; a start that fails is that channel's refusal and the rest go
+/// on. Also what is left for after the gate (run it with [`Node::after_gate`] once the
+/// gate goes).
+pub(crate) async fn plan_start_channels(
+    node: &Node,
+    pc: &PlanChannels,
+    source: &SourceId,
+    to_start: &[u32],
+    granted: Tuning,
+    guard: &tokio::sync::OwnedMutexGuard<()>,
+) -> (Vec<PlanStarted>, Vec<PlanRefused>, AfterGate) {
+    let bin_rate = node.bank_bin_rate(source, granted);
+    let modes = node.modes();
+    let (mut started, mut refused) = (Vec::new(), Vec::new());
+    let mut after = AfterGate::Nothing;
+    for &n in to_start {
+        let tuning = pc.channel_band(n);
+        let r = match pc.kind.expand(
+            source,
+            tuning,
+            granted.bandwidth_hz,
+            bin_rate,
+            pc.deviation,
+            pc.sideband,
+            &modes,
+        ) {
+            Ok(graph) => {
+                let (r, a) = node
+                    .job_start_gated(
+                        pc.kind.name(),
+                        source.clone(),
+                        tuning,
+                        graph,
+                        Some(granted.bandwidth_hz),
+                        false,
+                        Some(guard),
+                    )
+                    .await;
+                after = merge_after(source, after, a);
+                r.map_err(|e| node_error(node, e))
+            }
+            Err(e) => Err(e),
+        };
+        match r {
+            Ok(job) => started.push(PlanStarted {
+                channel: n,
+                center_hz: tuning.center_hz,
+                job,
+                attached: None,
+                attach_error: None,
+            }),
+            Err(error) => refused.push(PlanRefused {
+                channel: n,
+                center_hz: tuning.center_hz,
+                error,
+            }),
+        }
+    }
+    (started, refused, after)
+}
+
+/// `plan_start`'s step 7: attach a job of `attach` in `language` to every started job,
+/// and to each existing one without one; the warnings (channels that carry no voice,
+/// an existing job that could not be attached, the stage's load per its `readiness`).
+/// The attach needs no gate (an attached job holds no lease).
+pub(crate) async fn plan_attach(
+    node: &Node,
+    pc: &PlanChannels,
+    attach: &JobKind,
+    language: &str,
+    readiness: &Option<Readiness>,
+    started: &mut [PlanStarted],
+    existing: &mut [PlanExisting],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    // A channel that carries no voice (CB ch22, ch23) gets no attached stage: its
+    // demodulator runs, and the warning names the channels left out.
+    let no_voice = |n: u32| pc.plan.no_voice.contains(&n);
+    let mut skipped: Vec<u32> = started
+        .iter()
+        .map(|s| s.channel)
+        .chain(
+            existing
+                .iter()
+                .filter(|e| e.attached.is_none())
+                .map(|e| e.channel),
+        )
+        .filter(|&n| no_voice(n))
+        .collect();
+    skipped.sort_unstable();
+    if !skipped.is_empty() {
+        let chs: Vec<String> = skipped.iter().map(|n| format!("ch{n}")).collect();
+        warnings.push(format!(
+            "{}: data, no voice: no {} attached",
+            chs.join(", "),
+            attach.name()
+        ));
+    }
+    for s in started.iter_mut().filter(|s| !no_voice(s.channel)) {
+        match attach_one(node, attach, &s.job, language).await {
+            Ok(id) => s.attached = Some(id),
+            Err(e) => s.attach_error = Some(e),
+        }
+    }
+    // An existing entry has no error field: one that cannot be attached stays
+    // without, says why in a warning, and a second run tries again.
+    for e in existing
+        .iter_mut()
+        .filter(|e| e.attached.is_none() && !no_voice(e.channel))
+    {
+        match attach_one(node, attach, &e.job, language).await {
+            Ok(id) => e.attached = Some(id),
+            Err(err) => warnings.push(format!("ch{}: attach failed: {err}", e.channel)),
+        }
+    }
+    if let Some(c) = readiness.as_ref().and_then(|r| r.capacity) {
+        let n = node
+            .job_list()
+            .into_iter()
+            .filter(|r| r.state == JobState::Running && r.kind == attach.name())
+            .count();
+        if n > c as usize {
+            warnings.push(load_warning(n, attach, c));
+        }
+    }
+    warnings
+}
+
 /// `plan_start`: validate, find the channels already running, preflight the attached
 /// stage, stop `replace`, take one lease decision for the band bounding the channels to
 /// start, start each in channel-number order under the same hold of the source's gate,
-/// then attach to the started jobs (and to the existing ones without one).
+/// then attach to the started jobs (and to the existing ones without one). The
+/// composition of [`plan_check`] (with `attach` checked among the fields),
+/// [`plan_existing`], [`plan_start_channels`] and [`plan_attach`].
 #[allow(clippy::too_many_arguments)]
 async fn plan_start(
     node: &Node,
@@ -3692,108 +4451,28 @@ async fn plan_start(
     replace: Vec<JobId>,
 ) -> Result<OpResult, OpError> {
     // 1. Validate: nothing has happened yet.
-    let Some(p) = crate::plans::plan(&plan) else {
-        return Err(OpError::Unknown {
-            field: "plan".into(),
-            value: plan,
-            known: crate::plans::PLANS.iter().map(|p| p.id.into()).collect(),
-        });
-    };
-    let all = crate::plans::channels(p);
-    let mut known: Vec<u32> = all.iter().map(|&(n, _)| n).collect();
-    known.sort_unstable();
-    let numbers: Vec<u32> = match channels {
-        None => known,
-        Some(listed) => {
-            let mut seen = Vec::with_capacity(listed.len());
-            for n in listed {
-                if !known.contains(&n) {
-                    return Err(OpError::Unknown {
-                        field: "channels".into(),
-                        value: n.to_string(),
-                        known: known.iter().map(u32::to_string).collect(),
-                    });
-                }
-                if seen.contains(&n) {
-                    return Err(other(format!("channels: {n} is listed twice")));
-                }
-                seen.push(n);
-            }
-            seen.sort_unstable();
-            seen
-        }
-    };
-    if !kind.startable()
-        || matches!(
-            kind,
-            JobKind::Spectrum | JobKind::Scan | JobKind::Watch | JobKind::Identify
-        )
-    {
-        return Err(other(format!(
-            "{} cannot be started per channel",
-            kind.name()
-        )));
-    }
-    let deviation = check_start_params(&kind, deviation_hz, sideband)?;
-    if let Some(a) = &attach
-        && !a.attachable()
-    {
-        return Err(other(format!("{} is not attachable", a.name())));
-    }
-    if language.is_some() && attach.is_none() {
-        return Err(other("language needs attach"));
-    }
-    let language = language.unwrap_or_else(|| ATTACH_LANGUAGE_DEFAULT.into());
-    if !is_bcp47(&language) {
-        return Err(other(format!(
-            "language {language:?} is not a BCP-47 code such as en, de or pt-BR; pass null for en"
-        )));
-    }
-    kind.mode_row(&node.modes())?;
+    let (pc, language) = plan_check_as(
+        node,
+        &plan,
+        channels,
+        kind,
+        (deviation_hz, sideband),
+        (attach.as_ref(), language.as_deref()),
+    )?;
     let port = node
         .port(&source)
         .ok_or_else(|| unknown_source(node, &source))?;
-    let channel_band = |n: u32| Tuning {
-        center_hz: Hz(all.iter().find(|&&(m, _)| m == n).map_or(0, |&(_, hz)| hz)),
-        bandwidth_hz: Hz(p.bandwidth_hz),
-    };
 
     // One hold of the source's gate covers every step that follows up to the last
     // start: no other caller's tune slips between the lease decision and the starts.
     let guard = node.gate_guard(&source).await;
-    // 2. The channels an identical rigid job already runs on (one that `replace` names
-    // is about to stop, so its channel is started again).
-    let mut existing = Vec::new();
-    let mut to_start = Vec::new();
-    for &n in &numbers {
-        let band = channel_band(n);
-        let dup = node
-            .duplicate_of(&source, kind.name(), band, deviation.map(|d| d.0), sideband)
-            .filter(|j| !replace.contains(j));
-        match dup {
-            Some(job) => existing.push(PlanExisting {
-                channel: n,
-                center_hz: band.center_hz,
-                attached: attach.as_ref().and_then(|a| attached_to(node, &job, a)),
-                job,
-            }),
-            None => to_start.push(n),
-        }
-    }
+    // 2. The channels an identical rigid job already runs on.
+    let (mut existing, to_start) = plan_existing(node, &pc, &source, &replace, &attach);
     // 3. The attached stage must be ready: refused, with nothing done, otherwise.
-    let readiness = attach.as_ref().and_then(|a| node.stage_readiness(a.name()));
-    if let (Some(a), Some(r)) = (&attach, &readiness)
-        && !r.ready
-    {
-        return Err(other(format!(
-            "{}: {}; start without attach",
-            a.name(),
-            r.reason.as_deref().unwrap_or("not ready")
-        )));
-    }
+    let readiness = attach_readiness(node, attach.as_ref())?;
     // The bounding band against the source's ranges before anything is stopped: its
     // width is the corrective `out_of_range`.
-    let bounding = crate::plans::bounding(p, &to_start);
+    let bounding = pc.bounding(&to_start);
     if !to_start.is_empty() {
         checked_port(node, &source, &bounding)?;
     }
@@ -3803,15 +4482,13 @@ async fn plan_start(
         idle_after_replace(node, port.as_ref(), &replace, &e).await;
         return Err(node_error(node, e));
     }
-    let mut started = Vec::new();
-    let mut refused = Vec::new();
-    let capture = if to_start.is_empty() {
+    let (mut started, refused, capture) = if to_start.is_empty() {
         drop(guard);
         if !replace.is_empty() {
             node.idle_if_unheld(port.as_ref()).await;
         }
-        port.current()
-            .unwrap_or_else(|| crate::plans::bounding(p, &numbers))
+        let capture = port.current().unwrap_or_else(|| pc.bounding(&pc.numbers));
+        (Vec::new(), Vec::new(), capture)
     } else {
         // 5. One lease decision for the bounding band, taken as a rigid start of it
         // would be. The lease is held only until the channels hold theirs inside its
@@ -3831,131 +4508,42 @@ async fn plan_start(
                 return Err(node_error(node, e));
             }
         };
-        // 6. Each channel inside the capture, in channel-number order; a start that
-        // fails is that channel's refusal and the rest go on.
-        let bin_rate = node.bank_bin_rate(&source, granted);
-        let modes = node.modes();
+        // 6. Each channel inside the capture, in channel-number order.
+        let (started, refused, after) =
+            plan_start_channels(node, &pc, &source, &to_start, granted, &guard).await;
         // The tune above moved the capture: the elastic jobs follow once the gate goes.
-        let mut after = match tuned {
+        let moved = match tuned {
             true => AfterGate::Relaunch {
                 source: source.clone(),
                 except: None,
             },
             false => AfterGate::Nothing,
         };
-        for n in to_start {
-            let tuning = channel_band(n);
-            let r = match kind.expand(
-                &source,
-                tuning,
-                granted.bandwidth_hz,
-                bin_rate,
-                deviation,
-                sideband,
-                &modes,
-            ) {
-                Ok(graph) => {
-                    let (r, a) = node
-                        .job_start_gated(
-                            kind.name(),
-                            source.clone(),
-                            tuning,
-                            graph,
-                            Some(granted.bandwidth_hz),
-                            false,
-                            Some(&guard),
-                        )
-                        .await;
-                    after = match (after, a) {
-                        (AfterGate::Nothing, a) => a,
-                        (merged, AfterGate::Nothing) => merged,
-                        _ => AfterGate::Relaunch {
-                            source: source.clone(),
-                            except: None,
-                        },
-                    };
-                    r.map_err(|e| node_error(node, e))
-                }
-                Err(e) => Err(e),
-            };
-            match r {
-                Ok(job) => started.push(PlanStarted {
-                    channel: n,
-                    center_hz: tuning.center_hz,
-                    job,
-                    attached: None,
-                    attach_error: None,
-                }),
-                Err(error) => refused.push(PlanRefused {
-                    channel: n,
-                    center_hz: tuning.center_hz,
-                    error,
-                }),
-            }
-        }
+        let after = merge_after(&source, moved, after);
         drop(hold);
         drop(guard);
         node.after_gate(after).await;
         if started.is_empty() && !replace.is_empty() {
             node.idle_if_unheld(port.as_ref()).await;
         }
-        granted
+        (started, refused, granted)
     };
-    // 7. Attach to every started job, and to each existing one without one; the
-    // attach needs no gate (an attached job holds no lease).
-    let mut warnings = Vec::new();
-    if let Some(a) = &attach {
-        // A channel that carries no voice (CB ch22, ch23) gets no attached stage: its
-        // demodulator runs, and the warning names the channels left out.
-        let no_voice = |n: u32| p.no_voice.contains(&n);
-        let mut skipped: Vec<u32> = started
-            .iter()
-            .map(|s| s.channel)
-            .chain(
-                existing
-                    .iter()
-                    .filter(|e| e.attached.is_none())
-                    .map(|e| e.channel),
+    // 7. Attach to every started job, and to each existing one without one.
+    let warnings = match &attach {
+        Some(a) => {
+            plan_attach(
+                node,
+                &pc,
+                a,
+                &language,
+                &readiness,
+                &mut started,
+                &mut existing,
             )
-            .filter(|&n| no_voice(n))
-            .collect();
-        skipped.sort_unstable();
-        if !skipped.is_empty() {
-            let chs: Vec<String> = skipped.iter().map(|n| format!("ch{n}")).collect();
-            warnings.push(format!(
-                "{}: data, no voice: no {} attached",
-                chs.join(", "),
-                a.name()
-            ));
+            .await
         }
-        for s in started.iter_mut().filter(|s| !no_voice(s.channel)) {
-            match attach_one(node, a, &s.job, &language).await {
-                Ok(id) => s.attached = Some(id),
-                Err(e) => s.attach_error = Some(e),
-            }
-        }
-        // An existing entry has no error field: one that cannot be attached stays
-        // without, says why in a warning, and a second run tries again.
-        for e in existing
-            .iter_mut()
-            .filter(|e| e.attached.is_none() && !no_voice(e.channel))
-        {
-            match attach_one(node, a, &e.job, &language).await {
-                Ok(id) => e.attached = Some(id),
-                Err(err) => warnings.push(format!("ch{}: attach failed: {err}", e.channel)),
-            }
-        }
-        if let Some(c) = readiness.and_then(|r| r.capacity) {
-            let n = node
-                .job_list()
-                .into_iter()
-                .filter(|r| r.state == JobState::Running && r.kind == a.name())
-                .count();
-            if n > c as usize {
-                warnings.push(load_warning(n, a, c));
-            }
-        }
-    }
+        None => Vec::new(),
+    };
     Ok(OpResult::PlanStart {
         plan,
         source,
@@ -3964,6 +4552,1100 @@ async fn plan_start(
         existing,
         refused,
         warnings,
+    })
+}
+
+/// `set_list`: every set with its running instance. A read: it writes nothing, and an
+/// instance none of whose jobs runs reads `null` (its file goes at the next
+/// `set_start` or `set_stop`).
+fn set_list(node: &Node) -> Vec<SetInfo> {
+    let states: std::collections::HashMap<JobId, JobState> = node
+        .job_list()
+        .into_iter()
+        .map(|r| (r.id, r.state))
+        .collect();
+    let live = |j: &JobId| states.get(j).is_some_and(|s| !crate::node::job_ended(s));
+    let mut instances = node.set_instances();
+    instances.retain(|_, i| i.jobs().any(live));
+    node.sets()
+        .all()
+        .iter()
+        .map(|s| {
+            let mut info = SetInfo::from(s);
+            info.running = instances.get(&info.id).map(|i| SetRunning {
+                radios: i.radios.clone(),
+                since_ns: i.since_ns,
+                members: i
+                    .members
+                    .iter()
+                    .flat_map(|m| {
+                        m.jobs.iter().map(|j| SetRunningMember {
+                            id: m.id.clone(),
+                            job: j.clone(),
+                            state: match states.get(j) {
+                                Some(s) if !crate::node::job_ended(s) => status_name(s),
+                                _ => SET_JOB_ENDED.into(),
+                            },
+                        })
+                    })
+                    .collect(),
+            });
+            info
+        })
+        .collect()
+}
+
+/// What `set_list` reads for a job of an instance that no longer runs.
+const SET_JOB_ENDED: &str = "ended";
+
+/// A job state's `status` word (`running`, `stopped`, ...).
+fn status_name(s: &JobState) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v["status"].as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+/// `{role: source, ...}` for a refusal's message.
+fn mapping_text(radios: &BTreeMap<String, SourceId>) -> String {
+    let pairs: Vec<String> = radios
+        .iter()
+        .map(|(role, s)| format!("{role}: {}", s.0))
+        .collect();
+    format!("{{{}}}", pairs.join(", "))
+}
+
+/// `radios.a` or `radios.a and radios.b`: the roles a message names.
+fn roles_text(roles: &[&str]) -> String {
+    let named: Vec<String> = roles.iter().map(|r| format!("radios.{r}")).collect();
+    named.join(" and ")
+}
+
+/// The band bounding every band of `bands` (lowest edge to highest).
+fn bounding_of(bands: impl IntoIterator<Item = Tuning>) -> Tuning {
+    let (lo, hi) = bands
+        .into_iter()
+        .map(|t| band_edges(t.center_hz, t.bandwidth_hz))
+        .fold((u64::MAX, 0), |(lo, hi), (l, h)| (lo.min(l), hi.max(h)));
+    if lo > hi {
+        return Tuning {
+            center_hz: Hz(0),
+            bandwidth_hz: Hz(0),
+        };
+    }
+    Tuning {
+        center_hz: Hz(lo + (hi - lo) / 2),
+        bandwidth_hz: Hz(hi - lo),
+    }
+}
+
+/// Why a set member of `kind` (the set file's `members[index]`) cannot start on this
+/// node, when its kind is a mode row: an unknown row is `unknown` on
+/// `members[<index>].kind` naming the mode ids, a row that is not ready is `other`
+/// (`<state>: <reason>`). `None` for a ready row or a built-in kind without one.
+fn member_kind_refusal(kind: &JobKind, index: usize, modes: &ModeRegistry) -> Option<OpError> {
+    let id = kind.mode_id()?;
+    let Some(m) = modes.get(id) else {
+        return Some(OpError::Unknown {
+            field: format!("members[{index}].kind"),
+            value: id.to_string(),
+            known: modes.ids(),
+        });
+    };
+    let state = match m.state {
+        ModeState::Ready => return None,
+        ModeState::Broken => "broken",
+        ModeState::Unavailable => "unavailable",
+    };
+    Some(other(format!(
+        "{state}: {}",
+        m.reason.as_deref().unwrap_or_default()
+    )))
+}
+
+/// A set's `watch` member's `params.modes`, when not `null`, against `modes` for its
+/// band `bandwidth_hz` ([`crate::node::watch::check_modes_list`], as `job_start` checks
+/// a watch's policy); any other member passes.
+fn set_watch_modes(
+    kind: &JobKind,
+    params: Option<&serde_json::Value>,
+    modes: &ModeRegistry,
+    bandwidth_hz: Hz,
+) -> Result<(), String> {
+    let list = params
+        .and_then(|p| p.get("modes"))
+        .and_then(|m| m.as_array());
+    let (JobKind::Watch, Some(list)) = (kind, list) else {
+        return Ok(());
+    };
+    let list: Vec<String> = list
+        .iter()
+        .filter_map(|s| s.as_str().map(str::to_string))
+        .collect();
+    crate::node::watch::check_modes_list(modes, &list, bandwidth_hz.0)
+}
+
+/// A `set_start` member once checked: what it starts and on which source.
+struct SetMember<'a> {
+    /// Its index in the set file's `members`.
+    index: usize,
+    id: &'a str,
+    role: &'a str,
+    source: SourceId,
+    what: SetMemberStart,
+    /// A `job_start` member: the identical rigid job already running.
+    existing_job: Option<JobId>,
+    /// A `plan_start` member: the channels already running, and those left to start.
+    plan_existing: Vec<PlanExisting>,
+    plan_left: Vec<u32>,
+    /// What started for it, and what was refused (in start order).
+    started_job: Option<JobId>,
+    plan_started: Vec<PlanStarted>,
+}
+
+/// What a `set_start` member starts.
+enum SetMemberStart {
+    Job {
+        kind: JobKind,
+        tuning: Tuning,
+        deviation: Option<Hz>,
+        sideband: Option<Sideband>,
+        /// A `watch` member's params for its `detect` node.
+        params: Option<serde_json::Value>,
+    },
+    Plan {
+        pc: PlanChannels,
+        /// `None` also when the attach stage is not ready (a warning says so).
+        attach: Option<JobKind>,
+        language: String,
+        readiness: Option<Readiness>,
+    },
+}
+
+impl SetMemberStart {
+    /// The band the member needs: its own, or its channels' bounding band.
+    fn band(&self) -> Tuning {
+        match self {
+            SetMemberStart::Job { tuning, .. } => *tuning,
+            SetMemberStart::Plan { pc, .. } => pc.bounding(&pc.numbers),
+        }
+    }
+}
+
+/// The source for `role`, mapped to `null` in a `set_start`: the first of
+/// `source_free`'s free sources (id order, `source_list`'s) for `band` that no role of
+/// `roles` names and no role picked before it (`picked`) took. None: a `conflict` on the
+/// first source (id order) covering the band, `holders` every covering source's holders,
+/// `current` that source's capture (else its pin, else `band`), and `options` the prose
+/// naming the role, the band and the busy sources as `source_free` gives them, then an
+/// unpin for each pinned one; `other` with that prose when no source covers the band.
+fn pick_source(
+    node: &Node,
+    role: &str,
+    band: Tuning,
+    roles: &[(&str, Option<SourceId>)],
+    picked: &[(&str, SourceId)],
+) -> Result<SourceId, OpError> {
+    let taken_by = |s: &SourceId| {
+        roles
+            .iter()
+            .find(|(_, t)| t.as_ref() == Some(s))
+            .map(|(r, _)| *r)
+            .or_else(|| picked.iter().find(|(_, t)| t == s).map(|(r, _)| *r))
+    };
+    let (free, busy) = node.source_free(band.center_hz.0, band.bandwidth_hz.0);
+    if let Some(s) = free.iter().find(|s| taken_by(s).is_none()) {
+        return Ok(s.clone());
+    }
+    let mut why: Vec<String> = busy
+        .iter()
+        .map(|b| {
+            let held: Vec<&str> = b.holders.iter().map(|j| j.0.as_str()).collect();
+            let mut s = format!("{} (holders [{}]", b.id.0, held.join(", "));
+            if let Some(pin) = b.pin {
+                s.push_str(&format!(
+                    ", pinned at {} Hz ± {} Hz",
+                    pin.center_hz.0,
+                    pin.bandwidth_hz.0 / 2
+                ));
+            }
+            if let Some(fault) = &b.fault {
+                s.push_str(&format!(", fault: {fault}"));
+            }
+            s.push(')');
+            s
+        })
+        .collect();
+    why.extend(
+        free.iter()
+            .filter_map(|s| taken_by(s).map(|r| format!("{} (named by radios.{r})", s.0))),
+    );
+    let why = if why.is_empty() {
+        "none".to_string()
+    } else {
+        why.join(", ")
+    };
+    let prose = format!(
+        "radios.{role}: no free source covers {} Hz ± {} Hz; busy: {why}",
+        band.center_hz.0,
+        band.bandwidth_hz.0 / 2
+    );
+    let mut covering: Vec<&SourceId> = busy.iter().map(|b| &b.id).chain(&free).collect();
+    covering.sort();
+    let Some(source) = covering.first().map(|s| (*s).clone()) else {
+        return Err(other(prose));
+    };
+    let mut holders: Vec<JobId> = Vec::new();
+    for h in busy.iter().flat_map(|b| &b.holders) {
+        if !holders.contains(h) {
+            holders.push(h.clone());
+        }
+    }
+    let current = node
+        .port(&source)
+        .and_then(|p| p.current())
+        .or_else(|| busy.iter().find(|b| b.id == source).and_then(|b| b.pin))
+        .unwrap_or(band);
+    let mut options = vec![prose];
+    options.extend(
+        busy.iter()
+            .filter(|b| b.pin.is_some())
+            .map(|b| format!("unpin source {} (source_unpin)", b.id.0)),
+    );
+    Err(OpError::Conflict {
+        source,
+        holders,
+        current,
+        options,
+    })
+}
+
+impl SetMember<'_> {
+    /// The band the member needs: its own, or its channels' bounding band.
+    fn band(&self) -> Tuning {
+        self.what.band()
+    }
+
+    /// The band of what is left to start, `None` when nothing is.
+    fn band_to_start(&self) -> Option<Tuning> {
+        match &self.what {
+            SetMemberStart::Job { tuning, .. } => self.existing_job.is_none().then_some(*tuning),
+            SetMemberStart::Plan { pc, .. } => {
+                (!self.plan_left.is_empty()).then(|| pc.bounding(&self.plan_left))
+            }
+        }
+    }
+}
+
+/// The guard of `source`'s gate among `guards`.
+fn gate_of<'g>(
+    guards: &'g [(SourceId, tokio::sync::OwnedMutexGuard<()>)],
+    source: &SourceId,
+) -> &'g tokio::sync::OwnedMutexGuard<()> {
+    &guards
+        .iter()
+        .find(|(s, _)| s == source)
+        .expect("every source in use is gated")
+        .1
+}
+
+/// `job_start` of a set's `job_start` member on `source` inside the capture `capture`,
+/// under the source's gate (`guard`): the graph expanded at the capture's rate, a
+/// `watch` member's `params` set on its `detect` node before the start (no restart).
+#[allow(clippy::too_many_arguments)]
+async fn start_set_job(
+    node: &Node,
+    source: &SourceId,
+    kind: &JobKind,
+    tuning: Tuning,
+    (deviation, sideband): (Option<Hz>, Option<Sideband>),
+    params: Option<&serde_json::Value>,
+    capture: Tuning,
+    guard: &tokio::sync::OwnedMutexGuard<()>,
+) -> (Result<JobId, OpError>, AfterGate) {
+    let mut graph = match kind.expand(
+        source,
+        tuning,
+        capture.bandwidth_hz,
+        node.bank_bin_rate(source, capture),
+        deviation,
+        sideband,
+        &node.modes(),
+    ) {
+        Ok(g) => g,
+        Err(e) => return (Err(e), AfterGate::Nothing),
+    };
+    if let Some(p) = params {
+        for n in graph.nodes.iter_mut().filter(|n| n.kind == DETECT_STAGE) {
+            n.params = p.clone();
+        }
+    }
+    let (r, after) = node
+        .job_start_gated(
+            kind.name(),
+            source.clone(),
+            tuning,
+            graph,
+            Some(capture.bandwidth_hz),
+            false,
+            Some(guard),
+        )
+        .await;
+    (r.map_err(|e| node_error(node, e)), after)
+}
+
+/// `set_start`: the spec's eight steps (see [`Op::SetStart`]). Every check comes before
+/// the first gate; the gates of the sources in use are held, in source-id order, from
+/// the existing check to the last start; every source is decided before any is leased
+/// or tuned.
+async fn set_start(
+    node: &Node,
+    set: String,
+    radios: BTreeMap<String, Option<SourceId>>,
+    members: Option<Vec<String>>,
+    replace: Vec<JobId>,
+) -> Result<OpResult, OpError> {
+    let set_gate = node.set_gate().await;
+    // 1. Checks: nothing has happened yet.
+    let sets = node.sets();
+    let Some(loaded) = sets.get(&set) else {
+        return Err(OpError::Unknown {
+            field: "set".into(),
+            value: set,
+            known: sets.ids(),
+        });
+    };
+    if loaded.state != crate::sets::SetState::Ready {
+        return Err(other(format!(
+            "set {set} is broken: {}",
+            loaded.reason.as_deref().unwrap_or_default()
+        )));
+    }
+    let file = &loaded.set;
+    let member_ids = || file.members.iter().map(|m| m.id().to_string()).collect();
+    if let Some(list) = &members {
+        for (i, id) in list.iter().enumerate() {
+            if !file.members.iter().any(|m| m.id() == id) {
+                return Err(OpError::Unknown {
+                    field: format!("members[{i}]"),
+                    value: id.clone(),
+                    known: member_ids(),
+                });
+            }
+        }
+    }
+    let chosen: Vec<(usize, &crate::sets::Member)> = file
+        .members
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            members
+                .as_ref()
+                .is_none_or(|l| l.iter().any(|id| id == m.id()))
+        })
+        .collect();
+    for role in radios.keys() {
+        if !file.radios.iter().any(|(r, _)| r == role) {
+            return Err(OpError::Unknown {
+                field: "radios".into(),
+                value: role.clone(),
+                known: file.radios.iter().map(|(r, _)| r.clone()).collect(),
+            });
+        }
+    }
+    // The source of every role a chosen member uses, in the file's role order; a role
+    // mapped to `null` is picked once the members are checked (its band is theirs).
+    let mut role_map: Vec<(&str, Option<SourceId>)> = Vec::new();
+    for (role, _) in &file.radios {
+        if !chosen.iter().any(|(_, m)| m.radio() == role) {
+            continue;
+        }
+        let source = match radios.get(role) {
+            None => return Err(other(format!("radios.{role}: unmapped"))),
+            Some(s) => s.clone(),
+        };
+        if let Some(source) = &source
+            && node.port(source).is_none()
+        {
+            let mut e = unknown_source(node, source);
+            if let OpError::Unknown { field, .. } = &mut e {
+                *field = format!("radios.{role}");
+            }
+            return Err(e);
+        }
+        role_map.push((role, source));
+    }
+    node.prune_set_instances(&set_gate);
+    let previous = node.set_instances().remove(&set);
+    // Each member: refused (and set aside) when its kind cannot start here, else
+    // checked as its op checks it.
+    let modes = node.modes();
+    let (mut refused, mut warnings) = (Vec::new(), Vec::new());
+    let mut passed: Vec<(usize, &crate::sets::Member, SetMemberStart)> = Vec::new();
+    for (index, m) in chosen {
+        let refuse = |error| SetRefused {
+            member: m.id().to_string(),
+            channel: None,
+            error,
+        };
+        if let Some(error) = member_kind_refusal(m.kind(), index, &modes) {
+            refused.push(refuse(error));
+            continue;
+        }
+        let what = match m {
+            crate::sets::Member::JobStart {
+                kind,
+                center_hz,
+                bandwidth_hz,
+                deviation_hz,
+                sideband,
+                params,
+                ..
+            } => match check_start_params(kind, *deviation_hz, *sideband).and_then(|d| {
+                // A watch's `modes`, checked here as `job_start` checks them, so a row
+                // this node lacks is refused before its radio is held or tuned.
+                match set_watch_modes(kind, params.as_ref(), &modes, *bandwidth_hz) {
+                    Err(reason) => Err(other(format!("members[{index}].params.{reason}"))),
+                    Ok(()) => Ok(d),
+                }
+            }) {
+                Ok(deviation) => SetMemberStart::Job {
+                    kind: kind.clone(),
+                    tuning: Tuning {
+                        center_hz: *center_hz,
+                        bandwidth_hz: *bandwidth_hz,
+                    },
+                    deviation,
+                    sideband: *sideband,
+                    params: params.clone(),
+                },
+                Err(error) => {
+                    refused.push(refuse(error));
+                    continue;
+                }
+            },
+            crate::sets::Member::PlanStart {
+                plan,
+                channels,
+                kind,
+                deviation_hz,
+                sideband,
+                attach,
+                language,
+                ..
+            } => {
+                let pc = match plan_check(
+                    node,
+                    plan,
+                    channels.clone(),
+                    kind.clone(),
+                    *deviation_hz,
+                    *sideband,
+                ) {
+                    Ok(pc) => pc,
+                    Err(error) => {
+                        refused.push(refuse(error));
+                        continue;
+                    }
+                };
+                // An attach stage that is not ready: the demodulators start without it
+                // (a hand `plan_start` refuses the whole op instead).
+                let unready = attach.as_ref().and_then(|a| {
+                    node.stage_readiness(a.name())
+                        .filter(|r| !r.ready)
+                        .map(|r| (a, r))
+                });
+                let (attach, language, readiness) =
+                    match (plan_attach_check(node, attach, language), unready) {
+                        (Ok((language, readiness)), _) => (attach.clone(), language, readiness),
+                        (Err(_), Some((a, r))) => {
+                            warnings.push(format!(
+                                "members[{index}]: {}: {}; started without attach",
+                                a.name(),
+                                r.reason.as_deref().unwrap_or("not ready")
+                            ));
+                            (None, ATTACH_LANGUAGE_DEFAULT.to_string(), None)
+                        }
+                        (Err(error), None) => {
+                            refused.push(refuse(error));
+                            continue;
+                        }
+                    };
+                SetMemberStart::Plan {
+                    pc,
+                    attach,
+                    language,
+                    readiness,
+                }
+            }
+        };
+        passed.push((index, m, what));
+    }
+    // A role mapped to `null` (5.4), roles in the file's order: the first source, in
+    // `source_list` order, free for the band bounding the role's members and named by
+    // no other role of this request. While the set runs, the instance's source for the
+    // role is kept, so the same request run twice is the idempotent re-run. A role
+    // whose every member was refused is left out.
+    let mut role_source: Vec<(&str, SourceId)> = Vec::new();
+    for (role, source) in &role_map {
+        let source = match source {
+            Some(s) => s.clone(),
+            None => {
+                let bands: Vec<Tuning> = passed
+                    .iter()
+                    .filter(|(_, m, _)| m.radio() == *role)
+                    .map(|(_, _, what)| what.band())
+                    .collect();
+                if bands.is_empty() {
+                    continue;
+                }
+                match previous.as_ref().and_then(|i| i.radios.get(*role)) {
+                    Some(s) if node.port(s).is_some() => s.clone(),
+                    _ => pick_source(node, role, bounding_of(bands), &role_map, &role_source)?,
+                }
+            }
+        };
+        role_source.push((role, source));
+    }
+    let source_of = |role: &str| {
+        role_source
+            .iter()
+            .find(|(r, _)| *r == role)
+            .map(|(_, s)| s.clone())
+            .expect("every chosen member's role is mapped")
+    };
+    // One instance per set: another mapping of a role it runs is refused.
+    if let Some(inst) = &previous
+        && role_source
+            .iter()
+            .any(|(role, s)| inst.radios.get(*role).is_some_and(|t| t != s))
+    {
+        return Err(other(format!(
+            "set {set} runs on {}; set_stop it first",
+            mapping_text(&inst.radios)
+        )));
+    }
+    let mut checked: Vec<SetMember> = passed
+        .into_iter()
+        .map(|(index, m, what)| SetMember {
+            index,
+            id: m.id(),
+            role: m.radio(),
+            source: source_of(m.radio()),
+            what,
+            existing_job: None,
+            plan_existing: Vec::new(),
+            plan_left: Vec::new(),
+            started_job: None,
+            plan_started: Vec::new(),
+        })
+        .collect();
+    // The sources in use (source-id order): those with a member left after the checks.
+    // A source whose every member was refused is left out.
+    let mut in_use: BTreeMap<SourceId, Vec<&str>> = BTreeMap::new();
+    for c in &checked {
+        let roles = in_use.entry(c.source.clone()).or_default();
+        if !roles.contains(&c.role) {
+            roles.push(c.role);
+        }
+    }
+    // 2. Each source's bounding band against its ranges.
+    for (source, roles) in &in_use {
+        let band = bounding_of(
+            checked
+                .iter()
+                .filter(|c| &c.source == source)
+                .map(SetMember::band),
+        );
+        let port = node.port(source).expect("checked above");
+        let max = port.capabilities().max_bandwidth_hz.value().0;
+        if roles.len() > 1 && band.bandwidth_hz.0 > max {
+            let (lo, hi) = band_edges(band.center_hz, band.bandwidth_hz);
+            return Err(other(format!(
+                "{} share source {}, which captures at most {max} Hz at once; their members span {lo}-{hi} Hz ({} Hz)",
+                roles_text(roles),
+                source.0,
+                band.bandwidth_hz.0
+            )));
+        }
+        checked_port(node, source, &band).map_err(|mut e| {
+            if let OpError::OutOfRange { field, .. } = &mut e {
+                *field = format!("radios.{}", roles[0]);
+            }
+            e
+        })?;
+    }
+
+    // 3. The gates of every source in use, in source-id order, held to the end.
+    let mut guards: Vec<(SourceId, tokio::sync::OwnedMutexGuard<()>)> = Vec::new();
+    for source in in_use.keys() {
+        guards.push((source.clone(), node.gate_guard(source).await));
+    }
+    // Each `replace` id must hold one of the sources in use.
+    let mut replace_on: BTreeMap<SourceId, Vec<JobId>> = BTreeMap::new();
+    for id in &replace {
+        let holds = in_use
+            .keys()
+            .find(|s| node.lease_holders(s).iter().any(|(j, _)| j == id));
+        match holds {
+            Some(s) => replace_on.entry(s.clone()).or_default().push(id.clone()),
+            None if !node.job_list().iter().any(|r| &r.id == id) => {
+                return Err(unknown_job(node, id));
+            }
+            None => {
+                return Err(other(format!(
+                    "job {} does not hold any source of the request",
+                    id.0
+                )));
+            }
+        }
+    }
+    // 4. What already runs. A watch on a `watch` member's band is that member only
+    // with the member's policy; with another it is the answer, before anything starts.
+    for c in &mut checked {
+        match &c.what {
+            SetMemberStart::Job {
+                kind,
+                tuning,
+                deviation,
+                sideband,
+                params,
+            } => {
+                c.existing_job = node
+                    .duplicate_of(
+                        &c.source,
+                        kind.name(),
+                        *tuning,
+                        deviation.map(|d| d.0),
+                        *sideband,
+                    )
+                    .filter(|j| !replace.contains(j));
+                if *kind == JobKind::Watch
+                    && let Some(j) = &c.existing_job
+                {
+                    let want = params.clone().unwrap_or_else(|| serde_json::json!({}));
+                    let same = node
+                        .job_list()
+                        .into_iter()
+                        .find(|r| &r.id == j)
+                        .is_some_and(|r| node.watch_has_policy(&r.graph, &want));
+                    if !same {
+                        return Err(other(format!(
+                            "watch {} holds this band with other policy; stop it or graph_put it",
+                            j.0
+                        )));
+                    }
+                }
+            }
+            SetMemberStart::Plan { pc, attach, .. } => {
+                let (existing, left) = plan_existing(node, pc, &c.source, &replace, attach);
+                c.plan_existing = existing;
+                c.plan_left = left;
+            }
+        }
+    }
+    // 5. Replacements, under the gates.
+    for (source, ids) in &replace_on {
+        if let Err(e) = node
+            .replace_holders(source, ids, gate_of(&guards, source))
+            .await
+        {
+            drop(guards);
+            for (s, ids) in &replace_on {
+                if let Some(port) = node.port(s) {
+                    idle_after_replace(node, port.as_ref(), ids, &e).await;
+                }
+            }
+            return Err(node_error(node, e));
+        }
+    }
+    // After a refusal past this point: idle the sources whose holders were replaced.
+    let idle_replaced = async |node: &Node| {
+        for s in replace_on.keys() {
+            if let Some(port) = node.port(s) {
+                node.idle_if_unheld(port.as_ref()).await;
+            }
+        }
+    };
+    // 6. One decision per source with something to start, all before any tune.
+    let mut want: BTreeMap<SourceId, Tuning> = BTreeMap::new();
+    for source in in_use.keys() {
+        let bands: Vec<Tuning> = checked
+            .iter()
+            .filter(|c| &c.source == source)
+            .filter_map(SetMember::band_to_start)
+            .collect();
+        if !bands.is_empty() {
+            want.insert(source.clone(), bounding_of(bands));
+        }
+    }
+    for (source, band) in &want {
+        let port = node.port(source).expect("checked above");
+        if let Decision::Conflict {
+            holders,
+            current,
+            options,
+        } = node.decide(port.as_ref(), *band, gate_of(&guards, source))
+        {
+            let held: Vec<&str> = holders.iter().map(|j| j.0.as_str()).collect();
+            let mut named = vec![format!(
+                "{} ({}) is held by [{}]",
+                roles_text(&in_use[source]),
+                source.0,
+                held.join(", ")
+            )];
+            named.extend(options);
+            drop(guards);
+            idle_replaced(node).await;
+            return Err(OpError::Conflict {
+                source: source.clone(),
+                holders,
+                current,
+                options: named,
+            });
+        }
+    }
+    let mut holds = Vec::new();
+    let mut granted: BTreeMap<SourceId, Tuning> = BTreeMap::new();
+    let mut after: BTreeMap<SourceId, AfterGate> = BTreeMap::new();
+    for (source, band) in &want {
+        let port = node.port(source).expect("checked above");
+        match node
+            .hold_band(port.as_ref(), *band, gate_of(&guards, source))
+            .await
+        {
+            Ok((hold, capture, tuned)) => {
+                holds.push(hold);
+                granted.insert(source.clone(), capture);
+                if tuned {
+                    after.insert(
+                        source.clone(),
+                        AfterGate::Relaunch {
+                            source: source.clone(),
+                            except: None,
+                        },
+                    );
+                }
+            }
+            Err(e) => {
+                // A tune the port refused reads as the source's failure, as `job_start`
+                // words it; the sources already tuned stay tuned, nothing has started.
+                let e = match e {
+                    LeaseError::Port(p) => NodeError::SourcePort(source.clone(), p),
+                    e => NodeError::Lease(e),
+                };
+                drop(holds);
+                drop(guards);
+                for (_, a) in after {
+                    node.after_gate(a).await;
+                }
+                idle_replaced(node).await;
+                return Err(node_error(node, e));
+            }
+        }
+    }
+    // 8 (begun before 7). The instance: the roles in use, then each job recorded and
+    // written under the gates as soon as it starts, so a future dropped between two
+    // starts leaves every started job to `set_stop`.
+    let mut inst = previous.unwrap_or_else(|| crate::sets::SetInstance {
+        format: crate::sets::SETS_INSTANCE_FORMAT,
+        set: set.clone(),
+        radios: BTreeMap::new(),
+        since_ns: crate::node::now(),
+        members: Vec::new(),
+    });
+    // A role is in use when a member of it is left after the checks (call 8).
+    let role_in_use =
+        |role: &str, source: &SourceId| in_use.get(source).is_some_and(|r| r.contains(&role));
+    for (role, source) in &role_source {
+        if role_in_use(role, source) {
+            inst.radios.insert(role.to_string(), source.clone());
+        }
+    }
+    let record = |inst: &mut crate::sets::SetInstance, member: &str, job: &JobId| {
+        let i = match inst.members.iter().position(|m| m.id == member) {
+            Some(i) => i,
+            None => {
+                inst.members.push(crate::sets::InstanceMember {
+                    id: member.to_string(),
+                    jobs: Vec::new(),
+                });
+                inst.members.len() - 1
+            }
+        };
+        if !inst.members[i].jobs.contains(job) {
+            inst.members[i].jobs.push(job.clone());
+        }
+    };
+    // Written only once it names a job; a failed write is one warning.
+    let keep = |inst: &crate::sets::SetInstance, warnings: &mut Vec<String>| {
+        if inst.jobs().next().is_none() {
+            return;
+        }
+        if let Err(e) = node.put_set_instance(inst.clone()) {
+            let w = format!("the set's instance was not written: {e}");
+            if !warnings.contains(&w) {
+                warnings.push(w);
+            }
+        }
+    };
+    // 7. The starts, source by source in the file's role order, each inside its capture.
+    for (role, _) in &file.radios {
+        for c in checked.iter_mut().filter(|c| c.role == role.as_str()) {
+            let Some(capture) = granted.get(&c.source).copied() else {
+                continue;
+            };
+            let guard = gate_of(&guards, &c.source);
+            let mut a = AfterGate::Nothing;
+            match &c.what {
+                SetMemberStart::Job {
+                    kind,
+                    tuning,
+                    deviation,
+                    sideband,
+                    params,
+                } if c.existing_job.is_none() => {
+                    let (r, after_start) = start_set_job(
+                        node,
+                        &c.source,
+                        kind,
+                        *tuning,
+                        (*deviation, *sideband),
+                        params.as_ref(),
+                        capture,
+                        guard,
+                    )
+                    .await;
+                    a = after_start;
+                    match r {
+                        Ok(job) => {
+                            record(&mut inst, c.id, &job);
+                            keep(&inst, &mut warnings);
+                            c.started_job = Some(job);
+                        }
+                        Err(error) => refused.push(SetRefused {
+                            member: c.id.to_string(),
+                            channel: None,
+                            error,
+                        }),
+                    }
+                }
+                SetMemberStart::Plan { pc, .. } => {
+                    // Channel by channel, each recorded as it starts.
+                    for &n in &c.plan_left {
+                        let (started, no, after_start) =
+                            plan_start_channels(node, pc, &c.source, &[n], capture, guard).await;
+                        a = merge_after(&c.source, a, after_start);
+                        for s in started {
+                            record(&mut inst, c.id, &s.job);
+                            keep(&inst, &mut warnings);
+                            c.plan_started.push(s);
+                        }
+                        refused.extend(no.into_iter().map(|r| SetRefused {
+                            member: c.id.to_string(),
+                            channel: Some(r.channel),
+                            error: r.error,
+                        }));
+                    }
+                }
+                _ => {}
+            }
+            let merged = merge_after(
+                &c.source,
+                after.remove(&c.source).unwrap_or(AfterGate::Nothing),
+                a,
+            );
+            after.insert(c.source.clone(), merged);
+        }
+    }
+    keep(&inst, &mut warnings);
+    drop(holds);
+    drop(guards);
+    for (_, a) in after {
+        node.after_gate(a).await;
+    }
+    // A source whose holders were replaced and on which nothing started idles if
+    // nobody holds it.
+    for s in replace_on.keys() {
+        let started_on = checked
+            .iter()
+            .any(|c| &c.source == s && (c.started_job.is_some() || !c.plan_started.is_empty()));
+        if let (false, Some(port)) = (started_on, node.port(s)) {
+            node.idle_if_unheld(port.as_ref()).await;
+        }
+    }
+    // The attaches, which need no gate (an attached job holds no lease).
+    let mut attached_any = false;
+    for c in &mut checked {
+        let SetMemberStart::Plan {
+            pc,
+            attach: Some(a),
+            language,
+            readiness,
+        } = &c.what
+        else {
+            continue;
+        };
+        let w = plan_attach(
+            node,
+            pc,
+            a,
+            language,
+            readiness,
+            &mut c.plan_started,
+            &mut c.plan_existing,
+        )
+        .await;
+        warnings.extend(w.into_iter().map(|w| format!("members[{}]: {w}", c.index)));
+        let ours: Vec<&JobId> = inst.jobs().collect();
+        let mut add: Vec<JobId> = c
+            .plan_started
+            .iter()
+            .filter_map(|s| s.attached.clone())
+            .collect();
+        add.extend(
+            c.plan_existing
+                .iter()
+                .filter(|e| ours.contains(&&e.job))
+                .filter_map(|e| e.attached.clone()),
+        );
+        for job in &add {
+            record(&mut inst, c.id, job);
+            attached_any = true;
+        }
+    }
+    if attached_any {
+        keep(&inst, &mut warnings);
+    }
+    // The answer, in the file's role order then member order.
+    let mut result_radios = BTreeMap::new();
+    for (role, source) in &role_source {
+        if !role_in_use(role, source) {
+            continue;
+        }
+        let capture = granted.get(source).copied().unwrap_or_else(|| {
+            node.port(source)
+                .and_then(|p| p.current())
+                .unwrap_or_else(|| {
+                    bounding_of(
+                        checked
+                            .iter()
+                            .filter(|c| &c.source == source)
+                            .map(SetMember::band),
+                    )
+                })
+        });
+        result_radios.insert(
+            role.to_string(),
+            SetRadio {
+                source: source.clone(),
+                capture,
+            },
+        );
+    }
+    let (mut started, mut existing) = (Vec::new(), Vec::new());
+    for (role, _) in &file.radios {
+        for c in checked.iter().filter(|c| c.role == role.as_str()) {
+            if let (SetMemberStart::Job { tuning, .. }, Some(job)) = (&c.what, &c.existing_job) {
+                existing.push(SetExisting {
+                    member: c.id.to_string(),
+                    channel: None,
+                    center_hz: tuning.center_hz,
+                    job: job.clone(),
+                    attached: None,
+                });
+            }
+            existing.extend(c.plan_existing.iter().map(|e| SetExisting {
+                member: c.id.to_string(),
+                channel: Some(e.channel),
+                center_hz: e.center_hz,
+                job: e.job.clone(),
+                attached: e.attached.clone(),
+            }));
+            if let (SetMemberStart::Job { tuning, .. }, Some(job)) = (&c.what, &c.started_job) {
+                started.push(SetStarted {
+                    member: c.id.to_string(),
+                    channel: None,
+                    center_hz: tuning.center_hz,
+                    job: job.clone(),
+                    attached: None,
+                    attach_error: None,
+                });
+            }
+            started.extend(c.plan_started.iter().map(|s| SetStarted {
+                member: c.id.to_string(),
+                channel: Some(s.channel),
+                center_hz: s.center_hz,
+                job: s.job.clone(),
+                attached: s.attached.clone(),
+                attach_error: s.attach_error.clone(),
+            }));
+        }
+    }
+    Ok(OpResult::SetStart {
+        set,
+        radios: result_radios,
+        started,
+        existing,
+        refused,
+        warnings,
+    })
+}
+
+/// `set_stop`: stop the instance's jobs that still run, those on a radio first, then
+/// drop the instance (kept when a stop failed). A set that does not run stops nothing;
+/// an id that is neither a set nor an instance is `unknown`.
+async fn set_stop(node: &Node, set: String) -> Result<OpResult, OpError> {
+    let _set_gate = node.set_gate().await;
+    let Some(inst) = node.set_instances().remove(&set) else {
+        let sets = node.sets();
+        if sets.get(&set).is_none() {
+            return Err(OpError::Unknown {
+                field: "set".into(),
+                value: set,
+                known: sets.ids(),
+            });
+        }
+        return Ok(OpResult::SetStopped {
+            set,
+            stopped: Vec::new(),
+            ended: Vec::new(),
+            failed: Vec::new(),
+        });
+    };
+    let records = node.job_list();
+    let (mut to_stop, mut ended) = (Vec::new(), Vec::new());
+    for job in inst.jobs() {
+        match records.iter().find(|r| &r.id == job) {
+            Some(r) if !crate::node::job_ended(&r.state) => to_stop.push(r),
+            _ => ended.push(job.clone()),
+        }
+    }
+    // Jobs on a radio first: an attached job then usually ends with its input, and
+    // stopping it again is a no-op.
+    to_stop.sort_by_key(|r| r.input.is_some());
+    let (mut stopped, mut failed) = (Vec::new(), Vec::new());
+    for r in to_stop {
+        match node.job_stop(&r.id).await {
+            Ok(()) | Err(NodeError::UnknownJob(_)) => stopped.push(r.id.clone()),
+            Err(e) => failed.push(JobStopFailed {
+                job: r.id.clone(),
+                error: node_error(node, e),
+            }),
+        }
+    }
+    if failed.is_empty()
+        && let Err(e) = node.drop_set_instance(&set)
+    {
+        return Err(other(format!(
+            "set {set}: the instance was not removed: {e}"
+        )));
+    }
+    Ok(OpResult::SetStopped {
+        set,
+        stopped,
+        ended,
+        failed,
     })
 }
 

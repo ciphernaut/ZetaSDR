@@ -10,7 +10,7 @@ use tokio::sync::OwnedMutexGuard;
 use tokio_util::sync::CancellationToken;
 
 use crate::port::{Port, PortError, Tuning};
-use crate::types::{Capabilities, JobId, SourceId};
+use crate::types::{Capabilities, Hz, JobId, SourceId};
 
 #[derive(Debug)]
 pub enum LeaseError {
@@ -167,6 +167,63 @@ fn pinned_in<'a>(leases: &[Lease], source: &'a SourceId) -> Option<&'a SourceId>
     leases.iter().any(|l| l.pin).then_some(source)
 }
 
+/// What a rigid request of a band would get on a source, decided without touching
+/// the port or the leases (see [`LeaseManager::decide`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Decision {
+    /// The band lies inside the current capture (`Fits.0`): leased there, no tune.
+    Fits(Tuning),
+    /// Only elastic leases, or none, hold the source and the band is not inside
+    /// their capture: the port is tuned to the band.
+    Tune,
+    /// The band does not fit what holds the source: the fields of
+    /// [`LeaseError::Conflict`].
+    Conflict {
+        holders: Vec<JobId>,
+        current: Tuning,
+        options: Vec<String>,
+    },
+}
+
+/// The decision for a rigid request of `want` on `port` held by `held`, as
+/// [`LeaseManager::ensure_locked`] takes it. A `pin` request inside a capture only
+/// elastic leases follow is `Tune` rather than `Fits` (R13: a pin's purpose is the
+/// capture itself).
+fn rigid_decision(port: &dyn Port, held: &[Lease], want: &Tuning, pin: bool) -> Decision {
+    let source = port.id();
+    let shared = held.iter().any(|l| l.time_shared);
+    // The leases a rigid request must respect: the rigid ones. A held port lacking
+    // a current tuning is taken to be at its first holder's band, as in
+    // `tune_if_unheld`; it is never retuned.
+    if let Some(cur) = held
+        .iter()
+        .find(|l| !l.elastic)
+        .map(|l| port.current().unwrap_or(l.band))
+    {
+        if !shared && fits(want, &cur) {
+            return Decision::Fits(cur);
+        }
+        let holders = rigid(held);
+        let options = conflict_options(port, want, &cur, shared, &holders, pinned_in(held, source));
+        return Decision::Conflict {
+            holders,
+            current: cur,
+            options,
+        };
+    }
+    // Only elastic leases (or none): a rigid request inside the capture they follow
+    // is leased on it untuned, so it never shrinks a shared capture; otherwise it
+    // tunes as if unheld.
+    match (!pin && !held.is_empty())
+        .then(|| port.current())
+        .flatten()
+        .filter(|c| fits(want, c))
+    {
+        Some(cur) => Decision::Fits(cur),
+        None => Decision::Tune,
+    }
+}
+
 impl LeaseManager {
     pub fn new() -> Self {
         Self::default()
@@ -259,8 +316,33 @@ impl LeaseManager {
             .await
     }
 
+    /// What a rigid request of `want` on `port` would get under the source's gate the
+    /// caller holds (`guard`), without leasing anything or touching the port: `Fits`
+    /// (inside the current capture, under rigid holders or elastic ones), `Tune` (only
+    /// elastic leases or none hold the source and the band is not inside their
+    /// capture) or `Conflict`. [`LeaseManager::ensure_locked`] takes the same decision
+    /// for a rigid request, so a caller deciding several sources before tuning any
+    /// (`set_start`) gets what the lease will then do, the gates held in between.
+    pub(crate) fn decide(
+        &self,
+        port: &dyn Port,
+        want: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Decision {
+        self.assert_gate(port.id(), guard);
+        let held = self
+            .leases
+            .lock()
+            .unwrap()
+            .get(port.id())
+            .cloned()
+            .unwrap_or_default();
+        rigid_decision(port, &held, &want, false)
+    }
+
     /// [`LeaseManager::ensure_locked`], the lease marked `pin` when asked (so it
-    /// is never listed among the holders, not even for an instant).
+    /// is never listed among the holders, not even for an instant). A rigid request
+    /// is decided by [`LeaseManager::decide`]'s rule, then leased or tuned.
     async fn ensure_as(
         &self,
         port: &dyn Port,
@@ -279,49 +361,50 @@ impl LeaseManager {
         {
             let mut leases = self.leases.lock().unwrap();
             let held = leases.get(&source).cloned().unwrap_or_default();
-            let shared = held.iter().any(|l| l.time_shared);
-            // The leases this request must respect: every one for an elastic
-            // request, the rigid ones for a rigid request.
-            let first = held.iter().find(|l| elastic || !l.elastic).map(|l| l.band);
-            // A held port lacking a current tuning is taken to be at its
-            // first holder's band, as in `tune_if_unheld`; it is never retuned.
-            if let Some(cur) = first.map(|f| port.current().unwrap_or(f)) {
-                if elastic && !shared {
-                    let v = leases.get_mut(&source).unwrap();
-                    v.retain(|l| l.job != holder);
-                    v.push(lease(cur));
-                    return Ok((cur, false));
+            // An elastic request on a held port joins its capture untuned (a
+            // held port lacking a current tuning is at its first holder's band),
+            // unless a time-shared lease holds it.
+            if elastic && let Some(first) = held.first() {
+                let cur = port.current().unwrap_or(first.band);
+                if held.iter().any(|l| l.time_shared) {
+                    let holders = rigid(&held);
+                    let pinned = pinned_in(&held, &source);
+                    let options = conflict_options(port, &want, &cur, true, &holders, pinned);
+                    return Err(LeaseError::Conflict {
+                        source,
+                        holders,
+                        current: cur,
+                        options,
+                    });
                 }
-                if !elastic && !shared && fits(&want, &cur) {
-                    let v = leases.get_mut(&source).unwrap();
-                    v.retain(|l| l.job != holder);
-                    v.push(lease(want));
-                    return Ok((cur, false));
-                }
-                let holders = rigid(&held);
-                let pinned = pinned_in(&held, &source);
-                let options = conflict_options(port, &want, &cur, shared, &holders, pinned);
-                return Err(LeaseError::Conflict {
-                    source,
-                    holders,
-                    current: cur,
-                    options,
-                });
-            }
-            // Only elastic leases (or none): a rigid request inside the
-            // capture they follow is leased on it untuned, so it never
-            // shrinks a shared capture; otherwise it tunes as if unheld. A
-            // pin always tunes here (R13): its purpose is the capture itself,
-            // and the elastic jobs follow it.
-            if let Some(cur) = (!pin && !held.is_empty())
-                .then(|| port.current())
-                .flatten()
-                .filter(|c| fits(&want, c))
-            {
                 let v = leases.get_mut(&source).unwrap();
                 v.retain(|l| l.job != holder);
-                v.push(lease(want));
+                v.push(lease(cur));
                 return Ok((cur, false));
+            }
+            // A rigid request (a pin among them): the decision `decide` reports.
+            if !elastic {
+                match rigid_decision(port, &held, &want, pin) {
+                    Decision::Fits(cur) => {
+                        let v = leases.get_mut(&source).unwrap();
+                        v.retain(|l| l.job != holder);
+                        v.push(lease(want));
+                        return Ok((cur, false));
+                    }
+                    Decision::Conflict {
+                        holders,
+                        current,
+                        options,
+                    } => {
+                        return Err(LeaseError::Conflict {
+                            source,
+                            holders,
+                            current,
+                            options,
+                        });
+                    }
+                    Decision::Tune => {}
+                }
             }
         }
         let got = port.tune(want).await?;
@@ -639,23 +722,30 @@ impl LeaseManager {
     }
 
     /// The ports of `ports`, in the given order, that could take the band now: each
-    /// [`covers`] it and has no rigid holder, no pin and no fault. Elastic jobs never
-    /// make a port busy. A suggestion, not a reservation: nothing is leased.
+    /// [`covers`] it and has no rigid holder, no fault, and no pin unless the pin's
+    /// band holds the whole band (a pin admits jobs inside it, as `plan_start` inside a
+    /// pin does). Elastic jobs never make a port busy. A suggestion, not a
+    /// reservation: nothing is leased.
     pub fn free_sources(
         &self,
         ports: &[Arc<dyn Port>],
         center_hz: u64,
         bandwidth_hz: u64,
     ) -> Vec<SourceId> {
+        let want = Tuning {
+            center_hz: Hz(center_hz),
+            bandwidth_hz: Hz(bandwidth_hz),
+        };
         let leases = self.leases.lock().unwrap();
         ports
             .iter()
             .filter(|p| covers(p.capabilities(), center_hz, bandwidth_hz))
             .filter(|p| p.fault().is_none())
             .filter(|p| {
-                leases
-                    .get(p.id())
-                    .is_none_or(|v| v.iter().all(|l| l.elastic))
+                leases.get(p.id()).is_none_or(|v| {
+                    v.iter()
+                        .all(|l| l.elastic || (l.pin && fits(&want, &l.band)))
+                })
             })
             .map(|p| p.id().clone())
             .collect()
@@ -1095,6 +1185,39 @@ mod tests {
         assert_eq!(m.holders(p.id()).len(), 1);
     }
 
+    /// A pin admits jobs inside it: a source pinned over the whole band is free, one
+    /// pinned beside it (or over part of it) is not, and a rigid holder inside a
+    /// covering pin still makes it busy.
+    #[tokio::test]
+    async fn free_sources_takes_a_pin_that_covers_the_band() {
+        let m = LeaseManager::new();
+        let covering = Arc::new(FakePort::named("covering"));
+        let beside = Arc::new(FakePort::named("beside"));
+        let partial = Arc::new(FakePort::named("partial"));
+        let held = Arc::new(FakePort::named("held"));
+        m.pin(covering.as_ref(), t(130_925_000, 18_100_000))
+            .await
+            .unwrap();
+        m.pin(beside.as_ref(), t(148_000_000, 8_000_000))
+            .await
+            .unwrap();
+        m.pin(partial.as_ref(), t(132_000_000, 2_000_000))
+            .await
+            .unwrap();
+        m.pin(held.as_ref(), t(130_925_000, 18_100_000))
+            .await
+            .unwrap();
+        m.ensure(held.as_ref(), JobId::new(), t(131_550_000, 10_000), false)
+            .await
+            .unwrap();
+        let ports: Vec<Arc<dyn Port>> = vec![covering, beside, partial, held];
+        let ids = |v: Vec<SourceId>| v.into_iter().map(|s| s.0).collect::<Vec<_>>();
+        assert_eq!(
+            ids(m.free_sources(&ports, 133_503_750, 6_967_500)),
+            ["covering"]
+        );
+    }
+
     #[tokio::test]
     async fn free_sources_skips_held_pinned_faulted_and_uncovering_ports() {
         let m = LeaseManager::new();
@@ -1110,7 +1233,10 @@ mod tests {
         m.ensure(held.as_ref(), JobId::new(), want, false)
             .await
             .unwrap();
-        m.pin(pinned.as_ref(), want).await.unwrap();
+        // Pinned beside the band: busy (a pin over the band is free, the test above).
+        m.pin(pinned.as_ref(), t(401_000_000, 20_000))
+            .await
+            .unwrap();
         m.ensure(elastic.as_ref(), JobId::new(), want, true)
             .await
             .unwrap();
@@ -1130,5 +1256,126 @@ mod tests {
             ids(m.free_sources(&ports, 11_000_000, 20_000_000)),
             ["idle", "elastic"]
         );
+    }
+
+    /// The lease states `decide` and `ensure_locked` are compared in: the port at
+    /// 100 MHz / 1 MHz, set directly (no tune), and the leases on it inserted
+    /// directly, with the request inside or outside that capture.
+    #[derive(Clone, Copy, Debug)]
+    enum State {
+        Unheld,
+        ElasticInside,
+        ElasticOutside,
+        RigidInside,
+        RigidOutside,
+        ScanInside,
+    }
+
+    const STATES: [State; 6] = [
+        State::Unheld,
+        State::ElasticInside,
+        State::ElasticOutside,
+        State::RigidInside,
+        State::RigidOutside,
+        State::ScanInside,
+    ];
+
+    /// The port and manager in `state`, the holder its lease names (if any) and the
+    /// band requested.
+    fn in_state(state: State) -> (FakePort, LeaseManager, JobId, Tuning) {
+        let (p, m, j) = (FakePort::new(), LeaseManager::new(), JobId::new());
+        let cur = t(100_000_000, 1_000_000);
+        *p.cur.lock().unwrap() = Some(cur);
+        let lease = match state {
+            State::Unheld => None,
+            State::ElasticInside | State::ElasticOutside => Some(Lease::new(j.clone(), cur, true)),
+            State::RigidInside | State::RigidOutside => Some(Lease::new(j.clone(), cur, false)),
+            State::ScanInside => Some(Lease {
+                time_shared: true,
+                ..Lease::new(j.clone(), t(100_000_000, 40_000_000), false)
+            }),
+        };
+        if let Some(l) = lease {
+            m.leases
+                .lock()
+                .unwrap()
+                .entry(p.id().clone())
+                .or_default()
+                .push(l);
+        }
+        let want = match state {
+            State::ElasticOutside | State::RigidOutside => t(433_000_000, 100_000),
+            _ => t(100_100_000, 100_000),
+        };
+        (p, m, j, want)
+    }
+
+    #[tokio::test]
+    async fn decide_reports_fits_tune_or_conflict_without_touching_the_port() {
+        let cur = t(100_000_000, 1_000_000);
+        for state in STATES {
+            let (p, m, j, want) = in_state(state);
+            let guard = m.gate_guard(p.id()).await;
+            let d = m.decide(&p, want, &guard);
+            match state {
+                // Nothing holds the source: a rigid start tunes to its own band.
+                State::Unheld | State::ElasticOutside => {
+                    assert_eq!(d, Decision::Tune, "{state:?}")
+                }
+                State::ElasticInside | State::RigidInside => {
+                    assert_eq!(d, Decision::Fits(cur), "{state:?}")
+                }
+                State::RigidOutside => match d {
+                    Decision::Conflict {
+                        holders,
+                        current,
+                        options,
+                    } => {
+                        assert_eq!(holders, vec![j.clone()]);
+                        assert_eq!(current, cur);
+                        assert!(options.contains(&format!("retry with replace: [{}]", j.0)));
+                    }
+                    other => panic!("expected conflict, got {other:?}"),
+                },
+                // A scan's band is no capture to fit in: only stopping it frees the source.
+                State::ScanInside => match d {
+                    Decision::Conflict { options, .. } => assert_eq!(
+                        options,
+                        vec!["stop the scan holding the source".to_string()]
+                    ),
+                    other => panic!("expected conflict, got {other:?}"),
+                },
+            }
+            assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(p.current(), Some(cur), "{state:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_as_and_decide_agree() {
+        for state in STATES {
+            let (p, m, _, want) = in_state(state);
+            let guard = m.gate_guard(p.id()).await;
+            let d = m.decide(&p, want, &guard);
+            let r = m.ensure_locked(&p, JobId::new(), want, false, &guard).await;
+            match (&d, &r) {
+                (Decision::Fits(cur), Ok((got, false))) => assert_eq!(cur, got, "{state:?}"),
+                (Decision::Tune, Ok((got, true))) => assert_eq!(*got, want, "{state:?}"),
+                (
+                    Decision::Conflict {
+                        holders,
+                        current,
+                        options,
+                    },
+                    Err(LeaseError::Conflict {
+                        holders: h,
+                        current: c,
+                        options: o,
+                        ..
+                    }),
+                ) => assert_eq!((holders, current, options), (h, c, o), "{state:?}"),
+                _ => panic!("{state:?}: decide {d:?} but ensure {r:?}"),
+            }
+        }
     }
 }

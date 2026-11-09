@@ -377,6 +377,7 @@ async fn local_node(dir: &std::path::Path, port: Arc<dyn Port>) -> Node {
     registry.register(Arc::new(PassthroughStage::new()));
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.join("local"),
         ring_seconds: 1.0,

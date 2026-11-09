@@ -376,7 +376,8 @@ fn parse_meminfo(text: &str) -> Option<u64> {
 /// persisted and left alone (one-shot). `speech` is the backend `transcribe`
 /// jobs run on. `themes_dir` is the operator's themes (`--themes-dir`; `None` for
 /// [`zeta_core::themes::default_operator_dir`]). `modes_dir` is the operator's mode rows (`--modes-dir`; `None` for
-/// [`zeta_core::modes::default_operator_dir`]); each broken row is reported on stderr, one
+/// [`zeta_core::modes::default_operator_dir`]) and `sets_dir` the operator's named sets
+/// (`--sets-dir`; `None` for [`zeta_core::sets::default_operator_dir`]); each broken row is reported on stderr, one
 /// line each, then the handler report of the rows with handlers ([`probe_handlers`]); neither
 /// fails the node. Errors name the flag, never a Kiwi password or a node secret. The node
 /// comes with its [`RemotePorts`].
@@ -391,6 +392,7 @@ pub async fn open(
     burst_policy: BurstPolicy,
     modes_dir: Option<PathBuf>,
     themes_dir: Option<PathBuf>,
+    sets_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
 ) -> Result<(Node, RemotePorts), String> {
     let (registry, modes, modes_dir) = load_modes(&state_dir, plugins, speech, modes_dir).await?;
@@ -400,6 +402,7 @@ pub async fn open(
         registry,
         modes,
         modes_dir,
+        sets_dir.or_else(zeta_core::sets::default_operator_dir),
         sources,
         source_positions,
         resume,
@@ -408,6 +411,10 @@ pub async fn open(
     )
     .await?;
     node.set_themes(themes);
+    // Each broken set, one line each; none fails the node.
+    for line in node.sets().startup_lines() {
+        eprintln!("{line}");
+    }
     Ok((node, remotes))
 }
 
@@ -455,7 +462,8 @@ pub async fn load_modes(
 }
 
 /// [`open`] on rows already loaded by [`load_modes`] (their registry, the handle holding
-/// them and the operator directory it used). A node that fails to open closes the ports
+/// them and the operator directory it used), with the operator's sets in `sets_dir`
+/// (`None`: the embedded sets only). A node that fails to open closes the ports
 /// it had opened (see [`RemotePorts::close`]) before the error is returned.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_with(
@@ -463,6 +471,7 @@ pub async fn open_with(
     registry: StageRegistry,
     modes: ModesHandle,
     modes_dir: Option<PathBuf>,
+    sets_dir: Option<PathBuf>,
     sources: &[SourceSpec],
     source_positions: BTreeMap<SourceId, SourcePosition>,
     resume: bool,
@@ -475,6 +484,7 @@ pub async fn open_with(
         registry,
         modes,
         modes_dir,
+        sets_dir,
         sources,
         source_positions,
         resume,
@@ -500,6 +510,7 @@ async fn open_into(
     registry: StageRegistry,
     modes: ModesHandle,
     modes_dir: Option<PathBuf>,
+    sets_dir: Option<PathBuf>,
     sources: &[SourceSpec],
     source_positions: BTreeMap<SourceId, SourcePosition>,
     resume: bool,
@@ -592,6 +603,7 @@ async fn open_into(
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         bank_factory: Some(Arc::new(zeta_dsp::bank::PfbBankFactory)),
         modes_dir,
+        sets_dir,
     };
     let node = Node::open_with_handle(cfg, registry, ports, modes)
         .await

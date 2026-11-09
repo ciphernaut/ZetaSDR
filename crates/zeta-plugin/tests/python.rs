@@ -161,6 +161,7 @@ async fn python_plugin_runs_in_a_job_via_graph_put() {
     reg.register(Arc::new(gain));
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,

@@ -40,6 +40,7 @@ const EMBEDDED: [&str; 13] = [
 fn cfg(dir: &Path, modes_dir: &Path) -> NodeConfig {
     NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 1.0,
@@ -200,6 +201,7 @@ async fn a_node_without_a_modes_dir_lists_only_the_embedded_rows() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         modes_dir: None,
         ..cfg(dir.path(), dir.path())
@@ -467,7 +469,7 @@ async fn modes_list_and_show_carry_the_subject() {
         |id: &str| serde_json::to_value(modes.iter().find(|m| m.id.0 == id).unwrap()).unwrap();
     assert_eq!(info("adsb_decode")["subject"]["key"], "icao");
     assert_eq!(info("adsb_decode")["subject"]["waterfall"], "summary");
-    assert_eq!(info("pocsag_decode")["subject"], serde_json::Value::Null);
+    assert_eq!(info("pocsag_decode")["subject"]["key"], "address");
     let Ok(OpResult::Mode { mode }) = node
         .apply(Op::ModesShow {
             id: "adsb_decode".into(),
@@ -481,6 +483,52 @@ async fn modes_list_and_show_carry_the_subject() {
     assert_eq!(v["row"]["position"]["alt_unit"], "ft");
     assert_eq!(v["row"]["subject"]["track_points"], 100);
     assert_eq!(v["row"]["subject"]["track_min_m"], 500.0);
+}
+
+/// The rows a sonde band must never try live where their signals are: FLEX on the
+/// catalogue's 151.837-153.363 MHz, AIS on its two channels, APRS around its centres. Out of range
+/// (on the sonde band) a row is not `in_range` and never fits.
+#[test]
+fn flex_ais_and_aprs_are_tried_only_where_they_live() {
+    let mut reg = ModeRegistry::load(&stages(), None);
+    for id in ["flex_decode", "ais_decode", "aprs_decode"] {
+        reg.set_program(id, Some("/stand-in".into()), None);
+    }
+    let fit = |center_hz: u64, id: &str| {
+        let scored =
+            zeta_core::modes::score::score_rows(&reg, center_hz, 25_000, "fsk", &|_| 0.0, &|_| 0.0);
+        let s = scored.iter().find(|s| s.mode.row.id.0 == id).unwrap();
+        (s.in_range, s.fits_band)
+    };
+    for center in [401_776_000, 403_025_000, 404_026_000] {
+        for id in ["flex_decode", "ais_decode", "aprs_decode"] {
+            assert_eq!(fit(center, id), (false, false), "{id} at {center} Hz");
+        }
+    }
+    for (center, id) in [
+        (152_000_000, "flex_decode"),
+        (161_975_000, "ais_decode"),
+        (162_025_000, "ais_decode"),
+        (144_800_000, "aprs_decode"),
+        (144_390_000, "aprs_decode"),
+        (145_175_000, "aprs_decode"),
+    ] {
+        assert_eq!(fit(center, id), (true, true), "{id} at {center} Hz");
+    }
+    // Out of the US 929-932 MHz band too (the row has one range: the catalogue's VHF one).
+    assert_eq!(fit(931_000_000, "flex_decode"), (false, false));
+    assert_eq!(fit(156_800_000, "ais_decode"), (false, false));
+    // APRS lives on its centres (144.390, 144.800 and the AU 145.175 MHz), not all of
+    // 2 m: an FM or M17 signal elsewhere on the band gets no centre credit from it.
+    for center in [146_500_000, 147_000_000, 144_200_000] {
+        assert_eq!(
+            fit(center, "aprs_decode"),
+            (false, false),
+            "aprs at {center} Hz"
+        );
+    }
+    let aprs = reg.get("aprs_decode").unwrap();
+    assert!(aprs.row.band.centers_hz.contains(&145_175_000));
 }
 
 #[test]
@@ -571,7 +619,7 @@ fn the_rows_name_the_planned_subjects() {
     );
     use SubjectWaterfall::{Fold, Summary};
     let sondes: &[&str] = &["alt", "vel_v"];
-    let plan: [Plan; 11] = [
+    let plan: [Plan; 12] = [
         (
             "adsb_decode",
             "icao",
@@ -606,6 +654,15 @@ fn the_rows_name_the_planned_subjects() {
             Fold,
             sondes,
             Some("heading"),
+            None,
+        ),
+        (
+            "pocsag_decode",
+            "address",
+            "addresses",
+            Summary,
+            &["kind", "text"],
+            None,
             None,
         ),
         (
@@ -683,12 +740,6 @@ fn the_rows_name_the_planned_subjects() {
         assert_eq!(sub.heading.as_deref(), heading, "{id}");
         assert_eq!(sub.label.as_deref(), label, "{id}");
     }
-    let pocsag = reg
-        .all()
-        .iter()
-        .find(|m| m.row.id.0 == "pocsag_decode")
-        .unwrap();
-    assert_eq!(pocsag.row.subject, None);
 }
 
 /// The aircraft data-link rows as plan 30 pins them: dumpvdl2 at 105 kHz beside ACARS,

@@ -1,9 +1,8 @@
 # ZetaSDR recipes
 
 A recipe is a named, repeatable setup of the node: which radio, which band, which jobs, how to
-check it took, how to take it down. The node does not store recipes yet (it persists live job
-records, pins and gain, and knows mode rows and channel plans, none of which name a setup); this
-file is where they live until it does. An agent driving the node (`zeta ask`, the MCP tools, a
+check it took, how to take it down. Sets (`sets/*.json`, `set_list`, `set_start`) are the stored form of a recipe the node can
+check: they name roles, never sources. A setup that is not a set yet lives here as text. An agent driving the node (`zeta ask`, the MCP tools, a
 Claude Code session) copies the ops here instead of re-deriving the setup from field craft each
 time, so two runs by two models give the same jobs.
 
@@ -25,84 +24,52 @@ The frequencies in a recipe are the mode rows' well-known centres or a plan's ch
 found by hand is still fitted on its measured centre (field craft, "Fitting a demod to a signal"),
 never on a raster.
 
-## All ACARS channels on one radio
+## Airband data links as a set
 
-Decode every VHF ACARS channel the `acars_decode` row knows (worldwide primary, Europe, North
-America, Asia) in one capture. Verified on the field host's B210, 2026-11-02.
+ACARS on every VHF channel and VDL Mode 2 in one capture of a wide radio, ADS-B on a second radio.
+The set is `sets/airband.json`, a stored form of this recipe the node checks: `set_start airband`
+starts it, `set_stop airband` takes it down. Run live on the field host's b210 (ACARS, VDL2) and
+hackrf (ADS-B) before it became a set; the set itself is verified by the node's tests.
 
-**Check.** `source_list`: the radio has no rigid `holders` and no `pin` outside 129.7-132.2 MHz
-(the page's elastic spectrum does not count). `modes_list`: `acars_decode` is `ready`.
+**Check.** `set_list`: `airband` is listed, not `broken`, with its two roles, `wide` (a radio that
+captures 130.0-137.0 MHz at once, 8 MHz) and `second` (1090 MHz with 2.4 MHz). `source_list`: the
+radios have no rigid `holders` and no `pin` outside the set's bands (the page's elastic spectrum
+does not count). `modes_list`: `acars_decode` is `ready`; `vdl2_decode` needs dumpvdl2 and
+`adsb_decode` needs dump1090 on the node's host (an `unavailable` row names the missing program and
+its package). A member whose row is unavailable is `refused` at start and the rest go on: without
+dump1090 the set still runs ACARS and VDL2.
 
-**Ensure the capture.** 2 400 000 Hz at 130 925 000 Hz holds all seven channels, with the
-capture centre on none of them (the receiver's DC spike sits there). The B210 answers
-2 457 600 Hz; the lease rounds up, every channel still fits.
-
-```json
-{"op":"source_ensure","source":"b210","center_hz":130925000,"bandwidth_hz":2400000,"replace":[]}
-```
-
-Without this step the first `job_start` tunes the radio to a 10 kHz capture on its own channel and
-the second channel conflicts with it.
-
-**Start one decoder per channel.** Seven `job_start`, each inside the capture, so none retunes:
+**Start.** One op; map each role to a source of `source_list`, or to `null` to let the node pick the
+first free one.
 
 ```json
-{"op":"job_start","kind":"acars_decode","source":"b210","center_hz":130025000,"bandwidth_hz":10000,"deviation_hz":null,"sideband":null,"elastic":false,"replace":[]}
-{"op":"job_start","kind":"acars_decode","source":"b210","center_hz":130450000,"bandwidth_hz":10000,"deviation_hz":null,"sideband":null,"elastic":false,"replace":[]}
-{"op":"job_start","kind":"acars_decode","source":"b210","center_hz":131125000,"bandwidth_hz":10000,"deviation_hz":null,"sideband":null,"elastic":false,"replace":[]}
-{"op":"job_start","kind":"acars_decode","source":"b210","center_hz":131450000,"bandwidth_hz":10000,"deviation_hz":null,"sideband":null,"elastic":false,"replace":[]}
-{"op":"job_start","kind":"acars_decode","source":"b210","center_hz":131550000,"bandwidth_hz":10000,"deviation_hz":null,"sideband":null,"elastic":false,"replace":[]}
-{"op":"job_start","kind":"acars_decode","source":"b210","center_hz":131725000,"bandwidth_hz":10000,"deviation_hz":null,"sideband":null,"elastic":false,"replace":[]}
-{"op":"job_start","kind":"acars_decode","source":"b210","center_hz":131825000,"bandwidth_hz":10000,"deviation_hz":null,"sideband":null,"elastic":false,"replace":[]}
+{"op":"set_start","set":"airband","radios":{"wide":"b210","second":"hackrf"},"members":null,"replace":[]}
 ```
 
-The centres are `band.centers_hz` of `modes_show acars_decode`; read them from the row when it
-changes rather than from here.
+The set puts the ACARS channels and VDL2 under one lease decision for the band that bounds them
+(about 129.7-137.0 MHz, inside the b210's capture), so nothing retunes between members; ADS-B tunes
+the second radio itself. With one radio only, map `second` to the same source and the set is
+refused `other` naming both roles, since 130-137 MHz and 1090 MHz do not share a capture: use
+`members` to start `acars` and `vdl2`, and `adsb` later on its own.
 
-**Verify.** `source_list` for the radio: `current` is 130 925 000 / 2 457 600 Hz, `holders` has
-the seven ids, `bank.consumers` is 7 and `bank.dropped` stays 0. `job_list`: seven
-`acars_decode` jobs `running`. A `stream_tail` of the primary's event stream (the job's `event`
-stream in `stream_list`) for 10 s seeing no frame means no message arrived in those seconds, not a
-dead channel; ACARS traffic depends on aircraft in range.
+**Verify.** `set_list`: `running` names the sources and each job `running`. `source_list`: the
+wide radio's holders are the seven `acars_decode` jobs and the `vdl2_decode` job, `bank.dropped`
+stays 0. A `stream_tail` of an event stream for 10 s seeing no frame means no message arrived in
+those seconds, not a dead channel: traffic depends on aircraft in range. Events carry `reg`,
+`flight`, `label`, `text` (ACARS), `icao` (VDL2 and ADS-B) and `callsign`, `altitude_ft`, `lat`,
+`lon` (ADS-B); the Subjects tab lists one aircraft table across the links.
 
-**Stop.**
+**Stop.** The set stops only the jobs it started:
 
 ```json
-{"op":"jobs_stop","source":"b210","kind":"acars_decode","plan":null}
+{"op":"set_stop","set":"airband"}
 ```
 
-**Gotchas.** The page watches every job on the shown source through the source's feed. A decoder's
-outline dragged on the waterfall is a `job_retune` off its channel and stops decoding ACARS there:
-put it back with `job_retune` to the row's centre and 10 000 Hz. ADS-B on the same radio must wait
-for these to stop; put it on a second radio (next recipe).
-
-## ADS-B on a second radio
-
-Mode S / ADS-B at 1090 MHz, run by dump1090 on the node's host. Pairs with the ACARS recipe when
-the node has two radios: aircraft data links on both.
-
-**Check.** `modes_list`: `adsb_decode` is `ready` (an `unavailable` row names the missing
-dump1090; `apt install dump1090-fa`, then restart the node). `source_list`: the radio has no rigid
-`holders` and no `pin`.
-
-**Start.**
-
-```json
-{"op":"job_start","kind":"adsb_decode","source":"hackrf","center_hz":1090000000,"bandwidth_hz":2400000,"deviation_hz":null,"sideband":null,"elastic":false,"replace":[]}
-```
-
-A `bandwidth_hz` under 2 000 000 is refused by the row (`band.min_hz`). The job tunes the radio
-itself; no `source_ensure` is needed for a single job.
-
-**Verify.** `job_list`: one `adsb_decode` `running`; `source_list`: `current` 1 090 000 000 Hz, the
-job its holder. Events carry `icao`, `callsign`, `altitude_ft`, `lat`, `lon` as separate messages
-complete; the Subjects tab lists one row per aircraft.
-
-**Stop.**
-
-```json
-{"op":"jobs_stop","source":"hackrf","kind":"adsb_decode","plan":null}
-```
+**Gotchas.** The ACARS centres come from `band.centers_hz` of `modes_show acars_decode`; read them
+from the row when it changes. A decoder's outline dragged on the waterfall is a `job_retune` off its
+channel and stops decoding there: put it back with `job_retune` to the row's centre and band. A
+`conflict` names the role, the source and the holders and starts nothing anywhere: report it, the
+operator decides, and `members` narrows the next request to what is free.
 
 ## UHF CB listeners with transcription
 

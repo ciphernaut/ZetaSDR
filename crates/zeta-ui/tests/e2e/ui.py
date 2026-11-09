@@ -497,7 +497,7 @@ def scenario_pocsag_ribbon_appears(page, url, secret):
         page.evaluate("window.zetaTest.poll()")
         ribbon = page.locator("#waterfall .ov-ribbon.pocsag", has_text="1234567")
         expect(ribbon.first).to_be_visible(timeout=15_000)
-        expect(ribbon.first).to_contain_text("1234567: HELLO ZETA")
+        expect(ribbon.first).to_have_text("pocsag 1 addresses, last 1234567")
         page.wait_for_function(
             """(id) => {
               const e = document.querySelector(`#jobs .job[data-id="${id}"] .events`);
@@ -3595,6 +3595,164 @@ def scenario_owned_jobs_are_hidden_from_the_jobs_pane(page, url, secret):
                 stop_job(url, secret, j["id"])
 
 
+def detect_params(url, secret, job):
+    """The params of `job`'s `detect` node (graph_get)."""
+    graph = http_json(url, secret, "/op", {"op": "graph_get", "job": job})["value"]
+    detect = [n for n in graph["nodes"] if n["kind"] == "detect"]
+    return detect[0]["params"] if len(detect) == 1 else None
+
+
+def scenario_decode_across_entry_starts_a_watch_with_modes(page, url, secret):
+    # Plan 31 spec 4.7, 7.3: the box menu's "Decode across this band…" lists the ready rows
+    # that fit the box; one click starts a watch with `modes` on its `detect` node, whose
+    # decoder folds under the watch's row and whose subjects merge into one table per watch.
+    select_source(page, url, secret, "pocsag")
+    wait_span(page, 1.2)
+    menu = drag_menu(page, 0.25, 0.75)
+    entry = page.locator('#ctx .ctx-item[data-action="decode_across"]')
+    expect(entry).to_have_text("Decode across this band…")
+    sub = page.locator('#ctx .ctx-sub[data-for="decode_across"]')
+    expect(sub).to_be_hidden()
+    entry.click()
+    item = sub.locator('.ctx-item[data-mode="pocsag_decode"]')
+    expect(item).to_have_text("Decode POCSAG pagers across this band")
+    # A ready row wider than the box (RDS's 200 kHz) is not offered.
+    expect(sub.locator('.ctx-item[data-mode="rds_decode"]')).to_have_count(0)
+    item.click()
+    expect(menu).to_be_hidden()
+    watch = None
+    try:
+        def detected():
+            ws = running_watch_jobs(url, secret, "pocsag")
+            if len(ws) != 1:
+                return None
+            p = detect_params(url, secret, ws[0]["id"])
+            return ws[0]["id"] if p and p.get("modes") == ["pocsag_decode"] else None
+
+        watch = wait_until(detected, 10.0, "a watch on pocsag with modes [pocsag_decode]")
+        p = detect_params(url, secret, watch)
+        assert p["persist_ms"] == 500 and p["width_hz"] == [6250, 25000], p
+        expect(page.locator("#transcript .line", has_text="graph_put")).not_to_have_count(0)
+        # The fixture's page sits on the capture centre, which `detect` masks (a real radio's DC
+        # spike), and its clean FSK reads as two sub-kHz tones under the 0.5x width floor: the
+        # test seeds the row's known channel (148.6375 MHz) instead of waiting for a detection.
+        graph = http_json(url, secret, "/op", {"op": "graph_get", "job": watch})["value"]
+        next(n for n in graph["nodes"] if n["kind"] == "detect")["params"]["seed_known"] = True
+        http_json(url, secret, "/op", {"op": "graph_put", "job": watch, "graph": graph})
+
+        def decoder():
+            jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            w = next((j for j in jobs if j["id"] == watch), None)
+            kept = [d["job"] for d in (((w or {}).get("context") or {}).get("watch") or {})
+                    .get("decoding", [])]
+            return next((j["id"] for j in jobs if j["kind"] == "pocsag_decode"
+                         and j["source"] == "pocsag" and j["state"]["status"] == "running"
+                         and j["id"] in kept), None)
+
+        dec = wait_until(decoder, 20.0, "a pocsag_decode the watch keeps")
+        page.evaluate("window.zetaTest.poll()")
+        group = page.locator(f'#jobs .job-group[data-plan="{watch}"][data-kind="watch"]')
+        expect(group).to_have_count(1)
+        expect(group.locator(f'.job[data-id="{dec}"]')).to_have_count(1)
+        expect(group.locator("> summary")).to_have_text(
+            re.compile(r"pocsag_decode × 1 decoding, 0 waiting"))
+        expect(group.locator(f'> summary .job[data-id="{watch}"]')).to_have_count(1)
+        open_subjects(page)
+        sec = page.locator(f'#subjects section.subject-job[data-job="{watch}"]')
+        expect(sec).to_have_count(1)
+        expect(sec.locator("h3")).to_have_text(f"watch {watch[-6:]} · addresses")
+        expect(sec.locator('th[data-col="channel"]')).to_have_count(1)
+        row = sec.locator('tr.subject[data-key="1234567"]')
+        expect(row).to_have_count(1, timeout=20_000)
+        expect(row.locator('td[data-col="channel"]')).to_have_text("148.6375")
+        expect(page.locator(f'#subjects section.subject-job[data-job="{dec}"]')).to_have_count(0)
+    finally:
+        for w in running_watch_jobs(url, secret, "pocsag"):
+            stop_job(url, secret, w["id"])
+        wait_until(lambda: not running_jobs(url, secret, "pocsag_decode", "pocsag"), 10.0,
+                   "no pocsag_decode left after the watch stopped")
+
+
+def set_running(url, secret, set_id):
+    """`set_id`'s running instance from `set_list` (null when it does not run)."""
+    sets = http_json(url, secret, "/op", {"op": "set_list"})["value"]
+    return next(s for s in sets if s["id"] == set_id)["running"]
+
+
+def scenario_set_menu_starts_a_set_and_groups_its_jobs(page, url, secret):
+    # Plan 31 spec 5.5, 7.3: "Start set…" opens a role → source picker and sends set_start;
+    # the set's jobs fold under one group titled by the set's name, the members on the shown
+    # source listed and the others counted; the group's Stop is set_stop after a confirm.
+    menu = open_menu_on_tone(page, url, secret)
+    entry = page.locator('#ctx .ctx-item[data-action="set"]')
+    expect(entry).to_have_text("Start set…")
+    entry.click()
+    expect(menu).to_be_hidden()
+    form = page.locator("#ctx-set")
+    expect(form).to_be_visible()
+    form.locator("select.set-pick").select_option("two_sources")
+    expect(form.locator('select[data-role="a"]')).to_have_value("tone")
+    expect(form.locator('select[data-role="b"]')).to_have_value("")
+    form.locator('select[data-role="b"]').select_option("cb")
+    try:
+        with page.expect_request(lambda r: r.method == "POST" and r.url.endswith("/op")
+                                 and (r.post_data or "").find('"set_start"') >= 0) as req:
+            form.locator("button.start").click()
+        body = json.loads(req.value.post_data)
+        assert body == {"op": "set_start", "set": "two_sources",
+                        "radios": {"a": "tone", "b": "cb"}, "members": None,
+                        "replace": []}, f"set_start {body}"
+        expect(form).to_be_hidden()
+
+        def running():
+            r = set_running(url, secret, "two_sources")
+            ms = (r or {}).get("members", [])
+            return r if len(ms) == 2 and all(m["state"] == "running" for m in ms) else None
+
+        inst = wait_until(running, 10.0, "two_sources running with 2 members")
+        assert inst["radios"] == {"a": "tone", "b": "cb"}, inst
+        job_of = {m["id"]: m["job"] for m in inst["members"]}
+        line = page.locator("#transcript .line.op", has_text="set_start")
+        expect(line.first).to_contain_text(
+            "ok (2 started, 0 existing, 0 refused, 0 warnings)")
+        page.evaluate("window.zetaTest.poll()")
+        group = page.locator('#jobs .job-group[data-plan="two_sources"][data-kind="set"]')
+        expect(group).to_have_count(1)
+        expect(group.locator("> summary .group-text")).to_have_text(
+            re.compile(r"Two sources \(UI tests\) · 1 on tone, \+1 on cb"))
+        expect(group.locator(f'.job[data-id="{job_of["m"]}"]')).to_have_count(1)
+        expect(group.locator(f'.job[data-id="{job_of["cb20"]}"]')).to_have_count(0)
+        expect(page.locator(f'#jobs .job[data-id="{job_of["cb20"]}"]')).to_have_count(0)
+        # On cb the same group lists the CB channel and counts the measure.
+        page.click('.src-tab[data-id="cb"]')
+        expect(page.locator('.src-tab[data-id="cb"]')).to_have_attribute("aria-selected", "true")
+        page.evaluate("window.zetaTest.poll()")
+        group = page.locator('#jobs .job-group[data-plan="two_sources"][data-kind="set"]')
+        expect(group.locator("> summary .group-text")).to_have_text(
+            re.compile(r"Two sources \(UI tests\) · 1 on cb, \+1 on tone"))
+        expect(group.locator(f'.job[data-id="{job_of["cb20"]}"]')).to_have_count(1)
+        expect(group.locator(f'.job[data-id="{job_of["m"]}"]')).to_have_count(0)
+        # The group's Stop asks first, then sends set_stop.
+        stop = group.locator("> summary button.stop")
+        expect(stop).to_have_text("Stop")
+        stop.click()
+        expect(stop).to_have_text("Stop set?")
+        assert set_running(url, secret, "two_sources") is not None, "stopped on one click"
+        stop.click()
+        wait_until(lambda: set_running(url, secret, "two_sources") is None, 10.0,
+                   "two_sources no longer running")
+        wait_until(lambda: not running_jobs(url, secret, "measure", "tone")
+                   and not running_jobs(url, secret, "fm_demod", "cb"), 10.0,
+                   "no measure on tone and no fm_demod on cb after set_stop")
+        expect(page.locator("#transcript .line.op", has_text="set_stop").first).to_contain_text(
+            "ok (2 stopped, 0 ended, 0 failed)")
+    finally:
+        try:
+            http_json(url, secret, "/op", {"op": "set_stop", "set": "two_sources"})
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+
+
 def scenario_adsb_entry_asks_for_2400_khz(page, url, secret):
     # ADS-B always asks for 2.4 MHz, whatever was selected; the 48 kHz tone cannot serve it,
     # so the node refuses with out_of_range naming bandwidth_hz and the transcript says so.
@@ -5290,6 +5448,44 @@ def scenario_subjects_store_merge_units_and_fill(page, url, secret):
           out.dropped = drops.length;
           out.selectedAfter = store.selected();
           out.selectEvents = events;
+          // A watch's merged section (plan 31 spec 4.7) goes with the watch, not its decoders.
+          const { mountSubjectsPane } = await import('./subjects.js');
+          const el = document.createElement("div");
+          document.body.append(el);
+          let jobsNow = [];
+          const pane = mountSubjectsPane(el, store, view, {jobs: () => jobsNow});
+          const watch = (decoding, status = "running") => ({
+            id: "W0123456", kind: "watch", state: {status},
+            context: {watch: {decoding: decoding.map((j) => ({job: j, mode: "k"}))}}});
+          const dec = {id: "D", kind: "k", state: {status: "running"},
+                       tuning: {center_hz: 148637500, bandwidth_hz: 12500}};
+          const look = () => {
+            pane.render();
+            const sec = el.querySelector('section.subject-job[data-job="W0123456"]');
+            return sec && {
+              h3: sec.querySelector("h3").textContent,
+              channel: sec.querySelector('tr.subject[data-key="Z"] td[data-col="channel"]')
+                ?.textContent ?? null,
+              decoderSection: !!el.querySelector('section.subject-job[data-job="D"]'),
+            };
+          };
+          jobsNow = [watch(["D"]), dec];
+          store.sync(jobsNow);
+          store.event(dec, {icao: "Z", callsign: "Q"});
+          out.watchLive = look();
+          jobsNow = [watch([]), {...dec, state: {status: "stopped"}}];
+          store.sync(jobsNow);
+          out.decoderGone = look();
+          out.decoderGoneEligible = pane.eligible();
+          jobsNow = [watch([])];
+          store.sync(jobsNow);
+          out.decoderAged = look();
+          jobsNow = [watch([], "stopped")];
+          store.sync(jobsNow);
+          out.watchStopped = look();
+          out.watchStoppedSize = store.size("W0123456");
+          pane.destroy();
+          el.remove();
           store.destroy();
           out.windowStore = window.zetaSubjects;
           return out;
@@ -5327,11 +5523,21 @@ def scenario_subjects_store_merge_units_and_fill(page, url, secret):
     assert r["looked"] == 5, r  # subjectOf neither merges nor counts
     assert r["held"] is True and r["heldAny"] is True and r["heldNone"] is False, r
     assert r["selectedFirst"] is None, r
-    assert r["selected"] == {"job": "J", "key": "A"}, r
+    # A job no watch keeps is its own group (plan 31 spec 4.7).
+    assert r["selected"] == {"job": "J", "group": "J", "key": "A"}, r
     assert r["afterSync"] == 0 and r["lastAfterSync"] is None and r["dropped"] == 3, r
     assert r["selectedAfter"] is None, r
     assert r["selectEvents"][-1] is None, r
     assert r["windowStore"] is None, r
+    live = {"h3": "watch 123456 · aircraft", "channel": "148.6375", "decoderSection": False}
+    assert r["watchLive"] == live, r["watchLive"]
+    # The decoder lost (stopped, then gone from the list) while the watch runs: the section
+    # stays, its Channel the decoder's last centre, and the tab stays eligible.
+    assert r["decoderGone"] == live, r["decoderGone"]
+    assert r["decoderGoneEligible"] is True, r
+    assert r["decoderAged"] == live, r["decoderAged"]
+    # The watch stopped: its subjects and section go.
+    assert r["watchStopped"] is None and r["watchStoppedSize"] == 0, r
 
 
 def scenario_subjects_table_merges_three_aircraft(page, url, secret):

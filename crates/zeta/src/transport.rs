@@ -64,6 +64,7 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
             burst_policy,
             cli.modes_dir,
             cli.themes_dir,
+            cli.sets_dir,
             speech,
             cli.knowledge_acma,
         )
@@ -96,7 +97,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     }
     if cli.configures_local_node() {
         return usage(
-            "sources, plugins, modes and themes are configured on the serving node: drop --source-*, --plugin, --state-dir, --modes-dir, --themes-dir, --knowledge-acma and --bursts-keep-* with --node (their environment variables are ignored)",
+            "sources, plugins, modes, themes and sets are configured on the serving node: drop --source-*, --plugin, --state-dir, --modes-dir, --themes-dir, --sets-dir, --knowledge-acma and --bursts-keep-* with --node (their environment variables are ignored)",
         );
     }
     let Some(secret) = cli.secret.as_deref().filter(|s| !s.is_empty()) else {
@@ -120,15 +121,23 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
             None,
             None,
             None,
+            None,
         )
         .await;
     }
     let plan = cli.command.plan_filter();
-    let op = match cli.command.into_op() {
+    let mut op = match cli.command.into_op() {
         Ok(Some(op)) => op,
         Ok(None) => return usage("this command cannot run on a remote node"),
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
     };
+    // A `set start` without `--radio`: every role of the set, read from the node, as null.
+    if crate::cli::wants_roles(&op)
+        && let Ok(Ok(zeta_core::ops::OpResult::Sets(sets))) =
+            client.apply(&zeta_core::ops::Op::SetList {}).await
+    {
+        crate::cli::null_roles(&mut op, &sets);
+    }
     match client.apply(&op).await {
         Ok(Ok(mut r)) => {
             crate::cli::narrow_plans(&mut r, plan.as_deref());

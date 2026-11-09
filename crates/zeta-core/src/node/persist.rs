@@ -7,7 +7,7 @@ use super::NodeError;
 use crate::job::{JOB_RECORD_FORMAT, JobRecord};
 use crate::types::Timestamp;
 
-pub(super) fn now() -> Timestamp {
+pub(crate) fn now() -> Timestamp {
     Timestamp(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -26,6 +26,80 @@ pub(super) fn persist(dir: &Path, rec: &JobRecord) -> Result<(), NodeError> {
     let tmp = dir.join(format!("{}.json.tmp", rec.id.0));
     std::fs::write(&tmp, json).map_err(io)?;
     std::fs::rename(&tmp, &path).map_err(io)
+}
+
+/// The state directory's subdirectory of the running sets' instances: apart from
+/// `sets`, where an operator may point `--sets-dir` at their own set files.
+pub(super) const SET_INSTANCES_DIR: &str = "set-instances";
+
+/// Write the set instance as `<dir>/<set id>.json` atomically (temp file, then
+/// rename), creating `dir` when missing.
+pub(super) fn persist_instance(
+    dir: &Path,
+    inst: &crate::sets::SetInstance,
+) -> Result<(), NodeError> {
+    std::fs::create_dir_all(dir).map_err(io)?;
+    let json = serde_json::to_vec_pretty(inst).map_err(io)?;
+    let path = dir.join(format!("{}.json", inst.set));
+    let tmp = dir.join(format!("{}.json.tmp", inst.set));
+    std::fs::write(&tmp, json).map_err(io)?;
+    std::fs::rename(&tmp, &path).map_err(io)
+}
+
+/// Remove the set instance `<dir>/<set>.json`; one already gone is no error.
+pub(super) fn remove_instance(dir: &Path, set: &str) -> Result<(), NodeError> {
+    match std::fs::remove_file(dir.join(format!("{set}.json"))) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io(e)),
+        _ => Ok(()),
+    }
+}
+
+/// Every set instance in `dir` (none when it is missing), and one line per file that
+/// cannot be read as one (`set-instances/<file>: <error>`), whose id is not its file's name, or
+/// whose format is newer than [`crate::sets::SETS_INSTANCE_FORMAT`]. Leftover
+/// `*.json.tmp` files are removed.
+pub(super) fn load_instances(dir: &Path) -> (Vec<crate::sets::SetInstance>, Vec<String>) {
+    let (mut found, mut errors) = (Vec::new(), Vec::new());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (found, errors);
+    };
+    let mut paths: Vec<_> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    paths.sort();
+    for path in paths {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if name.ends_with(".json.tmp") {
+            // Best effort: a leftover that cannot be removed is harmless.
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|s| {
+                serde_json::from_str::<crate::sets::SetInstance>(&s).map_err(|e| e.to_string())
+            })
+            .and_then(|i| match i {
+                i if i.format > crate::sets::SETS_INSTANCE_FORMAT => Err(format!(
+                    "format {} newer than supported {}",
+                    i.format,
+                    crate::sets::SETS_INSTANCE_FORMAT
+                )),
+                i if i.set != stem => Err(format!("set {} is not the file's name", i.set)),
+                i => Ok(i),
+            });
+        match parsed {
+            Ok(i) => found.push(i),
+            Err(e) => errors.push(format!("{SET_INSTANCES_DIR}/{name}: {e}")),
+        }
+    }
+    (found, errors)
 }
 
 /// Load every `*.json` record and delete leftover `*.json.tmp` files from an

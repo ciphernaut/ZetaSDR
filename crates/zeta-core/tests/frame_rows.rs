@@ -137,6 +137,7 @@ async fn open_over(dir: &Path, modes_dir: &Path, iq: &Path) -> Node {
         bank_factory: None,
         modes_dir: Some(modes_dir.to_path_buf()),
         source_positions: Default::default(),
+        sets_dir: None,
     };
     let opts = FileOpts {
         realtime: true,

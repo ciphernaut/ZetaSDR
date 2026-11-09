@@ -72,11 +72,32 @@ pub struct DetectParams {
     /// `window_ms`, `pre_ms`, `post_ms`, `timeout_ms`) of the capture a `watch` with
     /// `on_unknown: capture` starts; checked by the graph as that stage's.
     pub capture: Option<serde_json::Value>,
+    /// Watch policy, ignored by the stage: the mode row ids a `watch` decodes its signals
+    /// with directly, a non-empty list of loaded rows no wider than its band; `null` lets
+    /// identify decide.
+    pub modes: Option<Vec<String>>,
+    /// Watch policy, ignored by the stage: how many decoders a `watch` keeps at once,
+    /// those placed on free sources included; at least 1.
+    pub max_decoders: u32,
+    /// Watch policy, ignored by the stage: how long (ms) a kept decoder whose signal is
+    /// `gone` may stay silent before the `watch` stops it `lost`.
+    pub hold_ms: u64,
+    /// Watch policy, ignored by the stage: how long (ms) after a decoder is `lost` or
+    /// `unproven` a `watch` starts no new decoder on a signal overlapping its channel.
+    pub cooldown_ms: u64,
+    /// Watch policy, ignored by the stage: with `modes`, how long (ms) a decoder started
+    /// without an identify run has to publish an event while its signal is present, else
+    /// the `watch` stops it `unproven`; 0 keeps it while its signal is there.
+    pub confirm_ms: u64,
+    /// Watch policy, ignored by the stage: with `modes`, whether a `watch` starts a
+    /// decoder on every known channel in its band at once, up to `max_decoders`.
+    pub seed_known: bool,
 }
 
 impl DetectParams {
     /// What the schema cannot say: `threshold_db` and `energy_db` finite, `edge_mask`
-    /// in `0..0.5`, `width_hz` ordered `[min, max]`. The error names the field.
+    /// in `0..0.5`, `width_hz` ordered `[min, max]`, `modes` not an empty list,
+    /// `max_decoders` at least 1. The error names the field.
     pub fn check(&self) -> Result<(), String> {
         if !self.threshold_db.is_finite() {
             return Err("threshold_db must be finite".into());
@@ -89,6 +110,12 @@ impl DetectParams {
         }
         if self.width_hz[0] > self.width_hz[1] {
             return Err("width_hz must be [min, max]".into());
+        }
+        if self.modes.as_ref().is_some_and(Vec::is_empty) {
+            return Err(zeta_core::ops::WATCH_MODES_EMPTY.into());
+        }
+        if self.max_decoders == 0 {
+            return Err("max_decoders: at least 1".into());
         }
         Ok(())
     }
@@ -134,6 +161,12 @@ impl Default for DetectParams {
             sondehub: None,
             on_unknown: OnUnknown::Report,
             capture: None,
+            modes: None,
+            max_decoders: zeta_core::ops::WATCH_MAX_DECODERS_DEFAULT,
+            hold_ms: zeta_core::ops::WATCH_HOLD_MS_DEFAULT,
+            cooldown_ms: zeta_core::ops::WATCH_COOLDOWN_MS_DEFAULT,
+            confirm_ms: zeta_core::ops::WATCH_CONFIRM_MS_DEFAULT,
+            seed_known: false,
         }
     }
 }
@@ -623,6 +656,53 @@ mod tests {
     const SIZE: usize = 1024;
     const CENTER_HZ: u64 = 403_000_000;
     const S: u64 = 1_000_000_000;
+
+    #[test]
+    fn the_watch_policy_defaults_are_the_spec_values() {
+        let p = DetectParams::default();
+        assert_eq!(
+            (
+                p.modes,
+                p.max_decoders,
+                p.hold_ms,
+                p.cooldown_ms,
+                p.confirm_ms,
+                p.seed_known
+            ),
+            (None, 16, 120_000, 30_000, 0, false)
+        );
+        // Left out of a stored graph's params, every one takes its default.
+        let old: DetectParams = serde_json::from_value(serde_json::json!({
+            "persist_ms": 1500, "gone_ms": 4000, "prefer": ["rx"]
+        }))
+        .unwrap();
+        assert_eq!(old.max_decoders, 16);
+        assert_eq!(old.modes, None);
+        let null: DetectParams =
+            serde_json::from_value(serde_json::json!({"modes": null})).unwrap();
+        assert_eq!(null.modes, None);
+    }
+
+    #[test]
+    fn check_refuses_an_empty_modes_list_and_a_zero_cap() {
+        let empty = DetectParams {
+            modes: Some(vec![]),
+            ..DetectParams::default()
+        };
+        let e = empty.check().unwrap_err();
+        assert!(e.contains("modes: empty list"), "{e}");
+        let zero = DetectParams {
+            max_decoders: 0,
+            ..DetectParams::default()
+        };
+        let e = zero.check().unwrap_err();
+        assert!(e.contains("max_decoders"), "{e}");
+        let listed = DetectParams {
+            modes: Some(vec!["pocsag_decode".into()]),
+            ..DetectParams::default()
+        };
+        listed.check().unwrap();
+    }
 
     /// Bin index of `offset_hz` from the centre.
     fn bin(offset_hz: f64) -> usize {

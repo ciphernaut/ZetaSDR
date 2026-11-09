@@ -4,7 +4,7 @@
 //! leaves the decoder running (inside the capture, or moved to a free source under
 //! `decode_on: free`); the watch then owns it: it is listed in `job_context.watch`
 //! (`signals`, `decoding`, `current`), stopped once its signal has gone and it has been
-//! silent for [`SILENCE_MS`] (`lost`), and stopped with the watch on a `job_stop`, a
+//! silent for the `detect` node's `hold_ms` (default [`SILENCE_MS`]) (`lost`), and stopped with the watch on a `job_stop`, a
 //! `replace` or a failure (a stage's, the loop's, a panic of the loop included). A
 //! `graph_put` restart or a node restart re-adopts the decoders from the persisted
 //! context instead: those whose job no longer runs are dropped, those whose signal does
@@ -15,12 +15,44 @@
 //! captured once per run by an owned `capture` child (see [`capture`]), unless identify
 //! named a learned signature for it (summary `learned <name> at <MHz>: ...`).
 //!
+//! With `modes` on the `detect` node (a span watch, spec 4.2), a signal is matched to the
+//! listed rows its measured width fits ([`SPAN_WIDTH_FIT`]) instead: none makes it
+//! `unknown` at once (`no listed mode fits`, retried and captured as above); else the
+//! fitting row nearest its width starts directly on the signal's centroid (`decoding`
+//! with `via: modes`, no identify run, in the capture or under `decode_on: free` on a
+//! free source), and rows tied for nearest (one channel width) run an identify
+//! restricted to them. At the start of each run a span watch learns its known channels
+//! (spec 4.3, `job_context.watch.known`): the listed rows' centres in the band and the
+//! licensed transmitters there whose emission fits a listed row ([`band_assignments`],
+//! asked once). A signal on one ranks first for a slot and a direct start on a
+//! register's names the licensee; with `seed_known` a decoder starts on each at once,
+//! `lost` `not seen again` unless a `new` on its channel comes within `hold_ms`. A known
+//! channel never moves a decoder.
+//!
+//! Every watch keeps at most the `detect` node's `max_decoders` decoders (spec 4.4),
+//! counting those on free sources: over the cap a signal that would take one is
+//! `waiting` (one event per signal), and when a slot frees the present waiting signal
+//! that ranks highest ([`rank`]: a known channel, then score, then SNR) takes it; nothing
+//! is pre-empted. With `confirm_ms`, a direct start that publishes no event within it
+//! while its signal is present is stopped `unproven`. In a span watch, a `lost`
+//! decoder's channel, and that of a decoder the operator stopped, is cooled for
+//! `cooldown_ms` (`job_context.watch.cooled`): a signal on it is tracked but neither
+//! started nor identified until the cooldown passes, and a signal still present after a
+//! loss the watch raised counts a try (past [`RETRY_MAX`] it is left alone until it goes
+//! and comes back). A span watch's re-adopted decoder is confirmed within the longer of
+//! `gone_ms` and `hold_ms`. A watch without `modes` keeps its earlier rules: no
+//! cooldown, a lost or stopped decoder's signal left alone until it comes back, and
+//! re-adoption confirmed within `gone_ms`.
+//!
 //! Events, `protocol: "watch"`, go on the job's event stream beside `detect`'s `signal`
-//! events: `state` `identifying | decoding | unknown | lost | capturing | captured`, with
-//! `signal`, `job`, `mode`, `source`, `placed` (`capture | free`), `features` and
-//! `allocations` and `origins` (for `unknown`), `captures` (for `captured`), `summary` and `t_ns`
-//! (fields that do not apply are `null`).
+//! events: `state` `identifying | decoding | waiting | unknown | lost | capturing |
+//! captured`, with `signal`, `job`, `mode`, `source`, `placed` (`capture | free`),
+//! `features` and `allocations` and `origins` (for `unknown`), `captures` (for
+//! `captured`), `via` (for `decoding`: `identify | modes`), `why` (for `lost`: `gone and
+//! silent | not seen again | unproven | relaunch failed`), `summary` and `t_ns` (fields
+//! that do not apply are `null`).
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,9 +66,15 @@ use super::persist::now;
 use super::{Inner, source_fault_reason};
 use crate::graph::{self, Edge, Graph, Node as GraphNode, NodeId};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
+use crate::knowledge::{Allocation, DEFAULT_REGION, band_assignments};
+use crate::modes::ModeRegistry;
 use crate::modes::ModeState;
 use crate::modes::score::score_rows;
-use crate::ops::{DETECT_GONE_MS_DEFAULT, DETECT_STAGE, JobKind, SONDEHUB_STAGE};
+use crate::ops::{
+    DETECT_GONE_MS_DEFAULT, DETECT_STAGE, JobKind, SONDEHUB_STAGE, WATCH_CONFIRM_MS_DEFAULT,
+    WATCH_COOLDOWN_MS_DEFAULT, WATCH_HOLD_MS_DEFAULT, WATCH_MAX_DECODERS_DEFAULT,
+    WATCH_MODES_EMPTY,
+};
 use crate::port::{Port, Tuning};
 use crate::stage::StageError;
 use crate::stream::{Frame, Payload};
@@ -50,8 +88,43 @@ pub const RETRY_MS: u64 = 60_000;
 /// it goes and comes back).
 pub const RETRY_MAX: u32 = 3;
 /// How long a decoder whose signal has gone may stay silent (no event) before it is
-/// stopped as `lost`.
-pub const SILENCE_MS: u64 = 120_000;
+/// stopped as `lost`, unless the `detect` node sets `hold_ms`.
+pub const SILENCE_MS: u64 = WATCH_HOLD_MS_DEFAULT;
+/// A row fits a signal whose measured width lies within these multiples of the row's
+/// `band.bandwidth_hz` (the scoring's width term).
+pub const WIDTH_FIT: (f64, f64) = (0.5, 1.5);
+
+/// A span watch's listed row fits a detected signal whose width lies within these
+/// multiples of the row's `band.bandwidth_hz`: wider than [`WIDTH_FIT`] above, since the
+/// detector reads a strong FSK signal's skirts (a 12.5 kHz page reads 19-25 kHz).
+pub const SPAN_WIDTH_FIT: (f64, f64) = (0.5, 2.0);
+/// Two fitting rows whose width ratios lie this close (in |ln ratio|) tie for nearest.
+const RATIO_TIE: f64 = 1e-9;
+
+/// Whether a signal `signal_hz` wide fits a row `row_hz` wide within `fit`.
+fn fits_within(fit: (f64, f64), row_hz: u64, signal_hz: u64) -> bool {
+    let row = row_hz as f64;
+    (row * fit.0..=row * fit.1).contains(&(signal_hz as f64))
+}
+
+/// Whether a signal `signal_hz` wide fits a row `row_hz` wide by [`WIDTH_FIT`].
+fn width_fits(row_hz: u64, signal_hz: u64) -> bool {
+    fits_within(WIDTH_FIT, row_hz, signal_hz)
+}
+
+/// Of the fitting rows `fits` (`(id, band.bandwidth_hz)`), those whose width ratio
+/// (`signal_hz` / the row's width) lies nearest 1 (by |ln ratio|): one row is started
+/// directly, several (rows of one channel width) tie and go to a restricted identify.
+fn nearest_fits(fits: &[(String, u64)], signal_hz: u64) -> Vec<String> {
+    let off = |row_hz: u64| (signal_hz as f64 / row_hz as f64).ln().abs();
+    let Some(best) = fits.iter().map(|(_, w)| off(*w)).min_by(f64::total_cmp) else {
+        return Vec::new();
+    };
+    fits.iter()
+        .filter(|(_, w)| off(*w) - best <= RATIO_TIE)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
 
 #[cfg(feature = "test-fixtures")]
 static RETRY_OVERRIDE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -188,18 +261,28 @@ pub(super) struct Policy {
     /// With `on_unknown: capture`, the `burst_capture` params (the `capture` block, `{}`
     /// for the defaults) of the capture an unknown signal gets; `None` with `report`.
     capture: Option<serde_json::Value>,
+    /// The mode rows signals are decoded with directly; `None` lets identify decide.
+    modes: Option<Vec<String>>,
+    /// Kept decoders at once.
+    max_decoders: u32,
+    /// How long a kept decoder whose signal is `gone` may stay silent before it is `lost`.
+    hold_ms: u64,
+    /// After a `lost` or `unproven`, how long its channel starts no new decoder.
+    cooldown_ms: u64,
+    /// With `modes`, how long a directly started decoder has to publish an event (0: off).
+    confirm_ms: u64,
+    /// With `modes`, start a decoder on every known channel in the band at once.
+    seed_known: bool,
 }
 
 impl Policy {
     /// The policy in `graph`'s `detect` node: `decode_on` (`capture`, default, or
-    /// `free`), `prefer` (source ids) and the detector's `gone_ms`.
+    /// `free`), `prefer` (source ids), the detector's `gone_ms`, `sondehub`,
+    /// `on_unknown`/`capture`, `modes`, `max_decoders`, `hold_ms` (left out: the
+    /// silence constant, or a test's override of it), `cooldown_ms`, `confirm_ms` and
+    /// `seed_known`.
     fn of(graph: &Graph) -> Policy {
-        let p = graph
-            .nodes
-            .iter()
-            .find(|n| n.kind == DETECT_STAGE)
-            .map(|n| n.params.clone())
-            .unwrap_or_default();
+        let p = policy_of(graph);
         Policy {
             free: p["decode_on"] == "free",
             prefer: p["prefer"]
@@ -216,8 +299,159 @@ impl Policy {
                 serde_json::Value::Null => serde_json::json!({}),
                 v => v.clone(),
             }),
+            modes: p["modes"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            }),
+            max_decoders: p["max_decoders"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(WATCH_MAX_DECODERS_DEFAULT),
+            hold_ms: p["hold_ms"].as_u64().unwrap_or_else(silence_ms),
+            cooldown_ms: p["cooldown_ms"]
+                .as_u64()
+                .unwrap_or(WATCH_COOLDOWN_MS_DEFAULT),
+            confirm_ms: p["confirm_ms"].as_u64().unwrap_or(WATCH_CONFIRM_MS_DEFAULT),
+            seed_known: p["seed_known"].as_bool().unwrap_or(false),
         }
     }
+}
+
+/// The params of `graph`'s `detect` node, where a watch's policy lives (`{}` without
+/// one): what a set's `watch` member is compared with for `existing`.
+pub(crate) fn policy_of(graph: &Graph) -> serde_json::Value {
+    graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == DETECT_STAGE)
+        .map(|n| n.params.clone())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Whether the `detect` params `a` and `b` are one policy: every key of either is
+/// compared, a key one of them leaves out at its default in `schema` (the `detect`
+/// stage's params schema), numbers by value (`6` is `6.0`).
+pub(crate) fn same_policy(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> bool {
+    let defaults = schema["properties"].as_object();
+    let value = |p: &serde_json::Value, k: &str| -> serde_json::Value {
+        match p.get(k) {
+            Some(v) => v.clone(),
+            None => defaults
+                .and_then(|d| d.get(k))
+                .and_then(|s| s.get("default"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        }
+    };
+    let keys = |p: &serde_json::Value| {
+        p.as_object()
+            .map(|o| o.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let mut all = keys(a);
+    all.extend(keys(b));
+    all.iter().all(|k| json_same(&value(a, k), &value(b, k)))
+}
+
+/// `a == b`, numbers compared by value.
+fn json_same(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value as V;
+    match (a, b) {
+        (V::Number(x), V::Number(y)) => x == y || x.as_f64() == y.as_f64(),
+        (V::Array(x), V::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| json_same(x, y))
+        }
+        (V::Object(x), V::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| json_same(v, w)))
+        }
+        _ => a == b,
+    }
+}
+
+/// How a kept decoder came to be started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Via {
+    /// An identify run proved it.
+    Identify,
+    /// Started directly from the watch's `modes`.
+    Modes,
+}
+
+impl Via {
+    /// The `via` of a decoder persisted before the field existed.
+    fn identify() -> Via {
+        Via::Identify
+    }
+}
+
+/// Check a watch's `modes` list against `modes` for a band `band_hz` wide: each id a
+/// loaded, ready row no wider than the band, and the list not empty. The reason names
+/// the entry: `modes[<i>]: unknown mode <id>`, `modes[<i>]: <id> is broken (<reason>)`
+/// (or `unavailable`), `modes[<i>]: <id> is <w> Hz wide; the watch's band is <b> Hz`,
+/// or `modes: empty list (null lets identify decide)`.
+pub(crate) fn check_modes_list(
+    modes: &ModeRegistry,
+    list: &[String],
+    band_hz: u64,
+) -> Result<(), String> {
+    if list.is_empty() {
+        return Err(WATCH_MODES_EMPTY.into());
+    }
+    for (i, id) in list.iter().enumerate() {
+        let Some(m) = modes.get(id) else {
+            return Err(format!("modes[{i}]: unknown mode {id}"));
+        };
+        let state = match m.state {
+            ModeState::Ready => None,
+            ModeState::Broken => Some("broken"),
+            ModeState::Unavailable => Some("unavailable"),
+        };
+        if let Some(state) = state {
+            let reason = m.reason.as_deref().unwrap_or("no reason given");
+            return Err(format!("modes[{i}]: {id} is {state} ({reason})"));
+        }
+        check_mode_width(i, m, band_hz)?;
+    }
+    Ok(())
+}
+
+/// [`check_modes_list`] as a set file is checked at load: the list not empty, and each
+/// row the registry holds (whatever its state) no wider than the band. An unknown,
+/// broken or unavailable row passes: a set may name a row this host lacks, refused when
+/// the set starts.
+pub(crate) fn check_modes_list_at_load(
+    modes: &ModeRegistry,
+    list: &[String],
+    band_hz: u64,
+) -> Result<(), String> {
+    if list.is_empty() {
+        return Err(WATCH_MODES_EMPTY.into());
+    }
+    for (i, id) in list.iter().enumerate() {
+        if let Some(m) = modes.get(id) {
+            check_mode_width(i, m, band_hz)?;
+        }
+    }
+    Ok(())
+}
+
+/// Entry `i` of a watch's `modes`, the row `m`, no wider than the band `band_hz`.
+fn check_mode_width(i: usize, m: &crate::modes::LoadedMode, band_hz: u64) -> Result<(), String> {
+    let (id, width) = (&m.row.id.0, m.row.band.bandwidth_hz);
+    if width > band_hz {
+        return Err(format!(
+            "modes[{i}]: {id} is {width} Hz wide; the watch's band is {band_hz} Hz"
+        ));
+    }
+    Ok(())
 }
 
 /// A signal as `detect` announced it.
@@ -298,6 +532,13 @@ struct Tracked {
     /// The captures its capture wrote.
     #[serde(default)]
     captures: Vec<String>,
+    /// The policy's `modes` rows its width fits by [`SPAN_WIDTH_FIT`] (and the watch's
+    /// band holds); empty with `modes: null`.
+    #[serde(default)]
+    fits: Vec<String>,
+    /// Whether it waits for a free decoder slot.
+    #[serde(default)]
+    waiting: bool,
 }
 
 /// What came of giving a kept decoder the `sondehub` sink.
@@ -333,6 +574,9 @@ struct Decoding {
     signal: Signal,
     since_ns: u64,
     placed: Placed,
+    /// How it was started (a decoder persisted before the field: `identify`).
+    #[serde(default = "Via::identify")]
+    via: Via,
     /// Why the decoder runs without the `sondehub` sink it was asked to have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sink_error: Option<String>,
@@ -346,7 +590,77 @@ struct Decoding {
     /// this passes.
     #[serde(skip)]
     confirm_by_ns: Option<u64>,
+    /// A direct start under `confirm_ms` that has published no event yet: stopped
+    /// `unproven` when this passes while its signal is present.
+    #[serde(skip)]
+    unproven_by_ns: Option<u64>,
 }
+
+/// A channel no new decoder starts on until `until_ns` (`job_context.watch.cooled`):
+/// the centre and width of a decoder that was `lost` (`why` its loss's), stopped by
+/// the operator (`why` [`WHY_STOPPED`]) or that failed (`why` [`WHY_FAILED`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Cooled {
+    center_hz: u64,
+    bandwidth_hz: u64,
+    until_ns: u64,
+    why: String,
+}
+
+/// A known channel (spec 4.3, `job_context.watch.known.channels`): a centre a span
+/// watch expected before the detector saw anything, a listed row's centre or a licensed
+/// transmitter whose emission fits a listed row. A signal on one ranks first for a free
+/// slot and a direct start on a register's names the licensee; with `seed_known` its
+/// decoder starts at once.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Known {
+    center_hz: u64,
+    /// The row's channel width.
+    bandwidth_hz: u64,
+    /// The listed row it decodes with.
+    mode: String,
+    from: KnownFrom,
+    licensee: Option<String>,
+    site: Option<String>,
+    distance_km: Option<f64>,
+    /// The register's assignments folded into it (0 for a row's centre).
+    sites: usize,
+    /// The nearest site's assignment, for the `decoding` summary.
+    #[serde(skip)]
+    allocation: Option<Allocation>,
+}
+
+/// Where a known channel comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum KnownFrom {
+    /// A listed row's `band.centers_hz`.
+    Row,
+    /// A licence register's transmitter.
+    Register,
+}
+
+/// The known channel `s` overlaps (by the known's width): a register's first (it names
+/// a licensee), then the nearest centre.
+fn known_at<'a>(known: &'a [Known], s: &Signal) -> Option<&'a Known> {
+    known
+        .iter()
+        .filter(|k| s.overlaps(k.center_hz, k.bandwidth_hz))
+        .min_by_key(|k| (k.allocation.is_none(), k.center_hz.abs_diff(s.center_hz)))
+}
+
+/// The `why` of a `lost` decoder whose signal went and that stayed silent for the hold.
+const WHY_SILENT: &str = "gone and silent";
+/// The `why` of a `lost` re-adopted decoder whose signal was not seen again in time.
+const WHY_NOT_SEEN: &str = "not seen again";
+/// The `why` of a `lost` direct start that published nothing within `confirm_ms`.
+const WHY_UNPROVEN: &str = "unproven";
+/// The `why` of a `lost` proved decoder that could not be relaunched with its sink.
+const WHY_RELAUNCH: &str = "relaunch failed";
+/// The `why` of a cooled channel whose decoder the operator stopped (not a `lost`).
+const WHY_STOPPED: &str = "stopped";
+/// The `why` of a cooled channel whose decoder ended `Failed` (not a `lost`).
+const WHY_FAILED: &str = "failed";
 
 /// What a running watch needs; made at launch from the record ([`Seed`]) and the
 /// streams the launch registered.
@@ -369,6 +683,8 @@ pub(super) struct Seed {
     adopt: Vec<Decoding>,
     /// The identify a run before a node restart was waiting on.
     stale: Option<JobId>,
+    /// The channels a run before this one cooled (persisted `watch.cooled`).
+    cooled: Vec<Cooled>,
 }
 
 impl Seed {
@@ -378,6 +694,7 @@ impl Seed {
             policy: Policy::of(&rec.graph),
             adopt: serde_json::from_value(w["decoding"].clone()).unwrap_or_default(),
             stale: w["current"].as_str().map(|s| JobId(s.into())),
+            cooled: serde_json::from_value(w["cooled"].clone()).unwrap_or_default(),
         }
     }
 }
@@ -411,6 +728,15 @@ impl Run {
 struct State {
     signals: Vec<Tracked>,
     decoding: Vec<Decoding>,
+    /// The policy's `max_decoders`, reported as `cap.max`.
+    max_decoders: u32,
+    /// The channels no new decoder starts on yet.
+    cooled: Vec<Cooled>,
+    /// A span watch's known channels in the band, built once at the start of a run.
+    known: Vec<Known>,
+    /// What the register query for `known` asked and was answered (`{"providers",
+    /// "assignments"}`); null without `modes`.
+    register: serde_json::Value,
     /// The identify run in progress and the centre of the signal it is on.
     current: Option<(JobId, u64)>,
     /// The decoders' event streams, by job.
@@ -504,8 +830,52 @@ impl State {
             "signals": self.signals,
             "decoding": self.decoding,
             "current": self.current.as_ref().map(|(j, _)| j.0.clone()),
+            "cooled": self.cooled,
+            "known": match &self.register {
+                serde_json::Value::Object(r) => {
+                    let mut k = r.clone();
+                    k.insert("channels".into(), serde_json::json!(self.known));
+                    serde_json::Value::Object(k)
+                }
+                _ => serde_json::Value::Null,
+            },
+            "cap": {
+                "max": self.max_decoders,
+                "decoding": self.decoding.len(),
+                "waiting": self.signals.iter().filter(|s| s.waiting).count(),
+            },
         }})
     }
+
+    /// Whether every decoder slot is taken.
+    fn full(&self) -> bool {
+        self.decoding.len() >= self.max_decoders as usize
+    }
+
+    /// Drop the cooled channels whose cooldown has passed by `now`; whether any went.
+    fn prune_cooled(&mut self, now: u64) -> bool {
+        let before = self.cooled.len();
+        self.cooled.retain(|c| c.until_ns > now);
+        self.cooled.len() != before
+    }
+}
+
+/// Whether `center_hz` ± `bandwidth_hz`/2 overlaps a channel `w` has cooled until after
+/// `now`.
+fn cooled_overlaps(w: &State, center_hz: u64, bandwidth_hz: u64, now: u64) -> bool {
+    w.cooled.iter().any(|c| {
+        c.until_ns > now && 2 * c.center_hz.abs_diff(center_hz) < c.bandwidth_hz + bandwidth_hz
+    })
+}
+
+/// How `a` ranks against `b` for a free decoder slot (greater first): a signal on a
+/// `known` channel first, then the queue's `score`, then SNR.
+fn rank(a: &Tracked, b: &Tracked, known: &[Known]) -> Ordering {
+    let on_known = |t: &Tracked| known_at(known, &t.signal).is_some();
+    on_known(a)
+        .cmp(&on_known(b))
+        .then(a.score.total_cmp(&b.score))
+        .then(a.signal.snr_db.total_cmp(&b.signal.snr_db))
 }
 
 /// One `watch` event's fields beyond `state` and `summary`.
@@ -523,6 +893,11 @@ struct Event<'a> {
     origins: Option<serde_json::Value>,
     /// The captures a `captured` lists.
     captures: Option<&'a [String]>,
+    /// How a `decoding` decoder was started.
+    via: Option<Via>,
+    /// Why a `lost` decoder was stopped: `gone and silent`, `not seen again`,
+    /// `unproven` or `relaunch failed`.
+    why: Option<String>,
 }
 
 impl Inner {
@@ -546,6 +921,8 @@ impl Inner {
             "allocations": e.allocations,
             "origins": e.origins,
             "captures": e.captures,
+            "via": e.via,
+            "why": e.why,
             "summary": summary,
             "t_ns": t.0,
         });
@@ -569,6 +946,15 @@ impl Inner {
             .unwrap()
             .get(id)
             .is_some_and(|e| e.record.state == JobState::Running && e.cancel.is_some())
+    }
+
+    /// Whether `id` ended `Failed`.
+    fn failed(&self, id: &JobId) -> bool {
+        self.jobs
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|e| matches!(e.record.state, JobState::Failed { .. }))
     }
 
     /// Wait up to [`ADOPT_WAIT`] for `id` to run; `None` when cancelled first.
@@ -612,8 +998,8 @@ impl Inner {
 
     /// The band an identify run on `s` takes and its queue score: the best-scoring ready
     /// row (`score_rows` at the signal's centre and width) that fits the signal (its
-    /// measured width within half to 1.5 times the row's band, the scoring's width term)
-    /// and the watch's band, else the signal's own width at score 0.
+    /// measured width within [`WIDTH_FIT`] of the row's band) and the watch's band, else
+    /// the signal's own width at score 0.
     fn identify_band(&self, r: &Run, s: &Signal) -> (u64, f32) {
         score_rows(
             &self.modes(),
@@ -627,13 +1013,40 @@ impl Inner {
         .filter(|x| x.mode.state == ModeState::Ready)
         .find(|x| {
             let band = &x.mode.row.band;
-            let bw = band.bandwidth_hz as f64;
-            (bw * 0.5..=bw * 1.5).contains(&(s.bandwidth_hz as f64))
+            width_fits(band.bandwidth_hz, s.bandwidth_hz)
                 && band.bandwidth_hz <= r.tuning.bandwidth_hz.0
         })
         .map_or((s.bandwidth_hz, 0.0), |x| {
             (x.mode.row.band.bandwidth_hz, x.score)
         })
+    }
+
+    /// The rows of the policy's `modes` that fit `s`, with their widths: ready, its
+    /// measured width within [`SPAN_WIDTH_FIT`] of the row's band, and the row's band no
+    /// wider than the watch's. Empty with `modes: null`.
+    fn fitting_rows(&self, r: &Run, s: &Signal) -> Vec<(String, u64)> {
+        let Some(list) = &r.seed.policy.modes else {
+            return Vec::new();
+        };
+        let modes = self.modes();
+        list.iter()
+            .filter_map(|id| {
+                let m = modes.get(id)?;
+                let width = m.row.band.bandwidth_hz;
+                (m.state == ModeState::Ready
+                    && fits_within(SPAN_WIDTH_FIT, width, s.bandwidth_hz)
+                    && width <= r.tuning.bandwidth_hz.0)
+                    .then(|| (id.clone(), width))
+            })
+            .collect()
+    }
+
+    /// The ids of [`Inner::fitting_rows`].
+    fn fit_ids(&self, r: &Run, s: &Signal) -> Vec<String> {
+        self.fitting_rows(r, s)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     }
 
     /// Whether a running job other than the watch's own (itself, its identify run, its
@@ -659,7 +1072,8 @@ impl Inner {
     }
 
     /// Start an owned `identify` run on `t`'s centre and band inside the watch's
-    /// capture, recorded as `current` first. The launch runs in its own task, so a stop
+    /// capture, recorded as `current` first, restricted to `candidates` when given (in
+    /// its `context.identify.candidates`). The launch runs in its own task, so a stop
     /// of the watch never drops it half way (as identify's own children). `Ok(None)`:
     /// cancelled.
     async fn start_identify(
@@ -667,6 +1081,7 @@ impl Inner {
         r: &Run,
         w: &mut State,
         t: &Tracked,
+        candidates: Option<&[String]>,
     ) -> Result<Option<JobId>, String> {
         let tuning = Tuning {
             center_hz: Hz(t.signal.center_hz),
@@ -691,7 +1106,10 @@ impl Inner {
             source: r.prov.source.clone(),
             tuning,
             state: JobState::Running,
-            context: serde_json::json!({}),
+            context: match candidates {
+                Some(c) => serde_json::json!({"identify": {"candidates": c}}),
+                None => serde_json::json!({}),
+            },
             created_ns: now(),
             input: None,
             capture_rate_hz: None,
@@ -803,37 +1221,170 @@ impl Inner {
         started
     }
 
-    /// Place a decoder identify proved (`proved`, running `mode` inside the watch's
-    /// capture) by the watch's policy: `capture` keeps it there; `free` starts `mode` on
-    /// the signal's centre and the row's width on a free source other than the watch's
-    /// (`prefer` first, then `source list` order), trying the next on a refusal (a
-    /// `conflict`: not free after all), then stops `proved`; with none it stays in the
-    /// capture. The decoder's job, source, placement and, when it fell back, why, with
-    /// what came of giving it the sink.
-    async fn place_decoder(
+    /// Start `mode` directly on the tracked signal `i` (the listed row nearest it) at the
+    /// signal's centroid with the row's width and the policy's `sondehub` sink, kept as a
+    /// decoder `via: modes` (event `decoding`). Under `decode_on: free` it goes to a free
+    /// source as a proved decoder would ([`Inner::start_free`]), else (or when none
+    /// takes it) on the watch's own source, inside its capture with no tune. The start
+    /// on the watch's source runs in its own task, cancellable as identify's launches
+    /// are. A start that fails counts as an unknown try of the signal (event `unknown`)
+    /// and is the `Err`; `Ok(None)`: cancelled.
+    async fn start_direct(
+        self: &Arc<Self>,
+        r: &Run,
+        w: &mut State,
+        i: usize,
+        mode: &str,
+    ) -> Result<Option<JobId>, String> {
+        let signal = w.signals[i].signal.clone();
+        let mut why = None;
+        if r.seed.policy.free {
+            match self.start_free(r, mode, &signal).await {
+                Ok((job, source, sink)) => {
+                    let placed = (source, Placed::Free, None);
+                    self.keep_direct(r, w, i, mode, &job, placed, sink);
+                    return Ok(Some(job));
+                }
+                Err(e) => why = Some(e),
+            }
+            if r.cancel.is_cancelled() {
+                return Ok(None);
+            }
+        }
+        let tuning = Tuning {
+            center_hz: Hz(signal.center_hz),
+            bandwidth_hz: Hz(self.row_width(mode, &signal)),
+        };
+        let (inner, source, m) = (self.clone(), r.prov.source.clone(), mode.to_string());
+        let sondehub = r.seed.policy.sondehub.clone();
+        let mut launch =
+            tokio::spawn(
+                async move { inner.start_on(&source, &m, tuning, sondehub.as_ref()).await },
+            );
+        let started = tokio::select! {
+            res = &mut launch => res.unwrap_or_else(|e| Err(format!("launch task: {e}"))),
+            _ = r.cancel.cancelled() => {
+                if self.gated(&r.id) {
+                    // The gate of the radio is not ours: finish and stop it from a task.
+                    let inner = self.clone();
+                    tokio::spawn(async move {
+                        if let Ok(Ok((job, _))) = launch.await {
+                            let _ = inner.stop(&job).await;
+                        }
+                    });
+                } else if let Ok(Ok((job, _))) = launch.await {
+                    let _ = self.stop_gated(&job).await;
+                }
+                return Ok(None);
+            }
+        };
+        let (job, sink) = match started {
+            Ok(s) => s,
+            Err(e) => {
+                count_try(&mut w.signals[i], now().0);
+                let summary = format!("unknown at {}: {mode} did not start: {e}", signal.mhz());
+                let ev = Event {
+                    signal: Some(&signal),
+                    mode: Some(mode),
+                    ..Event::default()
+                };
+                self.watch_event(r, "unknown", summary, ev);
+                return Err(e);
+            }
+        };
+        let placed = (r.prov.source.clone(), Placed::Capture, why);
+        self.keep_direct(r, w, i, mode, &job, placed, sink);
+        Ok(Some(job))
+    }
+
+    /// Keep the directly started decoder `job` of the tracked signal `i`, placed on
+    /// `(source, placed, why it fell back to the capture)`: listed in `decoding` `via:
+    /// modes`, its events followed, and the event `decoding` published.
+    #[allow(clippy::too_many_arguments)]
+    fn keep_direct(
+        &self,
+        r: &Run,
+        w: &mut State,
+        i: usize,
+        mode: &str,
+        job: &JobId,
+        (source, placed, why): (SourceId, Placed, Option<String>),
+        sink: SinkOutcome,
+    ) {
+        let sink_error = match sink {
+            SinkOutcome::Refused(why) | SinkOutcome::Lost(why) => Some(why),
+            SinkOutcome::Off | SinkOutcome::On | SinkOutcome::Cancelled => None,
+        };
+        let t = now().0;
+        let tracked = &mut w.signals[i];
+        tracked.handled = true;
+        tracked.waiting = false;
+        let gone_since_ns = (!tracked.present).then_some(t);
+        let confirm_ns = r.seed.policy.confirm_ms.saturating_mul(1_000_000);
+        let unproven_by_ns = (confirm_ns > 0).then(|| t.saturating_add(confirm_ns));
+        let signal = tracked.signal.clone();
+        let register = known_at(&w.known, &signal)
+            .and_then(|k| k.allocation.as_ref())
+            .map(|a| register_says(&serde_json::json!([a])))
+            .unwrap_or_default();
+        w.subs.insert(job.clone(), self.decoder_subs(job));
+        w.decoding.push(Decoding {
+            mode: mode.to_string(),
+            job: job.clone(),
+            source: source.clone(),
+            signal: signal.clone(),
+            since_ns: t,
+            placed,
+            via: Via::Modes,
+            sink_error: sink_error.clone(),
+            last_event_ns: t,
+            gone_since_ns,
+            confirm_by_ns: None,
+            unproven_by_ns,
+        });
+        let mut summary = format!(
+            "decoding {mode} at {} on {} ({}, modes){register}",
+            signal.mhz(),
+            source.0,
+            placed.as_str()
+        );
+        if let Some(why) = why {
+            summary.push_str(&format!(": {why}"));
+        }
+        if let Some(why) = sink_error {
+            summary.push_str(&format!("; sondehub sink refused: {why}"));
+        }
+        let e = Event {
+            signal: Some(&signal),
+            job: Some(job),
+            mode: Some(mode),
+            source: Some(&source),
+            placed: Some(placed),
+            via: Some(Via::Modes),
+            ..Event::default()
+        };
+        self.watch_event(r, "decoding", summary, e);
+    }
+
+    /// `mode`'s row width, else the signal's own.
+    fn row_width(&self, mode: &str, signal: &Signal) -> u64 {
+        self.modes()
+            .get(mode)
+            .map_or(signal.bandwidth_hz, |m| m.row.band.bandwidth_hz)
+    }
+
+    /// Start `mode` on the signal's centre and the row's width on a free source other
+    /// than the watch's (`prefer` first, then `source list` order), trying the next on a
+    /// refusal (a `conflict`: not free after all). The job, its source and what came of
+    /// the sink; else why none took it (`no free source`, or `no free source took it
+    /// (<source>: <why>; ...)`).
+    async fn start_free(
         self: &Arc<Self>,
         r: &Run,
         mode: &str,
         signal: &Signal,
-        proved: &JobId,
-    ) -> Placement {
-        let kept = |why: Option<String>, sink: SinkOutcome| Placement {
-            job: proved.clone(),
-            source: r.prov.source.clone(),
-            placed: Placed::Capture,
-            why,
-            sink,
-        };
-        if !r.seed.policy.free {
-            let sink = self
-                .sink_into(r, proved, r.seed.policy.sondehub.as_ref())
-                .await;
-            return kept(None, sink);
-        }
-        let width = self
-            .modes()
-            .get(mode)
-            .map_or(signal.bandwidth_hz, |m| m.row.band.bandwidth_hz);
+    ) -> Result<(JobId, SourceId, SinkOutcome), String> {
+        let width = self.row_width(mode, signal);
         let ports: Vec<Arc<dyn Port>> = {
             let mut v: Vec<_> = self.ports.read().unwrap().values().cloned().collect();
             v.sort_by(|a, b| a.id().0.cmp(&b.id().0));
@@ -863,22 +1414,53 @@ impl Inner {
                 .start_on(&source, mode, tuning, r.seed.policy.sondehub.as_ref())
                 .await
             {
-                Ok((job, sink)) => {
-                    self.stop_started(r, proved, &r.prov.source).await;
-                    return Placement {
-                        job,
-                        source,
-                        placed: Placed::Free,
-                        why: None,
-                        sink,
-                    };
-                }
+                Ok((job, sink)) => return Ok((job, source, sink)),
                 Err(e) => refused.push(format!("{}: {e}", source.0)),
             }
         }
-        let why = match refused.is_empty() {
+        Err(match refused.is_empty() {
             true => "no free source".to_string(),
             false => format!("no free source took it ({})", refused.join("; ")),
+        })
+    }
+
+    /// Place a decoder identify proved (`proved`, running `mode` inside the watch's
+    /// capture) by the watch's policy: `capture` keeps it there; `free` starts `mode` on
+    /// a free source ([`Inner::start_free`]), then stops `proved`; with none it stays in
+    /// the capture. The decoder's job, source, placement and, when it fell back, why, with
+    /// what came of giving it the sink.
+    async fn place_decoder(
+        self: &Arc<Self>,
+        r: &Run,
+        mode: &str,
+        signal: &Signal,
+        proved: &JobId,
+    ) -> Placement {
+        let kept = |why: Option<String>, sink: SinkOutcome| Placement {
+            job: proved.clone(),
+            source: r.prov.source.clone(),
+            placed: Placed::Capture,
+            why,
+            sink,
+        };
+        if !r.seed.policy.free {
+            let sink = self
+                .sink_into(r, proved, r.seed.policy.sondehub.as_ref())
+                .await;
+            return kept(None, sink);
+        }
+        let why = match self.start_free(r, mode, signal).await {
+            Ok((job, source, sink)) => {
+                self.stop_started(r, proved, &r.prov.source).await;
+                return Placement {
+                    job,
+                    source,
+                    placed: Placed::Free,
+                    why: None,
+                    sink,
+                };
+            }
+            Err(why) => why,
         };
         let sink = self
             .sink_into(r, proved, r.seed.policy.sondehub.as_ref())
@@ -1054,6 +1636,10 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
     let mut w = State {
         signals: Vec::new(),
         decoding: Vec::new(),
+        max_decoders: r.seed.policy.max_decoders,
+        cooled: std::mem::take(&mut r.seed.cooled),
+        known: Vec::new(),
+        register: serde_json::Value::Null,
         current: None,
         subs: HashMap::new(),
         pending: None,
@@ -1098,6 +1684,7 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
     release(&inner, &r.prov.source, current, pending, decoders, captures).await;
     if teardown {
         w.signals.clear();
+        w.cooled.clear();
     }
     inner.watch_save(&r, &w);
     result
@@ -1115,7 +1702,14 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
             Some(false) => {}
         }
     }
-    let gone_ns = r.seed.policy.gone_ms.saturating_mul(1_000_000);
+    // A span watch's resumed channel in a quiet spell is held as a kept one is (spec
+    // 9.5); any other watch confirms within the detector's `gone_ms`.
+    let policy = &r.seed.policy;
+    let confirm_ms = match policy.modes.is_some() {
+        true => policy.gone_ms.max(policy.hold_ms),
+        false => policy.gone_ms,
+    };
+    let confirm_ns = confirm_ms.saturating_mul(1_000_000);
     for mut d in std::mem::take(&mut r.seed.adopt) {
         match inner.wait_running(r, &d.job).await {
             None => return cancelled(),
@@ -1124,9 +1718,18 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
         }
         let t = now().0;
         d.last_event_ns = t;
-        d.confirm_by_ns = Some(t.saturating_add(gone_ns));
+        d.confirm_by_ns = Some(t.saturating_add(confirm_ns));
         w.subs.insert(d.job.clone(), inner.decoder_subs(&d.job));
         w.decoding.push(d);
+    }
+    if r.seed.policy.modes.is_some() {
+        match known_channels(inner, r).await {
+            None => return cancelled(),
+            Some((known, register)) => (w.known, w.register) = (known, register),
+        }
+        if r.seed.policy.seed_known && seed(inner, r, w).await.is_none() {
+            return cancelled();
+        }
     }
     inner.watch_save(r, w);
     loop {
@@ -1140,7 +1743,8 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
         if let Some(f) = r.port.fault() {
             return Err(StageError::Failed(source_fault_reason(r.port.id(), &f)));
         }
-        let mut changed = signals(inner, r, w);
+        let mut changed = w.prune_cooled(now().0);
+        changed |= signals(inner, r, w);
         changed |= verdict(inner, r, w).await;
         if r.cancel.is_cancelled() {
             return cancelled();
@@ -1159,6 +1763,166 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
             inner.watch_save(r, w);
         }
     }
+}
+
+/// A span watch's known channels (spec 4.3) and what the register query asked and
+/// answered (`{"providers": <providers giving assignments>, "assignments": <centres
+/// answered>}`; an unreachable register answers nothing, which this cannot tell from
+/// nothing licensed): each listed ready row's `band.centers_hz` inside the band
+/// (`from: row`), then each transmitter [`band_assignments`] finds in the band (the
+/// station's region, else [`DEFAULT_REGION`]; centres within half the narrowest listed
+/// row's width are one) whose decoded emission width fits a listed row by
+/// [`WIDTH_FIT`] (`from: register`, the row whose width lies nearest). `None`:
+/// cancelled.
+async fn known_channels(inner: &Arc<Inner>, r: &Run) -> Option<(Vec<Known>, serde_json::Value)> {
+    let modes = inner.modes();
+    let band = r.tuning;
+    let rows: Vec<(String, u64, Vec<u64>)> = r
+        .seed
+        .policy
+        .modes
+        .iter()
+        .flatten()
+        .filter_map(|id| {
+            let m = modes.get(id)?;
+            let width = m.row.band.bandwidth_hz;
+            (m.state == ModeState::Ready && width <= band.bandwidth_hz.0)
+                .then(|| (id.clone(), width, m.row.band.centers_hz.clone()))
+        })
+        .collect();
+    let inside = |hz: u64| hz.abs_diff(band.center_hz.0) <= band.bandwidth_hz.0 / 2;
+    let mut known: Vec<Known> = rows
+        .iter()
+        .flat_map(|(id, width, centres)| {
+            centres.iter().filter(|c| inside(**c)).map(|c| Known {
+                center_hz: *c,
+                bandwidth_hz: *width,
+                mode: id.clone(),
+                from: KnownFrom::Row,
+                licensee: None,
+                site: None,
+                distance_km: None,
+                sites: 0,
+                allocation: None,
+            })
+        })
+        .collect();
+    let providers = inner.knowledge.read().unwrap().clone();
+    let asked = providers.iter().filter(|p| p.gives_assignments()).count();
+    let Some(narrowest) = rows.iter().map(|(_, w, _)| *w).min() else {
+        let register = serde_json::json!({"providers": asked, "assignments": 0});
+        return Some((known, register));
+    };
+    let region = inner
+        .station
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or_else(|| DEFAULT_REGION.to_string(), |s| s.region.clone());
+    let lookup = band_assignments(
+        &providers,
+        &region,
+        band.center_hz,
+        band.bandwidth_hz,
+        Hz(narrowest / 2),
+    );
+    let found = tokio::select! {
+        a = lookup => a,
+        _ = r.cancel.cancelled() => return None,
+    };
+    for b in &found {
+        let a = &b.allocation;
+        let (Some(center), Some(emission)) = (a.center_hz, a.emission_decoded.as_ref()) else {
+            continue;
+        };
+        let licensed = emission.bandwidth_hz.0;
+        let row = rows
+            .iter()
+            .filter(|(_, w, _)| fits_within(WIDTH_FIT, *w, licensed))
+            .min_by(|x, y| {
+                let off = |w: u64| (w as f64 / licensed as f64).ln().abs();
+                off(x.1).total_cmp(&off(y.1))
+            });
+        let Some((id, width, _)) = row else {
+            continue;
+        };
+        known.push(Known {
+            center_hz: center.0,
+            bandwidth_hz: *width,
+            mode: id.clone(),
+            from: KnownFrom::Register,
+            licensee: a.licensee.clone(),
+            site: a.site.clone(),
+            distance_km: a.distance_km,
+            sites: b.sites,
+            allocation: Some(a.clone()),
+        });
+    }
+    let register = serde_json::json!({"providers": asked, "assignments": found.len()});
+    Some((known, register))
+}
+
+/// `seed_known`: start a decoder at once on each known channel up to the cap, at the
+/// known centre with its row ([`Inner::start_direct`] on a tracked signal there that
+/// the detector has not seen), unless a decoder (an adopted one, an earlier seed)
+/// already covers it, its channel is cooled or another job holds it. Each must be
+/// confirmed by a `new` on its channel within `hold_ms` or is `lost` `not seen again`.
+/// `None`: cancelled.
+async fn seed(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Option<()> {
+    let hold_ns = r.seed.policy.hold_ms.saturating_mul(1_000_000);
+    for k in w.known.clone() {
+        if w.full() {
+            break;
+        }
+        let t = now().0;
+        let signal = Signal {
+            center_hz: k.center_hz,
+            bandwidth_hz: k.bandwidth_hz,
+            snr_db: 0.0,
+            first_ns: t,
+            last_ns: t,
+        };
+        let decoded = w
+            .decoding
+            .iter()
+            .any(|d| d.signal.overlaps(signal.center_hz, signal.bandwidth_hz));
+        if decoded
+            || cooled_overlaps(w, signal.center_hz, signal.bandwidth_hz, t)
+            || inner.held_elsewhere(r, w, &signal)
+        {
+            continue;
+        }
+        w.signals.push(Tracked {
+            signal,
+            present: false,
+            tries: 0,
+            next_retry_ns: None,
+            handled: false,
+            band_hz: k.bandwidth_hz,
+            score: 0.0,
+            features: None,
+            allocations: None,
+            learned: None,
+            captured: false,
+            captures: Vec::new(),
+            fits: vec![k.mode.clone()],
+            waiting: false,
+        });
+        let i = w.signals.len() - 1;
+        match inner.start_direct(r, w, i, &k.mode).await {
+            Ok(None) => return None,
+            Ok(Some(job)) => {
+                if let Some(d) = w.decoding.iter_mut().find(|d| d.job == job) {
+                    d.confirm_by_ns = Some(d.since_ns.saturating_add(hold_ns));
+                }
+            }
+            // Its `unknown` is published; nothing on the air to retry.
+            Err(_) => {
+                w.signals.remove(i);
+            }
+        }
+    }
+    Some(())
 }
 
 /// Take `detect`'s announcements since the last tick into the state; whether it changed.
@@ -1190,9 +1954,14 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
         {
             match new {
                 true => {
+                    // The decoder stays where it runs (a seeded one on its known centre).
                     d.signal = s.clone();
                     d.gone_since_ns = None;
-                    d.confirm_by_ns = None;
+                    // A seeded decoder's `confirm_ms` counts from its signal's first `new`.
+                    if d.confirm_by_ns.take().is_some() && d.unproven_by_ns.is_some() {
+                        let confirm_ns = r.seed.policy.confirm_ms.saturating_mul(1_000_000);
+                        d.unproven_by_ns = Some(t.saturating_add(confirm_ns));
+                    }
                 }
                 false => d.gone_since_ns = Some(t),
             }
@@ -1200,6 +1969,7 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
         let tracked = nearest(&w.signals, s.center_hz, s.bandwidth_hz);
         match (new, tracked) {
             (true, Some(i)) => {
+                w.signals[i].fits = inner.fit_ids(r, &s);
                 w.signals[i].signal = s;
                 w.signals[i].present = true;
             }
@@ -1212,6 +1982,7 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
                     continue;
                 }
                 let (band_hz, score) = inner.identify_band(r, &s);
+                let fits = inner.fit_ids(r, &s);
                 w.signals.push(Tracked {
                     signal: s,
                     present: true,
@@ -1225,6 +1996,8 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
                     learned: None,
                     captured: false,
                     captures: Vec::new(),
+                    fits,
+                    waiting: false,
                 });
                 capture::seen_before(w);
             }
@@ -1314,6 +2087,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
                     mode: Some(&mode),
                     source: Some(&source),
                     placed: Some(placed),
+                    why: Some(WHY_RELAUNCH.into()),
                     ..Event::default()
                 };
                 inner.watch_event(r, "lost", summary, e);
@@ -1324,7 +2098,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         };
         let t = now().0;
         // A signal that went while identify ran sends no further `gone`: count its
-        // silence from now, so the decoder is still dropped after SILENCE_MS.
+        // silence from now, so the decoder is still dropped after the hold.
         let gone_since_ns = (!w.signals[i].present).then_some(t);
         w.subs.insert(job.clone(), inner.decoder_subs(&job));
         w.decoding.push(Decoding {
@@ -1334,10 +2108,12 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             signal: signal.clone(),
             since_ns: t,
             placed,
+            via: Via::Identify,
             sink_error: sink_error.clone(),
             last_event_ns: t,
             gone_since_ns,
             confirm_by_ns: None,
+            unproven_by_ns: None,
         });
         w.pending = None;
         let mut summary = format!(
@@ -1358,22 +2134,14 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             mode: Some(&mode),
             source: Some(&source),
             placed: Some(placed),
+            via: Some(Via::Identify),
             ..Event::default()
         };
         inner.watch_event(r, "decoding", summary, e);
         return true;
     }
     let tracked = &mut w.signals[i];
-    tracked.tries += 1;
-    match tracked.tries > RETRY_MAX {
-        true => {
-            tracked.handled = true;
-            tracked.next_retry_ns = None;
-        }
-        false => {
-            tracked.next_retry_ns = Some(now().0.saturating_add(retry_ms() * 1_000_000));
-        }
-    }
+    count_try(tracked, now().0);
     let label = v["verdict"]["label"].as_str().unwrap_or("unknown");
     let features = v["verdict"]["features"].clone();
     let allocations = v["verdict"]["allocations"].clone();
@@ -1504,9 +2272,14 @@ pub(super) fn register_says(allocations: &serde_json::Value) -> String {
     out
 }
 
-/// Note the decoders' events; drop those whose job no longer runs; stop (`lost`) those
-/// whose signal has gone and that stayed silent for [`SILENCE_MS`], and re-adopted ones
-/// whose signal did not reappear in time. Whether the state changed.
+/// Note the decoders' events; drop those whose job no longer runs (the operator stopped
+/// it; a span watch cools its channel [`WHY_STOPPED`], or [`WHY_FAILED`] counting a try
+/// when it ended `Failed`); stop (`lost`) those whose signal
+/// has gone and that stayed silent for the policy's `hold_ms`, re-adopted ones whose
+/// signal did not reappear in time, and direct starts that published nothing within
+/// `confirm_ms` while their signal was present (`unproven`). A span watch cools each
+/// lost one's channel for the policy's `cooldown_ms` ([`free_channel`]); any other watch
+/// forgets its signal. Each frees a slot for [`next`]. Whether the state changed.
 async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     let t = now().0;
     for d in &mut w.decoding {
@@ -1526,6 +2299,7 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
                             && counts(v)
                         {
                             d.last_event_ns = t;
+                            d.unproven_by_ns = None;
                         }
                     }
                     Err(TryRecvError::Lagged(_)) => {}
@@ -1534,7 +2308,9 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             }
         }
     }
-    let silence_ns = silence_ms().saturating_mul(1_000_000);
+    let silence_ns = r.seed.policy.hold_ms.saturating_mul(1_000_000);
+    let until_ns = t.saturating_add(r.seed.policy.cooldown_ms.saturating_mul(1_000_000));
+    let span = r.seed.policy.modes.is_some();
     let mut changed = false;
     let mut kept = Vec::with_capacity(w.decoding.len());
     for d in std::mem::take(&mut w.decoding) {
@@ -1545,26 +2321,43 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             continue;
         }
         if !inner.runs(&d.job) {
+            // Stopped by the operator (or ended on its own): its slot is free. A span
+            // watch's channel rests for the cooldown before the watch starts it again;
+            // any other watch leaves its signal alone until it goes and comes back. A
+            // decoder that failed counts a try, so one that keeps failing stops being
+            // restarted after [`RETRY_MAX`]; an operator stop counts none.
             w.subs.remove(&d.job);
+            if span {
+                match inner.failed(&d.job) {
+                    true => free_channel(inner, w, &d, until_ns, WHY_FAILED, Some(t)),
+                    false => free_channel(inner, w, &d, until_ns, WHY_STOPPED, None),
+                }
+            }
             changed = true;
             continue;
         }
         let unconfirmed = d.confirm_by_ns.is_some_and(|by| t >= by);
+        let unproven = d.gone_since_ns.is_none() && d.unproven_by_ns.is_some_and(|by| t >= by);
         let silent = d
             .gone_since_ns
             .is_some_and(|_| t.saturating_sub(d.last_event_ns.max(d.since_ns)) >= silence_ns);
-        if !(unconfirmed || silent) {
-            kept.push(d);
-            continue;
-        }
+        let why = match (unconfirmed, unproven, silent) {
+            (true, _, _) => WHY_NOT_SEEN,
+            (false, true, _) => WHY_UNPROVEN,
+            (false, false, true) => WHY_SILENT,
+            (false, false, false) => {
+                kept.push(d);
+                continue;
+            }
+        };
         inner.stop_started(r, &d.job, &d.source).await;
         w.subs.remove(&d.job);
-        w.signals
-            .retain(|x| !x.signal.overlaps(d.signal.center_hz, d.signal.bandwidth_hz));
-        let why = match unconfirmed {
-            true => "not seen again",
-            false => "gone and silent",
-        };
+        match span {
+            true => free_channel(inner, w, &d, until_ns, why, Some(t)),
+            false => w
+                .signals
+                .retain(|x| !x.signal.overlaps(d.signal.center_hz, d.signal.bandwidth_hz)),
+        }
         let summary = format!("lost {} at {}: {why}", d.mode, d.signal.mhz());
         let e = Event {
             signal: Some(&d.signal),
@@ -1572,6 +2365,7 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             mode: Some(&d.mode),
             source: Some(&d.source),
             placed: Some(d.placed),
+            why: Some(why.to_string()),
             ..Event::default()
         };
         inner.watch_event(r, "lost", summary, e);
@@ -1579,6 +2373,42 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     }
     w.decoding = kept;
     changed
+}
+
+/// A span watch's decoder `d` no longer runs: cool its channel (its centre, its row's
+/// width) until `until_ns` for `why`, forget the tracked signals on it that have gone,
+/// and put those still present back in the queue, started afresh once the cooldown
+/// passes. After a loss the watch raised or a failure (`lost_at`, its time), each
+/// requeued signal
+/// counts a try ([`count_try`]): past [`RETRY_MAX`] it is left alone until it goes and
+/// comes back, so a carrier no decoder proves does not churn.
+fn free_channel(
+    inner: &Inner,
+    w: &mut State,
+    d: &Decoding,
+    until_ns: u64,
+    why: &str,
+    lost_at: Option<u64>,
+) {
+    w.cooled.push(Cooled {
+        center_hz: d.signal.center_hz,
+        bandwidth_hz: inner.row_width(&d.mode, &d.signal),
+        until_ns,
+        why: why.to_string(),
+    });
+    let (center_hz, bandwidth_hz) = (d.signal.center_hz, d.signal.bandwidth_hz);
+    w.signals
+        .retain(|x| x.present || !x.signal.overlaps(center_hz, bandwidth_hz));
+    for x in &mut w.signals {
+        if x.signal.overlaps(center_hz, bandwidth_hz) {
+            x.handled = false;
+            x.next_retry_ns = None;
+            x.waiting = false;
+            if let Some(t) = lost_at {
+                count_try(x, t);
+            }
+        }
+    }
 }
 
 /// With no identify in progress, stop any running job this watch owns that it does not
@@ -1608,28 +2438,73 @@ enum Next {
     Cancelled,
 }
 
-/// Start an identify run on the best-scoring queued signal that is due, unless another
-/// job's band now overlaps it (it is then dropped). Publishes `identifying`.
+/// Act on the queued signal that is due and ranks highest ([`rank`]), unless another
+/// job's band now overlaps it (it is then dropped). A signal on a cooled channel is not
+/// due until its cooldown passes. With `modes: null`, start an identify run on it (event
+/// `identifying`). With `modes`, by the listed rows its width fits ([`SPAN_WIDTH_FIT`]):
+/// none, it is `unknown` at once (a try, retried and captured as an identify's unknown);
+/// else the fitting row whose width lies nearest the signal's starts directly
+/// ([`Inner::start_direct`]), and rows tied for nearest (one channel width) run an
+/// identify restricted to them. A signal that would take a decoder while all
+/// `max_decoders` slots are kept waits instead ([`wait`]) and takes a slot when one
+/// frees and it ranks highest; nothing is pre-empted.
 async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
     let t = now().0;
+    let mut marked = false;
     loop {
+        let full = w.full();
         let due = w
             .signals
             .iter()
             .enumerate()
-            .filter(|(_, x)| x.present && !x.handled)
+            .filter(|(_, x)| x.present && !x.handled && !(full && x.waiting))
             .filter(|(_, x)| x.next_retry_ns.is_none_or(|n| t >= n))
-            .max_by(|a, b| a.1.score.total_cmp(&b.1.score).then(b.0.cmp(&a.0)))
+            .filter(|(_, x)| !cooled_overlaps(w, x.signal.center_hz, x.signal.bandwidth_hz, t))
+            .max_by(|a, b| rank(a.1, b.1, &w.known).then(b.0.cmp(&a.0)))
             .map(|(i, _)| i);
         let Some(i) = due else {
-            return Next::Idle;
+            return match marked {
+                true => Next::Started,
+                false => Next::Idle,
+            };
         };
         if inner.held_elsewhere(r, w, &w.signals[i].signal) {
             w.signals.remove(i);
             continue;
         }
+        let mut candidates = None;
+        if r.seed.policy.modes.is_some() {
+            let signal = &w.signals[i].signal;
+            let fits = inner.fitting_rows(r, signal);
+            let nearest = nearest_fits(&fits, signal.bandwidth_hz);
+            w.signals[i].fits = fits.into_iter().map(|(id, _)| id).collect();
+            if nearest.is_empty() {
+                no_fit(inner, r, w, i, t).await;
+                return Next::Started;
+            }
+            if full {
+                wait(inner, r, w, i);
+                marked = true;
+                continue;
+            }
+            if let [mode] = nearest.as_slice() {
+                return match inner.start_direct(r, w, i, mode).await {
+                    Ok(None) => Next::Cancelled,
+                    Ok(Some(_)) | Err(_) => Next::Started,
+                };
+            }
+            candidates = Some(nearest);
+        } else if full {
+            wait(inner, r, w, i);
+            marked = true;
+            continue;
+        }
+        w.signals[i].waiting = false;
         let tracked = w.signals[i].clone();
-        match inner.start_identify(r, w, &tracked).await {
+        match inner
+            .start_identify(r, w, &tracked, candidates.as_deref())
+            .await
+        {
             Ok(None) => return Next::Cancelled,
             Ok(Some(id)) => {
                 let summary = format!("identifying {}", tracked.signal.mhz());
@@ -1645,11 +2520,7 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
                 // Not startable now (a conflict, a fault): counted as an unknown try.
                 w.current = None;
                 let tracked = &mut w.signals[i];
-                tracked.tries += 1;
-                match tracked.tries > RETRY_MAX {
-                    true => tracked.handled = true,
-                    false => tracked.next_retry_ns = Some(t.saturating_add(retry_ms() * 1_000_000)),
-                }
+                count_try(tracked, t);
                 let signal = tracked.signal.clone();
                 // No identify ran, so no register answer: `allocations` stays null.
                 let summary = format!("unknown at {}: identify did not start: {e}", signal.mhz());
@@ -1662,6 +2533,62 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
             }
         }
     }
+}
+
+/// Every slot is kept: the tracked signal `i` waits for one (event `waiting` the first
+/// time, summary `waiting at <MHz>: <n> of <cap> decoding`).
+fn wait(inner: &Inner, r: &Run, w: &mut State, i: usize) {
+    let tracked = &mut w.signals[i];
+    if tracked.waiting {
+        return;
+    }
+    tracked.waiting = true;
+    let signal = tracked.signal.clone();
+    let summary = format!(
+        "waiting at {}: {} of {} decoding",
+        signal.mhz(),
+        w.decoding.len(),
+        w.max_decoders
+    );
+    let e = Event {
+        signal: Some(&signal),
+        ..Event::default()
+    };
+    inner.watch_event(r, "waiting", summary, e);
+}
+
+/// Count a try of `tracked` that ended without a decoder (an unknown verdict, a start
+/// that failed, no listed row fitting): past [`RETRY_MAX`] it is left alone (`handled`,
+/// no retry) until it goes and comes back, else tried again [`RETRY_MS`] after `now_ns`.
+fn count_try(tracked: &mut Tracked, now_ns: u64) {
+    tracked.tries += 1;
+    match tracked.tries > RETRY_MAX {
+        true => {
+            tracked.handled = true;
+            tracked.next_retry_ns = None;
+        }
+        false => tracked.next_retry_ns = Some(now_ns.saturating_add(retry_ms() * 1_000_000)),
+    }
+}
+
+/// The tracked signal `i` fits none of the policy's `modes`: `unknown` at once (no
+/// identify run, so no register answer or origins), counted as a try and retried after
+/// [`RETRY_MS`] as an identify's unknown, and captured under `on_unknown: capture`.
+async fn no_fit(inner: &Arc<Inner>, r: &Run, w: &mut State, i: usize, t: u64) {
+    let tracked = &mut w.signals[i];
+    count_try(tracked, t);
+    let signal = tracked.signal.clone();
+    let summary = format!(
+        "unknown at {}: no listed mode fits {} kHz",
+        signal.mhz(),
+        khz(signal.bandwidth_hz)
+    );
+    let e = Event {
+        signal: Some(&signal),
+        ..Event::default()
+    };
+    inner.watch_event(r, "unknown", summary, e);
+    capture::on_unknown(inner, r, w, i).await;
 }
 
 #[cfg(test)]
@@ -1688,7 +2615,87 @@ mod tests {
             learned: None,
             captured: false,
             captures: Vec::new(),
+            fits: Vec::new(),
+            waiting: false,
         }
+    }
+
+    #[test]
+    fn a_span_fit_is_tolerant_and_prefers_the_nearest_width() {
+        // A strong 12.5 kHz page reads 22 kHz: it fits now, not by identify's rule.
+        assert!(fits_within(SPAN_WIDTH_FIT, 12_500, 22_000));
+        assert!(!width_fits(12_500, 22_000));
+        // Bounds inclusive; a 60 kHz signal fits no 12.5 or 25 kHz row.
+        assert!(fits_within(SPAN_WIDTH_FIT, 12_500, 25_000));
+        assert!(fits_within(SPAN_WIDTH_FIT, 12_500, 6_250));
+        assert!(!fits_within(SPAN_WIDTH_FIT, 12_500, 60_000));
+        assert!(!fits_within(SPAN_WIDTH_FIT, 25_000, 60_000));
+        let row = |id: &str, w: u64| (id.to_string(), w);
+        // 20 kHz: 25 kHz (ratio 0.8) is nearer than 12.5 kHz (ratio 1.6).
+        let fits = [row("acars", 12_500), row("vdl2", 25_000)];
+        assert_eq!(nearest_fits(&fits, 20_000), ["vdl2"]);
+        assert_eq!(nearest_fits(&fits, 14_000), ["acars"]);
+        // One channel width: a tie, for the restricted identify.
+        let fits = [row("pocsag_decode", 12_500), row("aprs_decode", 12_500)];
+        assert_eq!(
+            nearest_fits(&fits, 22_000),
+            ["pocsag_decode", "aprs_decode"]
+        );
+        assert!(nearest_fits(&[], 22_000).is_empty());
+    }
+
+    #[test]
+    fn a_slot_goes_to_a_known_channel_then_score_then_snr() {
+        let (mut a, mut b) = (tracked(148_600_000, 12_500), tracked(148_700_000, 12_500));
+        a.score = 2.0;
+        b.signal.snr_db = 40.0;
+        assert_eq!(rank(&a, &b, &[]), Ordering::Greater, "score before SNR");
+        b.score = 2.0;
+        assert_eq!(rank(&a, &b, &[]), Ordering::Less, "then SNR");
+        let known = [Known {
+            center_hz: 148_600_000,
+            bandwidth_hz: 12_500,
+            mode: "pocsag_decode".into(),
+            from: KnownFrom::Row,
+            licensee: None,
+            site: None,
+            distance_km: None,
+            sites: 0,
+            allocation: None,
+        }];
+        assert_eq!(rank(&a, &b, &known), Ordering::Greater, "known first");
+    }
+
+    #[test]
+    fn a_cooled_channel_blocks_only_overlapping_signals_until_it_passes() {
+        let mut w = State {
+            signals: Vec::new(),
+            decoding: Vec::new(),
+            max_decoders: 1,
+            cooled: vec![Cooled {
+                center_hz: 148_600_000,
+                bandwidth_hz: 12_500,
+                until_ns: 100,
+                why: WHY_UNPROVEN.into(),
+            }],
+            known: Vec::new(),
+            register: serde_json::Value::Null,
+            current: None,
+            subs: HashMap::new(),
+            pending: None,
+            capturing: Vec::new(),
+            captured: Vec::new(),
+            guard: None,
+        };
+        assert!(cooled_overlaps(&w, 148_605_000, 13_000, 99));
+        assert!(
+            !cooled_overlaps(&w, 148_625_000, 13_000, 99),
+            "a channel away"
+        );
+        assert!(!cooled_overlaps(&w, 148_605_000, 13_000, 100), "passed");
+        assert!(!w.prune_cooled(99));
+        assert!(w.prune_cooled(100));
+        assert!(w.cooled.is_empty());
     }
 
     #[test]

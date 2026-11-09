@@ -493,7 +493,11 @@ function notApplied(e) {
 function noteRefusals(v) {
   if (!v) return;
   for (const r of v.refused || []) {
-    state.transcript.note(`ch${r.channel}: ${errorText(r.error)}`, true);
+    // A set_start's refusal names its member (and the channel of a plan member).
+    const what = r.member === undefined
+      ? `ch${r.channel}`
+      : `${r.member}${r.channel === null || r.channel === undefined ? "" : ` ch${r.channel}`}`;
+    state.transcript.note(`${what}: ${errorText(r.error)}`, true);
   }
   for (const w of v.warnings || []) state.transcript.note(w);
 }
@@ -512,7 +516,7 @@ async function applyOp(op, { errors = false } = {}) {
   try {
     result = await state.api.op(op);
     if (QUIET_OPS.has(op.op)) t.reply(op, result);
-    if (op.op === "plan_start") noteRefusals(result && result.value);
+    if (op.op === "plan_start" || op.op === "set_start") noteRefusals(result && result.value);
   } catch (e) {
     if (notApplied(e)) t.note(`${op.op}: ${e.message}`, true);
     else if (e.json && e.json.error === "conflict") await offerReplace(op, e.json);
@@ -537,13 +541,19 @@ function holderText(id, err) {
 }
 
 // `conflict: source S held by …`, with the node's `unpin source S (source_unpin)` option
-// after it when the source is pinned (a pin is never among the holders).
+// after it when the source is pinned (a pin is never among the holders). A set_start's
+// conflict leads its options with the role's own line (`radios.<role> …`), which already
+// names each source and its holders: that line is shown instead of `source S held by …`.
 function conflictText(err) {
-  const holders = Array.isArray(err.holders) ? err.holders : [];
-  const who = holders.length ? holders.map((h) => holderText(h, err)).join(", ") : "nobody";
   const options = Array.isArray(err.options) ? err.options : [];
   const unpin = options.find((o) => typeof o === "string" && o.startsWith("unpin source "));
-  return `conflict: source ${err.source ?? "?"} held by ${who}${unpin ? `; ${unpin}` : ""}`;
+  const tail = unpin ? `; ${unpin}` : "";
+  if (typeof options[0] === "string" && options[0].startsWith("radios.")) {
+    return `conflict: ${options[0]}${tail}`;
+  }
+  const holders = Array.isArray(err.holders) ? err.holders : [];
+  const who = holders.length ? holders.map((h) => holderText(h, err)).join(", ") : "nobody";
+  return `conflict: source ${err.source ?? "?"} held by ${who}${tail}`;
 }
 
 // Whether the last `source_list` shows a pin on source `id`.
@@ -971,6 +981,10 @@ function start(api) {
   state.map.onChange(paintMapCount);
   state.ov.onEvent((job, p) => {
     state.subjects?.event(job, p);
+    // A watch starting or dropping a decoder moves its row between polls (plan 31 spec 4.7).
+    if (p && p.protocol === "watch" && p.job && (p.state === "decoding" || p.state === "lost")) {
+      if (!pollPaused && state.jobs) state.jobs.refresh();
+    }
     state.map?.event(job, p);
     if (p && p.protocol === "origin") state.map?.origin(job.id, p);
     const line = verdictLine(job, p);
@@ -1031,6 +1045,8 @@ function start(api) {
     ov: state.ov,
     ringSeconds: (id) => state.sources.find((x) => x.id === id)?.ring?.seconds ?? null,
     plan: () => resolvePlan(state.view.get("plan")),
+    sets: () => state.jobs?.sets() ?? [],
+    sources: () => state.sources,
     onOrigins: (key, answer) => state.map?.origin(key, answer),
     command: (text) => {
       const cmd = $("#cmd");
@@ -1051,6 +1067,7 @@ function start(api) {
   state.jobs = startJobs(api, $("#jobs"), state.transcript, {
     audioKind: (kind) => state.subjects?.rowOf(kind) ?? null,
     view: state.view,
+    shownSource: () => state.selected ?? null,
     countEl: $(".pane.jobs h2 .count"),
     onJobs: (jobs) => {
       state.lastJobs = jobs;
@@ -1454,9 +1471,8 @@ function paintDockHead() {
   if (labelEl.textContent !== label) labelEl.textContent = label;
   let count = "";
   if (pane === "subjects" && state.subjects && state.subjectsPane) {
-    const n = state.subjectsPane
-      .subjectJobs()
-      .reduce((sum, j) => sum + state.subjects.size(j.id), 0);
+    // Per group: a watch's decoders share one set of subjects.
+    const n = state.subjectsPane.groupIds().reduce((sum, g) => sum + state.subjects.size(g), 0);
     count = String(n);
   }
   const countEl = head.querySelector(".count");

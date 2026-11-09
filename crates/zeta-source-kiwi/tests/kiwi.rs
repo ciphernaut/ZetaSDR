@@ -84,6 +84,7 @@ async fn node_with(src: Arc<KiwiSource>) -> (Node, tempfile::TempDir) {
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 2.0,

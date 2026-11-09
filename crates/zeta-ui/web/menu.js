@@ -3,7 +3,8 @@
 // or asks the agent.
 //
 // Exports:
-//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command, muteFor, onOrigins})
+//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command, muteFor, onOrigins,
+//                  sets, sources})
 //       -> Menu   (`onOrigins(key, answer)`: What is this's classification `origins`, keyed
 //       `classify:<t_ns>`, and the Origins entry's band-form answer, keyed
 //       `band:<source>:<centre Hz>` and noted in the transcript as units.js originSummary
@@ -66,6 +67,21 @@
 //                                             `candidate`), held by the feed until a poll
 //                                             lists the job
 //   watch      Watch this band                job_start kind=watch on the selection as is
+//   decode_across  Decode across this band…   opens its submenu `.ctx-sub[data-for=
+//                                             "decode_across"]` (a click, or the pointer on
+//                                             it): one `.ctx-item[data-mode=<id>]` per `ready`
+//                                             row of `modes_list` (read once per page, then
+//                                             cached) whose band.bandwidth_hz is no wider than
+//                                             the selection, `Decode <row name> across this
+//                                             band`; the entry is hidden when none fits.
+//                                             Choosing a row: job_start kind=watch on the
+//                                             selection as is, then graph_get and graph_put of
+//                                             its `detect` node with modes [<id>], persist_ms
+//                                             DECODE_ACROSS_PERSIST_MS and width_hz
+//                                             DECODE_ACROSS_WIDTH_FIT × the row's width
+//                                             ([0.5, 2]: the node's span fit, so the detector's
+//                                             ceiling admits every signal the watch would
+//                                             decode; plan 31 spec 4.7: two ops, one click)
 //   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
 //   pocsag_decode  Decode › POCSAG            job_start kind=pocsag_decode, deviation_hz null,
 //                                             bandwidth_hz at least POCSAG_MIN_BANDWIDTH_HZ
@@ -106,6 +122,21 @@
 //                                             (mountMenu's `plan()`); puts `plan start <plan>
 //                                             fm_demod transcribe` in the command line
 //                                             (`command(text)`) and focuses it
+//   set        Start set…                     shown only when `sets()` (mountMenu's: set_list's
+//                                             entries, read with the jobs) has a `ready` set;
+//                                             opens #ctx-set where the menu stood (plan 31
+//                                             spec 5.5): `select.set-pick` of the ready sets
+//                                             (the first chosen), then per role of the chosen
+//                                             set (in its members' order) a
+//                                             `select[data-role=<role>]` of every source of
+//                                             `sources()` (source_list's records) plus
+//                                             "pick" (value "", sent as null), the first
+//                                             role on the shown source, the rest "pick";
+//                                             Start (`button.start`) sends set_start {set,
+//                                             radios, members: null, replace: []} (its line
+//                                             counts started, existing, refused and warnings;
+//                                             each refusal and warning is noted), Cancel,
+//                                             Escape or a press outside close it
 //   iq_read    Save selection as SigMF        iq_read {selection}; the transcript shows the path
 //   ask        Send to agent                  /ask "Look at <c> Hz, <bw> Hz wide, from <start>
 //                                             to <end>: what is it?"
@@ -223,6 +254,10 @@ export const FIT_NOISE_SNR_DB = 6;
 // spike) unmeasured when its band holds the centre off-centre. The node's
 // zeta_core::ops::MEASURE_DC_MASK_HZ is the source of truth; this copy only words the note.
 export const MEASURE_DC_MASK_HZ = 25000;
+// "Decode across this band…" (plan 31 spec 4.7): the `detect` params its watch gets, the
+// widths as fractions of the chosen row's band.bandwidth_hz, the node's span fit (0.5-2x).
+export const DECODE_ACROSS_PERSIST_MS = 500;
+export const DECODE_ACROSS_WIDTH_FIT = [0.5, 2];
 
 const OUTLINE_ENTRIES = [
   ["fit", "Fit to signal"],
@@ -258,6 +293,7 @@ const ENTRIES = [
   ["capture", "Capture bursts"],
   ["identify", "Identify (thorough)"],
   ["watch", "Watch this band"],
+  ["decode_across", "Decode across this band…"],
   ["aprs_decode", "Decode › APRS"],
   ["pocsag_decode", "Decode › POCSAG"],
   ["rds_decode", "Decode › RDS (FM station data)"],
@@ -275,6 +311,7 @@ const ENTRIES = [
   ["ssb_lsb_transcribe", "Transcribe › SSB (LSB)"],
   ["measure", "Start background job › measure"],
   ["plan", "Start plan…"],
+  ["set", "Start set…"],
   ["scan", "Scan this span"],
   ["iq_read", "Save selection as SigMF"],
   ["ask", "Send to agent"],
@@ -449,9 +486,11 @@ export function clampSpan(startNs, endNs, newest) {
 class Menu {
   constructor(
     wf,
-    { applyOp, attachOp, ask, transcript, ov, plan = () => null, ringSeconds = () => null, command = () => {}, muteFor = () => null, onOrigins = () => {} },
+    { applyOp, attachOp, ask, transcript, ov, plan = () => null, ringSeconds = () => null, command = () => {}, muteFor = () => null, onOrigins = () => {}, sets = () => [], sources = () => [] },
   ) {
     this.wf = wf;
+    this.sets = sets;
+    this.sources = sources;
     this.onOrigins = onOrigins;
     this.muteFor = muteFor;
     this.applyOp = applyOp;
@@ -491,7 +530,19 @@ class Menu {
         item.addEventListener("pointerleave", hide);
       }
       this.el.append(item);
+      if (action === "decode_across") {
+        item.setAttribute("aria-haspopup", "true");
+        item.addEventListener("pointerenter", () => this.showSub(true));
+        this.sub = document.createElement("div");
+        this.sub.className = "ctx-sub";
+        this.sub.dataset.for = action;
+        this.sub.setAttribute("role", "group");
+        this.sub.hidden = true;
+        this.el.append(this.sub);
+      }
     }
+    // The ready mode rows (a promise of modes_list's entries), read once per page.
+    this.readyRows = null;
     this.footer = document.createElement("div");
     this.footer.id = "ctx-footer";
     this.el.append(this.footer);
@@ -517,6 +568,40 @@ class Menu {
     this.outlineEl.append(this.outlineFooter);
     document.body.append(this.outlineEl);
 
+    // "Start set…"'s role → source picker (#ctx-set).
+    this.setEl = document.createElement("form");
+    this.setEl.id = "ctx-set";
+    this.setEl.setAttribute("role", "dialog");
+    this.setEl.setAttribute("aria-label", "Start set");
+    this.setEl.hidden = true;
+    const pickLabel = document.createElement("label");
+    pickLabel.textContent = "Set ";
+    this.setPick = document.createElement("select");
+    this.setPick.className = "set-pick";
+    pickLabel.append(this.setPick);
+    this.setRoles = document.createElement("div");
+    this.setRoles.className = "set-roles";
+    const buttons = document.createElement("div");
+    buttons.className = "set-buttons";
+    const start = document.createElement("button");
+    start.type = "submit";
+    start.className = "start";
+    start.textContent = "Start";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "cancel";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => this.closeSet());
+    buttons.append(start, cancel);
+    this.setEl.append(pickLabel, this.setRoles, buttons);
+    this.setPick.addEventListener("change", () => this.fillRoles());
+    this.setEl.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      this.startSet();
+    });
+    this.setSource = null; // the source shown when the picker opened (its first role's)
+    document.body.append(this.setEl);
+
     // The pointer position of the drag's end: pointerup reaches the document (capture) before
     // the waterfall's own handler calls onSelect.
     this.onPointerUp = (ev) => {
@@ -525,8 +610,14 @@ class Menu {
     this.onPointerDown = (ev) => {
       if (!this.el.hidden && !this.el.contains(ev.target)) this.close();
       if (!this.outlineEl.hidden && !this.outlineEl.contains(ev.target)) this.closeOutline();
+      if (!this.setEl.hidden && !this.setEl.contains(ev.target)) this.closeSet();
     };
     this.onKey = (ev) => {
+      if (!this.setEl.hidden && ev.key === "Escape") {
+        ev.preventDefault();
+        this.closeSet();
+        return;
+      }
       const outline = !this.outlineEl.hidden;
       const menu = outline ? this.outlineEl : this.el;
       if (menu.hidden) return;
@@ -536,7 +627,9 @@ class Menu {
         else this.close();
       } else if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
         ev.preventDefault();
-        const items = [...menu.querySelectorAll(".ctx-item:not([hidden])")];
+        const items = [...menu.querySelectorAll(".ctx-item")].filter(
+          (i) => i.closest("[hidden]") === null,
+        );
         const at = items.indexOf(document.activeElement);
         const step = ev.key === "ArrowDown" ? 1 : -1;
         items[(at + step + items.length) % items.length].focus();
@@ -581,6 +674,9 @@ class Menu {
     this.showFooter(this.current());
     // `Start plan…` only where the view's plan policy names a plan.
     this.el.querySelector('[data-action="plan"]').hidden = this.plan() === null;
+    // `Start set…` only when set_list has a ready set.
+    this.el.querySelector('[data-action="set"]').hidden = this.readySets().length === 0;
+    this.fillSub(this.sel);
     this.el.hidden = false;
     // Keep it inside the viewport.
     const w = this.el.offsetWidth;
@@ -592,6 +688,7 @@ class Menu {
 
   close() {
     this.el.hidden = true;
+    this.showSub(false);
     this.wf.clearSelection();
     // A fit in progress is cancelled: its result no longer belongs to an open menu.
     this.fitGen += 1;
@@ -716,6 +813,86 @@ class Menu {
     }
   }
 
+  // The ready rows of `modes_list`, read on first use and cached (a failure is tried again
+  // at the next opening).
+  modeRows() {
+    if (!this.readyRows) {
+      this.readyRows = this.ov.api
+        .op({ op: "modes_list", family: null, state: "ready" })
+        .then((r) => ((r && r.value && r.value.modes) || []).filter((m) => m.state === "ready"))
+        .catch(() => {
+          this.readyRows = null;
+          return [];
+        });
+    }
+    return this.readyRows;
+  }
+
+  // The "Decode across" submenu for selection `sel`: the ready rows no wider than it; the
+  // entry hidden when none fits. Hidden until asked for.
+  async fillSub(sel) {
+    this.showSub(false);
+    const rows = await this.modeRows();
+    if (this.sel !== sel) return;
+    const fit = rows.filter(
+      (r) => typeof r.band?.bandwidth_hz === "number" && r.band.bandwidth_hz <= sel.bandwidthHz,
+    );
+    this.sub.replaceChildren(
+      ...fit.map((row) => {
+        const item = document.createElement("button");
+        item.className = "ctx-item";
+        item.dataset.mode = row.id;
+        item.setAttribute("role", "menuitem");
+        item.textContent = `Decode ${row.name} across this band`;
+        item.addEventListener("click", () => this.decodeAcross(row));
+        return item;
+      }),
+    );
+    this.el.querySelector('[data-action="decode_across"]').hidden = fit.length === 0;
+  }
+
+  // Shows (`on`) or hides the "Decode across" submenu; an empty one stays hidden.
+  showSub(on) {
+    if (!this.sub) return;
+    this.sub.hidden = !on || this.sub.childElementCount === 0;
+    this.el
+      .querySelector('[data-action="decode_across"]')
+      .setAttribute("aria-expanded", String(!this.sub.hidden));
+  }
+
+  // A watch on the selection that decodes `row` directly (plan 31 spec 4.7, call 5.1: the
+  // page keeps the two-op form): job_start, then its `detect` node's modes, persist_ms and
+  // width_hz by graph_put.
+  async decodeAcross(row) {
+    if (!this.sel || this.fitting !== null) return;
+    const s = this.current();
+    this.close();
+    const r = await this.startJob("watch", s);
+    if (!r || r.result !== "job" || !r.value) return;
+    const id = r.value;
+    let graph;
+    try {
+      graph = (await this.ov.api.op({ op: "graph_get", job: id })).value;
+    } catch (e) {
+      this.t.note(`graph_get: ${e.message}`, true);
+      return;
+    }
+    const detect = ((graph && graph.nodes) || []).find((n) => n.kind === "detect");
+    if (!detect) {
+      this.t.note(`watch ${id}: no detect node`, true);
+      return;
+    }
+    const bw = row.band.bandwidth_hz;
+    const [lo, hi] = DECODE_ACROSS_WIDTH_FIT;
+    detect.params = {
+      ...(detect.params || {}),
+      modes: [row.id],
+      persist_ms: DECODE_ACROSS_PERSIST_MS,
+      width_hz: [Math.round(lo * bw), Math.round(hi * bw)],
+    };
+    await this.applyOp({ op: "graph_put", job: id, graph });
+  }
+
   // The last `source_list` record overlays.js holds for source `id` (null when it holds
   // another source's or none).
   sourceRec(id) {
@@ -755,6 +932,12 @@ class Menu {
   async choose(action) {
     // A fit in progress ignores further choices (a double click starts one job).
     if (!this.sel || this.fitting !== null) return;
+    if (action === "decode_across") {
+      // Shown, never toggled: the pointer reaching the entry already showed it.
+      this.showSub(true);
+      this.sub.querySelector(".ctx-item")?.focus({ preventScroll: true });
+      return;
+    }
     const s = this.current();
     this.showFooter(s, action);
     const job = jobOf(action);
@@ -818,6 +1001,8 @@ class Menu {
     } else if (action === "plan") {
       const plan = this.plan();
       if (plan !== null) this.command(`plan start ${plan} fm_demod transcribe`);
+    } else if (action === "set") {
+      this.openSet(s.sourceId);
     } else if (action === "scan") {
       await this.scan(s);
     } else if (jobOf(action)) {
@@ -959,11 +1144,100 @@ class Menu {
     });
   }
 
+  // set_list's ready sets (the page reads set_list with each job poll).
+  readySets() {
+    return (this.sets() || []).filter((s) => s && s.state === "ready");
+  }
+
+  // Opens #ctx-set where the menu stood: the ready sets, the first chosen, and its roles.
+  openSet(sourceId) {
+    const ready = this.readySets();
+    if (ready.length === 0) return;
+    this.setSource = sourceId;
+    this.setPick.replaceChildren(
+      ...ready.map((s) => {
+        const o = document.createElement("option");
+        o.value = s.id;
+        o.textContent = s.name;
+        o.title = s.notes || "";
+        return o;
+      }),
+    );
+    this.setPick.value = ready[0].id;
+    this.fillRoles();
+    this.setEl.hidden = false;
+    const w = this.setEl.offsetWidth;
+    const h = this.setEl.offsetHeight;
+    const x = parseFloat(this.el.style.left) || 0;
+    const y = parseFloat(this.el.style.top) || 0;
+    this.setEl.style.left = `${Math.max(0, Math.min(x, window.innerWidth - w))}px`;
+    this.setEl.style.top = `${Math.max(0, Math.min(y, window.innerHeight - h))}px`;
+    this.setPick.focus({ preventScroll: true });
+  }
+
+  // One row per role of the chosen set (in the order its members first use them), each a
+  // select of every attached source plus "pick" (null: the node picks a free one); the first
+  // role defaults to the source shown when the picker opened, the rest to "pick".
+  fillRoles() {
+    const set = this.readySets().find((s) => s.id === this.setPick.value);
+    if (!set) {
+      this.setRoles.replaceChildren();
+      return;
+    }
+    const roles = [];
+    for (const m of set.members || []) if (!roles.includes(m.radio)) roles.push(m.radio);
+    for (const r of Object.keys(set.radios || {})) if (!roles.includes(r)) roles.push(r);
+    const ids = (this.sources() || []).map((s) => s.id);
+    if (this.setSource && !ids.includes(this.setSource)) ids.unshift(this.setSource);
+    this.setRoles.replaceChildren(
+      ...roles.map((role, i) => {
+        const label = document.createElement("label");
+        label.className = "set-role";
+        label.title = set.radios?.[role]?.note || "";
+        label.append(`${role} `);
+        const sel = document.createElement("select");
+        sel.dataset.role = role;
+        const pick = document.createElement("option");
+        pick.value = "";
+        pick.textContent = "pick";
+        sel.append(pick);
+        for (const id of ids) {
+          const o = document.createElement("option");
+          o.value = id;
+          o.textContent = id;
+          sel.append(o);
+        }
+        sel.value = i === 0 && this.setSource ? this.setSource : "";
+        label.append(sel);
+        return label;
+      }),
+    );
+  }
+
+  // Start: set_start of the chosen set with each role's source (null for "pick"), every
+  // member, replacing nothing; its line (and any refusal) reaches the transcript through
+  // applyOp.
+  async startSet() {
+    const set = this.setPick.value;
+    const radios = {};
+    for (const sel of this.setRoles.querySelectorAll("select[data-role]")) {
+      radios[sel.dataset.role] = sel.value === "" ? null : sel.value;
+    }
+    this.closeSet();
+    if (!set) return;
+    await this.applyOp({ op: "set_start", set, radios, members: null, replace: [] });
+  }
+
+  closeSet() {
+    this.setEl.hidden = true;
+  }
+
   destroy() {
     document.removeEventListener("pointerup", this.onPointerUp, true);
     document.removeEventListener("pointerdown", this.onPointerDown, true);
     document.removeEventListener("keydown", this.onKey);
     this.el.remove();
     this.outlineEl.remove();
+    this.setEl.remove();
   }
 }

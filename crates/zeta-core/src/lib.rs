@@ -20,6 +20,7 @@ pub mod port;
 pub mod reach;
 pub mod ring;
 pub mod sessions;
+pub mod sets;
 pub mod signatures;
 pub mod stage;
 pub mod station;

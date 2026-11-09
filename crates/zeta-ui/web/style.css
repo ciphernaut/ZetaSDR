@@ -555,6 +555,45 @@ details.turn > pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 2px
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* A watch's decoders under its row (plan 31 spec 4.7): the watch's row is the summary, the
+   group's text a dim line under it carrying the fold's marker. */
+.job-group[data-kind="watch"] > summary {
+  display: block;
+  list-style: none;
+  color: inherit;
+  white-space: normal;
+}
+.job-group[data-kind="watch"] > summary::-webkit-details-marker { display: none; }
+.job-group[data-kind="watch"] > summary > .group-text {
+  display: block;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.job-group[data-kind="watch"] > summary > .group-text::before { content: "▾ "; }
+.job-group[data-kind="watch"]:not([open]) > summary > .group-text::before { content: "▸ "; }
+.job-group[data-kind="watch"] > .job { padding-inline-start: 12px; }
+/* A set's jobs under its name (plan 31 spec 5.5): the summary its text and the set's Stop;
+   its rows, and a watch member's nested group, indented under it. */
+.job-group[data-kind="set"] > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: normal;
+}
+.job-group[data-kind="set"] > summary > .group-text {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.job-group[data-kind="set"] > summary::-webkit-details-marker { display: none; }
+.job-group[data-kind="set"] > summary > .group-text::before { content: "▾ "; }
+.job-group[data-kind="set"]:not([open]) > summary > .group-text::before { content: "▸ "; }
+.job-group[data-kind="set"] > .job,
+.job-group[data-kind="set"] > .job-group { margin-inline-start: 12px; }
 /* Buttons offered after a transcript line (a conflict's "stop … and retry"). */
 .line button.action { margin-left: 6px; padding: 0 6px; font-style: normal; }
 
@@ -631,6 +670,14 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   color: var(--accent);
   outline: none;
 }
+/* "Decode across this band…"'s rows (menu.js), indented under the entry. */
+#ctx .ctx-sub {
+  display: flex;
+  flex-direction: column;
+  margin-inline-start: 8px;
+  padding-inline-start: 4px;
+  border-inline-start: 1px solid var(--border);
+}
 #ctx-footer, #ctx-outline-footer {
   margin-top: 4px;
   padding: 4px 8px 2px;
@@ -639,6 +686,24 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   font-size: 11px;
   overflow-wrap: anywhere;
 }
+/* "Start set…"'s role → source picker (menu.js #ctx-set). */
+#ctx-set {
+  position: fixed;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 240px;
+  max-width: calc(100vw - 16px);
+  padding: 6px 8px;
+  background: var(--bar);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 6px 18px var(--shadow);
+}
+#ctx-set label { display: flex; justify-content: space-between; gap: 8px; }
+#ctx-set .set-roles { display: flex; flex-direction: column; gap: 4px; }
+#ctx-set .set-buttons { display: flex; justify-content: flex-end; gap: 6px; }
 
 /* Graph view of a job (graph.js). */
 #graph {

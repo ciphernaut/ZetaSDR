@@ -57,7 +57,34 @@ struct Fixtures {
     framed: PathBuf,
     /// [`Fixtures::quick_modes`] and [`FRAME_ROW`].
     frame_modes: PathBuf,
+    /// Three pages at [`SPAN_OFFSETS_HZ`] in a [`SPAN_LOOP`] loop, each every 2 s, the
+    /// third only in the loop's seconds 6-14.
+    pocsag3: PathBuf,
+    /// `pocsag3`'s loop with its pages at [`KNOWN_OFFSETS_HZ`]: none on `pocsag_decode`'s
+    /// listed centre, the third (the register's channel) only in the loop's seconds 6-14.
+    known3: PathBuf,
+    /// The page at [`OFFSET_HZ`] beside the GFSK burst at [`FSK_BESIDE_HZ`], every 2 s.
+    pocsag_fsk: PathBuf,
+    /// A GFSK burst about 60 kHz wide at [`FSK_BESIDE_HZ`] every 2 s, at the suite's noise.
+    wide: PathBuf,
+    /// The page at [`OFFSET_HZ`] every 2 s beside a continuous band of shaped noise
+    /// [`NOISE_BAND_HZ`] wide at [`NOISE_OFFSET_HZ`]: it fits `pocsag_decode`'s width and
+    /// decodes nothing.
+    noise12k: PathBuf,
 }
+
+/// The span tests' pages, above the capture's centre.
+const SPAN_OFFSETS_HZ: [u64; 3] = [200_000, 300_000, 400_000];
+/// The known-rank test's pages, above the capture's centre: two unknown pages below
+/// [`OFFSET_HZ`] (`pocsag_decode`'s listed centre, where no page sits) and the register's
+/// channel above it, which comes on air only after the slot is taken.
+const KNOWN_OFFSETS_HZ: [u64; 3] = [150_000, 200_000, 400_000];
+/// The span fixture's loop (20 s): ten page cycles.
+const SPAN_LOOP: usize = 10 * CYCLE;
+/// The cycles of [`SPAN_LOOP`] the third page is in (seconds 6-14).
+const SPAN_THIRD_CYCLES: std::ops::Range<usize> = 3..7;
+/// Where `pocsag_fsk`'s GFSK burst sits above the capture's centre.
+const FSK_BESIDE_HZ: u64 = 100_000;
 
 /// The frame row of the frame-row watch test, at [`POCSAG_HZ`].
 const FRAME_ROW: &str = "fsk_test_frames";
@@ -116,19 +143,18 @@ fn fixtures() -> &'static Fixtures {
             RATE_HZ,
             OFFSET_HZ as f64,
         );
-        let pocsag = write(dir.path(), "pocsag", &cycle(page, 1), CENTER_HZ);
-        let mut state = 0x5eed_u64;
-        let symbols: Vec<u8> = (0..2400)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (state >> 63) as u8
-            })
-            .collect();
-        let mut burst = zeta_dsp::synth::gfsk_modulate(&symbols, 2, 2400, 3_000.0, RATE_HZ);
-        mix(&mut burst, OFFSET_HZ as f64);
+        let pocsag = write(dir.path(), "pocsag", &cycle(page.clone(), 1), CENTER_HZ);
+        let burst = fsk_burst(OFFSET_HZ, FSK_BAUD, FSK_DEVIATION_HZ);
         let fsk = write(dir.path(), "fsk", &cycle(burst, 2), CENTER_HZ);
+        let pocsag3 = write(dir.path(), "pocsag3", &span_loop(), CENTER_HZ);
+        let known3 = span_loop_at(KNOWN_OFFSETS_HZ);
+        let known3 = write(dir.path(), "known3", &known3, CENTER_HZ);
+        let narrow = fsk_burst(FSK_BESIDE_HZ, NARROW_FSK_BAUD, NARROW_FSK_DEVIATION_HZ);
+        let beside = cycle_at(sum(&[&page, &narrow]), 4, SPAN_FSK_SNR_DB);
+        let pocsag_fsk = write(dir.path(), "pocsag_fsk", &beside, CENTER_HZ);
+        let burst = fsk_burst(FSK_BESIDE_HZ, WIDE_FSK_BAUD, WIDE_FSK_DEVIATION_HZ);
+        let wide = write(dir.path(), "wide", &cycle(burst, 6), CENTER_HZ);
+        let noise12k = write(dir.path(), "noise12k", &noise_beside(&page), CENTER_HZ);
         let quick_modes = dir.path().join("modes");
         std::fs::create_dir_all(&quick_modes).unwrap();
         for (file, text) in zeta_core::modes::ModeRegistry::embedded() {
@@ -165,15 +191,141 @@ fn fixtures() -> &'static Fixtures {
             quick_modes,
             framed,
             frame_modes,
+            pocsag3,
+            known3,
+            pocsag_fsk,
+            wide,
+            noise12k,
         }
     })
 }
 
+/// `noise12k`'s band of shaped noise: its width and where it sits above the centre.
+const NOISE_BAND_HZ: u64 = 12_000;
+const NOISE_OFFSET_HZ: u64 = 350_000;
+/// The noise band's power against the page's (both well over the floor).
+const NOISE_BAND_POWER: f64 = 0.5;
+/// The low-pass shaping the noise band, and the noise segment tiled over a cycle.
+const NOISE_TAPS: usize = 1_025;
+const NOISE_SEGMENT: usize = CYCLE / 8;
+
+/// The `noise12k` cycle: `page` at its start, a continuous band of white noise through a
+/// [`NOISE_BAND_HZ`]/2 low-pass mixed to [`NOISE_OFFSET_HZ`], and the span fixtures'
+/// white noise over all.
+fn noise_beside(page: &[Complex<f32>]) -> Vec<Complex<f32>> {
+    let mut white = vec![Complex::new(0.0f32, 0.0); NOISE_SEGMENT + NOISE_TAPS];
+    zeta_dsp::synth::awgn(&mut white, 0.0, 9);
+    let taps = zeta_dsp::util::lowpass_taps(NOISE_BAND_HZ as f64 / 2.0, RATE_HZ as f64, NOISE_TAPS);
+    // The filter's start-up dropped: the segment is the settled band.
+    let band = zeta_dsp::util::fir_decimate(&white, &taps, 1).split_off(NOISE_TAPS);
+    let power = band.iter().map(|s| s.norm_sqr() as f64).sum::<f64>() / band.len() as f64;
+    let gain = (NOISE_BAND_POWER / power).sqrt() as f32;
+    let mut out: Vec<Complex<f32>> = band.iter().cycle().take(CYCLE).map(|s| s * gain).collect();
+    mix(&mut out, NOISE_OFFSET_HZ as f64);
+    for (o, p) in out.iter_mut().zip(page) {
+        *o += *p;
+    }
+    zeta_dsp::synth::awgn(&mut out, SPAN3_SNR_DB, 10);
+    out
+}
+
+/// The suite's GFSK burst: 2400 baud, 3 kHz deviation.
+const FSK_BAUD: u32 = 2_400;
+const FSK_DEVIATION_HZ: f64 = 3_000.0;
+/// `pocsag_fsk`'s GFSK burst: narrow enough (about 4 kHz) that no 12.5 kHz row fits it.
+const NARROW_FSK_BAUD: u32 = 1_200;
+const NARROW_FSK_DEVIATION_HZ: f64 = 1_000.0;
+/// The `wide` fixture's GFSK burst: about 60 kHz (Carson), far wider than any 12.5 or
+/// 25 kHz row's tolerant fit.
+const WIDE_FSK_BAUD: u32 = 9_600;
+const WIDE_FSK_DEVIATION_HZ: f64 = 20_000.0;
+/// The span fixtures' noise, under each fixture's mean power: each page stands about
+/// 34 dB over the floor in a detector bin, where the detector reads it 13-14 kHz wide.
+/// (The suite's 20 dB leaves the lone page 50 dB up, its skirts read 19-25 kHz wide, and
+/// no 12.5 kHz row fits it; much quieter, its two FSK tones read as two narrow runs.)
+const SPAN3_SNR_DB: f32 = 8.0;
+const SPAN_FSK_SNR_DB: f32 = 6.0;
+
+/// A random one-second GFSK burst (no row proves it) `offset_hz` above the centre.
+fn fsk_burst(offset_hz: u64, baud: u32, deviation_hz: f64) -> Vec<Complex<f32>> {
+    let mut state = 0x5eed_u64;
+    let symbols: Vec<u8> = (0..baud)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 63) as u8
+        })
+        .collect();
+    let mut burst = zeta_dsp::synth::gfsk_modulate(&symbols, 2, baud, deviation_hz, RATE_HZ);
+    mix(&mut burst, offset_hz as f64);
+    burst
+}
+
+/// The sample-wise sum of `parts`, as long as the longest.
+fn sum(parts: &[&[Complex<f32>]]) -> Vec<Complex<f32>> {
+    let len = parts.iter().map(|p| p.len()).max().unwrap_or(0);
+    let mut out = vec![Complex::new(0.0f32, 0.0); len];
+    for p in parts {
+        for (o, s) in out.iter_mut().zip(p.iter()) {
+            *o += *s;
+        }
+    }
+    out
+}
+
+/// The step between `pocsag3`'s page addresses: one batch of frames, so each page sits in
+/// the suite page's frame and the detector reads all three alike (a page in frame 0
+/// reads 3 kHz wide at the moment the detector announces it).
+const SPAN_ADDRESS_STEP: u32 = 8;
+
+/// The `pocsag3` loop: a page at each of [`SPAN_OFFSETS_HZ`] (its own address) at the
+/// start of every cycle, the third only in [`SPAN_THIRD_CYCLES`], white noise over all.
+fn span_loop() -> Vec<Complex<f32>> {
+    span_loop_at(SPAN_OFFSETS_HZ)
+}
+
+/// [`span_loop`] with its pages at `offsets_hz`.
+fn span_loop_at(offsets_hz: [u64; 3]) -> Vec<Complex<f32>> {
+    let pages: Vec<Vec<Complex<f32>>> = offsets_hz
+        .iter()
+        .enumerate()
+        .map(|(n, off)| {
+            zeta_dsp::synth::pocsag_packet_iq(
+                1_234_567 + SPAN_ADDRESS_STEP * n as u32,
+                3,
+                "HELLO ZETA",
+                1200,
+                RATE_HZ,
+                *off as f64,
+            )
+        })
+        .collect();
+    let two = sum(&[&pages[0], &pages[1]]);
+    let three = sum(&[&pages[0], &pages[1], &pages[2]]);
+    let mut out = vec![Complex::new(0.0f32, 0.0); SPAN_LOOP];
+    for c in 0..SPAN_LOOP / CYCLE {
+        let burst = match SPAN_THIRD_CYCLES.contains(&c) {
+            true => &three,
+            false => &two,
+        };
+        assert!(burst.len() < CYCLE, "burst {} samples", burst.len());
+        out[c * CYCLE..c * CYCLE + burst.len()].copy_from_slice(burst);
+    }
+    zeta_dsp::synth::awgn(&mut out, SPAN3_SNR_DB, 5);
+    out
+}
+
 /// `burst` at the start of a [`CYCLE`], the rest silence, with white noise over all.
-fn cycle(mut burst: Vec<Complex<f32>>, seed: u64) -> Vec<Complex<f32>> {
+fn cycle(burst: Vec<Complex<f32>>, seed: u64) -> Vec<Complex<f32>> {
+    cycle_at(burst, seed, 20.0)
+}
+
+/// [`cycle`] with the noise `snr_db` under the cycle's mean power.
+fn cycle_at(mut burst: Vec<Complex<f32>>, seed: u64, snr_db: f32) -> Vec<Complex<f32>> {
     assert!(burst.len() < CYCLE, "burst {} samples", burst.len());
     burst.resize(CYCLE, Complex::new(0.0, 0.0));
-    zeta_dsp::synth::awgn(&mut burst, 20.0, seed);
+    zeta_dsp::synth::awgn(&mut burst, snr_db, seed);
     burst
 }
 
@@ -230,9 +382,47 @@ impl Stage for FakeSink {
     }
 }
 
+/// The failing decoder stage of [`FAIL_ROW`]: it runs [`FAIL_AFTER`], then fails.
+const FAIL_STAGE: &str = "fail_decode";
+/// How long [`FAIL_STAGE`] runs before it fails: past the watch's start of it.
+const FAIL_AFTER: Duration = Duration::from_millis(1_000);
+
+/// A decoder stage that fails [`FAIL_AFTER`] after it starts.
+struct Failing(StageSpec);
+
+#[async_trait]
+impl Stage for Failing {
+    fn spec(&self) -> &StageSpec {
+        &self.0
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        _inputs: Vec<broadcast::Receiver<Frame>>,
+        _outputs: Vec<zeta_core::types::StreamId>,
+        _bus: Arc<StreamBus>,
+        cancel: tokio_util::sync::CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        tokio::select! {
+            _ = cancel.cancelled() => Err(StageError::Cancelled),
+            _ = tokio::time::sleep(FAIL_AFTER) => Err(StageError::Failed("test: fails".into())),
+        }
+    }
+}
+
 fn registry() -> StageRegistry {
     let mut r = StageRegistry::new();
     r.register(Arc::new(PassthroughStage::new()));
+    r.register(Arc::new(Failing(StageSpec {
+        kind: FAIL_STAGE,
+        inputs: vec![StreamKind::Iq],
+        outputs: vec![StreamKind::Event],
+        params_schema: schemars::json_schema!({"type": "object"}),
+    })));
     r.register(Arc::new(FakeSink(StageSpec {
         kind: "sink_sondehub",
         inputs: vec![StreamKind::Event],
@@ -342,6 +532,7 @@ async fn node_over(
 ) -> Node {
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.join("state"),
         ring_seconds: 4.0,
@@ -802,32 +993,92 @@ async fn an_unknown_signal_is_retried_at_most_three_times() {
     zeta_core::node::watch::test_timing(0, 0);
 }
 
-/// A licence register's answer: one transmitter licensed for 16K0F1D on the band.
-struct Register;
+/// A licence register's answer, after `delay`: `rows` when given, else one transmitter
+/// licensed for 16K0F1D at the centre of whatever band it is asked about.
+struct Register {
+    rows: Option<Vec<Allocation>>,
+    delay: Duration,
+}
+
+impl Register {
+    /// One transmitter licensed for 16K0F1D at the centre asked about.
+    fn licensed() -> Register {
+        Register {
+            rows: None,
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// `rows`, whatever it is asked.
+    fn with(rows: Vec<Allocation>) -> Register {
+        Register {
+            rows: Some(rows),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// [`Register::with`] answering after `delay`.
+    fn slow(rows: Vec<Allocation>, delay: Duration) -> Register {
+        Register {
+            rows: Some(rows),
+            delay,
+        }
+    }
+}
+
+/// A transmitter licensed at `center_hz` for `bw_hz` (`emission`, decoded) to
+/// `licensee` at `site`, `km` from the station.
+fn assignment(
+    center_hz: u64,
+    bw_hz: u64,
+    emission: &str,
+    licensee: &str,
+    site: &str,
+    km: f64,
+) -> Allocation {
+    Allocation {
+        provider: "register".into(),
+        region: "AU".into(),
+        min_hz: Hz(center_hz - bw_hz / 2),
+        max_hz: Hz(center_hz + bw_hz / 2),
+        service: "assignment".into(),
+        note: None,
+        kind: Some("assignment".into()),
+        licensee: Some(licensee.into()),
+        site: Some(site.into()),
+        distance_km: Some(km),
+        center_hz: Some(Hz(center_hz)),
+        bandwidth_hz: Some(Hz(bw_hz)),
+        role: Some("tx".into()),
+        emission: Some(emission.into()),
+        emission_decoded: zeta_core::emission::parse_emission(emission),
+        ..Allocation::default()
+    }
+}
 
 #[async_trait]
 impl KnowledgeProvider for Register {
     fn name(&self) -> &str {
         "register"
     }
+    fn gives_assignments(&self) -> bool {
+        true
+    }
     async fn allocations(&self, region: &str, center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Allocation> {
+        tokio::time::sleep(self.delay).await;
+        if let Some(rows) = &self.rows {
+            return rows.clone();
+        }
         vec![Allocation {
-            provider: "register".into(),
             region: region.into(),
-            min_hz: Hz(center_hz.0 - 8_000),
-            max_hz: Hz(center_hz.0 + 8_000),
-            service: "assignment".into(),
-            note: None,
-            kind: Some("assignment".into()),
-            licensee: Some("Test Telemetry Pty Ltd".into()),
-            site: Some("Mt Gravatt".into()),
-            distance_km: Some(7.6),
-            center_hz: Some(center_hz),
-            bandwidth_hz: Some(Hz(16_000)),
-            role: Some("tx".into()),
-            emission: Some("16K0F1D".into()),
-            emission_decoded: zeta_core::emission::parse_emission("16K0F1D"),
-            ..Allocation::default()
+            ..assignment(
+                center_hz.0,
+                16_000,
+                "16K0F1D",
+                "Test Telemetry Pty Ltd",
+                "Mt Gravatt",
+                7.6,
+            )
         }]
     }
     async fn signatures(&self, _center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Signature> {
@@ -846,7 +1097,7 @@ async fn an_unknown_summary_names_the_licensee() {
         Some(&fixtures().quick_modes),
     )
     .await;
-    node.add_knowledge(Arc::new(Register));
+    node.add_knowledge(Arc::new(Register::licensed()));
     let node = Arc::new(node);
     let watch = start_watch(&node, serde_json::json!({})).await;
     let events = Events::of(&node, &watch);
@@ -2096,4 +2347,1461 @@ async fn a_frame_row_decoder_is_dropped_when_its_frames_stop() {
     assert_eq!(state(&node, &job), Some(JobState::Stopped));
     stop_all(&node).await;
     zeta_core::node::watch::test_timing(0, 0);
+}
+
+/// The watch's band in the `modes` refusal test: narrower than `rds_decode`'s 200 kHz.
+const NARROW_BAND_HZ: u64 = 100_000;
+/// The id of the broken operator row the `modes` refusal test loads.
+const BROKEN_ROW: &str = "pocsag_broken";
+
+/// `node`'s watch graph `graph` with `modes` set on its `detect` node.
+fn with_modes(graph: &Graph, modes: Value) -> Graph {
+    let mut g = graph.clone();
+    let detect = g.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+    detect.params["modes"] = modes;
+    g
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_put_with_a_bad_modes_list_is_refused() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    // An operator row with a bad field: listed `broken`.
+    let modes_dir = dir.path().join("modes");
+    std::fs::create_dir_all(&modes_dir).unwrap();
+    let (_, text) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("pocsag_decode.json"))
+        .unwrap();
+    let mut row: Value = serde_json::from_str(text).unwrap();
+    row["id"] = BROKEN_ROW.into();
+    row["band"]["bandwidth_hz"] = "x".into();
+    std::fs::write(
+        modes_dir.join(format!("{BROKEN_ROW}.json")),
+        row.to_string(),
+    )
+    .unwrap();
+    let src = file_source("rx", &fixtures().pocsag);
+    let port = Muting::new(src.clone(), false);
+    let node = node_over(
+        dir.path(),
+        vec![(port.clone() as Arc<dyn Port>, src)],
+        Some(&modes_dir),
+    )
+    .await;
+    let node = Arc::new(node);
+    let band = Tuning {
+        center_hz: Hz(POCSAG_HZ),
+        bandwidth_hz: Hz(NARROW_BAND_HZ),
+    };
+    // Refused at the start too, starting nothing.
+    let mut g = JobKind::Watch
+        .expand(
+            &rx(),
+            band,
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    g = with_modes(&g, serde_json::json!(["no_such_mode"]));
+    let e = node
+        .job_start("watch", rx(), band, g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("modes[0]: unknown mode no_such_mode"),
+        "{e}"
+    );
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+    let watch = start_watch_on(&node, band, serde_json::json!({})).await;
+    let stream = node.job_outputs(&watch);
+    let graph = record(&node, &watch).unwrap().graph;
+    let cases = [
+        (
+            serde_json::json!(["pocsag_decode", "no_such_mode"]),
+            "modes[1]: unknown mode no_such_mode".to_string(),
+        ),
+        (
+            serde_json::json!([BROKEN_ROW]),
+            format!("modes[0]: {BROKEN_ROW} is broken ("),
+        ),
+        (
+            serde_json::json!(["rds_decode"]),
+            format!(
+                "modes[0]: rds_decode is 200000 Hz wide; the watch's band is {NARROW_BAND_HZ} Hz"
+            ),
+        ),
+        (serde_json::json!([]), "modes: empty list".to_string()),
+    ];
+    for (modes, want) in cases {
+        let op = Op::GraphPut {
+            job: watch.clone(),
+            graph: with_modes(&graph, modes.clone()),
+        };
+        let e = node.apply(op).await.unwrap_err();
+        assert!(e.to_string().contains(&want), "{modes}: {e}");
+        // Nothing restarted: the same run and its graph.
+        assert_eq!(record(&node, &watch).unwrap().graph, graph, "{modes}");
+        assert_eq!(node.job_outputs(&watch), stream, "{modes}");
+        assert_eq!(state(&node, &watch), Some(JobState::Running), "{modes}");
+    }
+    // A list of loaded rows that fit the band is taken.
+    let op = Op::GraphPut {
+        job: watch.clone(),
+        graph: with_modes(&graph, serde_json::json!(["pocsag_decode"])),
+    };
+    node.apply(op).await.unwrap();
+    until("the watch runs again", Duration::from_secs(5), || {
+        state(&node, &watch) == Some(JobState::Running)
+    })
+    .await;
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_event_carries_why_and_a_decoding_event_carries_via() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 2_000);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let decoding_event = &events.watch("decoding")[0];
+    assert_eq!(decoding_event["via"], "identify", "{decoding_event}");
+    assert_eq!(
+        decoding_event.get("why"),
+        Some(&Value::Null),
+        "{decoding_event}"
+    );
+    assert_eq!(decoding(&node, &watch)[0]["via"], "identify");
+    let identifying = &events.watch("identifying")[0];
+    assert_eq!(identifying.get("via"), Some(&Value::Null), "{identifying}");
+    port.mute();
+    until("a lost event", Duration::from_secs(20), || {
+        !events.watch("lost").is_empty()
+    })
+    .await;
+    let lost = &events.watch("lost")[0];
+    assert_eq!(lost["job"], job.0.as_str(), "{lost}");
+    assert_eq!(lost["why"], "gone and silent", "{lost}");
+    assert!(
+        lost["summary"]
+            .as_str()
+            .unwrap()
+            .contains("gone and silent"),
+        "{lost}"
+    );
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+/// The process-wide silence the hold test sets: far longer than the test waits.
+const LONG_SILENCE_MS: u64 = 60_000;
+/// The hold the hold test's `detect` node sets.
+const SHORT_HOLD_MS: u64 = 1_500;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hold_ms_on_the_detect_node_replaces_the_silence_constant() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, LONG_SILENCE_MS);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({"hold_ms": SHORT_HOLD_MS})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let cap = |n: &Node| n.job_context(&watch).map(|c| c["watch"]["cap"].clone());
+    until("cap counts the decoder", Duration::from_secs(5), || {
+        cap(&node) == Some(serde_json::json!({"max": 16, "decoding": 1, "waiting": 0}))
+    })
+    .await;
+    port.mute();
+    // The detector's `gone` comes `GONE_MS` after the last burst; the hold has run out
+    // by then. The silence constant (a minute) would keep it far longer.
+    until(
+        "a lost event",
+        Duration::from_millis(GONE_MS + 6_000),
+        || !events.watch("lost").is_empty(),
+    )
+    .await;
+    let lost = &events.watch("lost")[0];
+    assert_eq!(lost["job"], job.0.as_str(), "{lost}");
+    assert_eq!(lost["why"], "gone and silent", "{lost}");
+    until("cap counts nothing", Duration::from_secs(5), || {
+        cap(&node) == Some(serde_json::json!({"max": 16, "decoding": 0, "waiting": 0}))
+    })
+    .await;
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+/// The span tests' detector width window: a page (about 12 kHz) and up.
+const SPAN_WIDTH_HZ: [u64; 2] = [6_000, 20_000];
+/// The window of the no-fit test: wide enough down to see the narrow GFSK burst.
+const SPAN_WIDE_WIDTH_HZ: [u64; 2] = [2_000, 20_000];
+/// How near a directly started decoder sits to its page (about a detector bin).
+const SPAN_CENTRE_TOLERANCE_HZ: u64 = 1_500;
+/// `pocsag_decode`'s channel.
+const POCSAG_WIDTH_HZ: u64 = 12_500;
+/// Within how long a span watch over `pocsag3` decodes all three pages (the third is
+/// on air 8 s of every 20).
+const SPAN_ALL_THREE: Duration = Duration::from_secs(30);
+
+/// A span watch's `detect` params: `modes` and the suite's detector timing.
+fn span_params(modes: &[&str]) -> Value {
+    serde_json::json!({"modes": modes, "persist_ms": PERSIST_MS, "gone_ms": GONE_MS,
+        "width_hz": SPAN_WIDTH_HZ})
+}
+
+/// Whether `hz` lies within [`SPAN_CENTRE_TOLERANCE_HZ`] of the page `offset_hz` above
+/// the centre.
+fn on_page(hz: u64, offset_hz: u64) -> bool {
+    hz.abs_diff(CENTER_HZ + offset_hz) <= SPAN_CENTRE_TOLERANCE_HZ
+}
+
+/// The decoders' job ids `watch.decoding` lists.
+fn decoder_ids(node: &Node, watch: &JobId) -> Vec<JobId> {
+    decoding(node, watch)
+        .iter()
+        .filter_map(|d| d["job"].as_str().map(|s| JobId(s.into())))
+        .collect()
+}
+
+/// Wait until the watch keeps `n` decoders, checking each 250 ms that it owns no
+/// record (no identify run); their ids.
+async fn n_decoders_without_identify(node: &Node, watch: &JobId, n: usize) -> Vec<JobId> {
+    let deadline = tokio::time::Instant::now() + SPAN_ALL_THREE;
+    while decoding(node, watch).len() < n {
+        let owned = owned(node, watch);
+        assert!(owned.is_empty(), "{owned:#?}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{n} decoders: {:?}",
+            node.job_context(watch)
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    decoder_ids(node, watch)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_span_watch_starts_a_decoder_per_signal_without_identify() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, span_params(&["pocsag_decode"])).await;
+    let events = Events::of(&node, &watch);
+    let jobs = n_decoders_without_identify(&node, &watch, 3).await;
+    until("three decoding events", Duration::from_secs(5), || {
+        events.watch("decoding").len() >= 3
+    })
+    .await;
+    let all = events.all();
+    assert!(events.watch("identifying").is_empty(), "{all:#?}");
+    for e in events.watch("decoding") {
+        assert_eq!(e["via"], "modes", "{e}");
+        assert_eq!(e["mode"], "pocsag_decode", "{e}");
+        assert_eq!(e["placed"], "capture", "{e}");
+        let summary = e["summary"].as_str().unwrap();
+        assert!(summary.ends_with("on rx (capture, modes)"), "{e}");
+    }
+    let mut pages = Vec::new();
+    for job in &jobs {
+        let rec = record(&node, job).unwrap();
+        assert_eq!(rec.kind, "pocsag_decode");
+        assert_eq!(rec.owner, None, "a kept decoder is an ordinary job");
+        assert_eq!(
+            rec.tuning.bandwidth_hz,
+            Hz(POCSAG_WIDTH_HZ),
+            "{:?}",
+            rec.tuning
+        );
+        let page = SPAN_OFFSETS_HZ
+            .iter()
+            .position(|o| on_page(rec.tuning.center_hz.0, *o));
+        assert!(page.is_some(), "{:?}", rec.tuning);
+        pages.push(page);
+    }
+    pages.sort();
+    pages.dedup();
+    assert_eq!(pages.len(), 3, "one decoder per page: {pages:?}");
+    // Each decoder holds its channel inside the capture: no retune.
+    let holders = node.lease_holders(&rx());
+    for job in &jobs {
+        assert!(holders.iter().any(|(j, _)| j == job), "{holders:?}");
+    }
+    let ctx = node.job_context(&watch).unwrap();
+    for d in ctx["watch"]["decoding"].as_array().unwrap() {
+        assert_eq!(d["via"], "modes", "{ctx}");
+    }
+    for s in ctx["watch"]["signals"].as_array().unwrap() {
+        assert_eq!(s["fits"], serde_json::json!(["pocsag_decode"]), "{ctx}");
+        assert_eq!(s["waiting"], false, "{ctx}");
+    }
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_fitting_no_listed_mode_is_unknown_at_once() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(1_000, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag_fsk, false).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["width_hz"] = serde_json::json!(SPAN_WIDE_WIDTH_HZ);
+    params["on_unknown"] = "capture".into();
+    params["capture"] = serde_json::json!({"bursts": 1});
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let near_burst = |hz: u64| hz.abs_diff(CENTER_HZ + FSK_BESIDE_HZ) <= 5_000;
+    let burst = |e: &Value| e["signal"]["center_hz"].as_u64().is_some_and(near_burst);
+    let identifies = |n: &Node| {
+        n.job_list()
+            .into_iter()
+            .filter(|r| r.kind == "identify")
+            .count()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        assert_eq!(identifies(&node), 0, "no identify runs");
+        let unknown = events.watch("unknown").iter().filter(|e| burst(e)).count();
+        let decoded = events
+            .watch("decoding")
+            .iter()
+            .any(|e| on_page(e["signal"]["center_hz"].as_u64().unwrap_or(0), OFFSET_HZ));
+        // The first unknown and a retry, and the capture's end.
+        if unknown >= 2 && decoded && !events.watch("captured").is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:#?}",
+            events.all()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let all = events.all();
+    assert!(events.watch("identifying").is_empty(), "{all:#?}");
+    let d = &events.watch("decoding")[0];
+    assert_eq!(d["via"], "modes", "{d}");
+    let unknown: Vec<Value> = events
+        .watch("unknown")
+        .into_iter()
+        .filter(|e| burst(e))
+        .collect();
+    for e in &unknown {
+        let summary = e["summary"].as_str().unwrap();
+        assert!(summary.starts_with("unknown at "), "{e}");
+        assert!(summary.contains("no listed mode fits"), "{e}");
+        assert!(summary.ends_with(" kHz"), "{e}");
+        // No identify ran: no job, no verdict's register answer or origins.
+        assert!(e["job"].is_null(), "{e}");
+        assert!(e["allocations"].is_null(), "{e}");
+        assert!(e["origins"].is_null(), "{e}");
+    }
+    // Captured once, the retry included.
+    let (capturing, captured) = (events.watch("capturing"), events.watch("captured"));
+    assert_eq!(capturing.len(), 1, "{all:#?}");
+    assert_eq!(captured.len(), 1, "{all:#?}");
+    assert!(burst(&captured[0]), "{all:#?}");
+    let ids = captured[0]["captures"].as_array().unwrap();
+    assert_eq!(ids.len(), 1, "{all:#?}");
+    let rec = node.bursts().get(ids[0].as_str().unwrap()).expect("stored");
+    assert_eq!(rec.watch, Some(watch.clone()), "{rec:?}");
+    let ctx = node.job_context(&watch).unwrap();
+    let s = ctx["watch"]["signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["center_hz"].as_u64().is_some_and(near_burst))
+        .cloned()
+        .unwrap();
+    assert_eq!(s["fits"], serde_json::json!([]), "{ctx}");
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_fitting_modes_run_a_restricted_identify() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    // The span fixture's page: the suite's lone page reads too wide for a 12.5 kHz row.
+    let src = file_source("rx", &fixtures().pocsag_fsk);
+    let node = node_over(
+        dir.path(),
+        vec![(src.clone() as Arc<dyn Port>, src)],
+        Some(&fixtures().quick_modes),
+    )
+    .await;
+    let node = Arc::new(node);
+    let listed = ["pocsag_decode", "aprs_decode"];
+    let watch = start_watch(&node, span_params(&listed)).await;
+    let events = Events::of(&node, &watch);
+    until("an identifying event", Duration::from_secs(20), || {
+        !events.watch("identifying").is_empty()
+    })
+    .await;
+    let identify = JobId(
+        events.watch("identifying")[0]["job"]
+            .as_str()
+            .unwrap()
+            .into(),
+    );
+    let tried = Events::of(&node, &identify);
+    if let Some(rec) = record(&node, &identify) {
+        assert_eq!(rec.owner.as_ref(), Some(&watch), "{rec:?}");
+        assert_eq!(
+            rec.context["identify"]["candidates"],
+            serde_json::json!(listed),
+            "{rec:?}"
+        );
+    }
+    let job = decoded(&node, &events, &watch).await;
+    let all = events.all();
+    let d = &events.watch("decoding")[0];
+    assert_eq!(d["via"], "identify", "{d}");
+    assert_eq!(d["mode"], "pocsag_decode", "{d}");
+    assert_eq!(events.watch("identifying").len(), 1, "{all:#?}");
+    assert_eq!(decoding(&node, &watch)[0]["via"], "identify");
+    let candidates: Vec<Value> = tried
+        .all()
+        .into_iter()
+        .filter(|e| e["protocol"] == "candidate")
+        .collect();
+    assert!(!candidates.is_empty(), "{:#?}", tried.all());
+    for c in &candidates {
+        let mode = c["mode"].as_str().unwrap();
+        assert!(listed.contains(&mode), "{c}");
+    }
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    stop_all(&node).await;
+}
+
+/// The detector's `gone_ms` of the second-new test: shorter than the 2 s page cycle, so
+/// the page goes and comes back each cycle.
+const FLAP_GONE_MS: u64 = 500;
+/// The second-new test's `persist_ms`: shorter than one page, so each burst is announced.
+const FLAP_PERSIST_MS: u64 = 500;
+/// How long the second-new test watches the flapping page after its first decoder.
+const FLAP_WATCH: Duration = Duration::from_secs(10);
+/// How many `new`s of the page the second-new test must see to have tested anything.
+const FLAP_NEWS_MIN: usize = 3;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_new_on_a_decoded_channel_starts_nothing() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    // The span fixture's page (the burst beside it is under the width window).
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag_fsk, false).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["gone_ms"] = FLAP_GONE_MS.into();
+    params["persist_ms"] = FLAP_PERSIST_MS.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    tokio::time::sleep(FLAP_WATCH).await;
+    let all = events.all();
+    let news = events
+        .signals()
+        .iter()
+        .filter(|s| s["state"] == "new")
+        .filter(|s| on_page(s["center_hz"].as_u64().unwrap_or(0), OFFSET_HZ))
+        .count();
+    assert!(news >= FLAP_NEWS_MIN, "the page flaps: {all:#?}");
+    assert_eq!(events.watch("decoding").len(), 1, "{all:#?}");
+    assert_eq!(decoder_ids(&node, &watch), [job]);
+    let decoders = node
+        .job_list()
+        .into_iter()
+        .filter(|r| r.kind == "pocsag_decode")
+        .count();
+    assert_eq!(decoders, 1, "{:#?}", node.job_list());
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hand_started_decoder_inside_the_band_is_left_alone() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    let node = Arc::new(node);
+    // The capture held at the recording's band, as a pin holds a radio.
+    let pin = Op::SourcePin {
+        source: rx(),
+        center_hz: Hz(CENTER_HZ),
+        bandwidth_hz: Hz(RATE_HZ as u64),
+        replace: vec![],
+    };
+    node.apply(pin).await.unwrap();
+    let op = Op::JobStart {
+        kind: JobKind::from_name("pocsag_decode").unwrap(),
+        source: rx(),
+        center_hz: Hz(CENTER_HZ + OFFSET_HZ),
+        bandwidth_hz: Hz(POCSAG_WIDTH_HZ),
+        deviation_hz: None,
+        sideband: None,
+        elastic: false,
+        replace: vec![],
+    };
+    let hand = match node.apply(op).await {
+        Ok(OpResult::Job(j)) => j,
+        r => panic!("job_start: {r:?}"),
+    };
+    let watch = start_watch(&node, span_params(&["pocsag_decode"])).await;
+    let deadline = tokio::time::Instant::now() + SPAN_ALL_THREE;
+    while decoding(&node, &watch).len() < 2 {
+        assert!(!decoder_ids(&node, &watch).contains(&hand));
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?}",
+            node.job_context(&watch)
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // Two cycles more: the hand-started page never gets a second decoder.
+    tokio::time::sleep(Duration::from_millis(2 * GONE_MS)).await;
+    let ids = decoder_ids(&node, &watch);
+    assert_eq!(ids.len(), 2, "{:?}", node.job_context(&watch));
+    assert!(!ids.contains(&hand), "{ids:?}");
+    for job in &ids {
+        let rec = record(&node, job).unwrap();
+        assert!(!on_page(rec.tuning.center_hz.0, OFFSET_HZ), "{rec:?}");
+    }
+    node.job_stop(&watch).await.unwrap();
+    until("the watch's decoders stop", Duration::from_secs(10), || {
+        ids.iter()
+            .all(|j| state(&node, j) != Some(JobState::Running))
+    })
+    .await;
+    assert_eq!(state(&node, &hand), Some(JobState::Running));
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_a_span_watch_stops_every_decoder() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, span_params(&["pocsag_decode"])).await;
+    let jobs = n_decoders_without_identify(&node, &watch, 3).await;
+    node.job_stop(&watch).await.unwrap();
+    until("none of the three runs", Duration::from_secs(10), || {
+        jobs.iter()
+            .all(|j| state(&node, j) == Some(JobState::Stopped))
+    })
+    .await;
+    assert_eq!(state(&node, &watch), Some(JobState::Stopped));
+    until("no lease on rx", Duration::from_secs(5), || {
+        node.lease_holders(&rx()).is_empty()
+    })
+    .await;
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replace_of_a_span_watch_stops_its_decoders() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, span_params(&["pocsag_decode"])).await;
+    let jobs = n_decoders_without_identify(&node, &watch, 3).await;
+    let op = Op::JobStart {
+        kind: JobKind::Measure,
+        source: rx(),
+        center_hz: Hz(POCSAG_HZ),
+        bandwidth_hz: Hz(POCSAG_WIDTH_HZ),
+        deviation_hz: None,
+        sideband: None,
+        elastic: false,
+        replace: vec![watch.clone()],
+    };
+    let measure = match node.apply(op).await {
+        Ok(OpResult::Job(j)) => j,
+        r => panic!("replace of the watch: {r:?}"),
+    };
+    until(
+        "the watch and its decoders stop",
+        Duration::from_secs(10),
+        || {
+            state(&node, &watch) == Some(JobState::Stopped)
+                && jobs
+                    .iter()
+                    .all(|j| state(&node, j) == Some(JobState::Stopped))
+        },
+    )
+    .await;
+    let only_measure = [(measure.0.clone(), "measure".to_string())];
+    until("only the measure job runs", Duration::from_secs(10), || {
+        running(&node) == only_measure
+    })
+    .await;
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_span_watch_with_decode_on_free_starts_its_decoder_on_a_free_source() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let a = file_source("rx", &fixtures().pocsag_fsk);
+    let b = file_source_with("rx2", &fixtures().pocsag_fsk, false);
+    let ports: Vec<(Arc<dyn Port>, Arc<FileSource>)> = vec![(a.clone(), a), (b.clone(), b)];
+    let node = node_over(dir.path(), ports, None).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["decode_on"] = "free".into();
+    params["prefer"] = serde_json::json!(["rx2"]);
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let jobs = n_decoders_without_identify(&node, &watch, 1).await;
+    let job = jobs[0].clone();
+    until("a decoding event", Duration::from_secs(5), || {
+        !events.watch("decoding").is_empty()
+    })
+    .await;
+    let d = &events.watch("decoding")[0];
+    assert_eq!(d["via"], "modes", "{d}");
+    assert_eq!(d["placed"], "free", "{d}");
+    assert_eq!(d["source"], "rx2", "{d}");
+    assert!(
+        d["summary"]
+            .as_str()
+            .unwrap()
+            .ends_with("on rx2 (free, modes)"),
+        "{d}"
+    );
+    assert!(
+        events.watch("identifying").is_empty(),
+        "{:#?}",
+        events.all()
+    );
+    let rec = record(&node, &job).unwrap();
+    assert_eq!(rec.source, SourceId("rx2".into()));
+    assert_eq!(rec.kind, "pocsag_decode");
+    assert_eq!(rec.tuning.bandwidth_hz, Hz(POCSAG_WIDTH_HZ), "{rec:?}");
+    assert!(on_page(rec.tuning.center_hz.0, OFFSET_HZ), "{rec:?}");
+    let ctx = node.job_context(&watch).unwrap();
+    assert_eq!(ctx["watch"]["decoding"][0]["placed"], "free", "{ctx}");
+    assert_eq!(ctx["watch"]["decoding"][0]["via"], "modes", "{ctx}");
+    // Only the watch holds its own radio; the decoder holds the free one.
+    let holders = |s: &str| -> Vec<JobId> {
+        node.lease_holders(&SourceId(s.into()))
+            .into_iter()
+            .map(|(j, _)| j)
+            .collect()
+    };
+    assert_eq!(holders("rx"), std::slice::from_ref(&watch));
+    assert_eq!(holders("rx2"), std::slice::from_ref(&job));
+    node.job_stop(&watch).await.unwrap();
+    until("the decoder stops", Duration::from_secs(10), || {
+        state(&node, &job) == Some(JobState::Stopped)
+    })
+    .await;
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+}
+
+/// A width window wide enough for the suite's loud page (read 19-25 kHz).
+const LOUD_WIDTH_HZ: [u64; 2] = [6_000, 40_000];
+/// A width window wide enough for the `wide` fixture's burst.
+const WIDE_WIDTH_HZ: [u64; 2] = [6_000, 200_000];
+/// Identify's own width fit: the most a 12.5 kHz row takes by it.
+const IDENTIFY_FIT_MAX_HZ: u64 = POCSAG_WIDTH_HZ * 3 / 2;
+/// The span fit's upper bound for a 12.5 kHz row.
+const SPAN_FIT_MAX_HZ: u64 = 2 * POCSAG_WIDTH_HZ;
+
+/// Publish a `detect` announcement `state` of a signal at `center_hz`, `bandwidth_hz`
+/// wide, on `watch`'s event stream, as the detector would.
+fn announce(node: &Node, watch: &JobId, state: &str, center_hz: u64, bandwidth_hz: u64) {
+    let out = node
+        .job_outputs(watch)
+        .into_iter()
+        .find(|(k, _)| *k == StreamKind::Event)
+        .unwrap()
+        .1;
+    let prov = node
+        .bus()
+        .list()
+        .into_iter()
+        .find(|i| i.id == out)
+        .unwrap()
+        .provenance;
+    let v = serde_json::json!({"protocol": "signal", "state": state, "center_hz": center_hz,
+        "bandwidth_hz": bandwidth_hz, "snr_db": 30.0});
+    node.bus().publish(Frame::new(out, prov, Payload::Event(v)));
+}
+
+/// The width the detector reads a strong 12.5 kHz page at (its skirts).
+const PAGE_READ_WIDE_HZ: u64 = 22_000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_read_wide_still_starts_its_decoder_directly() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    // Noise only: the one signal is the announcement the test makes, read as wide as the
+    // detector reads the suite's loud page (19-25 kHz), wider than identify's rule takes.
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, true).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["width_hz"] = serde_json::json!(LOUD_WIDTH_HZ);
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    const { assert!(PAGE_READ_WIDE_HZ > IDENTIFY_FIT_MAX_HZ) };
+    until("the watch runs its loop", Duration::from_secs(5), || {
+        node.job_context(&watch)
+            .is_some_and(|c| c["watch"]["cap"].is_object())
+    })
+    .await;
+    announce(&node, &watch, "new", POCSAG_HZ, PAGE_READ_WIDE_HZ);
+    let jobs = n_decoders_without_identify(&node, &watch, 1).await;
+    until("a decoding event", Duration::from_secs(5), || {
+        !events.watch("decoding").is_empty()
+    })
+    .await;
+    let all = events.all();
+    assert!(events.watch("identifying").is_empty(), "{all:#?}");
+    let d = &events.watch("decoding")[0];
+    assert_eq!(d["via"], "modes", "{d}");
+    assert_eq!(d["signal"]["bandwidth_hz"], PAGE_READ_WIDE_HZ, "{d}");
+    let rec = record(&node, &jobs[0]).unwrap();
+    assert_eq!(rec.kind, "pocsag_decode");
+    assert_eq!(rec.tuning.center_hz, Hz(POCSAG_HZ), "{rec:?}");
+    assert_eq!(rec.tuning.bandwidth_hz, Hz(POCSAG_WIDTH_HZ), "{rec:?}");
+    let ctx = node.job_context(&watch).unwrap();
+    assert_eq!(
+        ctx["watch"]["signals"][0]["fits"],
+        serde_json::json!(["pocsag_decode"]),
+        "{ctx}"
+    );
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_far_wider_signal_fits_no_listed_mode() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().wide, false).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode", "aprs_decode"]);
+    params["width_hz"] = serde_json::json!(WIDE_WIDTH_HZ);
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    until("an unknown", Duration::from_secs(30), || {
+        !events.watch("unknown").is_empty()
+    })
+    .await;
+    let all = events.all();
+    let e = &events.watch("unknown")[0];
+    let read = e["signal"]["bandwidth_hz"].as_u64().unwrap();
+    assert!(read > SPAN_FIT_MAX_HZ, "{e}");
+    let summary = e["summary"].as_str().unwrap();
+    assert!(summary.contains("no listed mode fits"), "{e}");
+    assert!(events.watch("identifying").is_empty(), "{all:#?}");
+    assert!(events.watch("decoding").is_empty(), "{all:#?}");
+    assert!(owned(&node, &watch).is_empty());
+    stop_all(&node).await;
+}
+
+/// The cap of the cap tests: two of `pocsag3`'s three pages decode, the third waits.
+const CAP: u64 = 2;
+
+/// `watch.cap` in the watch's context.
+fn cap_of(node: &Node, watch: &JobId) -> Value {
+    node.job_context(watch)
+        .map(|c| c["watch"]["cap"].clone())
+        .unwrap_or(Value::Null)
+}
+
+/// The `watch.signals` the watch marks waiting.
+fn waiting_signals(node: &Node, watch: &JobId) -> Vec<Value> {
+    node.job_context(watch)
+        .and_then(|c| c["watch"]["signals"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s["waiting"] == true)
+        .collect()
+}
+
+/// The `watch.cooled` channels.
+fn cooled(node: &Node, watch: &JobId) -> Vec<Value> {
+    node.job_context(watch)
+        .and_then(|c| c["watch"]["cooled"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// The centre a decoder runs on.
+fn decoder_center(node: &Node, job: &JobId) -> u64 {
+    record(node, job).map_or(0, |r| r.tuning.center_hz.0)
+}
+
+/// Wait until a span watch over `pocsag3` capped at [`CAP`] decodes two pages and the
+/// third waits; the third page's centre.
+async fn capped(node: &Node, events: &Events, watch: &JobId) -> u64 {
+    until("two decoders and one waiting", SPAN_ALL_THREE, || {
+        decoding(node, watch).len() == CAP as usize
+            && events.watch("waiting").len() == 1
+            && waiting_signals(node, watch).len() == 1
+    })
+    .await;
+    let waiting = events.watch("waiting")[0].clone();
+    let summary = waiting["summary"].as_str().unwrap();
+    assert!(summary.starts_with("waiting at "), "{waiting}");
+    assert!(summary.ends_with(": 2 of 2 decoding"), "{waiting}");
+    let hz = waiting["signal"]["center_hz"].as_u64().unwrap();
+    assert!(
+        on_page(hz, SPAN_OFFSETS_HZ[2]),
+        "the third page waits: {waiting}"
+    );
+    until("cap {2, 2, 1}", Duration::from_secs(5), || {
+        cap_of(node, watch) == serde_json::json!({"max": CAP, "decoding": 2, "waiting": 1})
+    })
+    .await;
+    hz
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_cap_queues_and_a_freed_slot_is_taken_by_rank() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["max_decoders"] = CAP.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let third = capped(&node, &events, &watch).await;
+    let first = decoder_ids(&node, &watch);
+    node.job_stop(&first[0]).await.unwrap();
+    until(
+        "the waiting page takes the freed slot",
+        Duration::from_secs(5),
+        || {
+            let ids = decoder_ids(&node, &watch);
+            ids.len() == CAP as usize
+                && !ids.contains(&first[0])
+                && ids
+                    .iter()
+                    .any(|j| decoder_center(&node, j).abs_diff(third) <= SPAN_CENTRE_TOLERANCE_HZ)
+        },
+    )
+    .await;
+    until("cap {2, 2, 0}", Duration::from_secs(5), || {
+        cap_of(&node, &watch) == serde_json::json!({"max": CAP, "decoding": 2, "waiting": 0})
+    })
+    .await;
+    assert!(waiting_signals(&node, &watch).is_empty());
+    // Never over the cap, and the one waiting event.
+    assert_eq!(events.watch("decoding").len(), 3, "{:#?}", events.all());
+    assert_eq!(events.watch("waiting").len(), 1, "{:#?}", events.all());
+    stop_all(&node).await;
+}
+
+/// The quiet-channel test's hold and cooldown: the third page's decoder is lost soon
+/// after the page's quiet spell starts (seconds 14-26 of the run), and the channel is
+/// cooled past its return (a `new` about 27.5 s into the run).
+const QUIET_HOLD_MS: u64 = 2_000;
+const QUIET_COOLDOWN_MS: u64 = 15_000;
+
+/// Wall-clock nanoseconds, as the watch's `until_ns`.
+fn wall_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quiet_channel_is_held_then_lost_and_cooled() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["hold_ms"] = QUIET_HOLD_MS.into();
+    params["cooldown_ms"] = QUIET_COOLDOWN_MS.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let on_third = |hz: u64| on_page(hz, SPAN_OFFSETS_HZ[2]);
+    let thirds = |state: &str| -> Vec<Value> {
+        events
+            .watch(state)
+            .into_iter()
+            .filter(|e| e["signal"]["center_hz"].as_u64().is_some_and(on_third))
+            .collect()
+    };
+    until("the third page decodes", SPAN_ALL_THREE, || {
+        thirds("decoding").len() == 1
+    })
+    .await;
+    until("its decoder is lost", Duration::from_secs(20), || {
+        !thirds("lost").is_empty()
+    })
+    .await;
+    let lost = &thirds("lost")[0];
+    assert_eq!(lost["why"], "gone and silent", "{lost}");
+    let cool = cooled(&node, &watch);
+    let channel = cool
+        .iter()
+        .find(|c| c["center_hz"].as_u64().is_some_and(on_third))
+        .unwrap_or_else(|| panic!("cooled: {cool:#?}"))
+        .clone();
+    assert_eq!(channel["why"], "gone and silent", "{channel}");
+    assert_eq!(channel["bandwidth_hz"], POCSAG_WIDTH_HZ, "{channel}");
+    let until_ns = channel["until_ns"].as_u64().unwrap();
+    // The page comes back inside the cooldown: tracked, neither started nor waiting.
+    let news = || {
+        events
+            .signals()
+            .iter()
+            .filter(|s| s["state"] == "new")
+            .filter(|s| s["center_hz"].as_u64().is_some_and(on_third))
+            .count()
+    };
+    let before = news();
+    until("the third page returns", Duration::from_secs(20), || {
+        news() > before
+    })
+    .await;
+    assert!(wall_ns() < until_ns, "the page returned after the cooldown");
+    until("the watch tracks it", Duration::from_secs(5), || {
+        node.job_context(&watch).is_some_and(|c| {
+            c["watch"]["signals"].as_array().is_some_and(|s| {
+                s.iter()
+                    .any(|x| x["present"] == true && x["center_hz"].as_u64().is_some_and(on_third))
+            })
+        })
+    })
+    .await;
+    // After the cooldown it starts again, and not before.
+    until(
+        "a decoder after the cooldown",
+        Duration::from_millis(QUIET_COOLDOWN_MS + 10_000),
+        || thirds("decoding").len() == 2,
+    )
+    .await;
+    let again = &thirds("decoding")[1];
+    assert!(again["t_ns"].as_u64().unwrap() >= until_ns, "{again}");
+    assert!(events.watch("waiting").is_empty(), "{:#?}", events.all());
+    stop_all(&node).await;
+}
+
+/// The unproven test's `confirm_ms`: the page's decoder publishes within it (a page every
+/// 2 s, decoded at its end), the noise's never does.
+const CONFIRM_MS: u64 = 5_000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unproven_decoder_is_stopped_and_its_channel_cooled() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().noise12k, false).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["confirm_ms"] = CONFIRM_MS.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let near_noise = |hz: u64| hz.abs_diff(CENTER_HZ + NOISE_OFFSET_HZ) <= SPAN_CENTRE_TOLERANCE_HZ;
+    let on_noise = |e: &Value| e["signal"]["center_hz"].as_u64().is_some_and(near_noise);
+    until("the noise's decoder starts", SPAN_ALL_THREE, || {
+        events
+            .watch("decoding")
+            .iter()
+            .any(|e| on_noise(e) && e["via"] == "modes")
+    })
+    .await;
+    until(
+        "it is lost unproven",
+        Duration::from_millis(CONFIRM_MS + 5_000),
+        || events.watch("lost").iter().any(on_noise),
+    )
+    .await;
+    let lost = events.watch("lost").into_iter().find(on_noise).unwrap();
+    assert_eq!(lost["why"], "unproven", "{lost}");
+    let summary = lost["summary"].as_str().unwrap();
+    assert!(summary.contains("unproven"), "{lost}");
+    let job = JobId(lost["job"].as_str().unwrap().into());
+    until("its job stops", Duration::from_secs(5), || {
+        state(&node, &job) == Some(JobState::Stopped)
+    })
+    .await;
+    let cool = cooled(&node, &watch);
+    let named = cool
+        .iter()
+        .any(|c| c["why"] == "unproven" && c["center_hz"].as_u64().is_some_and(near_noise));
+    assert!(named, "{cool:#?}");
+    // The page publishes: its decoder is kept past the confirm.
+    let page = events
+        .watch("decoding")
+        .into_iter()
+        .find(|e| {
+            e["signal"]["center_hz"]
+                .as_u64()
+                .is_some_and(|hz| on_page(hz, OFFSET_HZ))
+        })
+        .unwrap_or_else(|| panic!("{:#?}", events.all()));
+    let page_job = JobId(page["job"].as_str().unwrap().into());
+    tokio::time::sleep(Duration::from_millis(CONFIRM_MS)).await;
+    assert_eq!(decoder_ids(&node, &watch), std::slice::from_ref(&page_job));
+    assert_eq!(state(&node, &page_job), Some(JobState::Running));
+    let page_lost = events
+        .watch("lost")
+        .iter()
+        .any(|e| e["job"] == page_job.0.as_str());
+    assert!(!page_lost, "{:#?}", events.all());
+    stop_all(&node).await;
+}
+
+/// The churn test's timing: each start of the noise's decoder is unproven quickly, and
+/// its channel and retry come round soon after.
+const CHURN_CONFIRM_MS: u64 = 1_500;
+const CHURN_COOLDOWN_MS: u64 = 1_000;
+const CHURN_RETRY_MS: u64 = 1_000;
+/// How long the churn test watches for a start past the last try: several rounds.
+const CHURN_QUIET: Duration = Duration::from_secs(10);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_carrier_no_decoder_proves_stops_being_restarted_after_its_tries() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(CHURN_RETRY_MS, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().noise12k, false).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["confirm_ms"] = CHURN_CONFIRM_MS.into();
+    params["cooldown_ms"] = CHURN_COOLDOWN_MS.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let near_noise = |hz: u64| hz.abs_diff(CENTER_HZ + NOISE_OFFSET_HZ) <= SPAN_CENTRE_TOLERANCE_HZ;
+    let on_noise = |e: &Value| e["signal"]["center_hz"].as_u64().is_some_and(near_noise);
+    let count = |state: &str| events.watch(state).iter().filter(|e| on_noise(e)).count();
+    // The first start and RETRY_MAX more, each lost unproven.
+    let starts = zeta_core::node::watch::RETRY_MAX as usize + 1;
+    until(
+        "every try is lost unproven",
+        Duration::from_secs(40),
+        || count("lost") >= starts,
+    )
+    .await;
+    tokio::time::sleep(CHURN_QUIET).await;
+    let all = events.all();
+    assert_eq!(count("decoding"), starts, "{all:#?}");
+    assert_eq!(count("lost"), starts, "{all:#?}");
+    for e in events.watch("lost").iter().filter(|e| on_noise(e)) {
+        assert_eq!(e["why"], "unproven", "{e}");
+    }
+    // Still tracked and present, left alone.
+    let ctx = node.job_context(&watch).unwrap();
+    let noise = ctx["watch"]["signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["center_hz"].as_u64().is_some_and(near_noise))
+        .cloned()
+        .unwrap_or_else(|| panic!("{ctx}"));
+    assert_eq!(noise["present"], true, "{noise}");
+    assert_eq!(noise["handled"], true, "{noise}");
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+/// The failing row: `pocsag_decode`'s channel and centres, decoded by [`FAIL_STAGE`].
+const FAIL_ROW: &str = "fail_test";
+
+/// A modes dir under `dir` holding [`FAIL_ROW`] alone.
+fn fail_modes(dir: &Path) -> PathBuf {
+    let modes = dir.join("fail_modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let embedded = zeta_core::modes::ModeRegistry::embedded();
+    let (_, text) = embedded
+        .iter()
+        .find(|(f, _)| f.ends_with("pocsag_decode.json"))
+        .expect("pocsag_decode embedded");
+    let mut row: Value = serde_json::from_str(text).unwrap();
+    row["id"] = FAIL_ROW.into();
+    row["name"] = "Failing test decoder".into();
+    row["label"] = "FAIL".into();
+    row["protocol"] = FAIL_ROW.into();
+    row["catalogue"] = serde_json::json!([]);
+    row.as_object_mut().unwrap().remove("test");
+    for n in row["decoder"]["nodes"].as_array_mut().unwrap() {
+        if n["id"] == "decode" {
+            n["kind"] = FAIL_STAGE.into();
+        }
+    }
+    std::fs::write(modes.join(format!("{FAIL_ROW}.json")), row.to_string()).unwrap();
+    modes
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_decoder_that_keeps_failing_stops_being_restarted_after_its_tries() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(CHURN_RETRY_MS, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let modes = fail_modes(dir.path());
+    let src = file_source("rx", &fixtures().pocsag);
+    let node = node_over(dir.path(), vec![(src.clone() as _, src)], Some(&modes)).await;
+    assert_eq!(
+        node.modes().get(FAIL_ROW).map(|m| m.state),
+        Some(zeta_core::modes::ModeState::Ready)
+    );
+    let node = Arc::new(node);
+    let mut params = span_params(&[FAIL_ROW]);
+    params["cooldown_ms"] = CHURN_COOLDOWN_MS.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let on = |e: &Value| {
+        e["signal"]["center_hz"]
+            .as_u64()
+            .is_some_and(|hz| on_page(hz, OFFSET_HZ))
+    };
+    let count = |state: &str| events.watch(state).iter().filter(|e| on(e)).count();
+    // The first start and RETRY_MAX more, each failing.
+    let starts = zeta_core::node::watch::RETRY_MAX as usize + 1;
+    until("every try starts", Duration::from_secs(40), || {
+        count("decoding") >= starts
+    })
+    .await;
+    tokio::time::sleep(CHURN_QUIET).await;
+    let all = events.all();
+    assert_eq!(count("decoding"), starts, "{all:#?}");
+    // Failed, not lost: no `lost` events; still tracked and present, left alone.
+    assert!(events.watch("lost").is_empty(), "{all:#?}");
+    let ctx = node.job_context(&watch).unwrap();
+    let page = ctx["watch"]["signals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["center_hz"]
+                .as_u64()
+                .is_some_and(|hz| on_page(hz, OFFSET_HZ))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("{ctx}"));
+    assert_eq!(page["present"], true, "{page}");
+    assert_eq!(page["handled"], true, "{page}");
+    assert!(decoder_ids(&node, &watch).is_empty(), "{ctx}");
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+/// The jobs_stop test's cooldown: the stopped channels rest this long before they start
+/// again.
+const STOPPED_COOLDOWN_MS: u64 = 2_000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jobs_stop_of_the_decoders_frees_the_cap() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["max_decoders"] = CAP.into();
+    params["cooldown_ms"] = STOPPED_COOLDOWN_MS.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    let third = capped(&node, &events, &watch).await;
+    let first = decoder_ids(&node, &watch);
+    let op = Op::JobsStop {
+        source: Some(rx()),
+        kind: JobKind::from_name("pocsag_decode"),
+        plan: None,
+    };
+    match node.apply(op).await {
+        Ok(OpResult::JobsStopped { stopped, failed }) => {
+            assert!(failed.is_empty(), "{failed:?}");
+            for j in &first {
+                assert!(stopped.contains(j), "{stopped:?}");
+            }
+        }
+        r => panic!("jobs_stop: {r:?}"),
+    }
+    until("the slots fill again", Duration::from_secs(20), || {
+        let ids = decoder_ids(&node, &watch);
+        ids.len() == CAP as usize
+            && ids
+                .iter()
+                .all(|j| !first.contains(j) && state(&node, j) == Some(JobState::Running))
+    })
+    .await;
+    // The waiting page took a slot.
+    let ids = decoder_ids(&node, &watch);
+    let took = ids
+        .iter()
+        .any(|j| decoder_center(&node, j).abs_diff(third) <= SPAN_CENTRE_TOLERANCE_HZ);
+    assert!(took, "{:?}", node.job_context(&watch));
+    for j in &first {
+        assert_eq!(state(&node, j), Some(JobState::Stopped));
+    }
+    let cap = cap_of(&node, &watch);
+    assert_eq!(cap["decoding"], CAP, "{cap}");
+    stop_all(&node).await;
+}
+
+/// The re-adoption test's hold: past the detector's `gone_ms`, and past the third page's
+/// quiet spell (seconds 13-27 of a run, between its last decoded page and its next `new`).
+const READOPT_HOLD_MS: u64 = 20_000;
+/// How long the re-adoption test watches the resumed watch.
+const READOPT_WATCH: Duration = Duration::from_secs(25);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_span_watch_is_readopted_with_the_hold() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    const { assert!(READOPT_HOLD_MS > READOPT_GONE_MS) };
+    let dir = tempfile::tempdir().unwrap();
+    let jobs = dir.path().join("state").join("jobs");
+    let file = |id: &JobId| jobs.join(format!("{}.json", id.0));
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["gone_ms"] = READOPT_GONE_MS.into();
+    params["hold_ms"] = READOPT_HOLD_MS.into();
+    let watch = start_watch(&node, params).await;
+    let ids = n_decoders_without_identify(&node, &watch, 3).await;
+    // The records as a kill mid-decode leaves them.
+    let recs: Vec<(PathBuf, String)> = std::iter::once(&watch)
+        .chain(ids.iter())
+        .map(|id| (file(id), std::fs::read_to_string(file(id)).unwrap()))
+        .collect();
+    let v: Value = serde_json::from_str(&recs[0].1).unwrap();
+    let kept = v["context"]["watch"]["decoding"].as_array().unwrap().len();
+    assert_eq!(kept, 3, "{v}");
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for (path, text) in &recs {
+        std::fs::write(path, text).unwrap();
+    }
+    // The recording starts over: the third page is quiet for its first 6 s, longer than
+    // `gone_ms`, shorter than the hold.
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    let node = Arc::new(node);
+    let events = Events::of(&node, &watch);
+    assert_eq!(state(&node, &watch), Some(JobState::Running));
+    tokio::time::sleep(READOPT_WATCH).await;
+    let mut listed = decoder_ids(&node, &watch);
+    listed.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut want = ids.clone();
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(listed, want, "{:?}", node.job_context(&watch));
+    for j in &ids {
+        assert_eq!(state(&node, j), Some(JobState::Running));
+    }
+    assert!(events.watch("lost").is_empty(), "{:#?}", events.all());
+    assert!(events.watch("decoding").is_empty(), "{:#?}", events.all());
+    stop_all(&node).await;
+}
+
+/// The seeding test's register: one 12.5 kHz data transmitter licensed at the second
+/// page of `pocsag3` (which is also `pocsag_decode`'s listed centre).
+fn telco() -> Allocation {
+    telco_at(CENTER_HZ + SPAN_OFFSETS_HZ[1])
+}
+
+/// A 12.5 kHz data transmitter licensed at `center_hz` to Telco, Mount X, 3 km away.
+fn telco_at(center_hz: u64) -> Allocation {
+    assignment(center_hz, 12_500, "12K5F1D", "Telco", "Mount X", 3.0)
+}
+
+/// The `watch.known` record.
+fn known(node: &Node, watch: &JobId) -> Value {
+    node.job_context(watch)
+        .map(|c| c["watch"]["known"].clone())
+        .unwrap_or_default()
+}
+
+/// The known channels' `(center_hz, from)`.
+fn known_channels(node: &Node, watch: &JobId) -> Vec<(u64, String)> {
+    known(node, watch)["channels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|k| {
+            (
+                k["center_hz"].as_u64().unwrap_or(0),
+                k["from"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The known-rank test's cooldown: the stopped decoder's channel stays out of the race
+/// for the freed slot.
+const RANK_COOLDOWN_MS: u64 = 30_000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn known_channels_rank_first_and_name_the_licensee() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().known3, false).await;
+    let licensed = CENTER_HZ + KNOWN_OFFSETS_HZ[2];
+    node.add_knowledge(Arc::new(Register::with(vec![telco_at(licensed)])));
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["max_decoders"] = 1.into();
+    params["cooldown_ms"] = RANK_COOLDOWN_MS.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    until("the known channels", Duration::from_secs(5), || {
+        known_channels(&node, &watch)
+            == [
+                (POCSAG_HZ, "row".to_string()),
+                (licensed, "register".to_string()),
+            ]
+    })
+    .await;
+    let k = known(&node, &watch);
+    assert_eq!(k["providers"], 1, "{k}");
+    assert_eq!(k["assignments"], 1, "{k}");
+    let register = &k["channels"][1];
+    assert_eq!(register["licensee"], "Telco", "{k}");
+    assert_eq!(register["site"], "Mount X", "{k}");
+    assert_eq!(register["mode"], "pocsag_decode", "{k}");
+    assert_eq!(register["sites"], 1, "{k}");
+    assert_eq!(register["bandwidth_hz"], POCSAG_WIDTH_HZ, "{k}");
+    assert_eq!(k["channels"][0]["sites"], 0, "{k}");
+    // An unknown page takes the one slot; the other unknown page and, once on air, the
+    // register's channel wait.
+    let on = |s: &Value, off: u64| s["center_hz"].as_u64().is_some_and(|hz| on_page(hz, off));
+    until("one decoding and two waiting", SPAN_ALL_THREE, || {
+        let waiting = waiting_signals(&node, &watch);
+        decoder_ids(&node, &watch).len() == 1
+            && waiting.len() == 2
+            && waiting.iter().any(|s| on(s, KNOWN_OFFSETS_HZ[2]))
+    })
+    .await;
+    let first = decoder_ids(&node, &watch);
+    let running = decoder_center(&node, &first[0]);
+    assert!(
+        on_page(running, KNOWN_OFFSETS_HZ[0]) || on_page(running, KNOWN_OFFSETS_HZ[1]),
+        "an unknown page decodes first: {running}"
+    );
+    // The freed slot goes to the known channel over the unknown page that waited longer.
+    node.job_stop(&first[0]).await.unwrap();
+    until(
+        "the register's channel takes the freed slot",
+        Duration::from_secs(5),
+        || {
+            let ids = decoder_ids(&node, &watch);
+            ids.len() == 1 && on_page(decoder_center(&node, &ids[0]), KNOWN_OFFSETS_HZ[2])
+        },
+    )
+    .await;
+    let e = events
+        .watch("decoding")
+        .into_iter()
+        .find(|e| on(&e["signal"], KNOWN_OFFSETS_HZ[2]))
+        .unwrap_or_else(|| panic!("{:#?}", events.all()));
+    let summary = e["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("; register says 12K5F1D (12.5 kHz FM data) Telco, Mount X, 3 km"),
+        "{e}"
+    );
+    // The unknown page still waits.
+    until("the unknown page waits", Duration::from_secs(5), || {
+        let waiting = waiting_signals(&node, &watch);
+        waiting.len() == 1 && !on(&waiting[0], KNOWN_OFFSETS_HZ[2])
+    })
+    .await;
+    stop_all(&node).await;
+}
+
+/// The seeding test's hold: the seeded decoder is lost this long after its start.
+const SEED_HOLD_MS: u64 = 2_000;
+/// How long the seeding test's register takes: the test's event collector subscribes
+/// meanwhile, so it sees the seeded decoder's `decoding`.
+const SEED_REGISTER_DELAY: Duration = Duration::from_millis(500);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seed_known_starts_the_known_channel_before_any_signal() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    // Noise only: the detector never announces a signal.
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, true).await;
+    node.add_knowledge(Arc::new(Register::slow(vec![telco()], SEED_REGISTER_DELAY)));
+    let node = Arc::new(node);
+    let mut params = span_params(&["pocsag_decode"]);
+    params["seed_known"] = true.into();
+    params["hold_ms"] = SEED_HOLD_MS.into();
+    let watch = start_watch(&node, params).await;
+    let events = Events::of(&node, &watch);
+    until("a seeded decoder", Duration::from_secs(10), || {
+        !events.watch("decoding").is_empty()
+    })
+    .await;
+    let e = events.watch("decoding")[0].clone();
+    assert_eq!(e["via"], "modes", "{e}");
+    assert_eq!(e["mode"], "pocsag_decode", "{e}");
+    let center = CENTER_HZ + SPAN_OFFSETS_HZ[1];
+    assert_eq!(e["signal"]["center_hz"], center, "{e}");
+    let news = || {
+        events
+            .signals()
+            .iter()
+            .filter(|s| s["state"] == "new")
+            .count()
+    };
+    assert_eq!(news(), 0, "{:#?}", events.all());
+    // The row's centre and the register's are one channel: one decoder.
+    let job = JobId(e["job"].as_str().unwrap().into());
+    assert_eq!(decoder_center(&node, &job), center);
+    until(
+        "it is lost",
+        Duration::from_millis(SEED_HOLD_MS + 5_000),
+        || !events.watch("lost").is_empty(),
+    )
+    .await;
+    let lost = &events.watch("lost")[0];
+    assert_eq!(lost["job"], job.0.as_str(), "{lost}");
+    assert_eq!(lost["why"], "not seen again", "{lost}");
+    assert_eq!(events.watch("decoding").len(), 1, "{:#?}", events.all());
+    assert_eq!(news(), 0, "{:#?}", events.all());
+    stop_all(&node).await;
+}
+
+/// The unreachable register's delay before it answers nothing.
+const UNREACHABLE_DELAY: Duration = Duration::from_millis(50);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreachable_register_leaves_known_from_rows_only() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag3, false).await;
+    node.add_knowledge(Arc::new(Register::slow(Vec::new(), UNREACHABLE_DELAY)));
+    let node = Arc::new(node);
+    let watch = start_watch(&node, span_params(&["pocsag_decode"])).await;
+    until("the row's channel only", Duration::from_secs(5), || {
+        known_channels(&node, &watch) == [(POCSAG_HZ, "row".to_string())]
+    })
+    .await;
+    let k = known(&node, &watch);
+    assert_eq!(k["providers"], 1, "{k}");
+    assert_eq!(k["assignments"], 0, "{k}");
+    n_decoders_without_identify(&node, &watch, 2).await;
+    stop_all(&node).await;
 }

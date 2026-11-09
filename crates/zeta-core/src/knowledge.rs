@@ -225,6 +225,76 @@ pub async fn nearest_allocations(
     assignments
 }
 
+/// One licensed transmitter centre of a band ([`band_assignments`]): the nearest site's
+/// assignment and how many assignments (sites) were folded into it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct BandAssignment {
+    pub allocation: Allocation,
+    pub sites: usize,
+}
+
+/// Which of two assignments on one centre names it: the nearer by `distance_km`, one
+/// without a distance losing to any with one.
+fn nearer(a: &Allocation, b: &Allocation) -> bool {
+    match (a.distance_km, b.distance_km) {
+        (Some(x), Some(y)) => x < y,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Every provider's transmitters (`kind` `assignment`, `role` `tx`, with a `center_hz`)
+/// whose centre lies inside `center_hz` ± `bandwidth_hz`/2 in `region`, uncapped (unlike
+/// [`nearest_allocations`]: a city's pager band holds many more than five, the watch's
+/// known channels). Assignments within `dedupe_hz` of the first of a run (the same
+/// carrier licensed at several sites) are one, named by the nearest site; sorted by
+/// centre. One call per provider.
+pub async fn band_assignments(
+    providers: &[Arc<dyn KnowledgeProvider>],
+    region: &str,
+    center_hz: Hz,
+    bandwidth_hz: Hz,
+    dedupe_hz: Hz,
+) -> Vec<BandAssignment> {
+    let half = bandwidth_hz.0 / 2;
+    let mut txs: Vec<(u64, Allocation)> = Vec::new();
+    for p in providers {
+        for a in p.allocations(region, center_hz, bandwidth_hz).await {
+            let Some(c) = a.center_hz.map(|c| c.0) else {
+                continue;
+            };
+            if a.kind.as_deref() == Some("assignment")
+                && a.role.as_deref() == Some("tx")
+                && c.abs_diff(center_hz.0) <= half
+            {
+                txs.push((c, a));
+            }
+        }
+    }
+    txs.sort_by_key(|(c, _)| *c);
+    let mut out: Vec<(u64, BandAssignment)> = Vec::new();
+    for (c, a) in txs {
+        match out.last_mut() {
+            Some((first, b)) if c - *first <= dedupe_hz.0 => {
+                b.sites += 1;
+                if nearer(&a, &b.allocation) {
+                    b.allocation = a;
+                }
+            }
+            _ => out.push((
+                c,
+                BandAssignment {
+                    allocation: a,
+                    sites: 1,
+                },
+            )),
+        }
+    }
+    let mut out: Vec<BandAssignment> = out.into_iter().map(|(_, b)| b).collect();
+    out.sort_by_key(|b| b.allocation.center_hz.map(|c| c.0));
+    out
+}
+
 /// Providers backed by JSON data held in memory.
 pub struct StaticKnowledge {
     signatures: Vec<Signature>,
@@ -478,6 +548,59 @@ mod tests {
             k.allocations("AU", Hz(100_000_000), Hz(1_000))
                 .await
                 .is_empty()
+        );
+    }
+
+    /// A transmitter (or with `role` `rx` a receiver) licensed at `center_hz`, `km` away.
+    fn tx(center_hz: u64, role: &str, site: &str, km: Option<f64>) -> Allocation {
+        Allocation {
+            kind: Some("assignment".into()),
+            role: Some(role.into()),
+            center_hz: Some(Hz(center_hz)),
+            site: Some(site.into()),
+            distance_km: km,
+            ..Allocation::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn band_assignments_is_uncapped_and_deduplicates_by_centre() {
+        let (a, b, c) = (148_100_000, 148_300_000, 148_500_000);
+        // Nine transmitters on three centres, each licensed at three sites within 2 kHz
+        // of each other, split over two providers; a receiver, a plan row and a
+        // transmitter outside the band besides.
+        let first = vec![
+            tx(c + 2_000, "tx", "c far", Some(30.0)),
+            tx(a, "tx", "a far", Some(20.0)),
+            tx(b + 1_000, "tx", "b nowhere", None),
+            tx(a + 1_000, "tx", "a near", Some(2.0)),
+            tx(b + 500, "rx", "b receiver", Some(0.1)),
+            row(Some("plan"), "plan", None),
+            tx(149_500_000, "tx", "outside", Some(1.0)),
+        ];
+        let second = vec![
+            tx(b, "tx", "b near", Some(4.0)),
+            tx(c, "tx", "c near", Some(1.0)),
+            tx(a + 2_000, "tx", "a mid", Some(9.0)),
+            tx(b + 2_000, "tx", "b mid", Some(8.0)),
+            tx(c + 1_000, "tx", "c mid", Some(10.0)),
+        ];
+        let providers: Vec<Arc<dyn KnowledgeProvider>> =
+            vec![Arc::new(Fixed(first)), Arc::new(Fixed(second))];
+        let got = band_assignments(&providers, "AU", Hz(b), Hz(1_000_000), Hz(6_250)).await;
+        let sites: Vec<(&str, usize)> = got
+            .iter()
+            .map(|x| (x.allocation.site.as_deref().unwrap(), x.sites))
+            .collect();
+        assert_eq!(sites, [("a near", 3), ("b near", 3), ("c near", 3)]);
+        let centres: Vec<u64> = got
+            .iter()
+            .map(|x| x.allocation.center_hz.unwrap().0)
+            .collect();
+        assert!(centres.windows(2).all(|w| w[0] < w[1]), "{centres:?}");
+        assert!(
+            got.iter()
+                .all(|x| x.allocation.role.as_deref() == Some("tx"))
         );
     }
 }

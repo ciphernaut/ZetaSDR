@@ -18,7 +18,7 @@
 //                               folded into it with a ×N count. Ok outcomes of the read-only
 //                               polls and lookups (QUIET_OPS: job_list, stream_list,
 //                               source_list, and modes_list and modes_show, which the overlays
-//                               ask to find positioned jobs, capture_list and signature_list, the Explore pane's polls, and station_get, the home read at load) whose
+//                               ask to find positioned jobs, capture_list and signature_list, the Explore pane's polls, station_get, the home read at load, and set_list, read with job_list) whose
 //                               transport is "ui" (a UI's own calls) are hidden; errors and
 //                               other callers' records always show (ruling R6). Records from
 //                               another caller are prefixed `[agent]`, `[http]`, `[local]`.
@@ -47,7 +47,7 @@
 //                               otherwise (null: none seen)
 //   isAudioJob(job, rowOf)      AUDIO_KINDS, or a mode row whose `outputs` lists `audio` (startJobs' `audioKind`: kind -> row)
 //   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing, squelch,
-//                                   view, position, onHot})
+//                                   view, position, onHot, shownSource})
 //                                                       -> {close, refresh, redraw}
 //       Each row carries `data-job` (the id, beside `data-id`), `data-colour` (overlays.js
 //       channelColour, the colour its outline and tag share) and, when the tuning is
@@ -96,10 +96,34 @@
 //       attached to them are moved into one `details.job-group[data-plan]` whose summary reads
 //       `<n> idle <kinds> on <plan>[, <m> <attached kind>]`; it is open unless the operator
 //       folded it (sessionStorage[JOB_FOLD_KEY + plan]). foldIdle(ms) changes the idle age.
+//       sets() gives set_list's entries as last read.
 //       A job folds only on evidence (foldPlan): an unwatched squelch kind needs the watched
 //       mix (watchedMix(): its id) running and covering its source, and that mix not to have
 //       heard it for JOBS_FOLD_IDLE_MS (activity(id): {watched, speaking, hot}, overlays.js);
 //       a `speaking` row never folds, nor a `hot` one unless the hot is its own row's hover.
+//       A watch's decoders fold under the watch first (groupOf, plan 31 spec 4.7, 9.22): a
+//       membership fold, drawn from one member, whatever their activity. The watch's own row
+//       becomes the summary of a `details.job-group[data-plan=<watch id>][data-kind="watch"]`
+//       standing where the watch's row stood, its `.group-text` reading `<watch kind> <id
+//       tail> · <mode> × <n>[, <mode> × <n>] decoding, <m> waiting` (m: the watch's
+//       context.watch.cap.waiting), its decoders' rows (and the rows attached to them) under
+//       it. Plan groups carry data-kind "plan". A decoder's Stop is its own job_stop.
+//       A set's jobs fold under the set (groupOf with `set_list`, read with each `job_list`
+//       poll; plan 31 spec 5.5, 9.19): a membership fold into
+//       `details.job-group[data-plan=<set id>][data-kind="set"]` standing where the first
+//       of them stood, its summary a `.group-text` reading `<set name> · <n> on <shown
+//       source>, +<m> on <other source>` (shownSource(), the source the page shows; null:
+//       `<n> on <source>` for each) and a `button.stop` that reads `Stop set?` on a first
+//       click and sends `set_stop` on a second within SET_STOP_CONFIRM_MS. Only the rows on
+//       the shown source are listed under it; a plan member's channels sit there directly,
+//       a watch member's group (the watch's row and its decoders) nests inside it: two
+//       levels at most. A watch row's Stop is the watch's job_stop, a member row's its own.
+//   groupOf(job, jobs, sets = []) -> {key, kind: "watch" | "set", title} | null
+//       the watch `job` decodes for: a running, unowned job named in some running watch's
+//       context.watch.decoding[].job (`key` the watch id, `title` `<watch kind> <id tail>`);
+//       else the set whose running instance lists it in `running.members[].job` (`sets`:
+//       set_list's entries; `key` the set id, `title` its name)
+//   SET_STOP_CONFIRM_MS         how long a set group's Stop stays armed (3000)
 import { channelColour } from "./overlays.js";
 import { mixCovering } from "./mix.js";
 import { channelLabel } from "./plans.js";
@@ -113,6 +137,33 @@ export const JOBS_POLL_MS = 2000;
 export const JOBS_FOLD_MIN = 8;
 export const JOBS_FOLD_IDLE_MS = 60_000;
 export const JOB_FOLD_KEY = "zeta.jobfold."; // + plan id: "open" | "closed", the operator's fold
+// The group a job folds under, the nearest first (plan 31 spec 4.7, 5.5, 9.22): a watch's
+// kept decoder (a running, unowned job that a running watch's `context.watch.decoding`
+// names) is in the watch's group; an unowned job a running set instance lists (`sets`,
+// `set_list`'s entries: `running.members[].job`) is in the set's group. Null otherwise.
+export function groupOf(j, jobs, sets = []) {
+  if (!j || j.owner) return null;
+  if (j.state?.status === "running") {
+    for (const w of jobs || []) {
+      if (w.id === j.id || w.state?.status !== "running") continue;
+      const decoding = w.context?.watch?.decoding;
+      if (Array.isArray(decoding) && decoding.some((d) => d && d.job === j.id)) {
+        return { key: w.id, kind: "watch", title: `${w.kind} ${w.id.slice(-6)}` };
+      }
+    }
+  }
+  for (const s of sets || []) {
+    const members = s?.running?.members;
+    if (Array.isArray(members) && members.some((m) => m && m.job === j.id)) {
+      return { key: s.id, kind: "set", title: s.name };
+    }
+  }
+  return null;
+}
+// How long a set group's Stop stays armed ("Stop set?") for the second click that sends
+// `set_stop` (spec 9.7: the confirm the page's other destructive buttons use).
+export const SET_STOP_CONFIRM_MS = 3000;
+
 // The row spans whose full text is their title (line two cuts them with an ellipsis).
 const TITLED = ["band", "source", "events"];
 export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod", "mix"];
@@ -132,6 +183,7 @@ export const QUIET_OPS = new Set([
   "capture_list",
   "signature_list",
   "station_get",
+  "set_list",
 ]);
 export const AUTO_SCAN_KEY = "zeta.autoScan";
 const MAX_LINES = 500;
@@ -190,6 +242,15 @@ function resultText(r) {
     const c = r.counts;
     return `ok (${c.started} started, ${c.existing} existing, ${c.refused} refused)`;
   }
+  if (r.truncated && r.counts && r.result === "set_start") {
+    const c = r.counts;
+    const w = Array.isArray(r.warnings) ? r.warnings.length : 0;
+    return `ok (${c.started} started, ${c.existing} existing, ${c.refused} refused, ${w} warnings)`;
+  }
+  if (r.truncated && r.counts && r.result === "set_stopped") {
+    const c = r.counts;
+    return `ok (${c.stopped} stopped, ${c.ended} ended, ${c.failed} failed)`;
+  }
   if (r.truncated && r.counts && r.result === "jobs_stopped") {
     return `ok (${r.counts.stopped} stopped, ${r.counts.failed} failed)`;
   }
@@ -218,6 +279,17 @@ function resultText(r) {
     case "plan_start": {
       const n = (k) => (v && Array.isArray(v[k]) ? v[k].length : 0);
       return `ok (${n("started")} started, ${n("existing")} existing, ${n("refused")} refused)`;
+    }
+    case "set_start": {
+      const n = (k) => (v && Array.isArray(v[k]) ? v[k].length : 0);
+      return (
+        `ok (${n("started")} started, ${n("existing")} existing, ${n("refused")} refused, ` +
+        `${n("warnings")} warnings)`
+      );
+    }
+    case "set_stopped": {
+      const n = (k) => (v && Array.isArray(v[k]) ? v[k].length : 0);
+      return `ok (${n("stopped")} stopped, ${n("ended")} ended, ${n("failed")} failed)`;
     }
     case "jobs_stopped": {
       const n = (k) => (v && Array.isArray(v[k]) ? v[k].length : 0);
@@ -649,10 +721,11 @@ function storedOpen(plan) {
 // The group row of a plan's idle channels, made once per plan and kept across renders (so a
 // focused summary stays focused); open unless the operator folded it this session. Only a
 // change of the fold is written (opening a fresh group queues a `toggle` too).
-function jobGroup(plan) {
+function jobGroup(plan, kind = "plan") {
   const g = document.createElement("details");
   g.className = "job-group";
   g.dataset.plan = plan;
+  g.dataset.kind = kind;
   g.open = storedOpen(plan);
   g.addEventListener("toggle", () => {
     if (g.open === storedOpen(plan)) return;
@@ -664,8 +737,45 @@ function jobGroup(plan) {
   });
   const summary = document.createElement("summary");
   summary.dir = "auto";
+  if (kind === "watch" || kind === "set") {
+    const text = document.createElement("span");
+    text.className = "group-text";
+    text.dir = "auto";
+    summary.append(text);
+  }
   g.append(summary);
   return g;
+}
+
+// A watch group's text: `<watch kind> <id tail> · <mode> × <n> decoding, <m> waiting`, the
+// modes those of `list` (its decoders) by the watch's `decoding` entries.
+function watchGroupText(watch, list) {
+  const w = watch.context?.watch || {};
+  const modeOf = new Map((w.decoding || []).map((d) => [d.job, d.mode]));
+  const modes = new Map();
+  for (const j of list) {
+    const m = modeOf.get(j.id) ?? j.kind;
+    modes.set(m, (modes.get(m) || 0) + 1);
+  }
+  const waiting = w.cap?.waiting ?? 0;
+  return (
+    `${watch.kind} ${watch.id.slice(-6)} · ` +
+    [...modes].map(([m, n]) => `${m} × ${n}`).join(", ") +
+    ` decoding, ${waiting} waiting`
+  );
+}
+
+// A set group's text: `<set name> · <n> on <shown source>, +<m> on <other source>` over
+// `list` (the instance's jobs on a radio, attached ones not counted), the other sources in
+// list order; with no shown source (`here` null), `<n> on <source>` for each.
+function setGroupText(set, list, here) {
+  const by = new Map();
+  for (const j of list) by.set(j.source, (by.get(j.source) || 0) + 1);
+  const parts = here === null ? [] : [`${by.get(here) || 0} on ${here}`];
+  for (const [src, n] of by) {
+    if (src !== here) parts.push(here === null ? `${n} on ${src}` : `+${n} on ${src}`);
+  }
+  return `${set.name} · ${parts.join(", ")}`;
 }
 
 // `<n> idle <kinds> on <plan>`, plus `, <m> <kind>` for each kind attached to them.
@@ -717,9 +827,47 @@ export function startJobs(
     lastEvent = null,
     activity = null,
     watchedMix = null,
+    shownSource = null,
   } = {},
 ) {
   let timer = null;
+  let sets = []; // set_list's entries, read with each job_list
+  // A set's group: its text and a Stop that arms on the first click ("Stop set?") and sends
+  // `set_stop` on a second one within SET_STOP_CONFIRM_MS (spec 5.5, 9.7). The group is kept
+  // across renders, so the armed state is too.
+  const setGroup = (id) => {
+    const g = jobGroup(id, "set");
+    const stop = document.createElement("button");
+    stop.className = "stop";
+    stop.textContent = "Stop";
+    stop.title = `set_stop ${id}`;
+    let armed = null;
+    stop.onclick = async (ev) => {
+      ev.preventDefault(); // a button in the summary does not toggle the fold
+      if (armed === null) {
+        stop.textContent = "Stop set?";
+        armed = setTimeout(() => {
+          armed = null;
+          stop.textContent = "Stop";
+        }, SET_STOP_CONFIRM_MS);
+        return;
+      }
+      clearTimeout(armed);
+      armed = null;
+      stop.textContent = "Stop";
+      stop.disabled = true;
+      try {
+        await api.op({ op: "set_stop", set: id });
+      } catch (e) {
+        if (!(e.json && e.status === 422)) transcript.note(`set_stop: ${e.message}`, true);
+      } finally {
+        stop.disabled = false;
+      }
+      refresh();
+    };
+    g.querySelector("summary").append(stop);
+    return g;
+  };
   let foldIdleMs = JOBS_FOLD_IDLE_MS;
   // id -> performance.now() when this page first saw the job running (its idle age starts
   // there when no event has been seen).
@@ -845,9 +993,33 @@ export function startJobs(
       if (!runningSince.has(j.id)) runningSince.set(j.id, now);
       if (activity && activity(j.id).speaking) lastSpeaking.set(j.id, now);
     }
+    // A watch's decoders first (groupOf), under a watch whose own row is shown.
+    const shownIds = new Set(shown.map((j) => j.id));
+    const watchOf = new Map(); // decoder id -> watch id
+    const decoders = new Map(); // watch id -> its decoders (not the attached ones)
+    for (const j of shown) {
+      const g = groupOf(j, jobs);
+      if (!g || !shownIds.has(g.key)) continue;
+      watchOf.set(j.id, g.key);
+      if (!decoders.has(g.key)) decoders.set(g.key, []);
+      decoders.get(g.key).push(j);
+    }
+    // Then a set's jobs (groupOf with the sets): the jobs a running instance lists. A watch
+    // member's group nests inside the set's (two levels at most, spec 9.19); a plan member's
+    // channels sit in the set's group directly.
+    const setOf = new Map(); // job id -> set id (the instance's jobs, not attached ones)
+    const setInfo = new Map(); // set id -> its set_list entry
+    for (const j of shown) {
+      if (watchOf.has(j.id) || j.input) continue;
+      const g = groupOf(j, jobs, sets);
+      if (!g || g.kind !== "set") continue;
+      setOf.set(j.id, g.key);
+      setInfo.set(g.key, sets.find((s) => s.id === g.key));
+    }
     const planOf = new Map();
     const members = new Map(); // plan -> its foldable jobs (not the attached ones)
     for (const j of shown) {
+      if (watchOf.has(j.id) || setOf.has(j.id)) continue;
       const plan = foldPlan(j, now, jobs);
       if (!plan) continue;
       planOf.set(j.id, plan);
@@ -855,17 +1027,50 @@ export function startJobs(
       members.get(plan).push(j);
     }
     for (const [plan, list] of members) if (list.length <= JOBS_FOLD_MIN) members.delete(plan);
-    for (const plan of [...groupEls.keys()]) if (!members.has(plan)) groupEls.delete(plan);
+    const setKey = (id) => `set:${id}`; // a set's key in groupEls (apart from plan ids)
+    const live = new Set([...members.keys(), ...decoders.keys(), ...[...setInfo.keys()].map(setKey)]);
+    for (const key of [...groupEls.keys()]) if (!live.has(key)) groupEls.delete(key);
     const inside = new Map(); // plan -> its rows, in list order
+    const watchRows = new Map(); // watch id -> {watch, row}: its own row
+    const decoderRows = new Map(); // watch id -> its decoders' rows, in list order
+    const setRows = new Map(); // set id -> its rows on the shown source, in list order
+    const here = shownSource ? shownSource() ?? null : null;
     const out = [];
+    // `node` (j's row, or a watch member's group) under j's set when j (or its input) is one
+    // of a set's jobs: listed when on the shown source, else only counted. Whether it was.
+    const intoSet = (j, node) => {
+      const set = setOf.get(j.input ?? j.id);
+      if (!set) return false;
+      const key = setKey(set);
+      if (!setRows.has(set)) {
+        if (groupEls.get(key)?.dataset.kind !== "set") groupEls.set(key, setGroup(set));
+        setRows.set(set, []);
+        out.push(groupEls.get(key));
+      }
+      if (here === null || j.source === here) setRows.get(set).push(node);
+      return true;
+    };
     shown.forEach((j, i) => {
+      if (decoders.has(j.id)) {
+        if (groupEls.get(j.id)?.dataset.kind !== "watch") groupEls.set(j.id, jobGroup(j.id, "watch"));
+        watchRows.set(j.id, { watch: j, row: rows[i] });
+        if (!intoSet(j, groupEls.get(j.id))) out.push(groupEls.get(j.id));
+        return;
+      }
+      const watch = watchOf.get(j.input ?? j.id);
+      if (watch) {
+        if (!decoderRows.has(watch)) decoderRows.set(watch, []);
+        decoderRows.get(watch).push(rows[i]);
+        return;
+      }
+      if (intoSet(j, rows[i])) return;
       const plan = planOf.get(j.input ?? j.id);
       if (!plan || !members.has(plan)) {
         out.push(rows[i]);
         return;
       }
       if (!inside.has(plan)) {
-        if (!groupEls.has(plan)) groupEls.set(plan, jobGroup(plan));
+        if (groupEls.get(plan)?.dataset.kind !== "plan") groupEls.set(plan, jobGroup(plan));
         inside.set(plan, []);
         out.push(groupEls.get(plan));
       }
@@ -877,6 +1082,28 @@ export function startJobs(
       const text = groupText(plan, members.get(plan), shown);
       if (summary.textContent !== text) summary.textContent = text;
       placeChildren(g, [summary, ...list]);
+    }
+    // A watch's group: the watch's row as its summary, its decoders under it.
+    for (const [id, { watch, row }] of watchRows) {
+      const list = decoderRows.get(id) || [];
+      const g = groupEls.get(id);
+      const summary = g.querySelector("summary");
+      const text = summary.querySelector(".group-text");
+      const t = watchGroupText(watch, decoders.get(id));
+      if (text.textContent !== t) text.textContent = t;
+      text.title = t;
+      placeChildren(summary, [row, text]);
+      placeChildren(g, [summary, ...list]);
+    }
+    // A set's group: its name and the count per source as its summary, its rows on the shown
+    // source (a watch member's group among them) under it.
+    for (const [id, list] of setRows) {
+      const g = groupEls.get(setKey(id));
+      const text = g.querySelector("summary > .group-text");
+      const t = setGroupText(setInfo.get(id), shown.filter((j) => setOf.get(j.id) === id), here);
+      if (text.textContent !== t) text.textContent = t;
+      text.title = t;
+      placeChildren(g, [g.querySelector("summary"), ...list]);
     }
     return out;
   };
@@ -911,7 +1138,11 @@ export function startJobs(
   };
   const refresh = async () => {
     try {
-      const r = await api.op({ op: "job_list" });
+      const [r, s] = await Promise.all([
+        api.op({ op: "job_list" }),
+        api.op({ op: "set_list" }).catch(() => null),
+      ]);
+      if (s) sets = s.value || [];
       if (!stopped) render(r.value || []);
     } catch {
       /* the next poll retries; op errors appear through the ops stream */
@@ -925,6 +1156,8 @@ export function startJobs(
   return {
     refresh,
     redraw,
+    // set_list's entries as last read with the jobs.
+    sets: () => sets,
     pause(on) {
       paused = !!on;
     },

@@ -638,6 +638,7 @@ async fn node_with(src: Arc<SoapySource>) -> (Node, tempfile::TempDir) {
     reg.register(Arc::new(PassthroughStage::new()));
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 2.0,

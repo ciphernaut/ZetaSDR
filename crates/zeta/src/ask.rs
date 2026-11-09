@@ -32,6 +32,7 @@ pub async fn run(
     burst_policy: zeta_core::bursts::BurstPolicy,
     modes_dir: Option<PathBuf>,
     themes_dir: Option<PathBuf>,
+    sets_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
     knowledge_acma: Option<(String, Option<f64>)>,
 ) -> ExitCode {
@@ -80,6 +81,7 @@ pub async fn run(
                 burst_policy,
                 modes_dir,
                 themes_dir,
+                sets_dir,
                 speech,
             );
             let (node, remotes) = match opened.await {

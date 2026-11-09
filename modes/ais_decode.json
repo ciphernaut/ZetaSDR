@@ -6,7 +6,7 @@
     "bandwidth_hz": 25000,
     "centers_hz": [161975000, 162025000],
     "min_hz": 12500,
-    "range_hz": null
+    "range_hz": [161962500, 162037500]
   },
   "modulation": ["fsk", "fm"],
   "label": "AIS",

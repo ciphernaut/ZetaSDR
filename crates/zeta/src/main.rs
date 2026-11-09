@@ -155,6 +155,7 @@ async fn main() -> ExitCode {
         burst_policy,
         cli.modes_dir.clone(),
         cli.themes_dir.clone(),
+        cli.sets_dir.clone(),
         speech.clone(),
     )
     .await
@@ -172,7 +173,14 @@ async fn main() -> ExitCode {
     }
     let code = match op {
         None => transport::serve(node, &serve_args, speech, secret.as_deref()).await,
-        Some(op) => one_shot(&node, op, then_tail, keep, plan.as_deref()).await,
+        Some(mut op) => {
+            if cli::wants_roles(&op)
+                && let Ok(zeta_core::ops::OpResult::Sets(sets)) = node.apply(Op::SetList {}).await
+            {
+                cli::null_roles(&mut op, &sets);
+            }
+            one_shot(&node, op, then_tail, keep, plan.as_deref()).await
+        }
     };
     // Remote nodes' `passthrough` jobs end with this process, not with the runtime.
     remotes.close().await;

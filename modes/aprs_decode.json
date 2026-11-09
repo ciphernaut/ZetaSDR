@@ -4,7 +4,8 @@
   "family": "amateur_digital",
   "band": {
     "bandwidth_hz": 12500,
-    "centers_hz": [144800000, 144390000]
+    "centers_hz": [144800000, 144390000, 145175000],
+    "range_hz": [144383750, 145181250]
   },
   "modulation": ["fm", "fsk"],
   "label": "APRS",
@@ -95,7 +96,7 @@
     },
     "within_ms": 5000
   },
-  "notes": "APRS at 144 800 000 Hz in AU and EU, 144 390 000 Hz in the US, 12 500 Hz band; one job hears every station on the channel. Positions in the three common formats (uncompressed, compressed, Mic-E) land on the map; objects and items are named, not placed.",
+  "notes": "APRS at 145 175 000 Hz in AU, 144 800 000 Hz in EU, 144 390 000 Hz in the US, 12 500 Hz band (identify tries it only from half a channel below the lowest centre to half a channel above the highest, its band.range_hz); one job hears every station on the channel. Positions in the three common formats (uncompressed, compressed, Mic-E) land on the map; objects and items are named, not placed.",
   "subject": {
     "key": "src",
     "name": "stations",

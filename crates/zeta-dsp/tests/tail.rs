@@ -26,6 +26,7 @@ async fn stream_tail_returns_events_from_running_job() {
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,

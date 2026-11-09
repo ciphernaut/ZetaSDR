@@ -480,6 +480,7 @@ async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,
@@ -605,6 +606,7 @@ async fn measure_emits_partials_when_the_input_gaps_every_400_ms() {
     zeta_dsp::register_all(&mut reg);
     let cfg = NodeConfig {
         source_positions: Default::default(),
+        sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.path().join("state"),
         ring_seconds: 1.0,

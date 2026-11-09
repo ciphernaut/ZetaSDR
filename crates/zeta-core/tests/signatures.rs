@@ -30,6 +30,7 @@ async fn open(dir: &Path) -> Node {
         bank_factory: None,
         modes_dir: None,
         source_positions: Default::default(),
+        sets_dir: None,
     };
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
