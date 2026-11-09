@@ -191,7 +191,7 @@ struct JobEntry {
     /// The job's output streams (those no edge of its graph consumes), in graph order
     /// (each node's in its stage's output order), set at launch; an attached job reads
     /// one of these.
-    outputs: Vec<(StreamKind, StreamId)>,
+    outputs: Vec<JobOutput>,
     /// Set at launch for a run nothing in which polls its port's fault: it has no IQ
     /// forwarder and no controller loop, and is not attached. A fault does not end it, so
     /// a recovery does not wait for it (see [`Inner::wait_ended`]).
@@ -263,12 +263,31 @@ impl LogFile {
 }
 
 /// The last audio stream of `outputs` (a job's, in graph order): what is read of the job.
-fn last_audio(outputs: &[(StreamKind, StreamId)]) -> Option<StreamId> {
+fn last_audio(outputs: &[JobOutput]) -> Option<StreamId> {
     outputs
         .iter()
         .rev()
-        .find(|(k, _)| *k == StreamKind::Audio)
-        .map(|(_, s)| s.clone())
+        .find(|o| o.kind == StreamKind::Audio && o.role.is_none())
+        .map(|o| o.id.clone())
+}
+
+/// An output stream of a job: its kind and the role its stage gave it, if any. A
+/// composite (a video demodulator's) is audio only in kind, so `last_audio` skips it.
+#[derive(Clone, Debug)]
+pub(crate) struct JobOutput {
+    pub kind: StreamKind,
+    pub id: StreamId,
+    pub role: Option<&'static str>,
+}
+
+impl JobOutput {
+    pub(crate) fn new(kind: StreamKind, id: StreamId) -> Self {
+        Self {
+            kind,
+            id,
+            role: None,
+        }
+    }
 }
 
 /// Whether a mix may read `rec`: not an attached job (it is a chain over a job's audio),
@@ -2041,7 +2060,7 @@ impl Node {
             .unwrap()
             .get(job)
             .filter(|e| e.cancel.is_some())
-            .map(|e| e.outputs.clone())
+            .map(|e| e.outputs.iter().map(|o| (o.kind, o.id.clone())).collect())
             .unwrap_or_default()
     }
 

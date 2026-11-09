@@ -87,6 +87,49 @@ impl Stage for MapStage {
     }
 }
 
+/// A stand-in demodulator whose audio outputs carry roles: `roles` lines up with `outputs`.
+struct RoleStage {
+    spec: StageSpec,
+    roles: Vec<Option<&'static str>>,
+}
+
+#[async_trait]
+impl Stage for RoleStage {
+    fn spec(&self) -> &StageSpec {
+        &self.spec
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    fn output_roles(&self, _params: &serde_json::Value) -> Vec<Option<&'static str>> {
+        self.roles.clone()
+    }
+    async fn run(
+        &self,
+        _params: serde_json::Value,
+        _inputs: Vec<broadcast::Receiver<Frame>>,
+        _outputs: Vec<StreamId>,
+        _bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        cancel.cancelled().await;
+        Err(StageError::Cancelled)
+    }
+}
+
+fn role_stage(kind: &'static str, roles: Vec<Option<&'static str>>) -> Arc<RoleStage> {
+    Arc::new(RoleStage {
+        spec: StageSpec {
+            kind,
+            inputs: vec![StreamKind::Iq],
+            outputs: vec![StreamKind::Audio; roles.len()],
+            params_schema: schemars::json_schema!({"type": "object"}),
+        },
+        roles,
+    })
+}
+
 fn audio() -> Payload {
     Payload::Audio {
         sample_rate_hz: Hz(48_000),
@@ -960,4 +1003,59 @@ fn registry_describe_lists_readiness() {
         d[0]["readiness"],
         serde_json::json!({"ready": true, "reason": null, "capacity": null})
     );
+}
+
+#[tokio::test]
+async fn a_composite_output_is_never_the_jobs_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let mut reg = registry();
+    reg.register(role_stage("comp_then_audio", vec![Some("composite"), None]));
+    reg.register(role_stage("comp_only", vec![Some("composite")]));
+    let node = Node::open(cfg(dir.path()), reg, vec![port]).await.unwrap();
+    src.start();
+
+    let both = node
+        .job_start(
+            "both",
+            file0(),
+            tuning(),
+            node_graph("comp_then_audio", serde_json::json!({})),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let audios: Vec<StreamInfo> = node
+        .job_outputs(&both)
+        .into_iter()
+        .map(|(_, id)| node.bus().list().into_iter().find(|s| s.id == id).unwrap())
+        .collect();
+    assert_eq!(audios.len(), 2);
+    assert_eq!(audios[0].role.as_deref(), Some("composite"));
+    assert_eq!(audios[1].role, None);
+    assert_eq!(node.job_audio_stream(&both).unwrap(), audios[1].id);
+    let attached = attach_ok(&node, &both).await;
+    let first = &record(&node, &attached).graph.nodes[0];
+    assert_eq!(first.params["stream"], audios[1].id.0);
+
+    let only = node
+        .job_start(
+            "only",
+            file0(),
+            tuning(),
+            node_graph("comp_only", serde_json::json!({})),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        attach(&node, &only).await,
+        Err(other(&format!("job {} has no audio stream", only.0)))
+    );
+    assert!(matches!(
+        node.job_audio_stream(&only),
+        Err(zeta_core::node::NodeError::NoAudioStream(_))
+    ));
 }

@@ -121,11 +121,31 @@ impl Frame {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_role)]
 pub struct StreamInfo {
     pub id: StreamId,
     pub kind: StreamKind,
     pub provenance: Provenance,
+    /// What the stream is for when it is not what its kind says: `composite` marks a video
+    /// demodulator's `audio` stream, which is not for ears. `None` for an ordinary stream.
+    /// Always written (`null` when none), so the published schema can require it.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<String>")]
+    pub role: Option<String>,
+}
+
+/// Schemars leaves a serde-defaulted field out of `required`; `role` is always written, so
+/// the published schema requires it.
+fn require_role(schema: &mut schemars::Schema) {
+    if let Some(req) = schema
+        .ensure_object()
+        .entry("required")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        && !req.iter().any(|r| r == "role")
+    {
+        req.push("role".into());
+    }
 }
 
 pub struct StreamBus {
@@ -181,12 +201,23 @@ impl StreamBus {
     }
 
     pub fn register(&self, kind: StreamKind, provenance: Provenance) -> StreamId {
+        self.register_with_role(kind, provenance, None)
+    }
+
+    /// As [`StreamBus::register`], with the stream's `role` (see [`StreamInfo::role`]).
+    pub fn register_with_role(
+        &self,
+        kind: StreamKind,
+        provenance: Provenance,
+        role: Option<&str>,
+    ) -> StreamId {
         let id = StreamId::new();
         let (tx, _) = broadcast::channel(self.capacity);
         let info = StreamInfo {
             id: id.clone(),
             kind,
             provenance,
+            role: role.map(str::to_string),
         };
         self.streams.write().unwrap().insert(id.clone(), (info, tx));
         id
@@ -286,6 +317,19 @@ impl StreamBus {
 mod tests {
     use super::*;
     use crate::types::{SourceId, Span, Timestamp};
+
+    #[test]
+    fn a_role_is_listed_and_defaults_to_none() {
+        let bus = StreamBus::new(4);
+        let plain = bus.register(StreamKind::Audio, prov("s"));
+        let marked = bus.register_with_role(StreamKind::Audio, prov("s"), Some("composite"));
+        let list = bus.list();
+        let role = |id: &StreamId| list.iter().find(|s| &s.id == id).unwrap().role.clone();
+        assert_eq!(role(&plain), None);
+        assert_eq!(role(&marked).as_deref(), Some("composite"));
+        let json = serde_json::to_value(list.iter().find(|s| s.id == plain).unwrap()).unwrap();
+        assert!(json["role"].is_null());
+    }
 
     fn prov(src: &str) -> Provenance {
         Provenance {

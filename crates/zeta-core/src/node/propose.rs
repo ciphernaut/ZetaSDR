@@ -114,8 +114,8 @@ pub(super) async fn capture_ended(
     let out = inner.jobs.lock().unwrap().get(&rec.id).and_then(|e| {
         e.outputs
             .iter()
-            .find(|(k, _)| *k == StreamKind::Event)
-            .map(|(_, s)| s.clone())
+            .find(|o| o.kind == StreamKind::Event)
+            .map(|o| o.id.clone())
     });
     let prov = Provenance {
         source: rec.source.clone(),

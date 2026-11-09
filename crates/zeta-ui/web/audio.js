@@ -79,7 +79,7 @@ export function splitChannels(samples, channels) {
 
 async function audioStreamId(api, jobId) {
   const list = await api.streams();
-  const s = list.find((i) => i.kind === "audio" && i.provenance && i.provenance.job === jobId);
+  const s = list.find((i) => i.kind === "audio" && !i.role && i.provenance && i.provenance.job === jobId);
   return s ? s.id : null;
 }
 

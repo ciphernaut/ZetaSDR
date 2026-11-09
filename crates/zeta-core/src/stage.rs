@@ -215,6 +215,12 @@ pub trait Stage: Send + Sync {
     fn outputs_for(&self, _params: &serde_json::Value) -> Vec<StreamKind> {
         self.spec().outputs.clone()
     }
+    /// The role of each output [`outputs_for`](Stage::outputs_for) lists, in order: `None`
+    /// for an ordinary one, `Some("composite")` for a video demodulator's composite, an
+    /// `audio` stream that is not a job's audio (not attached, mixed or played).
+    fn output_roles(&self, params: &serde_json::Value) -> Vec<Option<&'static str>> {
+        vec![None; self.outputs_for(params).len()]
+    }
     /// Check `params` (already valid against `spec().params_schema`) for what the schema
     /// cannot say, so a bad node is refused when the graph is validated instead of
     /// failing its job at run time; the error names the field. By default nothing more.

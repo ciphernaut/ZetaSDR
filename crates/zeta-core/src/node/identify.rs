@@ -144,7 +144,7 @@ impl Inner {
             && e.run == run
         {
             e.done = Some(h);
-            e.outputs = vec![(StreamKind::Event, out)];
+            e.outputs = vec![super::JobOutput::new(StreamKind::Event, out)];
         }
         Ok(())
     }
@@ -415,8 +415,8 @@ impl Inner {
                 .map(|e| e.outputs.clone())
                 .unwrap_or_default()
                 .iter()
-                .filter(|(k, _)| *k == StreamKind::Event)
-                .filter_map(|(_, s)| self.bus.subscribe(s))
+                .filter(|o| o.kind == StreamKind::Event)
+                .filter_map(|o| self.bus.subscribe(&o.id))
                 .map(Some)
                 .collect()
         };

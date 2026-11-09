@@ -13,7 +13,9 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use super::persist::{now, persist};
-use super::{Inner, JobEntry, LogFile, NodeError, ring_seconds_for, source_fault_reason, watch};
+use super::{
+    Inner, JobEntry, JobOutput, LogFile, NodeError, ring_seconds_for, source_fault_reason, watch,
+};
 use crate::graph::{self, Graph, GraphError, NodeId};
 use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
@@ -269,10 +271,24 @@ impl Inner {
             .iter()
             .map(|e| {
                 let from = graph.nodes.iter().find(|n| n.id == e.from);
+                // The edge carries a role when the slot of its kind on the stage it leaves does.
+                let role = graph
+                    .nodes
+                    .iter()
+                    .zip(&stages)
+                    .find(|(n, _)| n.id == e.from)
+                    .and_then(|(n, st)| {
+                        let at = st
+                            .outputs_for(&n.params)
+                            .iter()
+                            .position(|k| *k == e.kind)?;
+                        st.output_roles(&n.params).get(at).copied().flatten()
+                    });
                 register_event_stream(
                     &self.bus,
                     from.map_or("", |n| n.kind.as_str()),
                     e.kind,
+                    role,
                     prov.clone(),
                 )
             })
@@ -285,7 +301,7 @@ impl Inner {
         let mut streams: Vec<StreamId> = edge_streams.iter().cloned().chain(iq.clone()).collect();
         // The job's output streams (no edge consumes them), in graph order: what a job
         // attached to this one can read.
-        let mut job_outputs = Vec::new();
+        let mut job_outputs: Vec<JobOutput> = Vec::new();
         // The nodes with no outputs (a sink): an edge into one is still an output of
         // the job, so the sink does not hide the events it is fed from `stream tail`
         // and from the watch's silence check.
@@ -302,7 +318,8 @@ impl Inner {
         let mut watchers = Vec::new();
         for (n, stage) in graph.nodes.iter().zip(stages) {
             let mut inputs = Vec::new();
-            let mut leaving = Vec::new();
+            let mut leaving: Vec<(StreamKind, StreamId)> = Vec::new();
+            let roles = stage.output_roles(&n.params);
             // This node's job outputs: its edges into a sink, then its own streams.
             let first_output = job_outputs.len();
             for (e, sid) in graph.edges.iter().zip(&edge_streams) {
@@ -312,7 +329,16 @@ impl Inner {
                 if e.from == n.id {
                     leaving.push((e.kind, sid.clone()));
                     if sinks.contains(&e.to) {
-                        job_outputs.push((e.kind, sid.clone()));
+                        let role = stage
+                            .outputs_for(&n.params)
+                            .iter()
+                            .position(|k| *k == e.kind)
+                            .and_then(|at| roles.get(at).copied().flatten());
+                        job_outputs.push(JobOutput {
+                            kind: e.kind,
+                            id: sid.clone(),
+                            role,
+                        });
                     }
                 }
             }
@@ -324,26 +350,31 @@ impl Inner {
             }
             let before = job_outputs.len();
             let kinds = stage.outputs_for(&n.params);
-            let outputs = node_outputs(stage.spec(), &kinds, leaving, |k| {
-                let sid = register_event_stream(&self.bus, &n.kind, k, prov.clone());
+            let outputs = node_outputs(stage.spec(), &kinds, leaving, |at, k| {
+                let role = roles.get(at).copied().flatten();
+                let sid = register_event_stream(&self.bus, &n.kind, k, role, prov.clone());
                 streams.push(sid.clone());
-                job_outputs.push((k, sid.clone()));
+                job_outputs.push(JobOutput {
+                    kind: k,
+                    id: sid.clone(),
+                    role,
+                });
                 sid
             });
             // Subscribed before the stage runs, so its first event is not missed.
             if let Some(rec) = &tee {
-                self.tee_transcripts(rec, &job_outputs[before..], &token);
+                self.tee_transcripts(rec, &pairs(&job_outputs[before..]), &token);
             }
             if let Some(rec) = &proposer {
                 watchers.extend(super::propose::watch_for_proposals(
                     self,
                     rec,
-                    &job_outputs[first_output..],
+                    &pairs(&job_outputs[first_output..]),
                     &token,
                 ));
             }
             if let Some((rec, id)) = &identity {
-                self.tee_identity(rec, id, &job_outputs[before..], &token);
+                self.tee_identity(rec, id, &pairs(&job_outputs[before..]), &token);
             }
             let ids: Vec<StreamId> = outputs.into_iter().map(|(_, s)| s).collect();
             let own = ids.clone();
@@ -360,8 +391,8 @@ impl Inner {
             // The controller reads `detect`'s events and publishes its own beside them.
             let out = job_outputs
                 .iter()
-                .find(|(k, _)| *k == StreamKind::Event)
-                .map(|(_, s)| s.clone());
+                .find(|o| o.kind == StreamKind::Event)
+                .map(|o| o.id.clone());
             let rx = out.as_ref().and_then(|s| self.bus.subscribe(s));
             if let (Some(out), Some(rx)) = (out, rx) {
                 let run = watch::Run::new(
@@ -1007,7 +1038,7 @@ impl Inner {
             && e.run == run
         {
             e.done = Some(h);
-            e.outputs = vec![(StreamKind::Event, out)];
+            e.outputs = vec![JobOutput::new(StreamKind::Event, out)];
         }
         Ok(())
     }
@@ -1108,21 +1139,21 @@ fn node_outputs(
     spec: &StageSpec,
     kinds: &[StreamKind],
     mut leaving: Vec<(StreamKind, StreamId)>,
-    mut fresh: impl FnMut(StreamKind) -> StreamId,
+    mut fresh: impl FnMut(usize, StreamKind) -> StreamId,
 ) -> Vec<(StreamKind, StreamId)> {
     if spec.emits_any_kind() {
         if leaving.is_empty()
             && let Some(&k) = spec.outputs.first()
         {
-            leaving.push((k, fresh(k)));
+            leaving.push((k, fresh(0, k)));
         }
         return leaving;
     }
     let mut out = Vec::with_capacity(kinds.len());
-    for &k in kinds {
+    for (at, &k) in kinds.iter().enumerate() {
         match leaving.iter().position(|(ek, _)| *ek == k) {
             Some(i) => out.push(leaving.remove(i)),
-            None => out.push((k, fresh(k))),
+            None => out.push((k, fresh(at, k))),
         }
     }
     out.extend(leaving);
@@ -1664,11 +1695,17 @@ fn register_event_stream(
     bus: &crate::stream::StreamBus,
     from_kind: &str,
     kind: StreamKind,
+    role: Option<&str>,
     prov: Provenance,
 ) -> StreamId {
     if from_kind == "fft" {
         bus.register_unfed(kind, prov)
     } else {
-        bus.register(kind, prov)
+        bus.register_with_role(kind, prov, role)
     }
+}
+
+/// `outputs` as the (kind, stream) pairs the event tees and the proposal watcher take.
+fn pairs(outputs: &[JobOutput]) -> Vec<(StreamKind, StreamId)> {
+    outputs.iter().map(|o| (o.kind, o.id.clone())).collect()
 }

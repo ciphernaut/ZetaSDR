@@ -885,8 +885,8 @@ impl Inner {
         let out = entry
             .outputs
             .iter()
-            .find(|(k, s)| *k == StreamKind::Event && self.bus.receiver_count(s).is_some())
-            .map(|(_, s)| s.clone());
+            .find(|o| o.kind == StreamKind::Event && self.bus.receiver_count(&o.id).is_some())
+            .map(|o| o.id.clone());
         self.publish_origin(out, id, source, &a, summary);
         Ok(true)
     }

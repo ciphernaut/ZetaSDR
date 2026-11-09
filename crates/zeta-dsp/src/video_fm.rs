@@ -494,6 +494,11 @@ impl Stage for VideoFmDemodStage {
         &self.spec
     }
 
+    /// The composite is an `audio` stream that is not for ears.
+    fn output_roles(&self, _params: &serde_json::Value) -> Vec<Option<&'static str>> {
+        vec![Some("composite")]
+    }
+
     fn backend(&self) -> Backend {
         Backend::Cpu
     }

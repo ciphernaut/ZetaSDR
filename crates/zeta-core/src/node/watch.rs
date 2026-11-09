@@ -1636,8 +1636,8 @@ impl Inner {
             .map(|e| e.outputs.clone())
             .unwrap_or_default()
             .iter()
-            .filter(|(k, _)| *k == StreamKind::Event)
-            .filter_map(|(_, s)| self.bus.subscribe(s))
+            .filter(|o| o.kind == StreamKind::Event)
+            .filter_map(|o| self.bus.subscribe(&o.id))
             .collect()
     }
 
