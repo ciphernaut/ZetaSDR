@@ -16,9 +16,10 @@
 //! named a learned signature for it (summary `learned <name> at <MHz>: ...`).
 //!
 //! With `modes` on the `detect` node (a span watch, spec 4.2), a signal is matched to the
-//! listed rows its measured width fits ([`SPAN_WIDTH_FIT`]) instead: none makes it
-//! `unknown` at once (`no listed mode fits`, retried and captured as above); else the
-//! fitting row nearest its width starts directly on the signal's centroid (`decoding`
+//! listed rows its measured width fits ([`SPAN_WIDTH_FIT`], or [`SPAN_FLOOR_FIT`] for a
+//! reading at the detector's floor) instead: none makes it `unknown` at once (`no
+//! listed mode fits`, retried and captured as above); else the fitting row nearest its
+//! width starts directly on the signal's centroid (`decoding`
 //! with `via: modes`, no identify run, in the capture or under `decode_on: free` on a
 //! free source), and rows tied for nearest (one channel width) run an identify
 //! restricted to them. At the start of each run a span watch learns its known channels
@@ -71,9 +72,9 @@ use crate::modes::ModeRegistry;
 use crate::modes::ModeState;
 use crate::modes::score::score_rows;
 use crate::ops::{
-    DETECT_GONE_MS_DEFAULT, DETECT_STAGE, JobKind, SONDEHUB_STAGE, WATCH_CONFIRM_MS_DEFAULT,
-    WATCH_COOLDOWN_MS_DEFAULT, WATCH_HOLD_MS_DEFAULT, WATCH_MAX_DECODERS_DEFAULT,
-    WATCH_MODES_EMPTY,
+    DETECT_GONE_MS_DEFAULT, DETECT_STAGE, DETECT_WIDTH_HZ_DEFAULT, JobKind, SONDEHUB_STAGE,
+    WATCH_CONFIRM_MS_DEFAULT, WATCH_COOLDOWN_MS_DEFAULT, WATCH_HOLD_MS_DEFAULT,
+    WATCH_MAX_DECODERS_DEFAULT, WATCH_MODES_EMPTY,
 };
 use crate::port::{Port, Tuning};
 use crate::stage::StageError;
@@ -98,6 +99,12 @@ pub const WIDTH_FIT: (f64, f64) = (0.5, 1.5);
 /// multiples of the row's `band.bandwidth_hz`: wider than [`WIDTH_FIT`] above, since the
 /// detector reads a strong FSK signal's skirts (a 12.5 kHz page reads 19-25 kHz).
 pub const SPAN_WIDTH_FIT: (f64, f64) = (0.5, 2.0);
+/// A span watch's fit for a signal read at the detector's `width_hz` floor (within
+/// [`FLOOR_HAIR`]): the detector drops narrower runs, so a clean FSK carrier that reads
+/// narrow shows up at the floor, and a 6 kHz floor must still reach a 12.5 kHz row.
+pub const SPAN_FLOOR_FIT: (f64, f64) = (0.4, 2.0);
+/// A reading at most this fraction over the detector's floor counts as at the floor.
+const FLOOR_HAIR: f64 = 0.1;
 /// Two fitting rows whose width ratios lie this close (in |ln ratio|) tie for nearest.
 const RATIO_TIE: f64 = 1e-9;
 
@@ -105,6 +112,19 @@ const RATIO_TIE: f64 = 1e-9;
 fn fits_within(fit: (f64, f64), row_hz: u64, signal_hz: u64) -> bool {
     let row = row_hz as f64;
     (row * fit.0..=row * fit.1).contains(&(signal_hz as f64))
+}
+
+/// Whether a signal read `signal_hz` wide by a detector whose `width_hz` floor is
+/// `floor_hz` fits a span watch's row `row_hz` wide: by [`SPAN_FLOOR_FIT`] at the
+/// floor, else by [`SPAN_WIDTH_FIT`].
+fn span_fits(row_hz: u64, signal_hz: u64, floor_hz: u64) -> bool {
+    let at_floor = signal_hz as f64 <= floor_hz as f64 * (1.0 + FLOOR_HAIR);
+    let fit = if at_floor {
+        SPAN_FLOOR_FIT
+    } else {
+        SPAN_WIDTH_FIT
+    };
+    fits_within(fit, row_hz, signal_hz)
 }
 
 /// Whether a signal `signal_hz` wide fits a row `row_hz` wide by [`WIDTH_FIT`].
@@ -263,6 +283,8 @@ pub(super) struct Policy {
     capture: Option<serde_json::Value>,
     /// The mode rows signals are decoded with directly; `None` lets identify decide.
     modes: Option<Vec<String>>,
+    /// The detector's `width_hz` floor: a signal read at it fits by [`SPAN_FLOOR_FIT`].
+    width_floor_hz: u64,
     /// Kept decoders at once.
     max_decoders: u32,
     /// How long a kept decoder whose signal is `gone` may stay silent before it is `lost`.
@@ -304,6 +326,9 @@ impl Policy {
                     .filter_map(|s| s.as_str().map(str::to_string))
                     .collect()
             }),
+            width_floor_hz: p["width_hz"][0]
+                .as_u64()
+                .unwrap_or(DETECT_WIDTH_HZ_DEFAULT[0]),
             max_decoders: p["max_decoders"]
                 .as_u64()
                 .and_then(|n| u32::try_from(n).ok())
@@ -1022,8 +1047,9 @@ impl Inner {
     }
 
     /// The rows of the policy's `modes` that fit `s`, with their widths: ready, its
-    /// measured width within [`SPAN_WIDTH_FIT`] of the row's band, and the row's band no
-    /// wider than the watch's. Empty with `modes: null`.
+    /// measured width within [`SPAN_WIDTH_FIT`] of the row's band ([`SPAN_FLOOR_FIT`] at
+    /// the detector's floor, [`span_fits`]), and the row's band no wider than the
+    /// watch's. Empty with `modes: null`.
     fn fitting_rows(&self, r: &Run, s: &Signal) -> Vec<(String, u64)> {
         let Some(list) = &r.seed.policy.modes else {
             return Vec::new();
@@ -1034,7 +1060,7 @@ impl Inner {
                 let m = modes.get(id)?;
                 let width = m.row.band.bandwidth_hz;
                 (m.state == ModeState::Ready
-                    && fits_within(SPAN_WIDTH_FIT, width, s.bandwidth_hz)
+                    && span_fits(width, s.bandwidth_hz, r.seed.policy.width_floor_hz)
                     && width <= r.tuning.bandwidth_hz.0)
                     .then(|| (id.clone(), width))
             })
@@ -2642,6 +2668,31 @@ mod tests {
             ["pocsag_decode", "aprs_decode"]
         );
         assert!(nearest_fits(&[], 22_000).is_empty());
+    }
+
+    #[test]
+    fn a_reading_at_the_detectors_floor_fits_a_row_a_little_more_than_twice_it() {
+        // pagers_au: width_hz [6000, 25000]; a clean pager reads at the floor, which
+        // the plain fit (half of 12.5 kHz is 6.25 kHz) misses.
+        assert!(!fits_within(SPAN_WIDTH_FIT, 12_500, 6_000));
+        assert!(span_fits(12_500, 6_000, 6_000));
+        assert!(
+            span_fits(12_500, 6_200, 6_000),
+            "within a hair of the floor"
+        );
+        let row = |id: &str, w: u64| (id.to_string(), w);
+        let listed = [row("pocsag_decode", 12_500)];
+        let fits: Vec<_> = listed
+            .iter()
+            .filter(|(_, w)| span_fits(*w, 6_000, 6_000))
+            .cloned()
+            .collect();
+        assert_eq!(nearest_fits(&fits, 6_000), ["pocsag_decode"]);
+        // A 50 kHz row stays out of reach, and off the floor the plain fit holds.
+        assert!(!span_fits(50_000, 6_000, 6_000));
+        assert!(!span_fits(12_500, 6_000, 2_000));
+        assert!(!span_fits(12_500, 5_000, 4_000));
+        assert!(span_fits(12_500, 22_000, 6_000));
     }
 
     #[test]

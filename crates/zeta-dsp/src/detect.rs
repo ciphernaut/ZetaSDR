@@ -27,7 +27,7 @@ pub const THRESHOLD_DB_DEFAULT: f32 = 6.0;
 /// that should bound it from the other side is pending.
 pub const ENERGY_DB_DEFAULT: f32 = 30.0;
 /// Default `width_hz`: the real RS41 of 2026-11-01 read 4.5 kHz wide.
-pub const WIDTH_HZ_DEFAULT: [u64; 2] = [4000, 30000];
+pub const WIDTH_HZ_DEFAULT: [u64; 2] = zeta_core::ops::DETECT_WIDTH_HZ_DEFAULT;
 /// A track is announced `new` only after this many rows have matched it.
 pub const SIGHTINGS_MIN: u32 = 3;
 /// At most this many `signal` events a second per stage; the rest wait their turn.

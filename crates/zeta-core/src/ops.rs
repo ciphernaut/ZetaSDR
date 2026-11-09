@@ -1885,6 +1885,10 @@ pub const BITS_KIND: &str = "bits";
 /// `gone`. The watch re-adopts a decoder only when its signal reappears within it.
 pub const DETECT_GONE_MS_DEFAULT: u64 = 30_000;
 
+/// The `detect` stage's default `width_hz`: the real RS41 of 2026-11-01 read 4.5 kHz
+/// wide. A span watch reads its floor from it when the node leaves `width_hz` out.
+pub const DETECT_WIDTH_HZ_DEFAULT: [u64; 2] = [4000, 30000];
+
 /// A watch's default `max_decoders`: kept decoders at once, those on free sources
 /// included.
 pub const WATCH_MAX_DECODERS_DEFAULT: u32 = 16;
