@@ -7,7 +7,7 @@ set of typed operations (36 of them). The same operations are reached from the `
 authenticated HTTP and websocket API, a web page the node serves (waterfall, jobs, map,
 transcripts), an MCP server, and an agent that lets a local LLM call them. Every job is a graph of
 stages: channelisers, NBFM/WFM/AM/SSB demodulators, decoders (APRS on 2 m with positions on the map, AIS, radiosondes, ADS-B,
-then RDS, ACARS, HFDL and VDL2, POCSAG and FLEX pagers, and M17 digital voice), measurement and classification, a band watch that identifies
+then RDS, ACARS, HFDL and VDL2, POCSAG and FLEX pagers, and M17 digital voice, and analog video watched live as a picture), measurement and classification, a band watch that identifies
 what appears and can decode every channel of a span, named sets of jobs (airband, pagers), burst capture, transcription and a mix of every talking channel. It is for the
 radio amateur who wants the radio to do the fiddly work (hear what is on 2 m and 70 cm, track a
 radiosonde, see the aircraft overhead), and for an agent that needs operations it can call rather

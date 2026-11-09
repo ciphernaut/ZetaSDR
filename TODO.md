@@ -689,3 +689,27 @@ From the KiwiSDR server source (jks-prv/Beagle_SDR_GPS, read 2026-11-09), what t
 ## Spike: wideband views from the Kiwi and from custom B210-clone gateware
 
 From the operator, 2026-11-09. Two wanted outcomes, both through the spectrum-rows source above: (a) the Kiwi's wideband view on the page, one `W/F` connection stepped through zoom and centre as `scan` steps a radio; (b) custom gateware for the station's B210 clone (a larger FPGA than the original; UHD 4.6 sees it as a stock B210 today) that computes a wideband spectrum on the device and delivers rows beside the IQ, shown on the page the same way. Spike first, no spec yet: confirm the clone's FPGA part, how its image is loaded and built, and how rows would reach the host; then decide. Start with (a), which needs no hardware.
+
+## Video: the audio subcarrier stage
+
+`subcarrier_demod` per spec 5.4 of `docs/superpowers/specs/2026-11-06-video-decode-design.md` (the 6.5 MHz sound of a TV-style carrier). It takes its input from the demodulator before decimation when the composite rate is under 2 x 6.5 MHz, so the subcarrier survives the decimation.
+
+## Video: a true chroma notch and chroma decode
+
+The luma path's 3 MHz low-pass stands in for a chroma notch, and colour is not decoded. Add the notch at the subcarrier of the detected standard, then PAL and NTSC chroma decode.
+
+## Video: fixtures of the four bench transmitters
+
+0.5 s IQ cuts at 15.36 Msps cf32 (about 31 MB each) of each bench transmitter (a 5.8 GHz reverse camera, an FPV VTX, an HDMI sender, a 1.3 GHz VTX), kept out of the repository under a private path. The composite tests skip when they are absent, as `bits_chain.rs` does for private captures.
+
+## Video: thumbnails in the narrow footprint
+
+A live thumbnail rides a video job's tag on the waterfall, but not in the narrow footprint, where rail tags are thin. Give it a place there (the tab's strip, or a taller tag).
+
+## Video: PAL line numbering
+
+The decoder counts line 1 from the pre-equalising pulses; real PAL counts from the first broad pulse, so a real VTX's picture may sit about 2.5 lines low. Check on the bench fixtures and shift the count if so.
+
+## Video: odd and even field rows are not tested for alignment
+
+Fields are shown one at a time. Weaving the two fields into a frame is later, and needs a test that odd and even rows line up.
