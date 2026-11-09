@@ -1071,15 +1071,30 @@ fn scan_kind_is_accepted_and_lists_as_running() {
     assert_eq!(listed(dir.path())["state"]["status"], "stopped");
 }
 
-/// `identify` on the tone: `rs41_decode`, out of its range, is `skipped_band` at once,
-/// then the first row tried (`ais_decode`) is `no_frame` after its dwell; the job is
-/// still trying the next when the tail ends, so it is stopped (and its child with it).
+/// The dwell of the POCSAG copy the identify tail test runs, well inside the tail's cap.
+const POCSAG_TAIL_DWELL_MS: u64 = 2_000;
+
+/// `identify` on the tone: `m17_decode` is `unavailable` (c2dec pinned missing), the rows
+/// out of their range (`rs41_decode`, `ais_decode`, `flex_decode`) are `skipped_band` at
+/// once, then the first row tried (`pocsag_decode`) is `no_frame` after its dwell; the
+/// job is still trying the next when the tail ends, so it is stopped (and its child with
+/// it).
 #[test]
 fn job_start_identify_then_tail_prints_candidates() {
     let dir = tempfile::tempdir().unwrap();
+    // POCSAG dwells 5 s; an operator copy dwells 2 s, well inside the tail's 10 s.
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let mut pocsag: Value =
+        serde_json::from_str(include_str!("../../../modes/pocsag_decode.json")).unwrap();
+    pocsag["identify"]["dwell_ms"] = POCSAG_TAIL_DWELL_MS.into();
+    std::fs::write(modes.join("pocsag_decode.json"), pocsag.to_string()).unwrap();
+    let modes_dir = modes.display().to_string();
     let out = zeta(
         dir.path(),
         &[
+            "--modes-dir",
+            &modes_dir,
             "job",
             "start",
             "--kind",
@@ -1090,8 +1105,8 @@ fn job_start_identify_then_tail_prints_candidates() {
             "100000000",
             "--bandwidth-hz",
             "12500",
-            // `stream_tail` waits at most 10 000 ms: one second's measure and POCSAG's 5 s
-            // dwell, the first row tried (AIS and APRS live elsewhere, so are skipped).
+            // `stream_tail` waits at most 10 000 ms: one second's measure and the POCSAG
+            // copy's 2 s dwell, the first row tried (AIS and APRS live elsewhere: skipped).
             "--then-tail",
             "6,10000",
         ],
