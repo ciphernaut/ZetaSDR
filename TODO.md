@@ -596,6 +596,10 @@ Small:
 - Set -> watch -> decoders nesting on the page has no automated test (UAT with `pagers_au`).
 - The watch row sits inside `<summary>`, so it toggles on click and nests buttons in a summary (accessibility).
 
+From the field host's pager hour (UAT 31.a, 2026-11-09):
+- A span watch's `unknown` and `decoding` events carry empty `allocations` and `origins` even on a register-assigned frequency (149.1 MHz in the run): no identify runs, so nothing asks the register. The watch already holds `known.assignments` for the band; the events could name the overlapping ones.
+- A `lost` event names the signal's latest centre (the detector's drifted one), not the frequency the decoder is tuned to, so it cannot be matched with its `decoding` event by frequency. It should carry the decoder's tuning, with the signal's centre beside it.
+
 ## Modes: several ranges per row, and centres-only rows tried anywhere
 
 From plan 31's post-deploy fix wave (2026-11-09), where identify on the sonde band tried `flex_decode`, `ais_decode` and `aprs_decode`. Those three now carry a `band.range_hz`, but a row holds one range, so `flex_decode` dropped the catalogue's 927.3-936.6 MHz band from identify (job_start still runs it there). Other rows with centres and no range are still tried by identify anywhere a signal fits their width: `pocsag_decode` (148.6375 and 466.075 MHz), `acars_decode`, `vdl2_decode`, `adsb_decode` (only where the band is wide enough). Ideas: `range_hz` as a list of ranges (POCSAG 138-175 and 450-470 MHz, FLEX VHF and UHF, APRS 2 m and 70 cm), then give those rows their ranges. The watch's `identify_band` also ignores `in_range` when it picks a band width (harmless today: an out-of-range row scores lower).
