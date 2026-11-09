@@ -478,13 +478,29 @@ fn set_stop_needs_stops_allowed_unless_the_run_started_the_set() {
         &json!({"result": "set_start", "value": {"set": "airband", "started": [
             {"job": "01A", "attached": null},
             {"job": "01B", "attached": "01C"}
-        ], "existing": [{"job": "01OLD"}]}}),
+        ], "existing": []}}),
     );
     assert!(own.allows_stop(&stop));
     assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01A"})));
     assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01C"})));
     assert!(!own.allows_stop(&json!({"op": "job_stop", "job": "01OLD"})));
     assert!(!own.allows_stop(&json!({"op": "set_stop", "set": "pagers_au"})));
+}
+
+#[test]
+fn a_set_with_existing_members_is_not_the_runs_to_stop() {
+    let stop = json!({"op": "set_stop", "set": "airband"});
+    let mut own = OwnJobs::default();
+    own.record(
+        "set_start",
+        &json!({"set": "airband"}),
+        &json!({"result": "set_start", "value": {"set": "airband",
+            "started": [{"job": "01A", "attached": null}],
+            "existing": [{"job": "01OLD"}]}}),
+    );
+    assert!(!own.allows_stop(&stop));
+    assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01A"})));
+    assert!(!own.allows_stop(&json!({"op": "job_stop", "job": "01OLD"})));
 }
 
 #[test]

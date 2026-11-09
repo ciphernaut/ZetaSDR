@@ -133,7 +133,12 @@ impl OwnJobs {
                 }
             }
             "plan_start" | "set_start" => {
-                if let (true, Some(set)) = (tool == "set_start", value["set"].as_str()) {
+                // Only an instance this run created whole is its to stop: an `existing`
+                // member means the operator's own instance is running.
+                let whole = value["existing"].as_array().is_none_or(|e| e.is_empty())
+                    && value["started"].as_array().is_some_and(|s| !s.is_empty());
+                if let (true, true, Some(set)) = (tool == "set_start", whole, value["set"].as_str())
+                {
                     self.sets.insert(set.to_string());
                 }
                 for s in value["started"].as_array().into_iter().flatten() {
