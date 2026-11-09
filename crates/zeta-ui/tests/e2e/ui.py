@@ -7681,16 +7681,19 @@ def scenario_video_feed_stopping_falls_back_to_the_next(page, url, secret):
         expect(page.locator("#video .video-strip canvas")).to_have_count(2, timeout=10_000)
         main = page.locator("#video canvas.video-main")
         expect(main).to_have_attribute("data-job", first)
-        # Stopping before the main socket opens can still log one 404 (no operator is that quick).
-        # (the selected cell is drawn from the main socket; the other feed's cell has its own)
-        page.wait_for_function(
-            "() => window.zetaVideo.sockets_main === 1 && window.zetaVideo.sockets_thumb === 1",
-            timeout=10_000)
+        # Before each stop, wait for a picture the selected feed's own main socket has drawn:
+        # a stop before that socket's handshake makes the browser log a 404 the page cannot
+        # suppress (no operator is that quick). Each feed has its own main canvas, blank until
+        # its first frame.
+        drawn = lambda job: page.wait_for_function(  # noqa: E731
+            THUMB_PIXEL_JS, arg=f'#video canvas.video-main[data-job="{job}"]', timeout=10_000)
+        drawn(first)
         stop_job(url, secret, first)
         page.evaluate("window.zetaTest.poll()")
         status = page.locator("#video .video-status .text")
         expect(status).to_contain_text("video2 ·", timeout=8_000)
         expect(main).to_have_attribute("data-job", second, timeout=8_000)
+        drawn(second)
         stop_job(url, secret, second)
         page.evaluate("window.zetaTest.poll()")
         expect(page.locator("html")).not_to_have_attribute("data-strip", "video", timeout=8_000)
