@@ -489,6 +489,7 @@ session before the plan, as before.
 | 30 | Aircraft data links | `vdl2_decode` and `hfdl_decode` program rows over a field map on a row's `output` (`decoder.output.fields`, `$center_khz`, `subject.merge`), a per-source position (`--source-position`, the Kiwi's `/status`), one merged aircraft table on the page, the fixture lookup for `modes check`. Built on `worktree-agent-a1ff3bab5d4d2658f`, commits 4e34d62..4d16a91 (plus the docs); see Plan 30 status. Spec `docs/superpowers/specs/2026-11-06-aircraft-links-design.md`; plan `docs/superpowers/plans/2026-11-06-aircraft-links.md`. | 16, 23 (subjects); the source position shared with 32 |
 | 32 | Map layer | Origins from the register lit on a Map tab beside the radios; the dock; a Kiwi's position; map tiles from five providers. Built on `worktree-agent-a80225b3e557540e0`, commits 56ffb38..c68cf95f (from the merge of plan 30); see Plan 32 status. Spec `docs/superpowers/specs/2026-11-06-map-layer-design.md`; plan `docs/superpowers/plans/2026-11-06-map-layer.md`. | 30 (the source position), 23 (subjects) |
 | 31 | Span decoding and named sets | A watch with `modes` decodes every channel of a band (one decoder per signal, capped, held, cooled, ranked by the register); the `pagers_au` and `airband` sets start across radios in one `set_start`; the page decodes across a band and folds set, watch and decoders. Built on `worktree-agent-ab7d2cc8c2e3d9fea`, commits 050e529a..673d18d6 (plus the docs); see Plan 31 status. Spec `docs/superpowers/specs/2026-11-06-span-decoding-and-sets-design.md`; plan `docs/superpowers/plans/2026-11-06-span-decoding-and-sets.md`. | 29 (pager rows, `access`), 30 (`vdl2_decode`), 19.3, 32 |
+| 33 | Radio selection policy | The agent's default radio follows the page's focus under a user-set policy (`focus` by default: the focused radio only, else stop and ask; `focus-fallback`; `free-first`; `ask`; `radio_prefer`; both settings kept in the browser); the default tab's mark; the selection record as the access seam. Spec `docs/superpowers/specs/2026-11-09-radio-selection-design.md`; plan `docs/superpowers/plans/2026-11-09-radio-selection.md`; built on `worktree-agent-a96f20cbd8472c95d`, not yet on `main`; see Plan 33 status. | 3 (the agent and `/ask`), 21 (the agent gate), 32 (the Map tab) |
 
 Queued behind them, specs first, in the operator's order of interest: colour (chroma), recording
 (stills and clips into the capture store), discovery (a video carrier found by the watch), the
@@ -529,6 +530,24 @@ Rulings (roles only):
 - `access` is implemented now in plan 31's shape; whichever plan lands second drops the duplicate.
 
 Leftovers and the access-levels gist are in `TODO.md` ("Decoder wave 2: leftovers from plan 29", "Access: ACLs on restricted rows").
+
+## Plan 33 status
+
+Built on `worktree-agent-a96f20cbd8472c95d`, not yet on `main`. Spec `docs/superpowers/specs/2026-11-09-radio-selection-design.md`, plan `docs/superpowers/plans/2026-11-09-radio-selection.md`.
+
+What shipped:
+- Task 1, `radio.rs`: the policy, the context, `resolve` (a named radio first, the focus gate `policy`, the `## This request` paragraph); ids containing `.` or `:` can be named.
+- Task 2, the agent loop: one hidden `source_list` pre-read, the section in the one system message, `admit` beside the gate, `off_default` only for applied ops, `Transcript.selection`.
+- Task 3, `/ask` takes the page's context, and `zeta ask` takes `--radio`, `--radio-policy` and `--radio-prefer` with environment variables (a bad policy exits 1, the repo's usage convention).
+- Task 4, the page: the context on each ask, `radio_policy` and `radio_prefer` in `localStorage` under `zeta.radio_prefs`, the notes, and the box menu naming its radio.
+- Task 5, the default tab's accent dot (`.src-tab.default`, `.src-tab .default-mark`, `--default-mark`, `--default-mark-size`), prefs held when storage writes fail, and another tab's change redraws.
+- Task 6, the guide.
+
+What the gate proved: the UI suite passed every scenario during the tasks, about 255-272 s over two shards (450 s per-shard deadline). Final gate: see the merge.
+
+Calls made: spec section 10. The operator's decisions are section 11.
+
+What waits for the field host: `UAT.md` "Plan 33" (spec 6.5). Deferred work is in `TODO.md` ("Radio selection: later", "Access: ACLs on restricted rows").
 
 ## Plan 32 status
 

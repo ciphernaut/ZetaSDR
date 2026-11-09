@@ -775,13 +775,18 @@ fn fake_sets(dir: &Path) -> PathBuf {
 
 /// The fake model's scripts, in `zeta-fake-llm --scripts` form, keyed by a substring of the
 /// request: a refused stop, a refused capture delete, a fan-out through `plan_start`, a
-/// page-only `view_set`, and a turn with reasoning and content.
+/// page-only `view_set`, a turn with reasoning and content, a `job_start` on `tone` (the
+/// radio policy's probe, run with `cb` shown) and the box menu's question.
 fn fake_llm_scripts() -> serde_json::Value {
     use serde_json::json;
     use zeta_agent::fake::{text_response, tool_call_response, tool_call_response_with};
     let plan_start = json!({
         "plan": "uhf_cb_au", "channels": [20, 59], "kind": "fm_demod", "source": "cb",
         "deviation_hz": null, "sideband": null, "attach": null, "language": null, "replace": [],
+    });
+    let tone_measure = json!({
+        "kind": "measure", "source": "tone", "center_hz": 100_000_000, "bandwidth_hz": 12_500,
+        "deviation_hz": null, "sideband": null, "elastic": false, "replace": [],
     });
     json!([
         {"match": "stop the measure", "replies": [
@@ -812,6 +817,13 @@ fn fake_llm_scripts() -> serde_json::Value {
                 Some("I should list the sources first."),
             ),
             text_response("one source", "stop"),
+        ]},
+        {"match": "radio fallback probe", "replies": [
+            tool_call_response(&[("job_start", tone_measure)]),
+            text_response("Started it on tone.", "stop"),
+        ]},
+        {"match": "what is it?", "replies": [
+            text_response("A tone.", "stop"),
         ]},
     ])
 }

@@ -1665,6 +1665,7 @@ THEME_HOOKS = [
     ".outline", ".graph-node.selected", ".job-tag.hot", ".job-tag.speaking",
     ".job-tag .dot.closed", "html[data-theme]", "html[data-rail]", "html[data-footprint]",
     ".map-tab", "html[data-main]", "html[data-dock]", "section.pane.dock",
+    ".src-tab.default", ".src-tab .default-mark",
     "html[data-map-tiles]", "#map .map-tile-note",
 ]
 
@@ -1732,9 +1733,9 @@ def scenario_view_set_show_reset(page, url, secret):
                  "home none",
                  "subjects auto", "subject_dim_s 60", "subject_drop_s 300",
                  "origin_fade_s 300", "pane none", "theme console", "side both", "dock auto",
-                 "map_tiles auto"):
+                 "map_tiles auto", "radio_policy focus", "radio_prefer none"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 17, f"view show: {shown!r}"
+    assert shown.count("\n") == 19, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -4183,7 +4184,9 @@ def scenario_duplicate_start_renders_the_job(page, url, secret):
 # then answers "one source"; "stop the measure" calls job_stop on 01NOPE then answers "I was not
 # allowed to stop it."; "every CB channel" lists the sources, plan_starts fm_demod on ch20 and
 # ch59 of uhf_cb_au on `cb`, then answers "Started 2 channels."; "switch to the plain theme"
-# calls the page-only view_set {key: theme, value: plain}, then answers "Switched to plain.".
+# calls the page-only view_set {key: theme, value: plain}, then answers "Switched to plain.";
+# "radio fallback probe" job_starts a measure on `tone` (center 100 MHz, 12.5 kHz), then
+# answers "Started it on tone."; the box menu's "what is it?" answers "A tone.".
 
 def llm_url():
     url = os.environ.get("ZETA_UI_URL_LLM")
@@ -4213,6 +4216,8 @@ def scenario_ask_sends_32_turns_and_the_allowance(page, url, secret):
     assert len(asks) == 1, f"one /ask request: {asks}"
     assert asks[0]["max_turns"] == 32, asks[0]
     assert asks[0]["allow"] == NO_ALLOW, asks[0]
+    assert asks[0]["context"] == {"focus": "cb", "main": "rf", "radio_policy": "focus",
+                                  "radio_prefer": []}, asks[0]
     expect(answer).not_to_contain_text("[may stop jobs]")
     turn = page.locator("#transcript details.turn", has_text="turn 1 (1 call)")
     expect(turn).to_have_count(1)
@@ -4758,6 +4763,206 @@ def scenario_audio_comes_back_from_a_suspended_context(page, url, secret):
     finally:
         stop_job(url, secret, demod)
         stop_mixes(url, secret)
+
+
+# ---- the radio policy (plan 33 Task 4) ------------------------------------------------------
+# Against ZETA_UI_URL_LLM (`tone` and `cb`): "radio fallback probe" job_starts a measure on
+# `tone` while `cb` is shown. `radio_policy` and `radio_prefer` persist in `localStorage`
+# (RADIO_PREFS_KEY) across the tabs of one browser; the shown radio stays per tab.
+
+RADIO_PREFS_KEY = "zeta.radio_prefs"
+
+# Every Storage throws (the page's init script): the page boots with the defaults.
+THROWING_STORAGE_JS = """
+Storage.prototype.getItem = function () { throw new Error('storage unavailable'); };
+Storage.prototype.setItem = function () { throw new Error('storage unavailable'); };
+"""
+
+
+# Only the radio prefs' writes throw (reads work): a held value must not be re-read away.
+THROWING_SET_JS = """
+const realSet = Storage.prototype.setItem;
+Storage.prototype.setItem = function (k, v) {
+  if (k === 'zeta.radio_prefs') throw new Error('storage full');
+  return realSet.call(this, k, v);
+};
+"""
+
+
+def scenario_radio_default_mark_and_policy(page, url, secret):
+    url = llm_url()
+    select_source(page, url, secret, "cb")
+    tone_measures = lambda: running_kind(url, secret, "measure", "tone")
+    others = []
+    try:
+        asks = capture_asks(page)
+        # The default radio's mark (spec 4.9): the shown radio's tab under `focus`.
+        dflt = page.locator(".src-tab.default")
+        expect(dflt).to_have_count(1)
+        expect(dflt).to_have_attribute("data-id", "cb")
+        expect(dflt).to_have_attribute(
+            "title", re.compile(r"default radio for the agent \(policy focus\)"))
+        expect(page.locator(".src-tab.default .default-mark")).to_be_visible()
+        expect(page.locator('.src-tab[data-id="tone"] .default-mark')).to_be_hidden()
+        # Another tab selected: the mark moves with it.
+        page.click('.src-tab[data-id="tone"]')
+        expect(page.locator('.src-tab[data-id="tone"]')).to_have_class(re.compile(r"\bdefault\b"))
+        expect(dflt).to_have_count(1)
+        page.click('.src-tab[data-id="cb"]')
+        expect(dflt).to_have_attribute("data-id", "cb")
+        # `free-first` and `ask` have no default radio; `focus-fallback` has the shown one.
+        for pol, n in (("free-first", 0), ("ask", 0), ("focus-fallback", 1)):
+            run_cmd(page, f"view set radio_policy {pol}")
+            expect(view_line(page, f"radio_policy = {pol}")).to_be_visible()
+            expect(dflt).to_have_count(n)
+        expect(dflt).to_have_attribute(
+            "title", re.compile(r"default radio for the agent \(policy focus-fallback\)"))
+        run_cmd(page, "view set radio_policy focus")
+        expect(view_line(page, "radio_policy = focus")).to_be_visible()
+        expect(dflt).to_have_attribute(
+            "title", re.compile(r"default radio for the agent \(policy focus\)"))
+        # The Map tab keeps `cb` as the focus; the default `focus` refuses another radio,
+        # as the call's result in its turn, with no unlock button and nothing started.
+        page.locator("#tabs .src-tab.map-tab").click()
+        page.wait_for_function("() => document.documentElement.dataset.main === 'map'",
+                               timeout=5_000)
+        kept = page.locator('.src-tab[data-id="cb"]')
+        expect(kept).to_have_class(re.compile(r"\bkept\b"))
+        expect(kept).to_have_class(re.compile(r"\bdefault\b"))
+        run_cmd(page, "radio fallback probe")
+        answer = page.locator("#transcript .line.assistant", has_text="Started it on tone.")
+        expect(answer).to_have_count(1, timeout=10_000)
+        assert len(asks) == 1, f"one /ask request: {asks}"
+        assert asks[0]["context"] == {"focus": "cb", "main": "map", "radio_policy": "focus",
+                                      "radio_prefer": []}, asks[0]
+        turn = page.locator("#transcript details.turn", has_text="→ job_start").last
+        expect(turn).to_contain_text("radio policy focus")
+        # A refused run is not a run: no "ran on" note.
+        expect(page.locator("#transcript .line.note", has_text="ran on tone")).to_have_count(0)
+        expect(page.locator("#transcript button", has_text="allow")).to_have_count(0)
+        for _ in range(5):
+            assert not tone_measures(), "the focus policy started nothing on tone"
+            time.sleep(0.2)
+        # `focus-fallback`: the run on `tone` is noted after the answer, and the measure runs.
+        run_cmd(page, "view set radio_policy focus-fallback")
+        expect(view_line(page, "radio_policy = focus-fallback")).to_be_visible()
+        run_cmd(page, "radio fallback probe")
+        expect(answer).to_have_count(2, timeout=10_000)
+        note = page.locator(
+            "#transcript .line.note",
+            has_text="ran on tone (job_start), not the default radio cb (focus-fallback)")
+        expect(note).to_have_count(1)
+        assert asks[1]["context"]["radio_policy"] == "focus-fallback", asks[1]
+        started = wait_until(tone_measures, 5.0, "a measure on tone")
+        assert len(started) == 1, f"one measure on tone: {started}"
+        # The page's note helper: a dropped focus, and one line per off-default source.
+        notes = page.evaluate("""() => window.zetaTest.selectionNotes({
+            radio: null, policy: 'focus', note: 'focus gone is not a source',
+            off_default: []})""")
+        assert notes == ["focus gone is not a source; no default radio"], notes
+        notes = page.evaluate("""() => window.zetaTest.selectionNotes({
+            radio: null, policy: 'free-first', note: 'focus cb is faulted: usb gone',
+            off_default: []})""")
+        assert notes == [], notes
+        notes = page.evaluate("""() => window.zetaTest.selectionNotes({
+            radio: 'cb', policy: 'focus-fallback', note: null, off_default: [
+              {tool: 'job_start', source: 'tone'}, {tool: 'source_pin', source: 'tone'},
+              {tool: 'job_start', source: 'tone'}, {tool: 'job_start', source: 'hackrf'}]})""")
+        assert notes == [
+            "ran on tone (job_start, source_pin), not the default radio cb (focus-fallback)",
+            "ran on hackrf (job_start), not the default radio cb (focus-fallback)"], notes
+        # A focus that is not a source, posted without the page: the run's note says so.
+        r = http_json(url, secret, "/ask", {"request": "think", "context": {"focus": "gone"}})
+        assert r["selection"]["note"] == "focus gone is not a source", r["selection"]
+        # The box menu's question names its radio.
+        page.click('.src-tab[data-id="cb"]')
+        page.wait_for_function("() => document.documentElement.dataset.main === 'rf'",
+                               timeout=5_000)
+        wait_span(page, MENU_SPAN_S)
+        drag_menu(page)
+        page.click('#ctx .ctx-item[data-action="ask"]')
+        expect(page.locator("#transcript .line.assistant", has_text="A tone.")
+               ).to_have_count(1, timeout=10_000)
+        expect(page.locator("#transcript .line.user", has_text="what is it?")
+               ).to_contain_text("on cb,")
+        # `radio_prefer`: no repeats; a list is posted as ids.
+        run_cmd(page, "view set radio_prefer cb,cb")
+        expect(view_line(page, '"cb,cb" is not allowed', error=True)).to_contain_text(
+            "none, a comma-separated list of source ids")
+        run_cmd(page, "view set radio_prefer tone,cb")
+        expect(view_line(page, "radio_prefer = tone,cb")).to_be_visible()
+        n = len(asks)
+        run_cmd(page, "think")
+        wait_until(lambda: len(asks) > n, 5.0, "an /ask request")
+        assert asks[n]["context"]["radio_prefer"] == ["tone", "cb"], asks[n]
+        # Persistence: a second tab of the same browser reads both and posts them; its shown
+        # radio is its own; a reload keeps them; `view reset` there clears both.
+        second = page.context.new_page()
+        others.append(second)
+        second.set_viewport_size(WIDE)
+        login(second, url, secret)
+        second.click('.src-tab[data-id="tone"]')
+        expect(second.locator('.src-tab[data-id="tone"]')).to_have_attribute(
+            "aria-selected", "true")
+        assert view_value(second, "radio_policy") == "radio_policy focus-fallback"
+        assert view_value(second, "radio_prefer") == "radio_prefer tone,cb"
+        # The first page hears the storage event: its default mark goes with the policy.
+        expect(dflt).to_have_count(1)
+        run_cmd(second, "view set radio_policy free-first")
+        expect(view_line(second, "radio_policy = free-first")).to_be_visible()
+        expect(dflt).to_have_count(0, timeout=5_000)
+        run_cmd(second, "view set radio_policy focus-fallback")
+        expect(view_line(second, "radio_policy = focus-fallback")).to_be_visible()
+        expect(dflt).to_have_count(1, timeout=5_000)
+        asks2 = capture_asks(second)
+        run_cmd(second, "think")
+        expect(second.locator("#transcript .line.assistant", has_text="one source")
+               ).to_have_count(1, timeout=10_000)
+        assert asks2[0]["context"] == {"focus": "tone", "main": "rf",
+                                       "radio_policy": "focus-fallback",
+                                       "radio_prefer": ["tone", "cb"]}, asks2[0]
+        assert page.evaluate("window.zetaTest.shown()") == "cb", "the first tab still shows cb"
+        second.reload()
+        expect(second.locator('.src-tab[data-id="tone"]')).to_be_visible()
+        assert view_value(second, "radio_policy") == "radio_policy focus-fallback"
+        assert view_value(second, "radio_prefer") == "radio_prefer tone,cb"
+        run_cmd(second, "view reset")
+        expect(view_line(second, "view policies reset")).to_be_visible()
+        assert view_value(second, "radio_policy") == "radio_policy focus"
+        assert view_value(second, "radio_prefer") == "radio_prefer none"
+        stored = second.evaluate(f"localStorage.getItem('{RADIO_PREFS_KEY}')")
+        assert stored is None, f"view reset left {stored!r}"
+        # Storage that throws: the defaults, and a set holds for the page load.
+        run_cmd(page, "view set radio_policy free-first")
+        expect(view_line(page, "radio_policy = free-first")).to_be_visible()
+        third = page.context.new_page()
+        others.append(third)
+        third.add_init_script(THROWING_STORAGE_JS)
+        third.set_viewport_size(WIDE)
+        login(third, url, secret)
+        expect(third.locator('.src-tab[data-id="cb"]')).to_be_visible()
+        assert view_value(third, "radio_policy") == "radio_policy focus"
+        run_cmd(third, "view set radio_policy ask")
+        expect(view_line(third, "radio_policy = ask")).to_be_visible()
+        assert view_value(third, "radio_policy") == "radio_policy ask"
+        # Only a write that throws (reads work): the value still holds for the page load.
+        fourth = page.context.new_page()
+        others.append(fourth)
+        fourth.add_init_script(THROWING_SET_JS)
+        fourth.set_viewport_size(WIDE)
+        login(fourth, url, secret)
+        expect(fourth.locator('.src-tab[data-id="cb"]')).to_be_visible()
+        run_cmd(fourth, "view set radio_policy ask")
+        expect(view_line(fourth, "radio_policy = ask")).to_be_visible()
+        assert view_value(fourth, "radio_policy") == "radio_policy ask"
+    finally:
+        for p in others:
+            p.close()
+        run_cmd(page, "view reset")
+        page.evaluate(f"localStorage.removeItem('{RADIO_PREFS_KEY}')")
+        for j in tone_measures():
+            stop_job(url, secret, j)
+    assert not tone_measures(), "the measure on tone stopped"
 
 
 # ---- the map (plan 17 Task 9) -----------------------------------------------------------

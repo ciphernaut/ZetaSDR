@@ -19,9 +19,11 @@
 //         subscription keeps its normal backoff either way.
 //     api.op(obj) -> Promise<result JSON>              POST /op with `X-Zeta-Client: ui` (its
 //         ops-stream record carries transport "ui"); throws OpError (with .json)
-//     api.ask(text, maxTurns = 32, allow = {stop_jobs: false, replace: false, delete_captures: false, accept_signatures: false})
-//         -> Promise<Transcript>  POST /ask {request, max_turns, allow, page_tools: true}
-//         (the page applies the agent's `view_set` calls);
+//     api.ask(text, maxTurns = 32, allow = {stop_jobs: false, replace: false, delete_captures: false, accept_signatures: false}, context = null)
+//         -> Promise<Transcript>  POST /ask {request, max_turns, allow, page_tools: true,
+//         context} (the page applies the agent's `view_set` calls); `context` is the page's
+//         radio context, {focus, main, radio_policy, radio_prefer} (app.js askContext), left
+//         out when null; the answer's `selection` says which radio the run used and why;
 //         throws OpError (503 with {"error":"other","message":...} when serve has no LLM)
 //     api.stt(wav) -> Promise<{text}>   POST /stt with the WAV bytes (ArrayBuffer) as
 //         `Content-Type: audio/wav`; throws OpError (503 when serve has no speech daemon)
@@ -154,14 +156,11 @@ export class Api {
     replace: false,
     delete_captures: false,
     accept_signatures: false,
-  }) {
+  }, context = null) {
     // `page_tools`: the agent may change this page's view (`view_set`); the page applies it.
-    return this.#request("POST", "/ask", {
-      request: text,
-      max_turns: maxTurns,
-      allow,
-      page_tools: true,
-    });
+    const body = { request: text, max_turns: maxTurns, allow, page_tools: true };
+    if (context) body.context = context;
+    return this.#request("POST", "/ask", body);
   }
 
   stt(wav) {

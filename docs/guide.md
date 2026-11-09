@@ -575,7 +575,7 @@ OpenAI-compatible endpoint (thinking off, token budget per turn, bounded turns, 
 ./target/debug/zeta ask "what sources are there?" --llm-url http://127.0.0.1:8080 --llm-model gemma-4-12b
 ```
 
-`zeta ask` reads its request from stdin, so a `local-voice` transcript can be piped in. `--max-turns N` bounds the model turns; `--allow-stop` and `--allow-replace` let the agent stop jobs and stop the holders a conflict names, both refused otherwise.
+`zeta ask` reads its request from stdin, so a `local-voice` transcript can be piped in. `--max-turns N` bounds the model turns; `--allow-stop` and `--allow-replace` let the agent stop jobs and stop the holders a conflict names, both refused otherwise. `--radio ID` (`ZETA_RADIO`) names the default radio, `--radio-policy focus|focus-fallback|free-first|ask` (`ZETA_RADIO_POLICY`) the policy and `--radio-prefer IDS` (`ZETA_RADIO_PREFER`, comma-separated) the preference order; with none of them the agent has no context and takes the first free radio (`free-first`).
 
 ## UI
 
@@ -626,7 +626,7 @@ line takes `source pin --center-hz N --bandwidth-hz N [--replace ID]`, `source u
 gain DB|auto` for the selected source. A `fm_demod`/`am_demod` row whose channel is idle shows a
 `squelch` tag.
 
-View policies shape this, set from the command line and kept in the tab's `sessionStorage`:
+View policies shape this, set from the command line and kept in the tab's `sessionStorage` (except `radio_policy` and `radio_prefer`, which live in the browser's `localStorage` under `zeta.radio_prefs` and so follow every tab and restart):
 
 | Key | Values (default first) |
 |---|---|
@@ -645,6 +645,8 @@ View policies shape this, set from the command line and kept in the tab's `sessi
 | `subject_drop_s` | seconds of silence before a subject goes from the table and the map, `300` |
 | `origin_fade_s` | seconds over which a lit site's brightness falls to nothing after its signal was last active, `300` |
 | `map_tiles` | `auto` (the theme's `layout.map_tiles`, else `osm-dark` under a dark theme and `osm` under a light one), `osm`, `osm-dark`, `opentopo`, `esri-street`, `esri-imagery` |
+| `radio_policy` | `focus` (the agent uses the focused radio only; when it cannot take the band it says why, names the free radios and asks), `focus-fallback` (the first free radio in preference order, says which and why), `free-first`, `ask`; saved in the browser; `view reset` clears it; the agent cannot set it |
+| `radio_prefer` | `none`, or radio ids in order, `b210,hackrf`; the fallback's preference order; saved in the browser |
 
 `view set <key> <value>`, `view show`, `view reset` (every policy back to its default) and
 `view clear` (drops the finished job rows from the list) are typed at the command line; an

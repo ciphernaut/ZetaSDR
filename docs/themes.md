@@ -120,6 +120,8 @@ Each token is a custom property the core stylesheet declares in `:root`.
 - `--tint-outline`: a job outline's fill.
 - `--tint-speaking`: the fill of a speaking outline.
 - `--label-bg`: map label ground.
+- `--default-mark`: the default radio's dot on its tab.
+- `--default-mark-size`: that dot's diameter.
 - `--map-mark`: map position and track.
 - `--map-sel`: map selection and home.
 - `--map-dim`: map popup age.
@@ -212,6 +214,10 @@ Regions:
   Its parts are `.name`, `.range`, `.centre` and `.health`. `.map-tab` is the Map tab after the
   source tabs (also a `.src-tab`, with `.name` and a `.count`); while it is selected the shown
   source's tab carries `.kept`.
+- `.src-tab.default`: the tab of the default radio for the agent (the shown radio under the
+  `focus` and `focus-fallback` policies, none under `free-first` and `ask`), on the RF view and
+  the Map alike. `.src-tab .default-mark`: the dot first in every source tab, shown only under
+  `.src-tab.default`.
 - `#rail`: the frequency-aligned rail beside the axis (present while `data-rail` is `on`).
 - `.wf-axis`: the frequency axis. `#waterfall`: the waterfall region. `.wf-canvas`: its canvas.
 - `#side`: the side column. `section.pane` is a pane in it (`#pane-transcript`, `#pane-jobs`);
