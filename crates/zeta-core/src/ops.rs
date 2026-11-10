@@ -1642,6 +1642,14 @@ pub const SPECTRUM_SIZE_MAX: u32 = 8192;
 /// Spectrum rows per second of signal time.
 pub const SPECTRUM_ROWS_PER_S: u32 = 20;
 
+/// The sample count, since a spectrum's stream (re)started, at which row `row`
+/// of `rows_per_s` rows a second of `rate_hz` closes: `ceil((row + 1) × rate /
+/// rows_per_s)`. The `fft` stage closes the row at the first frame ending at or
+/// after it; a scan sizes a long dwell in whole rows by the same rule.
+pub fn spectrum_row_boundary(row: u64, rate_hz: u64, rows_per_s: u64) -> u64 {
+    (row.saturating_add(1).saturating_mul(rate_hz)).div_ceil(rows_per_s.max(1))
+}
+
 /// FFT size for a spectrum of `bandwidth_hz`: the smallest power of two at least
 /// `bandwidth_hz / SPECTRUM_BIN_TARGET_HZ`, clamped to
 /// `SPECTRUM_SIZE_MIN..=SPECTRUM_SIZE_MAX`.
@@ -1683,15 +1691,31 @@ pub const SCAN_ROWS_DWELL_MS: u64 = 100;
 pub const SCAN_MIN_FRAMES: u64 = 4;
 
 /// The samples a scan step of `dwell_ms` takes at `rate_hz` with FFT frames of
-/// `size`, and the dwell they are in ms (rounded to nearest): whole frames,
-/// `max(SCAN_MIN_FRAMES, floor(dwell_ms × rate / 1000 / size))` of them, so on a
+/// `size`, and the dwell they are in ms (rounded to nearest), in whole frames.
+/// A dwell under [`SCAN_ROWS_DWELL_MS`] is one row of
+/// `max(SCAN_MIN_FRAMES, floor(dwell_ms × rate / 1000 / size))` frames, so on a
 /// narrow source a short dwell is raised to four frames (341 ms of a 12 kHz
-/// channel at 1024).
+/// channel at 1024). A dwell of `SCAN_ROWS_DWELL_MS` or more (asked, or raised
+/// to it) is cut into `SPECTRUM_ROWS_PER_S` rows a second, so it is sized in
+/// whole rows instead: the frames at which the `fft` stage closes row `n - 1`
+/// ([`spectrum_row_boundary`]), for the fewest `n` covering the dwell
+/// (`ceil(dwell_ms × 20 / 1000)` rows) and holding at least the frames above;
+/// no frame the step waited for is left in a partial row.
 pub fn scan_dwell_samples(dwell_ms: u64, rate_hz: u64, size: u32) -> (u64, u64) {
     let (rate, size) = (rate_hz.max(1), u64::from(size.max(1)));
+    let ms = |samples: u64| (samples * 1000 + rate / 2) / rate;
     let frames = (dwell_ms.saturating_mul(rate) / 1000 / size).max(SCAN_MIN_FRAMES);
-    let samples = frames * size;
-    (samples, (samples * 1000 + rate / 2) / rate)
+    if dwell_ms < SCAN_ROWS_DWELL_MS && ms(frames * size) < SCAN_ROWS_DWELL_MS {
+        return (frames * size, ms(frames * size));
+    }
+    let rps = u64::from(SPECTRUM_ROWS_PER_S);
+    // Rows `n` closes on more than `frames - 1` frames once `n × rate / rps` exceeds
+    // `(frames - 1) × size`.
+    let rows = (dwell_ms.saturating_mul(rps).div_ceil(1000))
+        .max((frames - 1) * size * rps / rate + 1)
+        .max(1);
+    let frames = spectrum_row_boundary(rows - 1, rate, rps).div_ceil(size);
+    (frames * size, ms(frames * size))
 }
 
 /// How much of the ring, in ms, an `identify` job measures (layer 1) before it scores
@@ -6244,6 +6268,31 @@ mod tests {
         assert_eq!(scan_dwell_samples(20, 30_720_000, 8192), (614_400, 20));
         // 16 Msps: 78 frames of 4096, 19.968 ms, rounded to 20.
         assert_eq!(scan_dwell_samples(20, 16_000_000, 4096), (319_488, 20));
+        // 100 ms and more: whole rows of 20 a second. At 16 Msps row 0 closes on frame 196
+        // and row 1 on frame 391 (1 600 000 samples), not on the floor's 390.
+        assert_eq!(scan_dwell_samples(100, 16_000_000, 4096), (391 * 4096, 100));
+        // Five rows: row 4 closes at 4 000 000 samples, frame 977.
+        assert_eq!(scan_dwell_samples(250, 16_000_000, 4096), (977 * 4096, 250));
+        // A 12 kHz channel raised to four frames (341 ms) is already whole rows.
+        assert_eq!(scan_dwell_samples(250, 12_000, 1024), (4096, 341));
+        for (dwell, rate, size) in [
+            (100, 16_000_000, 4096),
+            (250, 30_720_000, 8192),
+            (130, 12_000, 1024),
+            (5000, 2_048_000, 1024),
+        ] {
+            let (samples, _) = scan_dwell_samples(dwell, rate, size);
+            let frames = samples / u64::from(size);
+            // The last frame closes a row: the frame before it is short of a boundary it reaches.
+            let rows = (0..)
+                .find(|&k| spectrum_row_boundary(k, rate, 20) > samples)
+                .unwrap();
+            assert!(rows >= 1);
+            assert!(
+                spectrum_row_boundary(rows - 1, rate, 20) > (frames - 1) * u64::from(size),
+                "{dwell} ms at {rate}"
+            );
+        }
     }
 
     #[test]

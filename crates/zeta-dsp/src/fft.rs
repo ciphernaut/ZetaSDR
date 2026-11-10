@@ -374,7 +374,9 @@ impl RowCutter {
     fn boundary(&self) -> u64 {
         match self.row_frames {
             Some(n) => (self.row_index + 1) * n * self.size as u64,
-            None => ((self.row_index + 1) * self.rate_hz).div_ceil(self.rows_per_s),
+            None => {
+                zeta_core::ops::spectrum_row_boundary(self.row_index, self.rate_hz, self.rows_per_s)
+            }
         }
     }
 

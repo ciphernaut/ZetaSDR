@@ -13,7 +13,7 @@ use zeta_core::bank::{BankFactory, ChannelBank};
 use zeta_core::graph::{Graph, GraphError, Node as GraphNode};
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
-use zeta_core::ops::{JobKind, Op, OpError, OpResult};
+use zeta_core::ops::{JobKind, Op, OpError, OpResult, scan_dwell_samples, spectrum_row_boundary};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageRegistry, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
@@ -244,8 +244,8 @@ impl Port for ScanPort {
 
 /// Stands in for the dsp `fft` stage (core cannot depend on it). It cuts each
 /// input block into rows as the real stage does: `row_frames` frames of `size`
-/// each when the params give it, else the whole frames of `1 / rows_per_s`
-/// seconds; a partial row at the block's end is dropped. One event per row with
+/// each when the params give it, else closing row `k` at the first frame ending
+/// at or after [`spectrum_row_boundary`]; a partial row at the block's end is dropped. One event per row with
 /// the params' `size`, `rows_per_s`, `row_frames`, `notch_hz` and `edge_mask`,
 /// the block's `center_hz`, the row's sample count and the tone it carries (mean
 /// phase step); the frame's span is the row's. Its params check refuses an
@@ -298,15 +298,30 @@ impl Stage for FakeFft {
                 continue;
             };
             let rate = b.sample_rate_hz.0;
-            let row_len = match params["row_frames"].as_u64() {
-                Some(n) => n as usize * size,
-                None => {
-                    let per_row = rate.div_ceil(params["rows_per_s"].as_u64().unwrap_or(20));
-                    (per_row as usize).div_ceil(size).max(1) * size
+            let rows_per_s = params["rows_per_s"].as_u64().unwrap_or(20);
+            // Where each row ends, in samples: `row_frames` frames each, else (as the real
+            // stage) row `k` closes at the first frame ending at or after its boundary.
+            let frames = b.samples.len() / size;
+            let mut ends = Vec::new();
+            let mut row = 0u64;
+            for f in 1..=frames {
+                let end = (f * size) as u64;
+                let closes = match params["row_frames"].as_u64() {
+                    Some(n) => (f as u64).is_multiple_of(n),
+                    None => end >= spectrum_row_boundary(row, rate, rows_per_s),
+                };
+                if closes {
+                    ends.push(end as usize);
+                    row += 1;
+                    while spectrum_row_boundary(row, rate, rows_per_s) <= end {
+                        row += 1;
+                    }
                 }
-            };
+            }
             let ns = |n: usize| (n as u128 * 1_000_000_000 / rate as u128) as u64;
-            for (k, s) in b.samples.chunks_exact(row_len).enumerate() {
+            let mut from = 0;
+            for end in ends {
+                let s = &b.samples[from..end];
                 let acc: Complex<f64> = s
                     .windows(2)
                     .map(|w| {
@@ -326,12 +341,12 @@ impl Stage for FakeFft {
                     "tone_hz": tone,
                 });
                 let mut prov = frame.provenance.clone();
-                let start = b.t0.0 + ns(k * row_len);
                 prov.span = Span {
-                    start_ns: Timestamp(start),
-                    end_ns: Timestamp(start + ns(row_len)),
+                    start_ns: Timestamp(b.t0.0 + ns(from)),
+                    end_ns: Timestamp(b.t0.0 + ns(end)),
                 };
                 bus.publish(Frame::new(outputs[0].clone(), prov, Payload::Event(ev)));
+                from = end;
             }
         }
     }
@@ -1003,21 +1018,54 @@ async fn a_short_dwell_publishes_one_row_a_step() {
     node.job_stop(&id).await.unwrap();
 }
 
-/// A dwell of 100 ms or more is cut as a spectrum is, 20 rows a second within the step.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_dwell_of_100_ms_keeps_20_rows_a_second() {
-    let (_dir, node, _port) = open_dwell(ScanPort::new(), 100).await;
+/// Check that a scan with a `dwell_ms` dwell (100 ms or more) on the 16 MHz port
+/// publishes `per_step` rows of about 50 ms for each step, 20 rows a second
+/// within the step: two steps' rows, each step's on one channel, contiguous,
+/// together spanning the whole effective dwell (no frame left in a partial row).
+async fn whole_rows_per_step(dwell_ms: u64, per_step: usize) {
+    let (_dir, node, _port) = open_dwell(ScanPort::new(), dwell_ms).await;
     let (id, mut rx) = start_scan(&node).await;
-    assert_eq!(node.job_context(&id).unwrap()["scan"]["dwell_ms"], 100);
-    for f in rows(&mut rx, 4, Duration::from_secs(10)).await {
-        let ev = ev(&f);
+    assert_eq!(node.job_context(&id).unwrap()["scan"]["dwell_ms"], dwell_ms);
+    let (dwell, _) = scan_dwell_samples(dwell_ms, 16 * MHZ, 4096);
+    let got = rows(&mut rx, 2 * per_step, Duration::from_secs(20)).await;
+    for f in &got {
+        let ev = ev(f);
         assert_eq!(ev["rows_per_s"], 20, "{ev}");
         assert!(ev["row_frames"].is_null(), "{ev}");
-        let span = f.provenance.span;
+        let span = &f.provenance.span;
         let ms = (span.end_ns.0 - span.start_ns.0) as f64 / 1e6;
         assert!((45.0..=55.0).contains(&ms), "a {ms} ms row");
     }
+    let steps: Vec<&[Frame]> = got.chunks(per_step).collect();
+    assert_ne!(channel(&steps[0][0]), channel(&steps[1][0]));
+    for step in steps {
+        assert!(
+            step.iter().all(|f| channel(f) == channel(&step[0])),
+            "a step's {per_step} rows on one channel"
+        );
+        for w in step.windows(2) {
+            assert_eq!(w[1].provenance.span.start_ns, w[0].provenance.span.end_ns);
+        }
+        let samples: u64 = step
+            .iter()
+            .map(|f| ev(f)["samples"].as_u64().unwrap())
+            .sum();
+        assert_eq!(samples, dwell, "the step's rows hold its whole dwell");
+    }
     node.job_stop(&id).await.unwrap();
+}
+
+/// A dwell of 100 ms or more is cut as a spectrum is, 20 rows a second within
+/// the step: two 50 ms rows from a 100 ms dwell.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dwell_of_100_ms_keeps_20_rows_a_second() {
+    whole_rows_per_step(100, 2).await;
+}
+
+/// A 250 ms dwell is five rows a step, and no sample the step waited for is dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dwell_of_250_ms_is_five_whole_rows() {
+    whole_rows_per_step(250, 5).await;
 }
 
 /// A scan of one step retunes to the same centre, which keeps the ring: each
