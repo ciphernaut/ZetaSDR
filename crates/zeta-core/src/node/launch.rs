@@ -1287,8 +1287,11 @@ async fn forward_iq(
 /// Push a port's blocks into its ring, creating the ring on the first block
 /// and sizing it to the memory budget at the new rate when the rate changes
 /// (a retune; the ring restarts, so the old rate's samples are not trimmed).
+/// Each push bumps the source's ring tick ([`Inner::ring_tick`]) once the ring
+/// is unlocked.
 pub(super) async fn feed_ring(inner: Arc<Inner>, source: SourceId, mut rx: IqReceiver) {
     let mut logged: HashSet<u64> = HashSet::new();
+    let tick = inner.ring_tick_tx(&source);
     loop {
         let block = tokio::select! {
             _ = inner.shutdown.cancelled() => return,
@@ -1314,12 +1317,15 @@ pub(super) async fn feed_ring(inner: Arc<Inner>, source: SourceId, mut rx: IqRec
             .entry(source.clone())
             .or_insert_with(|| Arc::new(RwLock::new(IqRing::new(seconds, block.sample_rate_hz))))
             .clone();
-        let mut ring = ring.write().unwrap();
-        if ring.sample_rate_hz() != block.sample_rate_hz {
-            // `push` restarts the ring at the new rate with this length.
-            ring.set_capacity_seconds(seconds);
+        {
+            let mut ring = ring.write().unwrap();
+            if ring.sample_rate_hz() != block.sample_rate_hz {
+                // `push` restarts the ring at the new rate with this length.
+                ring.set_capacity_seconds(seconds);
+            }
+            ring.push(&block);
         }
-        ring.push(&block);
+        tick.send_modify(|n| *n = n.wrapping_add(1));
     }
 }
 

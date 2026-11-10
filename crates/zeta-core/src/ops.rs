@@ -841,9 +841,12 @@ const FM_DEVIATION_MAX_HZ: u64 = 75_000;
 /// measures only that band, reporting its absolute `center_hz`. `scan`
 /// time-shares the radio across a band wider than one capture: it expands to
 /// one `fft` node whose mask params the node fills in; the node steps the source across the band (see [`scan_steps`]),
-/// dwelling [`SCAN_DWELL_MS`] on each step, and emits spectrum rows tagged
-/// with each step's `center_hz` while holding the whole band, so every other
-/// request on the source is a conflict until the scan is stopped.
+/// takes a dwell of settled samples at each step ([`SCAN_DWELL_MS`] by default, never
+/// under [`SCAN_MIN_FRAMES`] FFT frames, see [`scan_dwell_samples`]) as soon as the ring
+/// holds it, hands it to the `fft` stage off the tune's path, and emits spectrum rows
+/// (one a step under [`SCAN_ROWS_DWELL_MS`]) tagged with each step's `center_hz` while
+/// holding the whole band, so every other request on the source is a conflict until the
+/// scan is stopped.
 /// `identify` also expands to no graph: it holds a rigid lease on its band like a
 /// decoder, measures it for [`IDENTIFY_MEASURE_MS`], then tries every plausible mode
 /// row as a child job, in score order, publishing one `candidate` event per row and
@@ -1666,9 +1669,30 @@ pub fn watch_fft_size(capture_hz: u64) -> u32 {
 
 /// Widest capture one scan step asks of the source.
 pub const SCAN_STEP_MAX_HZ: u64 = 16_000_000;
-/// How long a scan waits on each step before reading the ring (the node's
-/// default; `NodeConfig::scan_dwell_ms` overrides it).
-pub const SCAN_DWELL_MS: u64 = 250;
+/// The dwell of settled samples a scan takes at each step, ms (the node's
+/// default; `NodeConfig::scan_dwell_ms` overrides it). Never under
+/// [`SCAN_MIN_FRAMES`] FFT frames (see [`scan_dwell_samples`]).
+pub const SCAN_DWELL_MS: u64 = 20;
+/// How long past its dwell a scan step waits for the dwell's samples before
+/// the step is skipped, ms.
+pub const SCAN_WAIT_MARGIN_MS: u64 = 500;
+/// A dwell this long or longer is cut into `SPECTRUM_ROWS_PER_S` rows a second;
+/// a shorter one is one row a step, ms.
+pub const SCAN_ROWS_DWELL_MS: u64 = 100;
+/// The fewest FFT frames a scan's dwell holds.
+pub const SCAN_MIN_FRAMES: u64 = 4;
+
+/// The samples a scan step of `dwell_ms` takes at `rate_hz` with FFT frames of
+/// `size`, and the dwell they are in ms (rounded to nearest): whole frames,
+/// `max(SCAN_MIN_FRAMES, floor(dwell_ms × rate / 1000 / size))` of them, so on a
+/// narrow source a short dwell is raised to four frames (341 ms of a 12 kHz
+/// channel at 1024).
+pub fn scan_dwell_samples(dwell_ms: u64, rate_hz: u64, size: u32) -> (u64, u64) {
+    let (rate, size) = (rate_hz.max(1), u64::from(size.max(1)));
+    let frames = (dwell_ms.saturating_mul(rate) / 1000 / size).max(SCAN_MIN_FRAMES);
+    let samples = frames * size;
+    (samples, (samples * 1000 + rate / 2) / rate)
+}
 
 /// How much of the ring, in ms, an `identify` job measures (layer 1) before it scores
 /// the mode rows.
@@ -6210,6 +6234,16 @@ mod tests {
         assert_eq!(scan_edge_mask_in_force(true, 0.10), 0.10);
         assert_eq!(scan_edge_mask_in_force(false, 0.10), 0.0);
         assert_eq!(scan_edge_mask_in_force(false, 0.0), 0.0);
+    }
+
+    #[test]
+    fn a_dwell_is_whole_frames_and_never_under_four() {
+        // A 12 kHz channel: 240 samples in 20 ms, under one 1024-point frame, so four frames.
+        assert_eq!(scan_dwell_samples(20, 12_000, 1024), (4096, 341));
+        // 30.72 Msps: 75 whole frames of 8192 are exactly 20 ms.
+        assert_eq!(scan_dwell_samples(20, 30_720_000, 8192), (614_400, 20));
+        // 16 Msps: 78 frames of 4096, 19.968 ms, rounded to 20.
+        assert_eq!(scan_dwell_samples(20, 16_000_000, 4096), (319_488, 20));
     }
 
     #[test]

@@ -187,14 +187,23 @@ pub struct FftParams {
     /// Fraction of the row masked at each edge, in `0..0.5`; 0 masks nothing.
     #[serde(default)]
     pub edge_mask: f64,
+    /// When set (at least 1), a row is the mean of exactly this many frames, whatever
+    /// `rows_per_s` says (which the row still reports): a scan step's one row of its
+    /// dwell. Absent or `null`, rows follow `rows_per_s`.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub row_frames: Option<u32>,
 }
 
 impl FftParams {
-    /// What the schema cannot say: `notch_hz` not negative, `edge_mask` in `0..0.5`.
-    /// The error names the field.
+    /// What the schema cannot say: `notch_hz` not negative, `edge_mask` in `0..0.5`,
+    /// `row_frames` at least 1. The error names the field.
     pub fn check(&self) -> Result<(), String> {
         if self.notch_hz < 0 {
             return Err("notch_hz must be at least 0".into());
+        }
+        if self.row_frames == Some(0) {
+            return Err("row_frames must be at least 1".into());
         }
         if !(0.0..0.5).contains(&self.edge_mask) {
             return Err("edge_mask must be in 0..0.5".into());
@@ -309,12 +318,15 @@ struct Row {
 /// signal time, counted in samples. Row `k` closes at the first chunk ending at or
 /// after sample `ceil((k + 1) * rate / rows_per_s)` since the stream (re)started;
 /// a row shorter than one chunk therefore holds one chunk and the next rows catch up.
+/// With `row_frames`, row `k` closes at sample `(k + 1) * row_frames * size` instead.
 /// A change of rate or centre, or lost frames, restarts the stream: the partial row
 /// is dropped and the next row starts at the next block's `t0`.
 struct RowCutter {
     size: usize,
     window: Window,
     rows_per_s: u64,
+    /// Chunks per row, when the params fix it (`FftParams::row_frames`).
+    row_frames: Option<u64>,
     rate_hz: u64,
     center_hz: u64,
     /// Samples of a chunk not yet complete, and the time of its first sample.
@@ -330,11 +342,12 @@ struct RowCutter {
 }
 
 impl RowCutter {
-    fn new(size: usize, window: Window, rows_per_s: u32) -> Self {
+    fn new(size: usize, window: Window, rows_per_s: u32, row_frames: Option<u32>) -> Self {
         Self {
             size,
             window,
             rows_per_s: rows_per_s as u64,
+            row_frames: row_frames.map(u64::from),
             rate_hz: 0,
             center_hz: 0,
             carry: Vec::with_capacity(size),
@@ -359,7 +372,10 @@ impl RowCutter {
 
     /// Samples since the restart at which the current row closes.
     fn boundary(&self) -> u64 {
-        ((self.row_index + 1) * self.rate_hz).div_ceil(self.rows_per_s)
+        match self.row_frames {
+            Some(n) => (self.row_index + 1) * n * self.size as u64,
+            None => ((self.row_index + 1) * self.rate_hz).div_ceil(self.rows_per_s),
+        }
     }
 
     /// Frames were lost: drop the carry and the partial row, and re-anchor the
@@ -506,7 +522,7 @@ impl Stage for FftStage {
         let size = p.size as usize;
         let rows_per_s = p.rows_per_s;
         let backend = self.backend.clone();
-        let mut cutter = RowCutter::new(size, p.window, rows_per_s);
+        let mut cutter = RowCutter::new(size, p.window, rows_per_s, p.row_frames);
         let (notch_hz, edge_mask) = (p.notch_hz as u64, p.edge_mask);
         // The masked bins of the current rate, recomputed when a row's rate differs
         // from the last row's (the cutter restarts then anyway).
@@ -681,6 +697,84 @@ mod tests {
         ev.clone()
     }
 
+    /// Every row the stage run with `params` emits over one block of `n` samples of a
+    /// 6 kHz tone at 48 kHz, once the input closes.
+    async fn rows_of(params: serde_json::Value, n: usize) -> Vec<Frame> {
+        let prov = Provenance {
+            source: SourceId("s".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(1),
+            },
+        };
+        let bus = Arc::new(StreamBus::new(64));
+        let out = bus.register(StreamKind::Event, prov.clone());
+        let mut rx_out = bus.subscribe(&out).unwrap();
+        let (tx, rx_in) = broadcast::channel(8);
+        let o2 = out.clone();
+        let h = tokio::spawn(async move {
+            FftStage::new(Arc::new(CpuFft::new()))
+                .run(
+                    params,
+                    vec![rx_in],
+                    vec![o2],
+                    bus,
+                    CancellationToken::new(),
+                    zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into())),
+                )
+                .await
+        });
+        tx.send(Frame::new(
+            StreamId::new(),
+            prov,
+            Payload::Iq(IqBlock {
+                t0: Timestamp(0),
+                sample_rate_hz: Hz(RATE),
+                center_hz: Hz(100_000_000),
+                samples: crate::util::nco(n, 6_000.0, RATE as f64).into(),
+            }),
+        ))
+        .unwrap();
+        drop(tx);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+        let mut rows = Vec::new();
+        while let Ok(f) = rx_out.try_recv() {
+            rows.push(f);
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn row_frames_closes_a_row_on_that_many_frames() {
+        // At 60 rows a second of 48 kHz a row is 800 samples, so three frames make three rows.
+        let p = |row_frames: serde_json::Value| {
+            let mut p = serde_json::json!({"size": 1024, "window": "hann", "rows_per_s": 60});
+            p["row_frames"] = row_frames;
+            p
+        };
+        assert_eq!(rows_of(p(serde_json::Value::Null), 3 * 1024).await.len(), 3);
+        // With row_frames 3, the same three frames are one row, whatever rows_per_s says.
+        let rows = rows_of(p(3.into()), 3 * 1024).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provenance.span.start_ns, Timestamp(0));
+        assert_eq!(
+            rows[0].provenance.span.end_ns,
+            Timestamp(3072 * 1_000_000_000 / RATE)
+        );
+        let Payload::Event(ev) = &rows[0].payload else {
+            panic!("expected an event")
+        };
+        assert_eq!(ev["rows_per_s"], 60);
+        // Two frames are not a row of three.
+        assert!(rows_of(p(3.into()), 2 * 1024).await.is_empty());
+        // At least one frame.
+        let stage = FftStage::new(Arc::new(CpuFft::new()));
+        let e = stage.check_params(&p(0.into())).unwrap_err();
+        assert!(e.contains("row_frames"), "{e}");
+    }
+
     #[tokio::test]
     async fn fft_stage_emits_v2_rows() {
         let ev =
@@ -753,6 +847,7 @@ mod tests {
             rows_per_s: 20,
             notch_hz,
             edge_mask,
+            row_frames: None,
         };
         assert_eq!(p(0, 0.0).check(), Ok(()));
         assert_eq!(p(300_000, 0.49).check(), Ok(()));

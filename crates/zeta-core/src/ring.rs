@@ -174,6 +174,42 @@ impl IqRing {
             .then(|| Timestamp(self.time_of(self.dropped + self.buf.len() as u64 - 1)))
     }
 
+    /// The first `samples` samples at `center` starting at `after` (at the
+    /// ring's earliest when `after` is `None` or older), as one block; `None`
+    /// while the ring holds fewer from there or holds another centre. The ring
+    /// holds one contiguous run (a gap restarts it), so the block is contiguous,
+    /// and a block ending at `t` is followed by the one asked for `after: t`.
+    pub fn run_after(
+        &self,
+        center: Hz,
+        after: Option<Timestamp>,
+        samples: usize,
+    ) -> Option<IqBlock> {
+        if self.center_hz != Some(center) || self.buf.is_empty() {
+            return None;
+        }
+        // Samples since the run's origin at `after`, rounded to the nearest, so a
+        // time a nanosecond either side of a sample's lands on it.
+        let from = match after {
+            Some(t) if t.0 > self.origin_ns => {
+                let rate = self.sample_rate_hz as u128;
+                let n = ((t.0 - self.origin_ns) as u128 * rate + NS / 2) / NS;
+                usize::try_from(n.saturating_sub(self.dropped as u128)).ok()?
+            }
+            _ => 0,
+        };
+        let to = from.checked_add(samples)?;
+        if to > self.buf.len() {
+            return None;
+        }
+        Some(IqBlock {
+            t0: Timestamp(self.time_of(self.dropped + from as u64)),
+            sample_rate_hz: Hz(self.sample_rate_hz),
+            center_hz: center,
+            samples: self.buf.range(from..to).copied().collect(),
+        })
+    }
+
     /// Samples covering the half-open span `[start_ns, end_ns)`, or an error;
     /// never partial. A span whose end is not after its start is `BadSpan`.
     pub fn read(&self, span: Span) -> Result<Vec<Complex<f32>>, RingError> {
@@ -438,6 +474,67 @@ mod tests {
         ring.push(&moved);
         assert_eq!(ring.center_hz(), Some(Hz(433_000_000)));
         assert_eq!(ring.earliest(), Some(Timestamp(1_000 * MS)));
+    }
+
+    /// The sample values of `b`, as the `n` the test blocks number them by.
+    fn values(b: &IqBlock) -> Vec<u64> {
+        b.samples.iter().map(|c| c.re as u64).collect()
+    }
+
+    #[test]
+    fn run_after_gives_the_first_samples_of_the_centre() {
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        ring.push(&block(0));
+        ring.push(&block(1));
+        let got = ring.run_after(Hz(100_000_000), None, 1500).unwrap();
+        assert_eq!(got.t0, Timestamp(0));
+        assert_eq!(got.center_hz, Hz(100_000_000));
+        assert_eq!(got.sample_rate_hz, Hz(RATE));
+        assert_eq!(values(&got), (0..1500).collect::<Vec<u64>>());
+        // A time older than the ring's earliest starts at the earliest.
+        let mut ring = wrapped();
+        let got = ring.run_after(Hz(100_000_000), Some(Timestamp(MS)), 10);
+        assert_eq!(got.map(|b| b.t0), Some(Timestamp(3_000 * MS)));
+        // After a gap the ring's run restarts, and so do the samples it gives.
+        ring.push(&block_at(9_000 * MS, 9000, 500));
+        let got = ring.run_after(Hz(100_000_000), None, 500).unwrap();
+        assert_eq!(got.t0, Timestamp(9_000 * MS));
+        assert_eq!(values(&got), (9000..9500).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn run_after_is_none_for_another_centre_or_too_few() {
+        let empty = IqRing::new(10.0, Hz(RATE));
+        assert!(empty.run_after(Hz(100_000_000), None, 1).is_none());
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        ring.push(&block(0));
+        ring.push(&block(1));
+        assert!(ring.run_after(Hz(433_000_000), None, 10).is_none());
+        assert!(ring.run_after(Hz(100_000_000), None, 2001).is_none());
+        assert!(ring.run_after(Hz(100_000_000), None, 2000).is_some());
+        // Past the newest sample: nothing yet.
+        assert!(
+            ring.run_after(Hz(100_000_000), Some(Timestamp(5_000 * MS)), 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn run_after_skips_what_was_taken() {
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        ring.push(&block(0));
+        ring.push(&block(1));
+        let c = Hz(100_000_000);
+        let first = ring.run_after(c, None, 600).unwrap();
+        let end = |b: &IqBlock| Timestamp(b.t0.0 + b.samples.len() as u64 * MS);
+        let second = ring.run_after(c, Some(end(&first)), 600).unwrap();
+        assert_eq!(second.t0, Timestamp(600 * MS));
+        assert_eq!(values(&second), (600..1200).collect::<Vec<u64>>());
+        // 800 samples are left after the second: too few for another 1000, until more arrive.
+        assert!(ring.run_after(c, Some(end(&second)), 1000).is_none());
+        ring.push(&block(2));
+        let third = ring.run_after(c, Some(end(&second)), 1000).unwrap();
+        assert_eq!(values(&third), (1200..2200).collect::<Vec<u64>>());
     }
 
     #[test]

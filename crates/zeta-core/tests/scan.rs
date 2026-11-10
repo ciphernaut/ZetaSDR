@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use num_complex::Complex;
@@ -18,7 +18,7 @@ use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageRegistry, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{
-    Capabilities, Claim, Hz, JobId, SampleFormat, SourceId, StreamId, StreamKind, Timestamp,
+    Capabilities, Claim, Hz, JobId, SampleFormat, SourceId, Span, StreamId, StreamKind, Timestamp,
 };
 
 const MHZ: u64 = 1_000_000;
@@ -31,33 +31,65 @@ fn tone_hz(center_hz: u64) -> f64 {
 /// Cadence of the port's blocks.
 const BLOCK_MS: u64 = 5;
 
-/// Samples in one block at `rate_hz`: `BLOCK_MS` of them.
-fn block_len(rate_hz: u64) -> usize {
-    (rate_hz * BLOCK_MS / 1_000) as usize
+/// Signal time in one block of a [`Delivery::Fast`] port: more than a 200 ms dwell,
+/// delivered every `BLOCK_MS`.
+const FAST_BLOCK_MS: u64 = 250;
+
+/// Capture width of a [`ScanPort::fast`] port: narrow, so its long blocks stay cheap
+/// (and a 200 ms dwell is 50 whole frames of 1024).
+const FAST_RATE_HZ: u64 = 256_000;
+
+/// How a [`ScanPort`] delivers its blocks while tuned, one every `BLOCK_MS`.
+#[derive(Clone, Copy, Debug)]
+enum Delivery {
+    /// `BLOCK_MS` of samples each, in real time.
+    Real,
+    /// `FAST_BLOCK_MS` of samples each: a whole dwell arrives at once.
+    Fast,
+    /// As `Real` for this many blocks, then none at all.
+    Stalling(u64),
+    /// As `Real`, but every third block starts 1 ms late: samples lost, a gap in the ring.
+    Gapping,
+}
+
+impl Delivery {
+    fn block_ms(self) -> u64 {
+        match self {
+            Delivery::Fast => FAST_BLOCK_MS,
+            _ => BLOCK_MS,
+        }
+    }
+}
+
+/// Samples in one `block_ms` block at `rate_hz`.
+fn block_len(rate_hz: u64, block_ms: u64) -> usize {
+    (rate_hz * block_ms / 1_000) as usize
 }
 
 /// A 16 MHz-wide port that records every `tune` and, while tuned, sends a
-/// block of `BLOCK_MS` of samples every `BLOCK_MS` at its current band,
-/// carrying a tone at [`tone_hz`] of that band's centre. Block timestamps
-/// advance by exactly `BLOCK_MS` from the first, so the ring sees one
-/// contiguous run per step and a dwell reads several blocks. With
+/// block every `BLOCK_MS` at its current band, carrying a tone at [`tone_hz`]
+/// of that band's centre, as its [`Delivery`] says. Block timestamps advance by
+/// exactly the block's signal time, so the ring sees one contiguous run per
+/// step and a dwell reads several blocks (but where `Gapping` skips). With
 /// `fail_tune`, that tune (1-based) and every later one fails.
 struct ScanPort {
     id: SourceId,
     caps: Capabilities,
     cur: Mutex<Option<Tuning>>,
-    tunes: Mutex<Vec<Tuning>>,
+    tunes: Mutex<Vec<(Tuning, Instant)>>,
     fail_tune: Option<usize>,
+    /// The `t0` of every block a `Gapping` port started late.
+    gaps: Mutex<Vec<u64>>,
     tx: broadcast::Sender<IqBlock>,
 }
 
-/// One block's samples at `t`: a whole number of tone cycles for every step
-/// centre used here (8, 24 and 40 MHz at 16 MHz), so blocks join without a
-/// phase jump.
-fn block_samples(t: Tuning) -> Arc<[Complex<f32>]> {
+/// One `block_ms` block's samples at `t`: a whole number of tone cycles for
+/// every step centre used here (8, 24 and 40 MHz at 16 MHz), so blocks join
+/// without a phase jump.
+fn block_samples(t: Tuning, block_ms: u64) -> Arc<[Complex<f32>]> {
     let rate = t.bandwidth_hz.0;
     let w = 2.0 * std::f64::consts::PI * tone_hz(t.center_hz.0) / rate as f64;
-    (0..block_len(rate))
+    (0..block_len(rate, block_ms))
         .map(|n| {
             let ph = w * n as f64;
             Complex::new(ph.cos() as f32, ph.sin() as f32)
@@ -72,20 +104,47 @@ impl ScanPort {
 
     /// A port whose capabilities say `remote` and `push` as given.
     fn with_caps(remote: bool, push: bool) -> Arc<Self> {
-        Self::build(None, remote, push)
+        Self::build(None, remote, push, Delivery::Real, 16 * MHZ)
     }
 
     fn with_fail_tune(fail_tune: Option<usize>) -> Arc<Self> {
-        Self::build(fail_tune, false, false)
+        Self::build(fail_tune, false, false, Delivery::Real, 16 * MHZ)
     }
 
-    fn build(fail_tune: Option<usize>, remote: bool, push: bool) -> Arc<Self> {
+    /// A `FAST_RATE_HZ`-wide port whose every block holds `FAST_BLOCK_MS` of samples.
+    fn fast() -> Arc<Self> {
+        Self::build(None, false, false, Delivery::Fast, FAST_RATE_HZ)
+    }
+
+    /// A port that sends `after_blocks` blocks, then stops delivering.
+    fn stalling(after_blocks: u64) -> Arc<Self> {
+        Self::build(
+            None,
+            false,
+            false,
+            Delivery::Stalling(after_blocks),
+            16 * MHZ,
+        )
+    }
+
+    /// A port whose every third block skips 1 ms of `t0`.
+    fn gapping() -> Arc<Self> {
+        Self::build(None, false, false, Delivery::Gapping, 16 * MHZ)
+    }
+
+    fn build(
+        fail_tune: Option<usize>,
+        remote: bool,
+        push: bool,
+        delivery: Delivery,
+        max_bandwidth_hz: u64,
+    ) -> Arc<Self> {
         let p = Arc::new(Self {
             id: SourceId("radio0".into()),
             caps: Capabilities {
                 tune_min_hz: Claim::Asserted(Hz(MHZ)),
                 tune_max_hz: Claim::Asserted(Hz(6_000 * MHZ)),
-                max_bandwidth_hz: Claim::Asserted(Hz(16 * MHZ)),
+                max_bandwidth_hz: Claim::Asserted(Hz(max_bandwidth_hz)),
                 formats: vec![SampleFormat::Cf32],
                 channels: 1,
                 rx: true,
@@ -96,6 +155,7 @@ impl ScanPort {
             cur: Mutex::new(None),
             tunes: Mutex::new(Vec::new()),
             fail_tune,
+            gaps: Mutex::new(Vec::new()),
             tx: broadcast::channel(16).0,
         });
         let weak = Arc::downgrade(&p);
@@ -104,29 +164,56 @@ impl ScanPort {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos() as u64;
+            let block_ms = delivery.block_ms();
             let mut tick = tokio::time::interval(Duration::from_millis(BLOCK_MS));
-            let mut cache: Option<(Tuning, Arc<[Complex<f32>]>)> = None;
+            let mut cache: Vec<(Tuning, Arc<[Complex<f32>]>)> = Vec::new();
+            let mut sent = 0u64;
             for k in 0u64.. {
                 tick.tick().await;
                 let Some(p) = weak.upgrade() else { return };
                 let Some(t) = p.current() else { continue };
-                if cache.as_ref().is_none_or(|(c, _)| *c != t) {
-                    cache = Some((t, block_samples(t)));
+                if matches!(delivery, Delivery::Stalling(n) if sent >= n) {
+                    continue;
                 }
-                let samples = cache.as_ref().expect("filled").1.clone();
+                let samples = match cache.iter().find(|(c, _)| *c == t) {
+                    Some((_, s)) => s.clone(),
+                    None => {
+                        let s = block_samples(t, block_ms);
+                        cache.push((t, s.clone()));
+                        s
+                    }
+                };
+                let mut t0 = base + k * block_ms * 1_000_000;
+                if matches!(delivery, Delivery::Gapping) {
+                    t0 += (k / 3) * 1_000_000;
+                    if k > 0 && k % 3 == 0 {
+                        p.gaps.lock().unwrap().push(t0);
+                    }
+                }
                 let _ = p.tx.send(IqBlock {
-                    t0: Timestamp(base + k * BLOCK_MS * 1_000_000),
+                    t0: Timestamp(t0),
                     sample_rate_hz: t.bandwidth_hz,
                     center_hz: t.center_hz,
                     samples,
                 });
+                sent += 1;
             }
         });
         p
     }
 
     fn tunes(&self) -> Vec<Tuning> {
-        self.tunes.lock().unwrap().clone()
+        self.tunes.lock().unwrap().iter().map(|(t, _)| *t).collect()
+    }
+
+    /// When each tune was asked for.
+    fn tuned_at(&self) -> Vec<Instant> {
+        self.tunes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, at)| *at)
+            .collect()
     }
 }
 
@@ -143,7 +230,7 @@ impl Port for ScanPort {
         if self.fail_tune.is_some_and(|f| n >= f) {
             return Err(PortError::Io(format!("tune {n} refused")));
         }
-        self.tunes.lock().unwrap().push(t);
+        self.tunes.lock().unwrap().push((t, Instant::now()));
         *self.cur.lock().unwrap() = Some(t);
         Ok(t)
     }
@@ -155,17 +242,24 @@ impl Port for ScanPort {
     }
 }
 
-/// Stands in for the dsp `fft` stage (core cannot depend on it): one event
-/// per input block with the params' `size`, `notch_hz` and `edge_mask`, the
-/// block's `center_hz`, its sample count and the tone it carries (mean phase
-/// step). Its params check refuses an `edge_mask` outside `0..0.5` naming the
-/// field, as the real stage does.
-struct FakeFft(StageSpec);
+/// Stands in for the dsp `fft` stage (core cannot depend on it). It cuts each
+/// input block into rows as the real stage does: `row_frames` frames of `size`
+/// each when the params give it, else the whole frames of `1 / rows_per_s`
+/// seconds; a partial row at the block's end is dropped. One event per row with
+/// the params' `size`, `rows_per_s`, `row_frames`, `notch_hz` and `edge_mask`,
+/// the block's `center_hz`, the row's sample count and the tone it carries (mean
+/// phase step); the frame's span is the row's. Its params check refuses an
+/// `edge_mask` outside `0..0.5` naming the field, as the real stage does. The
+/// slow one sleeps `delay` before each run.
+struct FakeFft {
+    spec: StageSpec,
+    delay: Duration,
+}
 
 #[async_trait]
 impl Stage for FakeFft {
     fn spec(&self) -> &StageSpec {
-        &self.0
+        &self.spec
     }
     fn backend(&self) -> Backend {
         Backend::Cpu
@@ -185,6 +279,11 @@ impl Stage for FakeFft {
         cancel: CancellationToken,
         _ctx: StageContext,
     ) -> Result<(), StageError> {
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(StageError::Cancelled),
+            _ = tokio::time::sleep(self.delay) => {}
+        }
+        let size = params["size"].as_u64().expect("a size") as usize;
         let rx = &mut inputs[0];
         loop {
             let frame = tokio::select! {
@@ -198,40 +297,62 @@ impl Stage for FakeFft {
             let Payload::Iq(b) = &frame.payload else {
                 continue;
             };
-            let s = &b.samples;
-            let acc: Complex<f64> = s
-                .windows(2)
-                .map(|w| {
-                    let p = w[1] * w[0].conj();
-                    Complex::new(p.re as f64, p.im as f64)
-                })
-                .sum();
-            let tone = acc.arg() * b.sample_rate_hz.0 as f64 / (2.0 * std::f64::consts::PI);
-            let ev = serde_json::json!({
-                "size": params["size"],
-                "notch_hz": params["notch_hz"].clone(),
-                "edge_mask": params["edge_mask"].clone(),
-                "center_hz": b.center_hz.0,
-                "samples": s.len(),
-                "tone_hz": tone,
-            });
-            bus.publish(Frame::new(
-                outputs[0].clone(),
-                frame.provenance.clone(),
-                Payload::Event(ev),
-            ));
+            let rate = b.sample_rate_hz.0;
+            let row_len = match params["row_frames"].as_u64() {
+                Some(n) => n as usize * size,
+                None => {
+                    let per_row = rate.div_ceil(params["rows_per_s"].as_u64().unwrap_or(20));
+                    (per_row as usize).div_ceil(size).max(1) * size
+                }
+            };
+            let ns = |n: usize| (n as u128 * 1_000_000_000 / rate as u128) as u64;
+            for (k, s) in b.samples.chunks_exact(row_len).enumerate() {
+                let acc: Complex<f64> = s
+                    .windows(2)
+                    .map(|w| {
+                        let p = w[1] * w[0].conj();
+                        Complex::new(p.re as f64, p.im as f64)
+                    })
+                    .sum();
+                let tone = acc.arg() * rate as f64 / (2.0 * std::f64::consts::PI);
+                let ev = serde_json::json!({
+                    "size": params["size"],
+                    "rows_per_s": params["rows_per_s"],
+                    "row_frames": params["row_frames"],
+                    "notch_hz": params["notch_hz"].clone(),
+                    "edge_mask": params["edge_mask"].clone(),
+                    "center_hz": b.center_hz.0,
+                    "samples": s.len(),
+                    "tone_hz": tone,
+                });
+                let mut prov = frame.provenance.clone();
+                let start = b.t0.0 + ns(k * row_len);
+                prov.span = Span {
+                    start_ns: Timestamp(start),
+                    end_ns: Timestamp(start + ns(row_len)),
+                };
+                bus.publish(Frame::new(outputs[0].clone(), prov, Payload::Event(ev)));
+            }
         }
     }
 }
 
 fn registry() -> StageRegistry {
+    registry_with(Duration::ZERO)
+}
+
+/// A registry whose `fft` sleeps `delay` before each run.
+fn registry_with(delay: Duration) -> StageRegistry {
     let mut r = StageRegistry::new();
-    r.register(Arc::new(FakeFft(StageSpec {
-        kind: "fft",
-        inputs: vec![StreamKind::Iq],
-        outputs: vec![StreamKind::Event],
-        params_schema: schemars::json_schema!({}),
-    })));
+    r.register(Arc::new(FakeFft {
+        spec: StageSpec {
+            kind: "fft",
+            inputs: vec![StreamKind::Iq],
+            outputs: vec![StreamKind::Event],
+            params_schema: schemars::json_schema!({}),
+        },
+        delay,
+    }));
     r
 }
 
@@ -276,10 +397,18 @@ async fn open_dwell(
     port: Arc<ScanPort>,
     dwell_ms: u64,
 ) -> (tempfile::TempDir, Node, Arc<ScanPort>) {
+    open_full(port, dwell_ms, registry()).await
+}
+
+async fn open_full(
+    port: Arc<ScanPort>,
+    dwell_ms: u64,
+    registry: StageRegistry,
+) -> (tempfile::TempDir, Node, Arc<ScanPort>) {
     let dir = tempfile::tempdir().unwrap();
     let node = Node::open(
         cfg_dwell(dir.path(), dwell_ms),
-        registry(),
+        registry,
         vec![port.clone()],
     )
     .await
@@ -289,12 +418,61 @@ async fn open_dwell(
 
 /// Start a scan over 0..40 MHz; its id and a receiver on its event stream.
 async fn start_scan(node: &Node) -> (JobId, broadcast::Receiver<Frame>) {
-    let id = match node.apply(start(JobKind::Scan, 20 * MHZ, 40 * MHZ)).await {
+    start_span(node, 20 * MHZ, 40 * MHZ).await
+}
+
+/// Start a scan of `bandwidth_hz` about `center_hz`; its id and a receiver on its event stream.
+async fn start_span(
+    node: &Node,
+    center_hz: u64,
+    bandwidth_hz: u64,
+) -> (JobId, broadcast::Receiver<Frame>) {
+    let id = match node
+        .apply(start(JobKind::Scan, center_hz, bandwidth_hz))
+        .await
+    {
         Ok(OpResult::Job(id)) => id,
         other => panic!("expected a job, got {other:?}"),
     };
     let rx = event_rx(node, &id);
     (id, rx)
+}
+
+/// Poll `f` every 20 ms until it holds, panicking with `what` after `within`.
+async fn until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + within;
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The next `n` rows on `rx` (lagged frames skipped), failing after `within`.
+async fn rows(rx: &mut broadcast::Receiver<Frame>, n: usize, within: Duration) -> Vec<Frame> {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut got = Vec::new();
+    while got.len() < n {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Ok(f)) => got.push(f),
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(e)) => panic!("the scan's stream ended: {e}"),
+            Err(_) => panic!("{} rows, wanted {n}", got.len()),
+        }
+    }
+    got
+}
+
+/// A row's event.
+fn ev(f: &Frame) -> &Value {
+    match &f.payload {
+        Payload::Event(v) => v,
+        other => panic!("scan stream carries events, got {other:?}"),
+    }
+}
+
+/// A row's channel, `scan/<step>`.
+fn channel(f: &Frame) -> &str {
+    &f.provenance.channel.as_ref().expect("a step channel").0
 }
 
 /// A receiver on job `id`'s event stream.
@@ -371,7 +549,7 @@ async fn scan_steps_the_port_across_the_span_and_emits_rows() {
     }
     assert!(seen[..3].iter().all(|&n| n >= 2), "rows per step {seen:?}");
     // The ring held a contiguous run, so a dwell read spanned several blocks.
-    let one = block_len(16 * MHZ) as u64;
+    let one = block_len(16 * MHZ, BLOCK_MS) as u64;
     eprintln!("largest dwell read {most} samples, one block {one}");
     assert!(
         most >= 2 * one,
@@ -464,24 +642,25 @@ async fn tune_fault_releases_the_scan_lease() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_list_stays_flat_across_sweeps() {
-    // A 100 ms dwell leaves a wide margin between a tune and the step's fft.
     let (_dir, node, port) = open_dwell(ScanPort::new(), 100).await;
     let (_id, _rx) = start_scan(&node).await;
-    // Both counts are taken just after a tune, inside the step's dwell, when
-    // no step's fft streams are live: after the first tune, and after the
-    // sixth (the last step of one even and one odd sweep, three steps each).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let count_after_tune = async |n: usize| {
-        while port.tunes().len() < n {
-            assert!(tokio::time::Instant::now() < deadline, "scan stalled");
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        node.bus().list().len()
-    };
-    let before = count_after_tune(1).await;
-    let after = count_after_tune(6).await;
-    eprintln!("streams before {before}, after two sweeps {after}");
-    assert_eq!(before, after, "per-step fft streams must be unregistered");
+    // The first count is taken as the scan starts, inside its first 100 ms
+    // dwell, before any step's fft has run. One step's fft runs beside the
+    // next step's wait, so after the sixth tune (the last step of one even and
+    // one odd sweep, three steps each) the count comes back to it once that
+    // fft has ended, well inside a dwell; per-step streams left registered
+    // never would.
+    let before = node.bus().list().len();
+    until("six tunes", Duration::from_secs(10), || {
+        port.tunes().len() >= 6
+    })
+    .await;
+    until(
+        "the stream count comes back to the first one",
+        Duration::from_secs(5),
+        || node.bus().list().len() == before,
+    )
+    .await;
 }
 
 /// Counts `make` calls and declines every band.
@@ -532,8 +711,16 @@ async fn scan_context_carries_its_step_count() {
     let ctx = node.job_context(&id).expect("the scan has a context");
     assert_eq!(ctx["scan"]["steps"], 3, "{ctx}");
     assert_eq!(ctx["scan"]["step_hz"], 16 * MHZ, "{ctx}");
-    // The harness opens the node with a 20 ms dwell.
+    // The harness opens the node with a 20 ms dwell: 78 frames of 4096 at 16 MHz, 19.968 ms.
     assert_eq!(ctx["scan"]["dwell_ms"], 20, "{ctx}");
+    assert!(ctx["scan"].get("dwell_ms_asked").is_none(), "{ctx}");
+    node.job_stop(&id).await.unwrap();
+    // On a 256 kHz step a 1 ms dwell is under four frames of 1024: 16 ms (4096 samples) is the dwell.
+    let (_dir, node, _port) = open_dwell(ScanPort::fast(), 1).await;
+    let (id, _rx) = start_span(&node, 100 * MHZ, FAST_RATE_HZ).await;
+    let ctx = node.job_context(&id).expect("the scan has a context");
+    assert_eq!(ctx["scan"]["dwell_ms"], 16, "{ctx}");
+    assert_eq!(ctx["scan"]["dwell_ms_asked"], 1, "{ctx}");
     node.job_stop(&id).await.unwrap();
 }
 
@@ -719,5 +906,169 @@ async fn graph_put_on_a_scan_changes_its_mask() {
         node.job_context(&id).unwrap()["scan"]["mask"]["edge_mask"],
         0.25
     );
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A port that hands over a whole dwell at once is stepped as fast as it does:
+/// the scan does not sleep the dwell away.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_that_delivers_fast_is_stepped_fast() {
+    let (_dir, node, port) = open_dwell(ScanPort::fast(), 200).await;
+    // Three 256 kHz steps; a 200 ms dwell (50 frames of 1024) slept on each would take 2 s for ten.
+    let (id, _rx) = start_span(&node, 100 * MHZ, 3 * FAST_RATE_HZ).await;
+    tunes_at_least(&port, 10, Duration::from_secs(1)).await;
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(ctx["scan"]["steps"], 3, "{ctx}");
+    assert_eq!(ctx["scan"]["dwell_ms"], 200, "{ctx}");
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A port that stops delivering costs each step its wait (the dwell and the
+/// margin), then the step is skipped: the scan keeps stepping and keeps running.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_that_stops_delivering_is_skipped_not_hung() {
+    let (_dir, node, port) = open_dwell(ScanPort::stalling(20), 20).await;
+    let (id, _rx) = start_scan(&node).await;
+    // 20 blocks are 100 ms of samples; the steps after them wait 520 ms each.
+    until(
+        "tunes after the port stalled",
+        Duration::from_secs(15),
+        || port.tunes().len() >= 8,
+    )
+    .await;
+    assert_eq!(
+        node.job_list().iter().find(|r| r.id == id).unwrap().state,
+        JobState::Running
+    );
+    let at = port.tuned_at();
+    let last = at[at.len() - 1] - at[at.len() - 2];
+    assert!(
+        last >= Duration::from_millis(500),
+        "a step with no samples waited only {last:?}"
+    );
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A slow fft does not reorder the rows: one step's fft at a time, in step order.
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_come_out_in_step_order_with_a_slow_fft() {
+    let (_dir, node, _port) = open_full(
+        ScanPort::new(),
+        20,
+        registry_with(Duration::from_millis(50)),
+    )
+    .await;
+    let (id, mut rx) = start_scan(&node).await;
+    let got = rows(&mut rx, 6, Duration::from_secs(10)).await;
+    let channels: Vec<&str> = got.iter().map(channel).collect();
+    assert_eq!(
+        channels,
+        ["scan/0", "scan/1", "scan/2", "scan/0", "scan/1", "scan/2"]
+    );
+    // Even then odd: 9, 24, 40 MHz, then 9, 20, 36 MHz.
+    let centres: Vec<u64> = got
+        .iter()
+        .map(|f| ev(f)["center_hz"].as_u64().unwrap())
+        .collect();
+    assert_eq!(centres, [9, 24, 40, 9, 20, 36].map(|m| m * MHZ));
+    // Stopped while a step's fft sleeps: the step loop and the fft task both end,
+    // and the lease goes.
+    assert_eq!(node.debug_stage_count(), 2);
+    node.job_stop(&id).await.unwrap();
+    until("the scan's tasks end", Duration::from_secs(5), || {
+        node.debug_stage_count() == 0
+    })
+    .await;
+    assert!(node.lease_holders(&SourceId("radio0".into())).is_empty());
+}
+
+/// A dwell under 100 ms is one row a step: the fft stage is told to close a
+/// row on the dwell's frames, and the row says `1000 / dwell_ms` rows a second.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_dwell_publishes_one_row_a_step() {
+    let (_dir, node, _port) = open_dwell(ScanPort::new(), 20).await;
+    let (id, mut rx) = start_scan(&node).await;
+    let got = rows(&mut rx, 9, Duration::from_secs(10)).await;
+    for f in &got {
+        let ev = ev(f);
+        assert_eq!(ev["rows_per_s"], 50, "{ev}");
+        // 78 frames of 4096 at 16 MHz.
+        assert_eq!(ev["row_frames"], 78, "{ev}");
+        assert_eq!(ev["samples"], 78 * 4096, "{ev}");
+    }
+    // A step with two rows would show its channel twice in a row.
+    for w in got.windows(2) {
+        assert_ne!(channel(&w[0]), channel(&w[1]), "two rows from one step");
+    }
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A dwell of 100 ms or more is cut as a spectrum is, 20 rows a second within the step.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dwell_of_100_ms_keeps_20_rows_a_second() {
+    let (_dir, node, _port) = open_dwell(ScanPort::new(), 100).await;
+    let (id, mut rx) = start_scan(&node).await;
+    assert_eq!(node.job_context(&id).unwrap()["scan"]["dwell_ms"], 100);
+    for f in rows(&mut rx, 4, Duration::from_secs(10)).await {
+        let ev = ev(&f);
+        assert_eq!(ev["rows_per_s"], 20, "{ev}");
+        assert!(ev["row_frames"].is_null(), "{ev}");
+        let span = f.provenance.span;
+        let ms = (span.end_ns.0 - span.start_ns.0) as f64 / 1e6;
+        assert!((45.0..=55.0).contains(&ms), "a {ms} ms row");
+    }
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A scan of one step retunes to the same centre, which keeps the ring: each
+/// step must still take samples newer than the last step's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_step_scan_takes_fresh_samples_each_step() {
+    let (_dir, node, port) = open().await;
+    let (id, mut rx) = start_span(&node, 100 * MHZ, MHZ).await;
+    let got = rows(&mut rx, 8, Duration::from_secs(10)).await;
+    assert!(port.tunes().len() >= 8, "{} tunes", port.tunes().len());
+    for w in got.windows(2) {
+        let (a, b) = (&w[0].provenance.span, &w[1].provenance.span);
+        assert!(
+            b.start_ns.0 >= a.end_ns.0,
+            "a row starting at {} overlaps the one before, ending at {}",
+            b.start_ns.0,
+            a.end_ns.0
+        );
+    }
+    node.job_stop(&id).await.unwrap();
+}
+
+/// Samples lost inside a dwell restart the ring's run, and the step's wait goes
+/// on from the new run within its timeout: rows still come, none across a gap.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_inside_a_dwell_restarts_the_wait() {
+    // A 10 ms dwell (39 frames of 4096) fits in the port's 15 ms runs, not in what is
+    // left of a run the tune lands in.
+    let (_dir, node, port) = open_dwell(ScanPort::gapping(), 10).await;
+    let (id, mut rx) = start_scan(&node).await;
+    let got = rows(&mut rx, 9, Duration::from_secs(10)).await;
+    let gaps = port.gaps.lock().unwrap().clone();
+    assert!(!gaps.is_empty());
+    for f in &got {
+        let (span, ev) = (&f.provenance.span, ev(f));
+        assert_eq!(ev["samples"], 39 * 4096, "{ev}");
+        assert!(
+            !gaps
+                .iter()
+                .any(|&g| span.start_ns.0 < g && g < span.end_ns.0),
+            "a row across a gap: {span:?}"
+        );
+    }
+    // One row a step and no step skipped for its gap: the channels go round 0, 1, 2.
+    let step = |f: &Frame| channel(f)["scan/".len()..].parse::<usize>().unwrap();
+    for w in got.windows(2) {
+        assert_eq!(
+            step(&w[1]),
+            (step(&w[0]) + 1) % 3,
+            "a step skipped or doubled"
+        );
+    }
     node.job_stop(&id).await.unwrap();
 }

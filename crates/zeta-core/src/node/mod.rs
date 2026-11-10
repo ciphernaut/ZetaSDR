@@ -365,6 +365,9 @@ struct Inner {
     bus: Arc<StreamBus>,
     ports: RwLock<HashMap<SourceId, Arc<dyn Port>>>,
     rings: Mutex<HashMap<SourceId, Arc<RwLock<IqRing>>>>,
+    /// Per source, bumped by `feed_ring` after each block it pushes into the ring (see
+    /// [`Inner::ring_tick`]).
+    ring_ticks: Mutex<HashMap<SourceId, Arc<tokio::sync::watch::Sender<u64>>>>,
     bank_factory: RwLock<Option<Arc<dyn BankFactory>>>,
     banks: Mutex<HashMap<SourceId, BankSlot>>,
     jobs: Mutex<HashMap<JobId, JobEntry>>,
@@ -385,7 +388,8 @@ struct Inner {
     /// Running transcript tees (see [`Inner::tee_transcripts`]).
     tees: Arc<std::sync::atomic::AtomicUsize>,
     /// Running tasks of every job's stage set (its stages, its IQ forwarder, a
-    /// scan's step loop), so a run left behind by a launch shows (see `StageRunning`).
+    /// scan's step loop and FFT task), so a run left behind by a launch shows (see
+    /// `StageRunning`).
     stages: Arc<std::sync::atomic::AtomicUsize>,
     /// The last run handed out (see [`JobEntry::run`]).
     runs: std::sync::atomic::AtomicU64,
@@ -410,6 +414,22 @@ struct Inner {
 }
 
 impl Inner {
+    /// A receiver that changes each time `feed_ring` has pushed a block of `source`
+    /// into its ring, so a reader waits on the ring instead of polling it.
+    pub(crate) fn ring_tick(&self, source: &SourceId) -> tokio::sync::watch::Receiver<u64> {
+        self.ring_tick_tx(source).subscribe()
+    }
+
+    /// The sender behind [`Inner::ring_tick`], made on first use by either side.
+    pub(crate) fn ring_tick_tx(&self, source: &SourceId) -> Arc<tokio::sync::watch::Sender<u64>> {
+        self.ring_ticks
+            .lock()
+            .unwrap()
+            .entry(source.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::watch::channel(0).0))
+            .clone()
+    }
+
     /// The decoder modes as they stand now: one registry, which a caller keeps for the
     /// whole of one use so a reload meanwhile never mixes two sets of rows.
     pub(crate) fn modes(&self) -> Arc<ModeRegistry> {
@@ -1034,6 +1054,7 @@ impl Node {
                 bus,
                 ports: RwLock::new(HashMap::new()),
                 rings: Mutex::new(HashMap::new()),
+                ring_ticks: Mutex::new(HashMap::new()),
                 bank_factory: RwLock::new(cfg.bank_factory),
                 banks: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
@@ -2453,7 +2474,7 @@ impl Node {
         self.inner.tees.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Tasks running for jobs' stages (each stage, IQ forwarder and scan loop);
+    /// Tasks running for jobs' stages (each stage, IQ forwarder, scan step loop and FFT task);
     /// 0 when no job runs. `GET /health` reports it as `stages_running`.
     pub fn debug_stage_count(&self) -> usize {
         self.inner.stages.load(std::sync::atomic::Ordering::SeqCst)

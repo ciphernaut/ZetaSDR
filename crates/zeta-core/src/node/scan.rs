@@ -1,11 +1,14 @@
-//! The `scan` job: time-shares one radio across a span wider than its capture,
-//! stepping the source across the span and publishing one `fft` stage's rows per
-//! step (see [`scan_loop`]).
+//! The `scan` job: time-shares one radio across a span wider than its capture.
+//! A step loop ([`scan_loop`]) tunes the source to each step, waits on the ring
+//! for the step's dwell of settled samples and hands them to one FFT task
+//! ([`fft_task`]), which runs the `fft` stage over each step in order and
+//! publishes its row on the scan's stream. There is no sleep: a step costs its
+//! tune and the time its samples take to arrive.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::OwnedMutexGuard;
+use tokio::sync::{OwnedMutexGuard, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -14,8 +17,9 @@ use super::{Inner, JobOutput, NodeError, source_fault_reason};
 use crate::graph::{self, GraphError, NodeId};
 use crate::job::JobRecord;
 use crate::ops::{
-    JobKind, SPECTRUM_ROWS_PER_S, ScanGrid, scan_edge_mask_in_force, scan_grid, scan_mask_default,
-    scan_notch_in_force, spectrum_size,
+    JobKind, SCAN_ROWS_DWELL_MS, SCAN_WAIT_MARGIN_MS, SPECTRUM_ROWS_PER_S, ScanGrid,
+    scan_dwell_samples, scan_edge_mask_in_force, scan_grid, scan_mask_default, scan_notch_in_force,
+    spectrum_size,
 };
 use crate::port::{IqBlock, Port};
 use crate::stage::{Stage, StageContext, StageError};
@@ -109,6 +113,8 @@ impl Inner {
             }
         }
         let id = rec.id.clone();
+        // The dwell in force on the first step: whole frames, never under four.
+        let (_, dwell_ms) = scan_dwell_samples(self.scan_dwell_ms, w, spectrum_size(w));
         // `job_context` tells a reader (the agent above all) how many steps a
         // sweep takes, how the odd sweeps shift and the mask in force, instead
         // of leaving it to guess from the rows.
@@ -124,23 +130,25 @@ impl Inner {
             } else {
                 serde_json::Value::Null
             };
-            ctx.insert(
-                "scan".into(),
-                serde_json::json!({
-                    "steps": grid.even.len(),
-                    "step_hz": w,
-                    "dwell_ms": self.scan_dwell_ms,
-                    "alternate": alternate,
-                    "mask": {"notch_hz": notch_hz, "edge_mask": edge_mask},
-                }),
-            );
+            let mut scan = serde_json::json!({
+                "steps": grid.even.len(),
+                "step_hz": w,
+                "dwell_ms": dwell_ms,
+                "alternate": alternate,
+                "mask": {"notch_hz": notch_hz, "edge_mask": edge_mask},
+            });
+            if dwell_ms != self.scan_dwell_ms {
+                scan["dwell_ms_asked"] = self.scan_dwell_ms.into();
+            }
+            ctx.insert("scan".into(), scan);
         }
         let token = self.shutdown.child_token();
         let (prov, run, ended) = self.record_running(rec, &token)?;
         let out = self.bus.register_unfed(StreamKind::Event, prov.clone());
-        let scan = Scan {
+        let scan = Arc::new(Scan {
             id: id.clone(),
             grid,
+            dwell_ms: self.scan_dwell_ms,
             notch_hz,
             edge_mask,
             port: port.clone(),
@@ -149,15 +157,25 @@ impl Inner {
             prov,
             out: out.clone(),
             cancel: token.clone(),
-        };
+        });
+        // The hand-off: one step waiting while the FFT task runs another.
+        let (tx, rx) = mpsc::channel(1);
         let mut set = JoinSet::new();
-        let (running, scan) = (
+        let (running, steps) = (
             StageRunning::new(self.stages.clone()),
-            scan_loop(self.clone(), scan),
+            scan_loop(self.clone(), scan.clone(), tx),
         );
         set.spawn(async move {
             let _running = running;
-            scan.await
+            steps.await
+        });
+        let (running, ffts) = (
+            StageRunning::new(self.stages.clone()),
+            fft_task(self.clone(), scan, rx),
+        );
+        set.spawn(async move {
+            let _running = running;
+            ffts.await
         });
         let h = tokio::spawn(supervise(
             self.clone(),
@@ -177,39 +195,30 @@ impl Inner {
         Ok(())
     }
 
-    /// The last `dwell` of `source`'s ring as one block, if the ring holds
-    /// samples captured at `center` (the step's band, not an earlier one's).
-    fn dwell_block(&self, source: &SourceId, center: Hz, dwell: Duration) -> Option<IqBlock> {
+    /// The first `samples` of `source`'s ring at `center` after `after` (see
+    /// [`crate::ring::IqRing::run_after`]), or `None` while it holds fewer.
+    fn ring_run_after(
+        &self,
+        source: &SourceId,
+        center: Hz,
+        after: Option<Timestamp>,
+        samples: usize,
+    ) -> Option<IqBlock> {
         let ring = self.rings.lock().unwrap().get(source).cloned()?;
         let ring = ring.read().unwrap();
-        if ring.center_hz() != Some(center) {
-            return None;
-        }
-        let (earliest, latest) = (ring.earliest()?, ring.latest()?);
-        let dwell_ns = u64::try_from(dwell.as_nanos()).unwrap_or(u64::MAX);
-        let start = latest.0.saturating_sub(dwell_ns).max(earliest.0);
-        let samples = ring
-            .read(Span {
-                start_ns: Timestamp(start),
-                end_ns: latest,
-            })
-            .ok()?;
-        Some(IqBlock {
-            t0: Timestamp(start),
-            sample_rate_hz: ring.sample_rate_hz(),
-            center_hz: center,
-            samples: samples.into(),
-        })
+        ring.run_after(center, after, samples)
     }
 }
 
 /// What a running scan needs: its lease holder id, the grids its sweeps
-/// alternate between, the mask its `fft` runs apply (`notch_hz` the notch in
-/// force), the `fft` stage, and its output stream.
+/// alternate between, the dwell asked for (ms; each step takes it in whole
+/// frames, [`scan_dwell_samples`]), the mask its `fft` runs apply (`notch_hz`
+/// the notch in force), the `fft` stage, and its output stream.
 struct Scan {
     id: JobId,
     port: Arc<dyn Port>,
     grid: ScanGrid,
+    dwell_ms: u64,
     notch_hz: u64,
     edge_mask: f64,
     stage: Arc<dyn Stage>,
@@ -219,18 +228,44 @@ struct Scan {
     cancel: CancellationToken,
 }
 
-/// The `scan` job's body, until cancelled: tune the source to each step of the
-/// sweep in turn (under the lease gate; even sweeps take the grid's even
-/// steps, odd ones its odd steps), wait the node's dwell, run the `fft` stage
-/// over the step's last dwell of ring samples (skipped when the ring holds
-/// less than one FFT of the step's band), and re-publish its rows on the
-/// job's stream with channel `scan/<step index>` (the index within the
-/// sweep's own list) and the step's `center_hz`.
-/// Cancellation is checked before every tune. A failed tune or a port fault
-/// fails the job; the port is left at the last step.
-async fn scan_loop(inner: Arc<Inner>, s: Scan) -> Result<(), StageError> {
-    let dwell = Duration::from_millis(inner.scan_dwell_ms);
+/// One step's dwell, handed from [`scan_loop`] to [`fft_task`]: the sweep and
+/// the step's index within that sweep's list, the centre it was taken at, its
+/// samples and how many FFT frames they are.
+struct Step {
+    #[expect(
+        dead_code,
+        reason = "a row's sweep is not published; kept for averaging by grid"
+    )]
+    sweep: u64,
+    index: usize,
+    center: Hz,
+    block: IqBlock,
+    frames: u32,
+}
+
+/// The `scan` job's step loop, until cancelled: tune the source to each step
+/// of the sweep in turn (under the lease gate; even sweeps take the grid's
+/// even steps, odd ones its odd steps), wait until the node's ring holds the
+/// step's dwell of samples at the new centre ([`scan_dwell_samples`]; the
+/// source delivers only settled samples after a tune, so the first ones at the
+/// centre are taken) and hand exactly those to the FFT task. At a centre the
+/// last step was also at (a one-step scan), the samples are the ones after
+/// the last step's. When they have not arrived by the dwell plus
+/// [`SCAN_WAIT_MARGIN_MS`] the step is skipped; samples lost inside a dwell
+/// restart the ring's run and the wait goes on from there. A hand-off waits
+/// while the FFT task still has one step queued.
+/// Cancellation is checked before every tune and ends every wait. A failed
+/// tune or a port fault fails the job; the port is left at the last step.
+async fn scan_loop(
+    inner: Arc<Inner>,
+    s: Arc<Scan>,
+    tx: mpsc::Sender<Step>,
+) -> Result<(), StageError> {
     let faulted = |f: String| StageError::Failed(source_fault_reason(s.port.id(), &f));
+    let source = &s.prov.source;
+    let mut tick = inner.ring_tick(source);
+    // The centre and the end of the last block taken.
+    let mut taken: Option<(Hz, Timestamp)> = None;
     let (mut sweep, mut i) = (0u64, 0usize);
     loop {
         // Checked before each tune, so a stopped scan never retunes again; a
@@ -248,18 +283,36 @@ async fn scan_loop(inner: Arc<Inner>, s: Scan) -> Result<(), StageError> {
             Ok(None) => return Err(StageError::Cancelled),
             Err(e) => return Err(faulted(e.to_string())),
         };
-        tokio::select! {
+        let size = spectrum_size(steps[i].bandwidth_hz.0);
+        let (samples, dwell_ms) = scan_dwell_samples(s.dwell_ms, got.bandwidth_hz.0, size);
+        let after = taken
+            .filter(|(c, _)| *c == got.center_hz)
+            .map(|(_, end)| end);
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(dwell_ms.saturating_add(SCAN_WAIT_MARGIN_MS));
+        let block = tokio::select! {
             _ = s.cancel.cancelled() => return Err(StageError::Cancelled),
-            _ = tokio::time::sleep(dwell) => {}
-        }
+            b = wait_for_run(&inner, &mut tick, source, got.center_hz, after, samples, deadline) => b,
+        };
         if let Some(f) = s.port.fault() {
             return Err(faulted(f));
         }
-        let size = spectrum_size(steps[i].bandwidth_hz.0);
-        if let Some(block) = inner.dwell_block(&s.prov.source, got.center_hz, dwell)
-            && block.samples.len() >= size as usize
-        {
-            fft_step(&inner, &s, i, got.center_hz, block, size).await?;
+        if let Some(block) = block {
+            taken = Some((got.center_hz, span_of(&block).end_ns));
+            let step = Step {
+                sweep,
+                index: i,
+                center: got.center_hz,
+                block,
+                frames: u32::try_from(samples / u64::from(size)).unwrap_or(u32::MAX),
+            };
+            tokio::select! {
+                _ = s.cancel.cancelled() => return Err(StageError::Cancelled),
+                // A closed channel: the FFT task ended, and its end is the job's.
+                sent = tx.send(step) => if sent.is_err() {
+                    return Err(StageError::Cancelled);
+                },
+            }
         }
         i += 1;
         if i == steps.len() {
@@ -269,26 +322,97 @@ async fn scan_loop(inner: Arc<Inner>, s: Scan) -> Result<(), StageError> {
     }
 }
 
-/// Run the scan's `fft` stage to completion over `block` as a one-shot IQ
-/// stream, then forward the rows it emitted to the scan's stream, tagged
-/// with channel `scan/<step>` and `center_hz`. Rows wait in the stage's
-/// output stream (bus capacity) until the stage ends; one dwell yields a few.
-async fn fft_step(
-    inner: &Arc<Inner>,
-    s: &Scan,
-    step: usize,
+/// The first `samples` of `source`'s ring at `center` after `after`, as soon
+/// as the ring holds them: checked now and again at each ring tick, until
+/// `deadline` (then `None`).
+async fn wait_for_run(
+    inner: &Inner,
+    tick: &mut tokio::sync::watch::Receiver<u64>,
+    source: &SourceId,
     center: Hz,
-    block: IqBlock,
-    size: u32,
-) -> Result<(), StageError> {
+    after: Option<Timestamp>,
+    samples: u64,
+    deadline: tokio::time::Instant,
+) -> Option<IqBlock> {
+    let samples = usize::try_from(samples).ok()?;
+    loop {
+        // Marked seen before the ring is read, so a push in between is a change.
+        tick.mark_unchanged();
+        if let Some(block) = inner.ring_run_after(source, center, after, samples) {
+            return Some(block);
+        }
+        match tokio::time::timeout_at(deadline, tick.changed()).await {
+            Ok(Ok(())) => {}
+            // The node keeps every tick's sender, so this is its end: nothing more comes.
+            Ok(Err(_)) => {
+                tokio::time::sleep_until(deadline).await;
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// The span of signal time `block` covers.
+fn span_of(block: &IqBlock) -> Span {
     let rate = block.sample_rate_hz.0.max(1) as u128;
-    let end = block.t0.0 + (block.samples.len() as u128 * 1_000_000_000 / rate) as u64;
+    let ns = block.samples.len() as u128 * 1_000_000_000 / rate;
+    Span {
+        start_ns: block.t0,
+        end_ns: Timestamp(block.t0.0 + ns as u64),
+    }
+}
+
+/// The scan's FFT task: run [`fft_step`] over each step [`scan_loop`] hands
+/// over, one at a time and in order, so the rows go out in step order. Ends
+/// when cancelled or when the loop has ended (the channel closed).
+async fn fft_task(
+    inner: Arc<Inner>,
+    s: Arc<Scan>,
+    mut rx: mpsc::Receiver<Step>,
+) -> Result<(), StageError> {
+    loop {
+        let step = tokio::select! {
+            _ = s.cancel.cancelled() => return Err(StageError::Cancelled),
+            r = rx.recv() => match r {
+                Some(step) => step,
+                // The loop ended, and its end is the job's.
+                None => return Err(StageError::Cancelled),
+            },
+        };
+        fft_step(&inner, &s, step).await?;
+    }
+}
+
+/// `rows_per_s` of a row that is a whole dwell of `dwell_ms`:
+/// `clamp(round(1000 / dwell_ms), 1, 60)`.
+fn dwell_rows_per_s(dwell_ms: u64) -> u32 {
+    let d = dwell_ms.max(1);
+    ((1000 + d / 2) / d).clamp(1, 60) as u32
+}
+
+/// Run the scan's `fft` stage to completion over the step's block as a
+/// one-shot IQ stream, then forward the rows it emitted to the scan's stream,
+/// tagged with channel `scan/<step>` and `center_hz`. A dwell under
+/// [`SCAN_ROWS_DWELL_MS`] is one row of all its frames (`row_frames`), whose
+/// `rows_per_s` says `1000 / dwell_ms`; a longer one is cut into
+/// `SPECTRUM_ROWS_PER_S` rows a second. Rows wait in the stage's output
+/// stream (bus capacity) until the stage ends.
+async fn fft_step(inner: &Inner, s: &Scan, step: Step) -> Result<(), StageError> {
+    let Step {
+        index,
+        center,
+        block,
+        frames,
+        ..
+    } = step;
+    // The dwell is `frames` whole frames.
+    let size = block.samples.len() / frames.max(1) as usize;
+    let rate = block.sample_rate_hz.0.max(1);
+    let dwell_ms = (block.samples.len() as u64 * 1000 + rate / 2) / rate;
     let prov = Provenance {
-        channel: Some(ChannelId(format!("scan/{step}"))),
-        span: Span {
-            start_ns: block.t0,
-            end_ns: Timestamp(end),
-        },
+        channel: Some(ChannelId(format!("scan/{index}"))),
+        span: span_of(&block),
         ..s.prov.clone()
     };
     let bus = &inner.bus;
@@ -299,13 +423,17 @@ async fn fft_step(
     bus.publish(Frame::new(input.clone(), prov.clone(), Payload::Iq(block)));
     // Closing the input ends the stage once it has drained the block.
     bus.unregister(&input);
-    let params = serde_json::json!({
+    let mut params = serde_json::json!({
         "size": size,
         "window": "hann",
         "rows_per_s": SPECTRUM_ROWS_PER_S,
         "notch_hz": s.notch_hz,
         "edge_mask": s.edge_mask,
     });
+    if dwell_ms < SCAN_ROWS_DWELL_MS {
+        params["row_frames"] = frames.into();
+        params["rows_per_s"] = dwell_rows_per_s(dwell_ms).into();
+    }
     let ran = s
         .stage
         .run(
@@ -336,5 +464,20 @@ async fn fft_step(
             ..prov.clone()
         };
         bus.publish(Frame::new(s.out.clone(), p, Payload::Event(v)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dwell_row_says_its_rate() {
+        assert_eq!(dwell_rows_per_s(20), 50);
+        assert_eq!(dwell_rows_per_s(19), 53);
+        assert_eq!(dwell_rows_per_s(341), 3);
+        assert_eq!(dwell_rows_per_s(1), 60);
+        assert_eq!(dwell_rows_per_s(0), 60);
+        assert_eq!(dwell_rows_per_s(5000), 1);
     }
 }
