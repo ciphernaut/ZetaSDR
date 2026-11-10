@@ -743,6 +743,16 @@ fn a_ground_station_frame_is_not_parsed() {
 fn an_adsc_fix_wins_over_a_text_report() {
     let mut line = vector("dumpvdl2-adsc.json");
     line["vdl2"]["avlc"]["acars"]["msg_text"] = json!("POSN10000W020000,ALPHA,025131,300,BRAVO");
+    // Control: without the ADS-C report the text parses, so only precedence keeps it out below.
+    let mut text_only = line.clone();
+    text_only["vdl2"]["avlc"]["acars"]
+        .as_object_mut()
+        .unwrap()
+        .remove("arinc622");
+    let ev = vdl2_event("m_text", "dumpvdl2-adsc.json", &text_only);
+    assert_eq!(ev["lat"], json!(10.0), "{ev}");
+    assert_eq!(ev["lon"], json!(-20.0), "{ev}");
+    assert_eq!(ev["alt_ft"], json!(30000), "{ev}");
     let ev = vdl2_event("m_both", "dumpvdl2-adsc.json", &line);
     assert_eq!(ev["lat"], json!(-27.38), "{ev}");
     assert_eq!(ev["lon"], json!(153.12), "{ev}");
