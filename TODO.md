@@ -571,7 +571,7 @@ From plan 30's live acceptance, 2026-11-07, at midnight local: no visible carrie
 Plan 32 (origins from the register lit on a Map tab, the dock, a Kiwi's position, map tiles) shipped without these:
 
 - Positions for `zeta-source-node` (forward the remote node's station as its position) and for VRT sources: today only a Kiwi's `/status` or `--source-position` gives a remote source a vantage, and a lookup on any other remote source answers `from` null.
-- Two strip panes at once (the Map beside the RF view), and a resizable dock: the dock is a fixed share (`DOCK_SHARE_DEFAULT`), switched between the bottom and the right column only. The right column itself is a fixed width too (`--side-w`, 360 px): with `view set dock right`, a wide table such as the ADS-B Subjects table scrolls sideways and nothing on the page widens the column (operator, UAT 32.5, 2026-11-10). A theme's `tokens` can set `--side-w`, so an operator theme in `--themes-dir` is a stopgap, but themes do not extend one another, so it means copying a whole theme. Ideas: a drag handle on the column's edge kept as a per-browser view setting, or a `view set side_w <px>`.
+- Two strip panes at once (the Map beside the RF view), and a resizable dock: the dock is a fixed share (`DOCK_SHARE_DEFAULT`), switched between the bottom and the right column only. See "Page: resizable side column and bottom pane" for the direction.
 - Fuzzy matching of decoded names against licensee names: identity confirmation matches a callsign exactly, so only an APRS-like `src` confirms a site.
 - Demotion rules for one-transmitter services (a broadcaster with one licence on one site scores like any fit): a service-aware term in the origin score.
 - The Explore table's licensee column still reads `allocations` (the nearest transmitter), not `origins` (the best-scored site), so the two can name different licensees for one capture.
@@ -619,6 +619,12 @@ From the 2026-11-08 live acceptance. The node keeps the 20 newest job records (`
 ## Modes: further ACARS position layouts
 
 Plan 34 reads the H1, 80, 16, 3L and QQ position forms from a downlink's text. Not yet read: the `RSI` table form (signed decimal degrees under a `LAT LON` header), and any further airline layouts that turn up in `events.log`. No dumphfdl fixture yet carries a text report, so HFDL's derive is untested end to end.
+
+## Page: resizable side column and bottom pane
+
+From the operator, 2026-11-10 (UAT 32.5). The right-hand column and the pane under the map or waterfall (Subjects, Bits, Transcript, Jobs) should both be resizable by the operator. Today all three sizes are fixed: the column is `--side-w` (360 px, a theme token), the right dock is `--dock-share` (40% of the column), and the bottom pane is a literal 40% of the main view's height in `style.css`, not even a token. A wide table such as the ADS-B Subjects table scrolls sideways in the column, and nothing on the page widens it.
+
+Direction: the sizes are the operator's layout, not a theme's look, so they must not mean editing every theme. Express each as a share of the screen: the side column as a percentage of the page's width, the bottom pane as a percentage of the main area's height, and the right dock as a percentage of the column's height. Set them by dragging the boundary, with a `view set` for each (so the agent and the CLI can set them too), kept with the other view policies. A theme may still give defaults; the operator's setting wins. Clamp each to a usable range (neither the main view nor the pane may vanish), and keep the narrow footprint's own layout. This is the sizing half of the canvas-layout direction in the node-editor gist.
 
 ## Modes: MIAM and ARINC 622 on plain ACARS
 
