@@ -656,6 +656,44 @@ fn the_vdl2_row_decodes_through_the_fake_program() {
     assert_eq!(code, 0);
 }
 
+/// The VDL2 row's `subject.station` on dumpvdl2 lines mapped by the row's own fields: a
+/// ground station's frame is its own, keyed on its `icao`; an aircraft frame counts `to`
+/// under the station it is addressed to (`dst`).
+#[test]
+fn the_vdl2_rows_station_counts_a_ground_stations_frame_and_an_aircraft_frame_to_it() {
+    use zeta_core::modes::{FieldPath, Station};
+    use zeta_core::node::{Grade, station_frame};
+    let row: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/vdl2_decode.json")).unwrap();
+    let fields: std::collections::BTreeMap<String, FieldPath> =
+        serde_json::from_value(row["decoder"]["output"]["fields"].clone()).unwrap();
+    let station: Station = serde_json::from_value(row["subject"]["station"].clone()).unwrap();
+    // The XID fixture, an aircraft's frame, addressed to the synthetic station `1A2B3C`.
+    let mut aircraft: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ext_vector("dumpvdl2-xid.json")).unwrap())
+            .unwrap();
+    aircraft["vdl2"]["avlc"]["dst"]["addr"] = serde_json::json!("1A2B3C");
+    let event = zeta_ext::apply_fields(&fields, &aircraft);
+    assert_eq!(event["addr_type"], "Aircraft", "{event}");
+    assert_eq!(
+        station_frame(&station, &event),
+        Some(("1A2B3C".to_string(), Grade::To)),
+        "{event}"
+    );
+    // The same exchange the other way: the ground station's own frame to the aircraft.
+    let mut ground = aircraft.clone();
+    let avlc = &mut ground["vdl2"]["avlc"];
+    avlc["src"] = serde_json::json!({"addr": "1A2B3C", "type": "Ground station"});
+    avlc["dst"] = serde_json::json!({"addr": "7C0000", "type": "Aircraft"});
+    let event = zeta_ext::apply_fields(&fields, &ground);
+    assert_eq!(event["icao"], "1A2B3C", "{event}");
+    assert_eq!(
+        station_frame(&station, &event),
+        Some(("1A2B3C".to_string(), Grade::From)),
+        "{event}"
+    );
+}
+
 /// The VDL2 row's derive reads an aircraft's H1 text position report when the frame
 /// carries no ADS-C report.
 #[test]

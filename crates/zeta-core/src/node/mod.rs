@@ -14,7 +14,7 @@ pub use origin::{
     ORIGIN_WIDTH_LOOSE, ORIGIN_WIDTH_NONE, ORIGIN_WIDTH_RANGE, Origin, OriginAnswer, OriginQuery,
     STATION_ANONYMOUS, STATION_REPUBLISH_MS, StationSeen, Terms, Vantage, answer as origin_answer,
     apply_stations, confirm, confirm_identity, heard_of, identity_value, job_modulation, score_row,
-    station_summary, summary,
+    station_frame, station_summary, summary,
 };
 mod persist;
 mod propose;
