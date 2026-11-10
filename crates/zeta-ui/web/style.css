@@ -224,10 +224,11 @@ html[data-main="map"] #waterfall { visibility: hidden; }
 #map path.map-site { stroke: var(--user); fill: var(--user); stroke-width: 2; fill-opacity: calc(0.8 * var(--site-brightness, 1)); stroke-opacity: calc(0.3 + 0.7 * var(--site-brightness, 1)); }
 #map path.map-site[data-agree="disagrees"] { fill: none; }
 /* A heard site (plan 35: the job decoded its ground station's frames, `from`, or frames sent
-   to it, `to`): filled whatever its designator says, a thin solid ring; `to` a shade fainter.
-   Distinct from the confirmed ring below, which wins on a site that is both. */
-#map path.map-site[data-heard] { fill: var(--user); stroke: var(--user); stroke-width: 1; stroke-dasharray: none; stroke-opacity: 1; }
-#map path.map-site[data-heard="to"] { fill-opacity: calc(0.55 * var(--site-brightness, 1)); stroke-opacity: 0.7; }
+   to it, `to`): filled whatever its designator says, a thin solid ring fading with the fill;
+   `to` a shade fainter. Distinct from the confirmed ring below, which wins on a site that is
+   both. */
+#map path.map-site[data-heard] { fill: var(--user); stroke: var(--user); stroke-width: 1; stroke-dasharray: none; stroke-opacity: calc(0.3 + 0.7 * var(--site-brightness, 1)); }
+#map path.map-site[data-heard="to"] { fill-opacity: calc(0.55 * var(--site-brightness, 1)); stroke-opacity: calc(0.7 * (0.3 + 0.7 * var(--site-brightness, 1))); }
 /* A site confirmed by a heard callsign or decoded id: a ring outside it. */
 #map path.map-site[data-confirmed] { stroke: var(--map-sel); stroke-width: 5; paint-order: stroke; stroke-opacity: 1; }
 #map path.map-bearing { stroke: var(--user); stroke-width: 1.5; fill: none; stroke-opacity: calc(0.7 * var(--site-brightness, 1)); }

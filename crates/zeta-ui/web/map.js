@@ -114,7 +114,8 @@
 //   store's ticks dims it with its subject, being heard again lights it, and a drop removes it.
 //   A lit set draws one L.circleMarker (class `map-site`, `data-agree` fits|disagrees|unknown
 //   from its best origin, `data-confirmed` when any is confirmed, the CSS custom property
-//   `--site-brightness` 0..1, the site's best score × the set's freshness) per distinct position
+//   `--site-brightness` 0..1, the site's best score × the set's freshness, a heard site's the
+//   freshness alone) per distinct position
 //   among its origins; a `disagrees` site is a dashed ring with no fill. A site whose best
 //   origin is `heard` (plan 35: the job decoded a fixed station's frame, or one addressed to
 //   it) carries `data-heard` from|to, its brightness its set's freshness alone (the score
@@ -775,8 +776,8 @@ class MapPane {
     this.centre([first.lat, first.lon]);
   }
 
-  // Each site's brightness, its best score × the set's freshness, on its marker and its
-  // bearing.
+  // Each site's brightness, its best score × the set's freshness (a heard site's score counts
+  // as 1, so its brightness is the freshness alone), on its marker and its bearing.
   paintSet(set) {
     if (!set.drawn) return;
     for (const part of set.drawn.parts) {
