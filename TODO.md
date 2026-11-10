@@ -718,7 +718,12 @@ The luma path's 3 MHz low-pass stands in for a chroma notch, and colour is not d
 
 ## Video: fixtures of the four bench transmitters
 
-0.5 s IQ cuts at 15.36 Msps cf32 (about 61 MB each as cf32, which the tests read) of each bench transmitter (a 5.8 GHz reverse camera, an FPV VTX, an HDMI sender, a 1.3 GHz VTX), kept out of the repository under a private path. The composite tests skip when they are absent, as `bits_chain.rs` does for private captures.
+Recorded 2026-11-10 (UAT 28.2) under a private path, kept out of the repository, with a note beside them.
+- What: 0.5 s IQ cuts at 30.72 Msps cf32 (about 123 MB each).
+  - The analog 1.3 GHz VTX in the 23 cm amateur band: clean at its rated 12 V, distorted when undervolted at 5 V.
+  - Two digital links, for a later layer-4 look that is parked: a 2.4 GHz frequency-hopping reversing camera (linked and idle), and a 5 GHz Wi-Fi-based HDMI sender's beacons.
+
+Still to do: point the composite tests at the analog cuts. A test reads them through an environment variable and skips when they are absent, as `bits_chain.rs` does for private captures. Decimate to the composite rate in the test, rather than keeping a second copy.
 
 ## Video: a thin rail tag hides its thumbnail
 
@@ -731,3 +736,22 @@ The decoder counts line 1 from the pre-equalising pulses; real PAL counts from t
 ## Video: odd and even field rows are not tested for alignment
 
 Fields are shown one at a time. Weaving the two fields into a frame is later, and needs a test that odd and even rows line up.
+
+## Video: B210 overflows at 30.72 Msps since plan 28.1
+
+UAT 28.2 (2026-11-10) found the field host's B210 overflowing about 15 times a minute at 30.72 Msps, where plan 28.1's probe measured none. On the 20.48 rung it was about 6 a minute. Each overflow costs the decoder a field, which the operator sees as ripping.
+
+The B210 sits on a chipset USB controller, shared with a webcam and an idle second SDR, while the CPU's own USB controller is empty. To do:
+1. Move the B210 to a CPU-attached port, or to a USB card of its own.
+2. Run the rate probe again (re-probe a radio: stop the node, drop the `capabilities` key from its source record, start it), and count the overflows a minute against today's.
+3. Report the overflow rate on the source (`stats.overflows` is cumulative), so a regression shows without a stopwatch.
+
+## Video: `sharp` runs at about 1 frame a second
+
+UAT 28.2: `sharp` (full width) showed about 1 frame a second on the bench, which is a slideshow. The spec's profile allows up to 5 a second, and `smooth` keeps up.
+
+Find where the rate goes: the full-width PNG encode on `spawn_blocking`, the newest-frame slot dropping under a slow encode, or the page's credit (`ws_credit_skipped` and `video_frames_skipped` on `/health`). Then either reach the profile's rate or make `sharp` an explicit stills mode.
+
+## Video: line timing jitter at modest SNR
+
+UAT 28.2: at 16-23 dB SNR the picture tears between the fields lost to overflows, presumably from line syncs misread in noise. Tune the line PLL (its gain and how it rejects an outlier edge) against the private 1.3 GHz fixtures, and add a test with noise added to a real cut.
