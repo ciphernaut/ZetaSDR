@@ -12,8 +12,8 @@ pub use origin::{
     ORIGIN_MODULATION_UNKNOWN, ORIGIN_NO_BAND_KINDS, ORIGIN_REACH_FLOOR, ORIGIN_REACH_IN,
     ORIGIN_REACH_UNKNOWN, ORIGIN_SITES, ORIGIN_SUMMARY_SITES, ORIGIN_WIDTH_FULL, ORIGIN_WIDTH_HALF,
     ORIGIN_WIDTH_LOOSE, ORIGIN_WIDTH_NONE, ORIGIN_WIDTH_RANGE, Origin, OriginAnswer, OriginQuery,
-    STATION_ANONYMOUS, StationSeen, Terms, Vantage, answer as origin_answer, apply_stations,
-    confirm, confirm_identity, heard_of, identity_value, job_modulation, score_row,
+    STATION_ANONYMOUS, STATION_REPUBLISH_MS, StationSeen, Terms, Vantage, answer as origin_answer,
+    apply_stations, confirm, confirm_identity, heard_of, identity_value, job_modulation, score_row,
     station_summary, summary,
 };
 mod persist;
@@ -215,6 +215,10 @@ struct JobEntry {
     /// a controller (`watch`) then leaves what it started for the next run to re-adopt
     /// instead of stopping it as a `job_stop` does.
     restarting: bool,
+    /// The job's fixed-station tally (design 4.2), counted by its rules tee, written into
+    /// `context.stations` at the throttle and by the supervisor at the run's end. Seeded
+    /// from the record's context, so a new entry (every launch) continues the counts.
+    stations: origin::StationTally,
 }
 
 impl JobEntry {
@@ -223,6 +227,7 @@ impl JobEntry {
     fn loaded(record: JobRecord, ended_ns: Timestamp) -> JobEntry {
         JobEntry {
             ended_ns,
+            stations: origin::StationTally::seeded(&record.context),
             record,
             run: 0,
             cancel: None,

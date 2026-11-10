@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -627,7 +628,8 @@ pub fn apply_stations(a: &mut OriginAnswer, stations: &BTreeMap<String, StationS
 /// <f> MHz: <entries>; <tail>`. The entries name the first [`ORIGIN_SUMMARY_SITES`]
 /// keys by descending `from + to` (ties by key): `<key> heard <n> frames` for a key
 /// with an own frame, else `<key> addressed by <n> frames`, the anonymous key
-/// ([`STATION_ANONYMOUS`]) reading `uplinks heard <n> frames`. The tail is
+/// ([`STATION_ANONYMOUS`]) reading `uplinks heard <n> frames` (`1 frame` for one, in
+/// every form). The tail is
 /// [`summary`]'s site list, or [`summary`] whole when nothing is lit. [`summary`]
 /// itself with an empty tally.
 pub fn station_summary(a: &OriginAnswer) -> String {
@@ -641,9 +643,9 @@ pub fn station_summary(a: &OriginAnswer) -> String {
         .iter()
         .take(ORIGIN_SUMMARY_SITES)
         .map(|(k, s)| match (k.as_str(), s.from > 0) {
-            (STATION_ANONYMOUS, _) => format!("uplinks heard {} frames", s.from),
-            (_, true) => format!("{k} heard {} frames", s.from),
-            (_, false) => format!("{k} addressed by {} frames", s.to),
+            (STATION_ANONYMOUS, _) => format!("uplinks heard {}", frames(s.from)),
+            (_, true) => format!("{k} heard {}", frames(s.from)),
+            (_, false) => format!("{k} addressed by {}", frames(s.to)),
         })
         .collect();
     let k = a.stations.len();
@@ -654,6 +656,138 @@ pub fn station_summary(a: &OriginAnswer) -> String {
         mhz(a.band.center_hz),
         entries.join(", ")
     )
+}
+
+/// `1 frame`, `<n> frames`.
+fn frames(n: u32) -> String {
+    match n {
+        1 => "1 frame".to_string(),
+        n => format!("{n} frames"),
+    }
+}
+
+/// How long a tally's repeats wait for their write, from the run's last write, ms
+/// (design 4.3): a new key or a grade rise is written at once.
+pub const STATION_REPUBLISH_MS: u64 = 60_000;
+
+/// A job's fixed-station tally in its entry (design 4.2): `seen` as it will be written
+/// to `job_context.stations`, `dirty` while it holds counts not written yet, when this
+/// run last wrote it (`None` before its first write) and whether a throttle timer is
+/// armed (one per job at most). A new entry, on every launch, seeds `seen` from the
+/// record's context ([`StationTally::seeded`]), so the counts are the job's, not the run's.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StationTally {
+    pub seen: BTreeMap<String, StationSeen>,
+    pub dirty: bool,
+    pub written_ns: Option<Timestamp>,
+    pub timer_armed: bool,
+}
+
+impl StationTally {
+    /// The tally of a record whose context is `context`: its `stations`, empty when
+    /// there are none or they do not parse; clean, never written by this run.
+    pub fn seeded(context: &serde_json::Value) -> StationTally {
+        let seen = context
+            .get("stations")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        StationTally {
+            seen,
+            ..StationTally::default()
+        }
+    }
+}
+
+/// What a counted frame asks of the tally's write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteNow {
+    /// Write now.
+    Now,
+    /// Arm the job's timer to write after this long.
+    Arm(Duration),
+    /// A write is due anyway (the timer is armed), or the frame is not the run's.
+    Later,
+}
+
+/// The throttle of design 4.3 for a frame just counted into `tally` (dirty): a new key
+/// or a grade rise writes now; else, with the timer armed, later; else now when this run
+/// has not written yet or wrote [`STATION_REPUBLISH_MS`] ago or more; else arm the
+/// timer for the rest of the window (the whole window for a clock that went back).
+pub fn decide(
+    tally: &StationTally,
+    key_is_new: bool,
+    grade_rose: bool,
+    now: Timestamp,
+) -> WriteNow {
+    if key_is_new || grade_rose {
+        return WriteNow::Now;
+    }
+    if tally.timer_armed {
+        return WriteNow::Later;
+    }
+    let Some(written) = tally.written_ns else {
+        return WriteNow::Now;
+    };
+    let window = Duration::from_millis(STATION_REPUBLISH_MS);
+    let since = Duration::from_nanos(now.0.saturating_sub(written.0));
+    match window.checked_sub(since) {
+        Some(left) if !left.is_zero() => WriteNow::Arm(left),
+        _ => WriteNow::Now,
+    }
+}
+
+/// The tally key a station field's value names: a string trimmed, a number as printed;
+/// `None` for a blank string, a missing field or any other value.
+fn station_key(v: Option<&serde_json::Value>) -> Option<String> {
+    match v? {
+        serde_json::Value::String(s) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// How `event` counts in a tally by the row's `station` rule (design 4.2): an event
+/// matching `when` is the station's own frame, `from` under the `key` field's value
+/// ([`STATION_ANONYMOUS`] with no `key`, or a missing or blank one); any other event with
+/// a non-blank `addressed` field is `to` under that value; else nothing.
+pub fn station_frame(
+    station: &crate::modes::Station,
+    event: &serde_json::Value,
+) -> Option<(String, Grade)> {
+    if station.matches(event) {
+        let key = station.key.as_ref().and_then(|k| station_key(event.get(k)));
+        return Some((
+            key.unwrap_or_else(|| STATION_ANONYMOUS.to_string()),
+            Grade::From,
+        ));
+    }
+    let to = station_key(event.get(station.addressed.as_ref()?))?;
+    Some((to, Grade::To))
+}
+
+/// Count one frame of `grade` at `t` under `key` in `seen`; whether the key is new, and
+/// whether a known key's grade rose (its first own frame).
+pub fn count(
+    seen: &mut BTreeMap<String, StationSeen>,
+    key: &str,
+    grade: Grade,
+    t: Timestamp,
+) -> (bool, bool) {
+    let new = !seen.contains_key(key);
+    let s = seen.entry(key.to_string()).or_insert(StationSeen {
+        from: 0,
+        to: 0,
+        first_ns: t,
+        last_ns: t,
+    });
+    let rose = !new && grade == Grade::From && s.from == 0;
+    match grade {
+        Grade::From => s.from = s.from.saturating_add(1),
+        Grade::To => s.to = s.to.saturating_add(1),
+    }
+    s.first_ns = Timestamp(s.first_ns.0.min(t.0));
+    s.last_ns = Timestamp(s.last_ns.0.max(t.0));
+    (new, rose)
 }
 
 /// Confirm every origin whose `callsign` equals `value` (both trimmed, case ignored):
@@ -937,8 +1071,8 @@ impl Inner {
             at: now(),
         };
         let mut a = origins(self, &q).await;
-        // No station tally is kept for a job yet: an empty one.
-        apply_stations(&mut a, &BTreeMap::new());
+        // The job's tally as it stands, so the first answer is already marked `heard`.
+        apply_stations(&mut a, &self.stations_of(id));
         self.keep_origin(&rec.id, &rec.source, &a)
     }
 
@@ -983,6 +1117,18 @@ impl Inner {
         let entry = jobs
             .get_mut(id)
             .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+        self.update_origins_of(entry, id, source, update)
+    }
+
+    /// [`Inner::update_origins`] on job `id`'s `entry`, under the jobs lock the caller
+    /// holds.
+    fn update_origins_of(
+        &self,
+        entry: &mut super::JobEntry,
+        id: &JobId,
+        source: &SourceId,
+        update: impl FnOnce(Option<OriginAnswer>) -> Option<(OriginAnswer, String)>,
+    ) -> Result<bool, NodeError> {
         let kept = entry
             .record
             .context
@@ -1028,6 +1174,128 @@ impl Inner {
             Some((a, summary))
         })
         .unwrap_or(false)
+    }
+
+    /// Count one frame of `grade` at `t_ns` under `key` in run `run` of job `id`'s tally
+    /// (design 4.2), leaving it dirty, and decide its write ([`decide`], by the wall
+    /// clock); an `Arm` marks the job's timer armed, so the caller spawns the one timer
+    /// ([`Inner::arm_stations`]). `Later`, counting nothing, when the job is gone or a
+    /// later run took its entry.
+    pub(super) fn note_station(
+        &self,
+        id: &JobId,
+        run: u64,
+        key: &str,
+        grade: Grade,
+        t_ns: Timestamp,
+    ) -> WriteNow {
+        let mut jobs = self.jobs.lock().unwrap();
+        let Some(entry) = jobs.get_mut(id).filter(|e| e.run == run) else {
+            return WriteNow::Later;
+        };
+        let tally = &mut entry.stations;
+        let (new, rose) = count(&mut tally.seen, key, grade, t_ns);
+        tally.dirty = true;
+        let w = decide(tally, new, rose, now());
+        if matches!(w, WriteNow::Arm(_)) {
+            tally.timer_armed = true;
+        }
+        w
+    }
+
+    /// Write run `run` of job `id`'s tally when it is dirty (design 4.3): into
+    /// `job_context.stations`, and, with a kept answer, onto that answer
+    /// ([`apply_stations`]: `heard` and `stations`, its confirmations kept), which is
+    /// republished with [`station_summary`]; one persist either way. With no kept answer
+    /// nothing is published. False, changing nothing, for a clean tally, a job gone, or
+    /// a run that is not the entry's (an older run never overwrites a newer tally); false
+    /// too for a failed persist, reported in `persist_errors` and left dirty, so a later
+    /// write retries (the window still runs from this attempt).
+    pub(super) fn write_stations(&self, id: &JobId, run: u64, source: &SourceId) -> bool {
+        let mut jobs = self.jobs.lock().unwrap();
+        let Some(entry) = jobs
+            .get_mut(id)
+            .filter(|e| e.run == run && e.stations.dirty)
+        else {
+            return false;
+        };
+        let seen = entry.stations.seen.clone();
+        let ctx = &mut entry.record.context;
+        if !ctx.is_object() {
+            *ctx = serde_json::json!({});
+        }
+        let value = serde_json::to_value(&seen).expect("a tally serialises");
+        ctx.as_object_mut()
+            .expect("context is an object")
+            .insert("stations".into(), value);
+        let kept = self.update_origins_of(entry, id, source, |kept| {
+            let mut a = kept?;
+            apply_stations(&mut a, &seen);
+            let summary = station_summary(&a);
+            Some((a, summary))
+        });
+        let written = match kept {
+            Ok(true) => Ok(()),
+            Ok(false) => persist(&self.jobs_dir, &entry.record),
+            Err(e) => Err(e),
+        };
+        entry.stations.written_ns = Some(now());
+        match written {
+            Ok(()) => {
+                entry.stations.dirty = false;
+                true
+            }
+            Err(e) => {
+                self.persist_errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("job {}: stations: {e}", id.0));
+                false
+            }
+        }
+    }
+
+    /// Job `id`'s station tally now (empty for a job the node does not know): what a
+    /// fresh lookup by job answers with ([`Inner::origin_job`]).
+    pub(super) fn stations_of(&self, id: &JobId) -> BTreeMap<String, StationSeen> {
+        self.jobs
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|e| e.stations.seen.clone())
+            .unwrap_or_default()
+    }
+
+    /// Run `run` of job `id`'s throttle timer (design 4.3): after `after`, unless `token`
+    /// (the run's) is cancelled first, disarm the job's timer and write its tally
+    /// ([`Inner::write_stations`], a no-op when it is clean). A cancelled run's timer does
+    /// nothing: the supervisor flushes the tally at the run's end. Holds the node weakly.
+    pub(super) fn arm_stations(
+        inner: std::sync::Weak<Inner>,
+        (id, run, source): (JobId, u64, SourceId),
+        token: tokio_util::sync::CancellationToken,
+        after: Duration,
+    ) {
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(after) => {}
+            }
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            if let Some(e) = inner
+                .jobs
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .filter(|e| e.run == run)
+            {
+                e.stations.timer_armed = false;
+            }
+            inner.write_stations(&id, run, &source);
+        });
     }
 
     /// Publish `a` as one `origin` event on `out`, the job's event output, or, with none
@@ -1729,8 +1997,26 @@ mod tests {
         assert_eq!(
             station_summary(&a),
             format!(
-                "4 ground stations on 136.975 MHz: D4 heard 1 frames, A1 addressed by 1 frames, \
-                 B2 addressed by 1 frames; {site}"
+                "4 ground stations on 136.975 MHz: D4 heard 1 frame, A1 addressed by 1 frame, \
+                 B2 addressed by 1 frame; {site}"
+            )
+        );
+    }
+
+    #[test]
+    fn station_summary_reads_one_frame_singular_in_every_form() {
+        let site = "Example Water Authority, Example Hill 17 km unknown 0.9";
+        let mut a = vhf_answer();
+        a.stations = tally(&[
+            ("*", seen(1, 0, 10)),
+            ("1A2B3C", seen(0, 1, 10)),
+            ("4D5E6F", seen(1, 0, 10)),
+        ]);
+        assert_eq!(
+            station_summary(&a),
+            format!(
+                "3 ground stations on 136.975 MHz: uplinks heard 1 frame, 1A2B3C addressed by \
+                 1 frame, 4D5E6F heard 1 frame; {site}"
             )
         );
     }
@@ -1738,7 +2024,7 @@ mod tests {
     #[test]
     fn station_summary_with_no_origins_keeps_todays_tail() {
         let t = tally(&[("1A2B3C", seen(1, 0, 10))]);
-        let head = "1 ground station on 403.025 MHz: 1A2B3C heard 1 frames; ";
+        let head = "1 ground station on 403.025 MHz: 1A2B3C heard 1 frame; ";
         for (rows, tail) in [
             (Some(3), "no licensed transmitter on 403.025 MHz"),
             (Some(0), "register gave no rows"),
@@ -2341,5 +2627,298 @@ mod tests {
             None,
         );
         assert_eq!(ans.origins.len(), 1);
+    }
+
+    /// A dirty tally last written at `written` (ns), its timer `armed`.
+    fn throttle(written: Option<u64>, armed: bool) -> StationTally {
+        StationTally {
+            seen: tally(&[("1A2B3C", seen(1, 2, 10))]),
+            dirty: true,
+            written_ns: written.map(Timestamp),
+            timer_armed: armed,
+        }
+    }
+
+    const MS: u64 = 1_000_000;
+
+    #[test]
+    fn a_new_key_writes_now() {
+        let t = throttle(Some(1_000 * MS), false);
+        assert_eq!(
+            decide(&t, true, false, Timestamp(1_001 * MS)),
+            WriteNow::Now
+        );
+        // Even with a timer armed, inside the window.
+        let t = throttle(Some(1_000 * MS), true);
+        assert_eq!(
+            decide(&t, true, false, Timestamp(1_001 * MS)),
+            WriteNow::Now
+        );
+    }
+
+    #[test]
+    fn a_grade_rise_writes_now() {
+        let t = throttle(Some(1_000 * MS), true);
+        assert_eq!(
+            decide(&t, false, true, Timestamp(1_001 * MS)),
+            WriteNow::Now
+        );
+    }
+
+    #[test]
+    fn a_repeat_inside_the_window_arms_the_remainder() {
+        let t = throttle(Some(1_000 * MS), false);
+        assert_eq!(
+            decide(&t, false, false, Timestamp(1_000 * MS + 15_000 * MS)),
+            WriteNow::Arm(Duration::from_millis(STATION_REPUBLISH_MS - 15_000))
+        );
+        // A clock that went back arms the whole window.
+        assert_eq!(
+            decide(&t, false, false, Timestamp(10 * MS)),
+            WriteNow::Arm(Duration::from_millis(STATION_REPUBLISH_MS))
+        );
+    }
+
+    #[test]
+    fn a_repeat_with_a_timer_armed_is_later() {
+        let t = throttle(Some(1_000 * MS), true);
+        assert_eq!(
+            decide(&t, false, false, Timestamp(1_500 * MS)),
+            WriteNow::Later
+        );
+    }
+
+    #[test]
+    fn a_repeat_past_the_window_writes_now() {
+        let t = throttle(Some(1_000 * MS), false);
+        let at = Timestamp(1_000 * MS + STATION_REPUBLISH_MS * MS);
+        assert_eq!(decide(&t, false, false, at), WriteNow::Now);
+    }
+
+    #[test]
+    fn a_runs_first_repeat_writes_now() {
+        // A tally seeded at launch has not been written by this run yet.
+        let t = throttle(None, false);
+        assert_eq!(decide(&t, false, false, Timestamp(5 * MS)), WriteNow::Now);
+    }
+
+    /// The station rule of design 4.1 on a VDL2-shaped row.
+    fn vdl2_station() -> crate::modes::Station {
+        crate::modes::Station {
+            when: [("addr_type".to_string(), serde_json::json!("Ground station"))].into(),
+            key: Some("icao".into()),
+            addressed: Some("dst".into()),
+        }
+    }
+
+    #[test]
+    fn a_station_frame_counts_from_under_key_and_another_to_under_addressed() {
+        let s = vdl2_station();
+        // On a station's own frame `dst` names the aircraft: ignored.
+        let own = serde_json::json!({"addr_type": "Ground station", "icao": " 1A2B3C ",
+                                     "dst": "7C1234"});
+        assert_eq!(
+            station_frame(&s, &own),
+            Some(("1A2B3C".to_string(), Grade::From))
+        );
+        let to = serde_json::json!({"addr_type": "Aircraft", "icao": "7C1234", "dst": "1A2B3C"});
+        assert_eq!(
+            station_frame(&s, &to),
+            Some(("1A2B3C".to_string(), Grade::To))
+        );
+        // An aircraft frame addressed to nobody, or blank, counts nothing.
+        let none = serde_json::json!({"addr_type": "Aircraft", "icao": "7C1234"});
+        assert_eq!(station_frame(&s, &none), None);
+        let blank = serde_json::json!({"addr_type": "Aircraft", "dst": "  "});
+        assert_eq!(station_frame(&s, &blank), None);
+        // A numeric key is its printed form; a missing or blank key is the anonymous one.
+        let num = serde_json::json!({"addr_type": "Ground station", "icao": 4242});
+        assert_eq!(
+            station_frame(&s, &num),
+            Some(("4242".to_string(), Grade::From))
+        );
+        let nameless = serde_json::json!({"addr_type": "Ground station", "icao": ""});
+        assert_eq!(
+            station_frame(&s, &nameless),
+            Some((STATION_ANONYMOUS.to_string(), Grade::From))
+        );
+        let acars = crate::modes::Station {
+            when: [("downlink".to_string(), serde_json::json!(false))].into(),
+            key: None,
+            addressed: None,
+        };
+        let up = serde_json::json!({"downlink": false, "reg": "VH-XXX"});
+        assert_eq!(
+            station_frame(&acars, &up),
+            Some((STATION_ANONYMOUS.to_string(), Grade::From))
+        );
+        let down = serde_json::json!({"downlink": true});
+        assert_eq!(station_frame(&acars, &down), None);
+    }
+
+    #[test]
+    fn count_reports_a_new_key_and_a_grade_rise_once() {
+        let mut t = BTreeMap::new();
+        assert_eq!(
+            count(&mut t, "GS1", Grade::To, Timestamp(10)),
+            (true, false)
+        );
+        assert_eq!(
+            count(&mut t, "GS1", Grade::To, Timestamp(20)),
+            (false, false)
+        );
+        assert_eq!(
+            count(&mut t, "GS1", Grade::From, Timestamp(30)),
+            (false, true)
+        );
+        assert_eq!(
+            count(&mut t, "GS1", Grade::From, Timestamp(40)),
+            (false, false)
+        );
+        assert_eq!(
+            count(&mut t, "GS2", Grade::From, Timestamp(50)),
+            (true, false)
+        );
+        assert_eq!(
+            t["GS1"],
+            StationSeen {
+                from: 2,
+                to: 2,
+                first_ns: Timestamp(10),
+                last_ns: Timestamp(40)
+            }
+        );
+        assert_eq!(t["GS2"].from, 1);
+        // An older frame widens `first_ns` and never pulls `last_ns` back.
+        count(&mut t, "GS2", Grade::To, Timestamp(5));
+        assert_eq!(
+            (t["GS2"].first_ns, t["GS2"].last_ns),
+            (Timestamp(5), Timestamp(50))
+        );
+    }
+
+    #[test]
+    fn a_tally_seeds_from_the_context() {
+        let t = tally(&[("GS1", seen(3, 4, 9))]);
+        let ctx = serde_json::json!({"stations": t, "origins": null});
+        let s = StationTally::seeded(&ctx);
+        assert_eq!(s.seen, t);
+        assert!(!s.dirty && !s.timer_armed && s.written_ns.is_none());
+        assert!(StationTally::seeded(&serde_json::json!({})).seen.is_empty());
+        let odd = serde_json::json!({"stations": 7});
+        assert!(StationTally::seeded(&odd).seen.is_empty());
+    }
+
+    /// A record of a job `id` on `radio`, to enter in the job table by hand.
+    fn record(id: &str) -> JobRecord {
+        JobRecord {
+            format: crate::job::JOB_RECORD_FORMAT,
+            id: JobId(id.into()),
+            kind: "fake".into(),
+            graph: crate::graph::Graph {
+                id: crate::graph::GraphId("g".into()),
+                nodes: vec![],
+                edges: vec![],
+            },
+            source: SourceId("radio".into()),
+            tuning: crate::port::Tuning {
+                center_hz: Hz(136_975_000),
+                bandwidth_hz: Hz(25_000),
+            },
+            state: crate::job::JobState::Running,
+            context: serde_json::json!({}),
+            created_ns: Timestamp(1),
+            input: None,
+            capture_rate_hz: None,
+            elastic: false,
+            operator_graph: false,
+            owner: None,
+        }
+    }
+
+    /// Enter `rec` in `n`'s job table as run `run`, its tally seeded from its context.
+    fn enter(n: &super::super::Node, rec: JobRecord, run: u64) {
+        let mut e = super::super::JobEntry::loaded(rec, Timestamp(1));
+        e.run = run;
+        n.inner.jobs.lock().unwrap().insert(e.record.id.clone(), e);
+    }
+
+    #[tokio::test]
+    async fn an_older_run_never_overwrites_a_newer_tally() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node(dir.path()).await;
+        let (id, source) = (JobId("j1".into()), SourceId("radio".into()));
+        let mut rec = record("j1");
+        rec.context = serde_json::json!({"stations": tally(&[("GS1", seen(5, 9, 100))])});
+        enter(&n, rec, 7);
+        assert_eq!(
+            n.inner.stations_of(&id)["GS1"].to,
+            9,
+            "seeded from the record"
+        );
+        // Run 6 (ended; run 7 took the entry) neither counts nor writes.
+        assert_eq!(
+            n.inner
+                .note_station(&id, 6, "GS1", Grade::To, Timestamp(200)),
+            WriteNow::Later
+        );
+        assert_eq!(
+            n.inner
+                .note_station(&id, 7, "GS1", Grade::To, Timestamp(200)),
+            WriteNow::Now
+        );
+        let before = n.inner.jobs.lock().unwrap()[&id].record.context.clone();
+        assert!(!n.inner.write_stations(&id, 6, &source));
+        {
+            let jobs = n.inner.jobs.lock().unwrap();
+            assert_eq!(jobs[&id].record.context, before);
+            assert!(jobs[&id].stations.dirty);
+            assert_eq!(jobs[&id].stations.seen["GS1"].to, 10);
+        }
+        assert!(n.inner.write_stations(&id, 7, &source));
+        assert!(
+            !n.inner.write_stations(&id, 7, &source),
+            "clean: nothing to write"
+        );
+        let ctx = n.inner.jobs.lock().unwrap()[&id].record.context.clone();
+        assert_eq!(ctx["stations"]["GS1"]["to"], 10);
+        let disk: JobRecord =
+            serde_json::from_slice(&std::fs::read(dir.path().join("state/jobs/j1.json")).unwrap())
+                .unwrap();
+        assert_eq!(disk.context["stations"]["GS1"]["to"], 10);
+        assert_eq!(n.inner.stations_of(&id)["GS1"].to, 10);
+    }
+
+    #[tokio::test]
+    async fn a_write_with_a_kept_answer_marks_it_heard_and_keeps_its_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node(dir.path()).await;
+        let (id, source) = (JobId("j2".into()), SourceId("radio".into()));
+        let mut kept = vhf_answer();
+        kept.origins[0].confirmed = Some(Confirmed {
+            field: "src".into(),
+            value: "XX4EX".into(),
+        });
+        let mut rec = record("j2");
+        rec.context = serde_json::json!({"origins": kept});
+        enter(&n, rec, 3);
+        assert_eq!(
+            n.inner
+                .note_station(&id, 3, "GS1", Grade::From, Timestamp(300)),
+            WriteNow::Now
+        );
+        assert!(n.inner.write_stations(&id, 3, &source));
+        let ctx = n.inner.jobs.lock().unwrap()[&id].record.context.clone();
+        let a: OriginAnswer = serde_json::from_value(ctx["origins"].clone()).unwrap();
+        assert_eq!(a.stations["GS1"].from, 1);
+        assert_eq!(
+            a.origins[0].heard,
+            Some(Heard {
+                last_ns: Timestamp(300),
+                grade: Grade::From
+            })
+        );
+        assert_eq!(a.origins[0].confirmed, kept.origins[0].confirmed);
+        assert_eq!(ctx["stations"]["GS1"]["from"], 1);
     }
 }

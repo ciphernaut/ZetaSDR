@@ -12,6 +12,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
+use super::origin::WriteNow;
 use super::persist::{now, persist};
 use super::{
     Inner, JobEntry, JobOutput, LogFile, NodeError, ring_seconds_for, source_fault_reason, watch,
@@ -19,7 +20,7 @@ use super::{
 use crate::graph::{self, Graph, GraphError, NodeId};
 use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
-use crate::modes::Identity;
+use crate::modes::{Identity, Station};
 use crate::ops::{
     JobKind, SPECTRUM_ROWS_PER_S, ScanGrid, local_hardware, scan_edge_mask_in_force, scan_grid,
     scan_mask_default, scan_notch_in_force, spectrum_size,
@@ -248,12 +249,13 @@ impl Inner {
         // A `bits` or `graph` job's or a mode row's job's record for its watch (proposals,
         // the row's first proof: see `super::propose::watch_for_proposals`).
         let proposer = super::propose::watches(self, &rec).then(|| rec.clone());
-        // A job whose mode row declares `subject.identity`: its record and the identity,
-        // for its identity tees (see `tee_identity`).
-        let identity = mode
+        // A job whose mode row declares `subject.identity` or `subject.station`: its record
+        // and the rules, for its rules tees (see `tee_rules`).
+        let rules = mode
             .as_ref()
-            .and_then(|m| m.subject.as_ref()?.identity.clone())
-            .map(|i| (rec.clone(), i));
+            .and_then(|m| m.subject.as_ref())
+            .filter(|s| s.identity.is_some() || s.station.is_some())
+            .map(|s| (rec.clone(), s.identity.clone(), s.station.clone()));
         // A `watch`'s controller runs beside its stages (see `super::watch`).
         let watch =
             (rec.kind == JobKind::Watch.name()).then(|| (watch::Seed::of(&rec), rec.tuning));
@@ -382,8 +384,9 @@ impl Inner {
                     &token,
                 ));
             }
-            if let Some((rec, id)) = &identity {
-                self.tee_identity(rec, id, &pairs(&job_outputs[before..]), &token);
+            if let Some((rec, identity, station)) = &rules {
+                let rules = (identity.clone(), station.clone());
+                self.tee_rules(rec, run, rules, &pairs(&job_outputs[before..]), &token);
             }
             let ids: Vec<StreamId> = outputs.into_iter().map(|(_, s)| s).collect();
             let own = ids.clone();
@@ -519,19 +522,31 @@ impl Inner {
         }
     }
 
-    /// Match the decoded identities of `rec`'s `Event` outputs among `outputs` against the
-    /// job's kept origins (design 4.6), one task per output, each subscribed before this
-    /// returns. An event whose `identity.field` holds a non-blank string
-    /// ([`super::origin::identity_value`]) is handed to [`Inner::confirm_origin`], which
-    /// confirms the kept origins it matches; a mismatch, or a value that already confirmed
-    /// every origin it matches in the context kept now, changes nothing (so a repeat
-    /// publishes nothing, and a fresh lookup is confirmed again). The job's own `origin` events are passed over. A tee ends when its
-    /// stream is unregistered at the job's end or on `token`; it never ends the job, and a
-    /// lag only skips events.
-    pub(super) fn tee_identity(
+    /// Evaluate the events of run `run` of `rec`'s `Event` outputs among `outputs` against
+    /// the row's subject rules, one task per output, each subscribed before this returns.
+    /// The job's own `origin` events are passed over.
+    ///
+    /// `identity` (design 4.6 of plan 32): an event whose `identity.field` holds a
+    /// non-blank string ([`super::origin::identity_value`]) is handed to
+    /// [`Inner::confirm_origin`], which confirms the kept origins it matches; a mismatch,
+    /// or a value that already confirmed every origin it matches in the context kept now,
+    /// changes nothing (so a repeat publishes nothing, and a fresh lookup is confirmed
+    /// again).
+    ///
+    /// `station` (design 4.4 of plan 35): an event that counts
+    /// ([`super::origin::station_frame`]) is counted into the job's tally
+    /// ([`Inner::note_station`]), at the event's `t_ns` (else its frame's span start), and
+    /// written now ([`Inner::write_stations`]) or the job's one timer armed
+    /// ([`Inner::arm_stations`]) as the throttle decides. The end-of-run flush is the
+    /// supervisor's: a tee ends on `token` first and never sees the run's last frames.
+    ///
+    /// A tee ends when its stream is unregistered at the job's end or on `token`; it never
+    /// ends the job, and a lag only skips events.
+    pub(super) fn tee_rules(
         self: &Arc<Self>,
         rec: &JobRecord,
-        identity: &Identity,
+        run: u64,
+        (identity, station): (Option<Identity>, Option<Station>),
         outputs: &[(StreamKind, StreamId)],
         token: &CancellationToken,
     ) {
@@ -540,7 +555,7 @@ impl Inner {
                 continue;
             };
             let (id, source, token) = (rec.id.clone(), rec.source.clone(), token.clone());
-            let identity = identity.clone();
+            let (identity, station) = (identity.clone(), station.clone());
             // Weak: a tee never keeps the node alive.
             let inner = Arc::downgrade(self);
             tokio::spawn(async move {
@@ -560,16 +575,43 @@ impl Inner {
                     if v.get("protocol").and_then(|p| p.as_str()) == Some("origin") {
                         continue;
                     }
-                    let Some(value) = v
-                        .get(&identity.field)
-                        .and_then(|f| super::origin::identity_value(&identity, f))
-                    else {
+                    let confirm = identity.as_ref().and_then(|i| {
+                        let value = v
+                            .get(&i.field)
+                            .and_then(|f| super::origin::identity_value(i, f))?;
+                        Some((i, value))
+                    });
+                    let counted = station
+                        .as_ref()
+                        .and_then(|s| super::origin::station_frame(s, v));
+                    if confirm.is_none() && counted.is_none() {
                         continue;
-                    };
-                    let Some(inner) = inner.upgrade() else {
+                    }
+                    let Some(node) = inner.upgrade() else {
                         return;
                     };
-                    inner.confirm_origin(&id, &source, &identity.field, &value);
+                    if let Some((i, value)) = confirm {
+                        node.confirm_origin(&id, &source, &i.field, &value);
+                    }
+                    let Some((key, grade)) = counted else {
+                        continue;
+                    };
+                    let t = v
+                        .get("t_ns")
+                        .and_then(|t| t.as_u64())
+                        .map_or(frame.provenance.span.start_ns, Timestamp);
+                    match node.note_station(&id, run, &key, grade, t) {
+                        WriteNow::Now => {
+                            node.write_stations(&id, run, &source);
+                        }
+                        WriteNow::Arm(after) => Inner::arm_stations(
+                            inner.clone(),
+                            (id.clone(), run, source.clone()),
+                            token.clone(),
+                            after,
+                        ),
+                        WriteNow::Later => {}
+                    }
                 }
             });
         }
@@ -864,6 +906,16 @@ impl Inner {
             self.leases.release(&rec.id);
             return Err(NodeError::Stopped(rec.id));
         }
+        // The station tally is the job's: the last run's entry holds the newest one (its
+        // supervisor's flush may postdate the copy of the record a relaunch carries), and
+        // this run's tally is seeded from the record (see `JobEntry::stations`).
+        if let Some(stations) = jobs
+            .get(&rec.id)
+            .and_then(|e| e.record.context.get("stations").cloned())
+            && let Some(ctx) = rec.context.as_object_mut()
+        {
+            ctx.insert("stations".into(), stations);
+        }
         if let Err(e) = persist(&self.jobs_dir, &rec) {
             self.leases.release(&rec.id);
             return Err(e);
@@ -884,6 +936,7 @@ impl Inner {
             rec.id.clone(),
             JobEntry {
                 ended_ns: rec.created_ns,
+                stations: super::origin::StationTally::seeded(&rec.context),
                 record: rec,
                 run,
                 cancel: Some(token.clone()),
@@ -1291,6 +1344,20 @@ pub(super) async fn supervise(
             },
         };
         inner.finish(&id, run, end);
+    }
+    // The station tally's end-of-run flush (design 4.2), whatever the end (a stop, a
+    // relaunch, a node shutdown): the rules tees ended on the token before the run's last
+    // frames, and the next run seeds from what this writes. Before the streams go, so a
+    // kept answer's republish still reaches the job's event output; a no-op for a clean
+    // tally or a run a later one replaced.
+    let source = inner
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|e| e.record.source.clone());
+    if let Some(source) = source {
+        inner.write_stations(&id, run, &source);
     }
     // The only place a started job's lease is released, but for a relaunch that
     // fails (`Inner::relaunch_elastic`).

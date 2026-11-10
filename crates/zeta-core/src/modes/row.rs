@@ -168,10 +168,12 @@ pub struct Subject {
 pub struct Station {
     /// Field = value pairs; an event matching every pair is from a station. Not empty.
     pub when: BTreeMap<String, serde_json::Value>,
-    /// The event field naming the station, when not the subject's key; `null` for the key.
+    /// The field naming the station on its own frame (a string trimmed, a number as
+    /// printed); `null` when the protocol names none: the anonymous station `"*"`.
     #[serde(default)]
     pub key: Option<String>,
-    /// The event field naming the aircraft or party the station addresses; `null` for none.
+    /// On any other event, the field naming the station it is addressed to; `null` for
+    /// none. Not read on a station's own frame, where it names the other party.
     #[serde(default)]
     pub addressed: Option<String>,
 }

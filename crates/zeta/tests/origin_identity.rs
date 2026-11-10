@@ -103,11 +103,28 @@ fn identity_row() -> Value {
 
 /// A node serving the identity row, with `fake_lines` printing `line`, and the register stub.
 fn node(dir: &Path, line: &str) -> ServeProc {
+    serve(
+        dir,
+        &identity_row(),
+        &[
+            ("ZETA_PLUGIN_ENV_FAKE_LINES", line),
+            ("ZETA_PLUGIN_ENV_FAKE_AFTER_BYTES", "0"),
+            ("ZETA_PLUGIN_ENV_FAKE_REPEAT_BYTES", REPEAT_BYTES),
+        ],
+    )
+}
+
+/// A node serving `row` alone, `fake_lines` pinned and run with `env`, and the register
+/// stub.
+fn serve(dir: &Path, row: &Value, env: &[(&str, &str)]) -> ServeProc {
     let modes = dir.join("modes");
     std::fs::create_dir_all(&modes).unwrap();
-    std::fs::write(modes.join("fake_ident.json"), identity_row().to_string()).unwrap();
+    let file = format!("{}.json", row["id"].as_str().unwrap());
+    std::fs::write(modes.join(file), row.to_string()).unwrap();
     let fake_lines = repo_root().join("crates/zeta-ext/tests/fake_lines");
     let register = acma_stub::serve_on_thread(register_rows(), Mode::Normal);
+    let mut env = env.to_vec();
+    env.push(("ZETA_HANDLER_FAKE_LINES", fake_lines.to_str().unwrap()));
     ServeProc::start_full(
         dir,
         SECRET,
@@ -118,12 +135,7 @@ fn node(dir: &Path, line: &str) -> ServeProc {
             &register,
         ],
         &[],
-        &[
-            ("ZETA_HANDLER_FAKE_LINES", fake_lines.to_str().unwrap()),
-            ("ZETA_PLUGIN_ENV_FAKE_LINES", line),
-            ("ZETA_PLUGIN_ENV_FAKE_AFTER_BYTES", "0"),
-            ("ZETA_PLUGIN_ENV_FAKE_REPEAT_BYTES", REPEAT_BYTES),
-        ],
+        &env,
     )
 }
 
@@ -137,6 +149,13 @@ async fn op(c: &NodeClient, v: Value) -> Value {
 /// Set the demo station, start the identity row on the tone band and look its origins up;
 /// the job's id.
 async fn start_and_look_up(c: &NodeClient) -> String {
+    let job = start(c, "fake_ident").await;
+    look_up(c, &job).await;
+    job
+}
+
+/// Set the demo station and start the row `kind` on the tone band; the job's id.
+async fn start(c: &NodeClient, kind: &str) -> String {
     op(
         c,
         json!({"op": "station_set", "lat": -27.3842, "lon": 153.1175, "alt_m": 4.0,
@@ -145,18 +164,16 @@ async fn start_and_look_up(c: &NodeClient) -> String {
     .await;
     let job = op(
         c,
-        json!({"op": "job_start", "kind": "fake_ident", "source": "tone",
+        json!({"op": "job_start", "kind": kind, "source": "tone",
                "center_hz": TONE_HZ, "bandwidth_hz": BAND_HZ, "deviation_hz": null,
                "sideband": null, "elastic": false, "replace": []}),
     )
     .await;
-    let job = job.as_str().expect("a job id").to_string();
-    look_up(c, &job).await;
-    job
+    job.as_str().expect("a job id").to_string()
 }
 
-/// `origin_lookup` by `job`; the XX4EX row must be lit.
-async fn look_up(c: &NodeClient, job: &str) {
+/// `origin_lookup` by `job`; the XX4EX row must be lit. The answer.
+async fn look_up(c: &NodeClient, job: &str) -> Value {
     let a = op(
         c,
         json!({"op": "origin_lookup", "job": job, "source": null, "center_hz": null,
@@ -170,6 +187,7 @@ async fn look_up(c: &NodeClient, job: &str) {
         .filter_map(|o| o["allocation"]["callsign"].as_str())
         .collect();
     assert_eq!(calls, ["XX4EX"], "the XX4EX row is lit: {a}");
+    a
 }
 
 /// The `events.log` lines of `job` whose event's `protocol` is `protocol`, each with its
@@ -203,16 +221,22 @@ async fn origin_frames(dir: &Path, job: &str, n: usize) -> Vec<Value> {
 /// Wait until [`SETTLE_EVENTS`] decoded events of `job` were logged after the last
 /// `origin` frame was.
 async fn settle(dir: &Path, job: &str) {
+    settle_on(dir, job, "fake_ident", SETTLE_EVENTS).await;
+}
+
+/// Wait until `n` decoded events of `job` (of `protocol`) were logged after the last
+/// `origin` frame was.
+async fn settle_on(dir: &Path, job: &str, protocol: &str, n: usize) {
     let last = logged(dir, job, "origin")
         .last()
         .map(|l| l["t_ns"].as_u64().unwrap())
         .expect("an origin frame");
     until(WITHIN, async || {
-        let after = logged(dir, job, "fake_ident")
+        let after = logged(dir, job, protocol)
             .iter()
             .filter(|l| l["t_ns"].as_u64().unwrap() > last)
             .count();
-        (after >= SETTLE_EVENTS).then_some(())
+        (after >= n).then_some(())
     })
     .await
     .expect("decoded events after the last origin frame");
@@ -296,4 +320,227 @@ async fn a_mismatching_callsign_changes_nothing() {
     let origins = ctx["origins"]["origins"].as_array().expect("origins kept");
     assert!(origins.iter().all(|o| o["confirmed"].is_null()), "{ctx}");
     assert_eq!(logged(dir.path(), &job, "origin").len(), 1);
+}
+
+/// The station row's decoded protocol.
+const GS: &str = "fake_gs";
+/// `fake_lines` repeats every 0.2 s of the 48 kHz cs16 IQ.
+const REPEAT_FAST_BYTES: &str = "38400";
+/// 2 s of the IQ before `fake_lines` prints, so the lookup usually lands first.
+const AFTER_LOOKUP_BYTES: &str = "384000";
+
+/// The station row's lines: an aircraft addressing `GS1`, `GS1`'s own frame, an aircraft
+/// addressing `GS2`; so `GS1` is new, then rises to `from`, then `GS2` is new.
+const GS_LINES: &str = concat!(
+    r#"{"kind":"ac","icao":"7C0001","to_gs":"GS1"}"#,
+    "\n",
+    r#"{"kind":"gs","icao":"GS1","gs":"GS1"}"#,
+    "\n",
+    r#"{"kind":"ac","icao":"7C0002","to_gs":"GS2"}"#,
+    "\n"
+);
+
+/// [`identity_row`] reshaped for fixed stations (plan 35, design 4.1): an event of `kind`
+/// `gs` is a station's own, named by `gs`; any other names the station it addresses in
+/// `to_gs`. Its lines are read from `lines`.
+fn station_row(lines: &Path) -> Value {
+    let mut row = identity_row();
+    row["id"] = GS.into();
+    row["name"] = "Fake ground stations (tests)".into();
+    row["protocol"] = GS.into();
+    row["decoder"]["args"] = json!(["--lines-file", lines.to_str().unwrap()]);
+    row["event"] = json!({
+        "schema": {"type": "object", "properties": {
+            "kind": {"type": "string"}, "icao": {"type": "string"},
+            "gs": {"type": "string"}, "to_gs": {"type": "string"}}},
+        "summary": "{icao}"
+    });
+    row["subject"] = json!({
+        "key": "icao",
+        "name": "aircraft",
+        "waterfall": "summary",
+        "columns": [],
+        "heading": null,
+        "label": null,
+        "identity": null,
+        "station": {"when": {"kind": "gs"}, "key": "gs", "addressed": "to_gs"}
+    });
+    row
+}
+
+/// A node serving the station row, `fake_lines` printing [`GS_LINES`] after `after` input
+/// bytes and again every `repeat` more (`0`: never).
+fn station_node(dir: &Path, after: &str, repeat: &str) -> ServeProc {
+    let lines = dir.join("gs.lines");
+    std::fs::write(&lines, GS_LINES).unwrap();
+    serve(
+        dir,
+        &station_row(&lines),
+        &[
+            ("ZETA_PLUGIN_ENV_FAKE_AFTER_BYTES", after),
+            ("ZETA_PLUGIN_ENV_FAKE_REPEAT_BYTES", repeat),
+        ],
+    )
+}
+
+/// `from` and `to` of `key` in a `stations` tally (0 for a key not there).
+fn counts(stations: &Value, key: &str) -> (u64, u64) {
+    let s = &stations[key];
+    (
+        s["from"].as_u64().unwrap_or(0),
+        s["to"].as_u64().unwrap_or(0),
+    )
+}
+
+/// Poll until `job_context.stations` passes `ok`; the stations.
+async fn stations_until(c: &NodeClient, job: &str, ok: impl Fn(&Value) -> bool) -> Value {
+    let Some(s) = until(WITHIN, async || {
+        let s = context(c, job).await["stations"].clone();
+        ok(&s).then_some(s)
+    })
+    .await
+    else {
+        panic!("stations never as expected: {}", context(c, job).await);
+    };
+    s
+}
+
+/// The single burst's tally: `GS1` heard once and addressed once, `GS2` addressed once.
+fn one_burst(s: &Value) -> bool {
+    counts(s, "GS1") == (1, 1) && counts(s, "GS2") == (0, 1)
+}
+
+/// Both keys seen and `GS1`'s grade risen: the immediate writes are done.
+fn both_keys(s: &Value) -> bool {
+    counts(s, "GS1").0 >= 1 && counts(s, "GS2").1 >= 1
+}
+
+/// Every origin of an `origin` frame or answer `a` is heard, graded `from`.
+fn all_heard_from(a: &Value) -> bool {
+    let origins = a["origins"].as_array().expect("origins");
+    !origins.is_empty() && origins.iter().all(|o| o["heard"]["grade"] == "from")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn station_frames_fill_the_tally_and_republish_with_heard() {
+    let dir = tempfile::tempdir().unwrap();
+    let serve = station_node(dir.path(), AFTER_LOOKUP_BYTES, "0");
+    let c = NodeClient::new(&serve.url, SECRET).unwrap();
+    let job = start(&c, GS).await;
+    look_up(&c, &job).await;
+    stations_until(&c, &job, one_burst).await;
+    // Whether the lookup or the burst came first, the last frame carries the tally.
+    let Some(last) = until(WITHIN, async || {
+        let f = logged(dir.path(), &job, "origin").pop()?["event"].clone();
+        one_burst(&f["stations"]).then_some(f)
+    })
+    .await
+    else {
+        panic!(
+            "no origin frame with the tally: {:?}",
+            logged(dir.path(), &job, "origin")
+        );
+    };
+    assert!(all_heard_from(&last), "{last}");
+    let summary = last["summary"].as_str().unwrap();
+    assert!(summary.starts_with("2 ground stations on "), "{summary}");
+    assert!(
+        summary.contains("GS1 heard 1 frame, GS2 addressed by 1 frame; "),
+        "{summary}"
+    );
+    let kept = &context(&c, &job).await["origins"];
+    assert!(
+        one_burst(&kept["stations"]) && all_heard_from(kept),
+        "{kept}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_lookup_answers_heard_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let serve = station_node(dir.path(), "0", "0");
+    let c = NodeClient::new(&serve.url, SECRET).unwrap();
+    let job = start(&c, GS).await;
+    // Written with no answer kept: the tally only, nothing published.
+    stations_until(&c, &job, one_burst).await;
+    assert!(logged(dir.path(), &job, "origin").is_empty());
+    let a = look_up(&c, &job).await;
+    assert!(one_burst(&a["stations"]) && all_heard_from(&a), "{a}");
+    let frames = origin_frames(dir.path(), &job, 1).await;
+    let summary = frames[0]["summary"].as_str().unwrap();
+    assert!(summary.starts_with("2 ground stations on "), "{summary}");
+    assert!(all_heard_from(&frames[0]), "{frames:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tally_is_written_within_the_window_not_per_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let serve = station_node(dir.path(), "0", REPEAT_FAST_BYTES);
+    let c = NodeClient::new(&serve.url, SECRET).unwrap();
+    let job = start(&c, GS).await;
+    look_up(&c, &job).await;
+    stations_until(&c, &job, both_keys).await;
+    settle_on(dir.path(), &job, GS, SETTLE_EVENTS).await;
+    let n = logged(dir.path(), &job, "origin").len();
+    // The lookup's frame, and one per new key or grade rise after it: at most four.
+    assert!((1..=4).contains(&n), "{n} origin frames");
+    // Three seconds of repeats (15 bursts of 3 lines) republish nothing.
+    settle_on(dir.path(), &job, GS, 45).await;
+    let frames = logged(dir.path(), &job, "origin");
+    assert_eq!(frames.len(), n, "a repeat republished: {frames:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_flushes_the_counts_the_window_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let serve = station_node(dir.path(), "0", REPEAT_FAST_BYTES);
+    let c = NodeClient::new(&serve.url, SECRET).unwrap();
+    let job = start(&c, GS).await;
+    look_up(&c, &job).await;
+    let before = stations_until(&c, &job, both_keys).await;
+    // Repeats counted and held back by the window, then the stop: the supervisor writes
+    // them, the tee having ended first.
+    settle_on(dir.path(), &job, GS, 9).await;
+    op(&c, json!({"op": "job_stop", "job": job})).await;
+    let after = stations_until(&c, &job, |s| counts(s, "GS1").1 > counts(&before, "GS1").1).await;
+    assert!(
+        counts(&after, "GS2").1 > counts(&before, "GS2").1,
+        "{after}"
+    );
+    let flushed = until(WITHIN, async || {
+        let last = logged(dir.path(), &job, "origin").pop()?;
+        (last["event"]["stations"] == after).then_some(())
+    })
+    .await;
+    assert!(
+        flushed.is_some(),
+        "not republished with the flush: {:?}",
+        logged(dir.path(), &job, "origin")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_continues_the_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut first = station_node(dir.path(), "0", REPEAT_BYTES);
+    let c = NodeClient::new(&first.url, SECRET).unwrap();
+    let job = start(&c, GS).await;
+    look_up(&c, &job).await;
+    let before = stations_until(&c, &job, both_keys).await;
+    first.terminate(Duration::from_secs(10));
+    drop(first);
+    let total = |s: &Value| -> u64 {
+        ["GS1", "GS2"]
+            .iter()
+            .map(|k| counts(s, k).0 + counts(s, k).1)
+            .sum()
+    };
+    let serve = station_node(dir.path(), "0", REPEAT_BYTES);
+    let c = NodeClient::new(&serve.url, SECRET).unwrap();
+    // The resumed run's first write: no count went back, and the total grew.
+    let after = stations_until(&c, &job, |s| total(s) > total(&before)).await;
+    for k in ["GS1", "GS2"] {
+        let (b, a) = (counts(&before, k), counts(&after, k));
+        assert!(a.0 >= b.0 && a.1 >= b.1, "{k} reset: {before} then {after}");
+    }
 }
