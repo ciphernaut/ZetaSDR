@@ -1784,16 +1784,18 @@ pub fn scan_notch_in_force(step_hz: u64, notch_hz: u64) -> u64 {
     }
 }
 
-/// The edge mask actually applied: when the scan's grid alternates, the
-/// configured `edge_mask` or the edges a usable fraction of `usable` leaves
-/// unused ([`scan_edge_mask`]), whichever is wider, so the rows never show the
-/// front end's roll-off; else `0.0` (a one-step scan has no other sweep and no
-/// neighbour to fill its edges in, so masking them would hide signal for good).
+/// The edge mask actually applied: the edges a usable fraction of `usable`
+/// leaves unused ([`scan_edge_mask`]) always, so the rows never show the front
+/// end's roll-off; when the scan's grid alternates, the configured `edge_mask`
+/// instead where it is wider. A one-step scan takes no more than the unused
+/// edges, which lie outside its span ([`scan_grid`]): it has no other sweep and
+/// no neighbour to fill a wider mask in, so that would hide signal for good.
 pub fn scan_edge_mask_in_force(alternates: bool, edge_mask: f64, usable: f64) -> f64 {
+    let unused = scan_edge_mask(usable);
     if alternates {
-        edge_mask.max(scan_edge_mask(usable))
+        edge_mask.max(unused)
     } else {
-        0.0
+        unused
     }
 }
 
@@ -1805,7 +1807,7 @@ pub struct ScanGrid {
     /// Sweeps 1, 3, 5, ...: the even grid shifted down by a quarter stride.
     pub odd: Vec<Tuning>,
     /// How far one step's centre is from the next's, Hz: the usable part of a
-    /// capture (a one-step grid: its width).
+    /// capture (a one-step grid: the span).
     pub stride_hz: u64,
 }
 
@@ -1830,14 +1832,17 @@ impl ScanGrid {
     }
 }
 
-/// The grids a scan of `span` takes on a source with `caps`. A span wider
-/// than one capture (`w = max_bandwidth_hz`) takes steps of the whole capture
-/// that advance by its usable part, `stride = floor(usable_fraction × w)`; a
-/// span inside one capture is one step exactly as wide as the span (its
-/// stride that width). The even grid is centred at `start + stride/2 +
-/// i·stride` for `i < n = ceil(bandwidth_hz / stride)`, where `start` is the
-/// span's lower edge, so the usable parts of the steps tile the span and the
-/// unused edges (masked, [`scan_edge_mask_in_force`]) overlap the neighbours'.
+/// The grids a scan of `span` takes on a source with `caps`. A capture of `w =
+/// max_bandwidth_hz` is flat over its usable part, `stride = floor(usable_fraction
+/// × w)`. A span wider than the stride takes steps of the whole capture that
+/// advance by the stride. A span no wider than the stride is one step, asking
+/// for `min(w, ceil(span / usable_fraction))`, so its usable part covers the
+/// span and the unused edges it masks ([`scan_edge_mask_in_force`]) lie
+/// outside it (with the whole capture usable, a step exactly as wide as the
+/// span); its stride is the span. The even grid is centred at `start +
+/// stride/2 + i·stride` for `i < n = ceil(bandwidth_hz / stride)`, where `start`
+/// is the span's lower edge, so the usable parts of the steps tile the span and
+/// the unused edges (masked) overlap the neighbours'.
 /// The odd grid is centred at `start + stride/4 + i·stride` for `i <= n` (a
 /// quarter stride lower), dropping a step whose usable part misses the span,
 /// so it has at most one more step. A quarter, not a half: with rows about as
@@ -1852,19 +1857,17 @@ impl ScanGrid {
 /// `tune_min + w/2`), and a centre equal to the one before it is dropped.
 pub fn scan_grid(span: Tuning, caps: &Capabilities) -> ScanGrid {
     let capture = caps.max_bandwidth_hz.value().0.max(1);
-    let one_step = span.bandwidth_hz.0 <= capture;
-    let w = if one_step {
-        span.bandwidth_hz.0.max(1)
+    let ppb = u128::from(usable_ppb(*caps.usable_fraction.value()));
+    let usable_part = u64::try_from(u128::from(capture) * ppb / 1_000_000_000)
+        .unwrap_or(capture)
+        .max(1);
+    let bw = span.bandwidth_hz.0.max(1);
+    let (w, stride) = if bw <= usable_part {
+        let asked =
+            u64::try_from((u128::from(bw) * 1_000_000_000).div_ceil(ppb.max(1))).unwrap_or(capture);
+        (asked.min(capture), bw)
     } else {
-        capture
-    };
-    let stride = if one_step {
-        w
-    } else {
-        let ppb = u128::from(usable_ppb(*caps.usable_fraction.value()));
-        u64::try_from(u128::from(w) * ppb / 1_000_000_000)
-            .unwrap_or(w)
-            .max(1)
+        (capture, usable_part)
     };
     let n = span.bandwidth_hz.0.div_ceil(stride).max(1);
     let start = span.center_hz.0.saturating_sub(span.bandwidth_hz.0 / 2);
@@ -6149,10 +6152,74 @@ mod tests {
 
     #[test]
     fn a_sub_band_scan_is_one_step_as_wide_as_the_span() {
+        // The whole capture usable: one step exactly as wide as the span.
         assert_eq!(
             scan_steps(t(100_000_000, 1_000_000), &caps_16m()),
             [t(100_000_000, 1_000_000)]
         );
+        // 0.9 usable: one step whose usable part is the span.
+        let g = scan_grid(t(100_000_000, 1_000_000), &caps_at(16_000_000, 0.9));
+        assert_eq!(g.even, [t(100_000_000, 1_111_112)]);
+        assert_eq!(g.stride_hz, 1_000_000);
+        assert!(!g.alternates());
+    }
+
+    #[test]
+    fn a_span_inside_the_stride_is_one_step_whose_edges_fall_outside_it() {
+        // The `fft` stage masks `floor(size x edge_mask)` bins at each edge.
+        for (span, capture, usable) in [
+            (t(464_000_000, 20_000_000), 30_720_000, 0.9),
+            (t(464_000_000, 27_648_000), 30_720_000, 0.9),
+            (t(100_000_000, 1_000_000), 16_000_000, 0.9),
+            (t(464_000_000, 18_000_000), 20_000_000, 0.9),
+            (t(464_000_000, 40_000_000), 61_440_000, 0.8),
+        ] {
+            let g = scan_grid(span, &caps_at(capture, usable));
+            assert_eq!(g.even.len(), 1, "{span:?}");
+            assert!(!g.alternates());
+            let step = g.even[0];
+            let bw = span.bandwidth_hz.0;
+            // ceil(span / usable), never more than the capture.
+            let asked = (bw as f64 / usable).ceil() as u64;
+            assert_eq!(step.bandwidth_hz.0, asked.min(capture), "{span:?}");
+            assert_eq!(step.center_hz, span.center_hz);
+            let edge = scan_edge_mask_in_force(g.alternates(), 0.02, usable);
+            assert_eq!(edge, scan_edge_mask(usable));
+            let w = step.bandwidth_hz.0 as f64;
+            let size = f64::from(spectrum_size(step.bandwidth_hz.0));
+            let bin = w / size;
+            let e = (size * edge).floor();
+            let lo = step.center_hz.0 as f64 - w / 2.0;
+            let (unmasked_lo, unmasked_hi) = (lo + e * bin, lo + (size - e) * bin);
+            let (span_lo, span_hi) = (
+                (span.center_hz.0 - bw / 2) as f64,
+                (span.center_hz.0 + bw / 2) as f64,
+            );
+            // The masked bins lie outside the span, and cover its outside to within a bin.
+            assert!(unmasked_lo <= span_lo && unmasked_hi >= span_hi, "{span:?}");
+            assert!(
+                span_lo - unmasked_lo <= bin,
+                "{span:?}: {unmasked_lo} {span_lo}"
+            );
+            assert!(
+                unmasked_hi - span_hi <= bin,
+                "{span:?}: {unmasked_hi} {span_hi}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_span_between_the_stride_and_the_capture_is_two_steps() {
+        // 30.72 MHz captures at 0.9: a 29 MHz span is wider than the 27.648 MHz stride.
+        let g = scan_grid(t(464_000_000, 29_000_000), &caps_at(30_720_000, 0.9));
+        assert_eq!(g.even.len(), 2);
+        assert!(g.even.iter().all(|s| s.bandwidth_hz.0 == 30_720_000));
+        assert_eq!(g.stride_hz, 27_648_000);
+        assert_eq!(g.even[0].center_hz.0, 464_000_000 - 14_500_000 + 13_824_000);
+        assert!(g.alternates());
+        // So is a span as wide as the capture.
+        let g = scan_grid(t(464_000_000, 30_720_000), &caps_at(30_720_000, 0.9));
+        assert_eq!(g.even.len(), 2);
     }
 
     #[test]
@@ -6280,8 +6347,8 @@ mod tests {
         for (span, caps) in cases {
             let g = scan_grid(span, &caps);
             if !g.alternates() {
-                // A span inside one capture (20 MHz in 20 or 30.72): one step, which
-                // nothing fills in; see the end of this test.
+                // A span inside the stride (20 MHz in 30.72 at 0.9): one step, whose
+                // notch nothing fills in; see the end of this test.
                 continue;
             }
             // The edge mask in force from a configured 0.02: the unused edge at 0.9
@@ -6388,7 +6455,9 @@ mod tests {
         let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
         assert!(close(scan_edge_mask_in_force(true, 0.02, 0.9), 0.05));
         assert!(close(scan_edge_mask_in_force(true, 0.1, 0.9), 0.1));
-        assert!(close(scan_edge_mask_in_force(false, 0.1, 0.9), 0.0));
+        // One step: only the unused edges, which lie outside its span.
+        assert!(close(scan_edge_mask_in_force(false, 0.1, 0.9), 0.05));
+        assert!(close(scan_edge_mask_in_force(false, 0.1, 1.0), 0.0));
         assert!(close(scan_edge_mask(1.0), 0.0));
         // 0.9 reads 0.05 to the operator, not 0.04999999999999999.
         assert_eq!(scan_edge_mask(0.9), 0.05);

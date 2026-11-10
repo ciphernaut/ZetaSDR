@@ -856,32 +856,56 @@ async fn scan_mask_defaults_follow_the_capabilities() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_step_scan_does_not_alternate() {
     // One step: the 50 kHz notch is in force (1 MHz is wider than four notches; the unit test
-    // covers a step too narrow for it), but with no odd sweep or neighbour to fill the edges
-    // in, no edge mask, though the stored node keeps the unused edges of the usable fraction.
+    // covers a step too narrow for it). At 0.9 usable a 900 kHz span asks for 1 MHz, so the
+    // unused edges it masks lie outside the span; with no odd sweep or neighbour to fill a
+    // wider mask in, a wider stored one is not applied.
     let port = ScanPort::new();
     port.replace_caps(|c| c.usable_fraction = Claim::Asserted(0.9));
     let (_dir, node, port) = open_with(port).await;
-    let id = match node.apply(start(JobKind::Scan, 100 * MHZ, MHZ)).await {
+    let id = match node.apply(start(JobKind::Scan, 100 * MHZ, 900_000)).await {
         Ok(OpResult::Job(id)) => id,
         o => panic!("{o:?}"),
     };
+    let mut rx = event_rx(&node, &id);
+    for f in rows(&mut rx, 2, Duration::from_secs(3)).await {
+        assert_eq!(ev(&f)["edge_mask"], 0.05, "{}", ev(&f));
+    }
     tunes_at_least(&port, 3, Duration::from_secs(3)).await;
-    assert!(port.tunes().iter().all(|t| *t
-        == Tuning {
-            center_hz: Hz(100 * MHZ),
-            bandwidth_hz: Hz(MHZ)
-        }));
+    let step = Tuning {
+        center_hz: Hz(100 * MHZ),
+        bandwidth_hz: Hz(MHZ),
+    };
+    assert!(
+        port.tunes().iter().all(|t| *t == step),
+        "{:?}",
+        port.tunes()
+    );
     let ctx = node.job_context(&id).unwrap();
     assert_eq!(ctx["scan"]["steps"], 1);
+    assert_eq!(ctx["scan"]["step_hz"], 900_000, "{ctx}");
+    assert_eq!(ctx["scan"]["rate_hz"], MHZ, "{ctx}");
     assert!(ctx["scan"]["alternate"].is_null(), "{ctx}");
     assert_eq!(
         ctx["scan"]["mask"],
-        serde_json::json!({"notch_hz": 50_000, "edge_mask": 0.0})
+        serde_json::json!({"notch_hz": 50_000, "edge_mask": 0.05})
     );
-    let g = graph_of(&node, &id).await;
+    let mut g = graph_of(&node, &id).await;
     let stored = fft_node(&g);
     assert_eq!(stored.params["notch_hz"], 50_000);
     assert_eq!(stored.params["edge_mask"], 0.05);
+    g.nodes[0].params["edge_mask"] = serde_json::json!(0.2);
+    assert!(matches!(
+        node.apply(Op::GraphPut {
+            job: id.clone(),
+            graph: g
+        })
+        .await,
+        Ok(OpResult::Ok)
+    ));
+    assert_eq!(
+        node.job_context(&id).unwrap()["scan"]["mask"]["edge_mask"],
+        0.05
+    );
     node.job_stop(&id).await.unwrap();
 }
 
