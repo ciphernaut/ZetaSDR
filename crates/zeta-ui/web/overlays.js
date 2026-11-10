@@ -967,7 +967,8 @@ class Overlays {
 
   // A frame from or to a fixed station (plan 35 spec 4.5), on a job whose row has
   // `subject.station`: one matching `station.when` (subjects.js matchesPairs, the table's
-  // comparison), or one whose `addressed` field is non-blank.
+  // comparison), or one whose `addressed` field names a station as the node's tally keys
+  // it (origin.rs station_key): a non-blank string, or a number.
   isStationFrame(job, p) {
     if (!p || typeof p !== "object" || Array.isArray(p)) return false;
     const st = this.subjects?.rowOf(job.kind)?.subject?.station;
@@ -975,7 +976,7 @@ class Overlays {
     if (matchesPairs(p, st.when)) return true;
     if (typeof st.addressed !== "string") return false;
     const to = p[st.addressed];
-    return ["string", "number", "boolean"].includes(typeof to) && String(to).trim() !== "";
+    return (typeof to === "string" && to.trim() !== "") || typeof to === "number";
   }
 
   // What the page knows of a job's activity: watched (a running job on the shown source, so

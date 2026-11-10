@@ -166,7 +166,8 @@ pub struct Subject {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields, rename = "ModeStation", transform = require_all)]
 pub struct Station {
-    /// Field = value pairs; an event matching every pair is from a station. Not empty.
+    /// Field = value pairs; an event matching every pair is from a station. Not empty;
+    /// no value `null`.
     pub when: BTreeMap<String, serde_json::Value>,
     /// The field naming the station on its own frame (a string trimmed, a number as
     /// printed); `null` when the protocol names none: the anonymous station `"*"`.
@@ -1044,6 +1045,10 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
                     format!("subject.station.when.{k}"),
                     "not in event.schema.properties",
                 ));
+            }
+            // A null pair: the page never matches one (a null field reads as absent).
+            if let Some(k) = st.when.iter().find(|(_, v)| v.is_null()).map(|(k, _)| k) {
+                return Err(RowError::new(format!("subject.station.when.{k}"), "null"));
             }
             for (name, f) in [("key", &st.key), ("addressed", &st.addressed)] {
                 if f.as_ref().is_some_and(|f| !properties.contains_key(f)) {
@@ -2161,6 +2166,20 @@ mod tests {
         });
         let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
         assert_eq!(e, RowError::new("subject.station.when", "empty"), "{e}");
+    }
+
+    #[test]
+    fn a_null_station_when_value_is_refused() {
+        // The page reads a null field as absent, the node as equal to null: refused.
+        let text = edited(ADSB, |v| {
+            v["subject"]["station"] = serde_json::json!({"when": {"callsign": null}})
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new("subject.station.when.callsign", "null"),
+            "{e}"
+        );
     }
 
     #[test]
