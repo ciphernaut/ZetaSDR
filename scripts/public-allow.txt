@@ -10,6 +10,9 @@
 # The demo station in the APRS position test before b3ff63b7 named the tolerance: the
 # latitude or longitude followed by the 0.0001 tolerance reads as a pair (history only).
 crates/zeta-dsp/src/aprs_info.rs:near\(i\.l(at|on), (-27\.3842|153\.1175), 0\.0001\);
+# Synthesised range edge in the ACARS position parser's test before 7606021e: 89 59.9 S,
+# 179 59.9 E as decimals (the working tree writes them as arithmetic; history only).
+crates/zeta-core/src/modes/derive.rs:assert_fix\("POSS89599E179599", -89\.99833, 179\.99833, None\);
 # Public data: iNTERCEPT catalogue descriptions, the dump1090 SBS sample position.
 crates/zeta-dsp/data/signals.json:"description":
 crates/zeta-ext/tests/adsb.rs:,52\.25720,3\.91937,
