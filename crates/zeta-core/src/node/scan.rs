@@ -226,13 +226,17 @@ impl Inner {
 
 /// The cost of one sweep's steps: the tune each took, the whole step, the
 /// steps whose samples did not arrive and the time the hand-off waited on the
-/// FFT task. [`SweepTiming::finish`] summarises and clears it.
+/// FFT task. [`SweepTiming::finish`] summarises and clears it. A sweep the
+/// throttle does not write is [`SweepTiming::carry`]ed: its skips and slow tunes
+/// stay counted for the next write, its durations are dropped.
 #[derive(Default)]
 struct SweepTiming {
     tunes: Vec<Duration>,
     steps: Vec<Duration>,
     skipped: u64,
     fft_wait: Duration,
+    /// Slow tunes of the sweeps carried since the last write.
+    slow: u64,
 }
 
 /// The median of `v` (its upper middle for an even count); zero when empty.
@@ -261,18 +265,34 @@ impl SweepTiming {
         self.fft_wait += d;
     }
 
-    /// The sweep's `context.scan.timing` (less `at_ns`, which the writer adds)
-    /// for a sweep of `span_hz` that took `sweep`; the next sweep starts empty.
-    /// A tune is slow over ten times the median tune, compared in microseconds.
-    fn finish(&mut self, span_hz: u64, sweep: Duration) -> serde_json::Value {
-        let t = std::mem::take(self);
-        let med = median(&t.tunes);
-        let med_us = med.as_micros().max(1);
-        let slow = t
-            .tunes
+    /// Slow tunes of the sweep so far: over ten times its median tune,
+    /// compared in microseconds.
+    fn slow_tunes(&self) -> u64 {
+        let med_us = median(&self.tunes).as_micros().max(1);
+        self.tunes
             .iter()
             .filter(|d| d.as_micros() > 10 * med_us)
-            .count();
+            .count() as u64
+    }
+
+    /// End a sweep that is not written: its skips and slow tunes are kept
+    /// for the next write, the rest is dropped.
+    fn carry(&mut self) {
+        *self = SweepTiming {
+            skipped: self.skipped,
+            slow: self.slow + self.slow_tunes(),
+            ..Default::default()
+        };
+    }
+
+    /// The sweep's `context.scan.timing` (less `at_ns`, which the writer adds)
+    /// for a sweep of `span_hz` that took `sweep`; the next sweep starts empty.
+    /// `skipped` and `slow_tunes` count since the last write (this sweep and any
+    /// carried before it); the other figures are this sweep's.
+    fn finish(&mut self, span_hz: u64, sweep: Duration) -> serde_json::Value {
+        let slow = self.slow_tunes() + self.slow;
+        let t = std::mem::take(self);
+        let med = median(&t.tunes);
         let sweep_ms = ms(sweep);
         let hz_per_s = if sweep_ms > 0.0 {
             span_hz as f64 * 1000.0 / sweep_ms
@@ -511,9 +531,9 @@ async fn scan_loop(
                 inner.scan_context_update(&s.id, |scan| {
                     scan.insert("timing".into(), t);
                 });
+            } else {
+                timing.carry();
             }
-            // A sweep not written is dropped, not carried into the next.
-            timing = SweepTiming::default();
         }
     }
 }
@@ -773,21 +793,33 @@ mod tests {
             super::super::JobEntry::loaded(rec, Timestamp(0)),
         );
         const N: u64 = 300;
+        // How many rewrites of `steps` the first thread has finished.
+        let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let a = {
-            let (inner, id) = (inner.clone(), id.clone());
+            let (inner, id, done) = (inner.clone(), id.clone(), done.clone());
             std::thread::spawn(move || {
                 for n in 0..N {
                     let mut f = serde_json::Map::new();
                     f.insert("steps".into(), n.into());
                     inner.scan_context_rewrite(&id, f);
+                    done.store(n + 1, std::sync::atomic::Ordering::SeqCst);
                 }
             })
         };
         let b = {
-            let (inner, id) = (inner.clone(), id.clone());
+            let (inner, id, done) = (inner.clone(), id.clone(), done.clone());
             std::thread::spawn(move || {
                 for n in 0..N {
+                    let finished = done.load(std::sync::atomic::Ordering::SeqCst);
                     inner.scan_context_update(&id, |scan| {
+                        // Neither writer's earlier write may have been reverted.
+                        if n > 0 {
+                            assert_eq!(scan["timing"]["at_ns"], n - 1, "a timing write was lost");
+                        }
+                        if finished > 0 {
+                            let steps = scan["steps"].as_u64().expect("steps");
+                            assert!(steps >= finished - 1, "a rewrite was lost: {steps}");
+                        }
                         scan.insert("timing".into(), serde_json::json!({"at_ns": n}));
                     });
                 }

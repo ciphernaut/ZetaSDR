@@ -1,6 +1,7 @@
 //! The `scan` job: time-shares one radio across a span wider than its capture.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -83,6 +84,8 @@ struct ScanPort {
     fail_tune: Option<usize>,
     /// The `t0` of every block a `Gapping` port started late.
     gaps: Mutex<Vec<u64>>,
+    /// While set, no block is sent ([`ScanPort::hold`]).
+    held: AtomicBool,
     tx: broadcast::Sender<IqBlock>,
 }
 
@@ -117,6 +120,11 @@ impl ScanPort {
     /// A `FAST_RATE_HZ`-wide port whose every block holds `FAST_BLOCK_MS` of samples.
     fn fast() -> Arc<Self> {
         Self::build(None, false, false, Delivery::Fast, FAST_RATE_HZ)
+    }
+
+    /// Stop sending blocks while `on`, as a port that has stalled; they resume when it is off.
+    fn hold(&self, on: bool) {
+        self.held.store(on, Ordering::SeqCst);
     }
 
     /// A port that sends `after_blocks` blocks, then stops delivering.
@@ -162,6 +170,7 @@ impl ScanPort {
             tunes: Mutex::new(Vec::new()),
             fail_tune,
             gaps: Mutex::new(Vec::new()),
+            held: AtomicBool::new(false),
             tx: broadcast::channel(16).0,
         });
         let weak = Arc::downgrade(&p);
@@ -179,6 +188,9 @@ impl ScanPort {
                 let Some(p) = weak.upgrade() else { return };
                 let Some(t) = p.current() else { continue };
                 if matches!(delivery, Delivery::Stalling(n) if sent >= n) {
+                    continue;
+                }
+                if p.held.load(Ordering::SeqCst) {
                     continue;
                 }
                 let samples = match cache.iter().find(|(c, _)| *c == t) {
@@ -1324,5 +1336,42 @@ async fn the_timing_is_written_at_most_once_a_second() {
     for w in seen.windows(2) {
         assert!(w[1] - w[0] >= 1_000_000_000, "{seen:?}");
     }
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A skip in a sweep the throttle does not write still shows at the next write:
+/// the one-step sweeps between two writes add their skips up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skip_in_an_unwritten_sweep_shows_at_the_next_write() {
+    let (_dir, node, port) = open_with(ScanPort::fast()).await;
+    let (id, _rx) = start_span(&node, 100 * MHZ, FAST_RATE_HZ).await;
+    until("a timing", Duration::from_secs(10), || {
+        timing(&node, &id).is_some()
+    })
+    .await;
+    let first = timing(&node, &id).unwrap()["at_ns"].as_u64().unwrap();
+    // Stall the port right after the first write: once the ring's backlog is
+    // used up one step waits out its 520 ms timeout, a skip in a sweep that ends
+    // inside the second the throttle holds the record back. A tune after a quiet
+    // spell of 450 ms is that step's end; the samples come back then.
+    port.hold(true);
+    let mut last = (port.tunes().len(), Instant::now());
+    until("a step given up on", Duration::from_secs(10), || {
+        let n = port.tunes().len();
+        if n == last.0 {
+            return false;
+        }
+        let quiet = last.1.elapsed() >= Duration::from_millis(450);
+        last = (n, Instant::now());
+        quiet
+    })
+    .await;
+    port.hold(false);
+    until("a skip reported", Duration::from_secs(10), || {
+        timing(&node, &id).is_some_and(|t| t["skipped"].as_u64().unwrap_or(0) >= 1)
+    })
+    .await;
+    let t = timing(&node, &id).unwrap();
+    assert!(t["at_ns"].as_u64().unwrap() > first, "{t}");
     node.job_stop(&id).await.unwrap();
 }
