@@ -87,8 +87,9 @@
       "into": { "lat": "lat", "lon": "lon", "alt_ft": "alt_ft" }
     }
   ],
-  "notes": "A downlink (a digit block id, downlink true) whose text is a position report (labels H1, 80, 16, 3L, QQ) carries lat, lon, sometimes alt_ft, and a position: the aircraft's own report, typically a few minutes old by the time it is relayed. Uplinks are never parsed.",
+  "notes": "A downlink (a digit block id, downlink true) whose text is a position report (labels H1, 80, 16, 3L, QQ) carries lat, lon, sometimes alt_ft, and a position: the aircraft's own report, typically a few minutes old by the time it is relayed. Uplinks are never parsed. An uplink lights the register's transmitter sites on the channel as `heard`; `job_context.stations` counts uplinks under `*`.",
   "subject": {
+    "station": { "when": { "downlink": false }, "key": null, "addressed": null },
     "key": "reg",
     "name": "aircraft",
     "waterfall": "summary",
