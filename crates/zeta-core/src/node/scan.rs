@@ -21,11 +21,11 @@ use crate::ops::{
     scan_dwell_samples, scan_edge_mask_in_force, scan_grid, scan_mask_default, scan_notch_in_force,
     spectrum_size,
 };
-use crate::port::{IqBlock, Port};
+use crate::port::{IqBlock, Port, Tuning};
 use crate::stage::{Stage, StageContext, StageError};
 use crate::stream::{Frame, Payload};
 use crate::types::{
-    ChannelId, Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
+    Capabilities, ChannelId, Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp,
 };
 
 impl Inner {
@@ -56,12 +56,13 @@ impl Inner {
             }
         })?;
         let mut rec = rec;
+        let caps = port.capabilities().clone();
         if !rec.graph.nodes.iter().any(|n| n.kind == "fft") {
             rec.graph = JobKind::Scan
                 .expand(
                     &rec.source,
                     rec.tuning,
-                    Hz(0),
+                    *caps.max_bandwidth_hz.value(),
                     None,
                     None,
                     None,
@@ -70,8 +71,6 @@ impl Inner {
                 .map_err(|e| NodeError::Other(format!("scan graph: {e}")))?;
         }
         graph::validate(&rec.graph, &self.registry)?;
-        let grid = scan_grid(rec.tuning, port.capabilities());
-        let w = grid.even[0].bandwidth_hz.0;
         let fft = rec
             .graph
             .nodes
@@ -81,20 +80,19 @@ impl Inner {
         if let Some(p) = fft.params.as_object_mut()
             && !p.contains_key("notch_hz")
         {
-            let (notch, edge) = scan_mask_default(port.capabilities());
+            let (notch, edge) = scan_mask_default(&caps);
+            let w = scan_grid(rec.tuning, &caps).even[0].bandwidth_hz.0;
             p.insert("notch_hz".into(), notch.into());
             p.entry("edge_mask").or_insert(edge.into());
             p.insert("size".into(), spectrum_size(w).into());
         }
-        let notch_cfg = fft.params["notch_hz"].as_u64().unwrap_or(0);
         // The stored node keeps what was configured; the rows and the context
-        // get the values in force: no notch on a step under four notches, no
-        // edge mask on a grid that does not alternate (no odd sweep fills it in).
-        let edge_mask = scan_edge_mask_in_force(
-            grid.alternates(),
+        // get the values in force (see [`Layout`]).
+        let mask = (
+            fft.params["notch_hz"].as_u64().unwrap_or(0),
             fft.params["edge_mask"].as_f64().unwrap_or(0.0),
         );
-        let notch_hz = scan_notch_in_force(w, notch_cfg);
+        let layout = Layout::of(rec.tuning, &caps, mask);
         match gate {
             Some(g) => {
                 self.leases
@@ -112,9 +110,7 @@ impl Inner {
                 *after = AfterGate::StopElastic(rec.source.clone());
             }
         }
-        let id = rec.id.clone();
-        // The dwell in force on the first step: whole frames, never under four.
-        let (_, dwell_ms) = scan_dwell_samples(self.scan_dwell_ms, w, spectrum_size(w));
+        let (id, span) = (rec.id.clone(), rec.tuning);
         // `job_context` tells a reader (the agent above all) how many steps a
         // sweep takes, how the odd sweeps shift and the mask in force, instead
         // of leaving it to guess from the rows.
@@ -122,35 +118,16 @@ impl Inner {
             rec.context = serde_json::json!({});
         }
         if let Some(ctx) = rec.context.as_object_mut() {
-            let alternate = if grid.alternates() {
-                serde_json::json!({
-                    "shift_hz": grid.shift_hz(),
-                    "steps_shifted": grid.odd.len(),
-                })
-            } else {
-                serde_json::Value::Null
-            };
-            let mut scan = serde_json::json!({
-                "steps": grid.even.len(),
-                "step_hz": w,
-                "dwell_ms": dwell_ms,
-                "alternate": alternate,
-                "mask": {"notch_hz": notch_hz, "edge_mask": edge_mask},
-            });
-            if dwell_ms != self.scan_dwell_ms {
-                scan["dwell_ms_asked"] = self.scan_dwell_ms.into();
-            }
-            ctx.insert("scan".into(), scan);
+            ctx.insert("scan".into(), layout.context(self.scan_dwell_ms).into());
         }
         let token = self.shutdown.child_token();
         let (prov, run, ended) = self.record_running(rec, &token)?;
         let out = self.bus.register_unfed(StreamKind::Event, prov.clone());
         let scan = Arc::new(Scan {
             id: id.clone(),
-            grid,
+            span,
+            layout,
             dwell_ms: self.scan_dwell_ms,
-            notch_hz,
-            edge_mask,
             port: port.clone(),
             ctx: StageContext::new(prov.source.clone()),
             stage,
@@ -208,19 +185,109 @@ impl Inner {
         let ring = ring.read().unwrap();
         ring.run_after(center, after, samples)
     }
+
+    /// Write `fields` into job `id`'s `job_context.scan`, keeping its other
+    /// keys (a `dwell_ms_asked` the fields no longer carry is dropped). Best
+    /// effort: a job already gone has no context to keep.
+    fn scan_context_rewrite(&self, id: &JobId, fields: serde_json::Map<String, serde_json::Value>) {
+        let ctx = self
+            .jobs
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|e| e.record.context.clone());
+        let mut scan = match ctx.map(|c| c["scan"].clone()) {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        scan.remove("dwell_ms_asked");
+        scan.extend(fields);
+        let _ = self.context_merge(id, serde_json::json!({"scan": scan}));
+    }
 }
 
-/// What a running scan needs: its lease holder id, the grids its sweeps
-/// alternate between, the dwell asked for (ms; each step takes it in whole
-/// frames, [`scan_dwell_samples`]), the mask its `fft` runs apply (`notch_hz`
-/// the notch in force), the `fft` stage, and its output stream.
+/// A scan's steps and the mask they are masked with, built from the source's
+/// capabilities at launch and again at the start of a sweep when the source's
+/// capture (`max_bandwidth_hz`) or its usable fraction changed (a cap measured
+/// after the scan started, [`scan_loop`]).
+#[derive(Clone, Debug)]
+struct Layout {
+    /// The capabilities it was built from: `max_bandwidth_hz` and `usable_fraction`.
+    capture_hz: u64,
+    usable: f64,
+    grid: ScanGrid,
+    /// The notch and edge mask in force: no notch on a step under four notches,
+    /// and on a grid that alternates the configured edge mask or the edges the
+    /// usable fraction leaves unused, whichever is wider, else none (no odd
+    /// sweep or neighbour fills the edges in).
+    notch_hz: u64,
+    edge_mask: f64,
+    /// The configured `(notch_hz, edge_mask)`, from the scan's stored `fft` node.
+    mask: (u64, f64),
+}
+
+impl Layout {
+    fn of(span: Tuning, caps: &Capabilities, mask: (u64, f64)) -> Self {
+        let grid = scan_grid(span, caps);
+        let usable = *caps.usable_fraction.value();
+        let w = grid.even[0].bandwidth_hz.0;
+        Layout {
+            capture_hz: caps.max_bandwidth_hz.value().0,
+            usable,
+            notch_hz: scan_notch_in_force(w, mask.0),
+            edge_mask: scan_edge_mask_in_force(grid.alternates(), mask.1, usable),
+            grid,
+            mask,
+        }
+    }
+
+    /// Whether `caps` would build another layout.
+    fn stale(&self, caps: &Capabilities) -> bool {
+        caps.max_bandwidth_hz.value().0 != self.capture_hz
+            || *caps.usable_fraction.value() != self.usable
+    }
+
+    /// The scan's `job_context.scan` for this layout and a dwell asked of
+    /// `dwell_asked_ms`: `steps`, `step_hz` (the stride), `rate_hz` (the
+    /// capture each step asks for), `dwell_ms` (in force on a step: whole
+    /// frames, never under four), `dwell_ms_asked` when that differs,
+    /// `alternate` and `mask`.
+    fn context(&self, dwell_asked_ms: u64) -> serde_json::Map<String, serde_json::Value> {
+        let g = &self.grid;
+        let w = g.even[0].bandwidth_hz.0;
+        let (_, dwell_ms) = scan_dwell_samples(dwell_asked_ms, w, spectrum_size(w));
+        let alternate = if g.alternates() {
+            serde_json::json!({"shift_hz": g.shift_hz(), "steps_shifted": g.odd.len()})
+        } else {
+            serde_json::Value::Null
+        };
+        let mut scan = serde_json::json!({
+            "steps": g.even.len(),
+            "step_hz": g.stride_hz,
+            "rate_hz": w,
+            "dwell_ms": dwell_ms,
+            "alternate": alternate,
+            "mask": {"notch_hz": self.notch_hz, "edge_mask": self.edge_mask},
+        });
+        if dwell_ms != dwell_asked_ms {
+            scan["dwell_ms_asked"] = dwell_asked_ms.into();
+        }
+        match scan {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!("built as an object"),
+        }
+    }
+}
+
+/// What a running scan needs: its lease holder id, its band, the layout it
+/// launched with, the dwell asked for (ms; each step takes it in whole frames,
+/// [`scan_dwell_samples`]), the `fft` stage, and its output stream.
 struct Scan {
     id: JobId,
     port: Arc<dyn Port>,
-    grid: ScanGrid,
+    span: Tuning,
+    layout: Layout,
     dwell_ms: u64,
-    notch_hz: u64,
-    edge_mask: f64,
     stage: Arc<dyn Stage>,
     ctx: StageContext,
     prov: Provenance,
@@ -230,7 +297,7 @@ struct Scan {
 
 /// One step's dwell, handed from [`scan_loop`] to [`fft_task`]: the sweep and
 /// the step's index within that sweep's list, the centre it was taken at, its
-/// samples and how many FFT frames they are.
+/// samples, how many FFT frames they are and the mask in force on it.
 struct Step {
     #[expect(
         dead_code,
@@ -241,6 +308,8 @@ struct Step {
     center: Hz,
     block: IqBlock,
     frames: u32,
+    notch_hz: u64,
+    edge_mask: f64,
 }
 
 /// The `scan` job's step loop, until cancelled: tune the source to each step
@@ -254,6 +323,10 @@ struct Step {
 /// [`SCAN_WAIT_MARGIN_MS`] the step is skipped; samples lost inside a dwell
 /// restart the ring's run and the wait goes on from there. A hand-off waits
 /// while the FFT task still has one step queued.
+/// At each sweep's start the source's capabilities are read again: when its
+/// capture or usable fraction changed (a rate cap measured after the scan
+/// started), the grid and mask are rebuilt from them and `job_context.scan`
+/// rewritten, so that sweep steps at the new width.
 /// Cancellation is checked before every tune and ends every wait. A failed
 /// tune or a port fault fails the job; the port is left at the last step.
 async fn scan_loop(
@@ -264,6 +337,7 @@ async fn scan_loop(
     let faulted = |f: String| StageError::Failed(source_fault_reason(s.port.id(), &f));
     let source = &s.prov.source;
     let mut tick = inner.ring_tick(source);
+    let mut layout = s.layout.clone();
     // The centre and the end of the last block taken.
     let mut taken: Option<(Hz, Timestamp)> = None;
     let (mut sweep, mut i) = (0u64, 0usize);
@@ -273,7 +347,11 @@ async fn scan_loop(
         if s.cancel.is_cancelled() {
             return Err(StageError::Cancelled);
         }
-        let steps = s.grid.steps(sweep);
+        if i == 0 && layout.stale(s.port.capabilities()) {
+            layout = Layout::of(s.span, s.port.capabilities(), layout.mask);
+            inner.scan_context_rewrite(&s.id, layout.context(s.dwell_ms));
+        }
+        let steps = layout.grid.steps(sweep);
         let got = match inner
             .leases
             .retune_shared(s.port.as_ref(), &s.id, steps[i], &s.cancel)
@@ -305,6 +383,8 @@ async fn scan_loop(
                 center: got.center_hz,
                 block,
                 frames: u32::try_from(samples / u64::from(size)).unwrap_or(u32::MAX),
+                notch_hz: layout.notch_hz,
+                edge_mask: layout.edge_mask,
             };
             tokio::select! {
                 _ = s.cancel.cancelled() => return Err(StageError::Cancelled),
@@ -404,6 +484,8 @@ async fn fft_step(inner: &Inner, s: &Scan, step: Step) -> Result<(), StageError>
         center,
         block,
         frames,
+        notch_hz,
+        edge_mask,
         ..
     } = step;
     // The dwell is `frames` whole frames.
@@ -427,8 +509,8 @@ async fn fft_step(inner: &Inner, s: &Scan, step: Step) -> Result<(), StageError>
         "size": size,
         "window": "hann",
         "rows_per_s": SPECTRUM_ROWS_PER_S,
-        "notch_hz": s.notch_hz,
-        "edge_mask": s.edge_mask,
+        "notch_hz": notch_hz,
+        "edge_mask": edge_mask,
     });
     if dwell_ms < SCAN_ROWS_DWELL_MS {
         params["row_frames"] = frames.into();

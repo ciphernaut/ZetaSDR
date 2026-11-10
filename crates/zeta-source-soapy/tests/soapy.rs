@@ -1326,3 +1326,14 @@ async fn a_rate_change_drops_the_settle_and_no_more() {
         "the reopened stream dropped 5 ms at 1.5 Msps, no more"
     );
 }
+
+#[test]
+fn a_device_asserts_0_9_of_its_capture_usable_unless_told() {
+    let dev = Arc::new(MockDevice::hackrf_like());
+    let src = SoapySource::with_device(SourceId("sdr0".into()), dev.clone()).unwrap();
+    assert_eq!(src.capabilities().usable_fraction, Claim::Asserted(0.9));
+    let src = SoapySource::with_device(SourceId("sdr0".into()), dev)
+        .unwrap()
+        .with_usable(0.8);
+    assert_eq!(src.capabilities().usable_fraction, Claim::Asserted(0.8));
+}

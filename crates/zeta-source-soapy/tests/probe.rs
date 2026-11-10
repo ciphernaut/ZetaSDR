@@ -341,6 +341,7 @@ fn a_max_rate_item_asserts_the_cap_and_is_stripped_from_the_driver_args() {
                 ppm: None,
                 max_rate_hz: Some(8_000_000),
                 settle_ms: None,
+                usable: None,
             }
         )
     );

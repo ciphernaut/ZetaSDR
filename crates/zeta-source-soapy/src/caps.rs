@@ -54,6 +54,14 @@ pub struct FrontEnd {
 /// times the B2xx family's measured one.
 pub const SETTLE_DEFAULT: Duration = Duration::from_millis(10);
 
+/// The part of a capture, centred, that a SoapySDR device's front-end filter
+/// passes flat, asserted for every device (`usable=` overrides it, see
+/// [`crate::SoapySource::with_usable`]): a scan advances by this much of each
+/// capture and masks the rest. Measured 2026-11-10 on the field host's B210:
+/// 28 MHz of a 30.72 Msps capture clean, the full width rolled off; 0.9 gives
+/// 27.648 MHz.
+pub const USABLE_DEFAULT: f64 = 0.9;
+
 /// The radios whose front end is measured or known: a UHD device (see
 /// [`is_uhd`]) whose hardware key starts with the prefix (matched
 /// case-insensitively; SoapyUHD gives the motherboard, `B210` for a B210). The
@@ -171,6 +179,8 @@ pub fn capabilities(dev: &dyn SoapyDevice, rates: &[RangeHz]) -> Result<Capabili
         tx: false,
         remote: dev.driver_key() == "remote",
         push: false,
+        usable_fraction: Claim::Asserted(USABLE_DEFAULT),
+        depths: vec![],
     })
 }
 
@@ -435,6 +445,8 @@ mod tests {
         );
         assert_eq!(c.channels, 1);
         assert!(c.rx && !c.tx && !c.remote && !c.push);
+        assert_eq!(c.usable_fraction, Claim::Asserted(0.9));
+        assert!(c.depths.is_empty());
     }
 
     #[test]

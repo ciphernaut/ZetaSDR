@@ -34,7 +34,8 @@
 //! A mock source's hello reports `max_bandwidth_hz: Measured(N)` with
 //! `--rate-cap-hz N` (as the real worker reports a cap the node passed back),
 //! or else with `ZETA_FAKE_MEASURED_CAP=N` (as a worker that probed); without
-//! either the mock's own asserted cap.
+//! either the mock's own asserted cap. Its `usable_fraction` is the Soapy
+//! source's asserted default, or `ZETA_FAKE_USABLE=F` (as `usable=F`).
 //!
 //! `--ring-fd N` serves through the ring inherited on descriptor `N`, as the
 //! real worker does (a ring that will not open is one stderr line, then the
@@ -256,6 +257,12 @@ fn mock_source(
     });
     if let Some(hz) = measured {
         src.set_max_bandwidth(Claim::Measured(Hz(hz)));
+    }
+    if let Some(usable) = std::env::var("ZETA_FAKE_USABLE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        src = src.with_usable(usable);
     }
     let src = Arc::new(src);
     let weak = Arc::downgrade(&src);

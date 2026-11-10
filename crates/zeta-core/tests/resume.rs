@@ -120,6 +120,8 @@ impl Radio {
                 tx: false,
                 remote: false,
                 push: false,
+                usable_fraction: Claim::Asserted(1.0),
+                depths: vec![],
             },
             cur: Mutex::new(None),
             tx: broadcast::channel(1).0,
@@ -403,11 +405,12 @@ async fn a_scan_record_with_an_empty_graph_resumes_with_the_default_mask() {
     assert_eq!(g.nodes.len(), 1);
     assert_eq!(g.nodes[0].kind, "fft");
     assert_eq!(g.nodes[0].params["notch_hz"], 50_000);
-    assert_eq!(g.nodes[0].params["edge_mask"], 0.02);
+    // The radio's whole capture is usable: no edges to mask.
+    assert_eq!(g.nodes[0].params["edge_mask"], 0.0);
     let ctx = node.job_context(&scan).unwrap();
     assert_eq!(
         ctx["scan"]["mask"],
-        serde_json::json!({"notch_hz": 50_000, "edge_mask": 0.02})
+        serde_json::json!({"notch_hz": 50_000, "edge_mask": 0.0})
     );
     assert!(ctx["scan"]["alternate"].is_object(), "{ctx}");
     node.job_stop(&scan).await.unwrap();

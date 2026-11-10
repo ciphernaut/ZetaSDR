@@ -504,6 +504,8 @@ impl FaultyPort {
                 tx: false,
                 remote: false,
                 push: false,
+                usable_fraction: Claim::Asserted(1.0),
+                depths: vec![],
             },
             cur: Mutex::new(None),
             tx: Mutex::new(Some(tx)),

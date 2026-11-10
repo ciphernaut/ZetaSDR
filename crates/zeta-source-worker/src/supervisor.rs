@@ -27,10 +27,13 @@
 //! probe). Once the port's capability record holds a measured cap (the first
 //! hello's, or the cached one), each spawn is told it with `--rate-cap-hz N`,
 //! unless the configured args already carry the flag, so a respawn skips the
-//! probe. A record whose cap was only asserted (a probe that found no rung
-//! clean, or a device that could not be probed) is replaced by a later hello
-//! that differs from it in nothing but a measured cap: the port then reports
-//! that record, the node caches it on the heal, and later spawns are told it.
+//! probe. The record the port attached with is replaced, once, by a later
+//! hello that differs from it only in what a newer worker knows better: its
+//! `usable_fraction` and `depths` (a record cached before them loads with
+//! their defaults), and a measured cap where the record's was only asserted (a
+//! probe that found no rung clean, or a device that could not be probed) or a
+//! cap chosen from its depths. The port then reports that record, the node
+//! caches it on the heal, and later spawns are told its cap.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -74,9 +77,9 @@ pub(crate) struct Shared {
     pub(crate) id: SourceId,
     snap: Mutex<Snapshot>,
     pub(crate) tx: broadcast::Sender<IqBlock>,
-    /// The capability record a respawn measured, replacing the asserted one
-    /// the port attached with (see [`measured_replaces`]). Set at most once:
-    /// after it, every spawn is passed the measured cap and reports it back.
+    /// The capability record a respawn's hello gave, replacing the one the
+    /// port attached with (see [`hello_replaces`]). Set at most once: after it,
+    /// every spawn is passed its measured cap and reports it back.
     pub(crate) measured: OnceLock<Capabilities>,
 }
 
@@ -460,16 +463,25 @@ impl Supervisor {
         match &self.caps {
             None => self.caps = Some(hello.capabilities.clone()),
             Some(c) if *c == hello.capabilities => {}
-            Some(c) if measured_replaces(c, &hello.capabilities) => {
+            Some(c)
+                if self.shared.measured.get().is_none()
+                    && hello_replaces(c, &hello.capabilities) =>
+            {
+                let new = &hello.capabilities;
                 eprintln!(
-                    "zeta: soapy worker for {}: rate cap {} Hz measured on respawn",
+                    "zeta: soapy worker for {}: record taken from the respawn's hello (rate cap {} Hz {}, usable {})",
                     self.id(),
-                    hello.capabilities.max_bandwidth_hz.value().0
+                    new.max_bandwidth_hz.value().0,
+                    match new.max_bandwidth_hz {
+                        Claim::Measured(_) => "measured",
+                        Claim::Asserted(_) => "asserted",
+                    },
+                    new.usable_fraction.value()
                 );
                 // Before the heal is announced below, so the node's recovery
                 // caches this record. The port attached before any of this
-                // (`first` is answered once): only a record it was given can
-                // be replaced, so `measured` is still empty here.
+                // (`first` is answered once) with a record it was given, and
+                // it is replaced once at most.
                 let _ = self.shared.measured.set(hello.capabilities.clone());
                 self.caps = Some(hello.capabilities.clone());
             }
@@ -825,15 +837,27 @@ impl Supervisor {
     }
 }
 
-/// Whether `new` is `old` with its asserted rate cap now measured, and nothing
-/// else changed: the one change a later hello may make to the port's record.
-fn measured_replaces(old: &Capabilities, new: &Capabilities) -> bool {
-    let (Claim::Asserted(_), Claim::Measured(_)) = (&old.max_bandwidth_hz, &new.max_bandwidth_hz)
-    else {
-        return false;
-    };
+/// Whether a later hello's record `new` may replace the port's `old` one: they
+/// are the same once `new`'s `usable_fraction` and `depths` are taken, and its
+/// `max_bandwidth_hz` too when `old`'s was asserted and `new`'s is measured,
+/// or when it is the cap of one of `new`'s depths (the depth the worker chose
+/// to run). A record cached before the first two fields were carried loads
+/// without them, so the live values reach the port on the first hello.
+fn hello_replaces(old: &Capabilities, new: &Capabilities) -> bool {
     let mut same = old.clone();
-    same.max_bandwidth_hz = new.max_bandwidth_hz.clone();
+    same.usable_fraction = new.usable_fraction.clone();
+    same.depths = new.depths.clone();
+    let measured = matches!(
+        (&old.max_bandwidth_hz, &new.max_bandwidth_hz),
+        (Claim::Asserted(_), Claim::Measured(_))
+    );
+    let chosen = new
+        .depths
+        .iter()
+        .any(|d| d.max_bandwidth_hz == new.max_bandwidth_hz);
+    if measured || chosen {
+        same.max_bandwidth_hz = new.max_bandwidth_hz.clone();
+    }
     same == *new
 }
 
@@ -1031,6 +1055,42 @@ fn read_stderr(stderr: File, id: &str, last: &Mutex<Option<String>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeta_core::types::{Depth, Hz};
+
+    #[test]
+    fn a_hello_replaces_only_what_a_newer_worker_knows_better() {
+        let old = Capabilities {
+            tune_min_hz: Claim::Asserted(Hz(70_000_000)),
+            tune_max_hz: Claim::Asserted(Hz(6_000_000_000)),
+            max_bandwidth_hz: Claim::Measured(Hz(30_720_000)),
+            formats: vec![],
+            channels: 1,
+            rx: true,
+            tx: false,
+            remote: false,
+            push: false,
+            usable_fraction: Claim::Asserted(1.0),
+            depths: vec![],
+        };
+        let mut new = old.clone();
+        new.usable_fraction = Claim::Asserted(0.9);
+        assert!(hello_replaces(&old, &new));
+        // A cap chosen from the hello's depths replaces a measured one.
+        new.depths = vec![Depth {
+            bits: 12,
+            lossless: true,
+            max_bandwidth_hz: Claim::Measured(Hz(38_400_000)),
+        }];
+        new.max_bandwidth_hz = Claim::Measured(Hz(38_400_000));
+        assert!(hello_replaces(&old, &new));
+        // A measured cap that is no depth's does not.
+        new.max_bandwidth_hz = Claim::Measured(Hz(40_000_000));
+        assert!(!hello_replaces(&old, &new));
+        // Nor does any other field.
+        let mut new = old.clone();
+        new.channels = 2;
+        assert!(!hello_replaces(&old, &new));
+    }
 
     #[test]
     fn signals_are_named_where_it_matters() {

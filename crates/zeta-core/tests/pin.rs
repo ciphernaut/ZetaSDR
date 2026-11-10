@@ -49,6 +49,8 @@ impl Radio {
                 tx: false,
                 remote: false,
                 push: false,
+                usable_fraction: Claim::Asserted(1.0),
+                depths: vec![],
             },
             cur: Mutex::new(None),
             tunes: AtomicUsize::new(0),

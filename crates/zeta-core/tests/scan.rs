@@ -1,7 +1,7 @@
 //! The `scan` job: time-shares one radio across a span wider than its capture.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -71,10 +71,13 @@ fn block_len(rate_hz: u64, block_ms: u64) -> usize {
 /// of that band's centre, as its [`Delivery`] says. Block timestamps advance by
 /// exactly the block's signal time, so the ring sees one contiguous run per
 /// step and a dwell reads several blocks (but where `Gapping` skips). With
-/// `fail_tune`, that tune (1-based) and every later one fails.
+/// `fail_tune`, that tune (1-based) and every later one fails. Its record can be
+/// replaced once ([`ScanPort::replace_caps`]), as a worker port's is by a
+/// respawn's hello.
 struct ScanPort {
     id: SourceId,
     caps: Capabilities,
+    later: OnceLock<Capabilities>,
     cur: Mutex<Option<Tuning>>,
     tunes: Mutex<Vec<(Tuning, Instant)>>,
     fail_tune: Option<usize>,
@@ -151,7 +154,10 @@ impl ScanPort {
                 tx: false,
                 remote,
                 push,
+                usable_fraction: Claim::Asserted(1.0),
+                depths: vec![],
             },
+            later: OnceLock::new(),
             cur: Mutex::new(None),
             tunes: Mutex::new(Vec::new()),
             fail_tune,
@@ -202,6 +208,13 @@ impl ScanPort {
         p
     }
 
+    /// Replace the port's record with its own changed by `f`, once.
+    fn replace_caps(&self, f: impl FnOnce(&mut Capabilities)) {
+        let mut caps = self.caps.clone();
+        f(&mut caps);
+        self.later.set(caps).expect("replaced once");
+    }
+
     fn tunes(&self) -> Vec<Tuning> {
         self.tunes.lock().unwrap().iter().map(|(t, _)| *t).collect()
     }
@@ -223,7 +236,7 @@ impl Port for ScanPort {
         &self.id
     }
     fn capabilities(&self) -> &Capabilities {
-        &self.caps
+        self.later.get().unwrap_or(&self.caps)
     }
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let n = self.tunes.lock().unwrap().len() + 1;
@@ -725,7 +738,9 @@ async fn scan_context_carries_its_step_count() {
     let (id, _rx) = start_scan(&node).await;
     let ctx = node.job_context(&id).expect("the scan has a context");
     assert_eq!(ctx["scan"]["steps"], 3, "{ctx}");
+    // radio0's whole 16 MHz is usable: the stride is the capture.
     assert_eq!(ctx["scan"]["step_hz"], 16 * MHZ, "{ctx}");
+    assert_eq!(ctx["scan"]["rate_hz"], 16 * MHZ, "{ctx}");
     // The harness opens the node with a 20 ms dwell: 78 frames of 4096 at 16 MHz, 19.968 ms.
     assert_eq!(ctx["scan"]["dwell_ms"], 20, "{ctx}");
     assert!(ctx["scan"].get("dwell_ms_asked").is_none(), "{ctx}");
@@ -791,13 +806,16 @@ async fn scan_alternates_its_grid_between_sweeps() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_mask_defaults_follow_the_capabilities() {
-    // radio0 is local hardware (remote false, push false): the defaults are in force on a 16 MHz step.
-    let (_dir, node, _port) = open().await;
+    // radio0 is local hardware (remote false, push false) and passes 0.9 of its capture
+    // flat here: the notch and the unused edges are masked on a 16 MHz step.
+    let port = ScanPort::new();
+    port.replace_caps(|c| c.usable_fraction = Claim::Asserted(0.9));
+    let (_dir, node, _port) = open_with(port).await;
     let (id, mut rx) = start_scan(&node).await;
     let ctx = node.job_context(&id).unwrap();
     assert_eq!(
         ctx["scan"]["mask"],
-        serde_json::json!({"notch_hz": 50_000, "edge_mask": 0.02})
+        serde_json::json!({"notch_hz": 50_000, "edge_mask": 0.05})
     );
     let Payload::Event(ev) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -808,14 +826,14 @@ async fn scan_mask_defaults_follow_the_capabilities() {
         panic!()
     };
     assert_eq!(ev["notch_hz"], 50_000);
-    assert_eq!(ev["edge_mask"], 0.02);
+    assert_eq!(ev["edge_mask"], 0.05);
     let g = graph_of(&node, &id).await;
     assert_eq!(g.nodes.len(), 1);
     assert_eq!(fft_node(&g).params["notch_hz"], 50_000);
-    assert_eq!(fft_node(&g).params["edge_mask"], 0.02);
+    assert_eq!(fft_node(&g).params["edge_mask"], 0.05);
     assert_eq!(fft_node(&g).params["size"], 4096);
     node.job_stop(&id).await.unwrap();
-    // A remote source gets none.
+    // A remote source whose whole capture is usable gets none.
     let (_dir, node, _port) = open_with(ScanPort::with_caps(true, false)).await;
     let (id, mut rx) = start_scan(&node).await;
     assert_eq!(
@@ -838,8 +856,11 @@ async fn scan_mask_defaults_follow_the_capabilities() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_step_scan_does_not_alternate() {
     // One step: the 50 kHz notch is in force (1 MHz is wider than four notches; the unit test
-    // covers a step too narrow for it), but with no odd sweep to fill the edges in, no edge mask.
-    let (_dir, node, port) = open().await;
+    // covers a step too narrow for it), but with no odd sweep or neighbour to fill the edges
+    // in, no edge mask, though the stored node keeps the unused edges of the usable fraction.
+    let port = ScanPort::new();
+    port.replace_caps(|c| c.usable_fraction = Claim::Asserted(0.9));
+    let (_dir, node, port) = open_with(port).await;
     let id = match node.apply(start(JobKind::Scan, 100 * MHZ, MHZ)).await {
         Ok(OpResult::Job(id)) => id,
         o => panic!("{o:?}"),
@@ -860,7 +881,92 @@ async fn a_one_step_scan_does_not_alternate() {
     let g = graph_of(&node, &id).await;
     let stored = fft_node(&g);
     assert_eq!(stored.params["notch_hz"], 50_000);
-    assert_eq!(stored.params["edge_mask"], 0.02);
+    assert_eq!(stored.params["edge_mask"], 0.05);
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A scan whose stored `fft` node has an edge mask narrower than the edges the
+/// source's usable fraction leaves unused (one stored before the fraction, or
+/// a `graph put`) still masks those edges; the stored node keeps its value.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_stored_with_a_narrower_edge_mask_masks_the_unused_edges() {
+    let port = ScanPort::new();
+    port.replace_caps(|c| c.usable_fraction = Claim::Asserted(0.9));
+    let (_dir, node, port) = open_with(port).await;
+    let (id, _rx) = start_scan(&node).await;
+    let mut g = graph_of(&node, &id).await;
+    g.nodes[0].params["edge_mask"] = serde_json::json!(0.02);
+    assert!(matches!(
+        node.apply(Op::GraphPut {
+            job: id.clone(),
+            graph: g
+        })
+        .await,
+        Ok(OpResult::Ok)
+    ));
+    assert_eq!(
+        fft_node(&graph_of(&node, &id).await).params["edge_mask"],
+        0.02
+    );
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(
+        ctx["scan"]["mask"],
+        serde_json::json!({"notch_hz": 50_000, "edge_mask": 0.05})
+    );
+    // 16 MHz captures 14.4 MHz apart over 0..40 MHz: 9 (7.2 clamped up), 21.6, 36 MHz.
+    assert_eq!(ctx["scan"]["step_hz"], 14_400_000, "{ctx}");
+    assert_eq!(ctx["scan"]["rate_hz"], 16 * MHZ, "{ctx}");
+    // The restarted scan's rows (a fresh event stream) carry the wider mask.
+    let mut rx = event_rx(&node, &id);
+    for f in rows(&mut rx, 3, Duration::from_secs(3)).await {
+        assert_eq!(ev(&f)["edge_mask"], 0.05, "{}", ev(&f));
+    }
+    assert!(port.tunes().iter().all(|t| t.bandwidth_hz.0 == 16 * MHZ));
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A scan started before the source's rate cap was measured sweeps at the
+/// asserted width; the sweep after the cap is measured steps at the new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_grid_follows_a_cap_measured_after_the_scan_started() {
+    let (_dir, node, port) = open().await;
+    let (id, _rx) = start_scan(&node).await;
+    assert_eq!(node.job_context(&id).unwrap()["scan"]["steps"], 3);
+    tunes_at_least(&port, 2, Duration::from_secs(3)).await;
+    port.replace_caps(|c| c.max_bandwidth_hz = Claim::Measured(Hz(20 * MHZ)));
+    until("a 20 MHz step", Duration::from_secs(5), || {
+        port.tunes().iter().any(|t| t.bandwidth_hz.0 == 20 * MHZ)
+    })
+    .await;
+    let tunes = port.tunes();
+    let first = tunes
+        .iter()
+        .position(|t| t.bandwidth_hz.0 == 20 * MHZ)
+        .unwrap();
+    // The sweep in progress ended at the asserted width (three steps a sweep, even or odd);
+    // every tune after is at the new one, on its grid: even 11 (10 clamped up), 30 MHz; odd
+    // 11 (5 clamped up), 25, 45 MHz.
+    assert!(first >= 3 && first % 3 == 0, "{tunes:?}");
+    assert!(tunes[..first].iter().all(|t| t.bandwidth_hz.0 == 16 * MHZ));
+    for t in &tunes[first..] {
+        assert_eq!(t.bandwidth_hz.0, 20 * MHZ, "{tunes:?}");
+        assert!(
+            [11, 30, 25, 45].map(|m| m * MHZ).contains(&t.center_hz.0),
+            "{tunes:?}"
+        );
+    }
+    until("the context's new grid", Duration::from_secs(3), || {
+        node.job_context(&id).unwrap()["scan"]["steps"] == 2
+    })
+    .await;
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(ctx["scan"]["step_hz"], 20 * MHZ, "{ctx}");
+    assert_eq!(ctx["scan"]["rate_hz"], 20 * MHZ, "{ctx}");
+    assert_eq!(
+        ctx["scan"]["alternate"],
+        serde_json::json!({"shift_hz": 5 * MHZ, "steps_shifted": 3}),
+        "{ctx}"
+    );
     node.job_stop(&id).await.unwrap();
 }
 

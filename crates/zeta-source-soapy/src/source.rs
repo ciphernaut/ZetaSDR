@@ -376,6 +376,14 @@ impl SoapySource {
         self
     }
 
+    /// Assert the part of a capture the device's front end passes flat
+    /// (`usable=` in the device args), in place of
+    /// [`crate::caps::USABLE_DEFAULT`]: the record's `usable_fraction`.
+    pub fn with_usable(mut self, usable: f64) -> Self {
+        self.caps.usable_fraction = Claim::Asserted(usable);
+        self
+    }
+
     /// How long `tune` waits for the reader thread to apply a retune
     /// (default 2 s); past it the port faults with `soapy retune timed out`.
     pub fn with_retune_timeout(mut self, d: Duration) -> Self {

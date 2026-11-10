@@ -86,6 +86,8 @@ async fn retune_resizes_ring_within_budget() {
             tx: false,
             remote: false,
             push: false,
+            usable_fraction: Claim::Asserted(1.0),
+            depths: vec![],
         },
         tx: broadcast::channel(16).0,
     });

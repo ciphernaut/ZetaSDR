@@ -19,6 +19,8 @@ fn caps() -> Capabilities {
         tx: false,
         remote: false,
         push: false,
+        usable_fraction: Claim::Asserted(1.0),
+        depths: vec![],
     }
 }
 

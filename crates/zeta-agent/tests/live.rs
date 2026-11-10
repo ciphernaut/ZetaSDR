@@ -34,6 +34,8 @@ async fn live_llm_tunes_a_source() {
             tx: true,
             remote: false,
             push: false,
+            usable_fraction: Claim::Asserted(1.0),
+            depths: vec![],
         },
         current: None,
         holders: vec![],

@@ -2285,6 +2285,8 @@ mod tests {
                     tx: false,
                     remote,
                     push: false,
+                    usable_fraction: Claim::Asserted(1.0),
+                    depths: vec![],
                 },
                 position,
                 tx: tokio::sync::broadcast::channel(1).0,

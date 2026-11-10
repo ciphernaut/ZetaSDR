@@ -96,9 +96,13 @@ impl<T> Claim<T> {
     }
 }
 
+/// What a source can do. The fields after `push` came later: a record without
+/// them (an older node's, or one cached before them) loads with their
+/// defaults, and the schema still requires every field, since a record is
+/// always written whole.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::knowledge::require_all)]
 pub struct Capabilities {
     pub tune_min_hz: Claim<Hz>,
     pub tune_max_hz: Claim<Hz>,
@@ -109,6 +113,33 @@ pub struct Capabilities {
     pub tx: bool,
     pub remote: bool,
     pub push: bool,
+    /// The part of a capture, centred, that the source's front-end filter
+    /// passes flat, from 0 to 1: a scan advances by this much of each capture
+    /// and masks the rest at the edges. Absent reads `asserted` 1.0.
+    #[serde(default = "whole_capture")]
+    pub usable_fraction: Claim<f64>,
+    /// The sample depths the source's link can carry, each with its rate cap;
+    /// empty when the source has one depth (or has not listed them).
+    #[serde(default)]
+    pub depths: Vec<Depth>,
+}
+
+/// [`Capabilities::usable_fraction`] when a record does not say: the whole
+/// capture.
+fn whole_capture() -> Claim<f64> {
+    Claim::Asserted(1.0)
+}
+
+/// One sample depth a source's link can carry: `bits` per I and Q sample,
+/// whether it holds every bit the ADC resolves (`lossless`), and the fastest
+/// rate the link sustains at it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct Depth {
+    pub bits: u8,
+    pub lossless: bool,
+    pub max_bandwidth_hz: Claim<Hz>,
 }
 
 /// Schema of a required `Option<T>`: `T`'s schema inlined with `"null"` added
@@ -225,8 +256,44 @@ mod tests {
     }
 
     #[test]
+    fn a_record_without_the_new_fields_loads_with_their_defaults() {
+        // A record as a node before `usable_fraction` and `depths` wrote it.
+        let old = serde_json::json!({
+            "tune_min_hz": {"asserted": 1_000_000},
+            "tune_max_hz": {"asserted": 6_000_000_000u64},
+            "max_bandwidth_hz": {"measured": 30_720_000},
+            "formats": ["cf32"],
+            "channels": 1,
+            "rx": true,
+            "tx": false,
+            "remote": false,
+            "push": false,
+        });
+        let caps: Capabilities = serde_json::from_value(old).unwrap();
+        assert_eq!(caps.usable_fraction, Claim::Asserted(1.0));
+        assert!(caps.depths.is_empty());
+        assert_eq!(caps.max_bandwidth_hz, Claim::Measured(Hz(30_720_000)));
+        // Written whole, and read back the same.
+        let mut caps = caps;
+        caps.usable_fraction = Claim::Asserted(0.9);
+        caps.depths = vec![Depth {
+            bits: 12,
+            lossless: true,
+            max_bandwidth_hz: Claim::Measured(Hz(30_720_000)),
+        }];
+        let v = serde_json::to_value(&caps).unwrap();
+        assert_eq!(v["usable_fraction"], serde_json::json!({"asserted": 0.9}));
+        assert_eq!(
+            v["depths"],
+            serde_json::json!([{"bits": 12, "lossless": true, "max_bandwidth_hz": {"measured": 30_720_000}}])
+        );
+        assert_eq!(serde_json::from_value::<Capabilities>(v).unwrap(), caps);
+    }
+
+    #[test]
     fn schemas_require_every_non_optional_field() {
         assert_all_required::<Capabilities>();
+        assert_all_required::<Depth>();
         assert_all_required::<Selection>();
         assert_all_required::<Span>();
     }

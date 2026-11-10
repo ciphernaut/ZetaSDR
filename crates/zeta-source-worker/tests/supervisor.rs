@@ -98,6 +98,8 @@ fn cached_caps() -> Capabilities {
         tx: false,
         remote: false,
         push: false,
+        usable_fraction: Claim::Asserted(1.0),
+        depths: vec![],
     }
 }
 
@@ -343,6 +345,46 @@ async fn a_crash_before_the_first_hello_with_a_cache_attaches_faulted_and_heals(
     assert_eq!(err, crashed);
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(starts(&rec).len(), 1, "no respawn after a refusal");
+}
+
+/// A node upgraded over a source record cached before `usable_fraction` and
+/// `depths` (it loads them as 1.0 and none) attaches faulted with it when the
+/// device is absent; the respawn's hello carries the live values, and the
+/// port takes them.
+#[tokio::test]
+async fn a_cached_record_from_before_this_plan_takes_the_hellos_new_fields() {
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "if [ \"$N\" -eq 0 ]; then exec \"$FAKE\" --script not-found \"$@\"; fi\n\
+         ZETA_FAKE_USABLE=0.9 exec \"$FAKE\" --script stream \"$@\"",
+    );
+    // The mock's whole record but for the two fields (`cached_caps` lists one
+    // format only, which a hello would not replace).
+    let mut cached = cached_caps();
+    cached.formats = vec![SampleFormat::Ci8, SampleFormat::Ci16, SampleFormat::Cf32];
+    assert_eq!(cached.usable_fraction, Claim::Asserted(1.0));
+    assert!(cached.depths.is_empty());
+    let (port, attach) = open(cfg, Some(cached.clone())).await;
+    assert!(matches!(attach, Attach::NotFound { .. }), "{attach:?}");
+    assert_eq!(port.capabilities(), &cached);
+    let healed = port.healed().unwrap();
+    assert!(
+        wait_for(Duration::from_secs(5), || *healed.borrow() > 0).await,
+        "no heal: {:?}",
+        port.fault()
+    );
+    port.heal_settled();
+    assert!(
+        wait_for(Duration::from_secs(5), || port.fault().is_none()).await,
+        "{:?}",
+        port.fault()
+    );
+    assert_eq!(port.capabilities().usable_fraction, Claim::Asserted(0.9));
+    // Nothing else of the record changed.
+    let mut want = cached;
+    want.usable_fraction = Claim::Asserted(0.9);
+    assert_eq!(port.capabilities(), &want);
 }
 
 #[tokio::test]

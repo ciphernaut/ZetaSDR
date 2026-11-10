@@ -38,7 +38,9 @@ impl Driver {
 /// ([`SoapySource::set_gain_now`]: automatic gain off, the overall receive gain
 /// set to it, a value outside the device's range refused). A `ppm=N` key is
 /// zeta's too: [`SoapySource::with_ppm`], and so is `settle_ms=N`
-/// ([`SoapySource::with_settle`], in place of the radio's default). So is
+/// ([`SoapySource::with_settle`], in place of the radio's default), and
+/// `usable=F` ([`SoapySource::with_usable`], the part of a capture a scan
+/// advances by). So is
 /// `max_rate_hz=N`, removed here and read by the worker (the rate cap it
 /// reports).
 pub fn open(id: SourceId, args: &str) -> Result<SoapySource, PortError> {
@@ -50,6 +52,9 @@ pub fn open(id: SourceId, args: &str) -> Result<SoapySource, PortError> {
     }
     if let Some(ms) = zeta.settle_ms {
         src = src.with_settle(std::time::Duration::from_secs_f64(ms / 1000.0));
+    }
+    if let Some(usable) = zeta.usable {
+        src = src.with_usable(usable);
     }
     if let Some(db) = zeta.gain {
         let g = src.set_gain_now(Some(db)).map_err(|e| {

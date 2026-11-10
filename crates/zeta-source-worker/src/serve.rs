@@ -73,7 +73,10 @@ pub const SIGNAL_EXIT_WATCHDOG: Duration = Duration::from_secs(5);
 /// short lines, so this only has to absorb a burst while `serve` is busy.
 const REQUEST_PIPE: usize = 64 * 1024;
 
-/// What the writer thread is handed.
+/// What the writer thread is handed. Nearly every message is a frame (`End`
+/// comes once), so the frame's size, a hello's capability record included,
+/// is what each one costs either way.
+#[allow(clippy::large_enum_variant)]
 enum Out {
     Frame(Frame),
     /// Flush, then stop.
