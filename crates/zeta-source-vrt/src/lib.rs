@@ -149,6 +149,10 @@ impl Port for VrtPort {
     /// A VRT sender is not tunable from here: succeeds, returning the sender's band,
     /// only when `t` lies inside it. Waits up to [`CONTEXT_WAIT`] for the first context
     /// packet.
+    ///
+    /// The contract (the first block delivered with a new centre holds only
+    /// samples taken after the tune settled) holds trivially: this port never
+    /// retunes the sender, so no block is ever delivered with a new centre.
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let id = &self.id.0;
         let mut rx = self.current.clone();

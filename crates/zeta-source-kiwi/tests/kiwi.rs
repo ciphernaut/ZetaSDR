@@ -218,6 +218,67 @@ async fn tune_sends_full_capture_passband() {
     assert_eq!(src.current(), Some(got));
 }
 
+fn source_settling(fake: &FakeKiwi, settle_ms: u64) -> Arc<KiwiSource> {
+    let mut cfg = config(fake, &[10]);
+    cfg.tune_settle_ms = settle_ms;
+    Arc::new(KiwiSource::new(SourceId("kiwi0".into()), cfg))
+}
+
+fn epoch_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+#[tokio::test]
+async fn a_retune_drops_frames_until_the_settle_has_passed() {
+    let fake = fake(vec![FakeReply::Ok], None).await;
+    let src = source_settling(&fake, 300);
+    let mut rx = src.subscribe();
+    src.tune(tuning(7_100_000, 10_000)).await.unwrap();
+    next_block(&mut rx).await;
+    src.tune(tuning(7_200_000, 10_000)).await.unwrap();
+    let t = epoch_ns();
+    let b = loop {
+        let b = next_block(&mut rx).await;
+        if b.center_hz == Hz(7_200_000) {
+            break b;
+        }
+    };
+    assert!(
+        b.t0.0 >= t + 250_000_000,
+        "first block of the new centre is {} ms after the tune",
+        b.t0.0.saturating_sub(t) / 1_000_000
+    );
+}
+
+#[tokio::test]
+async fn the_first_tune_of_a_connection_drops_nothing() {
+    let fake = fake(vec![FakeReply::Ok], None).await;
+    let src = source_settling(&fake, 60_000);
+    let mut rx = src.subscribe();
+    src.tune(tuning(7_100_000, 10_000)).await.unwrap();
+    let b = tokio::time::timeout(Duration::from_secs(2), next_block(&mut rx))
+        .await
+        .expect("a block within 2 s");
+    assert_eq!(b.center_hz, Hz(7_100_000));
+}
+
+#[tokio::test]
+async fn a_tune_to_the_same_centre_drops_nothing() {
+    let fake = fake(vec![FakeReply::Ok], None).await;
+    let src = source_settling(&fake, 60_000);
+    let mut rx = src.subscribe();
+    src.tune(tuning(7_100_000, 10_000)).await.unwrap();
+    next_block(&mut rx).await;
+    src.tune(tuning(7_100_000, 4_000)).await.unwrap();
+    let b = tokio::time::timeout(Duration::from_secs(2), next_block(&mut rx))
+        .await
+        .expect("a block within 2 s");
+    assert_eq!(b.center_hz, Hz(7_100_000));
+}
+
 #[tokio::test]
 async fn blocks_carry_audio_rate_and_contiguous_t0() {
     let fake = fake(vec![FakeReply::Ok], None).await;

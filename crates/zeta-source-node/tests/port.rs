@@ -132,6 +132,32 @@ async fn tune_starts_remote_passthrough_and_streams_blocks() {
     srv.stop().await;
 }
 
+/// A tune starts a fresh remote stream and nothing is discarded: each block
+/// carries the centre the remote's own stream names, not the one asked for.
+#[tokio::test]
+async fn blocks_carry_the_remote_streams_own_centre() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn(dir.path()).await;
+    let port = open_tone(&srv).await;
+    // Inside the recording but off its centre: the remote answers with the
+    // recording's fixed band.
+    let asked = Tuning {
+        center_hz: Hz(TONE_CENTER_HZ + 5_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    let got = port.tune(asked).await.expect("tunes");
+    assert_eq!(got.center_hz, Hz(TONE_CENTER_HZ));
+    let mut rx = port.subscribe();
+    let b = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a block within 5 s")
+        .expect("receives");
+    assert_eq!(b.center_hz, Hz(TONE_CENTER_HZ));
+    drop(rx);
+    drop(port);
+    srv.stop().await;
+}
+
 #[tokio::test]
 async fn bandwidth_over_cap_is_out_of_range_without_remote_job() {
     let dir = tempfile::tempdir().unwrap();

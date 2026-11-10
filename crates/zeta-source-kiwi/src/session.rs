@@ -433,6 +433,9 @@ async fn connection(
     let streamed = |sent: u64, conn: &Conn| conn.audio_rate.is_some_and(|r| sent >= u64::from(r));
     let mut conn = Conn::default();
     let mut events = Vec::new();
+    // Frames before this belong to the band the Kiwi had before the last
+    // new centre was sent; they are dropped, never delivered.
+    let mut drop_until: Option<Instant> = None;
     loop {
         let msg = tokio::select! {
             _ = ctx.cancel.cancelled() => {
@@ -444,8 +447,16 @@ async fn connection(
                     close(sink).await;
                     return End::Stop;
                 };
+                let new_centre = t.center_hz != band.center_hz;
                 *band = t;
                 if conn.sample_rate.is_some() {
+                    if new_centre {
+                        // The `SND` header carries no frequency: frames the
+                        // Kiwi had in flight (and its filter's ring-down)
+                        // still hold the old band, so drop for a settle.
+                        drop_until = Some(Instant::now() + Duration::from_millis(cfg.tune_settle_ms));
+                        clock.gap();
+                    }
                     for c in tuning_cmds(t) {
                         if let Err(e) = sink.send(Message::text(c)).await {
                             return lost(format!("send: {e}"), streamed(sent, &conn));
@@ -506,6 +517,9 @@ async fn connection(
                     spawn_status_read(ctx);
                 }
                 Event::Block { snd, gap } => {
+                    if drop_until.is_some_and(|d| Instant::now() < d) {
+                        continue;
+                    }
                     let rate = u64::from(conn.audio_rate.unwrap_or_default());
                     {
                         let mut s = ctx.status.lock().unwrap();

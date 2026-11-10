@@ -333,6 +333,14 @@ impl Port for FileSource {
     /// answer is the recording's fixed band, never the request. Under `tune_range`
     /// the band must lie inside that range instead, and the answer is the request's
     /// centre with the recording's rate (recorded as `current`).
+    ///
+    /// The contract (the first block delivered with a new centre holds only
+    /// samples taken after the tune settled) is met exactly: a tune is exact
+    /// and takes effect at a block boundary. Each block is labelled with the
+    /// centre in force when it is produced, a block already built keeps its
+    /// old label, and the first block of the new centre follows the last of
+    /// the old on the recording's own timeline, so there is no settle to wait
+    /// out and nothing to discard.
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let (c, rate) = (self.meta.center_hz.0, self.meta.sample_rate_hz.0);
         let ranged = self.opts.tune_range;

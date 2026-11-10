@@ -440,3 +440,51 @@ async fn tune_inside_tune_range_is_accepted_outside_is_refused() {
         other => panic!("got {other:?}"),
     }
 }
+
+/// A tune takes effect at a block boundary: the first block labelled with the
+/// new centre follows the last block of the old one on the recording's
+/// timeline (none is replayed, none is skipped), and no block carries the new
+/// centre from before the tune.
+#[tokio::test]
+async fn the_first_block_of_a_new_centre_is_stamped_after_the_tune() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = FileSource::open(
+        SourceId("f".into()),
+        &common::tone(dir.path()),
+        FileOpts {
+            realtime: true,
+            block_samples: 480,
+            repeat: true,
+            tune_range: Some((Hz(50_000_000), Hz(150_000_000))),
+        },
+    )
+    .unwrap();
+    let mut rx = src.subscribe();
+    let h = src.start();
+    let first = rx.recv().await.unwrap();
+    assert_eq!(first.center_hz, Hz(100_000_000));
+    let moved = Hz(120_000_000);
+    src.tune(Tuning {
+        center_hz: moved,
+        bandwidth_hz: Hz(12_500),
+    })
+    .await
+    .unwrap();
+    let (mut last_old, mut first_new) = (first.t0.0, None);
+    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while first_new.is_none() {
+        let b = tokio::time::timeout_at(until, rx.recv())
+            .await
+            .expect("a block of the new centre within 10 s")
+            .unwrap();
+        if b.center_hz == moved {
+            first_new = Some(b.t0.0);
+        } else {
+            assert!(b.t0.0 > last_old, "old-centre blocks stay in order");
+            last_old = b.t0.0;
+        }
+    }
+    // One 480-sample block at 48 kHz is 10 ms.
+    assert_eq!(first_new.unwrap(), last_old + 10_000_000);
+    h.abort();
+}

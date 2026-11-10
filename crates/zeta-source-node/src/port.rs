@@ -327,6 +327,12 @@ impl Port for NodePort {
     /// the band of its first IQ packet (`bandwidth_hz` = its sample rate).
     /// A remote that ships a rate above the cap is stopped again and the tune
     /// is `OutOfRange` with the shipped rate as `suggested` (above `max`).
+    ///
+    /// The contract (the first block delivered with a new centre holds only
+    /// samples taken after the tune settled) is inherited, and nothing is
+    /// discarded here: a tune starts a fresh remote stream, whose blocks carry
+    /// the remote's own `center_hz`, and the remote meets the contract for
+    /// its own source.
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let cap = self.caps.max_bandwidth_hz.value().0;
         let bw = t.bandwidth_hz.0;

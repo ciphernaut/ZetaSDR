@@ -18,6 +18,9 @@ use crate::status::KIWI_STATUS_PATH;
 const TUNE_MAX_HZ: u64 = 30_000_000;
 /// Widest IQ passband: `±6000` Hz around the centre.
 pub(crate) const MAX_BANDWIDTH_HZ: u64 = 12_000;
+/// Default delay after a new centre is sent before the session delivers
+/// frames again, in ms.
+pub(crate) const TUNE_SETTLE_MS: u64 = 250;
 /// Blocks buffered per receiver.
 const BROADCAST_CAPACITY: usize = 64;
 
@@ -34,6 +37,11 @@ pub struct KiwiConfig {
     pub read_timeout_ms: u64,
     /// Bound on connecting plus the `sample_rate`/`audio_rate` handshake.
     pub handshake_timeout_ms: u64,
+    /// How long after a new centre is sent the session drops `SND` frames:
+    /// their header carries no frequency, so frames in flight (and the
+    /// filter's ring-down) cannot be told from the new band's. Default
+    /// [`TUNE_SETTLE_MS`].
+    pub tune_settle_ms: u64,
     /// The receiver's status page, read once per connection for its position
     /// (bounded by `handshake_timeout_ms`); `None` reads nothing.
     pub status_url: Option<String>,
@@ -63,6 +71,7 @@ impl KiwiConfig {
             reconnect_delays_ms: vec![1000, 2000, 4000, 8000, 16000],
             read_timeout_ms: 10_000,
             handshake_timeout_ms: 10_000,
+            tune_settle_ms: TUNE_SETTLE_MS,
         })
     }
 }
@@ -82,6 +91,7 @@ impl fmt::Debug for KiwiConfig {
             .field("reconnect_delays_ms", &self.reconnect_delays_ms)
             .field("read_timeout_ms", &self.read_timeout_ms)
             .field("handshake_timeout_ms", &self.handshake_timeout_ms)
+            .field("tune_settle_ms", &self.tune_settle_ms)
             .field("status_url", &self.status_url)
             .finish()
     }
@@ -240,7 +250,11 @@ impl Port for KiwiSource {
     /// Opens a session when there is none or the port is faulted (clearing
     /// the fault once the Kiwi has answered `sample_rate` and `audio_rate`);
     /// on a live session sends the tuning commands unless the centre is
-    /// unchanged (the passband is always the full capture band). Returns the capture band: the requested centre, `audio_rate`
+    /// unchanged (the passband is always the full capture band). After a new
+    /// centre is sent, the session drops `SND` frames for `tune_settle_ms`
+    /// (the header carries no frequency), so the first block delivered with
+    /// that centre holds only samples taken after the tune settled; the first
+    /// tune of a connection drops nothing. Returns the capture band: the requested centre, `audio_rate`
     /// wide.
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let bw = t.bandwidth_hz.0;
