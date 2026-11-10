@@ -1,7 +1,7 @@
 //! The origin query (plan 32, design 4.1): which licensed transmitters a signal on a band
 //! may come from, seen from where it was received.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use schemars::JsonSchema;
@@ -100,7 +100,7 @@ pub struct Confirmed {
 /// One lit site: a register row and how well it fits the signal.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::knowledge::require_all)]
 pub struct Origin {
     /// The row as `knowledge_lookup` gives it.
     pub allocation: Allocation,
@@ -110,7 +110,45 @@ pub struct Origin {
     pub terms: Terms,
     #[schemars(required, schema_with = "crate::types::nullable::<Confirmed>")]
     pub confirmed: Option<Confirmed>,
+    /// The job's newest frame from or to a fixed station ([`heard_of`]); `null` with an
+    /// empty tally, and in an answer kept before the tally.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<Heard>")]
+    pub heard: Option<Heard>,
 }
+
+/// How a fixed station was heard: its own frame (`from`), or an aircraft's frame
+/// addressed to it (`to`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Grade {
+    From,
+    To,
+}
+
+/// The newest evidence of a fixed station on a job, set on every origin of its answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct Heard {
+    pub last_ns: Timestamp,
+    pub grade: Grade,
+}
+
+/// One fixed station in a job's tally (design 4.2): its own frames (`from`) and frames
+/// addressed to it (`to`); `first_ns` and `last_ns` span both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct StationSeen {
+    pub from: u32,
+    pub to: u32,
+    pub first_ns: Timestamp,
+    pub last_ns: Timestamp,
+}
+
+/// The tally key of the anonymous station: one whose own frames name no station.
+pub const STATION_ANONYMOUS: &str = "*";
 
 /// What a vantage was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -136,7 +174,7 @@ pub struct From {
 /// The origin query's answer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::knowledge::require_all)]
 pub struct OriginAnswer {
     pub origins: Vec<Origin>,
     pub band: SignalBand,
@@ -163,6 +201,12 @@ pub struct OriginAnswer {
     #[schemars(required, schema_with = "crate::types::nullable::<Reach>")]
     pub reach: Option<Reach>,
     pub t_ns: Timestamp,
+    /// The job's fixed-station tally when the answer was written, by station key
+    /// ([`STATION_ANONYMOUS`] for one its frames do not name); empty for the band form,
+    /// a job with no tally, and an answer kept before the tally.
+    #[serde(default)]
+    #[schemars(required)]
+    pub stations: BTreeMap<String, StationSeen>,
 }
 
 /// Where a source's signals are heard from.
@@ -366,6 +410,7 @@ pub fn answer(
         plans,
         reach,
         t_ns: now(),
+        stations: BTreeMap::new(),
     }
 }
 
@@ -478,6 +523,7 @@ pub fn score_row(
         agree,
         terms,
         confirmed: None,
+        heard: None,
     })
 }
 
@@ -503,12 +549,23 @@ fn mhz(hz: Hz) -> String {
 /// is unreachable, or empty there), else `no licensed transmitter on <f> MHz`.
 pub fn summary(a: &OriginAnswer) -> String {
     let f = mhz(a.band.center_hz);
-    if a.origins.is_empty() {
+    let Some(sites) = summary_sites(a) else {
         return match a.register_rows {
             None => "no register provider".to_string(),
             Some(0) => "register gave no rows".to_string(),
             Some(_) => format!("no licensed transmitter on {f} MHz"),
         };
+    };
+    let n = a.origins.len();
+    let noun = if n == 1 { "site" } else { "sites" };
+    format!("{n} {noun} on {f} MHz: {sites}")
+}
+
+/// [`summary`]'s site list, `<licensee>, <site> <d> km <agree> <score>; ...` for the
+/// first [`ORIGIN_SUMMARY_SITES`] origins; `None` when nothing is lit.
+fn summary_sites(a: &OriginAnswer) -> Option<String> {
+    if a.origins.is_empty() {
+        return None;
     }
     let sites: Vec<String> = a
         .origins
@@ -535,9 +592,68 @@ pub fn summary(a: &OriginAnswer) -> String {
             format!("{s} {agree} {:.1}", o.score)
         })
         .collect();
-    let n = a.origins.len();
-    let noun = if n == 1 { "site" } else { "sites" };
-    format!("{n} {noun} on {f} MHz: {}", sites.join("; "))
+    Some(sites.join("; "))
+}
+
+/// The newest evidence in a tally (design 4.3): the newest `last_ns` of the keys with
+/// an own frame (`from > 0`), graded `from`, when any has one; else the newest of all,
+/// graded `to`; `None` for an empty tally. A key's `last_ns` spans both grades.
+pub fn heard_of(stations: &BTreeMap<String, StationSeen>) -> Option<Heard> {
+    let newest = |grade, keep: fn(&StationSeen) -> bool| {
+        stations
+            .values()
+            .filter(|s| keep(s))
+            .map(|s| s.last_ns.0)
+            .max()
+            .map(|t| Heard {
+                last_ns: Timestamp(t),
+                grade,
+            })
+    };
+    newest(Grade::From, |s| s.from > 0).or_else(|| newest(Grade::To, |_| true))
+}
+
+/// Copy `stations` into `a` and set every origin's `heard` from it ([`heard_of`]):
+/// every origin of an answer is a transmitter row.
+pub fn apply_stations(a: &mut OriginAnswer, stations: &BTreeMap<String, StationSeen>) {
+    let heard = heard_of(stations);
+    a.stations = stations.clone();
+    for o in &mut a.origins {
+        o.heard = heard;
+    }
+}
+
+/// One line for an answer with a station tally (design 4.3): `<k> ground station[s] on
+/// <f> MHz: <entries>; <tail>`. The entries name the first [`ORIGIN_SUMMARY_SITES`]
+/// keys by descending `from + to` (ties by key): `<key> heard <n> frames` for a key
+/// with an own frame, else `<key> addressed by <n> frames`, the anonymous key
+/// ([`STATION_ANONYMOUS`]) reading `uplinks heard <n> frames`. The tail is
+/// [`summary`]'s site list, or [`summary`] whole when nothing is lit. [`summary`]
+/// itself with an empty tally.
+pub fn station_summary(a: &OriginAnswer) -> String {
+    if a.stations.is_empty() {
+        return summary(a);
+    }
+    let total = |s: &StationSeen| u64::from(s.from) + u64::from(s.to);
+    let mut keys: Vec<(&String, &StationSeen)> = a.stations.iter().collect();
+    keys.sort_by(|(x, s), (y, t)| total(t).cmp(&total(s)).then_with(|| x.cmp(y)));
+    let entries: Vec<String> = keys
+        .iter()
+        .take(ORIGIN_SUMMARY_SITES)
+        .map(|(k, s)| match (k.as_str(), s.from > 0) {
+            (STATION_ANONYMOUS, _) => format!("uplinks heard {} frames", s.from),
+            (_, true) => format!("{k} heard {} frames", s.from),
+            (_, false) => format!("{k} addressed by {} frames", s.to),
+        })
+        .collect();
+    let k = a.stations.len();
+    let noun = if k == 1 { "station" } else { "stations" };
+    let tail = summary_sites(a).unwrap_or_else(|| summary(a));
+    format!(
+        "{k} ground {noun} on {} MHz: {}; {tail}",
+        mhz(a.band.center_hz),
+        entries.join(", ")
+    )
 }
 
 /// Confirm every origin whose `callsign` equals `value` (both trimmed, case ignored):
@@ -820,7 +936,9 @@ impl Inner {
             job: Some(id.clone()),
             at: now(),
         };
-        let a = origins(self, &q).await;
+        let mut a = origins(self, &q).await;
+        // No station tally is kept for a job yet: an empty one.
+        apply_stations(&mut a, &BTreeMap::new());
         self.keep_origin(&rec.id, &rec.source, &a)
     }
 
@@ -843,7 +961,7 @@ impl Inner {
             if let Some(kept) = kept {
                 carry_confirmed(&kept, &mut out);
             }
-            Some((out.clone(), summary(&out)))
+            Some((out.clone(), station_summary(&out)))
         })?;
         Ok(out)
     }
@@ -937,6 +1055,7 @@ impl Inner {
             "receivers": a.receivers,
             "plans": a.plans,
             "reach": a.reach,
+            "stations": a.stations,
             "summary": summary,
             "t_ns": a.t_ns.0,
         });
@@ -1049,6 +1168,7 @@ mod tests {
             plans: 0,
             reach: None,
             t_ns: Timestamp(0),
+            stations: BTreeMap::new(),
         }
     }
 
@@ -1422,6 +1542,15 @@ mod tests {
         props.sort_unstable();
         assert_eq!(required, props);
         assert_eq!(schema["properties"]["from"]["type"][1], "null");
+        assert_eq!(schema["properties"]["stations"]["type"], "object");
+        let origin = serde_json::to_value(schemars::schema_for!(Origin)).unwrap();
+        assert!(
+            origin["required"]
+                .as_array()
+                .unwrap()
+                .contains(&"heard".into())
+        );
+        assert_eq!(origin["properties"]["heard"]["type"][1], "null");
         let query = serde_json::to_value(schemars::schema_for!(OriginQuery)).unwrap();
         assert_eq!(query["required"].as_array().unwrap().len(), 7);
         let band = q(&["fm"], CENTER, 12_500);
@@ -1482,6 +1611,179 @@ mod tests {
             "register gave no rows"
         );
         assert_eq!(summary(&empty_answer(vec![], None)), "no register provider");
+    }
+
+    /// A tally entry: `from` own frames and `to` addressed ones, last seen at `last`.
+    fn seen(from: u32, to: u32, last: u64) -> StationSeen {
+        StationSeen {
+            from,
+            to,
+            first_ns: Timestamp(1),
+            last_ns: Timestamp(last),
+        }
+    }
+
+    fn tally(entries: &[(&str, StationSeen)]) -> BTreeMap<String, StationSeen> {
+        entries.iter().map(|(k, s)| (k.to_string(), *s)).collect()
+    }
+
+    /// An answer on 136.975 MHz lighting one synthetic site at 17 km, score 0.9.
+    fn vhf_answer() -> OriginAnswer {
+        let f = 136_975_000;
+        let band = q(&[], f, 25_000);
+        let mut o = score_row(&tx(None, Some(25_000), f, Some(17.2)), &band, None, None).unwrap();
+        o.score = 0.9;
+        let mut a = empty_answer(vec![o], Some(1));
+        a.band.center_hz = Hz(f);
+        a.band.bandwidth_hz = Hz(25_000);
+        a
+    }
+
+    #[test]
+    fn heard_prefers_from_over_a_newer_to() {
+        assert_eq!(heard_of(&BTreeMap::new()), None);
+        let mixed = tally(&[
+            ("1A2B3C", seen(1, 0, 100)),
+            ("4D5E6F", seen(2, 4, 150)),
+            ("7A8B9C", seen(0, 5, 900)),
+        ]);
+        assert_eq!(
+            heard_of(&mixed),
+            Some(Heard {
+                last_ns: Timestamp(150),
+                grade: Grade::From
+            })
+        );
+        let addressed = tally(&[("1A2B3C", seen(0, 1, 300)), ("4D5E6F", seen(0, 2, 200))]);
+        assert_eq!(
+            heard_of(&addressed),
+            Some(Heard {
+                last_ns: Timestamp(300),
+                grade: Grade::To
+            })
+        );
+        let h = serde_json::to_value(heard_of(&mixed)).unwrap();
+        assert_eq!(h, serde_json::json!({"last_ns": 150, "grade": "from"}));
+        assert_eq!(serde_json::to_value(Grade::To).unwrap(), "to");
+        assert_eq!(
+            serde_json::to_value(seen(1, 2, 3)).unwrap(),
+            serde_json::json!({"from": 1, "to": 2, "first_ns": 1, "last_ns": 3})
+        );
+    }
+
+    #[test]
+    fn apply_stations_marks_every_origin() {
+        let band = q(&["fm"], CENTER, 12_500);
+        let mut second = tx(Some("16K0F3E"), None, CENTER, None);
+        second.licence_no = Some("0000002".into());
+        let origins = [tx(None, Some(12_500), CENTER, Some(5.0)), second]
+            .iter()
+            .map(|r| score_row(r, &band, None, None).unwrap())
+            .collect();
+        let mut a = empty_answer(origins, Some(2));
+        assert!(a.origins.iter().all(|o| o.heard.is_none()));
+        let t = tally(&[("1A2B3C", seen(0, 7, 500)), ("*", seen(2, 0, 400))]);
+        apply_stations(&mut a, &t);
+        assert_eq!(a.stations, t);
+        let want = Some(Heard {
+            last_ns: Timestamp(400),
+            grade: Grade::From,
+        });
+        assert!(a.origins.iter().all(|o| o.heard == want), "{a:?}");
+        apply_stations(&mut a, &BTreeMap::new());
+        assert!(a.stations.is_empty());
+        assert!(a.origins.iter().all(|o| o.heard.is_none()));
+    }
+
+    #[test]
+    fn station_summary_one_heard_two_addressed_and_uplinks() {
+        let site = "Example Water Authority, Example Hill 17 km unknown 0.9";
+        let mut a = vhf_answer();
+        assert_eq!(station_summary(&a), summary(&a));
+        a.stations = tally(&[("1A2B3C", seen(3, 0, 10))]);
+        assert_eq!(
+            station_summary(&a),
+            format!("1 ground station on 136.975 MHz: 1A2B3C heard 3 frames; {site}")
+        );
+        a.stations = tally(&[("1A2B3C", seen(0, 5, 10)), ("4D5E6F", seen(0, 9, 20))]);
+        assert_eq!(
+            station_summary(&a),
+            format!(
+                "2 ground stations on 136.975 MHz: 4D5E6F addressed by 9 frames, \
+                 1A2B3C addressed by 5 frames; {site}"
+            )
+        );
+        a.stations = tally(&[("*", seen(2, 0, 10))]);
+        assert_eq!(
+            station_summary(&a),
+            format!("1 ground station on 136.975 MHz: uplinks heard 2 frames; {site}")
+        );
+        // The first ORIGIN_SUMMARY_SITES keys by total, ties by key; a key with any own
+        // frame reads `heard`.
+        a.stations = tally(&[
+            ("D4", seen(1, 1, 10)),
+            ("C3", seen(0, 1, 10)),
+            ("B2", seen(0, 1, 10)),
+            ("A1", seen(0, 1, 10)),
+        ]);
+        assert_eq!(
+            station_summary(&a),
+            format!(
+                "4 ground stations on 136.975 MHz: D4 heard 1 frames, A1 addressed by 1 frames, \
+                 B2 addressed by 1 frames; {site}"
+            )
+        );
+    }
+
+    #[test]
+    fn station_summary_with_no_origins_keeps_todays_tail() {
+        let t = tally(&[("1A2B3C", seen(1, 0, 10))]);
+        let head = "1 ground station on 403.025 MHz: 1A2B3C heard 1 frames; ";
+        for (rows, tail) in [
+            (Some(3), "no licensed transmitter on 403.025 MHz"),
+            (Some(0), "register gave no rows"),
+            (None, "no register provider"),
+        ] {
+            let mut a = empty_answer(vec![], rows);
+            assert_eq!(station_summary(&a), tail);
+            a.stations = t.clone();
+            assert_eq!(station_summary(&a), format!("{head}{tail}"));
+        }
+    }
+
+    #[test]
+    fn an_answer_persisted_without_heard_and_stations_deserialises() {
+        // An answer as a context written before the station tally keeps it.
+        let v = serde_json::json!({
+            "origins": [{
+                "allocation": {
+                    "provider": "acma", "region": "AU", "min_hz": 136975000,
+                    "max_hz": 136975000, "service": "Aeronautical", "note": null,
+                    "kind": "assignment", "licensee": "Example Airways",
+                    "site": "Example Hill", "role": "tx"
+                },
+                "score": 0.6,
+                "agree": "unknown",
+                "terms": {"width": 0.3, "modulation": 0.2, "reach": 0.1},
+                "confirmed": null
+            }],
+            "band": {"center_hz": 136975000, "bandwidth_hz": 25000},
+            "source": "radio",
+            "modulation": [],
+            "symbol_rate_baud": null,
+            "from": null,
+            "from_note": "no station set",
+            "providers": ["acma"],
+            "register_rows": 1,
+            "receivers": 0,
+            "plans": 0,
+            "reach": null,
+            "t_ns": 5
+        });
+        let a: OriginAnswer = serde_json::from_value(v).unwrap();
+        assert!(a.stations.is_empty());
+        assert_eq!(a.origins.len(), 1);
+        assert_eq!(a.origins[0].heard, None);
     }
 
     #[test]

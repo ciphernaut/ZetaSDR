@@ -363,9 +363,15 @@ async fn a_decoder_job_reads_its_rows_labels_and_publishes_once() {
         "receivers",
         "plans",
         "reach",
+        "stations",
     ] {
         assert_eq!(e[k], want[k], "{k}");
     }
+    // No station tally yet: an empty one, and no site heard.
+    assert_eq!(e["stations"], json!({}));
+    let lit = e["origins"].as_array().unwrap();
+    assert_eq!(lit.len(), 3);
+    assert!(lit.iter().all(|o| o["heard"].is_null()), "{lit:?}");
     assert!(e["t_ns"].is_u64());
     assert_eq!(on_feed[0]["summary"], e["summary"]);
 }
@@ -498,6 +504,26 @@ async fn the_band_form_returns_only_and_is_read_only() {
         .find(|o| o.allocation.emission.as_deref() == Some("16K0F1D"))
         .unwrap();
     assert_eq!(fits.agree, Agree::Fits);
+}
+
+/// The band form belongs to no job, so it has no station tally: no site is heard and
+/// `stations` is empty, written as `{}`, and each origin's `heard` as `null`.
+#[tokio::test]
+async fn the_band_form_carries_no_heard_or_stations() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(dir.path(), true).await;
+    let a = lookup(&node, by_band("file0", TONE_HZ, Some(&["fm"]))).await;
+    assert_eq!(a.origins.len(), 3);
+    assert!(a.stations.is_empty());
+    assert!(a.origins.iter().all(|o| o.heard.is_none()));
+    let v = serde_json::to_value(&a).unwrap();
+    assert_eq!(v["stations"], json!({}));
+    let lit = v["origins"].as_array().unwrap();
+    assert!(
+        lit.iter()
+            .all(|o| o.as_object().unwrap().contains_key("heard") && o["heard"].is_null()),
+        "{lit:?}"
+    );
 }
 
 /// `classify` over the tone's ring with a register attached: the answer's modulation is
@@ -730,6 +756,7 @@ fn schema_lists_origin_lookup_and_the_origins_result() {
         plans: 0,
         reach: None,
         t_ns: zeta_core::types::Timestamp(0),
+        stations: Default::default(),
     });
     assert_eq!(serde_json::to_value(&r).unwrap()["result"], "origins");
 }
