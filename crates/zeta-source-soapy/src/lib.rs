@@ -42,11 +42,15 @@ pub struct ZetaArgs {
     pub settle_ms: Option<f64>,
 }
 
+/// The longest `settle_ms=` accepted (10 s): far past any radio's settle, and
+/// a bound that keeps the value convertible to a `Duration`.
+pub const SETTLE_MS_MAX: f64 = 10_000.0;
+
 /// Take zeta's own `gain=DB`, `ppm=N`, `max_rate_hz=N` and `settle_ms=N` keys
 /// out of SoapySDR device `args`: the args to hand the driver, and the values
 /// to apply after opening. A gain or ppm that is not a finite number, a rate
-/// that is not a positive whole number of Hz, or a settle that is not a finite
-/// number of ms, 0 or more, is an error.
+/// that is not a positive whole number of Hz, or a settle that is not a number
+/// of ms from 0 to [`SETTLE_MS_MAX`], is an error.
 pub fn split_zeta_args(args: &str) -> Result<(String, ZetaArgs), String> {
     let mut z = ZetaArgs::default();
     let mut rest = Vec::new();
@@ -59,10 +63,10 @@ pub fn split_zeta_args(args: &str) -> Result<(String, ZetaArgs), String> {
             }
             Some((k, v)) if k.trim() == "settle_ms" => {
                 let ms = v.trim().parse().ok();
-                let ms = ms.filter(|ms: &f64| ms.is_finite() && *ms >= 0.0);
-                z.settle_ms = Some(
-                    ms.ok_or_else(|| format!("settle_ms={v}: not a number of ms, 0 or more"))?,
-                );
+                let ms = ms.filter(|ms: &f64| (0.0..=SETTLE_MS_MAX).contains(ms));
+                z.settle_ms = Some(ms.ok_or_else(|| {
+                    format!("settle_ms={v}: not a number of ms from 0 to {SETTLE_MS_MAX}")
+                })?);
             }
             Some((k, v)) if matches!(k.trim(), "gain" | "ppm") => {
                 let n: Option<f64> = v.trim().parse().ok().filter(|d: &f64| d.is_finite());
@@ -80,7 +84,7 @@ pub fn split_zeta_args(args: &str) -> Result<(String, ZetaArgs), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ZetaArgs, split_zeta_args};
+    use super::{SETTLE_MS_MAX, ZetaArgs, split_zeta_args};
 
     fn split(args: &str) -> (String, Option<f64>) {
         let (rest, z) = split_zeta_args(args).unwrap();
@@ -133,10 +137,21 @@ mod tests {
         assert_eq!(split_zeta_args("driver=uhd").unwrap().1.settle_ms, None);
         assert_eq!(
             split_zeta_args("driver=uhd,settle_ms=fast").unwrap_err(),
-            "settle_ms=fast: not a number of ms, 0 or more"
+            "settle_ms=fast: not a number of ms from 0 to 10000"
         );
         assert!(split_zeta_args("settle_ms=-1").is_err());
         assert!(split_zeta_args("settle_ms=inf").is_err());
         assert!(split_zeta_args("settle_ms=NaN").is_err());
+        // Bounded, so nothing past the parser sees a settle a `Duration`
+        // cannot hold.
+        assert_eq!(
+            split_zeta_args("settle_ms=10000").unwrap().1.settle_ms,
+            Some(SETTLE_MS_MAX)
+        );
+        assert_eq!(
+            split_zeta_args("settle_ms=10001").unwrap_err(),
+            "settle_ms=10001: not a number of ms from 0 to 10000"
+        );
+        assert!(split_zeta_args("settle_ms=1e300").is_err());
     }
 }
