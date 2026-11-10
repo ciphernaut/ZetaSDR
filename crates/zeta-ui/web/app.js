@@ -1919,6 +1919,10 @@ window.zetaTest = {
   squelchJobs() {
     return state.ov ? [...state.ov.squelches.keys()] : [];
   },
+  // performance.now() of the job's last station frame (ov.lastStationEvent), or null.
+  lastStationEvent(jobId) {
+    return state.ov ? state.ov.lastStationEvent(jobId) : null;
+  },
   poll() {
     return state.jobs ? state.jobs.refresh() : Promise.resolve();
   },

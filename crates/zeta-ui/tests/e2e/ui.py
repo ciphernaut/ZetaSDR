@@ -5556,6 +5556,8 @@ def scenario_heard_sites(page, url, secret):
     select_source(page, url, secret, "tone")
     page.set_viewport_size(WIDE)
     job = start_subject_job(page, url, secret, "fake_vdl2", bandwidth_hz=42_000)
+    # A row without `station` beside it, so the page's station gate is seen to hold.
+    plain = start_subject_job(page, url, secret, "fake_subjects")
     sites = page.locator("#map path.map-site")
     heard = page.locator('#map path.map-site[data-heard="from"]')
     try:
@@ -5565,6 +5567,14 @@ def scenario_heard_sites(page, url, secret):
             s = (ctx.get("stations") or {}).get("1A2B3C")
             return s if s and s["from"] == 1 and s["to"] == 3 else None
         wait_until(tallied, 10, "1A2B3C heard once, addressed three times")
+        # The page timed the station frames of the station row, and none of the other row,
+        # whose events it saw too (each job's subjects all merged).
+        for j in (job, plain):
+            page.wait_for_function("(j) => window.zetaSubjects.size(j) === 3", arg=j,
+                                   timeout=10_000)
+        last = "(j) => window.zetaTest.lastStationEvent(j)"
+        assert page.evaluate(last, job) is not None, "no station frame timed on fake_vdl2"
+        assert page.evaluate(last, plain) is None, "a station frame timed on fake_subjects"
         job_row(page, job).locator("button.origins").click()
         expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=10_000)
         page.locator("#tabs .src-tab.map-tab").click()
@@ -5631,6 +5641,7 @@ def scenario_heard_sites(page, url, secret):
     finally:
         run_cmd(page, "view reset")
         stop_job(url, secret, job)
+        stop_job(url, secret, plain)
 
 
 # ---- subjects (plan 23 Task 2) ----------------------------------------------------------
