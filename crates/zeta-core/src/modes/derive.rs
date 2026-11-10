@@ -119,7 +119,7 @@ fn in_range(lat_sign: f64, lat: f64, lon_sign: f64, lon: f64) -> Option<(f64, f6
 }
 
 /// Form 1 at `i`: `POS`, at most one space, `N|S` `dd` `mmm`, at most one space,
-/// `E|W` `ddd` `mmm` (minutes times ten, under 600). The altitude is the H1 report's
+/// `E|W` `ddd` `mmm` (minutes times ten, under 600), not followed by a digit. The altitude is the H1 report's
 /// third comma field after the fix when it is three digits, else, when the anchor is
 /// `/POS`, the label 80 report's `/ALT <n>` (two or three digits) before the next
 /// `POS`; both are flight levels.
@@ -134,7 +134,7 @@ fn compact(b: &[u8], i: usize) -> Option<Fix> {
     let j = skip_space(j + 6);
     let lon_sign = hemisphere(b, j, b'E', b'W')?;
     let (lon_deg, lon_min) = (digits(b, j + 1, 3)?, digits(b, j + 4, 3)?);
-    if lat_min >= 600 || lon_min >= 600 {
+    if lat_min >= 600 || lon_min >= 600 || b.get(j + 7).is_some_and(u8::is_ascii_digit) {
         return None;
     }
     let deg = |d: u32, m: u32| f64::from(d) + f64::from(m) / 600.0;
@@ -286,6 +286,11 @@ mod tests {
             153.11833,
             Some(16_500),
         );
+    }
+
+    #[test]
+    fn form_1_rejects_a_stray_digit_after_the_longitude() {
+        assert!(pos("POSS27231E1530712").is_empty());
     }
 
     #[test]
