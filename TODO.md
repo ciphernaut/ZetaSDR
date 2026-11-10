@@ -85,6 +85,14 @@ Found in the whole-branch review of plan 27 (2026-11-05); none blocks the feed, 
 - Out-of-order job polls: agent.js `refresh` has no in-flight guard, so an older `job_list` landing after a newer one makes `ov.sync` forget a just-started job (its counter and gate reset). The feed's poll requests make it slightly more likely.
 - A failed `job_context` seed read is marked gateless and not asked again until a lag, a reconnect or a graph change, so a transient error leaves that row without a dot. Retry errors on the next sync instead.
 - Test nits: no test that `unregister` clears the feed table and the unfed set; a bare `panic!()` in ops_stream's `a_port_added_after_open_has_a_feed`; attach.rs's feed drain stops on `Lagged`; no websocket test of `lagged` on a feed socket; `node_source_frames_are_not_fed` uses a fake mix provenance rather than a real mix job.
+## Modes: HFDL ground stations as origins
+
+Plan 35 gave VDL2 and ACARS a `subject.station`; HFDL (`hfdl_decode`) is left out. dumphfdl splits a station's frames across an SPDU (`spdu.src`) and LPDUs (`lpdu.src`), its ids are integers, and the row's `gs_id` names the addressed station on a downlink and nothing on an uplink. Before `subject.station` can hold, the row needs output pointers covering both PDU types and a numeric key.
+
+## Origins: a node shutdown loses up to a minute of station counts
+
+`Node::drop` only cancels, and `serve` returns without awaiting the job supervisors, so the run-end flush of `job_context.stations` never lands on a restart or a deploy. The counts never go backwards (the last timed write stands), they only lose up to a minute. The relaunch path also copies back `context.stations` but not the flushed `context.origins`, so the kept answer's `stations` and `heard` lag until the next counted frame.
+
 ## Aircraft data links: done in plan 30
 
 Done in plan 30 (`docs/superpowers/specs/2026-11-06-aircraft-links-design.md`, `docs/superpowers/plans/2026-11-06-aircraft-links.md`); the airband named set is `sets/airband.json` (plan 31): its `vdl2` member is live now that `vdl2_decode` exists, and needs `dumpvdl2` on the host (refused `unavailable` without it).

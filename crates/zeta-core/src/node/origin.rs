@@ -1895,7 +1895,7 @@ mod tests {
         entries.iter().map(|(k, s)| (k.to_string(), *s)).collect()
     }
 
-    /// An answer on 136.975 MHz lighting one synthetic site at 17 km, score 0.9.
+    /// A synthetic answer lighting one site, score 0.9.
     fn vhf_answer() -> OriginAnswer {
         let f = 136_975_000;
         let band = q(&[], f, 25_000);
