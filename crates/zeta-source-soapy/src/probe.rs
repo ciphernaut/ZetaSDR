@@ -12,11 +12,15 @@
 //! delivered rate is judged on the samples of its own dwell. Only a clean rate is
 //! reported as the source's `max_bandwidth_hz`, `Measured`: the worker keeps
 //! the driver's asserted cap when none is (see [`ProbeResult::clean`]).
+//!
+//! A device whose link carries more than one sample depth has the ladder run
+//! at each ([`probe_depths`]), and the source runs the fastest lossless one
+//! ([`own_depth`]); the record's `max_bandwidth_hz` is that depth's figure.
 
 use std::time::Duration;
 
 use zeta_core::port::{Port, Tuning};
-use zeta_core::types::Hz;
+use zeta_core::types::{Claim, Depth, Hz};
 
 use crate::SoapySource;
 use crate::caps::{RateModel, pick_rate};
@@ -204,6 +208,106 @@ async fn probe(
         tried,
         clean: false,
     })
+}
+
+/// The rate cap of each sample depth on the device's link
+/// ([`SoapySource::link_depths`]), in its order: a depth `known` lists (`(bits,
+/// hz)`, a cap an earlier open measured) is `Measured` at it without a probe;
+/// every other is streamed through [`probe_rate`] at that depth, lossy ones
+/// included (the capability record is set once, at open), and is `Measured`
+/// at the clean rate found, or keeps the device's asserted cap when no rung
+/// was clean. A probe that errs (no rate tuned, the device lost) is the error.
+/// The source is left as it opened: nothing tuned, the driver's default depth.
+/// Empty for a device with one depth.
+pub async fn probe_depths(
+    src: &mut SoapySource,
+    center_hz: u64,
+    known: &[(u8, u64)],
+) -> Result<Vec<Depth>, String> {
+    probe_depths_with(src, center_hz, known, ProbeTiming::default()).await
+}
+
+/// [`probe_depths`] with its own settle and dwell.
+pub async fn probe_depths_with(
+    src: &mut SoapySource,
+    center_hz: u64,
+    known: &[(u8, u64)],
+    timing: ProbeTiming,
+) -> Result<Vec<Depth>, String> {
+    let asserted = src.capabilities().max_bandwidth_hz.clone();
+    let links = src.link_depths().to_vec();
+    let mut depths = Vec::with_capacity(links.len());
+    let mut found = Ok(());
+    for link in &links {
+        let cap = match known.iter().find(|(bits, _)| *bits == link.bits) {
+            Some(&(_, hz)) => Claim::Measured(Hz(hz)),
+            None => {
+                src.use_depth(Some(link.bits)).await;
+                match probe_rate_with(src, center_hz, timing).await {
+                    Ok(p) if p.clean => Claim::Measured(Hz(p.cap_hz)),
+                    Ok(_) => asserted.clone(),
+                    Err(e) => {
+                        found = Err(format!("{}-bit depth: {e}", link.bits));
+                        break;
+                    }
+                }
+            }
+        };
+        depths.push(Depth {
+            bits: link.bits,
+            lossless: link.lossless,
+            max_bandwidth_hz: cap,
+        });
+    }
+    if !links.is_empty() {
+        src.use_depth(None).await;
+    }
+    found.map(|()| depths)
+}
+
+/// Every sample depth on the device's link at the operator's `hz`
+/// (`max_rate_hz=`), asserted: nothing is probed.
+pub fn asserted_depths(src: &SoapySource, hz: u64) -> Vec<Depth> {
+    src.link_depths()
+        .iter()
+        .map(|l| Depth {
+            bits: l.bits,
+            lossless: l.lossless,
+            max_bandwidth_hz: Claim::Asserted(Hz(hz)),
+        })
+        .collect()
+}
+
+/// The source's own depth among `depths`: `asked` (`bits=`) when listed,
+/// else an error naming the listed ones; unasked, the lossless depth with the
+/// highest cap, a measured cap above an asserted one (a probe that found no
+/// rung clean has shown nothing faster), the deepest on a tie. A lossy depth
+/// is only ever asked for; with none lossless, the deepest.
+pub fn own_depth(depths: &[Depth], asked: Option<u8>) -> Result<u8, String> {
+    if let Some(bits) = asked {
+        if depths.iter().any(|d| d.bits == bits) {
+            return Ok(bits);
+        }
+        let listed: Vec<String> = depths.iter().map(|d| d.bits.to_string()).collect();
+        return Err(match listed.is_empty() {
+            true => format!("bits={bits}: the device's link has one sample depth"),
+            false => format!(
+                "bits={bits}: the device's link carries {} bits",
+                listed.join(", ")
+            ),
+        });
+    }
+    let rank = |d: &&Depth| {
+        let measured = matches!(d.max_bandwidth_hz, Claim::Measured(_));
+        (measured, d.max_bandwidth_hz.value().0, d.bits)
+    };
+    depths
+        .iter()
+        .filter(|d| d.lossless)
+        .max_by_key(rank)
+        .or_else(|| depths.iter().max_by_key(|d| d.bits))
+        .map(|d| d.bits)
+        .ok_or_else(|| "the device's link has one sample depth".to_string())
 }
 
 /// The probe's error when the source gave its device up as lost at `rate`.

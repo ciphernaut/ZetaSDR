@@ -5,7 +5,10 @@
 //! as a real-time stream at the rate set, which [`MockDevice::pace_at`] can make
 //! short or overflowing at a given rate (for the rate probe), and
 //! [`MockDevice::with_tune_garbage`] can make each tune leave a backlog and
-//! unsettled samples behind, as a real radio's does.
+//! unsettled samples behind, as a real radio's does. A device can name link
+//! formats under SoapyUHD's `WIRE` stream argument
+//! ([`MockDevice::with_wire_formats`]), and a stream opened with one can
+//! overflow at a rate the others keep up with ([`MockDevice::overflow_at_wire`]).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -104,7 +107,12 @@ pub struct MockDevice {
     gone: Arc<Gone>,
     hardware: String,
     garbage: Option<Arc<TuneGarbage>>,
+    /// The options of the `WIRE` stream argument.
+    wires: Vec<String>,
 }
+
+/// The stream argument a device names its link formats under (SoapyUHD's).
+const WIRE: &str = "WIRE";
 
 impl MockDevice {
     pub fn hackrf_like() -> Self {
@@ -142,7 +150,32 @@ impl MockDevice {
             gone: Arc::default(),
             hardware: String::new(),
             garbage: None,
+            wires: Vec::new(),
         }
+    }
+
+    /// The link formats the device names as the options of its `WIRE`
+    /// stream argument (default none), as SoapyUHD names a B210's.
+    pub fn with_wire_formats(mut self, wires: &[&str]) -> Self {
+        self.wires = wires.iter().map(|w| w.to_string()).collect();
+        self
+    }
+
+    /// With paced reads, a stream opened with `WIRE=<wire>` cannot keep up
+    /// at `rate_hz`: every tenth read overflows (and so the stream delivers
+    /// short), while a stream opened with another wire format, or none,
+    /// streams cleanly there.
+    pub fn overflow_at_wire(mut self, wire: &str, rate_hz: f64) -> Self {
+        let paces = self.paced.get_or_insert_with(Arc::default);
+        Arc::make_mut(paces).push(Pace {
+            rate_hz,
+            delivered: 1.0,
+            overflow_every: 10,
+            overflow_reads: Vec::new(),
+            short_reads: Vec::new(),
+            wire: Some(wire.into()),
+        });
+        self
     }
 
     /// The hardware key the device reports (default empty).
@@ -196,6 +229,7 @@ impl MockDevice {
             overflow_every,
             overflow_reads: Vec::new(),
             short_reads: Vec::new(),
+            wire: None,
         });
         self
     }
@@ -215,6 +249,7 @@ impl MockDevice {
             overflow_every: 0,
             overflow_reads: reads.to_vec(),
             short_reads: Vec::new(),
+            wire: None,
         });
         self
     }
@@ -239,6 +274,7 @@ impl MockDevice {
             overflow_every: 0,
             overflow_reads: overflows.to_vec(),
             short_reads: reads.to_vec(),
+            wire: None,
         });
         self
     }
@@ -454,10 +490,25 @@ impl SoapyDevice for MockDevice {
         }
         Ok(rate * (1.0 - short.0))
     }
-    fn open_rx(&self, format: WireFormat) -> Result<Box<dyn SoapyRx>, String> {
+    fn stream_arg_options(&self, key: &str) -> Result<Vec<String>, String> {
+        self.gone.touch("stream_arg_options")?;
+        Ok(match key {
+            WIRE => self.wires.clone(),
+            _ => Vec::new(),
+        })
+    }
+    /// Recorded as `open_rx(<format>)`, or `open_rx(<format>, K=V, ...)` with
+    /// stream arguments.
+    fn open_rx(
+        &self,
+        format: WireFormat,
+        args: &[(String, String)],
+    ) -> Result<Box<dyn SoapyRx>, String> {
         self.gone.touch("open_rx")?;
-        self.rec(format!("open_rx({format:?})"));
+        let kv: Vec<String> = args.iter().map(|(k, v)| format!(", {k}={v}")).collect();
+        self.rec(format!("open_rx({format:?}{})", kv.concat()));
         self.check("open_rx")?;
+        let wire = args.iter().find(|(k, _)| k == WIRE).map(|(_, v)| v.clone());
         Ok(Box::new(MockRx {
             reads: self.reads.clone(),
             calls: self.calls.clone(),
@@ -469,6 +520,7 @@ impl SoapyDevice for MockDevice {
                 paces,
                 clock: None,
                 garbage: self.garbage.clone(),
+                wire,
             }),
         }))
     }
@@ -524,6 +576,8 @@ struct Pace {
     overflow_reads: Vec<u64>,
     /// When not empty, `delivered` applies to these reads only.
     short_reads: Vec<u64>,
+    /// Only on a stream opened with this `WIRE` format (`None`: any).
+    wire: Option<String>,
 }
 
 /// A stream's pacing: the device's rate, the per-rate behaviour, and
@@ -533,6 +587,8 @@ struct Paced {
     paces: Arc<Vec<Pace>>,
     clock: Option<(f64, Instant, u64, u64)>,
     garbage: Option<Arc<TuneGarbage>>,
+    /// The `WIRE` format the stream was opened with.
+    wire: Option<String>,
 }
 
 impl Paced {
@@ -544,7 +600,12 @@ impl Paced {
         if rate <= 0.0 {
             return None;
         }
-        let pace = self.paces.iter().find(|p| (p.rate_hz - rate).abs() < 0.5);
+        let pace = self.paces.iter().find(|p| {
+            (p.rate_hz - rate).abs() < 0.5
+                && p.wire
+                    .as_ref()
+                    .is_none_or(|w| Some(w) == self.wire.as_ref())
+        });
         let (delivered, every) = pace.map_or((1.0, 0), |p| (p.delivered, p.overflow_every));
         let clock = match &mut self.clock {
             Some(c) if c.0 == rate => c,
@@ -706,7 +767,7 @@ mod tests {
         ]);
         d.set_frequency(1e8).unwrap();
         d.set_sample_rate(2e6).unwrap();
-        let mut rx = d.open_rx(WireFormat::Cs8).unwrap();
+        let mut rx = d.open_rx(WireFormat::Cs8, &[]).unwrap();
         rx.activate().unwrap();
         let mut b = [Complex::new(0.0, 0.0); 8];
         assert_eq!(rx.read(&mut b, 1000), Ok(3));
@@ -736,9 +797,9 @@ mod tests {
         assert_eq!(d.set_frequency(1e8), Err("f".into()));
         assert!(d.set_frequency(1e8).is_ok());
         assert_eq!(d.set_sample_rate(2e6), Err("r".into()));
-        assert!(d.open_rx(WireFormat::Cs8).is_err());
+        assert!(d.open_rx(WireFormat::Cs8, &[]).is_err());
         let d = MockDevice::hackrf_like().fail_on("activate", "a");
-        let mut rx = d.open_rx(WireFormat::Cs8).unwrap();
+        let mut rx = d.open_rx(WireFormat::Cs8, &[]).unwrap();
         assert_eq!(rx.activate(), Err("a".into()));
         assert!(rx.activate().is_ok());
     }

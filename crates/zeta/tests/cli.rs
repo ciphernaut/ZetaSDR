@@ -1628,6 +1628,34 @@ fn soapy_worker_takes_a_rate_cap() {
         .stderr(contains("invalid value 'fast' for '--rate-cap-hz"));
 }
 
+/// The node passes each sample depth's cached measured cap back as `--depth-cap
+/// BITS:HZ`, once per depth, so a respawn skips probing them.
+#[test]
+fn soapy_worker_takes_depth_caps() {
+    zeta_bin()
+        .args(["soapy-worker", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--depth-cap"))
+        .stdout(contains("BITS:HZ"));
+    for bad in ["fast", "16", "16:", ":20480000", "16:0", "300:20480000"] {
+        zeta_bin()
+            .args(["soapy-worker", "--id", "x", "--args", "driver=hackrf"])
+            .args(["--depth-cap", bad])
+            .assert()
+            .code(1)
+            .stderr(contains(format!("invalid value '{bad}' for '--depth-cap")));
+    }
+    // Repeated, well formed: parsed (a build without the driver then says so).
+    #[cfg(not(soapy))]
+    zeta_bin()
+        .args(["soapy-worker", "--id", "x", "--args", "driver=hackrf"])
+        .args(["--depth-cap", "16:20480000", "--depth-cap", "8:30720000"])
+        .assert()
+        .code(1)
+        .stderr(contains("built without soapy"));
+}
+
 /// `--soapy-in-process` is a global flag: a node without a Soapy source accepts it.
 #[test]
 fn soapy_in_process_is_accepted_as_a_global_flag() {

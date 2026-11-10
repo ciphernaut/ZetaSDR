@@ -7,7 +7,7 @@ use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Capabilities, Hz, SourceId, Timestamp};
+use crate::types::{Capabilities, Depth, Hz, SourceId, Timestamp};
 
 /// A centre frequency and the bandwidth captured around it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -314,5 +314,29 @@ pub trait Port: Send + Sync {
     /// What the port itself knows about where it is; never the configured flag.
     fn position(&self) -> Option<crate::types::SourcePosition> {
         None
+    }
+    /// The sample depth in force on the source's link, one of
+    /// [`Capabilities::depths`], with its rate cap; `None` for a source with
+    /// one depth. A port bounds `tune`'s bandwidth by its cap, which may differ
+    /// from the record's top-level `max_bandwidth_hz` (the source's own
+    /// depth's figure, fixed for the run).
+    fn depth(&self) -> Option<Depth> {
+        None
+    }
+    /// Run the source's link at `bits` per sample, one of
+    /// [`Capabilities::depths`]; the result is the depth in force after it.
+    /// The stream is closed and `current` cleared, so the caller tunes next (a
+    /// depth is fixed when a stream is set up). A depth the source does not
+    /// list is `Unsupported` naming the ones it does.
+    async fn set_depth(&self, bits: u8) -> Result<Depth, PortError> {
+        let _ = bits;
+        Err(PortError::Unsupported("source has one sample depth".into()))
+    }
+    /// The capability record to cache for the source's next start: the
+    /// record of [`Port::capabilities`], unless the port has measured since
+    /// what that record, fixed for the run, could not take (a worker's
+    /// respawn that measured a depth the record holds as asserted).
+    fn record_to_cache(&self) -> Capabilities {
+        self.capabilities().clone()
     }
 }

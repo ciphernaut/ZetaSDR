@@ -41,7 +41,17 @@ pub trait SoapyDevice: Send + Sync {
     fn set_frequency(&self, hz: f64) -> Result<(), String>;
     fn set_sample_rate(&self, hz: f64) -> Result<(), String>;
     fn sample_rate(&self) -> Result<f64, String>;
-    fn open_rx(&self, format: WireFormat) -> Result<Box<dyn SoapyRx>, String>;
+    /// The values the receive stream's argument `key` may take, as the driver
+    /// names them (SoapyUHD's `WIRE`: the link formats, `sc16`, `sc12`,
+    /// `sc8`); empty when the driver has no such argument.
+    fn stream_arg_options(&self, key: &str) -> Result<Vec<String>, String>;
+    /// Set up a receive stream in `format` with the stream arguments `args`
+    /// (none for the driver's defaults).
+    fn open_rx(
+        &self,
+        format: WireFormat,
+        args: &[(String, String)],
+    ) -> Result<Box<dyn SoapyRx>, String>;
     /// The overall receive gain's range in dB, `(min, max)`.
     fn gain_range(&self) -> Result<(f64, f64), String>;
     /// The overall receive gain in dB.

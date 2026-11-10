@@ -9,7 +9,7 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::{Claim, Hz, SourceId};
+use zeta_core::types::{Claim, Depth, Hz, SourceId};
 use zeta_source_soapy::SoapySource;
 use zeta_source_soapy::mock::{MockDevice, MockRead, STALE, UNSETTLED};
 use zeta_source_soapy::source::{MAX_AHEAD_NS, MAX_OVERFLOW_RUN, MAX_RESTARTS};
@@ -1336,4 +1336,109 @@ fn a_device_asserts_0_9_of_its_capture_usable_unless_told() {
         .unwrap()
         .with_usable(0.8);
     assert_eq!(src.capabilities().usable_fraction, Claim::Asserted(0.8));
+}
+
+// The sample depths on the device's link.
+
+/// A device naming two link formats, its 16-bit depth measured at
+/// `cap_16` and its 8-bit one at 20 MHz, running at its 16 bits.
+fn two_depths(cap_16: u64) -> (Arc<MockDevice>, Arc<SoapySource>) {
+    let dev = Arc::new(
+        MockDevice::hackrf_like()
+            .with_wire_formats(&["sc16", "sc8"])
+            .with_paced_reads(),
+    );
+    let mut src = at_once(SoapySource::with_device(SourceId("sdr0".into()), dev.clone()).unwrap());
+    src.set_depths(
+        vec![
+            Depth {
+                bits: 16,
+                lossless: true,
+                max_bandwidth_hz: Claim::Measured(Hz(cap_16)),
+            },
+            Depth {
+                bits: 8,
+                lossless: false,
+                max_bandwidth_hz: Claim::Measured(Hz(20_000_000)),
+            },
+        ],
+        16,
+    );
+    (dev, Arc::new(src))
+}
+
+/// The `open_rx` calls so far.
+fn opens(dev: &MockDevice) -> Vec<String> {
+    dev.calls()
+        .into_iter()
+        .filter(|c| c.starts_with("open_rx"))
+        .collect()
+}
+
+#[tokio::test]
+async fn set_depth_reopens_the_stream_with_the_depths_argument() {
+    let (dev, src) = two_depths(10_000_000);
+    let _rx = src.subscribe();
+    assert_eq!(src.depth().map(|d| d.bits), Some(16));
+    src.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    assert_eq!(opens(&dev), ["open_rx(Cs8, WIRE=sc16)"]);
+    let d = src.set_depth(8).await.unwrap();
+    assert_eq!(
+        d,
+        Depth {
+            bits: 8,
+            lossless: false,
+            max_bandwidth_hz: Claim::Measured(Hz(20_000_000)),
+        }
+    );
+    // Closed, nothing tuned: the caller tunes next.
+    assert_eq!(src.current(), None);
+    assert_deactivated(&dev).await;
+    assert_eq!(src.depth(), Some(d));
+    src.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    assert_eq!(
+        opens(&dev),
+        ["open_rx(Cs8, WIRE=sc16)", "open_rx(Cs8, WIRE=sc8)"]
+    );
+    assert_eq!(src.depth().map(|d| d.bits), Some(8));
+    // The record keeps the source's own depth's figure.
+    assert_eq!(
+        src.capabilities().max_bandwidth_hz,
+        Claim::Measured(Hz(10_000_000))
+    );
+}
+
+#[tokio::test]
+async fn set_depth_of_an_unlisted_depth_is_unsupported_naming_them() {
+    let (_dev, src) = two_depths(10_000_000);
+    match src.set_depth(12).await {
+        Err(PortError::Unsupported(m)) => assert!(m.contains("16, 8"), "{m}"),
+        r => panic!("expected unsupported, got {r:?}"),
+    }
+    assert_eq!(src.depth().map(|d| d.bits), Some(16));
+    // A device with one depth has none to change to.
+    let dev = Arc::new(MockDevice::hackrf_like());
+    let src = source(&dev);
+    assert_eq!(src.depth(), None);
+    assert_eq!(
+        src.set_depth(8).await,
+        Err(PortError::Unsupported("source has one sample depth".into()))
+    );
+}
+
+#[tokio::test]
+async fn a_tune_is_bounded_by_the_depth_in_force() {
+    let (_dev, src) = two_depths(10_000_000);
+    let _rx = src.subscribe();
+    match src.tune(tuning(100_000_000, 15_000_000)).await {
+        Err(PortError::OutOfRange {
+            field: "bandwidth_hz",
+            max: 10_000_000,
+            ..
+        }) => {}
+        r => panic!("expected out of range at 10 MHz, got {r:?}"),
+    }
+    src.set_depth(8).await.unwrap();
+    let got = src.tune(tuning(100_000_000, 15_000_000)).await.unwrap();
+    assert_eq!(got.bandwidth_hz, Hz(15_000_000));
 }

@@ -156,6 +156,7 @@ fn status_of(port: &dyn Port, transport_dropped: u64) -> Status {
         gain: port.gain(),
         stats: port.stats(),
         transport_dropped,
+        depth: port.depth(),
     }
 }
 
@@ -191,6 +192,7 @@ pub async fn serve(
             format: "cf32".into(),
             ring_bytes: ring.as_ref().map_or(0, |r| r.bytes() as u64),
         }),
+        depth: port.depth(),
     }));
 
     let dropped = Arc::new(AtomicU64::new(0));
@@ -245,6 +247,7 @@ pub async fn serve(
                         .await
                         .map(Reply::Tuning),
                     Cmd::SetGain { gain_db } => port.set_gain(gain_db).await.map(Reply::Gain),
+                    Cmd::SetDepth { bits } => port.set_depth(bits).await.map(Reply::Depth),
                 };
                 writer.control(Control::Reply { reply: req.id, result });
                 replied.notify_one();

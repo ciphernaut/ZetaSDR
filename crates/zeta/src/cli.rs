@@ -408,13 +408,18 @@ pub struct SoapyWorkerArgs {
     /// The source id the device serves as
     #[arg(long)]
     pub id: String,
-    /// SoapySDR device arguments, zeta's own gain=, ppm= and max_rate_hz= included
+    /// SoapySDR device arguments, zeta's own gain=, ppm=, max_rate_hz= and bits=
+    /// included
     #[arg(long)]
     pub args: String,
     /// The rate cap an earlier open measured, reported again without probing the
     /// device's rates
     #[arg(long, value_name = "HZ")]
     pub rate_cap_hz: Option<u64>,
+    /// The rate cap an earlier open measured at one sample depth of the device's
+    /// link, reported again without probing that depth; once per depth
+    #[arg(long = "depth-cap", value_name = "BITS:HZ", value_parser = depth_cap)]
+    pub depth_cap: Vec<String>,
     /// The inherited descriptor of the node's shared-memory ring; blocks go through
     /// it rather than the stdout pipe
     #[arg(long, value_name = "FD")]
@@ -1284,6 +1289,12 @@ pub enum OriginCmd {
         #[arg(long, value_name = "LABEL[,LABEL]", value_delimiter = ',')]
         modulation: Option<Vec<String>>,
     },
+}
+
+/// `soapy-worker --depth-cap`: checked as `BITS:HZ`, kept as given (the worker parses it
+/// again with the same function).
+fn depth_cap(s: &str) -> Result<String, String> {
+    zeta_source_worker::port::parse_depth_cap(s).map(|_| s.to_string())
 }
 
 /// `job start --kind`: a built-in kind's name, or any mode id (`^[a-z][a-z0-9_]*$`; the

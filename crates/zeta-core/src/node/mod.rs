@@ -510,11 +510,12 @@ impl Inner {
         }
     }
 
-    /// Cache a worker port's capabilities in its source record, so a later start
-    /// with the device absent can still list the source. A port that runs in the
-    /// node (`Port::worker` is `None`) has nothing to cache and writes no record.
-    /// A failed write goes to `persist_errors`; the memory record is then left as
-    /// it was.
+    /// Cache a worker port's capabilities ([`Port::record_to_cache`]) in its
+    /// source record, so a later start with the device absent can still list
+    /// the source and a worker is passed back what was measured. A port that
+    /// runs in the node (`Port::worker` is `None`) has nothing to cache and
+    /// writes no record. A failed write goes to `persist_errors`; the memory
+    /// record is then left as it was.
     pub(crate) fn note_capabilities(&self, port: &dyn Port) {
         if port.worker().is_none() {
             return;
@@ -526,7 +527,7 @@ impl Inner {
             .cloned()
             .unwrap_or_else(SourceRecord::new);
         rec.format = SOURCE_RECORD_FORMAT;
-        rec.capabilities = Some(port.capabilities().clone());
+        rec.capabilities = Some(port.record_to_cache());
         match persist_source(&self.sources_dir, source, &rec) {
             Ok(()) => {
                 sources.insert(source.clone(), rec);

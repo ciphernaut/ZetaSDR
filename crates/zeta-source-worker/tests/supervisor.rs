@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, TransportPath, Tuning};
-use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, SourceId};
-use zeta_source_worker::port::{Attach, Timings, WorkerConfig, WorkerPort, worker_args};
+use zeta_core::types::{Capabilities, Claim, Depth, Hz, SampleFormat, SourceId};
+use zeta_source_worker::port::{
+    Attach, HELLO_TIMEOUT, Timings, WorkerConfig, WorkerPort, worker_args,
+};
 use zeta_source_worker::ring::{DEFAULT_RING_BYTES, Ring};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_zeta-fake-worker");
@@ -1098,4 +1100,208 @@ async fn a_cap_measured_on_a_respawn_replaces_the_asserted_one() {
     assert_eq!(caps_passed(&spawns[0]), 0, "{:?}", spawns[0]);
     assert_eq!(caps_passed(&spawns[1]), 0, "{:?}", spawns[1]);
     assert_eq!(caps_passed(&spawns[2]), 1, "{:?}", spawns[2]);
+}
+
+// The sample depths on the device's link, across the worker's pipe.
+
+/// The fake's link: 16 bits measured at 20.48 MHz, 8 bits at 30.72 MHz.
+const DEPTHS: &str = "ZETA_FAKE_DEPTHS=16:20480000,8:30720000";
+
+fn depth(bits: u8, lossless: bool, cap: Claim<Hz>) -> Depth {
+    Depth {
+        bits,
+        lossless,
+        max_bandwidth_hz: cap,
+    }
+}
+
+fn measured(hz: u64) -> Claim<Hz> {
+    Claim::Measured(Hz(hz))
+}
+
+/// The `--depth-cap` values among a spawn's arguments, in order.
+fn depth_caps(args: &[String]) -> Vec<String> {
+    args.windows(2)
+        .filter(|w| w[0] == "--depth-cap")
+        .map(|w| w[1].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn set_depth_crosses_the_pipe_and_the_port_reports_it() {
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        &format!("{DEPTHS} exec \"$FAKE\" --script stream \"$@\""),
+    );
+    let (port, _) = open(cfg, None).await;
+    let caps = port.capabilities().clone();
+    assert_eq!(
+        caps.depths,
+        [
+            depth(16, true, measured(20_480_000)),
+            depth(8, false, measured(30_720_000)),
+        ]
+    );
+    // The record's cap is the source's own depth's, and that depth is in force.
+    assert_eq!(caps.max_bandwidth_hz, measured(20_480_000));
+    assert_eq!(port.depth(), Some(depth(16, true, measured(20_480_000))));
+    let wide = tuning(100_000_000, 25_000_000);
+    match port.tune(wide).await {
+        Err(PortError::OutOfRange {
+            max: 20_480_000, ..
+        }) => {}
+        r => panic!("expected the 16-bit cap, got {r:?}"),
+    }
+    assert_eq!(
+        port.set_depth(8).await,
+        Ok(depth(8, false, measured(30_720_000)))
+    );
+    assert_eq!(port.depth(), Some(depth(8, false, measured(30_720_000))));
+    assert_eq!(port.current(), None);
+    // Bounded by the depth in force now: the worker's own device stops short
+    // of 25 MHz and says so against the 8-bit cap.
+    match port.tune(wide).await {
+        Err(PortError::OutOfRange {
+            max: 30_720_000, ..
+        }) => {}
+        r => panic!("expected the 8-bit cap, got {r:?}"),
+    }
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    assert!(mock_samples(&next_block(&mut rx).await));
+    // The status that follows keeps it.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(port.depth().map(|d| d.bits), Some(8));
+    // The record is the run's: the depth changed, its figures did not.
+    assert_eq!(port.capabilities(), &caps);
+    match port.set_depth(12).await {
+        Err(PortError::Unsupported(m)) => assert!(m.contains("16, 8"), "{m}"),
+        r => panic!("expected unsupported, got {r:?}"),
+    }
+    assert_eq!(port.depth().map(|d| d.bits), Some(8));
+}
+
+#[tokio::test]
+async fn cached_depth_caps_are_passed_to_the_respawn() {
+    // A record cached from an earlier open: 16 bits measured, 8 bits not (no
+    // rung was clean), so only the measured one is passed back.
+    let mut cached = cached_caps();
+    cached.max_bandwidth_hz = measured(20_480_000);
+    cached.depths = vec![
+        depth(16, true, measured(20_480_000)),
+        depth(8, false, Claim::Asserted(Hz(20_000_000))),
+    ];
+    let args = worker_args("f", "driver=fake", Some(&cached));
+    assert_eq!(
+        args[5..],
+        ["--rate-cap-hz", "20480000", "--depth-cap", "16:20480000"]
+    );
+
+    // Nothing cached: spawn 0 measures both and crashes; the respawn is told
+    // both, beside the rate cap.
+    let dir = tempdir();
+    let (cfg, rec) = cfg_recording_args(dir.path(), DEPTHS, worker_args("f", "driver=fake", None));
+    let spawns = two_spawns(cfg, &rec, None).await;
+    assert!(depth_caps(&spawns[0]).is_empty(), "{:?}", spawns[0]);
+    assert_eq!(
+        depth_caps(&spawns[1]),
+        ["16:20480000", "8:30720000"],
+        "{:?}",
+        spawns[1]
+    );
+    assert_eq!(caps_passed(&spawns[1]), 1, "{:?}", spawns[1]);
+
+    // Cached at start: every spawn carries them once, the supervisor adding
+    // no second copy.
+    let dir = tempdir();
+    let (cfg, rec) = cfg_recording_args(dir.path(), DEPTHS, args);
+    let spawns = two_spawns(cfg, &rec, Some(cached)).await;
+    for args in &spawns[..2] {
+        assert_eq!(depth_caps(args), ["16:20480000"], "{args:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_respawn_is_back_at_the_sources_own_depth() {
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        &format!(
+            "{DEPTHS} ZETA_FAKE_CRASH_ONCE=1 exec \"$FAKE\" --script 'crash-after-ms 3000' \"$@\""
+        ),
+    );
+    let (port, _) = open(cfg, None).await;
+    port.set_depth(8).await.unwrap();
+    assert_eq!(port.depth().map(|d| d.bits), Some(8));
+    let healed = port.healed().unwrap();
+    assert!(
+        wait_for(Duration::from_secs(10), || *healed.borrow() > 0).await,
+        "no heal: {:?}",
+        port.fault()
+    );
+    assert!(
+        wait_for(Duration::from_secs(5), || port.depth().map(|d| d.bits)
+            == Some(16))
+        .await,
+        "{:?}",
+        port.depth()
+    );
+    assert_eq!(port.depth(), Some(depth(16, true, measured(20_480_000))));
+}
+
+/// The record the port attached with stays for the node's run once a respawn
+/// has replaced it (the capability record is set once per run), so a later
+/// respawn that measured a depth the record holds only as asserted cannot
+/// put its figure there. The figure still governs: the depth reports it, and
+/// it is the record the node caches for its next start.
+#[tokio::test]
+async fn a_respawns_measured_depth_cap_reaches_the_port_when_its_record_is_kept() {
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "case $N in\n\
+         0) ZETA_FAKE_DEPTHS=16:20480000,8 exec \"$FAKE\" --script 'crash-after-ms 300' \"$@\";;\n\
+         1) ZETA_FAKE_DEPTHS=16:20480000,8 ZETA_FAKE_USABLE=0.95 exec \"$FAKE\" --script 'crash-after-ms 300' \"$@\";;\n\
+         *) ZETA_FAKE_DEPTHS=16:20480000,8:30720000 ZETA_FAKE_USABLE=0.95 exec \"$FAKE\" --script stream \"$@\";;\n\
+         esac",
+    );
+    let (port, _) = open(cfg, None).await;
+    let asserted = Claim::Asserted(Hz(20_000_000));
+    assert_eq!(
+        port.capabilities().depths[1],
+        depth(8, false, asserted.clone())
+    );
+    // Spawn 1 replaced the record (its usable fraction), spawn 2 streams.
+    assert!(
+        wait_for(Duration::from_secs(10), || port.worker().unwrap().restarts
+            >= 2
+            && port.worker().unwrap().pid.is_some()
+            && port.capabilities().usable_fraction == Claim::Asserted(0.95))
+        .await,
+        "{:?} {:?}",
+        port.worker(),
+        port.capabilities()
+    );
+    assert_eq!(port.capabilities().depths[1], depth(8, false, asserted));
+    let cache = port.record_to_cache();
+    assert_eq!(cache.depths[1], depth(8, false, measured(30_720_000)));
+    assert_eq!(cache.usable_fraction, Claim::Asserted(0.95));
+    assert_eq!(
+        port.set_depth(8).await,
+        Ok(depth(8, false, measured(30_720_000)))
+    );
+    assert_eq!(port.depth(), Some(depth(8, false, measured(30_720_000))));
+}
+
+#[test]
+fn the_hello_deadline_covers_a_three_depth_probe() {
+    use zeta_source_soapy::probe::{PROBE_DWELL, PROBE_MAX_RUNGS, PROBE_RETRIES, PROBE_SETTLE};
+    let rungs = PROBE_MAX_RUNGS as u32 * (1 + PROBE_RETRIES);
+    let probe = (PROBE_SETTLE + PROBE_DWELL) * rungs;
+    assert!(
+        HELLO_TIMEOUT >= 3 * probe + Duration::from_secs(30),
+        "{HELLO_TIMEOUT:?} for three probes of {probe:?}"
+    );
+    assert_eq!(Timings::default().hello, HELLO_TIMEOUT);
 }

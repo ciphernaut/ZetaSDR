@@ -3,8 +3,9 @@
 //! The port spawns a worker that speaks the protocol of [`crate::wire`] (the
 //! node spawns `zeta soapy-worker`, the tests the fake worker) and keeps a
 //! snapshot of what the worker last reported, so the synchronous `Port`
-//! methods (`fault`, `current`, `gain`, `stats`) answer from memory and never
-//! wait on the child. `tune` and `set_gain` are round trips under a gate. A
+//! methods (`fault`, `current`, `gain`, `stats`, `depth`) answer from memory
+//! and never wait on the child. `tune`, `set_gain` and `set_depth` are round
+//! trips under a gate. A
 //! supervisor task ([`crate::supervisor`]) owns the child: it reaps a worker
 //! that died, turns the way it died into the port's fault, respawns it with a
 //! bounded backoff and bumps [`Port::healed`] when a fresh worker says hello
@@ -18,17 +19,19 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{oneshot, watch};
 use zeta_core::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Tuning, WorkerInfo};
-use zeta_core::types::{Capabilities, Claim, Hz, SourceId};
+use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId};
 
 use crate::supervisor::{Link, Shared, Supervisor};
 use crate::wire::{Cmd, Reply};
 
 /// How long a worker has to say hello after it is spawned: UHD loads a B210's
 /// FPGA image before the device opens (2-4 s cold), and the worker then probes
-/// its rates before the hello: up to six rungs, each up to two attempts of a
-/// 1.5 s settle and a 1.5 s dwell, so about 40 s with the load. Both must fit
-/// with margin.
-pub const HELLO_TIMEOUT: Duration = Duration::from_secs(60);
+/// the rates of each sample depth its link carries before the hello: three
+/// depths (`sc16`, `sc12`, `sc8`) × `PROBE_MAX_RUNGS` (6) × (1 +
+/// `PROBE_RETRIES`) (2) attempts × (`PROBE_SETTLE` + `PROBE_DWELL`) (3 s) =
+/// 108 s at most, the constants of `zeta_source_soapy::probe`. With the load
+/// and a margin of about half a minute, 150 s.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(150);
 /// The wait before the first respawn after a worker ended.
 pub const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 /// The cap the respawn wait doubles up to, and the poll interval while the
@@ -100,17 +103,53 @@ pub struct WorkerConfig {
 /// it instead of probing; see [`worker_args`] and the supervisor's respawns.
 pub const RATE_CAP_FLAG: &str = "--rate-cap-hz";
 
+/// The worker flag that passes one sample depth's measured rate cap back,
+/// `--depth-cap BITS:HZ`, once per depth, so the worker does not probe that
+/// depth again; see [`worker_args`] and the supervisor's respawns.
+pub const DEPTH_CAP_FLAG: &str = "--depth-cap";
+
+/// One `--depth-cap` value, `BITS:HZ` (`16:30720000`): a depth of 1 to 255 bits
+/// and a rate cap of at least 1 Hz.
+pub fn parse_depth_cap(s: &str) -> Result<(u8, u64), String> {
+    let bad = || format!("{s:?}: not BITS:HZ (e.g. 16:30720000)");
+    let (bits, hz) = s.split_once(':').ok_or_else(bad)?;
+    let bits: u8 = bits
+        .trim()
+        .parse()
+        .ok()
+        .filter(|b| *b > 0)
+        .ok_or_else(bad)?;
+    let hz: u64 = hz.trim().parse().ok().filter(|h| *h > 0).ok_or_else(bad)?;
+    Ok((bits, hz))
+}
+
+/// `--depth-cap BITS:HZ` for each depth of `caps` whose cap is measured.
+pub(crate) fn depth_cap_args(caps: &Capabilities) -> Vec<String> {
+    caps.depths
+        .iter()
+        .filter_map(|d| match d.max_bandwidth_hz {
+            Claim::Measured(Hz(hz)) => Some([DEPTH_CAP_FLAG.into(), format!("{}:{hz}", d.bits)]),
+            Claim::Asserted(_) => None,
+        })
+        .flatten()
+        .collect()
+}
+
 /// The arguments `zeta` is spawned with as the worker of `--source-soapy
 /// id=args`: `soapy-worker --id ID --args ARGS`, and `--rate-cap-hz N` when the
-/// capabilities cached from an earlier open carry a measured cap `N`, so the
-/// worker reports it instead of probing the device's rates again. An asserted
-/// cap is not passed: the worker probes, or reads it from `max_rate_hz=`.
+/// capabilities cached from an earlier open carry a measured cap `N`, and one
+/// `--depth-cap BITS:HZ` per sample depth they hold measured, so the worker
+/// reports those instead of probing the device's rates again. An asserted cap
+/// is not passed: the worker probes, or reads it from `max_rate_hz=`.
 pub fn worker_args(id: &str, args: &str, cached: Option<&Capabilities>) -> Vec<String> {
     let mut out = ["soapy-worker", "--id", id, "--args", args]
         .map(String::from)
         .to_vec();
     if let Some(Claim::Measured(Hz(cap))) = cached.map(|c| &c.max_bandwidth_hz) {
         out.extend([RATE_CAP_FLAG.into(), cap.to_string()]);
+    }
+    if let Some(c) = cached {
+        out.extend(depth_cap_args(c));
     }
     out
 }
@@ -138,7 +177,8 @@ pub struct WorkerPort {
     id: SourceId,
     caps: Capabilities,
     shared: Arc<Shared>,
-    /// Serialises `tune` and `set_gain`, as a device takes one at a time.
+    /// Serialises `tune`, `set_gain` and `set_depth`, as a device takes one at
+    /// a time.
     gate: tokio::sync::Mutex<()>,
     next_request: AtomicU64,
     healed: watch::Receiver<u64>,
@@ -252,7 +292,9 @@ impl WorkerPort {
     }
 
     /// Refuse a band the device cannot take before anything is sent, with the
-    /// texts `SoapySource` gives, so a bad request never waits on a worker.
+    /// texts `SoapySource` gives, so a bad request never waits on a worker. The
+    /// band's cap is the depth in force's (the live worker's), else the
+    /// record's.
     fn check(&self, t: Tuning) -> Result<(), PortError> {
         let (center, bw) = (t.center_hz.0, t.bandwidth_hz.0);
         let caps = self.capabilities();
@@ -260,7 +302,9 @@ impl WorkerPort {
         if !(min..=max).contains(&center) {
             return Err(out_of_range("center_hz", center, min, max));
         }
-        let max_bw = caps.max_bandwidth_hz.value().0;
+        let max_bw = self.depth().map_or(caps.max_bandwidth_hz.value().0, |d| {
+            d.max_bandwidth_hz.value().0
+        });
         if !(1..=max_bw).contains(&bw) {
             return Err(out_of_range("bandwidth_hz", bw, 1, max_bw));
         }
@@ -338,6 +382,18 @@ fn settle_gain(shared: &Shared, link: &Arc<Link>, g: GainInfo) {
     }
 }
 
+/// Record a depth the worker on `link` confirmed, while it is the live one
+/// (see [`settle_tune`]): its stream is closed, so nothing is tuned until the
+/// next tune. The next worker opens at the source's own depth and says so in
+/// its hello.
+fn settle_depth(shared: &Shared, link: &Arc<Link>, d: &Depth) {
+    let mut s = shared.snapshot();
+    if s.link.as_ref().is_some_and(|l| Arc::ptr_eq(l, link)) {
+        s.depth = Some(d.clone());
+        s.current = None;
+    }
+}
+
 fn out_of_range(field: &'static str, value: u64, min: u64, max: u64) -> PortError {
     PortError::OutOfRange {
         field,
@@ -377,6 +433,14 @@ impl Port for WorkerPort {
     /// place (see the supervisor's module docs).
     fn capabilities(&self) -> &Capabilities {
         self.shared.measured.get().unwrap_or(&self.caps)
+    }
+
+    /// The latest hello's record when it differs from [`Port::capabilities`]
+    /// only in what a newer worker knows better (a depth measured that the
+    /// record, set once per run, holds as asserted), else that record.
+    fn record_to_cache(&self) -> Capabilities {
+        let latest = self.shared.latest().clone();
+        latest.unwrap_or_else(|| self.capabilities().clone())
     }
 
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
@@ -426,6 +490,24 @@ impl Port for WorkerPort {
                 Ok(g)
             }
             (r, _) => Err(unexpected(&self.id, "set_gain", &r)),
+        }
+    }
+
+    /// The live worker's, from its hello, each status and each `set_depth`
+    /// reply: a respawn's measured cap governs tunes even when the record
+    /// keeps the first figures.
+    fn depth(&self) -> Option<Depth> {
+        self.shared.snapshot().depth.clone()
+    }
+
+    async fn set_depth(&self, bits: u8) -> Result<Depth, PortError> {
+        let _gate = self.gate.lock().await;
+        match self.request(Cmd::SetDepth { bits }, "set_depth").await? {
+            (Reply::Depth(d), link) => {
+                settle_depth(&self.shared, &link, &d);
+                Ok(d)
+            }
+            (r, _) => Err(unexpected(&self.id, "set_depth", &r)),
         }
     }
 

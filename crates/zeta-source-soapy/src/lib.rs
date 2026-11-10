@@ -12,6 +12,9 @@
 //! reader drops the tune's backlog and settle, the radio's
 //! ([`caps::front_end`]) unless `settle_ms=N` gives one. A scan advances by the
 //! capture's usable part, [`caps::USABLE_DEFAULT`] unless `usable=F` gives one.
+//! A device whose link carries more than one sample depth ([`caps::link_depths`])
+//! has each probed at open ([`probe::probe_depths`]) and runs the fastest
+//! lossless one ([`probe::own_depth`]) unless `bits=N` asks for another.
 
 pub mod caps;
 pub mod convert;
@@ -45,18 +48,26 @@ pub struct ZetaArgs {
     /// to 1, in place of [`caps::USABLE_DEFAULT`] (see
     /// [`SoapySource::with_usable`]).
     pub usable: Option<f64>,
+    /// `bits=N`: the sample depth on the device's link the source runs at, in
+    /// place of the fastest lossless one (see [`probe::own_depth`]); a lossy
+    /// depth only this way.
+    pub bits: Option<u8>,
 }
 
 /// The longest `settle_ms=` accepted (10 s): far past any radio's settle, and
 /// a bound that keeps the value convertible to a `Duration`.
 pub const SETTLE_MS_MAX: f64 = 10_000.0;
 
-/// Take zeta's own `gain=DB`, `ppm=N`, `max_rate_hz=N`, `settle_ms=N` and
-/// `usable=F` keys out of SoapySDR device `args`: the args to hand the driver,
-/// and the values to apply after opening. A gain or ppm that is not a finite
-/// number, a rate that is not a positive whole number of Hz, a settle that is
-/// not a number of ms from 0 to [`SETTLE_MS_MAX`], or a usable fraction that
-/// is not a number from 0.5 to 1, is an error.
+/// The deepest `bits=` accepted.
+pub const BITS_MAX: u8 = 32;
+
+/// Take zeta's own `gain=DB`, `ppm=N`, `max_rate_hz=N`, `settle_ms=N`,
+/// `usable=F` and `bits=N` keys out of SoapySDR device `args`: the args to
+/// hand the driver, and the values to apply after opening. A gain or ppm that
+/// is not a finite number, a rate that is not a positive whole number of Hz,
+/// a settle that is not a number of ms from 0 to [`SETTLE_MS_MAX`], a usable
+/// fraction that is not a number from 0.5 to 1, or a depth that is not a
+/// whole number of bits from 1 to [`BITS_MAX`], is an error.
 pub fn split_zeta_args(args: &str) -> Result<(String, ZetaArgs), String> {
     let mut z = ZetaArgs::default();
     let mut rest = Vec::new();
@@ -72,6 +83,13 @@ pub fn split_zeta_args(args: &str) -> Result<(String, ZetaArgs), String> {
                 let ms = ms.filter(|ms: &f64| (0.0..=SETTLE_MS_MAX).contains(ms));
                 z.settle_ms = Some(ms.ok_or_else(|| {
                     format!("settle_ms={v}: not a number of ms from 0 to {SETTLE_MS_MAX}")
+                })?);
+            }
+            Some((k, v)) if k.trim() == "bits" => {
+                let b = v.trim().parse().ok();
+                let b = b.filter(|b: &u8| (1..=BITS_MAX).contains(b));
+                z.bits = Some(b.ok_or_else(|| {
+                    format!("bits={v}: not a number of bits from 1 to {BITS_MAX}")
                 })?);
             }
             Some((k, v)) if k.trim() == "usable" => {
@@ -130,6 +148,7 @@ mod tests {
                     max_rate_hz: None,
                     settle_ms: None,
                     usable: None,
+                    bits: None,
                 }
             )
         );

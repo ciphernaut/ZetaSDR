@@ -1,5 +1,6 @@
-//! `zeta soapy-worker --id ID --args ARGS [--rate-cap-hz N] [--ring-fd N]`: one SoapySDR device
-//! served over stdin and stdout to the node that spawned it.
+//! `zeta soapy-worker --id ID --args ARGS [--rate-cap-hz N] [--depth-cap BITS:HZ]...
+//! [--ring-fd N]`: one SoapySDR device served over stdin and stdout to the node that
+//! spawned it.
 //!
 //! Once the device opens, the worker sets its rate cap (`max_bandwidth_hz`) before
 //! serving: `max_rate_hz=N` in the args asserts it; `--rate-cap-hz N` (a cap an earlier
@@ -7,6 +8,12 @@
 //! rates are probed from the top ([`zeta_source_soapy::probe`]) and the first that
 //! streams cleanly is the measured cap. A probe that finds no rate clean measures
 //! nothing: the device's own asserted cap stays, and the respawn probes again.
+//!
+//! A device whose link carries more than one sample depth (a B210's `sc16`, `sc12` and
+//! `sc8`) has a cap per depth instead: `max_rate_hz=N` asserts every depth at `N`; each
+//! `--depth-cap BITS:HZ` reports that depth's as measured; every other depth is probed,
+//! lossy ones included. The source then runs `bits=N`'s depth, else the fastest lossless
+//! one, and the record's cap is that depth's (`--rate-cap-hz` is not read).
 //!
 //! A node attaches every `--source-soapy` device through this child (see
 //! `node_setup::open_soapy`), so a driver that crashes, hangs or leaks takes down a
@@ -68,7 +75,8 @@ mod imp {
     use zeta_core::port::Port;
     use zeta_core::types::{Claim, Hz, SourceId};
     use zeta_source_soapy::SoapySource;
-    use zeta_source_soapy::probe::probe_rate;
+    use zeta_source_soapy::probe::{asserted_depths, own_depth, probe_depths, probe_rate};
+    use zeta_source_worker::port::parse_depth_cap;
     use zeta_source_worker::ring::Ring;
     use zeta_source_worker::serve::{
         EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, requests_until_signal, serve,
@@ -129,7 +137,24 @@ mod imp {
                 return ExitCode::from(EXIT_OPEN_FAILED);
             }
         };
-        set_rate_cap(&mut src, &args.id, own.max_rate_hz, args.rate_cap_hz).await;
+        let known: Result<Vec<(u8, u64)>, String> =
+            args.depth_cap.iter().map(|c| parse_depth_cap(c)).collect();
+        let set = match known {
+            Ok(_) if src.link_depths().is_empty() => match own.bits {
+                // The link has one depth: nothing for `bits=` to choose.
+                Some(bits) => own_depth(&[], Some(bits)).map(|_| ()),
+                None => {
+                    set_rate_cap(&mut src, &args.id, own.max_rate_hz, args.rate_cap_hz).await;
+                    Ok(())
+                }
+            },
+            Ok(known) => set_depths(&mut src, &args.id, own.max_rate_hz, own.bits, &known).await,
+            Err(e) => Err(format!("--depth-cap {e}")),
+        };
+        if let Err(e) = set {
+            eprintln!("{e}");
+            return ExitCode::from(EXIT_OPEN_FAILED);
+        }
         let port = Arc::new(src) as Arc<dyn Port>;
         // After the device: a ring that will not open costs the speed, not the device.
         let ring = args.ring_fd.and_then(open_ring);
@@ -183,6 +208,59 @@ mod imp {
             }
         };
         src.set_max_bandwidth(claim);
+    }
+
+    /// Fill the source's sample depths before it is served: every depth asserted at
+    /// `asserted` (`max_rate_hz=`) when given; else each depth in `known` (`--depth-cap`)
+    /// measured at its cap and every other probed at the centre of the tune range
+    /// ([`probe_depths`]), one stderr line per depth. The source then runs `asked`'s depth
+    /// (`bits=`), else the fastest lossless one ([`own_depth`]). A `bits=` the link does
+    /// not carry is the error, found before anything is probed. A probe that cannot tune
+    /// any rate, or that lost the device, leaves the asserted cap and no depths, with a
+    /// stderr line, as [`set_rate_cap`] does.
+    async fn set_depths(
+        src: &mut SoapySource,
+        id: &str,
+        asserted: Option<u64>,
+        asked: Option<u8>,
+        known: &[(u8, u64)],
+    ) -> Result<(), String> {
+        // The depths' bits alone decide whether `asked` is one of them.
+        own_depth(&asserted_depths(src, 0), asked)?;
+        let depths = match asserted {
+            Some(hz) => asserted_depths(src, hz),
+            None => {
+                let caps = src.capabilities();
+                let center = (caps.tune_min_hz.value().0 + caps.tune_max_hz.value().0) / 2;
+                match probe_depths(src, center, known).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("zeta-soapy-worker[{id}]: {e}; keeping the asserted cap");
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        for d in &depths {
+            let bits = d.bits;
+            let lossy = if d.lossless { "" } else { " (lossy)" };
+            let cap = d.max_bandwidth_hz.value().0;
+            let how = match (&d.max_bandwidth_hz, asserted) {
+                (Claim::Asserted(_), Some(_)) => "asserted (max_rate_hz=)".to_string(),
+                (Claim::Asserted(_), None) => {
+                    "not measured: no rung clean, the device's asserted cap kept".to_string()
+                }
+                (Claim::Measured(_), _) if known.iter().any(|(b, _)| *b == bits) => {
+                    "measured (passed back)".to_string()
+                }
+                (Claim::Measured(_), _) => "measured".to_string(),
+            };
+            eprintln!("zeta-soapy-worker[{id}]: {bits}-bit depth{lossy}: rate cap {cap} Hz {how}");
+        }
+        let own = own_depth(&depths, asked)?;
+        eprintln!("zeta-soapy-worker[{id}]: runs at {own} bits");
+        src.set_depths(depths, own);
+        Ok(())
     }
 
     /// The node's ring, inherited on `fd`; a ring that will not open is one stderr line,

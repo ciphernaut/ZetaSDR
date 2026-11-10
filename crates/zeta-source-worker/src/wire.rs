@@ -16,6 +16,11 @@
 //! was full. A protocol-1 child has no `transport` and no `transport_dropped`
 //! (both read as their defaults) and sends every block on the pipe as a kind-1
 //! frame.
+//!
+//! A child whose link carries more than one sample depth names the depth in
+//! force in its hello's and each status's `depth` (absent: `None`, a child
+//! with one depth or of an older build), and changes it on `set_depth`,
+//! answered with the depth after it.
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -23,7 +28,7 @@ use std::sync::Arc;
 use num_complex::Complex;
 use serde::{Deserialize, Serialize};
 use zeta_core::port::{GainInfo, IqBlock, PortError, PortStats, TransportInfo, Tuning};
-use zeta_core::types::{Capabilities, Hz, Timestamp};
+use zeta_core::types::{Capabilities, Depth, Hz, Timestamp};
 
 /// The protocol version the child announces in its [`Hello`].
 pub const PROTOCOL: u32 = 2;
@@ -40,8 +45,17 @@ const KIND_DESCRIPTOR: u8 = 2;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Cmd {
-    Tune { center_hz: u64, bandwidth_hz: u64 },
-    SetGain { gain_db: Option<f64> },
+    Tune {
+        center_hz: u64,
+        bandwidth_hz: u64,
+    },
+    SetGain {
+        gain_db: Option<f64>,
+    },
+    /// Run the link at `bits` per sample (`Port::set_depth`).
+    SetDepth {
+        bits: u8,
+    },
     Shutdown,
 }
 
@@ -86,6 +100,10 @@ pub struct Hello {
     /// How blocks reach the node; `None` from a protocol-1 child.
     #[serde(default)]
     pub transport: Option<TransportInfo>,
+    /// The sample depth the child opened at (the source's own); `None` for a
+    /// source with one depth.
+    #[serde(default)]
+    pub depth: Option<Depth>,
 }
 
 /// The child's health, sent whenever it changes and periodically.
@@ -100,15 +118,19 @@ pub struct Status {
     /// cumulative.
     #[serde(default)]
     pub transport_dropped: u64,
+    /// The sample depth in force; `None` for a source with one depth.
+    #[serde(default)]
+    pub depth: Option<Depth>,
 }
 
 /// A successful answer to a request: the band after a tune, the gain after a
-/// gain change.
+/// gain change, the depth after a depth change.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Reply {
     Tuning(Tuning),
     Gain(GainInfo),
+    Depth(Depth),
 }
 
 /// A control message from the child.
@@ -283,7 +305,10 @@ impl Descriptor {
     }
 }
 
-/// One frame of the child's stdout.
+/// One frame of the child's stdout. A control frame (a hello, with its
+/// capability record) is the largest; a frame lives only on its way to or
+/// from the pipe (at most a few dozen queued), so boxing it would buy little.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Frame {
     Control(Control),

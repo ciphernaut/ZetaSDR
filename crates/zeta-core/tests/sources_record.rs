@@ -10,7 +10,7 @@ use zeta_core::node::{Node, NodeConfig, load_source};
 use zeta_core::ops::{Op, OpResult};
 use zeta_core::port::{IqReceiver, Port, PortError, Tuning, WorkerInfo};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::{Capabilities, PositionFrom, SourceId, SourcePosition};
+use zeta_core::types::{Capabilities, Claim, Depth, Hz, PositionFrom, SourceId, SourcePosition};
 use zeta_source_file::{FileOpts, FileSource, fixtures};
 
 /// A recording that claims to run in a child process, as a Soapy worker port does.
@@ -266,4 +266,111 @@ async fn the_schema_lists_position_as_nullable() {
     );
     let ty = si["properties"]["position"]["type"].to_string();
     assert!(ty.contains("null"), "{si}");
+}
+
+/// A worker port whose link has two sample depths, running at 8 bits, and
+/// whose latest respawn measured a figure its record (set once per run)
+/// could not take.
+struct Deep(FileSource, Capabilities);
+
+impl Deep {
+    fn new(dir: &Path) -> Self {
+        let f = file(dir);
+        let mut later = f.capabilities().clone();
+        later.depths = vec![eight_bits()];
+        Deep(f, later)
+    }
+}
+
+fn eight_bits() -> Depth {
+    Depth {
+        bits: 8,
+        lossless: false,
+        max_bandwidth_hz: Claim::Measured(Hz(30_720_000)),
+    }
+}
+
+#[async_trait]
+impl Port for Deep {
+    fn id(&self) -> &SourceId {
+        self.0.id()
+    }
+    fn capabilities(&self) -> &Capabilities {
+        self.0.capabilities()
+    }
+    async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        self.0.tune(t).await
+    }
+    fn current(&self) -> Option<Tuning> {
+        self.0.current()
+    }
+    fn subscribe(&self) -> IqReceiver {
+        self.0.subscribe()
+    }
+    fn worker(&self) -> Option<WorkerInfo> {
+        Some(WorkerInfo {
+            pid: Some(1),
+            restarts: 1,
+            since_ns: None,
+            transport: None,
+            transport_dropped: 0,
+        })
+    }
+    fn depth(&self) -> Option<Depth> {
+        Some(eight_bits())
+    }
+    fn record_to_cache(&self) -> Capabilities {
+        self.1.clone()
+    }
+}
+
+#[tokio::test]
+async fn a_worker_port_caches_the_record_its_respawn_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = Arc::new(Deep::new(dir.path()));
+    let later = port.1.clone();
+    assert_ne!(port.capabilities(), &later);
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    let rec = load_source(&dir.path().join("state/sources"), &SourceId("file0".into())).unwrap();
+    assert_eq!(rec.capabilities, Some(later));
+    // `source_list` shows the run's record, and the depth in force.
+    let v = sources(&node).await;
+    assert_eq!(&v[0].capabilities, port.capabilities());
+    assert_eq!(v[0].depth, Some(eight_bits()));
+}
+
+#[tokio::test]
+async fn source_list_shows_the_depth_in_force_and_null_without() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(file(dir.path()))],
+    )
+    .await
+    .unwrap();
+    let json = serde_json::to_value(sources(&node).await).unwrap();
+    assert!(json[0]["depth"].is_null(), "{json}");
+    let schema = node.schema();
+    let si = &schema["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"].as_array().unwrap().contains(&"depth".into()),
+        "{si}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(Deep::new(dir.path()))],
+    )
+    .await
+    .unwrap();
+    let json = serde_json::to_value(sources(&node).await).unwrap();
+    assert_eq!(
+        json[0]["depth"],
+        serde_json::json!({"bits": 8, "lossless": false, "max_bandwidth_hz": {"measured": 30720000}})
+    );
 }

@@ -24,16 +24,21 @@
 //! protocol-2 one whose ring would not open) sends its blocks on the pipe.
 //!
 //! A worker measures its rate cap when it opens (the soapy worker's rate
-//! probe). Once the port's capability record holds a measured cap (the first
-//! hello's, or the cached one), each spawn is told it with `--rate-cap-hz N`,
-//! unless the configured args already carry the flag, so a respawn skips the
-//! probe. The record the port attached with is replaced, once, by a later
-//! hello that differs from it only in what a newer worker knows better: its
-//! `usable_fraction` and `depths` (a record cached before them loads with
-//! their defaults), and a measured cap where the record's was only asserted (a
-//! probe that found no rung clean, or a device that could not be probed) or a
-//! cap chosen from its depths. The port then reports that record, the node
-//! caches it on the heal, and later spawns are told its cap.
+//! probe, at each sample depth its link carries). Once the port's capability
+//! record holds a measured cap (the first hello's, or the cached one), each
+//! spawn is told it with `--rate-cap-hz N`, and each depth's measured cap with
+//! `--depth-cap BITS:HZ`, unless the configured args already carry the flag,
+//! so a respawn skips the probe. The record the port attached with is
+//! replaced, once, by a later hello that differs from it only in what a newer
+//! worker knows better: its `usable_fraction` and `depths` (a record cached
+//! before them loads with their defaults), and a measured cap where the
+//! record's was only asserted (a probe that found no rung clean, or a device
+//! that could not be probed) or a cap chosen from its depths (measured, over a
+//! measured record). The port then reports that record, the node caches it on
+//! the heal, and later spawns are told its cap. A later hello of that kind
+//! once the record was replaced cannot change it for the run: its figures
+//! still govern tunes (the port's depth is the live worker's) and are what the
+//! node caches for its next start (`Shared::latest`).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -47,9 +52,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, oneshot, watch};
 use zeta_core::port::{GainInfo, IqBlock, PortError, PortStats, TransportInfo, Tuning};
-use zeta_core::types::{Capabilities, Claim, Hz, SourceId, Timestamp};
+use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId, Timestamp};
 
-use crate::port::{Attach, RATE_CAP_FLAG, WorkerConfig};
+use crate::port::{Attach, DEPTH_CAP_FLAG, RATE_CAP_FLAG, WorkerConfig, depth_cap_args};
 use crate::ring::{self, Ring};
 use crate::serve::{EXIT_FAULTED, EXIT_NOT_FOUND, EXIT_OPEN_FAILED};
 use crate::spawn::{RING_FD, inherit_ring};
@@ -81,6 +86,11 @@ pub(crate) struct Shared {
     /// port attached with (see [`hello_replaces`]). Set at most once: after it,
     /// every spawn is passed its measured cap and reports it back.
     pub(crate) measured: OnceLock<Capabilities>,
+    /// The latest hello's record, when it is the port's own or differs from
+    /// it only in what a newer worker knows better (see [`hello_replaces`]):
+    /// what the node caches for its next start, since the port's record is
+    /// set once per run.
+    latest: Mutex<Option<Capabilities>>,
 }
 
 impl Shared {
@@ -90,7 +100,13 @@ impl Shared {
             snap: Mutex::new(Snapshot::default()),
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
             measured: OnceLock::new(),
+            latest: Mutex::new(None),
         }
+    }
+
+    /// The latest hello's record the node may cache (the field's docs).
+    pub(crate) fn latest(&self) -> MutexGuard<'_, Option<Capabilities>> {
+        self.latest.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn snapshot(&self) -> MutexGuard<'_, Snapshot> {
@@ -126,6 +142,9 @@ pub(crate) struct Snapshot {
     pub(crate) transport_dropped: u64,
     /// The live worker's ring, from its hello until it is reaped.
     pub(crate) ring: Option<Arc<Ring>>,
+    /// The live worker's sample depth in force, from its hello, its statuses
+    /// and its `set_depth` replies.
+    pub(crate) depth: Option<Depth>,
 }
 
 impl Snapshot {
@@ -460,6 +479,8 @@ impl Supervisor {
 
     /// A worker of our protocol said hello: it is live. Heals an episode, answers `first`.
     fn on_hello(&mut self, w: Worker, hello: Hello) -> State {
+        let kept =
+            |c: &Capabilities| c == &hello.capabilities || hello_replaces(c, &hello.capabilities);
         match &self.caps {
             None => self.caps = Some(hello.capabilities.clone()),
             Some(c) if *c == hello.capabilities => {}
@@ -485,10 +506,18 @@ impl Supervisor {
                 let _ = self.shared.measured.set(hello.capabilities.clone());
                 self.caps = Some(hello.capabilities.clone());
             }
+            Some(c) if hello_replaces(c, &hello.capabilities) => eprintln!(
+                "zeta: soapy worker for {}: the respawn measured anew; its figures govern through its depth and are cached for the next start, the record stays for this run",
+                self.id()
+            ),
             Some(_) => eprintln!(
                 "zeta: soapy worker for {}: capabilities changed; keeping the first",
                 self.id()
             ),
+        }
+        // Before the heal, as above: the node caches it then.
+        if self.caps.as_ref().is_some_and(kept) {
+            *self.shared.latest() = Some(hello.capabilities.clone());
         }
         {
             let mut s = self.shared.snapshot();
@@ -577,34 +606,35 @@ impl Supervisor {
         );
     }
 
-    /// `--rate-cap-hz N` for the next spawn: the port's capability record (the
-    /// first hello's, else the cached one) holds a measured cap `N` and the
-    /// configured args do not already pass one.
-    fn rate_cap_args(&self) -> Option<[String; 2]> {
-        if self.cfg.args.iter().any(|a| a == RATE_CAP_FLAG) {
-            return None;
-        }
-        match &self
-            .caps
-            .as_ref()
-            .or(self.cached.as_ref())?
-            .max_bandwidth_hz
+    /// The measured caps for the next spawn, from the port's capability record
+    /// (the first hello's, else the cached one): `--rate-cap-hz N` when it holds
+    /// a measured cap `N`, and one `--depth-cap BITS:HZ` per depth it holds
+    /// measured, each flag only when the configured args do not already pass
+    /// it.
+    fn rate_cap_args(&self) -> Vec<String> {
+        let Some(caps) = self.caps.as_ref().or(self.cached.as_ref()) else {
+            return Vec::new();
+        };
+        let configured = |flag: &str| self.cfg.args.iter().any(|a| a == flag);
+        let mut out = Vec::new();
+        if let (false, Claim::Measured(Hz(n))) = (configured(RATE_CAP_FLAG), &caps.max_bandwidth_hz)
         {
-            Claim::Measured(Hz(n)) => Some([RATE_CAP_FLAG.into(), n.to_string()]),
-            Claim::Asserted(_) => None,
+            out.extend([RATE_CAP_FLAG.into(), n.to_string()]);
         }
+        if !configured(DEPTH_CAP_FLAG) {
+            out.extend(depth_cap_args(caps));
+        }
+        out
     }
 
-    /// Spawn the worker with the scrubbed environment, a measured rate cap
+    /// Spawn the worker with the scrubbed environment, the measured caps
     /// ([`Supervisor::rate_cap_args`]), and its ring on [`RING_FD`] when there
     /// is one, and start its reader threads.
     async fn spawn(&self) -> std::io::Result<Worker> {
         let ring = self.new_ring();
         let mut cmd = Command::new(&self.cfg.program);
         cmd.args(&self.cfg.args);
-        if let Some(cap) = self.rate_cap_args() {
-            cmd.args(cap);
-        }
+        cmd.args(self.rate_cap_args());
         cmd.env_clear()
             .envs(crate::env::scrubbed())
             .stdin(Stdio::piped())
@@ -721,6 +751,7 @@ impl Supervisor {
             s.healing_fault = None;
             s.supervision_fault = Some(fault.clone());
             s.current = None;
+            s.depth = None;
             s.clear_worker();
         }
         // After the fault is set, so a waiting request reads it.
@@ -841,8 +872,9 @@ impl Supervisor {
 /// are the same once `new`'s `usable_fraction` and `depths` are taken, and its
 /// `max_bandwidth_hz` too when `old`'s was asserted and `new`'s is measured,
 /// or when it is the cap of one of `new`'s depths (the depth the worker chose
-/// to run). A record cached before the first two fields were carried loads
-/// without them, so the live values reach the port on the first hello.
+/// to run) and no asserted cap would replace a measured one. A record cached
+/// before the first two fields were carried loads without them, so the live
+/// values reach the port on the first hello.
 fn hello_replaces(old: &Capabilities, new: &Capabilities) -> bool {
     let mut same = old.clone();
     same.usable_fraction = new.usable_fraction.clone();
@@ -851,10 +883,15 @@ fn hello_replaces(old: &Capabilities, new: &Capabilities) -> bool {
         (&old.max_bandwidth_hz, &new.max_bandwidth_hz),
         (Claim::Asserted(_), Claim::Measured(_))
     );
-    let chosen = new
-        .depths
-        .iter()
-        .any(|d| d.max_bandwidth_hz == new.max_bandwidth_hz);
+    let unmeasured = matches!(
+        (&old.max_bandwidth_hz, &new.max_bandwidth_hz),
+        (Claim::Measured(_), Claim::Asserted(_))
+    );
+    let chosen = !unmeasured
+        && new
+            .depths
+            .iter()
+            .any(|d| d.max_bandwidth_hz == new.max_bandwidth_hz);
     if measured || chosen {
         same.max_bandwidth_hz = new.max_bandwidth_hz.clone();
     }
@@ -1004,6 +1041,7 @@ fn read_stdout(
                     s.gain = h.gain;
                     s.transport = h.transport.clone();
                     s.transport_dropped = 0;
+                    s.depth = h.depth.clone();
                 }
                 let _ = tx.send(h);
             }
@@ -1015,6 +1053,7 @@ fn read_stdout(
                     s.gain = st.gain;
                     s.stats = st.stats;
                     s.transport_dropped = st.transport_dropped;
+                    s.depth = st.depth;
                 }
             }
             Frame::Control(Control::Reply { reply, result }) => {
@@ -1090,6 +1129,37 @@ mod tests {
         let mut new = old.clone();
         new.channels = 2;
         assert!(!hello_replaces(&old, &new));
+    }
+
+    #[test]
+    fn an_asserted_depth_cap_does_not_replace_a_measured_record() {
+        let old = Capabilities {
+            tune_min_hz: Claim::Asserted(Hz(70_000_000)),
+            tune_max_hz: Claim::Asserted(Hz(6_000_000_000)),
+            max_bandwidth_hz: Claim::Measured(Hz(30_720_000)),
+            formats: vec![],
+            channels: 1,
+            rx: true,
+            tx: false,
+            remote: false,
+            push: false,
+            usable_fraction: Claim::Asserted(0.9),
+            depths: vec![],
+        };
+        // A respawn whose probe found no rung clean at its depth asserts the
+        // device's top rate: no measurement, so the measured record stays.
+        let mut new = old.clone();
+        new.depths = vec![Depth {
+            bits: 16,
+            lossless: true,
+            max_bandwidth_hz: Claim::Asserted(Hz(61_440_000)),
+        }];
+        new.max_bandwidth_hz = Claim::Asserted(Hz(61_440_000));
+        assert!(!hello_replaces(&old, &new));
+        // Over an asserted record it may: neither is a measurement.
+        let mut asserted = old.clone();
+        asserted.max_bandwidth_hz = Claim::Asserted(Hz(56_000_000));
+        assert!(hello_replaces(&asserted, &new));
     }
 
     #[test]

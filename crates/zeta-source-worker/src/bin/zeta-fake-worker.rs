@@ -1,4 +1,5 @@
-//! `zeta-fake-worker --id ID --script SCRIPT [--record PATH] [--rate-cap-hz N] [--ring-fd N]`: a
+//! `zeta-fake-worker --id ID --script SCRIPT [--record PATH] [--rate-cap-hz N]
+//! [--depth-cap BITS:HZ]... [--ring-fd N]`: a
 //! source worker for tests. Its stdout speaks the real protocol through
 //! [`serve`]; its port is a `SoapySource` over a scripted `MockDevice`, or a
 //! `FileSource` over a SigMF recording, chosen by `--script`:
@@ -36,6 +37,11 @@
 //! or else with `ZETA_FAKE_MEASURED_CAP=N` (as a worker that probed); without
 //! either the mock's own asserted cap. Its `usable_fraction` is the Soapy
 //! source's asserted default, or `ZETA_FAKE_USABLE=F` (as `usable=F`).
+//! `ZETA_FAKE_DEPTHS=BITS[:HZ],...` (bits 16, 12 or 8) gives the mock's link
+//! those sample depths, each `Measured` at the `--depth-cap BITS:HZ` it was
+//! passed, else at its `HZ` (as a worker that probed), else at the mock's
+//! asserted cap, `Asserted` (a probe that found no rung clean); the source
+//! runs its own depth (`own_depth`), whose cap is then the record's.
 //!
 //! `--ring-fd N` serves through the ring inherited on descriptor `N`, as the
 //! real worker does (a ring that will not open is one stderr line, then the
@@ -61,11 +67,13 @@ use tokio::sync::broadcast::error::TryRecvError;
 
 use async_trait::async_trait;
 use zeta_core::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Tuning};
-use zeta_core::types::{Capabilities, Claim, Hz, SourceId};
+use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId};
 use zeta_source_file::{FileOpts, FileSource, read_meta};
 use zeta_source_soapy::SoapySource;
 use zeta_source_soapy::device::RangeHz;
 use zeta_source_soapy::mock::{MockDevice, MockRead};
+use zeta_source_soapy::probe::own_depth;
+use zeta_source_worker::port::parse_depth_cap;
 use zeta_source_worker::ring::Ring;
 use zeta_source_worker::serve::{
     EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, requests_until_signal, serve,
@@ -89,6 +97,7 @@ struct Args {
     script: String,
     record: Option<PathBuf>,
     rate_cap_hz: Option<u64>,
+    depth_caps: Vec<(u8, u64)>,
     ring_fd: Option<RawFd>,
 }
 
@@ -96,6 +105,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     let (mut id, mut script, mut record, mut ring_fd) = (None, None, None, None);
     let mut rate_cap_hz = None;
+    let mut depth_caps = Vec::new();
     while let Some(flag) = it.next() {
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
@@ -108,6 +118,9 @@ fn parse_args() -> Result<Args, String> {
                         .parse()
                         .map_err(|_| format!("--rate-cap-hz {value:?}: not a rate"))?,
                 );
+            }
+            "--depth-cap" => {
+                depth_caps.push(parse_depth_cap(&value).map_err(|e| format!("--depth-cap {e}"))?)
             }
             "--ring-fd" => {
                 ring_fd = Some(
@@ -124,8 +137,37 @@ fn parse_args() -> Result<Args, String> {
         script: script.ok_or("--script is required")?,
         record,
         rate_cap_hz,
+        depth_caps,
         ring_fd,
     })
+}
+
+/// `ZETA_FAKE_DEPTHS`: `(bits, hz)` per depth named, in order.
+fn fake_depths() -> Result<Vec<(u8, Option<u64>)>, String> {
+    let Ok(v) = std::env::var("ZETA_FAKE_DEPTHS") else {
+        return Ok(Vec::new());
+    };
+    v.split(',')
+        .map(|d| {
+            let bad = || format!("ZETA_FAKE_DEPTHS: {d:?}: not BITS[:HZ]");
+            let (bits, hz) = d.split_once(':').map_or((d, None), |(b, h)| (b, Some(h)));
+            let bits = bits.trim().parse().map_err(|_| bad())?;
+            let hz = hz
+                .map(|h| h.trim().parse().map_err(|_| bad()))
+                .transpose()?;
+            Ok((bits, hz))
+        })
+        .collect()
+}
+
+/// The `WIRE` option of a depth of `bits`, as SoapyUHD names it.
+fn wire_of(bits: u8) -> Result<&'static str, String> {
+    match bits {
+        16 => Ok("sc16"),
+        12 => Ok("sc12"),
+        8 => Ok("sc8"),
+        _ => Err(format!("ZETA_FAKE_DEPTHS: no link format of {bits} bits")),
+    }
 }
 
 /// The scripted read size: `ZETA_FAKE_READ_SAMPLES`, or [`READ_SAMPLES`].
@@ -223,6 +265,13 @@ impl Port for Recorded {
         self.record.line(&format!("gain {v}"));
         self.inner.set_gain(db).await
     }
+    fn depth(&self) -> Option<Depth> {
+        self.inner.depth()
+    }
+    async fn set_depth(&self, bits: u8) -> Result<Depth, PortError> {
+        self.record.line(&format!("depth {bits}"));
+        self.inner.set_depth(bits).await
+    }
 }
 
 /// A `SoapySource` over a `MockDevice` whose reads a feeder thread scripts at
@@ -234,9 +283,15 @@ fn mock_source(
     id: &str,
     gone_after: Option<Duration>,
     rate_cap_hz: Option<u64>,
+    depth_caps: &[(u8, u64)],
 ) -> Result<Arc<SoapySource>, String> {
     let read = read_samples();
-    let mut dev = MockDevice::hackrf_like();
+    let depths = fake_depths()?;
+    let wires = depths
+        .iter()
+        .map(|(bits, _)| wire_of(*bits))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut dev = MockDevice::hackrf_like().with_wire_formats(&wires);
     // The source reads a hundredth of a second at a time: a wider scripted
     // read needs a rate at which the source's buffer holds it whole.
     let ceiling = read as f64 * 100.0;
@@ -250,6 +305,7 @@ fn mock_source(
     let dev = Arc::new(dev);
     let mut src =
         SoapySource::with_device(SourceId(id.into()), dev.clone()).map_err(|e| e.to_string())?;
+    let asserted = src.capabilities().max_bandwidth_hz.clone();
     let measured = rate_cap_hz.or_else(|| {
         std::env::var("ZETA_FAKE_MEASURED_CAP")
             .ok()
@@ -263,6 +319,25 @@ fn mock_source(
         .and_then(|v| v.parse().ok())
     {
         src = src.with_usable(usable);
+    }
+    if !depths.is_empty() {
+        let depths: Vec<Depth> = src
+            .link_depths()
+            .iter()
+            .map(|l| {
+                let passed = depth_caps.iter().find(|(b, _)| *b == l.bits).map(|c| c.1);
+                let named = depths.iter().find(|(b, _)| *b == l.bits).and_then(|d| d.1);
+                Depth {
+                    bits: l.bits,
+                    lossless: l.lossless,
+                    max_bandwidth_hz: passed
+                        .or(named)
+                        .map_or(asserted.clone(), |hz| Claim::Measured(Hz(hz))),
+                }
+            })
+            .collect();
+        let own = own_depth(&depths, None)?;
+        src.set_depths(depths, own);
     }
     let src = Arc::new(src);
     let weak = Arc::downgrade(&src);
@@ -502,6 +577,7 @@ fn wrong_hello(port: &dyn Port, protocol: u32, mut frames: File) -> ExitCode {
         gain: port.gain(),
         driver: "fake".into(),
         transport: None,
+        depth: port.depth(),
     }));
     if let Err(e) = write_frame(&mut frames, &hello).and_then(|()| frames.flush()) {
         eprintln!("zeta-fake-worker: hello: {e}");
@@ -597,15 +673,15 @@ fn main() -> ExitCode {
         // A receiver held for the life of the worker, see the `file` script.
         let mut keep: Option<IqReceiver> = None;
         let port: Result<Arc<dyn Port>, String> = match (name, arg) {
-            ("stream", _) => {
-                mock_source(&args.id, None, args.rate_cap_hz).map(|s| s as Arc<dyn Port>)
-            }
+            ("stream", _) => mock_source(&args.id, None, args.rate_cap_hz, &args.depth_caps)
+                .map(|s| s as Arc<dyn Port>),
             ("gone-after-ms", ms) => parse_ms(ms)
-                .and_then(|g| mock_source(&args.id, Some(g), args.rate_cap_hz))
+                .and_then(|g| mock_source(&args.id, Some(g), args.rate_cap_hz, &args.depth_caps))
                 .map(|s| s as Arc<dyn Port>),
             ("crash-after-ms", ms) => parse_ms(ms).and_then(|after| {
                 crash_after(after, args.record.as_deref());
-                mock_source(&args.id, None, args.rate_cap_hz).map(|s| s as Arc<dyn Port>)
+                mock_source(&args.id, None, args.rate_cap_hz, &args.depth_caps)
+                    .map(|s| s as Arc<dyn Port>)
             }),
             ("file", spec) => {
                 let (path, crash) = match spec.split_once(',') {

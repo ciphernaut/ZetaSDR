@@ -5,7 +5,7 @@ use serde_json::json;
 use zeta_core::port::{
     GainInfo, IqBlock, PortError, PortStats, TransportInfo, TransportPath, Tuning,
 };
-use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, Timestamp};
+use zeta_core::types::{Capabilities, Claim, Depth, Hz, SampleFormat, Timestamp};
 use zeta_source_worker::wire::*;
 
 fn caps() -> Capabilities {
@@ -21,6 +21,14 @@ fn caps() -> Capabilities {
         push: false,
         usable_fraction: Claim::Asserted(1.0),
         depths: vec![],
+    }
+}
+
+fn depth() -> Depth {
+    Depth {
+        bits: 8,
+        lossless: false,
+        max_bandwidth_hz: Claim::Measured(Hz(30_720_000)),
     }
 }
 
@@ -77,12 +85,13 @@ fn control_messages_round_trip_in_the_spec_shape() {
                 gain: Some(gain()),
                 driver: "hackrf".into(),
                 transport: None,
+                depth: None,
             }),
             json!({"hello": {
                 "protocol": 2,
                 "capabilities": serde_json::to_value(caps()).unwrap(),
                 "gain": serde_json::to_value(gain()).unwrap(),
-                "driver": "hackrf", "transport": null}}),
+                "driver": "hackrf", "transport": null, "depth": null}}),
         ),
         (
             Control::Reply {
@@ -125,12 +134,14 @@ fn control_messages_round_trip_in_the_spec_shape() {
                     tune_gaps: 4,
                 }),
                 transport_dropped: 0,
+                depth: Some(depth()),
             }),
             json!({"status": {"fault": "unplugged",
                 "current": {"center_hz": 144800000, "bandwidth_hz": 12500},
                 "gain": null,
                 "stats": {"measured_rate_hz": 2000000, "overflows": 1, "timeouts": 2, "restarts": 3,
-                    "tune_gaps": 4}, "transport_dropped": 0}}),
+                    "tune_gaps": 4}, "transport_dropped": 0,
+                "depth": {"bits": 8, "lossless": false, "max_bandwidth_hz": {"measured": 30720000}}}}),
         ),
     ];
     // The stats of an older worker, without `tune_gaps`, still load.
@@ -207,6 +218,7 @@ fn a_truncated_frame_is_an_error_and_a_clean_eof_is_none() {
             gain: None,
             stats: None,
             transport_dropped: 0,
+            depth: None,
         })),
     )
     .unwrap();
@@ -299,6 +311,7 @@ fn hello_carries_the_transport_and_reads_without_it() {
             format: "cf32".into(),
             ring_bytes: 67_108_864,
         }),
+        depth: None,
     };
     let v = serde_json::to_value(Control::Hello(h.clone())).unwrap();
     assert_eq!(
@@ -326,4 +339,61 @@ fn status_reads_without_transport_dropped() {
         panic!("expected a status");
     };
     assert_eq!(s.transport_dropped, 0);
+}
+
+#[test]
+fn set_depth_and_its_reply_round_trip() {
+    let r = parse_request(r#"{"id":5,"cmd":"set_depth","bits":8}"#).unwrap();
+    assert_eq!(
+        r,
+        Request {
+            id: 5,
+            cmd: Cmd::SetDepth { bits: 8 }
+        }
+    );
+    assert!(parse_request(r#"{"id":5,"cmd":"set_depth","bits":8,"x":1}"#).is_err());
+    assert!(parse_request(r#"{"id":5,"cmd":"set_depth"}"#).is_err());
+    let mut line = Vec::new();
+    write_request(&mut line, &r).unwrap();
+    assert_eq!(line, b"{\"id\":5,\"cmd\":\"set_depth\",\"bits\":8}\n");
+
+    let reply = Control::Reply {
+        reply: 5,
+        result: Ok(Reply::Depth(depth())),
+    };
+    let shape = json!({"reply": 5, "ok": {"bits": 8, "lossless": false,
+        "max_bandwidth_hz": {"measured": 30720000}}});
+    assert_eq!(serde_json::to_value(&reply).unwrap(), shape);
+    assert_eq!(serde_json::from_value::<Control>(shape).unwrap(), reply);
+    let mut buf = Vec::new();
+    write_frame(&mut buf, &Frame::Control(reply.clone())).unwrap();
+    match read_frame(&mut Cursor::new(buf)).unwrap() {
+        Some(Frame::Control(c)) => assert_eq!(c, reply),
+        other => panic!("expected control, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_hello_without_depth_reads_as_none() {
+    let v = json!({"hello": {"protocol": 2,
+        "capabilities": serde_json::to_value(caps()).unwrap(),
+        "gain": null, "driver": "x", "transport": null}});
+    let Control::Hello(h) = serde_json::from_value(v).unwrap() else {
+        panic!("expected a hello");
+    };
+    assert_eq!(h.depth, None);
+    let v = json!({"status": {"fault": null, "current": null, "gain": null, "stats": null,
+        "transport_dropped": 0}});
+    let Control::Status(s) = serde_json::from_value(v).unwrap() else {
+        panic!("expected a status");
+    };
+    assert_eq!(s.depth, None);
+    // A hello that names one carries it.
+    let mut h = h;
+    h.depth = Some(depth());
+    let v = serde_json::to_value(Control::Hello(h.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_value::<Control>(v).unwrap(),
+        Control::Hello(h)
+    );
 }

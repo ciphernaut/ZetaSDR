@@ -1,18 +1,20 @@
 //! The rate probe against the paced mock device: candidates from the top of
 //! the ladder, the first clean one wins (a sporadic overflow allowed, the
-//! settle after a retune not counted), and zeta's own `max_rate_hz=` item.
+//! settle after a retune not counted), and zeta's own `max_rate_hz=` item;
+//! then the probe per sample depth on the device's link and the source's own
+//! depth.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use zeta_core::port::Port;
-use zeta_core::types::{Claim, Hz, SourceId};
-use zeta_source_soapy::caps::RateModel;
+use zeta_core::types::{Claim, Depth, Hz, SourceId};
+use zeta_source_soapy::caps::{LinkDepth, RateModel, front_end, link_depths};
 use zeta_source_soapy::device::RangeHz;
 use zeta_source_soapy::mock::MockDevice;
 use zeta_source_soapy::probe::{
     PROBE_DWELL, PROBE_MAX_OVERFLOWS, PROBE_MAX_RUNGS, PROBE_RETRIES, PROBE_SETTLE, ProbeResult,
-    ProbeTiming, probe_candidates, probe_rate_with,
+    ProbeTiming, asserted_depths, own_depth, probe_candidates, probe_depths_with, probe_rate_with,
 };
 use zeta_source_soapy::{SoapySource, ZetaArgs, split_zeta_args};
 
@@ -342,6 +344,7 @@ fn a_max_rate_item_asserts_the_cap_and_is_stripped_from_the_driver_args() {
                 max_rate_hz: Some(8_000_000),
                 settle_ms: None,
                 usable: None,
+                bits: None,
             }
         )
     );
@@ -350,4 +353,212 @@ fn a_max_rate_item_asserts_the_cap_and_is_stripped_from_the_driver_args() {
         "max_rate_hz=fast: not a whole number of Hz"
     );
     assert!(split_zeta_args("driver=uhd,max_rate_hz=0").is_err());
+}
+
+// The sample depths on the device's link (`WIRE` on SoapyUHD).
+
+/// The link formats a B210 names under SoapyUHD's `WIRE` stream argument.
+const WIRES: [&str; 3] = ["sc16", "sc12", "sc8"];
+
+fn depth(bits: u8, lossless: bool, cap: Claim<Hz>) -> Depth {
+    Depth {
+        bits,
+        lossless,
+        max_bandwidth_hz: cap,
+    }
+}
+
+fn measured(hz: u64) -> Claim<Hz> {
+    Claim::Measured(Hz(hz))
+}
+
+/// The mock ladder as a B210 (a 12-bit converter) naming `sc16`, `sc12` and
+/// `sc8`.
+fn b210_link() -> MockDevice {
+    ladder().with_hardware("B210").with_wire_formats(&WIRES)
+}
+
+/// How many `open_rx` calls carried the stream argument `WIRE=<wire>`.
+fn opened_with(dev: &MockDevice, wire: &str) -> usize {
+    let arg = format!("WIRE={wire})");
+    dev.calls()
+        .iter()
+        .filter(|c| c.starts_with("open_rx(") && c.ends_with(&arg))
+        .count()
+}
+
+#[tokio::test]
+async fn each_depth_is_probed_and_the_fastest_lossless_one_is_the_sources_own() {
+    // `sc16` cannot keep up at the top rung; `sc12`, three quarters of the
+    // bytes, can.
+    let dev = Arc::new(b210_link().overflow_at_wire("sc16", 6.144e6));
+    let mut src = source(&dev);
+    let depths = probe_depths_with(&mut src, CENTER, &[], TIMING)
+        .await
+        .unwrap();
+    assert_eq!(
+        depths,
+        [
+            depth(16, true, measured(3_072_000)),
+            depth(12, true, measured(6_144_000)),
+            depth(8, false, measured(6_144_000)),
+        ]
+    );
+    for wire in WIRES {
+        assert!(opened_with(&dev, wire) >= 1, "{wire}: {:?}", dev.calls());
+    }
+    let own = own_depth(&depths, None).unwrap();
+    assert_eq!(own, 12);
+    src.set_depths(depths.clone(), own);
+    assert_eq!(src.capabilities().depths, depths);
+    assert_eq!(src.capabilities().max_bandwidth_hz, measured(6_144_000));
+    assert_eq!(src.depth(), Some(depths[1].clone()));
+    // Left as it opened: nothing tuned, nothing counted.
+    assert_eq!(src.current(), None);
+    assert_eq!(src.overflows(), 0);
+}
+
+#[test]
+fn a_tie_goes_to_the_deepest() {
+    let depths = [
+        depth(16, true, measured(30_720_000)),
+        depth(12, true, measured(30_720_000)),
+        depth(8, false, measured(61_440_000)),
+    ];
+    assert_eq!(own_depth(&depths, None), Ok(16));
+}
+
+#[test]
+fn a_lossy_depth_is_never_the_default() {
+    let depths = [
+        depth(16, true, measured(15_360_000)),
+        depth(12, true, measured(20_480_000)),
+        depth(8, false, measured(61_440_000)),
+    ];
+    assert_eq!(own_depth(&depths, None), Ok(12));
+    // Only as an explicit choice.
+    assert_eq!(own_depth(&depths, Some(8)), Ok(8));
+}
+
+#[test]
+fn an_unmeasured_depth_does_not_outrank_a_measured_one() {
+    // A depth whose probe found no rung clean keeps the device's asserted
+    // top rate: no evidence that it is faster.
+    let depths = [
+        depth(16, true, Claim::Asserted(Hz(61_440_000))),
+        depth(12, true, measured(30_720_000)),
+    ];
+    assert_eq!(own_depth(&depths, None), Ok(12));
+}
+
+#[tokio::test]
+async fn a_known_depth_cap_skips_its_probe() {
+    let dev = Arc::new(b210_link());
+    let mut src = source(&dev);
+    let depths = probe_depths_with(&mut src, CENTER, &[(16, 3_072_000)], TIMING)
+        .await
+        .unwrap();
+    assert_eq!(
+        depths,
+        [
+            depth(16, true, measured(3_072_000)),
+            depth(12, true, measured(6_144_000)),
+            depth(8, false, measured(6_144_000)),
+        ]
+    );
+    assert_eq!(opened_with(&dev, "sc16"), 0, "{:?}", dev.calls());
+    assert_eq!(opened_with(&dev, "sc12"), 1, "{:?}", dev.calls());
+}
+
+#[test]
+fn an_unlisted_bits_argument_names_the_depths() {
+    let depths = [
+        depth(16, true, measured(30_720_000)),
+        depth(12, true, measured(30_720_000)),
+        depth(8, false, measured(61_440_000)),
+    ];
+    let e = own_depth(&depths, Some(10)).unwrap_err();
+    assert!(e.contains("bits=10") && e.contains("16, 12, 8"), "{e}");
+    let e = own_depth(&[], Some(12)).unwrap_err();
+    assert!(e.contains("bits=12"), "{e}");
+    // `bits=` is zeta's own key, taken out of the driver's args.
+    let (rest, z) = split_zeta_args("driver=uhd,bits=12").unwrap();
+    assert_eq!((rest.as_str(), z.bits), ("driver=uhd", Some(12)));
+    assert_eq!(
+        split_zeta_args("bits=fine").unwrap_err(),
+        "bits=fine: not a number of bits from 1 to 32"
+    );
+    assert!(split_zeta_args("bits=0").is_err());
+    assert!(split_zeta_args("bits=33").is_err());
+}
+
+#[test]
+fn max_rate_hz_asserts_every_depth_without_a_probe() {
+    let dev = Arc::new(b210_link());
+    let src = source(&dev);
+    let opened = dev.calls().len();
+    let cap = Claim::Asserted(Hz(8_000_000));
+    assert_eq!(
+        asserted_depths(&src, 8_000_000),
+        [
+            depth(16, true, cap.clone()),
+            depth(12, true, cap.clone()),
+            depth(8, false, cap),
+        ]
+    );
+    assert!(dev.calls()[opened..].is_empty(), "{:?}", dev.calls());
+}
+
+#[tokio::test]
+async fn a_device_without_link_formats_has_no_depths() {
+    // None named, or only one: the source has one depth.
+    for dev in [ladder(), ladder().with_wire_formats(&["sc16"])] {
+        let dev = Arc::new(dev);
+        let mut src = source(&dev);
+        assert!(src.link_depths().is_empty());
+        let opened = dev.calls().len();
+        assert_eq!(
+            probe_depths_with(&mut src, CENTER, &[], TIMING).await,
+            Ok(vec![])
+        );
+        assert!(dev.calls()[opened..].is_empty(), "{:?}", dev.calls());
+        assert!(asserted_depths(&src, 8_000_000).is_empty());
+        assert_eq!(src.depth(), None);
+        assert!(src.capabilities().depths.is_empty());
+    }
+}
+
+#[test]
+fn an_unknown_converter_makes_only_the_deepest_lossless() {
+    let wire = |w: &str| ("WIRE".to_string(), w.to_string());
+    // A converter of unknown depth: only the deepest format is sure to hold
+    // every bit. The order the driver names them in does not matter, and a
+    // format the runtime has no depth for (`fc32`) is left out.
+    let dev = MockDevice::hackrf_like().with_wire_formats(&["sc8", "sc16", "sc12", "fc32"]);
+    assert_eq!(
+        link_depths(&dev, &front_end("hackrf", "")),
+        [
+            LinkDepth {
+                bits: 16,
+                lossless: true,
+                arg: wire("sc16"),
+            },
+            LinkDepth {
+                bits: 12,
+                lossless: false,
+                arg: wire("sc12"),
+            },
+            LinkDepth {
+                bits: 8,
+                lossless: false,
+                arg: wire("sc8"),
+            },
+        ]
+    );
+    // A 12-bit converter: 12 bits hold all of it.
+    let lossless: Vec<bool> = link_depths(&b210_link(), &front_end("b200", "B210"))
+        .iter()
+        .map(|d| d.lossless)
+        .collect();
+    assert_eq!(lossless, [true, true, false]);
 }

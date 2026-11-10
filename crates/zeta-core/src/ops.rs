@@ -2102,11 +2102,22 @@ pub struct SourceInfo {
         schema_with = "crate::types::nullable::<crate::types::SourcePosition>"
     )]
     pub position: Option<crate::types::SourcePosition>,
+    /// The sample depth in force on the source's link (`Port::depth`), one of
+    /// `capabilities.depths`, with its rate cap, which bounds a tune; `null`
+    /// for a source with one depth. Defaults to `null` when absent, so a
+    /// source of an older node still loads.
+    #[serde(default)]
+    #[schemars(
+        required,
+        schema_with = "crate::types::nullable::<crate::types::Depth>"
+    )]
+    pub depth: Option<crate::types::Depth>,
 }
 
 /// Schemars omits a serde-defaulted field from `required`, and `#[schemars(required)]`
-/// does not override that; every node of this version writes `worker` and `ring`, so the published
-/// schema requires it (as `JobRecord`'s schema does its defaulted fields).
+/// does not override that; every node of this version writes `worker`, `ring`, `position` and
+/// `depth`, so the published schema requires them (as `JobRecord`'s schema does its defaulted
+/// fields).
 fn require_worker(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -2114,7 +2125,7 @@ fn require_worker(schema: &mut schemars::Schema) {
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
     {
-        for field in ["worker", "ring", "position"] {
+        for field in ["worker", "ring", "position", "depth"] {
             if !req.iter().any(|r| r == field) {
                 req.push(field.into());
             }
@@ -3629,6 +3640,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                     stats: node.port(&id).and_then(|p| p.stats()),
                     worker: node.port(&id).and_then(|p| p.worker()),
                     position: node.source_position(&id),
+                    depth: node.port(&id).and_then(|p| p.depth()),
                     ring: node.ring(&id).map(|r| RingInfo {
                         seconds: r.read().unwrap().capacity_seconds(),
                     }),

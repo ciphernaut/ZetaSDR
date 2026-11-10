@@ -92,6 +92,57 @@ pub fn front_end(driver_key: &str, hardware_key: &str) -> FrontEnd {
         )
 }
 
+/// The receive-stream argument a driver names its link formats under: the
+/// sample depth between the device and the host (SoapyUHD's `WIRE`, UHD's
+/// `otw_format`), distinct from the format the host is handed (UHD unpacks on
+/// the host, so the reader still gets CS16 or CF32).
+pub const LINK_FORMAT_ARG: &str = "WIRE";
+
+/// The link formats a source can run, as `(option, bits per I and Q sample)`,
+/// deepest first: `sc16` (4 bytes a sample, UHD's default), `sc12` (3 bytes)
+/// and `sc8` (2 bytes, the low bits dropped). A driver's other options
+/// (`fc32`, 8 bytes, no use here) are left out.
+const LINK_FORMATS: [(&str, u8); 3] = [("sc16", 16), ("sc12", 12), ("sc8", 8)];
+
+/// One sample depth a device's link can carry: `bits` per I and Q sample,
+/// whether it holds every bit the converter resolves (`lossless`), and the
+/// stream argument that selects it (`("WIRE", "sc12")`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkDepth {
+    pub bits: u8,
+    pub lossless: bool,
+    pub arg: (String, String),
+}
+
+/// The sample depths `dev`'s link can carry, deepest first: the options of
+/// its [`LINK_FORMAT_ARG`] stream argument that are [`LINK_FORMATS`]. A depth
+/// is lossless when it holds at least the converter's bits (`fe.adc_bits`);
+/// with the converter's depth unknown, only the deepest is. A device that
+/// names fewer than two (or cannot be asked) has one depth, and no list.
+pub fn link_depths(dev: &dyn SoapyDevice, fe: &FrontEnd) -> Vec<LinkDepth> {
+    let options = dev.stream_arg_options(LINK_FORMAT_ARG).unwrap_or_default();
+    // Each with the driver's own spelling of it.
+    let named: Vec<(&String, u8)> = LINK_FORMATS
+        .into_iter()
+        .filter_map(|(o, bits)| {
+            let n = options.iter().find(|n| n.eq_ignore_ascii_case(o))?;
+            Some((n, bits))
+        })
+        .collect();
+    if named.len() < 2 {
+        return Vec::new();
+    }
+    let deepest = named[0].1;
+    named
+        .into_iter()
+        .map(|(option, bits)| LinkDepth {
+            bits,
+            lossless: fe.adc_bits.map_or(bits == deepest, |adc| bits >= adc),
+            arg: (LINK_FORMAT_ARG.to_string(), option.clone()),
+        })
+        .collect()
+}
+
 /// The device's sample-rate ranges. A UHD device reports them for its
 /// current master clock (a B210 opens at 16 MHz), so with `probe` (see
 /// [`is_uhd`]) the range is re-read after asking for twice the reported

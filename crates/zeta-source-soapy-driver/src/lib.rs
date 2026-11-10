@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use num_complex::Complex;
-use soapysdr::{Device, Direction, ErrorCode, Format, RxStream, StreamSample};
+use soapysdr::{Args, Device, Direction, ErrorCode, Format, RxStream, StreamSample};
 use zeta_core::port::PortError;
 use zeta_core::types::SourceId;
 use zeta_source_soapy::SoapySource;
@@ -40,9 +40,9 @@ impl Driver {
 /// zeta's too: [`SoapySource::with_ppm`], and so is `settle_ms=N`
 /// ([`SoapySource::with_settle`], in place of the radio's default), and
 /// `usable=F` ([`SoapySource::with_usable`], the part of a capture a scan
-/// advances by). So is
-/// `max_rate_hz=N`, removed here and read by the worker (the rate cap it
-/// reports).
+/// advances by). So are
+/// `max_rate_hz=N` and `bits=N`, removed here and read by the worker (the rate
+/// cap it reports, the link depth it runs at).
 pub fn open(id: SourceId, args: &str) -> Result<SoapySource, PortError> {
     let (args, zeta) = zeta_source_soapy::split_zeta_args(args).map_err(PortError::Io)?;
     let d = Driver::new(&args).map_err(PortError::Io)?;
@@ -181,11 +181,31 @@ impl SoapyDevice for Driver {
             .set_gain_mode(Direction::Rx, CH, automatic)
             .map_err(s)
     }
-    fn open_rx(&self, format: WireFormat) -> Result<Box<dyn SoapyRx>, String> {
+    /// The options of the receive stream's argument `key`
+    /// (`getStreamArgsInfo`; SoapyUHD names the link formats under `WIRE`).
+    fn stream_arg_options(&self, key: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .dev
+            .stream_args_info(Direction::Rx, CH)
+            .map_err(s)?
+            .into_iter()
+            .find(|a| a.key == key)
+            .map(|a| a.options.into_iter().map(|(v, _name)| v).collect())
+            .unwrap_or_default())
+    }
+    fn open_rx(
+        &self,
+        format: WireFormat,
+        args: &[(String, String)],
+    ) -> Result<Box<dyn SoapyRx>, String> {
+        let mut a = Args::new();
+        for (k, v) in args {
+            a.set(k.as_str(), v.as_str());
+        }
         Ok(match format {
-            WireFormat::Cs8 => Box::new(Rx::<Complex<i8>>::new(&self.dev, cs8_to_cf32)?),
-            WireFormat::Cs16 => Box::new(Rx::<Complex<i16>>::new(&self.dev, cs16_to_cf32)?),
-            WireFormat::Cf32 => Box::new(Rx::<Complex<f32>>::new(&self.dev, |x, o| {
+            WireFormat::Cs8 => Box::new(Rx::<Complex<i8>>::new(&self.dev, a, cs8_to_cf32)?),
+            WireFormat::Cs16 => Box::new(Rx::<Complex<i16>>::new(&self.dev, a, cs16_to_cf32)?),
+            WireFormat::Cf32 => Box::new(Rx::<Complex<f32>>::new(&self.dev, a, |x, o| {
                 o.copy_from_slice(x)
             })?),
         })
@@ -200,9 +220,13 @@ struct Rx<E: StreamSample> {
 }
 
 impl<E: StreamSample + Default + Copy + Send> Rx<E> {
-    fn new(dev: &Device, convert: fn(&[E], &mut [Complex<f32>])) -> Result<Self, String> {
+    fn new(
+        dev: &Device,
+        args: Args,
+        convert: fn(&[E], &mut [Complex<f32>]),
+    ) -> Result<Self, String> {
         Ok(Self {
-            stream: dev.rx_stream::<E>(&[CH]).map_err(s)?,
+            stream: dev.rx_stream_args::<E, _>(&[CH], args).map_err(s)?,
             scratch: Vec::new(),
             convert,
         })

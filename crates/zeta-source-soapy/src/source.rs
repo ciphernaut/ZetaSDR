@@ -35,6 +35,13 @@
 //! [`Port::set_gain`]: through the reader thread between reads while a stream
 //! runs (so a gain change and a retune keep their order), on the device
 //! directly otherwise.
+//!
+//! A device whose link carries more than one sample depth
+//! ([`crate::caps::link_depths`]) opens each stream with the stream argument
+//! of the depth in force ([`Port::depth`]). The depth is fixed when a stream is
+//! set up, so [`Port::set_depth`] ends the reader (under the gate, as the rate
+//! probe's end does: nothing needs ordering between reads, since the stream
+//! goes) and the next tune opens a stream at the new depth.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,11 +54,11 @@ use async_trait::async_trait;
 use num_complex::Complex;
 use tokio::sync::{broadcast, oneshot};
 use zeta_core::port::{GainInfo, IqBlock, IqReceiver, Port, PortError, PortStats, Tuning};
-use zeta_core::types::{Capabilities, Claim, Hz, SourceId, Timestamp};
+use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId, Timestamp};
 
 use crate::caps::{
-    RateModel, capabilities, front_end, is_uhd, next_rate_above, pick_format, pick_rate,
-    probe_rate_ranges, uhd_ladder,
+    LinkDepth, RateModel, capabilities, front_end, is_uhd, link_depths, next_rate_above,
+    pick_format, pick_rate, probe_rate_ranges, uhd_ladder,
 };
 use crate::device::{RangeHz, ReadError, SoapyDevice, SoapyRx, WireFormat};
 
@@ -296,6 +303,11 @@ pub struct SoapySource {
     lost: Arc<AtomicBool>,
     /// Serialises `tune`, which may wait on the reader thread.
     gate: tokio::sync::Mutex<()>,
+    /// The sample depths the device's link can carry (empty: one depth).
+    links: Vec<LinkDepth>,
+    /// The bits of the depth the next stream opens at (`None`: the driver's
+    /// default, no stream argument).
+    bits: Mutex<Option<u8>>,
 }
 
 impl SoapySource {
@@ -340,7 +352,8 @@ impl SoapySource {
             gain: read_gain(dev.as_ref()),
             ..Status::default()
         };
-        let settle = front_end(&dev.driver_key(), &dev.hardware_key()).settle;
+        let fe = front_end(&dev.driver_key(), &dev.hardware_key());
+        let links = link_depths(dev.as_ref(), &fe);
         Ok(Self {
             id,
             caps,
@@ -353,9 +366,11 @@ impl SoapySource {
             reader: Mutex::new(None),
             retune_timeout: RETUNE_ACK,
             ppm: 0.0,
-            settle,
+            settle: fe.settle,
             lost: Arc::new(AtomicBool::new(false)),
             gate: tokio::sync::Mutex::new(()),
+            links,
+            bits: Mutex::new(None),
         })
     }
 
@@ -404,13 +419,56 @@ impl SoapySource {
         self.caps.max_bandwidth_hz = claim;
     }
 
-    /// After the rate probe: stop the stream and wait for its reader to end,
-    /// then forget the tuning, the probe's overflows, tune gaps, timeouts and
-    /// stream restarts (the restart window too) and any fault a rung left, so the
-    /// source is as a fresh open leaves it (nothing tuned, nothing counted
-    /// against it). A device given up as lost keeps its fault: that is final.
-    pub(crate) async fn end_probe(&self) {
+    /// The sample depths the device's link can carry, deepest first, read at
+    /// open; empty for a device with one.
+    pub fn link_depths(&self) -> &[LinkDepth] {
+        &self.links
+    }
+
+    /// Fill the capability record's `depths` (each depth's rate cap, from
+    /// [`crate::probe::probe_depths`] or [`crate::probe::asserted_depths`])
+    /// and run the source at `own`, one of them (see
+    /// [`crate::probe::own_depth`]): the record's `max_bandwidth_hz` becomes
+    /// `own`'s cap, the figure for the source's own depth. Before the source
+    /// is shared; a later [`Port::set_depth`] changes the depth in force, never
+    /// the record.
+    pub fn set_depths(&mut self, depths: Vec<Depth>, own: u8) {
+        if let Some(d) = depths.iter().find(|d| d.bits == own) {
+            self.caps.max_bandwidth_hz = d.max_bandwidth_hz.clone();
+            *self.bits.get_mut().unwrap() = Some(own);
+        }
+        self.caps.depths = depths;
+    }
+
+    /// Open the next stream at the link depth of `bits` (`None`: the
+    /// driver's default): the stream is stopped, its reader waited for, and
+    /// the tuning forgotten, so the next tune opens one. For the probe, which
+    /// streams each depth before the record lists any, and for
+    /// [`Port::set_depth`].
+    pub(crate) async fn use_depth(&self, bits: Option<u8>) {
         let _gate = self.gate.lock().await;
+        self.join_reader().await;
+        let mut st = self.status.lock().unwrap();
+        st.current = None;
+        st.band = None;
+        *self.bits.lock().unwrap() = bits;
+    }
+
+    /// The stream argument of the depth the next stream opens at (none for
+    /// the driver's default).
+    fn stream_args(&self) -> Vec<(String, String)> {
+        let bits = *self.bits.lock().unwrap();
+        self.links
+            .iter()
+            .filter(|l| Some(l.bits) == bits)
+            .map(|l| l.arg.clone())
+            .collect()
+    }
+
+    /// Stop the reader and wait for it to end (it deactivates its stream on
+    /// the way out). The caller holds the gate.
+    async fn join_reader(&self) {
+        // Dropping the reader asks its thread to stop.
         let handle = self
             .reader
             .lock()
@@ -420,6 +478,16 @@ impl SoapySource {
         if let Some(h) = handle {
             let _ = tokio::task::spawn_blocking(move || h.join()).await;
         }
+    }
+
+    /// After the rate probe: stop the stream and wait for its reader to end,
+    /// then forget the tuning, the probe's overflows, tune gaps, timeouts and
+    /// stream restarts (the restart window too) and any fault a rung left, so the
+    /// source is as a fresh open leaves it (nothing tuned, nothing counted
+    /// against it). A device given up as lost keeps its fault: that is final.
+    pub(crate) async fn end_probe(&self) {
+        let _gate = self.gate.lock().await;
+        self.join_reader().await;
         let mut st = self.status.lock().unwrap();
         st.current = None;
         st.band = None;
@@ -587,8 +655,9 @@ impl SoapySource {
         let hw = hw_hz(center_hz, self.ppm);
         dev.set_frequency(hw as f64)
             .map_err(|e| self.fail(format!("soapy set_frequency({hw}): {e}")))?;
+        let args = self.stream_args();
         let mut rx = dev
-            .open_rx(self.format)
+            .open_rx(self.format, &args)
             .map_err(|e| self.fail(format!("soapy open_rx({:?}): {e}", self.format)))?;
         rx.activate()
             .map_err(|e| self.fail(format!("soapy activate: {e}")))?;
@@ -618,6 +687,7 @@ impl SoapySource {
             ppm: self.ppm,
             settle: self.settle,
             lost: self.lost.clone(),
+            args,
         };
         let handle = std::thread::Builder::new()
             .name(format!("soapy-{}", self.id.0))
@@ -662,9 +732,10 @@ impl Port for SoapySource {
         &self.caps
     }
 
-    /// Validates the centre against the device's ranges and picks the smallest
-    /// supported rate at least `bandwidth_hz` wide (on a UHD device the
-    /// smallest exact divisor of its master clock). A device that gives less
+    /// Validates the centre against the device's ranges and, with a depth in
+    /// force, the band against its cap ([`Port::depth`]), and picks the
+    /// smallest supported rate at least `bandwidth_hz` wide (on a UHD device
+    /// the smallest exact divisor of its master clock). A device that gives less
     /// than the band is asked once for the next rate above the request, then
     /// refused with `Unsupported`, the capture as it was. An unchanged band on a
     /// live, unfaulted reader is a no-op; a changed one is applied by the
@@ -681,7 +752,12 @@ impl Port for SoapySource {
         if !self.freq.iter().any(|r| r.min_hz <= c && c <= r.max_hz) {
             return Err(out_of_range("center_hz", center, fmin, fmax));
         }
-        let max_rate = claim(&self.caps.max_bandwidth_hz);
+        let depth = self.depth();
+        let cap = depth.as_ref().map(|d| claim(&d.max_bandwidth_hz));
+        let max_rate = cap.unwrap_or_else(|| claim(&self.caps.max_bandwidth_hz));
+        if cap.is_some_and(|cap| bw > cap) {
+            return Err(out_of_range("bandwidth_hz", bw, 1, max_rate));
+        }
         let rate = (bw > 0)
             .then(|| pick_rate(&self.rates, bw))
             .flatten()
@@ -700,14 +776,7 @@ impl Port for SoapySource {
         }
         // A new stream: stop the old reader (finished or faulted) and wait for
         // it to deactivate its stream before the device is reconfigured.
-        let old = self.reader.lock().unwrap().take();
-        if let Some(mut old) = old {
-            let handle = old.handle.take();
-            drop(old);
-            if let Some(h) = handle {
-                let _ = tokio::task::spawn_blocking(move || h.join()).await;
-            }
-        }
+        self.join_reader().await;
         // The reader has exited, so `lost` is final: a retune that was queued
         // when it lost the device was dropped, not applied.
         if let Some(e) = self.lost_error() {
@@ -735,6 +804,33 @@ impl Port for SoapySource {
 
     fn gain(&self) -> Option<GainInfo> {
         self.status.lock().unwrap().gain
+    }
+
+    fn depth(&self) -> Option<Depth> {
+        let bits = (*self.bits.lock().unwrap())?;
+        self.caps.depths.iter().find(|d| d.bits == bits).cloned()
+    }
+
+    /// A depth the record lists: the stream is closed and the tuning
+    /// forgotten (the next tune opens a stream at it), whatever was in force.
+    async fn set_depth(&self, bits: u8) -> Result<Depth, PortError> {
+        let depths = &self.caps.depths;
+        if depths.is_empty() {
+            return Err(PortError::Unsupported("source has one sample depth".into()));
+        }
+        let Some(d) = depths.iter().find(|d| d.bits == bits) else {
+            let listed: Vec<String> = depths.iter().map(|d| d.bits.to_string()).collect();
+            return Err(PortError::Unsupported(format!(
+                "source {} has no {bits}-bit depth; its link carries {}",
+                self.id.0,
+                listed.join(", ")
+            )));
+        };
+        if let Some(e) = self.lost_error() {
+            return Err(e);
+        }
+        self.use_depth(Some(bits)).await;
+        Ok(d.clone())
     }
 
     fn stats(&self) -> Option<PortStats> {
@@ -836,6 +932,9 @@ struct Ctx {
     ppm: f64,
     settle: Duration,
     lost: Arc<AtomicBool>,
+    /// The stream argument of the depth the stream was opened at, for
+    /// [`reopen`].
+    args: Vec<(String, String)>,
 }
 
 impl Ctx {
@@ -899,9 +998,9 @@ impl SoapyRx for Closed {
     }
 }
 
-/// Close the stream and open and activate a new one in the same format. The
-/// old one is closed first, so the driver drops any buffer it still held
-/// (SoapyHackRF keeps a half-read one across `activateStream`).
+/// Close the stream and open and activate a new one in the same format and
+/// depth. The old one is closed first, so the driver drops any buffer it still
+/// held (SoapyHackRF keeps a half-read one across `activateStream`).
 fn reopen(ctx: &Ctx, rx: &mut Box<dyn SoapyRx>) -> Result<(), String> {
     *rx = Box::new(Closed);
     open(ctx, rx)
@@ -911,7 +1010,7 @@ fn reopen(ctx: &Ctx, rx: &mut Box<dyn SoapyRx>) -> Result<(), String> {
 fn open(ctx: &Ctx, rx: &mut Box<dyn SoapyRx>) -> Result<(), String> {
     *rx = ctx
         .dev
-        .open_rx(ctx.format)
+        .open_rx(ctx.format, &ctx.args)
         .map_err(|e| format!("soapy open_rx({:?}): {e}", ctx.format))?;
     rx.activate().map_err(|e| format!("soapy activate: {e}"))
 }
