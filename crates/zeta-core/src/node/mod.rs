@@ -20,6 +20,7 @@ mod persist;
 mod propose;
 mod recover;
 mod retune;
+mod scan;
 mod sources;
 pub mod watch;
 
