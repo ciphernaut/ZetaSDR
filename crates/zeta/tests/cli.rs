@@ -1656,6 +1656,39 @@ fn soapy_worker_takes_depth_caps() {
         .stderr(contains("built without soapy"));
 }
 
+/// The node passes `--progress` to every worker it spawns: the worker then reports
+/// its rate probe's progress before its hello. A flag without a value.
+#[test]
+fn soapy_worker_takes_progress() {
+    zeta_bin()
+        .args(["soapy-worker", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--progress"))
+        .stdout(contains("before the hello"));
+    zeta_bin()
+        .args(["soapy-worker", "--id", "x", "--args", "driver=hackrf"])
+        .args(["--progress", "yes"])
+        .assert()
+        .code(1)
+        .stderr(contains("unexpected argument 'yes'"));
+    // Valueless, followed by another flag: parsed (a build without the driver then
+    // says so).
+    #[cfg(not(soapy))]
+    zeta_bin()
+        .args([
+            "soapy-worker",
+            "--progress",
+            "--id",
+            "x",
+            "--args",
+            "driver=hackrf",
+        ])
+        .assert()
+        .code(1)
+        .stderr(contains("built without soapy"));
+}
+
 /// `--soapy-in-process` is a global flag: a node without a Soapy source accepts it.
 #[test]
 fn soapy_in_process_is_accepted_as_a_global_flag() {

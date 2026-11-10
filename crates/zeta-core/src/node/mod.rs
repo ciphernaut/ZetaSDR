@@ -1190,7 +1190,9 @@ impl Node {
     /// remade whenever its blocks show a new band). A second port with an
     /// attached source's id is `DuplicateSource`. Does not resume jobs. A port that
     /// reports heals ([`Port::healed`], a supervised worker) is watched from now on:
-    /// each heal recovers the source (see [`Inner::recover_source`]).
+    /// each heal recovers the source (see [`Inner::recover_source`]); one that reports
+    /// its worker's start ([`Port::starting_changed`]) has it said on its feed (see
+    /// `recover::watch_starting`).
     pub fn add_port(&self, port: Arc<dyn Port>) -> Result<(), NodeError> {
         let inner = &self.inner;
         let source = port.id().clone();
@@ -1209,6 +1211,9 @@ impl Node {
         }
         tokio::spawn(feed_ring(inner.clone(), source.clone(), port.subscribe()));
         tokio::spawn(feed_bank(inner.clone(), source.clone(), port.subscribe()));
+        if let Some(rx) = port.starting_changed() {
+            tokio::spawn(recover::watch_starting(inner.clone(), source.clone(), rx));
+        }
         if let Some(rx) = port.healed() {
             tokio::spawn(recover::watch_healed(inner.clone(), source, rx));
         }

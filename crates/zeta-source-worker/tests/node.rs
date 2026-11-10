@@ -454,3 +454,41 @@ async fn drops_reach_source_list() {
     );
     assert_eq!(json["worker"]["transport"]["path"], "shm");
 }
+
+/// A respawn that measures its link before its hello: the source's feed says so when it
+/// begins and when it ends, though the respawn's hello still reports the fault it heals
+/// until the node has seen the heal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_respawn_that_measures_says_so_on_the_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = dir.path().join("record");
+    // Spawn 0 crashes; the respawn (the crash's marker beside the record) measures.
+    let env = format!(
+        "export ZETA_FAKE_CRASH_ONCE=1; [ -e '{}.crashed' ] && export ZETA_FAKE_PROGRESS=3;",
+        rec.display()
+    );
+    let (port, attach) = WorkerPort::open(cfg("crash-after-ms 500", &rec, &env), None)
+        .await
+        .unwrap();
+    assert_eq!(attach, Attach::Hello);
+    let node = node_over(&dir.path().join("state"), port).await;
+    let feed = node.bus().feed_of(&f()).expect("the source's feed");
+    let mut rx = node.bus().subscribe(&feed).unwrap();
+    let mut kinds = Vec::new();
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    while kinds.last().map(String::as_str) != Some("measured") {
+        let frame = match tokio::time::timeout_at(end, rx.recv()).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            r => panic!("no measured event: {kinds:?} {r:?}"),
+        };
+        if let zeta_core::stream::Payload::Event(v) = &frame.payload
+            && let Some(k) = v["source_event"].as_str()
+        {
+            assert_eq!(frame.provenance.job, None);
+            kinds.push(k.to_string());
+        }
+    }
+    assert_eq!(kinds, ["measuring", "measured"]);
+    assert_eq!(source(&node).await.worker.unwrap().starting, None);
+}

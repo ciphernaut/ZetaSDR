@@ -21,13 +21,20 @@
 //! force in its hello's and each status's `depth` (absent: `None`, a child
 //! with one depth or of an older build), and changes it on `set_depth`,
 //! answered with the depth after it.
+//!
+//! A child spawned with `--progress` may report what it is doing before its
+//! hello, in [`Control::Progress`] frames (the rate probe of its link, up to a
+//! minute or more). Only before the hello, and only to a node that passed the
+//! flag: the hello's protocol check comes after them, so a node that does not
+//! know the message cannot be protected by it, and one after the hello is a
+//! protocol error.
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 use num_complex::Complex;
 use serde::{Deserialize, Serialize};
-use zeta_core::port::{GainInfo, IqBlock, PortError, PortStats, TransportInfo, Tuning};
+use zeta_core::port::{GainInfo, IqBlock, PortError, PortStats, Starting, TransportInfo, Tuning};
 use zeta_core::types::{Capabilities, Depth, Hz, Timestamp};
 
 /// The protocol version the child announces in its [`Hello`].
@@ -142,10 +149,13 @@ pub enum Control {
         result: Result<Reply, PortError>,
     },
     Status(Status),
+    /// What the child is doing before its hello: sent only before it, and only
+    /// by a child spawned with `--progress` (see the module docs).
+    Progress(Starting),
 }
 
-/// The JSON shape of a [`Control`]: exactly one of `hello`, `status` or
-/// `reply` with `ok` or `err`.
+/// The JSON shape of a [`Control`]: exactly one of `hello`, `status`,
+/// `progress` or `reply` with `ok` or `err`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ControlJson {
@@ -159,6 +169,8 @@ struct ControlJson {
     ok: Option<Reply>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     err: Option<PortError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    progress: Option<Starting>,
 }
 
 impl Serialize for Control {
@@ -169,10 +181,12 @@ impl Serialize for Control {
             reply: None,
             ok: None,
             err: None,
+            progress: None,
         };
         match self {
             Control::Hello(h) => j.hello = Some(h.clone()),
             Control::Status(st) => j.status = Some(st.clone()),
+            Control::Progress(p) => j.progress = Some(p.clone()),
             Control::Reply { reply, result } => {
                 j.reply = Some(*reply);
                 match result {
@@ -195,6 +209,7 @@ impl<'de> Deserialize<'de> for Control {
                 reply: None,
                 ok: None,
                 err: None,
+                progress: None,
             } => Ok(Control::Hello(h)),
             ControlJson {
                 hello: None,
@@ -202,13 +217,23 @@ impl<'de> Deserialize<'de> for Control {
                 reply: None,
                 ok: None,
                 err: None,
+                progress: None,
             } => Ok(Control::Status(st)),
+            ControlJson {
+                hello: None,
+                status: None,
+                reply: None,
+                ok: None,
+                err: None,
+                progress: Some(p),
+            } => Ok(Control::Progress(p)),
             ControlJson {
                 hello: None,
                 status: None,
                 reply: Some(reply),
                 ok: Some(r),
                 err: None,
+                progress: None,
             } => Ok(Control::Reply {
                 reply,
                 result: Ok(r),
@@ -219,12 +244,13 @@ impl<'de> Deserialize<'de> for Control {
                 reply: Some(reply),
                 ok: None,
                 err: Some(e),
+                progress: None,
             } => Ok(Control::Reply {
                 reply,
                 result: Err(e),
             }),
             _ => Err(D::Error::custom(
-                "a control message is exactly one of hello, status, or reply with ok or err",
+                "a control message is exactly one of hello, status, progress, or reply with ok or err",
             )),
         }
     }

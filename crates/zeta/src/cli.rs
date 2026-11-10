@@ -424,6 +424,9 @@ pub struct SoapyWorkerArgs {
     /// it rather than the stdout pipe
     #[arg(long, value_name = "FD")]
     pub ring_fd: Option<i32>,
+    /// Report the rate probe's progress on stdout before the hello
+    #[arg(long)]
+    pub progress: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2097,5 +2100,32 @@ mod cli_origin_tests {
             let args = ["zeta", "origin", "lookup"].iter().chain(bad.iter());
             assert!(Cli::try_parse_from(args).is_err(), "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod soapy_worker_tests {
+    use super::*;
+
+    fn progress(extra: &[&str]) -> bool {
+        let base = [
+            "zeta",
+            "soapy-worker",
+            "--id",
+            "x",
+            "--args",
+            "driver=hackrf",
+        ];
+        let cli = Cli::try_parse_from(base.iter().chain(extra)).unwrap();
+        match cli.command {
+            Command::SoapyWorker(a) => a.progress,
+            c => panic!("soapy-worker: {c:?}"),
+        }
+    }
+
+    #[test]
+    fn soapy_worker_progress_is_off_unless_passed() {
+        assert!(!progress(&[]));
+        assert!(progress(&["--progress"]));
     }
 }

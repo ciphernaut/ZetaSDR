@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use zeta_core::port::Port;
+use zeta_core::port::{Port, Starting};
 use zeta_core::types::{Claim, Depth, Hz, SourceId};
 use zeta_source_soapy::caps::{LinkDepth, RateModel, front_end, link_depths};
 use zeta_source_soapy::device::RangeHz;
@@ -397,7 +397,7 @@ async fn each_depth_is_probed_and_the_fastest_lossless_one_is_the_sources_own() 
     // bytes, can.
     let dev = Arc::new(b210_link().overflow_at_wire("sc16", 6.144e6));
     let mut src = source(&dev);
-    let depths = probe_depths_with(&mut src, CENTER, &[], TIMING)
+    let depths = probe_depths_with(&mut src, CENTER, &[], TIMING, &mut |_| {})
         .await
         .unwrap();
     assert_eq!(
@@ -459,7 +459,7 @@ fn an_unmeasured_depth_does_not_outrank_a_measured_one() {
 async fn a_known_depth_cap_skips_its_probe() {
     let dev = Arc::new(b210_link());
     let mut src = source(&dev);
-    let depths = probe_depths_with(&mut src, CENTER, &[(16, 3_072_000)], TIMING)
+    let depths = probe_depths_with(&mut src, CENTER, &[(16, 3_072_000)], TIMING, &mut |_| {})
         .await
         .unwrap();
     assert_eq!(
@@ -522,7 +522,7 @@ async fn a_device_without_link_formats_has_no_depths() {
         assert!(src.link_depths().is_empty());
         let opened = dev.calls().len();
         assert_eq!(
-            probe_depths_with(&mut src, CENTER, &[], TIMING).await,
+            probe_depths_with(&mut src, CENTER, &[], TIMING, &mut |_| {}).await,
             Ok(vec![])
         );
         assert!(dev.calls()[opened..].is_empty(), "{:?}", dev.calls());
@@ -604,7 +604,7 @@ async fn a_depth_that_will_not_open_is_dropped_alone() {
     // others stand.
     let dev = Arc::new(b210_link().refusing_wire("sc12"));
     let mut src = source(&dev);
-    let depths = probe_depths_with(&mut src, CENTER, &[], TIMING)
+    let depths = probe_depths_with(&mut src, CENTER, &[], TIMING, &mut |_| {})
         .await
         .unwrap();
     assert_eq!(
@@ -621,4 +621,67 @@ async fn a_depth_that_will_not_open_is_dropped_alone() {
     // Left as it opened: no fault from the refused open.
     assert_eq!(src.fault(), None);
     assert_eq!(src.current(), None);
+}
+
+/// The bound on the time a probe has left with `rungs` rungs to go, in ms: every
+/// rung retried, each attempt a production settle and dwell.
+fn eta_ms(rungs: u32) -> u64 {
+    let attempt = (PROBE_SETTLE + PROBE_DWELL).as_millis() as u64;
+    u64::from(rungs) * u64::from(1 + PROBE_RETRIES) * attempt
+}
+
+#[tokio::test]
+async fn a_probe_reports_each_rung_before_it_runs() {
+    // `sc16` overflows at the top rung (tried twice), then streams clean at the
+    // second; `sc12` and `sc8` stream clean at the top.
+    let dev = Arc::new(b210_link().overflow_at_wire("sc16", 6.144e6));
+    let mut src = source(&dev);
+    let mut seen: Vec<(Starting, usize)> = Vec::new();
+    probe_depths_with(&mut src, CENTER, &[], TIMING, &mut |s| {
+        seen.push((s, dev.calls().len()))
+    })
+    .await
+    .unwrap();
+    let shown: Vec<(u32, u32, &str)> = seen
+        .iter()
+        .map(|(s, _)| (s.step, s.of, s.detail.as_str()))
+        .collect();
+    // Six rungs at each of three depths; a depth that finds its clean rung stops
+    // counting the rungs below it.
+    assert_eq!(
+        shown,
+        [
+            (1, 18, "16-bit at 6144000 Hz"),
+            (2, 18, "16-bit at 3072000 Hz"),
+            (3, 14, "12-bit at 6144000 Hz"),
+            (4, 9, "8-bit at 6144000 Hz"),
+        ]
+    );
+    for (i, (s, at)) in seen.iter().enumerate() {
+        assert_eq!(s.what, "measuring");
+        assert_eq!(s.step as usize, i + 1);
+        assert_eq!(s.eta_ms, eta_ms(s.of - s.step + 1), "{s:?}");
+        // Before the rung: the next rate set is the one it names.
+        let rate = s.detail.split(" at ").nth(1).unwrap();
+        let rate = rate.trim_end_matches(" Hz");
+        assert_eq!(
+            rate_calls(&dev, *at).first().cloned(),
+            Some(format!("set_sample_rate({rate})")),
+            "{s:?}"
+        );
+    }
+    assert!(seen.windows(2).all(|w| w[1].0.of <= w[0].0.of), "{shown:?}");
+}
+
+#[tokio::test]
+async fn a_start_from_known_caps_reports_nothing() {
+    let dev = Arc::new(b210_link());
+    let mut src = source(&dev);
+    let known = [(16, 3_072_000), (12, 6_144_000), (8, 6_144_000)];
+    let mut calls = 0;
+    let depths = probe_depths_with(&mut src, CENTER, &known, TIMING, &mut |_| calls += 1)
+        .await
+        .unwrap();
+    assert_eq!(depths.len(), 3);
+    assert_eq!(calls, 0);
 }

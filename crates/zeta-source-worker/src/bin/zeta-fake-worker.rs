@@ -1,5 +1,5 @@
 //! `zeta-fake-worker --id ID --script SCRIPT [--record PATH] [--rate-cap-hz N]
-//! [--depth-cap BITS:HZ]... [--ring-fd N]`: a
+//! [--depth-cap BITS:HZ]... [--ring-fd N] [--progress]`: a
 //! source worker for tests. Its stdout speaks the real protocol through
 //! [`serve`]; its port is a `SoapySource` over a scripted `MockDevice`, or a
 //! `FileSource` over a SigMF recording, chosen by `--script`:
@@ -43,6 +43,14 @@
 //! asserted cap, `Asserted` (a probe that found no rung clean); the source
 //! runs its own depth (`own_depth`), whose cap is then the record's.
 //!
+//! With `--progress` (a flag without a value, as the node passes every spawn),
+//! `ZETA_FAKE_PROGRESS=N` sends `N` progress frames 50 ms apart once the port
+//! has opened, before the hello, as a worker measuring its link does: `what`
+//! `measuring`, `detail` `16-bit at 20480000 Hz`, `step` 1 to `N` of `N`, and
+//! `eta_ms` the bound the real probe gives for the steps left; none without the
+//! flag. `ZETA_FAKE_LATE_PROGRESS=1` sends one right after the hello, which the
+//! node must refuse.
+//!
 //! `--ring-fd N` serves through the ring inherited on descriptor `N`, as the
 //! real worker does (a ring that will not open is one stderr line, then the
 //! pipe); `ZETA_FAKE_NO_RING=1` ignores the flag, as a worker of an older
@@ -72,7 +80,7 @@ use zeta_source_file::{FileOpts, FileSource, read_meta};
 use zeta_source_soapy::SoapySource;
 use zeta_source_soapy::device::RangeHz;
 use zeta_source_soapy::mock::{MockDevice, MockRead};
-use zeta_source_soapy::probe::own_depth;
+use zeta_source_soapy::probe::{own_depth, rung_progress};
 use zeta_source_worker::port::parse_depth_cap;
 use zeta_source_worker::ring::Ring;
 use zeta_source_worker::serve::{
@@ -91,6 +99,8 @@ const FEED_QUEUE: Duration = Duration::from_millis(50);
 const FEED_QUEUE_MIN: u64 = 4;
 /// The feeder's wake-up interval.
 const FEED_TICK: Duration = Duration::from_millis(5);
+/// The time between the fake's progress frames (`ZETA_FAKE_PROGRESS`).
+const PROGRESS_EVERY: Duration = Duration::from_millis(50);
 
 struct Args {
     id: String,
@@ -99,6 +109,7 @@ struct Args {
     rate_cap_hz: Option<u64>,
     depth_caps: Vec<(u8, u64)>,
     ring_fd: Option<RawFd>,
+    progress: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -106,7 +117,12 @@ fn parse_args() -> Result<Args, String> {
     let (mut id, mut script, mut record, mut ring_fd) = (None, None, None, None);
     let mut rate_cap_hz = None;
     let mut depth_caps = Vec::new();
+    let mut progress = false;
     while let Some(flag) = it.next() {
+        if flag == "--progress" {
+            progress = true;
+            continue;
+        }
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--id" => id = Some(value),
@@ -139,7 +155,28 @@ fn parse_args() -> Result<Args, String> {
         rate_cap_hz,
         depth_caps,
         ring_fd,
+        progress,
     })
+}
+
+/// Step `step` of a start of `of` steps, as the real worker's rate probe
+/// reports a rung of the mock's top rate at 16 bits.
+fn progress(step: u32, of: u32) -> Frame {
+    Frame::Control(Control::Progress(rung_progress(16, 20_480_000, step, of)))
+}
+
+/// `ZETA_FAKE_PROGRESS=N`'s frames on `frames`, [`PROGRESS_EVERY`] apart.
+async fn send_progress(frames: &mut File) -> io::Result<()> {
+    let n: u32 = std::env::var("ZETA_FAKE_PROGRESS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for step in 1..=n {
+        write_frame(frames, &progress(step, n))?;
+        frames.flush()?;
+        tokio::time::sleep(PROGRESS_EVERY).await;
+    }
+    Ok(())
 }
 
 /// `ZETA_FAKE_DEPTHS`: `(bits, hz)` per depth named, in order.
@@ -495,11 +532,13 @@ struct Bend {
     bad_slot: bool,
     /// Repeat seq 1 in slot 1 as the third descriptor.
     stale_seq: bool,
+    /// Send a progress frame right after the hello.
+    late_progress: bool,
 }
 
 impl Bend {
     fn any(self) -> bool {
-        self.protocol_1 || self.bad_slot || self.stale_seq
+        self.protocol_1 || self.bad_slot || self.stale_seq || self.late_progress
     }
 }
 
@@ -536,10 +575,14 @@ fn bend_frames(mut frames: File, bend: Bend) -> io::Result<(File, std::sync::mps
                     }
                     descriptors += 1;
                 }
-                let written = match (&f, bend.protocol_1) {
+                let hello = matches!(f, Frame::Control(Control::Hello(_)));
+                let mut written = match (&f, bend.protocol_1) {
                     (Frame::Control(c), true) => write_protocol_1(&mut frames, c),
                     _ => write_frame(&mut frames, &f),
                 };
+                if hello && bend.late_progress {
+                    written = written.and_then(|()| write_frame(&mut frames, &progress(1, 1)));
+                }
                 if written.and_then(|()| frames.flush()).is_err() {
                     break;
                 }
@@ -715,6 +758,13 @@ fn main() -> ExitCode {
                 return ExitCode::from(EXIT_OPEN_FAILED);
             }
         };
+        let mut frames = frames;
+        if args.progress
+            && let Err(e) = send_progress(&mut frames).await
+        {
+            eprintln!("zeta-fake-worker: progress: {e}");
+            return ExitCode::from(EXIT_OPEN_FAILED);
+        }
         let protocol: Option<u32> = std::env::var("ZETA_FAKE_PROTOCOL")
             .ok()
             .and_then(|v| v.parse().ok());
@@ -722,6 +772,7 @@ fn main() -> ExitCode {
             protocol_1: protocol == Some(1),
             bad_slot: std::env::var("ZETA_FAKE_BAD_SLOT").is_ok_and(|v| v == "1"),
             stale_seq: std::env::var("ZETA_FAKE_STALE_SEQ").is_ok_and(|v| v == "1"),
+            late_progress: std::env::var("ZETA_FAKE_LATE_PROGRESS").is_ok_and(|v| v == "1"),
         };
         if let Some(p) = protocol.filter(|p| *p != 1) {
             return wrong_hello(port.as_ref(), p, frames);

@@ -821,6 +821,8 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 /* The source bar's live numbers: plain shows them in the tab's title only. */
 .health { display: none; }
 .health .v { font-variant-numeric: tabular-nums; }
+/* A worker measuring its link at a start (app.js startingText): a note, not a fault. */
+.health .starting { color: var(--dim); margin-inline-end: 8px; }
 
 /* ---- the rail (spec 4.4) ---- */
 /* A job's colour (overlays.js channelColour): its outline, tag, ribbons and row share it. */

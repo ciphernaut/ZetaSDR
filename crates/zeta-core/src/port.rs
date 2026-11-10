@@ -74,9 +74,10 @@ pub struct PortStats {
 /// its hello said (`null` from a worker of protocol 1, which sends them on
 /// the pipe, or while none is running); `transport_dropped` counts the blocks
 /// the live worker dropped because the node had not freed a ring slot (or its
-/// pipe queue) in time. Both default when absent, so a source record of an
-/// older node still loads; every node of this version writes them, so the
-/// schema requires them.
+/// pipe queue) in time. `starting` is what a worker not yet live is doing at
+/// its start (see [`Starting`]). These three default when absent, so a source
+/// record of an older node still loads; every node of this version writes
+/// them, so the schema requires them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields, transform = crate::knowledge::require_all)]
@@ -91,6 +92,51 @@ pub struct WorkerInfo {
     pub transport: Option<TransportInfo>,
     #[serde(default)]
     pub transport_dropped: u64,
+    /// What a worker that has not yet said hello is doing at its start, while it
+    /// says (a respawn measuring its link's rates: up to a minute or more, and the
+    /// host is busy meanwhile); `null` otherwise, and once it said hello or ended.
+    /// Defaults when absent, so a record of an older node still loads.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<Starting>")]
+    pub starting: Option<Starting>,
+}
+
+/// A worker's start in progress, as it reports it before its hello: `what` it is
+/// doing (`measuring`: the rate probe of its link's sample depths), `detail` the
+/// step that follows (`12-bit at 30720000 Hz`: the depth and the rate the probe
+/// streams next), `step` of `of` (`of` the most steps it may take, which never
+/// rises; a probe that finds a depth's clean rate early takes fewer), and `eta_ms`
+/// the most time left, every step retried.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct Starting {
+    pub what: String,
+    pub detail: String,
+    pub step: u32,
+    pub of: u32,
+    pub eta_ms: u64,
+}
+
+/// The line the node logs, and puts on the source's feed, when `source`'s worker
+/// begins measuring its link: `s` is its first progress report, whose `eta_ms`
+/// (whole seconds, rounded up) bounds the wait.
+pub fn measuring_line(source: &SourceId, s: &Starting) -> String {
+    format!(
+        "source {}: measuring what this radio's link can sustain (first start only, up to about {} s; the host will be busy; max_rate_hz= or bits= skips it)",
+        source.0,
+        s.eta_ms.div_ceil(1000)
+    )
+}
+
+/// The line the node logs, and puts on the source's feed, when `source`'s worker
+/// said hello after measuring for `took` (whole seconds, rounded to nearest).
+pub fn measured_line(source: &SourceId, took: std::time::Duration) -> String {
+    format!(
+        "source {}: measured in {} s",
+        source.0,
+        took.as_secs_f64().round() as u64
+    )
 }
 
 /// How a worker child hands its blocks to the node: `shm` is a shared-memory
@@ -309,6 +355,13 @@ pub trait Port: Send + Sync {
     /// The worker process behind the port, for a port that runs its device in
     /// a child process; `None` for every other port.
     fn worker(&self) -> Option<WorkerInfo> {
+        None
+    }
+    /// A counter the port bumps each time its [`Port::worker`] record's `starting`
+    /// changes (a start begun, a step taken, the start over), so the node can say
+    /// what a worker is doing before its hello. `None` for a port with no such
+    /// reports.
+    fn starting_changed(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         None
     }
     /// What the port itself knows about where it is; never the configured flag.

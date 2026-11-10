@@ -40,6 +40,7 @@ impl Port for WorkerFixture {
             since_ns: None,
             transport: None,
             transport_dropped: 0,
+            starting: None,
         })
     }
 }
@@ -126,6 +127,7 @@ async fn source_list_shows_worker_for_a_worker_port_and_null_otherwise() {
             since_ns: None,
             transport: None,
             transport_dropped: 0,
+            starting: None,
         })
     );
     let json = serde_json::to_value(&v).unwrap();
@@ -314,6 +316,7 @@ impl Port for Deep {
             since_ns: None,
             transport: None,
             transport_dropped: 0,
+            starting: None,
         })
     }
     fn depth(&self) -> Option<Depth> {

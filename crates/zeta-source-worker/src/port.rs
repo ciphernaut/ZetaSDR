@@ -108,6 +108,11 @@ pub const RATE_CAP_FLAG: &str = "--rate-cap-hz";
 /// depth again; see [`worker_args`] and the supervisor's respawns.
 pub const DEPTH_CAP_FLAG: &str = "--depth-cap";
 
+/// The flag every spawn is passed: the worker may report its start's progress
+/// before its hello ([`crate::wire::Control::Progress`]); without it, it must
+/// not, as a node that does not know the message would end it as a bad frame.
+pub const PROGRESS_FLAG: &str = "--progress";
+
 /// One `--depth-cap` value, `BITS:HZ` (`16:30720000`): a depth of 1 to 255 bits
 /// and a rate cap of at least 1 Hz.
 pub fn parse_depth_cap(s: &str) -> Result<(u8, u64), String> {
@@ -272,6 +277,17 @@ impl WorkerPort {
                 self.close_bound.as_secs_f64()
             );
         }
+    }
+
+    /// How many `measuring` and `measured` lines the port's supervisor has
+    /// printed: one each per spawn that reported its start, the second only at
+    /// that spawn's hello. For the tests.
+    pub fn measuring_lines(&self) -> (u32, u32) {
+        let (measuring, measured) = &self.shared.measuring_lines;
+        (
+            measuring.load(Ordering::Relaxed),
+            measured.load(Ordering::Relaxed),
+        )
     }
 
     /// The inode of the live worker's ring memfd, so a test can tell one
@@ -529,7 +545,12 @@ impl Port for WorkerPort {
             since_ns: s.since_ns,
             transport: s.transport.clone(),
             transport_dropped: s.transport_dropped,
+            starting: s.starting.clone(),
         })
+    }
+
+    fn starting_changed(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.shared.starting_changed.subscribe())
     }
 }
 

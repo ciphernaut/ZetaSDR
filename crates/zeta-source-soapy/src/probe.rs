@@ -16,10 +16,12 @@
 //! A device whose link carries more than one sample depth has the ladder run
 //! at each ([`probe_depths`]), and the source runs the fastest lossless one
 //! ([`own_depth`]); the record's `max_bandwidth_hz` is that depth's figure.
+//! That probe says what it is doing before each rung (a [`Starting`]): the
+//! host is busy while the radio streams flat out, for up to a minute or more.
 
 use std::time::Duration;
 
-use zeta_core::port::{Port, Tuning};
+use zeta_core::port::{Port, Starting, Tuning};
 use zeta_core::types::{Claim, Depth, Hz};
 
 use crate::SoapySource;
@@ -131,7 +133,18 @@ pub async fn probe_rate_with(
     center_hz: u64,
     timing: ProbeTiming,
 ) -> Result<ProbeResult, String> {
-    let found = probe(src, center_hz, timing).await;
+    probe_rate_reporting(src, center_hz, timing, &mut |_, _| {}).await
+}
+
+/// [`probe_rate_with`], calling `on_rung` with each candidate's index and rate
+/// before its first attempt.
+async fn probe_rate_reporting(
+    src: &SoapySource,
+    center_hz: u64,
+    timing: ProbeTiming,
+    on_rung: &mut dyn FnMut(usize, u64),
+) -> Result<ProbeResult, String> {
+    let found = probe(src, center_hz, timing, on_rung).await;
     src.end_probe().await;
     found
 }
@@ -140,13 +153,15 @@ async fn probe(
     src: &SoapySource,
     center_hz: u64,
     timing: ProbeTiming,
+    on_rung: &mut dyn FnMut(usize, u64),
 ) -> Result<ProbeResult, String> {
     // The reader thread ends when nothing receives; hold a receiver throughout.
     let _rx = src.subscribe();
     let mut lowest: Option<u64> = None;
     let mut tried = 0;
     let mut errors = Vec::new();
-    for rate in probe_candidates(src.rate_model()) {
+    for (i, rate) in probe_candidates(src.rate_model()).into_iter().enumerate() {
+        on_rung(i, rate);
         let band = Tuning {
             center_hz: Hz(center_hz),
             bandwidth_hz: Hz(rate),
@@ -221,12 +236,35 @@ async fn probe(
 /// device lost during the probe is the error. The source is left as it
 /// opened: nothing tuned, the driver's default depth. Empty for a device with
 /// one depth.
+///
+/// `on_progress` is called before each rung with a [`Starting`] (see
+/// [`rung_progress`]); never when every depth is `known`.
 pub async fn probe_depths(
     src: &mut SoapySource,
     center_hz: u64,
     known: &[(u8, u64)],
+    on_progress: &mut dyn FnMut(Starting),
 ) -> Result<Vec<Depth>, String> {
-    probe_depths_with(src, center_hz, known, ProbeTiming::default()).await
+    probe_depths_with(src, center_hz, known, ProbeTiming::default(), on_progress).await
+}
+
+/// What [`probe_depths`] reports before a rung: `measuring`, the depth and the
+/// rate the rung streams (`12-bit at 30720000 Hz`), the rung's `step` counted
+/// from 1 over every depth, `of` the steps taken before it plus the most rungs
+/// the probe may still try (this one, the rest of its depth's ladder and every
+/// depth after it: never more than the last report's), and `eta_ms` the time
+/// those take at most, each rung retried ([`PROBE_RETRIES`]) and each attempt a
+/// [`PROBE_SETTLE`] and a [`PROBE_DWELL`] (the production figures, whatever
+/// the probe's own [`ProbeTiming`]).
+pub fn rung_progress(bits: u8, rate_hz: u64, step: u32, of: u32) -> Starting {
+    let attempt = (PROBE_SETTLE + PROBE_DWELL).as_millis() as u64;
+    Starting {
+        what: "measuring".into(),
+        detail: format!("{bits}-bit at {rate_hz} Hz"),
+        step,
+        of,
+        eta_ms: u64::from(of - step + 1) * u64::from(1 + PROBE_RETRIES) * attempt,
+    }
 }
 
 /// [`probe_depths`] with its own settle and dwell.
@@ -235,17 +273,30 @@ pub async fn probe_depths_with(
     center_hz: u64,
     known: &[(u8, u64)],
     timing: ProbeTiming,
+    on_progress: &mut dyn FnMut(Starting),
 ) -> Result<Vec<Depth>, String> {
     let asserted = src.capabilities().max_bandwidth_hz.clone();
     let links = src.link_depths().to_vec();
+    let is_known = |bits: u8| known.iter().any(|(b, _)| *b == bits);
+    let rungs = probe_candidates(src.rate_model()).len() as u32;
+    // The rungs of the depths after the one being probed, and the steps reported.
+    let mut later = rungs * links.iter().filter(|l| !is_known(l.bits)).count() as u32;
+    let mut step = 0;
     let mut depths = Vec::with_capacity(links.len());
     let mut found = Ok(());
     for link in &links {
         let cap = match known.iter().find(|(bits, _)| *bits == link.bits) {
             Some(&(_, hz)) => Claim::Measured(Hz(hz)),
             None => {
+                later -= rungs;
+                let bits = link.bits;
+                let mut report = |i: usize, rate: u64| {
+                    step += 1;
+                    let of = step - 1 + (rungs - i as u32) + later;
+                    on_progress(rung_progress(bits, rate, step, of));
+                };
                 src.use_depth(Some(link.bits)).await;
-                match probe_rate_with(src, center_hz, timing).await {
+                match probe_rate_reporting(src, center_hz, timing, &mut report).await {
                     Ok(p) if p.clean => Claim::Measured(Hz(p.cap_hz)),
                     Ok(_) => asserted.clone(),
                     Err(e) if src.is_lost() => {

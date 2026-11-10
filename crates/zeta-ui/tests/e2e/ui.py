@@ -7843,6 +7843,54 @@ def scenario_decode_video_greys_when_the_box_is_too_wide(page, url, secret):
         page.unroute("**/op", route)
 
 
+def scenario_a_measuring_source_shows_its_notice(page, url, secret):
+    # The e2e nodes run file sources only (a worker needs a soapy build), so the page is
+    # told that `tone`'s worker is measuring its link while `measuring` is on.
+    measuring = {"on": True}
+    worker = {"pid": 1, "restarts": 1, "since_ns": None, "transport": None,
+              "transport_dropped": 0,
+              "starting": {"what": "measuring", "detail": "12-bit at 30720000 Hz",
+                           "step": 2, "of": 6, "eta_ms": 30000}}
+    notice = "measuring the link: 12-bit at 30720000 Hz, 2 of 6, up to 30 s"
+
+    def route(r):
+        if '"source_list"' not in (r.request.post_data or "") or not measuring["on"]:
+            return r.continue_()
+        resp = r.fetch()
+        data = resp.json()
+        for src in data.get("value") or []:
+            if src.get("id") == "tone":
+                src["worker"] = worker
+        return r.fulfill(response=resp, body=json.dumps(data))
+
+    tab = '.src-tab[data-id="tone"]'
+    page.route("**/op", route)
+    try:
+        select_source(page, url, secret, "tone")
+        page.evaluate("window.zetaTest.poll()")
+        page.wait_for_function(
+            """([sel, text]) => {
+                const s = document.querySelector(`${sel} .health .starting`);
+                return !!s && s.textContent === text;
+            }""",
+            arg=[tab, notice], timeout=10_000)
+        first = page.evaluate(
+            "(sel) => document.querySelector(`${sel} .health`).firstElementChild.className",
+            tab)
+        assert first == "starting", first
+        assert notice in page.get_attribute(tab, "title"), page.get_attribute(tab, "title")
+        # Not a fault: the tab is not marked as one.
+        assert "fault" not in (page.get_attribute(tab, "class") or "").split()
+        measuring["on"] = False
+        page.evaluate("window.zetaTest.poll()")
+        page.wait_for_function(
+            "(sel) => !document.querySelector(`${sel} .health .starting`)",
+            arg=tab, timeout=10_000)
+        assert notice not in page.get_attribute(tab, "title")
+    finally:
+        page.unroute("**/op", route)
+
+
 def scenarios():
     return [(name[len("scenario_"):], fn) for name, fn in globals().items()
             if name.startswith("scenario_") and callable(fn)]

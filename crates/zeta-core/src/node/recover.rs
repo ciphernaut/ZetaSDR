@@ -24,8 +24,9 @@ use super::{Inner, JobEntry, NodeError, gain_error, resume_capture, source_fault
 use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
 use crate::ops::JobKind;
-use crate::port::{Port, Tuning};
-use crate::types::{JobId, SourceId};
+use crate::port::{Port, Starting, Tuning, measured_line, measuring_line};
+use crate::stream::{Frame, Payload};
+use crate::types::{JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 
 /// How long a recovery waits for the runs of the records it is about to relaunch to
 /// finish ending (their supervisors to release their leases and streams), so a
@@ -544,5 +545,91 @@ pub(super) async fn watch_healed(
         if healed > 0 {
             inner.recover_source(&source).await;
         }
+    }
+}
+
+/// Say on `source`'s feed when its worker begins and ends a start it reports
+/// ([`Port::starting_changed`], `rx`): on each bump the port's worker record is read,
+/// and `starting` going from none to some publishes one event `{"source_event":
+/// "measuring", "text": measuring_line(..), "starting": <it>}`, back to none
+/// `{"source_event": "measured", "text": measured_line(..)}` timed from the first.
+/// A step alone publishes nothing, and neither does the end of a worker that died
+/// before its hello (the port faulted with no live worker: the fault says why). A
+/// respawn's hello still reports the fault it heals until the node settles the heal,
+/// so a live worker (its hello's `since_ns`) is what tells the two ends apart. The
+/// events go out on a stream of the source's own (no job, no channel), registered at
+/// the first, which the bus forwards to the feed; `events.log` has them through the
+/// feed's tee. Runs until the node shuts down or the port drops the counter.
+pub(super) async fn watch_starting(
+    inner: Arc<Inner>,
+    source: SourceId,
+    mut rx: tokio::sync::watch::Receiver<u64>,
+) {
+    let mut since: Option<std::time::Instant> = None;
+    let mut stream: Option<StreamId> = None;
+    loop {
+        tokio::select! {
+            _ = inner.shutdown.cancelled() => return,
+            r = rx.changed() => if r.is_err() {
+                return;
+            },
+        }
+        rx.borrow_and_update();
+        let Some(port) = inner.port(&source) else {
+            return;
+        };
+        let worker = port.worker();
+        let now_starting = worker.as_ref().and_then(|w| w.starting.clone());
+        let payload = match (since, now_starting) {
+            (None, Some(s)) => {
+                since = Some(std::time::Instant::now());
+                measuring_event(&source, &s)
+            }
+            (Some(at), None) => {
+                since = None;
+                let live = worker.as_ref().is_some_and(|w| w.since_ns.is_some());
+                if port.fault().is_some() && !live {
+                    continue;
+                }
+                serde_json::json!({
+                    "source_event": "measured",
+                    "text": measured_line(&source, at.elapsed()),
+                })
+            }
+            _ => continue,
+        };
+        let stream = stream.get_or_insert_with(|| {
+            inner
+                .bus
+                .register(StreamKind::Event, source_provenance(&source, Timestamp(0)))
+        });
+        let t = now();
+        inner.bus.publish(Frame::new(
+            stream.clone(),
+            source_provenance(&source, t),
+            Payload::Event(payload),
+        ));
+    }
+}
+
+/// The `measuring` event of [`watch_starting`].
+fn measuring_event(source: &SourceId, s: &Starting) -> serde_json::Value {
+    serde_json::json!({
+        "source_event": "measuring",
+        "text": measuring_line(source, s),
+        "starting": s,
+    })
+}
+
+/// A source's own events' provenance: no job, no channel, at `t`.
+fn source_provenance(source: &SourceId, t: Timestamp) -> Provenance {
+    Provenance {
+        source: source.clone(),
+        job: None,
+        channel: None,
+        span: Span {
+            start_ns: t,
+            end_ns: t,
+        },
     }
 }

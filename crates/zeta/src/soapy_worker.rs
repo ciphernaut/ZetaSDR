@@ -1,6 +1,6 @@
 //! `zeta soapy-worker --id ID --args ARGS [--rate-cap-hz N] [--depth-cap BITS:HZ]...
-//! [--ring-fd N]`: one SoapySDR device served over stdin and stdout to the node that
-//! spawned it.
+//! [--ring-fd N] [--progress]`: one SoapySDR device served over stdin and stdout to the
+//! node that spawned it.
 //!
 //! Once the device opens, the worker sets its rate cap (`max_bandwidth_hz`) before
 //! serving: `max_rate_hz=N` in the args asserts it; `--rate-cap-hz N` (a cap an earlier
@@ -14,6 +14,11 @@
 //! `--depth-cap BITS:HZ` reports that depth's as measured; every other depth is probed,
 //! lossy ones included. The source then runs `bits=N`'s depth, else the fastest lossless
 //! one, and the record's cap is that depth's (`--rate-cap-hz` is not read).
+//!
+//! With `--progress` (the node passes it to every spawn) the probe of the depths reports
+//! each rung before it streams, a progress frame on stdout ahead of the hello, so the
+//! node can say why the host is busy; without it nothing but the hello comes first, as
+//! a node that does not know the frame would end the worker for it.
 //!
 //! A node attaches every `--source-soapy` device through this child (see
 //! `node_setup::open_soapy`), so a driver that crashes, hangs or leaks takes down a
@@ -68,11 +73,12 @@ mod imp {
 #[cfg(soapy)]
 mod imp {
     use std::fs::File;
+    use std::io::Write;
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::process::ExitCode;
     use std::sync::Arc;
 
-    use zeta_core::port::Port;
+    use zeta_core::port::{Port, Starting};
     use zeta_core::types::{Claim, Hz, SourceId};
     use zeta_source_soapy::SoapySource;
     use zeta_source_soapy::probe::{asserted_depths, own_depth, probe_depths, probe_rate};
@@ -81,6 +87,7 @@ mod imp {
     use zeta_source_worker::serve::{
         EXIT_NOT_FOUND, EXIT_OPEN_FAILED, redirect_stdout_to_stderr, requests_until_signal, serve,
     };
+    use zeta_source_worker::wire::{Control, Frame, write_frame};
 
     use crate::cli::SoapyWorkerArgs;
 
@@ -139,6 +146,13 @@ mod imp {
         };
         let known: Result<Vec<(u8, u64)>, String> =
             args.depth_cap.iter().map(|c| parse_depth_cap(c)).collect();
+        // Before `serve` takes the stdout: the probe runs here, ahead of the hello.
+        let progress = args.progress;
+        let mut report = |s: Starting| {
+            if progress {
+                write_progress(&frames, s);
+            }
+        };
         let set = match known {
             Ok(_) if src.link_depths().is_empty() => match own.bits {
                 // The link has one depth: nothing for `bits=` to choose.
@@ -148,7 +162,10 @@ mod imp {
                     Ok(())
                 }
             },
-            Ok(known) => set_depths(&mut src, &args.id, own.max_rate_hz, own.bits, &known).await,
+            Ok(known) => {
+                let (asserted, asked) = (own.max_rate_hz, own.bits);
+                set_depths(&mut src, &args.id, asserted, asked, &known, &mut report).await
+            }
             Err(e) => Err(format!("--depth-cap {e}")),
         };
         if let Err(e) = set {
@@ -159,6 +176,16 @@ mod imp {
         // After the device: a ring that will not open costs the speed, not the device.
         let ring = args.ring_fd.and_then(open_ring);
         serve(port, &driver, requests, frames, ring).await
+    }
+
+    /// Write one progress frame on the node's stdout; a failed write is a stderr line (a
+    /// node gone away is seen at the hello).
+    fn write_progress(frames: &File, s: Starting) {
+        let mut out = frames;
+        let frame = Frame::Control(Control::Progress(s));
+        if let Err(e) = write_frame(&mut out, &frame).and_then(|()| out.flush()) {
+            eprintln!("zeta: soapy-worker: progress: {e}");
+        }
     }
 
     /// Set the source's rate cap before it is served: `asserted` (`max_rate_hz=`) as
@@ -218,13 +245,15 @@ mod imp {
     /// not carry is the error, found before anything is probed, and so is one whose depth
     /// the probe left out (it would not stream; the other depths stand). A probe that lost
     /// the device leaves the asserted cap and no depths, with a stderr line, as
-    /// [`set_rate_cap`] does.
+    /// [`set_rate_cap`] does. The probe reports each rung to `on_progress` before it
+    /// streams.
     async fn set_depths(
         src: &mut SoapySource,
         id: &str,
         asserted: Option<u64>,
         asked: Option<u8>,
         known: &[(u8, u64)],
+        on_progress: &mut dyn FnMut(Starting),
     ) -> Result<(), String> {
         // The depths' bits alone decide whether `asked` is one of them.
         own_depth(&asserted_depths(src, 0), asked)?;
@@ -233,7 +262,7 @@ mod imp {
             None => {
                 let caps = src.capabilities();
                 let center = (caps.tune_min_hz.value().0 + caps.tune_max_hz.value().0) / 2;
-                match probe_depths(src, center, known).await {
+                match probe_depths(src, center, known, on_progress).await {
                     Ok(d) => d,
                     Err(e) => {
                         eprintln!("zeta-soapy-worker[{id}]: {e}; keeping the asserted cap");

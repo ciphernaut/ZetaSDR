@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Tuning, WorkerInfo};
+use crate::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Starting, Tuning, WorkerInfo};
 use crate::types::{Capabilities, SourceId};
 
 /// The gain range a [`FaultablePort`] reports, a HackRF-like 0..=76 dB.
@@ -19,7 +19,8 @@ const GAIN_RANGE_DB: (f64, f64) = (0.0, 76.0);
 /// port's cached capture does. [`FaultablePort::heal`] clears the fault and bumps the
 /// counter [`Port::healed`] hands out, as a respawned worker does. It also reports a
 /// plausible adjustable gain, recording every `set_gain`, and a worker, so the node's
-/// recovery of a worker-like source can be tested over a recording. The wrapped port's
+/// recovery of a worker-like source can be tested over a recording, and a worker's start
+/// the test sets ([`FaultablePort::set_starting`]). The wrapped port's
 /// own `fault` is not consulted: the test owns the fault.
 ///
 /// It wraps `Arc<dyn Port>` rather than `zeta-source-file`'s `FileSource` because that
@@ -32,6 +33,9 @@ pub struct FaultablePort {
     held: Mutex<bool>,
     gain: Mutex<Option<f64>>,
     gains: Mutex<Vec<Option<f64>>>,
+    /// The worker record's `starting`, set by [`FaultablePort::set_starting`].
+    starting: Mutex<Option<Starting>>,
+    starting_changed: tokio::sync::watch::Sender<u64>,
 }
 
 impl FaultablePort {
@@ -43,6 +47,8 @@ impl FaultablePort {
             held: Mutex::new(false),
             gain: Mutex::new(Some(GAIN_RANGE_DB.0)),
             gains: Mutex::new(Vec::new()),
+            starting: Mutex::new(None),
+            starting_changed: tokio::sync::watch::channel(0).0,
         })
     }
 
@@ -64,6 +70,14 @@ impl FaultablePort {
     pub fn heal_held(&self) {
         *self.held.lock().unwrap() = true;
         self.healed.send_modify(|n| *n += 1);
+    }
+
+    /// Set (or with `None` clear) what the worker record says the worker is doing at
+    /// its start, and bump the counter [`Port::starting_changed`] hands out, as a
+    /// worker port does at each progress report, its hello and its end.
+    pub fn set_starting(&self, s: Option<Starting>) {
+        *self.starting.lock().unwrap() = s;
+        self.starting_changed.send_modify(|n| *n += 1);
     }
 
     /// Every `set_gain` the port was asked for, in order.
@@ -144,6 +158,10 @@ impl Port for FaultablePort {
             since_ns: None,
             transport: None,
             transport_dropped: 0,
+            starting: self.starting.lock().unwrap().clone(),
         })
+    }
+    fn starting_changed(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.starting_changed.subscribe())
     }
 }

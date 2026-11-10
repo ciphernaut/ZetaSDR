@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, TransportPath, Tuning};
+use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Starting, TransportPath, Tuning};
 use zeta_core::types::{Capabilities, Claim, Depth, Hz, SampleFormat, SourceId};
 use zeta_source_worker::port::{
     Attach, HELLO_TIMEOUT, Timings, WorkerConfig, WorkerPort, worker_args,
@@ -1365,6 +1365,174 @@ async fn a_respawns_measured_depth_cap_reaches_the_port_when_its_record_is_kept(
         Ok(depth(8, false, measured(30_720_000)))
     );
     assert_eq!(port.depth(), Some(depth(8, false, measured(30_720_000))));
+}
+
+/// Poll `f` every 20 ms until it holds, panicking with `what` after `within`.
+async fn until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + within;
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait up to `within` for the port's worker record to show a start in progress,
+/// looking each time the port says it changed: the fake's probe lasts only about
+/// 150 ms, which a poll could miss on a loaded host.
+async fn starting_seen(port: &WorkerPort, within: Duration) -> Option<Starting> {
+    let mut changed = port
+        .starting_changed()
+        .expect("a worker port reports its start");
+    let wait = async {
+        loop {
+            if let Some(s) = port.worker().unwrap().starting {
+                return s;
+            }
+            if changed.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::time::timeout(within, wait).await.ok()
+}
+
+/// Spawn 0 finds no device (the port attaches faulted with the cached record,
+/// whose asserted cap and lack of depths pass no cap back); later spawns run
+/// `then`.
+fn respawn_body(then: &str) -> String {
+    format!("if [ \"$N\" -eq 0 ]; then exec \"$FAKE\" --script not-found \"$@\"; fi\n{then}")
+}
+
+#[tokio::test]
+async fn a_measuring_worker_shows_in_the_ports_worker_record() {
+    let dir = tempdir();
+    let body = respawn_body("ZETA_FAKE_PROGRESS=3 exec \"$FAKE\" --script stream \"$@\"");
+    let (cfg, _rec) = cfg_wrapped(dir.path(), &body);
+    let (port, attach) = open(cfg, Some(cached_caps())).await;
+    assert!(matches!(attach, Attach::NotFound { .. }), "{attach:?}");
+    let changed = port
+        .starting_changed()
+        .expect("a worker port reports its start");
+    let s = starting_seen(&port, Duration::from_secs(10))
+        .await
+        .expect("the respawn reports its probe");
+    assert_eq!(s.what, "measuring");
+    assert!(s.step >= 1, "{s:?}");
+    until(
+        "the hello ends the start and the port heals",
+        Duration::from_secs(10),
+        || {
+            // As the node does once it has seen the heal.
+            port.heal_settled();
+            port.worker().unwrap().starting.is_none() && port.fault().is_none()
+        },
+    )
+    .await;
+    assert!(*changed.borrow() >= 2, "{} changes", *changed.borrow());
+}
+
+#[tokio::test]
+async fn a_worker_that_dies_measuring_clears_the_record() {
+    let dir = tempdir();
+    let body = respawn_body(
+        "if [ \"$N\" -eq 1 ]; then ZETA_FAKE_PROGRESS=3 exec \"$FAKE\" --script 'crash-after-ms 60' \"$@\"; fi\n\
+         exec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (mut cfg, _rec) = cfg_wrapped(dir.path(), &body);
+    // Room between the death and the next spawn, so the record is read before it.
+    cfg.timings.backoff_first = Duration::from_millis(800);
+    cfg.timings.backoff_max = Duration::from_millis(800);
+    let (port, _) = open(cfg, Some(cached_caps())).await;
+    let mut changed = port.starting_changed().unwrap();
+    starting_seen(&port, Duration::from_secs(10))
+        .await
+        .expect("the respawn reports its probe");
+    // The start ends with the death, not at the next worker's hello.
+    let (ended, fault) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            changed.changed().await.unwrap();
+            let w = port.worker().unwrap();
+            if w.starting.is_none() {
+                return (w, port.fault());
+            }
+        }
+    })
+    .await
+    .expect("the start ends");
+    assert_eq!(ended.pid, None, "{ended:?}");
+    assert!(
+        fault.as_deref().is_some_and(|f| f.contains("SIGABRT")),
+        "{fault:?}"
+    );
+    until(
+        "a worker after the one that died measuring heals the port",
+        Duration::from_secs(15),
+        || {
+            port.heal_settled();
+            port.worker().unwrap().restarts >= 2
+                && port.worker().unwrap().pid.is_some()
+                && port.fault().is_none()
+        },
+    )
+    .await;
+    assert_eq!(port.worker().unwrap().starting, None);
+    // The start was logged, and no end: the worker's exit line says why.
+    assert_eq!(port.measuring_lines(), (1, 0));
+}
+
+#[tokio::test]
+async fn progress_after_the_hello_is_a_protocol_error() {
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "ZETA_FAKE_LATE_PROGRESS=1 exec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (port, attach) = open(cfg, None).await;
+    assert!(matches!(attach, Attach::Hello), "{attach:?}");
+    until(
+        "the worker is ended as a bad frame and respawned",
+        Duration::from_secs(10),
+        || {
+            port.worker().unwrap().restarts >= 1
+                && port.fault().is_some_and(|f| f.contains("bad frame"))
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_measuring_lines_pair() {
+    let dir = tempdir();
+    let (measuring, _rec) = cfg_wrapped(
+        dir.path(),
+        "ZETA_FAKE_PROGRESS=3 exec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (port, attach) = open(measuring, None).await;
+    assert!(matches!(attach, Attach::Hello), "{attach:?}");
+    assert_eq!(port.measuring_lines(), (1, 1));
+    assert_eq!(port.worker().unwrap().starting, None);
+
+    let (port, _) = open(cfg("stream"), None).await;
+    assert_eq!(port.measuring_lines(), (0, 0));
+}
+
+#[tokio::test]
+async fn every_spawn_is_passed_progress() {
+    let dir = tempdir();
+    let body = respawn_body("exec \"$FAKE\" --script stream \"$@\"");
+    let body = format!("echo \"args $*\" >> \"$REC\"\n{body}");
+    let (cfg, rec) = cfg_wrapped(dir.path(), &body);
+    let (port, _) = open(cfg, Some(cached_caps())).await;
+    until("a respawn says hello", Duration::from_secs(10), || {
+        port.worker().unwrap().pid.is_some()
+    })
+    .await;
+    let text = std::fs::read_to_string(&rec).unwrap();
+    let args: Vec<&str> = text.lines().filter(|l| l.starts_with("args ")).collect();
+    assert!(args.len() >= 2, "{text}");
+    for line in args {
+        assert!(line.split(' ').any(|a| a == "--progress"), "{line}");
+    }
 }
 
 #[test]

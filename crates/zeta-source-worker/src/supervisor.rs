@@ -40,23 +40,37 @@
 //! once the record was replaced cannot change it for the run: its figures
 //! still govern tunes (the port's depth is the live worker's) and are what the
 //! node caches for its next start (`Shared::latest`).
+//!
+//! Every spawn is passed `--progress`, so a worker that measures before its
+//! hello reports each step in a progress frame. The stdout thread keeps the
+//! latest in the snapshot (the port's worker record's `starting`, bumping
+//! [`Port::starting_changed`](zeta_core::port::Port::starting_changed)) and,
+//! at a spawn's first, prints `zeta: ` and [`measuring_line`]; that spawn's
+//! hello clears it and prints [`measured_line`] (a spawn that ends before its
+//! hello is cleared by the reap, and its exit line says why). A progress frame
+//! after the hello is a bad frame: the worker is ended.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, oneshot, watch};
-use zeta_core::port::{GainInfo, IqBlock, PortError, PortStats, TransportInfo, Tuning};
+use zeta_core::port::{
+    GainInfo, IqBlock, PortError, PortStats, Starting, TransportInfo, Tuning, measured_line,
+    measuring_line,
+};
 use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId, Timestamp};
 
 use crate::port::{
-    Attach, DEPTH_CAP_FLAG, RATE_CAP_FLAG, WorkerConfig, depth_cap_args, parse_depth_cap,
+    Attach, DEPTH_CAP_FLAG, PROGRESS_FLAG, RATE_CAP_FLAG, WorkerConfig, depth_cap_args,
+    parse_depth_cap,
 };
 use crate::ring::{self, Ring};
 use crate::serve::{EXIT_FAULTED, EXIT_NOT_FOUND, EXIT_OPEN_FAILED};
@@ -94,6 +108,10 @@ pub(crate) struct Shared {
     /// what the node caches for its next start, since the port's record is
     /// set once per run.
     latest: Mutex<Option<Capabilities>>,
+    /// Bumped each time the snapshot's `starting` changes.
+    pub(crate) starting_changed: watch::Sender<u64>,
+    /// How many `measuring` and `measured` lines were printed, for the tests.
+    pub(crate) measuring_lines: (AtomicU32, AtomicU32),
 }
 
 impl Shared {
@@ -104,7 +122,14 @@ impl Shared {
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
             measured: OnceLock::new(),
             latest: Mutex::new(None),
+            starting_changed: watch::channel(0).0,
+            measuring_lines: (AtomicU32::new(0), AtomicU32::new(0)),
         }
+    }
+
+    /// Say that the snapshot's `starting` changed.
+    fn bump_starting(&self) {
+        self.starting_changed.send_modify(|n| *n += 1);
     }
 
     /// The latest hello's record the node may cache (the field's docs).
@@ -148,17 +173,24 @@ pub(crate) struct Snapshot {
     /// The live worker's sample depth in force, from its hello, its statuses
     /// and its `set_depth` replies.
     pub(crate) depth: Option<Depth>,
+    /// What the spawn not yet live reports doing, from its latest progress
+    /// frame until its hello or its end.
+    pub(crate) starting: Option<Starting>,
 }
 
 impl Snapshot {
-    /// Forget the worker that was live: it has been reaped, and its ring goes
-    /// with it.
-    fn clear_worker(&mut self) {
+    /// Forget the worker that was live, or the spawn that was starting: it has
+    /// been reaped, and its ring goes with it. True when a start in progress was
+    /// cleared, which the caller announces ([`Shared::bump_starting`]) once the
+    /// lock is released.
+    #[must_use]
+    fn clear_worker(&mut self) -> bool {
         self.pid = None;
         self.since_ns = None;
         self.transport = None;
         self.transport_dropped = 0;
         self.ring = None;
+        self.starting.take().is_some()
     }
 
     /// The worker's own fault while one is live, or the fault its hello is healing;
@@ -276,7 +308,9 @@ struct Worker {
     /// protocol (a malformed frame, a descriptor the ring cannot hold): the
     /// fault the reap reports.
     bad_frame: Arc<Mutex<Option<String>>>,
-    hello: oneshot::Receiver<Hello>,
+    /// The hello, and when the spawn's first progress frame came (`None`
+    /// without one).
+    hello: oneshot::Receiver<(Hello, Option<Instant>)>,
     /// Closed when the stdout thread ends (`None` once seen).
     stdout_done: Option<oneshot::Receiver<()>>,
     stderr_done: oneshot::Receiver<()>,
@@ -436,7 +470,7 @@ impl Supervisor {
         loop {
             tokio::select! {
                 h = &mut w.hello, if hello_open => match h {
-                    Ok(hello) if !(PROTOCOL_MIN..=PROTOCOL).contains(&hello.protocol) => {
+                    Ok((hello, _)) if !(PROTOCOL_MIN..=PROTOCOL).contains(&hello.protocol) => {
                         // Another build's worker (the binary replaced under a
                         // running node): its frames cannot be trusted to mean
                         // what ours do, so it is ended before anything is sent.
@@ -451,7 +485,7 @@ impl Supervisor {
                         ended.crashed = false;
                         return self.ended(ended);
                     }
-                    Ok(hello) => return Some(self.on_hello(w, hello)),
+                    Ok((hello, measuring)) => return Some(self.on_hello(w, hello, measuring)),
                     // The stdout thread ended without a hello: wait for the
                     // exit, still bounded by the hello deadline.
                     Err(_) => hello_open = false,
@@ -480,8 +514,10 @@ impl Supervisor {
         }
     }
 
-    /// A worker of our protocol said hello: it is live. Heals an episode, answers `first`.
-    fn on_hello(&mut self, w: Worker, hello: Hello) -> State {
+    /// A worker of our protocol said hello: it is live. Ends the start it reported
+    /// (`measuring`: when its first progress frame came), heals an episode, answers
+    /// `first`.
+    fn on_hello(&mut self, w: Worker, hello: Hello, measuring: Option<Instant>) -> State {
         let kept =
             |c: &Capabilities| c == &hello.capabilities || hello_replaces(c, &hello.capabilities);
         match &self.caps {
@@ -522,11 +558,24 @@ impl Supervisor {
         if self.caps.as_ref().is_some_and(kept) {
             *self.shared.latest() = Some(hello.capabilities.clone());
         }
-        {
+        let was_starting = {
             let mut s = self.shared.snapshot();
             s.pid = w.pid;
             s.since_ns = Some(now_ns());
             s.ring = w.ring.clone();
+            s.starting.take().is_some()
+        };
+        // After the worker is live in the snapshot: the node tells the end of a
+        // start by it.
+        if was_starting {
+            self.shared.bump_starting();
+        }
+        if let Some(since) = measuring {
+            eprintln!("zeta: {}", measured_line(&self.cfg.id, since.elapsed()));
+            self.shared
+                .measuring_lines
+                .1
+                .fetch_add(1, Ordering::Relaxed);
         }
         if let Some(e) = self.episode.take() {
             self.healed.send_modify(|n| *n += 1);
@@ -655,6 +704,9 @@ impl Supervisor {
         let mut cmd = Command::new(&self.cfg.program);
         cmd.args(&self.cfg.args);
         cmd.args(self.rate_cap_args());
+        if !self.cfg.args.iter().any(|a| a == PROGRESS_FLAG) {
+            cmd.arg(PROGRESS_FLAG);
+        }
         cmd.env_clear()
             .envs(crate::env::scrubbed())
             .stdin(Stdio::piped())
@@ -762,7 +814,7 @@ impl Supervisor {
             Some(why) => (format!("soapy worker for {}: {why}", self.id()), None),
             None => exit_fault(self.id(), &self.cfg.args, status, worker_fault, last_stderr),
         };
-        {
+        let was_starting = {
             let mut s = self.shared.snapshot();
             if s.link.as_ref().is_some_and(|l| Arc::ptr_eq(l, &w.link)) {
                 s.link = None;
@@ -772,7 +824,11 @@ impl Supervisor {
             s.supervision_fault = Some(fault.clone());
             s.current = None;
             s.depth = None;
-            s.clear_worker();
+            s.clear_worker()
+        };
+        // After the fault is set, so the node reads the start's end as a death.
+        if was_starting {
+            self.shared.bump_starting();
         }
         // After the fault is set, so a waiting request reads it.
         w.link.fail_all();
@@ -882,8 +938,11 @@ impl Supervisor {
             s.link = None;
         }
         s.supervision_fault = Some(format!("soapy worker for {}: shut down", self.id()));
-        s.clear_worker();
+        let was_starting = s.clear_worker();
         drop(s);
+        if was_starting {
+            self.shared.bump_starting();
+        }
         w.link.fail_all();
     }
 }
@@ -996,17 +1055,20 @@ fn now_ns() -> u64 {
 /// here. Returns `bad frame: <why>` when it stopped because the worker broke
 /// the protocol (a malformed frame, a descriptor the ring cannot hold or that
 /// came without a ring, or whose `seq` is not the next: the producer numbers
-/// its blocks 0, 1, 2, … and this reader holds it to that); the worker is
-/// then ended and respawned. A stream cut short mid-frame is not that: a dying
-/// worker does it, and its exit says more.
+/// its blocks 0, 1, 2, … and this reader holds it to that, or a progress frame
+/// after the hello); the worker is then ended and respawned. A stream cut short
+/// mid-frame is not that: a dying worker does it, and its exit says more. A
+/// progress frame before the hello is the snapshot's `starting`; the first is
+/// logged ([`measuring_line`]) and its time handed on with the hello.
 fn read_stdout(
     mut stdout: File,
     shared: &Shared,
     link: &Arc<Link>,
     ring: Option<&Ring>,
-    hello: oneshot::Sender<Hello>,
+    hello: oneshot::Sender<(Hello, Option<Instant>)>,
 ) -> Option<String> {
     let mut hello = Some(hello);
+    let mut measuring: Option<Instant> = None;
     // The `seq` the next descriptor must carry: a stale or repeated one would
     // name a slot the producer may be rewriting (see `Ring::read`).
     let mut expected: u64 = 0;
@@ -1063,7 +1125,19 @@ fn read_stdout(
                     s.transport_dropped = 0;
                     s.depth = h.depth.clone();
                 }
-                let _ = tx.send(h);
+                let _ = tx.send((h, measuring));
+            }
+            Frame::Control(Control::Progress(p)) => {
+                if hello.is_none() {
+                    return bad("a progress report after the hello".into());
+                }
+                if measuring.is_none() {
+                    measuring = Some(Instant::now());
+                    eprintln!("zeta: {}", measuring_line(&shared.id, &p));
+                    shared.measuring_lines.0.fetch_add(1, Ordering::Relaxed);
+                }
+                shared.snapshot().starting = Some(p);
+                shared.bump_starting();
             }
             Frame::Control(Control::Status(st)) => {
                 let mut s = shared.snapshot();

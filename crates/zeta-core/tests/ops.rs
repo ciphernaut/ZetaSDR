@@ -644,7 +644,9 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                         // `plan_start`'s `started` lists the channels it started, and
                         // `set_stop`'s `ended` the jobs that had already ended.
                         && name != "started"
-                        && name != "ended";
+                        && name != "ended"
+                        // A worker record's `starting` is what its start is doing.
+                        && name != "starting";
                     // `_ns` is an instant; `_ms` a duration (a timeout), plain integer.
                     assert!(
                         !time || name.ends_with("_ns") || name.ends_with("_ms"),
@@ -2167,6 +2169,7 @@ async fn source_list_carries_nullable_stats() {
             "pid",
             "restarts",
             "since_ns",
+            "starting",
             "transport",
             "transport_dropped"
         ],

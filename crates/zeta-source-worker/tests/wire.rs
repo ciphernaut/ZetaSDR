@@ -3,7 +3,7 @@ use std::io::Cursor;
 use num_complex::Complex;
 use serde_json::json;
 use zeta_core::port::{
-    GainInfo, IqBlock, PortError, PortStats, TransportInfo, TransportPath, Tuning,
+    GainInfo, IqBlock, PortError, PortStats, Starting, TransportInfo, TransportPath, Tuning,
 };
 use zeta_core::types::{Capabilities, Claim, Depth, Hz, SampleFormat, Timestamp};
 use zeta_source_worker::wire::*;
@@ -396,4 +396,33 @@ fn a_hello_without_depth_reads_as_none() {
         serde_json::from_value::<Control>(v).unwrap(),
         Control::Hello(h)
     );
+}
+
+#[test]
+fn progress_round_trips() {
+    let p = Control::Progress(Starting {
+        what: "measuring".into(),
+        detail: "12-bit at 30720000 Hz".into(),
+        step: 2,
+        of: 6,
+        eta_ms: 30_000,
+    });
+    let shape = json!({"progress": {"what": "measuring", "detail": "12-bit at 30720000 Hz",
+        "step": 2, "of": 6, "eta_ms": 30000}});
+    assert_eq!(serde_json::to_value(&p).unwrap(), shape);
+    assert_eq!(serde_json::from_value::<Control>(shape).unwrap(), p);
+    let mut buf = Vec::new();
+    write_frame(&mut buf, &Frame::Control(p.clone())).unwrap();
+    match read_frame(&mut Cursor::new(buf)).unwrap() {
+        Some(Frame::Control(c)) => assert_eq!(c, p),
+        other => panic!("expected control, got {other:?}"),
+    }
+    // Exactly one message: a progress beside a status is refused, and so is a
+    // field it does not have.
+    let both = json!({"progress": {"what": "measuring", "detail": "x", "step": 1, "of": 1,
+        "eta_ms": 0}, "status": {"fault": null, "current": null, "gain": null, "stats": null}});
+    assert!(serde_json::from_value::<Control>(both).is_err());
+    let extra = json!({"progress": {"what": "measuring", "detail": "x", "step": 1, "of": 1,
+        "eta_ms": 0, "x": 1}});
+    assert!(serde_json::from_value::<Control>(extra).is_err());
 }
