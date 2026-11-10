@@ -91,7 +91,7 @@ Plan 35 gave VDL2 and ACARS a `subject.station`; HFDL (`hfdl_decode`) is left ou
 
 ## Origins: a node shutdown loses up to a minute of station counts
 
-`Node::drop` only cancels, and `serve` returns without awaiting the job supervisors, so the run-end flush of `job_context.stations` never lands on a restart or a deploy. The counts never go backwards (the last timed write stands), they only lose up to a minute. The relaunch path also copies back `context.stations` but not the flushed `context.origins`, so the kept answer's `stations` and `heard` lag until the next counted frame.
+`Node::drop` only cancels, and `serve` returns without awaiting the job supervisors, so the run-end flush of `job_context.stations` never lands on a restart or a deploy. The counts never go backwards: a launch seeds each station from the larger of `context.stations` and the kept answer's `stations`, and a relaunch carries both from the last run's entry. A shutdown still loses up to a window (a minute) of counts not written yet.
 
 ## Aircraft data links: done in plan 30
 

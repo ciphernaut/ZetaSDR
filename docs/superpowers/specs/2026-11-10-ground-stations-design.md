@@ -13,26 +13,24 @@ in-process ACARS event and the `src_type` field of the HFDL row.
 
 ## 1. Intent and why
 
-On the field host, `origin_lookup` on the VDL2 job finds the register's two licensed data-link
-transmitters on the channel at the airport, both the same airline-telecoms licensee, a few
-hundred metres apart. Both score about 0.5 and draw as dashed rings: the licence's emission
+On the field host, `origin_lookup` on the VDL2 job finds the register's licensed data-link
+transmitters on the channel. They score about 0.5 and draw as dashed rings: the licence's emission
 designator says AM data and the measured modulation (PSK) disagrees, so the modulation term
 is zero. Their brightness follows the job's last event, whichever end of the link sent it. A
 site is only ever `confirmed` when a decoded callsign equals the register's, which a VDL2
 ground station's ICAO address never will.
 
-What the job hears depends on where it listens. The field host is about a hundred kilometres
-from the airport: in two days its VDL2 job decoded 278 frames, every one an aircraft's
-(`addr_type: Aircraft`; airborne aircraft are line of sight, a 20 W ground station on the
-terminal is not), and its seven ACARS jobs heard 105 downlinks and one uplink. Yet every one of
-those aircraft frames names the ground station it is talking to (`dst`): two station
-addresses account for all 278, and the aircraft are talking to them on this channel, within
-VHF range of the receiver. A receiver nearer the airport hears the station's own frames as
-well: CRC-clean, on the licensed channel, the strongest evidence the node will ever have that
-the register's transmitter is on air, stronger than an emission designator typed into a
-licence years ago. The same holds for an ACARS uplink (a block whose `block_id` is a letter,
-plan 34's `downlink: false`) and for an HFDL squitter, though HF reach makes the register's
-row a weaker guess there.
+What the job hears depends on where it listens. The field host is a receiver far from the
+airport, beyond line of sight of its ground transmitters: every frame its VDL2 job decoded in
+two days was an aircraft's (`addr_type: Aircraft`; airborne aircraft are line of sight, a
+ground station on the terminal is not), and its ACARS jobs heard downlinks and almost no
+uplinks. Yet every one of those aircraft frames named its ground station (`dst`): the
+aircraft are talking to those stations on this channel, within VHF range of the receiver. A
+receiver nearer the airport hears the station's own frames as well: CRC-clean, on the licensed
+channel, the strongest evidence the node will ever have that the register's transmitter is on
+air, stronger than an emission designator typed into a licence years ago. The same holds for
+an ACARS uplink (a block whose `block_id` is a letter, plan 34's `downlink: false`) and for an
+HFDL squitter, though HF reach makes the register's row a weaker guess there.
 
 Two things follow:
 
@@ -191,7 +189,7 @@ and the two values are equal as JSON on the node, and `String(have) === String(v
 
 ```json
 "stations": {
-  "10916A": { "from": 0, "to": 412, "first_ns": 1794106239601503721, "last_ns": 1794279100000000000 }
+  "1A2B3C": { "from": 0, "to": 400, "first_ns": 1000, "last_ns": 2000 }
 }
 ```
 
@@ -332,9 +330,9 @@ no aircraft row. The `to`-only grade and ordered sequences are unit tests in `or
 ### 5.5 Live (UAT, the field host)
 
 With the VDL2 job running and a lookup done: within a minute, `job_context.stations` lists the
-channel's two ground stations with growing `to` counts (the field host hears the aircraft, not
-the stations: `from` stays 0 there); the map shows the airport's two sites solid, graded
-`to`, bright after each aircraft frame; the origin event in `events.log` is republished about
+channel's ground station(s) with growing `to` counts (the field host hears the aircraft, not
+the stations: `from` stays 0 there); the map shows the register's transmitter site(s) on the
+channel solid, graded `to`, bright after each aircraft frame; the origin event in `events.log` is republished about
 once a minute, not per frame; the hover says `addressed by`. From a vantage within reach of
 the airport (a portable receiver, or a Kiwi near it), the same job shows `from` counts, the
 hover `heard`, and the Subjects table marks the ground-station row. With the seven ACARS jobs
@@ -354,9 +352,10 @@ on those channels light when one arrives.
 
 - Evidence as a third mark (`heard`) beside `agree` and `confirmed`, not a score change: the
   decode proves a transmitter on the channel, not which site.
-- Two grades of `heard`, `from` and `to`, after the field host's log showed that a receiver a
-  hundred kilometres from the airport hears the aircraft and never the station: without the
-  addressed grade neither the lit site nor the tally would ever show anything there.
+- Two grades of `heard`, `from` and `to`, after the field host's log showed that a receiver far
+  from the airport, beyond line of sight of its ground transmitters, hears the aircraft and
+  never the station: without the addressed grade neither the lit site nor the tally would ever
+  show anything there.
 - The tally in `job_context.stations`, independent of whether a lookup has run, with a copy in
   the origin answer for the page; never a per-frame event.
 - A 60 s throttle with an immediate write on a new station, a per-job timer so a rare channel

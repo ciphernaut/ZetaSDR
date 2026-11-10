@@ -18,25 +18,24 @@ already draws every event that carries a `position`.
 The page plots an event when the row's `position` map finds numbers in the event's `lat` and
 `lon` fields. Today three aviation rows can supply them:
 
-- `adsb_decode`, from dump1090's decoded position: thousands of fixes a day on the field host.
+- `adsb_decode`, from dump1090's decoded position: fixes all day on the field host.
 - `vdl2_decode`, only from an ADS-C basic report that libacars decodes inside dumpvdl2
-  (`/vdl2/avlc/acars/arinc622/adsc/tags/<i>/basic_report`): one fix in two days on the field
-  host.
+  (`/vdl2/avlc/acars/arinc622/adsc/tags/<i>/basic_report`): a rare fix on the field host.
 - `acars_decode` has no `position` map at all, and the in-process stage emits only the block's
   fields (`reg`, `flight`, `label`, `text`, ...), so nothing an ACARS job produces can be
   plotted. It never could; the operator's memory of ACARS on the map was ADS-B.
 
-Yet the aircraft do say where they are. On the field host's event log of the last two days,
-about 113 of the ACARS and VDL2 events carried an ACARS payload, and 17 of them a fix in the
-message text, against the single ADS-C report:
+Yet the aircraft do say where they are. In the field host's event log, a fair share of the
+ACARS and VDL2 events carrying an ACARS payload had a fix in the message text, many more than
+carried an ADS-C report:
 
 | Form | Label | Seen | Example (synthetic, at the demo station) |
 |---|---|---|---|
-| FMS position report, degrees and tenths of minutes | H1 (`#M1B` sublabel) | 13 | `POSS27231E153071,ALPHA,025131,165,BRAVO,025351,CHARL,M9,252035,168` |
-| Position report with `/POS` and `/ALT` | 80 | 1 | `3N01 POSRPT 0054/09 YBBN/YSSY VH-ZET\r\n/POS S27231E153071/ALT 255/MCH 743/FOB 133.7` |
-| Decimal degrees with hemisphere letters | 16, 3L | 1 (+ the TODO's `3L`) | `194606,28825,2106,  91,S 27.384 E153.118`; `S 27.384/E153.118` |
-| Degrees and minutes to one decimal, run together | QQ | 1 | `YBBNYSSY 2003\r\n001FE09200331S2723.1E15307.1017214` |
-| Signed decimals under a `LAT LON` header | H1 (`RSI`) | 1 | `  LAT      LON      GALT\r\n-27.3842  153.1175  31480` |
+| FMS position report, degrees and tenths of minutes | H1 (`#M1B` sublabel) | most | `POSS27231E153071,ALPHA,025131,165,BRAVO,025351,CHARL,M9,252035,168` |
+| Position report with `/POS` and `/ALT` | 80 | rare | `3N01 POSRPT 0054/09 YBBN/YSSY VH-ZET\r\n/POS S27231E153071/ALT 255/MCH 743/FOB 133.7` |
+| Decimal degrees with hemisphere letters | 16, 3L | rare (+ the TODO's `3L`) | `194606,28825,2106,  91,S 27.384 E153.118`; `S 27.384/E153.118` |
+| Degrees and minutes to one decimal, run together | QQ | rare | `YBBNYSSY 2003\r\n001FE09200331S2723.1E15307.1017214` |
+| Signed decimals under a `LAT LON` header | H1 (`RSI`) | rare | `  LAT      LON      GALT\r\n-27.3842  153.1175  31480` |
 
 libacars 2.2.1 decodes ADS-C, CPDLC, MIAM and the media advisory, not these free-text reports,
 so dumpvdl2 and dumphfdl leave them in `msg_text`, and the in-process ACARS stage has no parser
