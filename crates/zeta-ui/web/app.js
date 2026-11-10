@@ -96,7 +96,8 @@
 // `main map` (a second click `main rf`), a source tab `main rf` after selecting its source;
 // the shown source is unchanged meanwhile and its tab carries class `kept`.
 // Lit sites (plan 32 spec 4.4): an `origin` event of a job the overlays follow lights the
-// job's set (map.origin keyed by the job id, faded from the job's last event, ov.lastEvent),
+// job's set (map.origin keyed by the job id, faded from the job's last event, ov.lastEvent;
+// on a row with `subject.station`, from its last station frame once one came, plan 35),
 // and is a transcript line as a watch's verdict is (verdictLine); What is this on a box and
 // on a capture light one-shot sets from their classification's `origins` (`classify:<t_ns>`,
 // `capture:<id>`); each jobs poll seeds the running jobs' `context.origins` (map.seed). A
@@ -1052,7 +1053,9 @@ function start(api) {
   state.map = mountMap($("#map"), api, state.view, {
     jobs: () => state.lastJobs,
     subjects: state.subjects,
-    lastEvent: (id) => (state.ov ? state.ov.lastEvent(id) : null),
+    // A row with fixed stations fades its lit sites from the last station frame (plan 35),
+    // any other from the job's last event.
+    lastEvent: (id) => state.ov?.lastStationEvent(id) ?? state.ov?.lastEvent(id) ?? null,
     tiles: resolveTiles,
   });
   state.map.onChange(paintMapCount);

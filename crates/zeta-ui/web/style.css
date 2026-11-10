@@ -223,11 +223,16 @@ html[data-main="map"] #waterfall { visibility: hidden; }
    their site. */
 #map path.map-site { stroke: var(--user); fill: var(--user); stroke-width: 2; fill-opacity: calc(0.8 * var(--site-brightness, 1)); stroke-opacity: calc(0.3 + 0.7 * var(--site-brightness, 1)); }
 #map path.map-site[data-agree="disagrees"] { fill: none; }
+/* A heard site (plan 35: the job decoded its ground station's frames, `from`, or frames sent
+   to it, `to`): filled whatever its designator says, a thin solid ring; `to` a shade fainter.
+   Distinct from the confirmed ring below, which wins on a site that is both. */
+#map path.map-site[data-heard] { fill: var(--user); stroke: var(--user); stroke-width: 1; stroke-dasharray: none; stroke-opacity: 1; }
+#map path.map-site[data-heard="to"] { fill-opacity: calc(0.55 * var(--site-brightness, 1)); stroke-opacity: 0.7; }
 /* A site confirmed by a heard callsign or decoded id: a ring outside it. */
 #map path.map-site[data-confirmed] { stroke: var(--map-sel); stroke-width: 5; paint-order: stroke; stroke-opacity: 1; }
 #map path.map-bearing { stroke: var(--user); stroke-width: 1.5; fill: none; stroke-opacity: calc(0.7 * var(--site-brightness, 1)); }
 #map .map-source { width: auto; height: auto; white-space: nowrap; padding: 0 3px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); border: 1px solid var(--map-sel); }
-#map .leaflet-popup-content .map-origin + .map-origin, #map .leaflet-popup-content .map-lookup { margin-top: 6px; }
+#map .leaflet-popup-content .map-origin + .map-origin, #map .leaflet-popup-content .map-stations, #map .leaflet-popup-content .map-lookup { margin-top: 6px; }
 #map .leaflet-popup-content .map-lookup { color: var(--map-dim); font-size: 11px; }
 /* map.js osm-dark: OpenStreetMap's tiles darkened on that tile layer's container alone, so the
    markers, tracks and labels in the other panes keep their colours. */
@@ -264,6 +269,8 @@ html[data-dock="right"][data-strip] #waterfall, html[data-dock="right"][data-str
 #subjects thead th:first-child { z-index: 3; }
 #subjects tr.subject { cursor: pointer; }
 #subjects tr.subject.dim { color: var(--dim); }
+/* A fixed station's own row (plan 35): a small mast before its key. */
+#subjects tr.subject.station td:first-child::before { content: "\25B4\00A0"; color: var(--dim); }
 #subjects tr.subject.selected, #subjects tr.subject.selected td:first-child { background: var(--bar); }
 #subjects tr.subject.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 /* the rail (overlays.js setRail): the job tags beside the axis, shown under a theme whose

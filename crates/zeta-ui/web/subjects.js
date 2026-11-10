@@ -55,6 +55,10 @@
 //   fillSummary(template, fields) -> string   summary.rs's `fill`: `{f}`, `{f?}` (dropped with
 //     the separators before it), `{a?b}`, each with an optional `:.N` or `:+.N`; trimmed at
 //     both ends
+//   matchesPairs(obj, pairs) -> bool   every field = value pair of `pairs` (a row's
+//     `merge_skip`, `station.when`) holds on `obj`: present, non-null and
+//     `String(have) === String(v)`; false for an empty or missing `pairs` (overlays.js tests
+//     events with it, so the page has one comparison)
 //   mountSubjectsPane(el, store, view, {jobs, watching, footprint}) -> pane
 //     A watch's kept decoders draw one `section.subject-job[data-job=<watch id>]` at the first
 //     one's place (plan 31 spec 4.7), headed `<watch kind> <id tail> · <subject name>`, its
@@ -65,7 +69,9 @@
 //     and goes when the watch stops.
 //     One `section.subject-job[data-job]` per other running job with subjects or whose row has table
 //     columns, so a job heard nothing from yet says `0 aircraft` (an `h3` and a table of
-//     `tr.subject[data-job][data-key]`, classes `dim` and `selected`), and one for a subject job
+//     `tr.subject[data-job][data-key]`, classes `dim`, `selected` and `station`: a fixed
+//     station's own row, its row's `subject.station.key` non-null and its state matching
+//     `station.when`, plan 35), and one for a subject job
 //     `watching(id)` denies, with `.not-watched`, after the watched ones. The default order is
 //     last seen in SORT_STEP_MS steps, newest step first, then the key, so a busy table does not
 //     churn. `th[data-col]` sorts exactly: a first click ascending, a second reversed, nulls last
@@ -527,17 +533,35 @@ function fieldValue(s, field) {
   return text === "" ? null : text;
 }
 
-// The subject takes no part in `merge`: its state matches every pair of its row's
-// `subject.merge_skip` (an empty map never matches).
-function skipsMerge(s) {
-  const pairs = Object.entries(s.row.subject.merge_skip ?? {});
+// `obj` holds every pair of `pairs` (a row's `merge_skip` or `station.when`, field = value):
+// each field present, non-null and equal as text (`String(have) === String(v)`, so a number
+// or boolean pair matches its printed form). An empty or missing map never matches.
+export function matchesPairs(obj, pairs) {
+  const entries = Object.entries(pairs ?? {});
   return (
-    pairs.length > 0 &&
-    pairs.every(([f, v]) => {
-      const have = s.state[f];
+    !!obj &&
+    entries.length > 0 &&
+    entries.every(([f, v]) => {
+      const have = obj[f];
       return have !== null && have !== undefined && String(have) === String(v);
     })
   );
+}
+
+// The subject takes no part in `merge`: its state matches every pair of its row's
+// `subject.merge_skip` (an empty map never matches).
+function skipsMerge(s) {
+  return matchesPairs(s.state, s.row.subject.merge_skip);
+}
+
+// A fixed station's own row (plan 35 spec 4.5): its row names stations by a key
+// (`subject.station.key` non-null) and its state matches `station.when`. A group is one when
+// every member is.
+function isStation(s) {
+  return (s.members ?? [s]).every((m) => {
+    const st = m.row?.subject?.station;
+    return !!st && st.key !== null && st.key !== undefined && matchesPairs(m.state, st.when);
+  });
 }
 
 // The union of the rows' `merge` fields, in order.
@@ -960,6 +984,7 @@ class SubjectsPane {
       if (tr.dataset.key !== s.key) tr.dataset.key = s.key;
       tr.classList.toggle("dim", s.dim);
       tr.classList.toggle("selected", holds(s, sel));
+      tr.classList.toggle("station", isStation(s));
       const values = subjectValues(s);
       cols.forEach((c, n) => {
         const text = c.text(s, values);

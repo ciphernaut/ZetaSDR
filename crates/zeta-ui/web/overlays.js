@@ -221,6 +221,12 @@
 //                            selected source
 //     ov.lastEvent(jobId) -> ms|null  performance.now() of the last event counted in the job's
 //                            row (agent.js folds idle plan channels on it)
+//     ov.lastStationEvent(jobId) -> ms|null  performance.now() of the last counted event of a
+//                            job whose row has `subject.station` (plan 35) that is a fixed
+//                            station's frame: matching `station.when` (subjects.js
+//                            matchesPairs) or with a non-blank `addressed` field; null before
+//                            one and for every other row (app.js fades the map's lit sets
+//                            from it, else from ov.lastEvent)
 //     ov.activity(jobId) -> {watched, speaking, hot}  what the page knows of the job now
 //                            (watched: running on the selected source, so on the feed)
 //     ov.onEvent(fn)         fn(job, payload) for every non-spectrum event of a job on the
@@ -232,7 +238,7 @@
 
 import { SQUELCH_KINDS, setSquelchTag } from "./agent.js";
 import { channelLabel } from "./plans.js";
-import { subjectLabel, subjectSummary } from "./subjects.js";
+import { matchesPairs, subjectLabel, subjectSummary } from "./subjects.js";
 import { bandText } from "./units.js";
 
 export const RIBBON_TTL_MS = 60_000;
@@ -389,6 +395,7 @@ class Overlays {
     this.seedGen = 0; // bumped by ov.reseedAll: a read issued before it is discarded
     this.counters = new Map(); // job id -> non-spectrum events seen on the feed
     this.lastEvents = new Map(); // job id -> performance.now() of its last counted event
+    this.stationEvents = new Map(); // job id -> performance.now() of its last station frame
     this.hotJob = null; // the job id whose tag, outline and row show `hot`
     this.speaking = []; // the job ids a mix is playing now: `speaking` on each
     this.snippets = new Map(); // input job id -> the last transcript text of its attached job
@@ -434,6 +441,7 @@ class Overlays {
     this.pending = [];
     this.counters.clear();
     this.lastEvents.clear();
+    this.stationEvents.clear();
     this.squelches.clear();
     this.gateless.clear();
     for (const [jobId, rec] of [...this.positioned]) {
@@ -491,6 +499,7 @@ class Overlays {
   forget(jobId) {
     this.counters.delete(jobId);
     this.lastEvents.delete(jobId);
+    this.stationEvents.delete(jobId);
     this.squelches.delete(jobId);
     this.gateless.delete(jobId);
     this.unlabel(jobId);
@@ -884,6 +893,7 @@ class Overlays {
     const n = (this.counters.get(job.id) || 0) + 1;
     this.counters.set(job.id, n);
     this.lastEvents.set(job.id, performance.now());
+    if (this.isStationFrame(job, p)) this.stationEvents.set(job.id, performance.now());
     this.jobRow(job, n);
     if (obj) {
       if (p.label && typeof p.label === "object" && typeof p.center_hz === "number") {
@@ -949,6 +959,23 @@ class Overlays {
 
   lastEvent(jobId) {
     return this.lastEvents.get(jobId) ?? null;
+  }
+
+  lastStationEvent(jobId) {
+    return this.stationEvents.get(jobId) ?? null;
+  }
+
+  // A frame from or to a fixed station (plan 35 spec 4.5), on a job whose row has
+  // `subject.station`: one matching `station.when` (subjects.js matchesPairs, the table's
+  // comparison), or one whose `addressed` field is non-blank.
+  isStationFrame(job, p) {
+    if (!p || typeof p !== "object" || Array.isArray(p)) return false;
+    const st = this.subjects?.rowOf(job.kind)?.subject?.station;
+    if (!st || typeof st !== "object") return false;
+    if (matchesPairs(p, st.when)) return true;
+    if (typeof st.addressed !== "string") return false;
+    const to = p[st.addressed];
+    return ["string", "number", "boolean"].includes(typeof to) && String(to).trim() !== "";
   }
 
   // What the page knows of a job's activity: watched (a running job on the shown source, so

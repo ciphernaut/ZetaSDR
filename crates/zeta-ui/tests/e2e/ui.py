@@ -5543,6 +5543,96 @@ def scenario_classify_lights_sites(page, url, secret):
         run_cmd(page, "view reset")
 
 
+# ---- heard sites (plan 35 Task 4) -------------------------------------------------------
+# The node's `fake_vdl2` row (ui.rs) names its ground stations (`subject.station`): its lines,
+# 2 s into the job, are three aircraft frames addressed (`dst`) to the ground station 1A2B3C
+# and 1A2B3C's own uplink, once (fake lines are written whole, never repeated here). On the
+# tone's band, which the register stub answers, the job's origin answer lights both stub
+# transmitters as heard, graded `from`.
+
+def scenario_heard_sites(page, url, secret):
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    page.set_viewport_size(WIDE)
+    job = start_subject_job(page, url, secret, "fake_vdl2", bandwidth_hz=42_000)
+    sites = page.locator("#map path.map-site")
+    heard = page.locator('#map path.map-site[data-heard="from"]')
+    try:
+        # The node's tally first, so the lookup answers `heard` already.
+        def tallied():
+            ctx = http_json(url, secret, "/op", {"op": "job_context", "job": job})["value"]
+            s = (ctx.get("stations") or {}).get("1A2B3C")
+            return s if s and s["from"] == 1 and s["to"] == 3 else None
+        wait_until(tallied, 10, "1A2B3C heard once, addressed three times")
+        job_row(page, job).locator("button.origins").click()
+        expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=10_000)
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(sites).to_have_count(2, timeout=10_000)
+        expect(heard).to_have_count(2)
+        expect(page.locator("#map path.map-bearing")).to_have_count(2)
+        # A heard site paints at freshness alone: brighter than its score.
+        answer = http_json(url, secret, "/op", {"op": "job_context", "job": job})["value"]["origins"]
+        scores = [o["score"] for o in answer["origins"]]
+        assert all(o["heard"]["grade"] == "from" for o in answer["origins"]), answer
+        assert max(scores) < 0.9, scores
+        bright = sites.evaluate_all(
+            "els => els.map((e) => Number(e.style.getPropertyValue('--site-brightness')))")
+        assert min(bright) >= 0.9, bright
+        # The hover names the grade, the popup each station's counts.
+        tip = page.locator("#map .leaflet-tooltip")
+        hill = hover_site_of(page, "Example Water Authority")
+        hill_tip = page.locator("#map .leaflet-tooltip", has_text="Example Water Authority")
+        expect(hill_tip).to_contain_text("ground station heard, 1 frame")
+        # The frames' time is the tone recording's clock, no age on the page's: none given.
+        expect(hill_tip).not_to_contain_text("min ago")
+        hill.click()
+        pop = page.locator("#map .leaflet-popup-content")
+        expect(pop).to_contain_text("1A2B3C: heard 1, addressed by 3")
+        page.keyboard.press("Escape")
+        # The `to` grade on a disagreeing site: still filled, still a bearing, its own mark,
+        # never the confirmed ring.
+        page.evaluate("""() => window.zetaTest.lightOrigin('band:heard-to', {
+            t_ns: Date.now() * 1e6, from: {kind: 'station', lat: -27.3842, lon: 153.1175},
+            stations: {'1A2B3C': {from: 0, to: 2, first_ns: Date.now() * 1e6,
+                                  last_ns: Date.now() * 1e6}},
+            origins: [{score: 0.2, agree: 'disagrees', confirmed: null,
+              heard: {last_ns: Date.now() * 1e6, grade: 'to'},
+              allocation: {lat: -27.30, lon: 153.30, licensee: 'Example Airways',
+                           site: 'Example Tower'}}]})""")
+        to = page.locator('#map path.map-site[data-heard="to"]')
+        expect(to).to_have_count(1)
+        expect(page.locator("#map path.map-bearing")).to_have_count(3)
+        assert to.get_attribute("data-confirmed") is None
+        assert to.evaluate("(e) => getComputedStyle(e).fill") != "none"
+        to.hover()
+        expect(page.locator("#map .leaflet-tooltip", has_text="Example Airways")).to_contain_text(
+            "ground station addressed by 2 frames, last 0 min ago")
+        page.evaluate("() => window.zetaTest.lightOrigin('band:heard-to', {origins: []})")
+        expect(to).to_have_count(0)
+        # No station frame comes again: lit afresh, the site fades on the view's fade.
+        run_cmd(page, "view set origin_fade_s 2")
+        job_row(page, job).locator("button.origins").click()
+        page.wait_for_function(
+            """() => {
+              const e = document.querySelector('#map path.map-site[data-heard="from"]');
+              if (!e) return false;
+              const b = Number(e.style.getPropertyValue('--site-brightness'));
+              return b > 0 && b <= 0.5;
+            }""", timeout=3_000)
+        # The Subjects table marks the ground station's row and no aircraft's.
+        open_subjects(page)
+        expect(page.locator('#subjects tr.subject.station[data-key="1A2B3C"]')).to_have_count(
+            1, timeout=10_000)
+        expect(page.locator('#subjects tr.subject[data-key="7C0000"]')).to_have_count(1)
+        expect(page.locator('#subjects tr.subject.station[data-key="7C0000"]')).to_have_count(0)
+        expect(page.locator("#subjects tr.subject.station")).to_have_count(1)
+        assert not errors, f"console errors: {errors}"
+    finally:
+        run_cmd(page, "view reset")
+        stop_job(url, secret, job)
+
+
 # ---- subjects (plan 23 Task 2) ----------------------------------------------------------
 # The node's `fake_subjects` row prints three aircraft in separate messages, `fake_fold` two
 # sondes (ui.rs), each 2 s into the job.

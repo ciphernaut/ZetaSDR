@@ -584,12 +584,14 @@ const FAKE_ACARS_LINES: &str = "{\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"label\
 {\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"label\":\"H1\",\"text\":\"two\"}";
 
 /// `fake_vdl2`'s lines: 7C0000 (`reg` VH-ZET, so one aircraft with `fake_acars`'s VH-ZET)
-/// twice, 7C0001 with no `reg` once, and the ground station 1A2B3C's uplink to VH-ZET once
-/// (its `reg` the uplink's aircraft, kept apart by `merge_skip`).
-const FAKE_VDL2_LINES: &str = "{\"icao\":\"7C0000\",\"addr_type\":\"Aircraft\",\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"text\":\"alpha\"}\n\
-{\"icao\":\"7C0001\",\"addr_type\":\"Aircraft\",\"reg\":null,\"flight\":\"QFA9\",\"text\":\"gamma\"}\n\
-{\"icao\":\"7C0000\",\"addr_type\":\"Aircraft\",\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"text\":\"beta\"}\n\
-{\"icao\":\"1A2B3C\",\"addr_type\":\"Ground station\",\"reg\":\"VH-ZET\",\"flight\":null,\"text\":\"uplink\"}";
+/// twice, 7C0001 with no `reg` once, each addressed (`dst`) to the ground station 1A2B3C, and
+/// 1A2B3C's uplink to VH-ZET (`dst` 7C0000) once (its `reg` the uplink's aircraft, kept apart
+/// by `merge_skip`). So the row's `subject.station` tallies 1A2B3C heard once and addressed
+/// three times.
+const FAKE_VDL2_LINES: &str = "{\"icao\":\"7C0000\",\"addr_type\":\"Aircraft\",\"dst\":\"1A2B3C\",\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"text\":\"alpha\"}\n\
+{\"icao\":\"7C0001\",\"addr_type\":\"Aircraft\",\"dst\":\"1A2B3C\",\"reg\":null,\"flight\":\"QFA9\",\"text\":\"gamma\"}\n\
+{\"icao\":\"7C0000\",\"addr_type\":\"Aircraft\",\"dst\":\"1A2B3C\",\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"text\":\"beta\"}\n\
+{\"icao\":\"1A2B3C\",\"addr_type\":\"Ground station\",\"dst\":\"7C0000\",\"reg\":\"VH-ZET\",\"flight\":null,\"text\":\"uplink\"}";
 
 /// A modes directory under `dir` holding the fake rows and their lines files; its path.
 fn fake_modes(dir: &Path) -> PathBuf {
@@ -693,6 +695,7 @@ fn fake_modes(dir: &Path) -> PathBuf {
                 "schema": {"type": "object", "properties": {
                     "icao": {"type": "string"},
                     "addr_type": text,
+                    "dst": text,
                     "reg": text,
                     "flight": text,
                     "text": text,
@@ -714,6 +717,10 @@ fn fake_modes(dir: &Path) -> PathBuf {
                 "label": "flight",
                 "merge": ["reg", "icao"],
                 "merge_skip": {"addr_type": "Ground station"},
+                // Plan 35: the ground station's own frames, and those addressed to it, light
+                // the register's sites as heard.
+                "station": {"when": {"addr_type": "Ground station"}, "key": "icao",
+                            "addressed": "dst"},
             }),
         ),
     ];

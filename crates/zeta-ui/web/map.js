@@ -36,7 +36,8 @@
 //       fix (`cap` at most, as `kept` is under it)
 //   mountMap(el, api, view, {jobs, subjects, lastEvent, tiles}) -> MapPane
 //       (`lastEvent(jobId)`: performance.now() of the job's last event on the feed,
-//       overlays.js lastEvent; `tiles()` the provider id in force, app.js resolving the
+//       overlays.js lastEvent, or its lastStationEvent on a row with fixed stations, plan 35;
+//       `tiles()` the provider id in force, app.js resolving the
 //       view's `map_tiles` through the theme)
 //       `el` (#map) is shown while view.get("main") is "map" and hidden otherwise (view.onChange;
 //       `invalidateSize` on each show).
@@ -66,7 +67,7 @@
 //                               `litAt` (default now) when it lit. Sets are kept while the map
 //                               is hidden.
 //     map.tick()                each second (the subjects' tick): each site's brightness = its
-//                               best score × the set's freshness, freshness = max(0, 1 − age / view
+//                               best score (1 for a heard site) × the set's freshness, freshness = max(0, 1 − age / view
 //                               `origin_fade_s`), age the seconds since the later of `litAt`
 //                               and `activity()`; a set whose freshness is zero goes
 //     map.seed(jobs)            after each jobs poll: a running job's `context.origins` not
@@ -114,13 +115,21 @@
 //   A lit set draws one L.circleMarker (class `map-site`, `data-agree` fits|disagrees|unknown
 //   from its best origin, `data-confirmed` when any is confirmed, the CSS custom property
 //   `--site-brightness` 0..1, the site's best score × the set's freshness) per distinct position
-//   among its origins; a `disagrees` site is a dashed ring with no fill. One non-interactive
-//   L.polyline (class `map-bearing`, its site's brightness) runs from the answer's `from` to each `fits` or
-//   `unknown` site while `from` is set; with `from.kind` `source` a non-interactive L.marker
+//   among its origins; a `disagrees` site is a dashed ring with no fill. A site whose best
+//   origin is `heard` (plan 35: the job decoded a fixed station's frame, or one addressed to
+//   it) carries `data-heard` from|to, its brightness its set's freshness alone (the score
+//   counts as 1) and a fill whatever its `agree`. One non-interactive
+//   L.polyline (class `map-bearing`, its site's brightness) runs from the answer's `from` to each `fits`,
+//   `unknown` or heard site while `from` is set; with `from.kind` `source` a non-interactive L.marker
 //   (class `map-source`) labelled with the source id stands at `from`. Its tooltip: licensee /
 //   site / `<emission> (<words>)` / `<score> <agree>` / `modulation not measured` (an unknown) /
-//   `<d> km, <bearing>°` (only with a distance) / `confirmed by <value>`; its popup lists each
-//   origin there with those lines, `licence <no>`, `<power> W`, then the measured band and labels,
+//   `<d> km, <bearing>°` (only with a distance) / `confirmed by <value>` / `ground station heard,
+//   <n> frames, last <m> min ago` (`from`) or `ground station addressed by <n> frames, last <m>
+//   min ago` (`to`), the answer's `stations` summed over keys, the age from `heard.last_ns`
+//   left out when that is no time on the page's clock (a replayed recording's: over a day
+//   old, or more than a minute ahead); its popup lists each
+//   origin there with those lines, `licence <no>`, `<power> W`, for a heard site one line per
+//   station key `<key>: heard <from>, addressed by <to>` (`*` reading `uplinks`), then the measured band and labels,
 //   the source and `from <station|source id>`, and no buttons: a click selects
 //   nothing. While a set's `from_note` is `no station set`, `div.map-note` in the map's corner
 //   says the sites are not cut by reach, once per load. The first lit site centres the map
@@ -196,6 +205,10 @@ const FIRST_ZOOM = 10;
 // A lit site's marker radius, and the note shown while an answer had no vantage.
 const SITE_RADIUS = 7;
 const SITE_DASH = "4 4";
+// A heard site's hover gives the last frame's age only for a `last_ns` on this page's clock:
+// at most a day old, and no more than a minute ahead (the node's clock against the page's).
+const HEARD_AGE_MAX_MS = 24 * 3600_000;
+const HEARD_AGE_SKEW_MS = 60_000;
 const NO_STATION = "no station set";
 export const NO_STATION_NOTE = "no station set: sites are not cut by reach (station_set)";
 // One-shot set keys; any other key is a job id.
@@ -342,8 +355,8 @@ function emissionWords(e) {
   return [e.modulation_name, e.info_name].filter((x) => typeof x === "string" && x).join(", ");
 }
 
-// The tooltip's lines for one origin (spec 4.4, Hover).
-function tooltipLines(o) {
+// The tooltip's lines for one origin (spec 4.4, Hover); `stations` its answer's tally.
+function tooltipLines(o, stations) {
   const a = o.allocation;
   const lines = [];
   if (a.licensee) lines.push(a.licensee);
@@ -359,7 +372,44 @@ function tooltipLines(o) {
     lines.push(`${a.distance_km.toFixed(1)} km${b}`);
   }
   if (o.confirmed) lines.push(`confirmed by ${o.confirmed.value}`);
+  const h = heardLine(o.heard, stations);
+  if (h) lines.push(h);
   return lines;
+}
+
+// `1 frame`, `<n> frames`.
+function framesText(n) {
+  return n === 1 ? "1 frame" : `${n} frames`;
+}
+
+// The hover's line for a heard site (plan 35 spec 4.5), from the answer's `stations` summed
+// over keys: `ground station heard, <n> frames, last <m> min ago` for the `from` grade,
+// `ground station addressed by <n> frames, ...` for `to`; null when not heard.
+function heardLine(heard, stations) {
+  if (!heard || (heard.grade !== "from" && heard.grade !== "to")) return null;
+  const all = Object.values(stations && typeof stations === "object" ? stations : {});
+  const n = all.reduce((sum, s) => sum + (Number(s?.[heard.grade]) || 0), 0);
+  let line =
+    heard.grade === "from"
+      ? `ground station heard, ${framesText(n)}`
+      : `ground station addressed by ${framesText(n)}`;
+  // `last_ns` is the frames' stream time: the wall clock on a live radio, a recording's own on
+  // a replayed file, which is no age on this page's clock and is left out.
+  const ageMs = Number.isFinite(heard.last_ns) ? Date.now() - heard.last_ns / 1e6 : NaN;
+  if (ageMs > -HEARD_AGE_SKEW_MS && ageMs < HEARD_AGE_MAX_MS) {
+    line += `, last ${Math.max(0, Math.round(ageMs / 60_000))} min ago`;
+  }
+  return line;
+}
+
+// The popup's lines for an answer's stations: one per key with both counts, the anonymous
+// key (`*`, a protocol naming no station) as `uplinks`.
+function stationLines(stations) {
+  if (!stations || typeof stations !== "object") return [];
+  return Object.entries(stations).map(([k, s]) => {
+    const name = k === "*" ? "uplinks" : k;
+    return `${name}: heard ${Number(s?.from) || 0}, addressed by ${Number(s?.to) || 0}`;
+  });
 }
 
 function linesBox(lines, cls = "") {
@@ -379,10 +429,14 @@ function sitePopup(site, answer) {
   const box = document.createElement("div");
   for (const o of site.origins) {
     const a = o.allocation;
-    const lines = tooltipLines(o);
+    const lines = tooltipLines(o, answer.stations);
     if (a.licence_no) lines.push(`licence ${a.licence_no}`);
     if (Number.isFinite(a.power_w)) lines.push(`${a.power_w} W`);
     box.append(linesBox(lines, "map-origin"));
+  }
+  if (site.origins.some((o) => o.heard)) {
+    const lines = stationLines(answer.stations);
+    if (lines.length > 0) box.append(linesBox(lines, "map-stations"));
   }
   const tail = [];
   if (answer.band) {
@@ -677,10 +731,14 @@ class MapPane {
     const drawn = { markers: [], lines: [], parts: [], source: null };
     for (const site of set.sites) {
       const agree = site.best.agree;
+      // Heard (plan 35): the decode outranks the terms, so freshness alone, a fill and a
+      // bearing whatever the designator says.
+      const grade = site.best.heard?.grade;
+      const heard = grade === "from" || grade === "to";
       const at = [site.lat, site.lon];
-      const part = { score: Number(site.best.score) || 0, layers: [] };
+      const part = { score: heard ? 1 : Number(site.best.score) || 0, layers: [] };
       drawn.parts.push(part);
-      if (from && agree !== "disagrees") {
+      if (from && (heard || agree !== "disagrees")) {
         const line = L.polyline([[from.lat, from.lon], at], {
           className: "map-bearing",
           interactive: false,
@@ -691,15 +749,16 @@ class MapPane {
       const m = L.circleMarker(at, {
         radius: SITE_RADIUS,
         className: "map-site",
-        fill: agree !== "disagrees",
-        dashArray: agree === "disagrees" ? SITE_DASH : null,
+        fill: heard || agree !== "disagrees",
+        dashArray: agree === "disagrees" && !heard ? SITE_DASH : null,
       }).addTo(this.map);
       const el = m.getElement();
       if (el) {
         el.dataset.agree = agree;
         if (site.origins.some((o) => o.confirmed)) el.dataset.confirmed = "";
+        if (heard) el.dataset.heard = grade;
       }
-      m.bindTooltip(() => linesBox(tooltipLines(site.best)));
+      m.bindTooltip(() => linesBox(tooltipLines(site.best, set.answer.stations)));
       m.bindPopup(() => sitePopup(site, set.answer));
       drawn.markers.push(m);
       part.layers.push(m);
