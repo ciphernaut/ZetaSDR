@@ -608,9 +608,9 @@ From plan 31's post-deploy fix wave (2026-11-09), where identify on the sonde ba
 
 From the 2026-11-08 live acceptance. The node keeps the 20 newest job records (`JOB_HISTORY_MAX`, `crates/zeta-core/src/node/mod.rs`), so 16 stopped test jobs evicted 16 of the operator's older stopped records (a 477 MHz demod with its transcriber and mix, FM demods, RDS, measures). Ideas: a larger cap, keep records the operator started apart from agent or test ones, or keep one record per (kind, band) so a re-run replaces its predecessor instead of a stranger's.
 
-## Modes: positions in ACARS free text
+## Modes: further ACARS position layouts
 
-From the 2026-11-08 live acceptance. An ACARS `3L` message carried "S 27.751/E153.531" in its text, which no field map reads. A small parser for the common free-text position forms (as plan 29 did for APRS) would put such aircraft on the map.
+Plan 34 reads the H1, 80, 16, 3L and QQ position forms from a downlink's text. Not yet read: the `RSI` table form (signed decimal degrees under a `LAT LON` header), and any further airline layouts that turn up in `events.log`. No dumphfdl fixture yet carries a text report, so HFDL's derive is untested end to end.
 
 ## AIS: not yet proven on air
 

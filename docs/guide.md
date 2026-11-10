@@ -194,7 +194,7 @@ Sixteen built-in job kinds (`transcribe` is attached with `job attach`, not star
 - `pocsag_decode` decodes POCSAG pagers (512, 1200 and 2400 baud, detected automatically) from a 12.5 kHz FM channel: one event per message (`address`, `function`, `kind`, `text`).
 - `rds_decode` reads the RDS data of a broadcast FM station from its 200 kHz band: events carrying `pi`, `ps` and `rt` as they complete.
 - `adsb_decode` decodes Mode S / ADS-B at 1 090 MHz from a band of 2.4 MHz (under 2 MHz is refused): one event per message (`icao`, `callsign`, `altitude_ft`, `lat`, `lon`, `ground_speed_kt`, `track_deg`). It runs dump1090 on the node's host (crate `zeta-ext`: GPL, so an external process, never linked; `ZETA_DUMP1090` overrides the program path); the job fails naming dump1090 when the host has none.
-- `acars_decode` decodes ACARS (AM, 2400 baud MSK) from a 10 kHz channel: one event per CRC-clean block (`reg`, `flight`, `label`, `text`).
+- `acars_decode` decodes ACARS (AM, 2400 baud MSK) from a 10 kHz channel: one event per CRC-clean block (`reg`, `flight`, `label`, `text`, `downlink`). An event whose text carries a position report (ACARS labels H1, 80, 16, 3L and QQ, downlinks only, never an uplink) carries `lat`, `lon`, sometimes `alt_ft`, and `position`: the aircraft's own report, minutes old, so it plots on the map.
 - `measure` emits one layer-1 feature record per second of IQ (occupied band, SNR, burst, symbol rate, label).
 - `denoise` removes broadband noise from audio with RNNoise (the pure-Rust `nnnoiseless` crate, BSD-3-Clause, weights embedded); it downmixes to mono and resamples to 48 kHz.
 

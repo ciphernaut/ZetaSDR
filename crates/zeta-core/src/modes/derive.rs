@@ -429,6 +429,11 @@ mod tests {
     fn range_is_checked() {
         assert_none("POSS90001E153071");
         assert_none("POSS27231E180001");
-        assert_fix("POSS89599E179599", -89.99833, 179.99833, None);
+        assert_fix(
+            "POSS89599E179599",
+            -(89.0 + 59.9 / 60.0),
+            179.0 + 59.9 / 60.0,
+            None,
+        );
     }
 }
