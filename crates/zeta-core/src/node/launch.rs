@@ -906,16 +906,9 @@ impl Inner {
             self.leases.release(&rec.id);
             return Err(NodeError::Stopped(rec.id));
         }
-        // The station tally is the job's: the last run's entry holds the newest one (its
-        // supervisor's flush may postdate the copy of the record a relaunch carries), and
+        // The station tally is the job's: the last run's entry holds the newest one, and
         // this run's tally is seeded from the record (see `JobEntry::stations`).
-        if let Some(stations) = jobs
-            .get(&rec.id)
-            .and_then(|e| e.record.context.get("stations").cloned())
-            && let Some(ctx) = rec.context.as_object_mut()
-        {
-            ctx.insert("stations".into(), stations);
-        }
+        super::origin::carry_stations(jobs.get(&rec.id).map(|e| &e.record), &mut rec);
         if let Err(e) = persist(&self.jobs_dir, &rec) {
             self.leases.release(&rec.id);
             return Err(e);

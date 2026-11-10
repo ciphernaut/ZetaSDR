@@ -684,17 +684,84 @@ pub struct StationTally {
 }
 
 impl StationTally {
-    /// The tally of a record whose context is `context`: its `stations`, empty when
-    /// there are none or they do not parse; clean, never written by this run.
+    /// The tally of a record whose context is `context`: its `stations` and its kept
+    /// answer's (`origins.stations`, which a fresh lookup persists from the tally in
+    /// memory, so it can be ahead of `stations`) merged key by key, field by field
+    /// ([`merge_seen`]), so a restart never seeds a count lower than one written; either
+    /// one empty when absent or when it does not parse. Clean, never written by this run.
     pub fn seeded(context: &serde_json::Value) -> StationTally {
-        let seen = context
-            .get("stations")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+        let parse = |v: Option<&serde_json::Value>| -> BTreeMap<String, StationSeen> {
+            v.and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default()
+        };
+        let mut seen = parse(context.get("stations"));
+        let kept = parse(context.get("origins").and_then(|o| o.get("stations")));
+        for (k, s) in kept {
+            seen.entry(k)
+                .and_modify(|have| *have = merge_seen(have, &s))
+                .or_insert(s);
+        }
         StationTally {
             seen,
             ..StationTally::default()
         }
+    }
+}
+
+/// What a launch of `rec` carries of the job's last run, whose record is `old` (`None`
+/// for a job with no entry): the station tally is the job's, and the last run's entry
+/// holds the newest one (its supervisor's flush may postdate the copy of the record a
+/// relaunch carries, a `job_retune`'s), so `old`'s `stations` and kept `origins`
+/// replace `rec`'s. A run whose band does not hold `old`'s centre (a retune off the
+/// band) hears other stations: it carries no tally, its `stations` dropped and its kept
+/// answer's `heard` and `stations` cleared ([`apply_stations`] with none), the answer
+/// itself kept. A re-centre within the band keeps everything. Nothing for a context
+/// that is not an object.
+pub fn carry_stations(old: Option<&JobRecord>, rec: &mut JobRecord) {
+    let Some(old) = old else {
+        return;
+    };
+    let off_band = {
+        let (c, half) = (rec.tuning.center_hz.0, rec.tuning.bandwidth_hz.0 / 2);
+        old.tuning.center_hz.0.abs_diff(c) > half
+    };
+    let Some(ctx) = rec.context.as_object_mut() else {
+        return;
+    };
+    for k in ["stations", "origins"] {
+        if let Some(v) = old.context.get(k) {
+            ctx.insert(k.into(), v.clone());
+        }
+    }
+    if !off_band {
+        return;
+    }
+    ctx.remove("stations");
+    let Some(kept) = ctx.get_mut("origins") else {
+        return;
+    };
+    match serde_json::from_value::<OriginAnswer>(kept.clone()) {
+        Ok(mut a) => {
+            apply_stations(&mut a, &BTreeMap::new());
+            *kept = serde_json::to_value(&a).expect("an origin answer serialises");
+        }
+        // Not an answer: at least nothing of it seeds the tally.
+        Err(_) => {
+            if let Some(o) = kept.as_object_mut() {
+                o.remove("stations");
+            }
+        }
+    }
+}
+
+/// Two records of one station merged field by field: the larger `from` and `to`, the
+/// earlier `first_ns`, the later `last_ns`.
+pub fn merge_seen(a: &StationSeen, b: &StationSeen) -> StationSeen {
+    StationSeen {
+        from: a.from.max(b.from),
+        to: a.to.max(b.to),
+        first_ns: Timestamp(a.first_ns.0.min(b.first_ns.0)),
+        last_ns: Timestamp(a.last_ns.0.max(b.last_ns.0)),
     }
 }
 
@@ -2809,6 +2876,72 @@ mod tests {
         assert!(StationTally::seeded(&odd).seen.is_empty());
     }
 
+    #[test]
+    fn a_tally_seeds_the_larger_of_the_context_and_the_kept_answer_field_by_field() {
+        // A fresh lookup persisted the tally onto the kept answer after the last write
+        // of `stations`: a restart must not seed the smaller count.
+        let stations = tally(&[
+            ("GS1", seen(3, 4, 9)),
+            (
+                "GS2",
+                StationSeen {
+                    from: 0,
+                    to: 2,
+                    first_ns: Timestamp(2),
+                    last_ns: Timestamp(20),
+                },
+            ),
+        ]);
+        let kept = tally(&[
+            (
+                "GS1",
+                StationSeen {
+                    from: 5,
+                    to: 1,
+                    first_ns: Timestamp(4),
+                    last_ns: Timestamp(30),
+                },
+            ),
+            (
+                "GS2",
+                StationSeen {
+                    from: 0,
+                    to: 1,
+                    first_ns: Timestamp(1),
+                    last_ns: Timestamp(10),
+                },
+            ),
+            ("GS3", seen(1, 0, 40)),
+        ]);
+        let ctx = serde_json::json!({"stations": stations, "origins": {"stations": kept}});
+        let s = StationTally::seeded(&ctx);
+        let want = tally(&[
+            (
+                "GS1",
+                StationSeen {
+                    from: 5,
+                    to: 4,
+                    first_ns: Timestamp(1),
+                    last_ns: Timestamp(30),
+                },
+            ),
+            (
+                "GS2",
+                StationSeen {
+                    from: 0,
+                    to: 2,
+                    first_ns: Timestamp(1),
+                    last_ns: Timestamp(20),
+                },
+            ),
+            ("GS3", seen(1, 0, 40)),
+        ]);
+        assert_eq!(s.seen, want);
+        assert!(!s.dirty);
+        let only_kept = serde_json::json!({"origins": {"stations": kept}});
+        assert_eq!(StationTally::seeded(&only_kept).seen, kept);
+    }
+
     /// A record of a job `id` on `radio`, to enter in the job table by hand.
     fn record(id: &str) -> JobRecord {
         JobRecord {
@@ -2920,5 +3053,191 @@ mod tests {
         );
         assert_eq!(a.origins[0].confirmed, kept.origins[0].confirmed);
         assert_eq!(ctx["stations"]["GS1"]["from"], 1);
+    }
+
+    /// A context holding `t` as `stations` and a kept answer marked with `t`.
+    fn context_with(t: &BTreeMap<String, StationSeen>) -> serde_json::Value {
+        let mut a = vhf_answer();
+        apply_stations(&mut a, t);
+        serde_json::json!({"stations": t, "origins": a})
+    }
+
+    /// Job `id`'s context and tally now.
+    fn entry_now(
+        n: &super::super::Node,
+        id: &JobId,
+    ) -> (serde_json::Value, BTreeMap<String, StationSeen>) {
+        let jobs = n.inner.jobs.lock().unwrap();
+        (
+            jobs[id].record.context.clone(),
+            jobs[id].stations.seen.clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_relaunch_from_a_stale_record_keeps_the_flushed_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node(dir.path()).await;
+        let id = JobId("j3".into());
+        // The old run's flush wrote 10; the relaunch carries a copy taken at 5.
+        let mut old = record("j3");
+        old.context = context_with(&tally(&[("GS1", seen(2, 10, 100))]));
+        enter(&n, old, 4);
+        let mut stale = record("j3");
+        stale.context = context_with(&tally(&[("GS1", seen(1, 5, 50))]));
+        let token = tokio_util::sync::CancellationToken::new();
+        let _run = n.inner.record_running(stale, &token).unwrap();
+        let (ctx, seen_now) = entry_now(&n, &id);
+        assert_eq!(ctx["stations"]["GS1"]["to"], 10);
+        assert_eq!(ctx["origins"]["stations"]["GS1"]["to"], 10);
+        assert_eq!(ctx["origins"]["origins"][0]["heard"]["last_ns"], 100);
+        assert_eq!(seen_now["GS1"].to, 10);
+        let disk: JobRecord =
+            serde_json::from_slice(&std::fs::read(dir.path().join("state/jobs/j3.json")).unwrap())
+                .unwrap();
+        assert_eq!(disk.context["origins"]["stations"]["GS1"]["to"], 10);
+    }
+
+    #[tokio::test]
+    async fn a_retune_off_the_band_drops_the_tally_and_a_recentre_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node(dir.path()).await;
+        let t = tally(&[("GS1", seen(2, 10, 100))]);
+        for (job, center, keeps) in [("j4", 131_550_000, false), ("j5", 136_980_000, true)] {
+            let id = JobId(job.into());
+            let mut old = record(job);
+            old.context = context_with(&t);
+            enter(&n, old.clone(), 4);
+            let mut new = old;
+            new.tuning.center_hz = Hz(center);
+            let token = tokio_util::sync::CancellationToken::new();
+            let _run = n.inner.record_running(new, &token).unwrap();
+            let (ctx, seen_now) = entry_now(&n, &id);
+            let a: OriginAnswer = serde_json::from_value(ctx["origins"].clone()).unwrap();
+            assert!(!a.origins.is_empty(), "{job}: the kept answer stays");
+            if keeps {
+                assert_eq!(seen_now, t, "{job}");
+                assert_eq!(ctx["stations"]["GS1"]["to"], 10, "{job}");
+                assert_eq!(a.stations, t, "{job}");
+                assert!(a.origins.iter().all(|o| o.heard.is_some()), "{job}");
+            } else {
+                assert!(seen_now.is_empty(), "{job}: {seen_now:?}");
+                assert!(ctx.get("stations").is_none(), "{job}: {ctx}");
+                assert!(a.stations.is_empty(), "{job}");
+                assert!(a.origins.iter().all(|o| o.heard.is_none()), "{job}");
+            }
+        }
+    }
+
+    /// Yield until `done` holds (the timer task runs on this thread), at most 1000 times.
+    async fn until(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..1000 {
+            if done() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        done()
+    }
+
+    /// Enter job `id` as run 2, count one own frame of `GS1` and write it, then count a
+    /// repeat: the window's remainder it arms.
+    async fn armed(n: &super::super::Node, id: &JobId, source: &SourceId) -> Duration {
+        enter(n, record(&id.0), 2);
+        let first = n
+            .inner
+            .note_station(id, 2, "GS1", Grade::From, Timestamp(100));
+        assert_eq!(first, WriteNow::Now);
+        assert!(n.inner.write_stations(id, 2, source));
+        let WriteNow::Arm(after) = n
+            .inner
+            .note_station(id, 2, "GS1", Grade::From, Timestamp(200))
+        else {
+            panic!("a repeat inside the window arms the timer");
+        };
+        assert!(n.inner.jobs.lock().unwrap()[id].stations.timer_armed);
+        after
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_armed_timer_writes_the_tally_once_past_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node(dir.path()).await;
+        let (id, source) = (JobId("j6".into()), SourceId("radio".into()));
+        let after = armed(&n, &id, &source).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        Inner::arm_stations(
+            Arc::downgrade(&n.inner),
+            (id.clone(), 2, source.clone()),
+            token.clone(),
+            after,
+        );
+        let state = || {
+            let jobs = n.inner.jobs.lock().unwrap();
+            let e = &jobs[&id];
+            (
+                e.record.context["stations"]["GS1"]["from"].clone(),
+                e.stations.dirty,
+                e.stations.timer_armed,
+                e.stations.written_ns,
+            )
+        };
+        // The timer task starts its sleep now, at the window's start.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(after / 2).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let (from, dirty, timer, written) = state();
+        assert_eq!((from, dirty, timer), (serde_json::json!(1), true, true));
+        tokio::time::advance(after).await;
+        assert!(until(|| !state().1).await, "the timer wrote the tally");
+        let (from, dirty, timer, fired) = state();
+        assert_eq!((from, dirty, timer), (serde_json::json!(2), false, false));
+        assert_ne!(fired, written, "the timer's write is a new one");
+        let disk: JobRecord =
+            serde_json::from_slice(&std::fs::read(dir.path().join("state/jobs/j6.json")).unwrap())
+                .unwrap();
+        assert_eq!(disk.context["stations"]["GS1"]["from"], 2);
+        // Once: nothing writes again, however long it waits.
+        tokio::time::advance(after * 3).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(state().3, fired, "written once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_runs_timer_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node(dir.path()).await;
+        let (id, source) = (JobId("j7".into()), SourceId("radio".into()));
+        let after = armed(&n, &id, &source).await;
+        let before = n.inner.jobs.lock().unwrap()[&id].record.context.clone();
+        let token = tokio_util::sync::CancellationToken::new();
+        Inner::arm_stations(
+            Arc::downgrade(&n.inner),
+            (id.clone(), 2, source.clone()),
+            token.clone(),
+            after,
+        );
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        token.cancel();
+        tokio::time::advance(after * 2).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let jobs = n.inner.jobs.lock().unwrap();
+        let e = &jobs[&id];
+        assert_eq!(e.record.context, before, "nothing written");
+        assert!(
+            e.stations.dirty,
+            "the count waits for the supervisor's flush"
+        );
+        assert_eq!(e.stations.seen["GS1"].from, 2);
     }
 }
