@@ -31,6 +31,7 @@
         ],
         "gs_id": ["/hfdl/spdu/src/id", "/hfdl/lpdu/hfnpdu/gs/id"],
         "gs": ["/hfdl/spdu/src/name", "/hfdl/lpdu/hfnpdu/gs/name"],
+        "src_type": "/hfdl/lpdu/src/type",
         "flight": {
           "pointers": ["/hfdl/lpdu/hfnpdu/flight_id", "/hfdl/lpdu/hfnpdu/acars/flight"],
           "trim": " "
@@ -56,6 +57,7 @@
         "icao": { "type": ["string", "null"] },
         "gs_id": { "type": ["integer", "null"] },
         "gs": { "type": ["string", "null"] },
+        "src_type": { "type": ["string", "null"] },
         "flight": { "type": ["string", "null"] },
         "pdu": { "type": ["string", "null"] },
         "lat": { "type": ["number", "null"] },
@@ -85,8 +87,16 @@
     "within_ms": 10000
   },
   "position": { "lat": "lat", "lon": "lon", "alt_m": null },
+  "derive": [
+    {
+      "when": { "src_type": "Aircraft" },
+      "from": "text",
+      "extract": "acars_position",
+      "into": { "lat": "lat", "lon": "lon" }
+    }
+  ],
   "time": null,
-  "notes": "HFDL (PSK on a 1440 Hz subcarrier, 300-1800 bit/s) between airliners and ground stations at 2.8-22.1 MHz, decoded by dumphfdl, typically on a KiwiSDR's 12 kHz band. Start the job with center_hz on the listed (dial) frequency: the signal sits 1.44 kHz above it, inside the 6 kHz band. Take the frequencies from a list (dumphfdl's system table, or the operator's own), not a raster; they change with the hour. Each ground station sends a squitter every 32 s, so a squitter (pdu absent, gs_id set) within a minute proves the channel even when no aircraft is heard. An aircraft is keyed on its ICAO address once dumphfdl has heard its logon. Neither dumpvdl2 nor dumphfdl is in Debian or Ubuntu: the OpenWebRX+ apt repository packages dumpvdl2, dumphfdl and libacars2, and both build from source in a few minutes (libacars first).",
+  "notes": "HFDL (PSK on a 1440 Hz subcarrier, 300-1800 bit/s) between airliners and ground stations at 2.8-22.1 MHz, decoded by dumphfdl, typically on a KiwiSDR's 12 kHz band. Start the job with center_hz on the listed (dial) frequency: the signal sits 1.44 kHz above it, inside the 6 kHz band. Take the frequencies from a list (dumphfdl's system table, or the operator's own), not a raster; they change with the hour. Each ground station sends a squitter every 32 s, so a squitter (pdu absent, gs_id set) within a minute proves the channel even when no aircraft is heard. An aircraft is keyed on its ICAO address once dumphfdl has heard its logon. src_type is the LPDU's source as dumphfdl prints it, Aircraft or Ground station. Without a structured pos, an Aircraft frame whose ACARS text is a position report (labels H1, 80, 16, 3L, QQ) carries lat, lon and a position (no altitude): the aircraft's own report, typically a few minutes old by the time it is relayed; a ground station's uplinks are never parsed. Neither dumpvdl2 nor dumphfdl is in Debian or Ubuntu: the OpenWebRX+ apt repository packages dumpvdl2, dumphfdl and libacars2, and both build from source in a few minutes (libacars first).",
   "subject": {
     "key": "icao",
     "name": "aircraft",

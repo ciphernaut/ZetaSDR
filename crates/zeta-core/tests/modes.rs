@@ -592,7 +592,7 @@ fn the_rows_thin_their_tracks_as_planned() {
         ("dfm_decode", 500, 100.0),
         ("m20_decode", 500, 100.0),
         ("aprs_decode", 100, 50.0),
-        ("acars_decode", 100, 0.0),
+        ("acars_decode", 100, 1000.0),
         ("rds_decode", 100, 0.0),
         ("vdl2_decode", 100, 1000.0),
         ("hfdl_decode", 100, 1000.0),

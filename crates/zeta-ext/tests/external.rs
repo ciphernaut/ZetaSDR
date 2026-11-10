@@ -607,8 +607,19 @@ fn field_map(v: Value) -> std::collections::BTreeMap<String, zeta_core::modes::F
     serde_json::from_value(v).unwrap()
 }
 
-/// A program row printing the lines of `lines` through `fake_lines`; with `map` its
-/// schema lists every mapped field and the position is the vdl2 one.
+/// The vdl2 row's `derive`: an aircraft's text position report fills an empty fix.
+fn vdl2_derive() -> Value {
+    json!([{
+        "when": {"addr_type": "Aircraft"},
+        "from": "text",
+        "extract": "acars_position",
+        "into": {"lat": "lat", "lon": "lon", "alt_ft": "alt_ft"}
+    }])
+}
+
+/// A program row printing the lines of `lines` through `fake_lines`; with `map` (the
+/// vdl2 one) its schema lists every mapped field, and the position and derive are the
+/// vdl2 ones.
 fn mapped_row(id: &str, lines: &str, map: Option<Value>) -> Value {
     let lines = data(lines).display().to_string();
     let mut props = serde_json::Map::new();
@@ -633,6 +644,7 @@ fn mapped_row(id: &str, lines: &str, map: Option<Value>) -> Value {
     if let Some(m) = map {
         r["decoder"]["output"]["fields"] = m;
         r["position"] = json!({"lat": "lat", "lon": "lon", "alt_m": "alt_ft", "alt_unit": "ft"});
+        r["derive"] = vdl2_derive();
     }
     r
 }
@@ -689,6 +701,53 @@ fn a_non_numeric_fix_is_no_position() {
     let ev = zeta_core::modes::summary::envelope(&reg.get("m_na").unwrap().row, 1, fields);
     assert_eq!(ev["icao"], "7C0000");
     assert!(ev.get("position").is_none(), "{ev}");
+}
+
+/// `line` through the vdl2 map and the envelope of the vdl2-shaped row `id`.
+fn vdl2_event(id: &str, lines: &str, line: &Value) -> Value {
+    let reg = registry(&[mapped_row(id, lines, Some(vdl2_map()))]);
+    let fields = zeta_ext::apply_fields(&field_map(vdl2_map()), line);
+    zeta_core::modes::summary::envelope(&reg.get(id).unwrap().row, 1, fields)
+}
+
+#[test]
+fn a_text_position_report_gives_a_position() {
+    let line = vector("dumpvdl2-h1pos.json");
+    let ev = vdl2_event("m_h1", "dumpvdl2-h1pos.json", &line);
+    assert_eq!(ev["icao"], "7C0000", "{ev}");
+    assert_eq!(ev["reg"], "VH-ZET", "{ev}");
+    assert_eq!(ev["label"], "H1", "{ev}");
+    let near = |v: &Value, want: f64| (v.as_f64().unwrap() - want).abs() < 0.001;
+    assert!(near(&ev["lat"], -27.385), "{ev}");
+    assert!(near(&ev["position"]["lat"], -27.385), "{ev}");
+    assert!(near(&ev["position"]["lon"], 153.1183), "{ev}");
+    assert_eq!(ev["alt_ft"], json!(16500), "{ev}");
+    // 16 500 ft in metres.
+    let alt_m = ev["position"]["alt_m"].as_f64().unwrap();
+    assert!((alt_m - 5029.2).abs() < 0.5, "{ev}");
+}
+
+#[test]
+fn a_ground_station_frame_is_not_parsed() {
+    let mut line = vector("dumpvdl2-h1pos.json");
+    line["vdl2"]["avlc"]["src"]["type"] = json!("Ground station");
+    let ev = vdl2_event("m_gs", "dumpvdl2-h1pos.json", &line);
+    assert_eq!(ev["addr_type"], "Ground station", "{ev}");
+    assert!(ev["text"].as_str().unwrap().contains("POSS27231E153071"));
+    for k in ["position", "lat", "lon", "alt_ft"] {
+        assert!(ev.get(k).is_none(), "{k} in {ev}");
+    }
+}
+
+#[test]
+fn an_adsc_fix_wins_over_a_text_report() {
+    let mut line = vector("dumpvdl2-adsc.json");
+    line["vdl2"]["avlc"]["acars"]["msg_text"] = json!("POSN10000W020000,ALPHA,025131,300,BRAVO");
+    let ev = vdl2_event("m_both", "dumpvdl2-adsc.json", &line);
+    assert_eq!(ev["lat"], json!(-27.38), "{ev}");
+    assert_eq!(ev["lon"], json!(153.12), "{ev}");
+    assert_eq!(ev["alt_ft"], json!(37000), "{ev}");
+    assert_eq!(ev["position"]["lat"], json!(-27.38), "{ev}");
 }
 
 #[test]

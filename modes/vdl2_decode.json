@@ -98,8 +98,16 @@
     "within_ms": 10000
   },
   "position": { "lat": "lat", "lon": "lon", "alt_m": "alt_ft", "alt_unit": "ft" },
+  "derive": [
+    {
+      "when": { "addr_type": "Aircraft" },
+      "from": "text",
+      "extract": "acars_position",
+      "into": { "lat": "lat", "lon": "lon", "alt_ft": "alt_ft" }
+    }
+  ],
   "time": null,
-  "notes": "VDL Mode 2 (D8PSK, 10.5 kbaud) in 25 kHz channels at 136.725-136.975 MHz, decoded by dumpvdl2; every AVLC frame is an event keyed on its source address, and an ADS-C report riding an ACARS downlink carries the aircraft's position. A ground station gets its own row, whose ACARS columns name the aircraft of each uplink. Beside ACARS on one radio the order matters, because a running capture cannot widen: pin the radio at 133 500 000 Hz with 8 000 000 Hz first, then start the ACARS plan, then the VDL2 job (136 975 000 Hz, 25 000 Hz); started the other way round, VDL2 is a conflict naming the ACARS jobs. Neither dumpvdl2 nor dumphfdl is in Debian or Ubuntu: the OpenWebRX+ apt repository packages dumpvdl2, dumphfdl and libacars2, and both build from source in a few minutes (libacars first).",
+  "notes": "VDL Mode 2 (D8PSK, 10.5 kbaud) in 25 kHz channels at 136.725-136.975 MHz, decoded by dumpvdl2; every AVLC frame is an event keyed on its source address, and an ADS-C report riding an ACARS downlink carries the aircraft's position. Without one, an aircraft frame whose ACARS text is a position report (labels H1, 80, 16, 3L, QQ) carries lat, lon, sometimes alt_ft, and a position: the aircraft's own report, typically a few minutes old by the time it is relayed; a ground station's uplinks are never parsed. A ground station gets its own row, whose ACARS columns name the aircraft of each uplink. Beside ACARS on one radio the order matters, because a running capture cannot widen: pin the radio at 133 500 000 Hz with 8 000 000 Hz first, then start the ACARS plan, then the VDL2 job (136 975 000 Hz, 25 000 Hz); started the other way round, VDL2 is a conflict naming the ACARS jobs. Neither dumpvdl2 nor dumphfdl is in Debian or Ubuntu: the OpenWebRX+ apt repository packages dumpvdl2, dumphfdl and libacars2, and both build from source in a few minutes (libacars first).",
   "subject": {
     "key": "icao",
     "name": "aircraft",

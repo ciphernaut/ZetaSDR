@@ -44,7 +44,11 @@
         "msg_no": { "type": ["string", "null"] },
         "flight": { "type": ["string", "null"] },
         "text": { "type": "string" },
-        "crc_ok": { "type": "boolean" }
+        "crc_ok": { "type": "boolean" },
+        "downlink": { "type": "boolean" },
+        "lat": { "type": ["number", "null"] },
+        "lon": { "type": ["number", "null"] },
+        "alt_ft": { "type": ["integer", "null"] }
       }
     },
     "summary": "{reg} {label}: {text?}"
@@ -62,10 +66,28 @@
     "family": "acars",
     "reg": "VH-ZET",
     "label": "H1",
-    "text": "#M1BPOS/ZETASDR TEST",
-    "expect": {"reg": "VH-ZET", "label": "H1"},
+    "block_id": "2",
+    "text": "M01AZET001#M1BPOSS27231E153071,ALPHA,025131,165,BRAVO,025351,CHARL,M9,252035,168",
+    "expect": {
+      "reg": "VH-ZET",
+      "label": "H1",
+      "flight": "ZET001",
+      "lat": {"near": -27.385, "within": 0.001},
+      "lon": {"near": 153.1183, "within": 0.001},
+      "alt_ft": 16500
+    },
     "within_ms": 5000
   },
+  "position": { "lat": "lat", "lon": "lon", "alt_m": "alt_ft", "alt_unit": "ft" },
+  "derive": [
+    {
+      "when": { "downlink": true },
+      "from": "text",
+      "extract": "acars_position",
+      "into": { "lat": "lat", "lon": "lon", "alt_ft": "alt_ft" }
+    }
+  ],
+  "notes": "A downlink (a digit block id, downlink true) whose text is a position report (labels H1, 80, 16, 3L, QQ) carries lat, lon, sometimes alt_ft, and a position: the aircraft's own report, typically a few minutes old by the time it is relayed. Uplinks are never parsed.",
   "subject": {
     "key": "reg",
     "name": "aircraft",
@@ -89,6 +111,8 @@
     ],
     "heading": null,
     "label": "flight",
-    "merge": ["reg"]
+    "merge": ["reg"],
+    "track_points": 100,
+    "track_min_m": 1000
   }
 }

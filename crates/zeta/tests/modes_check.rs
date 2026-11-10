@@ -656,6 +656,45 @@ fn the_vdl2_row_decodes_through_the_fake_program() {
     assert_eq!(code, 0);
 }
 
+/// The VDL2 row's derive reads an aircraft's H1 text position report when the frame
+/// carries no ADS-C report.
+#[test]
+fn the_vdl2_row_derives_a_text_position_through_the_fake_program() {
+    let dir = tempfile::tempdir().unwrap();
+    fake_program_row(
+        dir.path(),
+        include_str!("../../../modes/vdl2_decode.json"),
+        "vdl2_h1",
+        "dumpvdl2-h1pos.json",
+        serde_json::json!({
+            "icao": "7C0000",
+            "addr_type": "Aircraft",
+            "lat": {"near": -27.385, "within": 0.001},
+            "lon": {"near": 153.1183, "within": 0.001},
+            "alt_ft": 16500
+        }),
+    );
+    let (out, code) = stdout(&mut check(dir.path(), &["vdl2_h1"]));
+    assert_eq!(out.trim(), "vdl2_h1: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
+/// The HFDL row maps an aircraft frame's source type, the value its derive gates on.
+#[test]
+fn the_hfdl_row_maps_an_aircraft_source_type() {
+    let dir = tempfile::tempdir().unwrap();
+    fake_program_row(
+        dir.path(),
+        include_str!("../../../modes/hfdl_decode.json"),
+        "hfdl_down",
+        "dumphfdl-downlink.json",
+        serde_json::json!({"icao": "7C0000", "src_type": "Aircraft"}),
+    );
+    let (out, code) = stdout(&mut check(dir.path(), &["hfdl_down"]));
+    assert_eq!(out.trim(), "hfdl_down: ok", "{out}");
+    assert_eq!(code, 0);
+}
+
 /// The HFDL row keys an uplink on the aircraft it is for (`dst`).
 #[test]
 fn the_hfdl_row_decodes_an_uplink_through_the_fake_program() {
