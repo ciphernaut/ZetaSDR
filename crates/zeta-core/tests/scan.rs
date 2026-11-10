@@ -1250,3 +1250,79 @@ async fn a_gap_inside_a_dwell_restarts_the_wait() {
     }
     node.job_stop(&id).await.unwrap();
 }
+
+/// `context.scan.timing` of job `id`, once a sweep has written it.
+fn timing(node: &Node, id: &JobId) -> Option<Value> {
+    node.job_context(id)
+        .map(|c| c["scan"]["timing"].clone())
+        .filter(Value::is_object)
+}
+
+/// The record says what the last whole sweep cost, every key of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scan_record_fills_its_timing_after_a_sweep() {
+    let (_dir, node, _port) = open().await;
+    let (id, _rx) = start_scan(&node).await;
+    until("a sweep's timing", Duration::from_secs(10), || {
+        timing(&node, &id).is_some_and(|t| t["sweep_ms"].as_f64().unwrap_or(0.0) > 0.0)
+    })
+    .await;
+    let t = timing(&node, &id).unwrap();
+    for k in [
+        "at_ns",
+        "sweep_ms",
+        "step_ms",
+        "tune_ms",
+        "slow_tunes",
+        "skipped",
+        "fft_wait_ms",
+        "hz_per_s",
+    ] {
+        assert!(!t[k].is_null(), "no {k}: {t}");
+    }
+    assert!(!t["tune_ms"]["median"].is_null() && !t["tune_ms"]["max"].is_null());
+    assert_eq!(t["skipped"], 0, "{t}");
+    assert!(t["hz_per_s"].as_f64().unwrap() > 0.0, "{t}");
+    // A reader takes a missing `method` as `stepped`.
+    assert!(node.job_context(&id).unwrap()["scan"]["method"].is_null());
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A step whose samples never arrive is counted, not only waited out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_that_stops_delivering_counts_its_skips() {
+    let (_dir, node, _port) = open_dwell(ScanPort::stalling(20), 20).await;
+    let (id, _rx) = start_scan(&node).await;
+    until("a skipped step", Duration::from_secs(20), || {
+        timing(&node, &id).is_some_and(|t| t["skipped"].as_u64().unwrap_or(0) >= 1)
+    })
+    .await;
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A one-step scan sweeps many times a second; its record is written at most
+/// once a second, compared by `at_ns` (the figures of a fake repeat).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_timing_is_written_at_most_once_a_second() {
+    let (_dir, node, _port) = open_with(ScanPort::fast()).await;
+    let (id, _rx) = start_span(&node, 100 * MHZ, FAST_RATE_HZ).await;
+    until("a timing", Duration::from_secs(10), || {
+        timing(&node, &id).is_some()
+    })
+    .await;
+    let mut seen: Vec<u64> = vec![];
+    let end = tokio::time::Instant::now() + Duration::from_millis(2500);
+    while tokio::time::Instant::now() < end {
+        if let Some(at) = timing(&node, &id).and_then(|t| t["at_ns"].as_u64())
+            && seen.last() != Some(&at)
+        {
+            seen.push(at);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(seen.len() >= 2, "{seen:?}");
+    for w in seen.windows(2) {
+        assert!(w[1] - w[0] >= 1_000_000_000, "{seen:?}");
+    }
+    node.job_stop(&id).await.unwrap();
+}

@@ -186,25 +186,116 @@ impl Inner {
         ring.run_after(center, after, samples)
     }
 
-    /// Write `fields` into job `id`'s `job_context.scan`, keeping its other
-    /// keys (a `dwell_ms_asked` the fields no longer carry is dropped). Best
-    /// effort: a job already gone has no context to keep.
-    fn scan_context_rewrite(&self, id: &JobId, fields: serde_json::Map<String, serde_json::Value>) {
-        let ctx = self
-            .jobs
-            .lock()
-            .unwrap()
-            .get(id)
-            .map(|e| e.record.context.clone());
-        let mut scan = match ctx.map(|c| c["scan"].clone()) {
+    /// Apply `f` to job `id`'s `job_context.scan` (an object, made when it is
+    /// missing) and persist the record, all under one `jobs` lock: the sweep
+    /// start's rewrite and the sweep's timing both write `scan`, and each reads
+    /// what the other left, so neither loses the other's keys. Best effort: a
+    /// job already gone has no context to keep.
+    fn scan_context_update(
+        &self,
+        id: &JobId,
+        f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) {
+        let mut jobs = self.jobs.lock().unwrap();
+        let Some(entry) = jobs.get_mut(id) else {
+            return;
+        };
+        let ctx = &mut entry.record.context;
+        if !ctx.is_object() {
+            *ctx = serde_json::json!({});
+        }
+        let obj = ctx.as_object_mut().expect("context is an object");
+        let mut scan = match obj.remove("scan") {
             Some(serde_json::Value::Object(m)) => m,
             _ => serde_json::Map::new(),
         };
-        scan.remove("dwell_ms_asked");
-        scan.extend(fields);
-        let _ = self.context_merge(id, serde_json::json!({"scan": scan}));
+        f(&mut scan);
+        obj.insert("scan".into(), scan.into());
+        let _ = super::persist::persist(&self.jobs_dir, &entry.record);
+    }
+
+    /// Write `fields` into job `id`'s `job_context.scan`, keeping its other
+    /// keys (a `dwell_ms_asked` the fields no longer carry is dropped).
+    fn scan_context_rewrite(&self, id: &JobId, fields: serde_json::Map<String, serde_json::Value>) {
+        self.scan_context_update(id, |scan| {
+            scan.remove("dwell_ms_asked");
+            scan.extend(fields);
+        });
     }
 }
+
+/// The cost of one sweep's steps: the tune each took, the whole step, the
+/// steps whose samples did not arrive and the time the hand-off waited on the
+/// FFT task. [`SweepTiming::finish`] summarises and clears it.
+#[derive(Default)]
+struct SweepTiming {
+    tunes: Vec<Duration>,
+    steps: Vec<Duration>,
+    skipped: u64,
+    fft_wait: Duration,
+}
+
+/// The median of `v` (its upper middle for an even count); zero when empty.
+fn median(v: &[Duration]) -> Duration {
+    let mut v = v.to_vec();
+    v.sort();
+    v.get(v.len() / 2).copied().unwrap_or_default()
+}
+
+/// `d` in milliseconds, to the microsecond.
+fn ms(d: Duration) -> f64 {
+    (d.as_secs_f64() * 1e6).round() / 1e3
+}
+
+impl SweepTiming {
+    /// One step's tune and its whole time (tune, wait for samples, hand-off),
+    /// and whether its samples did not arrive.
+    fn step(&mut self, tune: Duration, step: Duration, skipped: bool) {
+        self.tunes.push(tune);
+        self.steps.push(step);
+        self.skipped += u64::from(skipped);
+    }
+
+    /// Time the hand-off waited for the FFT task to take a step.
+    fn fft_wait(&mut self, d: Duration) {
+        self.fft_wait += d;
+    }
+
+    /// The sweep's `context.scan.timing` (less `at_ns`, which the writer adds)
+    /// for a sweep of `span_hz` that took `sweep`; the next sweep starts empty.
+    /// A tune is slow over ten times the median tune, compared in microseconds.
+    fn finish(&mut self, span_hz: u64, sweep: Duration) -> serde_json::Value {
+        let t = std::mem::take(self);
+        let med = median(&t.tunes);
+        let med_us = med.as_micros().max(1);
+        let slow = t
+            .tunes
+            .iter()
+            .filter(|d| d.as_micros() > 10 * med_us)
+            .count();
+        let sweep_ms = ms(sweep);
+        let hz_per_s = if sweep_ms > 0.0 {
+            span_hz as f64 * 1000.0 / sweep_ms
+        } else {
+            0.0
+        };
+        serde_json::json!({
+            "sweep_ms": sweep_ms,
+            "step_ms": ms(median(&t.steps)),
+            "tune_ms": {
+                "median": ms(med),
+                "max": ms(t.tunes.iter().max().copied().unwrap_or_default()),
+            },
+            "slow_tunes": slow,
+            "skipped": t.skipped,
+            "fft_wait_ms": ms(t.fft_wait),
+            "hz_per_s": hz_per_s,
+        })
+    }
+}
+
+/// The least time between two writes of `context.scan.timing`, ns.
+const TIMING_EVERY_NS: u64 = 1_000_000_000;
 
 /// A scan's steps and the mask they are masked with, built from the source's
 /// capabilities at launch and again at the start of a sweep when the source's
@@ -341,17 +432,26 @@ async fn scan_loop(
     // The centre and the end of the last block taken.
     let mut taken: Option<(Hz, Timestamp)> = None;
     let (mut sweep, mut i) = (0u64, 0usize);
+    let mut timing = SweepTiming::default();
+    let mut sweep_start = tokio::time::Instant::now();
+    // When the timing was last written (ns since the epoch): at most once a second.
+    let mut written_ns = 0u64;
     loop {
         // Checked before each tune, so a stopped scan never retunes again; a
         // tune is never abandoned half way, so it is checked after it too.
         if s.cancel.is_cancelled() {
             return Err(StageError::Cancelled);
         }
+        if i == 0 {
+            sweep_start = tokio::time::Instant::now();
+        }
+        let step_start = tokio::time::Instant::now();
         if i == 0 && layout.stale(s.port.capabilities()) {
             layout = Layout::of(s.span, s.port.capabilities(), layout.mask);
             inner.scan_context_rewrite(&s.id, layout.context(s.dwell_ms));
         }
         let steps = layout.grid.steps(sweep);
+        let tune_start = tokio::time::Instant::now();
         let got = match inner
             .leases
             .retune_shared(s.port.as_ref(), &s.id, steps[i], &s.cancel)
@@ -361,6 +461,7 @@ async fn scan_loop(
             Ok(None) => return Err(StageError::Cancelled),
             Err(e) => return Err(faulted(e.to_string())),
         };
+        let tune = tune_start.elapsed();
         let size = spectrum_size(steps[i].bandwidth_hz.0);
         let (samples, dwell_ms) = scan_dwell_samples(s.dwell_ms, got.bandwidth_hz.0, size);
         let after = taken
@@ -375,6 +476,7 @@ async fn scan_loop(
         if let Some(f) = s.port.fault() {
             return Err(faulted(f));
         }
+        let skipped = block.is_none();
         if let Some(block) = block {
             taken = Some((got.center_hz, span_of(&block).end_ns));
             let step = Step {
@@ -386,6 +488,7 @@ async fn scan_loop(
                 notch_hz: layout.notch_hz,
                 edge_mask: layout.edge_mask,
             };
+            let waited = tokio::time::Instant::now();
             tokio::select! {
                 _ = s.cancel.cancelled() => return Err(StageError::Cancelled),
                 // A closed channel: the FFT task ended, and its end is the job's.
@@ -393,11 +496,24 @@ async fn scan_loop(
                     return Err(StageError::Cancelled);
                 },
             }
+            timing.fft_wait(waited.elapsed());
         }
+        timing.step(tune, step_start.elapsed(), skipped);
         i += 1;
         if i == steps.len() {
             i = 0;
             sweep += 1;
+            let at_ns = super::persist::now().0;
+            if at_ns.saturating_sub(written_ns) >= TIMING_EVERY_NS {
+                let mut t = timing.finish(s.span.bandwidth_hz.0, sweep_start.elapsed());
+                t["at_ns"] = at_ns.into();
+                written_ns = at_ns;
+                inner.scan_context_update(&s.id, |scan| {
+                    scan.insert("timing".into(), t);
+                });
+            }
+            // A sweep not written is dropped, not carried into the next.
+            timing = SweepTiming::default();
         }
     }
 }
@@ -561,5 +677,127 @@ mod tests {
         assert_eq!(dwell_rows_per_s(1), 60);
         assert_eq!(dwell_rows_per_s(0), 60);
         assert_eq!(dwell_rows_per_s(5000), 1);
+    }
+
+    fn ms_of(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn the_summary_takes_medians_and_counts_slow_tunes() {
+        let mut t = SweepTiming::default();
+        for (tune, step, skipped) in [
+            (3, 25, false),
+            (3, 25, false),
+            (3, 30, true),
+            (150, 180, false),
+            (3, 25, false),
+        ] {
+            t.step(ms_of(tune), ms_of(step), skipped);
+        }
+        t.fft_wait(ms_of(4));
+        t.fft_wait(ms_of(6));
+        let v = t.finish(40_000_000, ms_of(285));
+        assert_eq!(v["tune_ms"]["median"], 3.0, "{v}");
+        assert_eq!(v["tune_ms"]["max"], 150.0, "{v}");
+        assert_eq!(v["slow_tunes"], 1, "{v}");
+        assert_eq!(v["step_ms"], 25.0, "{v}");
+        assert_eq!(v["skipped"], 1, "{v}");
+        assert_eq!(v["fft_wait_ms"], 10.0, "{v}");
+        assert_eq!(v["sweep_ms"], 285.0, "{v}");
+        // The summary cleared the sweep.
+        let v = t.finish(1, ms_of(1));
+        assert_eq!(
+            (v["skipped"].as_u64(), v["slow_tunes"].as_u64()),
+            (Some(0), Some(0))
+        );
+    }
+
+    #[test]
+    fn hz_per_s_is_the_span_over_the_sweep() {
+        let mut t = SweepTiming::default();
+        t.step(ms_of(1), ms_of(2), false);
+        // 40 MHz in 250 ms is 160 MHz a second.
+        let v = t.finish(40_000_000, ms_of(250));
+        assert_eq!(v["hz_per_s"], 160_000_000.0, "{v}");
+    }
+
+    /// The sweep start's rewrite and a timing write each read what the other
+    /// left: hammered from two threads, the last write of each survives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sweep_start_rewrite_and_a_timing_write_cannot_lose_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = super::super::NodeConfig {
+            source_positions: Default::default(),
+            burst_policy: Default::default(),
+            state_dir: dir.path().join("state"),
+            ring_seconds: 1.0,
+            ring_budget_bytes: u64::MAX,
+            scan_dwell_ms: 20,
+            backends: vec![crate::stage::Backend::Cpu],
+            resume: false,
+            bank_factory: None,
+            modes_dir: None,
+            sets_dir: None,
+        };
+        let node = super::super::Node::open(cfg, crate::stage::StageRegistry::new(), vec![])
+            .await
+            .unwrap();
+        let inner = node.inner.clone();
+        let id = JobId::new();
+        let rec = JobRecord {
+            format: crate::job::JOB_RECORD_FORMAT,
+            id: id.clone(),
+            kind: "scan".into(),
+            graph: graph::Graph {
+                id: graph::GraphId("g".into()),
+                nodes: vec![],
+                edges: vec![],
+            },
+            source: SourceId("a".into()),
+            tuning: Tuning {
+                center_hz: Hz(20_000_000),
+                bandwidth_hz: Hz(40_000_000),
+            },
+            state: crate::job::JobState::Running,
+            context: serde_json::json!({"note": "kept"}),
+            created_ns: Timestamp(0),
+            input: None,
+            capture_rate_hz: None,
+            elastic: false,
+            operator_graph: false,
+            owner: None,
+        };
+        inner.jobs.lock().unwrap().insert(
+            id.clone(),
+            super::super::JobEntry::loaded(rec, Timestamp(0)),
+        );
+        const N: u64 = 300;
+        let a = {
+            let (inner, id) = (inner.clone(), id.clone());
+            std::thread::spawn(move || {
+                for n in 0..N {
+                    let mut f = serde_json::Map::new();
+                    f.insert("steps".into(), n.into());
+                    inner.scan_context_rewrite(&id, f);
+                }
+            })
+        };
+        let b = {
+            let (inner, id) = (inner.clone(), id.clone());
+            std::thread::spawn(move || {
+                for n in 0..N {
+                    inner.scan_context_update(&id, |scan| {
+                        scan.insert("timing".into(), serde_json::json!({"at_ns": n}));
+                    });
+                }
+            })
+        };
+        a.join().unwrap();
+        b.join().unwrap();
+        let ctx = node.job_context(&id).unwrap();
+        assert_eq!(ctx["scan"]["steps"], N - 1, "{ctx}");
+        assert_eq!(ctx["scan"]["timing"]["at_ns"], N - 1, "{ctx}");
+        assert_eq!(ctx["note"], "kept", "{ctx}");
     }
 }
