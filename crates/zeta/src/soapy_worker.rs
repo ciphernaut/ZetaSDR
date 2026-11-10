@@ -215,9 +215,10 @@ mod imp {
     /// measured at its cap and every other probed at the centre of the tune range
     /// ([`probe_depths`]), one stderr line per depth. The source then runs `asked`'s depth
     /// (`bits=`), else the fastest lossless one ([`own_depth`]). A `bits=` the link does
-    /// not carry is the error, found before anything is probed. A probe that cannot tune
-    /// any rate, or that lost the device, leaves the asserted cap and no depths, with a
-    /// stderr line, as [`set_rate_cap`] does.
+    /// not carry is the error, found before anything is probed, and so is one whose depth
+    /// the probe left out (it would not stream; the other depths stand). A probe that lost
+    /// the device leaves the asserted cap and no depths, with a stderr line, as
+    /// [`set_rate_cap`] does.
     async fn set_depths(
         src: &mut SoapySource,
         id: &str,
@@ -257,7 +258,11 @@ mod imp {
             };
             eprintln!("zeta-soapy-worker[{id}]: {bits}-bit depth{lossy}: rate cap {cap} Hz {how}");
         }
-        let own = own_depth(&depths, asked)?;
+        // A depth the probe left out (it would not stream) cannot be asked for.
+        let own = own_depth(&depths, asked).map_err(|e| match asked {
+            Some(bits) => format!("{e}; the {bits}-bit depth was left out at open"),
+            None => e,
+        })?;
         eprintln!("zeta-soapy-worker[{id}]: runs at {own} bits");
         src.set_depths(depths, own);
         Ok(())

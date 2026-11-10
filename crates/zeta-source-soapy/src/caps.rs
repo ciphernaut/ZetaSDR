@@ -42,12 +42,14 @@ pub fn is_uhd(args: &str, driver_key: &str) -> bool {
 /// What the source knows of a radio's front end beyond what its driver
 /// reports: how long a tune takes to settle after `set_frequency` returns
 /// (the reader discards the samples until then, see
-/// [`crate::SoapySource::with_settle`]), and the bits its ADC resolves
-/// (`None`: not known).
+/// [`crate::SoapySource::with_settle`]), the bits its ADC resolves
+/// (`None`: not known), and the link formats ([`LINK_FORMAT_ARG`] options) its
+/// driver accepts without naming them in its stream-argument information.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrontEnd {
     pub settle: Duration,
     pub adc_bits: Option<u8>,
+    pub link_formats: &'static [&'static str],
 }
 
 /// The settle of a radio [`FRONT_ENDS`] has no row for: conservative, ten
@@ -67,12 +69,17 @@ pub const USABLE_DEFAULT: f64 = 0.9;
 /// case-insensitively; SoapyUHD gives the motherboard, `B210` for a B210). The
 /// B2xx family (an AD9361 behind a 12-bit ADC): a fast tune's power is within
 /// 0.05 dB of steady 1 ms after `set_frequency` returns, measured on the
-/// field host's B210.
+/// field host's B210. Its link also carries `sc12`, which UHD's B200 code
+/// accepts as `otw_format`, while SoapyUHD (0.4.1) names only `sc8` and `sc16`
+/// under `WIRE` (it hands the argument on as `otw_format`, as its upstream
+/// source reads; not checked against a live radio). The probe finds whether
+/// it streams.
 const FRONT_ENDS: [(&str, FrontEnd); 1] = [(
     "b2",
     FrontEnd {
         settle: Duration::from_millis(1),
         adc_bits: Some(12),
+        link_formats: &["sc12"],
     },
 )];
 
@@ -87,6 +94,7 @@ pub fn front_end(driver_key: &str, hardware_key: &str) -> FrontEnd {
             FrontEnd {
                 settle: SETTLE_DEFAULT,
                 adc_bits: None,
+                link_formats: &[],
             },
             |(_, f)| *f,
         )
@@ -115,12 +123,20 @@ pub struct LinkDepth {
 }
 
 /// The sample depths `dev`'s link can carry, deepest first: the options of
-/// its [`LINK_FORMAT_ARG`] stream argument that are [`LINK_FORMATS`]. A depth
+/// its [`LINK_FORMAT_ARG`] stream argument, with those its front end's row
+/// adds (`fe.link_formats`, accepted but not named), that are
+/// [`LINK_FORMATS`]; an option both name keeps the driver's spelling. A depth
 /// is lossless when it holds at least the converter's bits (`fe.adc_bits`);
-/// with the converter's depth unknown, only the deepest is. A device that
-/// names fewer than two (or cannot be asked) has one depth, and no list.
+/// with the converter's depth unknown, only the deepest is. A link of fewer
+/// than two (a driver that names none, or cannot be asked) has one depth, and
+/// no list. Whether a depth streams at all is the probe's to find.
 pub fn link_depths(dev: &dyn SoapyDevice, fe: &FrontEnd) -> Vec<LinkDepth> {
-    let options = dev.stream_arg_options(LINK_FORMAT_ARG).unwrap_or_default();
+    let mut options = dev.stream_arg_options(LINK_FORMAT_ARG).unwrap_or_default();
+    for extra in fe.link_formats {
+        if !options.iter().any(|o| o.eq_ignore_ascii_case(extra)) {
+            options.push(extra.to_string());
+        }
+    }
     // Each with the driver's own spelling of it.
     let named: Vec<(&String, u8)> = LINK_FORMATS
         .into_iter()
@@ -588,6 +604,7 @@ mod tests {
         let b2xx = FrontEnd {
             settle: Duration::from_millis(1),
             adc_bits: Some(12),
+            link_formats: &["sc12"],
         };
         // SoapyUHD names the device type as its driver key and the
         // motherboard as its hardware key.
@@ -597,6 +614,7 @@ mod tests {
         let default = FrontEnd {
             settle: SETTLE_DEFAULT,
             adc_bits: None,
+            link_formats: &[],
         };
         assert_eq!(SETTLE_DEFAULT, Duration::from_millis(10));
         assert_eq!(front_end("x300", "X310"), default);

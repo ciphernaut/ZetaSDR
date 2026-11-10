@@ -26,9 +26,10 @@
 //! A worker measures its rate cap when it opens (the soapy worker's rate
 //! probe, at each sample depth its link carries). Once the port's capability
 //! record holds a measured cap (the first hello's, or the cached one), each
-//! spawn is told it with `--rate-cap-hz N`, and each depth's measured cap with
-//! `--depth-cap BITS:HZ`, unless the configured args already carry the flag,
-//! so a respawn skips the probe. The record the port attached with is
+//! spawn is told it with `--rate-cap-hz N` (unless the configured args already
+//! carry the flag), and each depth measured with `--depth-cap BITS:HZ` (unless
+//! they carry one for those bits; the latest hello's figures first), so a
+//! respawn skips the probe. The record the port attached with is
 //! replaced, once, by a later hello that differs from it only in what a newer
 //! worker knows better: its `usable_fraction` and `depths` (a record cached
 //! before them loads with their defaults), and a measured cap where the
@@ -54,7 +55,9 @@ use tokio::sync::{broadcast, oneshot, watch};
 use zeta_core::port::{GainInfo, IqBlock, PortError, PortStats, TransportInfo, Tuning};
 use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId, Timestamp};
 
-use crate::port::{Attach, DEPTH_CAP_FLAG, RATE_CAP_FLAG, WorkerConfig, depth_cap_args};
+use crate::port::{
+    Attach, DEPTH_CAP_FLAG, RATE_CAP_FLAG, WorkerConfig, depth_cap_args, parse_depth_cap,
+};
 use crate::ring::{self, Ring};
 use crate::serve::{EXIT_FAULTED, EXIT_NOT_FOUND, EXIT_OPEN_FAILED};
 use crate::spawn::{RING_FD, inherit_ring};
@@ -606,23 +609,40 @@ impl Supervisor {
         );
     }
 
-    /// The measured caps for the next spawn, from the port's capability record
-    /// (the first hello's, else the cached one): `--rate-cap-hz N` when it holds
-    /// a measured cap `N`, and one `--depth-cap BITS:HZ` per depth it holds
-    /// measured, each flag only when the configured args do not already pass
-    /// it.
+    /// The measured caps for the next spawn: `--rate-cap-hz N` when the port's
+    /// capability record (the first hello's, else the cached one) holds a
+    /// measured cap `N` and the configured args pass none; and one `--depth-cap
+    /// BITS:HZ` for each depth measured that the configured args' own
+    /// `--depth-cap` values lack, taken from the latest hello's record
+    /// (`Shared::latest`, which holds what a respawn measured after the port's
+    /// record was set for the run), else the port's record. So no depth
+    /// measured once is probed again.
     fn rate_cap_args(&self) -> Vec<String> {
-        let Some(caps) = self.caps.as_ref().or(self.cached.as_ref()) else {
-            return Vec::new();
-        };
-        let configured = |flag: &str| self.cfg.args.iter().any(|a| a == flag);
+        let latest = self.shared.latest().clone();
         let mut out = Vec::new();
-        if let (false, Claim::Measured(Hz(n))) = (configured(RATE_CAP_FLAG), &caps.max_bandwidth_hz)
+        let configured = |flag: &str| self.cfg.args.iter().any(|a| a == flag);
+        if let Some(Claim::Measured(Hz(n))) = self
+            .caps
+            .as_ref()
+            .or(self.cached.as_ref())
+            .map(|c| &c.max_bandwidth_hz)
+            .filter(|_| !configured(RATE_CAP_FLAG))
         {
             out.extend([RATE_CAP_FLAG.into(), n.to_string()]);
         }
-        if !configured(DEPTH_CAP_FLAG) {
-            out.extend(depth_cap_args(caps));
+        let given: Vec<u8> = self
+            .cfg
+            .args
+            .windows(2)
+            .filter(|w| w[0] == DEPTH_CAP_FLAG)
+            .filter_map(|w| parse_depth_cap(&w[1]).ok().map(|(bits, _)| bits))
+            .collect();
+        if let Some(caps) = latest
+            .as_ref()
+            .or(self.caps.as_ref())
+            .or(self.cached.as_ref())
+        {
+            out.extend(depth_cap_args(caps, &given));
         }
         out
     }

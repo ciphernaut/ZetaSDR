@@ -109,6 +109,8 @@ pub struct MockDevice {
     garbage: Option<Arc<TuneGarbage>>,
     /// The options of the `WIRE` stream argument.
     wires: Vec<String>,
+    /// `WIRE` values a stream will not open with.
+    refused_wires: Vec<String>,
 }
 
 /// The stream argument a device names its link formats under (SoapyUHD's).
@@ -151,6 +153,7 @@ impl MockDevice {
             hardware: String::new(),
             garbage: None,
             wires: Vec::new(),
+            refused_wires: Vec::new(),
         }
     }
 
@@ -158,6 +161,13 @@ impl MockDevice {
     /// stream argument (default none), as SoapyUHD names a B210's.
     pub fn with_wire_formats(mut self, wires: &[&str]) -> Self {
         self.wires = wires.iter().map(|w| w.to_string()).collect();
+        self
+    }
+
+    /// Every `open_rx` with `WIRE=<wire>` fails (it is still recorded), as a
+    /// driver that refuses a link format it was asked for.
+    pub fn refusing_wire(mut self, wire: &str) -> Self {
+        self.refused_wires.push(wire.into());
         self
     }
 
@@ -509,6 +519,9 @@ impl SoapyDevice for MockDevice {
         self.rec(format!("open_rx({format:?}{})", kv.concat()));
         self.check("open_rx")?;
         let wire = args.iter().find(|(k, _)| k == WIRE).map(|(_, v)| v.clone());
+        if let Some(w) = wire.as_ref().filter(|w| self.refused_wires.contains(w)) {
+            return Err(format!("{WIRE}={w}: format not supported"));
+        }
         Ok(Box::new(MockRx {
             reads: self.reads.clone(),
             calls: self.calls.clone(),

@@ -1211,15 +1211,88 @@ async fn cached_depth_caps_are_passed_to_the_respawn() {
         spawns[1]
     );
     assert_eq!(caps_passed(&spawns[1]), 1, "{:?}", spawns[1]);
+}
 
-    // Cached at start: every spawn carries them once, the supervisor adding
-    // no second copy.
+/// A record cached with one depth measured and one not: the node spawns the
+/// worker with the measured one; the first hello measures the other; the
+/// respawn is passed both, the configured one once and the new one beside it,
+/// so it probes nothing.
+#[tokio::test]
+async fn a_respawn_merges_the_configured_depth_caps_with_those_measured_since() {
+    let mut cached = cached_caps();
+    cached.max_bandwidth_hz = measured(20_480_000);
+    cached.depths = vec![
+        depth(16, true, measured(20_480_000)),
+        depth(8, false, Claim::Asserted(Hz(20_000_000))),
+    ];
+    let args = worker_args("f", "driver=fake", Some(&cached));
     let dir = tempdir();
     let (cfg, rec) = cfg_recording_args(dir.path(), DEPTHS, args);
     let spawns = two_spawns(cfg, &rec, Some(cached)).await;
-    for args in &spawns[..2] {
-        assert_eq!(depth_caps(args), ["16:20480000"], "{args:?}");
-    }
+    assert_eq!(depth_caps(&spawns[0]), ["16:20480000"], "{:?}", spawns[0]);
+    assert_eq!(
+        depth_caps(&spawns[1]),
+        ["16:20480000", "8:30720000"],
+        "{:?}",
+        spawns[1]
+    );
+    assert_eq!(caps_passed(&spawns[1]), 1, "{:?}", spawns[1]);
+}
+
+/// Once a respawn has replaced the port's record (set once per run), a depth
+/// the next respawn measures cannot enter it; the respawn after that is still
+/// passed its cap, from the latest hello, and does not probe it again.
+#[tokio::test]
+async fn a_depth_measured_after_the_record_was_set_is_passed_to_the_next_respawn() {
+    let dir = tempdir();
+    let rec = dir.path().join("record");
+    let wrapper = dir.path().join("wrapper.sh");
+    let crash = format!("exec '{FAKE}' --id f --script 'crash-after-ms 300' --record \"$REC\"");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "REC='{}'\nN=$(grep -c '^start' \"$REC\" 2>/dev/null || true)\n\
+             for a in \"$@\"; do echo \"arg $a\" >> \"$REC\"; done\n\
+             case \"${{N:-0}}\" in\n\
+             0) ZETA_FAKE_DEPTHS=16:20480000,8 {crash};;\n\
+             1) ZETA_FAKE_DEPTHS=16:20480000,8 ZETA_FAKE_USABLE=0.95 {crash};;\n\
+             2) ZETA_FAKE_DEPTHS=16:20480000,8:30720000 ZETA_FAKE_USABLE=0.95 {crash};;\n\
+             *) exec '{FAKE}' --id f --script stream --record \"$REC\";;\n\
+             esac\n",
+            rec.display()
+        ),
+    )
+    .unwrap();
+    let mut args = vec![wrapper.display().to_string()];
+    args.extend(worker_args("f", "driver=fake", None));
+    let cfg = WorkerConfig {
+        id: SourceId("f".into()),
+        program: PathBuf::from("/bin/sh"),
+        args,
+        timings: timings(),
+        ring_bytes: 0,
+    };
+    let (port, _) = open(cfg, None).await;
+    assert!(
+        wait_for(Duration::from_secs(10), || starts(&rec).len() >= 4).await,
+        "spawns: {:?}",
+        starts(&rec)
+    );
+    // Spawn 1 replaced the record; spawn 2's 8-bit figure stayed out of it.
+    assert_eq!(port.capabilities().usable_fraction, Claim::Asserted(0.95));
+    assert_eq!(
+        port.capabilities().depths[1],
+        depth(8, false, Claim::Asserted(Hz(20_000_000)))
+    );
+    drop(port);
+    let spawns = spawn_args(&rec);
+    assert_eq!(depth_caps(&spawns[2]), ["16:20480000"], "{:?}", spawns[2]);
+    assert_eq!(
+        depth_caps(&spawns[3]),
+        ["16:20480000", "8:30720000"],
+        "{:?}",
+        spawns[3]
+    );
 }
 
 #[tokio::test]

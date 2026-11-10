@@ -216,9 +216,11 @@ async fn probe(
 /// every other is streamed through [`probe_rate`] at that depth, lossy ones
 /// included (the capability record is set once, at open), and is `Measured`
 /// at the clean rate found, or keeps the device's asserted cap when no rung
-/// was clean. A probe that errs (no rate tuned, the device lost) is the error.
-/// The source is left as it opened: nothing tuned, the driver's default depth.
-/// Empty for a device with one depth.
+/// was clean. A depth whose probe errs (the stream will not open at it, no
+/// rate tuned) is left out, with a stderr line, and the others stand; only a
+/// device lost during the probe is the error. The source is left as it
+/// opened: nothing tuned, the driver's default depth. Empty for a device with
+/// one depth.
 pub async fn probe_depths(
     src: &mut SoapySource,
     center_hz: u64,
@@ -246,9 +248,17 @@ pub async fn probe_depths_with(
                 match probe_rate_with(src, center_hz, timing).await {
                     Ok(p) if p.clean => Claim::Measured(Hz(p.cap_hz)),
                     Ok(_) => asserted.clone(),
-                    Err(e) => {
+                    Err(e) if src.is_lost() => {
                         found = Err(format!("{}-bit depth: {e}", link.bits));
                         break;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "zeta-source-soapy: {}: {}-bit depth left out: {e}",
+                            src.id().0,
+                            link.bits
+                        );
+                        continue;
                     }
                 }
             }

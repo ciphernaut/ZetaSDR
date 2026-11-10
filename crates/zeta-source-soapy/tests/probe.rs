@@ -357,7 +357,11 @@ fn a_max_rate_item_asserts_the_cap_and_is_stripped_from_the_driver_args() {
 
 // The sample depths on the device's link (`WIRE` on SoapyUHD).
 
-/// The link formats a B210 names under SoapyUHD's `WIRE` stream argument.
+/// The link formats SoapyUHD (0.4.1) names for a B210 under its `WIRE`
+/// stream argument: `sc12` it accepts but does not name.
+const NAMED: [&str; 2] = ["sc8", "sc16"];
+/// The link formats a B210 carries: those named, and `sc12` from its
+/// front end's row.
 const WIRES: [&str; 3] = ["sc16", "sc12", "sc8"];
 
 fn depth(bits: u8, lossless: bool, cap: Claim<Hz>) -> Depth {
@@ -372,10 +376,10 @@ fn measured(hz: u64) -> Claim<Hz> {
     Claim::Measured(Hz(hz))
 }
 
-/// The mock ladder as a B210 (a 12-bit converter) naming `sc16`, `sc12` and
-/// `sc8`.
+/// The mock ladder as a B210 (a 12-bit converter) under SoapyUHD, naming
+/// `sc8` and `sc16`.
 fn b210_link() -> MockDevice {
-    ladder().with_hardware("B210").with_wire_formats(&WIRES)
+    ladder().with_hardware("B210").with_wire_formats(&NAMED)
 }
 
 /// How many `open_rx` calls carried the stream argument `WIRE=<wire>`.
@@ -561,4 +565,60 @@ fn an_unknown_converter_makes_only_the_deepest_lossless() {
         .map(|d| d.lossless)
         .collect();
     assert_eq!(lossless, [true, true, false]);
+}
+
+#[test]
+fn a_b2xx_row_adds_the_sc12_soapyuhd_does_not_name() {
+    let wire = |w: &str| ("WIRE".to_string(), w.to_string());
+    let src = source(&Arc::new(b210_link()));
+    let links: Vec<(u8, (String, String))> = src
+        .link_depths()
+        .iter()
+        .map(|l| (l.bits, l.arg.clone()))
+        .collect();
+    assert_eq!(
+        links,
+        [(16, wire("sc16")), (12, wire("sc12")), (8, wire("sc8"))]
+    );
+    // Named by the driver as well: once, in the driver's spelling.
+    let dev = ladder()
+        .with_hardware("B210")
+        .with_wire_formats(&["SC8", "SC12", "SC16"]);
+    let args: Vec<String> = link_depths(&dev, &front_end("b200", "B210"))
+        .into_iter()
+        .map(|l| l.arg.1)
+        .collect();
+    assert_eq!(args, ["SC16", "SC12", "SC8"]);
+    // Another radio under the same driver gets no `sc12` it never named.
+    let other = ladder().with_hardware("X310").with_wire_formats(&NAMED);
+    let bits: Vec<u8> = link_depths(&other, &front_end("b200", "X310"))
+        .iter()
+        .map(|l| l.bits)
+        .collect();
+    assert_eq!(bits, [16, 8]);
+}
+
+#[tokio::test]
+async fn a_depth_that_will_not_open_is_dropped_alone() {
+    // The driver refuses a stream at `sc12`: that depth is left out, and the
+    // others stand.
+    let dev = Arc::new(b210_link().refusing_wire("sc12"));
+    let mut src = source(&dev);
+    let depths = probe_depths_with(&mut src, CENTER, &[], TIMING)
+        .await
+        .unwrap();
+    assert_eq!(
+        depths,
+        [
+            depth(16, true, measured(6_144_000)),
+            depth(8, false, measured(6_144_000)),
+        ]
+    );
+    assert_eq!(own_depth(&depths, None), Ok(16));
+    // An operator who asked for it is told the link has no such depth now.
+    let e = own_depth(&depths, Some(12)).unwrap_err();
+    assert!(e.contains("bits=12") && e.contains("16, 8"), "{e}");
+    // Left as it opened: no fault from the refused open.
+    assert_eq!(src.fault(), None);
+    assert_eq!(src.current(), None);
 }

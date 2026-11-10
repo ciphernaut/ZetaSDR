@@ -123,10 +123,12 @@ pub fn parse_depth_cap(s: &str) -> Result<(u8, u64), String> {
     Ok((bits, hz))
 }
 
-/// `--depth-cap BITS:HZ` for each depth of `caps` whose cap is measured.
-pub(crate) fn depth_cap_args(caps: &Capabilities) -> Vec<String> {
+/// `--depth-cap BITS:HZ` for each depth of `caps` whose cap is measured,
+/// but for the bits in `except` (passed already).
+pub(crate) fn depth_cap_args(caps: &Capabilities, except: &[u8]) -> Vec<String> {
     caps.depths
         .iter()
+        .filter(|d| !except.contains(&d.bits))
         .filter_map(|d| match d.max_bandwidth_hz {
             Claim::Measured(Hz(hz)) => Some([DEPTH_CAP_FLAG.into(), format!("{}:{hz}", d.bits)]),
             Claim::Asserted(_) => None,
@@ -149,7 +151,7 @@ pub fn worker_args(id: &str, args: &str, cached: Option<&Capabilities>) -> Vec<S
         out.extend([RATE_CAP_FLAG.into(), cap.to_string()]);
     }
     if let Some(c) = cached {
-        out.extend(depth_cap_args(c));
+        out.extend(depth_cap_args(c, &[]));
     }
     out
 }
