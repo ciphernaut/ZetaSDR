@@ -47,17 +47,23 @@ pub(crate) fn nullable_f64<'de, D: serde::Deserializer<'de>>(
 /// A streaming source's health counters since it opened: the sample rate
 /// actually delivered over the last 10 s, to the hertz (`null` before two
 /// blocks arrived), reads that overflowed (samples lost in the driver), reads
-/// that timed out, and stream restarts (a stream whose stamps ran ahead of the
-/// wall clock).
+/// that timed out, stream restarts (a stream whose stamps ran ahead of the
+/// wall clock), and tune gaps: overflows the reader's own blocked tune caused
+/// (it could not read while the device retuned), which fall among the samples
+/// a tune discards anyway and so are not in `overflows`. `tune_gaps` defaults
+/// when absent, so the stats of an older worker still load; every source of
+/// this version writes it, so the schema requires it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::knowledge::require_all)]
 pub struct PortStats {
     #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
     pub measured_rate_hz: Option<u64>,
     pub overflows: u64,
     pub timeouts: u64,
     pub restarts: u64,
+    #[serde(default)]
+    pub tune_gaps: u64,
 }
 
 /// The worker process behind a source, as `source_list` shows it: the live
@@ -252,6 +258,11 @@ pub fn over_cap(suggested: Option<u64>, max: u64) -> String {
 pub trait Port: Send + Sync {
     fn id(&self) -> &SourceId;
     fn capabilities(&self) -> &Capabilities;
+    /// After `tune` returns a new centre, the first block the port delivers with that centre holds only samples taken after the tune settled.
+    ///
+    /// When a tune has settled is the port's own knowledge (a device's settle
+    /// time, a remote's latency), so a consumer never discards samples after a
+    /// tune itself; each port says in its `tune` how it meets this.
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError>;
     fn current(&self) -> Option<Tuning>;
     fn subscribe(&self) -> IqReceiver;

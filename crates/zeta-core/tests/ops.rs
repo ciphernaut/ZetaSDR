@@ -2192,7 +2192,13 @@ async fn source_list_carries_nullable_stats() {
     req.sort();
     assert_eq!(
         req,
-        ["measured_rate_hz", "overflows", "restarts", "timeouts"],
+        [
+            "measured_rate_hz",
+            "overflows",
+            "restarts",
+            "timeouts",
+            "tune_gaps"
+        ],
         "{stats}"
     );
     let rate = stats["properties"]["measured_rate_hz"]["type"]

@@ -269,26 +269,27 @@ fn mock_source(
 /// Keep [`FEED_QUEUE`] of paced reads of `read` samples in the mock's script
 /// at the source's current rate. Each read is a `Slow` step: its sleep is the
 /// read's share of the rate, shortened while the samples actually delivered
-/// (counted on a receiver of the source's own broadcast) lag the wall clock
-/// and lengthened while they lead it, so thread wake-up overshoot does not
-/// add up to a slow stream. Whole milliseconds are carried from read to read.
+/// (the source's own [`SoapySource::samples_delivered`], which counts the
+/// samples a tune discards as well as those it sends) lag the wall clock and
+/// lengthened while they lead it, so thread wake-up overshoot does not add up
+/// to a slow stream. Whole milliseconds are carried from read to read. The
+/// feeder holds a receiver of the source's broadcast, so the reader runs.
 fn feed(dev: &MockDevice, src: &Weak<SoapySource>, gone_after: Option<Duration>, read: usize) {
     let start = Instant::now();
     let Some(mut rx) = src.upgrade().map(|s| s.subscribe()) else {
         return;
     };
     let mut pace: Option<Pace> = None;
+    let mut total = 0u64;
     loop {
         std::thread::sleep(FEED_TICK);
         if gone_after.is_some_and(|g| start.elapsed() >= g) {
             dev.push_reads(vec![MockRead::Gone("unplugged".into())]);
             return;
         }
-        let mut delivered = 0u64;
         loop {
             match rx.try_recv() {
-                Ok(b) => delivered += b.samples.len() as u64,
-                Err(TryRecvError::Lagged(n)) => delivered += n * read as u64,
+                Ok(_) | Err(TryRecvError::Lagged(_)) => {}
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Closed) => {
                     let Some(s) = src.upgrade() else { return };
@@ -298,6 +299,9 @@ fn feed(dev: &MockDevice, src: &Weak<SoapySource>, gone_after: Option<Duration>,
             }
         }
         let Some(src) = src.upgrade() else { return };
+        let now_total = src.samples_delivered();
+        let delivered = now_total - total;
+        total = now_total;
         let Some(rate) = src.current().map(|t| t.bandwidth_hz.0).filter(|r| *r > 0) else {
             continue;
         };

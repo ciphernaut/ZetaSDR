@@ -3,7 +3,9 @@
 //! Reads follow a script ([`MockDevice::with_reads`], [`MockDevice::push_reads`]);
 //! an empty script reads as timeouts, or with [`MockDevice::with_paced_reads`]
 //! as a real-time stream at the rate set, which [`MockDevice::pace_at`] can make
-//! short or overflowing at a given rate (for the rate probe).
+//! short or overflowing at a given rate (for the rate probe), and
+//! [`MockDevice::with_tune_garbage`] can make each tune leave a backlog and
+//! unsettled samples behind, as a real radio's does.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +15,22 @@ use std::time::{Duration, Instant};
 use num_complex::Complex;
 
 use crate::device::{RangeHz, ReadError, SoapyDevice, SoapyRx, WireFormat};
+
+/// With [`MockDevice::with_tune_garbage`]: the `re` of a paced sample taken
+/// before the last `set_frequency` returned (the old band and the tune's
+/// zeros, still in the driver's buffer).
+pub const STALE: f32 = -1.0;
+/// With [`MockDevice::with_tune_garbage`]: the `re` of a paced sample taken
+/// after the last `set_frequency` returned but within its settle.
+pub const UNSETTLED: f32 = -2.0;
+
+/// What each tune leaves behind ([`MockDevice::with_tune_garbage`]).
+struct TuneGarbage {
+    backlog: usize,
+    settle: Duration,
+    /// When the last `set_frequency` returned.
+    returned: Mutex<Option<Instant>>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MockRead {
@@ -84,6 +102,8 @@ pub struct MockDevice {
     /// `(db, automatic)`: the gain set and whether automatic gain is on.
     gain: Mutex<(f64, bool)>,
     gone: Arc<Gone>,
+    hardware: String,
+    garbage: Option<Arc<TuneGarbage>>,
 }
 
 impl MockDevice {
@@ -120,7 +140,32 @@ impl MockDevice {
             gain_mode_available: true,
             gain: Mutex::new((0.0, false)),
             gone: Arc::default(),
+            hardware: String::new(),
+            garbage: None,
         }
+    }
+
+    /// The hardware key the device reports (default empty).
+    pub fn with_hardware(mut self, key: &str) -> Self {
+        self.hardware = key.into();
+        self
+    }
+
+    /// With paced reads, each tune leaves garbage behind as a real radio's
+    /// does: `set_frequency` takes `backlog` samples' time at the rate set,
+    /// so the next `backlog` samples (those taken while it ran) come back at
+    /// once with `re == STALE`, and the paced samples due within `settle` of
+    /// its return carry `re == UNSETTLED`. A paced sample's `im` is then its
+    /// index in its stream (from 0 when the pace restarts), its `re` 0 once
+    /// settled. A delayed call ([`MockDevice::delay_next`]) leaves its delay's
+    /// samples stale as well.
+    pub fn with_tune_garbage(mut self, backlog: usize, settle: Duration) -> Self {
+        self.garbage = Some(Arc::new(TuneGarbage {
+            backlog,
+            settle,
+            returned: Mutex::new(None),
+        }));
+        self
     }
 
     /// Whether the device has automatic gain (`has_gain_mode`); the default is
@@ -333,6 +378,9 @@ impl SoapyDevice for MockDevice {
     fn driver_key(&self) -> String {
         self.driver.clone()
     }
+    fn hardware_key(&self) -> String {
+        self.hardware.clone()
+    }
     fn frequency_ranges(&self) -> Result<Vec<RangeHz>, String> {
         self.gone.touch("frequency_ranges")?;
         Ok(self.freq.clone())
@@ -367,7 +415,15 @@ impl SoapyDevice for MockDevice {
     }
     fn set_frequency(&self, hz: f64) -> Result<(), String> {
         self.control(format!("set_frequency({hz})"), || {
-            self.check("set_frequency")
+            self.check("set_frequency")?;
+            if let Some(g) = &self.garbage {
+                let rate = *self.rate.lock().unwrap();
+                if rate > 0.0 {
+                    std::thread::sleep(Duration::from_secs_f64(g.backlog as f64 / rate));
+                }
+                *g.returned.lock().unwrap() = Some(Instant::now());
+            }
+            Ok(())
         })
     }
     fn set_sample_rate(&self, hz: f64) -> Result<(), String> {
@@ -412,6 +468,7 @@ impl SoapyDevice for MockDevice {
                 rate: self.rate.clone(),
                 paces,
                 clock: None,
+                garbage: self.garbage.clone(),
             }),
         }))
     }
@@ -475,12 +532,14 @@ struct Paced {
     rate: Arc<Mutex<f64>>,
     paces: Arc<Vec<Pace>>,
     clock: Option<(f64, Instant, u64, u64)>,
+    garbage: Option<Arc<TuneGarbage>>,
 }
 
 impl Paced {
-    /// A read of `len` samples at the rate set: block until they are due, then
-    /// the samples it returns, or an overflow. `None` before any rate is set.
-    fn read(&mut self, len: usize) -> Option<Result<usize, ReadError>> {
+    /// A read of `out.len()` samples at the rate set: block until they are
+    /// due, then the samples it returns (written only with tune garbage), or
+    /// an overflow. `None` before any rate is set.
+    fn read(&mut self, out: &mut [Complex<f32>]) -> Option<Result<usize, ReadError>> {
         let rate = *self.rate.lock().unwrap();
         if rate <= 0.0 {
             return None;
@@ -495,8 +554,10 @@ impl Paced {
         if pace.is_some_and(|p| p.overflow_reads.contains(&clock.3)) {
             return Some(Err(ReadError::Overflow));
         }
-        clock.2 += len as u64;
-        let due = clock.1 + Duration::from_secs_f64(clock.2 as f64 / rate);
+        let first = clock.2;
+        let start = clock.1;
+        clock.2 += out.len() as u64;
+        let due = start + Duration::from_secs_f64(clock.2 as f64 / rate);
         if let Some(wait) = due.checked_duration_since(Instant::now()) {
             std::thread::sleep(wait);
         }
@@ -506,7 +567,41 @@ impl Paced {
         let short =
             pace.is_some_and(|p| p.short_reads.is_empty() || p.short_reads.contains(&clock.3));
         let delivered = if short { delivered } else { 1.0 };
-        Some(Ok((len as f64 * delivered).round() as usize))
+        let n = (out.len() as f64 * delivered).round() as usize;
+        if let Some(g) = &self.garbage {
+            g.mark(&mut out[..n], start, first, rate);
+        }
+        Some(Ok(n))
+    }
+}
+
+impl TuneGarbage {
+    /// Write the samples of a paced read whose first is sample `first` of a
+    /// stream paced from `start` at `rate`: `re` says whether each was taken
+    /// before the last tune returned, within its settle, or after; `im` is
+    /// its index.
+    fn mark(&self, out: &mut [Complex<f32>], start: Instant, first: u64, rate: f64) {
+        let returned = *self.returned.lock().unwrap();
+        // The return and the settle's end as seconds into the stream.
+        let since_start = |t: Instant| match t.checked_duration_since(start) {
+            Some(d) => d.as_secs_f64(),
+            None => -start.duration_since(t).as_secs_f64(),
+        };
+        let (ret, settled) = returned.map_or((f64::NEG_INFINITY, f64::NEG_INFINITY), |r| {
+            (since_start(r), since_start(r) + self.settle.as_secs_f64())
+        });
+        for (i, o) in out.iter_mut().enumerate() {
+            let k = first + i as u64;
+            let taken = k as f64 / rate;
+            let re = if taken < ret {
+                STALE
+            } else if taken < settled {
+                UNSETTLED
+            } else {
+                0.0
+            };
+            *o = Complex::new(re, k as f32);
+        }
     }
 }
 
@@ -546,7 +641,9 @@ impl SoapyRx for MockRx {
     }
     /// An empty script reads as `Timeout` forever (paced samples with
     /// [`MockDevice::with_paced_reads`]). A `Timeout` step blocks for
-    /// `timeout_us`, as a real device does.
+    /// `timeout_us`, as a real device does. A `Samples` (or `Slow`) step
+    /// longer than `out` fills it and leaves the rest at the front of the
+    /// script, as a device keeps what a short read had no room for.
     fn read(&mut self, out: &mut [Complex<f32>], timeout_us: i64) -> Result<usize, ReadError> {
         if let Some(m) = self.gone.msg.lock().unwrap().clone() {
             self.gone.after.lock().unwrap().push("read".into());
@@ -555,7 +652,7 @@ impl SoapyRx for MockRx {
         let step = self.reads.lock().unwrap().pop_front();
         let step = match (step, &mut self.paced) {
             (Some(step), _) => step,
-            (None, Some(p)) => match p.read(out.len()) {
+            (None, Some(p)) => match p.read(out) {
                 Some(r) => return r,
                 None => MockRead::Timeout,
             },
@@ -568,6 +665,11 @@ impl SoapyRx for MockRx {
                 self.read(out, timeout_us)
             }
             MockRead::Samples(n) => {
+                if n > out.len() {
+                    // The device keeps what the read had no room for.
+                    let rest = MockRead::Samples(n - out.len());
+                    self.reads.lock().unwrap().push_front(rest);
+                }
                 let n = n.min(out.len());
                 for o in &mut out[..n] {
                     let v = self.next as f32;

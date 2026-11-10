@@ -120,15 +120,23 @@ fn control_messages_round_trip_in_the_spec_shape() {
                     overflows: 1,
                     timeouts: 2,
                     restarts: 3,
+                    tune_gaps: 4,
                 }),
                 transport_dropped: 0,
             }),
             json!({"status": {"fault": "unplugged",
                 "current": {"center_hz": 144800000, "bandwidth_hz": 12500},
                 "gain": null,
-                "stats": {"measured_rate_hz": 2000000, "overflows": 1, "timeouts": 2, "restarts": 3}, "transport_dropped": 0}}),
+                "stats": {"measured_rate_hz": 2000000, "overflows": 1, "timeouts": 2, "restarts": 3,
+                    "tune_gaps": 4}, "transport_dropped": 0}}),
         ),
     ];
+    // The stats of an older worker, without `tune_gaps`, still load.
+    let old: PortStats = serde_json::from_value(
+        json!({"measured_rate_hz": null, "overflows": 1, "timeouts": 2, "restarts": 3}),
+    )
+    .unwrap();
+    assert_eq!(old.tune_gaps, 0);
     for (c, shape) in cases {
         assert_eq!(serde_json::to_value(&c).unwrap(), shape);
         let back: Control = serde_json::from_value(shape).unwrap();

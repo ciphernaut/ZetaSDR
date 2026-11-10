@@ -30,6 +30,9 @@ pub enum ReadError {
 
 pub trait SoapyDevice: Send + Sync {
     fn driver_key(&self) -> String;
+    /// The driver's name for the hardware (SoapyUHD: the motherboard, `B210`);
+    /// empty when it gives none.
+    fn hardware_key(&self) -> String;
     fn frequency_ranges(&self) -> Result<Vec<RangeHz>, String>;
     fn sample_rate_ranges(&self) -> Result<Vec<RangeHz>, String>;
     /// Native format, and supported formats intersected with {CS8, CS16, CF32}.

@@ -11,7 +11,7 @@ use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{Claim, Hz, SourceId};
 use zeta_source_soapy::SoapySource;
-use zeta_source_soapy::mock::{MockDevice, MockRead};
+use zeta_source_soapy::mock::{MockDevice, MockRead, STALE, UNSETTLED};
 use zeta_source_soapy::source::{MAX_AHEAD_NS, MAX_OVERFLOW_RUN, MAX_RESTARTS};
 
 fn tuning(center: u64, bw: u64) -> Tuning {
@@ -21,8 +21,17 @@ fn tuning(center: u64, bw: u64) -> Tuning {
     }
 }
 
+/// A source whose tunes settle at once, so an opened stream drops nothing of
+/// the scripted reads these tests count (the settle has its own tests, at the
+/// end).
 fn source(dev: &Arc<MockDevice>) -> Arc<SoapySource> {
-    Arc::new(SoapySource::with_device(SourceId("sdr0".into()), dev.clone()).unwrap())
+    Arc::new(at_once(
+        SoapySource::with_device(SourceId("sdr0".into()), dev.clone()).unwrap(),
+    ))
+}
+
+fn at_once(src: SoapySource) -> SoapySource {
+    src.with_settle(Duration::ZERO)
 }
 
 fn samples(n: usize) -> Vec<MockRead> {
@@ -139,8 +148,7 @@ async fn tune_sets_frequency_and_smallest_rate() {
 async fn tune_applies_ppm_to_the_hardware_and_reports_the_requested_centre() {
     let dev = Arc::new(MockDevice::hackrf_like().with_reads(samples(2)));
     let src = Arc::new(
-        SoapySource::with_device(SourceId("sdr0".into()), dev.clone())
-            .unwrap()
+        at_once(SoapySource::with_device(SourceId("sdr0".into()), dev.clone()).unwrap())
             .with_ppm(3.4),
     );
     let mut rx = src.subscribe();
@@ -520,8 +528,7 @@ async fn retune_timeout_faults_and_next_tune_reopens() {
     reads.extend(vec![MockRead::Timeout; 3]);
     let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
     let src = Arc::new(
-        SoapySource::with_device(SourceId("sdr0".into()), dev.clone())
-            .unwrap()
+        at_once(SoapySource::with_device(SourceId("sdr0".into()), dev.clone()).unwrap())
             .with_retune_timeout(Duration::from_millis(100)),
     );
     let mut rx = src.subscribe();
@@ -559,8 +566,7 @@ async fn t0_monotonic_across_reopen() {
     reads.extend(vec![MockRead::Timeout; 5]);
     let dev = Arc::new(MockDevice::hackrf_like().with_reads(reads));
     let src = Arc::new(
-        SoapySource::with_device(SourceId("sdr0".into()), dev.clone())
-            .unwrap()
+        at_once(SoapySource::with_device(SourceId("sdr0".into()), dev.clone()).unwrap())
             .with_retune_timeout(Duration::from_millis(20)),
     );
     let mut rx = src.subscribe();
@@ -1026,8 +1032,7 @@ async fn gain_and_retune_keep_their_order_on_the_reader() {
 
 fn slow_source(dev: &Arc<MockDevice>, timeout_ms: u64) -> Arc<SoapySource> {
     Arc::new(
-        SoapySource::with_device(SourceId("sdr0".into()), dev.clone())
-            .unwrap()
+        at_once(SoapySource::with_device(SourceId("sdr0".into()), dev.clone()).unwrap())
             .with_retune_timeout(Duration::from_millis(timeout_ms)),
     )
 }
@@ -1147,4 +1152,177 @@ async fn the_gain_arg_at_open_uses_the_same_path() {
     );
     src.set_gain(Some(10.0)).await.unwrap();
     assert_eq!(dev.calls(), ["set_gain(10)"]);
+}
+
+// The settled-samples contract (`Port::tune`): after a tune, the first block
+// at the new centre holds only samples taken after the tune settled.
+
+/// The settle these tests give both the mock's tune and the source.
+const SETTLE: Duration = Duration::from_millis(5);
+
+/// A device streaming in real time at the rate set, whose tunes leave 20 000
+/// samples of backlog and 5 ms of unsettled samples, behind a source that
+/// settles for 5 ms.
+fn garbage_source() -> (Arc<MockDevice>, Arc<SoapySource>) {
+    let dev = Arc::new(
+        MockDevice::hackrf_like()
+            .with_paced_reads()
+            .with_tune_garbage(20_000, SETTLE),
+    );
+    (dev.clone(), settling_source(&dev))
+}
+
+/// A device behind a source that settles for 5 ms.
+fn settling_source(dev: &Arc<MockDevice>) -> Arc<SoapySource> {
+    let src = SoapySource::with_device(SourceId("sdr0".into()), dev.clone())
+        .unwrap()
+        .with_settle(SETTLE);
+    Arc::new(src)
+}
+
+fn has_garbage(b: &IqBlock) -> bool {
+    b.samples.iter().any(|s| s.re == STALE || s.re == UNSETTLED)
+}
+
+/// The next block at `center` within `within`, checking on the way that no
+/// block's `t0` goes back past the end of the one before (`last`).
+async fn next_at(rx: &mut IqReceiver, center: u64, within: Duration, last: &mut u64) -> IqBlock {
+    tokio::time::timeout(within, async {
+        loop {
+            let b = next_block(rx).await;
+            assert!(b.t0.0 >= *last, "t0 {} went back past {}", b.t0.0, *last);
+            *last = end_ns(&b);
+            if b.center_hz == Hz(center) {
+                return b;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("a block at {center} Hz within {within:?}"))
+}
+
+/// Tune A, take a block, tune B (its `set_frequency` held `slow_ms` more),
+/// and check the blocks at B: the first within `within`, and it and the four
+/// after it free of backlog and unsettled samples.
+async fn the_blocks_after_a_tune_are_settled(
+    dev: &MockDevice,
+    src: &SoapySource,
+    within: Duration,
+    slow_ms: u64,
+) {
+    let mut rx = src.subscribe();
+    let mut last = 0;
+    src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    let a = next_at(&mut rx, 100_000_000, Duration::from_secs(2), &mut last).await;
+    assert!(!has_garbage(&a), "the first block at A");
+    if slow_ms > 0 {
+        dev.delay_next("set_frequency", slow_ms);
+    }
+    src.tune(tuning(101_000_000, 12_500)).await.unwrap();
+    let b = next_at(&mut rx, 101_000_000, within, &mut last).await;
+    assert!(!has_garbage(&b), "the first block at B");
+    for _ in 0..4 {
+        let b = next_at(&mut rx, 101_000_000, Duration::from_secs(1), &mut last).await;
+        assert!(!has_garbage(&b), "a later block at B");
+    }
+}
+
+#[tokio::test]
+async fn the_first_block_of_a_new_centre_has_no_backlog_and_no_unsettled_sample() {
+    let (dev, src) = garbage_source();
+    the_blocks_after_a_tune_are_settled(&dev, &src, Duration::from_secs(2), 0).await;
+}
+
+#[tokio::test]
+async fn a_slow_set_frequency_still_ends_its_window() {
+    let (dev, src) = garbage_source();
+    the_blocks_after_a_tune_are_settled(&dev, &src, Duration::from_secs(3), 100).await;
+}
+
+/// A scripted sample's index in the stream (its `re`).
+fn index(b: &IqBlock) -> f32 {
+    b.samples[0].re
+}
+
+#[tokio::test]
+async fn a_backlog_that_never_drains_ends_at_the_cap() {
+    // Scripted reads return at once: no read ever waits for its samples.
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(vec![MockRead::Samples(1024); 8]));
+    let src = settling_source(&dev);
+    let mut rx = src.subscribe();
+    let mut last = 0;
+    src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    let mut a = next_at(&mut rx, 100_000_000, Duration::from_secs(2), &mut last).await;
+    while let Ok(Ok(b)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+        a = b;
+    }
+    last = end_ns(&a);
+    src.tune(tuning(101_000_000, 12_500)).await.unwrap();
+    dev.push_reads(vec![MockRead::Samples(1024); 40]);
+    let b = next_at(&mut rx, 101_000_000, Duration::from_secs(2), &mut last).await;
+    // Dropped: at least the settle (5000 samples at 1 Msps), and at most the
+    // cap (the call's time and the settle, plus one read) with room to spare.
+    let dropped = index(&b) - (index(&a) + a.samples.len() as f32);
+    assert!((5000.0..20_000.0).contains(&dropped), "dropped {dropped}");
+}
+
+#[tokio::test]
+async fn an_overflow_inside_the_tune_window_is_a_tune_gap() {
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(vec![MockRead::Samples(1024); 8]));
+    let src = settling_source(&dev);
+    let mut rx = src.subscribe();
+    let mut last = 0;
+    src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    next_at(&mut rx, 100_000_000, Duration::from_secs(2), &mut last).await;
+    src.tune(tuning(101_000_000, 12_500)).await.unwrap();
+    let mut reads = vec![MockRead::Overflow];
+    reads.extend(vec![MockRead::Samples(1024); 40]);
+    dev.push_reads(reads);
+    next_at(&mut rx, 101_000_000, Duration::from_secs(2), &mut last).await;
+    let stats = src.stats().unwrap();
+    assert_eq!((stats.tune_gaps, stats.overflows), (1, 0), "{stats:?}");
+}
+
+#[tokio::test]
+async fn an_overflow_after_the_window_is_an_overflow() {
+    let dev = Arc::new(MockDevice::hackrf_like().with_reads(vec![MockRead::Samples(1024); 8]));
+    let src = settling_source(&dev);
+    let mut rx = src.subscribe();
+    let mut last = 0;
+    src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    next_at(&mut rx, 100_000_000, Duration::from_secs(2), &mut last).await;
+    src.tune(tuning(101_000_000, 12_500)).await.unwrap();
+    // 20 reads of 1024 run well past the cap (about 6000 samples).
+    let mut reads = vec![MockRead::Samples(1024); 20];
+    reads.push(MockRead::Overflow);
+    reads.extend(vec![MockRead::Samples(1024); 10]);
+    dev.push_reads(reads);
+    next_at(&mut rx, 101_000_000, Duration::from_secs(2), &mut last).await;
+    let counted = wait_until(2000, || src.stats().unwrap().overflows == 1).await;
+    let stats = src.stats().unwrap();
+    assert!(counted, "{stats:?}");
+    assert_eq!(stats.tune_gaps, 0, "{stats:?}");
+}
+
+#[tokio::test]
+async fn a_rate_change_drops_the_settle_and_no_more() {
+    let (_dev, src) = garbage_source();
+    let mut rx = src.subscribe();
+    let mut last = 0;
+    src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    let a = next_at(&mut rx, 100_000_000, Duration::from_secs(2), &mut last).await;
+    // A paced sample's `im` is its index in its stream: the open dropped
+    // exactly the settle, 5000 samples at 1 Msps.
+    assert_eq!(a.samples[0].im, 5000.0);
+    let got = src.tune(tuning(101_000_000, 1_500_000)).await.unwrap();
+    assert_eq!(got.bandwidth_hz, Hz(1_500_000), "a rate change");
+    let b = next_at(&mut rx, 101_000_000, Duration::from_secs(2), &mut last).await;
+    assert!(
+        !b.samples.iter().any(|s| s.re == UNSETTLED),
+        "an unsettled sample"
+    );
+    assert_eq!(
+        b.samples[0].im, 7500.0,
+        "the reopened stream dropped 5 ms at 1.5 Msps, no more"
+    );
 }

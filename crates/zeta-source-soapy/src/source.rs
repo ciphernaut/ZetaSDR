@@ -17,6 +17,20 @@
 //! restarts within a minute fault the source. A rate change reopens the stream
 //! for the same reason, instead of reactivating it in place.
 //!
+//! A tune delivers only settled samples ([`Port::tune`]'s contract): the
+//! reader discards what follows its own retune. After a `set_frequency` in
+//! place that took `D`, it reads [`settle_chunk`] samples at a time and drops
+//! them until a read that started at least the settle after the call returned
+//! had to wait for its samples (its wall time at least half the time they
+//! span: the driver's backlog, taken before the return, is drained), and in
+//! any case after `(D + settle) × rate` samples and one read more. After the
+//! stream (re)opened (the first tune, a rate change) it drops `settle × rate`
+//! samples. The clock anchors again when the window ends. The settle is the
+//! radio's ([`crate::caps::front_end`]) or `settle_ms=`
+//! ([`SoapySource::with_settle`]). An overflow inside the window is the tune's
+//! own (the reader was blocked in the call) and counts as a tune gap
+//! ([`PortStats::tune_gaps`]), not as an overflow.
+//!
 //! The overall receive gain is read when the source opens and set by
 //! [`Port::set_gain`]: through the reader thread between reads while a stream
 //! runs (so a gain change and a retune keep their order), on the device
@@ -36,8 +50,8 @@ use zeta_core::port::{GainInfo, IqBlock, IqReceiver, Port, PortError, PortStats,
 use zeta_core::types::{Capabilities, Claim, Hz, SourceId, Timestamp};
 
 use crate::caps::{
-    RateModel, capabilities, is_uhd, next_rate_above, pick_format, pick_rate, probe_rate_ranges,
-    uhd_ladder,
+    RateModel, capabilities, front_end, is_uhd, next_rate_above, pick_format, pick_rate,
+    probe_rate_ranges, uhd_ladder,
 };
 use crate::device::{RangeHz, ReadError, SoapyDevice, SoapyRx, WireFormat};
 
@@ -45,6 +59,8 @@ use crate::device::{RangeHz, ReadError, SoapyDevice, SoapyRx, WireFormat};
 const BROADCAST_CAPACITY: usize = 64;
 /// Smallest read, in samples.
 const MIN_BLOCK: usize = 16_384;
+/// Smallest read while a tune settles, in samples (see [`settle_chunk`]).
+const MIN_SETTLE_CHUNK: usize = 1024;
 /// Timeout of one blocking read.
 const READ_TIMEOUT_US: i64 = 100_000;
 /// Consecutive read timeouts (1 s without samples) that fault the port.
@@ -75,6 +91,8 @@ struct Status {
     /// End of the last block sent (ns); a new stream never anchors before it.
     last_end: u64,
     overflows: u64,
+    /// Overflows inside a tune's window (see [`PortStats::tune_gaps`]).
+    tune_gaps: u64,
     timeouts: u64,
     /// Streams restarted because their stamps ran ahead of the wall clock.
     restarts: u64,
@@ -271,6 +289,8 @@ pub struct SoapySource {
     reader: Mutex<Option<Reader>>,
     retune_timeout: Duration,
     ppm: f64,
+    /// How long a tune takes to settle after `set_frequency` returns.
+    settle: Duration,
     /// Set with the fault when the reader gave the device up as lost: the
     /// device is never called again and `tune` refuses.
     lost: Arc<AtomicBool>,
@@ -289,7 +309,8 @@ impl SoapySource {
     /// (the SoapySDR device arguments it was opened with) and its driver key
     /// decide whether it is a UHD device, whose rate range is probed at its
     /// maximum clock (see [`probe_rate_ranges`]) and whose rates are exact
-    /// divisors of that clock (see [`uhd_ladder`]).
+    /// divisors of that clock (see [`uhd_ladder`]). The settle after a tune is
+    /// the radio's (see [`front_end`]) until [`SoapySource::with_settle`].
     pub fn with_device_args(
         id: SourceId,
         dev: Arc<dyn SoapyDevice>,
@@ -319,6 +340,7 @@ impl SoapySource {
             gain: read_gain(dev.as_ref()),
             ..Status::default()
         };
+        let settle = front_end(&dev.driver_key(), &dev.hardware_key()).settle;
         Ok(Self {
             id,
             caps,
@@ -331,6 +353,7 @@ impl SoapySource {
             reader: Mutex::new(None),
             retune_timeout: RETUNE_ACK,
             ppm: 0.0,
+            settle,
             lost: Arc::new(AtomicBool::new(false)),
             gate: tokio::sync::Mutex::new(()),
         })
@@ -341,6 +364,15 @@ impl SoapySource {
     /// (`current`, blocks, the band keep the requested centre).
     pub fn with_ppm(mut self, ppm: f64) -> Self {
         self.ppm = ppm;
+        self
+    }
+
+    /// How long a tune takes to settle after the device's `set_frequency`
+    /// returns, in place of the radio's default (see [`front_end`];
+    /// `settle_ms=` in the device args): the reader discards the samples taken
+    /// until then (see the module's notes).
+    pub fn with_settle(mut self, d: Duration) -> Self {
+        self.settle = d;
         self
     }
 
@@ -365,8 +397,8 @@ impl SoapySource {
     }
 
     /// After the rate probe: stop the stream and wait for its reader to end,
-    /// then forget the tuning, the probe's overflows, timeouts and stream
-    /// restarts (the restart window too) and any fault a rung left, so the
+    /// then forget the tuning, the probe's overflows, tune gaps, timeouts and
+    /// stream restarts (the restart window too) and any fault a rung left, so the
     /// source is as a fresh open leaves it (nothing tuned, nothing counted
     /// against it). A device given up as lost keeps its fault: that is final.
     pub(crate) async fn end_probe(&self) {
@@ -385,6 +417,7 @@ impl SoapySource {
         st.band = None;
         st.window.clear();
         st.overflows = 0;
+        st.tune_gaps = 0;
         st.timeouts = 0;
         st.restarts = 0;
         st.restart_times.clear();
@@ -575,6 +608,7 @@ impl SoapySource {
             stop: stop.clone(),
             cmds: cmds_rx,
             ppm: self.ppm,
+            settle: self.settle,
             lost: self.lost.clone(),
         };
         let handle = std::thread::Builder::new()
@@ -628,7 +662,10 @@ impl Port for SoapySource {
     /// live, unfaulted reader is a no-op; a changed one is applied by the
     /// reader between reads; otherwise (first tune, fault, reader gone) the
     /// stream is (re)opened, which clears the fault. Returns the capture band:
-    /// the requested centre, the device's actual sample rate wide.
+    /// the requested centre, the device's actual sample rate wide. The reader
+    /// meets the settled-samples contract by discarding the tune's backlog and
+    /// settle before it sends a block at the new centre (see the module's
+    /// notes); `tune` returns once the device is retuned, not after the settle.
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let (center, bw) = (t.center_hz.0, t.bandwidth_hz.0);
         let (fmin, fmax) = (claim(&self.caps.tune_min_hz), claim(&self.caps.tune_max_hz));
@@ -700,6 +737,7 @@ impl Port for SoapySource {
             overflows: st.overflows,
             timeouts: st.timeouts,
             restarts: st.restarts,
+            tune_gaps: st.tune_gaps,
         })
     }
 
@@ -788,6 +826,7 @@ struct Ctx {
     stop: Arc<AtomicBool>,
     cmds: std_mpsc::Receiver<Cmd>,
     ppm: f64,
+    settle: Duration,
     lost: Arc<AtomicBool>,
 }
 
@@ -869,26 +908,39 @@ fn open(ctx: &Ctx, rx: &mut Box<dyn SoapyRx>) -> Result<(), String> {
     rx.activate().map_err(|e| format!("soapy activate: {e}"))
 }
 
+/// How [`apply`] retuned.
+enum Tuned {
+    /// On the running stream: its `set_frequency` took `took` and returned at
+    /// `returned`.
+    InPlace { took: Duration, returned: Instant },
+    /// The stream was closed and a new one opened.
+    Reopened,
+}
+
 /// Apply a retune between reads: a rate change (or a rate short of the band)
 /// closes the stream before the rate and frequency are set, then opens a new
-/// one, so the device is never reconfigured under an active stream. `picked` is the rate picked for the stream running at
-/// `rate`. A refused rate restores `rate.asked` and reopens the stream on the
-/// old centre (the frequency is set only once the rate holds); a device error
-/// leaves the stream to fault.
+/// one, so the device is never reconfigured under an active stream. `picked`
+/// is the rate picked for the stream running at `rate`. A refused rate
+/// restores `rate.asked` and reopens the stream on the old centre (the
+/// frequency is set only once the rate holds); a device error leaves the
+/// stream to fault.
 fn apply(
     ctx: &Ctx,
     rx: &mut Box<dyn SoapyRx>,
     cmd: &Retune,
     picked: u64,
     rate: Rate,
-) -> Result<Rate, RateError> {
+) -> Result<(Rate, Tuned), RateError> {
     let io = RateError::Io;
     let hw = hw_hz(cmd.center_hz, ctx.ppm);
     if cmd.rate_hz == picked && rate.actual >= cmd.bandwidth_hz {
+        let called = Instant::now();
         ctx.dev
             .set_frequency(hw as f64)
             .map_err(|e| io(format!("soapy set_frequency({hw}): {e}")))?;
-        return Ok(rate);
+        let returned = Instant::now();
+        let took = returned.duration_since(called);
+        return Ok((rate, Tuned::InPlace { took, returned }));
     }
     *rx = Box::new(Closed);
     let got = match set_rate(ctx.dev.as_ref(), &ctx.rates, cmd.rate_hz, cmd.bandwidth_hz) {
@@ -909,7 +961,87 @@ fn apply(
         .set_frequency(hw as f64)
         .map_err(|e| io(format!("soapy set_frequency({hw}): {e}")))?;
     open(ctx, rx).map_err(io)?;
-    Ok(got)
+    Ok((got, Tuned::Reopened))
+}
+
+/// The read length while a tune settles at `rate_hz`: a millisecond of
+/// samples, at least [`MIN_SETTLE_CHUNK`], so the reader sees when the
+/// driver's backlog has drained.
+fn settle_chunk(rate_hz: u64) -> usize {
+    MIN_SETTLE_CHUNK.max(usize::try_from(rate_hz / 1000).unwrap_or(usize::MAX))
+}
+
+/// Samples in `d` at `rate_hz`.
+fn samples_in(d: Duration, rate_hz: u64) -> u64 {
+    let n = (d.as_nanos() * u128::from(rate_hz)).div_ceil(1_000_000_000);
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// The reads a tune discards, so the first block at its centre holds only
+/// samples taken after it settled (see the module's notes).
+enum Window {
+    /// After a `set_frequency` in place: reads are dropped until one that
+    /// started at least `settle` after `returned` had to wait for its samples,
+    /// or `cap` samples were dropped.
+    InPlace {
+        returned: Instant,
+        settle: Duration,
+        cap: u64,
+        dropped: u64,
+    },
+    /// After the stream (re)opened: `left` samples more.
+    Opened { left: u64 },
+}
+
+impl Window {
+    /// The window after `tuned` at `rate_hz` with `settle`; `None` when
+    /// nothing is to be dropped (a reopen with no settle).
+    fn after(tuned: Tuned, settle: Duration, rate_hz: u64) -> Option<Self> {
+        match tuned {
+            Tuned::InPlace { took, returned } => Some(Window::InPlace {
+                returned,
+                settle,
+                cap: samples_in(took + settle, rate_hz) + settle_chunk(rate_hz) as u64,
+                dropped: 0,
+            }),
+            Tuned::Reopened => {
+                let left = samples_in(settle, rate_hz);
+                (left > 0).then_some(Window::Opened { left })
+            }
+        }
+    }
+
+    /// How many samples the next read asks for.
+    fn read_len(&self, rate_hz: u64) -> usize {
+        let chunk = settle_chunk(rate_hz);
+        match self {
+            Window::InPlace { .. } => chunk,
+            Window::Opened { left } => chunk.min(usize::try_from(*left).unwrap_or(usize::MAX)),
+        }
+    }
+
+    /// Drop a read of `n` samples that started at `started` and took `wall`;
+    /// whether the window has ended with it.
+    fn drop_read(&mut self, n: usize, started: Instant, wall: Duration, rate_hz: u64) -> bool {
+        match self {
+            Window::InPlace {
+                returned,
+                settle,
+                cap,
+                dropped,
+            } => {
+                *dropped += n as u64;
+                let span = Duration::from_secs_f64(n as f64 / rate_hz as f64);
+                let waited = wall * 2 >= span;
+                let settled = started.saturating_duration_since(*returned) >= *settle;
+                (waited && settled) || *dropped >= *cap
+            }
+            Window::Opened { left } => {
+                *left = left.saturating_sub(n as u64);
+                *left == 0
+            }
+        }
+    }
 }
 
 /// The reader thread. Exits on stop, on no receivers, or with a fault (set
@@ -919,7 +1051,9 @@ fn apply(
 /// with no further native call on it. Every other exit deactivates. A block
 /// that would end more than [`MAX_AHEAD_NS`] after now is not sent: the
 /// stream is reopened and reads are discarded until the wall clock passes the
-/// last block sent (`catch_up`), then the clock anchors there.
+/// last block sent (`catch_up`), then the clock anchors there. After the
+/// stream opens and after each retune, the tune's [`Window`] is dropped
+/// first.
 fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut rate: Rate) {
     // A reopen continues after the previous stream's last block.
     let last_end = ctx.status.lock().unwrap().last_end;
@@ -936,6 +1070,8 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
     // After a restart: the end of the last block sent, which the wall clock
     // must pass before a block is sent again.
     let mut catch_up: Option<u64> = None;
+    // The stream was just opened at its centre: its settle is dropped first.
+    let mut window = Window::after(Tuned::Reopened, ctx.settle, rate.actual);
     loop {
         if ctx.stop.load(Ordering::Relaxed) || ctx.tx.receiver_count() == 0 {
             break;
@@ -952,12 +1088,13 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
                 }
             };
             match apply(&ctx, &mut rx, &cmd, picked, rate) {
-                Ok(got) => {
+                Ok((got, tuned)) => {
                     let actual = got.actual;
                     center = cmd.center_hz;
                     picked = cmd.rate_hz;
                     rate = got;
                     clock.reanchor(actual);
+                    window = Window::after(tuned, ctx.settle, actual);
                     buf.resize(block_len(actual), Complex::new(0.0, 0.0));
                     {
                         let mut st = ctx.status.lock().unwrap();
@@ -971,8 +1108,10 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
                     let _ = cmd.ack.send(Ok(()));
                 }
                 Err(RateError::Narrow(m)) => {
-                    // The old capture runs on; it restarts after the gap.
+                    // The old capture runs on, on a stream opened again after
+                    // the rate was restored; it restarts after the gap.
                     clock.reanchor(clock.rate);
+                    window = Window::after(Tuned::Reopened, ctx.settle, clock.rate);
                     let _ = cmd.ack.send(Err(RateError::Narrow(m)));
                 }
                 Err(RateError::Io(m)) => {
@@ -984,10 +1123,23 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
             }
             continue;
         }
-        match rx.read(&mut buf, READ_TIMEOUT_US) {
+        let len = window
+            .as_ref()
+            .map_or(buf.len(), |w| w.read_len(clock.rate));
+        let started = Instant::now();
+        match rx.read(&mut buf[..len], READ_TIMEOUT_US) {
             Ok(n) if n > 0 => {
                 quiet = 0;
                 overflow_run = 0;
+                if let Some(w) = &mut window {
+                    // Received, so counted as delivered, but never sent.
+                    ctx.status.lock().unwrap().delivered += n as u64;
+                    if w.drop_read(n, started, started.elapsed(), clock.rate) {
+                        window = None;
+                        clock.reanchor(clock.rate);
+                    }
+                    continue;
+                }
                 if let Some(t) = catch_up {
                     let now = now_ns();
                     if now < t {
@@ -1071,7 +1223,15 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
                 }
             }
             Err(ReadError::Overflow) => {
-                ctx.status.lock().unwrap().overflows += 1;
+                {
+                    // Inside a tune's window the reader was blocked in its own
+                    // call: a tune gap, among samples dropped anyway.
+                    let mut st = ctx.status.lock().unwrap();
+                    match window {
+                        Some(_) => st.tune_gaps += 1,
+                        None => st.overflows += 1,
+                    }
+                }
                 overflow_run += 1;
                 if overflow_run >= MAX_OVERFLOW_RUN {
                     ctx.lose(format!(

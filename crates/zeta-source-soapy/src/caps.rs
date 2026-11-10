@@ -1,4 +1,7 @@
-//! Asserted capabilities and the sample-rate / format choice.
+//! Asserted capabilities, the per-radio front-end table and the sample-rate /
+//! format choice.
+
+use std::time::Duration;
 
 use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat};
 
@@ -34,6 +37,51 @@ pub fn is_uhd(args: &str, driver_key: &str) -> bool {
     });
     let key = driver_key.to_ascii_lowercase();
     by_args || UHD_DRIVER_KEYS.iter().any(|k| key.starts_with(k))
+}
+
+/// What the source knows of a radio's front end beyond what its driver
+/// reports: how long a tune takes to settle after `set_frequency` returns
+/// (the reader discards the samples until then, see
+/// [`crate::SoapySource::with_settle`]), and the bits its ADC resolves
+/// (`None`: not known).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontEnd {
+    pub settle: Duration,
+    pub adc_bits: Option<u8>,
+}
+
+/// The settle of a radio [`FRONT_ENDS`] has no row for: conservative, ten
+/// times the B2xx family's measured one.
+pub const SETTLE_DEFAULT: Duration = Duration::from_millis(10);
+
+/// The radios whose front end is measured or known: a UHD device (see
+/// [`is_uhd`]) whose hardware key starts with the prefix (matched
+/// case-insensitively; SoapyUHD gives the motherboard, `B210` for a B210). The
+/// B2xx family (an AD9361 behind a 12-bit ADC): a fast tune's power is within
+/// 0.05 dB of steady 1 ms after `set_frequency` returns, measured on the
+/// field host's B210.
+const FRONT_ENDS: [(&str, FrontEnd); 1] = [(
+    "b2",
+    FrontEnd {
+        settle: Duration::from_millis(1),
+        adc_bits: Some(12),
+    },
+)];
+
+/// The front end of a device reporting `driver_key` and `hardware_key`: its
+/// row in [`FRONT_ENDS`], or [`SETTLE_DEFAULT`] and no ADC depth.
+pub fn front_end(driver_key: &str, hardware_key: &str) -> FrontEnd {
+    let hw = hardware_key.to_ascii_lowercase();
+    FRONT_ENDS
+        .iter()
+        .find(|(prefix, _)| is_uhd("", driver_key) && hw.starts_with(prefix))
+        .map_or(
+            FrontEnd {
+                settle: SETTLE_DEFAULT,
+                adc_bits: None,
+            },
+            |(_, f)| *f,
+        )
 }
 
 /// The device's sample-rate ranges. A UHD device reports them for its
@@ -470,6 +518,29 @@ mod tests {
         assert!(!is_uhd("driver=hackrf", "hackrf"));
         assert!(!is_uhd("driver=rtlsdr", "RTLSDR"));
         assert!(!is_uhd("driver=remote,remote:driver=uhd", "remote"));
+    }
+
+    #[test]
+    fn the_b2xx_family_settles_in_1_ms_and_the_rest_in_the_default() {
+        let b2xx = FrontEnd {
+            settle: Duration::from_millis(1),
+            adc_bits: Some(12),
+        };
+        // SoapyUHD names the device type as its driver key and the
+        // motherboard as its hardware key.
+        assert_eq!(front_end("b200", "B210"), b2xx);
+        assert_eq!(front_end("uhd", "B200mini"), b2xx);
+        assert_eq!(front_end("b200", "b205mini"), b2xx);
+        let default = FrontEnd {
+            settle: SETTLE_DEFAULT,
+            adc_bits: None,
+        };
+        assert_eq!(SETTLE_DEFAULT, Duration::from_millis(10));
+        assert_eq!(front_end("x300", "X310"), default);
+        assert_eq!(front_end("uhd", ""), default);
+        assert_eq!(front_end("hackrf", "B2"), default, "a B2 not on UHD");
+        assert_eq!(front_end("hackrf", "HackRF One"), default);
+        assert_eq!(front_end("", ""), default);
     }
 
     #[test]

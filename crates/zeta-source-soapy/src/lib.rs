@@ -8,7 +8,9 @@
 //! [`SoapySource::set_gain_now`]) or `source_set_gain` sets it
 //! ([`zeta_core::port::Port::set_gain`]). At open the worker probes the rate
 //! ladder for the fastest rate the device streams cleanly ([`probe`]) unless
-//! `max_rate_hz=N` asserts one.
+//! `max_rate_hz=N` asserts one. A tune delivers only settled samples: the
+//! reader drops the tune's backlog and settle, the radio's
+//! ([`caps::front_end`]) unless `settle_ms=N` gives one.
 
 pub mod caps;
 pub mod convert;
@@ -34,12 +36,17 @@ pub struct ZetaArgs {
     /// by the operator; the worker reports it as the cap instead of probing
     /// (see [`probe::probe_rate_cap`]).
     pub max_rate_hz: Option<u64>,
+    /// `settle_ms=N`: how long a tune takes to settle after the device's
+    /// `set_frequency` returns, in ms, in place of the radio's default (see
+    /// [`caps::front_end`] and [`SoapySource::with_settle`]).
+    pub settle_ms: Option<f64>,
 }
 
-/// Take zeta's own `gain=DB`, `ppm=N` and `max_rate_hz=N` keys out of SoapySDR
-/// device `args`: the args to hand the driver, and the values to apply after
-/// opening. A gain or ppm that is not a finite number, or a rate that is not a
-/// positive whole number of Hz, is an error.
+/// Take zeta's own `gain=DB`, `ppm=N`, `max_rate_hz=N` and `settle_ms=N` keys
+/// out of SoapySDR device `args`: the args to hand the driver, and the values
+/// to apply after opening. A gain or ppm that is not a finite number, a rate
+/// that is not a positive whole number of Hz, or a settle that is not a finite
+/// number of ms, 0 or more, is an error.
 pub fn split_zeta_args(args: &str) -> Result<(String, ZetaArgs), String> {
     let mut z = ZetaArgs::default();
     let mut rest = Vec::new();
@@ -49,6 +56,13 @@ pub fn split_zeta_args(args: &str) -> Result<(String, ZetaArgs), String> {
                 let hz = v.trim().parse().ok().filter(|hz: &u64| *hz > 0);
                 z.max_rate_hz =
                     Some(hz.ok_or_else(|| format!("max_rate_hz={v}: not a whole number of Hz"))?);
+            }
+            Some((k, v)) if k.trim() == "settle_ms" => {
+                let ms = v.trim().parse().ok();
+                let ms = ms.filter(|ms: &f64| ms.is_finite() && *ms >= 0.0);
+                z.settle_ms = Some(
+                    ms.ok_or_else(|| format!("settle_ms={v}: not a number of ms, 0 or more"))?,
+                );
             }
             Some((k, v)) if matches!(k.trim(), "gain" | "ppm") => {
                 let n: Option<f64> = v.trim().parse().ok().filter(|d: &f64| d.is_finite());
@@ -98,6 +112,7 @@ mod tests {
                     gain: Some(40.0),
                     ppm: Some(3.4),
                     max_rate_hz: None,
+                    settle_ms: None,
                 }
             )
         );
@@ -105,5 +120,23 @@ mod tests {
             split_zeta_args("driver=uhd,ppm=fast").unwrap_err(),
             "ppm=fast: not a number"
         );
+    }
+
+    #[test]
+    fn settle_ms_is_taken_out_of_the_device_args() {
+        let (rest, z) = split_zeta_args("driver=uhd,settle_ms=2.5").unwrap();
+        assert_eq!((rest.as_str(), z.settle_ms), ("driver=uhd", Some(2.5)));
+        assert_eq!(
+            split_zeta_args("settle_ms=0").unwrap().1.settle_ms,
+            Some(0.0)
+        );
+        assert_eq!(split_zeta_args("driver=uhd").unwrap().1.settle_ms, None);
+        assert_eq!(
+            split_zeta_args("driver=uhd,settle_ms=fast").unwrap_err(),
+            "settle_ms=fast: not a number of ms, 0 or more"
+        );
+        assert!(split_zeta_args("settle_ms=-1").is_err());
+        assert!(split_zeta_args("settle_ms=inf").is_err());
+        assert!(split_zeta_args("settle_ms=NaN").is_err());
     }
 }
