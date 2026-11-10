@@ -211,7 +211,9 @@ Regions:
 
 - `#top`: the top bar. `.brand`: the product name in it.
 - `.src-tab`: a source tab (a button); `.src-tab[aria-selected="true"]` is the selected one.
-  Its parts are `.name`, `.range`, `.centre` and `.health`. `.map-tab` is the Map tab after the
+  Its parts are `.name`, `.range`, `.centre` and `.health`, and `.starting` (after `.range`)
+  while the source's worker measures its link at a start: a note, not a fault, so keep it
+  visible on every tab. `.map-tab` is the Map tab after the
   source tabs (also a `.src-tab`, with `.name` and a `.count`); while it is selected the shown
   source's tab carries `.kept`.
 - `.src-tab.default`: the tab of the default radio for the agent (the shown radio under the

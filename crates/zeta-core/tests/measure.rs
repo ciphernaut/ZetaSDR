@@ -145,6 +145,11 @@ async fn the_measuring_events_pair() {
     }
     let (measuring, measured) = (&events[0].1, &events[1].1);
     assert_eq!(measuring["text"], measuring_line(&s(), &first));
+    // Step 1 of 6: six rungs, each tried twice, 3 s an attempt.
+    assert_eq!(
+        measuring["text"],
+        "source s: measuring what this radio's link can sustain (up to about 36 s; the host will be busy; max_rate_hz= skips it)"
+    );
     assert_eq!(measuring["starting"], serde_json::to_value(&first).unwrap());
     let text = measured["text"].as_str().unwrap();
     assert!(text.starts_with("source s: measured in "), "{text}");

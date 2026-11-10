@@ -248,19 +248,24 @@ pub async fn probe_depths(
     probe_depths_with(src, center_hz, known, ProbeTiming::default(), on_progress).await
 }
 
-/// What [`probe_depths`] reports before a rung: `measuring`, the depth and the
-/// rate the rung streams (`12-bit at 30720000 Hz`), the rung's `step` counted
-/// from 1 over every depth, `of` the steps taken before it plus the most rungs
-/// the probe may still try (this one, the rest of its depth's ladder and every
-/// depth after it: never more than the last report's), and `eta_ms` the time
-/// those take at most, each rung retried ([`PROBE_RETRIES`]) and each attempt a
-/// [`PROBE_SETTLE`] and a [`PROBE_DWELL`] (the production figures, whatever
-/// the probe's own [`ProbeTiming`]).
-pub fn rung_progress(bits: u8, rate_hz: u64, step: u32, of: u32) -> Starting {
+/// What [`probe_depths`] and [`rate_cap`] report before a rung: `measuring`,
+/// the depth and the rate the rung streams (`12-bit at 30720000 Hz`; the rate
+/// alone, `30720000 Hz`, on a link of one depth, whose bits the source does not
+/// know), the rung's `step` counted from 1 over every depth, `of` the steps
+/// taken before it plus the most rungs the probe may still try (this one, the
+/// rest of its depth's ladder and every depth after it: never more than the
+/// last report's), and `eta_ms` the time those take at most, each rung retried
+/// ([`PROBE_RETRIES`]) and each attempt a [`PROBE_SETTLE`] and a
+/// [`PROBE_DWELL`] (the production figures, whatever the probe's own
+/// [`ProbeTiming`]).
+pub fn rung_progress(bits: Option<u8>, rate_hz: u64, step: u32, of: u32) -> Starting {
     let attempt = (PROBE_SETTLE + PROBE_DWELL).as_millis() as u64;
     Starting {
         what: "measuring".into(),
-        detail: format!("{bits}-bit at {rate_hz} Hz"),
+        detail: match bits {
+            Some(bits) => format!("{bits}-bit at {rate_hz} Hz"),
+            None => format!("{rate_hz} Hz"),
+        },
         step,
         of,
         eta_ms: u64::from(of - step + 1) * u64::from(1 + PROBE_RETRIES) * attempt,
@@ -293,7 +298,7 @@ pub async fn probe_depths_with(
                 let mut report = |i: usize, rate: u64| {
                     step += 1;
                     let of = step - 1 + (rungs - i as u32) + later;
-                    on_progress(rung_progress(bits, rate, step, of));
+                    on_progress(rung_progress(Some(bits), rate, step, of));
                 };
                 src.use_depth(Some(link.bits)).await;
                 match probe_rate_reporting(src, center_hz, timing, &mut report).await {
@@ -324,6 +329,57 @@ pub async fn probe_depths_with(
         src.use_depth(None).await;
     }
     found.map(|()| depths)
+}
+
+/// How the rate cap of a device whose link has one depth is set at open
+/// ([`rate_cap`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RateCap {
+    /// `max_rate_hz=N`: asserted, nothing probed.
+    Asserted(u64),
+    /// `--rate-cap-hz N`, a cap an earlier open measured: measured, nothing
+    /// probed.
+    Passed(u64),
+    /// Neither: what [`probe_rate`] found.
+    Probed(Result<ProbeResult, String>),
+}
+
+/// The rate cap of a device whose link has one depth: `asserted`
+/// (`max_rate_hz=`), else `cached` (`--rate-cap-hz`), else [`probe_rate`] at
+/// `center_hz`, reporting each rung to `on_progress` before it streams (see
+/// [`rung_progress`]; `of` is the ladder's rungs). Nothing is reported when
+/// the cap is given.
+pub async fn rate_cap(
+    src: &SoapySource,
+    center_hz: u64,
+    asserted: Option<u64>,
+    cached: Option<u64>,
+    on_progress: &mut dyn FnMut(Starting),
+) -> RateCap {
+    let timing = ProbeTiming::default();
+    rate_cap_with(src, center_hz, asserted, cached, timing, on_progress).await
+}
+
+/// [`rate_cap`] with its own settle and dwell.
+pub async fn rate_cap_with(
+    src: &SoapySource,
+    center_hz: u64,
+    asserted: Option<u64>,
+    cached: Option<u64>,
+    timing: ProbeTiming,
+    on_progress: &mut dyn FnMut(Starting),
+) -> RateCap {
+    match (asserted, cached) {
+        (Some(hz), _) => RateCap::Asserted(hz),
+        (None, Some(hz)) => RateCap::Passed(hz),
+        (None, None) => {
+            let rungs = probe_candidates(src.rate_model()).len() as u32;
+            let mut report = |i: usize, rate: u64| {
+                on_progress(rung_progress(None, rate, i as u32 + 1, rungs));
+            };
+            RateCap::Probed(probe_rate_reporting(src, center_hz, timing, &mut report).await)
+        }
+    }
 }
 
 /// Every sample depth on the device's link at the operator's `hz`

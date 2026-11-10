@@ -81,7 +81,7 @@ mod imp {
     use zeta_core::port::{Port, Starting};
     use zeta_core::types::{Claim, Hz, SourceId};
     use zeta_source_soapy::SoapySource;
-    use zeta_source_soapy::probe::{asserted_depths, own_depth, probe_depths, probe_rate};
+    use zeta_source_soapy::probe::{RateCap, asserted_depths, own_depth, probe_depths, rate_cap};
     use zeta_source_worker::port::parse_depth_cap;
     use zeta_source_worker::ring::Ring;
     use zeta_source_worker::serve::{
@@ -158,7 +158,8 @@ mod imp {
                 // The link has one depth: nothing for `bits=` to choose.
                 Some(bits) => own_depth(&[], Some(bits)).map(|_| ()),
                 None => {
-                    set_rate_cap(&mut src, &args.id, own.max_rate_hz, args.rate_cap_hz).await;
+                    let given = (own.max_rate_hz, args.rate_cap_hz);
+                    set_rate_cap(&mut src, &args.id, given, &mut report).await;
                     Ok(())
                 }
             },
@@ -197,20 +198,21 @@ mod imp {
     /// on every start, so a bad probe must not become one). A probe that cannot tune
     /// any rate, or that lost the device, leaves the asserted cap too, with a stderr
     /// line saying why: `serve` then reports a lost device's fault and exits, and the
-    /// respawn probes again.
+    /// respawn probes again. `(asserted, cached)` are `max_rate_hz=` and `--rate-cap-hz`;
+    /// the probe reports each rung to `on_progress` before it streams ([`rate_cap`]).
     async fn set_rate_cap(
         src: &mut SoapySource,
         id: &str,
-        asserted: Option<u64>,
-        cached: Option<u64>,
+        (asserted, cached): (Option<u64>, Option<u64>),
+        on_progress: &mut dyn FnMut(Starting),
     ) {
-        let claim = match (asserted, cached) {
-            (Some(hz), _) => Claim::Asserted(Hz(hz)),
-            (None, Some(hz)) => Claim::Measured(Hz(hz)),
-            (None, None) => {
-                let caps = src.capabilities();
-                let center = (caps.tune_min_hz.value().0 + caps.tune_max_hz.value().0) / 2;
-                match probe_rate(src, center).await {
+        let caps = src.capabilities();
+        let center = (caps.tune_min_hz.value().0 + caps.tune_max_hz.value().0) / 2;
+        let claim = match rate_cap(src, center, asserted, cached, on_progress).await {
+            RateCap::Asserted(hz) => Claim::Asserted(Hz(hz)),
+            RateCap::Passed(hz) => Claim::Measured(Hz(hz)),
+            RateCap::Probed(found) => {
+                match found {
                     Ok(p) if p.clean => {
                         let (cap, tried) = (p.cap_hz, p.tried);
                         eprintln!(

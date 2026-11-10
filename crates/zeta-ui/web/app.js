@@ -411,12 +411,21 @@ function decorateTab(tab, s) {
   } else if (!s.pin && tag) {
     tag.remove();
   }
+  const starting = startingText(s);
+  let note = tab.querySelector(".starting");
+  if (starting && !note) {
+    note = document.createElement("span");
+    note.className = "starting";
+    tab.querySelector(".range").after(note);
+  } else if (!starting && note) {
+    note.remove();
+  }
+  if (note && starting) note.textContent = starting;
   let title;
   if (s.fault) title = `fault: ${JSON.stringify(s.fault)}`;
   else if (s.pin) title = pinTitle(s);
   else title = rangeText(s);
   const pairs = healthPairs(s);
-  const starting = startingText(s);
   tab.dataset.baseTitle = `${title}; ${pairs.map(([k, v]) => `${k} ${v}`).join(" ")}`;
   if (starting) tab.dataset.baseTitle += `; ${starting}`;
   tab.title = tab.dataset.baseTitle;
@@ -427,15 +436,7 @@ function decorateTab(tab, s) {
     health.className = "health";
     tab.append(health);
   }
-  const notice = [];
-  if (starting) {
-    const el = document.createElement("span");
-    el.className = "starting";
-    el.textContent = starting;
-    notice.push(el);
-  }
   health.replaceChildren(
-    ...notice,
     ...pairs.flatMap(([k, v]) => {
       const key = document.createElement("span");
       key.className = "k";
@@ -450,8 +451,8 @@ function decorateTab(tab, s) {
 }
 
 // While a source's worker reports its start (`worker.starting`: a respawn measuring what its
-// link sustains, the host busy meanwhile), the notice its tab shows first in its health and
-// in its title: not a fault. Null otherwise.
+// link sustains, the host busy meanwhile), the notice its tab shows as its own part (`.starting`
+// after `.range`, on every tab and in every theme) and in its title: not a fault. Null otherwise.
 function startingText(s) {
   const st = s.worker?.starting;
   if (!st) return null;

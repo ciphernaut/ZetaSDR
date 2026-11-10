@@ -162,7 +162,12 @@ fn parse_args() -> Result<Args, String> {
 /// Step `step` of a start of `of` steps, as the real worker's rate probe
 /// reports a rung of the mock's top rate at 16 bits.
 fn progress(step: u32, of: u32) -> Frame {
-    Frame::Control(Control::Progress(rung_progress(16, 20_480_000, step, of)))
+    Frame::Control(Control::Progress(rung_progress(
+        Some(16),
+        20_480_000,
+        step,
+        of,
+    )))
 }
 
 /// `ZETA_FAKE_PROGRESS=N`'s frames on `frames`, [`PROGRESS_EVERY`] apart.

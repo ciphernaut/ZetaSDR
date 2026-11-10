@@ -14,7 +14,8 @@ use zeta_source_soapy::device::RangeHz;
 use zeta_source_soapy::mock::MockDevice;
 use zeta_source_soapy::probe::{
     PROBE_DWELL, PROBE_MAX_OVERFLOWS, PROBE_MAX_RUNGS, PROBE_RETRIES, PROBE_SETTLE, ProbeResult,
-    ProbeTiming, asserted_depths, own_depth, probe_candidates, probe_depths_with, probe_rate_with,
+    ProbeTiming, RateCap, asserted_depths, own_depth, probe_candidates, probe_depths_with,
+    probe_rate_with, rate_cap_with,
 };
 use zeta_source_soapy::{SoapySource, ZetaArgs, split_zeta_args};
 
@@ -684,4 +685,73 @@ async fn a_start_from_known_caps_reports_nothing() {
         .unwrap();
     assert_eq!(depths.len(), 3);
     assert_eq!(calls, 0);
+}
+
+#[tokio::test]
+async fn a_one_depth_probe_reports_each_rung_before_it_runs() {
+    // The top two rungs overflow on both attempts; the third streams clean.
+    let dev = Arc::new(ladder().pace_at(6.144e6, 1.0, OVERFLOWING).pace_at(
+        3.072e6,
+        1.0,
+        OVERFLOWING,
+    ));
+    let src = source(&dev);
+    assert!(src.link_depths().is_empty());
+    let mut seen: Vec<(Starting, usize)> = Vec::new();
+    let cap = rate_cap_with(&src, CENTER, None, None, TIMING, &mut |s| {
+        seen.push((s, dev.calls().len()))
+    })
+    .await;
+    assert_eq!(
+        cap,
+        RateCap::Probed(Ok(ProbeResult {
+            cap_hz: 2_048_000,
+            tried: 3,
+            clean: true,
+        }))
+    );
+    let shown: Vec<(u32, u32, &str)> = seen
+        .iter()
+        .map(|(s, _)| (s.step, s.of, s.detail.as_str()))
+        .collect();
+    // One depth of six rungs: `of` is the ladder.
+    assert_eq!(
+        shown,
+        [
+            (1, 6, "6144000 Hz"),
+            (2, 6, "3072000 Hz"),
+            (3, 6, "2048000 Hz"),
+        ]
+    );
+    for (s, at) in &seen {
+        assert_eq!(s.what, "measuring");
+        assert_eq!(s.eta_ms, eta_ms(s.of - s.step + 1), "{s:?}");
+        let rate = s.detail.trim_end_matches(" Hz");
+        assert_eq!(
+            rate_calls(&dev, *at).first().cloned(),
+            Some(format!("set_sample_rate({rate})")),
+            "{s:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_one_depth_cap_given_reports_nothing() {
+    let dev = Arc::new(ladder());
+    let src = source(&dev);
+    let opened = dev.calls().len();
+    let mut calls = 0;
+    // `max_rate_hz=`, then a cap an earlier open measured (`--rate-cap-hz`).
+    let asserted = rate_cap_with(&src, CENTER, Some(3_072_000), None, TIMING, &mut |_| {
+        calls += 1
+    })
+    .await;
+    assert_eq!(asserted, RateCap::Asserted(3_072_000));
+    let passed = rate_cap_with(&src, CENTER, None, Some(2_048_000), TIMING, &mut |_| {
+        calls += 1
+    })
+    .await;
+    assert_eq!(passed, RateCap::Passed(2_048_000));
+    assert_eq!(calls, 0);
+    assert!(rate_calls(&dev, opened).is_empty(), "{:?}", dev.calls());
 }

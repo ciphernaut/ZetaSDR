@@ -7864,31 +7864,37 @@ def scenario_a_measuring_source_shows_its_notice(page, url, secret):
         return r.fulfill(response=resp, body=json.dumps(data))
 
     tab = '.src-tab[data-id="tone"]'
+    note = page.locator(f"{tab} .starting")
+    themes = sorted(os.listdir(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))), "themes")))
     page.route("**/op", route)
     try:
         select_source(page, url, secret, "tone")
         page.evaluate("window.zetaTest.poll()")
-        page.wait_for_function(
-            """([sel, text]) => {
-                const s = document.querySelector(`${sel} .health .starting`);
-                return !!s && s.textContent === text;
-            }""",
-            arg=[tab, notice], timeout=10_000)
-        first = page.evaluate(
-            "(sel) => document.querySelector(`${sel} .health`).firstElementChild.className",
-            tab)
-        assert first == "starting", first
+        expect(note).to_be_visible(timeout=10_000)
+        expect(note).to_have_text(notice)
         assert notice in page.get_attribute(tab, "title"), page.get_attribute(tab, "title")
         # Not a fault: the tab is not marked as one.
         assert "fault" not in (page.get_attribute(tab, "class") or "").split()
+        # Shown in every theme, on the selected tab and on another's.
+        for theme in themes:
+            run_cmd(page, f"view set theme {theme}")
+            expect(page.locator("html")).to_have_attribute("data-theme", theme)
+            for selected in ("tone", "aprs"):
+                page.click(f'.src-tab[data-id="{selected}"]')
+                expect(page.locator(f'.src-tab[data-id="{selected}"]')).to_have_attribute(
+                    "aria-selected", "true")
+                expect(note).to_be_visible()
+                assert page.evaluate(
+                    "(sel) => document.querySelector(sel).offsetParent !== null",
+                    f"{tab} .starting"), (theme, selected)
         measuring["on"] = False
         page.evaluate("window.zetaTest.poll()")
-        page.wait_for_function(
-            "(sel) => !document.querySelector(`${sel} .health .starting`)",
-            arg=tab, timeout=10_000)
+        expect(note).to_have_count(0, timeout=10_000)
         assert notice not in page.get_attribute(tab, "title")
     finally:
         page.unroute("**/op", route)
+        run_cmd(page, "view reset")
 
 
 def scenarios():

@@ -123,7 +123,7 @@ pub struct Starting {
 /// (whole seconds, rounded up) bounds the wait.
 pub fn measuring_line(source: &SourceId, s: &Starting) -> String {
     format!(
-        "source {}: measuring what this radio's link can sustain (first start only, up to about {} s; the host will be busy; max_rate_hz= or bits= skips it)",
+        "source {}: measuring what this radio's link can sustain (up to about {} s; the host will be busy; max_rate_hz= skips it)",
         source.0,
         s.eta_ms.div_ceil(1000)
     )
