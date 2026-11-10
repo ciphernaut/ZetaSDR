@@ -620,6 +620,10 @@ From the 2026-11-08 live acceptance. The node keeps the 20 newest job records (`
 
 Plan 34 reads the H1, 80, 16, 3L and QQ position forms from a downlink's text. Not yet read: the `RSI` table form (signed decimal degrees under a `LAT LON` header), and any further airline layouts that turn up in `events.log`. No dumphfdl fixture yet carries a text report, so HFDL's derive is untested end to end.
 
+## Modes: MIAM and ARINC 622 on plain ACARS
+
+From the plan 34 UAT (2026-11-10). A plain-ACARS downlink with label `MA` carries a MIAM-compressed payload, which often wraps an ARINC 622 message: an ADS-C position report, or CPDLC. dumpvdl2 and dumphfdl decode these through libacars, so their events get the ADS-C fix; the in-process `acars_decode` stage publishes the compressed text as is, so the same aircraft's position on plain ACARS is lost. Ideas: run libacars on the block (its MIAM and ARINC 622 decoders; behind a `cfg` as `soapy` is, check its licence), or a Rust MIAM core decoder (the framing plus deflate) feeding the ADS-C shapes the VDL2 row already reads. Either way the decoded basic report fills `lat`, `lon` and `alt_ft` as structured fields, so it wins over the text derive of plan 34.
+
 ## AIS: not yet proven on air
 
 From the 2026-11-08 live acceptance: 15 min on the HackRF (indoor antenna) and 11 min on the B210 at 161.975/162.025 MHz gave no events; a ring cut showed one 25 ms burst about 12 dB over the floor in 9.5 s, which did not decode. The channels are nearly empty at the field host, so this says little about the decoder. Decode the kept cut with another AIS decoder offline, and retry from a site in view of shipping.
