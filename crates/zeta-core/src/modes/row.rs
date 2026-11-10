@@ -155,6 +155,35 @@ pub struct Subject {
     /// confirm a lit site; `null` for a subject the register has no field for.
     #[serde(default)]
     pub identity: Option<Identity>,
+    /// The mode's fixed stations: events matching it come from a ground station, not a
+    /// mobile subject; `null` for a mode with none.
+    #[serde(default)]
+    pub station: Option<Station>,
+}
+
+/// How a mode's events from fixed ground stations are told from the rest.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModeStation", transform = require_all)]
+pub struct Station {
+    /// Field = value pairs; an event matching every pair is from a station. Not empty.
+    pub when: BTreeMap<String, serde_json::Value>,
+    /// The event field naming the station, when not the subject's key; `null` for the key.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// The event field naming the aircraft or party the station addresses; `null` for none.
+    #[serde(default)]
+    pub addressed: Option<String>,
+}
+
+impl Station {
+    /// Whether `event` is from a station: an object holding every `when` field, equal.
+    pub fn matches(&self, event: &serde_json::Value) -> bool {
+        let Some(o) = event.as_object() else {
+            return false;
+        };
+        self.when.iter().all(|(k, v)| o.get(k) == Some(v))
+    }
 }
 
 /// How a mode's decoded subject is matched against the register (design 4.6): the event
@@ -1002,6 +1031,25 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
                     format!("subject.merge_skip.{k}"),
                     "not in event.schema.properties",
                 ));
+            }
+        }
+        if let Some(st) = &sub.station {
+            if st.when.is_empty() {
+                return Err(RowError::new("subject.station.when", "empty"));
+            }
+            if let Some(k) = st.when.keys().find(|k| !properties.contains_key(*k)) {
+                return Err(RowError::new(
+                    format!("subject.station.when.{k}"),
+                    "not in event.schema.properties",
+                ));
+            }
+            for (name, f) in [("key", &st.key), ("addressed", &st.addressed)] {
+                if f.as_ref().is_some_and(|f| !properties.contains_key(f)) {
+                    return Err(RowError::new(
+                        format!("subject.station.{name}"),
+                        "not in event.schema.properties",
+                    ));
+                }
             }
         }
     }
@@ -2060,6 +2108,74 @@ mod tests {
             ),
             "{e}"
         );
+    }
+
+    #[test]
+    fn station_round_trips_and_defaults_null() {
+        let row = parse(ADSB).unwrap();
+        assert!(row.subject.as_ref().unwrap().station.is_none());
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["subject"]["station"], serde_json::Value::Null);
+        let text = edited(ADSB, |v| {
+            v["subject"]["station"] = serde_json::json!({"when": {"callsign": "x"}})
+        });
+        let row = parse(&text).unwrap();
+        validate(&row, &no_stages()).unwrap();
+        let st = row.subject.as_ref().unwrap().station.as_ref().unwrap();
+        assert!(st.key.is_none() && st.addressed.is_none());
+        assert_eq!(parse(&serde_json::to_string(&row).unwrap()).unwrap(), row);
+    }
+
+    #[test]
+    fn station_names_schema_fields() {
+        for (st, field) in [
+            (
+                serde_json::json!({"when": {"nope": 1}}),
+                "subject.station.when.nope",
+            ),
+            (
+                serde_json::json!({"when": {"callsign": 1}, "key": "nope"}),
+                "subject.station.key",
+            ),
+            (
+                serde_json::json!({"when": {"callsign": 1}, "addressed": "nope"}),
+                "subject.station.addressed",
+            ),
+        ] {
+            let text = edited(ADSB, |v| v["subject"]["station"] = st.clone());
+            let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+            assert_eq!(
+                e,
+                RowError::new(field, "not in event.schema.properties"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_station_when_is_refused() {
+        let text = edited(ADSB, |v| {
+            v["subject"]["station"] = serde_json::json!({"when": {}})
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(e, RowError::new("subject.station.when", "empty"), "{e}");
+    }
+
+    #[test]
+    fn station_matches_every_pair_present_and_equal() {
+        let st = Station {
+            when: BTreeMap::from([
+                ("a".to_string(), serde_json::json!(true)),
+                ("b".to_string(), serde_json::json!("x")),
+            ]),
+            key: None,
+            addressed: None,
+        };
+        assert!(st.matches(&serde_json::json!({"a": true, "b": "x", "c": 1})));
+        assert!(!st.matches(&serde_json::json!({"a": true})));
+        assert!(!st.matches(&serde_json::json!({"a": "true", "b": "x"})));
+        assert!(!st.matches(&serde_json::json!({"a": true, "b": "y"})));
+        assert!(!st.matches(&serde_json::json!("a")));
     }
 
     /// `ADSB` with `text`, `downlink` and `alt_ft` in its schema (it has `lat` and `lon`)

@@ -33,8 +33,8 @@ pub use row::{
     Extractor, FRAME_PARSERS, Family, FieldPath, FrameBlock, FrameDemod, Handler,
     IDENTITY_REGISTERS, IDENTITY_STRIPS, Identify, Identity, InputStream, InputVia, Install,
     ModeId, ModeRow, OutputVia, Parser, PositionMap, ProgramBlock, ProgramInput, ProgramOutput,
-    Proof, QUICK_ATTEMPTS, RowError, RowTest, SampleFormat, Subject, SubjectColumn, SubjectUnit,
-    SubjectWaterfall, TestSpec, center_khz_text, is_mode_id, parse, validate,
+    Proof, QUICK_ATTEMPTS, RowError, RowTest, SampleFormat, Station, Subject, SubjectColumn,
+    SubjectUnit, SubjectWaterfall, TestSpec, center_khz_text, is_mode_id, parse, validate,
 };
 
 /// Where a loaded row stands: `ready` (parsed, validated and, for a program row or a
