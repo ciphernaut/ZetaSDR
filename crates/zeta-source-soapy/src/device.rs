@@ -33,6 +33,11 @@ pub trait SoapyDevice: Send + Sync {
     /// The driver's name for the hardware (SoapyUHD: the motherboard, `B210`);
     /// empty when it gives none.
     fn hardware_key(&self) -> String;
+    /// The device's serial number, from the driver's hardware information
+    /// (key `serial`); `None` when it gives none.
+    fn serial(&self) -> Option<String> {
+        None
+    }
     fn frequency_ranges(&self) -> Result<Vec<RangeHz>, String>;
     fn sample_rate_ranges(&self) -> Result<Vec<RangeHz>, String>;
     /// Native format, and supported formats intersected with {CS8, CS16, CF32}.

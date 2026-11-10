@@ -1,6 +1,6 @@
 //! `zeta soapy-worker --id ID --args ARGS [--rate-cap-hz N] [--depth-cap BITS:HZ]...
-//! [--ring-fd N] [--progress]`: one SoapySDR device served over stdin and stdout to the
-//! node that spawned it.
+//! [--measured-at-speed SPEED] [--ring-fd N] [--progress]`: one SoapySDR device served
+//! over stdin and stdout to the node that spawned it.
 //!
 //! Once the device opens, the worker sets its rate cap (`max_bandwidth_hz`) before
 //! serving: `max_rate_hz=N` in the args asserts it; `--rate-cap-hz N` (a cap an earlier
@@ -14,6 +14,14 @@
 //! `--depth-cap BITS:HZ` reports that depth's as measured; every other depth is probed,
 //! lossy ones included. The source then runs `bits=N`'s depth, else the fastest lossless
 //! one, and the record's cap is that depth's (`--rate-cap-hz` is not read).
+//!
+//! Once the device opens, the worker finds where it is attached from its serial (a USB
+//! radio's bus, port path and negotiated speed, [`usb_attachment`]) and names it in the
+//! hello. Passed-back figures belong to the link speed they were measured at
+//! (`--measured-at-speed`): on a link of another speed (a USB 3 radio now on a USB 2
+//! port, or the reverse) the worker ignores `--rate-cap-hz` and every `--depth-cap` and
+//! probes, each progress report saying `link speed changed (<old> to <new>)`. Another
+//! port at the same speed, or a speed either side cannot tell, keeps them.
 //!
 //! With `--progress` (the node passes it to every spawn) the probe of the depths reports
 //! each rung before it streams, a progress frame on stdout ahead of the hello, so the
@@ -29,6 +37,7 @@
 //!
 //! [`EXIT_NOT_FOUND`]: zeta_source_worker::serve::EXIT_NOT_FOUND
 //! [`EXIT_OPEN_FAILED`]: zeta_source_worker::serve::EXIT_OPEN_FAILED
+//! [`usb_attachment`]: zeta_source_soapy::attach::usb_attachment
 
 use std::process::ExitCode;
 
@@ -75,12 +84,14 @@ mod imp {
     use std::fs::File;
     use std::io::Write;
     use std::os::fd::{FromRawFd, OwnedFd};
+    use std::path::Path;
     use std::process::ExitCode;
     use std::sync::Arc;
 
-    use zeta_core::port::{Port, Starting};
+    use zeta_core::port::{Port, Starting, cached_figures_hold, link_speed, speed_changed_prefix};
     use zeta_core::types::{Claim, Hz, SourceId};
     use zeta_source_soapy::SoapySource;
+    use zeta_source_soapy::attach::usb_attachment;
     use zeta_source_soapy::probe::{RateCap, asserted_depths, own_depth, probe_depths, rate_cap};
     use zeta_source_worker::port::parse_depth_cap;
     use zeta_source_worker::ring::Ring;
@@ -144,12 +155,36 @@ mod imp {
                 return ExitCode::from(EXIT_OPEN_FAILED);
             }
         };
+        let attachment = src
+            .serial()
+            .and_then(|serial| usb_attachment(Path::new("/sys"), &serial));
+        src.set_attachment(attachment.clone());
+        // Passed-back figures hold only on a link of the speed they were measured at.
+        let was = args.measured_at_speed.as_deref();
+        let hold = cached_figures_hold(was, attachment.as_deref());
+        let why = if hold {
+            String::new()
+        } else {
+            let now = attachment.as_deref().and_then(link_speed).unwrap_or("");
+            let why = speed_changed_prefix(was.unwrap_or(""), now);
+            eprintln!(
+                "zeta-soapy-worker[{}]: {}the cached rates are measured again",
+                args.id, why
+            );
+            why
+        };
+        let (rate_cap_hz, depth_caps) = if hold {
+            (args.rate_cap_hz, &args.depth_cap[..])
+        } else {
+            (None, &[][..])
+        };
         let known: Result<Vec<(u8, u64)>, String> =
-            args.depth_cap.iter().map(|c| parse_depth_cap(c)).collect();
+            depth_caps.iter().map(|c| parse_depth_cap(c)).collect();
         // Before `serve` takes the stdout: the probe runs here, ahead of the hello.
         let progress = args.progress;
-        let mut report = |s: Starting| {
+        let mut report = |mut s: Starting| {
             if progress {
+                s.detail = format!("{why}{}", s.detail);
                 write_progress(&frames, s);
             }
         };
@@ -158,7 +193,7 @@ mod imp {
                 // The link has one depth: nothing for `bits=` to choose.
                 Some(bits) => own_depth(&[], Some(bits)).map(|_| ()),
                 None => {
-                    let given = (own.max_rate_hz, args.rate_cap_hz);
+                    let given = (own.max_rate_hz, rate_cap_hz);
                     set_rate_cap(&mut src, &args.id, given, &mut report).await;
                     Ok(())
                 }

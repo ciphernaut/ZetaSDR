@@ -116,14 +116,15 @@ fn fits(want: &Tuning, cur: &Tuning) -> bool {
 
 /// Ways out of a conflict between `want` and the port's current band `cur`
 /// that the caller can act on. Stopping a holder is listed only when a job
-/// holds the source (a pin alone is no holder). Widening is listed only when the port could
-/// capture both bands at once; no operation performs it yet. A port under a
+/// holds the source (a pin alone is no holder). A request for a band (`want`
+/// given) may choose one inside `cur`, and widening is listed only when the port
+/// could capture both bands at once; no operation performs it yet. A port under a
 /// time-shared lease (a scan) is freed only by stopping that holder. Then, on a
 /// `pinned` source, its unpin; last, the request again with `replace` naming the
 /// rigid `holders`, when there are any.
 fn conflict_options(
     port: &dyn Port,
-    want: &Tuning,
+    want: Option<&Tuning>,
     cur: &Tuning,
     shared: bool,
     holders: &[JobId],
@@ -136,12 +137,14 @@ fn conflict_options(
     if !holders.is_empty() {
         options.push("stop one of the holders".to_string());
     }
-    options.push("choose a band inside current".to_string());
-    let (wl, wh) = band(want);
-    let (cl, ch) = band(cur);
-    let n = wh.max(ch) - wl.min(cl);
-    if n <= port.capabilities().max_bandwidth_hz.value().0 {
-        options.push(format!("widen capture to {n} Hz (not yet available)"));
+    if let Some(want) = want {
+        options.push("choose a band inside current".to_string());
+        let (wl, wh) = band(want);
+        let (cl, ch) = band(cur);
+        let n = wh.max(ch) - wl.min(cl);
+        if n <= port.capabilities().max_bandwidth_hz.value().0 {
+            options.push(format!("widen capture to {n} Hz (not yet available)"));
+        }
     }
     if let Some(id) = pinned {
         options.push(format!("unpin source {} (source_unpin)", id.0));
@@ -204,7 +207,14 @@ fn rigid_decision(port: &dyn Port, held: &[Lease], want: &Tuning, pin: bool) -> 
             return Decision::Fits(cur);
         }
         let holders = rigid(held);
-        let options = conflict_options(port, want, &cur, shared, &holders, pinned_in(held, source));
+        let options = conflict_options(
+            port,
+            Some(want),
+            &cur,
+            shared,
+            &holders,
+            pinned_in(held, source),
+        );
         return Decision::Conflict {
             holders,
             current: cur,
@@ -369,7 +379,7 @@ impl LeaseManager {
                 if held.iter().any(|l| l.time_shared) {
                     let holders = rigid(&held);
                     let pinned = pinned_in(&held, &source);
-                    let options = conflict_options(port, &want, &cur, true, &holders, pinned);
+                    let options = conflict_options(port, Some(&want), &cur, true, &holders, pinned);
                     return Err(LeaseError::Conflict {
                         source,
                         holders,
@@ -558,7 +568,7 @@ impl LeaseManager {
             let holders = rigid(v);
             let pinned = pinned_in(v, &source);
             return Err(LeaseError::Conflict {
-                options: conflict_options(port, &span, &cur, shared, &holders, pinned),
+                options: conflict_options(port, Some(&span), &cur, shared, &holders, pinned),
                 holders,
                 source,
                 current: cur,
@@ -572,6 +582,39 @@ impl LeaseManager {
             pin: false,
         });
         Ok(())
+    }
+
+    /// `Ok` unless a rigid or time-shared lease or a pin holds `port`, other than
+    /// those of the jobs `except` (the ones a caller will stop), under the source's
+    /// gate the caller holds; elastic leases never hold it. The conflict is built
+    /// as [`LeaseManager::acquire_shared_locked`]'s, naming every rigid holder,
+    /// with no band to choose or widen to: for a request that asks for no band
+    /// (`source_measure`).
+    pub(crate) fn unheld_locked(
+        &self,
+        port: &dyn Port,
+        except: &[JobId],
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(), LeaseError> {
+        let source = port.id().clone();
+        self.assert_gate(&source, guard);
+        let leases = self.leases.lock().unwrap();
+        let Some(v) = leases.get(&source) else {
+            return Ok(());
+        };
+        let Some(first) = v.iter().find(|l| !l.elastic && !except.contains(&l.job)) else {
+            return Ok(());
+        };
+        let cur = port.current().unwrap_or(first.band);
+        let shared = v.iter().any(|l| l.time_shared);
+        let holders = rigid(v);
+        let pinned = pinned_in(v, &source);
+        Err(LeaseError::Conflict {
+            options: conflict_options(port, None, &cur, shared, &holders, pinned),
+            holders,
+            source,
+            current: cur,
+        })
     }
 
     /// Tune `port` to `step` for the holder of a time-shared lease, under
@@ -661,7 +704,7 @@ impl LeaseManager {
         }
         let holders = rigid(&held);
         let pinned = pinned_in(&held, &source);
-        let options = conflict_options(port, &want, &cur, shared, &holders, pinned);
+        let options = conflict_options(port, Some(&want), &cur, shared, &holders, pinned);
         Err(LeaseError::Conflict {
             source,
             holders,

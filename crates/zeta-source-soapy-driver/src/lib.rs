@@ -119,6 +119,13 @@ impl SoapyDevice for Driver {
     fn hardware_key(&self) -> String {
         self.dev.hardware_key().unwrap_or_default()
     }
+    fn serial(&self) -> Option<String> {
+        let info = self.dev.hardware_info().ok()?;
+        info.get("serial")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    }
     fn frequency_ranges(&self) -> Result<Vec<RangeHz>, String> {
         self.dev
             .frequency_range(Direction::Rx, CH)

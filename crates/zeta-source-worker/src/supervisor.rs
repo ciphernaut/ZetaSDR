@@ -24,12 +24,14 @@
 //! protocol-2 one whose ring would not open) sends its blocks on the pipe.
 //!
 //! A worker measures its rate cap when it opens (the soapy worker's rate
-//! probe, at each sample depth its link carries). Once the port's capability
-//! record holds a measured cap (the first hello's, or the cached one), each
-//! spawn is told it with `--rate-cap-hz N` (unless the configured args already
-//! carry the flag), and each depth measured with `--depth-cap BITS:HZ` (unless
-//! they carry one for those bits; the latest hello's figures first), so a
-//! respawn skips the probe. The record the port attached with is
+//! probe, at each sample depth its link carries). Once a hello has given
+//! figures, each spawn is told the latest hello's (they supersede what the
+//! configured args carried): `--rate-cap-hz N` for a measured cap, `--depth-cap
+//! BITS:HZ` for each depth measured, and `--measured-at-speed SPEED`, the link
+//! speed of that hello's attachment, so a respawn skips the probe unless its
+//! link now runs at another speed. Before any hello the port's capability
+//! record (the cached one) is told the same way, beside what the configured
+//! args carry (each flag and each depth's bits once). The record the port attached with is
 //! replaced, once, by a later hello that differs from it only in what a newer
 //! worker knows better: its `usable_fraction` and `depths` (a record cached
 //! before them loads with their defaults), and a measured cap where the
@@ -39,7 +41,17 @@
 //! the heal, and later spawns are told its cap. A later hello of that kind
 //! once the record was replaced cannot change it for the run: its figures
 //! still govern tunes (the port's depth is the live worker's) and are what the
-//! node caches for its next start (`Shared::latest`).
+//! node caches for its next start (`Shared::latest`, with their link speed):
+//! any hello whose record differs from the port's only in the figures a
+//! measurement gives (`max_bandwidth_hz`, `usable_fraction`, `depths`).
+//!
+//! [`Port::remeasure`](zeta_core::port::Port::remeasure) ends the live worker as
+//! at shutdown (or kills the spawn still starting, or cuts a backoff short) and
+//! spawns one at once with no figures: the configured args lose theirs, and the
+//! cached record and the latest hello are forgotten for the arguments. The port
+//! is faulted `measuring the link again` until the new worker's hello, which
+//! heals it as any respawn's does; each progress frame of that spawn is
+//! prefixed `as asked: `. Later spawns are told what it measured.
 //!
 //! Every spawn is passed `--progress`, so a worker that measures before its
 //! hello reports each step in a progress frame. The stdout thread keeps the
@@ -63,14 +75,14 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, oneshot, watch};
 use zeta_core::port::{
-    GainInfo, IqBlock, PortError, PortStats, Starting, TransportInfo, Tuning, measured_line,
-    measuring_line,
+    AS_ASKED_PREFIX, GainInfo, IqBlock, PortError, PortStats, Starting, TransportInfo, Tuning,
+    link_speed, measured_line, measuring_line,
 };
 use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId, Timestamp};
 
 use crate::port::{
-    Attach, DEPTH_CAP_FLAG, PROGRESS_FLAG, RATE_CAP_FLAG, WorkerConfig, depth_cap_args,
-    parse_depth_cap,
+    Attach, DEPTH_CAP_FLAG, MEASURED_AT_SPEED_FLAG, PROGRESS_FLAG, RATE_CAP_FLAG, WorkerConfig,
+    figure_args, parse_depth_cap,
 };
 use crate::ring::{self, Ring};
 use crate::serve::{EXIT_FAULTED, EXIT_NOT_FOUND, EXIT_OPEN_FAILED};
@@ -103,11 +115,16 @@ pub(crate) struct Shared {
     /// port attached with (see [`hello_replaces`]). Set at most once: after it,
     /// every spawn is passed its measured cap and reports it back.
     pub(crate) measured: OnceLock<Capabilities>,
-    /// The latest hello's record, when it is the port's own or differs from
-    /// it only in what a newer worker knows better (see [`hello_replaces`]):
-    /// what the node caches for its next start, since the port's record is
-    /// set once per run.
-    latest: Mutex<Option<Capabilities>>,
+    /// The latest hello's record and the link speed of its attachment, when
+    /// the record is the port's own or differs from it only in the figures a
+    /// measurement gives (see [`same_but_figures`]): what the node caches for
+    /// its next start, since the port's record is set once per run, and what
+    /// later spawns are told.
+    latest: Mutex<Option<(Capabilities, Option<String>)>>,
+    /// The link speed the cached record's figures were measured at (the source
+    /// record's), until [`Port::remeasure`](zeta_core::port::Port::remeasure)
+    /// forgets it.
+    cached_speed: Mutex<Option<String>>,
     /// Bumped each time the snapshot's `starting` changes.
     pub(crate) starting_changed: watch::Sender<u64>,
     /// How many `measuring` and `measured` lines were printed, for the tests.
@@ -122,6 +139,7 @@ impl Shared {
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
             measured: OnceLock::new(),
             latest: Mutex::new(None),
+            cached_speed: Mutex::new(None),
             starting_changed: watch::channel(0).0,
             measuring_lines: (AtomicU32::new(0), AtomicU32::new(0)),
         }
@@ -132,9 +150,15 @@ impl Shared {
         self.starting_changed.send_modify(|n| *n += 1);
     }
 
-    /// The latest hello's record the node may cache (the field's docs).
-    pub(crate) fn latest(&self) -> MutexGuard<'_, Option<Capabilities>> {
+    /// The latest hello's record and speed the node may cache (the field's
+    /// docs).
+    pub(crate) fn latest(&self) -> MutexGuard<'_, Option<(Capabilities, Option<String>)>> {
         self.latest.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The link speed the cached record was measured at (the field's docs).
+    pub(crate) fn cached_speed(&self) -> MutexGuard<'_, Option<String>> {
+        self.cached_speed.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn snapshot(&self) -> MutexGuard<'_, Snapshot> {
@@ -176,6 +200,8 @@ pub(crate) struct Snapshot {
     /// What the spawn not yet live reports doing, from its latest progress
     /// frame until its hello or its end.
     pub(crate) starting: Option<Starting>,
+    /// Where the live worker's device is attached, from its hello.
+    pub(crate) attachment: Option<String>,
 }
 
 impl Snapshot {
@@ -190,6 +216,7 @@ impl Snapshot {
         self.transport = None;
         self.transport_dropped = 0;
         self.ring = None;
+        self.attachment = None;
         self.starting.take().is_some()
     }
 
@@ -368,7 +395,17 @@ pub(crate) struct Supervisor {
     backoff: Duration,
     episode: Option<Episode>,
     last_dying_log: Option<Instant>,
+    /// Set by a remeasure until a hello gives figures to cache (`Shared::latest`):
+    /// spawns are told none.
+    measure_anew: bool,
+    /// Set by a remeasure until the next hello: that spawn's progress is
+    /// prefixed [`AS_ASKED_PREFIX`].
+    as_asked: bool,
 }
+
+/// The receiver of [`Port::remeasure`](zeta_core::port::Port::remeasure)'s asks,
+/// each answered once the respawn is under way.
+pub(crate) type Remeasures = tokio::sync::mpsc::Receiver<oneshot::Sender<()>>;
 
 impl Supervisor {
     pub(crate) fn new(
@@ -389,6 +426,8 @@ impl Supervisor {
             backoff,
             episode: None,
             last_dying_log: None,
+            measure_anew: false,
+            as_asked: false,
         }
     }
 
@@ -409,22 +448,24 @@ impl Supervisor {
 
     /// Run until `cancel` fires or its sender is dropped (the port dropped),
     /// or the first spawn is refused. `first` is answered once, with what the
-    /// first spawn said.
+    /// first spawn said. Each ask on `remeasure` ends the worker of the moment
+    /// and spawns one that measures (see the module docs).
     pub(crate) async fn run(
         mut self,
         mut cancel: oneshot::Receiver<()>,
         first: oneshot::Sender<(Attach, Option<Capabilities>)>,
+        mut remeasure: Remeasures,
     ) {
         self.first = Some(first);
         let mut state = State::Starting;
         loop {
             state = match state {
-                State::Starting => match self.start(&mut cancel).await {
+                State::Starting => match self.start(&mut cancel, &mut remeasure).await {
                     Some(s) => s,
                     None => return,
                 },
                 State::Live { worker, since } => {
-                    match self.live(worker, since, &mut cancel).await {
+                    match self.live(worker, since, &mut cancel, &mut remeasure).await {
                         Some(s) => s,
                         None => return,
                     }
@@ -432,6 +473,11 @@ impl Supervisor {
                 State::Waiting { next_at } => {
                     tokio::select! {
                         _ = tokio::time::sleep_until(next_at.into()) => State::Starting,
+                        Some(ack) = remeasure.recv() => {
+                            self.remeasure_from_here();
+                            let _ = ack.send(());
+                            State::Starting
+                        }
                         _ = &mut cancel => return,
                     }
                 }
@@ -439,9 +485,44 @@ impl Supervisor {
         }
     }
 
+    /// The fault a port measuring its link again on the operator's word shows
+    /// until the new worker's hello.
+    fn remeasure_fault(&self) -> String {
+        format!("soapy worker for {}: measuring the link again", self.id())
+    }
+
+    /// A remeasure, once no worker is live: forget every figure the next spawns
+    /// would be told (the configured args' flags, the cached record and its
+    /// speed, the latest hello), fault the port until a hello, and open an
+    /// episode so that hello heals it.
+    fn remeasure_from_here(&mut self) {
+        self.cfg.args = without_figures(&self.cfg.args);
+        self.cached = None;
+        *self.shared.latest() = None;
+        *self.shared.cached_speed() = None;
+        self.measure_anew = true;
+        self.as_asked = true;
+        self.shared.snapshot().supervision_fault = Some(self.remeasure_fault());
+        if self.episode.is_none() {
+            self.episode = Some(Episode {
+                since: Instant::now(),
+                attempts: 0,
+                logged: false,
+            });
+        }
+        eprintln!(
+            "zeta: soapy worker for {}: measuring the link again, as asked",
+            self.id()
+        );
+    }
+
     /// Spawn a worker and wait for its hello. `None` when cancelled or when
     /// the first spawn was refused.
-    async fn start(&mut self, cancel: &mut oneshot::Receiver<()>) -> Option<State> {
+    async fn start(
+        &mut self,
+        cancel: &mut oneshot::Receiver<()>,
+        remeasure: &mut Remeasures,
+    ) -> Option<State> {
         self.spawns += 1;
         if self.spawns > 1 {
             self.shared.snapshot().restarts += 1;
@@ -506,8 +587,18 @@ impl Supervisor {
                     ended.crashed = false;
                     return self.ended(ended);
                 }
+                Some(ack) = remeasure.recv() => {
+                    // A start in progress (a probe, perhaps) gives way to one
+                    // told nothing.
+                    let _ = w.child.kill().await;
+                    let _ = self.reap(w, None, None).await;
+                    self.remeasure_from_here();
+                    let _ = ack.send(());
+                    return Some(State::Starting);
+                }
                 _ = &mut *cancel => {
-                    self.shutdown(w).await;
+                    let fault = self.shut_down_fault();
+                    self.shutdown(w, fault).await;
                     return None;
                 }
             }
@@ -518,8 +609,7 @@ impl Supervisor {
     /// (`measuring`: when its first progress frame came), heals an episode, answers
     /// `first`.
     fn on_hello(&mut self, w: Worker, hello: Hello, measuring: Option<Instant>) -> State {
-        let kept =
-            |c: &Capabilities| c == &hello.capabilities || hello_replaces(c, &hello.capabilities);
+        let kept = |c: &Capabilities| same_but_figures(c, &hello.capabilities);
         match &self.caps {
             None => self.caps = Some(hello.capabilities.clone()),
             Some(c) if *c == hello.capabilities => {}
@@ -554,10 +644,15 @@ impl Supervisor {
                 self.id()
             ),
         }
-        // Before the heal, as above: the node caches it then.
+        // Before the heal, as above: the node caches it then, with the speed
+        // its figures were measured at.
+        // A remeasure is over once a hello gave figures to tell later spawns.
         if self.caps.as_ref().is_some_and(kept) {
-            *self.shared.latest() = Some(hello.capabilities.clone());
+            let speed = hello.attachment.as_deref().and_then(link_speed);
+            *self.shared.latest() = Some((hello.capabilities.clone(), speed.map(String::from)));
+            self.measure_anew = false;
         }
+        self.as_asked = false;
         let was_starting = {
             let mut s = self.shared.snapshot();
             s.pid = w.pid;
@@ -603,6 +698,7 @@ impl Supervisor {
         mut w: Box<Worker>,
         since: Instant,
         cancel: &mut oneshot::Receiver<()>,
+        remeasure: &mut Remeasures,
     ) -> Option<State> {
         let mut stdout_done = w.stdout_done.take();
         let status = tokio::select! {
@@ -620,8 +716,15 @@ impl Supervisor {
                     }
                 }
             }
+            Some(ack) = remeasure.recv() => {
+                self.shutdown(*w, self.remeasure_fault()).await;
+                self.remeasure_from_here();
+                let _ = ack.send(());
+                return Some(State::Starting);
+            }
             _ = &mut *cancel => {
-                self.shutdown(*w).await;
+                let fault = self.shut_down_fault();
+                self.shutdown(*w, fault).await;
                 return None;
             }
         };
@@ -658,27 +761,35 @@ impl Supervisor {
         );
     }
 
-    /// The measured caps for the next spawn: `--rate-cap-hz N` when the port's
-    /// capability record (the first hello's, else the cached one) holds a
-    /// measured cap `N` and the configured args pass none; and one `--depth-cap
-    /// BITS:HZ` for each depth measured that the configured args' own
-    /// `--depth-cap` values lack, taken from the latest hello's record
-    /// (`Shared::latest`, which holds what a respawn measured after the port's
-    /// record was set for the run), else the port's record. So no depth
-    /// measured once is probed again.
-    fn rate_cap_args(&self) -> Vec<String> {
-        let latest = self.shared.latest().clone();
-        let mut out = Vec::new();
-        let configured = |flag: &str| self.cfg.args.iter().any(|a| a == flag);
-        if let Some(Claim::Measured(Hz(n))) = self
-            .caps
-            .as_ref()
-            .or(self.cached.as_ref())
-            .map(|c| &c.max_bandwidth_hz)
-            .filter(|_| !configured(RATE_CAP_FLAG))
-        {
-            out.extend([RATE_CAP_FLAG.into(), n.to_string()]);
+    /// The configured args the next spawn keeps: all of them, but none of the
+    /// figures they carry (`--rate-cap-hz`, `--depth-cap`, `--measured-at-speed`)
+    /// once a hello has given its own ([`Supervisor::rate_cap_args`] passes
+    /// those).
+    fn base_args(&self) -> Vec<String> {
+        if self.shared.latest().is_some() {
+            without_figures(&self.cfg.args)
+        } else {
+            self.cfg.args.clone()
         }
+    }
+
+    /// The measured figures for the next spawn ([`figure_args`]): none while a
+    /// remeasure waits for its hello. Else the latest hello's
+    /// (`Shared::latest`, which holds what a respawn measured after the port's
+    /// record was set for the run) with the link speed of its attachment, so no
+    /// depth measured once is probed again on a link of the same speed. Before
+    /// any hello the port's record (the cached one), beside the configured
+    /// args: `--rate-cap-hz N` unless they carry the flag, a `--depth-cap
+    /// BITS:HZ` for each depth they lack, and the cached record's speed unless
+    /// they carry one.
+    fn rate_cap_args(&self) -> Vec<String> {
+        if self.measure_anew {
+            return Vec::new();
+        }
+        if let Some((caps, speed)) = self.shared.latest().clone() {
+            return figure_args(&caps, true, &[], speed.as_deref());
+        }
+        let configured = |flag: &str| self.cfg.args.iter().any(|a| a == flag);
         let given: Vec<u8> = self
             .cfg
             .args
@@ -686,23 +797,24 @@ impl Supervisor {
             .filter(|w| w[0] == DEPTH_CAP_FLAG)
             .filter_map(|w| parse_depth_cap(&w[1]).ok().map(|(bits, _)| bits))
             .collect();
-        if let Some(caps) = latest
-            .as_ref()
-            .or(self.caps.as_ref())
-            .or(self.cached.as_ref())
-        {
-            out.extend(depth_cap_args(caps, &given));
-        }
-        out
+        let Some(caps) = self.caps.as_ref().or(self.cached.as_ref()) else {
+            return Vec::new();
+        };
+        let speed = self
+            .shared
+            .cached_speed()
+            .clone()
+            .filter(|_| !configured(MEASURED_AT_SPEED_FLAG));
+        figure_args(caps, !configured(RATE_CAP_FLAG), &given, speed.as_deref())
     }
 
     /// Spawn the worker with the scrubbed environment, the measured caps
-    /// ([`Supervisor::rate_cap_args`]), and its ring on [`RING_FD`] when there
-    /// is one, and start its reader threads.
+    /// ([`Supervisor::base_args`], [`Supervisor::rate_cap_args`]), and its ring
+    /// on [`RING_FD`] when there is one, and start its reader threads.
     async fn spawn(&self) -> std::io::Result<Worker> {
         let ring = self.new_ring();
         let mut cmd = Command::new(&self.cfg.program);
-        cmd.args(&self.cfg.args);
+        cmd.args(self.base_args());
         cmd.args(self.rate_cap_args());
         if !self.cfg.args.iter().any(|a| a == PROGRESS_FLAG) {
             cmd.arg(PROGRESS_FLAG);
@@ -746,10 +858,11 @@ impl Supervisor {
 
         let (shared, l) = (self.shared.clone(), link.clone());
         let (r, bad) = (ring.clone(), bad_frame.clone());
+        let as_asked = self.as_asked;
         let reader = std::thread::Builder::new()
             .name(format!("worker-stdout-{id}"))
             .spawn(move || {
-                let why = read_stdout(stdout, &shared, &l, r.as_deref(), hello_tx);
+                let why = read_stdout(stdout, &shared, &l, r.as_deref(), hello_tx, as_asked);
                 if let Some(why) = why {
                     *bad.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
                 }
@@ -915,10 +1028,15 @@ impl Supervisor {
         })
     }
 
+    /// The fault a worker shut down for good leaves.
+    fn shut_down_fault(&self) -> String {
+        format!("soapy worker for {}: shut down", self.id())
+    }
+
     /// Stop a worker: `shutdown` on its stdin, its stdin closed, the grace to
-    /// exit, then kill.
+    /// exit, then kill; `fault` is what the port reports after it.
     /// Always reaped before returning.
-    async fn shutdown(&self, mut w: Worker) {
+    async fn shutdown(&self, mut w: Worker, fault: String) {
         let _ = w
             .link
             .write(&Request {
@@ -937,7 +1055,7 @@ impl Supervisor {
         if s.link.as_ref().is_some_and(|l| Arc::ptr_eq(l, &w.link)) {
             s.link = None;
         }
-        s.supervision_fault = Some(format!("soapy worker for {}: shut down", self.id()));
+        s.supervision_fault = Some(fault);
         let was_starting = s.clear_worker();
         drop(s);
         if was_starting {
@@ -975,6 +1093,35 @@ fn hello_replaces(old: &Capabilities, new: &Capabilities) -> bool {
         same.max_bandwidth_hz = new.max_bandwidth_hz.clone();
     }
     same == *new
+}
+
+/// Whether a later hello's record `new` differs from the port's `old` one only in
+/// the figures a measurement gives: its `max_bandwidth_hz`, `usable_fraction` and
+/// `depths` (a respawn that measured a depth anew, or its link again at a new
+/// speed). Such a hello's record is the one the node caches; any other field
+/// changed is another device, and the record stays the run's.
+fn same_but_figures(old: &Capabilities, new: &Capabilities) -> bool {
+    let mut same = old.clone();
+    same.max_bandwidth_hz = new.max_bandwidth_hz.clone();
+    same.usable_fraction = new.usable_fraction.clone();
+    same.depths = new.depths.clone();
+    same == *new
+}
+
+/// `args` without the figures a spawn is told (`--rate-cap-hz`, `--depth-cap`,
+/// `--measured-at-speed`, each with its value).
+fn without_figures(args: &[String]) -> Vec<String> {
+    let figure = |a: &str| [RATE_CAP_FLAG, DEPTH_CAP_FLAG, MEASURED_AT_SPEED_FLAG].contains(&a);
+    let mut out = Vec::with_capacity(args.len());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if figure(a) {
+            it.next();
+        } else {
+            out.push(a.clone());
+        }
+    }
+    out
 }
 
 /// The fault a worker's end leaves, and for a device-not-found exit what was
@@ -1058,14 +1205,17 @@ fn now_ns() -> u64 {
 /// its blocks 0, 1, 2, … and this reader holds it to that, or a progress frame
 /// after the hello); the worker is then ended and respawned. A stream cut short
 /// mid-frame is not that: a dying worker does it, and its exit says more. A
-/// progress frame before the hello is the snapshot's `starting`; the first is
-/// logged ([`measuring_line`]) and its time handed on with the hello.
+/// progress frame before the hello is the snapshot's `starting` (its `detail`
+/// prefixed [`AS_ASKED_PREFIX`] on a spawn `as_asked`, the one a remeasure
+/// starts); the first is logged ([`measuring_line`]) and its time handed on
+/// with the hello.
 fn read_stdout(
     mut stdout: File,
     shared: &Shared,
     link: &Arc<Link>,
     ring: Option<&Ring>,
     hello: oneshot::Sender<(Hello, Option<Instant>)>,
+    as_asked: bool,
 ) -> Option<String> {
     let mut hello = Some(hello);
     let mut measuring: Option<Instant> = None;
@@ -1124,12 +1274,16 @@ fn read_stdout(
                     s.transport = h.transport.clone();
                     s.transport_dropped = 0;
                     s.depth = h.depth.clone();
+                    s.attachment = h.attachment.clone();
                 }
                 let _ = tx.send((h, measuring));
             }
-            Frame::Control(Control::Progress(p)) => {
+            Frame::Control(Control::Progress(mut p)) => {
                 if hello.is_none() {
                     return bad("a progress report after the hello".into());
+                }
+                if as_asked {
+                    p.detail = format!("{AS_ASKED_PREFIX}{}", p.detail);
                 }
                 if measuring.is_none() {
                     measuring = Some(Instant::now());
@@ -1254,6 +1408,55 @@ mod tests {
         let mut asserted = old.clone();
         asserted.max_bandwidth_hz = Claim::Asserted(Hz(56_000_000));
         assert!(hello_replaces(&asserted, &new));
+    }
+
+    #[test]
+    fn a_hello_that_measured_anew_is_the_one_cached() {
+        let old = Capabilities {
+            tune_min_hz: Claim::Asserted(Hz(70_000_000)),
+            tune_max_hz: Claim::Asserted(Hz(6_000_000_000)),
+            max_bandwidth_hz: Claim::Measured(Hz(30_720_000)),
+            formats: vec![],
+            channels: 1,
+            rx: true,
+            tx: false,
+            remote: false,
+            push: false,
+            usable_fraction: Claim::Asserted(0.9),
+            depths: vec![],
+        };
+        // A link measured again at a new speed: a measured cap over a measured
+        // one, which the run's record keeps, is what the next start gets.
+        let mut new = old.clone();
+        new.max_bandwidth_hz = Claim::Measured(Hz(8_000_000));
+        assert!(!hello_replaces(&old, &new));
+        assert!(same_but_figures(&old, &new));
+        // Another device is not.
+        new.channels = 2;
+        assert!(!same_but_figures(&old, &new));
+    }
+
+    #[test]
+    fn the_figures_are_taken_out_of_the_args() {
+        let args: Vec<String> = [
+            "soapy-worker",
+            "--id",
+            "b",
+            "--rate-cap-hz",
+            "30720000",
+            "--depth-cap",
+            "16:30720000",
+            "--measured-at-speed",
+            "5000",
+            "--args",
+            "driver=uhd",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            without_figures(&args),
+            ["soapy-worker", "--id", "b", "--args", "driver=uhd"]
+        );
     }
 
     #[test]

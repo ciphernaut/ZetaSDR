@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Starting, Tuning, WorkerInfo};
+use crate::port::{
+    GainInfo, IqReceiver, LinkMeasure, Port, PortError, PortStats, Starting, Tuning, WorkerInfo,
+};
 use crate::types::{Capabilities, SourceId};
 
 /// The gain range a [`FaultablePort`] reports, a HackRF-like 0..=76 dB.
@@ -20,8 +22,10 @@ const GAIN_RANGE_DB: (f64, f64) = (0.0, 76.0);
 /// counter [`Port::healed`] hands out, as a respawned worker does. It also reports a
 /// plausible adjustable gain, recording every `set_gain`, and a worker, so the node's
 /// recovery of a worker-like source can be tested over a recording, and a worker's start
-/// the test sets ([`FaultablePort::set_starting`]). The wrapped port's
-/// own `fault` is not consulted: the test owns the fault.
+/// the test sets ([`FaultablePort::set_starting`]), the figures its latest hello measured
+/// ([`FaultablePort::set_latest`]), which it caches with their speed, and counts the
+/// `remeasure` calls it answers `Ok`. The wrapped port's own `fault` is not consulted:
+/// the test owns the fault.
 ///
 /// It wraps `Arc<dyn Port>` rather than `zeta-source-file`'s `FileSource` because that
 /// crate depends on this one; pass the file source, it coerces.
@@ -36,6 +40,9 @@ pub struct FaultablePort {
     /// The worker record's `starting`, set by [`FaultablePort::set_starting`].
     starting: Mutex<Option<Starting>>,
     starting_changed: tokio::sync::watch::Sender<u64>,
+    /// The worker record's `latest`, set by [`FaultablePort::set_latest`].
+    latest: Mutex<Option<LinkMeasure>>,
+    remeasures: Mutex<u32>,
 }
 
 impl FaultablePort {
@@ -49,6 +56,8 @@ impl FaultablePort {
             gains: Mutex::new(Vec::new()),
             starting: Mutex::new(None),
             starting_changed: tokio::sync::watch::channel(0).0,
+            latest: Mutex::new(None),
+            remeasures: Mutex::new(0),
         })
     }
 
@@ -78,6 +87,18 @@ impl FaultablePort {
     pub fn set_starting(&self, s: Option<Starting>) {
         *self.starting.lock().unwrap() = s;
         self.starting_changed.send_modify(|n| *n += 1);
+    }
+
+    /// Set (or with `None` clear) the figures the worker record says the latest hello
+    /// measured and the speed they were measured at: what [`Port::record_to_cache`]
+    /// gives, over the inner port's record, as a worker port's respawn does.
+    pub fn set_latest(&self, m: Option<LinkMeasure>) {
+        *self.latest.lock().unwrap() = m;
+    }
+
+    /// How many times the port was asked to measure its link again.
+    pub fn remeasure_calls(&self) -> u32 {
+        *self.remeasures.lock().unwrap()
     }
 
     /// Every `set_gain` the port was asked for, in order.
@@ -159,7 +180,22 @@ impl Port for FaultablePort {
             transport: None,
             transport_dropped: 0,
             starting: self.starting.lock().unwrap().clone(),
+            attachment: None,
+            link_measure: self.latest.lock().unwrap().clone(),
         })
+    }
+    fn record_to_cache(&self) -> (Capabilities, Option<String>) {
+        let mut caps = self.inner.capabilities().clone();
+        let Some(m) = self.latest.lock().unwrap().clone() else {
+            return (caps, None);
+        };
+        caps.max_bandwidth_hz = m.max_bandwidth_hz;
+        caps.depths = m.depths;
+        (caps, m.at_speed)
+    }
+    async fn remeasure(&self) -> Result<(), PortError> {
+        *self.remeasures.lock().unwrap() += 1;
+        Ok(())
     }
     fn starting_changed(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.starting_changed.subscribe())

@@ -69,7 +69,11 @@ pub enum Op {
     /// `ring_bytes`, `null` while none runs or from an older worker; and
     /// `transport_dropped`, what it could not hand over: ring pieces (2 MiB) the node
     /// had not released, or whole blocks its own pump could not take (pipe queue full,
-    /// broadcast lagging);
+    /// broadcast lagging); `attachment`, where its device is attached
+    /// (`usb:<bus>-<path>@<speed>`, `null` where it cannot tell); and `latest`, the
+    /// figures the latest hello measured (`max_bandwidth_hz`, `depths`) with the link
+    /// speed they were measured at (`at_speed`), cached for the next start (see
+    /// `source_measure`);
     /// `null` for a source that runs in the node), and `ring`, the IQ history (`seconds`, `null`
     /// before the first block; a `classify` or `iq_read` span older than it fails
     /// `too_old`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
@@ -112,6 +116,24 @@ pub enum Op {
     /// Release the source's pin (see `source_pin`).
     SourceUnpin {
         source: SourceId,
+    },
+    /// Drop the source's cached rate figures and measure its link again: the
+    /// worker is ended and respawned to probe each sample depth's clean rate, as at
+    /// a first start (up to a minute or more, the host busy meanwhile; `source_list`
+    /// shows `worker.starting` while it lasts and faults the source until the new
+    /// worker's hello, which heals it). The new figures govern tunes at once
+    /// (`depth`) and show in `worker.link_measure`; `capabilities` keeps this run's record
+    /// until the next start. A source measures again by itself only when its link
+    /// speed changed; this is the operator's choice after devices were added around
+    /// the radio. A source with no worker is refused; one held by a rigid or
+    /// time-shared job or a pin is a `conflict` naming them (elastic jobs never
+    /// hold it: they fail with the fault and are relaunched at the heal). The result
+    /// is `ok` once the respawn is under way.
+    SourceMeasure {
+        source: SourceId,
+        /// Jobs holding the source that may be stopped to make room (`[]` for
+        /// none); see `job_start`.
+        replace: Vec<JobId>,
     },
     /// The sources that could take the band now: `free` lists, in id order, every
     /// source whose `tune_min_hz..=tune_max_hz` holds both edges of the band and whose
@@ -2771,6 +2793,7 @@ impl Op {
             Op::SourceEnsure { .. } => "source_ensure",
             Op::SourcePin { .. } => "source_pin",
             Op::SourceUnpin { .. } => "source_unpin",
+            Op::SourceMeasure { .. } => "source_measure",
             Op::SourceFree { .. } => "source_free",
             Op::SourceSetGain { .. } => "source_set_gain",
             Op::JobStart { .. } => "job_start",
@@ -3712,6 +3735,15 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 return Err(unknown_source(node, &source));
             }
             node.source_unpin(&source)
+                .await
+                .map(|()| OpResult::Ok)
+                .map_err(|e| node_error(node, e))
+        }
+        Op::SourceMeasure { source, replace } => {
+            if node.port(&source).is_none() {
+                return Err(unknown_source(node, &source));
+            }
+            node.source_measure(&source, &replace)
                 .await
                 .map(|()| OpResult::Ok)
                 .map_err(|e| node_error(node, e))

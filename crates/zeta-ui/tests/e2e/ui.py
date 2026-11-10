@@ -7897,6 +7897,114 @@ def scenario_a_measuring_source_shows_its_notice(page, url, secret):
         run_cmd(page, "view reset")
 
 
+def scenario_run_link_diagnostics(page, url, secret):
+    # As in the scenario above, the e2e nodes run file sources only: the page is told that
+    # `tone` has a worker (its latest hello measured one 16-bit depth at 20.48 Msps), and
+    # `source_measure` is answered here as zeta-ws answers an `ok` and a `conflict`.
+    since = 1_000_000
+    depth = {"bits": 16, "lossless": True, "max_bandwidth_hz": {"measured": 20_480_000}}
+    st = {
+        "worker": {"pid": 1, "restarts": 1, "since_ns": since, "transport": None,
+                   "transport_dropped": 0, "starting": None, "attachment": "usb:2-1.4@5000",
+                   "link_measure": {"max_bandwidth_hz": {"measured": 20_480_000},
+                              "depths": [depth], "at_speed": "5000"}},
+        "answer": None,
+        "sent": [],
+    }
+
+    def route(r):
+        body = r.request.post_data or ""
+        if '"source_measure"' in body:
+            st["sent"].append(json.loads(body))
+            if st["answer"] is None:
+                return r.fulfill(status=200, content_type="application/json",
+                                 body=json.dumps({"result": "ok"}))
+            return r.fulfill(status=422, content_type="application/json",
+                             body=json.dumps(st["answer"]))
+        if '"source_list"' not in body:
+            return r.continue_()
+        resp = r.fetch()
+        data = resp.json()
+        for src in data.get("value") or []:
+            if src.get("id") == "tone":
+                src["worker"] = st["worker"]
+        return r.fulfill(response=resp, body=json.dumps(data))
+
+    def sent(n):
+        # Route handlers run while Playwright waits, so wait in the page.
+        for _ in range(100):
+            if len(st["sent"]) >= n:
+                return st["sent"][n - 1]
+            page.wait_for_timeout(100)
+        raise AssertionError(f"source_measure #{n} never sent: {st['sent']}")
+
+    tab = '.src-tab[data-id="tone"]'
+    button = page.locator("#src-menu .link-diag")
+    job = None
+    page.route("**/op", route)
+    try:
+        select_source(page, url, secret, "tone")
+        # The entry shows under the tab of a source with a worker (once a poll says so,
+        # the pointer already on the tab), and only there.
+        page.hover(tab)
+        page.evaluate("window.zetaTest.poll()")
+        expect(button).to_be_visible(timeout=5_000)
+        expect(button).to_have_text("Run link diagnostics")
+        expect(button).to_have_attribute(
+            "title", "measures the rates this radio's link sustains: about a minute, "
+            "the host will be busy")
+        page.hover('.src-tab[data-id="aprs"]')
+        expect(button).to_be_hidden(timeout=5_000)
+        page.hover(tab)
+        expect(button).to_be_visible(timeout=5_000)
+        button.click()
+        op = sent(1)
+        assert op == {"op": "source_measure", "source": "tone", "replace": []}, op
+        expect(page.locator("#transcript")).to_contain_text(
+            "measuring tone again: about a minute, the host will be busy", timeout=5_000)
+        # The respawn measures: the notice shows, and no result yet.
+        st["worker"] = dict(st["worker"], pid=None, since_ns=None, link_measure=None,
+                            starting={"what": "measuring", "detail": "as asked: 16-bit at "
+                                      "30720000 Hz", "step": 1, "of": 6, "eta_ms": 36000})
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator(f"{tab} .starting")).to_be_visible(timeout=10_000)
+        result = "link diagnostics tone: 16-bit 20.48 → 30.72 Msps; record updates at the next start"
+        expect(page.locator("#transcript")).not_to_contain_text("link diagnostics tone")
+        # Its hello: a later since_ns, no start, the new figure.
+        st["worker"] = dict(st["worker"], pid=2, since_ns=since + 1, starting=None,
+                            link_measure={"max_bandwidth_hz": {"measured": 30_720_000},
+                                    "depths": [dict(depth, max_bandwidth_hz={
+                                        "measured": 30_720_000})],
+                                    "at_speed": "5000"})
+        page.evaluate("window.zetaTest.poll()")
+        expect(page.locator("#transcript .line", has_text=result)).to_have_count(
+            1, timeout=10_000)
+        expect(page.locator(f"{tab} .starting")).to_have_count(0)
+        # A conflict offers the usual stop and retry, the retry naming the holder.
+        job = start_job(url, secret, "passthrough", "tone", 100_000_000, 10_000)
+        st["answer"] = {"error": "conflict", "source": "tone", "holders": [job],
+                        "current": {"center_hz": 100_000_000, "bandwidth_hz": 48_000},
+                        "options": []}
+        page.evaluate("window.zetaTest.poll()")
+        page.hover(tab)
+        expect(button).to_be_visible(timeout=5_000)
+        button.click()
+        sent(2)
+        line = page.locator("#transcript .line.error",
+                            has_text=re.compile(rf"conflict: source tone held by passthrough {job}"))
+        expect(line).to_have_count(1, timeout=10_000)
+        retry = line.locator("button", has_text=f"stop passthrough {job[-6:]} and retry")
+        expect(retry).to_have_count(1)
+        st["answer"] = None
+        retry.click()
+        op = sent(3)
+        assert op == {"op": "source_measure", "source": "tone", "replace": [job]}, op
+    finally:
+        page.unroute("**/op", route)
+        if job:
+            stop_job(url, secret, job)
+
+
 def scenarios():
     return [(name[len("scenario_"):], fn) for name, fn in globals().items()
             if name.startswith("scenario_") and callable(fn)]

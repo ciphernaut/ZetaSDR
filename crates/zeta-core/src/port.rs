@@ -7,7 +7,7 @@ use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Capabilities, Depth, Hz, SourceId, Timestamp};
+use crate::types::{Capabilities, Claim, Depth, Hz, SourceId, Timestamp};
 
 /// A centre frequency and the bandwidth captured around it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -75,10 +75,15 @@ pub struct PortStats {
 /// the pipe, or while none is running); `transport_dropped` counts the blocks
 /// the live worker dropped because the node had not freed a ring slot (or its
 /// pipe queue) in time. `starting` is what a worker not yet live is doing at
-/// its start (see [`Starting`]). These three default when absent, so a source
-/// record of an older node still loads; every node of this version writes
-/// them, so the schema requires them.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// its start (see [`Starting`]). `attachment` is where the live worker's device
+/// is attached, as its hello said (`usb:2-1.4@5000`: the bus and port path,
+/// then the negotiated speed; `null` while none is running or where the source
+/// cannot tell); `link_measure` the figures of the latest hello and the link speed
+/// they were measured at (see [`LinkMeasure`]): what the node caches for the
+/// source's next start ([`Port::record_to_cache`]), `null` before the first
+/// hello. These default when absent, so a source record of an older node still
+/// loads; every node of this version writes them, so the schema requires them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields, transform = crate::knowledge::require_all)]
 pub struct WorkerInfo {
@@ -99,6 +104,67 @@ pub struct WorkerInfo {
     #[serde(default)]
     #[schemars(schema_with = "crate::types::nullable::<Starting>")]
     pub starting: Option<Starting>,
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<String>")]
+    pub attachment: Option<String>,
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<LinkMeasure>")]
+    pub link_measure: Option<LinkMeasure>,
+}
+
+/// A hello's measured figures and the link speed they were measured at: its
+/// `max_bandwidth_hz` (the source's own depth's cap) and `depths`, as
+/// [`Capabilities`] names them, and `at_speed`, the [`link_speed`] of its
+/// `attachment` (`null` where the source cannot tell).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct LinkMeasure {
+    pub max_bandwidth_hz: Claim<Hz>,
+    pub depths: Vec<Depth>,
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub at_speed: Option<String>,
+}
+
+/// The negotiated speed in an `attachment` (`usb:2-1.4@5000` gives `5000`): the
+/// part after the `@`; `None` without one.
+pub fn link_speed(attachment: &str) -> Option<&str> {
+    attachment
+        .rsplit_once('@')
+        .map(|(_, speed)| speed)
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether figures measured at link speed `measured_at_speed` still hold for a
+/// device now at `attachment`: true unless both speeds are known and differ (no
+/// speed in the record, no attachment or no speed in it, keeps them). The port
+/// path is shown, never compared: another port at the same speed keeps them.
+pub fn cached_figures_hold(measured_at_speed: Option<&str>, attachment: Option<&str>) -> bool {
+    match (measured_at_speed, attachment.and_then(link_speed)) {
+        (Some(was), Some(now)) => was == now,
+        _ => true,
+    }
+}
+
+/// The start of a [`Starting::detail`] whose probe runs because the link's
+/// speed changed: `link speed changed (<old> to <new>): `.
+pub fn speed_changed_prefix(old: &str, new: &str) -> String {
+    format!("link speed changed ({old} to {new}): ")
+}
+
+/// The start of a [`Starting::detail`] whose probe runs because `source_measure`
+/// asked for it.
+pub const AS_ASKED_PREFIX: &str = "as asked: ";
+
+/// Why a start measures, from its `detail`: `link speed changed (<old> to
+/// <new>)` or `as asked`, or `None` (a first measure says nothing).
+fn measure_reason(detail: &str) -> Option<&str> {
+    if detail.starts_with(AS_ASKED_PREFIX) {
+        return Some(AS_ASKED_PREFIX.trim_end_matches(": "));
+    }
+    let rest = detail.strip_prefix("link speed changed (")?;
+    let end = rest.find("): ")?;
+    Some(&detail[..detail.len() - rest.len() + end + 1])
 }
 
 /// A worker's start in progress, as it reports it before its hello: `what` it is
@@ -120,10 +186,13 @@ pub struct Starting {
 
 /// The line the node logs, and puts on the source's feed, when `source`'s worker
 /// begins measuring its link: `s` is its first progress report, whose `eta_ms`
-/// (whole seconds, rounded up) bounds the wait.
+/// (whole seconds, rounded up) bounds the wait. A measure that has a reason
+/// names it first in the parentheses: `link speed changed (<old> to <new>)` or
+/// `as asked` (`source_measure`), from the start of `s.detail`.
 pub fn measuring_line(source: &SourceId, s: &Starting) -> String {
+    let why = measure_reason(&s.detail).map_or(String::new(), |r| format!("{r}; "));
     format!(
-        "source {}: measuring what this radio's link can sustain (up to about {} s; the host will be busy; max_rate_hz= skips it)",
+        "source {}: measuring what this radio's link can sustain ({why}up to about {} s; the host will be busy; max_rate_hz= skips it)",
         source.0,
         s.eta_ms.div_ceil(1000)
     )
@@ -385,11 +454,76 @@ pub trait Port: Send + Sync {
         let _ = bits;
         Err(PortError::Unsupported("source has one sample depth".into()))
     }
-    /// The capability record to cache for the source's next start: the
-    /// record of [`Port::capabilities`], unless the port has measured since
-    /// what that record, fixed for the run, could not take (a worker's
-    /// respawn that measured a depth the record holds as asserted).
-    fn record_to_cache(&self) -> Capabilities {
-        self.capabilities().clone()
+    /// The capability record to cache for the source's next start, and the link
+    /// speed its figures were measured at (`None`: unknown): the record of
+    /// [`Port::capabilities`], unless the port has measured since what that
+    /// record, fixed for the run, could not take (a worker's respawn that
+    /// measured a depth the record holds as asserted, or measured again at a
+    /// new link speed). The two are read together and cached together, so
+    /// figures are never kept beside a speed they were not measured at.
+    fn record_to_cache(&self) -> (Capabilities, Option<String>) {
+        (self.capabilities().clone(), None)
+    }
+    /// Where the source's device is attached, where it can tell: a USB radio's
+    /// bus and port path and its negotiated speed (`usb:2-1.4@5000`, see
+    /// [`link_speed`]); `None` for every other source.
+    fn attachment(&self) -> Option<String> {
+        None
+    }
+    /// Drop the source's measured figures and measure its link again: a worker
+    /// port ends its worker and spawns one that probes, faulted until its hello.
+    /// `Unsupported` for a source with no worker.
+    async fn remeasure(&self) -> Result<(), PortError> {
+        Err(PortError::Unsupported("source has no worker".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_speed_is_the_part_after_the_at() {
+        assert_eq!(link_speed("usb:2-1.4@5000"), Some("5000"));
+        assert_eq!(link_speed("usb:2-1.4"), None);
+        assert_eq!(link_speed("usb:2-1.4@"), None);
+    }
+
+    #[test]
+    fn cached_figures_hold_unless_both_speeds_are_known_and_differ() {
+        assert!(!cached_figures_hold(Some("5000"), Some("usb:1-2@480")));
+        // Another port at the same speed keeps them: the path is never compared.
+        assert!(cached_figures_hold(Some("5000"), Some("usb:3-1@5000")));
+        assert!(cached_figures_hold(None, Some("usb:1-2@480")));
+        assert!(cached_figures_hold(Some("5000"), None));
+        assert!(cached_figures_hold(Some("5000"), Some("usb:1-2")));
+        assert!(cached_figures_hold(None, None));
+    }
+
+    #[test]
+    fn the_measuring_line_says_why() {
+        let s = SourceId("b210".into());
+        let step = |detail: &str| Starting {
+            what: "measuring".into(),
+            detail: detail.into(),
+            step: 1,
+            of: 6,
+            eta_ms: 35_500,
+        };
+        assert_eq!(
+            measuring_line(&s, &step("16-bit at 30720000 Hz")),
+            "source b210: measuring what this radio's link can sustain (up to about 36 s; the host will be busy; max_rate_hz= skips it)"
+        );
+        assert_eq!(
+            measuring_line(
+                &s,
+                &step("link speed changed (5000 to 480): 16-bit at 30720000 Hz")
+            ),
+            "source b210: measuring what this radio's link can sustain (link speed changed (5000 to 480); up to about 36 s; the host will be busy; max_rate_hz= skips it)"
+        );
+        assert_eq!(
+            measuring_line(&s, &step("as asked: 16-bit at 30720000 Hz")),
+            "source b210: measuring what this radio's link can sustain (as asked; up to about 36 s; the host will be busy; max_rate_hz= skips it)"
+        );
     }
 }

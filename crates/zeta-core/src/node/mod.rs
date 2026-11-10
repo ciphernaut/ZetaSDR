@@ -510,24 +510,29 @@ impl Inner {
         }
     }
 
-    /// Cache a worker port's capabilities ([`Port::record_to_cache`]) in its
-    /// source record, so a later start with the device absent can still list
-    /// the source and a worker is passed back what was measured. A port that
-    /// runs in the node (`Port::worker` is `None`) has nothing to cache and
-    /// writes no record. A failed write goes to `persist_errors`; the memory
-    /// record is then left as it was.
+    /// Cache a worker port's capabilities and the link speed their figures were
+    /// measured at ([`Port::record_to_cache`], read together) in its source
+    /// record, so a later start with the device absent can still list the
+    /// source and a worker is passed back what was measured, with the speed it
+    /// checks them against. Runs at attach and after each heal, so a respawn
+    /// that measured again is cached with its speed. A port that runs in the
+    /// node (`Port::worker` is `None`) has nothing to cache and writes no
+    /// record. A failed write goes to `persist_errors`; the memory record is
+    /// then left as it was.
     pub(crate) fn note_capabilities(&self, port: &dyn Port) {
         if port.worker().is_none() {
             return;
         }
         let source = port.id();
+        let (caps, speed) = port.record_to_cache();
         let mut sources = self.sources.lock().unwrap();
         let mut rec = sources
             .get(source)
             .cloned()
             .unwrap_or_else(SourceRecord::new);
         rec.format = SOURCE_RECORD_FORMAT;
-        rec.capabilities = Some(port.record_to_cache());
+        rec.capabilities = Some(caps);
+        rec.measured_at_speed = speed;
         match persist_source(&self.sources_dir, source, &rec) {
             Ok(()) => {
                 sources.insert(source.clone(), rec);
@@ -2677,6 +2682,52 @@ impl Node {
         // Outside the gate: the idle takes it.
         self.idle_if_unheld(port.as_ref()).await;
         written
+    }
+
+    /// Drop `source`'s cached rate figures and have its worker measure the link
+    /// again ([`Port::remeasure`]), under one hold of the source's gate: a source
+    /// with no worker is `Other("source <id> has no worker")`; one a rigid or
+    /// time-shared lease or a pin holds, other than the `replace` jobs, is the
+    /// conflict naming them ([`LeaseManager::unheld_locked`]); then the `replace`
+    /// jobs are stopped ([`Node::replace_holders`]), the record's `capabilities`
+    /// and `measured_at_speed` are cleared and persisted (a start before the new
+    /// hello probes as a first one does), and the port respawns its worker. The
+    /// heal that follows the new hello relaunches what failed and caches the new
+    /// figures with their speed ([`Inner::note_capabilities`]).
+    pub async fn source_measure(
+        &self,
+        source: &SourceId,
+        replace: &[JobId],
+    ) -> Result<(), NodeError> {
+        let port = self
+            .port(source)
+            .ok_or_else(|| NodeError::UnknownSource(source.clone()))?;
+        let guard = self.inner.leases.gate_guard(source).await;
+        if port.worker().is_none() {
+            return Err(NodeError::Other(format!(
+                "source {} has no worker",
+                source.0
+            )));
+        }
+        self.inner
+            .leases
+            .unheld_locked(port.as_ref(), replace, &guard)
+            .map_err(NodeError::Lease)?;
+        self.replace_holders(source, replace, &guard).await?;
+        let result = match self.set_source_record(source, |r| {
+            r.capabilities = None;
+            r.measured_at_speed = None;
+        }) {
+            Ok(()) => port.remeasure().await.map_err(gain_error),
+            Err(e) => Err(e),
+        };
+        drop(guard);
+        // The `replace` jobs were stopped without idling the port (as for
+        // `source_pin`); after a failure nothing respawns it, so idle it here.
+        if result.is_err() && !replace.is_empty() {
+            self.idle_if_unheld(port.as_ref()).await;
+        }
+        result
     }
 
     /// Set `source`'s overall receive gain (`None`: automatic gain) through

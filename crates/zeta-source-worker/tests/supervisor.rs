@@ -186,7 +186,16 @@ fn mock_samples(b: &IqBlock) -> bool {
 }
 
 async fn open(cfg: WorkerConfig, cached: Option<Capabilities>) -> (Arc<WorkerPort>, Attach) {
-    WorkerPort::open(cfg, cached)
+    open_at(cfg, cached, None).await
+}
+
+/// [`open`] with the link speed the cached figures were measured at.
+async fn open_at(
+    cfg: WorkerConfig,
+    cached: Option<Capabilities>,
+    speed: Option<&str>,
+) -> (Arc<WorkerPort>, Attach) {
+    WorkerPort::open(cfg, cached, speed.map(String::from))
         .await
         .expect("the worker attaches")
 }
@@ -294,7 +303,10 @@ async fn not_found_without_a_cache_is_refused_and_leaves_no_child() {
             pidfile.display()
         ),
     );
-    let err = WorkerPort::open(cfg, None).await.err().expect("refused");
+    let err = WorkerPort::open(cfg, None, None)
+        .await
+        .err()
+        .expect("refused");
     assert_eq!(err, "device not found: fake");
     let pid: u32 = std::fs::read_to_string(&pidfile)
         .unwrap()
@@ -343,7 +355,10 @@ async fn a_crash_before_the_first_hello_with_a_cache_attaches_faulted_and_heals(
 
     let dir = tempdir();
     let (cfg, rec) = cfg_wrapped(dir.path(), crash_first);
-    let err = WorkerPort::open(cfg, None).await.err().expect("refused");
+    let err = WorkerPort::open(cfg, None, None)
+        .await
+        .err()
+        .expect("refused");
     assert_eq!(err, crashed);
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(starts(&rec).len(), 1, "no respawn after a refusal");
@@ -391,7 +406,7 @@ async fn a_cached_record_from_before_this_plan_takes_the_hellos_new_fields() {
 
 #[tokio::test]
 async fn open_fails_is_refused_with_the_last_stderr_line() {
-    let err = WorkerPort::open(cfg("open-fails"), Some(cached_caps()))
+    let err = WorkerPort::open(cfg("open-fails"), Some(cached_caps()), None)
         .await
         .err()
         .expect("refused");
@@ -410,7 +425,10 @@ async fn a_hang_before_hello_is_killed_at_the_timeout() {
         ),
     );
     let t0 = Instant::now();
-    let err = WorkerPort::open(cfg, None).await.err().expect("refused");
+    let err = WorkerPort::open(cfg, None, None)
+        .await
+        .err()
+        .expect("refused");
     let took = t0.elapsed();
     assert_eq!(err, "soapy worker for f: no hello in 3 s");
     assert!(
@@ -682,7 +700,10 @@ async fn a_hello_of_another_protocol_is_refused_and_the_child_reaped() {
         ),
     );
     let t0 = Instant::now();
-    let err = WorkerPort::open(cfg, None).await.err().expect("refused");
+    let err = WorkerPort::open(cfg, None, None)
+        .await
+        .err()
+        .expect("refused");
     assert_eq!(err, "soapy worker for f: protocol 3, expected 1 or 2");
     assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
     let pid: u32 = std::fs::read_to_string(&pidfile)
@@ -1007,20 +1028,32 @@ async fn a_cached_measured_cap_is_passed_to_the_respawn() {
     let mut measured = cached_caps();
     measured.max_bandwidth_hz = Claim::Measured(Hz(20_480_000));
     let base = ["soapy-worker", "--id", "f", "--args", "driver=fake"];
-    assert_eq!(worker_args("f", "driver=fake", None), base);
+    assert_eq!(worker_args("f", "driver=fake", None, None), base);
     assert_eq!(
-        worker_args("f", "driver=fake", Some(&cached_caps())),
+        worker_args("f", "driver=fake", Some(&cached_caps()), None),
         base,
         "an asserted cap is probed again"
     );
-    let args = worker_args("f", "driver=fake", Some(&measured));
+    let args = worker_args("f", "driver=fake", Some(&measured), None);
     assert_eq!(args[..5], base);
     assert_eq!(args[5..], ["--rate-cap-hz", "20480000"]);
+    // With the speed the figures were measured at beside them, for the worker to
+    // check its link against.
+    let at = worker_args("f", "driver=fake", Some(&measured), Some("5000"));
+    assert_eq!(
+        at[5..],
+        ["--rate-cap-hz", "20480000", "--measured-at-speed", "5000"]
+    );
+    // A speed without figures is nothing to check.
+    assert_eq!(worker_args("f", "driver=fake", None, Some("5000")), base);
 
     // Cached at start: every spawn carries the cap once, the supervisor adding
-    // no second copy.
+    // no second copy. This wrapper hands the fake none of the node's args, so
+    // spawn 0 is told by its environment to report the cap passed back, as the
+    // real worker's hello does; the respawn is passed the hello's figures in
+    // place of the configured ones.
     let dir = tempdir();
-    let (cfg, rec) = cfg_recording_args(dir.path(), "", args);
+    let (cfg, rec) = cfg_recording_args(dir.path(), "ZETA_FAKE_MEASURED_CAP=20480000", args);
     let spawns = two_spawns(cfg, &rec, Some(measured)).await;
     for args in &spawns[..2] {
         assert_eq!(caps_passed(args), 1, "{args:?}");
@@ -1035,7 +1068,7 @@ async fn a_cap_learned_from_the_hello_is_passed_to_the_respawn() {
     let (cfg, rec) = cfg_recording_args(
         dir.path(),
         "ZETA_FAKE_MEASURED_CAP=20480000",
-        worker_args("f", "driver=fake", None),
+        worker_args("f", "driver=fake", None, None),
     );
     let spawns = two_spawns(cfg, &rec, None).await;
     assert_eq!(caps_passed(&spawns[0]), 0, "{:?}", spawns[0]);
@@ -1070,7 +1103,7 @@ async fn a_cap_measured_on_a_respawn_replaces_the_asserted_one() {
     )
     .unwrap();
     let mut args = vec![wrapper.display().to_string()];
-    args.extend(worker_args("f", "driver=fake", None));
+    args.extend(worker_args("f", "driver=fake", None, None));
     let cfg = WorkerConfig {
         id: SourceId("f".into()),
         program: PathBuf::from("/bin/sh"),
@@ -1192,7 +1225,7 @@ async fn cached_depth_caps_are_passed_to_the_respawn() {
         depth(16, true, measured(20_480_000)),
         depth(8, false, Claim::Asserted(Hz(20_000_000))),
     ];
-    let args = worker_args("f", "driver=fake", Some(&cached));
+    let args = worker_args("f", "driver=fake", Some(&cached), None);
     assert_eq!(
         args[5..],
         ["--rate-cap-hz", "20480000", "--depth-cap", "16:20480000"]
@@ -1201,7 +1234,11 @@ async fn cached_depth_caps_are_passed_to_the_respawn() {
     // Nothing cached: spawn 0 measures both and crashes; the respawn is told
     // both, beside the rate cap.
     let dir = tempdir();
-    let (cfg, rec) = cfg_recording_args(dir.path(), DEPTHS, worker_args("f", "driver=fake", None));
+    let (cfg, rec) = cfg_recording_args(
+        dir.path(),
+        DEPTHS,
+        worker_args("f", "driver=fake", None, None),
+    );
     let spawns = two_spawns(cfg, &rec, None).await;
     assert!(depth_caps(&spawns[0]).is_empty(), "{:?}", spawns[0]);
     assert_eq!(
@@ -1225,7 +1262,7 @@ async fn a_respawn_merges_the_configured_depth_caps_with_those_measured_since() 
         depth(16, true, measured(20_480_000)),
         depth(8, false, Claim::Asserted(Hz(20_000_000))),
     ];
-    let args = worker_args("f", "driver=fake", Some(&cached));
+    let args = worker_args("f", "driver=fake", Some(&cached), None);
     let dir = tempdir();
     let (cfg, rec) = cfg_recording_args(dir.path(), DEPTHS, args);
     let spawns = two_spawns(cfg, &rec, Some(cached)).await;
@@ -1264,7 +1301,7 @@ async fn a_depth_measured_after_the_record_was_set_is_passed_to_the_next_respawn
     )
     .unwrap();
     let mut args = vec![wrapper.display().to_string()];
-    args.extend(worker_args("f", "driver=fake", None));
+    args.extend(worker_args("f", "driver=fake", None, None));
     let cfg = WorkerConfig {
         id: SourceId("f".into()),
         program: PathBuf::from("/bin/sh"),
@@ -1357,7 +1394,7 @@ async fn a_respawns_measured_depth_cap_reaches_the_port_when_its_record_is_kept(
         port.capabilities()
     );
     assert_eq!(port.capabilities().depths[1], depth(8, false, asserted));
-    let cache = port.record_to_cache();
+    let (cache, _) = port.record_to_cache();
     assert_eq!(cache.depths[1], depth(8, false, measured(30_720_000)));
     assert_eq!(cache.usable_fraction, Claim::Asserted(0.95));
     assert_eq!(
@@ -1545,4 +1582,221 @@ fn the_hello_deadline_covers_a_three_depth_probe() {
         "{HELLO_TIMEOUT:?} for three probes of {probe:?}"
     );
     assert_eq!(Timings::default().hello, HELLO_TIMEOUT);
+}
+
+/// The fake's whole record (`cached_caps` lists one format only) with its cap
+/// measured at 20.48 MHz, as a node caches it after a probe.
+fn cached_measured() -> Capabilities {
+    let mut c = cached_caps();
+    c.formats = vec![SampleFormat::Ci8, SampleFormat::Ci16, SampleFormat::Cf32];
+    c.max_bandwidth_hz = measured(20_480_000);
+    c
+}
+
+/// [`cfg_wrapped`] whose wrapper first appends `args <its arguments>` to the
+/// record, one line per spawn.
+fn cfg_args_wrapped(dir: &Path, body: &str) -> (WorkerConfig, PathBuf) {
+    cfg_wrapped(dir, &format!("echo \"args $*\" >> \"$REC\"\n{body}"))
+}
+
+/// The arguments of each spawn, from the record's `args` lines.
+fn args_lines(rec: &Path) -> Vec<Vec<String>> {
+    std::fs::read_to_string(rec)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("args "))
+        .map(|l| l.split(' ').map(String::from).collect())
+        .collect()
+}
+
+/// Whether `args` hold `flag` followed by `value`.
+fn has(args: &[String], flag: &str, value: &str) -> bool {
+    args.windows(2).any(|w| w[0] == flag && w[1] == value)
+}
+
+/// Whether `args` hold `flag` at all.
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+#[tokio::test]
+async fn cached_caps_are_used_at_the_same_speed() {
+    let dir = tempdir();
+    let (cfg, rec) = cfg_args_wrapped(
+        dir.path(),
+        "ZETA_FAKE_ATTACHMENT=usb:1-2@5000 ZETA_FAKE_PROGRESS=3 exec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (port, attach) = open_at(cfg, Some(cached_measured()), Some("5000")).await;
+    assert!(matches!(attach, Attach::Hello), "{attach:?}");
+    // Nothing was measured: no progress reached the port, no line was printed.
+    assert_eq!(port.measuring_lines(), (0, 0));
+    assert_eq!(*port.starting_changed().unwrap().borrow(), 0);
+    assert_eq!(port.capabilities().max_bandwidth_hz, measured(20_480_000));
+    let args = &args_lines(&rec)[0];
+    assert!(has(args, "--rate-cap-hz", "20480000"), "{args:?}");
+    assert!(has(args, "--measured-at-speed", "5000"), "{args:?}");
+    let w = port.worker().unwrap();
+    assert_eq!(w.attachment.as_deref(), Some("usb:1-2@5000"));
+    let latest = w.link_measure.expect("the hello's figures");
+    assert_eq!(latest.at_speed.as_deref(), Some("5000"));
+    assert_eq!(latest.max_bandwidth_hz, measured(20_480_000));
+}
+
+/// Spawn 0 finds no device, so the port attaches with the cached record measured
+/// at 5000; spawn 1 is on a USB 2 port and measures 30.72 MHz there, running
+/// `then` after the environment.
+fn speed_change_body(then: &str) -> String {
+    respawn_body(&format!(
+        "export ZETA_FAKE_ATTACHMENT=usb:1-2@480 ZETA_FAKE_MEASURED_CAP=30720000\n{then}"
+    ))
+}
+
+#[tokio::test]
+async fn a_changed_link_speed_is_measured_again_and_says_why() {
+    let dir = tempdir();
+    let (cfg, rec) = cfg_args_wrapped(
+        dir.path(),
+        &speed_change_body("ZETA_FAKE_PROGRESS=2 exec \"$FAKE\" --script stream \"$@\""),
+    );
+    let (port, attach) = open_at(cfg, Some(cached_measured()), Some("5000")).await;
+    assert!(matches!(attach, Attach::NotFound { .. }), "{attach:?}");
+    let s = starting_seen(&port, Duration::from_secs(10))
+        .await
+        .expect("the respawn reports its probe");
+    assert!(
+        s.detail.starts_with("link speed changed (5000 to 480): "),
+        "{s:?}"
+    );
+    until("the respawn says hello", Duration::from_secs(10), || {
+        port.worker().unwrap().pid.is_some()
+    })
+    .await;
+    let args = &args_lines(&rec)[1];
+    assert!(has(args, "--measured-at-speed", "5000"), "{args:?}");
+    assert!(has(args, "--rate-cap-hz", "20480000"), "{args:?}");
+    let w = port.worker().unwrap();
+    assert_eq!(w.attachment.as_deref(), Some("usb:1-2@480"));
+    let latest = w.link_measure.expect("the hello's figures");
+    assert_eq!(latest.at_speed.as_deref(), Some("480"));
+    assert_eq!(latest.max_bandwidth_hz, measured(30_720_000));
+    // The record stays set for the run; the new figures are what is cached.
+    assert_eq!(port.capabilities(), &cached_measured());
+    let (cache, speed) = port.record_to_cache();
+    assert_eq!(cache.max_bandwidth_hz, measured(30_720_000));
+    assert_eq!(speed.as_deref(), Some("480"));
+    assert_eq!(port.measuring_lines(), (1, 1));
+}
+
+#[tokio::test]
+async fn another_port_at_the_same_speed_keeps_the_cache() {
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_args_wrapped(
+        dir.path(),
+        "ZETA_FAKE_ATTACHMENT=usb:3-1@5000 ZETA_FAKE_PROGRESS=3 exec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (port, attach) = open_at(cfg, Some(cached_measured()), Some("5000")).await;
+    assert!(matches!(attach, Attach::Hello), "{attach:?}");
+    assert_eq!(port.measuring_lines(), (0, 0));
+    // The hello reports the cap it was passed.
+    assert_eq!(port.capabilities().max_bandwidth_hz, measured(20_480_000));
+    assert_eq!(
+        port.worker().unwrap().attachment.as_deref(),
+        Some("usb:3-1@5000")
+    );
+}
+
+#[tokio::test]
+async fn a_source_without_an_attachment_keeps_its_cache() {
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_args_wrapped(
+        dir.path(),
+        "ZETA_FAKE_PROGRESS=3 exec \"$FAKE\" --script stream \"$@\"",
+    );
+    let (port, attach) = open_at(cfg, Some(cached_measured()), Some("5000")).await;
+    assert!(matches!(attach, Attach::Hello), "{attach:?}");
+    assert_eq!(port.measuring_lines(), (0, 0));
+    assert_eq!(port.capabilities().max_bandwidth_hz, measured(20_480_000));
+    let w = port.worker().unwrap();
+    assert_eq!(w.attachment, None);
+    assert_eq!(w.link_measure.expect("the hello's figures").at_speed, None);
+}
+
+#[tokio::test]
+async fn a_respawn_passes_the_latest_hellos_figures_and_speed() {
+    let dir = tempdir();
+    let (cfg, rec) = cfg_args_wrapped(
+        dir.path(),
+        &speed_change_body(
+            "if [ \"$N\" -eq 1 ]; then exec \"$FAKE\" --script 'crash-after-ms 400' \"$@\"; fi\n\
+             exec \"$FAKE\" --script stream \"$@\"",
+        ),
+    );
+    let (port, _) = open_at(cfg, Some(cached_measured()), Some("5000")).await;
+    until("a third spawn says hello", Duration::from_secs(15), || {
+        let w = port.worker().unwrap();
+        w.restarts >= 2 && w.pid.is_some()
+    })
+    .await;
+    let spawns = args_lines(&rec);
+    assert!(spawns.len() >= 3, "{spawns:?}");
+    let args = &spawns[2];
+    assert!(has(args, "--rate-cap-hz", "30720000"), "{args:?}");
+    assert!(has(args, "--measured-at-speed", "480"), "{args:?}");
+    assert!(!has(args, "--measured-at-speed", "5000"), "{args:?}");
+    // Spawn 2 holds the figures spawn 1 measured: nothing measured again.
+    assert_eq!(port.measuring_lines(), (1, 1));
+}
+
+#[tokio::test]
+async fn remeasure_respawns_without_caps() {
+    let dir = tempdir();
+    let (cfg, rec) = cfg_args_wrapped(
+        dir.path(),
+        "ZETA_FAKE_ATTACHMENT=usb:1-2@5000 ZETA_FAKE_PROGRESS=2 ZETA_FAKE_MEASURED_CAP=30720000 \
+         exec \"$FAKE\" --script stream \"$@\"",
+    );
+    let mut cfg = cfg;
+    // As the node spawns it: the cached figures and their speed in the args.
+    cfg.args
+        .extend(["--rate-cap-hz", "20480000", "--measured-at-speed", "5000"].map(String::from));
+    let (port, attach) = open_at(cfg, Some(cached_measured()), Some("5000")).await;
+    assert!(matches!(attach, Attach::Hello), "{attach:?}");
+    assert_eq!(port.measuring_lines(), (0, 0));
+    let healed = port.healed().unwrap();
+    let before = *healed.borrow();
+    let changed = port.starting_changed().unwrap();
+    assert_eq!(port.remeasure().await, Ok(()));
+    // Faulted until the new worker's hello.
+    let fault = port.fault();
+    assert!(
+        fault
+            .as_deref()
+            .is_some_and(|f| f.contains("measuring the link again")),
+        "{fault:?}"
+    );
+    let s = starting_seen(&port, Duration::from_secs(10))
+        .await
+        .expect("the respawn reports its probe");
+    assert!(s.detail.starts_with("as asked: "), "{s:?}");
+    until(
+        "the new worker's hello heals the port",
+        Duration::from_secs(10),
+        || {
+            port.heal_settled();
+            port.worker().unwrap().pid.is_some() && port.fault().is_none()
+        },
+    )
+    .await;
+    assert!(*healed.borrow() > before, "the heal was announced");
+    assert!(*changed.borrow() >= 2, "{} changes", *changed.borrow());
+    let spawns = args_lines(&rec);
+    assert!(spawns.len() >= 2, "{spawns:?}");
+    for flag in ["--rate-cap-hz", "--depth-cap", "--measured-at-speed"] {
+        assert!(!has_flag(&spawns[1], flag), "{flag} in {:?}", spawns[1]);
+    }
+    assert_eq!(port.measuring_lines(), (1, 1));
+    // The new figures are what is cached, at the speed they were measured at.
+    let (cache, speed) = port.record_to_cache();
+    assert_eq!(cache.max_bandwidth_hz, measured(30_720_000));
+    assert_eq!(speed.as_deref(), Some("5000"));
 }

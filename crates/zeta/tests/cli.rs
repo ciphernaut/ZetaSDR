@@ -670,6 +670,7 @@ fn mutating_one_shot_refused_while_serve_lock_held() {
     let ensure: Vec<&str> = ["source", "ensure"].into_iter().chain(band).collect();
     let pin: Vec<&str> = ["source", "pin"].into_iter().chain(band).collect();
     let unpin = ["source", "unpin", "--source", "tone"];
+    let measure = ["source", "measure", "--source", "tone"];
     let graph = dir.path().join("g.json");
     std::fs::write(&graph, "{}").unwrap();
     let put = [
@@ -697,6 +698,7 @@ fn mutating_one_shot_refused_while_serve_lock_held() {
         &ensure[..],
         &pin[..],
         &unpin[..],
+        &measure[..],
         &put[..],
         &stop[..],
         &retune[..],
@@ -1651,6 +1653,53 @@ fn soapy_worker_takes_depth_caps() {
     zeta_bin()
         .args(["soapy-worker", "--id", "x", "--args", "driver=hackrf"])
         .args(["--depth-cap", "16:20480000", "--depth-cap", "8:30720000"])
+        .assert()
+        .code(1)
+        .stderr(contains("built without soapy"));
+}
+
+/// `source measure` asks a source's worker to measure its link again; a file source
+/// has no worker (`other`, exit 2, naming it).
+#[test]
+fn source_measure_is_a_subcommand() {
+    let dir = tempfile::tempdir().unwrap();
+    zeta_bin()
+        .args(["source", "measure", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--source"))
+        .stdout(contains("--replace"));
+    let out = zeta(dir.path(), &["source", "measure", "--source", "tone"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "other", "{v}");
+    assert_eq!(v["message"], "source tone has no worker", "{v}");
+}
+
+/// The node passes the link speed the cached figures were measured at as
+/// `--measured-at-speed SPEED`, beside them.
+#[test]
+fn soapy_worker_takes_measured_at_speed() {
+    zeta_bin()
+        .args(["soapy-worker", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--measured-at-speed"))
+        .stdout(contains("SPEED"));
+    zeta_bin()
+        .args(["soapy-worker", "--id", "x", "--args", "driver=hackrf"])
+        .args(["--measured-at-speed"])
+        .assert()
+        .code(1)
+        .stderr(contains("--measured-at-speed"));
+    #[cfg(not(soapy))]
+    zeta_bin()
+        .args(["soapy-worker", "--id", "x", "--args", "driver=hackrf"])
+        .args(["--rate-cap-hz", "20480000", "--measured-at-speed", "5000"])
         .assert()
         .code(1)
         .stderr(contains("built without soapy"));

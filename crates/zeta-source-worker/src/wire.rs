@@ -20,7 +20,8 @@
 //! A child whose link carries more than one sample depth names the depth in
 //! force in its hello's and each status's `depth` (absent: `None`, a child
 //! with one depth or of an older build), and changes it on `set_depth`,
-//! answered with the depth after it.
+//! answered with the depth after it. A child that can tell where its device is
+//! attached names it in its hello's `attachment` (absent: `None`).
 //!
 //! A child spawned with `--progress` may report what it is doing before its
 //! hello, in [`Control::Progress`] frames (the rate probe of its link, up to a
@@ -111,6 +112,11 @@ pub struct Hello {
     /// source with one depth.
     #[serde(default)]
     pub depth: Option<Depth>,
+    /// Where the device is attached (`usb:2-1.4@5000`: bus, port path and
+    /// negotiated speed; [`zeta_core::port::Port::attachment`]); `None` where the
+    /// source cannot tell, or from a child of an older build.
+    #[serde(default)]
+    pub attachment: Option<String>,
 }
 
 /// The child's health, sent whenever it changes and periodically.

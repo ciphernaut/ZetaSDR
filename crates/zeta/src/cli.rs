@@ -420,6 +420,11 @@ pub struct SoapyWorkerArgs {
     /// link, reported again without probing that depth; once per depth
     #[arg(long = "depth-cap", value_name = "BITS:HZ", value_parser = depth_cap)]
     pub depth_cap: Vec<String>,
+    /// The link speed the passed-back caps were measured at (as the device's
+    /// attachment names it, `5000` for USB 3); on a link of another speed the
+    /// worker ignores them and measures again
+    #[arg(long, value_name = "SPEED")]
+    pub measured_at_speed: Option<String>,
     /// The inherited descriptor of the node's shared-memory ring; blocks go through
     /// it rather than the stdout pipe
     #[arg(long, value_name = "FD")]
@@ -1048,6 +1053,16 @@ pub enum SourceCmd {
         #[arg(long)]
         source: String,
     },
+    /// Measure a source's link again (link diagnostics): its worker drops the cached
+    /// rate figures and probes each sample depth, about a minute with the host busy;
+    /// refused while jobs or a pin hold the source
+    Measure {
+        /// Source id
+        #[arg(long)]
+        source: String,
+        #[command(flatten)]
+        replace: ReplaceArg,
+    },
     /// List the sources that could take a band now (free) and those held, pinned or
     /// faulted (busy)
     Free {
@@ -1078,7 +1093,8 @@ pub enum SourceCmd {
     },
 }
 
-/// `--replace ID[,ID]` on `job start`, `source ensure` and `source pin`.
+/// `--replace ID[,ID]` on `job start`, `source ensure`, `source pin` and `source
+/// measure`.
 #[derive(Debug, Args)]
 pub struct ReplaceArg {
     /// Jobs holding the source that may be stopped to make room, comma-separated
@@ -1409,6 +1425,7 @@ impl Command {
                 SourceCmd::Ensure { .. }
                     | SourceCmd::Pin { .. }
                     | SourceCmd::Unpin { .. }
+                    | SourceCmd::Measure { .. }
                     | SourceCmd::Gain { .. }
             ) | Command::Job(
                 JobCmd::Start { .. }
@@ -1480,6 +1497,10 @@ impl Command {
             },
             Command::Source(SourceCmd::Unpin { source }) => Op::SourceUnpin {
                 source: SourceId(source),
+            },
+            Command::Source(SourceCmd::Measure { source, replace }) => Op::SourceMeasure {
+                source: SourceId(source),
+                replace: replace.into_ids(),
             },
             Command::Source(SourceCmd::Free {
                 center_hz,
@@ -1912,6 +1933,43 @@ mod cli_signature_tests {
         assert!(mutates(&["zeta", "signature", "reject", "--id", "X"]));
         assert!(!mutates(&["zeta", "signature", "list"]));
         assert!(!mutates(&["zeta", "signature", "show", "--id", "X"]));
+    }
+}
+
+#[cfg(test)]
+mod cli_source_measure_tests {
+    use super::*;
+
+    #[test]
+    fn source_measure_maps_to_the_op_and_mutates() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+        let cmd = parse(&["zeta", "source", "measure", "--source", "radio0"]);
+        assert!(cmd.mutates());
+        assert_eq!(
+            cmd.into_op().unwrap(),
+            Some(Op::SourceMeasure {
+                source: SourceId("radio0".into()),
+                replace: vec![],
+            })
+        );
+        // `--replace` as `source pin`'s.
+        let cmd = parse(&[
+            "zeta",
+            "source",
+            "measure",
+            "--source",
+            "radio0",
+            "--replace",
+            "a,b",
+        ]);
+        assert_eq!(
+            cmd.into_op().unwrap(),
+            Some(Op::SourceMeasure {
+                source: SourceId("radio0".into()),
+                replace: vec![JobId("a".into()), JobId("b".into())],
+            })
+        );
+        assert!(Cli::try_parse_from(["zeta", "source", "measure"]).is_err());
     }
 }
 

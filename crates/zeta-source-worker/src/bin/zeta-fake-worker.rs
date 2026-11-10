@@ -1,5 +1,5 @@
 //! `zeta-fake-worker --id ID --script SCRIPT [--record PATH] [--rate-cap-hz N]
-//! [--depth-cap BITS:HZ]... [--ring-fd N] [--progress]`: a
+//! [--depth-cap BITS:HZ]... [--measured-at-speed SPEED] [--ring-fd N] [--progress]`: a
 //! source worker for tests. Its stdout speaks the real protocol through
 //! [`serve`]; its port is a `SoapySource` over a scripted `MockDevice`, or a
 //! `FileSource` over a SigMF recording, chosen by `--script`:
@@ -43,13 +43,23 @@
 //! asserted cap, `Asserted` (a probe that found no rung clean); the source
 //! runs its own depth (`own_depth`), whose cap is then the record's.
 //!
+//! `ZETA_FAKE_ATTACHMENT=A` is where the mock source says its device is attached
+//! (`usb:1-2@480`; none without it), which the hello carries. Passed figures hold
+//! as the real worker's do (`cached_figures_hold` of `--measured-at-speed` and
+//! the attachment): on a link of another speed the fake ignores `--rate-cap-hz`
+//! and every `--depth-cap` and measures, reporting `ZETA_FAKE_MEASURED_CAP` (or
+//! the mock's own cap) as measured.
+//!
 //! With `--progress` (a flag without a value, as the node passes every spawn),
-//! `ZETA_FAKE_PROGRESS=N` sends `N` progress frames 50 ms apart once the port
-//! has opened, before the hello, as a worker measuring its link does: `what`
-//! `measuring`, `detail` `16-bit at 20480000 Hz`, `step` 1 to `N` of `N`, and
-//! `eta_ms` the bound the real probe gives for the steps left; none without the
-//! flag. `ZETA_FAKE_LATE_PROGRESS=1` sends one right after the hello, which the
-//! node must refuse.
+//! a fake that measures (it was passed no cap, or the speed changed) sends
+//! `ZETA_FAKE_PROGRESS=N` progress frames 50 ms apart once the port has opened,
+//! before the hello, as a worker measuring its link does: `what` `measuring`,
+//! `detail` `16-bit at 20480000 Hz`, `step` 1 to `N` of `N`, and `eta_ms` the
+//! bound the real probe gives for the steps left; none without the flag, or
+//! from a fake whose figures hold. One that measures because the speed changed
+//! sends at least one, each `detail` prefixed `link speed changed (<old> to
+//! <new>): `. `ZETA_FAKE_LATE_PROGRESS=1` sends one right after the hello,
+//! which the node must refuse.
 //!
 //! `--ring-fd N` serves through the ring inherited on descriptor `N`, as the
 //! real worker does (a ring that will not open is one stderr line, then the
@@ -74,7 +84,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast::error::TryRecvError;
 
 use async_trait::async_trait;
-use zeta_core::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Tuning};
+use zeta_core::port::{
+    GainInfo, IqReceiver, Port, PortError, PortStats, Tuning, cached_figures_hold, link_speed,
+    speed_changed_prefix,
+};
 use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId};
 use zeta_source_file::{FileOpts, FileSource, read_meta};
 use zeta_source_soapy::SoapySource;
@@ -108,6 +121,7 @@ struct Args {
     record: Option<PathBuf>,
     rate_cap_hz: Option<u64>,
     depth_caps: Vec<(u8, u64)>,
+    measured_at_speed: Option<String>,
     ring_fd: Option<RawFd>,
     progress: bool,
 }
@@ -117,6 +131,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut id, mut script, mut record, mut ring_fd) = (None, None, None, None);
     let mut rate_cap_hz = None;
     let mut depth_caps = Vec::new();
+    let mut measured_at_speed = None;
     let mut progress = false;
     while let Some(flag) = it.next() {
         if flag == "--progress" {
@@ -138,6 +153,7 @@ fn parse_args() -> Result<Args, String> {
             "--depth-cap" => {
                 depth_caps.push(parse_depth_cap(&value).map_err(|e| format!("--depth-cap {e}"))?)
             }
+            "--measured-at-speed" => measured_at_speed = Some(value),
             "--ring-fd" => {
                 ring_fd = Some(
                     value
@@ -154,30 +170,30 @@ fn parse_args() -> Result<Args, String> {
         record,
         rate_cap_hz,
         depth_caps,
+        measured_at_speed,
         ring_fd,
         progress,
     })
 }
 
 /// Step `step` of a start of `of` steps, as the real worker's rate probe
-/// reports a rung of the mock's top rate at 16 bits.
-fn progress(step: u32, of: u32) -> Frame {
-    Frame::Control(Control::Progress(rung_progress(
-        Some(16),
-        20_480_000,
-        step,
-        of,
-    )))
+/// reports a rung of the mock's top rate at 16 bits, its `detail` after `why`.
+fn progress(step: u32, of: u32, why: &str) -> Frame {
+    let mut p = rung_progress(Some(16), 20_480_000, step, of);
+    p.detail = format!("{why}{}", p.detail);
+    Frame::Control(Control::Progress(p))
 }
 
-/// `ZETA_FAKE_PROGRESS=N`'s frames on `frames`, [`PROGRESS_EVERY`] apart.
-async fn send_progress(frames: &mut File) -> io::Result<()> {
+/// `ZETA_FAKE_PROGRESS=N`'s frames on `frames`, [`PROGRESS_EVERY`] apart, at
+/// least `min` of them, each `detail` after `why`.
+async fn send_progress(frames: &mut File, min: u32, why: &str) -> io::Result<()> {
     let n: u32 = std::env::var("ZETA_FAKE_PROGRESS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(min);
     for step in 1..=n {
-        write_frame(frames, &progress(step, n))?;
+        write_frame(frames, &progress(step, n, why))?;
         frames.flush()?;
         tokio::time::sleep(PROGRESS_EVERY).await;
     }
@@ -310,6 +326,9 @@ impl Port for Recorded {
     fn depth(&self) -> Option<Depth> {
         self.inner.depth()
     }
+    fn attachment(&self) -> Option<String> {
+        self.inner.attachment()
+    }
     async fn set_depth(&self, bits: u8) -> Result<Depth, PortError> {
         self.record.line(&format!("depth {bits}"));
         self.inner.set_depth(bits).await
@@ -320,12 +339,15 @@ impl Port for Recorded {
 /// the tuned rate: a mock read returns at once, and a stream that ran ahead of
 /// the wall clock would be restarted and in the end faulted by the source's
 /// clock guard. With `gone_after`, the feeder stops after that long from start
-/// and scripts `Gone("unplugged")`.
+/// and scripts `Gone("unplugged")`. The source is attached at `attachment`; with
+/// `measures`, a cap it measured is reported even without one named (the mock's
+/// own, as measured).
 fn mock_source(
     id: &str,
     gone_after: Option<Duration>,
-    rate_cap_hz: Option<u64>,
-    depth_caps: &[(u8, u64)],
+    (rate_cap_hz, depth_caps): (Option<u64>, &[(u8, u64)]),
+    attachment: Option<String>,
+    measures: bool,
 ) -> Result<Arc<SoapySource>, String> {
     let read = read_samples();
     let depths = fake_depths()?;
@@ -347,12 +369,15 @@ fn mock_source(
     let dev = Arc::new(dev);
     let mut src =
         SoapySource::with_device(SourceId(id.into()), dev.clone()).map_err(|e| e.to_string())?;
+    src.set_attachment(attachment);
     let asserted = src.capabilities().max_bandwidth_hz.clone();
-    let measured = rate_cap_hz.or_else(|| {
-        std::env::var("ZETA_FAKE_MEASURED_CAP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    });
+    let measured = rate_cap_hz
+        .or_else(|| {
+            std::env::var("ZETA_FAKE_MEASURED_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .or(measures.then_some(asserted.value().0));
     if let Some(hz) = measured {
         src.set_max_bandwidth(Claim::Measured(Hz(hz)));
     }
@@ -586,7 +611,7 @@ fn bend_frames(mut frames: File, bend: Bend) -> io::Result<(File, std::sync::mps
                     _ => write_frame(&mut frames, &f),
                 };
                 if hello && bend.late_progress {
-                    written = written.and_then(|()| write_frame(&mut frames, &progress(1, 1)));
+                    written = written.and_then(|()| write_frame(&mut frames, &progress(1, 1, "")));
                 }
                 if written.and_then(|()| frames.flush()).is_err() {
                     break;
@@ -626,6 +651,7 @@ fn wrong_hello(port: &dyn Port, protocol: u32, mut frames: File) -> ExitCode {
         driver: "fake".into(),
         transport: None,
         depth: port.depth(),
+        attachment: port.attachment(),
     }));
     if let Err(e) = write_frame(&mut frames, &hello).and_then(|()| frames.flush()) {
         eprintln!("zeta-fake-worker: hello: {e}");
@@ -718,18 +744,34 @@ fn main() -> ExitCode {
                 std::thread::sleep(Duration::from_secs(3600));
             }
         }
+        // Passed figures hold as the real worker's do; on a link of another
+        // speed they are ignored and the link is measured.
+        let attachment = std::env::var("ZETA_FAKE_ATTACHMENT")
+            .ok()
+            .filter(|a| !a.is_empty());
+        let was = args.measured_at_speed.as_deref();
+        let hold = cached_figures_hold(was, attachment.as_deref());
+        let (passed, why) = if hold {
+            ((args.rate_cap_hz, &args.depth_caps[..]), String::new())
+        } else {
+            let now = attachment.as_deref().and_then(link_speed).unwrap_or("");
+            (
+                (None, &[][..]),
+                speed_changed_prefix(was.unwrap_or(""), now),
+            )
+        };
+        let probes = !hold || (args.rate_cap_hz.is_none() && args.depth_caps.is_empty());
+        let mock = |gone| mock_source(&args.id, gone, passed, attachment.clone(), !hold);
         // A receiver held for the life of the worker, see the `file` script.
         let mut keep: Option<IqReceiver> = None;
         let port: Result<Arc<dyn Port>, String> = match (name, arg) {
-            ("stream", _) => mock_source(&args.id, None, args.rate_cap_hz, &args.depth_caps)
-                .map(|s| s as Arc<dyn Port>),
+            ("stream", _) => mock(None).map(|s| s as Arc<dyn Port>),
             ("gone-after-ms", ms) => parse_ms(ms)
-                .and_then(|g| mock_source(&args.id, Some(g), args.rate_cap_hz, &args.depth_caps))
+                .and_then(|g| mock(Some(g)))
                 .map(|s| s as Arc<dyn Port>),
             ("crash-after-ms", ms) => parse_ms(ms).and_then(|after| {
                 crash_after(after, args.record.as_deref());
-                mock_source(&args.id, None, args.rate_cap_hz, &args.depth_caps)
-                    .map(|s| s as Arc<dyn Port>)
+                mock(None).map(|s| s as Arc<dyn Port>)
             }),
             ("file", spec) => {
                 let (path, crash) = match spec.split_once(',') {
@@ -765,7 +807,8 @@ fn main() -> ExitCode {
         };
         let mut frames = frames;
         if args.progress
-            && let Err(e) = send_progress(&mut frames).await
+            && probes
+            && let Err(e) = send_progress(&mut frames, u32::from(!hold), &why).await
         {
             eprintln!("zeta-fake-worker: progress: {e}");
             return ExitCode::from(EXIT_OPEN_FAILED);

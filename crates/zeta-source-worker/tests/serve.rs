@@ -532,3 +532,24 @@ fn a_block_wider_than_a_slot_is_split() {
     assert!(within_a_block >= 2, "{pieces:?}");
     child.kill().unwrap();
 }
+
+#[test]
+fn a_hello_carries_the_attachment_set_on_the_source() {
+    let mut child = spawn_with(
+        "stream",
+        &[("ZETA_FAKE_ATTACHMENT", "usb:2-1.4@5000")],
+        None,
+    );
+    let frames = Frames::new(child.stdout.take().unwrap());
+    let h = read_hello(&frames);
+    assert_eq!(h.attachment.as_deref(), Some("usb:2-1.4@5000"));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // A source that cannot tell names none.
+    let mut child = spawn_with("stream", &[], None);
+    let frames = Frames::new(child.stdout.take().unwrap());
+    assert_eq!(read_hello(&frames).attachment, None);
+    let _ = child.kill();
+    let _ = child.wait();
+}

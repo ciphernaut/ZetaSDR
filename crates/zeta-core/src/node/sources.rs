@@ -38,6 +38,11 @@ pub struct SourceRecord {
     /// `None` for a source that runs in the node (nothing to cache).
     #[serde(default)]
     pub capabilities: Option<Capabilities>,
+    /// The link speed the figures in `capabilities` were measured at (the
+    /// [`crate::port::link_speed`] of the worker's attachment then); `None` when
+    /// unknown. A worker whose link now runs at another speed measures again.
+    #[serde(default)]
+    pub measured_at_speed: Option<String>,
 }
 
 impl SourceRecord {

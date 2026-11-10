@@ -308,6 +308,9 @@ pub struct SoapySource {
     /// The bits of the depth the next stream opens at (`None`: the driver's
     /// default, no stream argument).
     bits: Mutex<Option<u8>>,
+    /// Where the device is attached ([`Port::attachment`]), as the worker found
+    /// it; `None` until it is set, or where it cannot be told.
+    attachment: Option<String>,
 }
 
 impl SoapySource {
@@ -371,6 +374,7 @@ impl SoapySource {
             gate: tokio::sync::Mutex::new(()),
             links,
             bits: Mutex::new(None),
+            attachment: None,
         })
     }
 
@@ -417,6 +421,19 @@ impl SoapySource {
     /// changes it.
     pub fn set_max_bandwidth(&mut self, claim: Claim<Hz>) {
         self.caps.max_bandwidth_hz = claim;
+    }
+
+    /// The device's serial number, as its driver names it; `None` when it names
+    /// none.
+    pub fn serial(&self) -> Option<String> {
+        self.dev.serial()
+    }
+
+    /// Record where the device is attached (a USB radio's
+    /// [`crate::attach::usb_attachment`]), which [`Port::attachment`] then
+    /// reports, before the source is shared.
+    pub fn set_attachment(&mut self, a: Option<String>) {
+        self.attachment = a;
     }
 
     /// The sample depths the device's link can carry, deepest first, read at
@@ -804,6 +821,10 @@ impl Port for SoapySource {
 
     fn gain(&self) -> Option<GainInfo> {
         self.status.lock().unwrap().gain
+    }
+
+    fn attachment(&self) -> Option<String> {
+        self.attachment.clone()
     }
 
     fn depth(&self) -> Option<Depth> {

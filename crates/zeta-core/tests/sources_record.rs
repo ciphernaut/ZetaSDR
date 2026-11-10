@@ -41,6 +41,8 @@ impl Port for WorkerFixture {
             transport: None,
             transport_dropped: 0,
             starting: None,
+            attachment: None,
+            link_measure: None,
         })
     }
 }
@@ -128,6 +130,8 @@ async fn source_list_shows_worker_for_a_worker_port_and_null_otherwise() {
             transport: None,
             transport_dropped: 0,
             starting: None,
+            attachment: None,
+            link_measure: None,
         })
     );
     let json = serde_json::to_value(&v).unwrap();
@@ -317,13 +321,15 @@ impl Port for Deep {
             transport: None,
             transport_dropped: 0,
             starting: None,
+            attachment: None,
+            link_measure: None,
         })
     }
     fn depth(&self) -> Option<Depth> {
         Some(eight_bits())
     }
-    fn record_to_cache(&self) -> Capabilities {
-        self.1.clone()
+    fn record_to_cache(&self) -> (Capabilities, Option<String>) {
+        (self.1.clone(), Some("5000".into()))
     }
 }
 
@@ -338,6 +344,7 @@ async fn a_worker_port_caches_the_record_its_respawn_measured() {
         .unwrap();
     let rec = load_source(&dir.path().join("state/sources"), &SourceId("file0".into())).unwrap();
     assert_eq!(rec.capabilities, Some(later));
+    assert_eq!(rec.measured_at_speed.as_deref(), Some("5000"));
     // `source_list` shows the run's record, and the depth in force.
     let v = sources(&node).await;
     assert_eq!(&v[0].capabilities, port.capabilities());

@@ -111,6 +111,8 @@ pub struct MockDevice {
     wires: Vec<String>,
     /// `WIRE` values a stream will not open with.
     refused_wires: Vec<String>,
+    /// The serial the hardware information names (default none).
+    serial: Option<String>,
 }
 
 /// The stream argument a device names its link formats under (SoapyUHD's).
@@ -154,7 +156,15 @@ impl MockDevice {
             garbage: None,
             wires: Vec::new(),
             refused_wires: Vec::new(),
+            serial: None,
         }
+    }
+
+    /// The serial number the device's hardware information names (default
+    /// none), as a driver names a USB radio's.
+    pub fn with_serial(mut self, s: &str) -> Self {
+        self.serial = Some(s.into());
+        self
     }
 
     /// The link formats the device names as the options of its `WIRE`
@@ -426,6 +436,9 @@ impl SoapyDevice for MockDevice {
     }
     fn hardware_key(&self) -> String {
         self.hardware.clone()
+    }
+    fn serial(&self) -> Option<String> {
+        self.serial.clone()
     }
     fn frequency_ranges(&self) -> Result<Vec<RangeHz>, String> {
         self.gone.touch("frequency_ranges")?;

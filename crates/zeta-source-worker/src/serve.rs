@@ -162,8 +162,9 @@ fn status_of(port: &dyn Port, transport_dropped: u64) -> Status {
 
 /// Serve `port` over `stdin` and `stdout` until stdin closes, a `shutdown`
 /// arrives (both exit 0) or the port faults ([`EXIT_FAULTED`]). `driver` is the
-/// driver key the hello names. Blocks go through `ring` when there is one (the
-/// hello says `shm`), on the pipe otherwise (`pipe`).
+/// driver key the hello names, beside the port's own `attachment`. Blocks go
+/// through `ring` when there is one (the hello says `shm`), on the pipe
+/// otherwise (`pipe`).
 pub async fn serve(
     port: Arc<dyn Port>,
     driver: &str,
@@ -193,6 +194,7 @@ pub async fn serve(
             ring_bytes: ring.as_ref().map_or(0, |r| r.bytes() as u64),
         }),
         depth: port.depth(),
+        attachment: port.attachment(),
     }));
 
     let dropped = Arc::new(AtomicU64::new(0));

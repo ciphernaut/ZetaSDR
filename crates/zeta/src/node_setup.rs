@@ -228,8 +228,10 @@ const NEVER_SEEN: &str = "never seen on this host; plug it in once";
 /// (and is polled for, or respawned with backoff) when the source
 /// record in `state_dir` holds the capabilities an earlier open cached; never seen, it
 /// is refused. A rate cap those capabilities hold as measured is passed to the worker
-/// ([`worker_args`](zeta_source_worker::port::worker_args)), which then skips its rate
-/// probe. `in_process` (`--soapy-in-process`) opens the driver here instead, the
+/// ([`worker_args`](zeta_source_worker::port::worker_args)) with the link speed the
+/// record says it was measured at (`measured_at_speed`), and the worker then skips its
+/// rate probe unless its link now runs at another speed. `in_process`
+/// (`--soapy-in-process`) opens the driver here instead, the
 /// path before workers existed, for diagnosis. The worker port is also returned on its
 /// own, to be closed before the process exits.
 #[cfg(soapy)]
@@ -248,17 +250,18 @@ async fn open_soapy(
     }
     let program = worker_program()?;
     let source = SourceId(id.to_owned());
-    let cached = zeta_core::node::load_source(&state_dir.join("sources"), &source)
-        .and_then(|r| r.capabilities);
+    let record = zeta_core::node::load_source(&state_dir.join("sources"), &source);
+    // The figures and the speed they were measured at, together.
+    let (cached, speed) = record.map_or((None, None), |r| (r.capabilities, r.measured_at_speed));
     let seen = cached.is_some();
     let cfg = WorkerConfig {
         id: source,
         program,
-        args: worker_args(id, args, cached.as_ref()),
+        args: worker_args(id, args, cached.as_ref(), speed.as_deref()),
         timings: Timings::default(),
         ring_bytes: DEFAULT_RING_BYTES,
     };
-    match WorkerPort::open(cfg, cached).await {
+    match WorkerPort::open(cfg, cached, speed).await {
         // A hello, or a device seen before that was not found or whose worker crashed
         // opening it (UHD still releasing it from a node that just stopped): the
         // supervisor has logged that it is waiting for the device, and the port is

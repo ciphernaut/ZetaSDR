@@ -1442,3 +1442,23 @@ async fn a_tune_is_bounded_by_the_depth_in_force() {
     let got = src.tune(tuning(100_000_000, 15_000_000)).await.unwrap();
     assert_eq!(got.bandwidth_hz, Hz(15_000_000));
 }
+
+#[test]
+fn a_source_reports_its_devices_serial() {
+    let dev = Arc::new(MockDevice::hackrf_like().with_serial("ABC"));
+    let src = SoapySource::with_device(SourceId("sdr0".into()), dev).unwrap();
+    assert_eq!(src.serial().as_deref(), Some("ABC"));
+    // A driver that names no serial gives none.
+    let dev = Arc::new(MockDevice::hackrf_like());
+    let src = SoapySource::with_device(SourceId("sdr0".into()), dev).unwrap();
+    assert_eq!(src.serial(), None);
+}
+
+#[test]
+fn a_source_reports_the_attachment_set_on_it() {
+    let dev = Arc::new(MockDevice::hackrf_like().with_serial("ABC"));
+    let mut src = SoapySource::with_device(SourceId("sdr0".into()), dev).unwrap();
+    assert_eq!(Port::attachment(&src), None);
+    src.set_attachment(Some("usb:2-1.4@5000".into()));
+    assert_eq!(Port::attachment(&src).as_deref(), Some("usb:2-1.4@5000"));
+}

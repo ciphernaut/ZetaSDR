@@ -86,12 +86,14 @@ fn control_messages_round_trip_in_the_spec_shape() {
                 driver: "hackrf".into(),
                 transport: None,
                 depth: None,
+                attachment: Some("usb:2-1.4@5000".into()),
             }),
             json!({"hello": {
                 "protocol": 2,
                 "capabilities": serde_json::to_value(caps()).unwrap(),
                 "gain": serde_json::to_value(gain()).unwrap(),
-                "driver": "hackrf", "transport": null, "depth": null}}),
+                "driver": "hackrf", "transport": null, "depth": null,
+                "attachment": "usb:2-1.4@5000"}}),
         ),
         (
             Control::Reply {
@@ -312,6 +314,7 @@ fn hello_carries_the_transport_and_reads_without_it() {
             ring_bytes: 67_108_864,
         }),
         depth: None,
+        attachment: None,
     };
     let v = serde_json::to_value(Control::Hello(h.clone())).unwrap();
     assert_eq!(
@@ -330,6 +333,18 @@ fn hello_carries_the_transport_and_reads_without_it() {
         panic!("expected a hello");
     };
     assert_eq!(old.transport, None);
+}
+
+#[test]
+fn a_hello_without_attachment_reads_as_none() {
+    // A worker of an older build says nothing of where its device is attached.
+    let v = json!({"hello": {"protocol": PROTOCOL,
+        "capabilities": serde_json::to_value(caps()).unwrap(),
+        "gain": null, "driver": "x", "transport": null, "depth": null}});
+    let Control::Hello(h) = serde_json::from_value(v).unwrap() else {
+        panic!("expected a hello");
+    };
+    assert_eq!(h.attachment, None);
 }
 
 #[test]

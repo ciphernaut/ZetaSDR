@@ -16,6 +16,7 @@
 //! has each probed at open ([`probe::probe_depths`]) and runs the fastest
 //! lossless one ([`probe::own_depth`]) unless `bits=N` asks for another.
 
+pub mod attach;
 pub mod caps;
 pub mod convert;
 pub mod device;

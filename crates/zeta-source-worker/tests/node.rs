@@ -202,7 +202,7 @@ async fn a_node_over_a_crashing_fake_worker_recovers_its_jobs() {
     // the test can watch the record read `Failed` before the recovery relaunches it.
     let mut crashing = cfg(&script, &rec, "ZETA_FAKE_CRASH_ONCE=1");
     crashing.timings = timings_backoff(Duration::from_millis(800));
-    let (port, attach) = WorkerPort::open(crashing, None).await.unwrap();
+    let (port, attach) = WorkerPort::open(crashing, None, None).await.unwrap();
     assert_eq!(attach, Attach::Hello);
     let node = node_over(&dir.path().join("state"), port).await;
     let op = Op::SourcePin {
@@ -258,7 +258,7 @@ async fn a_crash_shorter_than_the_fault_poll_still_relaunches_the_job() {
     let rec = dir.path().join("record");
     let mut crashing = cfg(&script, &rec, "ZETA_FAKE_CRASH_ONCE=1");
     crashing.timings = timings_backoff(Duration::from_millis(1));
-    let (port, attach) = WorkerPort::open(crashing, None).await.unwrap();
+    let (port, attach) = WorkerPort::open(crashing, None, None).await.unwrap();
     assert_eq!(attach, Attach::Hello);
     let node = node_over(&dir.path().join("state"), port).await;
     let job = start_passthrough(&node).await;
@@ -302,7 +302,7 @@ async fn a_heal_before_the_port_is_attached_ends_the_held_fault() {
     let rec = dir.path().join("record");
     let mut crashing = cfg(&script, &rec, "ZETA_FAKE_CRASH_ONCE=1");
     crashing.timings = timings_backoff(Duration::from_millis(1));
-    let (port, attach) = WorkerPort::open(crashing, None).await.unwrap();
+    let (port, attach) = WorkerPort::open(crashing, None, None).await.unwrap();
     assert_eq!(attach, Attach::Hello);
     let healed = port.healed().unwrap();
     until("the worker is back", Duration::from_secs(5), || {
@@ -330,7 +330,7 @@ async fn a_cap_measured_on_a_respawn_reaches_the_source_record() {
         "export ZETA_FAKE_CRASH_ONCE=1; [ -e '{}.crashed' ] && export ZETA_FAKE_MEASURED_CAP=20480000;",
         rec.display()
     );
-    let (port, attach) = WorkerPort::open(cfg("crash-after-ms 500", &rec, &env), None)
+    let (port, attach) = WorkerPort::open(cfg("crash-after-ms 500", &rec, &env), None, None)
         .await
         .unwrap();
     assert_eq!(attach, Attach::Hello);
@@ -360,7 +360,7 @@ async fn startup_with_the_device_absent_attaches_faulted_when_seen_before() {
     let rec = dir.path().join("record");
     // A first start with the device present caches its capabilities.
     {
-        let (port, attach) = WorkerPort::open(cfg("stream", &rec, ""), None)
+        let (port, attach) = WorkerPort::open(cfg("stream", &rec, ""), None, None)
             .await
             .unwrap();
         assert_eq!(attach, Attach::Hello);
@@ -369,7 +369,7 @@ async fn startup_with_the_device_absent_attaches_faulted_when_seen_before() {
     let cached = load_source(&state_dir.join("sources"), &f()).and_then(|r| r.capabilities);
     assert!(cached.is_some(), "the first open cached no capabilities");
 
-    let (port, attach) = WorkerPort::open(cfg("not-found", &rec, ""), cached)
+    let (port, attach) = WorkerPort::open(cfg("not-found", &rec, ""), cached, None)
         .await
         .unwrap();
     assert_eq!(
@@ -389,7 +389,7 @@ async fn startup_with_the_device_absent_attaches_faulted_when_seen_before() {
 async fn a_one_shot_source_list_leaves_no_worker_behind() {
     let dir = tempfile::tempdir().unwrap();
     let rec = dir.path().join("record");
-    let (port, _) = WorkerPort::open(cfg("stream", &rec, ""), None)
+    let (port, _) = WorkerPort::open(cfg("stream", &rec, ""), None, None)
         .await
         .unwrap();
     let node = node_over(&dir.path().join("state"), port).await;
@@ -417,7 +417,7 @@ async fn drops_reach_source_list() {
     let rec = dir.path().join("record");
     let mut c = cfg("stream", &rec, "ZETA_FAKE_READ_SAMPLES=256");
     c.ring_bytes = MIN_SLOTS * SLOT_SAMPLES * 8 + 64;
-    let (port, _) = WorkerPort::open(c, None).await.unwrap();
+    let (port, _) = WorkerPort::open(c, None, None).await.unwrap();
     let node = node_over(&dir.path().join("state"), port).await;
     let op = Op::SourcePin {
         source: f(),
@@ -467,7 +467,7 @@ async fn a_respawn_that_measures_says_so_on_the_feed() {
         "export ZETA_FAKE_CRASH_ONCE=1; [ -e '{}.crashed' ] && export ZETA_FAKE_PROGRESS=3;",
         rec.display()
     );
-    let (port, attach) = WorkerPort::open(cfg("crash-after-ms 500", &rec, &env), None)
+    let (port, attach) = WorkerPort::open(cfg("crash-after-ms 500", &rec, &env), None, None)
         .await
         .unwrap();
     assert_eq!(attach, Attach::Hello);

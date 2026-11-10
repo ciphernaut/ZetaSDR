@@ -9,7 +9,8 @@
 //! supervisor task ([`crate::supervisor`]) owns the child: it reaps a worker
 //! that died, turns the way it died into the port's fault, respawns it with a
 //! bounded backoff and bumps [`Port::healed`] when a fresh worker says hello
-//! after a fault.
+//! after a fault. [`Port::remeasure`] has it end the live worker and spawn one
+//! that measures its link again.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +19,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{oneshot, watch};
-use zeta_core::port::{GainInfo, IqReceiver, Port, PortError, PortStats, Tuning, WorkerInfo};
+use zeta_core::port::{
+    GainInfo, IqReceiver, LinkMeasure, Port, PortError, PortStats, Tuning, WorkerInfo,
+};
 use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId};
 
 use crate::supervisor::{Link, Shared, Supervisor};
@@ -108,6 +111,13 @@ pub const RATE_CAP_FLAG: &str = "--rate-cap-hz";
 /// depth again; see [`worker_args`] and the supervisor's respawns.
 pub const DEPTH_CAP_FLAG: &str = "--depth-cap";
 
+/// The worker flag that passes the link speed the cached figures were measured
+/// at (`--measured-at-speed SPEED`, the [`zeta_core::port::link_speed`] of the
+/// worker's attachment then), beside them: a worker whose link now runs at
+/// another speed ignores the figures and measures again
+/// ([`zeta_core::port::cached_figures_hold`]).
+pub const MEASURED_AT_SPEED_FLAG: &str = "--measured-at-speed";
+
 /// The flag every spawn is passed: the worker may report its start's progress
 /// before its hello ([`crate::wire::Control::Progress`]); without it, it must
 /// not, as a node that does not know the message would end it as a bad frame.
@@ -142,21 +152,47 @@ pub(crate) fn depth_cap_args(caps: &Capabilities, except: &[u8]) -> Vec<String> 
         .collect()
 }
 
+/// The measured figures of `caps` as worker flags, but for the depths in
+/// `except` (passed already): `--rate-cap-hz N` unless `rate_cap` is false,
+/// one `--depth-cap BITS:HZ` per measured depth, and `--measured-at-speed
+/// SPEED` after them when `speed` is known and any figure was passed.
+pub(crate) fn figure_args(
+    caps: &Capabilities,
+    rate_cap: bool,
+    except: &[u8],
+    speed: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let (true, Claim::Measured(Hz(cap))) = (rate_cap, &caps.max_bandwidth_hz) {
+        out.extend([RATE_CAP_FLAG.into(), cap.to_string()]);
+    }
+    out.extend(depth_cap_args(caps, except));
+    if let Some(speed) = speed.filter(|_| !out.is_empty()) {
+        out.extend([MEASURED_AT_SPEED_FLAG.into(), speed.to_string()]);
+    }
+    out
+}
+
 /// The arguments `zeta` is spawned with as the worker of `--source-soapy
 /// id=args`: `soapy-worker --id ID --args ARGS`, and `--rate-cap-hz N` when the
 /// capabilities cached from an earlier open carry a measured cap `N`, and one
 /// `--depth-cap BITS:HZ` per sample depth they hold measured, so the worker
-/// reports those instead of probing the device's rates again. An asserted cap
-/// is not passed: the worker probes, or reads it from `max_rate_hz=`.
-pub fn worker_args(id: &str, args: &str, cached: Option<&Capabilities>) -> Vec<String> {
+/// reports those instead of probing the device's rates again, with
+/// `--measured-at-speed SPEED` beside them when the record knows the link speed
+/// they were measured at (`measured_at_speed`), so a worker on a link of
+/// another speed measures again. An asserted cap is not passed: the worker
+/// probes, or reads it from `max_rate_hz=`.
+pub fn worker_args(
+    id: &str,
+    args: &str,
+    cached: Option<&Capabilities>,
+    measured_at_speed: Option<&str>,
+) -> Vec<String> {
     let mut out = ["soapy-worker", "--id", id, "--args", args]
         .map(String::from)
         .to_vec();
-    if let Some(Claim::Measured(Hz(cap))) = cached.map(|c| &c.max_bandwidth_hz) {
-        out.extend([RATE_CAP_FLAG.into(), cap.to_string()]);
-    }
     if let Some(c) = cached {
-        out.extend(depth_cap_args(c, &[]));
+        out.extend(figure_args(c, true, &[], measured_at_speed));
     }
     out
 }
@@ -194,6 +230,9 @@ pub struct WorkerPort {
     cancel: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     /// Turns true once the supervisor has returned, its worker reaped.
     done: watch::Receiver<bool>,
+    /// Asks the supervisor to measure the link again; it answers once the
+    /// respawn is under way.
+    remeasure: tokio::sync::mpsc::Sender<oneshot::Sender<()>>,
     /// How long [`WorkerPort::close`] waits for `done`.
     close_bound: Duration,
 }
@@ -201,8 +240,11 @@ pub struct WorkerPort {
 impl WorkerPort {
     /// Spawn the worker once and attach on what it says; see [`Attach`].
     ///
-    /// A hello attaches with the hello's capability record. A device-not-found
-    /// exit attaches only with `cached` (the record from an earlier open):
+    /// A hello attaches with the hello's capability record. `measured_at_speed`
+    /// is the link speed `cached`'s figures were measured at (the source
+    /// record's), cached again with them until a hello gives figures of its
+    /// own. A device-not-found exit attaches only with `cached` (the record
+    /// from an earlier open):
     /// the port is faulted `device not found: <args>` and the supervisor is
     /// already polling. A worker that died by a signal before its hello also
     /// attaches only with `cached` ([`Attach::Crashed`]): faulted, respawning
@@ -213,17 +255,20 @@ impl WorkerPort {
     pub async fn open(
         cfg: WorkerConfig,
         cached: Option<Capabilities>,
+        measured_at_speed: Option<String>,
     ) -> Result<(Arc<WorkerPort>, Attach), String> {
         let id = cfg.id.clone();
         let shared = Arc::new(Shared::new(id.clone()));
+        *shared.cached_speed() = measured_at_speed;
         let (healed_tx, healed) = watch::channel(0);
         let (cancel, cancel_rx) = oneshot::channel();
         let (first_tx, first_rx) = oneshot::channel();
         let (done_tx, done) = watch::channel(false);
+        let (remeasure, remeasure_rx) = tokio::sync::mpsc::channel(1);
         let close_bound = cfg.timings.shutdown_grace.saturating_add(CLOSE_SLACK);
         let supervisor = Supervisor::new(cfg, shared.clone(), healed_tx, cached);
         tokio::spawn(async move {
-            supervisor.run(cancel_rx, first_tx).await;
+            supervisor.run(cancel_rx, first_tx, remeasure_rx).await;
             done_tx.send_replace(true);
         });
         let first = first_rx
@@ -249,6 +294,7 @@ impl WorkerPort {
             cancel: std::sync::Mutex::new(Some(cancel)),
             done,
             close_bound,
+            remeasure,
         };
         Ok((Arc::new(port), attach))
     }
@@ -453,12 +499,35 @@ impl Port for WorkerPort {
         self.shared.measured.get().unwrap_or(&self.caps)
     }
 
-    /// The latest hello's record when it differs from [`Port::capabilities`]
-    /// only in what a newer worker knows better (a depth measured that the
-    /// record, set once per run, holds as asserted), else that record.
-    fn record_to_cache(&self) -> Capabilities {
+    /// The latest hello's record and the link speed of its attachment, when
+    /// the record differs from [`Port::capabilities`] only in the figures a
+    /// measurement gives (a depth measured that the record, set once per run,
+    /// holds as asserted; a link measured again at a new speed); else that
+    /// record, with the speed the cached one was measured at.
+    fn record_to_cache(&self) -> (Capabilities, Option<String>) {
         let latest = self.shared.latest().clone();
-        latest.unwrap_or_else(|| self.capabilities().clone())
+        latest.unwrap_or_else(|| {
+            (
+                self.capabilities().clone(),
+                self.shared.cached_speed().clone(),
+            )
+        })
+    }
+
+    /// The live worker's, from its hello.
+    fn attachment(&self) -> Option<String> {
+        self.shared.snapshot().attachment.clone()
+    }
+
+    /// The supervisor ends the live worker as at shutdown (or the start in
+    /// progress) and spawns one at once with no measured figures: the port is
+    /// faulted `measuring the link again` until its hello, which heals it as
+    /// any respawn's does. Later spawns are passed what it measured.
+    async fn remeasure(&self) -> Result<(), PortError> {
+        let gone = || PortError::Io(format!("soapy worker for {}: supervisor ended", self.id.0));
+        let (ack, under_way) = oneshot::channel();
+        self.remeasure.send(ack).await.map_err(|_| gone())?;
+        under_way.await.map_err(|_| gone())
     }
 
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
@@ -546,6 +615,16 @@ impl Port for WorkerPort {
             transport: s.transport.clone(),
             transport_dropped: s.transport_dropped,
             starting: s.starting.clone(),
+            attachment: s.attachment.clone(),
+            link_measure: self
+                .shared
+                .latest()
+                .as_ref()
+                .map(|(c, at_speed)| LinkMeasure {
+                    max_bandwidth_hz: c.max_bandwidth_hz.clone(),
+                    depths: c.depths.clone(),
+                    at_speed: at_speed.clone(),
+                }),
         })
     }
 

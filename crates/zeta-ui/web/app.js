@@ -20,9 +20,10 @@
 // the transcript through the `ops` stream); `view` alone or followed by `set`, `show`,
 // `reset` or `clear` is a view command (view.js: `view set <key> <value>`, `view show`,
 // `view reset`, `view clear`), handled here before both, its answer a transcript line;
-// `source pin [<center_hz> <bandwidth_hz>]`, `source unpin` and `source gain <db>|auto` act
-// on the shown source the same way (runSourceCommand: `source_pin` at its `current` capture or
-// the band given, `source_unpin`, `source_set_gain`), their reply or error a transcript line;
+// `source pin [<center_hz> <bandwidth_hz>]`, `source unpin`, `source gain <db>|auto` and
+// `source measure` act on the shown source the same way (runSourceCommand: `source_pin` at its
+// `current` capture or the band given, `source_unpin`, `source_set_gain`, `source_measure`),
+// their reply or error a transcript line;
 // anything else (other text starting "view " or "source " included) goes to `api.ask`.
 // Every ask carries askContext() (the shown radio, `main`, `radio_policy`, `radio_prefer`);
 // after the answer, selectionNotes(selection) adds a note per source a radio op ran on off
@@ -475,6 +476,148 @@ function healthPairs(s) {
   return pairs.map(([k, v]) => [k, String(v)]);
 }
 
+// ---- link diagnostics (spec 4.6a) ------------------------------------------------------
+
+// A source tab is a <button> and holds no control, so a source's own actions sit in one hover
+// box beside the strip, `div#src-menu`: shown under a tab while the pointer is on a tab whose
+// source has a `worker` record, or on the box, and hidden SRC_MENU_HIDE_MS after it left both.
+// Its one entry, "Run link diagnostics", applies `source_measure` (applyOp: a conflict gets the
+// usual stop-and-retry); when the respawn's worker says hello the transcript gets the result
+// (noteDiagnostics).
+const SRC_MENU_HIDE_MS = 300;
+const LINK_DIAG_TITLE = "measures the rates this radio's link sustains: about a minute, the host will be busy";
+const srcMenu = { el: null, source: null, tab: null, over: null, hide: null };
+
+function srcMenuEl() {
+  if (srcMenu.el) return srcMenu.el;
+  const el = document.createElement("div");
+  el.id = "src-menu";
+  el.hidden = true;
+  const diag = document.createElement("button");
+  diag.className = "link-diag";
+  diag.textContent = "Run link diagnostics";
+  diag.title = LINK_DIAG_TITLE;
+  diag.onclick = () => {
+    const source = srcMenu.source;
+    hideSrcMenu();
+    if (source) applyOp({ op: "source_measure", source, replace: [] });
+  };
+  el.append(diag);
+  el.onmouseenter = () => {
+    srcMenu.over = "menu";
+    clearTimeout(srcMenu.hide);
+  };
+  el.onmouseleave = () => leaveSrcMenu("menu");
+  document.body.append(el);
+  srcMenu.el = el;
+  return el;
+}
+
+// The pointer came onto `tab`: the box shows under it when its source has a worker record.
+function enterSrcTab(tab) {
+  srcMenu.over = "tab";
+  srcMenu.tab = tab;
+  clearTimeout(srcMenu.hide);
+  refreshSrcMenu();
+}
+
+function leaveSrcMenu(what) {
+  if (srcMenu.over === what) srcMenu.over = null;
+  clearTimeout(srcMenu.hide);
+  srcMenu.hide = setTimeout(() => {
+    if (!srcMenu.over) hideSrcMenu();
+  }, SRC_MENU_HIDE_MS);
+}
+
+function hideSrcMenu() {
+  clearTimeout(srcMenu.hide);
+  srcMenu.over = null;
+  srcMenu.tab = null;
+  srcMenu.source = null;
+  if (srcMenu.el) srcMenu.el.hidden = true;
+}
+
+// Show the box under the tab the pointer is on, or hide it when that tab's source has no
+// worker record (each poll calls this too, so a record that arrives later shows it).
+function refreshSrcMenu() {
+  const tab = srcMenu.tab;
+  if (!tab || srcMenu.over !== "tab") return;
+  const s = state.sources.find((x) => x.id === tab.dataset.id);
+  if (!s || !s.worker) {
+    if (srcMenu.el) srcMenu.el.hidden = true;
+    srcMenu.source = null;
+    return;
+  }
+  const el = srcMenuEl();
+  const r = tab.getBoundingClientRect();
+  el.style.left = `${Math.max(0, Math.round(r.left))}px`;
+  el.style.top = `${Math.round(r.bottom)}px`;
+  srcMenu.source = s.id;
+  el.hidden = false;
+}
+
+// Megasamples a second for `hz`, to at most two decimals, trailing zeros dropped (38.4).
+function msps(hz) {
+  return String(Number((hz / 1e6).toFixed(2)));
+}
+
+// What a source's link was measured at: [{bits, hz}] per depth (`bits` null for a source with
+// one), from its worker's latest hello, else its record.
+function linkFigures(s) {
+  const latest = s?.worker?.link_measure;
+  const depths = latest?.depths?.length ? latest.depths : s?.capabilities?.depths || [];
+  if (depths.length) return depths.map((d) => ({ bits: d.bits, hz: hz(d.max_bandwidth_hz) }));
+  const top = hz(latest?.max_bandwidth_hz ?? s?.capabilities?.max_bandwidth_hz);
+  return top === null ? [] : [{ bits: null, hz: top }];
+}
+
+// The result line of a measure: `link diagnostics <source>: <items>; record updates at the next
+// start`, an item per depth (`12-bit 30.72 → 38.4 Msps`, or `8-bit unchanged`), or `unchanged`
+// alone when nothing moved.
+export function diagnosticsLine(source, before, after) {
+  const items = after.map(({ bits, hz: now }) => {
+    const was = before.find((b) => b.bits === bits);
+    const what = bits === null ? "" : `${bits}-bit `;
+    if (was && was.hz === now) return null;
+    return was ? `${what}${msps(was.hz)} → ${msps(now)} Msps` : `${what}→ ${msps(now)} Msps`;
+  });
+  const dropped = before.filter((b) => !after.some((a) => a.bits === b.bits));
+  const moved = items.some((i) => i !== null) || dropped.length > 0;
+  const text = moved
+    ? [
+        ...after.map(({ bits }, i) => items[i] ?? `${bits === null ? "" : `${bits}-bit `}unchanged`),
+        ...dropped.map(({ bits }) => `${bits}-bit dropped`),
+      ].join(", ")
+    : "unchanged";
+  return `link diagnostics ${source}: ${text}; record updates at the next start`;
+}
+
+// The measures waiting for their worker's hello, by source: the figures and the worker's
+// `since_ns` before the call.
+const diagnostics = new Map();
+
+// Wait for `source`'s measure (just applied) to end, from `kept`, what diagKept(s) gave before.
+function awaitDiagnostics(source, kept) {
+  diagnostics.set(source, kept);
+}
+
+function diagKept(s) {
+  return { before: linkFigures(s), since: s?.worker?.since_ns ?? null };
+}
+
+// On a `source_list` whose worker of a waiting source said hello after the call (a later
+// `since_ns`) and is no longer starting, one transcript line with the result.
+function noteDiagnostics(sources) {
+  for (const [source, kept] of diagnostics) {
+    const s = sources.find((x) => x.id === source);
+    const w = s?.worker;
+    if (!w || w.starting || typeof w.since_ns !== "number") continue;
+    if (kept.since !== null && !(w.since_ns > kept.since)) continue;
+    diagnostics.delete(source);
+    state.transcript?.note(diagnosticsLine(source, kept.before, linkFigures(s)));
+  }
+}
+
 function renderTabs(sources) {
   const tabs = $("#tabs");
   tabs.replaceChildren(
@@ -497,6 +640,8 @@ function renderTabs(sources) {
       centre.textContent = centreText(s);
       tab.append(mark, name, range, centre);
       decorateTab(tab, s);
+      tab.addEventListener("mouseenter", () => enterSrcTab(tab));
+      tab.addEventListener("mouseleave", () => leaveSrcMenu("tab"));
       tab.onclick = () => {
         select(s.id);
         if (state.view && state.view.get("main") !== "rf") state.view.set("main", "rf");
@@ -566,9 +711,15 @@ async function applyOp(op, { errors = false } = {}) {
   const t = state.transcript;
   if (!state.api) return null;
   let result = null;
+  // A measure's result is noted when the new worker says hello (noteDiagnostics).
+  const kept = op.op === "source_measure" ? diagKept(state.sources.find((s) => s.id === op.source)) : null;
   try {
     result = await state.api.op(op);
     if (QUIET_OPS.has(op.op)) t.reply(op, result);
+    if (kept) {
+      awaitDiagnostics(op.source, kept);
+      t.note(sourceReply(op, result));
+    }
     if (op.op === "plan_start" || op.op === "set_start") noteRefusals(result && result.value);
   } catch (e) {
     if (notApplied(e)) t.note(`${op.op}: ${e.message}`, true);
@@ -582,7 +733,14 @@ async function applyOp(op, { errors = false } = {}) {
 // ---- conflicts -------------------------------------------------------------------------
 
 // Ops that take `replace` (a conflict on them can be retried with the holders named).
-const REPLACEABLE = new Set(["job_start", "job_retune", "source_ensure", "source_pin", "plan_start"]);
+const REPLACEABLE = new Set([
+  "job_start",
+  "job_retune",
+  "source_ensure",
+  "source_pin",
+  "source_measure",
+  "plan_start",
+]);
 
 // `<kind> <id> @ <centre MHz>` for holder `id`, from the last job list (the conflict's
 // `current` centre when the job is not in it).
@@ -709,6 +867,10 @@ function sourceOp(src, words) {
     if (args.length) return { error: "source unpin: expected no arguments" };
     return { op: { op: "source_unpin", source: src.id } };
   }
+  if (verb === "measure") {
+    if (args.length) return { error: "source measure: expected no arguments" };
+    return { op: { op: "source_measure", source: src.id, replace: [] } };
+  }
   // gain
   if (args.length === 1 && args[0] === "auto") {
     return { op: { op: "source_set_gain", source: src.id, gain_db: null } };
@@ -725,14 +887,17 @@ function sourceReply(op, result) {
     return `pinned ${op.source} at ${op.center_hz} Hz, ${op.bandwidth_hz} Hz`;
   }
   if (op.op === "source_unpin") return `unpinned ${op.source}`;
+  if (op.op === "source_measure") {
+    return `measuring ${op.source} again: about a minute, the host will be busy`;
+  }
   const g = (result && result.value) || {};
   if (g.automatic || g.db === null || g.db === undefined) return `gain ${op.source}: automatic`;
   return `gain ${op.source}: ${g.db} dB (${g.min_db}..=${g.max_db})`;
 }
 
-// `source pin [<center_hz> <bandwidth_hz>]`, `source unpin`, `source gain <db>|auto` on the
-// shown source: {text, error} for the transcript, or {text: null} when a conflict was
-// offered its retry line instead (offerReplace).
+// `source pin [<center_hz> <bandwidth_hz>]`, `source unpin`, `source gain <db>|auto`,
+// `source measure` on the shown source: {text, error} for the transcript, or {text: null}
+// when a conflict was offered its retry line instead (offerReplace).
 export async function runSourceCommand(st, words) {
   let src;
   try {
@@ -745,7 +910,9 @@ export async function runSourceCommand(st, words) {
   if (parsed.error) return { text: parsed.error, error: true };
   const op = parsed.op;
   try {
+    const kept = diagKept(src);
     const result = await st.api.op(op);
+    if (op.op === "source_measure") awaitDiagnostics(src.id, kept);
     return { text: sourceReply(op, result), error: false };
   } catch (e) {
     if (e.json && e.json.error === "conflict") {
@@ -946,7 +1113,7 @@ async function runCommand(text) {
     state.transcript.note(r.text, r.error);
     return;
   }
-  if (/^source\s+(pin|unpin|gain)\b/.test(text)) {
+  if (/^source\s+(pin|unpin|gain|measure)\b/.test(text)) {
     state.transcript.user(text);
     const r = await runSourceCommand(state, text.split(/\s+/).slice(1));
     if (r.text !== null) state.transcript.note(r.text, r.error);
@@ -1610,12 +1777,15 @@ function shown() {
   return state.sources.find((s) => s.id === state.selected) || null;
 }
 
-// The tabs follow each `source_list` poll (pin tag, title, fault) without re-selecting.
+// The tabs follow each `source_list` poll (pin tag, title, fault) without re-selecting, and so
+// do the hover box and the measures waiting for their result.
 function syncTabs(sources) {
   for (const tab of document.querySelectorAll(".src-tab")) {
     const s = sources.find((x) => x.id === tab.dataset.id);
     if (s) decorateTab(tab, s);
   }
+  refreshSrcMenu();
+  noteDiagnostics(sources);
 }
 
 // After each jobs poll: `source_list` into state.sources and the waterfall (a moved capture),
