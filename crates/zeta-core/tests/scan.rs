@@ -3070,8 +3070,14 @@ async fn a_scan_refused_because_another_already_sweeps_fails_instead_of_stepping
         .await
     {
         Err(OpError::Other { message }) => {
-            assert!(message.starts_with(&format!("sweep on source radio0: {ONE_SWEEP}")), "{message}");
-            assert!(message.contains(&first.0), "names the sweeping scan: {message}");
+            assert!(
+                message.starts_with(&format!("sweep on source radio0: {ONE_SWEEP}")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&first.0),
+                "names the sweeping scan: {message}"
+            );
         }
         other => panic!("expected Other, got {other:?}"),
     }

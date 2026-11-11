@@ -1528,7 +1528,10 @@ async fn a_one_view_stream_rides_through_a_server_pause_on_one_socket() {
         last = tokio::time::Instant::now();
     }
     assert_eq!(fake.wf_connections(), 1, "no reconnect");
-    assert!(gap >= Duration::from_millis(1_200), "the pause was seen: {gap:?}");
+    assert!(
+        gap >= Duration::from_millis(1_200),
+        "the pause was seen: {gap:?}"
+    );
     assert_eq!(*rows.state.borrow(), SweepState::Running);
     assert_eq!(views_sent(&fake), 1, "{:?}", fake.commands());
 }
