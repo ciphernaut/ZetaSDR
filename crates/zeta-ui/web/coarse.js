@@ -16,7 +16,9 @@
 //                manual one, is not rigid; a `pin` is) and whose tune range contains the
 //                view's centre; else the shown source itself when it has no holder at all
 //                and no pin (today's scan mode: the scan stops the page's elastic job,
-//                which restarts when it ends)
+//                which restarts when it ends); a source whose `capabilities.sweep` holds
+//                the view sweeps it for itself and is a scanner whatever holds or pins it,
+//                the shown one included (plan 36.2: no lease, the node decides)
 //         <id>   that source, as given
 //       The span is the view clamped to the scanner's tune_min_hz..tune_max_hz. A manual scan
 //       (one not in sessionStorage[AUTO_SCAN_KEY]) running on the scanner is followed
@@ -54,7 +56,7 @@
 //     coarse.destroy()
 
 import { AUTO_SCAN_KEY, errorText } from "./agent.js";
-import { capHz, rigidHolders } from "./waterfall.js";
+import { capHz, rigidHolders, sweepsItself } from "./waterfall.js";
 
 export const SCAN_DEBOUNCE_MS = 300;
 export const SPAN_CHANGE = 0.05;
@@ -279,14 +281,18 @@ class Coarse {
     if (this.scanJobId) scans.add(this.scanJobId);
     const rigid = (s) => rigidHolders(s).filter((h) => !scans.has(h));
     const centre = (v.lo + v.hi) / 2;
+    // A source that sweeps the view itself is a scanner whatever holds or pins it.
+    const sweeps = (s) => !s.fault && sweepsItself(s, v.lo, v.hi);
     const other = srcs.find((s) => {
-      if (s.id === shown || s.fault || rigid(s).length) return false;
+      if (s.id === shown || s.fault) return false;
+      if (sweeps(s)) return true;
+      if (rigid(s).length) return false;
       const r = tuneRange(s);
       return !!r && r.lo <= centre && centre <= r.hi;
     });
     if (other) return other;
     const self = srcs.find((s) => s.id === shown);
-    if (self && !self.fault && rigidHolders(self).length === 0) {
+    if (self && (sweeps(self) || (!self.fault && rigidHolders(self).length === 0))) {
       return self;
     }
     return null;

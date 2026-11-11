@@ -22,11 +22,15 @@
 //     wf.syncJobs(jobs)  a `job_list` result (app.js hands it every poll): follows a scan job
 //         that started on the shown source, or goes back to a spectrum job when it ended
 //     wf.onNotice   fn(text) for transcript lines (a refused retune); set by app.js
-//     wf.release(src) -> Promise<bool>  checks `source_list` holders of `src` (rigid jobs; the
-//         page's own elastic job is never one; a `pin` is one, see rigidHolders) and, when
+//     wf.release(src, span) -> Promise<bool>  checks `source_list` holders of `src` (rigid jobs;
+//         the page's own elastic job is never one; a `pin` is one, see rigidHolders) and, when
 //         there are none, stops following
 //         (false, with a `conflict: …` notice, when a job holds it). The page's own job is
-//         left to the node: a scan on the source stops it. The caller then runs
+//         left to the node: a stepped scan on the source stops it, while under a self-sweep
+//         (`span` {lo, hi} in Hz inside the source's `capabilities.sweep`, see sweepsItself)
+//         the node takes no lease and stops nothing, so the page's own spectrum job keeps
+//         running, unseen while the waterfall follows the scan, and the page does not refuse
+//         for rigid holders: the node decides. The caller then runs
 //         setSource(src) again (menu.js after starting a scan).
 //     wf.painted    columns painted since mount (never reset; for tests)
 //     wf.lastRowFormat  "q" (spectrum event v2) or "db" (older nodes) for the last painted
@@ -384,6 +388,13 @@ export function rigidHolders(info) {
   return holders;
 }
 
+// Whether `src` (a `source_list` record) sweeps `lo..hi` Hz for itself: its
+// `capabilities.sweep` holds the span. Such a scan takes no lease (plan 36.2).
+export function sweepsItself(src, lo, hi) {
+  const sw = src && src.capabilities && src.capabilities.sweep;
+  return !!sw && sw.min_hz <= lo && hi <= sw.max_hz;
+}
+
 // `t` when it is a {center_hz, bandwidth_hz} with both set, else null.
 function usableTuning(t) {
   return t && t.center_hz && t.bandwidth_hz ? t : null;
@@ -675,11 +686,12 @@ class Waterfall {
   }
 
   // Lets go of `src` for a scan: true once nothing follows it; false (with a `conflict: …`
-  // notice) when a rigid job holds it. The page's own elastic job keeps running: the scan
-  // stops it on the node. Throws when `source_list` fails (nothing released then).
-  async release(src) {
-    const holders = await this.holders(src);
-    if (holders.length) {
+  // notice) when a rigid job holds it, unless the source sweeps `span` itself (the node
+  // decides). The page's own elastic job keeps running: a stepped scan stops it on the node. Throws when `source_list` fails (nothing released then).
+  async release(src, span = null) {
+    const info = await this.sourceInfo(src);
+    const holders = rigidHolders(info);
+    if (holders.length && !(span && sweepsItself(info, span.lo, span.hi))) {
       this.notice(`conflict: source ${src.id} held by ${holders.join(", ")}`);
       return false;
     }

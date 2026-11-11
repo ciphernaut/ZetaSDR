@@ -120,7 +120,9 @@
 //   scan       Scan this span                 (starts the default look, 20 ms x 1; the job's
 //                                             row offers the others: agent.js SCAN_LOOKS) wf.release() (stops the page's own spectrum job
 //                                             unless another job holds the source: then a
-//                                             `conflict: …` line and nothing more), job_start
+//                                             `conflict: …` line and nothing more; a source that
+//                                             sweeps the span itself, `wf.release(src, span)`,
+//                                             is asked anyway: the node decides), job_start
 //                                             kind=scan on the selection's centre and
 //                                             bandwidth, then wf.resume() (scan mode when the
 //                                             scan runs, else the spectrum job again)
@@ -1122,13 +1124,17 @@ class Menu {
   }
 
   // A scan time-shares the radio: the waterfall lets go of the source first (refused while a
-  // rigid job holds it), the scan stops the page's elastic spectrum job on the node, and the
+  // rigid job holds it, unless the source sweeps the span itself and the node decides), the scan stops the page's elastic spectrum job on the node, and the
   // waterfall follows the scan after (and starts its own job again when the scan ends).
   async scan(s) {
     if (this.wf.sourceId !== s.sourceId) return;
     let released = false;
     try {
-      released = await this.wf.release(this.wf.src);
+      const half = s.bandwidthHz / 2;
+      released = await this.wf.release(this.wf.src, {
+        lo: s.centerHz - half,
+        hi: s.centerHz + half,
+      });
     } catch (e) {
       this.t.note(`scan: ${e.message}`, true);
     }
