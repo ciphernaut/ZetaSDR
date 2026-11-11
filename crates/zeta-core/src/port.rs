@@ -589,7 +589,9 @@ pub trait Port: Send + Sync {
     /// before the rows close. Dropping the [`SweepRows`] ends the sweep and
     /// frees what it held upstream. What the source cannot do at once (no
     /// view free beside its IQ session) it refuses here, with the reason; the
-    /// default refuses every sweep.
+    /// default refuses every sweep. It is called under the source's gate:
+    /// refuse or return within a few seconds (the node gives up on it after
+    /// [`crate::ops::SWEEP_START_TIMEOUT_MS`] and drops the call).
     async fn sweep(&self, req: SweepRequest) -> Result<SweepRows, PortError> {
         let _ = req;
         Err(PortError::Unsupported(

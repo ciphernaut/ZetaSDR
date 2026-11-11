@@ -327,6 +327,9 @@ struct Inner {
     ring_seconds: f64,
     ring_budget_bytes: u64,
     scan_dwell_ms: u64,
+    /// How long a scan waits for a source to start its own sweep
+    /// ([`crate::ops::SWEEP_START_TIMEOUT_MS`]; tests shorten it).
+    sweep_start_timeout: Mutex<std::time::Duration>,
     /// Where the operator said sources are (`--source-position`).
     source_positions: BTreeMap<SourceId, SourcePosition>,
     backends: Vec<Backend>,
@@ -1042,6 +1045,9 @@ impl Node {
                 ring_seconds: cfg.ring_seconds,
                 ring_budget_bytes: cfg.ring_budget_bytes,
                 scan_dwell_ms: cfg.scan_dwell_ms,
+                sweep_start_timeout: Mutex::new(std::time::Duration::from_millis(
+                    crate::ops::SWEEP_START_TIMEOUT_MS,
+                )),
                 source_positions: cfg.source_positions,
                 backends: cfg.backends,
                 registry,
@@ -2499,6 +2505,13 @@ impl Node {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn debug_fault_episode(&self, source: &SourceId) -> Option<u64> {
         self.inner.episode_since(source)
+    }
+
+    /// Wait `d` instead of [`crate::ops::SWEEP_START_TIMEOUT_MS`] for a source to
+    /// start its own sweep, for tests of a start that never returns.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn debug_set_sweep_start_timeout(&self, d: std::time::Duration) {
+        *self.inner.sweep_start_timeout.lock().unwrap() = d;
     }
 
     /// Hold `source`'s gate, for tests of what waits on it.

@@ -242,7 +242,9 @@ impl Inner {
     /// the port to sweep `req`: its rows, or its refusal, the claim then dropped
     /// unless a live run of the id holds it. Taken before the call and under the
     /// gate, the claim is never taken after the job's release, and an idle never
-    /// lands between it and the sweep's start.
+    /// lands between it and the sweep's start. A call that has not returned after
+    /// [`crate::ops::SWEEP_START_TIMEOUT_MS`] is dropped (ending the source's attempt) and
+    /// read as a refusal, `sweep start timed out`: the gate is never held longer.
     async fn start_sweep(
         &self,
         port: &dyn Port,
@@ -251,7 +253,11 @@ impl Inner {
         gate: &OwnedMutexGuard<()>,
     ) -> Result<SweepRows, PortError> {
         self.leases.claim_sweep_locked(port.id(), id.clone(), gate);
-        let rows = port.sweep(req).await;
+        let wait = *self.sweep_start_timeout.lock().unwrap();
+        let rows = match tokio::time::timeout(wait, port.sweep(req)).await {
+            Ok(rows) => rows,
+            Err(_) => Err(PortError::Io("sweep start timed out".into())),
+        };
         if rows.is_err() {
             self.release_unless_live(id);
         }

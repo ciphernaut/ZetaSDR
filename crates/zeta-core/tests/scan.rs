@@ -125,8 +125,8 @@ struct ScanPort {
 /// it sends no row for step `skip_step`; with `burst` it sends [`SWEEP_BURST`] rows
 /// at once (more than its channel holds), then pauses, so a reader cannot keep up
 /// and cannot be starved; with `depths` the port also carries [`two_depths`]. The
-/// first row comes after `first_row_ms` (default 5). Each row's span is the next
-/// `SWEEP_ROW_MS` after the last one's.
+/// first row comes after `first_row_ms` (default 5); with `hang` the call never
+/// returns. Each row's span is the next `SWEEP_ROW_MS` after the last one's.
 #[derive(Clone, Debug, Default)]
 struct SweepScript {
     refuse: Option<String>,
@@ -136,6 +136,7 @@ struct SweepScript {
     burst: bool,
     depths: bool,
     first_row_ms: Option<u64>,
+    hang: bool,
 }
 
 /// Steps and bins of a [`ScanPort::sweeping`] port's plan.
@@ -489,6 +490,9 @@ impl Port for ScanPort {
         self.requests.lock().unwrap().push(req);
         if let Some(why) = script.refuse {
             return Err(PortError::Unsupported(why));
+        }
+        if script.hang {
+            std::future::pending::<()>().await;
         }
         let step_hz = req.span.bandwidth_hz.0 / u64::from(SWEEP_STEPS);
         let bin_hz = step_hz as f64 / f64::from(SWEEP_BINS);
@@ -2783,7 +2787,11 @@ async fn a_sweep_the_source_gives_up_on_fails_the_scan_without_faulting_the_sour
         other => panic!("expected Failed, got {other:?}"),
     }
     assert!(radio0_info(&node).await.fault.is_none());
-    assert!(node.lease_sweepers(&radio0()).is_empty());
+    // The supervisor records the end before it releases the claim.
+    until("the claim is released", Duration::from_secs(5), || {
+        node.lease_sweepers(&radio0()).is_empty()
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(job_state(&node, &rigid), Some(JobState::Running));
     node.job_stop(&rigid).await.unwrap();
@@ -2843,5 +2851,30 @@ async fn a_scan_with_bits_is_stepped() {
     let ctx = scan_ctx(&node, &id);
     assert_eq!(ctx["method"], "stepped", "{ctx}");
     assert_eq!(ctx["bits"], 8, "{ctx}");
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A source whose sweep never starts is given up on, so the gate is not held for
+/// it: the call is read as a refusal, its claim is dropped and the scan steps.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sweep_start_that_never_returns_is_refused_and_the_scan_steps() {
+    let script = SweepScript {
+        hang: true,
+        ..Default::default()
+    };
+    let (_dir, node, port) = open_with(ScanPort::sweeping(script)).await;
+    let wait = Duration::from_millis(300);
+    node.debug_set_sweep_start_timeout(wait);
+    let asked = Instant::now();
+    let (id, _rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    let took = asked.elapsed();
+    assert!(took >= wait, "started after {took:?}");
+    // Well under the node's own 5 s: the shortened wait was the one in force.
+    assert!(took < Duration::from_secs(4), "started after {took:?}");
+    assert_eq!(port.requests().len(), 1);
+    assert!(node.lease_sweepers(&radio0()).is_empty());
+    tunes_at_least(&port, 1, Duration::from_secs(5)).await;
+    assert_eq!(scan_ctx(&node, &id)["method"], "stepped");
     node.job_stop(&id).await.unwrap();
 }

@@ -1822,6 +1822,10 @@ pub const SCAN_DWELL_MS: u64 = 20;
 /// How long past its dwell a scan step waits for the dwell's samples before
 /// the step is skipped, ms.
 pub const SCAN_WAIT_MARGIN_MS: u64 = 500;
+/// The longest a scan waits, under the source's gate, for a source to grant or
+/// refuse its own sweep; past it the sweep is refused as `sweep start timed
+/// out`, ms.
+pub const SWEEP_START_TIMEOUT_MS: u64 = 5000;
 /// A dwell this long or longer is cut into `SPECTRUM_ROWS_PER_S` rows a second;
 /// a shorter one is one row a step, ms.
 pub const SCAN_ROWS_DWELL_MS: u64 = 100;
