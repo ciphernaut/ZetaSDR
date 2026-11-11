@@ -20,8 +20,9 @@
 //! slot, it sets it ([`Ring::set_format`]) and names it in its hello. A slot
 //! is [`SLOT_BYTES`] whatever the format, so an `sc16` slot holds twice the
 //! samples of a `cf32` one ([`SlotFormat::samples_per_slot`]) and the ring
-//! twice the time; [`Ring::read`] converts an `sc16` slot with
-//! [`sc16_to_cf32`], the conversion a source in the node uses, so the node
+//! twice the time; [`Ring::read`] converts an `sc16` slot by
+//! [`zeta_core::port::sc16_to_cf32`]'s per-sample conversion
+//! ([`sc16_sample_to_cf32`]), the one a source in the node uses, so the node
 //! reads the same bits either way. Version 1 had no format (always `cf32`)
 //! and counted its slots in samples; a child that finds another version than
 //! its own serves on the pipe.
@@ -39,7 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use num_complex::Complex;
-use zeta_core::port::sc16_to_cf32;
+use zeta_core::port::sc16_sample_to_cf32;
 
 /// The bytes of one slot, whatever its format: 2 MiB.
 pub const SLOT_BYTES: usize = 2 << 20;
@@ -398,7 +399,8 @@ impl Ring {
 
     /// Consumer: copies out the `n` samples of block `seq` in `slot`, after
     /// checking the descriptor against the ring, converted to `cf32` by the
-    /// ring's format (an `sc16` slot through [`sc16_to_cf32`]); `n` is bounded
+    /// ring's format (an `sc16` slot through [`sc16_sample_to_cf32`], the
+    /// conversion of [`zeta_core::port::sc16_to_cf32`]); `n` is bounded
     /// by what a slot of that format holds. The slot stays held until
     /// [`Ring::release`].
     ///
@@ -436,9 +438,9 @@ impl Ring {
             // `per_slot >= n` of them, aligned): the producer finished them
             // before `head` passed `seq` and leaves them until the release.
             let raw = unsafe { std::slice::from_raw_parts(src.cast::<Complex<i16>>(), n) };
-            let mut out = vec![Complex::new(0.0, 0.0); n];
-            sc16_to_cf32(raw, &mut out);
-            return Ok(out.into());
+            // Converted straight into the block's `Arc`: an exact-size iterator
+            // is collected in one allocation, with no buffer filled first.
+            return Ok(raw.iter().map(|&s| sc16_sample_to_cf32(s)).collect());
         }
         let mut out = Arc::<[Complex<f32>]>::new_uninit_slice(n);
         let dst = Arc::get_mut(&mut out).expect("a fresh Arc is unique");

@@ -307,11 +307,14 @@ struct SweepTiming {
     slow: u64,
 }
 
-/// The median of `v` (its upper middle for an even count); zero when empty.
+/// The median of `v` (its lower middle for an even count, so one slow tune of
+/// two counts as slow); zero when empty.
 fn median(v: &[Duration]) -> Duration {
     let mut v = v.to_vec();
     v.sort();
-    v.get(v.len() / 2).copied().unwrap_or_default()
+    v.get(v.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or_default()
 }
 
 /// `d` in milliseconds, to the microsecond.
@@ -387,8 +390,8 @@ const TIMING_EVERY_NS: u64 = 1_000_000_000;
 
 /// A scan's steps and the mask they are masked with, built from the source's
 /// capabilities at launch and again at the start of a sweep when the source's
-/// capture ([`capture_of`]: `max_bandwidth_hz`, or the cap of the depth the
-/// scan asked for), its usable fraction or its depth in force changed (a cap
+/// capture ([`capture_of`]: the cap of the depth in force, or the record's
+/// figure), its usable fraction or its depth in force changed (a cap
 /// measured after the scan started, [`scan_loop`]).
 #[derive(Clone, Debug)]
 struct Layout {
@@ -580,18 +583,16 @@ fn check_stored_bits(port: &dyn Port, graph: &graph::Graph) -> Result<Option<u8>
     }
 }
 
-/// The capture a scan at `bits` steps at on `port`: the cap of that depth as
-/// the port has it in force ([`Port::depth`], which a respawn's measurement can
-/// move), else as the record lists it; without `bits`, `max_bandwidth_hz`.
+/// The capture a scan at `bits` steps at on `port`: the cap of the depth in
+/// force ([`Port::depth`], which a re-measure can move under the run's record,
+/// and which the port bounds its tunes by) when it is that depth, or any depth
+/// without `bits`; else the record's figure for `bits`, or its
+/// `max_bandwidth_hz` without them (a source with one depth).
 fn capture_of(port: &dyn Port, bits: Option<u8>) -> u64 {
-    match bits {
-        Some(b) => port
-            .depth()
-            .filter(|d| d.bits == b)
-            .map(|d| d.max_bandwidth_hz.value().0)
-            .unwrap_or_else(|| scan_capture_hz(port.capabilities(), Some(b))),
-        None => scan_capture_hz(port.capabilities(), None),
-    }
+    port.depth()
+        .filter(|d| bits.is_none_or(|b| d.bits == b))
+        .map(|d| d.max_bandwidth_hz.value().0)
+        .unwrap_or_else(|| scan_capture_hz(port.capabilities(), bits))
 }
 
 /// The depth a scan asking for `bits` reports on `port`: `bits`, else the
@@ -1051,6 +1052,19 @@ mod tests {
             (v["skipped"].as_u64(), v["slow_tunes"].as_u64()),
             (Some(0), Some(0))
         );
+    }
+
+    /// Of two tunes the median is the lower, so one slow tune of a two-step
+    /// sweep counts as slow.
+    #[test]
+    fn a_two_step_sweep_counts_its_slow_tune() {
+        let mut t = SweepTiming::default();
+        t.step(ms_of(3), ms_of(25), false);
+        t.step(ms_of(150), ms_of(180), false);
+        let v = t.finish(40_000_000, ms_of(205));
+        assert_eq!(v["tune_ms"]["median"], 3.0, "{v}");
+        assert_eq!(v["slow_tunes"], 1, "{v}");
+        assert_eq!(v["step_ms"], 25.0, "{v}");
     }
 
     #[test]

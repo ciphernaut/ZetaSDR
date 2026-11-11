@@ -393,8 +393,9 @@ they belong to the serving node and are rejected. Source ids are unique across t
   with the link's speed, so they are measured again by themselves only when the negotiated speed
   changed. `zeta source measure --source ID` (the page's "Run link diagnostics", in the hover box under the
   radio's tab) drops them and measures again, about a minute with the host busy; it is a `conflict`
-  naming the holders while a job or a pin holds the radio, and the new figures govern tunes at once
-  while `capabilities` shows them from the next start.
+  naming the holders while a job or a pin holds the radio. The new figures govern tunes at once
+  through `depth` and are cached for the next start; `capabilities` is set once a run (the first
+  hello of the run that differs from it replaces it, later ones leave it).
 
 ```bash
 ./target/debug/zeta --source-kiwi kiwi0=kiwisdr.example:8073 source list   # remote true, current null

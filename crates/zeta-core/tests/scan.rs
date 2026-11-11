@@ -78,7 +78,9 @@ fn block_len(rate_hz: u64, block_ms: u64) -> usize {
 /// replaced once ([`ScanPort::replace_caps`]), as a worker port's is by a
 /// respawn's hello. One made [`ScanPort::with_depths`] carries two sample
 /// depths, changes depth as a Soapy source does (the tuning forgotten), bounds a
-/// tune by the depth in force and logs every `set_depth` and tune in order.
+/// tune by the depth in force and logs every `set_depth` and tune in order;
+/// the cap of its depth in force can drop under the record's after a given
+/// tune ([`ScanPort::drop_cap_after`]), as a re-measure's does.
 struct ScanPort {
     id: SourceId,
     caps: Capabilities,
@@ -91,6 +93,10 @@ struct ScanPort {
     failed: AtomicBool,
     /// The depth in force (bits), on a port with depths.
     depth: Mutex<Option<u8>>,
+    /// After this many tunes, the cap of the depth in force becomes this (Hz).
+    cap_drop: Mutex<Option<(usize, u64)>>,
+    /// The cap of the depth in force once it dropped; the record keeps its own.
+    live_cap: Mutex<Option<u64>>,
     /// Every `set_depth` and tune, in order.
     log: Mutex<Vec<Call>>,
     /// The `t0` of every block a `Gapping` port started late.
@@ -235,6 +241,8 @@ impl ScanPort {
             fail_once: false,
             failed: AtomicBool::new(false),
             depth: Mutex::new(None),
+            cap_drop: Mutex::new(None),
+            live_cap: Mutex::new(None),
             log: Mutex::new(Vec::new()),
             gaps: Mutex::new(Vec::new()),
             held: AtomicBool::new(false),
@@ -300,6 +308,13 @@ impl ScanPort {
         self.tunes.lock().unwrap().iter().map(|(t, _)| *t).collect()
     }
 
+    /// Once `n` tunes have been made, the cap of the depth in force is
+    /// `hz` (set inside the `n`th tune, so no sweep sees half of it); the
+    /// record is not changed.
+    fn drop_cap_after(&self, n: usize, hz: u64) {
+        *self.cap_drop.lock().unwrap() = Some((n, hz));
+    }
+
     /// When each tune was asked for.
     fn tuned_at(&self) -> Vec<Instant> {
         self.tunes
@@ -343,6 +358,11 @@ impl Port for ScanPort {
         self.tunes.lock().unwrap().push((t, Instant::now()));
         self.log.lock().unwrap().push(Call::Tune(t));
         *self.cur.lock().unwrap() = Some(t);
+        if let Some((after, hz)) = *self.cap_drop.lock().unwrap()
+            && n >= after
+        {
+            *self.live_cap.lock().unwrap() = Some(hz);
+        }
         Ok(t)
     }
     fn current(&self) -> Option<Tuning> {
@@ -353,7 +373,11 @@ impl Port for ScanPort {
     }
     fn depth(&self) -> Option<Depth> {
         let bits = (*self.depth.lock().unwrap())?;
-        self.caps.depths.iter().find(|d| d.bits == bits).cloned()
+        let mut d = self.caps.depths.iter().find(|d| d.bits == bits).cloned()?;
+        if let Some(hz) = *self.live_cap.lock().unwrap() {
+            d.max_bandwidth_hz = Claim::Measured(Hz(hz));
+        }
+        Some(d)
     }
     async fn set_depth(&self, bits: u8) -> Result<Depth, PortError> {
         let Some(d) = self.caps.depths.iter().find(|d| d.bits == bits).cloned() else {
@@ -1508,39 +1532,65 @@ async fn the_timing_is_written_at_most_once_a_second() {
 
 /// A skip in a sweep the throttle does not write still shows at the next write:
 /// the one-step sweeps between two writes add their skips up.
+///
+/// The port is held right after a write: once the ring's backlog is used up
+/// one step waits out its 520 ms timeout, a skip in a sweep that ends inside
+/// the second the throttle holds the record back. That step is found from the
+/// port's own tune times (two tunes 450 ms apart), never from the gaps between
+/// this test's polls; the samples come back then. The write that reports the
+/// skip must be of a later, quick sweep (`sweep_ms` under the timeout): a
+/// write of the skipped sweep itself (the hold came late) shows nothing of the
+/// carry, so the hold is tried again, up to five times, and the test fails if
+/// none shows it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_skip_in_an_unwritten_sweep_shows_at_the_next_write() {
     let (_dir, node, port) = open_with(ScanPort::fast()).await;
     let (id, _rx) = start_span(&node, 100 * MHZ, FAST_RATE_HZ).await;
-    until("a timing", Duration::from_secs(10), || {
-        timing(&node, &id).is_some()
-    })
-    .await;
-    let first = timing(&node, &id).unwrap()["at_ns"].as_u64().unwrap();
-    // Stall the port right after the first write: once the ring's backlog is
-    // used up one step waits out its 520 ms timeout, a skip in a sweep that ends
-    // inside the second the throttle holds the record back. A tune after a quiet
-    // spell of 450 ms is that step's end; the samples come back then.
-    port.hold(true);
-    let mut last = (port.tunes().len(), Instant::now());
-    until("a step given up on", Duration::from_secs(10), || {
-        let n = port.tunes().len();
-        if n == last.0 {
-            return false;
+    let at = || timing(&node, &id).and_then(|t| t["at_ns"].as_u64());
+    until("a timing", Duration::from_secs(10), || at().is_some()).await;
+    let first = at().unwrap();
+    let quiet = Duration::from_millis(450);
+    let mut tries = Vec::new();
+    for _ in 0..5 {
+        let last = at().unwrap();
+        until("the next write", Duration::from_secs(10), || {
+            at() > Some(last)
+        })
+        .await;
+        let written = at().unwrap();
+        let from = port.tunes().len().saturating_sub(1);
+        port.hold(true);
+        until("a step given up on", Duration::from_secs(10), || {
+            port.tuned_at()[from..]
+                .windows(2)
+                .any(|w| w[1].duration_since(w[0]) >= quiet)
+        })
+        .await;
+        port.hold(false);
+        // The first write after the hold that counts a skip; at most one a
+        // second, so a poll every 20 ms sees it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut report = None;
+        while report.is_none() && tokio::time::Instant::now() < deadline {
+            report = timing(&node, &id).filter(|t| {
+                t["at_ns"].as_u64() > Some(written) && t["skipped"].as_u64().unwrap_or(0) >= 1
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let quiet = last.1.elapsed() >= Duration::from_millis(450);
-        last = (n, Instant::now());
-        quiet
-    })
-    .await;
-    port.hold(false);
-    until("a skip reported", Duration::from_secs(10), || {
-        timing(&node, &id).is_some_and(|t| t["skipped"].as_u64().unwrap_or(0) >= 1)
-    })
-    .await;
-    let t = timing(&node, &id).unwrap();
-    assert!(t["at_ns"].as_u64().unwrap() > first, "{t}");
-    node.job_stop(&id).await.unwrap();
+        let carried = report.as_ref().is_some_and(|t| {
+            t["sweep_ms"]
+                .as_f64()
+                .is_some_and(|ms| ms < quiet.as_secs_f64() * 1e3)
+        });
+        if carried {
+            let t = report.unwrap();
+            assert!(t["at_ns"].as_u64().unwrap() > first, "{t}");
+            node.job_stop(&id).await.unwrap();
+            return;
+        }
+        tries.push(report);
+    }
+    panic!("no skip was carried to a later write: {tries:?}");
 }
 
 /// `job_start`'s `dwell_ms` and `average` are written into the scan's `fft` node
@@ -1948,6 +1998,72 @@ async fn a_scan_without_bits_reports_the_sources_own_depth() {
     for f in rows(&mut rx, 2, Duration::from_secs(10)).await {
         assert!(ev(&f).get("bits").is_none(), "{}", ev(&f));
     }
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A re-measure lowers the cap of the depth in force under the run's record
+/// (which keeps its 16 MHz): a scan without `bits` plans from the live cap, so
+/// the sweep after the drop steps at the new 10 MHz and no tune is refused, and
+/// a scan launched after it steps at 10 MHz from its first tune.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_scan_follows_a_depth_cap_that_drops_under_the_record() {
+    let (_dir, node, port) = open_with(ScanPort::with_depths(None)).await;
+    // 40 MHz at 16 MHz is three steps: the cap drops inside the first sweep's last tune.
+    port.drop_cap_after(3, 10 * MHZ);
+    let (id, _rx) = start_bits(&node, (20 * MHZ, 40 * MHZ), None).await;
+    until(
+        "eight tunes at the new width",
+        Duration::from_secs(10),
+        || {
+            port.tunes()
+                .iter()
+                .filter(|t| t.bandwidth_hz.0 == 10 * MHZ)
+                .count()
+                >= 8
+        },
+    )
+    .await;
+    assert_eq!(
+        node.job_list().iter().find(|r| r.id == id).unwrap().state,
+        JobState::Running
+    );
+    let tunes = port.tunes();
+    assert!(
+        tunes[..3].iter().all(|t| t.bandwidth_hz.0 == 16 * MHZ),
+        "{tunes:?}"
+    );
+    assert!(
+        tunes[3..].iter().all(|t| t.bandwidth_hz.0 == 10 * MHZ),
+        "{tunes:?}"
+    );
+    until("the context's new width", Duration::from_secs(3), || {
+        node.job_context(&id).unwrap()["scan"]["rate_hz"] == 10 * MHZ
+    })
+    .await;
+    assert_eq!(
+        port.capabilities().max_bandwidth_hz.value().0,
+        16 * MHZ,
+        "the record keeps its figure"
+    );
+    node.job_stop(&id).await.unwrap();
+
+    let before = port.tunes().len();
+    let (id, _rx) = start_bits(&node, (20 * MHZ, 40 * MHZ), None).await;
+    assert_eq!(
+        node.job_context(&id).unwrap()["scan"]["rate_hz"],
+        10 * MHZ,
+        "planned at launch from the live cap"
+    );
+    tunes_at_least(&port, before + 4, Duration::from_secs(10)).await;
+    assert_eq!(
+        node.job_list().iter().find(|r| r.id == id).unwrap().state,
+        JobState::Running
+    );
+    let tunes = port.tunes();
+    assert!(
+        tunes[before..].iter().all(|t| t.bandwidth_hz.0 == 10 * MHZ),
+        "{tunes:?}"
+    );
     node.job_stop(&id).await.unwrap();
 }
 

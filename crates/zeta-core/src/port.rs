@@ -259,11 +259,19 @@ pub type Sc16Receiver = tokio::sync::broadcast::Receiver<Sc16Block>;
 /// full scale is -1.0 to 32767/32768. A source that converts in its own
 /// process and a node that converts a worker's ring use this function alike,
 /// so a capture is bit-identical either way. Converts the first
-/// `min(x.len(), out.len())` samples.
+/// `min(x.len(), out.len())` samples, each by [`sc16_sample_to_cf32`].
 pub fn sc16_to_cf32(x: &[Complex<i16>], out: &mut [Complex<f32>]) {
     for (o, s) in out.iter_mut().zip(x) {
-        *o = Complex::new(f32::from(s.re) / 32768.0, f32::from(s.im) / 32768.0);
+        *o = sc16_sample_to_cf32(*s);
     }
+}
+
+/// One sample of [`sc16_to_cf32`], for a caller that converts into memory it
+/// has not filled yet (the node's ring reader, collecting straight into the
+/// block's `Arc`).
+#[inline]
+pub fn sc16_sample_to_cf32(s: Complex<i16>) -> Complex<f32> {
+    Complex::new(f32::from(s.re) / 32768.0, f32::from(s.im) / 32768.0)
 }
 
 /// A port's refusal. It serialises through [`PortErrorWire`] (`kind` names the

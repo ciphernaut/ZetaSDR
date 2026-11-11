@@ -237,7 +237,9 @@ fn epoch_ns() -> u64 {
 #[tokio::test]
 async fn a_retune_drops_frames_until_the_settle_has_passed() {
     let fake = fake(vec![FakeReply::Ok], None).await;
-    let src = source_settling(&fake, 300);
+    // A settle well over the asserted 250 ms, so a stall between the tune and
+    // the clock read below cannot eat the margin on a loaded runner.
+    let src = source_settling(&fake, 1_000);
     let mut rx = src.subscribe();
     src.tune(tuning(7_100_000, 10_000)).await.unwrap();
     next_block(&mut rx).await;

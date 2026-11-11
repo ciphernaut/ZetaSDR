@@ -189,6 +189,24 @@ mod tests {
         }
     }
 
+    /// The mean is of power, not of dB: 0 dB and -30 dB average to
+    /// 10 log10((1 + 0.001) / 2), about -3 dB, where a mean of the dB figures
+    /// would be -15 dB.
+    #[test]
+    fn rows_average_in_linear_power() {
+        let mut avg = SweepAverage::new(2);
+        let (fa, qa) = quantise_row(&[0.0; 8]);
+        let (fb, qb) = quantise_row(&[-30.0; 8]);
+        avg.push((1, 0), fa, &qa);
+        let (db, n) = avg.push((1, 0), fb, &qb);
+        assert_eq!(n, 2);
+        let want = 10.0 * (1.001f64 / 2.0).log10();
+        assert!(
+            db.iter().all(|&v| (f64::from(v) - want).abs() < 0.3),
+            "{db:?}, want {want:.2} dB"
+        );
+    }
+
     #[test]
     fn keys_do_not_mix() {
         let mut avg = SweepAverage::new(4);

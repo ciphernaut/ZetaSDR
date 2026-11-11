@@ -8089,7 +8089,7 @@ def scenario_run_link_diagnostics(page, url, secret):
                                       "30720000 Hz", "step": 1, "of": 6, "eta_ms": 36000})
         page.evaluate("window.zetaTest.poll()")
         expect(page.locator(f"{tab} .starting")).to_be_visible(timeout=10_000)
-        result = "link diagnostics tone: 16-bit 20.48 → 30.72 Msps; record updates at the next start"
+        result = "link diagnostics tone: 16-bit 20.48 → 30.72 Msps; in force now, the record is set once a run"
         expect(page.locator("#transcript")).not_to_contain_text("link diagnostics tone")
         # Its hello: a later since_ns, no start, the new figure.
         st["worker"] = dict(st["worker"], pid=2, since_ns=since + 1, starting=None,

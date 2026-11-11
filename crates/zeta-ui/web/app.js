@@ -571,9 +571,10 @@ function linkFigures(s) {
   return top === null ? [] : [{ bits: null, hz: top }];
 }
 
-// The result line of a measure: `link diagnostics <source>: <items>; record updates at the next
-// start`, an item per depth (`12-bit 30.72 → 38.4 Msps`, or `8-bit unchanged`), or `unchanged`
-// alone when nothing moved.
+// The result line of a measure: `link diagnostics <source>: <items>; in force now, the record
+// is set once a run`, an item per depth (`12-bit 30.72 → 38.4 Msps`, or `8-bit unchanged`), or
+// `unchanged` alone when nothing moved. The figures govern tunes at once through the depth in
+// force; the source's record takes only the first differing hello of a run.
 export function diagnosticsLine(source, before, after) {
   const items = after.map(({ bits, hz: now }) => {
     const was = before.find((b) => b.bits === bits);
@@ -589,7 +590,7 @@ export function diagnosticsLine(source, before, after) {
         ...dropped.map(({ bits }) => `${bits}-bit dropped`),
       ].join(", ")
     : "unchanged";
-  return `link diagnostics ${source}: ${text}; record updates at the next start`;
+  return `link diagnostics ${source}: ${text}; in force now, the record is set once a run`;
 }
 
 // The measures waiting for their worker's hello, by source: the figures and the worker's

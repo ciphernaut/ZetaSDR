@@ -1594,10 +1594,12 @@ async fn a_measuring_worker_shows_in_the_ports_worker_record() {
 async fn a_worker_that_dies_measuring_clears_the_record() {
     let dir = tempdir();
     let body = respawn_body(
-        "if [ \"$N\" -eq 1 ]; then ZETA_FAKE_PROGRESS=3 exec \"$FAKE\" --script 'crash-after-ms 60' \"$@\"; fi\n\
+        "if [ \"$N\" -eq 1 ]; then ZETA_FAKE_PROGRESS=40 ZETA_FAKE_CRASH_AT_PROGRESS=1 exec \"$FAKE\" --script 'crash-after-ms 1000' \"$@\"; fi\n\
          exec \"$FAKE\" --script stream \"$@\"",
     );
     let (mut cfg, _rec) = cfg_wrapped(dir.path(), &body);
+    // Spawn 1 dies a second after its first progress frame (the timer starts
+    // there, not at its start), still measuring: its 40 frames take 2 s.
     // Room between the death and the next spawn, so the record is read before it.
     cfg.timings.backoff_first = Duration::from_millis(800);
     cfg.timings.backoff_max = Duration::from_millis(800);

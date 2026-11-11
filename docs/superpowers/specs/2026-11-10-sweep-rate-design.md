@@ -156,8 +156,9 @@ Raw results and scripts: `scratch/sweep-spike/` (untracked).
   record replayed on a respawn, and from a remote node through `--source-node`, and a test
   requires every field in the schema. The fields this plan adds (`usable_fraction`, `depths`, `sweep`)
   are optional with defaults, so a new node reads an old or cached record; a new record is not
-  promised to be readable by an older node (a `--source-node` pair is upgraded far end first or
-  together, and the plan says so in `docs/`).
+  promised to be readable by an older node (a `--source-node` pair is upgraded together: an old
+  near node cannot parse a new far node's `source_list`, and an old far node refuses the new
+  `job_start` fields; the plan says so in `docs/`).
 - The repository is public: roles, not host names, in every tracked file. No observed
   frequencies of real services in fixtures or docs.
 - One operation set. A new scan field goes in `ops.rs` and reaches every transport;

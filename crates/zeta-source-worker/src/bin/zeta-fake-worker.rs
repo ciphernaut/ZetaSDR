@@ -10,7 +10,9 @@
 //! - `not-found`: exits 3 after `device not found: fake` on stderr.
 //! - `open-fails`: exits 4 after `fake open: no such device` on stderr.
 //! - `crash-after-ms N`: `stream`, and N ms after start `abort()` (SIGABRT,
-//!   without a core dump).
+//!   without a core dump); with `ZETA_FAKE_CRASH_AT_PROGRESS=1`, N ms after its
+//!   first progress frame is written instead (no crash if it sends none), so a
+//!   test of a death while measuring cannot lose the race to a slow start.
 //! - `hang-hello`: never writes a hello.
 //! - `hang-open`: installs the stop-signal handling the real worker installs,
 //!   prints `hanging in open` on stderr and blocks for good, as a driver hung
@@ -194,16 +196,26 @@ fn progress(step: u32, of: u32, why: &str) -> Frame {
 }
 
 /// `ZETA_FAKE_PROGRESS=N`'s frames on `frames`, [`PROGRESS_EVERY`] apart, at
-/// least `min` of them, each `detail` after `why`.
-async fn send_progress(frames: &mut File, min: u32, why: &str) -> io::Result<()> {
+/// least `min` of them, each `detail` after `why`; `on_first` runs once the
+/// first is written.
+async fn send_progress(
+    frames: &mut File,
+    min: u32,
+    why: &str,
+    on_first: impl FnOnce(),
+) -> io::Result<()> {
     let n: u32 = std::env::var("ZETA_FAKE_PROGRESS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
         .max(min);
+    let mut on_first = Some(on_first);
     for step in 1..=n {
         write_frame(frames, &progress(step, n, why))?;
         frames.flush()?;
+        if let Some(f) = on_first.take() {
+            f();
+        }
         tokio::time::sleep(PROGRESS_EVERY).await;
     }
     Ok(())
@@ -808,11 +820,18 @@ fn main() -> ExitCode {
         };
         // A receiver held for the life of the worker, see the `file` script.
         let mut keep: Option<IqReceiver> = None;
+        // `crash-after-ms`'s timer, when it starts at the first progress frame.
+        let mut crash_at_progress: Option<Duration> = None;
+        let at_progress = std::env::var("ZETA_FAKE_CRASH_AT_PROGRESS").is_ok_and(|v| v == "1");
         let port: Result<Arc<dyn Port>, String> = match (name, arg) {
             ("stream", _) => mock(None),
             ("gone-after-ms", ms) => parse_ms(ms).and_then(|g| mock(Some(g))),
             ("crash-after-ms", ms) => parse_ms(ms).and_then(|after| {
-                crash_after(after, args.record.as_deref());
+                if at_progress {
+                    crash_at_progress = Some(after);
+                } else {
+                    crash_after(after, args.record.as_deref());
+                }
                 mock(None)
             }),
             ("file", spec) => {
@@ -850,7 +869,12 @@ fn main() -> ExitCode {
         let mut frames = frames;
         if args.progress
             && probes
-            && let Err(e) = send_progress(&mut frames, u32::from(!hold), &why).await
+            && let Err(e) = send_progress(&mut frames, u32::from(!hold), &why, || {
+                if let Some(after) = crash_at_progress {
+                    crash_after(after, args.record.as_deref());
+                }
+            })
+            .await
         {
             eprintln!("zeta-fake-worker: progress: {e}");
             return ExitCode::from(EXIT_OPEN_FAILED);

@@ -128,8 +128,9 @@ pub enum Op {
     /// a first start (up to a minute or more, the host busy meanwhile; `source_list`
     /// shows `worker.starting` while it lasts and faults the source until the new
     /// worker's hello, which heals it). The new figures govern tunes at once
-    /// (`depth`) and show in `worker.link_measure`; `capabilities` keeps this run's record
-    /// until the next start. A source measures again by itself only when its link
+    /// (`depth`), show in `worker.link_measure` and are cached for the next start;
+    /// `capabilities` is set once a run: the first hello of the run that differs from
+    /// it replaces it, and later ones leave it. A source measures again by itself only when its link
     /// speed changed; this is the operator's choice after devices were added around
     /// the radio. A source with no worker is refused; one held by a rigid or
     /// time-shared job or a pin is a `conflict` naming them (elastic jobs never
