@@ -507,6 +507,8 @@ async fn start_fm(node: &Node) -> JobId {
         bandwidth_hz: Hz(12_500),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };
@@ -672,6 +674,8 @@ async fn job_start_with_transcribe_is_refused() {
             bandwidth_hz: Hz(48_000),
             deviation_hz: None,
             sideband: None,
+            dwell_ms: None,
+            average: None,
             elastic: false,
             replace: vec![],
         })

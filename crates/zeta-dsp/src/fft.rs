@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::port::IqBlock;
+pub use zeta_core::spectrum::{STEP_DB, quantise_row, quantise_row_masked};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Span, StreamId, StreamKind, Timestamp};
@@ -193,17 +194,40 @@ pub struct FftParams {
     #[serde(default)]
     #[schemars(range(min = 1))]
     pub row_frames: Option<u32>,
+    /// A `scan`'s dwell at each step, ms (1..=5000); absent or `null` is the node's
+    /// (`--scan-dwell-ms`). Read by the scan job from its stored `fft` node; the stage
+    /// itself ignores it.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 5000))]
+    pub dwell_ms: Option<u64>,
+    /// A `scan`'s rows are the mean power of each step's last this many sweeps
+    /// (1..=64); absent or `null` is 1. Read by the scan job as `dwell_ms` is.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 64))]
+    pub average: Option<u32>,
 }
 
 impl FftParams {
     /// What the schema cannot say: `notch_hz` not negative, `edge_mask` in `0..0.5`,
-    /// `row_frames` at least 1. The error names the field.
+    /// `row_frames` at least 1, `dwell_ms` in `1..=SCAN_DWELL_MAX_MS` and `average` in
+    /// `1..=SCAN_AVERAGE_MAX`. The error names the field.
     pub fn check(&self) -> Result<(), String> {
+        use zeta_core::ops::{SCAN_AVERAGE_MAX, SCAN_DWELL_MAX_MS};
         if self.notch_hz < 0 {
             return Err("notch_hz must be at least 0".into());
         }
         if self.row_frames == Some(0) {
             return Err("row_frames must be at least 1".into());
+        }
+        if let Some(d) = self.dwell_ms
+            && !(1..=SCAN_DWELL_MAX_MS).contains(&d)
+        {
+            return Err(format!("dwell_ms must be in 1..={SCAN_DWELL_MAX_MS}"));
+        }
+        if let Some(a) = self.average
+            && !(1..=SCAN_AVERAGE_MAX).contains(&a)
+        {
+            return Err(format!("average must be in 1..={SCAN_AVERAGE_MAX}"));
         }
         if !(0.0..0.5).contains(&self.edge_mask) {
             return Err("edge_mask must be in 0..0.5".into());
@@ -252,48 +276,8 @@ pub fn masked_ranges(size: usize, bin_hz: f64, notch_hz: u64, edge_mask: f64) ->
     merged
 }
 
-/// Quantisation step of a row's `q` values.
-pub const STEP_DB: f32 = 0.5;
-/// A row's `floor_db` is this percentile of its dB values ...
-const FLOOR_PERCENTILE: f32 = 0.02;
-/// ... minus this margin.
-const FLOOR_MARGIN_DB: f32 = 5.0;
 /// Accepted `rows_per_s`.
 const ROWS_PER_S: std::ops::RangeInclusive<u32> = 1..=60;
-
-/// `(floor_db, q)` for a row of dB values: `floor_db` is the row's 2nd-percentile
-/// value minus 5 dB and `q = clamp(round((db - floor_db) / STEP_DB), 0, 255)`, so
-/// `floor_db + q * STEP_DB` is within half a step of `db` over 127.5 dB above the floor.
-pub fn quantise_row(db: &[f32]) -> (f32, Vec<u8>) {
-    quantise_row_masked(db, &[])
-}
-
-/// [`quantise_row`] with `floor_db` taken from the bins outside `masked` (sorted,
-/// non-overlapping `[lo, hi)` ranges, as [`masked_ranges`] gives them), or from every
-/// bin when `masked` covers them all; `q` is computed for every bin, masked or not.
-pub fn quantise_row_masked(db: &[f32], masked: &[[usize; 2]]) -> (f32, Vec<u8>) {
-    if db.is_empty() {
-        return (0.0, Vec::new());
-    }
-    let in_mask = |k: usize| masked.iter().any(|&[lo, hi]| (lo..hi).contains(&k));
-    let mut sorted: Vec<f32> = db
-        .iter()
-        .enumerate()
-        .filter(|&(k, _)| !in_mask(k))
-        .map(|(_, &v)| v)
-        .collect();
-    if sorted.is_empty() {
-        sorted = db.to_vec();
-    }
-    sorted.sort_by(f32::total_cmp);
-    let idx = (FLOOR_PERCENTILE * (sorted.len() - 1) as f32) as usize;
-    let floor = sorted[idx] - FLOOR_MARGIN_DB;
-    let q = db
-        .iter()
-        .map(|&v| ((v - floor) / STEP_DB).round().clamp(0.0, 255.0) as u8)
-        .collect();
-    (floor, q)
-}
 
 /// Nanoseconds of `n` samples at `rate_hz`.
 fn ns_of(n: usize, rate_hz: u64) -> u64 {
@@ -850,6 +834,8 @@ mod tests {
             notch_hz,
             edge_mask,
             row_frames: None,
+            dwell_ms: None,
+            average: None,
         };
         assert_eq!(p(0, 0.0).check(), Ok(()));
         assert_eq!(p(300_000, 0.49).check(), Ok(()));
@@ -871,6 +857,28 @@ mod tests {
             stage.check_params(&serde_json::json!({"size": 1024, "window": "hann"})),
             Ok(())
         );
+    }
+
+    #[test]
+    fn fft_params_check_bounds_the_scan_look() {
+        let stage = FftStage::new(Arc::new(CpuFft::new()));
+        let check = |field: &str, v: u64| {
+            let mut p = serde_json::json!({"size": 1024, "window": "hann"});
+            p[field] = v.into();
+            stage.check_params(&p)
+        };
+        assert_eq!(check("dwell_ms", 1), Ok(()));
+        assert_eq!(check("dwell_ms", 5000), Ok(()));
+        assert_eq!(check("average", 64), Ok(()));
+        for (field, v) in [
+            ("dwell_ms", 0),
+            ("dwell_ms", 5001),
+            ("average", 0),
+            ("average", 65),
+        ] {
+            let e = check(field, v).unwrap_err();
+            assert!(e.contains(field), "{field} {v}: {e}");
+        }
     }
 
     #[test]

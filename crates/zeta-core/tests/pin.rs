@@ -211,6 +211,8 @@ fn start(kind: JobKind, t: Tuning, elastic: bool, replace: Vec<JobId>) -> Op {
         bandwidth_hz: t.bandwidth_hz,
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic,
         replace,
     }

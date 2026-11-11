@@ -79,6 +79,8 @@ async fn demod(node: &Node, center_hz: u64) -> JobId {
         bandwidth_hz: Hz(12_500),
         deviation_hz: Some(DEVIATION_HZ),
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };

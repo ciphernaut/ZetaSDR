@@ -214,6 +214,8 @@ fn start(kind: JobKind, t: Tuning) -> Op {
         bandwidth_hz: t.bandwidth_hz,
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     }
@@ -800,6 +802,8 @@ async fn jobs_stop_stops_what_matches_and_keeps_the_elastic_spectrum() {
             bandwidth_hz: Hz(1_000_000),
             deviation_hz: None,
             sideband: None,
+            dwell_ms: None,
+            average: None,
             elastic: true,
             replace: vec![],
         },

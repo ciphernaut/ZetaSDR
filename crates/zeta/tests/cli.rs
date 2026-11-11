@@ -3854,3 +3854,90 @@ fn ask_radio_policy_environment_variable_is_checked_too() {
         .code(1)
         .stderr(contains("focus-fallback"));
 }
+
+#[test]
+fn job_start_takes_dwell_ms_and_average() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = |extra: &[&str]| {
+        let mut args = vec![
+            "job",
+            "start",
+            "--kind",
+            "scan",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ];
+        args.extend_from_slice(extra);
+        zeta(dir.path(), &args)
+    };
+    // One step of the 48 kHz file source: 20 ms is raised to four frames of 1024 (85 ms),
+    // one row a step, each the mean of the step's last two sweeps.
+    let out = start(&[
+        "--dwell-ms",
+        "20",
+        "--average",
+        "2",
+        "--then-tail",
+        "3,10000",
+        "--keep",
+    ])
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    let id = v[0]["value"].as_str().expect("job id").to_owned();
+    let sweeps: Vec<u64> = v[1]["value"]["frames"]
+        .as_array()
+        .expect("frames")
+        .iter()
+        .map(|f| f["payload"]["sweeps"].as_u64().expect("sweeps"))
+        .collect();
+    assert_eq!(sweeps, [1, 2, 2], "{v}");
+    // The tail is logged after the start.
+    let log = std::fs::read_to_string(dir.path().join("state").join("ops.log")).unwrap();
+    let op = log
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["op"].clone())
+        .find(|op| op["op"] == "job_start")
+        .expect("the start logged");
+    assert_eq!(
+        (op["dwell_ms"].as_u64(), op["average"].as_u64()),
+        (Some(20), Some(2)),
+        "{op}"
+    );
+    let out = zeta(dir.path(), &["graph", "get", "--job", &id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let g = json(&out);
+    let fft = g["value"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .find(|n| n["kind"] == "fft")
+        .expect("an fft node")
+        .clone();
+    assert_eq!(fft["params"]["dwell_ms"], 20, "{fft}");
+    assert_eq!(fft["params"]["average"], 2, "{fft}");
+    // Out of range is refused naming the field.
+    let out = start(&["--average", "65"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "out_of_range", "{v}");
+    assert_eq!(v["field"], "average", "{v}");
+    zeta(dir.path(), &["job", "stop", "--job", &id])
+        .assert()
+        .success();
+}

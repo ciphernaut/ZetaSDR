@@ -808,6 +808,8 @@ async fn a_signal_inside_another_jobs_band_is_ignored() {
         bandwidth_hz: Hz(12_500),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };
@@ -1457,6 +1459,8 @@ async fn watch_is_neither_elastic_nor_attachable() {
         bandwidth_hz: Hz(RATE_HZ as u64),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: true,
         replace: vec![],
     };
@@ -1930,6 +1934,8 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
         bandwidth_hz: Hz(12_500),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![watch.clone()],
     };
@@ -2854,6 +2860,8 @@ async fn a_hand_started_decoder_inside_the_band_is_left_alone() {
         bandwidth_hz: Hz(POCSAG_WIDTH_HZ),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };
@@ -2930,6 +2938,8 @@ async fn a_replace_of_a_span_watch_stops_its_decoders() {
         bandwidth_hz: Hz(POCSAG_WIDTH_HZ),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![watch.clone()],
     };

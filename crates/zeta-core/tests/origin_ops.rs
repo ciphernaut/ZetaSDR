@@ -232,6 +232,8 @@ async fn start(node: &Node, kind: JobKind, source: &str, center: u64) -> JobId {
         bandwidth_hz: Hz(BAND_HZ),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };

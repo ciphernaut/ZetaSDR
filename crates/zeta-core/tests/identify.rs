@@ -287,6 +287,8 @@ async fn identify(node: &Node, center_hz: u64) -> (JobId, tokio::task::JoinHandl
         bandwidth_hz: Hz(BANDWIDTH_HZ),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };
@@ -571,6 +573,8 @@ async fn identify_is_neither_elastic_nor_attachable() {
         bandwidth_hz: Hz(BANDWIDTH_HZ),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: true,
         replace: vec![],
     };
@@ -627,6 +631,8 @@ async fn a_replace_of_identify_completes_while_a_child_is_stopped() {
         bandwidth_hz: Hz(BANDWIDTH_HZ),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![id.clone()],
     };
@@ -990,6 +996,8 @@ async fn trials_stay_on_the_band_when_the_capture_is_no_wider() {
         bandwidth_hz: Hz(NARROW_RATE_HZ as u64),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };

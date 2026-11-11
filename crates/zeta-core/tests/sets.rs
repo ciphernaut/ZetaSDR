@@ -718,6 +718,8 @@ fn job_start(source: &str, kind: JobKind, t: Tuning) -> Op {
         bandwidth_hz: t.bandwidth_hz,
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     }
@@ -1199,6 +1201,8 @@ async fn a_set_start_dropped_after_its_starts_leaves_every_job_to_set_stop() {
         bandwidth_hz: Hz(1_000_000),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: true,
         replace: vec![],
     };

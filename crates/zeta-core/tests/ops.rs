@@ -208,6 +208,8 @@ async fn job_start_passthrough_then_list_then_stop() {
         bandwidth_hz: Hz(48_000),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };
@@ -342,6 +344,8 @@ async fn source_ensure_during_job_start_does_not_retune() {
         bandwidth_hz: job_tuning.bandwidth_hz,
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };
@@ -437,6 +441,8 @@ async fn job_start_holds_the_gate_through_its_tune_and_lease() {
         bandwidth_hz: Hz(12_500),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };
@@ -657,8 +663,11 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                     // knowledge `Signature` inlines it as its nullable `burst`.
                     let burst =
                         path.ends_with(".Burst") || path.ends_with(".Signature.properties.burst");
+                    // A nullable one (`job_start`'s `dwell_ms`) is an integer or `null`.
                     if name.ends_with("_ms") && !burst {
-                        assert_eq!(s["type"], "integer", "{path}.{name} is not an integer");
+                        let integer = s["type"] == "integer"
+                            || s["type"] == serde_json::json!(["integer", "null"]);
+                        assert!(integer, "{path}.{name} is not an integer: {s}");
                     }
                     if ["_hz", "_ns", "_baud"].iter().any(|u| name.ends_with(u)) {
                         assert!(unit_typed(s, defs), "{path}.{name} is not a unit type: {s}");
@@ -1012,6 +1021,8 @@ async fn conflict_reports_current_tuning_and_real_options() {
         bandwidth_hz: held.bandwidth_hz,
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };
@@ -1114,6 +1125,8 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         bandwidth_hz: Hz(48_000),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };
@@ -1843,6 +1856,8 @@ fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
         bandwidth_hz: Hz(12_500),
         deviation_hz,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     }
@@ -3194,6 +3209,8 @@ async fn start_on(node: &Node, source: &str, kind: JobKind, elastic: bool) -> Jo
         bandwidth_hz: Hz(20_000),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic,
         replace: vec![],
     };
@@ -3397,6 +3414,8 @@ async fn job_start_on_a_faulted_source_is_refused_naming_the_source() {
         bandwidth_hz: Hz(48_000),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };
@@ -3600,4 +3619,116 @@ async fn an_asserted_cap_refuses_without_a_why() {
     let json = serde_json::to_value(&err).unwrap();
     assert_eq!(json["why"], serde_json::Value::Null, "{json}");
     assert!(json.as_object().unwrap().contains_key("why"), "{json}");
+}
+
+/// A `job_start` with a scan's look; the rest as [`start_with`] (no deviation).
+fn start_look(kind: JobKind, dwell_ms: Option<u64>, average: Option<u32>) -> Op {
+    Op::JobStart {
+        kind,
+        source: SourceId("hackrf0".into()),
+        center_hz: Hz(100_005_000),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz: None,
+        sideband: None,
+        dwell_ms,
+        average,
+        elastic: false,
+        replace: vec![],
+    }
+}
+
+#[tokio::test]
+async fn dwell_ms_and_average_out_of_range_name_the_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap();
+    for (op, field, value, max) in [
+        (
+            start_look(JobKind::Scan, Some(0), None),
+            "dwell_ms",
+            0,
+            5000,
+        ),
+        (
+            start_look(JobKind::Scan, Some(5001), None),
+            "dwell_ms",
+            5001,
+            5000,
+        ),
+        (start_look(JobKind::Scan, None, Some(0)), "average", 0, 64),
+        (start_look(JobKind::Scan, None, Some(65)), "average", 65, 64),
+    ] {
+        match node.apply(op).await {
+            Err(OpError::OutOfRange {
+                field: f,
+                value: v,
+                min,
+                max: m,
+                ..
+            }) => assert_eq!((f.as_str(), v, min, m), (field, value, 1, max)),
+            other => panic!("{field} {value}: expected OutOfRange, got {other:?}"),
+        }
+    }
+    assert!(node.job_list().is_empty());
+}
+
+#[tokio::test]
+async fn a_look_on_another_kind_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap();
+    for (op, field) in [
+        (start_look(JobKind::FmDemod, Some(20), None), "dwell_ms"),
+        (start_look(JobKind::Spectrum, None, Some(4)), "average"),
+    ] {
+        match node.apply(op).await {
+            Err(OpError::Other { message }) => assert!(
+                message.starts_with(&format!("{field} applies only to kind scan; pass null")),
+                "{message}"
+            ),
+            other => panic!("{field}: expected Other, got {other:?}"),
+        }
+    }
+    assert!(node.job_list().is_empty());
+}
+
+#[test]
+fn job_start_without_the_look_fields_still_parses() {
+    let op: Op = serde_json::from_value(serde_json::json!({
+        "op": "job_start", "kind": "scan", "source": "hackrf0",
+        "center_hz": 100_000_000, "bandwidth_hz": 40_000_000,
+        "deviation_hz": null, "sideband": null, "elastic": false, "replace": [],
+    }))
+    .unwrap();
+    match op {
+        Op::JobStart {
+            dwell_ms, average, ..
+        } => assert_eq!((dwell_ms, average), (None, None)),
+        other => panic!("{other:?}"),
+    }
+    // The schema lists them as required and nullable, as `deviation_hz`.
+    let s = schema();
+    let v = variants(&s["op"])
+        .iter()
+        .find(|v| v["properties"]["op"]["const"] == "job_start")
+        .expect("job_start variant");
+    let req = v["required"].as_array().unwrap();
+    for f in ["dwell_ms", "average"] {
+        assert!(req.contains(&f.into()), "{f}: {v}");
+        assert_eq!(
+            v["properties"][f]["type"],
+            serde_json::json!(["integer", "null"]),
+            "{f}: {v}"
+        );
+    }
 }

@@ -111,6 +111,8 @@ async fn a_capture_job_ends_stopped_with_its_records_in_the_store() {
         bandwidth_hz: Hz(12_500),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };

@@ -245,6 +245,8 @@ fn start_op(kind: JobKind, source: &str, center_hz: u64) -> Op {
         bandwidth_hz: Hz(WIDTH),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     }

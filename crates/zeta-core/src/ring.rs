@@ -58,14 +58,15 @@ impl IqRing {
             capacity_seconds,
             sample_rate_hz: sample_rate_hz.0,
             center_hz: None,
-            capacity: Self::cap_for(capacity_seconds, sample_rate_hz.0),
+            capacity: Self::capacity_for(capacity_seconds, sample_rate_hz.0),
             buf: VecDeque::new(),
             origin_ns: 0,
             dropped: 0,
         }
     }
 
-    fn cap_for(seconds: f64, rate: u64) -> usize {
+    /// The samples a ring of `seconds` holds at `rate`.
+    pub fn capacity_for(seconds: f64, rate: u64) -> usize {
         (seconds * rate as f64).ceil() as usize
     }
 
@@ -86,7 +87,7 @@ impl IqRing {
         }
         if block.sample_rate_hz.0 != self.sample_rate_hz {
             self.sample_rate_hz = block.sample_rate_hz.0;
-            self.capacity = Self::cap_for(self.capacity_seconds, self.sample_rate_hz);
+            self.capacity = Self::capacity_for(self.capacity_seconds, self.sample_rate_hz);
             // Drop the old allocation first, then grow: assigning a new buffer in one
             // expression would allocate the new one while the old one is still live.
             self.buf = VecDeque::new();
@@ -122,7 +123,7 @@ impl IqRing {
     /// the ring. Before a rate change use [`IqRing::set_capacity_seconds`].
     pub fn resize(&mut self, seconds: f64) {
         self.capacity_seconds = seconds;
-        self.capacity = Self::cap_for(seconds, self.sample_rate_hz);
+        self.capacity = Self::capacity_for(seconds, self.sample_rate_hz);
         if self.buf.len() > self.capacity {
             let excess = self.buf.len() - self.capacity;
             self.buf.drain(..excess);

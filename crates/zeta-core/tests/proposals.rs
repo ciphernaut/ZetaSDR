@@ -264,6 +264,8 @@ async fn capture_job(node: &Node, bursts: u32) -> JobId {
         bandwidth_hz: Hz(BANDWIDTH_HZ),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };
@@ -629,6 +631,8 @@ async fn frame_row_job(node: &Node) -> JobId {
         bandwidth_hz: Hz(BANDWIDTH_HZ),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };

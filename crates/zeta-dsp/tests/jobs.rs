@@ -77,6 +77,8 @@ async fn fm_demod_job_produces_audio_with_tone() {
             bandwidth_hz: Hz(12_500),
             deviation_hz: Some(2_500), // the fixture's deviation
             sideband: None,
+            dwell_ms: None,
+            average: None,
             elastic: false,
             replace: vec![],
         })
@@ -185,6 +187,8 @@ async fn aprs_decode_job_decodes_fixture_packet() {
             bandwidth_hz: Hz(12_500),
             deviation_hz: None,
             sideband: None,
+            dwell_ms: None,
+            average: None,
             elastic: false,
             replace: vec![],
         })
@@ -279,6 +283,8 @@ async fn start(node: &Node, kind: JobKind, center_hz: u64, bandwidth_hz: u64) ->
             bandwidth_hz: Hz(bandwidth_hz),
             deviation_hz: None,
             sideband: None,
+            dwell_ms: None,
+            average: None,
             elastic: false,
             replace: vec![],
         })

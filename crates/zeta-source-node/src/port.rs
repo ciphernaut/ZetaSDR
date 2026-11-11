@@ -218,6 +218,8 @@ impl Remote {
             bandwidth_hz: t.bandwidth_hz,
             deviation_hz: None,
             sideband: None,
+            dwell_ms: None,
+            average: None,
             elastic: false,
             replace: vec![],
         };

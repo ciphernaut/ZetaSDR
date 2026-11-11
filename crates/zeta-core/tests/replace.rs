@@ -184,6 +184,8 @@ fn start_on(source: &str, kind: JobKind, t: Tuning, elastic: bool, replace: &[&J
         bandwidth_hz: t.bandwidth_hz,
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic,
         replace: replace.iter().map(|j| (*j).clone()).collect(),
     }
@@ -641,6 +643,8 @@ async fn a_different_deviation_is_not_a_duplicate() {
         bandwidth_hz: b.bandwidth_hz,
         deviation_hz: dev,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };

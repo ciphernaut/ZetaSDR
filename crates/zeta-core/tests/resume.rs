@@ -347,6 +347,8 @@ async fn job_start_records_the_capture_rate() {
         bandwidth_hz: Hz(9_600),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };

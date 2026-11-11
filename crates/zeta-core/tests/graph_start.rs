@@ -272,6 +272,8 @@ async fn job_start_refuses_the_graph_and_bits_kinds() {
                 bandwidth_hz: Hz(BAND_HZ),
                 deviation_hz: None,
                 sideband: None,
+                dwell_ms: None,
+                average: None,
                 elastic: false,
                 replace: vec![],
             })

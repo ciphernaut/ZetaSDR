@@ -667,6 +667,8 @@ fn passthrough() -> Op {
         bandwidth_hz: Hz(1_000_000),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     }

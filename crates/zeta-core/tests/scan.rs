@@ -273,13 +273,20 @@ impl Port for ScanPort {
 /// at or after [`spectrum_row_boundary`]; a partial row at the block's end is dropped. One event per row with
 /// the params' `size`, `rows_per_s`, `row_frames`, `notch_hz` and `edge_mask`,
 /// the block's `center_hz`, the row's sample count and the tone it carries (mean
-/// phase step); the frame's span is the row's. Its params check refuses an
+/// phase step), and a quantised row of [`FAKE_BINS`] bins at [`FAKE_DB`] dB
+/// (`floor_db` [`FAKE_FLOOR_DB`], `step_db` 0.5); the frame's span is the row's. Its params check refuses an
 /// `edge_mask` outside `0..0.5` naming the field, as the real stage does. The
 /// slow one sleeps `delay` before each run.
 struct FakeFft {
     spec: StageSpec,
     delay: Duration,
 }
+
+/// Bins of a [`FakeFft`] row's `q`, each at `FAKE_DB` dB above a floor of
+/// `FAKE_FLOOR_DB` (q 20 at 0.5 dB a step).
+const FAKE_BINS: usize = 16;
+const FAKE_FLOOR_DB: f64 = -100.0;
+const FAKE_DB: f64 = -90.0;
 
 #[async_trait]
 impl Stage for FakeFft {
@@ -364,6 +371,9 @@ impl Stage for FakeFft {
                     "center_hz": b.center_hz.0,
                     "samples": s.len(),
                     "tone_hz": tone,
+                    "floor_db": FAKE_FLOOR_DB,
+                    "step_db": 0.5,
+                    "q": vec![((FAKE_DB - FAKE_FLOOR_DB) / 0.5) as u8; FAKE_BINS],
                 });
                 let mut prov = frame.provenance.clone();
                 prov.span = Span {
@@ -420,9 +430,63 @@ fn start(kind: JobKind, center_hz: u64, bandwidth_hz: u64) -> Op {
         bandwidth_hz: Hz(bandwidth_hz),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     }
+}
+
+/// A scan's `job_start` of `bandwidth_hz` about `center_hz` with a look.
+fn start_look(
+    center_hz: u64,
+    bandwidth_hz: u64,
+    dwell_ms: Option<u64>,
+    average: Option<u32>,
+) -> Op {
+    match start(JobKind::Scan, center_hz, bandwidth_hz) {
+        Op::JobStart {
+            kind,
+            source,
+            center_hz,
+            bandwidth_hz,
+            deviation_hz,
+            sideband,
+            elastic,
+            replace,
+            ..
+        } => Op::JobStart {
+            kind,
+            source,
+            center_hz,
+            bandwidth_hz,
+            deviation_hz,
+            sideband,
+            dwell_ms,
+            average,
+            elastic,
+            replace,
+        },
+        _ => unreachable!(),
+    }
+}
+
+/// Start a scan with a look; its id and a receiver on its event stream.
+async fn start_scan_look(
+    node: &Node,
+    (center_hz, bandwidth_hz): (u64, u64),
+    dwell_ms: Option<u64>,
+    average: Option<u32>,
+) -> (JobId, broadcast::Receiver<Frame>) {
+    let id = match node
+        .apply(start_look(center_hz, bandwidth_hz, dwell_ms, average))
+        .await
+    {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected a job, got {other:?}"),
+    };
+    let rx = event_rx(node, &id);
+    (id, rx)
 }
 
 async fn open() -> (tempfile::TempDir, Node, Arc<ScanPort>) {
@@ -1373,5 +1437,272 @@ async fn a_skip_in_an_unwritten_sweep_shows_at_the_next_write() {
     .await;
     let t = timing(&node, &id).unwrap();
     assert!(t["at_ns"].as_u64().unwrap() > first, "{t}");
+    node.job_stop(&id).await.unwrap();
+}
+
+/// `job_start`'s `dwell_ms` and `average` are written into the scan's `fft` node
+/// and shown in `job_context.scan`; without them the scan takes the node's dwell
+/// and 1, and its rows pass as the stage made them, with `sweeps: 1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn job_start_takes_dwell_ms_and_average_and_the_record_shows_them() {
+    let (_dir, node, _port) = open().await;
+    let (id, _rx) = start_scan_look(&node, (20 * MHZ, 40 * MHZ), Some(40), Some(4)).await;
+    let fft = fft_node(&graph_of(&node, &id).await).params.clone();
+    assert_eq!(
+        (fft["dwell_ms"].as_u64(), fft["average"].as_u64()),
+        (Some(40), Some(4)),
+        "{fft}"
+    );
+    let ctx = node.job_context(&id).unwrap();
+    // 156 frames of 4096 at 16 MHz: 39.94 ms.
+    assert_eq!(ctx["scan"]["dwell_ms"], 40, "{ctx}");
+    assert!(ctx["scan"].get("dwell_ms_asked").is_none(), "{ctx}");
+    assert_eq!(ctx["scan"]["average"], 4, "{ctx}");
+    node.job_stop(&id).await.unwrap();
+
+    let (id, mut rx) = start_scan_look(&node, (20 * MHZ, 40 * MHZ), None, None).await;
+    let fft = fft_node(&graph_of(&node, &id).await).params.clone();
+    assert!(
+        fft.get("dwell_ms").is_none() && fft.get("average").is_none(),
+        "{fft}"
+    );
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(ctx["scan"]["dwell_ms"], 20, "{ctx}");
+    assert_eq!(ctx["scan"]["average"], 1, "{ctx}");
+    for f in rows(&mut rx, 6, Duration::from_secs(10)).await {
+        let ev = ev(&f);
+        assert_eq!(ev["sweeps"], 1, "{ev}");
+        assert_eq!(ev["floor_db"], FAKE_FLOOR_DB, "{ev}");
+        assert_eq!(ev["samples"], 78 * 4096, "{ev}");
+    }
+    node.job_stop(&id).await.unwrap();
+}
+
+/// With `average: 4` each row is the mean of its step's last four sweeps of its
+/// grid: a centre's rows count `sweeps` 1, 2, 3, 4, 4, the even and odd sweeps
+/// apart (9 MHz is a step of both grids), requantised from the mean.
+#[tokio::test(flavor = "multi_thread")]
+async fn averaged_rows_count_their_sweeps_per_grid() {
+    let (_dir, node, _port) = open().await;
+    let (id, mut rx) = start_scan_look(&node, (20 * MHZ, 40 * MHZ), None, Some(4)).await;
+    // Even sweeps step 9, 24, 40 MHz, odd ones 9, 20, 36 MHz.
+    let mut by_centre: std::collections::BTreeMap<u64, Vec<u64>> = Default::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while by_centre.get(&(9 * MHZ)).is_none_or(|v| v.len() < 10)
+        || [20, 24, 36, 40]
+            .iter()
+            .any(|m| by_centre.get(&(m * MHZ)).is_none_or(|v| v.len() < 5))
+    {
+        let f = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(broadcast::error::RecvError::Lagged(n))) => panic!("{n} rows lost"),
+            other => panic!("rows so far {by_centre:?}: {other:?}"),
+        };
+        let ev = ev(&f);
+        // The fake's rows are flat at -90 dB; their mean is requantised: the floor is
+        // 5 dB under it and every bin 10 steps up.
+        assert_eq!(ev["floor_db"], -95.0, "{ev}");
+        assert_eq!(ev["q"], serde_json::json!(vec![10; FAKE_BINS]), "{ev}");
+        let c = ev["center_hz"].as_u64().unwrap();
+        by_centre
+            .entry(c)
+            .or_default()
+            .push(ev["sweeps"].as_u64().unwrap());
+    }
+    for m in [20, 24, 36, 40] {
+        assert_eq!(
+            by_centre[&(m * MHZ)][..5],
+            [1, 2, 3, 4, 4],
+            "{m} MHz: {by_centre:?}"
+        );
+    }
+    // One even and one odd step a sweep pair: each grid counts its own.
+    assert_eq!(
+        by_centre[&(9 * MHZ)][..10],
+        [1, 1, 2, 2, 3, 3, 4, 4, 4, 4],
+        "{by_centre:?}"
+    );
+    node.job_stop(&id).await.unwrap();
+}
+
+/// The next row's event on `rx`, failing at `deadline`.
+async fn next_row(rx: &mut broadcast::Receiver<Frame>, deadline: tokio::time::Instant) -> Value {
+    match tokio::time::timeout_at(deadline, rx.recv()).await {
+        Ok(Ok(f)) => ev(&f).clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A new layout (here the usable fraction measured after the scan started: the
+/// same width, a new stride) starts the averages afresh, even at a centre both
+/// layouts step.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_layout_starts_the_averages_afresh() {
+    let (_dir, node, port) = open().await;
+    let (id, mut rx) = start_scan_look(&node, (20 * MHZ, 40 * MHZ), None, Some(4)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let ev = next_row(&mut rx, deadline).await;
+        if ev["center_hz"] == 9 * MHZ && ev["sweeps"] == 4 {
+            break;
+        }
+    }
+    // 16 MHz captures 14.4 MHz apart: 9, 21.6 and 36 MHz, the edges masked at 0.05.
+    port.replace_caps(|c| c.usable_fraction = Claim::Asserted(0.9));
+    let first = loop {
+        let ev = next_row(&mut rx, deadline).await;
+        if ev["edge_mask"] == 0.05 && ev["center_hz"] == 9 * MHZ {
+            break ev;
+        }
+    };
+    assert_eq!(first["sweeps"], 1, "{first}");
+    node.job_stop(&id).await.unwrap();
+}
+
+/// `graph_put` on the stored `fft` node changes a running scan's look: the scan
+/// restarts with the new dwell and average.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_put_changes_dwell_and_average_on_a_running_scan() {
+    let (_dir, node, _port) = open().await;
+    let (id, _rx) = start_scan(&node).await;
+    let mut g = graph_of(&node, &id).await;
+    let fft = g.nodes.iter_mut().find(|n| n.kind == "fft").unwrap();
+    fft.params["dwell_ms"] = serde_json::json!(40);
+    fft.params["average"] = serde_json::json!(2);
+    assert!(matches!(
+        node.apply(Op::GraphPut {
+            job: id.clone(),
+            graph: g
+        })
+        .await,
+        Ok(OpResult::Ok)
+    ));
+    assert_eq!(
+        node.job_list().iter().find(|r| r.id == id).unwrap().state,
+        JobState::Running
+    );
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(
+        (
+            ctx["scan"]["dwell_ms"].as_u64(),
+            ctx["scan"]["average"].as_u64()
+        ),
+        (Some(40), Some(2)),
+        "{ctx}"
+    );
+    // The restarted scan's rows (a fresh event stream) take 40 ms and average two sweeps.
+    let mut rx = event_rx(&node, &id);
+    let got = rows(&mut rx, 9, Duration::from_secs(10)).await;
+    for f in &got {
+        assert_eq!(ev(f)["samples"], 156 * 4096, "{}", ev(f));
+    }
+    assert!(
+        got.iter().any(|f| ev(f)["sweeps"] == 2),
+        "no row averaged two sweeps"
+    );
+    assert!(got.iter().all(|f| {
+        ev(f)["sweeps"]
+            .as_u64()
+            .is_some_and(|n| (1..=2).contains(&n))
+    }));
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A `dwell_ms` under four FFT frames is raised to them; the context says the
+/// dwell in force and the one asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dwell_under_four_frames_is_raised_and_the_asked_one_reported() {
+    let (_dir, node, _port) = open_with(ScanPort::fast()).await;
+    // On a 256 kHz step a 1 ms dwell is under four frames of 1024: 16 ms (4096 samples).
+    let (id, mut rx) = start_scan_look(&node, (100 * MHZ, FAST_RATE_HZ), Some(1), None).await;
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(ctx["scan"]["dwell_ms"], 16, "{ctx}");
+    assert_eq!(ctx["scan"]["dwell_ms_asked"], 1, "{ctx}");
+    for f in rows(&mut rx, 3, Duration::from_secs(10)).await {
+        assert_eq!(ev(&f)["samples"], 4096, "{}", ev(&f));
+    }
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A dwell longer than the source's ring holds could never be read from it:
+/// it is capped to the ring (here 1 s), in whole rows, and the asked one reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dwell_longer_than_the_ring_is_capped_to_it() {
+    let (_dir, node, _port) = open_with(ScanPort::fast()).await;
+    let (id, mut rx) = start_scan_look(&node, (100 * MHZ, FAST_RATE_HZ), Some(5000), None).await;
+    let ctx = node.job_context(&id).unwrap();
+    let dwell = ctx["scan"]["dwell_ms"].as_u64().unwrap();
+    assert!((900..=1000).contains(&dwell), "{ctx}");
+    assert_eq!(ctx["scan"]["dwell_ms_asked"], 5000, "{ctx}");
+    // A whole step's rows arrive: 20 rows a second within the step.
+    let got = rows(&mut rx, 25, Duration::from_secs(20)).await;
+    let samples: u64 = got[..20]
+        .iter()
+        .map(|f| ev(f)["samples"].as_u64().unwrap())
+        .sum();
+    assert!(samples <= FAST_RATE_HZ, "{samples} samples in a 1 s ring");
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A scan stored before the look existed (its `fft` node and its context
+/// without `dwell_ms` or `average`) resumes at the node's dwell and 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_stored_before_the_look_resumes_at_the_defaults() {
+    use zeta_core::graph::{GraphId, NodeId};
+    use zeta_core::job::{JOB_RECORD_FORMAT, JobRecord};
+    let dir = tempfile::tempdir().unwrap();
+    let id = JobId::new();
+    let rec = JobRecord {
+        format: JOB_RECORD_FORMAT,
+        id: id.clone(),
+        kind: "scan".into(),
+        graph: Graph {
+            id: GraphId::new(),
+            nodes: vec![GraphNode {
+                id: NodeId::new(),
+                kind: "fft".into(),
+                params: serde_json::json!({
+                    "size": 4096, "window": "hann", "rows_per_s": 20,
+                    "notch_hz": 50_000, "edge_mask": 0.0,
+                }),
+            }],
+            edges: vec![],
+        },
+        source: SourceId("radio0".into()),
+        tuning: Tuning {
+            center_hz: Hz(20 * MHZ),
+            bandwidth_hz: Hz(40 * MHZ),
+        },
+        state: JobState::Running,
+        context: serde_json::json!({"scan": {"steps": 3, "dwell_ms": 20}}),
+        created_ns: Timestamp(1),
+        input: None,
+        capture_rate_hz: None,
+        elastic: false,
+        operator_graph: false,
+        owner: None,
+    };
+    let jobs = dir.path().join("state").join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    std::fs::write(
+        jobs.join(format!("{}.json", id.0)),
+        serde_json::to_vec(&rec).unwrap(),
+    )
+    .unwrap();
+    let node = Node::open(cfg_dwell(dir.path(), 20), registry(), vec![ScanPort::new()])
+        .await
+        .unwrap();
+    assert_eq!(
+        node.job_list().iter().find(|r| r.id == id).unwrap().state,
+        JobState::Running
+    );
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(ctx["scan"]["dwell_ms"], 20, "{ctx}");
+    assert_eq!(ctx["scan"]["average"], 1, "{ctx}");
+    let mut rx = event_rx(&node, &id);
+    for f in rows(&mut rx, 3, Duration::from_secs(10)).await {
+        assert_eq!(ev(&f)["sweeps"], 1, "{}", ev(&f));
+        assert_eq!(ev(&f)["samples"], 78 * 4096, "{}", ev(&f));
+    }
     node.job_stop(&id).await.unwrap();
 }

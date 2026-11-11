@@ -183,6 +183,8 @@ async fn python_plugin_runs_in_a_job_via_graph_put() {
             bandwidth_hz: Hz(48_000),
             deviation_hz: None,
             sideband: None,
+            dwell_ms: None,
+            average: None,
             elastic: false,
             replace: vec![],
         })

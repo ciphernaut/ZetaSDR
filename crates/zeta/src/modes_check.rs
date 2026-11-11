@@ -241,6 +241,8 @@ async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> 
         bandwidth_hz: Hz(test.bandwidth_hz.unwrap_or(m.row.band.bandwidth_hz)),
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic: false,
         replace: vec![],
     };

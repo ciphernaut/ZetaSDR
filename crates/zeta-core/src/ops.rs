@@ -157,6 +157,7 @@ pub enum Op {
         #[schemars(required, schema_with = "nullable_gain_db")]
         gain_db: Option<f64>,
     },
+    #[schemars(transform = require_the_look)]
     JobStart {
         kind: JobKind,
         source: SourceId,
@@ -173,6 +174,24 @@ pub enum Op {
         #[serde(deserialize_with = "nullable_sideband")]
         #[schemars(required, schema_with = "nullable_sideband_schema")]
         sideband: Option<Sideband>,
+        /// `scan` only: the samples taken at each step, ms (1..=5000); `null` is the
+        /// node's (20 unless `--scan-dwell-ms` says otherwise). Never under four FFT
+        /// frames, and never more than the source's ring holds: `job_context.scan`
+        /// gives the `dwell_ms` in force and `dwell_ms_asked` when that differs. A long
+        /// look sees a faint steady signal; any other kind must pass `null`.
+        #[serde(default, deserialize_with = "nullable_u64")]
+        #[schemars(required, schema_with = "nullable_dwell_ms")]
+        dwell_ms: Option<u64>,
+        /// `scan` only: each published row is the mean power of that step's last
+        /// `average` sweeps (1..=64), counted per grid (an even step with the even
+        /// sweeps of its centre); each row's `sweeps` says how many so far. `null`
+        /// is one. Many quick looks averaged lower the noise ripple as one long dwell
+        /// does while each step is still revisited every sweep; any other kind must
+        /// pass `null`. Both change on a running scan through `graph_put` (the `fft`
+        /// node's `dwell_ms` and `average`).
+        #[serde(default, deserialize_with = "nullable_u32")]
+        #[schemars(required, schema_with = "nullable_average")]
+        average: Option<u32>,
         /// `spectrum` only (`false` for any other kind): the job follows the
         /// source's capture instead of holding it. It never conflicts, never
         /// retunes a held source (its `tuning` is the capture it joins), is
@@ -722,6 +741,32 @@ fn nullable_hz_u64(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     })
 }
 
+/// Deserialize a required `Option<u32>` (see [`nullable_u64`]).
+fn nullable_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    <Option<u32> as Deserialize>::deserialize(d)
+}
+
+/// Schema of `job_start`'s `dwell_ms`: `["integer","null"]` (the range is checked by
+/// the node, so a value outside it is `out_of_range` naming the field).
+fn nullable_dwell_ms(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "format": "uint64",
+        "minimum": 0,
+        "description": "`scan` only: the samples taken at each step, ms (1..=5000); `null` is the node's (20 unless `--scan-dwell-ms` says otherwise). Any other kind must pass `null`."
+    })
+}
+
+/// Schema of `job_start`'s `average`: `["integer","null"]` (range as `dwell_ms`'s).
+fn nullable_average(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "format": "uint32",
+        "minimum": 0,
+        "description": "`scan` only: each row is the mean power of its step's last `average` sweeps (1..=64); `null` is 1. Any other kind must pass `null`."
+    })
+}
+
 /// Deserialize a required `Option<Sideband>` (see [`nullable_u64`]).
 fn nullable_sideband<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Sideband>, D::Error> {
     <Option<Sideband> as Deserialize>::deserialize(d)
@@ -836,6 +881,30 @@ fn require_all_value(schema: &mut schemars::Schema) {
         .and_then(|v| <&mut schemars::Schema>::try_from(v).ok());
     if let Some(value) = value {
         crate::knowledge::require_all(value);
+    }
+}
+
+/// `job_start` requires its look, `dwell_ms` and `average`, after `sideband` (the
+/// field order agents read), and like `deviation_hz` shows no default for them;
+/// they still default to `null` when a request from before them leaves them out.
+fn require_the_look(schema: &mut schemars::Schema) {
+    const LOOK: [&str; 2] = ["dwell_ms", "average"];
+    if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
+        req.retain(|f| !LOOK.iter().any(|l| f == l));
+        let at = req
+            .iter()
+            .position(|f| f == "sideband")
+            .map_or(req.len(), |i| i + 1);
+        for (k, f) in LOOK.iter().enumerate() {
+            req.insert(at + k, (*f).into());
+        }
+    }
+    if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties") {
+        for f in LOOK {
+            if let Some(serde_json::Value::Object(p)) = props.get_mut(f) {
+                p.remove("default");
+            }
+        }
     }
 }
 
@@ -1714,6 +1783,10 @@ pub const SCAN_WAIT_MARGIN_MS: u64 = 500;
 pub const SCAN_ROWS_DWELL_MS: u64 = 100;
 /// The fewest FFT frames a scan's dwell holds.
 pub const SCAN_MIN_FRAMES: u64 = 4;
+/// The longest dwell a scan's `dwell_ms` may ask for, ms.
+pub const SCAN_DWELL_MAX_MS: u64 = 5000;
+/// The most sweeps a scan's `average` may take.
+pub const SCAN_AVERAGE_MAX: u32 = 64;
 
 /// The samples a scan step of `dwell_ms` takes at `rate_hz` with FFT frames of
 /// `size`, and the dwell they are in ms (rounded to nearest), in whole frames.
@@ -1740,6 +1813,31 @@ pub fn scan_dwell_samples(dwell_ms: u64, rate_hz: u64, size: u32) -> (u64, u64) 
         .max((frames - 1) * size * rps / rate + 1)
         .max(1);
     let frames = spectrum_row_boundary(rows - 1, rate, rps).div_ceil(size);
+    (frames * size, ms(frames * size))
+}
+
+/// [`scan_dwell_samples`] capped to `max_samples` (the source's ring: a longer run
+/// could never be read from it), in whole frames and, for a dwell cut into rows
+/// (`SCAN_ROWS_DWELL_MS` or more), in whole rows: the most rows whose frames fit.
+/// The four-frame floor yields to the cap, which is never under one frame.
+pub fn scan_dwell_within(dwell_ms: u64, rate_hz: u64, size: u32, max_samples: u64) -> (u64, u64) {
+    let (samples, ms) = scan_dwell_samples(dwell_ms, rate_hz, size);
+    if samples <= max_samples {
+        return (samples, ms);
+    }
+    let (rate, size) = (rate_hz.max(1), u64::from(size.max(1)));
+    let ms = |samples: u64| (samples * 1000 + rate / 2) / rate;
+    let fit = (max_samples / size).max(1);
+    if ms(fit * size) < SCAN_ROWS_DWELL_MS {
+        return (fit * size, ms(fit * size));
+    }
+    // Row `n - 1` closes at `ceil(n × rate / rps)` samples: the most rows whose
+    // closing frame is within `fit` frames.
+    let rps = u64::from(SPECTRUM_ROWS_PER_S);
+    let frames = match fit * size * rps / rate {
+        0 => fit,
+        n => spectrum_row_boundary(n - 1, rate, rps).div_ceil(size),
+    };
     (frames * size, ms(frames * size))
 }
 
@@ -3461,6 +3559,34 @@ pub(crate) fn check_start_params(
     }
 }
 
+/// `job_start`'s checks of a scan's look: `dwell_ms` (1..=`SCAN_DWELL_MAX_MS`) and
+/// `average` (1..=`SCAN_AVERAGE_MAX`) are for kind `scan` only, as `deviation_hz` is
+/// for the FM demodulators; out of range is `out_of_range` naming the field.
+pub(crate) fn check_look(
+    kind: &JobKind,
+    dwell_ms: Option<u64>,
+    average: Option<u32>,
+) -> Result<(), OpError> {
+    for (field, v, max) in [
+        ("dwell_ms", dwell_ms, SCAN_DWELL_MAX_MS),
+        (
+            "average",
+            average.map(u64::from),
+            u64::from(SCAN_AVERAGE_MAX),
+        ),
+    ] {
+        let Some(v) = v else { continue };
+        if *kind != JobKind::Scan {
+            return Err(other(format!(
+                "{field} applies only to kind scan; pass null (kind is {})",
+                kind.name()
+            )));
+        }
+        range(field, v, 1, max)?;
+    }
+    Ok(())
+}
+
 /// An op error with the request field it is about (`plan`, `channels`, `kind`,
 /// `deviation_hz`, `sideband`, `attach`, `language`), for a caller that names fields
 /// itself (a set file's member).
@@ -3764,6 +3890,8 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             bandwidth_hz,
             deviation_hz,
             sideband,
+            dwell_ms,
+            average,
             elastic,
             replace,
         } => {
@@ -3774,6 +3902,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 });
             }
             let deviation = check_start_params(&kind, deviation_hz, sideband)?;
+            check_look(&kind, dwell_ms, average)?;
             // An unknown or unready mode is refused before anything is tuned.
             kind.mode_row(&node.modes())?;
             let tuning = Tuning {
@@ -3789,8 +3918,23 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                     tune.saturating_add(caps.max_bandwidth_hz.value().0)
                 })?;
                 let capture = *port.capabilities().max_bandwidth_hz.value();
-                let graph =
+                let mut graph =
                     kind.expand(&source, tuning, capture, None, None, None, &node.modes())?;
+                // The look lives on the scan's `fft` node, where `graph_put` changes
+                // it and a resume finds it; absent is the defaults.
+                if let Some(p) = graph
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.kind == "fft")
+                    .and_then(|n| n.params.as_object_mut())
+                {
+                    if let Some(d) = dwell_ms {
+                        p.insert("dwell_ms".into(), d.into());
+                    }
+                    if let Some(a) = average {
+                        p.insert("average".into(), a.into());
+                    }
+                }
                 // With `replace`, the named holders stop and the scan leases under
                 // one hold of the gate; the elastic jobs it displaces stop after.
                 let guard = node.gate_for_replace(&source, &replace).await;
@@ -6572,6 +6716,32 @@ mod tests {
                 "{dwell} ms at {rate}"
             );
         }
+    }
+
+    #[test]
+    fn a_dwell_is_capped_to_the_ring_in_whole_rows() {
+        // Within the ring: as scan_dwell_samples.
+        assert_eq!(
+            scan_dwell_within(250, 16_000_000, 4096, 16_000_000),
+            scan_dwell_samples(250, 16_000_000, 4096)
+        );
+        // 5 s of 256 kHz in a 1 s ring: 250 frames of 1024, 20 whole rows, 1000 ms.
+        assert_eq!(
+            scan_dwell_within(5000, 256_000, 1024, 256_000),
+            (256_000, 1000)
+        );
+        // 5 s of 16 Msps in a 1 s ring (16e6 samples, 3906 whole frames): 19 rows close
+        // by frame 3711, the 20th would need frame 3907.
+        let (samples, ms) = scan_dwell_within(5000, 16_000_000, 4096, 16_000_000);
+        assert!(samples <= 16_000_000, "{samples}");
+        assert_eq!((samples, ms), (3711 * 4096, 950));
+        // A ring under 100 ms of frames (never made by the node): whole frames that fit.
+        assert_eq!(
+            scan_dwell_within(20, 16_000_000, 4096, 100_000),
+            (24 * 4096, 6)
+        );
+        // Under one frame: one frame.
+        assert_eq!(scan_dwell_within(20, 16_000_000, 4096, 100), (4096, 0));
     }
 
     #[test]

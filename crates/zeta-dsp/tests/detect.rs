@@ -112,6 +112,8 @@ async fn detect_publishes_new_and_gone_for_a_synthesised_burst() {
             bandwidth_hz: Hz(RATE as u64),
             deviation_hz: None,
             sideband: None,
+            dwell_ms: None,
+            average: None,
             elastic: false,
             replace: vec![],
         })

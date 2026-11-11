@@ -22,6 +22,7 @@ pub mod ring;
 pub mod sessions;
 pub mod sets;
 pub mod signatures;
+pub mod spectrum;
 pub mod stage;
 pub mod station;
 pub mod stream;

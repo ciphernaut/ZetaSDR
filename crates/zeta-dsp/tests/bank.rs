@@ -679,6 +679,8 @@ async fn measure_emits_partials_when_the_input_gaps_every_400_ms() {
             bandwidth_hz: Hz(12_500),
             deviation_hz: None,
             sideband: None,
+            dwell_ms: None,
+            average: None,
             elastic: false,
             replace: vec![],
         })

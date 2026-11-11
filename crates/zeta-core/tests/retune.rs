@@ -180,6 +180,8 @@ async fn start_as(node: &Node, kind: JobKind, band: Tuning, elastic: bool) -> Jo
         bandwidth_hz: band.bandwidth_hz,
         deviation_hz: None,
         sideband: None,
+        dwell_ms: None,
+        average: None,
         elastic,
         replace: vec![],
     };

@@ -1141,6 +1141,14 @@ pub enum JobCmd {
         /// Sideband for ssb_demod only; absent = usb
         #[arg(long, value_enum)]
         sideband: Option<SidebandArg>,
+        /// scan only: the samples taken at each step, ms (1..=5000); absent = the
+        /// node's (--scan-dwell-ms, 20)
+        #[arg(long, value_name = "MS")]
+        dwell_ms: Option<u64>,
+        /// scan only: each row is the mean power of its step's last N sweeps
+        /// (1..=64); absent = 1
+        #[arg(long, value_name = "N")]
+        average: Option<u32>,
         /// spectrum only: follow the source's capture instead of holding it
         /// (never conflicts; relaunched under the same id on every retune)
         #[arg(long)]
@@ -1523,6 +1531,8 @@ impl Command {
                 band: b,
                 deviation_hz,
                 sideband,
+                dwell_ms,
+                average,
                 elastic,
                 replace,
                 ..
@@ -1533,6 +1543,8 @@ impl Command {
                 bandwidth_hz: Hz(b.bandwidth_hz),
                 deviation_hz,
                 sideband: sideband.map(Into::into),
+                dwell_ms,
+                average,
                 elastic,
                 replace: replace.into_ids(),
             },
