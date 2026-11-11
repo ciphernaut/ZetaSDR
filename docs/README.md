@@ -17,6 +17,8 @@ attach one.
   skill, is [skills/zetasdr/SKILL.md](../skills/zetasdr/SKILL.md).
 - [RECIPES.md](../RECIPES.md): named job setups (airband data links as a set, UHF CB listeners with transcription, a radiosonde watch, your own theme) as the
   operations to send, in order.
+- [kiwi-waterfall.md](kiwi-waterfall.md): the KiwiSDR waterfall stream as the server's source has it: the
+  frame, the commands, and how a `W/F` socket is counted, paired and ended.
 - [speech.md](speech.md): transcribing a channel. Installing a speech daemon on a node's host,
   writing your own, sharing one between nodes, and source separation.
 - [themes.md](themes.md): the web page's themes, and how to write one.
