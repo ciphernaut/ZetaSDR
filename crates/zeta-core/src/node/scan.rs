@@ -20,8 +20,9 @@ use crate::graph::{self, GraphError, NodeId};
 use crate::job::JobRecord;
 use crate::ops::{
     JobKind, SCAN_AVERAGE_MAX, SCAN_DWELL_MAX_MS, SCAN_ROWS_DWELL_MS, SCAN_WAIT_MARGIN_MS,
-    SPECTRUM_ROWS_PER_S, ScanGrid, scan_dwell_within, scan_edge_mask_in_force, scan_grid,
-    scan_mask_default, scan_notch_in_force, spectrum_size,
+    SPECTRUM_ROWS_PER_S, ScanGrid, scan_average_budget_bytes, scan_average_in_force,
+    scan_dwell_within, scan_edge_mask_in_force, scan_grid, scan_mask_default, scan_notch_in_force,
+    scan_rows_per_step, spectrum_size,
 };
 use crate::port::{IqBlock, Port, Tuning};
 use crate::ring::IqRing;
@@ -133,7 +134,8 @@ impl Inner {
         }
         if let Some(ctx) = rec.context.as_object_mut() {
             let ring = self.ring_capacity_samples(&rec.source, layout.rate_hz());
-            ctx.insert("scan".into(), layout.context(look, ring).into());
+            let budget = scan_average_budget_bytes(self.ring_budget_bytes);
+            ctx.insert("scan".into(), layout.context(look, ring, budget).into());
         }
         let token = self.shutdown.child_token();
         let (prov, run, ended) = self.record_running(rec, &token)?;
@@ -244,10 +246,12 @@ impl Inner {
     }
 
     /// Write `fields` into job `id`'s `job_context.scan`, keeping its other
-    /// keys (a `dwell_ms_asked` the fields no longer carry is dropped).
+    /// keys (a `dwell_ms_asked` or `average_asked` the fields no longer carry is
+    /// dropped).
     fn scan_context_rewrite(&self, id: &JobId, fields: serde_json::Map<String, serde_json::Value>) {
         self.scan_context_update(id, |scan| {
             scan.remove("dwell_ms_asked");
+            scan.remove("average_asked");
             scan.extend(fields);
         });
     }
@@ -392,16 +396,46 @@ impl Layout {
         self.grid.even[0].bandwidth_hz.0
     }
 
-    /// The scan's `job_context.scan` for this layout, `look` and a ring of
-    /// `ring_samples` at the step's rate: `steps`, `step_hz` (the stride),
-    /// `rate_hz` (the capture each step asks for), `dwell_ms` (in force on a
-    /// step: whole frames, never under four, never more than the ring holds),
-    /// `dwell_ms_asked` when that differs, `average`, `alternate` and `mask`.
-    fn context(&self, look: Look, ring_samples: u64) -> serde_json::Map<String, serde_json::Value> {
+    /// The `average` in force for `look` on this layout, with a ring of
+    /// `ring_samples` at the step's rate and `budget_bytes` for the averages
+    /// ([`scan_average_in_force`]): the grid's steps (both grids' when it
+    /// alternates), the rows a step of the dwell in force and the step's bins.
+    fn average_in_force(&self, look: Look, ring_samples: u64, budget_bytes: u64) -> u32 {
+        let w = self.rate_hz();
+        let size = spectrum_size(w);
+        let (samples, dwell_ms) = scan_dwell_within(look.dwell_ms, w, size, ring_samples);
+        let g = &self.grid;
+        let steps = match g.alternates() {
+            true => g.even.len() + g.odd.len(),
+            false => g.even.len(),
+        };
+        scan_average_in_force(
+            look.average,
+            budget_bytes,
+            steps as u64,
+            scan_rows_per_step(samples, dwell_ms, w),
+            u64::from(size),
+        )
+    }
+
+    /// The scan's `job_context.scan` for this layout, `look`, a ring of
+    /// `ring_samples` at the step's rate and `budget_bytes` for the averages:
+    /// `steps`, `step_hz` (the stride), `rate_hz` (the capture each step asks
+    /// for), `dwell_ms` (in force on a step: whole frames, never under four,
+    /// never more than the ring holds), `dwell_ms_asked` when that differs,
+    /// `average` (in force, [`Layout::average_in_force`]), `average_asked` when
+    /// that differs, `alternate` and `mask`.
+    fn context(
+        &self,
+        look: Look,
+        ring_samples: u64,
+        budget_bytes: u64,
+    ) -> serde_json::Map<String, serde_json::Value> {
         let g = &self.grid;
         let w = self.rate_hz();
         let dwell_asked_ms = look.dwell_ms;
         let (_, dwell_ms) = scan_dwell_within(dwell_asked_ms, w, spectrum_size(w), ring_samples);
+        let average = self.average_in_force(look, ring_samples, budget_bytes);
         let alternate = if g.alternates() {
             serde_json::json!({"shift_hz": g.shift_hz(), "steps_shifted": g.odd.len()})
         } else {
@@ -412,12 +446,15 @@ impl Layout {
             "step_hz": g.stride_hz,
             "rate_hz": w,
             "dwell_ms": dwell_ms,
-            "average": look.average,
+            "average": average,
             "alternate": alternate,
             "mask": {"notch_hz": self.notch_hz, "edge_mask": self.edge_mask},
         });
         if dwell_ms != dwell_asked_ms {
             scan["dwell_ms_asked"] = dwell_asked_ms.into();
+        }
+        if average != look.average {
+            scan["average_asked"] = look.average.into();
         }
         match scan {
             serde_json::Value::Object(m) => m,
@@ -428,7 +465,8 @@ impl Layout {
 
 /// A scan's look, from its stored `fft` node: the dwell asked for (ms; each
 /// step takes it in whole frames, [`scan_dwell_within`]) and how many sweeps
-/// each row averages.
+/// each row is asked to average (at most what the averaging budget holds,
+/// [`Layout::average_in_force`]).
 #[derive(Clone, Copy, Debug)]
 struct Look {
     dwell_ms: u64,
@@ -452,13 +490,14 @@ struct Scan {
 
 /// One step's dwell, handed from [`scan_loop`] to [`fft_task`]: the sweep and
 /// the step's index within that sweep's list, the layout it was stepped on (a
-/// count of the layouts the scan has built, and whether its grid alternates),
-/// the centre it was taken at, its samples, how many FFT frames they are and
-/// the mask in force on it.
+/// count of the layouts the scan has built, whether its grid alternates and
+/// the `average` in force on it), the centre it was taken at, its samples, how
+/// many FFT frames they are and the mask in force on it.
 struct Step {
     sweep: u64,
     layout: u64,
     alternates: bool,
+    average: u32,
     index: usize,
     center: Hz,
     block: IqBlock,
@@ -495,6 +534,9 @@ async fn scan_loop(
     let mut layout = s.layout.clone();
     // How many times the layout was rebuilt: the FFT task starts its averages afresh.
     let mut generation = 0u64;
+    let budget = scan_average_budget_bytes(inner.ring_budget_bytes);
+    let ring = inner.ring_capacity_samples(source, layout.rate_hz());
+    let mut average = layout.average_in_force(s.look, ring, budget);
     // The centre and the end of the last block taken.
     let mut taken: Option<(Hz, Timestamp)> = None;
     let (mut sweep, mut i) = (0u64, 0usize);
@@ -516,7 +558,8 @@ async fn scan_loop(
             layout = Layout::of(s.span, s.port.capabilities(), layout.mask);
             generation += 1;
             let ring = inner.ring_capacity_samples(source, layout.rate_hz());
-            inner.scan_context_rewrite(&s.id, layout.context(s.look, ring));
+            average = layout.average_in_force(s.look, ring, budget);
+            inner.scan_context_rewrite(&s.id, layout.context(s.look, ring, budget));
         }
         let steps = layout.grid.steps(sweep);
         let tune_start = tokio::time::Instant::now();
@@ -553,6 +596,7 @@ async fn scan_loop(
                 sweep,
                 layout: generation,
                 alternates: layout.grid.alternates(),
+                average,
                 index: i,
                 center: got.center_hz,
                 block,
@@ -634,15 +678,16 @@ fn span_of(block: &IqBlock) -> Span {
 /// The scan's FFT task: run [`fft_step`] over each step [`scan_loop`] hands
 /// over, one at a time and in order, so the rows go out in step order. Ends
 /// when cancelled or when the loop has ended (the channel closed). With an
-/// `average` over 1 it keeps the averages: one per grid (even and odd sweeps
-/// apart), started afresh when the layout changes.
+/// `average` in force over 1 it keeps the averages: one per grid (even and odd
+/// sweeps apart), of the step's `average`, started afresh when the layout
+/// changes (which is when the average in force can change).
 async fn fft_task(
     inner: Arc<Inner>,
     s: Arc<Scan>,
     mut rx: mpsc::Receiver<Step>,
 ) -> Result<(), StageError> {
-    let fresh = || [0, 1].map(|_| SweepAverage::new(s.look.average));
-    let mut averages = (0u64, fresh());
+    let fresh = |n: u32| [0, 1].map(|_| SweepAverage::new(n));
+    let mut averages = (0u64, fresh(1));
     loop {
         let step = tokio::select! {
             _ = s.cancel.cancelled() => return Err(StageError::Cancelled),
@@ -652,11 +697,11 @@ async fn fft_task(
                 None => return Err(StageError::Cancelled),
             },
         };
-        if step.layout != averages.0 {
-            averages = (step.layout, fresh());
+        if step.layout != averages.0 || averages.1[0].depth() != step.average {
+            averages = (step.layout, fresh(step.average));
         }
         let grid = usize::from(step.alternates && step.sweep % 2 == 1);
-        let avg = (s.look.average > 1).then(|| &mut averages.1[grid]);
+        let avg = (step.average > 1).then(|| &mut averages.1[grid]);
         fft_step(&inner, &s, step, avg).await?;
     }
 }
@@ -724,7 +769,7 @@ fn dwell_rows_per_s(dwell_ms: u64) -> u32 {
 /// `rows_per_s` says `1000 / dwell_ms`; a longer one is cut into
 /// `SPECTRUM_ROWS_PER_S` rows a second. Rows wait in the stage's output
 /// stream (bus capacity) until the stage ends. Each row carries `sweeps`:
-/// with `avg` (an `average` over 1) it is averaged into it ([`average_row`]),
+/// with `avg` (an `average` in force over 1) it is averaged into it ([`average_row`]),
 /// else it passes as the stage made it with `sweeps: 1`.
 async fn fft_step(
     inner: &Inner,

@@ -87,6 +87,11 @@ impl SweepAverage {
         }
     }
 
+    /// How many rows of each key it averages.
+    pub fn depth(&self) -> u32 {
+        self.n as u32
+    }
+
     /// Push a row of `floor_db` and `q` (at [`STEP_DB`]) for `key`; the mean
     /// linear power, in dB, of the last `n` rows pushed for it, and how many
     /// that was. A row of another length than the key's last restarts the key.

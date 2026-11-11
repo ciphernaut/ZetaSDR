@@ -1458,6 +1458,8 @@ async fn job_start_takes_dwell_ms_and_average_and_the_record_shows_them() {
     assert_eq!(ctx["scan"]["dwell_ms"], 40, "{ctx}");
     assert!(ctx["scan"].get("dwell_ms_asked").is_none(), "{ctx}");
     assert_eq!(ctx["scan"]["average"], 4, "{ctx}");
+    // Within the averaging budget: the average asked is the one in force.
+    assert!(ctx["scan"].get("average_asked").is_none(), "{ctx}");
     node.job_stop(&id).await.unwrap();
 
     let (id, mut rx) = start_scan_look(&node, (20 * MHZ, 40 * MHZ), None, None).await;
@@ -1704,5 +1706,31 @@ async fn a_scan_stored_before_the_look_resumes_at_the_defaults() {
         assert_eq!(ev(&f)["sweeps"], 1, "{}", ev(&f));
         assert_eq!(ev(&f)["samples"], 78 * 4096, "{}", ev(&f));
     }
+    node.job_stop(&id).await.unwrap();
+}
+
+/// The averages may hold an eighth of the node's ring budget: an `average` that
+/// would hold more is lowered to what fits, the context shows both, and no row
+/// counts more sweeps than the average in force.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_average_over_its_budget_is_lowered_to_fit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = cfg_dwell(dir.path(), 20);
+    // 2500 bytes for the averages: one 256 kHz step's row is 1024 bins, so two sweeps fit.
+    cfg.ring_budget_bytes = 20_000;
+    let node = Node::open(cfg, registry(), vec![ScanPort::fast()])
+        .await
+        .unwrap();
+    let (id, mut rx) = start_scan_look(&node, (100 * MHZ, FAST_RATE_HZ), None, Some(64)).await;
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(ctx["scan"]["steps"], 1, "{ctx}");
+    assert_eq!(ctx["scan"]["average"], 2, "{ctx}");
+    assert_eq!(ctx["scan"]["average_asked"], 64, "{ctx}");
+    let sweeps: Vec<u64> = rows(&mut rx, 6, Duration::from_secs(10))
+        .await
+        .iter()
+        .map(|f| ev(f)["sweeps"].as_u64().unwrap())
+        .collect();
+    assert_eq!(sweeps, [1, 2, 2, 2, 2, 2]);
     node.job_stop(&id).await.unwrap();
 }

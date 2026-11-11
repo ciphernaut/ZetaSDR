@@ -1841,6 +1841,42 @@ pub fn scan_dwell_within(dwell_ms: u64, rate_hz: u64, size: u32, max_samples: u6
     (frames * size, ms(frames * size))
 }
 
+/// The rows a scan step of `samples` (a dwell of `dwell_ms`, as
+/// [`scan_dwell_within`] gives them) at `rate_hz` publishes: one under
+/// [`SCAN_ROWS_DWELL_MS`], else the `SPECTRUM_ROWS_PER_S` rows a second that
+/// close within it ([`spectrum_row_boundary`]), at least one.
+pub fn scan_rows_per_step(samples: u64, dwell_ms: u64, rate_hz: u64) -> u64 {
+    if dwell_ms < SCAN_ROWS_DWELL_MS {
+        return 1;
+    }
+    (samples * u64::from(SPECTRUM_ROWS_PER_S) / rate_hz.max(1)).max(1)
+}
+
+/// The share of the node's ring budget a scan's averages may hold: an eighth
+/// (512 MiB of the default 4 GiB).
+pub fn scan_average_budget_bytes(ring_budget_bytes: u64) -> u64 {
+    ring_budget_bytes / 8
+}
+
+/// The `average` in force for a scan asked for `asked`: the averages keep
+/// `average` rows of `bins` bytes for each of `rows_per_step` rows of each of
+/// `steps` steps (both grids' steps when the grid alternates), so it is at most
+/// `floor(budget_bytes / (steps × rows_per_step × bins))`, and at least 1.
+pub fn scan_average_in_force(
+    asked: u32,
+    budget_bytes: u64,
+    steps: u64,
+    rows_per_step: u64,
+    bins: u64,
+) -> u32 {
+    let per_sweep = steps
+        .saturating_mul(rows_per_step)
+        .saturating_mul(bins)
+        .max(1);
+    let fits = (budget_bytes / per_sweep).min(u64::from(u32::MAX)) as u32;
+    asked.min(fits).max(1)
+}
+
 /// How much of the ring, in ms, an `identify` job measures (layer 1) before it scores
 /// the mode rows.
 pub const IDENTIFY_MEASURE_MS: u64 = 1_000;
@@ -6716,6 +6752,24 @@ mod tests {
                 "{dwell} ms at {rate}"
             );
         }
+    }
+
+    #[test]
+    fn the_average_is_capped_to_its_budget() {
+        // The default ring budget (4 GiB) gives the averages 512 MiB.
+        assert_eq!(scan_average_budget_bytes(4 << 30), 512 << 20);
+        // 216 steps of 4096 bins, one row a step: 885 KiB a sweep; 64 fit.
+        assert_eq!(scan_average_in_force(64, 512 << 20, 216, 1, 4096), 64);
+        // Both grids (432 steps) at 5 s (100 rows a step): 64 sweeps would be 11 GB;
+        // 512 MiB holds floor(536870912 / (432 × 100 × 4096)) = 3.
+        assert_eq!(scan_average_in_force(64, 512 << 20, 432, 100, 4096), 3);
+        // Never under one, even when one sweep does not fit.
+        assert_eq!(scan_average_in_force(64, 1000, 432, 100, 4096), 1);
+        assert_eq!(scan_average_in_force(1, 0, 0, 0, 0), 1);
+        // Rows a step: one under 100 ms; else 20 a second of the samples.
+        assert_eq!(scan_rows_per_step(319_488, 20, 16_000_000), 1);
+        assert_eq!(scan_rows_per_step(977 * 4096, 250, 16_000_000), 5);
+        assert_eq!(scan_rows_per_step(80_000_000, 5000, 16_000_000), 100);
     }
 
     #[test]
