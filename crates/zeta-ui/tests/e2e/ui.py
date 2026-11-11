@@ -1062,6 +1062,77 @@ def scenario_scan_looks_and_sweep_time(page, url, secret):
             stop_job(url, secret, j["id"])
 
 
+def scenario_scan_look_on_a_source_with_depths(page, url, secret):
+    # The e2e nodes run file sources only: the page is told that `tone` has a lossless 16-bit
+    # and a lossy 8-bit depth, and a scan's context is answered here with `bits: 16` (the depth
+    # in force) while its stored node sets no bits, as on a source with depths.
+    st = {"graph_get": 0, "context": 0}
+
+    def route(r):
+        body = r.request.post_data or ""
+        if '"graph_get"' in body:
+            st["graph_get"] += 1
+            return r.continue_()
+        if '"job_context"' in body:
+            st["context"] += 1
+            ctx = {"scan": {"dwell_ms": 85, "dwell_ms_asked": 20, "average": 1, "bits": 16,
+                            "timing": {"sweep_ms": 100 + st["context"]}}}
+            return r.fulfill(status=200, content_type="application/json",
+                             body=json.dumps({"result": "context", "value": ctx}))
+        if '"source_list"' not in body:
+            return r.continue_()
+        resp = r.fetch()
+        data = resp.json()
+        for src in data.get("value") or []:
+            if src.get("id") == "tone":
+                src.setdefault("capabilities", {})["depths"] = [
+                    {"bits": 16, "lossless": True, "max_bandwidth_hz": {"measured": 20_480_000}},
+                    {"bits": 8, "lossless": False, "max_bandwidth_hz": {"measured": 20_480_000}},
+                ]
+        return r.fulfill(response=resp, body=json.dumps(data))
+
+    show_tone_waterfall(page, url, secret)
+    page.route("**/op", route)
+    wait_span(page, 1.5)
+    drag_menu(page, 0.0, 1.05)
+    page.click('#ctx .ctx-item[data-action="scan"]')
+    scans = []
+    try:
+        # Route handlers run only while Playwright waits: poll through the page.
+        for _ in range(50):
+            scans = running_scan_jobs(url, secret, "tone")
+            if scans:
+                break
+            page.wait_for_timeout(100)
+        assert scans, "a scan job on tone within 5 s"
+        row = page.locator(f'#jobs .job[data-job="{scans[0]["id"]}"]')
+        select = row.locator("select.scan-look")
+        expect(select).to_be_visible(timeout=10_000)
+        expect(select.locator('option[value="coarse"]')).to_have_count(1)
+        expect(select.locator('option[value="coarse"]')).to_have_attribute("title", re.compile("^8-bit samples"))
+        # Route handlers run while Playwright waits: wait in the page for several polls.
+        page.wait_for_timeout(7_000)
+        assert st["context"] >= 3, f"job_context polled {st['context']} times"
+        assert st["graph_get"] <= 1, f"graph_get re-read {st['graph_get']} times in the steady state"
+        # A focused select keeps its place and the row's sweep time still follows the polls.
+        select.focus()
+        sweep = row.locator(".sweep-ms")
+        first = sweep.text_content()
+        page.wait_for_function(
+            "([id, t]) => document.querySelector(`#jobs .job[data-job=\"${id}\"] .sweep-ms`)"
+            ".textContent !== t", arg=[scans[0]["id"], first], timeout=8_000)
+        assert page.evaluate("() => document.activeElement.className") == "scan-look"
+        # A choice blurs it.
+        select.select_option("long")
+        page.wait_for_timeout(500)
+        assert page.evaluate("() => document.activeElement.className") != "scan-look", \
+            "the select kept the focus after a choice"
+    finally:
+        page.unroute("**/op", route)
+        for j in running_scan_jobs(url, secret, "tone") or scans:
+            stop_job(url, secret, j["id"])
+
+
 def scenario_scan_of_a_sub_band_scans_just_that_band(page, url, secret):
     show_tone_waterfall(page, url, secret)
     wait_span(page, 1.5)  # drag_menu asserts at least 1 s

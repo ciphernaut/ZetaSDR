@@ -75,8 +75,9 @@
 //       averaged, long look; coarse and fast when `depths(source)` lists a lossy depth) or
 //       `custom`; a choice sets dwell_ms, average and bits on the stored fft node and applies
 //       `graph_put` through applyOp (a conflict shows its line naming the holders; graph_put
-//       takes no `replace`, so there is no stop-and-retry). The row whose select has the focus
-//       is left as it is across renders (an open dropdown stays open).
+//       takes no `replace`, so there is no stop-and-retry). While a row's select has the focus
+//       the select stays as it is across renders (an open dropdown stays open) and the row's
+//       state and sweep time are updated in place; a choice blurs it.
 //       A running row of a SQUELCH_KINDS kind is tagged `squelch` (setSquelchTag) while
 //       squelch(id) (overlays.js: the last `squelch` event seen on the job's event stream)
 //       has `open: false`.
@@ -593,6 +594,7 @@ function lookSelect(job, scan, depths, onLook) {
   sel.value = current;
   sel.onchange = () => {
     const l = SCAN_LOOKS.find((x) => x.id === sel.value);
+    sel.blur(); // the next render may replace the row
     if (l) onLook(job, { dwell_ms: l.dwell_ms, average: l.average, bits: l.bits === "lossy" ? lossy : l.bits });
   };
   return sel;
@@ -924,7 +926,8 @@ export function startJobs(
       params &&
       ((params.dwell_ms ?? 20) !== (ctx.dwell_ms_asked ?? ctx.dwell_ms ?? 20) ||
         (params.average ?? 1) !== (ctx.average_asked ?? ctx.average ?? 1) ||
-        (params.bits ?? null) !== (ctx.bits ?? null));
+        // the depth in force is in the context whether or not the node stores one
+        (params.bits != null && params.bits !== ctx.bits));
     if (!params || stale) {
       const g = await api.op({ op: "graph_get", job: id }).catch(() => null);
       params = g?.value?.nodes?.find((n) => n.kind === "fft")?.params ?? null;
@@ -1238,10 +1241,20 @@ export function startJobs(
     const focused = document.activeElement?.matches?.("select.scan-look")
       ? document.activeElement.closest(".job")
       : null;
-    const rows = shown.map((j) =>
-      focused && focused.dataset.job === j.id && focused.parentNode
-        ? focused
-        : jobRow(j, async (id, button) => {
+    const keep = (fresh) => {
+      // Only the select stays as it is: the row's state and sweep time follow the fresh row.
+      for (const cls of ["state", "sweep-ms"]) {
+        const now = fresh.querySelector(`.${cls}`);
+        const was = focused.querySelector(`.${cls}`);
+        if (now && was) was.textContent = now.textContent;
+        else if (now) focused.append(now);
+        else if (was) was.remove();
+      }
+      focused.dataset.state = fresh.dataset.state;
+      return focused;
+    };
+    const rows = shown.map((j) => {
+      const fresh = jobRow(j, async (id, button) => {
         button.disabled = true;
         try {
           await api.op({ op: "job_stop", job: id });
@@ -1249,8 +1262,9 @@ export function startJobs(
           if (!(e.json && e.status === 422)) transcript.note(`job_stop: ${e.message}`, true);
         }
         refresh();
-      }, buttons),
-    );
+      }, buttons);
+      return focused && focused.dataset.job === j.id && focused.parentNode ? keep(fresh) : fresh;
+    });
     placeChildren(el, fold(shown, rows, jobs));
     if (countEl) {
       const n = shown.filter((j) => !isFinished(j)).length;
