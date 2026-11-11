@@ -20,8 +20,9 @@
 //     wf.sourceId   id of the source being shown (null when none, or after setSource failed)
 //     wf.jobId      the followed job's id (null until known)
 //     wf.mode       "spectrum" (a spectrum job's capture), "scan" (a running scan job,
-//         followed read-only) or "sweep" (the page's own scan of a source that sweeps for
-//         itself, re-aimed with the view; see Sweep mode)
+//         followed read-only, unless it is the page's own background scan of the shown
+//         source: see Wide views on a free radio) or "sweep" (the page's own scan of a source
+//         that sweeps for itself, re-aimed with the view; see Sweep mode)
 //     wf.syncJobs(jobs)  a `job_list` result (app.js hands it every poll): follows a scan job
 //         that started on the shown source, or goes back to a spectrum job when it ended
 //     wf.onNotice   fn(text) for transcript lines (a refused retune); set by app.js
@@ -54,6 +55,16 @@
 //         scans views past the capture (zoom_out "scan"); see Band control.
 //     wf.coarseCan  null, or async fn(lo, hi) -> bool set by coarse.js: whether a scanner
 //         could show lo..hi (null counts as yes); see Band control.
+//     wf.coarseOwns null, or fn(jobId) -> bool set by coarse.js: whether the job is the page's
+//         own background scan; see Wide views on a free radio.
+//     wf.ownScan() -> whether the waterfall follows the page's own scan of the shown source
+//     wf.followScan(id, tuning)  follows the page's own scan `id` of the shown source over
+//         `tuning` ({center_hz, bandwidth_hz}) in scan mode, keeping what is painted and the
+//         view shown (the band becomes the scan's span)
+//     wf.swapScan(start)  replaces the page's own scan of the shown source: the scan
+//         followed is let go (its end restarts nothing) while async `start()` runs, the view
+//         moving freely meanwhile, then follows what it answers: {id, tuning} (followScan),
+//         {restore: {lo, hi}} (restoreView) or null (setSource again)
 //     wf.follow     null, or fn() -> "target" | "free" set by app.js (the `follow` policy;
 //         null counts as "target"); see Following the capture.
 //     wf.addCoarseEvent(msg)  a frame of the coarse layer's scan (coarse.js onRow): stitched
@@ -138,8 +149,13 @@
 // holder or a pin) whose view nothing can show (zoom_out "none", or no scanner for it:
 // wf.coarseCan) says so at every such gesture, `conflict: source <id> held by <kind> <id>,
 // …; the view stays at its capture` in the transcript (heldBack), and the view eases back
-// into the capture; an unheld one is asked with `source_ensure` as above. In scan mode the
-// view stays inside the scan's span and never retunes; in sweep mode it re-aims the scan.
+// into the capture; an unheld one is asked with `source_ensure` as above. The page's own
+// background scan (wf.coarseOwns) is no holder here: the coarse layer moves or stops it. In
+// scan mode following a scan the page did not start, the view stays inside the scan's span
+// and never retunes: a gesture past it is clamped and says so, `view: the waterfall follows
+// scan <id>, which this page did not start; the view stays inside its span <lo>-<hi> MHz`.
+// Following the page's own scan of the shown source, see Wide views on a free radio; in
+// sweep mode the view re-aims the scan.
 //
 // Layers (spec 4.2): outside scan mode each column is composed from two buffers: the coarse
 // column, into which every coarse row is stitched over its own step's band exactly as scan
@@ -172,6 +188,18 @@
 // blank.
 // When the page's own job_start is refused as a conflict and a scan now runs on the source,
 // the waterfall follows that scan instead.
+//
+// Wide views on a free radio: a view wider than the shown source can capture, with nothing
+// but scans holding it, is scanned by the page's own background scan on the source itself
+// (coarse.js, the shown-source fallback), which stops the page's elastic job; the waterfall
+// then follows that scan in scan mode (followScan: from the job's end or the jobs poll,
+// keeping what is painted), but the view stays the operator's: a wheel zoom, an axis drag
+// and an Apply show the band asked at once (wf.ownScan), clamped only to the source's tune
+// range (rangeClamp; a drag stops at its edges), the rows already painted drawn again on it
+// (each on its own band), and a step reaching past the span does not widen the view. The
+// coarse layer, SCAN_DEBOUNCE_MS after the last gesture, then moves what feeds the view: a
+// band one capture holds retunes there (the scan stopped first, restoreView); a wider one
+// replaces the scan with one over it (swapScan), the picture kept until its rows come.
 //
 // Sweep mode (a source whose `source_list` record has `capabilities.sweep`, a KiwiSDR): the
 // tab shows the source's own waterfall. The page starts no spectrum job there; it starts a
@@ -585,6 +613,8 @@ class Waterfall {
     this.retuning = false;
     this.coarseActive = null;
     this.coarseCan = null;
+    this.coarseOwns = null;
+    this.swapping = false; // the page's own scan of the shown source being replaced (swapScan)
     this.reaimTarget = null; // sweep mode: the view the next job_retune asks for
     this.reaimTimer = null;
     this.reaimBusy = false;
@@ -729,25 +759,97 @@ class Waterfall {
       }
       if (!jobId) return;
       this.jobId = jobId;
-      const streamId = await this.findStream(jobId, gen);
-      if (gen !== this.gen) return;
-      if (!streamId) throw new Error(`no event stream for job ${jobId}`);
-      this.sub = this.api.streamText(
-        streamId,
-        (msg) => {
-          if (gen !== this.gen || msg.type !== "frame") return;
-          this.badge.hidden = true;
-          this.addEvent(msg);
-        },
-        ({ reconnecting }) => {
-          if (gen === this.gen && reconnecting) this.badge.hidden = false;
-        },
-        { onReconnect: () => this.reresolve(src, jobId, gen) },
-      );
+      await this.subscribe(src, jobId, gen);
     } catch (e) {
       if (gen === this.gen) this.src = null; // selecting the source again retries
       console.warn(`waterfall ${src.id}: ${e.message}`);
     }
+  }
+
+  // Follows the event stream of `jobId` on `src` for generation `gen`; throws when the job
+  // has none.
+  async subscribe(src, jobId, gen) {
+    const streamId = await this.findStream(jobId, gen);
+    if (gen !== this.gen) return;
+    if (!streamId) throw new Error(`no event stream for job ${jobId}`);
+    this.sub = this.api.streamText(
+      streamId,
+      (msg) => {
+        if (gen !== this.gen || msg.type !== "frame") return;
+        this.badge.hidden = true;
+        this.addEvent(msg);
+      },
+      ({ reconnecting }) => {
+        if (gen === this.gen && reconnecting) this.badge.hidden = false;
+      },
+      { onReconnect: () => this.reresolve(src, jobId, gen) },
+    );
+  }
+
+  // Whether `id` is the page's own background scan (coarse.js's).
+  ownsScan(id) {
+    return !!id && !!this.coarseOwns && this.coarseOwns(id);
+  }
+
+  // Whether the waterfall follows the page's own background scan of the shown source (the
+  // shown-source fallback, also while it is being replaced): the view is the operator's, not
+  // the scan's (see Wide views on a free radio).
+  ownScan() {
+    return this.mode === "scan" && (this.swapping || this.ownsScan(this.jobId));
+  }
+
+  // Follows `id`, the page's own scan of the shown source over `tuning`, without clearing:
+  // what is painted stays (each row on its own band), the band becomes the scan's span and
+  // the view shown is kept. When its stream is not found the source is shown again as it is.
+  async followScan(id, tuning) {
+    const src = this.src;
+    if (!src) return;
+    const gen = ++this.gen;
+    if (this.sub) this.sub.close();
+    this.sub = null;
+    const prev = this.shown();
+    this.mode = "scan";
+    this.jobId = id;
+    this.tuning = usableTuning(tuning);
+    if (this.tuning) {
+      const t = this.tuning;
+      this.band = { lo: t.center_hz - t.bandwidth_hz / 2, hi: t.center_hz + t.bandwidth_hz / 2 };
+      this.view = this.keptView(prev);
+      this.viewChanged();
+    }
+    try {
+      await this.subscribe(src, id, gen);
+    } catch (e) {
+      console.warn(`waterfall ${src.id}: ${e.message}`);
+      if (gen === this.gen) this.setSource(src, { restart: true });
+    }
+  }
+
+  // Replaces the page's own scan of the shown source (coarse.js): the scan followed is let go
+  // (its end restarts nothing) while `start` runs, gestures meanwhile moving the view freely,
+  // then the waterfall follows what `start` answers: {id, tuning}, the page's new scan
+  // (followScan, the picture kept); {restore: {lo, hi}}, that band captured (restoreView);
+  // null, the source as it is (setSource).
+  async swapScan(start) {
+    const src = this.src;
+    if (!src) return;
+    const gen = ++this.gen;
+    if (this.sub) this.sub.close();
+    this.sub = null;
+    this.jobId = null;
+    this.swapping = true;
+    let next = null;
+    try {
+      next = await start();
+    } catch (e) {
+      console.warn(`waterfall ${src.id}: ${e.message}`);
+    } finally {
+      this.swapping = false;
+    }
+    if (gen !== this.gen || this.src !== src) return; // another source, or a restart
+    if (next && next.id) this.followScan(next.id, next.tuning);
+    else if (next && next.restore) this.restoreView(next.restore.lo, next.restore.hi);
+    else this.setSource(src, { restart: true });
   }
 
   // Follows the shown source again after release().
@@ -756,7 +858,9 @@ class Waterfall {
   }
 
   // The followed job's current event stream id; null to try again after the next backoff.
-  // When the job no longer runs, setSource starts over (closing this subscription).
+  // When the job no longer runs, setSource starts over (closing this subscription), or, when
+  // the page's own scan now runs on the source (it took the source from the page's job),
+  // the waterfall follows that scan with the picture kept (followScan).
   async reresolve(src, jobId, gen) {
     const id = await this.lookupStream(jobId);
     if (gen !== this.gen) return null;
@@ -766,14 +870,17 @@ class Waterfall {
     const job = jobs.find((j) => j.id === jobId);
     if (job && isRunning(job)) return null; // restarting
     this.forgetUiJob(jobId);
-    this.setSource(src, { restart: true });
+    const scan = this.mode === "spectrum" ? runningScan(jobs, src.id) : null;
+    if (scan && this.ownsScan(scan.id)) this.followScan(scan.id, scan.tuning);
+    else this.setSource(src, { restart: true });
     return null;
   }
 
-  // A `job_list` result: follow a scan that started on the shown source, or leave scan mode
-  // when the followed scan is gone (the stream's close usually gets there first).
+  // A `job_list` result: follow a scan that started on the shown source (the page's own with
+  // the picture kept, followScan), or leave scan mode when the followed scan is gone (the
+  // stream's close usually gets there first).
   syncJobs(jobs) {
-    if (!this.src || !this.sub || this.retuning) return;
+    if (!this.src || !this.sub || this.retuning || this.swapping) return;
     if (this.mode === "sweep") {
       // The tab's sweep ended (stopped elsewhere), or a stepped scan started on the source
       // (followed read-only instead): start over. Not for a stepped scan waiting for the
@@ -796,7 +903,8 @@ class Waterfall {
     const scan = runningScan(jobs, this.src.id);
     if (scan && scan.id !== this.jobId && !this.stopping.has(scan.id)) {
       if (this.mode === "spectrum" && this.jobId) this.stopOwnJob(this.jobId);
-      this.setSource(this.src, { restart: true });
+      if (this.mode === "spectrum" && this.ownsScan(scan.id)) this.followScan(scan.id, scan.tuning);
+      else this.setSource(this.src, { restart: true });
     } else if (!scan && this.mode === "scan") {
       this.setSource(this.src, { restart: true });
     }
@@ -1083,11 +1191,13 @@ class Waterfall {
 
   // Scan mode: the band grows to take in `row` (a step may reach past the scan's tuning),
   // keeping what is painted: the stored rows are drawn again on the wider band.
+  // The page's own scan keeps the view shown (the operator's), the wider band notwithstanding.
   widenBand(row) {
     const b = this.band;
     if (row.lo >= b.lo && row.hi <= b.hi) return;
+    const prev = this.shown();
     this.band = { lo: Math.min(b.lo, row.lo), hi: Math.max(b.hi, row.hi) };
-    this.view = this.fitView(this.view);
+    this.view = this.ownScan() ? this.keptView(prev) : this.fitView(this.view);
     this.viewChanged();
   }
 
@@ -1370,8 +1480,10 @@ class Waterfall {
     set(this.widthIn, s ? ((s.hi - s.lo) / 1e3).toFixed(3) : "");
   }
 
-  // Shows lo..hi Hz: a re-render inside the capture (a scan: kept inside its span), else a
-  // retune (ruling R2); in sweep mode the page's scan is re-aimed (aimSweep).
+  // Shows lo..hi Hz: a re-render inside the capture (a scan someone else started: kept inside
+  // its span, said in the transcript), else a retune (ruling R2); in sweep mode the page's
+  // scan is re-aimed (aimSweep); following the page's own scan of the shown source the view
+  // is shown as asked, inside the tune range, and the coarse layer moves what feeds it.
   requestView(lo, hi) {
     if (!this.band || this.retuning || !(hi > lo)) return;
     this.cancelEase();
@@ -1381,10 +1493,21 @@ class Waterfall {
     }
     const b = this.band;
     const tol = this.slackHz();
-    if (lo >= b.lo - tol && hi <= b.hi + tol) {
+    if (this.ownScan()) {
+      [lo, hi] = this.rangeClamp(lo, hi);
+      this.view = this.keptView({ lo, hi });
+      this.viewChanged();
+    } else if (lo >= b.lo - tol && hi <= b.hi + tol) {
       this.setView(lo, hi);
     } else if (this.mode === "scan") {
-      this.setView(...this.clampToBand(lo, hi));
+      const [a, z] = this.clampToBand(lo, hi);
+      if (Math.abs(a - lo) > tol || Math.abs(z - hi) > tol) {
+        const mhz = (hz) => (hz / 1e6).toFixed(3);
+        this.notice(
+          `view: the waterfall follows scan ${this.jobId}, which this page did not start; the view stays inside its span ${mhz(b.lo)}-${mhz(b.hi)} MHz`,
+        );
+      }
+      this.setView(a, z);
     } else {
       this.retune(lo, hi);
     }
@@ -1400,6 +1523,18 @@ class Waterfall {
     this.showBandInputs();
     this.scheduleRedraw();
     this.fireView();
+  }
+
+  // lo..hi moved inside the shown source's tune range (the whole range when wider); as given
+  // when the range is not known.
+  rangeClamp(lo, hi) {
+    const c = (this.src && this.src.capabilities) || {};
+    const min = capHz(c.tune_min_hz);
+    const max = capHz(c.tune_max_hz);
+    if (min === null || max === null || !(max > min)) return [lo, hi];
+    const span = Math.min(hi - lo, max - min);
+    const a = Math.max(min, Math.min(max - span, lo));
+    return [a, a + span];
   }
 
   // lo..hi moved inside the capture; the whole capture when it is wider.
@@ -1467,6 +1602,8 @@ class Waterfall {
     // Sweep mode: the view stops at the edges of the sweep's range.
     const sw = this.mode === "sweep" ? sweepCaps(this.src) : null;
     if (sw) p.target = clampSweep(sw, p.target[0], p.target[1]);
+    // The page's own scan of the shown source: the view stops at the tune range's edges.
+    else if (this.ownScan()) p.target = this.rangeClamp(p.target[0], p.target[1]);
     this.view = { lo: p.target[0], hi: p.target[1] };
     this.viewChanged();
   }
@@ -1507,7 +1644,8 @@ class Waterfall {
         if (this.src === src) revert();
         return;
       }
-      const holders = rigidHolders(info);
+      // The page's own background scan is no holder here: the coarse layer moves or stops it.
+      const holders = rigidHolders(info).filter((h) => !this.ownsScan(h));
       const coarseOn = !!this.coarseActive && this.coarseActive();
       if (coarseOn && (holders.length || !this.capturable(info, lo, hi))) {
         // A held source whose view no scanner can show: said at the gesture, eased back.

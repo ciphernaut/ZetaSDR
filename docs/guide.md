@@ -638,6 +638,16 @@ or pan, spans the visible range clamped to the scanner's tune range, is replaced
 changes and stopped when the view returns inside the fine capture. A scan the page did not start
 is never touched.
 
+On a free radio (nothing but scans holding it) with no other source to scan the view, the page's
+scan runs on the radio itself, and the view stays yours: the wheel, a drag on the axis and the
+`#band` form show the band asked at once, stopping only at the radio's tune range, with the rows
+already painted drawn on it. About 300 ms after the last change the page moves what feeds the
+view: a band one capture holds stops the page's scan and retunes the radio there; a wider one
+replaces the scan with one over the new band, and its rows replace the old as they arrive. A scan
+someone else started on the shown radio is followed as it is: a gesture past its span stays
+inside it, with `view: the waterfall follows scan <id>, which this page did not start; …` in the
+transcript.
+
 A source that sweeps for itself (one with `capabilities.sweep`, such as a KiwiSDR) shows its own
 waterfall in its tab, live. The page starts a `scan` with `method: source` of its own over the
 whole sweep range (0-30 MHz on a Kiwi), asked as one view so the rows come at the source's frame
@@ -815,7 +825,9 @@ gets (a file source answers `out_of_range` and the view reverts). When a job or 
 source and no scanner can show the wider view, every such zoom, drag or Apply writes
 `conflict: source <id> held by <kind> <id>, …; the view stays at its capture` to the
 transcript, naming each holder, and the view eases back to the capture. With a scanner the
-coarse layer below shows the wider view instead.
+coarse layer below shows the wider view instead; on a free radio zoomed out past its widest
+capture the page's own scan of the radio feeds the view, which keeps moving with every gesture
+(see the two layers, above).
 
 `scan` sweeps a span wider than one capture: `job start --kind scan --center-hz C
 --bandwidth-hz W` steps the source across `C ± W/2` in captures of the source's whole

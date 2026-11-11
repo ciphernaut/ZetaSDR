@@ -2868,6 +2868,362 @@ def scenario_zoom_in_stops_the_shown_source_scan(page, url, secret):
         stop_scans(url, secret)
 
 
+# ---- a wide view on a free radio ----------------------------------------------------------
+# `retune` (48 kHz captures over 200-300 MHz, nothing holding it) zoomed out past its widest
+# capture: the view still moves with every gesture, clamped only to the tune range; what feeds
+# it follows (a retune when the view fits one capture, the page's own scan otherwise).
+
+# What the operator sees and what feeds it: the mode, the band shown, the axis, the coarse
+# layer.
+WV_STATE_JS = """() => {
+  const t = window.zetaTest;
+  const w = t.wf();
+  const wf = t.waterfall();
+  return {mode: t.waterfallMode, view: w && w.view, band: w && w.band, jobId: w && w.jobId,
+    painted: w && w.painted, coarsePainted: w && w.coarsePainted, coarse: t.coarse(),
+    outside: !!wf && wf.isOutside(), retuning: !!wf && wf.retuning,
+    ticks: [...document.querySelectorAll('#waterfall .wf-axis .tick:not(.ch)')]
+      .map((e) => e.textContent)};
+}"""
+
+
+class WideView:
+    """Steps of a wide-view scenario: each `step` records what the page shows (axis, view,
+    mode), the ops it sent, the jobs running and the new transcript lines, prints them, and
+    with ZETA_UI_WV_SHOTS=<dir> saves a screenshot `<ZETA_UI_WV_TAG or after>-<name>.png`."""
+
+    def __init__(self, page, url, secret, prefix):
+        self.page, self.url, self.secret, self.prefix = page, url, secret, prefix
+        # A request listener, not a route: a route holds the page's ops while the scenario
+        # polls the node over HTTP without calling Playwright.
+        self.ops = []
+        self.seen_ops = 0
+        self.seen_lines = 0
+        page.on("request", self.on_request)
+
+    def on_request(self, req):
+        if req.method == "POST" and req.url.endswith("/op"):
+            try:
+                self.ops.append(json.loads(req.post_data or ""))
+            except ValueError:
+                pass
+
+    def close(self):
+        self.page.remove_listener("request", self.on_request)
+
+    def state(self):
+        return self.page.evaluate(WV_STATE_JS)
+
+    def jobs(self):
+        jobs = http_json(self.url, self.secret, "/op", {"op": "job_list"})["value"]
+        out = []
+        for j in jobs:
+            if j["state"]["status"] != "running":
+                continue
+            scan = (j.get("context") or {}).get("scan") or {}
+            out.append({"id": j["id"], "kind": j["kind"], "source": j["source"],
+                        "tuning": j.get("tuning"), "elastic": j.get("elastic"),
+                        "waiting": scan.get("waiting")})
+        return out
+
+    def step(self, name):
+        st = self.state()
+        ops = [o for o in self.ops[self.seen_ops:]
+               if o.get("op") not in ("job_list", "source_list", "stream_list")]
+        self.seen_ops = len(self.ops)
+        lines = self.page.locator("#transcript .line").all_text_contents()
+        new = lines[self.seen_lines:]
+        self.seen_lines = len(lines)
+        print(f"  [{self.prefix}:{name}] ticks {st['ticks']} mode {st['mode']} "
+              f"view {st['view']} band {st['band']} outside {st['outside']} "
+              f"coarse {st['coarse']} painted {st['painted']}/{st['coarsePainted']}")
+        print(f"  [{self.prefix}:{name}] ops {ops}")
+        print(f"  [{self.prefix}:{name}] jobs {self.jobs()}")
+        print(f"  [{self.prefix}:{name}] lines {new}")
+        shots = os.environ.get("ZETA_UI_WV_SHOTS")
+        if shots:
+            tag = os.environ.get("ZETA_UI_WV_TAG", "after")
+            self.page.screenshot(path=os.path.join(shots, f"{tag}-{self.prefix}-{name}.png"))
+        return st
+
+
+def wait_shown(page, lo, hi, what, tol=None, timeout=5_000):
+    """Wait until the band shown (wf().view) is lo..hi, to `tol` Hz (default 1% of its width)."""
+    tol = tol if tol is not None else (hi - lo) * 0.01
+    try:
+        page.wait_for_function(
+            """([lo, hi, tol]) => {
+              const v = window.zetaTest.wf().view;
+              return !!v && Math.abs(v.lo - lo) <= tol && Math.abs(v.hi - hi) <= tol;
+            }""", arg=[lo, hi, tol], timeout=timeout)
+    except Exception as e:
+        raise AssertionError(f"{what}: shown {page.evaluate(WV_STATE_JS)}, want {lo}..{hi}") \
+            from e
+    return page.evaluate(WF_STATE_JS)["view"]
+
+
+def wait_own_scan_over(page, url, secret, lo, hi, what, within_s=10.0):
+    """Wait until the page's own scan (sessionStorage) is the only scan running on `retune`,
+    stepping (not waiting) over lo..hi (to 2% of its width), and the waterfall follows it; its
+    job record."""
+    tol = (hi - lo) * 0.02
+
+    def ok():
+        own = page.evaluate(AUTO_SCAN_JS)
+        scans = running_scan_jobs(url, secret, "retune")
+        if len(scans) != 1 or scans[0]["id"] != own:
+            return None
+        if ((scans[0].get("context") or {}).get("scan") or {}).get("waiting"):
+            return None
+        t = scans[0]["tuning"]
+        a, z = t["center_hz"] - t["bandwidth_hz"] / 2, t["center_hz"] + t["bandwidth_hz"] / 2
+        if abs(a - lo) > tol or abs(z - hi) > tol:
+            return None
+        w = page.evaluate(WV_STATE_JS)
+        return scans[0] if w["mode"] == "scan" and w["jobId"] == own else None
+
+    try:
+        return wait_until(ok, within_s, what)
+    except AssertionError as e:
+        raise AssertionError(f"{e}: scans {running_scan_jobs(url, secret, 'retune')}, own "
+                             f"{page.evaluate(AUTO_SCAN_JS)}, page {page.evaluate(WV_STATE_JS)}"
+                             ) from None
+
+
+def wait_rows_in(page, lo, hi, what):
+    """Wait for a column painted after now from a row inside lo..hi (a scan step may reach a
+    step past the span's ends)."""
+    p0 = page.evaluate(WF_STATE_JS)["painted"]
+    try:
+        page.wait_for_function(
+            f"""([lo, hi, p0]) => {{
+              const r = ({NEWEST_ROW_JS})();
+              const w = window.zetaTest.wf();
+              return w.painted > p0 + 2 && !!r && r.lo >= lo - (r.hi - r.lo)
+                && r.hi <= hi + (r.hi - r.lo);
+            }}""", arg=[lo, hi, p0], timeout=10_000)
+    except Exception as e:
+        raise AssertionError(f"{what}: newest row {page.evaluate(NEWEST_ROW_JS)}, want inside "
+                             f"{lo}..{hi}") from e
+
+
+def no_refusals(page, what):
+    """Neither a conflict nor a refused-view line in the transcript."""
+    for text in ("conflict:", "view reverted", "view: the waterfall follows"):
+        lines = page.locator("#transcript .line", has_text=text).all_text_contents()
+        assert not lines, f"{what}: {lines}"
+
+
+def show_retune_zoomed_out(page, url, secret, centre_hz, width_hz):
+    """Show `retune` with nothing else running, Apply centre_hz/width_hz (wider than its 48 kHz
+    capture) and wait for the page's own scan over it; the view."""
+    stop_scans(url, secret)
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    set_band(page, centre_hz, width_hz)
+    lo, hi = centre_hz - width_hz / 2, centre_hz + width_hz / 2
+    wait_shown(page, lo, hi, "the view after Apply")
+    wait_own_scan_over(page, url, secret, lo, hi, "the page's scan over the view")
+    return page.evaluate(WF_STATE_JS)["view"]
+
+
+def scenario_wide_view_on_a_free_radio_moves_with_every_gesture(page, url, secret):
+    # The operator's steps on a free radio: zoomed out past the widest capture (several wheel
+    # notches), a drag on the axis and a typed band always move the view; what feeds it follows:
+    # the page's own scan over a view wider than a capture, a retune for one that fits.
+    stop_scans(url, secret)
+    wv = None
+    try:
+        select_source(page, url, secret, "retune")
+        page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+        wv = WideView(page, url, secret, "operator")
+        start = wv.step("1-shown")["view"]
+        centre = (start["lo"] + start["hi"]) / 2
+        for i in range(6):
+            wheel_at_centre(page, 100)
+            page.wait_for_timeout(250)
+            wv.step(f"2-wheel-out-{i + 1}")
+        # Six notches out: 64 times the capture, about where the view was.
+        width = 48_000 * 64
+        v = wait_shown(page, centre - width / 2, centre + width / 2, "zoomed out six notches",
+                       tol=width * 0.02)
+        wait_own_scan_over(page, url, secret, v["lo"], v["hi"], "the page's scan, zoomed out")
+        wait_rows_in(page, v["lo"], v["hi"], "rows of the zoomed-out view")
+        wv.step("3-zoomed-out")
+        no_refusals(page, "zoomed out")
+        # (a) The axis dragged down a quarter of its height shows a quarter of the view higher,
+        # then up half its height half the view lower; each time the scan moves with it.
+        h = page.locator("#waterfall .wf-axis").bounding_box()["height"]
+        for name, dy in (("4-drag-down", h / 4), ("5-drag-up", -h / 2)):
+            before = page.evaluate(WF_STATE_JS)["view"]
+            drag_axis(page, dy)
+            off = dy / h * (before["hi"] - before["lo"])
+            v = wait_shown(page, before["lo"] + off, before["hi"] + off, f"after {name}")
+            wait_own_scan_over(page, url, secret, v["lo"], v["hi"], f"the scan after {name}")
+            wait_rows_in(page, v["lo"], v["hi"], f"rows after {name}")
+            page.wait_for_timeout(500)
+            wait_shown(page, v["lo"], v["hi"], f"not clamped back after {name}", timeout=100)
+            wv.step(name)
+        if os.environ.get("ZETA_UI_WV_SHOTS"):
+            # For the screenshots only: the scan's sweeps fill the view in.
+            page.wait_for_timeout(4_000)
+            wv.step("5b-filled")
+        # (b) A band typed in, wider than a capture and well away: shown, and scanned there.
+        apply_band(page, "280", "2000")
+        wait_shown(page, 279_000_000, 281_000_000, "after Apply 280 MHz, 2 MHz wide")
+        wait_own_scan_over(page, url, secret, 279_000_000, 281_000_000, "the scan at 280 MHz")
+        wait_rows_in(page, 279_000_000, 281_000_000, "rows at 280 MHz")
+        wv.step("6-apply-wide-280")
+        no_refusals(page, "after the wide Apply")
+        # A band one capture holds, far from the scan: the scan stops, the radio is tuned there.
+        apply_band(page, "220", "24")
+        wait_shown(page, 219_988_000, 220_012_000, "after Apply 220 MHz, 24 kHz wide")
+        wait_until(lambda: source_info(url, secret, "retune")["current"]["center_hz"]
+                   == 220_000_000, 10.0, "retune tuned to 220 MHz")
+        wait_until(lambda: not running_scan_jobs(url, secret, "retune"), 5.0,
+                   "the page's scan stopped")
+        page.wait_for_function(
+            "() => window.zetaTest.waterfallMode === 'spectrum'"
+            " && window.zetaTest.coarse().scanJobId === null", timeout=10_000)
+        wait_rows_in(page, 219_976_000, 220_024_000, "rows of the 220 MHz capture")
+        page.wait_for_timeout(500)
+        wait_shown(page, 219_988_000, 220_012_000, "still at 220 MHz", timeout=100)
+        assert page.evaluate(AUTO_SCAN_JS) is None, page.evaluate(AUTO_SCAN_JS)
+        wv.step("7-apply-narrow-220")
+        no_refusals(page, "after the narrow Apply")
+    finally:
+        if wv:
+            wv.close()
+        stop_scans(url, secret)
+
+
+def scenario_wide_view_moves_on_every_drag(page, url, secret):
+    # Several drags in a row, paced and back to back, each move the view at once; the page ends
+    # with one scan of its own, over where the view stopped.
+    wv = None
+    try:
+        v = show_retune_zoomed_out(page, url, secret, 250_000_000, 2_000_000)
+        wv = WideView(page, url, secret, "drags")
+        h = page.locator("#waterfall .wf-axis").bounding_box()["height"]
+        for i, wait_ms in enumerate((400, 400, 0, 0, 0)):
+            drag_axis(page, h / 8)
+            v = wait_shown(page, v["lo"] + 250_000, v["hi"] + 250_000, f"drag {i + 1}")
+            page.wait_for_timeout(wait_ms)
+        wv.step("1-five-drags")
+        v = wait_shown(page, 250_250_000, 252_250_000, "after five drags of 250 kHz")
+        wait_own_scan_over(page, url, secret, v["lo"], v["hi"], "one scan over the last view")
+        wait_rows_in(page, v["lo"], v["hi"], "rows of the last view")
+        no_refusals(page, "after the drags")
+        wv.step("2-settled")
+    finally:
+        if wv:
+            wv.close()
+        stop_scans(url, secret)
+
+
+def scenario_wide_view_zoomed_back_in_tunes_where_the_view_is(page, url, secret):
+    # Moved while zoomed out, then zoomed back in to a band one capture holds: the page's scan
+    # stops and the radio is tuned where the view is.
+    wv = None
+    try:
+        show_retune_zoomed_out(page, url, secret, 250_000_000, 2_000_000)
+        wv = WideView(page, url, secret, "zoom-in")
+        h = page.locator("#waterfall .wf-axis").bounding_box()["height"]
+        drag_axis(page, h / 4)
+        v = wait_shown(page, 249_500_000, 251_500_000, "dragged half a MHz up")
+        wv.step("1-moved")
+        centre = (v["lo"] + v["hi"]) / 2
+        for _ in range(6):
+            wheel_at_centre(page, -100)
+            page.wait_for_timeout(60)
+        v = page.evaluate(WF_STATE_JS)["view"]
+        width = 2_000_000 / 64
+        assert abs(v["hi"] - v["lo"] - width) <= width * 0.02, (v, width)
+        centre = (v["lo"] + v["hi"]) / 2
+        assert abs(centre - 250_500_000) <= 10_000, v
+        wait_until(lambda: not running_scan_jobs(url, secret, "retune"), 5.0,
+                   "the page's scan stopped")
+        cur = wait_until(lambda: (lambda c: c if c and abs(c["center_hz"] - centre) <= 1_000
+                                  else None)(source_info(url, secret, "retune")["current"]),
+                         10.0, f"retune tuned to the view's centre {centre}")
+        page.wait_for_function(
+            "() => window.zetaTest.waterfallMode === 'spectrum'"
+            " && window.zetaTest.coarse().scanJobId === null", timeout=10_000)
+        wait_shown(page, v["lo"], v["hi"], "the zoomed-in view kept")
+        wait_rows_in(page, cur["center_hz"] - 24_000, cur["center_hz"] + 24_000,
+                     "rows of the new capture")
+        no_refusals(page, "zoomed back in")
+        wv.step("2-zoomed-in")
+    finally:
+        if wv:
+            wv.close()
+        stop_scans(url, secret)
+
+
+def scenario_wide_view_stops_at_the_tune_range_edge(page, url, secret):
+    # retune tunes 200-300 MHz: a view dragged or typed past an edge stops at it, and so does
+    # the page's scan.
+    wv = None
+    try:
+        show_retune_zoomed_out(page, url, secret, 202_000_000, 2_000_000)
+        wv = WideView(page, url, secret, "edge")
+        h = page.locator("#waterfall .wf-axis").bounding_box()["height"]
+        drag_axis(page, -h * 3 / 4)  # would show 199.5-201.5 MHz
+        wait_shown(page, 200_000_000, 202_000_000, "dragged down to the bottom edge")
+        assert ticks(page)[4] == "200.000", ticks(page)
+        wv.step("1-bottom-edge")
+        apply_band(page, "299.5", "4000")  # would show 297.5-301.5 MHz
+        wait_shown(page, 296_000_000, 300_000_000, "typed past the top edge")
+        wait_own_scan_over(page, url, secret, 296_000_000, 300_000_000, "the scan at the top")
+        assert ticks(page)[0] == "300.000", ticks(page)
+        apply_band(page, "250", "400000")  # wider than the whole range
+        wait_shown(page, 200_000_000, 300_000_000, "wider than the range: all of it")
+        wait_own_scan_over(page, url, secret, 200_000_000, 300_000_000, "the scan over it all")
+        no_refusals(page, "at the edges")
+        wv.step("2-whole-range")
+    finally:
+        if wv:
+            wv.close()
+        stop_scans(url, secret)
+
+
+def scenario_wide_view_follows_a_scan_it_did_not_start_read_only(page, url, secret):
+    # A scan someone else started on the shown radio is followed as it is: a gesture past its
+    # span is refused with a transcript line, and the scan is left running.
+    stop_scans(url, secret)
+    wait_until(lambda: not running_scan_jobs(url, secret, "retune"), 5.0, "no scan on retune")
+    manual = start_job(url, secret, "scan", "retune", 250_000_000, 96_000)
+    try:
+        wait_until(lambda: (lambda r: r and not ((r.get("context") or {}).get("scan") or {})
+                            .get("waiting"))(job_record(url, secret, manual)), 5.0,
+                   "the manual scan stepping")
+        select_source(page, url, secret, "retune")
+        page.wait_for_function(
+            f"() => window.zetaTest.waterfallMode === 'scan'"
+            f" && window.zetaTest.wf().jobId === {json.dumps(manual)}"
+            " && window.zetaTest.wf().painted > 3", timeout=10_000)
+        page.wait_for_timeout(500)
+        page.wait_for_function(
+            f"() => window.zetaTest.waterfallMode === 'scan'"
+            f" && window.zetaTest.wf().jobId === {json.dumps(manual)}", timeout=10_000)
+        h = page.locator("#waterfall .wf-axis").bounding_box()["height"]
+        drag_axis(page, h / 4)
+        line = page.locator("#transcript .line", has_text="which this page did not start")
+        expect(line.first).to_be_visible()
+        expect(line.first).to_contain_text(manual)
+        page.wait_for_timeout(1_000)
+        w = page.evaluate(WF_STATE_JS)
+        tol = (w["band"]["hi"] - w["band"]["lo"]) * 0.01
+        assert w["view"]["lo"] >= w["band"]["lo"] - tol and w["view"]["hi"] <= w["band"]["hi"] + tol, \
+            f"the view left the scan's span: {w}"
+        rec = job_record(url, secret, manual)
+        assert rec["state"]["status"] == "running", rec
+        assert page.evaluate(AUTO_SCAN_JS) is None, page.evaluate(AUTO_SCAN_JS)
+    finally:
+        stop_job(url, secret, manual)
+        stop_scans(url, secret)
+
+
 # ---- two layers, outlines, easing (plan 11 Task 7) -----------------------------------------
 # The coarse scan's rows are painted across the whole view under the fine capture; every rigid
 # holder's band is outlined with its kind (the capture itself with none); under `follow

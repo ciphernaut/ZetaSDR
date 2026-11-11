@@ -14,9 +14,10 @@
 //         auto   the first source in `source_list` order that is not the shown one, is not
 //                faulted, has no rigid holder (a running scan holding it, the page's own or a
 //                manual one, is not rigid; a `pin` is) and whose tune range contains the
-//                view's centre; else the shown source itself when it has no holder at all
-//                and no pin (today's scan mode: the scan stops the page's elastic job,
-//                which restarts when it ends); a source whose `capabilities.sweep` holds
+//                view's centre; else the shown source itself when it has no rigid holder
+//                (a running scan is none, the page's own included) and no pin (the
+//                shown-source fallback: the scan stops the page's elastic job, which
+//                restarts when it ends); a source whose `capabilities.sweep` holds
 //                the view sweeps it for itself and is a scanner whatever holds or pins it,
 //                the shown one included (plan 36.2: no lease, the node decides)
 //         <id>   that source, as given
@@ -29,14 +30,19 @@
 //       by more than SPAN_CHANGE, is stopped first. With no scanner, or an empty span, the
 //       own scan is stopped and the transcript gets `coarse layer: no free source can scan
 //       <lo>-<hi> MHz`, once per view. Back inside the capture under auto_scan_stop "inside",
-//       or under zoom_out "none", the own scan is stopped. A scan the page did not start is
+//       or under zoom_out "none", the own scan is stopped; an own scan of the shown source
+//       is stopped there whatever auto_scan_stop says (it would only wait behind the
+//       capture the view is on). A scan the page did not start is
 //       never stopped. A failed stop of the own scan keeps its id (it stays the page's own,
 //       never mistaken for a manual one) and is retried on the next decision, STOP_RETRY_MS
 //       later at the latest; the id is forgotten only once a fresh job_list shows the scan
 //       no longer running. While the waterfall itself follows the own scan (the shown-source
-//       fallback, scan mode) nothing else is decided: zoomed back in under auto_scan_stop
-//       "inside" to a band the shown source can capture, the own scan is stopped and the
-//       waterfall restores that view (wf.restoreView). A followed scan whose event stream
+//       fallback, scan mode, where the view is the operator's: waterfall.js Wide views on a
+//       free radio) the view decides what feeds it: a band the shown source can capture in
+//       one tune, under auto_scan_stop "inside", stops the own scan and the waterfall
+//       restores that band (wf.restoreView); any other view, clamped to the source's tune
+//       range, whose span moved by more than SPAN_CHANGE replaces the own scan with one over
+//       it, the waterfall keeping its picture meanwhile (wf.swapScan). A followed scan whose event stream
 //       is not found (STREAM_LOOKUPS tries) is no longer followed and a decision is
 //       scheduled, which follows it again.
 //       Nothing is decided while the waterfall eases to a new capture (wf.easing): its end
@@ -46,7 +52,9 @@
 //       view leave the capture instead of clamping it or retuning past the source; and
 //       wf.coarseCan(lo, hi) -> Promise<bool>: whether, under zoom_out "scan", a scanner would
 //       be chosen for lo..hi with a non-empty span (both lists fetched afresh, as above), so
-//       the waterfall can tell the operator at once when a held source's view has none.
+//       the waterfall can tell the operator at once when a held source's view has none; and
+//       wf.coarseOwns(id) -> bool: whether `id` is the own scan (the waterfall never counts it
+//       as a holder, and follows it with the view its own).
 //       While the waterfall shows a source's own sweep (wf.mode "sweep", a KiwiSDR's tab) it
 //       decides nothing and starts nothing: that sweep shows any view of the source (one
 //       waterfall connection per Kiwi); its own scan, if any, is stopped and the coarse
@@ -130,6 +138,7 @@ class Coarse {
 
     wf.coarseActive = () => view.get("zoom_out") === "scan";
     wf.coarseCan = (lo, hi) => this.canScan(lo, hi);
+    wf.coarseOwns = (id) => !!id && id === this.scanJobId;
     wf.onView(() => this.schedule());
     view.onChange((key) => {
       if (key === "zoom_out" || key === "scanner" || key === "auto_scan_stop") {
@@ -213,7 +222,7 @@ class Coarse {
     }
     // The shown-source fallback: the waterfall itself follows the own scan in scan mode.
     if (this.scanJobId && wf.jobId === this.scanJobId) {
-      await this.endFallback();
+      await this.moveFallback();
       return;
     }
     const v = wf.isOutside() ? { lo: wf.view.lo, hi: wf.view.hi } : null;
@@ -221,7 +230,11 @@ class Coarse {
     if (!v || !scanning) {
       this.noted = null;
       if (!scanning) wf.clearCoarse();
-      if (this.scanJobId && (!scanning || this.view.get("auto_scan_stop") === "inside")) {
+      // An own scan of the shown source is stopped whatever auto_scan_stop says: inside the
+      // capture the radio is the view's (a retune the scan gave way to), not the scan's.
+      const onShown = this.ownSource(jobs) === wf.sourceId;
+      const stop = !scanning || onShown || this.view.get("auto_scan_stop") === "inside";
+      if (this.scanJobId && stop) {
         await this.stopOwn();
       }
       if (!this.scanJobId) this.unfollow();
@@ -263,23 +276,48 @@ class Coarse {
     await this.startOwn(pick.id, lo, hi);
   }
 
-  // The shown-source fallback scan (ruling R23): zoomed back in (narrower than the scan by
-  // more than SPAN_CHANGE) to a band the shown source can capture, under auto_scan_stop
-  // "inside", the scan is stopped and the waterfall asks for that band (wf.restoreView), so
-  // the page's elastic job comes back on it. The scan's span does not follow other zooms: in
-  // scan mode the waterfall keeps the view inside the scan, so only a zoom in can change it.
-  async endFallback() {
+  // The source of the own scan (its span, else `jobs`), or null.
+  ownSource(jobs) {
+    if (!this.scanJobId) return null;
+    if (this.span) return this.span.source;
+    const j = jobs.find((x) => x.id === this.scanJobId);
+    return j ? j.source : null;
+  }
+
+  // The shown-source fallback scan (ruling R23), which the waterfall follows in scan mode
+  // with the view the operator's (wf.ownScan): a view the shown source can capture in one
+  // tune, under auto_scan_stop "inside", stops the scan and the waterfall asks for that band
+  // (wf.restoreView), so the page's elastic job comes back on it; any other view (clamped to
+  // the source's tune range) whose span moved by more than SPAN_CHANGE from the scan's
+  // replaces the scan with one over it (stopOwn, startOwn), the waterfall keeping its picture
+  // meanwhile (wf.swapScan). The decision runs SCAN_DEBOUNCE_MS after the last gesture, so a
+  // drag replaces the scan once.
+  async moveFallback() {
     const wf = this.wf;
     const v = wf.shown();
-    const s = this.span || wf.band;
-    if (!v || !s || this.view.get("auto_scan_stop") !== "inside") return;
-    if (!(v.hi - v.lo < (s.hi - s.lo) * (1 - SPAN_CHANGE))) return;
+    if (!v) return;
     const srcs = (await this.fetchList("source_list")) || this.lastSources() || [];
     if (this.destroyed || !this.scanJobId || wf.jobId !== this.scanJobId) return;
     const info = srcs.find((x) => x.id === wf.sourceId);
-    if (!info || !wf.capturable(info, v.lo, v.hi)) return;
-    if (!(await this.stopOwn())) return;
-    wf.restoreView(v.lo, v.hi);
+    if (!info) return;
+    const tuning = wf.tuning;
+    const s =
+      this.span ||
+      (tuning && { lo: tuning.center_hz - tuning.bandwidth_hz / 2, hi: tuning.center_hz + tuning.bandwidth_hz / 2 });
+    const restore = this.view.get("auto_scan_stop") === "inside" && wf.capturable(info, v.lo, v.hi);
+    const range = tuneRange(info);
+    const lo = range ? Math.max(v.lo, range.lo) : v.lo;
+    const hi = range ? Math.min(v.hi, range.hi) : v.hi;
+    if (!restore && (!(hi > lo) || (s && !this.moved(s, lo, hi)))) return;
+    const target = { lo: v.lo, hi: v.hi };
+    await wf.swapScan(async () => {
+      if (!(await this.stopOwn())) return null; // still running: followed again, retried
+      if (restore) return { restore: target };
+      await this.startOwn(info.id, lo, hi);
+      if (!this.scanJobId) return null;
+      const center_hz = Math.round((lo + hi) / 2);
+      return { id: this.scanJobId, tuning: { center_hz, bandwidth_hz: Math.max(1, Math.round(hi - lo)) } };
+    });
   }
 
   // Whether a scanner would be chosen for lo..hi (zoom_out "scan", a non-empty span).
@@ -317,8 +355,9 @@ class Coarse {
       return !!r && r.lo <= centre && centre <= r.hi;
     });
     if (other) return other;
+    // The shown source itself when nothing but a scan holds it (the page's own included).
     const self = srcs.find((s) => s.id === shown);
-    if (self && (sweeps(self) || (!self.fault && rigidHolders(self).length === 0))) {
+    if (self && (sweeps(self) || (!self.fault && rigid(self).length === 0))) {
       return self;
     }
     return null;
