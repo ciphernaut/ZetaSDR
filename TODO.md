@@ -717,6 +717,8 @@ Not the same as the worker's healing (plan 20), which keeps an unplugged device 
 
 From the operator, 2026-11-09, attaching a KiwiSDR: "the Kiwi has a wideband RF view; are you sure we cannot tap into that?" Today the node takes only IQ from a source and runs its own `fft`, so a Kiwi source is its 12 kHz IQ channel and nothing else. The Kiwi's waterfall is a second websocket (`W/F` beside `SND`, which `zeta-source-kiwi` recognises and ignores) that streams its own FFT of the whole 0-30 MHz: 1024 bins of 8-bit dB per frame at the chosen zoom (zoom 0 is the whole band, about 29 kHz a bin; each zoom level halves the span; up to about 23 rows a second), with `SET zoom=.. start=..`, `SET maxdb/mindb` and `SET wf_speed`. It is a spectrum, not IQ: nothing can be demodulated from it, but it is exactly what a `spectrum` job's `fft` node produces and what the page's waterfall and a `watch`'s `detect` consume. A waterfall takes one of the Kiwi's waterfall-capable channels, fewer than its receiver channels on many Kiwis (the status page's `mode=rxN.wfM`). Wanted, as one mechanism and not a Kiwi special: a source capability `spectrum: {min_hz, max_hz, bins, rows_per_s}` for a source that can deliver spectrum rows itself; `spectrum` (and a span `watch`) on such a source expands to a `source_spectrum` node in place of `fft`, publishing `spectrum` rows with the source's `center_hz`/`bandwidth_hz` and a calibration offset, and the band it asks for picks the zoom and start; `measure`, the demodulators and the decoders still take the IQ channel. The same shape serves a future FPGA/PFB front end that computes its spectrum on the device and a `--source-node` forwarding another node's rows. The page then shows the Kiwi's whole HF band on its tab while one 12 kHz channel is worked on it.
 
+Built in plan 36.2: a `scan` on a source whose `capabilities.sweep` holds the span is swept by the source itself (`Port::sweep`; a KiwiSDR's waterfall stepped through zoom and centre), its rows forwarded as scan rows beside the source's other jobs. Still wanted: a `spectrum` job (and a span `watch`) reading a source's rows instead of running `fft`, and a `--source-node` forwarding a far source's rows (today a scan on it steps).
+
 From the KiwiSDR server source (jks-prv/Beagle_SDR_GPS, read 2026-11-09), what the stream is and where its limits sit:
 - Each `W/F` frame is a 16-byte header (`W/F` tag and a pad byte, then `x_bin_server`, `flags_x_zoom_server`, `seq` as little-endian u32) and 1024 unsigned bytes, one per display pixel: `dB = byte - 255`, nominally dBm at the antenna (the server maps 0..-200 dBm to 255..55; `MSG wf_cal=` carries the operator's calibration offset, applied by the client). Frames with the compression flag are IMA ADPCM, 2 pixels a byte and 10 tail samples to drop; `SET wf_comp=0` turns it off (zoom 0 is never compressed). `SET wf_speed=1..4` picks 1, 5, 13 or 23 frames a second. `SET zoom=Z cf=KHZ` (servers from v1.329) places the view: span is 30 MHz / 2^Z, Z 0..14; `SET interp=` picks how the server's FFT bins (8192 points, 4096 used at zoom 0, about 8 kHz each) fold into the 1024 pixels (max, min, last, drop, cma; 13 is drop with CIC compensation); `SET window_func=` picks the window. The first 2 to 4 bins of each frame are zeroed for DC. A `W/F` connection needs a waterfall-capable channel, and the connection's `MSG wf_chans=0` says none was free (an audio-FFT channel instead).
 - The 1024-pixel width is a server constant (`WF_WIDTH`), so the 29 kHz-per-pixel full-band view cannot be sharpened from our side at zoom 0. It can be sharpened the way our `scan` already does on a local radio: step one `W/F` connection through zoom and centre (`SET zoom= cf=`, a dwell for the CIC to settle, 23 frames a second), and assemble `spectrum` rows per step. That is the same job shape as `scan` with the Kiwi's own FFT in place of ours, with a calibrated dBm scale our local radios do not have. Changing the width itself would mean running a forked Kiwi server.
@@ -725,6 +727,8 @@ From the KiwiSDR server source (jks-prv/Beagle_SDR_GPS, read 2026-11-09), what t
 ## Spike: wideband views from the Kiwi and from custom B210-clone gateware
 
 From the operator, 2026-11-09. Two wanted outcomes, both through the spectrum-rows source above: (a) the Kiwi's wideband view on the page, one `W/F` connection stepped through zoom and centre as `scan` steps a radio; (b) custom gateware for the station's B210 clone (a larger FPGA than the original; UHD 4.6 sees it as a stock B210 today) that computes a wideband spectrum on the device and delivers rows beside the IQ, shown on the page the same way. Spike first, no spec yet: confirm the clone's FPGA part, how its image is loaded and built, and how rows would reach the host; then decide. Start with (a), which needs no hardware.
+
+Outcome (a) is closed by plan 36.2: a scan on a KiwiSDR sweeps its whole range over one `W/F` socket stepped through zoom and centre. Outcome (b) stays open.
 
 ## Video: the audio subcarrier stage
 
@@ -773,3 +777,31 @@ Find where the rate goes: the full-width PNG encode on `spawn_blocking`, the new
 ## Video: line timing jitter at modest SNR
 
 UAT 28.2: at 16-23 dB SNR the picture tears between the fields lost to overflows, presumably from line syncs misread in noise. Tune the line PLL (its gain and how it rejects an outlier edge) against the private 1.3 GHz fixtures, and add a test with noise added to a real cut.
+
+## Resume: a self-sweep scan leaves its shared capture alone
+
+A source with a resumable self-sweep scan has its shared capture left alone (`resume_captures`), so rigid jobs beside it resume without it. No effect on a KiwiSDR, which has one capture width; it matters for the next self-sweeping source with a wide capture.
+
+## Kiwi: pair the waterfall socket with the IQ session to save a user slot
+
+A scan's `W/F` socket stands alone and costs one more user slot while it runs (plan 36.2). Paired with the IQ session's timestamp it would share the session's channel. The server ends a pair together (closing the `W/F` stops the `SND`), so the socket would have to be parked, not closed, at a sweep's end. To settle on the live Kiwi's server version: UAT 36.2 check 2 (V1, V3, V4).
+
+## Sources: the HackRF's firmware sweep behind `Port::sweep`
+
+The HackRF's `hackrf_sweep` firmware mode is a second self-sweeping source: a span in one pass at a much higher rate than stepped tunes. Its `Capabilities.sweep` and `Port::sweep` would reuse the scan's source path; the open questions are its bin widths and the gaps between its steps.
+
+## Page: a self-sweep's rows as the coarse layer under the same source's fine capture
+
+Today the waterfall follows the scan and hides the fine rows of a capture on the same source. A self-sweep's rows could draw as the coarse layer beneath the fine capture, as another source's scan does for a source with a scanner.
+
+## Scan: `graph_put` to stepped on a self-sweep beside demodulators
+
+A `graph_put` that turns a self-sweeping scan to `stepped` while demodulators run beside it fails the scan after stopping it, since the stepped scan then needs the lease. Pre-check the lease in `graph_put` and refuse before the stop.
+
+## Sets: a scan member on a self-sweeping source still stops `replace` holders up front
+
+Check whether a named set's member can be a scan. If it can, a set whose scan member is on a self-sweeping source stops the `replace` holders before the scan's launch decides, though a self-sweep needs none stopped.
+
+## Scan: the self-sweep half of `node/scan.rs` in its own module
+
+`crates/zeta-core/src/node/scan.rs` carries the stepped loop and the self-sweep's start, wait and clock. Move the self-sweep half to its own module.

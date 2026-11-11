@@ -69,6 +69,21 @@ checked against a later server (v1.837); the facts below are unverified on that 
   frame whose header names the new view was sampled after the change; drop frames until it does.
   The down-converter's flush is a commented-out "uncertain" note (`:1124`), hence one extra frame.
 
+## What was built (plan 36.2)
+
+- `zeta-source-kiwi` opens a `W/F` socket of its own for a scan (never paired with the IQ session, so
+  the IQ session is untouched and the sweep costs one more user slot while it runs), with its own
+  timestamp, and steps zoom and centre over the span (`wf_plan`; at most zoom 10, `WF_ZOOM_MAX`, so a
+  frame refills within its limit). The zoom and the step count follow `bin_hz`; a span that fits one view
+  is one step at a finer zoom.
+- It keeps only the frames whose header names the asked view and drops `WF_SETTLE_FRAMES` after a
+  change, then paints each view's rows as scan rows (frame `channel` `scan/<step>`) with the first
+  pixels masked and `wf_cal` added, so the levels are calibrated dBm (`calibrated` on the row).
+- A refusal (`too_busy`, `exclusive_use`, a bare close, `badp`, a handshake over `WF_HANDSHAKE_MAX_MS`)
+  is read as the sweep's reason; the node's scan falls back to stepped or, for a restarted `source`
+  scan, waits and asks again. The IQ session ending does not end the sweep.
+- Still unverified on a live Kiwi: the pairing, `no_dup_ip` and the settle (`UAT.md` "Plan 36.2").
+
 ## Not verified
 
 - That a later server (v1.837 or a KiwiSDR 2) behaves as above.

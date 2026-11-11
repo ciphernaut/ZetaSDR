@@ -85,9 +85,11 @@ pub enum Op {
     /// `too_old`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
     /// source reported it, `configured` from `--source-position`) where the source knows
     /// where it is, `null` otherwise, and `sweeps`, the scans the source is sweeping for
-    /// by its own means (a source whose `capabilities.sweep` says it can: `min_hz`,
-    /// `max_hz`, `bin_hz_min`, `rows_per_s_max`, `calibrated`, the levels in dBm; `null`
-    /// for a source that cannot), which hold no band and are never among `holders`.
+    /// by its own means, which hold no band and are never among `holders` (`sweeps` is
+    /// always an array, empty when none). A source can sweep when `capabilities.sweep`
+    /// is set: `min_hz`, `max_hz`, `bin_hz_min`, `rows_per_s_max` and `calibrated` (the
+    /// levels in dBm); `capabilities.sweep` is `null` for a source that cannot sweep
+    /// for itself.
     /// Jobs on a faulted source fail with
     /// `source ID: FAULT` as their reason; a successful tune (`source_ensure`,
     /// `job_start`) clears it. A channelised job's `job_context` holds `channel.path`:
@@ -514,6 +516,14 @@ pub enum Op {
         #[schemars(required, schema_with = "crate::types::nullable::<String>")]
         plan: Option<String>,
     },
+    /// A job's record: what it is doing now, kept by the job itself (`scan`, `watch`,
+    /// `identify`, `squelch`, `channel`, ...). A `scan`'s `scan` key holds `method`
+    /// (`stepped` or `source`), `steps`, `step_hz`, `dwell_ms` (`dwell_ms_asked`),
+    /// `average` (`average_asked`), `alternate`, `mask` and `timing`; a stepped scan adds
+    /// `rate_hz`, `bits` and `fallback` (why a source's own sweep was refused at the
+    /// start); a `source` scan adds `bin_hz`, `calibrated` and `waiting` (the source's
+    /// reason while it refuses a restarted sweep, `null` otherwise), and has no
+    /// `rate_hz` and no `bits`.
     JobContext {
         job: JobId,
     },

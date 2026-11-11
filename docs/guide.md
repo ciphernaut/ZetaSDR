@@ -349,7 +349,8 @@ they belong to the serving node and are rejected. Source ids are unique across t
   are given. The Kiwi's own position, from its status when it has GPS, is the vantage of
   `origin_lookup`; `--source-position ID=LAT,LON[,ALT_M]` says where a source is when it does not
   report one (one that does overrides it), so a Kiwi's lookups are cut to its own reach, not the
-  station's.
+  station's. A `scan` on it is swept by the Kiwi's waterfall, one more user slot while it runs
+  (see the scan section).
 - **SoapySDR**, `--source-soapy ID=ARGS` (`ARGS` such as `driver=hackrf,serial=...`): a local
   device, `push` false (the node reads it). Gain starts at the driver's default and is changed
   live with `source gain` (below); `gain=DB` in `ARGS` sets the opening gain (a `DB` outside the
@@ -810,11 +811,11 @@ the radio's tuning range. The sweep is paced by the radio, not by a sleep: the s
 for the samples of its dwell (a source delivers only samples taken after the tune settled) and
 tunes on while the FFT of the step runs beside it. Its cost is in the job context, `scan.timing`
 (`sweep_ms`, the median `step_ms`, `tune_ms`, `slow_tunes`, `skipped`, `fft_wait_ms`, `hz_per_s`),
-refreshed about once a second, so the sweep time is read there rather than counted from steps. A scan time-shares the radio, so it holds the lease on
+refreshed about once a second, so the sweep time is read there rather than counted from steps. A stepped scan time-shares the radio, so it holds the lease on
 its whole span: while it runs every other `job_start` or `source_ensure` on that source is a
 `conflict` naming the scan (no silent pre-emption), and `source_list` shows the scan as holder
 and the step it is on as `current`. Stopping it frees the source and leaves `current` at the
-last step. The UI's context menu has "Scan this span"; in scan mode the waterfall's axis spans
+last step (a source that sweeps for itself is the exception, below). The UI's context menu has "Scan this span"; in scan mode the waterfall's axis spans
 the scan and each row paints its step's segment of a new column, so a sweep fills in
 progressively.
 
@@ -840,6 +841,37 @@ in `source list`) holds the source's link at that sample depth for the scan and 
 width, putting the source's own depth back at the end: at 8 bits a weak signal beside a strong one in
 the same capture is lost in quantisation noise, so it is a coarse survey of occupancy, never the
 default and never for faint signals; it is granted only when the scan is the source's sole holder.
+
+A source that sweeps for itself (`capabilities.sweep` in `source list`: `null` for a source that cannot,
+else `min_hz`, `max_hz`, `bin_hz_min`, `rows_per_s_max` and `calibrated`; a KiwiSDR's waterfall is the
+first) sweeps a scan's span itself when `capabilities.sweep` holds it: `context.scan.method` is `source`,
+the scan takes no lease and no IQ, leaves the source's capture and its holders alone (a demodulator on the
+Kiwi plays on), and `source list` lists it under `sweeps`, not `holders`. `--method stepped` forces the
+stepped scan and `--method source` never steps. `--bin-hz` asks the source for a bin width (it picks its
+zoom and step count; the default is the coarser of 6 kHz and the source's `bin_hz_min`), `--dwell-ms` and
+`--average` apply to the source's rows, and `--bits` beside `--method source` or `--bin-hz` is refused
+(`bits applies to a stepped scan`). `--replace` on a scan stops the named jobs only when the scan has to
+step: a granted self-sweep stops nothing, and `--method source` with `--replace` is refused (`replace
+applies to a stepped scan`); do not pass `--replace` for a scan a source will sweep for itself unless a
+`conflict` asked for it, since it stops its holders before the launch decides. The job context of a
+`source` scan holds `method`, `steps`, `step_hz`, `bin_hz`, `dwell_ms` (`dwell_ms_asked`), `average`
+(`average_asked`), `alternate`, `mask`, `calibrated`, `waiting` and `timing`, and has no `rate_hz` and
+no `bits`; a row's `calibrated` says its levels are absolute dBm, which a local radio's rows are not, so
+never compare levels across the two. A sweep a source refuses at a first start makes the scan step, and
+`scan.fallback` says why; when the source's IQ channel is held that is the usual `conflict` carrying the
+source's reason. A scan that ran as `source` and is restarted (a node restart, a `graph_put`, a look
+change) never steps: refused then, it stays up with `scan.waiting` and the reason, and asks again after
+1, 2, 4, 8 and 16 s, then every 16 s. A source's sweep start is bounded at 5 s (`sweep start timed out`
+reads as a refusal). The page's "Scan this span" asks for a scan whoever holds the source's IQ channel.
+
+On a KiwiSDR the sweep is its waterfall stream (`docs/kiwi-waterfall.md`): one more user slot of the
+Kiwi's own while the scan runs and none otherwise, calibrated dBm rows, the zoom and the step count
+following `bin_hz`, the whole 0-30 MHz about once a second at the default, the first pixels of each view
+masked. A refusal carries the Kiwi's reason: `too_busy` (no waterfall channel free), a bare close (all
+slots taken), `exclusive_use` (a locked Kiwi), or the second socket refused on a Kiwi that allows one
+connection per address. The Kiwi has one waterfall connection to the node, so a second scan on it runs
+stepped or is a `conflict`. A `--source-node` source does not forward a far source's sweep (a scan on it
+steps), so run the same version on both ends of a `--source-node` pair and upgrade them together.
 
 ```bash
 Z="./target/release/zeta --node http://field-host:7979"   # ZETA_SECRET set
