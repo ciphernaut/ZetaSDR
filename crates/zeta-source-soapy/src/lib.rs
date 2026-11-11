@@ -13,7 +13,7 @@
 //! ([`caps::front_end`]) unless `settle_ms=N` gives one. A scan advances by the
 //! capture's usable part, [`caps::USABLE_DEFAULT`] unless `usable=F` gives one.
 //! A device whose link carries more than one sample depth ([`caps::link_depths`])
-//! has each probed at open ([`probe::probe_depths`]) and runs the fastest
+//! has each probed at open ([`probe::probe_depths`]) and runs the narrowest
 //! lossless one ([`probe::own_depth`]) unless `bits=N` asks for another.
 
 pub mod attach;
@@ -50,7 +50,7 @@ pub struct ZetaArgs {
     /// [`SoapySource::with_usable`]).
     pub usable: Option<f64>,
     /// `bits=N`: the sample depth on the device's link the source runs at, in
-    /// place of the fastest lossless one (see [`probe::own_depth`]); a lossy
+    /// place of the narrowest lossless one (see [`probe::own_depth`]); a lossy
     /// depth only this way.
     pub bits: Option<u8>,
 }

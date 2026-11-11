@@ -14,7 +14,7 @@
 //! the driver's asserted cap when none is (see [`ProbeResult::clean`]).
 //!
 //! A device whose link carries more than one sample depth has the ladder run
-//! at each ([`probe_depths`]), and the source runs the fastest lossless one
+//! at each ([`probe_depths`]), and the source runs the narrowest lossless one
 //! ([`own_depth`]); the record's `max_bandwidth_hz` is that depth's figure.
 //! That probe says what it is doing before each rung (a [`Starting`]): the
 //! host is busy while the radio streams flat out, for up to a minute or more.
@@ -396,10 +396,12 @@ pub fn asserted_depths(src: &SoapySource, hz: u64) -> Vec<Depth> {
 }
 
 /// The source's own depth among `depths`: `asked` (`bits=`) when listed,
-/// else an error naming the listed ones; unasked, the lossless depth with the
-/// highest cap, a measured cap above an asserted one (a probe that found no
-/// rung clean has shown nothing faster), the deepest on a tie. A lossy depth
-/// is only ever asked for; with none lossless, the deepest.
+/// else an error naming the listed ones; unasked, the narrowest lossless
+/// depth, whatever the measured rates say: a lossless depth carries all the
+/// converter gives, so a narrower one is the same fidelity in fewer bytes on
+/// the link, and the probe's figures vary between runs, so they must not flip
+/// the choice. A lossy depth is only ever asked for; with none lossless, the
+/// deepest.
 pub fn own_depth(depths: &[Depth], asked: Option<u8>) -> Result<u8, String> {
     if let Some(bits) = asked {
         if depths.iter().any(|d| d.bits == bits) {
@@ -414,14 +416,10 @@ pub fn own_depth(depths: &[Depth], asked: Option<u8>) -> Result<u8, String> {
             ),
         });
     }
-    let rank = |d: &&Depth| {
-        let measured = matches!(d.max_bandwidth_hz, Claim::Measured(_));
-        (measured, d.max_bandwidth_hz.value().0, d.bits)
-    };
     depths
         .iter()
         .filter(|d| d.lossless)
-        .max_by_key(rank)
+        .min_by_key(|d| d.bits)
         .or_else(|| depths.iter().max_by_key(|d| d.bits))
         .map(|d| d.bits)
         .ok_or_else(|| "the device's link has one sample depth".to_string())

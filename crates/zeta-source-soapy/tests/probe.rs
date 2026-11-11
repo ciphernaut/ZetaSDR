@@ -393,7 +393,7 @@ fn opened_with(dev: &MockDevice, wire: &str) -> usize {
 }
 
 #[tokio::test]
-async fn each_depth_is_probed_and_the_fastest_lossless_one_is_the_sources_own() {
+async fn each_depth_is_probed_and_the_narrowest_lossless_one_is_the_sources_own() {
     // `sc16` cannot keep up at the top rung; `sc12`, three quarters of the
     // bytes, can.
     let dev = Arc::new(b210_link().overflow_at_wire("sc16", 6.144e6));
@@ -424,10 +424,34 @@ async fn each_depth_is_probed_and_the_fastest_lossless_one_is_the_sources_own() 
 }
 
 #[test]
-fn a_tie_goes_to_the_deepest() {
+fn the_narrowest_lossless_depth_is_the_sources_own() {
+    // A tie: the narrower depth puts fewer bytes on the link for the same
+    // fidelity.
     let depths = [
         depth(16, true, measured(30_720_000)),
         depth(12, true, measured(30_720_000)),
+        depth(8, false, measured(61_440_000)),
+    ];
+    assert_eq!(own_depth(&depths, None), Ok(12));
+    // The deeper depth measured faster on this run: the probe's figures vary
+    // between runs and do not flip the choice.
+    let depths = [
+        depth(16, true, measured(30_720_000)),
+        depth(12, true, measured(20_480_000)),
+        depth(8, false, measured(61_440_000)),
+    ];
+    assert_eq!(own_depth(&depths, None), Ok(12));
+    // Nor does a narrower depth whose probe found no rung clean.
+    let depths = [
+        depth(16, true, measured(30_720_000)),
+        depth(12, true, Claim::Asserted(Hz(61_440_000))),
+    ];
+    assert_eq!(own_depth(&depths, None), Ok(12));
+    // The operator's `bits=` still wins.
+    assert_eq!(own_depth(&depths, Some(16)), Ok(16));
+    // With no lossless depth, the deepest.
+    let depths = [
+        depth(16, false, measured(30_720_000)),
         depth(8, false, measured(61_440_000)),
     ];
     assert_eq!(own_depth(&depths, None), Ok(16));
@@ -447,8 +471,8 @@ fn a_lossy_depth_is_never_the_default() {
 
 #[test]
 fn an_unmeasured_depth_does_not_outrank_a_measured_one() {
-    // A depth whose probe found no rung clean keeps the device's asserted
-    // top rate: no evidence that it is faster.
+    // A deeper depth whose probe found no rung clean keeps the device's
+    // asserted top rate: it is not the source's own either.
     let depths = [
         depth(16, true, Claim::Asserted(Hz(61_440_000))),
         depth(12, true, measured(30_720_000)),
