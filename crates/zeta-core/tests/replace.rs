@@ -427,21 +427,16 @@ async fn conflict_options_name_the_replace_retry() {
     }
     node.job_stop(&a).await.unwrap();
     node.job_stop(&c).await.unwrap();
-    // A scan time-shares the source: only stopping it frees the radio.
+    // A stepped scan time-shares the source but gives way: no conflict, nothing to replace.
     let scan = started(
         &node,
         start(JobKind::Scan, band(100_000_000, 40_000_000), &[]),
     )
     .await;
-    match node.apply(start(JobKind::Passthrough, far, &[])).await {
-        Err(OpError::Conflict {
-            holders, options, ..
-        }) => {
-            assert_eq!(holders, vec![scan.clone()]);
-            assert_eq!(options, vec!["stop the scan holding the source"]);
-        }
-        other => panic!("expected conflict, got {other:?}"),
-    }
+    let b = started(&node, start(JobKind::Passthrough, far, &[])).await;
+    assert_eq!(record(&node, &scan).state, JobState::Running);
+    assert_eq!(source(&node, RADIO).await.holders, vec![b.clone()]);
+    node.job_stop(&b).await.unwrap();
     node.job_stop(&scan).await.unwrap();
 }
 

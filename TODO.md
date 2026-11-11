@@ -26,6 +26,10 @@ Plan 36.1 made the shift a quarter of the stride (the usable fraction of the cap
 
 From the same run. At the 1 Msps UHF CB pin `stats.timeouts` climbs about 8 per second (71 → 412 in a minute) with the rate reading 1.1 % fast and no overflows; at 2 Msps and up it stays at 0. The HackRF is under its 2 Msps minimum there and the driver's read times out between blocks. Harmless so far (the jobs ran) but the counter is useless as a health signal at that rate: either read with a timeout scaled to the block duration, or capture at 2 Msps and decimate for a 1 MHz pin. Also: the 1 Msps capture gets no channel bank (`channel.path` `direct`, `no bank`); say why in `source list`, or give it one.
 
+## Lease: widen a held capture around a rigid job
+
+A rigid request for a band outside the capture rigid jobs hold is a conflict, and its options list `widen capture to <n> Hz (not yet available)` when the radio could capture both. Built, it would retune the source to a capture holding the old band and the new one (centred to keep the holders' channels inside, its edges off their channels), relaunching the holders on it, so a wide view or a second decoder near a running one works without stopping it. Open: who may widen (a job's start, a pin, the page's view), the holders' channel path across the retune (a bank remade at the new rate), and the elastic jobs following.
+
 ## Lease: keep a lone job's capture centre off its channel
 
 From plan 15's non-goals, 2026-10-31. A demodulator's or decoder's own capture centre sits on its channel, so the receiver's DC spike lands in the channel (the same problem the scan grid had; a one-off demod read it as a 59 dB carrier on 2026-10-23). Keeping the centre off the channel needs the lease manager to know the capture's minimum width before it tunes, which the capability record does not carry, and the offset depends on the notch width plan 15 measures (`SCAN_NOTCH_HZ`: its live acceptance's figure is this gist's input). Its own small plan after plan 15. Seen live 2026-11-01 on the B210: after `replace` moved the last fm_demod to 477.466 MHz the capture centred on it, putting the DC spike on the channel.
@@ -785,10 +789,6 @@ Find where the rate goes: the full-width PNG encode on `spawn_blocking`, the new
 
 UAT 28.2: at 16-23 dB SNR the picture tears between the fields lost to overflows, presumably from line syncs misread in noise. Tune the line PLL (its gain and how it rejects an outlier edge) against the private 1.3 GHz fixtures, and add a test with noise added to a real cut.
 
-## Resume: a self-sweep scan leaves its shared capture alone
-
-A source with a resumable self-sweep scan has its shared capture left alone (`resume_captures`), so rigid jobs beside it resume without it. No effect on a KiwiSDR, which has one capture width; it matters for the next self-sweeping source with a wide capture.
-
 ## Kiwi: pair the waterfall socket with the IQ session to save a user slot
 
 A scan's `W/F` socket stands alone and costs one more user slot while it runs (plan 36.2). Paired with the IQ session's timestamp it would share the session's channel. The server ends a pair together (closing the `W/F` stops the `SND`), so the socket would have to be parked, not closed, at a sweep's end. To settle on the live Kiwi's server version: UAT 36.2 check 2 (V1, V3, V4).
@@ -800,10 +800,6 @@ The HackRF's `hackrf_sweep` firmware mode is a second self-sweeping source: a sp
 ## Page: a self-sweep's rows as the coarse layer under the same source's fine capture
 
 Today the waterfall follows the scan and hides the fine rows of a capture on the same source. A self-sweep's rows could draw as the coarse layer beneath the fine capture, as another source's scan does for a source with a scanner.
-
-## Scan: `graph_put` to stepped on a self-sweep beside demodulators
-
-A `graph_put` that turns a self-sweeping scan to `stepped` while demodulators run beside it fails the scan after stopping it, since the stepped scan then needs the lease. Pre-check the lease in `graph_put` and refuse before the stop.
 
 ## Scan: a `source` scan left waiting
 

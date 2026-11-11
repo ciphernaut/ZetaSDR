@@ -27,11 +27,11 @@ use crate::job::JobRecord;
 use crate::lease::LeaseError;
 use crate::ops::{
     JobKind, SCAN_AVERAGE_MAX, SCAN_BIN_HZ_STEPPED, SCAN_BIN_MAX_HZ, SCAN_BITS_STEPPED,
-    SCAN_DWELL_MAX_MS, SCAN_ROWS_DWELL_MS, SCAN_WAIT_MARGIN_MS, SPECTRUM_BIN_TARGET_HZ,
-    SPECTRUM_ROWS_PER_S, SWEEP_RETRY_MS, ScanGrid, ScanMethod, scan_average_budget_bytes,
-    scan_average_in_force, scan_bits_refusal, scan_capture_hz, scan_dwell_within,
-    scan_edge_mask_in_force, scan_grid_at, scan_mask_default, scan_notch_in_force,
-    scan_rows_per_step, scan_sweep_refusal, spectrum_size,
+    SCAN_DWELL_MAX_MS, SCAN_RESUME_RETRY_MS, SCAN_ROWS_DWELL_MS, SCAN_WAIT_MARGIN_MS,
+    SPECTRUM_BIN_TARGET_HZ, SPECTRUM_ROWS_PER_S, SWEEP_RETRY_MS, ScanGrid, ScanMethod,
+    scan_average_budget_bytes, scan_average_in_force, scan_bits_refusal, scan_capture_hz,
+    scan_dwell_within, scan_edge_mask_in_force, scan_grid_at, scan_mask_default,
+    scan_notch_in_force, scan_rows_per_step, scan_sweep_refusal, spectrum_size,
 };
 use crate::port::{
     IqBlock, Port, PortError, SWEEP_NO_RETARGET, SweepPlan, SweepRequest, SweepRow, SweepRows,
@@ -81,6 +81,14 @@ impl Inner {
     /// The holders `replace` names (a `job_start`'s; `gate` is held whenever it
     /// names any) are stopped under `gate` right before the stepped scan's lease,
     /// and only then: a sweep the source grants needs no room, so they run on.
+    ///
+    /// A stepped scan's lease gives way ([`scan_yields`]: unless its `bits` changes the
+    /// source's depth): on a source a rigid job, a pin or a scan that does not give way
+    /// holds, it is not refused but recorded running and waiting
+    /// (`job_context.scan.waiting` the reason, [`Inner::hold_reason`]), its elastic
+    /// jobs left alone, and its step loop takes the source once it is free
+    /// ([`wait_to_resume`]). A scan whose `bits` changes the depth is refused there as
+    /// before, the conflict naming the holders.
     pub(super) async fn launch_scan(
         self: &Arc<Self>,
         rec: JobRecord,
@@ -113,6 +121,7 @@ impl Inner {
         }
         graph::validate(&rec.graph, &self.registry)?;
         let bits = check_stored_bits(port.as_ref(), &rec.graph)?;
+        let yields = scan_yields(port.as_ref(), bits);
         let capture = capture_of(port.as_ref(), bits);
         let fft = rec
             .graph
@@ -228,29 +237,49 @@ impl Inner {
                 fallback = Some(refused);
             }
         }
-        match gate {
+        // The lease's token (fired when it gives way), or the reason it waits for.
+        let take = |g: &OwnedMutexGuard<()>| {
+            match self.leases.acquire_shared_locked(
+                port.as_ref(),
+                rec.id.clone(),
+                rec.tuning,
+                yields,
+                g,
+            ) {
+                Ok(token) => Ok(Ok(token.unwrap_or_default())),
+                // A scan that gives way waits for the source instead of failing.
+                Err(LeaseError::Conflict { .. }) if yields => {
+                    self.leases.wait_locked(&rec.source, rec.id.clone(), g);
+                    Ok(Err(self.hold_reason(&rec.source)))
+                }
+                Err(e) => Err(NodeError::Lease(with_fallback(e, fallback.as_deref()))),
+            }
+        };
+        let held = match gate {
             Some(g) => {
                 // The stepped scan needs the radio: the holders `replace` names stop
                 // now, under the same hold as the lease.
                 if !replace.is_empty() {
                     self.replace_holders(&rec.source, replace, g).await?;
                 }
-                self.leases
-                    .acquire_shared_locked(port.as_ref(), rec.id.clone(), rec.tuning, g)
-                    .map_err(|e| with_fallback(e, fallback.as_deref()))?;
-                *after = AfterGate::StopElastic(rec.source.clone());
+                take(g)?
             }
             None => {
                 debug_assert!(replace.is_empty(), "a replace is stopped under the gate");
-                self.stop_elastic(&rec.source).await;
-                self.leases
-                    .acquire_shared(port.as_ref(), rec.id.clone(), rec.tuning)
-                    .await?;
-                // An elastic start between the stop and the lease joined the port;
-                // none can join once the scan holds it (an elastic request on a
-                // time-shared source is a conflict), so stopping again after closes it.
-                *after = AfterGate::StopElastic(rec.source.clone());
+                // The elastic jobs go first only when the scan will take the source:
+                // a scan that waits leaves them following the holders' capture.
+                if !self.leases.held_standing(&rec.source) {
+                    self.stop_elastic(&rec.source).await;
+                }
+                let g = self.leases.gate_guard(port.id()).await;
+                take(&g)?
             }
+        };
+        // An elastic start between the stop and the lease joined the port; once the
+        // scan holds it an elastic request takes it away (and the scan, free again at
+        // once, stops it), so stopping again after closes it.
+        if held.is_ok() {
+            *after = AfterGate::StopElastic(rec.source.clone());
         }
         let (id, span) = (rec.id.clone(), rec.tuning);
         // `job_context` tells a reader (the agent above all) how many steps a
@@ -266,6 +295,8 @@ impl Inner {
             if let Some(why) = fallback {
                 scan.insert("fallback".into(), why.into());
             }
+            let waiting = held.as_ref().err().cloned();
+            scan.insert("waiting".into(), waiting.into());
             ctx.insert("scan".into(), scan.into());
         }
         let token = self.shutdown.child_token();
@@ -277,6 +308,7 @@ impl Inner {
             layout,
             look,
             bits,
+            yields,
             port: port.clone(),
             ctx: StageContext::new(prov.source.clone()),
             stage,
@@ -289,7 +321,7 @@ impl Inner {
         let mut set = JoinSet::new();
         let (running, steps) = (
             StageRunning::new(self.stages.clone()),
-            scan_run(self.clone(), scan.clone(), tx),
+            scan_run(self.clone(), scan.clone(), held.ok(), tx),
         );
         set.spawn(async move {
             let _running = running;
@@ -466,6 +498,31 @@ impl Inner {
             return Err(NodeError::Other(SCAN_BITS_STEPPED.into()));
         }
         Ok(())
+    }
+
+    /// Why a scan waits for `source`, in a conflict's words: `source <id> is held by
+    /// <kind> <id>, …` for each rigid holder (a holder that is no job by its id
+    /// alone), and `pin` when the source is pinned.
+    pub(super) fn hold_reason(&self, source: &SourceId) -> String {
+        let holders = self.leases.holders(source);
+        let pinned = self.leases.pinned(source).is_some();
+        let mut who: Vec<String> = {
+            let jobs = self.jobs.lock().unwrap();
+            holders
+                .iter()
+                .map(|(j, _)| match jobs.get(j) {
+                    Some(e) => format!("{} {}", e.record.kind, j.0),
+                    None => j.0.clone(),
+                })
+                .collect()
+        };
+        if pinned {
+            who.push("pin".into());
+        }
+        match who.is_empty() {
+            true => format!("source {} is held", source.0),
+            false => format!("source {} is held by {}", source.0, who.join(", ")),
+        }
     }
 
     /// The most samples `source`'s ring holds at `rate_hz`: the ring's own
@@ -825,6 +882,8 @@ struct Scan {
     look: Look,
     /// The sample depth asked for (`None`: the source's own).
     bits: Option<u8>,
+    /// Whether its lease gives way ([`scan_yields`]).
+    yields: bool,
     stage: Arc<dyn Stage>,
     ctx: StageContext,
     prov: Provenance,
@@ -868,28 +927,6 @@ fn check_stored_bits(port: &dyn Port, graph: &graph::Graph) -> Result<Option<u8>
         Some(why) => Err(NodeError::Other(why)),
         None => Ok(u8::try_from(v).ok()),
     }
-}
-
-/// Whether the scan `rec` launches without taking its source's capture, whatever the
-/// source answers: no `bits` stored, and `method: "source"` stored, or none stored
-/// and its record saying it ran as `source` (a refusal then fails it or makes it
-/// wait, [`Inner::launch_scan`]; it never steps).
-pub(super) fn never_steps(rec: &JobRecord) -> bool {
-    let params = rec
-        .graph
-        .nodes
-        .iter()
-        .find(|n| n.kind == "fft")
-        .map(|n| &n.params);
-    let stored = |k: &str| params.and_then(|p| p.get(k)).filter(|v| !v.is_null());
-    let ran_as_source = rec.context.pointer("/scan/method").and_then(|m| m.as_str())
-        == Some(ScanMethod::Source.name());
-    let method = params.map(stored_method).and_then(Result::ok).flatten();
-    stored("bits").is_none()
-        && match method {
-            Some(m) => m == ScanMethod::Source,
-            None => ran_as_source && stored("method").is_none(),
-        }
 }
 
 /// The `method` stored in a scan's `fft` node `params`: `None` when absent or `null`,
@@ -952,6 +989,14 @@ fn capture_of(port: &dyn Port, bits: Option<u8>) -> u64 {
         .unwrap_or_else(|| scan_capture_hz(port.capabilities(), bits))
 }
 
+/// Whether a stepped scan asking for `bits` on `port` gives way to every other
+/// request ([`crate::lease::LeaseManager::acquire_shared_locked`]'s `yields`): unless
+/// its `bits` is a lossy depth, or a depth other than the one in force, which it would
+/// change for every holder.
+fn scan_yields(port: &dyn Port, bits: Option<u8>) -> bool {
+    bits.is_none_or(|b| port.depth().is_some_and(|d| d.bits == b && d.lossless))
+}
+
 /// The depth a scan asking for `bits` reports on `port`: `bits`, else the
 /// port's depth in force; `None` on a source without depths.
 fn bits_in_force(port: &dyn Port, bits: Option<u8>) -> Option<u8> {
@@ -969,25 +1014,33 @@ fn bits_in_force(port: &dyn Port, bits: Option<u8>) -> Option<u8> {
 /// returns: the supervisor releases the lease only once every task of the job
 /// has ended, so no job is granted the source until it is back at its own
 /// depth. A depth that cannot be put back (the device gone) is logged; a
-/// respawned worker opens at the source's own depth.
+/// respawned worker opens at the source's own depth. A scan that gives way asked for
+/// the depth in force or none, so it never touches the depth. `held` is the token of
+/// the lease the launch took, or `None` for a scan that starts waiting.
 async fn scan_run(
     inner: Arc<Inner>,
     s: Arc<Scan>,
+    held: Option<CancellationToken>,
     tx: mpsc::Sender<Step>,
 ) -> Result<(), StageError> {
-    // Only a scan that asked for a depth changes it, and only that one puts it back.
-    let before = s.bits.and(s.port.depth().map(|d| d.bits));
+    // Only a scan that asked for another depth changes it, and only that one puts it
+    // back.
+    let before = (!s.yields)
+        .then(|| s.bits.and(s.port.depth().map(|d| d.bits)))
+        .flatten();
     let set = match s.bits {
-        Some(b) if before != Some(b) => s.port.set_depth(b).await.map(|_| ()).map_err(|e| {
-            StageError::Failed(source_fault_reason(
-                s.port.id(),
-                &format!("set_depth {b}: {e}"),
-            ))
-        }),
+        Some(b) if !s.yields && before != Some(b) => {
+            s.port.set_depth(b).await.map(|_| ()).map_err(|e| {
+                StageError::Failed(source_fault_reason(
+                    s.port.id(),
+                    &format!("set_depth {b}: {e}"),
+                ))
+            })
+        }
         _ => Ok(()),
     };
     let ended = match set {
-        Ok(()) => scan_loop(inner, s.clone(), tx).await,
+        Ok(()) => scan_loop(inner, s.clone(), held, tx).await,
         Err(e) => Err(e),
     };
     if let Some(b) = before
@@ -1020,9 +1073,19 @@ async fn scan_run(
 /// and `job_context.scan` rewritten, so that sweep steps at the new width.
 /// Cancellation is checked before every tune and ends every wait. A failed
 /// tune or a port fault fails the job; the port is left at the last step.
+///
+/// A lease that gives way ([`scan_yields`]) can be taken away by any request
+/// granted on the source: its token (`held`) fires under the source's gate, before
+/// the request tunes. The loop then tunes nothing more: the step under way is
+/// dropped (its dwell ends at once, and samples taken when the token has fired are
+/// never handed on), a step waiting for the gate finds no lease, and the loop waits
+/// ([`wait_to_resume`]) until it takes the source back, then starts a new sweep from
+/// its first step (the averages afresh). `held` `None`: the launch found the source
+/// held, so it waits first.
 async fn scan_loop(
     inner: Arc<Inner>,
     s: Arc<Scan>,
+    held: Option<CancellationToken>,
     tx: mpsc::Sender<Step>,
 ) -> Result<(), StageError> {
     let faulted = |f: String| StageError::Failed(source_fault_reason(s.port.id(), &f));
@@ -1041,12 +1104,30 @@ async fn scan_loop(
     let mut sweep_start = tokio::time::Instant::now();
     // When the timing was last written (ns since the epoch): at most once a second.
     let mut written_ns = 0u64;
+    // Fired when the lease gives way; `None` while the scan waits for its source.
+    let mut held = held;
     loop {
         // Checked before each tune, so a stopped scan never retunes again; a
         // tune is never abandoned half way, so it is checked after it too.
         if s.cancel.is_cancelled() {
             return Err(StageError::Cancelled);
         }
+        let yielded = match &held {
+            Some(t) => t.clone(),
+            None => {
+                let t = wait_to_resume(&inner, &s).await?;
+                held = Some(t.clone());
+                // A new sweep from its first step, the averages afresh.
+                if i > 0 {
+                    sweep += 1;
+                }
+                i = 0;
+                taken = None;
+                timing = SweepTiming::default();
+                generation += 1;
+                t
+            }
+        };
         if i == 0 {
             sweep_start = tokio::time::Instant::now();
         }
@@ -1071,6 +1152,11 @@ async fn scan_loop(
             .await
         {
             Ok(Some(t)) => t,
+            // The lease gave way: wait for the source.
+            Ok(None) if s.yields && !s.cancel.is_cancelled() => {
+                held = None;
+                continue;
+            }
             Ok(None) => return Err(StageError::Cancelled),
             Err(e) => return Err(faulted(e.to_string())),
         };
@@ -1086,8 +1172,14 @@ async fn scan_loop(
             + Duration::from_millis(dwell_ms.saturating_add(SCAN_WAIT_MARGIN_MS));
         let block = tokio::select! {
             _ = s.cancel.cancelled() => return Err(StageError::Cancelled),
+            _ = yielded.cancelled() => None,
             b = wait_for_run(&inner, &mut tick, source, got.center_hz, after, samples, deadline) => b,
         };
+        // Given way while it dwelt: what came may be the request's, so it is dropped.
+        if yielded.is_cancelled() {
+            held = None;
+            continue;
+        }
         if let Some(f) = s.port.fault() {
             return Err(faulted(f));
         }
@@ -1133,6 +1225,70 @@ async fn scan_loop(
             } else {
                 timing.carry();
             }
+        }
+    }
+}
+
+/// Wait until the scan `s`, whose lease gave way (or was never granted), takes its
+/// source back: under the source's gate,
+/// [`crate::lease::LeaseManager::resume_shared_locked`], granted once no rigid job, no
+/// pin and no other scan holds it. Refused, `job_context.scan.waiting` says who holds it
+/// ([`Inner::hold_reason`], written when it changes) and the loop sleeps until the
+/// source changes (a release, a yield: [`crate::lease::LeaseManager::changes`]) or
+/// [`SCAN_RESUME_RETRY_MS`] pass, the gate never held meanwhile. Granted, `waiting` is
+/// null and the source's elastic jobs are stopped, as a scan's start stops them (in a
+/// task of their own: a stop of this scan under the gate never waits on it). The new
+/// lease's token, or `Cancelled` once the scan is stopped.
+async fn wait_to_resume(inner: &Arc<Inner>, s: &Scan) -> Result<CancellationToken, StageError> {
+    let source = s.port.id();
+    let mut written: Option<String> = None;
+    loop {
+        // Taken before the gate: a change after this read is never missed.
+        let mut changes = inner.leases.changes(source);
+        let gate = tokio::select! {
+            _ = s.cancel.cancelled() => return Err(StageError::Cancelled),
+            g = inner.leases.gate_guard(source) => g,
+        };
+        if s.cancel.is_cancelled() {
+            return Err(StageError::Cancelled);
+        }
+        let resumed =
+            inner
+                .leases
+                .resume_shared_locked(s.port.as_ref(), s.id.clone(), s.span, &gate);
+        let why = match resumed {
+            Ok(token) => {
+                drop(gate);
+                inner.scan_context_update(&s.id, |scan| {
+                    scan.insert("waiting".into(), serde_json::Value::Null);
+                });
+                let (inner, source) = (inner.clone(), source.clone());
+                tokio::spawn(async move { inner.stop_elastic(&source).await });
+                return Ok(token);
+            }
+            Err(_) => {
+                inner.leases.wait_locked(source, s.id.clone(), &gate);
+                let why = inner.hold_reason(source);
+                drop(gate);
+                why
+            }
+        };
+        if written.as_ref() != Some(&why) {
+            inner.scan_context_update(&s.id, |scan| {
+                scan.insert("waiting".into(), why.clone().into());
+            });
+            written = Some(why);
+        }
+        let retry = Duration::from_millis(SCAN_RESUME_RETRY_MS);
+        tokio::select! {
+            _ = s.cancel.cancelled() => return Err(StageError::Cancelled),
+            r = changes.changed() => {
+                if r.is_err() {
+                    // No more changes come (the node is going): the retry alone.
+                    tokio::time::sleep(retry).await;
+                }
+            }
+            _ = tokio::time::sleep(retry) => {}
         }
     }
 }

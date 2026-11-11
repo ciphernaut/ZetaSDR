@@ -579,8 +579,11 @@ fn failed_reason(node: &Node, id: &JobId) -> String {
     }
 }
 
+/// The pin resumes first; a record outside it fails naming the unpin, and a scan
+/// resumes waiting for the pin and the job inside it (a stepped scan gives way),
+/// tuning nothing.
 #[tokio::test]
-async fn pin_resumes_before_the_records_and_a_scan_fails_naming_it() {
+async fn pin_resumes_before_the_records_and_a_scan_waits_for_it() {
     let dir = tempfile::tempdir().unwrap();
     let pinned = band(100_000_000, 1_000_000);
     let inside = running("passthrough", band(100_200_000, 48_000), 1);
@@ -599,8 +602,13 @@ async fn pin_resumes_before_the_records_and_a_scan_fails_naming_it() {
     assert_eq!(record(&node, &inside.id).state, JobState::Running);
     let r = failed_reason(&node, &outside.id);
     assert!(r.contains("unpin source"), "{r}");
-    let r = failed_reason(&node, &scan.id);
-    assert!(r.contains("unpin source"), "{r}");
+    assert_eq!(record(&node, &scan.id).state, JobState::Running);
+    let want = format!("source radio0 is held by passthrough {}, pin", inside.id.0);
+    assert_eq!(
+        record(&node, &scan.id).context["scan"]["waiting"],
+        want.as_str()
+    );
+    assert_eq!(source(&node).await.scans_waiting, vec![scan.id.clone()]);
     assert_eq!(radio.tunes(), 1, "only the pin tuned");
 }
 

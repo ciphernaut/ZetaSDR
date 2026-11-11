@@ -212,8 +212,10 @@ pub enum Op {
         /// A lossy depth (8 bits on a B210) sweeps faster, but a weak signal beside a
         /// strong one in the same capture is lost in its quantisation noise: for a
         /// coarse survey of occupancy, never for faint signals, and never the
-        /// default. A scan is its source's sole holder, so it is a conflict naming
-        /// any other holder, and a job started while it runs is one naming it.
+        /// default. Such a scan (a lossy depth, or one other than the source's in
+        /// force) changes what every holder gets, so it does not give way as a
+        /// stepped scan does: it is its source's sole holder, a conflict naming any
+        /// other holder, and a job started while it runs is one naming it.
         /// `job_context.scan.bits` and each row's `bits` say the depth in force.
         /// Changes on a running scan through `graph_put` (the `fft` node's `bits`).
         /// Any other kind must pass `null`.
@@ -221,7 +223,8 @@ pub enum Op {
         #[schemars(required, schema_with = "nullable_bits")]
         bits: Option<u8>,
         /// `scan` only: how the span is swept. `stepped`: the node tunes the source's
-        /// capture across it, under a time-shared lease. `source`: the source sweeps it
+        /// capture across it, under a time-shared lease that gives way to any other request
+        /// (the scan then waits, `job_context.scan.waiting`). `source`: the source sweeps it
         /// for itself (a span inside `source_list`'s `capabilities.sweep`), taking no
         /// lease, so it runs beside the demodulators on the source; a refusal is the
         /// start's error, and `bits` or a non-empty `replace` with it is refused.
@@ -1959,6 +1962,10 @@ pub const SWEEP_START_TIMEOUT_MS: u64 = 5000;
 /// restart waits before asking again, ms: each refusal the next delay, the last
 /// repeating (the KiwiSDR session's own reconnect delays).
 pub const SWEEP_RETRY_MS: [u64; 5] = [1000, 2000, 4000, 8000, 16000];
+/// How long a stepped scan waiting for its source (it gave way to another request,
+/// or the source was held when it started) waits before it looks again when no
+/// release or yield on the source woke it first, ms: a backstop, not a poll.
+pub const SCAN_RESUME_RETRY_MS: u64 = 5000;
 /// A dwell this long or longer is cut into `SPECTRUM_ROWS_PER_S` rows a second;
 /// a shorter one is one row a step, ms.
 pub const SCAN_ROWS_DWELL_MS: u64 = 100;
@@ -2401,7 +2408,8 @@ pub struct SourceInfo {
     pub capabilities: Capabilities,
     #[schemars(required, schema_with = "crate::types::nullable::<Tuning>")]
     pub current: Option<Tuning>,
-    /// The jobs holding a rigid lease (never an elastic job).
+    /// The jobs holding a rigid lease (never an elastic job). A stepped scan is one
+    /// while it steps; one waiting for the source is not (see `scans_waiting`).
     pub holders: Vec<JobId>,
     /// The elastic jobs following the source's capture.
     pub elastic: Vec<JobId>,
@@ -2464,11 +2472,18 @@ pub struct SourceInfo {
     /// source of an older node still loads.
     #[serde(default)]
     pub sweeps: Vec<JobId>,
+    /// The stepped scans waiting for the source: they gave way to another request,
+    /// or it was held when they started, and they hold nothing and block nothing
+    /// (`job_context.scan.waiting` says who they wait for); each takes the source back
+    /// by itself once no rigid job, no pin and no other scan holds it. Defaults to
+    /// empty when absent, so a source of an older node still loads.
+    #[serde(default)]
+    pub scans_waiting: Vec<JobId>,
 }
 
 /// Schemars omits a serde-defaulted field from `required`, and `#[schemars(required)]`
 /// does not override that; every node of this version writes `worker`, `ring`, `position`,
-/// `depth` and `sweeps`, so the published schema requires them (as `JobRecord`'s schema does
+/// `depth`, `sweeps` and `scans_waiting`, so the published schema requires them (as `JobRecord`'s schema does
 /// its defaulted fields).
 fn require_worker(schema: &mut schemars::Schema) {
     if let Some(req) = schema
@@ -2477,7 +2492,14 @@ fn require_worker(schema: &mut schemars::Schema) {
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
     {
-        for field in ["worker", "ring", "position", "depth", "sweeps"] {
+        for field in [
+            "worker",
+            "ring",
+            "position",
+            "depth",
+            "sweeps",
+            "scans_waiting",
+        ] {
             if !req.iter().any(|r| r == field) {
                 req.push(field.into());
             }
@@ -4112,6 +4134,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                     position: node.source_position(&id),
                     depth: node.port(&id).and_then(|p| p.depth()),
                     sweeps: node.lease_sweepers(&id),
+                    scans_waiting: node.lease_waiting(&id),
                     ring: node.ring(&id).map(|r| RingInfo {
                         seconds: r.read().unwrap().capacity_seconds(),
                     }),
@@ -4240,7 +4263,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             };
             if kind == JobKind::Scan {
                 // No tune here: the scan leases its whole band and steps the
-                // source itself; a held source is a conflict at the lease.
+                // source itself; on a held source it waits (a lossy one is a conflict).
                 let port = checked_port_up_to(node, &source, &tuning, |caps| {
                     let tune =
                         (caps.tune_max_hz.value().0).saturating_sub(caps.tune_min_hz.value().0);

@@ -530,6 +530,8 @@ details.turn > pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 2px
 .job > .mix-now { order: 8; }
 .job > .pos { order: 9; }
 .job > .sweep-ms { order: 9; color: var(--dim); font-size: 11px; }
+/* A scan waiting for its source: a note, not a fault. */
+.job > .waiting { order: 9; color: var(--dim); font-style: italic; font-size: 11px; }
 .job select.scan-look { font: inherit; font-size: 11px; max-inline-size: 11em; }
 .job > .reason { order: 10; }
 .job > .id { order: 11; flex: 0 0 auto; margin-inline-start: auto; }

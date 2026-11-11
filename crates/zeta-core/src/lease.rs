@@ -4,6 +4,15 @@
 //! rigid requests ignore it, and it never retunes a held port. A sweep claim
 //! (a scan the source sweeps for by its own means) holds nothing either, and no
 //! IQ request sees it; it only keeps the port from being idled.
+//!
+//! A time-shared lease that gives way ([`LeaseManager::acquire_shared_locked`] with
+//! `yields`: a stepped scan that keeps the depth in force) blocks nothing either: every request
+//! is decided as if it were not there, and one that is granted takes it away under the
+//! source's gate (its holder's token fired, the holder listed as waiting,
+//! [`LeaseManager::waiting`]). The holder takes it back with
+//! [`LeaseManager::resume_shared_locked`] once nothing rigid, no pin and no other
+//! time-shared lease holds the source, watching [`LeaseManager::changes`] (bumped by
+//! every yield and every release) rather than polling.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -64,7 +73,9 @@ impl From<PortError> for LeaseError {
 
 /// One holder's lease on a source. A `time_shared` lease (a scan) covers a
 /// band wider than any one capture: its holder retunes the port across it,
-/// so no other request fits while it is held. An `elastic` lease's band is
+/// so no other request fits while it is held, unless it `yields`: then the
+/// first request granted takes it away (the token fired, so its holder stops
+/// at once). An `elastic` lease's band is
 /// the capture it joined; it is never a holder for a rigid request. A `pin`
 /// lease (under [`pin_holder`]) is rigid but not a job: it holds the source like
 /// one and is never listed among the holders.
@@ -75,6 +86,7 @@ struct Lease {
     time_shared: bool,
     elastic: bool,
     pin: bool,
+    yields: Option<CancellationToken>,
 }
 
 impl Lease {
@@ -85,8 +97,18 @@ impl Lease {
             time_shared: false,
             elastic,
             pin: false,
+            yields: None,
         }
     }
+}
+
+/// `leases` as a request sees them: without the time-shared leases that give way.
+fn standing(leases: &[Lease]) -> Vec<Lease> {
+    leases
+        .iter()
+        .filter(|l| l.yields.is_none())
+        .cloned()
+        .collect()
 }
 
 /// The holder id of `source`'s pin: `pin:<source id>`, never a job's (a ULID).
@@ -103,6 +125,11 @@ pub struct LeaseManager {
     /// in claim order. A claim holds no band and no IQ request reads it: only
     /// [`LeaseManager::sweepers`] and [`LeaseManager::idle_if_unheld`] do.
     sweeps: Mutex<HashMap<SourceId, Vec<JobId>>>,
+    /// The holders whose time-shared lease on each source gave way (or never was
+    /// granted) and who wait to take it, in order; [`LeaseManager::release`] drops them.
+    waiting: Mutex<HashMap<SourceId, Vec<JobId>>>,
+    /// Bumped on every yield and every release on a source ([`LeaseManager::changes`]).
+    changes: Mutex<HashMap<SourceId, tokio::sync::watch::Sender<u64>>>,
 }
 
 fn band(t: &Tuning) -> (u64, u64) {
@@ -125,7 +152,8 @@ fn fits(want: &Tuning, cur: &Tuning) -> bool {
 /// holds the source (a pin alone is no holder). A request for a band (`want`
 /// given) may choose one inside `cur`, and widening is listed only when the port
 /// could capture both bands at once; no operation performs it yet. A port under a
-/// time-shared lease (a scan) is freed only by stopping that holder. Then, on a
+/// time-shared lease that does not give way (a scan at a lossy depth) is freed only
+/// by stopping that holder; one that gives way never makes a conflict. Then, on a
 /// `pinned` source, its unpin; last, the request again with `replace` naming the
 /// rigid `holders`, when there are any.
 fn conflict_options(
@@ -276,12 +304,14 @@ impl LeaseManager {
     /// Call [`Port::idle`] under the source's gate when nobody holds `port`
     /// (after a `release`). A lease taken meanwhile wins: no idle then. Nor
     /// while a sweep claim is held: the source's own sweep may need what an
-    /// idle stops upstream.
+    /// idle stops upstream; nor while a scan waits for the source: it takes it
+    /// back at once.
     pub async fn idle_if_unheld(&self, port: &dyn Port) {
         let gate = self.gate(port.id());
         let _guard = gate.lock().await;
         let leased = self.leases.lock().unwrap().contains_key(port.id());
-        if !leased && !self.sweeps.lock().unwrap().contains_key(port.id()) {
+        let waited = self.waiting.lock().unwrap().contains_key(port.id());
+        if !leased && !waited && !self.sweeps.lock().unwrap().contains_key(port.id()) {
             port.idle().await;
         }
     }
@@ -323,6 +353,166 @@ impl LeaseManager {
             .unwrap_or_default()
     }
 
+    /// The holders waiting to take a time-shared lease on `source` (it gave way to a
+    /// request, or the source was held when they started), in order: they hold nothing.
+    pub fn waiting(&self, source: &SourceId) -> Vec<JobId> {
+        self.waiting
+            .lock()
+            .unwrap()
+            .get(source)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether a lease a request must respect holds `source`: a rigid one, a pin or a
+    /// time-shared one that does not give way (never an elastic one, nor a time-shared
+    /// one that gives way).
+    pub fn held_standing(&self, source: &SourceId) -> bool {
+        self.leases
+            .lock()
+            .unwrap()
+            .get(source)
+            .is_some_and(|v| v.iter().any(|l| !l.elastic && l.yields.is_none()))
+    }
+
+    /// Whether `holder` waits to take a time-shared lease on any source.
+    pub fn is_waiting(&self, holder: &JobId) -> bool {
+        self.waiting
+            .lock()
+            .unwrap()
+            .values()
+            .any(|v| v.contains(holder))
+    }
+
+    /// A receiver of `source`'s changes: the value is bumped by every yield and every
+    /// release on the source, and the receiver has seen the value at the call, so a
+    /// change after it is never missed.
+    pub fn changes(&self, source: &SourceId) -> tokio::sync::watch::Receiver<u64> {
+        self.changes
+            .lock()
+            .unwrap()
+            .entry(source.clone())
+            .or_insert_with(|| tokio::sync::watch::channel(0).0)
+            .subscribe()
+    }
+
+    /// Bump `source`'s changes.
+    fn changed(&self, source: &SourceId) {
+        self.changes
+            .lock()
+            .unwrap()
+            .entry(source.clone())
+            .or_insert_with(|| tokio::sync::watch::channel(0).0)
+            .send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Take away the time-shared leases on `source` in `leases` (the manager's map,
+    /// locked by the caller under the source's gate) that give way: each holder's
+    /// token fired, each listed as waiting, and the source's changes bumped. A request
+    /// does this once it is granted, before it tunes.
+    fn yield_shared(&self, leases: &mut HashMap<SourceId, Vec<Lease>>, source: &SourceId) {
+        let Some(v) = leases.get_mut(source) else {
+            return;
+        };
+        let gone: Vec<Lease> = v.iter().filter(|l| l.yields.is_some()).cloned().collect();
+        if gone.is_empty() {
+            return;
+        }
+        v.retain(|l| l.yields.is_none());
+        if v.is_empty() {
+            leases.remove(source);
+        }
+        let mut waiting = self.waiting.lock().unwrap();
+        let w = waiting.entry(source.clone()).or_default();
+        for l in gone {
+            if let Some(t) = &l.yields {
+                t.cancel();
+            }
+            if !w.contains(&l.job) {
+                w.push(l.job);
+            }
+        }
+        drop(waiting);
+        self.changed(source);
+    }
+
+    /// `holder` no longer waits on `source`.
+    fn unwait(&self, source: &SourceId, holder: &JobId) {
+        let mut waiting = self.waiting.lock().unwrap();
+        if let Some(w) = waiting.get_mut(source) {
+            w.retain(|j| j != holder);
+            if w.is_empty() {
+                waiting.remove(source);
+            }
+        }
+    }
+
+    /// Give `holder` (waiting, [`LeaseManager::waiting`]) a time-shared lease that
+    /// gives way on the whole `span` of `port`, under the source's gate the caller
+    /// holds: granted (the lease's token, fired when it gives way again, and `holder`
+    /// no longer waiting) only when no rigid lease, no pin and no other time-shared
+    /// lease holds the source (elastic leases never do: the caller stops them); else
+    /// the conflict naming the holders, as [`LeaseManager::acquire_shared_locked`]
+    /// words it, and `holder` still waiting. It never takes another lease away.
+    pub(crate) fn resume_shared_locked(
+        &self,
+        port: &dyn Port,
+        holder: JobId,
+        span: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<CancellationToken, LeaseError> {
+        let source = port.id().clone();
+        self.assert_gate(&source, guard);
+        let mut leases = self.leases.lock().unwrap();
+        let v = leases.entry(source.clone()).or_default();
+        v.retain(|l| l.job != holder);
+        if let Some(first) = v.iter().find(|l| !l.elastic) {
+            let cur = port.current().unwrap_or(first.band);
+            let shared = v.iter().any(|l| l.time_shared);
+            let holders = rigid(v);
+            let pinned = pinned_in(v, &source);
+            let options = conflict_options(port, Some(&span), &cur, shared, &holders, pinned);
+            return Err(LeaseError::Conflict {
+                options,
+                holders,
+                source,
+                current: cur,
+            });
+        }
+        if v.is_empty() {
+            leases.remove(&source);
+        }
+        let token = CancellationToken::new();
+        leases.entry(source.clone()).or_default().push(Lease {
+            job: holder.clone(),
+            band: span,
+            time_shared: true,
+            elastic: false,
+            pin: false,
+            yields: Some(token.clone()),
+        });
+        drop(leases);
+        self.unwait(&source, &holder);
+        Ok(token)
+    }
+
+    /// List `holder` as waiting for a time-shared lease on `source` it was not
+    /// granted (a scan started on a held source), under the source's gate the caller
+    /// holds.
+    pub(crate) fn wait_locked(
+        &self,
+        source: &SourceId,
+        holder: JobId,
+        guard: &OwnedMutexGuard<()>,
+    ) {
+        self.assert_gate(source, guard);
+        let mut waiting = self.waiting.lock().unwrap();
+        let w = waiting.entry(source.clone()).or_default();
+        if !w.contains(&holder) {
+            w.push(holder);
+        }
+    }
+
     /// Grant `holder` the band `want` on `port`, tuning only if the port is unheld.
     ///
     /// A rigid request (`elastic` false) is never refused by elastic leases:
@@ -331,7 +521,9 @@ impl LeaseManager {
     /// (the caller relaunches the elastic jobs on the new capture). An elastic request on a held port
     /// joins the current capture (its lease band, and the result, is that
     /// capture) without a tune and never conflicts, except with a time-shared
-    /// lease (a scan), which no capture outlasts.
+    /// lease (a scan) that does not give way, which no capture outlasts. A
+    /// time-shared lease that gives way is never in the way: a request granted
+    /// takes it away first.
     pub async fn ensure(
         &self,
         port: &dyn Port,
@@ -391,7 +583,7 @@ impl LeaseManager {
             .lock()
             .unwrap()
             .get(port.id())
-            .cloned()
+            .map(|v| standing(v))
             .unwrap_or_default();
         rigid_decision(port, &held, &want, false)
     }
@@ -416,7 +608,8 @@ impl LeaseManager {
         self.assert_gate(&source, guard);
         {
             let mut leases = self.leases.lock().unwrap();
-            let held = leases.get(&source).cloned().unwrap_or_default();
+            // A time-shared lease that gives way is decided as if it were not there.
+            let held = leases.get(&source).map(|v| standing(v)).unwrap_or_default();
             // An elastic request on a held port joins its capture untuned (a
             // held port lacking a current tuning is at its first holder's band),
             // unless a time-shared lease holds it.
@@ -433,7 +626,8 @@ impl LeaseManager {
                         options,
                     });
                 }
-                let v = leases.get_mut(&source).unwrap();
+                self.yield_shared(&mut leases, &source);
+                let v = leases.entry(source.clone()).or_default();
                 v.retain(|l| l.job != holder);
                 v.push(lease(cur));
                 return Ok((cur, false));
@@ -442,7 +636,8 @@ impl LeaseManager {
             if !elastic {
                 match rigid_decision(port, &held, &want, pin) {
                     Decision::Fits(cur) => {
-                        let v = leases.get_mut(&source).unwrap();
+                        self.yield_shared(&mut leases, &source);
+                        let v = leases.entry(source.clone()).or_default();
                         v.retain(|l| l.job != holder);
                         v.push(lease(want));
                         return Ok((cur, false));
@@ -462,6 +657,8 @@ impl LeaseManager {
                     Decision::Tune => {}
                 }
             }
+            // Granted: what gives way goes before the tune.
+            self.yield_shared(&mut leases, &source);
         }
         let got = port.tune(want).await?;
         let mut leases = self.leases.lock().unwrap();
@@ -533,6 +730,8 @@ impl LeaseManager {
             let v = leases.entry(source.clone()).or_default();
             let old = v.iter().filter(|l| &l.job == holder).cloned().collect();
             v.retain(|l| &l.job != holder);
+            // A time-shared lease that gives way leaves no capture to keep: the band
+            // is leased as a rigid request, which takes it away.
             let shared = v.iter().any(|l| l.time_shared);
             if !shared && let Some(cur) = port.current().filter(|c| fits(&want, c)) {
                 v.push(Lease::new(holder.clone(), want, false));
@@ -583,16 +782,19 @@ impl LeaseManager {
     /// Grant `holder` a time-shared lease on the whole `span` of `port`
     /// without tuning it (see [`LeaseManager::retune_shared`]). The port must
     /// be unheld by rigid leases (elastic ones are the caller's to stop: no
-    /// capture outlasts a step); while the lease is held every other `ensure`
-    /// and `tune_if_unheld` is a conflict naming `holder`.
+    /// capture outlasts a step); another time-shared lease that gives way is
+    /// taken away, as by any request. With `yields` the new lease gives way too
+    /// and its token is returned (fired when it does); without, while it is held
+    /// every other `ensure` and `tune_if_unheld` is a conflict naming `holder`.
     pub async fn acquire_shared(
         &self,
         port: &dyn Port,
         holder: JobId,
         span: Tuning,
-    ) -> Result<(), LeaseError> {
+        yields: bool,
+    ) -> Result<Option<CancellationToken>, LeaseError> {
         let guard = self.gate_guard(port.id()).await;
-        self.acquire_shared_locked(port, holder, span, &guard)
+        self.acquire_shared_locked(port, holder, span, yields, &guard)
     }
 
     /// [`LeaseManager::acquire_shared`] under the source's gate the caller holds.
@@ -601,18 +803,23 @@ impl LeaseManager {
         port: &dyn Port,
         holder: JobId,
         span: Tuning,
+        yields: bool,
         guard: &OwnedMutexGuard<()>,
-    ) -> Result<(), LeaseError> {
+    ) -> Result<Option<CancellationToken>, LeaseError> {
         let source = port.id().clone();
         self.assert_gate(&source, guard);
         let mut leases = self.leases.lock().unwrap();
         let v = leases.entry(source.clone()).or_default();
         v.retain(|l| l.job != holder);
-        if let Some(first) = v.iter().find(|l| !l.elastic) {
+        let held = standing(v);
+        if v.is_empty() {
+            leases.remove(&source);
+        }
+        if let Some(first) = held.iter().find(|l| !l.elastic) {
             let cur = port.current().unwrap_or(first.band);
-            let shared = v.iter().any(|l| l.time_shared);
-            let holders = rigid(v);
-            let pinned = pinned_in(v, &source);
+            let shared = held.iter().any(|l| l.time_shared);
+            let holders = rigid(&held);
+            let pinned = pinned_in(&held, &source);
             return Err(LeaseError::Conflict {
                 options: conflict_options(port, Some(&span), &cur, shared, &holders, pinned),
                 holders,
@@ -620,19 +827,25 @@ impl LeaseManager {
                 current: cur,
             });
         }
-        v.push(Lease {
-            job: holder,
+        self.yield_shared(&mut leases, &source);
+        let token = yields.then(CancellationToken::new);
+        leases.entry(source.clone()).or_default().push(Lease {
+            job: holder.clone(),
             band: span,
             time_shared: true,
             elastic: false,
             pin: false,
+            yields: token.clone(),
         });
-        Ok(())
+        drop(leases);
+        self.unwait(&source, &holder);
+        Ok(token)
     }
 
     /// `Ok` unless a rigid or time-shared lease or a pin holds `port`, other than
     /// those of the jobs `except` (the ones a caller will stop), under the source's
-    /// gate the caller holds; elastic leases never hold it. The conflict is built
+    /// gate the caller holds; elastic leases never hold it, nor does a time-shared
+    /// lease that gives way (taken away when this is `Ok`). The conflict is built
     /// as [`LeaseManager::acquire_shared_locked`]'s, naming every rigid holder,
     /// with no band to choose or widen to: for a request that asks for no band
     /// (`source_measure`).
@@ -644,17 +857,17 @@ impl LeaseManager {
     ) -> Result<(), LeaseError> {
         let source = port.id().clone();
         self.assert_gate(&source, guard);
-        let leases = self.leases.lock().unwrap();
-        let Some(v) = leases.get(&source) else {
-            return Ok(());
-        };
+        let mut leases = self.leases.lock().unwrap();
+        let v = leases.get(&source).map(|v| standing(v)).unwrap_or_default();
         let Some(first) = v.iter().find(|l| !l.elastic && !except.contains(&l.job)) else {
+            // Granted: what gives way goes now.
+            self.yield_shared(&mut leases, &source);
             return Ok(());
         };
         let cur = port.current().unwrap_or(first.band);
         let shared = v.iter().any(|l| l.time_shared);
-        let holders = rigid(v);
-        let pinned = pinned_in(v, &source);
+        let holders = rigid(&v);
+        let pinned = pinned_in(&v, &source);
         Err(LeaseError::Conflict {
             options: conflict_options(port, None, &cur, shared, &holders, pinned),
             holders,
@@ -665,9 +878,11 @@ impl LeaseManager {
 
     /// Tune `port` to `step` for the holder of a time-shared lease, under
     /// the source's gate. `None` (and no tune) once `holder` holds no
-    /// time-shared lease on `port`, or when `cancel` fires while it waits for
-    /// the gate (whoever holds it may be stopping the scan); once the gate is
-    /// taken the tune is never abandoned half way.
+    /// time-shared lease on `port` (it gave way, or was released), or when
+    /// `cancel` fires while it waits for the gate (whoever holds it may be
+    /// stopping the scan); once the gate is taken the tune is never abandoned half
+    /// way. A request that takes the lease away holds the gate while it does, so a
+    /// step's tune is either made before the request's or not at all.
     pub async fn retune_shared(
         &self,
         port: &dyn Port,
@@ -729,9 +944,11 @@ impl LeaseManager {
             .lock()
             .unwrap()
             .get(&source)
-            .map(|v| v.iter().filter(|l| !l.elastic).cloned().collect())
+            .map(|v| standing(v).into_iter().filter(|l| !l.elastic).collect())
             .unwrap_or_default();
         let Some(first) = held.first() else {
+            // Granted: what gives way goes before the tune.
+            self.yield_shared(&mut self.leases.lock().unwrap(), &source);
             // Only elastic leases: a band inside their capture needs no tune.
             let elastic = !self.elastic_holders(&source).is_empty();
             if let Some(cur) = elastic
@@ -759,11 +976,17 @@ impl LeaseManager {
         })
     }
 
-    /// Drop every lease and sweep claim held by `holder`.
+    /// Drop every lease, sweep claim and wait held by `holder`, and bump the changes
+    /// of each source it held a lease on (a scan waiting there may take it).
     pub fn release(&self, holder: &JobId) {
         let mut leases = self.leases.lock().unwrap();
-        leases.retain(|_, v| {
+        let mut freed = Vec::new();
+        leases.retain(|source, v| {
+            let n = v.len();
             v.retain(|l| &l.job != holder);
+            if v.len() != n {
+                freed.push(source.clone());
+            }
             !v.is_empty()
         });
         drop(leases);
@@ -771,9 +994,17 @@ impl LeaseManager {
             v.retain(|j| j != holder);
             !v.is_empty()
         });
+        self.waiting.lock().unwrap().retain(|_, v| {
+            v.retain(|j| j != holder);
+            !v.is_empty()
+        });
+        for source in freed {
+            self.changed(&source);
+        }
     }
 
-    /// Whether `source` is held by a time-shared lease (a scan).
+    /// Whether `source` is held by a time-shared lease (a scan; one that gives way
+    /// included, while it holds).
     pub fn time_shared(&self, source: &SourceId) -> bool {
         self.leases
             .lock()
@@ -818,7 +1049,8 @@ impl LeaseManager {
     /// The ports of `ports`, in the given order, that could take the band now: each
     /// [`covers`] it and has no rigid holder, no fault, and no pin unless the pin's
     /// band holds the whole band (a pin admits jobs inside it, as `plan_start` inside a
-    /// pin does). Elastic jobs never make a port busy. A suggestion, not a
+    /// pin does). Elastic jobs never make a port busy, nor does a scan whose lease
+    /// gives way. A suggestion, not a
     /// reservation: nothing is leased.
     pub fn free_sources(
         &self,
@@ -838,7 +1070,7 @@ impl LeaseManager {
             .filter(|p| {
                 leases.get(p.id()).is_none_or(|v| {
                     v.iter()
-                        .all(|l| l.elastic || (l.pin && fits(&want, &l.band)))
+                        .all(|l| l.elastic || l.yields.is_some() || (l.pin && fits(&want, &l.band)))
                 })
             })
             .map(|p| p.id().clone())
@@ -1169,7 +1401,7 @@ mod tests {
     #[tokio::test]
     async fn retune_shared_waiting_on_the_gate_gives_up_on_cancel() {
         let (p, m, scan) = (FakePort::new(), LeaseManager::new(), JobId::new());
-        m.acquire_shared(&p, scan.clone(), t(100_000_000, 40_000_000))
+        m.acquire_shared(&p, scan.clone(), t(100_000_000, 40_000_000), false)
             .await
             .unwrap();
         let guard = m.gate_guard(p.id()).await;
@@ -1310,9 +1542,14 @@ mod tests {
         );
         // A stepped scan's time-shared lease is granted.
         let stepped = JobId::new();
-        m.acquire_shared(p.as_ref(), stepped.clone(), t(100_000_000, 40_000_000))
-            .await
-            .unwrap();
+        m.acquire_shared(
+            p.as_ref(),
+            stepped.clone(),
+            t(100_000_000, 40_000_000),
+            false,
+        )
+        .await
+        .unwrap();
         assert!(m.time_shared(p.id()));
         assert_eq!(m.holders(p.id()).len(), 1);
         assert_eq!(m.sweepers(p.id()), vec![scan]);
@@ -1330,7 +1567,7 @@ mod tests {
         m.ensure(&rigid_port, demod.clone(), band, false)
             .await
             .unwrap();
-        m.acquire_shared(&shared_port, stepped.clone(), span)
+        m.acquire_shared(&shared_port, stepped.clone(), span, false)
             .await
             .unwrap();
         let (a, b) = (JobId::new(), JobId::new());
@@ -1505,15 +1742,17 @@ mod tests {
         RigidInside,
         RigidOutside,
         ScanInside,
+        YieldingScanInside,
     }
 
-    const STATES: [State; 6] = [
+    const STATES: [State; 7] = [
         State::Unheld,
         State::ElasticInside,
         State::ElasticOutside,
         State::RigidInside,
         State::RigidOutside,
         State::ScanInside,
+        State::YieldingScanInside,
     ];
 
     /// The port and manager in `state`, the holder its lease names (if any) and the
@@ -1528,6 +1767,11 @@ mod tests {
             State::RigidInside | State::RigidOutside => Some(Lease::new(j.clone(), cur, false)),
             State::ScanInside => Some(Lease {
                 time_shared: true,
+                ..Lease::new(j.clone(), t(100_000_000, 40_000_000), false)
+            }),
+            State::YieldingScanInside => Some(Lease {
+                time_shared: true,
+                yields: Some(CancellationToken::new()),
                 ..Lease::new(j.clone(), t(100_000_000, 40_000_000), false)
             }),
         };
@@ -1554,8 +1798,9 @@ mod tests {
             let guard = m.gate_guard(p.id()).await;
             let d = m.decide(&p, want, &guard);
             match state {
-                // Nothing holds the source: a rigid start tunes to its own band.
-                State::Unheld | State::ElasticOutside => {
+                // Nothing holds the source (a scan that gives way is as if not there):
+                // a rigid start tunes to its own band.
+                State::Unheld | State::ElasticOutside | State::YieldingScanInside => {
                     assert_eq!(d, Decision::Tune, "{state:?}")
                 }
                 State::ElasticInside | State::RigidInside => {
@@ -1573,7 +1818,8 @@ mod tests {
                     }
                     other => panic!("expected conflict, got {other:?}"),
                 },
-                // A scan's band is no capture to fit in: only stopping it frees the source.
+                // A scan that does not give way (a lossy depth): its band is no capture
+                // to fit in, and only stopping it frees the source.
                 State::ScanInside => match d {
                     Decision::Conflict { options, .. } => assert_eq!(
                         options,
@@ -1585,6 +1831,177 @@ mod tests {
             assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert_eq!(p.current(), Some(cur), "{state:?}");
         }
+    }
+
+    /// A time-shared lease that gives way is taken away by a request granted, under the
+    /// gate: its token fires, its holder waits, the source's changes move, and its next
+    /// step tunes nothing; it is given back only once nothing rigid holds the source.
+    /// Every kind of request takes it: rigid, elastic, a pin, a tune without a lease, a
+    /// request for no band, another scan's start.
+    #[tokio::test]
+    async fn a_lease_that_gives_way_is_taken_by_any_request_and_given_back_when_free() {
+        let (p, m) = (FakePort::new(), LeaseManager::new());
+        let scan = JobId::new();
+        let span = t(100_000_000, 40_000_000);
+        let token = m
+            .acquire_shared(&p, scan.clone(), span, true)
+            .await
+            .unwrap()
+            .expect("a token");
+        let changes = m.changes(p.id());
+        let job = JobId::new();
+        let want = t(433_000_000, 1_000_000);
+        assert_eq!(m.ensure(&p, job.clone(), want, false).await.unwrap(), want);
+        assert!(token.is_cancelled());
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(m.holders(p.id()), vec![(job.clone(), want)]);
+        assert_eq!(m.waiting(p.id()), vec![scan.clone()]);
+        assert!(m.is_waiting(&scan));
+        let n = p.tunes.load(std::sync::atomic::Ordering::SeqCst);
+        let step = m
+            .retune_shared(
+                &p,
+                &scan,
+                t(90_000_000, 10_000_000),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(step, None);
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), n);
+        assert_eq!(p.current(), Some(want));
+        // Not given back while the job holds the source; nor does the try take anything.
+        let g = m.gate_guard(p.id()).await;
+        match m.resume_shared_locked(&p, scan.clone(), span, &g) {
+            Err(LeaseError::Conflict { holders, .. }) => assert_eq!(holders, vec![job.clone()]),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        drop(g);
+        assert_eq!(m.holders(p.id()), vec![(job.clone(), want)]);
+        let changes = m.changes(p.id());
+        m.release(&job);
+        assert!(changes.has_changed().unwrap(), "a release is a change");
+        let g = m.gate_guard(p.id()).await;
+        let again = m.resume_shared_locked(&p, scan.clone(), span, &g).unwrap();
+        drop(g);
+        assert!(!again.is_cancelled());
+        assert!(m.waiting(p.id()).is_empty());
+        assert_eq!(m.holders(p.id()), vec![(scan.clone(), span)]);
+
+        // Each other kind of request takes it the same way.
+        let take = |token: CancellationToken, what: &str| {
+            assert!(token.is_cancelled(), "{what} left the scan holding");
+            assert_eq!(m.waiting(p.id()), vec![scan.clone()], "{what}");
+        };
+        let resume = || async {
+            let g = m.gate_guard(p.id()).await;
+            m.resume_shared_locked(&p, scan.clone(), span, &g).unwrap()
+        };
+        let other = JobId::new();
+        m.ensure(&p, other.clone(), want, true).await.unwrap();
+        take(again, "an elastic request");
+        m.release(&other);
+        let tok = resume().await;
+        m.pin(&p, want).await.unwrap();
+        take(tok, "a pin");
+        m.unpin(p.id());
+        let tok = resume().await;
+        m.tune_if_unheld(&p, want).await.unwrap();
+        take(tok, "a tune without a lease");
+        let tok = resume().await;
+        let g = m.gate_guard(p.id()).await;
+        m.unheld_locked(&p, &[], &g).unwrap();
+        drop(g);
+        take(tok, "a request for no band");
+        let tok = resume().await;
+        let second = JobId::new();
+        m.acquire_shared(&p, second.clone(), span, true)
+            .await
+            .unwrap();
+        take(tok, "another scan's start");
+        // And a waiting scan never takes another's lease away.
+        let g = m.gate_guard(p.id()).await;
+        assert!(m.resume_shared_locked(&p, scan.clone(), span, &g).is_err());
+        drop(g);
+        assert_eq!(m.holders(p.id()), vec![(second, span)]);
+    }
+
+    /// A time-shared lease that does not give way (a scan at another depth) is a
+    /// conflict naming it for every request, as before.
+    #[tokio::test]
+    async fn a_lease_that_does_not_give_way_is_a_conflict() {
+        let (p, m) = (FakePort::new(), LeaseManager::new());
+        let scan = JobId::new();
+        let span = t(100_000_000, 40_000_000);
+        assert!(
+            m.acquire_shared(&p, scan.clone(), span, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let want = t(433_000_000, 1_000_000);
+        for elastic in [false, true] {
+            match m.ensure(&p, JobId::new(), want, elastic).await {
+                Err(LeaseError::Conflict {
+                    holders, options, ..
+                }) => {
+                    assert_eq!(holders, vec![scan.clone()]);
+                    assert_eq!(
+                        options,
+                        vec!["stop the scan holding the source".to_string()]
+                    );
+                }
+                other => panic!("expected a conflict, got {other:?}"),
+            }
+        }
+        assert!(
+            m.acquire_shared(&p, JobId::new(), span, true)
+                .await
+                .is_err()
+        );
+        assert!(m.waiting(p.id()).is_empty());
+        assert_eq!(m.holders(p.id()), vec![(scan, span)]);
+    }
+
+    /// A step's tune under way when a request takes the lease away lands before the
+    /// request's: the request waits on the gate the step holds, so the port ends at
+    /// the request's band whichever goes first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_step_in_flight_tunes_before_the_request_that_takes_its_lease() {
+        let p = Arc::new(FakePort {
+            delay: true,
+            ..FakePort::new()
+        });
+        let m = Arc::new(LeaseManager::new());
+        let scan = JobId::new();
+        let span = t(100_000_000, 40_000_000);
+        m.acquire_shared(p.as_ref(), scan.clone(), span, true)
+            .await
+            .unwrap();
+        let (pp, mm, ss) = (p.clone(), m.clone(), scan.clone());
+        let step = tokio::spawn(async move {
+            mm.retune_shared(
+                pp.as_ref(),
+                &ss,
+                t(90_000_000, 10_000_000),
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let want = t(433_000_000, 1_000_000);
+        let got = m
+            .ensure(p.as_ref(), JobId::new(), want, false)
+            .await
+            .unwrap();
+        assert_eq!(got, want);
+        step.await.unwrap().unwrap();
+        assert_eq!(
+            p.current(),
+            Some(want),
+            "the step's tune landed after the request's"
+        );
+        assert_eq!(m.waiting(p.id()), vec![scan]);
     }
 
     #[tokio::test]

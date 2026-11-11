@@ -71,6 +71,9 @@
 //       An attached job (one with an `input` job) is a `.job.attached` row placed right
 //       under its input's row, its kind shown as `↳ <kind>`, with neither of the audio
 //       buttons. A job's `state.reason` (a failure) is also the row's tooltip.
+//       A running scan waiting for its source (`context.scan.waiting`: it gave way to another
+//       request, or the source was held when it started) shows `.waiting`, `waiting: <the
+//       reason>` in the note colour.
 //       A running scan row (one `job_context` per poll, a `graph_get` once per job; both are
 //       QUIET_OPS) shows `.sweep-ms` (the
 //       last sweep, `<n> ms` or `<n.n> s`) and a `select.scan-look` over SCAN_LOOKS (fast,
@@ -582,6 +585,12 @@ export function lookOf(params, lossy) {
 export const sweepText = (ms) => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
 
 // Whether a scan job is one its source sweeps for itself (`method` source).
+// Why a running scan waits for its source, its `context.scan.waiting` (null while it runs).
+function scanWaiting(job) {
+  const w = job && job.context && job.context.scan && job.context.scan.waiting;
+  return typeof w === "string" && w ? w : null;
+}
+
 function sourceSwept(job, scan) {
   return (job.context?.scan?.method ?? scan?.params?.method) === "source";
 }
@@ -695,6 +704,15 @@ function jobRow(
     span.textContent = pos;
     span.dir = "auto";
     span.title = "the last position decoded, from the view's home";
+    row.append(span);
+  }
+  const waiting = job.kind === "scan" && status === "running" ? scanWaiting(job) : null;
+  if (waiting) {
+    const span = document.createElement("span");
+    span.className = "waiting";
+    span.textContent = `waiting: ${waiting}`;
+    span.dir = "auto";
+    span.title = "the scan gave way and takes the source back once it is free";
     row.append(span);
   }
   const scan = job.kind === "scan" && status === "running" && scanInfo ? scanInfo(job) : null;

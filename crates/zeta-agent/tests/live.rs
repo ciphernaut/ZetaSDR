@@ -51,6 +51,7 @@ async fn live_llm_tunes_a_source() {
         position: None,
         depth: None,
         sweeps: vec![],
+        scans_waiting: vec![],
     }]);
     let tuning = OpResult::Tuning(Tuning {
         center_hz: Hz(101_500_000),

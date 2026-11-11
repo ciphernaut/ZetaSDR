@@ -339,29 +339,42 @@ async fn resume_launches_the_widest_record_first_whatever_the_file_order() {
     }
 }
 
-#[tokio::test]
-async fn scan_resumes_first_and_names_itself_in_the_others_reason() {
+/// A stepped scan resumes after the rigid records, however wide or narrow, and gives
+/// way to them: the demodulator resumes `Running`, and the scan resumes `Running` and
+/// waiting for it (`job_context.scan.waiting` naming it), never tuning the radio, until
+/// the demodulator stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_resumes_after_the_rigid_records_and_waits_for_them() {
     let (a, b) = (JobId::new(), JobId::new());
-    for (demod, scan) in [(&a, &b), (&b, &a)] {
+    for (demod, scan, width) in [(&a, &b, 40_000_000), (&b, &a, 40_000_000), (&a, &b, 40_000)] {
         let dir = tempfile::tempdir().unwrap();
         write_records(
             dir.path(),
             &[
                 running(demod, "passthrough", band(48_000), 1),
-                running(scan, "scan", band(40_000_000), 2),
+                running(scan, "scan", band(width), 2),
             ],
         );
-        let node = Node::open(cfg(dir.path()), registry(), vec![Radio::new()])
+        let radio = Radio::new();
+        let node = Node::open(cfg(dir.path()), registry(), vec![radio.clone()])
             .await
             .unwrap();
+        assert_eq!(record(&node, demod).state, JobState::Running);
         assert_eq!(record(&node, scan).state, JobState::Running);
-        match record(&node, demod).state {
-            JobState::Failed { reason } => {
-                assert!(reason.contains(&scan.0), "{reason}");
-                assert!(reason.contains("is held by"), "{reason}");
-            }
-            s => panic!("demod resumed as {s:?}"),
-        }
+        let want = format!("source radio0 is held by passthrough {}", demod.0);
+        until(
+            "the scan waits for the demodulator",
+            Duration::from_secs(10),
+            || record(&node, scan).context["scan"]["waiting"] == want.as_str(),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(radio.tunes(), vec![band(48_000)], "the waiting scan tuned");
+        node.job_stop(demod).await.unwrap();
+        until("the scan runs", Duration::from_secs(10), || {
+            record(&node, scan).context["scan"]["waiting"].is_null()
+        })
+        .await;
         node.job_stop(scan).await.unwrap();
     }
 }
@@ -407,29 +420,6 @@ async fn resume_restores_a_capture_shared_by_narrow_rigid_jobs() {
     let mut want = ids.to_vec();
     want.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(holders, want);
-}
-
-/// A scan resumes before every rigid record, even one wider than the scan's band.
-#[tokio::test]
-async fn a_narrow_scan_still_resumes_before_a_wider_rigid_record() {
-    let dir = tempfile::tempdir().unwrap();
-    let (demod, scan) = (JobId::new(), JobId::new());
-    write_records(
-        dir.path(),
-        &[
-            running(&demod, "passthrough", band(48_000), 1),
-            running(&scan, "scan", band(40_000), 2),
-        ],
-    );
-    let node = Node::open(cfg(dir.path()), registry(), vec![Radio::new()])
-        .await
-        .unwrap();
-    assert_eq!(record(&node, &scan).state, JobState::Running);
-    match record(&node, &demod).state {
-        JobState::Failed { reason } => assert!(reason.contains(&scan.0), "{reason}"),
-        s => panic!("demod resumed as {s:?}"),
-    }
-    node.job_stop(&scan).await.unwrap();
 }
 
 #[tokio::test]

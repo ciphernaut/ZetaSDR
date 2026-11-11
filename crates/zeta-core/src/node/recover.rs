@@ -6,7 +6,7 @@
 //! device again the port bumps [`Port::healed`]; the node then does for that one source
 //! what `open` does for all of them: the gain from the source's record, the pin from the
 //! record, then the records that failed with the fault, relaunched under their own ids
-//! in resume order (a scan first, then widest first, elastic jobs after the rigid ones,
+//! in resume order (widest first, elastic jobs after the rigid ones, scans after both,
 //! attached jobs last, once their inputs run). Only the records that failed during the
 //! current fault episode come back: a record that failed with the same prefix before
 //! (in an earlier episode, or under an earlier process) stays as it was.
@@ -181,10 +181,11 @@ impl Inner {
 
     /// Relaunch, in resume order, the records `relaunch` accepts (read at each one's
     /// turn, so an attached record sees its input relaunched before it): jobs on the
-    /// radio first, a scan first of all however narrow (it time-shares the source and
-    /// the others fail naming it, as they would live), then the widest band first
-    /// (ties oldest first) inside the capture [`Inner::resume_captures`] restores,
-    /// elastic jobs after every rigid one (they join whatever capture those left), then
+    /// radio first, the widest band first (ties oldest first) inside the capture
+    /// [`Inner::resume_captures`] restores, elastic jobs after every rigid one (they
+    /// join whatever capture those left), scans after both however wide (a stepped
+    /// scan gives way to every other request, so it waits for a source the others hold
+    /// and stops the elastic jobs of one they leave free, as it would live), then
     /// leaseless jobs (a mix lists what runs), and attached jobs last, on their inputs' streams. A
     /// launch that fails leaves its record `Failed` with the reason (`source <id> not present` for an absent source,
     /// the port's refusal under the source's name), persisted, with a fresh entry.
@@ -202,8 +203,8 @@ impl Inner {
             (
                 r.input.is_some(),
                 r.leaseless(),
+                r.kind == JobKind::Scan.name(),
                 r.elastic,
-                r.kind != JobKind::Scan.name(),
                 Reverse(r.tuning.bandwidth_hz.0),
                 r.created_ns.0,
             )
@@ -268,10 +269,10 @@ impl Inner {
     /// Before resuming, hold each source at the capture its resumable rigid records
     /// shared (see [`resume_capture`]) with a lease under a fresh id, so the first
     /// launch does not tune it down to its own band and the narrower ones fit again.
-    /// The caller releases each returned lease once every record is launched. A
-    /// source with a resumable scan is left alone: the scan takes it first; so is a
-    /// pinned source: the pin is its capture. With `only`, its source alone, leased
-    /// under its gate.
+    /// The caller releases each returned lease once every record is launched (a scan
+    /// then waiting for the hold takes the source if nothing else holds it). A scan
+    /// takes no part of the capture; a pinned source is left alone: the pin is its
+    /// capture. With `only`, its source alone, leased under its gate.
     async fn resume_captures(
         &self,
         records: &[JobRecord],
@@ -298,14 +299,7 @@ impl Inner {
                 .iter()
                 .filter(|r| &r.source == source && r.input.is_none() && relaunch(self, r))
                 .collect();
-            if mine
-                .iter()
-                .any(|r| r.kind == JobKind::Scan.name() && !super::scan::never_steps(r))
-            {
-                continue;
-            }
-            // A scan that never steps (the source's own sweep) takes no lease and no
-            // part of the capture: the others' is held as without it.
+            // A scan resumes after the others and takes no part of their capture.
             let mine: Vec<&JobRecord> = mine
                 .into_iter()
                 .filter(|r| r.kind != JobKind::Scan.name())
@@ -502,9 +496,13 @@ impl Inner {
             };
             jobs.values()
                 .filter(|e| &e.record.source == source)
+                // A scan waiting for the source reads no fault (it tunes nothing): it
+                // waits on, and takes the source back once the recovery frees it.
                 .filter(|e| match e.record.state {
                     JobState::Failed { .. } => true,
-                    JobState::Running => running && !blind(e),
+                    JobState::Running => {
+                        running && !blind(e) && !self.leases.is_waiting(&e.record.id)
+                    }
                     _ => false,
                 })
                 .filter_map(|e| Some((e.record.id.clone(), e.ended.clone()?)))

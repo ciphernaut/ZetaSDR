@@ -2806,6 +2806,12 @@ impl Node {
         self.inner.leases.sweepers(source)
     }
 
+    /// Stepped scans waiting for `source`: their lease gave way to another request (or
+    /// the source was held when they started), so they hold nothing.
+    pub fn lease_waiting(&self, source: &SourceId) -> Vec<JobId> {
+        self.inner.leases.waiting(source)
+    }
+
     /// `source_free`: the sources, in id order, that could take the band now
     /// ([`LeaseManager::free_sources`]: a pin over the whole band admits it), and every
     /// other source that covers it with its holders, elastic jobs, pin and fault.

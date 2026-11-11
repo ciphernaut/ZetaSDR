@@ -11,7 +11,8 @@
 //         under the same id, with new streams, on every retune), on the source's `current`
 //         band (its whole capture) or, when `current` is null, on the centre of its tune range
 //         with its max_bandwidth_hz. While a `scan` job runs on the source, the waterfall follows
-//         that job instead and starts none (scan mode, below). UI-started job ids go in
+//         that job instead and starts none (scan mode, below); a stepped scan waiting for the
+//         source (`context.scan.waiting`: it gave way to another request) is not followed. UI-started job ids go in
 //         sessionStorage[UI_JOBS_KEY]; they are stopped on `pagehide` (fetch keepalive, with
 //         the bearer), and when the waterfall moves to another source (a job it started for
 //         the source it leaves; one it reused is left running). The job's event stream is
@@ -24,16 +25,15 @@
 //     wf.syncJobs(jobs)  a `job_list` result (app.js hands it every poll): follows a scan job
 //         that started on the shown source, or goes back to a spectrum job when it ended
 //     wf.onNotice   fn(text) for transcript lines (a refused retune); set by app.js
-//     wf.release(src, span) -> Promise<bool>  checks `source_list` holders of `src` (rigid jobs;
-//         the page's own elastic job is never one; a `pin` is one, see rigidHolders) and, when
-//         there are none, stops following
-//         (false, with a `conflict: …` notice, when a job holds it). The page's own job is
-//         left to the node: a stepped scan on the source stops it, while under a self-sweep
-//         (`span` {lo, hi} in Hz inside the source's `capabilities.sweep`, see sweepsItself)
-//         the node takes no lease and stops nothing, so the page's own spectrum job keeps
-//         running, unseen while the waterfall follows the scan, and the page does not refuse
-//         for rigid holders: the node decides. The caller then runs
-//         setSource(src) again (menu.js after starting a scan).
+//     wf.release() -> Promise<bool>  stops following the source for a scan: true. It
+//         never refuses for the source's holders: the node decides (a stepped scan on a held
+//         source waits for it, `context.scan.waiting`, and the waterfall goes on showing the
+//         capture meanwhile; a lossy one is the node's conflict). The page's own job is left
+//         to the node: a stepped scan that takes the source stops it, while under a
+//         self-sweep (a span inside the source's `capabilities.sweep`, see
+//         sweepsItself) the node takes no lease and stops nothing, so the page's own
+//         spectrum job keeps running, unseen while the waterfall follows the scan. The caller
+//         then runs setSource(src) again (menu.js after starting a scan).
 //     wf.painted    columns painted since mount (never reset; for tests)
 //     wf.lastRowFormat  "q" (spectrum event v2) or "db" (older nodes) for the last painted
 //         row; null before the first
@@ -404,8 +404,25 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isRunning = (j) => !!(j && j.state && j.state.status === "running");
 
 // The running `scan` job on `sourceId` in a `job_list` result, or null.
+// A running scan on the source to follow: not a stepped one waiting for the source (it gave
+// way to another request and shows nothing meanwhile; the capture its holders keep is shown).
 function runningScan(jobs, sourceId) {
-  return jobs.find((j) => j.kind === "scan" && j.source === sourceId && isRunning(j)) || null;
+  return (
+    jobs.find(
+      (j) => j.kind === "scan" && j.source === sourceId && isRunning(j) && !waitingStepped(j),
+    ) || null
+  );
+}
+
+// Why a running scan waits, its `context.scan.waiting` (null while it runs).
+function scanWaiting(job) {
+  const w = job && job.context && job.context.scan && job.context.scan.waiting;
+  return typeof w === "string" && w ? w : null;
+}
+
+// Whether `job` is a stepped scan waiting for its source.
+function waitingStepped(job) {
+  return scanWaiting(job) !== null && job.context.scan.method !== "source";
 }
 
 // The rigid holders of a `source_list` record: its `holders` (job ids), then `pin` when the
@@ -774,16 +791,10 @@ class Waterfall {
     return rigidHolders(await this.sourceInfo(src));
   }
 
-  // Lets go of `src` for a scan: true once nothing follows it; false (with a `conflict: …`
-  // notice) when a rigid job holds it, unless the source sweeps `span` itself (the node
-  // decides). The page's own elastic job keeps running: a stepped scan stops it on the node. Throws when `source_list` fails (nothing released then).
-  async release(src, span = null) {
-    const info = await this.sourceInfo(src);
-    const holders = rigidHolders(info);
-    if (holders.length && !(span && sweepsItself(info, span.lo, span.hi))) {
-      this.notice(`conflict: source ${src.id} held by ${holders.join(", ")}`);
-      return false;
-    }
+  // Lets go of `src` for a scan: true once nothing follows it. Never refused for its holders:
+  // the node decides (a stepped scan waits for a held source). The page's own elastic job keeps
+  // running: a stepped scan stops it on the node when it takes the source.
+  async release() {
     this.gen += 1; // no frames, reconnects or restarts from the job being let go
     this.cancelReaim();
     if (this.sub) this.sub.close();

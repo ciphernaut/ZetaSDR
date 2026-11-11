@@ -93,7 +93,7 @@ Every applied op is appended as one JSON line (the op's payload plus `t_ns`) to 
 (a read-only op that succeeds, such as `source list` or `stream tail`, without its result),
 rotated to `ops.log.1` past 8 MiB; `ops tail` reads it and is a usage error with `--node`. A restart
 restores a source's capture (the band bounding its rigid jobs, when the radio can capture it),
-resumes its jobs a scan first, then widest first, elastic after rigid, and re-expands a built-in graph if the
+resumes its jobs widest first, elastic after rigid and a scan last (it waits if they hold the radio), and re-expands a built-in graph if the
 capture rate differs from the one recorded (`capture_rate_hz`).
 
 Holding a capture, receive gain and transcripts:
@@ -828,11 +828,19 @@ the radio's tuning range. The sweep is paced by the radio, not by a sleep: the s
 for the samples of its dwell (a source delivers only samples taken after the tune settled) and
 tunes on while the FFT of the step runs beside it. Its cost is in the job context, `scan.timing`
 (`sweep_ms`, the median `step_ms`, `tune_ms`, `slow_tunes`, `skipped`, `fft_wait_ms`, `hz_per_s`),
-refreshed about once a second, so the sweep time is read there rather than counted from steps. A stepped scan time-shares the radio, so it holds the lease on
-its whole span: while it runs every other `job_start` or `source_ensure` on that source is a
-`conflict` naming the scan (no silent pre-emption), and `source_list` shows the scan as holder
-and the step it is on as `current`. Stopping it frees the source and leaves `current` at the
-last step (a source that sweeps for itself is the exception, below). The UI's context menu has "Scan this span"; in scan mode the waterfall's axis spans
+refreshed about once a second, so the sweep time is read there rather than counted from steps. A stepped scan time-shares the radio
+but never blocks anything: while it steps it holds a lease on its whole span (`source_list` shows it
+as holder and the step it is on as `current`), and that lease gives way. Any other request on the
+source (a rigid or elastic `job_start`, `source_ensure`, `source_pin`, `job_retune`, a plan or set
+start, `source_measure`, another stepped scan) is granted as if the scan were not there, and no job is
+stopped: the scan stops tuning and waits, still `running`, with `context.scan.waiting` saying who holds
+the source (`source <id> is held by <kind> <id>, ...`, `pin` for a pin; `null` while it steps) and
+`timing` keeping its last figures; `source_list` lists it under `scans_waiting`, not `holders`. It
+takes the source back by itself, starting a new sweep, as soon as no rigid job, no pin and no other
+scan holds it (woken by the release, with a 5 s retry behind that), and then stops the elastic jobs as
+its start does. A stepped scan started on a held radio returns its id and waits the same way; with
+`--replace` naming the holders it stops them and steps at once. Stopping a scan frees the source and
+leaves `current` at the last step (a source that sweeps for itself is the exception, below). The UI's context menu has "Scan this span"; in scan mode the waterfall's axis spans
 the scan and each row paints its step's segment of a new column, so a sweep fills in
 progressively.
 
@@ -857,7 +865,10 @@ lowers the noise ripple as one 320 ms dwell does while every step is still visit
 in `source list`) holds the source's link at that sample depth for the scan and steps at that depth's
 width, putting the source's own depth back at the end: at 8 bits a weak signal beside a strong one in
 the same capture is lost in quantisation noise, so it is a coarse survey of occupancy, never the
-default and never for faint signals; it is granted only when the scan is the source's sole holder.
+default and never for faint signals. Such a scan (a lossy depth, or any other than the one in force)
+changes what every holder gets, so it does not give way: it is granted only as the source's sole
+holder (else the usual `conflict` naming the holders), and a job started beside it is a `conflict`
+naming it.
 
 A source that sweeps for itself (`capabilities.sweep` in `source list`: `null` for a source that cannot,
 else `min_hz`, `max_hz`, `bin_hz_min`, `rows_per_s_max` and `calibrated`; a KiwiSDR's waterfall is the
@@ -877,8 +888,7 @@ and `rows_per_s`, the rows a second since the last write, which is what to read 
 rewritten at most once a second, re-aims included), and has no `rate_hz` and no `bits`; while it is `waiting` it holds only `method`, `mask`, `calibrated` and `waiting` (the plan's
 keys arrive when the source grants the sweep, `timing` after its first sweep); a row's `calibrated` says its levels are absolute dBm, which a local radio's rows are not, so
 never compare levels across the two. A sweep a source refuses at a first start makes the scan step, and
-`scan.fallback` says why; when the source's IQ channel is held that is the usual `conflict` carrying the
-source's reason. A scan that ran as `source` and is restarted (a node restart, a `graph_put`, a look
+`scan.fallback` says why; when the source's IQ channel is held the stepped scan waits for it. A scan that ran as `source` and is restarted (a node restart, a `graph_put`, a look
 change) never steps: refused then, it stays up with `scan.waiting` and the reason, and asks again after
 1, 2, 4, 8 and 16 s, then every 16 s. A source's sweep start is bounded at 5 s (`sweep start timed out`
 reads as a refusal). The page's "Scan this span" asks for a scan whoever holds the source's IQ channel.
@@ -907,7 +917,9 @@ $Z job start --kind scan --source b210 --center-hz 500000000 --bandwidth-hz 1000
 # the B210's whole range in 27.648 MHz steps (0.9 of its measured 30.72 Msps); read the sweep time
 $Z job context --job <scan job>      # scan.timing.sweep_ms, scan.steps, scan.step_hz
 $Z job start --kind measure --source b210 --center-hz 95300000 --bandwidth-hz 200000
-# {"error": "conflict", "holders": ["<scan job>"], "options": ["stop the scan holding the source"]}
+# granted: the scan gives way
+$Z job context --job <scan job>      # scan.waiting: "source b210 is held by measure <job>"
+$Z job stop --job <measure job>      # the scan takes the radio back: scan.waiting null
 ```
 
 The IQ ring is sized from a memory budget per source: seconds = budget / (rate x 8 B), clamped
@@ -1004,7 +1016,7 @@ with a file source the one-shot form works. Prefer a federating `serve` until th
 
 ### A radio that comes back
 
-A Soapy device runs in a `zeta soapy-worker` child that the node spawns, so a driver crash or a pulled cable faults the source and never ends the node. Expect this on a cable pull: within about a second `source list` shows `fault` as `no samples for 1000 ms (device unplugged?)` (the worker's exit 5), every job on the source fails with `source <id>: <fault>`, and `job_start` is refused with `source <id>: <fault>` (`source_ensure` and `source_pin` still answer `io: <fault>`). A driver crash reads `soapy worker for <id> died: signal 11 (SIGSEGV)` (or `exit code N`); a device that is not there reads `device not found: <args>`, and an open that fails `soapy open failed: <last stderr line>`. Nothing needs restarting: the node respawns the worker (1 s doubling to 5 s, reset after 60 s alive; every 5 s while the device is absent), logs `zeta: soapy worker for <id>: <fault>; waiting for the device` once and, when the device is back, `zeta: soapy worker for <id>: back after <n> attempts, <s> s`. Then it restores the gain and the pin and relaunches every job that failed with that fault, under its own id (a scan first, then widest first; an attached `transcribe` after its input; the `watch` re-adopting its decoders), logging `zeta: source <id>: recovered: pin <c>/<bw> Hz, gain <g> dB, <n> jobs relaunched`. Jobs you stopped, jobs that failed for their own reason and jobs that failed in an earlier episode stay as they are. The node awaits the worker's hello for up to 60 s (`soapy worker for <id>: no hello in 60 s`); on the field host the B210 says hello in 2-4 s. The worker hands its IQ to the node through a shared-memory ring the node creates for each spawn (64 MiB by default, `cf32` slots of 2 MiB, inherited by the child as fd 3), and the pipe carries only control and small block descriptors, so a burst of samples never delays a fault or a status. A worker without a ring (`memfd_create` unavailable) sends the blocks on the pipe, and `worker.transport.path` says which (`shm` or `pipe`).
+A Soapy device runs in a `zeta soapy-worker` child that the node spawns, so a driver crash or a pulled cable faults the source and never ends the node. Expect this on a cable pull: within about a second `source list` shows `fault` as `no samples for 1000 ms (device unplugged?)` (the worker's exit 5), every job on the source fails with `source <id>: <fault>`, and `job_start` is refused with `source <id>: <fault>` (`source_ensure` and `source_pin` still answer `io: <fault>`). A driver crash reads `soapy worker for <id> died: signal 11 (SIGSEGV)` (or `exit code N`); a device that is not there reads `device not found: <args>`, and an open that fails `soapy open failed: <last stderr line>`. Nothing needs restarting: the node respawns the worker (1 s doubling to 5 s, reset after 60 s alive; every 5 s while the device is absent), logs `zeta: soapy worker for <id>: <fault>; waiting for the device` once and, when the device is back, `zeta: soapy worker for <id>: back after <n> attempts, <s> s`. Then it restores the gain and the pin and relaunches every job that failed with that fault, under its own id (widest first, a scan last; an attached `transcribe` after its input; the `watch` re-adopting its decoders), logging `zeta: source <id>: recovered: pin <c>/<bw> Hz, gain <g> dB, <n> jobs relaunched`. Jobs you stopped, jobs that failed for their own reason and jobs that failed in an earlier episode stay as they are. The node awaits the worker's hello for up to 60 s (`soapy worker for <id>: no hello in 60 s`); on the field host the B210 says hello in 2-4 s. The worker hands its IQ to the node through a shared-memory ring the node creates for each spawn (64 MiB by default, `cf32` slots of 2 MiB, inherited by the child as fd 3), and the pipe carries only control and small block descriptors, so a burst of samples never delays a fault or a status. A worker without a ring (`memfd_create` unavailable) sends the blocks on the pipe, and `worker.transport.path` says which (`shm` or `pipe`).
 
 `worker` in `source list` is `{pid, restarts, since_ns, transport, transport_dropped}` (`null` for a source that runs in the node): `restarts` counts respawns since the node started, `since_ns` is when the live worker said hello, and a `restarts` that climbs while the device is healthy means the driver keeps crashing: read the worker's own stderr lines, prefixed `zeta-soapy-worker[<id>]: `. A source that stays faulted while `restarts` rises is waiting for a device that is not on the bus. A device absent at startup attaches faulted (`device not found: <args>`) when an earlier start saw it, else the flag is refused (`device not found: <args> (never seen on this host; plug it in once)`, exit 1). `--soapy-in-process` opens the device in the node as before, for diagnosing the worker only: a crash then ends the node.
 

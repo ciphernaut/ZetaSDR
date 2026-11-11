@@ -1043,28 +1043,26 @@ async fn scan_steps_the_port_across_the_span_and_emits_rows() {
     }
 }
 
+/// A stepped scan gives way: a `job_start` inside its span (inside the step the
+/// port happens to be at, or not) and a `source_ensure` are granted, never a
+/// conflict naming the scan; the scan waits while the job holds the source.
 #[tokio::test(flavor = "multi_thread")]
-async fn job_start_during_scan_is_a_conflict_naming_it() {
+async fn job_start_during_scan_is_granted_and_never_a_conflict_naming_it() {
     let (_dir, node, _port) = open().await;
     let (id, _rx) = start_scan(&node).await;
-    // Inside the span, and inside the step the port happens to be at: still refused.
-    for op in [
-        start(JobKind::Spectrum, 8 * MHZ, MHZ),
-        start(JobKind::FmDemod, 24 * MHZ, 12_500),
-        Op::SourceEnsure {
-            source: SourceId("radio0".into()),
-            center_hz: Hz(8 * MHZ),
-            bandwidth_hz: Hz(MHZ),
-            replace: vec![],
-        },
-    ] {
-        match node.apply(op).await {
-            Err(OpError::Conflict { holders, .. }) => assert_eq!(holders, vec![id.clone()]),
-            other => panic!("expected a conflict naming the scan, got {other:?}"),
-        }
-    }
+    let ensure = Op::SourceEnsure {
+        source: SourceId("radio0".into()),
+        center_hz: Hz(8 * MHZ),
+        bandwidth_hz: Hz(MHZ),
+        replace: vec![],
+    };
+    assert!(matches!(node.apply(ensure).await, Ok(OpResult::Tuning(_))));
+    let job = start_job(&node, start(JobKind::Spectrum, 8 * MHZ, MHZ)).await;
     let (_, holders) = source_info(node.apply(Op::SourceList {}).await.unwrap());
-    assert_eq!(holders, vec![id]);
+    assert_eq!(holders, vec![job.clone()]);
+    until_waiting_for(&node, &id, &job.0).await;
+    node.job_stop(&job).await.unwrap();
+    node.job_stop(&id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3002,32 +3000,28 @@ async fn a_refused_sweep_falls_back_to_stepped_and_says_why() {
     node.job_stop(&id).await.unwrap();
 }
 
-/// With the source's capture held, the fallback is the usual conflict naming the
-/// holders, the source's reason among its options; nothing is stopped and no scan
-/// is left.
+/// With the source's capture held, the scan that falls back to stepping waits for
+/// the holder rather than failing: its record says `fallback` (the source's reason)
+/// and `waiting` (the holder); nothing is stopped and no claim is left.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_refused_sweep_under_a_held_channel_is_the_conflict_with_the_reason() {
+async fn a_refused_sweep_under_a_held_channel_waits_with_the_reason() {
     let (_dir, node, port) = open_with(refusing()).await;
     let rigid = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
-    match node
-        .apply(start(JobKind::Scan, SWEEP_SPAN.0, SWEEP_SPAN.1))
-        .await
-    {
-        Err(OpError::Conflict {
-            holders, options, ..
-        }) => {
-            assert_eq!(holders, vec![rigid.clone()]);
-            let want = format!("the source refused to sweep for itself: {NO_WATERFALL}");
-            assert!(options.contains(&want), "{options:?}");
-        }
-        other => panic!("expected a conflict, got {other:?}"),
-    }
+    let scan = start_job(&node, start(JobKind::Scan, SWEEP_SPAN.0, SWEEP_SPAN.1)).await;
+    let ctx = scan_ctx(&node, &scan);
+    assert_eq!(ctx["fallback"], NO_WATERFALL, "{ctx}");
+    assert_eq!(ctx["method"], "stepped", "{ctx}");
+    let why = until_waiting_for(&node, &scan, &rigid.0).await;
+    assert_eq!(
+        why,
+        format!("source radio0 is held by spectrum {}", rigid.0)
+    );
     assert_eq!(port.requests().len(), 1);
-    assert!(no_scan_listed(&node), "{:?}", node.job_list());
     assert!(node.lease_sweepers(&radio0()).is_empty());
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(job_state(&node, &rigid), Some(JobState::Running));
     assert_eq!(radio0_info(&node).await.holders, vec![rigid.clone()]);
+    node.job_stop(&scan).await.unwrap();
     node.job_stop(&rigid).await.unwrap();
 }
 
@@ -3704,4 +3698,276 @@ async fn a_one_step_self_sweep_refreshes_its_timing_across_re_aims() {
     // A row every SWEEP_ROW_MS (5 ms): well over 20 a second, under 1000.
     assert!(rps > 20.0 && rps < 1000.0, "{t}");
     node.job_stop(&id).await.unwrap();
+}
+
+// ---- A stepped scan gives way: a request it blocked is granted, the scan waits ----
+
+/// Job `id`'s `context.scan.waiting`: the reason, or `None` while it runs.
+fn waiting_of(node: &Node, id: &JobId) -> Option<String> {
+    scan_ctx(node, id)["waiting"].as_str().map(String::from)
+}
+
+/// Wait until job `id`'s `context.scan.waiting` names `who` (a job id, or `pin`).
+async fn until_waiting_for(node: &Node, id: &JobId, who: &str) -> String {
+    until(
+        &format!("the scan waits for {who}"),
+        Duration::from_secs(10),
+        || waiting_of(node, id).is_some_and(|w| w.contains(who)),
+    )
+    .await;
+    waiting_of(node, id).unwrap()
+}
+
+/// Wait until the scan `id` runs again: `waiting` null and new rows on `rx`.
+async fn until_resumed(node: &Node, id: &JobId, rx: &mut broadcast::Receiver<Frame>) {
+    until("the scan runs again", Duration::from_secs(10), || {
+        scan_ctx(node, id)["waiting"].is_null()
+    })
+    .await;
+    // Rows the bus held from before the wait are drained; a fresh one follows.
+    while rx.try_recv().is_ok() {}
+    rows(rx, 2, Duration::from_secs(10)).await;
+}
+
+/// No tune for `quiet` from now: the port's count stays at what it is.
+async fn no_tune_for(port: &ScanPort, quiet: Duration) {
+    let n = port.tunes().len();
+    tokio::time::sleep(quiet).await;
+    assert_eq!(port.tunes().len(), n, "the waiting scan tuned the port");
+}
+
+/// A rigid job started beside a stepped scan is granted, not a conflict: the scan
+/// gives way (`waiting` naming the job by kind and id, nothing tuned while it holds,
+/// `source_list` listing the job as holder and the scan under `scans_waiting`), and
+/// takes the source back by itself when the job stops (`waiting` null, rows again).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rigid_job_beside_a_stepped_scan_is_granted_and_the_scan_waits_for_it() {
+    let (_dir, node, port) = open().await;
+    let (scan, mut rx) = start_scan(&node).await;
+    rows(&mut rx, 3, Duration::from_secs(10)).await;
+    let want = Tuning {
+        center_hz: Hz(100 * MHZ),
+        bandwidth_hz: Hz(MHZ),
+    };
+    let job = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    assert_eq!(port.current(), Some(want));
+    let why = until_waiting_for(&node, &scan, &job.0).await;
+    assert_eq!(why, format!("source radio0 is held by spectrum {}", job.0));
+    assert_eq!(job_state(&node, &scan), Some(JobState::Running));
+    no_tune_for(&port, Duration::from_millis(400)).await;
+    assert_eq!(port.current(), Some(want));
+    let info = radio0_info(&node).await;
+    assert_eq!(info.holders, vec![job.clone()]);
+    assert_eq!(info.scans_waiting, vec![scan.clone()]);
+    node.job_stop(&job).await.unwrap();
+    until_resumed(&node, &scan, &mut rx).await;
+    let info = radio0_info(&node).await;
+    assert_eq!(info.holders, vec![scan.clone()]);
+    assert!(info.scans_waiting.is_empty(), "{info:?}");
+    node.job_stop(&scan).await.unwrap();
+}
+
+/// An elastic job started beside a stepped scan is granted too (no conflict); it
+/// follows the capture, so the scan, free again at once, takes the source back and
+/// stops it as a scan's start stops the elastic jobs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_elastic_job_beside_a_stepped_scan_is_granted_and_the_scan_takes_the_source_back() {
+    let (_dir, node, _port) = open().await;
+    let (scan, mut rx) = start_scan(&node).await;
+    rows(&mut rx, 3, Duration::from_secs(10)).await;
+    let job = start_job(&node, elastic(start(JobKind::Spectrum, 100 * MHZ, MHZ))).await;
+    until(
+        "the elastic job is stopped",
+        Duration::from_secs(10),
+        || job_state(&node, &job) == Some(JobState::Stopped),
+    )
+    .await;
+    until_resumed(&node, &scan, &mut rx).await;
+    let info = radio0_info(&node).await;
+    assert_eq!(info.holders, vec![scan.clone()]);
+    assert!(info.elastic.is_empty(), "{info:?}");
+    node.job_stop(&scan).await.unwrap();
+}
+
+/// `source_ensure` beside a stepped scan tunes the source (no conflict); it holds
+/// nothing, so the scan takes the source back at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn source_ensure_beside_a_stepped_scan_is_granted() {
+    let (_dir, node, port) = open().await;
+    let (scan, mut rx) = start_scan(&node).await;
+    rows(&mut rx, 3, Duration::from_secs(10)).await;
+    let want = Tuning {
+        center_hz: Hz(433 * MHZ),
+        bandwidth_hz: Hz(MHZ),
+    };
+    let r = node
+        .apply(Op::SourceEnsure {
+            source: radio0(),
+            center_hz: want.center_hz,
+            bandwidth_hz: want.bandwidth_hz,
+            replace: vec![],
+        })
+        .await;
+    assert_eq!(r, Ok(OpResult::Tuning(want)));
+    assert!(port.tunes().contains(&want), "{:?}", port.tunes());
+    until_resumed(&node, &scan, &mut rx).await;
+    assert_eq!(job_state(&node, &scan), Some(JobState::Running));
+    node.job_stop(&scan).await.unwrap();
+}
+
+/// `source_pin` beside a stepped scan pins the source (no conflict) and holds the
+/// scan off, `waiting` saying `pin`; `source_unpin` lets it take the source back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pin_beside_a_stepped_scan_holds_it_off_until_unpinned() {
+    let (_dir, node, port) = open().await;
+    let (scan, mut rx) = start_scan(&node).await;
+    rows(&mut rx, 3, Duration::from_secs(10)).await;
+    let want = Tuning {
+        center_hz: Hz(433 * MHZ),
+        bandwidth_hz: Hz(MHZ),
+    };
+    let r = node
+        .apply(Op::SourcePin {
+            source: radio0(),
+            center_hz: want.center_hz,
+            bandwidth_hz: want.bandwidth_hz,
+            replace: vec![],
+        })
+        .await;
+    assert_eq!(r, Ok(OpResult::Tuning(want)));
+    let why = until_waiting_for(&node, &scan, "pin").await;
+    assert_eq!(why, "source radio0 is held by pin");
+    no_tune_for(&port, Duration::from_millis(400)).await;
+    assert_eq!(port.current(), Some(want));
+    node.apply(Op::SourceUnpin { source: radio0() })
+        .await
+        .unwrap();
+    until_resumed(&node, &scan, &mut rx).await;
+    node.job_stop(&scan).await.unwrap();
+}
+
+/// A stepped scan started on a source a rigid job holds is not refused: it returns
+/// its id, runs `waiting` for the job (tuning nothing, its record the stepped scan's
+/// keys), and begins when the job stops. With `replace` naming the holder it stops it
+/// and runs at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stepped_scan_started_on_a_held_source_waits_then_runs() {
+    let (_dir, node, port) = open().await;
+    let job = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    let n = port.tunes().len();
+    let (scan, mut rx) = start_scan(&node).await;
+    assert_eq!(job_state(&node, &scan), Some(JobState::Running));
+    let why = until_waiting_for(&node, &scan, &job.0).await;
+    assert_eq!(why, format!("source radio0 is held by spectrum {}", job.0));
+    let ctx = scan_ctx(&node, &scan);
+    assert_eq!(ctx["method"], "stepped", "{ctx}");
+    assert!(ctx["steps"].as_u64().is_some(), "{ctx}");
+    no_tune_for(&port, Duration::from_millis(400)).await;
+    assert_eq!(port.tunes().len(), n);
+    assert_eq!(radio0_info(&node).await.scans_waiting, vec![scan.clone()]);
+    node.job_stop(&job).await.unwrap();
+    until_resumed(&node, &scan, &mut rx).await;
+    node.job_stop(&scan).await.unwrap();
+
+    // With `replace`: the holder stopped, the scan steps at once.
+    let job = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    let op = replacing(
+        start(JobKind::Scan, 20 * MHZ, 40 * MHZ),
+        std::slice::from_ref(&job),
+    );
+    let scan = start_job(&node, op).await;
+    assert_eq!(job_state(&node, &job), Some(JobState::Stopped));
+    assert!(scan_ctx(&node, &scan)["waiting"].is_null());
+    let info = radio0_info(&node).await;
+    assert_eq!(info.holders, vec![scan.clone()]);
+    let mut rx = event_rx(&node, &scan);
+    rows(&mut rx, 2, Duration::from_secs(10)).await;
+    node.job_stop(&scan).await.unwrap();
+}
+
+/// A waiting scan stopped ends promptly and leaves nothing: no lease, no wait, no
+/// stage task.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_a_waiting_scan_leaves_nothing_behind() {
+    let (_dir, node, _port) = open().await;
+    let (scan, mut rx) = start_scan(&node).await;
+    rows(&mut rx, 2, Duration::from_secs(10)).await;
+    let job = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    until_waiting_for(&node, &scan, &job.0).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(5), node.job_stop(&scan)).await;
+    assert!(matches!(stopped, Ok(Ok(()))), "{stopped:?}");
+    assert_eq!(job_state(&node, &scan), Some(JobState::Stopped));
+    let info = radio0_info(&node).await;
+    assert_eq!(info.holders, vec![job.clone()]);
+    assert!(info.scans_waiting.is_empty(), "{info:?}");
+    node.job_stop(&job).await.unwrap();
+    until("no stage task runs", Duration::from_secs(10), || {
+        node.debug_stage_count() == 0
+    })
+    .await;
+    assert!(node.lease_holders(&radio0()).is_empty());
+    assert!(node.lease_waiting(&radio0()).is_empty());
+}
+
+/// Two requests queued on the source's gate behind a running scan race its yield:
+/// whatever the order, neither is refused for the scan, one is granted, a band the
+/// granted one's capture does not hold is the usual conflict naming that job (never
+/// the scan), and the scan holds nothing and waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_requests_racing_the_yield_are_never_refused_for_the_scan() {
+    let (_dir, node, _port) = open().await;
+    let node = Arc::new(node);
+    // Bands that do not fit together, then two that do (the second inside the first).
+    let pairs = [
+        ((100 * MHZ, MHZ), (433 * MHZ, MHZ)),
+        ((100 * MHZ, MHZ), (100 * MHZ + 200_000, 100_000)),
+    ];
+    for (a, b) in pairs {
+        let (scan, mut rx) = start_scan(&node).await;
+        rows(&mut rx, 2, Duration::from_secs(10)).await;
+        let gate = node.debug_gate(&radio0()).await;
+        let ask = |(hz, bw): (u64, u64)| {
+            let node = node.clone();
+            tokio::spawn(async move { node.apply(start(JobKind::Spectrum, hz, bw)).await })
+        };
+        let (ra, rb) = (ask(a), ask(b));
+        // Both queued on the gate (and the scan's next step with them).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!ra.is_finished() && !rb.is_finished());
+        drop(gate);
+        let got = [ra.await.unwrap(), rb.await.unwrap()];
+        let granted: Vec<JobId> = got
+            .iter()
+            .filter_map(|r| match r {
+                Ok(OpResult::Job(id)) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        for r in &got {
+            match r {
+                Ok(OpResult::Job(_)) => {}
+                Err(OpError::Conflict { holders, .. }) => {
+                    assert!(!holders.contains(&scan), "refused for the scan: {r:?}");
+                    assert_eq!(holders, &granted, "{r:?}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // Apart, one is granted; nested, both are when the wider goes first, else
+        // the wider is the usual conflict naming the narrower.
+        assert!(!granted.is_empty(), "{got:?}");
+        if b.0 == 433 * MHZ {
+            assert_eq!(granted.len(), 1, "{got:?}");
+        }
+        let why = until_waiting_for(&node, &scan, &granted[0].0).await;
+        assert!(why.starts_with("source radio0 is held by"), "{why}");
+        let info = radio0_info(&node).await;
+        assert!(!info.holders.contains(&scan), "{info:?}");
+        assert_eq!(info.scans_waiting, vec![scan.clone()]);
+        for id in granted {
+            node.job_stop(&id).await.unwrap();
+        }
+        until_resumed(&node, &scan, &mut rx).await;
+        node.job_stop(&scan).await.unwrap();
+    }
 }

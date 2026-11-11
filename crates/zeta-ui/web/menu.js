@@ -118,11 +118,10 @@
 //   measure    Start background job › measure job_start kind=measure, deviation_hz null
 //                                             (every job_start sends sideband: null unless SSB)
 //   scan       Scan this span                 (starts the default look, 20 ms x 1; the job's
-//                                             row offers the others: agent.js SCAN_LOOKS) wf.release() (stops the page's own spectrum job
-//                                             unless another job holds the source: then a
-//                                             `conflict: …` line and nothing more; a source that
-//                                             sweeps the span itself, `wf.release(src, span)`,
-//                                             is asked anyway: the node decides), job_start
+//                                             row offers the others: agent.js SCAN_LOOKS) wf.release() (the
+//                                             waterfall lets go; the node decides: on a source
+//                                             another job holds the scan waits, its row saying
+//                                             so), job_start
 //                                             kind=scan on the selection's centre and
 //                                             bandwidth, then wf.resume() (scan mode when the
 //                                             scan runs, else the spectrum job again)
@@ -1123,22 +1122,14 @@ class Menu {
     });
   }
 
-  // A scan time-shares the radio: the waterfall lets go of the source first (refused while a
-  // rigid job holds it, unless the source sweeps the span itself and the node decides), the scan stops the page's elastic spectrum job on the node, and the
-  // waterfall follows the scan after (and starts its own job again when the scan ends).
+  // A scan time-shares the radio but blocks nothing: the waterfall lets go of the source first
+  // and the node decides (a stepped scan on a source another job holds waits for it, its row
+  // saying so, while the waterfall shows the capture); a scan that takes the source stops the
+  // page's elastic spectrum job on the node, and the waterfall follows the scan after (and
+  // starts its own job again when the scan ends).
   async scan(s) {
     if (this.wf.sourceId !== s.sourceId) return;
-    let released = false;
-    try {
-      const half = s.bandwidthHz / 2;
-      released = await this.wf.release(this.wf.src, {
-        lo: s.centerHz - half,
-        hi: s.centerHz + half,
-      });
-    } catch (e) {
-      this.t.note(`scan: ${e.message}`, true);
-    }
-    if (!released) return;
+    if (!(await this.wf.release())) return;
     await this.applyOp({
       op: "job_start",
       kind: "scan",

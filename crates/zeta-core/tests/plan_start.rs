@@ -335,15 +335,19 @@ async fn a_holder_outside_the_band_is_a_conflict_and_nothing_starts() {
     assert_eq!(running(&node).len(), 80);
 }
 
-#[tokio::test]
-async fn a_scan_on_the_source_is_a_conflict() {
+/// A stepped scan on the source gives way: the plan starts every channel, nothing is
+/// stopped, and the scan runs on waiting for the source.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_on_the_source_gives_way() {
     let dir = tempfile::tempdir().unwrap();
     let radio = Radio::new(RADIO);
     let node = open(dir.path(), &radio).await;
     let scan = started(&node, start(JobKind::Scan, band(403_000_000, 6_000_000))).await;
-    let (holders, _) = conflict(node.apply(fm_plan(None, &[])).await);
-    assert_eq!(holders, vec![scan.clone()]);
-    assert_eq!(running(&node), vec![scan]);
+    let a = planned(&node, fm_plan(None, &[])).await;
+    assert_eq!(a.started.len(), 80);
+    assert_eq!(running(&node).len(), 81);
+    assert!(running(&node).contains(&scan));
+    assert_eq!(node.lease_waiting(&SourceId(RADIO.into())), vec![scan]);
 }
 
 #[tokio::test]

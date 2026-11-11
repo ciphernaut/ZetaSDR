@@ -1013,51 +1013,41 @@ def scenario_scan_entry_starts_a_scan_job(page, url, secret):
     wait_waterfall_follows(page, "!!w.jobId", "back to spectrum")
 
 
-def scenario_scan_entry_on_a_self_sweeping_source_asks_the_node(page, url, secret):
-    # A source whose `capabilities.sweep` holds the span sweeps for itself beside a held IQ
-    # channel, so the page asks the node instead of refusing. The e2e node's recording does not
-    # sweep: the node's own conflict is what the transcript shows, not the page's.
+def scenario_scan_entry_on_a_held_source_starts_a_scan_that_waits(page, url, secret):
+    # A stepped scan blocks nothing and is never blocked: on a source a rigid job holds, "Scan
+    # this span" posts the scan (the page does not refuse on its own), the node starts it
+    # waiting, and its row says so in the note colour; no conflict line. The waterfall keeps
+    # showing the capture meanwhile. Once the holder stops the scan takes the source and the
+    # waterfall follows it.
     posted = []
 
     def route(r):
         body = r.request.post_data or ""
         if '"job_start"' in body and '"scan"' in body:
             posted.append(body)
-        if '"source_list"' not in body:
-            return r.continue_()
-        resp = r.fetch()
-        data = resp.json()
-        for src in data.get("value") or []:
-            if src.get("id") == "tone":
-                src.setdefault("capabilities", {})["sweep"] = {
-                    "min_hz": 0, "max_hz": 1e12, "bin_hz_min": 1,
-                    "rows_per_s_max": 23, "calibrated": True}
-        return r.fulfill(response=resp, body=json.dumps(data))
+        return r.continue_()
 
     stop_scans(url, secret)
     show_tone_waterfall(page, url, secret)
     wait_span(page, 1.5)  # drag_menu asserts at least 1 s
     job = start_job(url, secret, "measure", "tone", 100_000_000, 10_000)
+    page.route("**/op", route)
     try:
-        # Without the stub the page refuses on its own and posts nothing.
         drag_menu(page, 0.0, 1.05)
         page.click('#ctx .ctx-item[data-action="scan"]')
-        # The page's line ends at the job id; the node's names the job's kind and a hint.
-        refusal = page.locator("#transcript .line", has_text=re.compile(r"^conflict: source tone held by \S+$"))
-        expect(refusal.first).to_be_visible(timeout=10_000)
-        assert not posted, f"a scan was posted without a sweep capability: {posted}"
-        before = refusal.count()
-        page.route("**/op", route)
-        drag_menu(page, 0.0, 1.05)
-        page.click('#ctx .ctx-item[data-action="scan"]')
-        deadline = time.monotonic() + 10.0
-        while not posted and time.monotonic() < deadline:
-            page.wait_for_timeout(100)
+        scans = wait_until(lambda: running_scan_jobs(url, secret, "tone"), 10.0, "a scan job on tone")
         assert posted, "the page never posted a scan job_start"
-        page.wait_for_timeout(1_000)
-        assert refusal.count() == before, "the page refused on its own"
-        expect(page.locator("#transcript .line", has_text="and retry").first).to_be_visible(
-            timeout=10_000)
+        scan = scans[0]["id"]
+        waiting = job_row(page, scan).locator(".waiting")
+        expect(waiting).to_have_text(f"waiting: source tone is held by measure {job}", timeout=10_000)
+        colour = waiting.evaluate("e => getComputedStyle(e).fontStyle")
+        assert colour == "italic", f"the waiting text is no note: {colour}"
+        assert page.locator("#transcript .line", has_text="conflict: source tone").count() == 0, \
+            "a conflict line for a scan that waits"
+        page.wait_for_function("() => window.zetaTest.waterfallMode === 'spectrum'", timeout=10_000)
+        stop_job(url, secret, job)
+        expect(job_row(page, scan).locator(".waiting")).to_have_count(0, timeout=15_000)
+        page.wait_for_function("() => window.zetaTest.waterfallMode === 'scan'", timeout=15_000)
     finally:
         page.unroute("**/op", route)
         for j in running_scan_jobs(url, secret, "tone"):
