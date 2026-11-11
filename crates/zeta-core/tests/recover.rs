@@ -974,3 +974,62 @@ async fn a_fault_leaves_a_mix_running_and_it_picks_the_relaunched_job_up() {
     );
     stop_all(&node).await;
 }
+
+/// A self-sweep scan reads no fault (it is a blind run), so a held fault's heal does
+/// not wait for it: the rigid job that failed of the fault is relaunched at once,
+/// not after the 10 s bound, and the scan runs throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_heal_does_not_wait_for_a_self_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = tone(dir.path(), "s");
+    let port = FaultablePort::sweeping(
+        src.clone(),
+        zeta_core::types::SweepCaps {
+            min_hz: Hz(TONE_HZ - 1_000_000),
+            max_hz: Hz(TONE_HZ + 1_000_000),
+            bin_hz_min: Hz(100),
+            rows_per_s_max: 200,
+            calibrated: false,
+        },
+    );
+    let node = Node::open(cfg(dir.path(), true), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    src.start();
+    let fed = start_passthrough(&node, "s").await;
+    let op = Op::JobStart {
+        kind: JobKind::Scan,
+        source: s(),
+        center_hz: Hz(TONE_HZ),
+        bandwidth_hz: Hz(1_000_000),
+        deviation_hz: None,
+        sideband: None,
+        dwell_ms: None,
+        average: None,
+        bits: None,
+        elastic: false,
+        replace: vec![],
+    };
+    let scan = match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("job_start scan: {r:?}"),
+    };
+    assert_eq!(node.lease_sweepers(&s()), vec![scan.clone()]);
+    fault(&node, &port, &[&fed]).await;
+    assert_eq!(state(&node, &scan), Some(JobState::Running));
+    let fed_before = node.job_outputs(&fed);
+    // The heal finds the port still faulted: every job that polls the fault is waited for.
+    port.heal_held();
+    until(
+        "the rigid job is relaunched well inside the 10 s bound",
+        Duration::from_secs(5),
+        || {
+            assert_eq!(state(&node, &scan), Some(JobState::Running));
+            state(&node, &fed) == Some(JobState::Running) && node.job_outputs(&fed) != fed_before
+        },
+    )
+    .await;
+    assert_eq!(state(&node, &scan), Some(JobState::Running));
+    assert_eq!(node.lease_sweepers(&s()), vec![scan]);
+    stop_all(&node).await;
+}

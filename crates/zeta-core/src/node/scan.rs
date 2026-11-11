@@ -7,7 +7,9 @@
 //! stored `fft` node's `dwell_ms` (the samples a step takes) and `average` (each
 //! row the mean of its step's last sweeps, [`SweepAverage`]) and `bits` (the
 //! sample depth the source's link runs at for the scan: held for the run and
-//! put back before the lease goes, [`scan_run`]).
+//! put back before the lease goes, [`scan_run`]). A source that sweeps the span
+//! for itself is asked to instead ([`sweep_loop`]): its rows are forwarded in
+//! the same row shape, under a sweep claim and no lease (`method: source`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,11 +24,14 @@ use crate::graph::{self, GraphError, NodeId};
 use crate::job::JobRecord;
 use crate::ops::{
     JobKind, SCAN_AVERAGE_MAX, SCAN_DWELL_MAX_MS, SCAN_ROWS_DWELL_MS, SCAN_WAIT_MARGIN_MS,
-    SPECTRUM_ROWS_PER_S, ScanGrid, scan_average_budget_bytes, scan_average_in_force,
-    scan_bits_refusal, scan_capture_hz, scan_dwell_within, scan_edge_mask_in_force, scan_grid_at,
-    scan_mask_default, scan_notch_in_force, scan_rows_per_step, spectrum_size,
+    SPECTRUM_BIN_TARGET_HZ, SPECTRUM_ROWS_PER_S, ScanGrid, scan_average_budget_bytes,
+    scan_average_in_force, scan_bits_refusal, scan_capture_hz, scan_dwell_within,
+    scan_edge_mask_in_force, scan_grid_at, scan_mask_default, scan_notch_in_force,
+    scan_rows_per_step, spectrum_size,
 };
-use crate::port::{IqBlock, Port, Tuning};
+use crate::port::{
+    IqBlock, Port, PortError, SweepPlan, SweepRequest, SweepRow, SweepRows, SweepState, Tuning,
+};
 use crate::ring::IqRing;
 use crate::spectrum::{STEP_DB, SweepAverage, dequantise, quantise_row, quantise_row_masked};
 use crate::stage::{Stage, StageContext, StageError};
@@ -52,6 +57,13 @@ impl Inner {
     /// The elastic jobs on the source are stopped: first, or with `gate` (held
     /// by the caller, see [`Inner::launch_gated`]) once the lease is granted,
     /// through `after`.
+    ///
+    /// Before any of that, a scan asking no `bits` on a source whose `sweep`
+    /// holds its band asks the source to sweep it ([`Inner::start_sweep`],
+    /// under the gate: `gate`, else taken for the call), for the target bin
+    /// (`SPECTRUM_BIN_TARGET_HZ` or the source's finest, whichever is coarser)
+    /// and the look's dwell; granted, it runs as [`Inner::launch_self_sweep`]
+    /// (no lease, nobody stopped, `after` left alone), refused, it steps.
     pub(super) async fn launch_scan(
         self: &Arc<Self>,
         rec: JobRecord,
@@ -122,6 +134,28 @@ impl Inner {
                 .as_u64()
                 .map_or(1, |a| a.clamp(1, u64::from(SCAN_AVERAGE_MAX)) as u32),
         };
+        // A source that sweeps the span for itself is asked first, unless the scan
+        // asks for IQ (`bits`): no lease, no stop of the elastic jobs. A refusal
+        // steps the span as any scan.
+        if let Some(sweep) = caps.sweep.as_ref().filter(|s| s.holds(rec.tuning))
+            && bits.is_none()
+        {
+            let req = SweepRequest {
+                span: rec.tuning,
+                bin_hz: Hz(sweep.bin_hz_min.0.max(SPECTRUM_BIN_TARGET_HZ)),
+                dwell_ms: look.dwell_ms,
+            };
+            let rows = match gate {
+                Some(g) => self.start_sweep(port.as_ref(), &rec.id, req, g).await,
+                None => {
+                    let g = self.leases.gate_guard(port.id()).await;
+                    self.start_sweep(port.as_ref(), &rec.id, req, &g).await
+                }
+            };
+            if let Ok(rows) = rows {
+                return self.launch_self_sweep(rec, port, look, sweep.calibrated, rows);
+            }
+        }
         match gate {
             Some(g) => {
                 self.leases
@@ -200,6 +234,96 @@ impl Inner {
         {
             e.done = Some(h);
             e.outputs = vec![JobOutput::new(StreamKind::Event, out)];
+        }
+        Ok(())
+    }
+
+    /// Take job `id`'s sweep claim on `port` under its gate (`gate`, held), then ask
+    /// the port to sweep `req`: its rows, or its refusal, the claim then dropped
+    /// unless a live run of the id holds it. Taken before the call and under the
+    /// gate, the claim is never taken after the job's release, and an idle never
+    /// lands between it and the sweep's start.
+    async fn start_sweep(
+        &self,
+        port: &dyn Port,
+        id: &JobId,
+        req: SweepRequest,
+        gate: &OwnedMutexGuard<()>,
+    ) -> Result<SweepRows, PortError> {
+        self.leases.claim_sweep_locked(port.id(), id.clone(), gate);
+        let rows = port.sweep(req).await;
+        if rows.is_err() {
+            self.release_unless_live(id);
+        }
+        rows
+    }
+
+    /// Run a scan the source sweeps for itself: record it running with
+    /// [`sweep_loop`] as its one task under [`supervise`] (handed the port, so its
+    /// claim is released and the port idled at the end), `blind` (it reads no
+    /// fault, so a heal does not wait for it), with `job_context.scan` from the
+    /// source's plan ([`sweep_context`]). It holds no lease and stops nobody.
+    fn launch_self_sweep(
+        self: &Arc<Self>,
+        mut rec: JobRecord,
+        port: Arc<dyn Port>,
+        look: Look,
+        calibrated: bool,
+        rows: SweepRows,
+    ) -> Result<(), NodeError> {
+        let plan = rows.plan.clone();
+        let grids = if plan.shift_hz.0 != 0 { 2 } else { 1 };
+        let average = scan_average_in_force(
+            look.average,
+            scan_average_budget_bytes(self.ring_budget_bytes),
+            u64::from(plan.steps) * grids,
+            1,
+            u64::from(plan.size),
+        );
+        if !rec.context.is_object() {
+            rec.context = serde_json::json!({});
+        }
+        if let Some(ctx) = rec.context.as_object_mut() {
+            let scan = sweep_context(&plan, look, average, calibrated);
+            ctx.insert("scan".into(), scan.into());
+        }
+        let (id, span) = (rec.id.clone(), rec.tuning);
+        let token = self.shutdown.child_token();
+        let (prov, run, ended) = self.record_running(rec, &token)?;
+        let out = self.bus.register_unfed(StreamKind::Event, prov.clone());
+        let sweep = SelfSweep {
+            id: id.clone(),
+            span,
+            average,
+            calibrated,
+            prov,
+            out: out.clone(),
+            cancel: token.clone(),
+        };
+        let mut set = JoinSet::new();
+        let (running, task) = (
+            StageRunning::new(self.stages.clone()),
+            sweep_loop(self.clone(), sweep, rows),
+        );
+        set.spawn(async move {
+            let _running = running;
+            task.await
+        });
+        let h = tokio::spawn(supervise(
+            self.clone(),
+            id.clone(),
+            (run, ended),
+            Some(port),
+            set,
+            token,
+            (vec![out.clone()], None, Vec::new()),
+        ));
+        if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
+            && e.run == run
+        {
+            e.done = Some(h);
+            e.outputs = vec![JobOutput::new(StreamKind::Event, out)];
+            e.blind = true;
         }
         Ok(())
     }
@@ -470,12 +594,12 @@ impl Layout {
 
     /// The scan's `job_context.scan` for this layout, `look`, a ring of
     /// `ring_samples` at the step's rate and `budget_bytes` for the averages:
-    /// `steps`, `step_hz` (the stride), `rate_hz` (the capture each step asks
-    /// for), `dwell_ms` (in force on a step: whole frames, never under four,
-    /// never more than the ring holds), `dwell_ms_asked` when that differs,
-    /// `average` (in force, [`Layout::average_in_force`]), `average_asked` when
-    /// that differs, `bits` (the depth in force, on a source with depths),
-    /// `alternate` and `mask`.
+    /// `method` (`stepped`), `steps`, `step_hz` (the stride), `rate_hz` (the
+    /// capture each step asks for), `dwell_ms` (in force on a step: whole frames,
+    /// never under four, never more than the ring holds), `dwell_ms_asked` when
+    /// that differs, `average` (in force, [`Layout::average_in_force`]),
+    /// `average_asked` when that differs, `bits` (the depth in force, on a
+    /// source with depths), `alternate` and `mask`.
     fn context(
         &self,
         look: Look,
@@ -493,6 +617,7 @@ impl Layout {
             serde_json::Value::Null
         };
         let mut scan = serde_json::json!({
+            "method": "stepped",
             "steps": g.even.len(),
             "step_hz": g.stride_hz,
             "rate_hz": w,
@@ -1003,6 +1128,234 @@ async fn fft_step(
             ..prov.clone()
         };
         bus.publish(Frame::new(s.out.clone(), p, Payload::Event(v)));
+    }
+}
+
+// The scan a source sweeps for itself (spec 4.7): the source's rows forwarded in
+// the scan row shape. No lease, no tune, no FFT here.
+
+/// What a self-sweep scan needs beside its rows (which carry the plan the source
+/// chose): its id, its band, the `average` in force, whether the source's levels
+/// are `calibrated`, and its output stream.
+struct SelfSweep {
+    id: JobId,
+    span: Tuning,
+    average: u32,
+    calibrated: bool,
+    prov: Provenance,
+    out: StreamId,
+    cancel: CancellationToken,
+}
+
+/// A self-sweep scan's `job_context.scan` at its start: `method` (`source`), the
+/// source's `plan` (`steps`, `step_hz`, `bin_hz`, `dwell_ms`, the dwell in force,
+/// with `dwell_ms_asked` when `look`'s differs), `average` (in force) with
+/// `average_asked` when that differs, `alternate` (the odd sweeps' shift, or
+/// null), `mask` (none: the source masks its own rows), `calibrated`, and
+/// `waiting` (null). No `rate_hz` and no `bits`: the scan takes no IQ.
+fn sweep_context(
+    plan: &SweepPlan,
+    look: Look,
+    average: u32,
+    calibrated: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let alternate = match plan.shift_hz.0 {
+        0 => serde_json::Value::Null,
+        shift => serde_json::json!({"shift_hz": shift, "steps_shifted": plan.steps}),
+    };
+    let mut scan = serde_json::json!({
+        "method": "source",
+        "steps": plan.steps,
+        "step_hz": plan.step_hz.0,
+        "bin_hz": plan.bin_hz,
+        "dwell_ms": plan.dwell_ms,
+        "average": average,
+        "alternate": alternate,
+        "mask": {"notch_hz": 0, "edge_mask": 0.0},
+        "calibrated": calibrated,
+        "waiting": null,
+    });
+    if plan.dwell_ms != look.dwell_ms {
+        scan["dwell_ms_asked"] = look.dwell_ms.into();
+    }
+    if average != look.average {
+        scan["average_asked"] = look.average.into();
+    }
+    match scan {
+        serde_json::Value::Object(m) => m,
+        _ => unreachable!("built as an object"),
+    }
+}
+
+/// A self-sweep's [`SweepTiming`] as its rows arrive: a row is a step of no tune
+/// that took the time since the last row; when a row of the next sweep arrives,
+/// each step the last sweep sent no row for is a skip, and the sweep (from the
+/// last row of the one before it, or the loop's start, to its own last row) is
+/// written as `job_context.scan.timing` at most once a second, else carried.
+struct SweepClock {
+    timing: SweepTiming,
+    /// When the timing was last written (ns since the epoch).
+    written_ns: u64,
+    last_row: tokio::time::Instant,
+    /// The sweep under way: its number, when it began and the steps it sent.
+    sweep: Option<(u64, tokio::time::Instant, Vec<bool>)>,
+    steps: usize,
+}
+
+impl SweepClock {
+    fn new(steps: u32) -> Self {
+        SweepClock {
+            timing: SweepTiming::default(),
+            written_ns: 0,
+            last_row: tokio::time::Instant::now(),
+            sweep: None,
+            steps: usize::try_from(steps).unwrap_or(usize::MAX),
+        }
+    }
+
+    /// Count a row of step `step` of sweep `sweep`, closing the sweep before it.
+    fn row(&mut self, inner: &Inner, s: &SelfSweep, sweep: u64, step: u32) {
+        let now = tokio::time::Instant::now();
+        if let Some((_, start, sent)) = self.sweep.take_if(|(n, ..)| *n != sweep) {
+            for _ in sent.iter().filter(|sent| !**sent) {
+                self.timing.step(Duration::ZERO, Duration::ZERO, true);
+            }
+            let at_ns = super::persist::now().0;
+            if at_ns.saturating_sub(self.written_ns) >= TIMING_EVERY_NS {
+                let took = self.last_row - start;
+                let mut t = self.timing.finish(s.span.bandwidth_hz.0, took);
+                t["at_ns"] = at_ns.into();
+                self.written_ns = at_ns;
+                inner.scan_context_update(&s.id, |scan| {
+                    scan.insert("timing".into(), t);
+                });
+            } else {
+                self.timing.carry();
+            }
+        }
+        let (steps, last_row) = (self.steps, self.last_row);
+        let (_, _, sent) = self
+            .sweep
+            .get_or_insert_with(|| (sweep, last_row, vec![false; steps]));
+        if let Some(sent) = usize::try_from(step).ok().and_then(|i| sent.get_mut(i)) {
+            *sent = true;
+        }
+        self.timing.step(Duration::ZERO, now - self.last_row, false);
+        self.last_row = now;
+    }
+}
+
+/// A source's row as a scan row: `size`, `bin_hz`, `rows_per_s`, `center_hz`,
+/// `floor_db` and `q` by [`quantise_row_masked`] over the row's `masked` (with
+/// `avg`, an `average` in force over 1, from the mean of the step's last rows
+/// instead), `step_db`, `masked` (when not empty), `sweeps` and, with
+/// `calibrated`, `calibrated: true`.
+fn sweep_row_event(
+    row: &SweepRow,
+    rows_per_s: u32,
+    calibrated: bool,
+    avg: Option<&mut SweepAverage>,
+) -> serde_json::Value {
+    let (mut floor_db, mut q) = quantise_row_masked(&row.db, &row.masked);
+    let mut sweeps = 1;
+    if let Some(avg) = avg {
+        let (db, n) = avg.push((row.center_hz.0, 0), floor_db, &q);
+        (floor_db, q) = quantise_row_masked(&db, &row.masked);
+        sweeps = n;
+    }
+    let mut ev = serde_json::json!({
+        "size": row.db.len(),
+        "bin_hz": row.bin_hz,
+        "rows_per_s": rows_per_s,
+        "center_hz": row.center_hz.0,
+        "floor_db": floor_db,
+        "step_db": STEP_DB,
+        "q": q,
+        "sweeps": sweeps,
+    });
+    if !row.masked.is_empty() {
+        ev["masked"] = serde_json::json!(row.masked);
+    }
+    if calibrated {
+        ev["calibrated"] = true.into();
+    }
+    ev
+}
+
+/// The self-sweep scan's one task, until cancelled: forward each of the source's
+/// rows on the scan's stream as a scan row ([`sweep_row_event`]), channel
+/// `scan/<step>`, its span the row's, with `rows_per_s` the dwell's
+/// ([`dwell_rows_per_s`]); with an `average` in force over 1 it keeps one
+/// [`SweepAverage`] per grid, the odd sweeps apart when the plan shifts them, as
+/// [`fft_task`] does. The source's state is written as `job_context.scan.waiting`
+/// (the reason while it retries, else null) and each sweep's timing as `timing`
+/// ([`SweepClock`]). The rows closing ends the job, failed as `sweep on source
+/// <id>: <the reason>` (never `source <id>: …`: the source's IQ side is not at
+/// fault). It never reads [`Port::fault`]; cancelled, it drops the rows first,
+/// which ends the source's sweep.
+async fn sweep_loop(inner: Arc<Inner>, s: SelfSweep, rows: SweepRows) -> Result<(), StageError> {
+    let SweepRows {
+        plan,
+        rows: mut rx,
+        mut state,
+    } = rows;
+    let rows_per_s = dwell_rows_per_s(plan.dwell_ms);
+    let alternates = plan.shift_hz.0 != 0;
+    let mut averages = [0, 1].map(|_| SweepAverage::new(s.average));
+    let mut clock = SweepClock::new(plan.steps);
+    let mut waiting = None;
+    // A state the source set before the loop began is written too.
+    state.mark_changed();
+    let mut state_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            _ = s.cancel.cancelled() => {
+                drop(rx);
+                return Err(StageError::Cancelled);
+            }
+            r = rx.recv() => {
+                let Some(row) = r else {
+                    let why = match &*state.borrow() {
+                        SweepState::Ended(r) => r.clone(),
+                        _ => "ended".to_string(),
+                    };
+                    return Err(StageError::Failed(format!(
+                        "sweep on source {}: {why}",
+                        s.prov.source.0
+                    )));
+                };
+                clock.row(&inner, &s, row.sweep, row.step);
+                let grid = usize::from(alternates && row.sweep % 2 == 1);
+                let avg = (s.average > 1).then(|| &mut averages[grid]);
+                let ev = sweep_row_event(&row, rows_per_s, s.calibrated, avg);
+                let prov = Provenance {
+                    channel: Some(ChannelId(format!("scan/{}", row.step))),
+                    span: row.span,
+                    ..s.prov.clone()
+                };
+                inner
+                    .bus
+                    .publish(Frame::new(s.out.clone(), prov, Payload::Event(ev)));
+            }
+            changed = state.changed(), if state_open => {
+                if changed.is_err() {
+                    // The source is done with the state; the rows closing says the rest.
+                    state_open = false;
+                    continue;
+                }
+                let now = match &*state.borrow_and_update() {
+                    SweepState::Waiting(r) => Some(r.clone()),
+                    SweepState::Running | SweepState::Ended(_) => None,
+                };
+                if now != waiting {
+                    waiting = now.clone();
+                    inner.scan_context_update(&s.id, |scan| {
+                        scan.insert("waiting".into(), now.into());
+                    });
+                }
+            }
+        }
     }
 }
 

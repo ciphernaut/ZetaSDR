@@ -299,6 +299,20 @@ impl LeaseManager {
         }
     }
 
+    /// [`LeaseManager::claim_sweep`] under `source`'s gate (`guard`, from
+    /// [`LeaseManager::gate_guard`]), so it never interleaves with an
+    /// [`LeaseManager::idle_if_unheld`]: an idle under way either ends before the
+    /// claim or sees it and leaves the port alone.
+    pub(crate) fn claim_sweep_locked(
+        &self,
+        source: &SourceId,
+        holder: JobId,
+        guard: &OwnedMutexGuard<()>,
+    ) {
+        self.assert_gate(source, guard);
+        self.claim_sweep(source, holder);
+    }
+
     /// The jobs holding a sweep claim on `source`, in claim order.
     pub fn sweepers(&self, source: &SourceId) -> Vec<JobId> {
         self.sweeps

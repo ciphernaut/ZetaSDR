@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::port::{
-    GainInfo, IqReceiver, LinkMeasure, Port, PortError, PortStats, Starting, Tuning, WorkerInfo,
+    GainInfo, IqReceiver, LinkMeasure, Port, PortError, PortStats, SWEEP_ROWS_CAPACITY, Starting,
+    SweepPlan, SweepRequest, SweepRow, SweepRows, SweepState, Tuning, WorkerInfo,
 };
-use crate::types::{Capabilities, SourceId};
+use crate::types::{Capabilities, Hz, SourceId, Span, SweepCaps, Timestamp};
 
 /// The gain range a [`FaultablePort`] reports, a HackRF-like 0..=76 dB.
 const GAIN_RANGE_DB: (f64, f64) = (0.0, 76.0);
@@ -25,7 +26,9 @@ const GAIN_RANGE_DB: (f64, f64) = (0.0, 76.0);
 /// the test sets ([`FaultablePort::set_starting`]), the figures its latest hello measured
 /// ([`FaultablePort::set_latest`]), which it caches with their speed, and counts the
 /// `remeasure` calls it answers `Ok`. The wrapped port's own `fault` is not consulted:
-/// the test owns the fault.
+/// the test owns the fault. One made [`FaultablePort::sweeping`] sweeps for itself (a row
+/// every 5 ms, its fault or not, until the rows are dropped); any other forwards a sweep
+/// to the inner port.
 ///
 /// It wraps `Arc<dyn Port>` rather than `zeta-source-file`'s `FileSource` because that
 /// crate depends on this one; pass the file source, it coerces.
@@ -43,10 +46,23 @@ pub struct FaultablePort {
     /// The worker record's `latest`, set by [`FaultablePort::set_latest`].
     latest: Mutex<Option<LinkMeasure>>,
     remeasures: Mutex<u32>,
+    /// The inner port's record with a `sweep`, on a port made [`FaultablePort::sweeping`].
+    caps: Option<Capabilities>,
 }
 
 impl FaultablePort {
     pub fn new(inner: Arc<dyn Port>) -> Arc<Self> {
+        Self::build(inner, None)
+    }
+
+    /// [`FaultablePort::new`] over `inner`, sweeping for itself as `sweep` says.
+    pub fn sweeping(inner: Arc<dyn Port>, sweep: SweepCaps) -> Arc<Self> {
+        let mut caps = inner.capabilities().clone();
+        caps.sweep = Some(sweep);
+        Self::build(inner, Some(caps))
+    }
+
+    fn build(inner: Arc<dyn Port>, caps: Option<Capabilities>) -> Arc<Self> {
         Arc::new(Self {
             inner,
             fault: Mutex::new(None),
@@ -58,6 +74,7 @@ impl FaultablePort {
             starting_changed: tokio::sync::watch::channel(0).0,
             latest: Mutex::new(None),
             remeasures: Mutex::new(0),
+            caps,
         })
     }
 
@@ -124,7 +141,7 @@ impl Port for FaultablePort {
         self.inner.id()
     }
     fn capabilities(&self) -> &Capabilities {
-        self.inner.capabilities()
+        self.caps.as_ref().unwrap_or(self.inner.capabilities())
     }
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let fault = self.fault.lock().unwrap().clone();
@@ -185,7 +202,7 @@ impl Port for FaultablePort {
         })
     }
     fn record_to_cache(&self) -> (Capabilities, Option<String>) {
-        let mut caps = self.inner.capabilities().clone();
+        let mut caps = self.capabilities().clone();
         let Some(m) = self.latest.lock().unwrap().clone() else {
             return (caps, None);
         };
@@ -199,5 +216,51 @@ impl Port for FaultablePort {
     }
     fn starting_changed(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.starting_changed.subscribe())
+    }
+    /// Made [`FaultablePort::sweeping`]: one step of 256 bins over the span, a row
+    /// every 5 ms until the rows are dropped. Else the inner port's sweep.
+    async fn sweep(&self, req: SweepRequest) -> Result<SweepRows, PortError> {
+        if self.caps.is_none() {
+            return self.inner.sweep(req).await;
+        }
+        const BINS: u32 = 256;
+        let bin_hz = req.span.bandwidth_hz.0 as f64 / f64::from(BINS);
+        let plan = SweepPlan {
+            steps: 1,
+            step_hz: req.span.bandwidth_hz,
+            size: BINS,
+            bin_hz,
+            dwell_ms: req.dwell_ms,
+            shift_hz: Hz(0),
+        };
+        let (tx, rows) = tokio::sync::mpsc::channel(SWEEP_ROWS_CAPACITY);
+        let (state_tx, state) = tokio::sync::watch::channel(SweepState::Running);
+        let center_hz = req.span.center_hz;
+        tokio::spawn(async move {
+            let _state = state_tx;
+            for sweep in 0u64.. {
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                }
+                let now = crate::node::now();
+                let row = SweepRow {
+                    sweep,
+                    step: 0,
+                    center_hz,
+                    bin_hz,
+                    db: vec![-100.0; BINS as usize],
+                    masked: Vec::new(),
+                    span: Span {
+                        start_ns: Timestamp(now.0.saturating_sub(5_000_000)),
+                        end_ns: now,
+                    },
+                };
+                if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) = tx.try_send(row) {
+                    return;
+                }
+            }
+        });
+        Ok(SweepRows { plan, rows, state })
     }
 }

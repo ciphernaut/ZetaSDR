@@ -1,7 +1,7 @@
 //! The `scan` job: time-shares one radio across a span wider than its capture.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -15,12 +15,15 @@ use zeta_core::graph::{Graph, GraphError, Node as GraphNode};
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult, scan_dwell_samples, spectrum_row_boundary};
-use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
+use zeta_core::port::{
+    IqBlock, IqReceiver, Port, PortError, SWEEP_ROWS_CAPACITY, SweepPlan, SweepRequest, SweepRow,
+    SweepRows, SweepState, Tuning,
+};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageRegistry, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{
     Capabilities, Claim, Depth, Hz, JobId, SampleFormat, SourceId, Span, StreamId, StreamKind,
-    Timestamp,
+    SweepCaps, Timestamp,
 };
 
 const MHZ: u64 = 1_000_000;
@@ -104,7 +107,44 @@ struct ScanPort {
     /// While set, no block is sent ([`ScanPort::hold`]).
     held: AtomicBool,
     tx: broadcast::Sender<IqBlock>,
+    /// How its own sweep goes, on a port made [`ScanPort::sweeping`].
+    script: Option<SweepScript>,
+    /// Every sweep asked for, in order.
+    requests: Mutex<Vec<SweepRequest>>,
+    /// Sweeps whose rows are not dropped yet.
+    live: Arc<AtomicUsize>,
+    /// Rows a full channel refused.
+    dropped: Arc<AtomicUsize>,
+    /// How many times the port was idled.
+    idles: AtomicUsize,
 }
+
+/// How a [`ScanPort::sweeping`] port's own sweep goes: it refuses with `refuse`;
+/// after `wait_after` rows it says `Waiting("socket lost")` for 300 ms and sends
+/// nothing meanwhile; after `end_after` rows it says `Ended("gone")` and closes;
+/// it sends no row for step `skip_step`; with `burst` it sends [`SWEEP_BURST`] rows
+/// at once (more than its channel holds), then pauses, so a reader cannot keep up
+/// and cannot be starved; with `depths` the port also carries [`two_depths`]. The
+/// first row comes after `first_row_ms` (default 5). Each row's span is the next
+/// `SWEEP_ROW_MS` after the last one's.
+#[derive(Clone, Debug, Default)]
+struct SweepScript {
+    refuse: Option<String>,
+    wait_after: Option<usize>,
+    end_after: Option<usize>,
+    skip_step: Option<u32>,
+    burst: bool,
+    depths: bool,
+    first_row_ms: Option<u64>,
+}
+
+/// Steps and bins of a [`ScanPort::sweeping`] port's plan.
+const SWEEP_STEPS: u32 = 4;
+const SWEEP_BINS: u32 = 1024;
+/// The cadence of its rows.
+const SWEEP_ROW_MS: u64 = 5;
+/// The rows a `burst` sends back to back: twice what the channel holds.
+const SWEEP_BURST: usize = 2 * SWEEP_ROWS_CAPACITY;
 
 /// A call on a [`ScanPort`], as its log keeps it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -195,6 +235,48 @@ impl ScanPort {
         })
     }
 
+    /// A port that sweeps for itself across its whole tune range, as `script`
+    /// says: `bin_hz_min` 1 kHz, `calibrated`. Its plan is [`SWEEP_STEPS`] steps
+    /// of [`SWEEP_BINS`] bins, a row every [`SWEEP_ROW_MS`], step by step, each
+    /// step's bins at one level (`-100 + 10 * step` dB), bins 0 and 1 masked.
+    fn sweeping(script: SweepScript) -> Arc<Self> {
+        Self::build_with(None, false, false, Delivery::Real, 16 * MHZ, |me| {
+            me.caps.sweep = Some(SweepCaps {
+                min_hz: Hz(MHZ),
+                max_hz: Hz(6_000 * MHZ),
+                bin_hz_min: Hz(1000),
+                rows_per_s_max: 200,
+                calibrated: true,
+            });
+            if script.depths {
+                me.caps.depths = two_depths();
+                me.caps.max_bandwidth_hz = Claim::Measured(Hz(16 * MHZ));
+                *me.depth.get_mut().unwrap() = Some(16);
+            }
+            me.script = Some(script);
+        })
+    }
+
+    /// Every sweep asked for so far.
+    fn requests(&self) -> Vec<SweepRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// Sweeps whose rows are not dropped yet.
+    fn live(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    /// Rows a full channel refused.
+    fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::SeqCst)
+    }
+
+    /// How many times the port was idled.
+    fn idles(&self) -> usize {
+        self.idles.load(Ordering::SeqCst)
+    }
+
     /// Every `set_depth` and tune so far, in order.
     fn calls(&self) -> Vec<Call> {
         self.log.lock().unwrap().clone()
@@ -248,6 +330,11 @@ impl ScanPort {
             gaps: Mutex::new(Vec::new()),
             held: AtomicBool::new(false),
             tx: broadcast::channel(16).0,
+            script: None,
+            requests: Mutex::new(Vec::new()),
+            live: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            idles: AtomicUsize::new(0),
         };
         f(&mut p);
         let p = Arc::new(p);
@@ -389,6 +476,101 @@ impl Port for ScanPort {
         *self.cur.lock().unwrap() = None;
         self.log.lock().unwrap().push(Call::SetDepth(bits));
         Ok(d)
+    }
+    async fn idle(&self) {
+        self.idles.fetch_add(1, Ordering::SeqCst);
+    }
+    async fn sweep(&self, req: SweepRequest) -> Result<SweepRows, PortError> {
+        let Some(script) = self.script.clone() else {
+            return Err(PortError::Unsupported(
+                "source does not sweep for itself".into(),
+            ));
+        };
+        self.requests.lock().unwrap().push(req);
+        if let Some(why) = script.refuse {
+            return Err(PortError::Unsupported(why));
+        }
+        let step_hz = req.span.bandwidth_hz.0 / u64::from(SWEEP_STEPS);
+        let bin_hz = step_hz as f64 / f64::from(SWEEP_BINS);
+        let lo = req.span.center_hz.0 - req.span.bandwidth_hz.0 / 2;
+        let plan = SweepPlan {
+            steps: SWEEP_STEPS,
+            step_hz: Hz(step_hz),
+            size: SWEEP_BINS,
+            bin_hz,
+            dwell_ms: req.dwell_ms,
+            shift_hz: Hz(0),
+        };
+        let (tx, rows) = tokio::sync::mpsc::channel(SWEEP_ROWS_CAPACITY);
+        let (state_tx, state) = tokio::sync::watch::channel(SweepState::Running);
+        let (live, dropped) = (self.live.clone(), self.dropped.clone());
+        live.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
+            let pause = |ms: u64| {
+                let tx = tx.clone();
+                async move {
+                    tokio::select! {
+                        _ = tx.closed() => false,
+                        _ = tokio::time::sleep(Duration::from_millis(ms)) => true,
+                    }
+                }
+            };
+            let base = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+            let (mut sent, mut waited) = (0usize, false);
+            let mut first = Some(script.first_row_ms.unwrap_or(SWEEP_ROW_MS));
+            'sweeps: for sweep in 0u64.. {
+                for step in 0..SWEEP_STEPS {
+                    if script.skip_step == Some(step) {
+                        continue;
+                    }
+                    if script.wait_after == Some(sent) && !waited {
+                        waited = true;
+                        state_tx.send_replace(SweepState::Waiting("socket lost".into()));
+                        if !pause(300).await {
+                            break 'sweeps;
+                        }
+                        state_tx.send_replace(SweepState::Running);
+                    }
+                    if script.end_after == Some(sent) {
+                        state_tx.send_replace(SweepState::Ended("gone".into()));
+                        break 'sweeps;
+                    }
+                    let ms = first.take().unwrap_or(SWEEP_ROW_MS);
+                    let in_burst = script.burst && !sent.is_multiple_of(SWEEP_BURST);
+                    if !in_burst && !pause(ms).await {
+                        break 'sweeps;
+                    }
+                    let end_ns = base + (sent as u64 + 1) * SWEEP_ROW_MS * 1_000_000;
+                    let row = SweepRow {
+                        sweep,
+                        step,
+                        center_hz: Hz(lo + step_hz * u64::from(step) + step_hz / 2),
+                        bin_hz,
+                        db: vec![-100.0 + 10.0 * step as f32; SWEEP_BINS as usize],
+                        masked: vec![[0, 2]],
+                        span: Span {
+                            start_ns: Timestamp(end_ns - SWEEP_ROW_MS * 1_000_000),
+                            end_ns: Timestamp(end_ns),
+                        },
+                    };
+                    match tx.try_send(row) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            dropped.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break 'sweeps,
+                    }
+                    sent += 1;
+                }
+            }
+            drop(tx);
+            drop(state_tx);
+            live.fetch_sub(1, Ordering::SeqCst);
+        });
+        Ok(SweepRows { plan, rows, state })
     }
 }
 
@@ -1487,8 +1669,7 @@ async fn the_scan_record_fills_its_timing_after_a_sweep() {
     assert!(!t["tune_ms"]["median"].is_null() && !t["tune_ms"]["max"].is_null());
     assert_eq!(t["skipped"], 0, "{t}");
     assert!(t["hz_per_s"].as_f64().unwrap() > 0.0, "{t}");
-    // A reader takes a missing `method` as `stepped`.
-    assert!(node.job_context(&id).unwrap()["scan"]["method"].is_null());
+    assert_eq!(node.job_context(&id).unwrap()["scan"]["method"], "stepped");
     node.job_stop(&id).await.unwrap();
 }
 
@@ -2274,4 +2455,393 @@ async fn graph_put_changes_bits_on_a_running_scan() {
     }
     node.job_stop(&id).await.unwrap();
     restored_before_the_next_tune(&port.calls());
+}
+
+// The scan on a source that sweeps for itself (plan 36.2): the source's rows in the
+// scan row shape, under a sweep claim and no lease.
+
+/// The span the self-sweep tests scan: 80..120 MHz, inside a
+/// [`ScanPort::sweeping`] port's sweep; its steps centre on 85, 95, 105, 115 MHz.
+const SWEEP_SPAN: (u64, u64) = (100 * MHZ, 40 * MHZ);
+
+/// The centre of a [`ScanPort::sweeping`] port's step `step` over [`SWEEP_SPAN`].
+fn sweep_centre(step: u64) -> u64 {
+    85 * MHZ + step * 10 * MHZ
+}
+
+fn radio0() -> SourceId {
+    SourceId("radio0".into())
+}
+
+/// Job `id`'s `job_context.scan`.
+fn scan_ctx(node: &Node, id: &JobId) -> Value {
+    node.job_context(id).expect("a context")["scan"].clone()
+}
+
+fn job_state(node: &Node, id: &JobId) -> Option<JobState> {
+    node.job_list()
+        .into_iter()
+        .find(|r| &r.id == id)
+        .map(|r| r.state)
+}
+
+/// `op` (a `job_start`) made elastic.
+fn elastic(mut op: Op) -> Op {
+    if let Op::JobStart { elastic, .. } = &mut op {
+        *elastic = true;
+    }
+    op
+}
+
+async fn start_job(node: &Node, op: Op) -> JobId {
+    match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected a job, got {other:?}"),
+    }
+}
+
+async fn radio0_info(node: &Node) -> zeta_core::ops::SourceInfo {
+    match node.apply(Op::SourceList {}).await {
+        Ok(OpResult::Sources(v)) => v.into_iter().find(|i| i.id == radio0()).unwrap(),
+        other => panic!("expected sources, got {other:?}"),
+    }
+}
+
+/// A row's step, from its channel `scan/<step>`.
+fn step_of(f: &Frame) -> u64 {
+    channel(f)
+        .strip_prefix("scan/")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("a step channel: {}", channel(f)))
+}
+
+/// The source is asked to sweep and its rows come out as a scan's: on `scan/<step>`
+/// channels in order, quantised over the unmasked bins, with `sweeps` and
+/// `calibrated`; the radio is never tuned and the record says `method: source`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_sweeping_port_is_asked_and_its_rows_come_out_in_the_scan_row_shape() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let (id, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    let got = rows(&mut rx, 12, Duration::from_secs(10)).await;
+    let first = got
+        .iter()
+        .position(|f| step_of(f) == 0)
+        .expect("a row of step 0");
+    let sweep = &got[first..first + 4];
+    for (step, f) in sweep.iter().enumerate() {
+        let step = step as u64;
+        assert_eq!(channel(f), format!("scan/{step}"));
+        assert_eq!(f.provenance.job.as_ref(), Some(&id));
+        let ev = ev(f);
+        assert_eq!(ev["size"], 1024, "{ev}");
+        assert_eq!(ev["q"].as_array().map(Vec::len), Some(1024), "{ev}");
+        assert_eq!(ev["step_db"], 0.5, "{ev}");
+        assert_eq!(ev["masked"], serde_json::json!([[0, 2]]), "{ev}");
+        assert_eq!(ev["sweeps"], 1, "{ev}");
+        assert_eq!(ev["calibrated"], true, "{ev}");
+        assert_eq!(ev["center_hz"], sweep_centre(step), "{ev}");
+        assert_eq!(ev["bin_hz"], 10.0 * MHZ as f64 / 1024.0, "{ev}");
+        // The node's 20 ms dwell, passed to the source and kept: 50 rows a second.
+        assert_eq!(ev["rows_per_s"], 50, "{ev}");
+        // Each step's bins sit at one level: the floor 5 dB under it, every bin 10 up.
+        assert_eq!(ev["floor_db"], -105.0 + 10.0 * step as f64, "{ev}");
+        assert_eq!(ev["q"][500], 10, "{ev}");
+    }
+    assert!(port.tunes().is_empty(), "{:?}", port.tunes());
+    assert_eq!(port.requests().len(), 1);
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["method"], "source", "{ctx}");
+    assert_eq!(ctx["steps"], 4, "{ctx}");
+    assert_eq!(ctx["step_hz"], 10 * MHZ, "{ctx}");
+    assert_eq!(ctx["bin_hz"], 10.0 * MHZ as f64 / 1024.0, "{ctx}");
+    assert_eq!(ctx["dwell_ms"], 20, "{ctx}");
+    assert_eq!(ctx["average"], 1, "{ctx}");
+    assert!(ctx["alternate"].is_null(), "{ctx}");
+    assert_eq!(
+        ctx["mask"],
+        serde_json::json!({"notch_hz": 0, "edge_mask": 0.0}),
+        "{ctx}"
+    );
+    assert_eq!(ctx["calibrated"], true, "{ctx}");
+    assert!(ctx["waiting"].is_null(), "{ctx}");
+    for k in ["rate_hz", "bits", "dwell_ms_asked", "average_asked"] {
+        assert!(ctx.get(k).is_none(), "{k}: {ctx}");
+    }
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A self-sweep takes no lease: it starts beside a rigid job holding the source, and
+/// an elastic job on the source is not stopped for it; it is listed in `sweeps`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_sweep_takes_no_lease_and_runs_beside_a_demodulator() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let rigid = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    let follower = start_job(&node, elastic(start(JobKind::Spectrum, 100 * MHZ, MHZ))).await;
+    let (scan, _rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    let info = radio0_info(&node).await;
+    assert_eq!(info.holders, vec![rigid.clone()]);
+    assert_eq!(info.sweeps, vec![scan.clone()]);
+    assert_eq!(info.elastic, vec![follower.clone()]);
+    // Whatever the stop of the elastic jobs would have taken, it is not taken.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for id in [&rigid, &follower, &scan] {
+        assert_eq!(
+            job_state(&node, id),
+            Some(JobState::Running),
+            "job {}",
+            id.0
+        );
+    }
+    let band = Tuning {
+        center_hz: Hz(100 * MHZ),
+        bandwidth_hz: Hz(MHZ),
+    };
+    assert!(
+        port.tunes().iter().all(|t| *t == band),
+        "{:?}",
+        port.tunes()
+    );
+    node.job_stop(&scan).await.unwrap();
+}
+
+/// A stopped self-sweep drops its rows (ending the source's sweep) and its claim.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_a_self_sweep_drops_the_rows_and_the_claim() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let (id, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    rows(&mut rx, 4, Duration::from_secs(10)).await;
+    assert_eq!(port.live(), 1);
+    assert_eq!(node.lease_sweepers(&radio0()), vec![id.clone()]);
+    node.job_stop(&id).await.unwrap();
+    until("the source's sweep ends", Duration::from_secs(5), || {
+        port.live() == 0
+    })
+    .await;
+    assert!(node.lease_sweepers(&radio0()).is_empty());
+    assert!(radio0_info(&node).await.sweeps.is_empty());
+    // Nothing holds the source any more: it is idled.
+    assert!(port.idles() >= 1);
+}
+
+/// A self-sweep stopped before its source sent a row leaves no claim, and the
+/// source, held by nothing, is idled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_sweep_stopped_while_its_sweep_is_still_starting_leaves_no_claim() {
+    let script = SweepScript {
+        first_row_ms: Some(60_000),
+        ..Default::default()
+    };
+    let (_dir, node, port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, _rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    assert_eq!(node.lease_sweepers(&radio0()), vec![id.clone()]);
+    assert_eq!(port.idles(), 0);
+    node.job_stop(&id).await.unwrap();
+    assert!(node.lease_sweepers(&radio0()).is_empty());
+    assert_eq!(port.idles(), 1);
+    until("the source's sweep ends", Duration::from_secs(5), || {
+        port.live() == 0
+    })
+    .await;
+}
+
+/// `dwell_ms` is the source's to apply and `average` the node's: the request carries
+/// the dwell and the target bin (6 kHz over the source's 1 kHz floor), and with
+/// `average: 4` a centre's rows count `sweeps` 1, 2, 3, 4, 4.
+#[tokio::test(flavor = "multi_thread")]
+async fn dwell_ms_goes_to_the_source_and_average_is_the_nodes() {
+    let script = SweepScript {
+        // Time to subscribe before the first row.
+        first_row_ms: Some(300),
+        ..Default::default()
+    };
+    let (_dir, node, port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, mut rx) = start_scan_look(&node, SWEEP_SPAN, Some(200), Some(4)).await;
+    let req = port.requests();
+    assert_eq!(req.len(), 1);
+    assert_eq!(req[0].dwell_ms, 200);
+    assert_eq!(req[0].bin_hz, Hz(6000));
+    assert_eq!(
+        req[0].span,
+        Tuning {
+            center_hz: Hz(SWEEP_SPAN.0),
+            bandwidth_hz: Hz(SWEEP_SPAN.1),
+        }
+    );
+    let mut sweeps = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while sweeps.len() < 5 {
+        let ev = next_row(&mut rx, deadline).await;
+        if ev["center_hz"] == sweep_centre(1) {
+            assert_eq!(ev["floor_db"], -95.0, "{ev}");
+            assert_eq!(ev["q"][500], 10, "{ev}");
+            sweeps.push(ev["sweeps"].as_u64().unwrap());
+        }
+    }
+    assert_eq!(sweeps, [1, 2, 3, 4, 4]);
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["average"], 4, "{ctx}");
+    assert_eq!(ctx["dwell_ms"], 200, "{ctx}");
+    assert!(ctx.get("average_asked").is_none(), "{ctx}");
+    assert!(ctx.get("dwell_ms_asked").is_none(), "{ctx}");
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A self-sweep's record carries the same `timing` as a stepped one's, with no tune
+/// time; a step its source sent no row for is counted skipped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_sweeps_record_fills_the_same_timing() {
+    let (_dir, node, _port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let (id, _rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    until("a sweep's timing", Duration::from_secs(10), || {
+        timing(&node, &id).is_some_and(|t| t["sweep_ms"].as_f64().unwrap_or(0.0) > 0.0)
+    })
+    .await;
+    let t = timing(&node, &id).unwrap();
+    for k in [
+        "sweep_ms",
+        "step_ms",
+        "tune_ms",
+        "slow_tunes",
+        "skipped",
+        "fft_wait_ms",
+        "hz_per_s",
+        "at_ns",
+    ] {
+        assert!(!t[k].is_null(), "no {k}: {t}");
+    }
+    assert_eq!(t["tune_ms"]["median"].as_f64(), Some(0.0), "{t}");
+    assert_eq!(t["tune_ms"]["max"].as_f64(), Some(0.0), "{t}");
+    assert_eq!(t["skipped"], 0, "{t}");
+    assert!(t["hz_per_s"].as_f64().unwrap() > 0.0, "{t}");
+    node.job_stop(&id).await.unwrap();
+
+    let script = SweepScript {
+        skip_step: Some(2),
+        ..Default::default()
+    };
+    let (_dir, node, _port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, _rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    until("a skipped step", Duration::from_secs(10), || {
+        timing(&node, &id).is_some_and(|t| t["skipped"].as_u64().unwrap_or(0) >= 1)
+    })
+    .await;
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A sweep the source lost and retries keeps the scan up: the record says `waiting`
+/// with the reason, then `null` once rows come again; nothing is tuned and the
+/// method stays `source`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_sweep_says_waiting_and_resumes() {
+    let script = SweepScript {
+        wait_after: Some(6),
+        ..Default::default()
+    };
+    let (_dir, node, port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, _rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    until("the record says waiting", Duration::from_secs(10), || {
+        scan_ctx(&node, &id)["waiting"] == "socket lost"
+    })
+    .await;
+    assert_eq!(job_state(&node, &id), Some(JobState::Running));
+    until("the record stops waiting", Duration::from_secs(10), || {
+        scan_ctx(&node, &id)["waiting"].is_null()
+    })
+    .await;
+    assert_eq!(job_state(&node, &id), Some(JobState::Running));
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["method"], "source", "{ctx}");
+    assert_eq!(ctx["steps"], 4, "{ctx}");
+    assert!(ctx["timing"].is_object(), "{ctx}");
+    assert!(port.tunes().is_empty(), "{:?}", port.tunes());
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A sweep the source ends for good fails the scan with a reason that is the
+/// sweep's, not the source's: no fault is opened and the job on the source's IQ
+/// side runs on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sweep_the_source_gives_up_on_fails_the_scan_without_faulting_the_source() {
+    let script = SweepScript {
+        end_after: Some(6),
+        ..Default::default()
+    };
+    let (_dir, node, _port) = open_with(ScanPort::sweeping(script)).await;
+    let rigid = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    let (id, _rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    until("the scan ends", Duration::from_secs(10), || {
+        job_state(&node, &id) != Some(JobState::Running)
+    })
+    .await;
+    match job_state(&node, &id) {
+        Some(JobState::Failed { reason }) => {
+            assert!(
+                reason.starts_with("sweep on source radio0: gone"),
+                "{reason}"
+            )
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(radio0_info(&node).await.fault.is_none());
+    assert!(node.lease_sweepers(&radio0()).is_empty());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(job_state(&node, &rigid), Some(JobState::Running));
+    node.job_stop(&rigid).await.unwrap();
+}
+
+/// A source faster than the node loses rows, never queues them without bound: the
+/// rows that arrive come in the source's order and the scan runs on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_reader_costs_rows_not_memory() {
+    let script = SweepScript {
+        burst: true,
+        ..Default::default()
+    };
+    let (_dir, node, port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    until("a row is dropped", Duration::from_secs(10), || {
+        port.dropped() > 0
+    })
+    .await;
+    let got = rows(&mut rx, 20, Duration::from_secs(10)).await;
+    for w in got.windows(2) {
+        assert!(
+            w[0].provenance.span.end_ns.0 < w[1].provenance.span.end_ns.0,
+            "rows out of order: {:?} then {:?}",
+            w[0].provenance.span,
+            w[1].provenance.span
+        );
+    }
+    assert_eq!(job_state(&node, &id), Some(JobState::Running));
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A span the source's sweep does not hold is stepped, without asking the source.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_span_outside_the_sources_sweep_is_stepped() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    // 0..40 MHz: under the sweep's 1 MHz floor.
+    let (id, _rx) = start_scan(&node).await;
+    tunes_at_least(&port, 1, Duration::from_secs(5)).await;
+    assert!(port.requests().is_empty());
+    assert_eq!(scan_ctx(&node, &id)["method"], "stepped");
+    assert!(node.lease_sweepers(&radio0()).is_empty());
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A scan asking for `bits` asks for IQ: it is stepped, without asking the source.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_with_bits_is_stepped() {
+    let script = SweepScript {
+        depths: true,
+        ..Default::default()
+    };
+    let (_dir, node, port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, _rx) = start_bits(&node, SWEEP_SPAN, Some(8)).await;
+    tunes_at_least(&port, 1, Duration::from_secs(5)).await;
+    assert!(port.requests().is_empty());
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["method"], "stepped", "{ctx}");
+    assert_eq!(ctx["bits"], 8, "{ctx}");
+    node.job_stop(&id).await.unwrap();
 }
