@@ -18,8 +18,8 @@ use zeta_core::ops::{
     JobKind, Op, OpError, OpResult, ScanMethod, scan_dwell_samples, spectrum_row_boundary,
 };
 use zeta_core::port::{
-    IqBlock, IqReceiver, Port, PortError, SWEEP_ROWS_CAPACITY, SweepPlan, SweepRequest, SweepRow,
-    SweepRows, SweepState, Tuning,
+    IqBlock, IqReceiver, Port, PortError, SWEEP_ROWS_CAPACITY, SweepControl, SweepPlan,
+    SweepRequest, SweepRetarget, SweepRow, SweepRows, SweepState, Tuning,
 };
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageRegistry, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
@@ -113,6 +113,8 @@ struct ScanPort {
     script: Option<SweepScript>,
     /// Every sweep asked for, in order.
     requests: Mutex<Vec<SweepRequest>>,
+    /// Every re-aim of a running sweep, in order.
+    retargets: Arc<Mutex<Vec<SweepRequest>>>,
     /// Sweeps whose rows are not dropped yet.
     live: Arc<AtomicUsize>,
     /// Rows a full channel refused.
@@ -132,7 +134,11 @@ struct ScanPort {
 /// and cannot be starved; with `depths` the port also carries [`two_depths`]. The
 /// first row comes after `first_row_ms` (default 5); with `hang` the call never
 /// returns, and with `start_ms` it returns (or refuses) only after that long. Each
-/// row's span is the next `SWEEP_ROW_MS` after the last one's.
+/// row's span is the next `SWEEP_ROW_MS` after the last one's. With `retarget` its
+/// rows carry a control: a re-aim is recorded ([`ScanPort::retargets`]) and answered
+/// with the plan of the new request before the next row, which is of the new plan,
+/// sweep 0 step 0. Its plan has `steps` steps ([`SWEEP_STEPS`] when `None`) and says
+/// `shift_hz` (0 when `None`), though no row is shifted.
 #[derive(Clone, Debug, Default)]
 struct SweepScript {
     refuse: Option<String>,
@@ -144,6 +150,9 @@ struct SweepScript {
     first_row_ms: Option<u64>,
     hang: bool,
     start_ms: Option<u64>,
+    retarget: bool,
+    steps: Option<u32>,
+    shift_hz: Option<u64>,
 }
 
 /// Steps and bins of a [`ScanPort::sweeping`] port's plan.
@@ -271,6 +280,11 @@ impl ScanPort {
         self.requests.lock().unwrap().clone()
     }
 
+    /// Every re-aim of a running sweep so far.
+    fn retargets(&self) -> Vec<SweepRequest> {
+        self.retargets.lock().unwrap().clone()
+    }
+
     /// Sweeps whose rows are not dropped yet.
     fn live(&self) -> usize {
         self.live.load(Ordering::SeqCst)
@@ -346,6 +360,7 @@ impl ScanPort {
             tx: broadcast::channel(16).0,
             script: None,
             requests: Mutex::new(Vec::new()),
+            retargets: Arc::new(Mutex::new(Vec::new())),
             live: Arc::new(AtomicUsize::new(0)),
             dropped: Arc::new(AtomicUsize::new(0)),
             idles: AtomicUsize::new(0),
@@ -512,21 +527,35 @@ impl Port for ScanPort {
         if script.hang {
             std::future::pending::<()>().await;
         }
-        let step_hz = req.span.bandwidth_hz.0 / u64::from(SWEEP_STEPS);
-        let bin_hz = step_hz as f64 / f64::from(SWEEP_BINS);
-        let lo = req.span.center_hz.0 - req.span.bandwidth_hz.0 / 2;
-        let plan = SweepPlan {
-            steps: SWEEP_STEPS,
-            step_hz: Hz(step_hz),
-            size: SWEEP_BINS,
-            bin_hz,
-            dwell_ms: req.dwell_ms,
-            shift_hz: Hz(0),
+        let steps = script.steps.unwrap_or(SWEEP_STEPS);
+        let shift_hz = script.shift_hz.unwrap_or(0);
+        // The plan of a request, and the low edge of its span.
+        let plan_of = move |req: &SweepRequest| {
+            let step_hz = req.span.bandwidth_hz.0 / u64::from(steps);
+            let plan = SweepPlan {
+                steps,
+                step_hz: Hz(step_hz),
+                size: SWEEP_BINS,
+                bin_hz: step_hz as f64 / f64::from(SWEEP_BINS),
+                dwell_ms: req.dwell_ms,
+                shift_hz: Hz(shift_hz),
+            };
+            (plan, req.span.center_hz.0 - req.span.bandwidth_hz.0 / 2)
+        };
+        let (plan, mut lo) = plan_of(&req);
+        let (control, mut ctl) = match script.retarget {
+            true => {
+                let (c, rx) = SweepControl::channel();
+                (Some(c), Some(rx))
+            }
+            false => (None, None),
         };
         let (tx, rows) = tokio::sync::mpsc::channel(SWEEP_ROWS_CAPACITY);
         let (state_tx, state) = tokio::sync::watch::channel(SweepState::Running);
         let (live, dropped) = (self.live.clone(), self.dropped.clone());
+        let retargets = self.retargets.clone();
         live.fetch_add(1, Ordering::SeqCst);
+        let mut now = plan.clone();
         tokio::spawn(async move {
             let pause = |ms: u64| {
                 let tx = tx.clone();
@@ -543,56 +572,73 @@ impl Port for ScanPort {
                 .as_nanos() as u64;
             let (mut sent, mut waited) = (0usize, false);
             let mut first = Some(script.first_row_ms.unwrap_or(SWEEP_ROW_MS));
-            'sweeps: for sweep in 0u64.. {
-                for step in 0..SWEEP_STEPS {
-                    if script.skip_step == Some(step) {
-                        continue;
-                    }
-                    if script.wait_after == Some(sent) && !waited {
-                        waited = true;
-                        state_tx.send_replace(SweepState::Waiting("socket lost".into()));
-                        if !pause(300).await {
-                            break 'sweeps;
+            'plan: loop {
+                for sweep in 0u64.. {
+                    for step in 0..now.steps {
+                        // A re-aim is answered before the next row, which is the new plan's.
+                        if let Some(SweepRetarget { req, reply }) =
+                            ctl.as_mut().and_then(|c| c.try_recv().ok())
+                        {
+                            retargets.lock().unwrap().push(req);
+                            (now, lo) = plan_of(&req);
+                            let _ = reply.send(Ok(now.clone()));
+                            continue 'plan;
                         }
-                        state_tx.send_replace(SweepState::Running);
-                    }
-                    if script.end_after == Some(sent) {
-                        state_tx.send_replace(SweepState::Ended("gone".into()));
-                        break 'sweeps;
-                    }
-                    let ms = first.take().unwrap_or(SWEEP_ROW_MS);
-                    let in_burst = script.burst && !sent.is_multiple_of(SWEEP_BURST);
-                    if !in_burst && !pause(ms).await {
-                        break 'sweeps;
-                    }
-                    let end_ns = base + (sent as u64 + 1) * SWEEP_ROW_MS * 1_000_000;
-                    let row = SweepRow {
-                        sweep,
-                        step,
-                        center_hz: Hz(lo + step_hz * u64::from(step) + step_hz / 2),
-                        bin_hz,
-                        db: vec![-100.0 + 10.0 * step as f32; SWEEP_BINS as usize],
-                        masked: vec![[0, 2]],
-                        span: Span {
-                            start_ns: Timestamp(end_ns - SWEEP_ROW_MS * 1_000_000),
-                            end_ns: Timestamp(end_ns),
-                        },
-                    };
-                    match tx.try_send(row) {
-                        Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            dropped.fetch_add(1, Ordering::SeqCst);
+                        if script.skip_step == Some(step) {
+                            continue;
                         }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break 'sweeps,
+                        if script.wait_after == Some(sent) && !waited {
+                            waited = true;
+                            state_tx.send_replace(SweepState::Waiting("socket lost".into()));
+                            if !pause(300).await {
+                                break 'plan;
+                            }
+                            state_tx.send_replace(SweepState::Running);
+                        }
+                        if script.end_after == Some(sent) {
+                            state_tx.send_replace(SweepState::Ended("gone".into()));
+                            break 'plan;
+                        }
+                        let ms = first.take().unwrap_or(SWEEP_ROW_MS);
+                        let in_burst = script.burst && !sent.is_multiple_of(SWEEP_BURST);
+                        if !in_burst && !pause(ms).await {
+                            break 'plan;
+                        }
+                        let end_ns = base + (sent as u64 + 1) * SWEEP_ROW_MS * 1_000_000;
+                        let step_hz = now.step_hz.0;
+                        let row = SweepRow {
+                            sweep,
+                            step,
+                            center_hz: Hz(lo + step_hz * u64::from(step) + step_hz / 2),
+                            bin_hz: now.bin_hz,
+                            db: vec![-100.0 + 10.0 * step as f32; SWEEP_BINS as usize],
+                            masked: vec![[0, 2]],
+                            span: Span {
+                                start_ns: Timestamp(end_ns - SWEEP_ROW_MS * 1_000_000),
+                                end_ns: Timestamp(end_ns),
+                            },
+                        };
+                        match tx.try_send(row) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                dropped.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break 'plan,
+                        }
+                        sent += 1;
                     }
-                    sent += 1;
                 }
             }
             drop(tx);
             drop(state_tx);
             live.fetch_sub(1, Ordering::SeqCst);
         });
-        Ok(SweepRows { plan, rows, state })
+        Ok(SweepRows {
+            plan,
+            rows,
+            state,
+            control,
+        })
     }
 }
 
@@ -3358,5 +3404,256 @@ async fn a_graph_put_of_bits_beside_source_or_bin_hz_is_refused() {
     assert_eq!(scan_ctx(&node, &id)["method"], "source");
     assert_eq!(port.requests().len(), 1);
     assert_eq!(port.live(), 1);
+    node.job_stop(&id).await.unwrap();
+}
+
+// ---- `job_retune` on a scan its source sweeps for itself: re-aimed, not restarted ----
+
+/// A `job_retune` of job `id` to `center_hz`/`bandwidth_hz` with `bin_hz` and `replace`.
+async fn retune_scan(
+    node: &Node,
+    id: &JobId,
+    (center_hz, bandwidth_hz): (u64, u64),
+    bin_hz: Option<u64>,
+    replace: &[JobId],
+) -> Result<OpResult, OpError> {
+    let op = Op::JobRetune {
+        job: id.clone(),
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(bandwidth_hz),
+        bin_hz,
+        replace: replace.to_vec(),
+    };
+    tokio::time::timeout(Duration::from_secs(10), node.apply(op))
+        .await
+        .expect("job_retune returns")
+}
+
+/// Job `id`'s record, as `job_list` lists it.
+fn record_of(node: &Node, id: &JobId) -> zeta_core::job::JobRecord {
+    node.job_list()
+        .into_iter()
+        .find(|r| &r.id == id)
+        .expect("the job is listed")
+}
+
+/// The id of job `id`'s event stream.
+fn event_stream(node: &Node, id: &JobId) -> StreamId {
+    node.bus()
+        .list()
+        .into_iter()
+        .find(|s| s.kind == StreamKind::Event && s.provenance.job.as_ref() == Some(id))
+        .expect("the job has an event stream")
+        .id
+}
+
+/// The span a self-sweep is re-aimed at in these tests: 40 MHz at 110 MHz, so its
+/// steps' centres (95, 105, 115 and 125 MHz) overlap the first span's (85-115 MHz) on
+/// other steps: a row is the new plan's when its centre is `95 + 10 × step` MHz.
+const REAIMED: (u64, u64) = (110 * MHZ, 40 * MHZ);
+
+fn of_reaimed_plan(f: &Frame) -> bool {
+    ev(f)["center_hz"] == 95 * MHZ + step_of(f) * 10 * MHZ
+}
+
+/// `job_retune` on a running self-sweep re-aims the source's sweep on the rows it
+/// already holds: the same job, stream and claim, one re-aim and no second `sweep`,
+/// the record's tuning and `bin_hz` and its `job_context.scan` following the new
+/// plan (its `timing` kept), and the averages started afresh: the first rows of the
+/// new plan say `sweeps: 1` though their centres were averaged before.
+#[tokio::test(flavor = "multi_thread")]
+async fn job_retune_re_aims_a_self_sweep_on_its_running_sweep() {
+    let script = SweepScript {
+        retarget: true,
+        ..Default::default()
+    };
+    let (_dir, node, port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, mut rx) = start_scan_look(&node, SWEEP_SPAN, None, Some(4)).await;
+    // Averaged for a while: every step's `sweeps` up to 4.
+    let got = rows(&mut rx, 24, Duration::from_secs(10)).await;
+    assert!(got.iter().any(|f| ev(f)["sweeps"] == 4), "never averaged 4");
+    until(
+        "a sweep's timing is written",
+        Duration::from_secs(10),
+        || !scan_ctx(&node, &id)["timing"].is_null(),
+    )
+    .await;
+    let stream = event_stream(&node, &id);
+    let r = retune_scan(&node, &id, REAIMED, Some(2000), &[]).await;
+    assert_eq!(r, Ok(OpResult::Job(id.clone())));
+    let want = SweepRequest {
+        span: Tuning {
+            center_hz: Hz(REAIMED.0),
+            bandwidth_hz: Hz(REAIMED.1),
+        },
+        bin_hz: Hz(2000),
+        dwell_ms: 20,
+    };
+    assert_eq!(port.retargets(), vec![want]);
+    assert_eq!(port.requests().len(), 1, "{:?}", port.requests());
+    assert_eq!(port.live(), 1);
+    assert_eq!(job_state(&node, &id), Some(JobState::Running));
+    assert_eq!(event_stream(&node, &id), stream);
+    assert_eq!(node.lease_sweepers(&radio0()), vec![id.clone()]);
+    let rec = record_of(&node, &id);
+    assert_eq!(rec.tuning, want.span);
+    assert_eq!(fft_node(&rec.graph).params["bin_hz"], 2000);
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["method"], "source", "{ctx}");
+    assert_eq!(ctx["steps"], 4, "{ctx}");
+    assert_eq!(ctx["step_hz"], 10 * MHZ, "{ctx}");
+    assert_eq!(ctx["bin_hz"], 10.0 * MHZ as f64 / 1024.0, "{ctx}");
+    assert!(ctx["alternate"].is_null(), "{ctx}");
+    assert_eq!(ctx["average"], 4, "{ctx}");
+    assert!(ctx["waiting"].is_null(), "{ctx}");
+    assert!(!ctx["timing"].is_null(), "the timing is kept: {ctx}");
+    // On the same stream: rows the bus held from before, then only the new plan's,
+    // averaged afresh.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let first = loop {
+        let f = rows(&mut rx, 1, deadline - tokio::time::Instant::now())
+            .await
+            .remove(0);
+        if of_reaimed_plan(&f) {
+            break f;
+        }
+    };
+    assert_eq!(ev(&first)["sweeps"], 1, "{}", ev(&first));
+    let after = rows(&mut rx, 16, Duration::from_secs(10)).await;
+    for f in &after {
+        assert!(
+            of_reaimed_plan(f),
+            "an old plan's row after the new: {}",
+            ev(f)
+        );
+    }
+    assert!(after.iter().any(|f| ev(f)["sweeps"] == 4), "averaged again");
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A source that cannot re-aim its sweep has it ended and a new one asked for under
+/// the same id: one more `sweep`, at the new span, and the scan runs on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_that_cannot_re_aim_is_asked_for_a_new_sweep() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let (id, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    rows(&mut rx, 4, Duration::from_secs(10)).await;
+    let r = retune_scan(&node, &id, REAIMED, None, &[]).await;
+    assert_eq!(r, Ok(OpResult::Job(id.clone())));
+    let span = Tuning {
+        center_hz: Hz(REAIMED.0),
+        bandwidth_hz: Hz(REAIMED.1),
+    };
+    until("a new sweep is asked for", Duration::from_secs(10), || {
+        port.requests().len() == 2
+    })
+    .await;
+    assert_eq!(port.requests()[1].span, span);
+    assert_eq!(port.requests()[1].bin_hz, port.requests()[0].bin_hz);
+    assert!(port.retargets().is_empty());
+    until("the old sweep ends", Duration::from_secs(5), || {
+        port.live() == 1
+    })
+    .await;
+    assert_eq!(job_state(&node, &id), Some(JobState::Running));
+    assert_eq!(record_of(&node, &id).tuning, span);
+    assert_eq!(scan_ctx(&node, &id)["method"], "source");
+    let mut rx = event_rx(&node, &id);
+    let got = rows(&mut rx, 4, Duration::from_secs(10)).await;
+    assert!(got.iter().all(of_reaimed_plan));
+    assert!(port.tunes().is_empty(), "{:?}", port.tunes());
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A span the source's sweep does not hold is refused naming the sweep's range, and
+/// so are a `replace` and a `bin_hz` out of range: the scan runs on as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_re_aim_the_source_cannot_take_is_refused_and_the_scan_runs_on() {
+    let script = SweepScript {
+        retarget: true,
+        ..Default::default()
+    };
+    let (_dir, node, port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    rows(&mut rx, 4, Duration::from_secs(10)).await;
+    let other = |message: &str| {
+        Err(OpError::Other {
+            message: message.into(),
+        })
+    };
+    assert_eq!(
+        retune_scan(&node, &id, (7_000 * MHZ, 40 * MHZ), None, &[]).await,
+        other(
+            "source radio0 does not sweep 6980000000-7020000000 Hz for itself: \
+             its sweep holds 1000000-6000000000 Hz"
+        )
+    );
+    let holder = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    assert_eq!(
+        retune_scan(&node, &id, REAIMED, None, std::slice::from_ref(&holder)).await,
+        other("replace applies to a stepped scan")
+    );
+    match retune_scan(&node, &id, REAIMED, Some(0), &[]).await {
+        Err(OpError::OutOfRange { field, .. }) => assert_eq!(field, "bin_hz"),
+        r => panic!("expected out_of_range, got {r:?}"),
+    }
+    assert!(port.retargets().is_empty());
+    assert_eq!(port.requests().len(), 1);
+    assert_eq!(job_state(&node, &id), Some(JobState::Running));
+    assert_eq!(job_state(&node, &holder), Some(JobState::Running));
+    assert_eq!(
+        record_of(&node, &id).tuning,
+        Tuning {
+            center_hz: Hz(SWEEP_SPAN.0),
+            bandwidth_hz: Hz(SWEEP_SPAN.1),
+        }
+    );
+    let got = rows(&mut rx, 8, Duration::from_secs(10)).await;
+    let last = got.last().unwrap();
+    assert_eq!(ev(last)["center_hz"], sweep_centre(step_of(last)));
+    node.job_stop(&id).await.unwrap();
+    node.job_stop(&holder).await.unwrap();
+}
+
+/// A stepped scan is still not retunable, and `bin_hz` on another kind is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stepped_scan_is_not_retunable_and_bin_hz_is_for_a_scan() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let id = start_job(&node, sweep_start(Some(ScanMethod::Stepped), None)).await;
+    tunes_at_least(&port, 1, Duration::from_secs(5)).await;
+    assert_eq!(
+        retune_scan(&node, &id, REAIMED, None, &[]).await,
+        Err(OpError::Other {
+            message: "scan is not retunable".into()
+        })
+    );
+    node.job_stop(&id).await.unwrap();
+    let rigid = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    assert_eq!(
+        retune_scan(&node, &rigid, (100 * MHZ, MHZ), Some(1000), &[]).await,
+        Err(OpError::Other {
+            message: "bin_hz applies only to a scan its source sweeps for itself; \
+                      pass null (kind is spectrum)"
+                .into()
+        })
+    );
+    node.job_stop(&rigid).await.unwrap();
+}
+
+/// A self-sweep of one step does not alternate, whatever shift its source says:
+/// `alternate` is null.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_step_self_sweep_does_not_alternate() {
+    let script = SweepScript {
+        steps: Some(1),
+        shift_hz: Some(10_000),
+        ..Default::default()
+    };
+    let (_dir, node, _port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    rows(&mut rx, 2, Duration::from_secs(10)).await;
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["steps"], 1, "{ctx}");
+    assert!(ctx["alternate"].is_null(), "{ctx}");
     node.job_stop(&id).await.unwrap();
 }

@@ -617,6 +617,31 @@ fn job_retune_replace_flag_round_trips_to_the_op() {
 }
 
 #[test]
+fn job_retune_bin_hz_flag_round_trips_to_the_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let retune = |extra: &[&str]| {
+        let mut args = vec![
+            "job",
+            "retune",
+            "--job",
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "--center-hz",
+            "15000000",
+            "--bandwidth-hz",
+            "30000000",
+        ];
+        args.extend_from_slice(extra);
+        zeta(dir.path(), &args)
+    };
+    retune(&["--bin-hz", "30000"]).assert().code(2);
+    let op = last_logged_op(dir.path());
+    assert_eq!(op["op"], "job_retune", "{op}");
+    assert_eq!(op["bin_hz"], 30_000, "{op}");
+    retune(&[]).assert().code(2);
+    assert!(last_logged_op(dir.path())["bin_hz"].is_null());
+}
+
+#[test]
 fn iq_read_one_shot_writes_capture() {
     let dir = tempfile::tempdir().unwrap();
     let out = zeta(

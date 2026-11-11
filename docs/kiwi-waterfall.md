@@ -84,6 +84,16 @@ checked against a later server (v1.837); the facts below are unverified on that 
   scan, waits and asks again. The IQ session ending does not end the sweep.
 - Still unverified on a live Kiwi: the pairing, `no_dup_ip` and the settle (`UAT.md` "Plan 36.2").
 
+## The live view
+
+- A plan of one view (the span fits a view at its zoom) does not shift its odd sweeps: the view is asked
+  once and never settled again, so every frame is a row (at a dwell of one frame, `WF_FPS`), at every
+  zoom, not only zoom 0. The first pixels the server zeroes stay masked.
+- A running sweep is re-aimed on its open socket (`SweepRows::retarget`, the node's `job_retune` of a
+  `source` scan): a new plan from the handshake's `bandwidth`, one `SET zoom= cf=`, its sweeps counted
+  from 0; the old view's frames are dropped by the zoom and `x_bin` match and the settle. A reconnect
+  resumes at the last plan asked.
+
 ## Not verified
 
 - That a later server (v1.837 or a KiwiSDR 2) behaves as above.

@@ -240,7 +240,12 @@ impl Port for Radio {
                 }
             }
         });
-        Ok(SweepRows { plan, rows, state })
+        Ok(SweepRows {
+            plan,
+            rows,
+            state,
+            control: None,
+        })
     }
 }
 

@@ -9,8 +9,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zeta_core::port::{
-    IqBlock, IqReceiver, Port, PortError, SWEEP_ROWS_CAPACITY, SweepRequest, SweepRow, SweepRows,
-    SweepState, Tuning,
+    IqBlock, IqReceiver, Port, PortError, SWEEP_ROWS_CAPACITY, SweepControl, SweepRequest,
+    SweepRow, SweepRows, SweepState, Tuning,
 };
 use zeta_core::types::{
     Capabilities, Claim, Hz, SampleFormat, SourceId, SourcePosition, SweepCaps,
@@ -21,7 +21,7 @@ use crate::status::KIWI_STATUS_PATH;
 use crate::wf::{self, WF_END_WAIT_MS, WF_FPS, WF_SETTLE_FRAMES, WF_ZOOM_MAX};
 
 /// Highest centre frequency a KiwiSDR tunes, in Hz.
-const TUNE_MAX_HZ: u64 = 30_000_000;
+pub(crate) const TUNE_MAX_HZ: u64 = 30_000_000;
 /// Widest IQ passband: `±6000` Hz around the centre.
 pub(crate) const MAX_BANDWIDTH_HZ: u64 = 12_000;
 /// Default delay after a new centre is sent before the session delivers
@@ -424,6 +424,11 @@ impl Port for KiwiSource {
     /// reason, transport failures `Io`; none touches the IQ session or
     /// [`Port::fault`]. The connect and handshake are bounded by
     /// `handshake_timeout_ms`, at most `wf::WF_HANDSHAKE_MAX_MS`.
+    ///
+    /// The rows carry a control: [`SweepRows::retarget`] re-aims the sweep on its
+    /// open socket (one `SET zoom= cf=`, no reconnect), refusing a span outside the
+    /// band as this call does. A plan of one view holds it (no odd-sweep shift):
+    /// a row every frame the dwell takes, at every zoom.
     async fn sweep(&self, req: SweepRequest) -> Result<SweepRows, PortError> {
         wf::span_within(req.span, TUNE_MAX_HZ)?;
         let mut live = self.sweep.lock().await;
@@ -441,6 +446,7 @@ impl Port for KiwiSource {
         let (rows_tx, rows) = mpsc::channel(SWEEP_ROWS_CAPACITY);
         let (state_tx, state) = watch::channel(SweepState::Running);
         let (ready_tx, ready) = oneshot::channel();
+        let (control, control_rx) = SweepControl::channel();
         let cancel = CancellationToken::new();
         let weak = rows_tx.downgrade();
         let ctx = wf::Ctx {
@@ -449,7 +455,7 @@ impl Port for KiwiSource {
             rows: rows_tx,
             state: state_tx,
         };
-        let task = tokio::spawn(wf::run(ctx, req, ready_tx));
+        let task = tokio::spawn(wf::run(ctx, req, ready_tx, control_rx));
         *live = Some(LiveSweep {
             rows: weak,
             cancel,
@@ -468,6 +474,7 @@ impl Port for KiwiSource {
                 plan: plan.sweep_plan(),
                 rows,
                 state,
+                control: Some(control),
             }),
             Err(e) => {
                 // The task ends by itself (its rows dropped here); its close is

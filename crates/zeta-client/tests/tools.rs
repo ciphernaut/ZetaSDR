@@ -89,9 +89,13 @@ fn job_retune_tool_shape() {
         .collect();
     assert_eq!(
         required,
-        BTreeSet::from(["bandwidth_hz", "center_hz", "job", "replace"])
+        BTreeSet::from(["bandwidth_hz", "bin_hz", "center_hz", "job", "replace"])
     );
     assert_eq!(t.input_schema["properties"]["replace"]["type"], "array");
+    assert_eq!(
+        t.input_schema["properties"]["bin_hz"]["type"],
+        json!(["integer", "null"])
+    );
     assert!(t.description.contains("under the same id"));
 }
 

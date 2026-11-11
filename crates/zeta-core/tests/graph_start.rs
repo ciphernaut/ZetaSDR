@@ -380,6 +380,7 @@ async fn job_retune_refuses_a_graph_job() {
             job: id.clone(),
             center_hz: Hz(CENTER_HZ),
             bandwidth_hz: Hz(BAND_HZ),
+            bin_hz: None,
             replace: vec![],
         })
         .await

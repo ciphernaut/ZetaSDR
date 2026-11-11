@@ -276,6 +276,7 @@ async fn retune(node: &Node, job: &JobId, center_hz: u64) -> Result<JobId, OpErr
         job: job.clone(),
         center_hz: Hz(center_hz),
         bandwidth_hz: Hz(WIDTH),
+        bin_hz: None,
         replace: vec![],
     };
     job_of(node, op).await

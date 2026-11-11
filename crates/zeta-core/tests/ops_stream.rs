@@ -491,6 +491,7 @@ fn op_name_matches_the_serialised_tag() {
             job: JobId("j".into()),
             center_hz: Hz(1),
             bandwidth_hz: Hz(1),
+            bin_hz: None,
             replace: vec![],
         },
         Op::JobList {},

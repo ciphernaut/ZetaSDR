@@ -221,6 +221,9 @@ struct JobEntry {
     /// `context.stations` at the throttle and by the supervisor at the run's end. Seeded
     /// from the record's context, so a new entry (every launch) continues the counts.
     stations: origin::StationTally,
+    /// Set at launch for a scan its source sweeps for itself: where `job_retune` hands
+    /// its re-aims ([`scan::Reaim`]) to the run's task.
+    reaim: Option<tokio::sync::mpsc::Sender<scan::Reaim>>,
 }
 
 impl JobEntry {
@@ -241,6 +244,7 @@ impl JobEntry {
             gated_stop: false,
             released: false,
             restarting: false,
+            reaim: None,
         }
     }
 }

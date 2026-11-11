@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::types::{Capabilities, Claim, Depth, Hz, SourceId, Span, Timestamp};
 
@@ -300,7 +300,8 @@ pub struct SweepPlan {
 }
 
 /// One view of a source's own sweep: step `step` of sweep `sweep` (counted
-/// from 0 at the sweep's start), centred on `center_hz`, `db` the power of
+/// from 0 at the sweep's start, and from 0 again at each re-aim,
+/// [`SweepRows::retarget`]), centred on `center_hz`, `db` the power of
 /// each of [`SweepPlan::size`] bins of `bin_hz` from the low edge up, `masked`
 /// the `[lo, hi)` bin ranges not to be read as signal, and `span` when its
 /// samples were taken.
@@ -326,12 +327,73 @@ pub enum SweepState {
 }
 
 /// A sweep a source runs for itself: the plan it chose, its rows (at most
-/// [`SWEEP_ROWS_CAPACITY`] waiting) and its state.
+/// [`SWEEP_ROWS_CAPACITY`] waiting), its state and, for a source that can re-aim
+/// a running sweep, its `control` ([`SweepRows::retarget`]; `None`: it cannot).
 #[derive(Debug)]
 pub struct SweepRows {
     pub plan: SweepPlan,
     pub rows: mpsc::Receiver<SweepRow>,
     pub state: watch::Receiver<SweepState>,
+    pub control: Option<SweepControl>,
+}
+
+impl SweepRows {
+    /// Re-aim the running sweep at `req` (a new span, bin width and dwell) without
+    /// ending it: the source re-plans on what it already holds (the Kiwi's open
+    /// `W/F` socket) and answers with the new plan, or refuses with the reason
+    /// (a span it cannot sweep is `OutOfRange`, as [`Port::sweep`] refuses it), the
+    /// sweep then going on as it was. A source that cannot re-aim (`control`
+    /// `None`) is `Unsupported`: the caller ends the sweep and asks for a new one.
+    ///
+    /// Contract: every row the source sends after its answer belongs to the new
+    /// plan (its `sweep` and `step` counted from 0 again), and every row it sent
+    /// before belongs to the old one, so a reader that drops the rows still queued
+    /// when the answer arrives never reads a row of the old plan as the new one's.
+    /// A row still holds only pixels of its own view. Called under the source's
+    /// gate, like [`Port::sweep`]: answer within a few seconds.
+    pub async fn retarget(&self, req: SweepRequest) -> Result<SweepPlan, PortError> {
+        match &self.control {
+            Some(c) => c.retarget(req).await,
+            None => Err(PortError::Unsupported(SWEEP_NO_RETARGET.into())),
+        }
+    }
+}
+
+/// Why a sweep cannot be re-aimed: its source has no [`SweepControl`].
+pub const SWEEP_NO_RETARGET: &str = "source cannot re-aim a running sweep";
+
+/// One ask to re-aim a running sweep ([`SweepRows::retarget`]): the new request
+/// and where the source answers it.
+#[derive(Debug)]
+pub struct SweepRetarget {
+    pub req: SweepRequest,
+    pub reply: oneshot::Sender<Result<SweepPlan, PortError>>,
+}
+
+/// The handle that re-aims a running sweep: [`SweepControl::channel`] gives the
+/// source the receiving end, which its sweep reads while it runs, and puts this
+/// end in its [`SweepRows`]. A sweep that has ended answers `Io`.
+#[derive(Clone, Debug)]
+pub struct SweepControl(mpsc::Sender<SweepRetarget>);
+
+impl SweepControl {
+    /// A control and the receiver its sweep reads.
+    pub fn channel() -> (SweepControl, mpsc::Receiver<SweepRetarget>) {
+        let (tx, rx) = mpsc::channel(1);
+        (SweepControl(tx), rx)
+    }
+
+    /// Ask the sweep to re-aim at `req` and wait for its answer (see
+    /// [`SweepRows::retarget`]).
+    pub async fn retarget(&self, req: SweepRequest) -> Result<SweepPlan, PortError> {
+        let ended = || PortError::Io("the sweep has ended".into());
+        let (reply, answer) = oneshot::channel();
+        self.0
+            .send(SweepRetarget { req, reply })
+            .await
+            .map_err(|_| ended())?;
+        answer.await.map_err(|_| ended())?
+    }
 }
 
 /// The rows a source's sweep holds for a reader that has not taken them; a
@@ -592,6 +654,14 @@ pub trait Port: Send + Sync {
     /// default refuses every sweep. It is called under the source's gate:
     /// refuse or return within a few seconds (the node gives up on it after
     /// [`crate::ops::SWEEP_START_TIMEOUT_MS`] and drops the call).
+    ///
+    /// A source that can re-aim the running sweep without ending it (a new span,
+    /// bin width or dwell on what it already holds) gives its rows a
+    /// [`SweepControl`] ([`SweepRows::retarget`], whose contract is this one's:
+    /// called under the source's gate, answered within a few seconds); without one
+    /// the node ends the sweep and asks for a new one. A plan of one view does not
+    /// alternate (`shift_hz` 0): the view stays put and its rows come as fast as
+    /// the source makes them.
     async fn sweep(&self, req: SweepRequest) -> Result<SweepRows, PortError> {
         let _ = req;
         Err(PortError::Unsupported(

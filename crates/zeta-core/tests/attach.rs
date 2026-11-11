@@ -526,6 +526,7 @@ async fn retune_input(node: &Node, input: &JobId) {
         job: input.clone(),
         center_hz: Hz(100_002_000),
         bandwidth_hz: Hz(10_000),
+        bin_hz: None,
         replace: vec![],
     };
     let r = tokio::time::timeout(Duration::from_secs(10), node.apply(op))

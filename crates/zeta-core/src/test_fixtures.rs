@@ -261,6 +261,11 @@ impl Port for FaultablePort {
                 }
             }
         });
-        Ok(SweepRows { plan, rows, state })
+        Ok(SweepRows {
+            plan,
+            rows,
+            state,
+            control: None,
+        })
     }
 }

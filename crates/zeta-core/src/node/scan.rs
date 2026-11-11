@@ -9,12 +9,14 @@
 //! sample depth the source's link runs at for the scan: held for the run and
 //! put back before the lease goes, [`scan_run`]). A source that sweeps the span
 //! for itself is asked to instead ([`sweep_loop`]): its rows are forwarded in
-//! the same row shape, under a sweep claim and no lease (`method: source`).
+//! the same row shape, under a sweep claim and no lease (`method: source`). Such a
+//! scan is re-aimed at a new span by `job_retune` ([`Reaim`]) on the source's
+//! running sweep ([`SweepRows::retarget`]), under the same id and stream.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{OwnedMutexGuard, mpsc};
+use tokio::sync::{OwnedMutexGuard, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -32,7 +34,8 @@ use crate::ops::{
     scan_rows_per_step, scan_sweep_refusal, spectrum_size,
 };
 use crate::port::{
-    IqBlock, Port, PortError, SweepPlan, SweepRequest, SweepRow, SweepRows, SweepState, Tuning,
+    IqBlock, Port, PortError, SWEEP_NO_RETARGET, SweepPlan, SweepRequest, SweepRow, SweepRows,
+    SweepState, Tuning,
 };
 use crate::ring::IqRing;
 use crate::spectrum::{STEP_DB, SweepAverage, dequantise, quantise_row, quantise_row_masked};
@@ -351,6 +354,7 @@ impl Inner {
     /// source's plan ([`sweep_context`]), or, `start` waiting (a restart the
     /// source refused, the claim already taken), [`waiting_context`] until a
     /// sweep asked again as `req` is granted. It holds no lease and stops nobody.
+    /// The run's entry keeps the sender of its [`Reaim`]s (`job_retune`).
     fn launch_self_sweep(
         self: &Arc<Self>,
         mut rec: JobRecord,
@@ -390,10 +394,11 @@ impl Inner {
             out: out.clone(),
             cancel: token.clone(),
         };
+        let (reaim_tx, reaim) = mpsc::channel(1);
         let mut set = JoinSet::new();
         let (running, task) = (
             StageRunning::new(self.stages.clone()),
-            sweep_task(self.clone(), sweep, start),
+            sweep_task(self.clone(), sweep, start, reaim),
         );
         set.spawn(async move {
             let _running = running;
@@ -414,6 +419,7 @@ impl Inner {
             e.done = Some(h);
             e.outputs = vec![JobOutput::new(StreamKind::Event, out)];
             e.blind = true;
+            e.reaim = Some(reaim_tx);
         }
         Ok(())
     }
@@ -500,22 +506,63 @@ impl Inner {
         id: &JobId,
         f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
     ) {
+        self.scan_record_update(id, |_, scan| f(scan));
+    }
+
+    /// [`Inner::scan_context_update`] with the record itself in reach too.
+    fn scan_record_update(
+        &self,
+        id: &JobId,
+        f: impl FnOnce(&mut JobRecord, &mut serde_json::Map<String, serde_json::Value>),
+    ) {
         let mut jobs = self.jobs.lock().unwrap();
         let Some(entry) = jobs.get_mut(id) else {
             return;
         };
-        let ctx = &mut entry.record.context;
-        if !ctx.is_object() {
-            *ctx = serde_json::json!({});
+        let rec = &mut entry.record;
+        if !rec.context.is_object() {
+            rec.context = serde_json::json!({});
         }
-        let obj = ctx.as_object_mut().expect("context is an object");
+        let obj = rec.context.as_object_mut().expect("context is an object");
         let mut scan = match obj.remove("scan") {
             Some(serde_json::Value::Object(m)) => m,
             _ => serde_json::Map::new(),
         };
-        f(&mut scan);
-        obj.insert("scan".into(), scan.into());
+        f(rec, &mut scan);
+        if let Some(obj) = rec.context.as_object_mut() {
+            obj.insert("scan".into(), scan.into());
+        }
         let _ = super::persist::persist(&self.jobs_dir, &entry.record);
+    }
+
+    /// A self-sweep re-aimed at `span` (and `bin_hz`, when asked): the record's
+    /// `tuning`, its `fft` node's `bin_hz` (so a resume asks the same) and its
+    /// `job_context.scan` rewritten with `fields`, the new plan's, keeping the
+    /// `timing` (as [`Inner::scan_context_rewrite`] does), in one write.
+    fn scan_reaimed(
+        &self,
+        id: &JobId,
+        span: Tuning,
+        bin_hz: Option<u64>,
+        fields: serde_json::Map<String, serde_json::Value>,
+    ) {
+        self.scan_record_update(id, |rec, scan| {
+            rec.tuning = span;
+            if let Some(b) = bin_hz
+                && let Some(p) = rec
+                    .graph
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.kind == "fft")
+                    .and_then(|n| n.params.as_object_mut())
+            {
+                p.insert("bin_hz".into(), b.into());
+            }
+            scan.remove("dwell_ms_asked");
+            scan.remove("average_asked");
+            scan.remove("bits");
+            scan.extend(fields);
+        });
     }
 
     /// Write `fields` into job `id`'s `job_context.scan`, keeping its other
@@ -1337,6 +1384,32 @@ struct SelfSweep {
     cancel: CancellationToken,
 }
 
+/// A `job_retune` of a self-sweep scan, handed to its task: the new `span`, the
+/// `bin_hz` asked (`None`: the scan's own) and where the task answers, with the
+/// source's new plan or why not (`Unsupported`: the source cannot re-aim, or the
+/// scan has no sweep running, so the caller restarts it instead).
+pub(super) struct Reaim {
+    pub span: Tuning,
+    pub bin_hz: Option<u64>,
+    pub reply: oneshot::Sender<Result<SweepPlan, PortError>>,
+}
+
+/// Why a scan waiting for its sweep cannot be re-aimed: it has none to re-aim.
+const REAIM_WAITING: &str = "the scan is waiting for its sweep";
+
+/// Answer a re-aim while the scan has no sweep running: `Unsupported`.
+fn refuse_reaim(r: Reaim) {
+    let _ = r
+        .reply
+        .send(Err(PortError::Unsupported(REAIM_WAITING.into())));
+}
+
+/// Whether the source's `plan` alternates its odd sweeps: a shift and more than
+/// one step (a plan of one view holds still, whatever shift it says).
+fn plan_alternates(plan: &SweepPlan) -> bool {
+    plan.shift_hz.0 != 0 && plan.steps > 1
+}
+
 /// How a self-sweep scan starts: with the source's rows, or `Waiting` (the reason)
 /// for a restart the source refused, asking again ([`wait_for_sweep`]).
 enum SweepStart {
@@ -1345,10 +1418,10 @@ enum SweepStart {
 }
 
 /// The `average` in force for `look` on the source's `plan` with `budget_bytes` for
-/// the averages: one row a step, the plan's steps (twice when its odd sweeps
-/// shift) and its bins ([`scan_average_in_force`]).
+/// the averages: one row a step, the plan's steps (twice when it alternates,
+/// [`plan_alternates`]) and its bins ([`scan_average_in_force`]).
 fn sweep_average(look: Look, budget_bytes: u64, plan: &SweepPlan) -> u32 {
-    let grids = if plan.shift_hz.0 != 0 { 2 } else { 1 };
+    let grids = if plan_alternates(plan) { 2 } else { 1 };
     scan_average_in_force(
         look.average,
         budget_bytes,
@@ -1375,16 +1448,22 @@ fn waiting_context(calibrated: bool, why: &str) -> serde_json::Map<String, serde
 }
 
 /// The self-sweep scan's one task: [`sweep_loop`] over the rows `start` holds, or,
-/// waiting, over the rows of the sweep [`wait_for_sweep`] is granted.
-async fn sweep_task(inner: Arc<Inner>, s: SelfSweep, start: SweepStart) -> Result<(), StageError> {
+/// waiting, over the rows of the sweep [`wait_for_sweep`] is granted; `reaim` brings
+/// its `job_retune`s.
+async fn sweep_task(
+    inner: Arc<Inner>,
+    s: SelfSweep,
+    start: SweepStart,
+    mut reaim: mpsc::Receiver<Reaim>,
+) -> Result<(), StageError> {
     let rows = match start {
         SweepStart::Rows(rows) => rows,
-        SweepStart::Waiting(why) => match wait_for_sweep(&inner, &s, why).await {
+        SweepStart::Waiting(why) => match wait_for_sweep(&inner, &s, why, &mut reaim).await {
             Some(rows) => rows,
             None => return Err(StageError::Cancelled),
         },
     };
-    sweep_loop(inner, s, rows).await
+    sweep_loop(inner, s, rows, reaim).await
 }
 
 /// Ask the source again for the sweep it refused (`waiting`, the reason), after each
@@ -1392,22 +1471,37 @@ async fn sweep_task(inner: Arc<Inner>, s: SelfSweep, start: SweepStart) -> Resul
 /// once cancelled): each ask under the source's gate ([`Inner::start_sweep`], the
 /// scan's claim kept through a refusal), skipped with the reason while the source's
 /// `sweep` does not hold the span. A new reason is written as `waiting`; granted,
-/// the plan's keys ([`sweep_context`]) with `waiting: null`. It never steps.
-async fn wait_for_sweep(inner: &Inner, s: &SelfSweep, mut waiting: String) -> Option<SweepRows> {
+/// the plan's keys ([`sweep_context`]) with `waiting: null`. It never steps. A
+/// re-aim meanwhile is refused `Unsupported` ([`refuse_reaim`]): there is no sweep to
+/// re-aim, so `job_retune` restarts the scan at the new span instead.
+async fn wait_for_sweep(
+    inner: &Inner,
+    s: &SelfSweep,
+    mut waiting: String,
+    reaim: &mut mpsc::Receiver<Reaim>,
+) -> Option<SweepRows> {
     let mut k = 0usize;
     loop {
         let ms = SWEEP_RETRY_MS[k.min(SWEEP_RETRY_MS.len() - 1)];
         k += 1;
-        tokio::select! {
-            _ = s.cancel.cancelled() => return None,
-            _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
+        let wake = tokio::time::Instant::now() + Duration::from_millis(ms);
+        loop {
+            tokio::select! {
+                _ = s.cancel.cancelled() => return None,
+                Some(r) = reaim.recv() => refuse_reaim(r),
+                _ = tokio::time::sleep_until(wake) => break,
+            }
         }
         let asked = match scan_sweep_refusal(s.port.id(), s.port.capabilities(), s.span) {
             Some(why) => Err(why),
             None => {
-                let gate = tokio::select! {
-                    _ = s.cancel.cancelled() => return None,
-                    g = inner.leases.gate_guard(s.port.id()) => g,
+                // A `job_retune` holding the gate waits for its re-aim's answer.
+                let gate = loop {
+                    tokio::select! {
+                        _ = s.cancel.cancelled() => return None,
+                        Some(r) = reaim.recv() => refuse_reaim(r),
+                        g = inner.leases.gate_guard(s.port.id()) => break g,
+                    }
                 };
                 tokio::select! {
                     _ = s.cancel.cancelled() => return None,
@@ -1439,17 +1533,18 @@ async fn wait_for_sweep(inner: &Inner, s: &SelfSweep, mut waiting: String) -> Op
 /// source's `plan` (`steps`, `step_hz`, `bin_hz`, `dwell_ms`, the dwell in force,
 /// with `dwell_ms_asked` when `look`'s differs), `average` (in force) with
 /// `average_asked` when that differs, `alternate` (the odd sweeps' shift, or
-/// null), `mask` (none: the source masks its own rows), `calibrated`, and
-/// `waiting` (null). No `rate_hz` and no `bits`: the scan takes no IQ.
+/// null: none, or a plan of one step, [`plan_alternates`]), `mask` (none: the
+/// source masks its own rows), `calibrated`, and `waiting` (null). No `rate_hz`
+/// and no `bits`: the scan takes no IQ.
 fn sweep_context(
     plan: &SweepPlan,
     look: Look,
     average: u32,
     calibrated: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
-    let alternate = match plan.shift_hz.0 {
-        0 => serde_json::Value::Null,
-        shift => serde_json::json!({"shift_hz": shift, "steps_shifted": plan.steps}),
+    let alternate = match plan_alternates(plan) {
+        false => serde_json::Value::Null,
+        true => serde_json::json!({"shift_hz": plan.shift_hz.0, "steps_shifted": plan.steps}),
     };
     let mut scan = serde_json::json!({
         "method": "source",
@@ -1581,15 +1676,30 @@ fn sweep_row_event(
 /// <id>: <the reason>` (never `source <id>: …`: the source's IQ side is not at
 /// fault). It never reads [`Port::fault`]; cancelled, it drops the rows first,
 /// which ends the source's sweep.
-async fn sweep_loop(inner: Arc<Inner>, s: SelfSweep, rows: SweepRows) -> Result<(), StageError> {
+///
+/// A [`Reaim`] is asked of the source ([`SweepRows::retarget`], at the scan's
+/// `bin_hz` unless it names one and the scan's dwell), bounded as a sweep's start
+/// is: granted, the rows still queued (the old plan's) are dropped, the averages
+/// and the sweep clock start afresh on the new plan, and the record's tuning and
+/// `job_context.scan` follow it ([`Inner::scan_reaimed`]); refused, nothing
+/// changes. A source with no control, or one that has not answered in time, is
+/// `Unsupported`: the caller restarts the scan, which ends this sweep whatever the
+/// source does with the re-aim later.
+async fn sweep_loop(
+    inner: Arc<Inner>,
+    mut s: SelfSweep,
+    rows: SweepRows,
+    mut reaim: mpsc::Receiver<Reaim>,
+) -> Result<(), StageError> {
     let SweepRows {
         plan,
         rows: mut rx,
         mut state,
+        control,
     } = rows;
-    let rows_per_s = dwell_rows_per_s(plan.dwell_ms);
-    let alternates = plan.shift_hz.0 != 0;
-    let average = sweep_average(s.look, s.budget, &plan);
+    let mut rows_per_s = dwell_rows_per_s(plan.dwell_ms);
+    let mut alternates = plan_alternates(&plan);
+    let mut average = sweep_average(s.look, s.budget, &plan);
     let mut averages = [0, 1].map(|_| SweepAverage::new(average));
     let mut clock = SweepClock::new(plan.steps);
     let mut waiting = None;
@@ -1602,6 +1712,40 @@ async fn sweep_loop(inner: Arc<Inner>, s: SelfSweep, rows: SweepRows) -> Result<
             _ = s.cancel.cancelled() => {
                 drop(rx);
                 return Err(StageError::Cancelled);
+            }
+            Some(r) = reaim.recv() => {
+                let req = SweepRequest {
+                    span: r.span,
+                    bin_hz: r.bin_hz.map_or(s.req.bin_hz, Hz),
+                    dwell_ms: s.req.dwell_ms,
+                };
+                let answer = match &control {
+                    None => Err(PortError::Unsupported(SWEEP_NO_RETARGET.into())),
+                    Some(c) => {
+                        let wait = *inner.sweep_start_timeout.lock().unwrap();
+                        tokio::time::timeout(wait, c.retarget(req))
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(PortError::Unsupported("sweep re-aim timed out".into()))
+                            })
+                    }
+                };
+                if let Ok(plan) = &answer {
+                    // Every row queued before the answer is the old plan's.
+                    while rx.try_recv().is_ok() {}
+                    (s.span, s.req) = (r.span, req);
+                    rows_per_s = dwell_rows_per_s(plan.dwell_ms);
+                    alternates = plan_alternates(plan);
+                    average = sweep_average(s.look, s.budget, plan);
+                    averages = [0, 1].map(|_| SweepAverage::new(average));
+                    clock = SweepClock::new(plan.steps);
+                    let fields = sweep_context(plan, s.look, average, s.calibrated);
+                    inner.scan_reaimed(&s.id, r.span, r.bin_hz, fields);
+                    // The fields say `waiting: null`; the source's state is read again.
+                    waiting = None;
+                    state.mark_changed();
+                }
+                let _ = r.reply.send(answer);
             }
             r = rx.recv() => {
                 let Some(row) = r else {

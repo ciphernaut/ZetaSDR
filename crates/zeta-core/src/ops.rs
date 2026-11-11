@@ -240,7 +240,8 @@ pub enum Op {
         /// (1..=1000000; the source gives the nearest it can); `null` is 6000 or the
         /// source's finest, whichever is coarser. Refused with `method: "stepped"` or
         /// a `bits`.
-        /// Changes on a running scan through `graph_put` (the `fft` node's `bin_hz`).
+        /// Changes on a running scan through `graph_put` (the `fft` node's `bin_hz`), or
+        /// with a new span through `job_retune` on a scan the source sweeps.
         /// Any other kind must pass `null`.
         #[serde(default, deserialize_with = "nullable_u64")]
         #[schemars(required, schema_with = "nullable_bin_hz")]
@@ -286,16 +287,35 @@ pub enum Op {
     /// graph is expanded again for the new band at the capture's rate and the job
     /// relaunched, `tuning` updated. Applies to a `running` job the node expanded and can
     /// re-expand: the four demodulators, the decoders, `measure`, `passthrough` and the
-    /// mode rows. Refused naming the kind for `scan`, `watch`, `identify`, `spectrum`
+    /// mode rows. Refused naming the kind for a stepped `scan` (a `scan` its source sweeps is re-aimed, below), `watch`, `identify`, `spectrum`
     /// (elastic or rigid), `mix` (it has no band), a `graph_start` job (it runs on no
     /// radio) and `transcribe` (attached: retune its
     /// input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new
     /// graph or start a new job). A job that is not running is `job <id> is <state>`; an
     /// unknown id is `unknown`. The result is the job's id, as `job_start` answers.
+    ///
+    /// A `scan` its source sweeps for itself (`job_context.scan.method` `source`) is
+    /// re-aimed instead: under the source's gate the source's running sweep moves to the
+    /// new span (and `bin_hz`, when given) on what it already holds, the Kiwi's open
+    /// waterfall socket, without ending it; the job keeps its id, its event stream and its
+    /// sweep claim, `tuning` and `job_context.scan` follow the source's new plan (`steps`,
+    /// `step_hz`, `bin_hz`, `alternate`; `timing` is kept) and the averages start afresh
+    /// (each row's `sweeps` from 1). A source that cannot re-aim has its sweep ended and
+    /// a new one asked for under the same id. A span the source's `capabilities.sweep`
+    /// does not hold is refused naming its range, the scan running on as it was; a
+    /// non-empty `replace` is refused (`replace applies to a stepped scan`: the sweep
+    /// takes no lease). A stepped scan is `scan is not retunable`.
+    #[schemars(transform = require_retune_bin_hz)]
     JobRetune {
         job: JobId,
         center_hz: Hz,
         bandwidth_hz: Hz,
+        /// A `scan` its source sweeps for itself only: the bin width asked of the source
+        /// for the new span, Hz (1..=1000000; the source gives the nearest it can);
+        /// `null` keeps the one the scan asked for. Any other job must pass `null`.
+        #[serde(default, deserialize_with = "nullable_u64")]
+        #[schemars(required, schema_with = "nullable_retune_bin_hz")]
+        bin_hz: Option<u64>,
         replace: Vec<JobId>,
     },
     /// Start a mix: a job that sums the audio of every other job with an audio output on
@@ -843,6 +863,16 @@ fn nullable_bin_hz(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     })
 }
 
+/// Schema of `job_retune`'s `bin_hz`: `["integer","null"]` (range as `job_start`'s).
+fn nullable_retune_bin_hz(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "format": "uint64",
+        "minimum": 0,
+        "description": "A `scan` its source sweeps for itself (`job_context.scan.method` `source`) only: the bin width asked of the source for the new span, Hz (1..=1000000); `null` keeps the one the scan asked for. Any other job must pass `null`."
+    })
+}
+
 /// Deserialize a required `Option<ScanMethod>` (see [`nullable_u64`]).
 fn nullable_scan_method<'de, D: serde::Deserializer<'de>>(
     d: D,
@@ -1004,6 +1034,25 @@ fn require_all_value(schema: &mut schemars::Schema) {
         .and_then(|v| <&mut schemars::Schema>::try_from(v).ok());
     if let Some(value) = value {
         crate::knowledge::require_all(value);
+    }
+}
+
+/// `job_retune` requires its `bin_hz`, after `bandwidth_hz`, and shows no default for
+/// it, as `job_start` does its look ([`require_the_look`]); it still defaults to
+/// `null` when a request from before it leaves it out.
+fn require_retune_bin_hz(schema: &mut schemars::Schema) {
+    if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
+        req.retain(|f| f != "bin_hz");
+        let at = req
+            .iter()
+            .position(|f| f == "bandwidth_hz")
+            .map_or(req.len(), |i| i + 1);
+        req.insert(at, "bin_hz".into());
+    }
+    if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties")
+        && let Some(serde_json::Value::Object(p)) = props.get_mut("bin_hz")
+    {
+        p.remove("default");
     }
 }
 
@@ -4403,8 +4452,9 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             job,
             center_hz,
             bandwidth_hz,
+            bin_hz,
             replace,
-        } => job_retune(node, job, center_hz, bandwidth_hz, replace).await,
+        } => job_retune(node, job, center_hz, bandwidth_hz, bin_hz, replace).await,
         Op::PlanStart {
             plan,
             channels,
@@ -6294,11 +6344,21 @@ async fn job_retune(
     job: JobId,
     center_hz: Hz,
     bandwidth_hz: Hz,
+    bin_hz: Option<u64>,
     replace: Vec<JobId>,
 ) -> Result<OpResult, OpError> {
     let Some(rec) = node.job_list().into_iter().find(|r| r.id == job) else {
         return Err(unknown_job(node, &job));
     };
+    if rec.kind == JobKind::Scan.name() {
+        return scan_retune(node, rec, center_hz, bandwidth_hz, bin_hz, replace).await;
+    }
+    if bin_hz.is_some() {
+        return Err(other(format!(
+            "bin_hz applies only to a scan its source sweeps for itself; pass null (kind is {})",
+            rec.kind
+        )));
+    }
     // Before the operator's-graph test: a mute's `graph_put` sets that flag on a mix.
     if rec.kind == JobKind::Mix.name() {
         return Err(other("mix is not retunable"));
@@ -6356,6 +6416,69 @@ async fn job_retune(
             Err(node_error(node, e))
         }
     }
+}
+
+/// `job_retune` of a `scan`: a scan its source sweeps for itself (its context's
+/// `scan.method` `source`) is re-aimed ([`Node::retune_self_sweep`]); a stepped one is
+/// `scan is not retunable`, as before. Checked in order: the method, the state (`job
+/// <id> is <status>`), `bin_hz` (1..=`SCAN_BIN_MAX_HZ`, `out_of_range`), a non-empty
+/// `replace` ([`SCAN_REPLACE_STEPPED`]), a band of at least 1 Hz and the source's
+/// `sweep` holding it ([`scan_retune_refusal`]), all before the gate.
+async fn scan_retune(
+    node: &Node,
+    rec: JobRecord,
+    center_hz: Hz,
+    bandwidth_hz: Hz,
+    bin_hz: Option<u64>,
+    replace: Vec<JobId>,
+) -> Result<OpResult, OpError> {
+    let source_scan = rec.context.pointer("/scan/method").and_then(|m| m.as_str())
+        == Some(ScanMethod::Source.name());
+    if !source_scan {
+        return Err(other(format!("{} is not retunable", rec.kind)));
+    }
+    if rec.state != JobState::Running {
+        let state = serde_json::to_value(&rec.state).unwrap_or_default();
+        let status = state["status"].as_str().unwrap_or_default();
+        return Err(other(format!("job {} is {status}", rec.id.0)));
+    }
+    if let Some(b) = bin_hz {
+        range("bin_hz", b, 1, SCAN_BIN_MAX_HZ)?;
+    }
+    if !replace.is_empty() {
+        return Err(other(SCAN_REPLACE_STEPPED));
+    }
+    let want = Tuning {
+        center_hz,
+        bandwidth_hz,
+    };
+    let port = node
+        .port(&rec.source)
+        .ok_or_else(|| unknown_source(node, &rec.source))?;
+    range("bandwidth_hz", bandwidth_hz.0, 1, u64::MAX)?;
+    if let Some(why) = scan_retune_refusal(&rec.source, port.capabilities(), want) {
+        return Err(other(why));
+    }
+    node.retune_self_sweep(&rec.id, want, bin_hz)
+        .await
+        .map(|()| OpResult::Job(rec.id.clone()))
+        .map_err(|e| node_error(node, e))
+}
+
+/// Why a scan that runs as its source's own sweep cannot be re-aimed at `span`: the
+/// source's `sweep` does not hold it (`source <id> does not sweep <lo>-<hi> Hz for
+/// itself: its sweep holds <min>-<max> Hz`, or `... it does not sweep for itself`
+/// when it has none now); `None` when it does.
+pub(crate) fn scan_retune_refusal(
+    source: &SourceId,
+    caps: &Capabilities,
+    span: Tuning,
+) -> Option<String> {
+    let why = scan_sweep_refusal(source, caps, span)?;
+    Some(match &caps.sweep {
+        Some(s) => format!("{why}: its sweep holds {}-{} Hz", s.min_hz.0, s.max_hz.0),
+        None => format!("{why}: it does not sweep for itself"),
+    })
 }
 
 /// The ring's sample rate and centre and the selection's samples, once the

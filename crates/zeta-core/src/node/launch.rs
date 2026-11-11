@@ -954,6 +954,7 @@ impl Inner {
                 gated_stop: false,
                 released: false,
                 restarting: false,
+                reaim: None,
             },
         );
         Ok((prov, run, ended))

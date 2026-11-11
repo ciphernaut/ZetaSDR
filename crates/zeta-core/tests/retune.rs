@@ -210,6 +210,7 @@ async fn retune(
         job: id.clone(),
         center_hz: Hz(center_hz),
         bandwidth_hz: Hz(bandwidth_hz),
+        bin_hz: None,
         replace: replace.iter().map(|j| (*j).clone()).collect(),
     };
     tokio::time::timeout(Duration::from_secs(10), node.apply(op))

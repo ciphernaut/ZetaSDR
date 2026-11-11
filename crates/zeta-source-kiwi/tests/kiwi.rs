@@ -1323,3 +1323,252 @@ async fn a_scan_on_a_fake_kiwi_sweeps_for_itself_beside_a_demodulator() {
     assert_eq!(path_ts_of(&paths, "/W/F").len(), 1, "{paths:?}");
     assert_eq!(paths.len(), 2, "{paths:?}");
 }
+
+// ---- Re-aiming a running sweep (the live view): the same `W/F` socket. ----
+
+/// 300 kHz at 7.1 MHz at 5 kHz bins: one view at zoom 6 (468 750 Hz).
+fn narrow() -> SweepRequest {
+    SweepRequest {
+        span: tuning(7_100_000, 300_000),
+        bin_hz: Hz(5_000),
+        dwell_ms: 20,
+    }
+}
+
+/// The view command of [`narrow`]'s one view.
+const NARROW_VIEW: &str = "SET zoom=6 cf=7100.000";
+
+/// How many times `cmd` was sent.
+fn sent(fake: &FakeKiwi, cmd: &str) -> usize {
+    fake.commands().iter().filter(|c| *c == cmd).count()
+}
+
+/// How many view commands (`SET zoom=`) were sent.
+fn views_sent(fake: &FakeKiwi) -> usize {
+    fake.commands()
+        .iter()
+        .filter(|c| c.starts_with("SET zoom="))
+        .count()
+}
+
+#[tokio::test]
+async fn a_retarget_moves_the_view_on_the_same_socket() {
+    // Old-view frames after each change, then one of the new view still holding the
+    // old view's pixels: neither may reach a row of the new plan.
+    let fake = wf_fake(FakeWf {
+        lag_frames: 3,
+        ..FakeWf::default()
+    })
+    .await;
+    let src = source(&fake, &[10]);
+    let mut rows = src.sweep(whole_band()).await.unwrap();
+    assert_eq!(rows.plan.steps, 8);
+    for _ in 0..3 {
+        next_row(&mut rows).await;
+    }
+    assert_eq!(fake.wf_connections(), 1);
+    assert_eq!(sent(&fake, NARROW_VIEW), 0);
+    let plan = rows.retarget(narrow()).await.unwrap();
+    assert_eq!(plan.steps, 1);
+    assert_eq!(plan.step_hz, Hz(468_750));
+    assert_eq!(plan.size, 1024);
+    assert!((plan.bin_hz - 457.76).abs() < 0.01, "{}", plan.bin_hz);
+    assert_eq!(plan.shift_hz, Hz(0));
+    assert_eq!(plan.dwell_ms, 43);
+    // The rows queued before the answer are the old plan's.
+    while rows.rows.try_recv().is_ok() {}
+    for k in 0..10 {
+        let row = next_row(&mut rows).await;
+        assert_eq!((row.sweep, row.step), (k, 0), "{row:?}");
+        assert!(row.center_hz.0.abs_diff(7_100_000) <= 4, "{row:?}");
+        assert_eq!(row.bin_hz, plan.bin_hz);
+        let x = x_bin_of(&row, 468_750);
+        assert!(
+            (row.db[5] - painted(x)).abs() < 1e-3,
+            "row {k}: {} is another view's, not {}",
+            row.db[5],
+            painted(x)
+        );
+    }
+    assert_eq!(fake.wf_connections(), 1, "no new socket");
+    assert_eq!(sent(&fake, NARROW_VIEW), 1, "{:?}", fake.commands());
+    assert_eq!(src.fault(), None);
+}
+
+#[tokio::test]
+async fn a_retarget_outside_the_band_is_refused_and_the_sweep_goes_on() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    let mut rows = src.sweep(whole_band()).await.unwrap();
+    next_row(&mut rows).await;
+    for span in [tuning(29_900_000, 400_000), tuning(15_000_000, 0)] {
+        let r = rows
+            .retarget(SweepRequest {
+                span,
+                ..whole_band()
+            })
+            .await;
+        assert!(
+            matches!(r, Err(PortError::OutOfRange { .. })),
+            "{span:?}: {r:?}"
+        );
+    }
+    // Still the whole band's eight views.
+    for _ in 0..16 {
+        let row = next_row(&mut rows).await;
+        let even = 1_875_000 + u64::from(row.step) * 3_750_000;
+        let shifted = row.sweep % 2 == 1 && row.step > 0;
+        let want = if shifted { even - 29_296 } else { even };
+        assert!(row.center_hz.0.abs_diff(want) <= 2, "{row:?}");
+        assert_eq!(row.db.len(), 1024);
+    }
+    assert_eq!(fake.wf_connections(), 1);
+    assert_eq!(*rows.state.borrow(), SweepState::Running);
+}
+
+#[tokio::test]
+async fn after_a_reconnect_the_sweep_resumes_at_the_retargeted_plan() {
+    let fake = wf_fake(FakeWf {
+        frames_per_connection: Some(40),
+        ..FakeWf::default()
+    })
+    .await;
+    let src = source(&fake, &[50; 20]);
+    let mut rows = src.sweep(whole_band()).await.unwrap();
+    next_row(&mut rows).await;
+    let plan = rows.retarget(narrow()).await.unwrap();
+    assert_eq!(plan.steps, 1);
+    assert!(
+        wait_until(5_000, || fake.wf_connections() >= 2).await,
+        "{}",
+        fake.wf_connections()
+    );
+    let state = wait_state(&rows, 5_000, |s| *s == SweepState::Running).await;
+    assert_eq!(state, SweepState::Running);
+    while rows.rows.try_recv().is_ok() {}
+    for _ in 0..5 {
+        let row = next_row(&mut rows).await;
+        assert!(row.center_hz.0.abs_diff(7_100_000) <= 4, "{row:?}");
+        assert_eq!(row.bin_hz, plan.bin_hz);
+    }
+    // Every connection after the retarget asked only for the new view.
+    let cmds = not_keepalive(fake.commands());
+    let at = cmds.iter().position(|c| c == NARROW_VIEW).expect("asked");
+    assert!(
+        cmds[at..]
+            .iter()
+            .filter(|c| c.starts_with("SET zoom="))
+            .all(|c| c == NARROW_VIEW),
+        "{cmds:?}"
+    );
+    assert!(sent(&fake, NARROW_VIEW) >= 2, "{cmds:?}");
+    assert_eq!(src.fault(), None);
+}
+
+#[tokio::test]
+async fn a_one_view_plan_holds_its_view_and_takes_every_frame() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    let mut rows = src.sweep(narrow()).await.unwrap();
+    assert_eq!(rows.plan.steps, 1);
+    assert_eq!(rows.plan.shift_hz, Hz(0));
+    // The fake sends a frame every 5 ms: 60 rows take 0.3 s at one a frame, and
+    // well under the bound even on a slow host.
+    let start = tokio::time::Instant::now();
+    let mut centres = std::collections::BTreeSet::new();
+    for k in 0..60u64 {
+        let row = next_row(&mut rows).await;
+        assert_eq!((row.sweep, row.step), (k, 0));
+        assert_eq!(row.masked, vec![[0, 2]]);
+        centres.insert(row.center_hz.0);
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(centres.len(), 1, "{centres:?}");
+    assert!(
+        centres.first().unwrap().abs_diff(7_100_000) <= 4,
+        "{centres:?}"
+    );
+    assert_eq!(views_sent(&fake), 1, "{:?}", fake.commands());
+}
+
+#[tokio::test]
+async fn job_retune_re_aims_a_kiwi_scan_on_its_open_socket() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    let (node, _dir) = node_with(src.clone()).await;
+    let scan = Op::JobStart {
+        kind: JobKind::Scan,
+        source: SourceId("kiwi0".into()),
+        center_hz: Hz(15_000_000),
+        bandwidth_hz: Hz(30_000_000),
+        deviation_hz: None,
+        sideband: None,
+        dwell_ms: None,
+        average: None,
+        bits: None,
+        method: None,
+        bin_hz: Some(30_000),
+        elastic: false,
+        replace: vec![],
+    };
+    let OpResult::Job(id) = node.apply(scan).await.unwrap() else {
+        panic!("expected a job");
+    };
+    let context = |node: &Node| {
+        node.job_list()
+            .into_iter()
+            .find(|j| j.id == id)
+            .expect("the job")
+            .context["scan"]
+            .clone()
+    };
+    // The whole band at zoom 0: one view, held.
+    let ctx = context(&node);
+    assert_eq!(ctx["steps"], 1, "{ctx}");
+    assert!(ctx["alternate"].is_null(), "{ctx}");
+    assert!(wait_until(3_000, || views_sent(&fake) >= 1).await);
+    let retune = Op::JobRetune {
+        job: id.clone(),
+        center_hz: Hz(7_100_000),
+        bandwidth_hz: Hz(300_000),
+        bin_hz: Some(5_000),
+        replace: vec![],
+    };
+    assert_eq!(node.apply(retune).await, Ok(OpResult::Job(id.clone())));
+    let ctx = context(&node);
+    assert_eq!(ctx["method"], "source", "{ctx}");
+    assert_eq!(ctx["steps"], 1, "{ctx}");
+    assert_eq!(ctx["step_hz"], 468_750, "{ctx}");
+    assert!(ctx["alternate"].is_null(), "{ctx}");
+    assert!(
+        wait_until(3_000, || sent(&fake, NARROW_VIEW) == 1).await,
+        "{:?}",
+        fake.commands()
+    );
+    assert_eq!(fake.wf_connections(), 1, "the same socket");
+    let rec = node.job_list().into_iter().find(|j| j.id == id).unwrap();
+    assert_eq!(rec.state, JobState::Running);
+    assert_eq!(rec.tuning, tuning(7_100_000, 300_000));
+    // A span the Kiwi's sweep does not hold is refused naming its range.
+    let outside = Op::JobRetune {
+        job: id.clone(),
+        center_hz: Hz(29_900_000),
+        bandwidth_hz: Hz(400_000),
+        bin_hz: None,
+        replace: vec![],
+    };
+    assert_eq!(
+        node.apply(outside).await,
+        Err(OpError::Other {
+            message: "source kiwi0 does not sweep 29700000-30100000 Hz for itself: \
+                      its sweep holds 0-30000000 Hz"
+                .into()
+        })
+    );
+    assert_eq!(fake.wf_connections(), 1);
+    node.job_stop(&id).await.unwrap();
+}

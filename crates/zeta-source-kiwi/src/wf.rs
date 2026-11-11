@@ -27,6 +27,17 @@
 //! whole sweep delivered) while the state says `Waiting`. A refusal on a reconnect,
 //! or the budget spent, ends the sweep (`Ended`, then the rows close). The rows'
 //! receiver dropped, or the source dropped, closes the socket cleanly.
+//!
+//! A plan of one view (the span fits one view at its zoom) holds that view: no odd
+//! sweep's shift, so the view is asked once, never settled again, and every frame
+//! the dwell takes is a row (at [`WF_FPS`] with a dwell of one frame), at every
+//! zoom. A running sweep is re-aimed on its open socket ([`SweepRetarget`], from
+//! [`zeta_core::port::SweepRows::retarget`]): the new plan from the handshake's
+//! `bandwidth`, its first view asked with one `SET zoom= cf=`, its sweeps counted
+//! from 0, and the frames of the old view dropped by the zoom and `x_bin` match and
+//! the settle, as at every step. A reconnect resumes at the last plan asked; a
+//! re-aim asked while the socket is down is answered then and taken up by the next
+//! connection.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -35,11 +46,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{Instant, interval_at, sleep, sleep_until, timeout_at};
+use tokio::time::{Instant, interval_at, sleep_until, timeout_at};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
-use zeta_core::port::{PortError, SweepPlan, SweepRequest, SweepRow, SweepState, Tuning};
+use zeta_core::port::{
+    PortError, SweepPlan, SweepRequest, SweepRetarget, SweepRow, SweepState, Tuning,
+};
 use zeta_core::types::{Hz, Span, Timestamp};
 
 use crate::proto::{
@@ -49,7 +62,7 @@ use crate::proto::{
 use crate::session::{
     MAX_BAD_SND, MAX_FRAME_BYTES, MAX_MSG_BYTES, Sink, badp_meaning, close, path_ts,
 };
-use crate::source::KiwiConfig;
+use crate::source::{KiwiConfig, TUNE_MAX_HZ};
 
 /// The finest zoom the sweep uses: above it the server samples overlapped.
 pub(crate) const WF_ZOOM_MAX: u8 = 10;
@@ -111,7 +124,9 @@ impl WfPlan {
 /// `bin_hz` and the finest one whose view still holds the whole span, never over
 /// [`WF_ZOOM_MAX`]. A view that holds the span is centred on it; otherwise the
 /// views tile it from its low edge. Every start is clamped to the band and a
-/// repeated start is dropped.
+/// repeated start is dropped. A plan of one view does not shift its odd sweeps
+/// (`shift_hz` 0): it holds the view, and only the server's zeroed pixels go
+/// unread, masked in every row.
 pub(crate) fn wf_plan(span: Tuning, bin_hz: u64, dwell_ms: u64, bandwidth_hz: u64) -> WfPlan {
     let view = |z: u8| bandwidth_hz >> z;
     let width = span.bandwidth_hz.0;
@@ -142,13 +157,14 @@ pub(crate) fn wf_plan(span: Tuning, bin_hz: u64, dwell_ms: u64, bandwidth_hz: u6
     let frames = (dwell_ms * u64::from(WF_FPS))
         .div_ceil(1000)
         .clamp(1, u64::from(u32::MAX)) as u32;
+    let one_view = starts.len() == 1;
     WfPlan {
         zoom,
         view_hz,
         bin_hz: view_hz as f64 / WF_PIXELS as f64,
         starts,
-        // Zoom 0 is the whole band: no view to shift to.
-        shift_hz: if zoom == 0 {
+        // Zoom 0 is the whole band: no view to shift to; one view holds still.
+        shift_hz: if zoom == 0 || one_view {
             0
         } else {
             WF_SHIFT_PIXELS * view_hz / PIXELS
@@ -339,8 +355,8 @@ pub(crate) struct Stepper {
     step: usize,
     /// The `x_bin` of the step's view.
     want: u32,
-    /// The `x_bin` of the view last sent to the server.
-    asked: Option<u32>,
+    /// The zoom and `x_bin` of the view last sent to the server.
+    asked: Option<(u8, u32)>,
     settle_left: u32,
     /// Linear power summed per pixel over the kept frames.
     acc: Vec<f64>,
@@ -389,13 +405,25 @@ impl Stepper {
         let start = self.plan.start(self.sweep, self.step);
         self.want = self.plan.x_bin(start, self.bandwidth, self.zoom_max);
         self.kept = 0;
-        if self.asked == Some(self.want) {
+        let view = (self.plan.zoom, self.want);
+        if self.asked == Some(view) {
             self.settle_left = 0;
             return None;
         }
-        self.asked = Some(self.want);
+        self.asked = Some(view);
         self.settle_left = self.settle;
         Some(cmd_wf_view(self.plan.zoom, start + self.plan.view_hz / 2))
+    }
+
+    /// Step through `plan` instead, from its sweep 0 and step 0 (a re-aim): the
+    /// first view's command, or `None` when the server shows it already. The
+    /// dwell under way is dropped; what the old view sends is not of the new one.
+    pub fn retarget(&mut self, plan: WfPlan) -> Option<String> {
+        self.plan = plan;
+        self.sweep = 0;
+        self.step = 0;
+        self.rows = 0;
+        self.view()
     }
 
     /// One frame, arrived at `now_ns`; `wf_cal` is added to the row's levels.
@@ -495,9 +523,36 @@ enum End {
 
 /// What [`run`] carries from one connection to the next.
 struct Carry {
-    /// The plan, from the first connection's `bandwidth`.
+    /// The plan in force and the `bandwidth` it was made for: the first
+    /// connection's, or the last re-aim's ([`replan`]).
     plan: Option<(WfPlan, u64)>,
     sweep: u64,
+}
+
+/// Re-plan the sweep for `req` on the Kiwi's `bandwidth` the handshake gave: the
+/// new plan, from sweep 0, now `carry`'s; a span outside the band refused as
+/// `sweep` refuses it, `carry` left as it was.
+fn replan(carry: &mut Carry, req: SweepRequest) -> Result<WfPlan, PortError> {
+    let Some(bandwidth) = carry.plan.as_ref().map(|(_, bw)| *bw) else {
+        return Err(PortError::Unsupported("the sweep is not set up yet".into()));
+    };
+    span_within(req.span, bandwidth.min(TUNE_MAX_HZ))?;
+    let plan = wf_plan(req.span, req.bin_hz.0, req.dwell_ms, bandwidth);
+    carry.plan = Some((plan.clone(), bandwidth));
+    carry.sweep = 0;
+    Ok(plan)
+}
+
+/// The next re-aim asked of the sweep; never, once its control is closed (the
+/// receiver is then dropped, so it is not polled again).
+async fn next_retarget(control: &mut Option<mpsc::Receiver<SweepRetarget>>) -> SweepRetarget {
+    if let Some(c) = control.as_mut()
+        && let Some(r) = c.recv().await
+    {
+        return r;
+    }
+    *control = None;
+    std::future::pending().await
 }
 
 fn now_ns() -> u64 {
@@ -516,12 +571,15 @@ fn reason_of(e: &PortError) -> String {
 /// The sweep's task: connections until a stop, a refusal or the reconnect
 /// budget spent, each `Ended` with its reason before the rows close. `ready`
 /// answers the first connection's setup (the plan) or its failure to `sweep`;
-/// before it, nothing is retried.
+/// before it, nothing is retried. `control` brings the re-aims, answered on the
+/// open socket or, between connections, for the next one.
 pub(crate) async fn run(
     ctx: Ctx,
     req: SweepRequest,
     ready: oneshot::Sender<Result<WfPlan, PortError>>,
+    control: mpsc::Receiver<SweepRetarget>,
 ) {
+    let mut control = Some(control);
     let mut ready = Some(ready);
     let mut carry = Carry {
         plan: None,
@@ -529,8 +587,8 @@ pub(crate) async fn run(
     };
     let mut attempts = 0usize;
     let stopped = || SweepState::Ended("the sweep was stopped".into());
-    let reason = loop {
-        let (end, sink) = connection(&ctx, req, &mut carry, &mut ready).await;
+    let reason = 'conn: loop {
+        let (end, sink) = connection(&ctx, req, &mut carry, &mut ready, &mut control).await;
         // Answer `sweep` before the (up to 1 s) close, so its bound holds.
         let end = match (end, ready.take()) {
             (End::Refused(e), Some(r)) => {
@@ -550,8 +608,8 @@ pub(crate) async fn run(
             close(sink).await;
         }
         match end {
-            End::Stop => break stopped(),
-            End::Refused(e) => break SweepState::Ended(reason_of(&e)),
+            End::Stop => break 'conn stopped(),
+            End::Refused(e) => break 'conn SweepState::Ended(reason_of(&e)),
             End::Lost { err, whole } => {
                 if whole {
                     attempts = 0;
@@ -559,15 +617,23 @@ pub(crate) async fn run(
                 let Some(&delay) = ctx.cfg.reconnect_delays_ms.get(attempts) else {
                     let why =
                         format!("connection lost ({err}); {attempts} reconnect attempts failed");
-                    break SweepState::Ended(why);
+                    break 'conn SweepState::Ended(why);
                 };
                 attempts += 1;
                 ctx.state
                     .send_replace(SweepState::Waiting(format!("connection lost ({err})")));
-                tokio::select! {
-                    _ = ctx.cancel.cancelled() => break stopped(),
-                    _ = ctx.rows.closed() => break stopped(),
-                    _ = sleep(Duration::from_millis(delay)) => {}
+                let wake = Instant::now() + Duration::from_millis(delay);
+                loop {
+                    tokio::select! {
+                        _ = ctx.cancel.cancelled() => break 'conn stopped(),
+                        _ = ctx.rows.closed() => break 'conn stopped(),
+                        _ = sleep_until(wake) => break,
+                        r = next_retarget(&mut control) => {
+                            // Taken up by the next connection.
+                            let answer = replan(&mut carry, r.req).map(|p| p.sweep_plan());
+                            let _ = r.reply.send(answer);
+                        }
+                    }
                 }
             }
         }
@@ -583,6 +649,7 @@ async fn connection(
     req: SweepRequest,
     carry: &mut Carry,
     ready: &mut Option<oneshot::Sender<Result<WfPlan, PortError>>>,
+    control: &mut Option<mpsc::Receiver<SweepRetarget>>,
 ) -> (End, Option<Sink>) {
     let cfg = &ctx.cfg;
     let lost = |err: String, whole: bool| End::Lost { err, whole };
@@ -638,6 +705,26 @@ async fn connection(
             _ = ctx.rows.closed() => end!(End::Stop),
             _ = keepalive.tick() => {
                 send!(CMD_KEEPALIVE);
+                continue;
+            }
+            r = next_retarget(control), if carry.plan.is_some() => {
+                let plan = match replan(carry, r.req) {
+                    Ok(plan) => plan,
+                    Err(e) => {
+                        let _ = r.reply.send(Err(e));
+                        continue;
+                    }
+                };
+                // The stepper is the new plan's before the answer: every row after it is.
+                let cmd = stepper.as_mut().and_then(|s| {
+                    let cmd = s.retarget(plan.clone());
+                    step_deadline = Instant::now() + s.patience();
+                    cmd
+                });
+                let _ = r.reply.send(Ok(plan.sweep_plan()));
+                if let Some(cmd) = cmd {
+                    send!(cmd);
+                }
                 continue;
             }
             _ = sleep_until(handshake_deadline), if stepper.is_none() => {
@@ -821,6 +908,8 @@ mod tests {
         assert_eq!(p.zoom, 6);
         assert_eq!(p.view_hz, 468_750);
         assert_eq!(p.starts, vec![7_100_000 - 234_375]);
+        // One view: nothing shifts.
+        assert_eq!(p.shift_hz, 0);
     }
 
     #[test]
@@ -1099,6 +1188,51 @@ wf_chans=4 wf_chans_real=4 wf_cal=-13 wf_setup";
         ));
         // A whole step's patience: settle, dwell and ten spare frames.
         assert_eq!(s.patience(), Duration::from_micros(12 * 1_000_000 / 23));
+    }
+
+    #[test]
+    fn one_view_at_any_zoom_holds_still() {
+        // 300 kHz at 7.1 MHz: one view at zoom 6, so no odd sweep shifts it.
+        let plan = wf_plan(span(6_950_000, 7_250_000), 5000, 20, BW);
+        assert_eq!((plan.zoom, plan.starts.len(), plan.shift_hz), (6, 1, 0));
+        assert_eq!(plan.start(1, 0), plan.start(0, 0));
+        let x = plan.x_bin(plan.starts[0], BW, 14);
+        let mut s = Stepper::new(plan, BW, 14, 1, 0);
+        assert_eq!(s.view().as_deref(), Some("SET zoom=6 cf=7100.000"));
+        assert_eq!(s.on_frame(&frame(6, x, -50.0), 0, 1), FrameOut::Belongs);
+        for k in 0..4u64 {
+            let FrameOut::Row(row) = s.on_frame(&frame(6, x, -50.0), 0, 2 + k) else {
+                panic!("a row a frame");
+            };
+            // The server's zeroed pixels are still masked.
+            assert_eq!(row.masked, vec![[0, 2]]);
+            assert_eq!(row.sweep, k);
+            // Never asked again, never settled again.
+            assert_eq!(s.next(), (None, Some((1, 1))));
+        }
+    }
+
+    #[test]
+    fn a_retarget_asks_the_new_view_even_at_the_same_x_bin() {
+        // Zoom 3 at 0 Hz, then zoom 0 at 0 Hz: the same `x_bin`, another view.
+        let mut s = Stepper::new(wf_plan(span(0, BW), 6000, 20, BW), BW, 14, 1, 0);
+        assert_eq!(s.view().as_deref(), Some("SET zoom=3 cf=1875.000"));
+        assert_eq!(s.on_frame(&frame(3, 0, -50.0), 0, 1), FrameOut::Belongs);
+        assert!(matches!(
+            s.on_frame(&frame(3, 0, -50.0), 0, 2),
+            FrameOut::Row(_)
+        ));
+        s.next();
+        let cmd = s.retarget(wf_plan(span(0, BW), 30_000, 20, BW));
+        assert_eq!(cmd.as_deref(), Some("SET zoom=0 cf=15000.000"));
+        // The old zoom's frames are not the new view's; the new one settles first.
+        assert_eq!(s.on_frame(&frame(3, 0, -50.0), 0, 3), FrameOut::Other);
+        assert_eq!(s.on_frame(&frame(0, 0, -50.0), 0, 4), FrameOut::Belongs);
+        let FrameOut::Row(row) = s.on_frame(&frame(0, 0, -50.0), 0, 5) else {
+            panic!("a row");
+        };
+        assert_eq!((row.sweep, row.step), (0, 0));
+        assert_eq!(row.masked, vec![[0, 4]]);
     }
 
     #[test]

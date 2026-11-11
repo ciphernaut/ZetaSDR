@@ -1205,6 +1205,10 @@ pub enum JobCmd {
         /// New bandwidth in Hz
         #[arg(long, value_name = "HZ")]
         bandwidth_hz: u64,
+        /// A scan its source sweeps for itself only: the bin width asked of the
+        /// source for the new span (1-1000000 Hz); absent keeps the scan's
+        #[arg(long, value_name = "HZ")]
+        bin_hz: Option<u64>,
         #[command(flatten)]
         replace: ReplaceArg,
     },
@@ -1598,11 +1602,13 @@ impl Command {
                 job,
                 center_hz,
                 bandwidth_hz,
+                bin_hz,
                 replace,
             }) => Op::JobRetune {
                 job: JobId(job),
                 center_hz: Hz(center_hz),
                 bandwidth_hz: Hz(bandwidth_hz),
+                bin_hz,
                 replace: replace.into_ids(),
             },
             Command::Job(JobCmd::List) => Op::JobList {},

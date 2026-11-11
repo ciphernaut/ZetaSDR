@@ -13,7 +13,7 @@ use super::{Inner, Node, NodeError};
 use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
 use crate::ops::{JobKind, RETUNE_CARRIED_PARAMS};
-use crate::port::Tuning;
+use crate::port::{PortError, Tuning};
 use crate::types::JobId;
 
 impl Node {
@@ -269,6 +269,113 @@ impl Inner {
                     },
                 );
             }
+        }
+    }
+}
+
+impl Node {
+    /// Re-aim the running scan `id` that its source sweeps for itself at `want` (and
+    /// `bin_hz`, when given), under one hold of its source's gate. The run's task asks
+    /// the source to re-aim its running sweep ([`super::scan::Reaim`],
+    /// [`crate::port::SweepRows::retarget`]); granted, the job keeps its id, stream,
+    /// claim and `timing`, its record following the new plan. A source that cannot
+    /// re-aim (or a scan still waiting for its sweep) is `Unsupported`: the scan is then
+    /// relaunched in place at `want` ([`Inner::relaunch_in_place`]), which ends its
+    /// sweep and asks the source for a new one (waiting, never stepping, when the source
+    /// refuses: it ran as `source`). Any other refusal is `sweep on source <id>:
+    /// <reason>`, the scan running on as it was. The caller has checked the method, the
+    /// span against the source's `sweep` and `bin_hz`; a job that does not run here is
+    /// as [`Node::job_retune`] says.
+    pub(crate) async fn retune_self_sweep(
+        &self,
+        id: &JobId,
+        want: Tuning,
+        bin_hz: Option<u64>,
+    ) -> Result<(), NodeError> {
+        let running = |rec: &JobRecord| {
+            NodeError::Other(format!(
+                "job {} is not running in this node (one-shot: use --node against zeta serve)",
+                rec.id.0
+            ))
+        };
+        let source = {
+            let jobs = self.inner.jobs.lock().unwrap();
+            let e = jobs
+                .get(id)
+                .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+            if e.cancel.is_none() || e.record.state != JobState::Running {
+                return Err(running(&e.record));
+            }
+            e.record.source.clone()
+        };
+        let port = self
+            .port(&source)
+            .ok_or_else(|| NodeError::UnknownSource(source.clone()))?;
+        let guard = self.inner.leases.gate_guard(&source).await;
+        // Read again under the gate: the run whose task is asked is the live one.
+        let (rec, reaim) = {
+            let jobs = self.inner.jobs.lock().unwrap();
+            let e = jobs
+                .get(id)
+                .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+            if e.cancel.is_none() || e.record.state != JobState::Running {
+                return Err(running(&e.record));
+            }
+            (e.record.clone(), e.reaim.clone())
+        };
+        let answer = match reaim {
+            Some(tx) => {
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                let asked = super::scan::Reaim {
+                    span: want,
+                    bin_hz,
+                    reply,
+                };
+                match tx.send(asked).await {
+                    // Dropped unanswered: the run is ending; the relaunch below says how.
+                    Ok(()) => answer.await.unwrap_or_else(|_| {
+                        Err(PortError::Unsupported("the scan's sweep ended".into()))
+                    }),
+                    Err(_) => Err(PortError::Unsupported("the scan's sweep ended".into())),
+                }
+            }
+            None => Err(PortError::Unsupported(
+                "the scan has no sweep to re-aim".into(),
+            )),
+        };
+        match answer {
+            Ok(_) => Ok(()),
+            Err(PortError::Unsupported(_)) => {
+                let mut new = JobRecord {
+                    tuning: want,
+                    ..rec
+                };
+                if let Some(b) = bin_hz
+                    && let Some(p) = new
+                        .graph
+                        .nodes
+                        .iter_mut()
+                        .find(|n| n.kind == "fft")
+                        .and_then(|n| n.params.as_object_mut())
+                {
+                    p.insert("bin_hz".into(), b.into());
+                }
+                let (r, after) = self.inner.relaunch_in_place(new, Some(&guard)).await;
+                drop(guard);
+                self.inner.after_gate(after).await;
+                if r.is_err() {
+                    self.idle_if_unheld(port.as_ref()).await;
+                }
+                r
+            }
+            Err(e) => Err(NodeError::Other(format!(
+                "sweep on source {}: {}",
+                source.0,
+                match &e {
+                    PortError::Io(m) => m.clone(),
+                    e => e.to_string(),
+                }
+            ))),
         }
     }
 }

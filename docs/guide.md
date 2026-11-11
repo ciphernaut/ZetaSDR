@@ -865,6 +865,15 @@ change) never steps: refused then, it stays up with `scan.waiting` and the reaso
 1, 2, 4, 8 and 16 s, then every 16 s. A source's sweep start is bounded at 5 s (`sweep start timed out`
 reads as a refusal). The page's "Scan this span" asks for a scan whoever holds the source's IQ channel.
 
+A `source` scan is moved with `job retune --job ID --center-hz C --bandwidth-hz B [--bin-hz N]`: the
+source re-aims its running sweep (a Kiwi on its open waterfall socket: one view command, no reconnect)
+and the job keeps its id, its stream and its `timing`; `tuning` and `context.scan` follow the new plan,
+the averages start again (`sweeps` from 1), and a source that cannot re-aim has its sweep ended and a new
+one asked for under the same id. A span outside `capabilities.sweep` is refused naming its range and
+`--replace` is refused; a stepped scan is still not retunable. A span that fits one view is one step
+that holds still (`alternate` is `null`), so a Kiwi sends a row every waterfall frame, about 23 a second,
+at any zoom.
+
 On a KiwiSDR the sweep is its waterfall stream (`docs/kiwi-waterfall.md`): one more user slot of the
 Kiwi's own while the scan runs and none otherwise, calibrated dBm rows, the zoom and the step count
 following `bin_hz`, the whole 0-30 MHz about once a second at the default, the first pixels of each view
