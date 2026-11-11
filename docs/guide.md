@@ -386,7 +386,7 @@ they belong to the serving node and are rejected. Source ids are unique across t
   reduces under it (one stderr line per snap); past that it refuses.
   A device whose link carries more than one sample depth (a B2xx: `sc16`, `sc12`, the lossy `sc8`)
   is probed at each at open, `source list` shows them as `capabilities.depths` and the one in force
-  as `depth`, and the source runs the narrowest lossless one (a B210's 12 bits carry all its converter gives, in fewer bytes than 16) unless `bits=N` in `ARGS` names another.
+  as `depth`, and the source runs the narrowest lossless one that measures as wide as the widest (a B210's 12 bits carry all its converter gives, in fewer bytes than 16, so 12-bit wins when it measured as wide as 16-bit) unless `bits=N` in `ARGS` names another.
   `settle_ms=N` in `ARGS` sets how long a tune takes to settle (1 ms on a B2xx, 10 ms for a radio
   zeta has not measured) and `usable=F` the part of a capture the front end passes flat (0.9). A
   start with no cached figures measures first (about 70-110 s for a B210's three depths, with the

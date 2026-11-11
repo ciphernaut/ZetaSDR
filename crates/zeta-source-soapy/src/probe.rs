@@ -15,7 +15,7 @@
 //!
 //! A device whose link carries more than one sample depth has the ladder run
 //! at each ([`probe_depths`]), and the source runs the narrowest lossless one
-//! ([`own_depth`]); the record's `max_bandwidth_hz` is that depth's figure.
+//! that measures as wide as the widest ([`own_depth`]); the record's `max_bandwidth_hz` is that depth's figure.
 //! That probe says what it is doing before each rung (a [`Starting`]): the
 //! host is busy while the radio streams flat out, for up to a minute or more.
 
@@ -396,12 +396,16 @@ pub fn asserted_depths(src: &SoapySource, hz: u64) -> Vec<Depth> {
 }
 
 /// The source's own depth among `depths`: `asked` (`bits=`) when listed,
-/// else an error naming the listed ones; unasked, the narrowest lossless
-/// depth, whatever the measured rates say: a lossless depth carries all the
-/// converter gives, so a narrower one is the same fidelity in fewer bytes on
-/// the link, and the probe's figures vary between runs, so they must not flip
-/// the choice. A lossy depth is only ever asked for; with none lossless, the
-/// deepest.
+/// else an error naming the listed ones. Unasked, the narrowest lossless
+/// depth that measures as wide as the widest: among the lossless depths, the
+/// narrowest whose cap is measured and not below the highest measured
+/// lossless cap. A lossless depth carries all the converter gives, so a
+/// narrower one that streams as wide is the same fidelity in fewer bytes on
+/// the link; one that measured narrower, or was never measured clean, would
+/// shrink the source's bandwidth (a resumed job's capture could no longer
+/// fit), so it does not win. With no lossless depth measured, the lossless
+/// depth with the highest asserted cap, the deepest on a tie. A lossy depth
+/// is only ever asked for; with none lossless, the deepest.
 pub fn own_depth(depths: &[Depth], asked: Option<u8>) -> Result<u8, String> {
     if let Some(bits) = asked {
         if depths.iter().any(|d| d.bits == bits) {
@@ -416,10 +420,19 @@ pub fn own_depth(depths: &[Depth], asked: Option<u8>) -> Result<u8, String> {
             ),
         });
     }
-    depths
-        .iter()
-        .filter(|d| d.lossless)
-        .min_by_key(|d| d.bits)
+    let measured = |d: &Depth| match d.max_bandwidth_hz {
+        Claim::Measured(hz) => Some(hz.0),
+        _ => None,
+    };
+    let lossless = || depths.iter().filter(|d| d.lossless);
+    let widest = lossless().filter_map(measured).max();
+    let chosen = match widest {
+        Some(widest) => lossless()
+            .filter(|d| measured(d).is_some_and(|hz| hz >= widest))
+            .min_by_key(|d| d.bits),
+        None => lossless().max_by_key(|d| (d.max_bandwidth_hz.value().0, d.bits)),
+    };
+    chosen
         .or_else(|| depths.iter().max_by_key(|d| d.bits))
         .map(|d| d.bits)
         .ok_or_else(|| "the device's link has one sample depth".to_string())

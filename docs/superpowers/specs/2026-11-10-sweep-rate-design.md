@@ -108,8 +108,9 @@ Raw results and scripts: `scratch/sweep-spike/` (untracked).
   signal.
 - The worker's ring carries `sc16` when the device's native format is 16-bit, converted at the
   node: half the memory traffic for a wide capture.
-- A source whose link can carry a narrower sample depth uses the narrowest lossless one
-  (12-bit on a B210: the same fidelity as 16-bit in fewer bytes), and a scan can ask for
+- A source whose link can carry a narrower sample depth uses the narrowest lossless one that
+  measures as wide as the widest (12-bit on a B210 when it measures as wide: the same fidelity
+  as 16-bit in fewer bytes), and a scan can ask for
   a lossy depth (8-bit) as an explicit, never default, coarse and fast look (4.6a).
 - **A source that can sweep for itself does** (36.2): the scan asks it for spectrum rows over a
   span and paints them as it paints its own. On the operator's KiwiSDR, 0-30 MHz at 8 kHz a bin
@@ -350,10 +351,13 @@ As one mechanism, not a B210 special:
   `WIRE` argument), and the top-level `max_bandwidth_hz` stays the figure for the depth in
   force.
 - **The source's depth.** A device argument on `--source-soapy` (the builder names it) sets
-  the link depth the source runs at. Unset, the source runs the narrowest **lossless** depth,
-  whatever the measured rates say: on a B210, `sc12`, which carries all its 12-bit converter
-  gives in fewer bytes than `sc16` (fidelity decides, not the probe's figures, which vary
-  between runs). A lossy depth is never chosen by default.
+  the link depth the source runs at. Unset, the source runs the narrowest **lossless** depth
+  that measures as wide as the widest: among the lossless depths, the narrowest whose cap is
+  measured and not below the highest measured lossless cap. On a B210 that is `sc12`, which
+  carries all its 12-bit converter gives in fewer bytes than `sc16`, when it measured as wide;
+  one that measured narrower, or was never measured clean, does not win, so the source's
+  bandwidth never falls below a resumed job's capture. With no lossless depth measured, the
+  highest asserted cap, the deepest on a tie. A lossy depth is never chosen by default.
 - **The probe.** The rate ladder (`probe.rs`, plan 28.1) runs per depth. At open it probes the
   depths the driver names, lossy ones included: a source's capability record cannot change
   while it runs (the worker's hello carries it once), so every depth's rate is measured at open

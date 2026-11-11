@@ -424,7 +424,7 @@ async fn each_depth_is_probed_and_the_narrowest_lossless_one_is_the_sources_own(
 }
 
 #[test]
-fn the_narrowest_lossless_depth_is_the_sources_own() {
+fn the_narrowest_lossless_depth_as_wide_as_the_widest_is_the_sources_own() {
     // A tie: the narrower depth puts fewer bytes on the link for the same
     // fidelity.
     let depths = [
@@ -433,20 +433,28 @@ fn the_narrowest_lossless_depth_is_the_sources_own() {
         depth(8, false, measured(61_440_000)),
     ];
     assert_eq!(own_depth(&depths, None), Ok(12));
-    // The deeper depth measured faster on this run: the probe's figures vary
-    // between runs and do not flip the choice.
+    // The narrower depth measured narrower: it would shrink the source's
+    // bandwidth under a resumed job's capture, so the wider-capped one wins.
     let depths = [
         depth(16, true, measured(30_720_000)),
         depth(12, true, measured(20_480_000)),
         depth(8, false, measured(61_440_000)),
     ];
-    assert_eq!(own_depth(&depths, None), Ok(12));
-    // Nor does a narrower depth whose probe found no rung clean.
+    assert_eq!(own_depth(&depths, None), Ok(16));
+    // A narrower depth whose probe found no rung clean has shown nothing:
+    // the measured one wins, whatever the asserted figure.
     let depths = [
         depth(16, true, measured(30_720_000)),
         depth(12, true, Claim::Asserted(Hz(61_440_000))),
     ];
-    assert_eq!(own_depth(&depths, None), Ok(12));
+    assert_eq!(own_depth(&depths, None), Ok(16));
+    // With no lossless depth measured, the highest asserted cap, the deepest
+    // on a tie.
+    let asserted = [
+        depth(16, true, Claim::Asserted(Hz(30_720_000))),
+        depth(12, true, Claim::Asserted(Hz(30_720_000))),
+    ];
+    assert_eq!(own_depth(&asserted, None), Ok(16));
     // The operator's `bits=` still wins.
     assert_eq!(own_depth(&depths, Some(16)), Ok(16));
     // With no lossless depth, the deepest.

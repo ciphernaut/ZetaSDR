@@ -13,7 +13,7 @@
 //! `sc8`) has a cap per depth instead: `max_rate_hz=N` asserts every depth at `N`; each
 //! `--depth-cap BITS:HZ` reports that depth's as measured; every other depth is probed,
 //! lossy ones included. The source then runs `bits=N`'s depth, else the narrowest lossless
-//! one, and the record's cap is that depth's (`--rate-cap-hz` is not read).
+//! one that measures as wide as the widest, and the record's cap is that depth's (`--rate-cap-hz` is not read).
 //!
 //! Once the device opens, the worker finds where it is attached from its serial (a USB
 //! radio's bus, port path and negotiated speed, [`usb_attachment`]) and names it in the
@@ -282,7 +282,8 @@ mod imp {
     /// `asserted` (`max_rate_hz=`) when given; else each depth in `known` (`--depth-cap`)
     /// measured at its cap and every other probed at the centre of the tune range
     /// ([`probe_depths`]), one stderr line per depth. The source then runs `asked`'s depth
-    /// (`bits=`), else the narrowest lossless one ([`own_depth`]). A `bits=` the link does
+    /// (`bits=`), else the narrowest lossless one that measures as wide as the widest
+    /// ([`own_depth`]). A `bits=` the link does
     /// not carry is the error, found before anything is probed, and so is one whose depth
     /// the probe left out (it would not stream; the other depths stand). A probe that lost
     /// the device leaves the asserted cap and no depths, with a stderr line, as
