@@ -21,13 +21,19 @@ const CH: usize = 0;
 /// An opened SoapySDR device.
 pub struct Driver {
     dev: Device,
+    /// The device arguments it was found with, for a `serial=` the driver's
+    /// hardware information lacks.
+    args: String,
 }
 
 impl Driver {
     /// `soapysdr::Device::new(args)`, e.g. `"driver=hackrf"`.
     pub fn new(args: &str) -> Result<Self, String> {
         Device::new(args)
-            .map(|dev| Self { dev })
+            .map(|dev| Self {
+                dev,
+                args: args.to_string(),
+            })
             .map_err(|e| format!("soapy open {args:?}: {e}"))
     }
 }
@@ -119,12 +125,20 @@ impl SoapyDevice for Driver {
     fn hardware_key(&self) -> String {
         self.dev.hardware_key().unwrap_or_default()
     }
+    /// The hardware information's `serial`, else its `mboard_serial` (SoapyUHD's
+    /// name for a B210's), else the device arguments' `serial=`
+    /// ([`zeta_source_soapy::attach::device_serial`]).
     fn serial(&self) -> Option<String> {
-        let info = self.dev.hardware_info().ok()?;
-        info.get("serial")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
+        let info: Vec<(String, String)> = self
+            .dev
+            .hardware_info()
+            .map(|a| {
+                a.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        zeta_source_soapy::attach::device_serial(&info, &self.args)
     }
     fn frequency_ranges(&self) -> Result<Vec<RangeHz>, String> {
         self.dev

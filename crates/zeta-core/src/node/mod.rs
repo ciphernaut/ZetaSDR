@@ -2689,9 +2689,11 @@ impl Node {
     /// with no worker is `Other("source <id> has no worker")`; one a rigid or
     /// time-shared lease or a pin holds, other than the `replace` jobs, is the
     /// conflict naming them ([`LeaseManager::unheld_locked`]); then the `replace`
-    /// jobs are stopped ([`Node::replace_holders`]), the record's `capabilities`
-    /// and `measured_at_speed` are cleared and persisted (a start before the new
-    /// hello probes as a first one does), and the port respawns its worker. The
+    /// jobs are stopped ([`Node::replace_holders`]), the record's figures are no
+    /// longer measurements (its `capabilities` kept with every measured cap
+    /// asserted, [`sources::unmeasured`], and `measured_at_speed` cleared, persisted:
+    /// a start before the new hello probes, and still knows the source when the
+    /// device is away), and the port respawns its worker. The
     /// heal that follows the new hello relaunches what failed and caches the new
     /// figures with their speed ([`Inner::note_capabilities`]).
     pub async fn source_measure(
@@ -2715,7 +2717,7 @@ impl Node {
             .map_err(NodeError::Lease)?;
         self.replace_holders(source, replace, &guard).await?;
         let result = match self.set_source_record(source, |r| {
-            r.capabilities = None;
+            r.capabilities = r.capabilities.take().map(sources::unmeasured);
             r.measured_at_speed = None;
         }) {
             Ok(()) => port.remeasure().await.map_err(gain_error),

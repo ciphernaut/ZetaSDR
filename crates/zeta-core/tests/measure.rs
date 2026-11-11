@@ -290,9 +290,20 @@ async fn source_measure_clears_the_figures_and_respawns() {
     let (node, port, _src) = measured_node(dir.path()).await;
     assert_eq!(node.apply(measure_op(vec![])).await, Ok(OpResult::Ok));
     assert_eq!(port.remeasure_calls(), 1);
-    let rec = load_source(&sources_dir(dir.path()), &s()).unwrap();
-    assert_eq!(rec.capabilities, None, "{rec:?}");
+    // The record stays, so the source is still known at a restart with the device
+    // away; its figures are no longer measurements, so the next start probes.
+    let rec = load_source(&sources_dir(dir.path()), &s()).expect("the record still loads");
     assert_eq!(rec.measured_at_speed, None, "{rec:?}");
+    let caps = rec.capabilities.expect("the capabilities stay");
+    assert_eq!(caps.max_bandwidth_hz, Claim::Asserted(Hz(20_480_000)));
+    assert_eq!(
+        caps.depths,
+        vec![Depth {
+            bits: 16,
+            lossless: true,
+            max_bandwidth_hz: Claim::Asserted(Hz(20_480_000)),
+        }]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

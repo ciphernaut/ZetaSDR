@@ -447,7 +447,24 @@ fn jobs_stop_needs_stops_allowed() {
 
 #[test]
 fn gate_covers_every_replace_taking_op() {
-    for name in GATED_REPLACE_OPS {
+    // Every op whose schema takes a `replace` stops jobs with it: each must be gated, so
+    // a new one cannot reach the agent ungated.
+    let schema = zeta_core::ops::schema();
+    let variants = schema["op"]["oneOf"]
+        .as_array()
+        .or_else(|| schema["op"]["anyOf"].as_array())
+        .expect("op variants");
+    let takes_replace: Vec<&str> = variants
+        .iter()
+        .filter(|v| v["properties"].get("replace").is_some())
+        .filter_map(|v| v["properties"]["op"]["const"].as_str())
+        .collect();
+    assert!(
+        takes_replace.contains(&"source_measure"),
+        "{takes_replace:?}"
+    );
+    for name in &takes_replace {
+        assert!(GATED_REPLACE_OPS.contains(name), "{name} is not gated");
         assert!(
             gate(&json!({"op": name, "replace": ["a"]}), Allow::default()).is_some(),
             "{name}"

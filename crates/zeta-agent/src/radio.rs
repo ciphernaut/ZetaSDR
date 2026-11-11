@@ -31,6 +31,7 @@ pub const RADIO_OPS: &[&str] = &[
     "source_ensure",
     "source_pin",
     "source_set_gain",
+    "source_measure",
 ];
 
 /// The policy words, in [`RadioPolicy`] order.
@@ -785,6 +786,36 @@ mod tests {
             assert_eq!(s.admit(tool, &json!({"source": "cb"})), None, "{tool}");
         }
         assert!(s.off_default.is_empty());
+    }
+
+    #[test]
+    fn link_diagnostics_take_a_radio_as_a_gain_change_does() {
+        // `source_measure` occupies its radio for about a minute: the policy checks it, and
+        // a run on another radio is recorded as off the default.
+        let sources = vec![src("cb", None), src("tone", None)];
+        let s = resolve(
+            "measure the link",
+            &ctx(Some("cb"), FocusFrom::Shown, RadioPolicy::Focus),
+            &sources,
+            Caller::page(),
+        );
+        for tool in ["source_set_gain", "source_measure"] {
+            let refused = s.admit(tool, &json!({"source": "tone", "replace": []}));
+            assert_eq!(
+                refused.map(|r| r["error"].clone()),
+                Some(json!("policy")),
+                "{tool}"
+            );
+            assert_eq!(s.admit(tool, &json!({"source": "cb", "replace": []})), None);
+        }
+        let mut s = resolve(
+            "measure the link",
+            &ctx(Some("cb"), FocusFrom::Shown, RadioPolicy::FocusFallback),
+            &sources,
+            Caller::page(),
+        );
+        s.record_applied("source_measure", &json!({"source": "tone", "replace": []}));
+        assert!(!s.off_default.is_empty());
     }
 
     #[test]

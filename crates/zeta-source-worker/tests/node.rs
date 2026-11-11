@@ -385,6 +385,51 @@ async fn startup_with_the_device_absent_attaches_faulted_when_seen_before() {
     );
 }
 
+/// `source_measure` drops the cached figures but keeps the source known: a restart while
+/// the device is away (the new worker's hello still outstanding) attaches it faulted,
+/// never a startup error, and the next start probes (no cap is passed back).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_measure_keeps_the_source_known_for_a_restart_with_the_device_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let rec = dir.path().join("record");
+    {
+        let measured = cfg("stream", &rec, "ZETA_FAKE_MEASURED_CAP=20480000");
+        let (port, attach) = WorkerPort::open(measured, None, None).await.unwrap();
+        assert_eq!(attach, Attach::Hello);
+        let node = node_over(&state_dir, port).await;
+        assert_eq!(
+            node.apply(Op::SourceMeasure {
+                source: f(),
+                replace: vec![],
+            })
+            .await,
+            Ok(OpResult::Ok)
+        );
+    }
+    let rec_now = load_source(&state_dir.join("sources"), &f()).expect("the record still loads");
+    assert_eq!(rec_now.measured_at_speed, None);
+    let cached = rec_now.capabilities.expect("the source stays known");
+    assert_eq!(cached.max_bandwidth_hz, Claim::Asserted(Hz(20_480_000)));
+    let args = zeta_source_worker::port::worker_args("f", "driver=fake", Some(&cached), None);
+    assert!(!args.iter().any(|a| a == "--rate-cap-hz"), "{args:?}");
+
+    let (port, attach) = WorkerPort::open(cfg("not-found", &rec, ""), Some(cached), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        attach,
+        Attach::NotFound {
+            args: "fake".into()
+        }
+    );
+    let node = node_over(&state_dir, port).await;
+    assert_eq!(
+        source(&node).await.fault.as_deref(),
+        Some("device not found: fake")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_one_shot_source_list_leaves_no_worker_behind() {
     let dir = tempfile::tempdir().unwrap();

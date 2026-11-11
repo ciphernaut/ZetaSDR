@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::NodeError;
 use super::persist::io;
 use crate::port::Tuning;
-use crate::types::{Capabilities, SourceId};
+use crate::types::{Capabilities, Claim, Hz, SourceId};
 
 /// The format a source record is written in; a newer one on disk is a load error.
 pub const SOURCE_RECORD_FORMAT: u32 = 1;
@@ -53,6 +53,19 @@ impl SourceRecord {
             ..Self::default()
         }
     }
+}
+
+/// `caps` with no figure held as a measurement: the top-level `max_bandwidth_hz`
+/// and each depth's cap turned `Asserted` at the same value. What `source_measure`
+/// leaves in the record: the source stays known (a start with the device away
+/// attaches it faulted), and a worker is passed back no cap, so it probes.
+pub(crate) fn unmeasured(mut caps: Capabilities) -> Capabilities {
+    let assert = |c: &mut Claim<Hz>| *c = Claim::Asserted(*c.value());
+    assert(&mut caps.max_bandwidth_hz);
+    for d in &mut caps.depths {
+        assert(&mut d.max_bandwidth_hz);
+    }
+    caps
 }
 
 /// A gain the op set: `db` in decibels, `None` for automatic gain.

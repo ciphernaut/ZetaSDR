@@ -36,6 +36,7 @@ pub const GATED_REPLACE_OPS: &[&str] = &[
     "job_retune",
     "source_ensure",
     "source_pin",
+    "source_measure",
     "plan_start",
     "set_start",
 ];

@@ -70,7 +70,7 @@ pub enum Op {
     /// `transport_dropped`, what it could not hand over: ring pieces (2 MiB) the node
     /// had not released, or whole blocks its own pump could not take (pipe queue full,
     /// broadcast lagging); `attachment`, where its device is attached
-    /// (`usb:<bus>-<path>@<speed>`, `null` where it cannot tell); and `latest`, the
+    /// (`usb:<bus>-<path>@<speed>`, `null` where it cannot tell); and `link_measure`, the
     /// figures the latest hello measured (`max_bandwidth_hz`, `depths`) with the link
     /// speed they were measured at (`at_speed`), cached for the next start (see
     /// `source_measure`);
