@@ -638,6 +638,20 @@ or pan, spans the visible range clamped to the scanner's tune range, is replaced
 changes and stopped when the view returns inside the fine capture. A scan the page did not start
 is never touched.
 
+A source that sweeps for itself (one with `capabilities.sweep`, such as a KiwiSDR) shows its own
+waterfall in its tab, live. The page starts a `scan` with `method: source` of its own over the
+whole sweep range (0-30 MHz on a Kiwi), asked as one view so the rows come at the source's frame
+rate, about 23 a second on a Kiwi. It starts no spectrum job on the 12 kHz IQ channel; a
+demodulator on that channel keeps its outline as usual. The wheel, a drag on the axis and the
+`#band` form move the view at once, with the rows already painted stretched onto it, and a moment
+after the last change the page re-aims its scan there with `job_retune` on the same job: no new
+connection, and the new rows replace the stretched ones as they arrive. The view stops at the
+edges of the sweep range and at the source's finest view. A sweep takes no lease, so a job on
+the radio never blocks these moves. Leaving the tab stops the page's scan. A scan someone else
+started on the source is followed as it is, and the page's own comes back when it ends. The
+jobs list tags the page's scan `source`; the coarse-and-fast look is not offered for it, because
+a source's own sweep has no sample depth to choose.
+
 A pinned source's band is outlined, its source tab carries a `pin` tag (`.tag.pin`) and the pin is
 counted as a holder there. The command
 line takes `source pin --center-hz N --bandwidth-hz N [--replace ID]`, `source unpin` and `source
@@ -795,10 +809,13 @@ so a row is at most 8 KB of JSON. The UI still draws an older node's float `db` 
 In the UI the waterfall's own `spectrum` job covers the whole capture. `#band` (centre in MHz,
 width in kHz, Apply), a drag on the frequency axis (pan) and the wheel (zoom x2 about the
 pointer) change the view. A view inside the capture is rendering only: no operation is sent.
-A view that leaves the capture retunes: if another job holds the source the transcript shows
-`conflict: source <id> held by <jobs>` and the view reverts; otherwise the page stops its own
+A view that leaves the capture retunes when nothing holds the source: the page stops its own
 spectrum job, sends `source_ensure` for the new band and restarts the job on the capture it
-gets (a file source answers `out_of_range` and the view reverts).
+gets (a file source answers `out_of_range` and the view reverts). When a job or a pin holds the
+source and no scanner can show the wider view, every such zoom, drag or Apply writes
+`conflict: source <id> held by <kind> <id>, …; the view stays at its capture` to the
+transcript, naming each holder, and the view eases back to the capture. With a scanner the
+coarse layer below shows the wider view instead.
 
 `scan` sweeps a span wider than one capture: `job start --kind scan --center-hz C
 --bandwidth-hz W` steps the source across `C ± W/2` in captures of the source's whole

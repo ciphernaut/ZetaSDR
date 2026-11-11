@@ -131,7 +131,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (12 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (13 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -223,7 +223,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 3, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (12 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (13 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -248,7 +248,8 @@ BRIGHT_AT_RIGHT_JS = """() => {
 def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
-    for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2"):
+    for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2",
+                   "kiwi"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -543,7 +544,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (12 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (13 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -2221,6 +2222,371 @@ def scenario_zoom_out_beyond_scanner_range_starts_nothing(page, url, secret):
     finally:
         stop_scans(url, secret)
 
+
+# ---- the KiwiSDR's own waterfall (a source that sweeps for itself) -----------------------
+
+# The fake Kiwi's carriers (ui.rs KIWI_CARRIERS), Hz: drawn where they sit in the view asked.
+KIWI_CARRIERS = [int(x) for x in os.environ.get("ZETA_UI_KIWI_CARRIERS", "").split(",") if x]
+# A frequency between the carriers, where the fake draws only its floor.
+KIWI_QUIET_HZ = 8_000_000
+
+# The brightest R+G+B of the newest column within 2 px of `hz`'s row (null before the band).
+CARRIER_AT_JS = """(hz) => {
+  const w = window.zetaTest.waterfall();
+  const c = document.querySelector('#waterfall canvas.wf-canvas');
+  const y = w && w.yForHz(hz);
+  if (y === null || y === undefined || !c || c.width < 4) return null;
+  const dpr = c.width / (c.clientWidth || 1);
+  const py = Math.round(y * dpr);
+  const d = c.getContext('2d').getImageData(c.width - 3, 0, 1, c.height).data;
+  let best = 0;
+  for (let k = py - 2; k <= py + 2; k++) {
+    if (k < 0 || k >= c.height) continue;
+    best = Math.max(best, d[4 * k] + d[4 * k + 1] + d[4 * k + 2]);
+  }
+  return best;
+}"""
+# The band the newest painted row covers, {lo, hi} Hz, or null.
+NEWEST_ROW_JS = """() => {
+  const w = window.zetaTest.waterfall();
+  if (!w || !w.columns) return null;
+  const r = w.rows[(w.columns - 1) % w.rows.length];
+  return r && typeof r.lo === 'number' ? {lo: r.lo, hi: r.hi} : null;
+}"""
+BRIGHT = 500  # R+G+B of a carrier (the top of the ramp); the floor is well under it
+DARK = 400
+
+
+def shot(page, name):
+    """A screenshot in ZETA_UI_SHOTS (when set) named `name`.png."""
+    d = os.environ.get("ZETA_UI_SHOTS")
+    if d:
+        os.makedirs(d, exist_ok=True)
+        page.screenshot(path=os.path.join(d, f"{name}.png"))
+
+
+def stop_kiwi_jobs(url, secret):
+    jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
+    for j in jobs:
+        if j["source"] == "kiwi" and j["state"]["status"] == "running":
+            stop_job(url, secret, j["id"])
+
+
+def scan_context(url, secret, job):
+    r = http_json(url, secret, "/op", {"op": "job_context", "job": job})["value"]
+    return (r or {}).get("scan") or {}
+
+
+def show_kiwi(page, url, secret):
+    """The kiwi tab shown and its own waterfall painting: the page's source scan's id."""
+    select_source(page, url, secret, "kiwi")
+    scans = wait_until(lambda: running_scan_jobs(url, secret, "kiwi"), 10.0, "a scan on kiwi")
+    job = scans[0]["id"]
+    page.wait_for_function(
+        f"() => {{ const w = window.zetaTest.wf(); return !!w && w.jobId === {json.dumps(job)}"
+        " && w.painted > 5; }", timeout=15_000)
+    return job
+
+
+def wait_view(page, lo, hi, what, tol=None):
+    """Wait until the band shown is lo..hi Hz (within `tol`, default 0.5% of its width) and
+    the capture (the scan's span) is the same band: the re-aim answered."""
+    tol = tol if tol is not None else (hi - lo) * 0.005
+    try:
+        page.wait_for_function(
+            """([lo, hi, tol]) => {
+              const w = window.zetaTest.wf();
+              const near = (b) => !!b && Math.abs(b.lo - lo) <= tol && Math.abs(b.hi - hi) <= tol;
+              return near(w.view) && near(w.band);
+            }""", arg=[lo, hi, tol], timeout=10_000)
+    except Exception as e:
+        raise AssertionError(f"{what}: view {page.evaluate(WF_STATE_JS)}, want {lo}..{hi}") from e
+
+
+def wait_rows_of(page, what):
+    """Wait until the newest painted row covers the band shown (to 0.2% of its width) and is
+    no wider than twice it: a row of the view asked, not a stretched one of the view before.
+    The band shown, {lo, hi}."""
+    try:
+        page.wait_for_function(
+            f"""() => {{
+              const v = window.zetaTest.wf().view;
+              const r = ({NEWEST_ROW_JS})();
+              const tol = (v.hi - v.lo) * 0.002;
+              return !!r && r.lo <= v.lo + tol && r.hi >= v.hi - tol
+                && r.hi - r.lo <= 2 * (v.hi - v.lo) + tol;
+            }}""", timeout=10_000)
+    except Exception as e:
+        raise AssertionError(f"{what}: newest row {page.evaluate(NEWEST_ROW_JS)}, "
+                             f"view {page.evaluate(WF_STATE_JS)['view']}") from e
+    return page.evaluate(WF_STATE_JS)["view"]
+
+
+def wait_carrier(page, hz, what):
+    try:
+        page.wait_for_function(f"(hz) => ({CARRIER_AT_JS})(hz) > {BRIGHT}", arg=hz, timeout=10_000)
+    except Exception as e:
+        raise AssertionError(f"{what}: {hz} Hz reads {page.evaluate(CARRIER_AT_JS, hz)}") from e
+
+
+class OpLog:
+    """Records the bodies of the page's POST /op (installed with `page.route`)."""
+
+    def __init__(self):
+        self.ops = []
+
+    def route(self, r):
+        body = r.request.post_data or ""
+        try:
+            self.ops.append(json.loads(body))
+        except ValueError:
+            pass
+        r.continue_()
+
+    def named(self, name):
+        return [o for o in self.ops if o.get("op") == name]
+
+    def scan_starts(self):
+        return [o for o in self.named("job_start") if o.get("kind") == "scan"]
+
+
+def wheel_at_hz(page, hz, delta_y):
+    """One wheel event over the canvas at `hz`'s row; the pointer's CSS y in the canvas."""
+    box = page.locator("#waterfall canvas.wf-canvas").bounding_box()
+    y = page.evaluate("(hz) => window.zetaTest.waterfall().yForHz(hz)", hz)
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + y)
+    page.mouse.wheel(0, delta_y)
+    return y
+
+
+def drag_axis(page, dy):
+    """Drag the frequency axis by `dy` CSS px from its middle (down shows higher)."""
+    axis = page.locator("#waterfall .wf-axis").bounding_box()
+    x, y = axis["x"] + axis["width"] / 2, axis["y"] + axis["height"] / 2
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x, y + dy, steps=6)
+    page.mouse.up()
+
+
+def apply_band(page, centre_mhz, width_khz):
+    page.fill('#band input[name="center"]', str(centre_mhz))
+    page.fill('#band input[name="width"]', str(width_khz))
+    page.click("#band button")
+
+
+def canvas_height(page):
+    return page.evaluate("() => document.querySelector('#waterfall canvas.wf-canvas').clientHeight")
+
+
+def scenario_kiwi_tab_shows_the_kiwis_own_waterfall(page, url, secret):
+    # The Kiwi sweeps 0-30 MHz for itself: its tab is fed by one scan the page starts with
+    # method source over the whole range, one view streaming at the Kiwi's frame rate; no
+    # 12 kHz spectrum job on its IQ channel.
+    assert KIWI_CARRIERS, "ui.rs passes ZETA_UI_KIWI_CARRIERS"
+    stop_kiwi_jobs(url, secret)
+    try:
+        job = show_kiwi(page, url, secret)
+        scans = running_scan_jobs(url, secret, "kiwi")
+        assert [j["id"] for j in scans] == [job], f"scans on kiwi: {scans}"
+        t = scans[0]["tuning"]
+        assert (t["center_hz"], t["bandwidth_hz"]) == (15_000_000, 30_000_000), t
+        ctx = scan_context(url, secret, job)
+        assert ctx.get("method") == "source", ctx
+        assert ctx.get("steps") == 1, ctx
+        assert ctx.get("alternate") is None, ctx
+        assert running_spectrum_jobs(url, secret, "kiwi") == [], "a spectrum job on kiwi"
+        assert page.evaluate("window.zetaTest.waterfallMode") == "sweep"
+        wait_ticks(page, "30.000", "0.000", "the whole 0-30 MHz")
+        # Rows stream: well over 5 a second (about 23 on the Kiwi).
+        p0 = page.evaluate(WF_STATE_JS)["painted"]
+        page.wait_for_timeout(3_000)
+        p1 = page.evaluate(WF_STATE_JS)["painted"]
+        assert (p1 - p0) / 3.0 > 10, f"{(p1 - p0) / 3.0:.1f} rows a second"
+        for hz in KIWI_CARRIERS:
+            wait_carrier(page, hz, "a carrier at its frequency")
+        quiet = page.evaluate(CARRIER_AT_JS, KIWI_QUIET_HZ)
+        assert quiet < DARK, f"between the carriers: {quiet}"
+        shot(page, "kiwi_tab_shows_the_kiwis_own_waterfall-1-whole-band")
+        # The jobs list shows the scan as the source's own sweep.
+        tag = job_row(page, job).locator(".kind .tag.method")
+        expect(tag).to_have_text("source")
+        # Still one scan, no spectrum job, after the polls went round.
+        page.wait_for_timeout(2_500)
+        assert [j["id"] for j in running_scan_jobs(url, secret, "kiwi")] == [job]
+        assert running_spectrum_jobs(url, secret, "kiwi") == []
+    finally:
+        stop_kiwi_jobs(url, secret)
+
+
+def scenario_kiwi_zoom_drag_and_centre_reaim_the_scan(page, url, secret):
+    # A wheel zoom, an axis drag and the #band form re-aim the page's scan (job_retune on the
+    # same job id), and the shown span follows; the carrier under the pointer stays under it.
+    stop_kiwi_jobs(url, secret)
+    log = OpLog()
+    try:
+        job = show_kiwi(page, url, secret)
+        wait_ticks(page, "30.000", "0.000", "the whole 0-30 MHz")
+        wait_carrier(page, KIWI_CARRIERS[1], "the carrier before the zoom")
+        page.wait_for_timeout(3_000)  # some history to stretch (and for the pictures)
+        page.route("**/op", log.route)
+        f = KIWI_CARRIERS[1]
+        y0 = wheel_at_hz(page, f, -100)
+        page.wait_for_timeout(60)
+        wheel_at_hz(page, f, -100)
+        # Two notches in about f: a quarter of the span, f where it was.
+        lo, hi = f - f / 4, f + (30_000_000 - f) / 4
+        wait_view(page, lo, hi, "after the zoom")
+        v = wait_rows_of(page, "rows of the zoomed view")
+        y1 = page.evaluate("(hz) => window.zetaTest.waterfall().yForHz(hz)", f)
+        # (The pointer sits on a whole CSS pixel: half a pixel of the whole band, x4.)
+        assert abs(y1 - y0) < 3, f"the carrier moved from y {y0} to {y1}"
+        wait_carrier(page, f, "the carrier under the pointer after the zoom")
+        page.wait_for_timeout(1_500)
+        shot(page, "kiwi_zoom_drag_and_centre_reaim_the_scan-1-zoomed-in")
+        retunes = log.named("job_retune")
+        assert retunes and all(r["job"] == job for r in retunes), retunes
+        last = retunes[-1]
+        assert abs(last["center_hz"] - (v["lo"] + v["hi"]) / 2) < 2, (last, v)
+        assert abs(last["bandwidth_hz"] - (v["hi"] - v["lo"])) < 4, (last, v)
+        assert last["bin_hz"] and last["bin_hz"] * 1024 >= last["bandwidth_hz"], last
+        ctx = scan_context(url, secret, job)
+        assert ctx.get("steps") == 1, f"one view after the zoom: {ctx}"
+        # A drag down the axis by a quarter of its height shows a quarter of a view higher.
+        n = len(log.named("job_retune"))
+        drag_axis(page, canvas_height(page) / 4)
+        span = v["hi"] - v["lo"]
+        lo, hi = v["lo"] + span / 4, v["hi"] + span / 4
+        wait_view(page, lo, hi, "after the drag")
+        wait_rows_of(page, "rows of the dragged view")
+        assert len(log.named("job_retune")) > n, "the drag sent no job_retune"
+        page.wait_for_timeout(1_500)
+        shot(page, "kiwi_zoom_drag_and_centre_reaim_the_scan-2-dragged")
+        # The #band form: centre and width typed in, Apply.
+        n = len(log.named("job_retune"))
+        apply_band(page, KIWI_CARRIERS[2] / 1e6, 1000)
+        lo, hi = KIWI_CARRIERS[2] - 500_000, KIWI_CARRIERS[2] + 500_000
+        wait_view(page, lo, hi, "after Apply")
+        wait_rows_of(page, "rows of the applied view")
+        wait_carrier(page, KIWI_CARRIERS[2], "the carrier at the applied centre")
+        assert len(log.named("job_retune")) > n, "Apply sent no job_retune"
+        page.wait_for_timeout(1_500)
+        shot(page, "kiwi_zoom_drag_and_centre_reaim_the_scan-3-applied")
+        assert all(r["job"] == job for r in log.named("job_retune")), log.named("job_retune")
+        assert log.scan_starts() == [], f"scans started: {log.scan_starts()}"
+        assert [j["id"] for j in running_scan_jobs(url, secret, "kiwi")] == [job]
+        # The page's re-aims are quiet: no job_retune line floods the transcript.
+        assert page.locator("#transcript .line", has_text="job_retune").count() == 0
+    finally:
+        page.unroute("**/op", log.route)
+        stop_kiwi_jobs(url, secret)
+
+
+def scenario_kiwi_view_moves_with_a_demodulator_running(page, url, secret):
+    # A rigid am_demod holds the Kiwi's IQ channel: the waterfall is the Kiwi's own sweep, which
+    # takes no lease, so every gesture still moves the view and the demodulator runs on.
+    stop_kiwi_jobs(url, secret)
+    demod = start_job(url, secret, "am_demod", "kiwi", KIWI_CARRIERS[0], 6_000)
+    log = OpLog()
+    try:
+        job = show_kiwi(page, url, secret)
+        assert job != demod
+        page.route("**/op", log.route)
+        f = KIWI_CARRIERS[0]
+        wheel_at_hz(page, f, -100)
+        lo, hi = f / 2, f + (30_000_000 - f) / 2
+        wait_view(page, lo, hi, "after the zoom beside the demodulator")
+        drag_axis(page, -canvas_height(page) / 8)
+        span = hi - lo
+        lo, hi = max(0, lo - span / 8), max(0, lo - span / 8) + span
+        wait_view(page, lo, hi, "after the drag beside the demodulator")
+        apply_band(page, KIWI_CARRIERS[3] / 1e6, 2000)
+        lo, hi = KIWI_CARRIERS[3] - 1_000_000, KIWI_CARRIERS[3] + 1_000_000
+        wait_view(page, lo, hi, "after Apply beside the demodulator")
+        wait_carrier(page, KIWI_CARRIERS[3], "the carrier at the applied centre")
+        assert len(log.named("job_retune")) >= 3, log.named("job_retune")
+        assert all(r["job"] == job for r in log.named("job_retune"))
+        assert job_record(url, secret, demod)["state"]["status"] == "running"
+        assert [j["id"] for j in running_scan_jobs(url, secret, "kiwi")] == [job]
+        assert page.locator("#transcript .line", has_text="conflict: source kiwi").count() == 0
+    finally:
+        page.unroute("**/op", log.route)
+        stop_job(url, secret, demod)
+        stop_kiwi_jobs(url, secret)
+
+
+def scenario_kiwi_view_stops_at_the_band_edge(page, url, secret):
+    # A drag or a centre past 0 Hz or 30 MHz stops the view at the edge of the Kiwi's range,
+    # and the re-aim asks only for what the Kiwi sweeps.
+    stop_kiwi_jobs(url, secret)
+    log = OpLog()
+    try:
+        job = show_kiwi(page, url, secret)
+        page.route("**/op", log.route)
+        apply_band(page, 1, 1000)
+        wait_view(page, 500_000, 1_500_000, "a 1 MHz view at 1 MHz")
+        # Up the axis by half its height: 1 MHz lower, past 0 Hz: stopped at 0.
+        drag_axis(page, -canvas_height(page) / 2)
+        wait_view(page, 0, 1_000_000, "dragged past 0 Hz")
+        wait_ticks(page, "1.000", "0.000", "the view stops at 0 Hz")
+        # A centre above 30 MHz: the view sits at the top edge.
+        apply_band(page, 29.9, 1000)
+        wait_view(page, 29_000_000, 30_000_000, "a centre past 30 MHz")
+        drag_axis(page, canvas_height(page) / 2)
+        page.wait_for_timeout(800)
+        wait_view(page, 29_000_000, 30_000_000, "dragged past 30 MHz")
+        wait_ticks(page, "30.000", "29.000", "the view stops at 30 MHz")
+        # Wider than the whole range: the whole range.
+        apply_band(page, 15, 90_000)
+        wait_view(page, 0, 30_000_000, "wider than the range")
+        for r in log.named("job_retune"):
+            assert r["job"] == job, r
+            assert r["center_hz"] - r["bandwidth_hz"] / 2 >= 0, r
+            assert r["center_hz"] + r["bandwidth_hz"] / 2 <= 30_000_000, r
+        assert page.locator("#transcript .line.error", has_text="job_retune").count() == 0
+        assert [j["id"] for j in running_scan_jobs(url, secret, "kiwi")] == [job]
+    finally:
+        page.unroute("**/op", log.route)
+        stop_kiwi_jobs(url, secret)
+
+
+# How many times the transcript said `t`: its lines, each with its ×N fold.
+SAID_JS = """(t) => [...document.querySelectorAll('#transcript .line')]
+  .filter((l) => l.textContent.includes(t))
+  .reduce((n, l) => n + Number((l.textContent.match(/×(\\d+)\\s*$/) || [0, 1])[1]), 0)"""
+
+
+def scenario_held_radio_says_who_holds_it(page, url, secret):
+    # A plain radio held by a rigid job, with no scanner able to show the wider view: each zoom
+    # out and each #band Apply past the capture says who holds it, at the gesture, and the
+    # view eases back to the capture.
+    stop_scans(url, secret)
+    fresh_spectrum_jobs(url, secret)
+    job = start_job(url, secret, "measure", "tone", 100_000_000, 10_000)
+    try:
+        show_tone_waterfall(page, url, secret)
+        page.wait_for_function("() => window.zetaTest.wf().painted > 5")
+        # No scanner can help: the one named tunes 200-300 MHz.
+        run_cmd(page, "view set scanner retune")
+        expect(view_line(page, "scanner = retune")).to_be_visible()
+        wait_ticks(page, "100.024", "99.976", "the capture")
+        text = f"conflict: source tone held by measure {job}; the view stays at its capture"
+        wheel_at_centre(page, 100)
+        page.wait_for_function(f"(t) => ({SAID_JS})(t) >= 1", arg=text, timeout=10_000)
+        wait_ticks(page, "100.024", "99.976", "the view eased back to the capture")
+        assert page.evaluate(SAID_JS, text) == 1, page.evaluate(SAID_JS, text)
+        apply_band(page, 100.5, 2000)
+        page.wait_for_function(f"(t) => ({SAID_JS})(t) >= 2", arg=text, timeout=10_000)
+        wait_ticks(page, "100.024", "99.976", "Apply eased back to the capture")
+        page.wait_for_function("() => !window.zetaTest.wf().easing", timeout=5_000)
+        assert running_scan_jobs(url, secret, "scanner") == [], "a scan on scanner"
+        assert running_scan_jobs(url, secret, "tone") == [], "a scan on tone"
+        assert ensure_lines(page) == 0, "a source_ensure on a held source"
+        assert job_record(url, secret, job)["state"]["status"] == "running"
+    finally:
+        run_cmd(page, "view set scanner auto")
+        stop_job(url, secret, job)
+        stop_scans(url, secret)
 
 def scenario_failed_auto_scan_stop_is_retried(page, url, secret):
     # A job_stop of the page's own scan that fails keeps the scan the page's own: the id stays

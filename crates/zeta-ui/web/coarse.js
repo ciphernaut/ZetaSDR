@@ -43,7 +43,14 @@
 //       fires onView again. Under zoom_out "none", or with no scanner for the view, the
 //       waterfall's coarse rows are dropped (wf.clearCoarse): the coarse layer is empty.
 //       It also sets wf.coarseActive = () => zoom_out is "scan": the waterfall then lets the
-//       view leave the capture instead of clamping it or retuning past the source.
+//       view leave the capture instead of clamping it or retuning past the source; and
+//       wf.coarseCan(lo, hi) -> Promise<bool>: whether, under zoom_out "scan", a scanner would
+//       be chosen for lo..hi with a non-empty span (both lists fetched afresh, as above), so
+//       the waterfall can tell the operator at once when a held source's view has none.
+//       While the waterfall shows a source's own sweep (wf.mode "sweep", a KiwiSDR's tab) it
+//       decides nothing and starts nothing: that sweep shows any view of the source (one
+//       waterfall connection per Kiwi); its own scan, if any, is stopped and the coarse
+//       rows dropped.
 //       The followed scan's (own or manual) event stream is subscribed in text mode and each
 //       frame handed to the onRow callbacks. Its own scan is stopped on `pagehide` (fetch
 //       keepalive, with the bearer), the id kept so the next page in the tab knows it.
@@ -122,6 +129,7 @@ class Coarse {
     this.destroyed = false;
 
     wf.coarseActive = () => view.get("zoom_out") === "scan";
+    wf.coarseCan = (lo, hi) => this.canScan(lo, hi);
     wf.onView(() => this.schedule());
     view.onChange((key) => {
       if (key === "zoom_out" || key === "scanner" || key === "auto_scan_stop") {
@@ -185,6 +193,14 @@ class Coarse {
     // A retune, an axis drag or an ease in progress: its end fires onView again.
     if (!wf.band) return;
     if (wf.retuning || wf.pan || wf.easing) {
+      return;
+    }
+    // The source's own sweep feeds the waterfall: it shows any view, nothing to scan.
+    if (wf.mode === "sweep") {
+      this.noted = null;
+      wf.clearCoarse();
+      if (this.scanJobId && !(await this.stopOwn())) return;
+      if (!this.scanJobId) this.unfollow();
       return;
     }
     const fresh = await this.fetchList("job_list");
@@ -264,6 +280,16 @@ class Coarse {
     if (!info || !wf.capturable(info, v.lo, v.hi)) return;
     if (!(await this.stopOwn())) return;
     wf.restoreView(v.lo, v.hi);
+  }
+
+  // Whether a scanner would be chosen for lo..hi (zoom_out "scan", a non-empty span).
+  async canScan(lo, hi) {
+    if (this.destroyed || this.view.get("zoom_out") !== "scan") return false;
+    const jobs = (await this.fetchList("job_list")) || this.lastJobs() || [];
+    const srcs = (await this.fetchList("source_list")) || this.lastSources() || [];
+    const pick = this.chooseScanner(srcs, jobs, { lo, hi });
+    const range = pick && tuneRange(pick);
+    return !!range && Math.min(hi, range.hi) > Math.max(lo, range.lo);
   }
 
   // Whether lo..hi differs from the running span by more than SPAN_CHANGE of its width.
@@ -442,5 +468,6 @@ class Coarse {
     this.unfollow();
     window.removeEventListener("pagehide", this.onPageHide);
     if (this.wf.coarseActive) this.wf.coarseActive = null;
+    this.wf.coarseCan = null;
   }
 }

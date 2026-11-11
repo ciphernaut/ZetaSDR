@@ -18,7 +18,7 @@
 //                               folded into it with a ×N count. Ok outcomes of the read-only
 //                               polls and lookups (QUIET_OPS: job_list, stream_list,
 //                               source_list, and modes_list and modes_show, which the overlays
-//                               ask to find positioned jobs, capture_list and signature_list, the Explore pane's polls, station_get, the home read at load, and set_list, read with job_list) whose
+//                               ask to find positioned jobs, capture_list and signature_list, the Explore pane's polls, station_get, the home read at load, set_list, read with job_list, and job_retune, which the waterfall sends as the view of a source's own sweep moves) whose
 //                               transport is "ui" (a UI's own calls) are hidden; errors and
 //                               other callers' records always show (ruling R6). Records from
 //                               another caller are prefixed `[agent]`, `[http]`, `[local]`.
@@ -61,7 +61,9 @@
 //       Stop, ▶ or Transcribe button. A row of an elastic job (the page's own spectrum job)
 //       reads `<kind> elastic` and has only Stop. The row of the page's own automatic scan
 //       (the id in sessionStorage[AUTO_SCAN_KEY], coarse.js) reads `scan auto`; a scan the
-//       page did not start reads `scan`. Each row shows kind, source,
+//       page did not start reads `scan`. A scan its source sweeps for itself (its
+//       `context.scan.method`, or its fft node's `method`, is `source`) carries a `.tag.method`
+//       reading `source`. Each row shows kind, source,
 //       state, id, an `.events` cell (filled by overlays.js: a count of the job's events seen on its source's feed), on rows of an AUDIO_KINDS kind a
 //       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job) and, while
 //       running, a `button.transcribe` (Transcribe) calling onTranscribe(job) (ruling R14), a
@@ -72,7 +74,9 @@
 //       A running scan row (one `job_context` per poll, a `graph_get` once per job; both are
 //       QUIET_OPS) shows `.sweep-ms` (the
 //       last sweep, `<n> ms` or `<n.n> s`) and a `select.scan-look` over SCAN_LOOKS (fast,
-//       averaged, long look; coarse and fast when `depths(source)` lists a lossy depth) or
+//       averaged, long look; coarse and fast when `depths(source)` lists a lossy depth and the
+//       scan is not one its source sweeps: a depth is the radio link's, not the source's own
+//       sweep's) or
 //       `custom`; a choice sets dwell_ms, average and bits on the stored fft node and applies
 //       `graph_put` through applyOp (a conflict shows its line naming the holders; graph_put
 //       takes no `replace`, so there is no stop-and-retry). While a row's select has the focus
@@ -195,6 +199,7 @@ export const QUIET_OPS = new Set([
   "set_list",
   "job_context",
   "graph_get",
+  "job_retune",
 ]);
 export const AUTO_SCAN_KEY = "zeta.autoScan";
 const MAX_LINES = 500;
@@ -576,8 +581,14 @@ export function lookOf(params, lossy) {
 // A sweep time as `<n> ms` under a second, else `<n.n> s`.
 export const sweepText = (ms) => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
 
+// Whether a scan job is one its source sweeps for itself (`method` source).
+function sourceSwept(job, scan) {
+  return (job.context?.scan?.method ?? scan?.params?.method) === "source";
+}
+
 function lookSelect(job, scan, depths, onLook) {
-  const lossy = lossyBits(depths);
+  // A depth is the radio link's: a source's own sweep has none to choose.
+  const lossy = sourceSwept(job, scan) ? null : lossyBits(depths);
   const sel = document.createElement("select");
   sel.className = "scan-look";
   sel.title = "the scan's look: dwell per step and sweeps averaged (graph_put on its fft node)";
@@ -655,6 +666,14 @@ function jobRow(
         tag.title = ch.title;
         span.append(" ", tag);
       }
+    }
+    if (cls === "kind" && job.kind === "scan" && sourceSwept(job, scanInfo ? scanInfo(job) : null)) {
+      const tag = document.createElement("span");
+      tag.className = "tag method";
+      tag.dir = "auto";
+      tag.textContent = "source";
+      tag.title = "method: source; the source sweeps it for itself, holding no lease";
+      span.append(" ", tag);
     }
     if (cls === "kind" && job.kind === "scan" && job.id === autoScanId()) {
       const tag = document.createElement("span");

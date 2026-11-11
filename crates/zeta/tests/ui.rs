@@ -12,7 +12,10 @@
 //! 20 MHz, which `measure` labels `noise`; see [`quiet_fixture`]), `fsk` (framed 2-FSK at
 //! 433.92 MHz, the Bits pane's; see [`fsk_fixture`]), and `--modes-dir` holding the
 //! `fake_pos` program row (zeta-ext's `fake_lines`, printing two fixes of one sonde 2 s into a
-//! job; see [`fake_pos_row`]) and `--sets-dir` holding [`fake_sets`]' `two_sources`; the node's state directory is passed to ui.py in
+//! job; see [`fake_pos_row`]) and `--sets-dir` holding [`fake_sets`]' `two_sources`, and
+//! `kiwi`, a KiwiSDR on 127.0.0.1 (zeta-source-kiwi's `FakeKiwi`, see [`start_fake_kiwi`]),
+//! whose waterfall draws [`KIWI_CARRIERS`] where they sit in the view asked (their
+//! frequencies passed to ui.py in `ZETA_UI_KIWI_CARRIERS`); the node's state directory is passed to ui.py in
 //! `ZETA_UI_STATE_DIR`. That node's station is the demo station ([`DEMO_STATION`],
 //! `station_set` once it is up), and its `--knowledge-acma` is zeta-ext's register stub
 //! (`testing::acma_stub`) on 127.0.0.1 answering [`fake_register_rows`] (the tone's band
@@ -42,6 +45,7 @@ use std::time::{Duration, Instant};
 
 use common::{ServeProc, speech_fixture};
 use zeta_ext::testing::acma_stub::{self, Mode};
+use zeta_source_kiwi::testing::{FakeCarrier, FakeKiwi, FakeScript, FakeWf};
 use zeta_speech::testing::FakeDaemon;
 
 const SECRET: &str = "ui-secret-0123456789";
@@ -896,6 +900,52 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The fake Kiwi's carriers: made-up test frequencies spread over its 0-30 MHz, of
+/// different widths and levels, so a picture of the waterfall shows where the view is.
+const KIWI_CARRIERS: [FakeCarrier; 4] = [
+    FakeCarrier {
+        hz: 4_321_000,
+        width_hz: 5_000,
+        db: -50,
+    },
+    FakeCarrier {
+        hz: 11_111_000,
+        width_hz: 3_000,
+        db: -45,
+    },
+    FakeCarrier {
+        hz: 17_777_000,
+        width_hz: 10_000,
+        db: -55,
+    },
+    FakeCarrier {
+        hz: 23_456_000,
+        width_hz: 2_000,
+        db: -40,
+    },
+];
+/// The fake Kiwi's frame interval: the live one's 23 waterfall frames a second.
+const KIWI_FRAME_MS: u64 = 43;
+
+/// A fake KiwiSDR on 127.0.0.1 serving `SND` and `W/F` (frames following the view last
+/// asked, [`KIWI_CARRIERS`] drawn in them), on a runtime of its own (the test is sync).
+fn start_fake_kiwi() -> (tokio::runtime::Runtime, FakeKiwi) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("fake kiwi runtime");
+    let fake = rt.block_on(FakeKiwi::start(FakeScript {
+        frame_interval_ms: KIWI_FRAME_MS,
+        wf: FakeWf {
+            carriers: KIWI_CARRIERS.to_vec(),
+            ..FakeWf::default()
+        },
+        ..FakeScript::default()
+    }));
+    (rt, fake)
+}
+
 /// One shard's nodes (see the module docs) and what keeps them up: ui.py runs against them.
 struct Nodes {
     serve: ServeProc,
@@ -905,6 +955,9 @@ struct Nodes {
     rebuild_meta: PathBuf,
     _voiced: FakeDaemon,
     dirs: Vec<tempfile::TempDir>,
+    // Dropped before its runtime: the fake's task is aborted on it.
+    _kiwi: FakeKiwi,
+    _kiwi_rt: tokio::runtime::Runtime,
 }
 
 impl Nodes {
@@ -973,6 +1026,8 @@ impl Nodes {
         let fake_dump1090 = repo_root().join("crates/zeta-ext/tests/fake_dump1090");
         let fake_dump1090 = fake_dump1090.to_str().expect("fake_dump1090 path is UTF-8");
         let register = acma_stub::serve_on_thread(fake_register_rows(), Mode::Normal);
+        let (kiwi_rt, kiwi) = start_fake_kiwi();
+        let kiwi_flag = format!("kiwi={}", kiwi.addr());
         let serve = ServeProc::start_full(
             dir.path(),
             SECRET,
@@ -1007,6 +1062,8 @@ impl Nodes {
                 &video,
                 "--source-file",
                 &video2,
+                "--source-kiwi",
+                &kiwi_flag,
             ],
             &["--stt-socket", sock],
             &[
@@ -1053,6 +1110,8 @@ impl Nodes {
             rebuild_meta,
             _voiced,
             dirs: vec![dir, sock_dir, nostt_dir, llm_dir, short_dir],
+            _kiwi: kiwi,
+            _kiwi_rt: kiwi_rt,
         }
     }
 
@@ -1078,12 +1137,22 @@ impl Nodes {
             .env("ZETA_UI_URL_SHORTRING", &self.shortring.url)
             .env("ZETA_BIN", env!("CARGO_BIN_EXE_zeta"))
             .env("ZETA_UI_REBUILD_META", &self.rebuild_meta)
+            .env("ZETA_UI_KIWI_CARRIERS", kiwi_carriers())
             .current_dir(repo_root())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("run ui.py")
     }
+}
+
+/// [`KIWI_CARRIERS`]' frequencies, comma-separated Hz (ui.py's `ZETA_UI_KIWI_CARRIERS`).
+fn kiwi_carriers() -> String {
+    KIWI_CARRIERS
+        .iter()
+        .map(|c| c.hz.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// How many shards run at once: `ZETA_UI_SHARDS`, else [`SHARDS`]; 1 with `ZETA_UI_ONLY`.

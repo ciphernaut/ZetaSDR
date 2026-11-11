@@ -18,7 +18,9 @@
 //         followed in text mode.
 //     wf.sourceId   id of the source being shown (null when none, or after setSource failed)
 //     wf.jobId      the followed job's id (null until known)
-//     wf.mode       "spectrum" (a spectrum job's capture) or "scan" (a running scan job)
+//     wf.mode       "spectrum" (a spectrum job's capture), "scan" (a running scan job,
+//         followed read-only) or "sweep" (the page's own scan of a source that sweeps for
+//         itself, re-aimed with the view; see Sweep mode)
 //     wf.syncJobs(jobs)  a `job_list` result (app.js hands it every poll): follows a scan job
 //         that started on the shown source, or goes back to a spectrum job when it ended
 //     wf.onNotice   fn(text) for transcript lines (a refused retune); set by app.js
@@ -50,6 +52,8 @@
 //         true when the view reaches past the capture (the coarse layer's part, coarse.js).
 //     wf.coarseActive   null, or fn() -> bool set by coarse.js: true while the coarse layer
 //         scans views past the capture (zoom_out "scan"); see Band control.
+//     wf.coarseCan  null, or async fn(lo, hi) -> bool set by coarse.js: whether a scanner
+//         could show lo..hi (null counts as yes); see Band control.
 //     wf.follow     null, or fn() -> "target" | "free" set by app.js (the `follow` policy;
 //         null counts as "target"); see Following the capture.
 //     wf.addCoarseEvent(msg)  a frame of the coarse layer's scan (coarse.js onRow): stitched
@@ -130,11 +134,12 @@
 // the view reverts with `view reverted: <error>` in the transcript). Otherwise (a rigid
 // holder, a view too wide, or past the tune range) the page never retunes (spec 4.1): while
 // wf.coarseActive() holds the view is left past the capture (outside: true) for the coarse
-// layer to scan, the fine rows painted over their own band only; without it (zoom_out
-// "none") a held source clamps the view into the capture with `conflict: source <id> held by
-// <jobs>; the view stays inside its capture` in the transcript, and an unheld one is asked
-// with `source_ensure` as above. In scan mode the view stays inside the scan's span and never
-// retunes.
+// layer to scan, the fine rows painted over their own band only. A held source (a rigid
+// holder or a pin) whose view nothing can show (zoom_out "none", or no scanner for it:
+// wf.coarseCan) says so at every such gesture, `conflict: source <id> held by <kind> <id>,
+// …; the view stays at its capture` in the transcript (heldBack), and the view eases back
+// into the capture; an unheld one is asked with `source_ensure` as above. In scan mode the
+// view stays inside the scan's span and never retunes; in sweep mode it re-aims the scan.
 //
 // Layers (spec 4.2): outside scan mode each column is composed from two buffers: the coarse
 // column, into which every coarse row is stitched over its own step's band exactly as scan
@@ -168,6 +173,24 @@
 // When the page's own job_start is refused as a conflict and a scan now runs on the source,
 // the waterfall follows that scan instead.
 //
+// Sweep mode (a source whose `source_list` record has `capabilities.sweep`, a KiwiSDR): the
+// tab shows the source's own waterfall. The page starts no spectrum job there; it starts a
+// `scan` with `method: "source"` of its own (kept in UI_JOBS_KEY, so it is stopped when the
+// waterfall moves to another source and on pagehide) over the view kept for the source, else
+// the whole sweep range, with `bin_hz` for ONE view (sweepBin), or reuses the one it started
+// that still runs. A scan on the source the page did not start (from the menu, another page)
+// is followed read-only in scan mode instead, and the page's own one there is stopped; when
+// it ends the page's own one comes back. Rows are painted as scan rows, each over its own
+// band. A zoom, an axis drag or the #band form show the new view at once (clampSweep: inside
+// the sweep range, never narrower than bin_hz_min × 1024: a drag stops at the edge) with the
+// rows already painted stretched onto it, and SWEEP_REAIM_MS after the last change send
+// `job_retune {job, center_hz, bandwidth_hz, bin_hz, replace: []}` on the scan (a quiet op):
+// the band becomes the new view and the rows of the new view replace the old as they come.
+// No holder is consulted: a sweep takes no lease. A refused re-aim eases back to the band
+// with `view reverted: <error>`. When the source refuses to sweep at the start, the page
+// says so (`waterfall: source <id> does not sweep for itself: <error>; showing its
+// capture`) and shows its capture as on any radio.
+//
 // Reload: pagehide stops the UI's jobs and records their ids under STOPPING_KEY; the next page
 // in the tab never reuses those (their stop may still be in flight), stops them again in case
 // the keepalive request was lost, and starts a fresh job instead. A page restored from the
@@ -195,6 +218,10 @@ export const EASE_MS = 400;
 // With no fine column painted for this long, each coarse row (at most MAX_ROWS_PER_S a second)
 // paints a column of the coarse layer alone.
 export const COARSE_ALONE_MS = 1000;
+// Sweep mode: the wait after the last view change before the page's scan is re-aimed.
+export const SWEEP_REAIM_MS = 200;
+// The pixels of one view of a source's own sweep (a KiwiSDR's 1024).
+const SWEEP_PIXELS = 1024;
 // The ring entry of a column painted from the coarse layer alone.
 const COARSE_ONLY = Object.freeze({ coarseOnly: true });
 
@@ -395,6 +422,46 @@ export function sweepsItself(src, lo, hi) {
   return !!sw && sw.min_hz <= lo && hi <= sw.max_hz;
 }
 
+// The `capabilities.sweep` of a `source_list` record ({min_hz, max_hz, bin_hz_min, …}), or
+// null when the source does not sweep for itself.
+export function sweepCaps(src) {
+  const sw = src && src.capabilities && src.capabilities.sweep;
+  if (!sw || typeof sw.min_hz !== "number" || typeof sw.max_hz !== "number") return null;
+  return sw.max_hz > sw.min_hz ? sw : null;
+}
+
+// The narrowest view the page asks of a sweep: bin_hz_min × SWEEP_PIXELS (and MIN_VIEW_HZ).
+function sweepMinSpan(sw) {
+  return Math.max(MIN_VIEW_HZ, (sw.bin_hz_min || 0) * SWEEP_PIXELS);
+}
+
+// lo..hi as a view the sweep `sw` holds: no wider than its range, no narrower than its finest
+// view (sweepMinSpan, about the centre), moved inside the range. [lo, hi].
+export function clampSweep(sw, lo, hi) {
+  const span = Math.min(sw.max_hz - sw.min_hz, Math.max(sweepMinSpan(sw), hi - lo));
+  const a = Math.max(sw.min_hz, Math.min(sw.max_hz - span, (lo + hi) / 2 - span / 2));
+  return [a, a + span];
+}
+
+// The {center_hz, bandwidth_hz} asked for lo..hi: whole Hz, an even width, inside the range.
+export function sweepTuning(sw, lo, hi) {
+  const a = Math.max(sw.min_hz, Math.ceil(lo));
+  const b = Math.min(sw.max_hz, Math.floor(hi));
+  let bw = Math.max(2, b - a);
+  bw -= bw % 2;
+  return { center_hz: a + bw / 2, bandwidth_hz: bw };
+}
+
+// The bin_hz that sweeps `bandwidthHz` as ONE view: the pixel of the narrowest halving of the
+// sweep range that still holds it (a source sweeps in views that halve its range, a KiwiSDR's
+// zooms, and plans the finer of the bin's view and the span's: a bin of span/1024 between two
+// halvings would take two views), never under bin_hz_min.
+export function sweepBin(sw, bandwidthHz) {
+  let view = sw.max_hz - sw.min_hz;
+  while (Math.floor(view / 2) >= bandwidthHz) view = Math.floor(view / 2);
+  return Math.max(sw.bin_hz_min || 1, Math.ceil(view / SWEEP_PIXELS));
+}
+
 // `t` when it is a {center_hz, bandwidth_hz} with both set, else null.
 function usableTuning(t) {
   return t && t.center_hz && t.bandwidth_hz ? t : null;
@@ -478,6 +545,10 @@ class Waterfall {
     this.pendingView = null; // the view to apply when the band is next set (a retune)
     this.retuning = false;
     this.coarseActive = null;
+    this.coarseCan = null;
+    this.reaimTarget = null; // sweep mode: the view the next job_retune asks for
+    this.reaimTimer = null;
+    this.reaimBusy = false;
     this.follow = null;
     this.onNotice = null;
     this.coarseRows = []; // {row, col}: a coarse row stitched before fine column `col`
@@ -588,6 +659,7 @@ class Waterfall {
   // `restart`: the followed job went away; keep the badge up until frames flow again.
   async setSource(src, { restart = false } = {}) {
     const gen = ++this.gen;
+    this.cancelReaim();
     if (this.jobId && this.src && (!src || src.id !== this.src.id)) this.stopOwnJob(this.jobId);
     if (this.sub) this.sub.close();
     this.sub = null;
@@ -663,6 +735,22 @@ class Waterfall {
   // when the followed scan is gone (the stream's close usually gets there first).
   syncJobs(jobs) {
     if (!this.src || !this.sub || this.retuning) return;
+    if (this.mode === "sweep") {
+      // The page's own sweep ended (stopped elsewhere), or someone else's scan started on the
+      // source (followed read-only instead): start over.
+      const own = jobs.find((j) => j.id === this.jobId);
+      const mine = new Set(loadIds(UI_JOBS_KEY));
+      const other = jobs.find(
+        (j) =>
+          j.kind === "scan" &&
+          j.source === this.src.id &&
+          isRunning(j) &&
+          !mine.has(j.id) &&
+          !this.stopping.has(j.id),
+      );
+      if (other || (own && !isRunning(own))) this.setSource(this.src, { restart: true });
+      return;
+    }
     const scan = runningScan(jobs, this.src.id);
     if (scan && scan.id !== this.jobId && !this.stopping.has(scan.id)) {
       if (this.mode === "spectrum" && this.jobId) this.stopOwnJob(this.jobId);
@@ -696,6 +784,7 @@ class Waterfall {
       return false;
     }
     this.gen += 1; // no frames, reconnects or restarts from the job being let go
+    this.cancelReaim();
     if (this.sub) this.sub.close();
     this.sub = null;
     this.jobId = null;
@@ -717,6 +806,11 @@ class Waterfall {
   // `retried`: a job_start conflict already sent us round once (a scan took the source).
   async findOrStartJob(src, retried = false) {
     const jobs = (await this.api.op({ op: "job_list" })).value || [];
+    const sw = sweepCaps(src);
+    if (sw && !retried) {
+      const id = await this.findOrStartSweep(src, sw, jobs);
+      if (id) return id;
+    }
     const scan = runningScan(jobs, src.id);
     if (scan && !this.stopping.has(scan.id)) {
       this.mode = "scan";
@@ -769,6 +863,135 @@ class Waterfall {
     return id;
   }
 
+  // Sweep mode's job on `src`, which sweeps for itself (`sw`, its capabilities.sweep): a
+  // running scan the page did not start is followed read-only (scan mode; the page's own one
+  // there is stopped); else the page's own running one is reused, or one is started with
+  // method "source" over the view kept (a restart), else the whole range. Null when the
+  // source refuses to sweep: the caller shows its capture instead.
+  async findOrStartSweep(src, sw, jobs) {
+    const mine = new Set(loadIds(UI_JOBS_KEY));
+    const scans = jobs.filter(
+      (j) => j.kind === "scan" && j.source === src.id && isRunning(j) && !this.stopping.has(j.id),
+    );
+    const other = scans.find((j) => !mine.has(j.id));
+    if (other) {
+      for (const j of scans) if (mine.has(j.id)) this.stopOwnJob(j.id);
+      this.mode = "scan";
+      this.tuning = usableTuning(other.tuning);
+      if (this.tuning) this.setBand(this.tuning.center_hz, this.tuning.bandwidth_hz);
+      return other.id;
+    }
+    this.mode = "sweep";
+    const own = scans.find((j) => mine.has(j.id));
+    if (own) {
+      this.tuning = usableTuning(own.tuning);
+      if (this.tuning) this.setBand(this.tuning.center_hz, this.tuning.bandwidth_hz);
+      return own.id;
+    }
+    const want = this.pendingView || this.view || { lo: sw.min_hz, hi: sw.max_hz };
+    const t = sweepTuning(sw, ...clampSweep(sw, want.lo, want.hi));
+    let r;
+    try {
+      r = await this.api.op({
+        op: "job_start",
+        kind: "scan",
+        source: src.id,
+        center_hz: t.center_hz,
+        bandwidth_hz: t.bandwidth_hz,
+        deviation_hz: null,
+        sideband: null,
+        dwell_ms: null,
+        average: null,
+        bits: null,
+        method: "source",
+        bin_hz: sweepBin(sw, t.bandwidth_hz),
+        elastic: false,
+        replace: [],
+      });
+    } catch (e) {
+      this.mode = "spectrum";
+      this.notice(
+        `waterfall: source ${src.id} does not sweep for itself: ${e.json ? errorText(e.json) : e.message}; showing its capture`,
+      );
+      return null;
+    }
+    const id = r.value;
+    storeIds(UI_JOBS_KEY, [...new Set([...loadIds(UI_JOBS_KEY), id])]);
+    this.tuning = t;
+    this.view = null;
+    this.setBand(t.center_hz, t.bandwidth_hz);
+    return id;
+  }
+
+  // ---- sweep mode: re-aiming the page's scan --------------------------------------------
+
+  // Shows lo..hi (clamped to the sweep, clampSweep) at once and re-aims the page's scan there
+  // SWEEP_REAIM_MS after the last such call.
+  aimSweep(lo, hi) {
+    const sw = sweepCaps(this.src);
+    if (!sw) return;
+    [lo, hi] = clampSweep(sw, lo, hi);
+    this.view = { lo, hi };
+    this.viewChanged();
+    this.reaimTarget = { lo, hi };
+    clearTimeout(this.reaimTimer);
+    this.reaimTimer = setTimeout(() => this.reaim(), SWEEP_REAIM_MS);
+  }
+
+  cancelReaim() {
+    clearTimeout(this.reaimTimer);
+    this.reaimTimer = null;
+    this.reaimTarget = null;
+  }
+
+  // One job_retune at a time, for the newest target; answered, the band is the view asked
+  // (the rows of the new view replace the stretched ones as they come). Refused: the view
+  // eases back to the band with `view reverted: <error>`.
+  async reaim() {
+    if (this.reaimBusy) return; // its end sends the newest target
+    const target = this.reaimTarget;
+    const sw = sweepCaps(this.src);
+    this.reaimTarget = null;
+    if (!target || !sw || this.mode !== "sweep" || !this.jobId) return;
+    const t = sweepTuning(sw, target.lo, target.hi);
+    const lo = t.center_hz - t.bandwidth_hz / 2;
+    const hi = t.center_hz + t.bandwidth_hz / 2;
+    const gen = this.gen;
+    if (this.band && this.band.lo === lo && this.band.hi === hi) {
+      this.settleSweepView();
+      return;
+    }
+    this.reaimBusy = true;
+    try {
+      await this.api.op({
+        op: "job_retune",
+        job: this.jobId,
+        center_hz: t.center_hz,
+        bandwidth_hz: t.bandwidth_hz,
+        bin_hz: sweepBin(sw, t.bandwidth_hz),
+        replace: [],
+      });
+      if (gen !== this.gen) return;
+      this.tuning = t;
+      this.band = { lo, hi };
+      this.settleSweepView();
+    } catch (e) {
+      if (gen !== this.gen) return;
+      this.notice(`view reverted: ${e.json ? errorText(e.json) : e.message}`);
+      if (!this.reaimTarget && this.band) this.easeTo(this.band.lo, this.band.hi);
+    } finally {
+      this.reaimBusy = false;
+      if (gen === this.gen && this.reaimTarget) this.reaim();
+    }
+  }
+
+  // With no newer target pending, the view shown is the band (null: the whole of it).
+  settleSweepView() {
+    if (this.reaimTarget) return;
+    this.view = this.keptView(this.view);
+    this.viewChanged();
+  }
+
   async lookupStream(jobId) {
     const streams = await this.api.streams();
     const s = streams.find((x) => x.kind === "event" && x.provenance && x.provenance.job === jobId);
@@ -795,7 +1018,7 @@ class Waterfall {
     const hi = centerHz + spanHz / 2;
     const next = { lo, hi };
     // (No row painted yet: the band was the job's tuning, which the rows' bins correct.)
-    if (this.band && this.mode !== "scan" && this.columns > 0) {
+    if (this.band && this.mode === "spectrum" && this.columns > 0) {
       if (sameBand(this.band, next)) {
         this.staleBand = null;
         return;
@@ -919,10 +1142,11 @@ class Waterfall {
     for (const cb of this.viewCbs) cb(v);
   }
 
+  // (Never in sweep mode: a view past the band there is a re-aim on its way.)
   isOutside() {
     const b = this.band;
     const v = this.view;
-    if (!b || !v) return false;
+    if (!b || !v || this.mode === "sweep") return false;
     const tol = this.slackHz();
     return v.lo < b.lo - tol || v.hi > b.hi + tol;
   }
@@ -1103,10 +1327,14 @@ class Waterfall {
   }
 
   // Shows lo..hi Hz: a re-render inside the capture (a scan: kept inside its span), else a
-  // retune (ruling R2).
+  // retune (ruling R2); in sweep mode the page's scan is re-aimed (aimSweep).
   requestView(lo, hi) {
     if (!this.band || this.retuning || !(hi > lo)) return;
     this.cancelEase();
+    if (this.mode === "sweep") {
+      this.aimSweep(lo, hi);
+      return;
+    }
     const b = this.band;
     const tol = this.slackHz();
     if (lo >= b.lo - tol && hi <= b.hi + tol) {
@@ -1158,6 +1386,18 @@ class Waterfall {
     const f = this.hzForY(this.local(ev).y);
     let lo = f - (f - s.lo) * k;
     let hi = f + (s.hi - f) * k;
+    const sw = this.mode === "sweep" ? sweepCaps(this.src) : null;
+    if (sw) {
+      // Never finer than the sweep's finest view, about the pointer; clamped to the range.
+      const min = sweepMinSpan(sw);
+      if (hi - lo < min) {
+        if (s.hi - s.lo <= min * (1 + 1e-9)) return;
+        lo = f - ((f - s.lo) * min) / (s.hi - s.lo);
+        hi = lo + min;
+      }
+      this.requestView(lo, hi);
+      return;
+    }
     if (hi - lo < MIN_VIEW_HZ) return;
     const fits = hi - lo <= (this.band.hi - this.band.lo) * (1 + 1e-9);
     if (fits && !this.isOutside()) [lo, hi] = this.clampToBand(lo, hi);
@@ -1180,6 +1420,9 @@ class Waterfall {
     const off = ((ev.clientY - p.y0) * (p.from.hi - p.from.lo)) / this.cssHeight();
     if (off === 0) return;
     p.target = [p.from.lo + off, p.from.hi + off];
+    // Sweep mode: the view stops at the edges of the sweep's range.
+    const sw = this.mode === "sweep" ? sweepCaps(this.src) : null;
+    if (sw) p.target = clampSweep(sw, p.target[0], p.target[1]);
     this.view = { lo: p.target[0], hi: p.target[1] };
     this.viewChanged();
   }
@@ -1223,18 +1466,17 @@ class Waterfall {
       const holders = rigidHolders(info);
       const coarseOn = !!this.coarseActive && this.coarseActive();
       if (coarseOn && (holders.length || !this.capturable(info, lo, hi))) {
+        // A held source whose view no scanner can show: said at the gesture, eased back.
+        if (holders.length && this.coarseCan && !(await this.coarseCan(lo, hi))) {
+          await this.heldBack(src, holders, lo, hi);
+          return;
+        }
         // The coarse layer's view (spec 4.3 zoom_out scan): left past the capture.
         coarse = this.src === src;
         return;
       }
       if (holders.length) {
-        this.notice(
-          `conflict: source ${src.id} held by ${holders.join(", ")}; the view stays inside its capture`,
-        );
-        if (this.src === src && this.band) {
-          this.view = prev;
-          this.setView(...this.clampToBand(lo, hi));
-        }
+        await this.heldBack(src, holders, lo, hi);
         return;
       }
       const gen = this.gen;
@@ -1259,6 +1501,27 @@ class Waterfall {
       // The view settled past the capture: tell the listeners (the coarse layer waits for it).
       if (coarse) this.fireView();
     }
+  }
+
+  // A held source the view lo..hi cannot leave its capture for: `conflict: source <id> held
+  // by <kind> <id>, …; the view stays at its capture` (a pin named `pin`; the kinds from a
+  // fresh job_list, the bare ids when it fails), and the view eases back into the capture.
+  async heldBack(src, holders, lo, hi) {
+    let jobs = [];
+    try {
+      jobs = (await this.api.op({ op: "job_list" })).value || [];
+    } catch {
+      /* the ids alone */
+    }
+    const name = (id) => {
+      if (id === "pin") return "pin";
+      const j = jobs.find((x) => x.id === id);
+      return j ? `${j.kind} ${id}` : id;
+    };
+    this.notice(
+      `conflict: source ${src.id} held by ${holders.map(name).join(", ")}; the view stays at its capture`,
+    );
+    if (this.src === src && this.band) this.easeTo(...this.clampToBand(lo, hi));
   }
 
   // Leaves scan mode for lo..hi (coarse.js, ruling R23: the page's own scan on the shown
@@ -1328,8 +1591,9 @@ class Waterfall {
     if (!bandRow(row, msg.payload, this.tuning)) return;
     // A spectrum row is the capture; a scan row is one step of the span (the job's tuning),
     // the band widened to the union of the steps (one may reach past the tuning).
-    if (this.mode !== "scan" || !this.band) this.setBand((row.lo + row.hi) / 2, row.hi - row.lo);
-    else this.widenBand(row);
+    // In sweep mode the band is the view asked (each row keeps its own, maybe wider, band).
+    if (this.mode === "spectrum" || !this.band) this.setBand((row.lo + row.hi) / 2, row.hi - row.lo);
+    else if (this.mode === "scan") this.widenBand(row);
     this.paintColumn(row);
     this.lastRowFormat = row.q ? "q" : "db";
     this.painted += 1;
@@ -1358,7 +1622,7 @@ class Waterfall {
   // A frame of the coarse layer's scan: stitched into the coarse column over its step's band
   // (as scan mode stitches its rows) and kept for redraws; the next fine column shows it.
   addCoarseEvent(msg) {
-    if (this.mode === "scan" || !this.shown() || !this.coarseColumn) return;
+    if (this.mode !== "spectrum" || !this.shown() || !this.coarseColumn) return;
     const row = decodeRow(msg.payload);
     if (!row || !bandRow(row, msg.payload, null)) return;
     this.coarseRows.push({ row, col: this.columns });
@@ -1429,7 +1693,7 @@ class Waterfall {
   // Writes the fine `row` into this.column: in scan mode over the previous column (only the
   // row's band changes), else over the coarse column (see Layers).
   composeColumn(row) {
-    if (this.mode !== "scan") this.column.data.set(this.coarseColumn.data);
+    if (this.mode === "spectrum") this.column.data.set(this.coarseColumn.data);
     this.fillColumn(row, false);
   }
 
@@ -1441,7 +1705,7 @@ class Waterfall {
     this.composeColumn(row);
     if (w > cw) this.ctx.drawImage(this.canvas, cw, 0, w - cw, h, 0, 0, w - cw, h);
     this.ctx.putImageData(this.column, w - cw, 0);
-    if (this.mode !== "scan" && this.coarseRows.length) this.coarsePainted += 1;
+    if (this.mode === "spectrum" && this.coarseRows.length) this.coarsePainted += 1;
   }
 
   // Writes `row` (bins spread over row.lo..row.hi Hz) into `buf` (this.column by default)
@@ -1544,7 +1808,7 @@ class Waterfall {
     const n = Math.min(stored, Math.ceil(w / cw));
     const coarse = this.coarseRows;
     let ci = 0; // the next coarse row to stitch
-    if (this.mode === "scan") {
+    if (this.mode !== "spectrum") {
       const oldest = this.columns - n; // the oldest column shown
       const rowAt = (c) => this.rows[c % RING_COLUMNS];
       const from = stepsBack(rowAt, oldest, 2 * this.sweepRows(), this.columns - stored);
@@ -1572,7 +1836,7 @@ class Waterfall {
       this.ctx.putImageData(this.column, w - (k + 1) * cw, 0);
     }
     // Coarse rows newer than the newest column: in the coarse column for the next one.
-    if (this.mode !== "scan") {
+    if (this.mode === "spectrum") {
       for (; ci < coarse.length; ci++) this.fillColumn(coarse[ci].row, false, this.coarseColumn);
     }
   }

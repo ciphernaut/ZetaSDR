@@ -80,7 +80,10 @@ impl Default for FakeScript {
 /// frames of the view before it; with `lag_frames` over 0 the first frame
 /// naming a new view still carries the old view's pixels, as a down-converter
 /// that has not flushed would. Pixels 0-1 are 55 and the rest
-/// `100 + (x_bin / 4096) % 100`.
+/// `100 + (x_bin / 4096) % 100`, unless `carriers` lists some: then the rest is a floor
+/// near -110 dB with a little ripple, and each carrier is drawn at the pixels its band
+/// covers in the view painted (at least the one pixel its centre falls in), so a picture
+/// of the frames shows where the view is.
 #[derive(Clone, Debug)]
 pub struct FakeWf {
     /// One reply per `W/F` connection, in order; the last one repeats.
@@ -95,6 +98,18 @@ pub struct FakeWf {
     pub compressed: bool,
     /// Frames always name zoom 0 at 0 Hz, whatever is asked.
     pub ignore_view: bool,
+    /// Carriers drawn by frequency in every frame (none: the flat `x_bin` paint).
+    pub carriers: Vec<FakeCarrier>,
+}
+
+/// A carrier the fake's waterfall draws where it sits in the view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FakeCarrier {
+    pub hz: u64,
+    /// The band drawn, centred on `hz`, Hz.
+    pub width_hz: u64,
+    /// Its level, dB (the byte is `dB + 255`).
+    pub db: i16,
 }
 
 impl Default for FakeWf {
@@ -108,6 +123,7 @@ impl Default for FakeWf {
             frames_per_connection: None,
             compressed: false,
             ignore_view: false,
+            carriers: Vec::new(),
         }
     }
 }
@@ -423,6 +439,41 @@ fn painted(x_bin: u32) -> u8 {
     (100 + (x_bin / 4096) % 100) as u8
 }
 
+/// The floor the carriers are drawn over: about -110 dB, rippling by frame and pixel.
+const CARRIER_FLOOR_DB: i16 = -110;
+
+/// The pixels of the view `(zoom, x_bin)` with `carriers` drawn where their bands fall
+/// (a carrier narrower than a pixel takes the pixel its centre is in), frame `seq`'s ripple
+/// on the floor; pixels 0-1 left for the caller.
+fn carrier_pixels(view: (u8, u32), carriers: &[FakeCarrier], seq: u32) -> Vec<u8> {
+    let (zoom, x_bin) = view;
+    let units = (WF_PIXELS as f64) * f64::from(1u32 << FAKE_ZOOM_MAX);
+    let start = f64::from(x_bin) * FAKE_WF_BANDWIDTH_HZ as f64 / units;
+    let pixel = (FAKE_WF_BANDWIDTH_HZ >> zoom) as f64 / WF_PIXELS as f64;
+    let byte = |db: i16| (db + 255).clamp(0, 255) as u8;
+    let mut px: Vec<u8> = (0..WF_PIXELS)
+        .map(|i| {
+            let ripple = ((i as u32)
+                .wrapping_mul(7)
+                .wrapping_add(seq.wrapping_mul(13)))
+                % 7;
+            byte(CARRIER_FLOOR_DB + ripple as i16 - 3)
+        })
+        .collect();
+    for c in carriers {
+        let lo = c.hz as f64 - c.width_hz as f64 / 2.0;
+        let hi = c.hz as f64 + c.width_hz as f64 / 2.0;
+        let centre = ((c.hz as f64 - start) / pixel).floor();
+        let first = ((lo - start) / pixel).floor().min(centre);
+        let last = ((hi - start) / pixel).ceil().max(centre + 1.0);
+        let n = WF_PIXELS as f64;
+        let (first, last) = (first.clamp(0.0, n), last.clamp(0.0, n));
+        let lit = (first as usize)..(last.max(first) as usize);
+        px[lit].fill(byte(c.db));
+    }
+    px
+}
+
 async fn waterfall(
     mut tx: Tx,
     reader: JoinHandle<()>,
@@ -508,7 +559,11 @@ wf_chans={c} wf_chans_real={c} wf_cal={cal} wf_setup",
                 }
             }
         };
-        let mut pixels = vec![painted(paint.1); WF_PIXELS];
+        let mut pixels = if wf.carriers.is_empty() {
+            vec![painted(paint.1); WF_PIXELS]
+        } else {
+            carrier_pixels(paint, &wf.carriers, seq)
+        };
         pixels[..2].fill(55);
         let frame = encode_wf(header.1, header.0, flags, seq, &pixels);
         if tx.send(Message::Binary(frame.into())).await.is_err() {
@@ -531,5 +586,36 @@ mod tests {
         let max = (1024 << 14) - (1024 << 11);
         assert_eq!(wf_view("SET zoom=3 cf=29999.000"), Some((3, max)));
         assert_eq!(wf_view("SET maxdb=0 mindb=-100"), None);
+    }
+
+    #[test]
+    fn carriers_are_drawn_where_they_sit_in_the_view() {
+        let carrier = FakeCarrier {
+            hz: 7_510_000,
+            width_hz: 3_000,
+            db: -40,
+        };
+        let high = (-40i16 + 255) as u8;
+        let x_bin_of = |hz: u64| (hz * (1024 << 14) / FAKE_WF_BANDWIDTH_HZ) as u32;
+        // Zoom 0, the whole band: 29 296.875 Hz a pixel, 7.51 MHz in pixel 256.
+        let px = carrier_pixels((0, 0), &[carrier], 0);
+        let lit: Vec<usize> = (0..WF_PIXELS).filter(|i| px[*i] == high).collect();
+        assert_eq!(lit, vec![256]);
+        // Zoom 2 from 7.5 MHz: about 7.3 kHz a pixel, 10 kHz up is pixel 1.
+        let px = carrier_pixels((2, x_bin_of(7_500_000)), &[carrier], 0);
+        let lit: Vec<usize> = (0..WF_PIXELS).filter(|i| px[*i] == high).collect();
+        assert_eq!(lit, vec![1]);
+        // Zoom 10 centred on it: some 105 pixels of a 28.6 Hz grid.
+        let start = 7_510_000 - (FAKE_WF_BANDWIDTH_HZ >> 10) / 2;
+        let px = carrier_pixels((10, x_bin_of(start)), &[carrier], 0);
+        let lit = (0..WF_PIXELS).filter(|i| px[*i] == high).count();
+        assert!((100..=110).contains(&lit), "{lit}");
+        assert_eq!(px[512], high);
+        // A carrier out of the view draws nothing.
+        assert!(
+            carrier_pixels((10, 0), &[carrier], 0)
+                .iter()
+                .all(|p| *p < 150)
+        );
     }
 }

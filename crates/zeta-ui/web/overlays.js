@@ -70,7 +70,7 @@
 //                            another job's output, not a time-shared `scan`) and the source's
 //                            `pin` (key "pin", text "pin"; plan 12 spec 4.1), and unoutlines
 //                            the rest; with none the capture itself (wf.band, key
-//                            "capture", text "capture"; not in scan mode) is outlined,
+//                            "capture", text "capture"; not in scan or sweep mode) is outlined,
 //                            following the band as it changes. Then the job-row counters
 //                            of every running job on the selected source (`spectrum` jobs
 //                            skipped: their events are the waterfall's) are refreshed, a
@@ -793,10 +793,11 @@ class Overlays {
     });
   }
 
-  // The capture's outline follows wf.band while no rigid holder is outlined.
+  // The capture's outline follows wf.band while no rigid holder is outlined (a spectrum
+  // job's capture only: a scan's or a sweep's band is the view, not a capture).
   outlineCapture() {
     const b = this.wf.band;
-    if (this.captureOutlined && b && this.wf.mode !== "scan") {
+    if (this.captureOutlined && b && this.wf.mode === "spectrum") {
       const o = this.outlines.get(CAPTURE_KEY);
       if (!o || o.lo !== b.lo || o.hi !== b.hi) this.outline(b.lo, b.hi, "capture", CAPTURE_KEY);
     } else {
