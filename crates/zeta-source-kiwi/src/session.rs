@@ -91,7 +91,7 @@ pub(crate) enum Event {
     MsgError,
 }
 
-fn badp_meaning(n: u8) -> &'static str {
+pub(crate) fn badp_meaning(n: u8) -> &'static str {
     match n {
         1 => "bad password or all channels busy that don't require a password",
         2 => "still determining local interface address, try again in a few moments",
@@ -305,7 +305,7 @@ fn now_ns() -> u64 {
 
 /// The `<ts>` path element: unix seconds plus the pid, as the reference
 /// keeps it unique per client.
-fn path_ts() -> u32 {
+pub(crate) fn path_ts() -> u32 {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -351,13 +351,13 @@ pub(crate) async fn run(
     }
 }
 
-type Sink = futures_util::stream::SplitSink<
+pub(crate) type Sink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Message,
 >;
 
 /// Send a close frame (bounded wait), freeing the Kiwi's slot.
-async fn close(mut sink: Sink) {
+pub(crate) async fn close(mut sink: Sink) {
     let _ = timeout(Duration::from_secs(1), sink.close()).await;
 }
 

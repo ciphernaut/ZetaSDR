@@ -5,14 +5,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
-use zeta_core::types::{Capabilities, Claim, Hz, SampleFormat, SourceId, SourcePosition};
+use zeta_core::port::{
+    IqBlock, IqReceiver, Port, PortError, SWEEP_ROWS_CAPACITY, SweepRequest, SweepRow, SweepRows,
+    SweepState, Tuning,
+};
+use zeta_core::types::{
+    Capabilities, Claim, Hz, SampleFormat, SourceId, SourcePosition, SweepCaps,
+};
 
 use crate::session::{self, Ctx, Status};
 use crate::status::KIWI_STATUS_PATH;
+use crate::wf::{self, WF_END_WAIT_MS, WF_FPS, WF_SETTLE_FRAMES, WF_ZOOM_MAX};
 
 /// Highest centre frequency a KiwiSDR tunes, in Hz.
 const TUNE_MAX_HZ: u64 = 30_000_000;
@@ -42,6 +48,10 @@ pub struct KiwiConfig {
     /// filter's ring-down) cannot be told from the new band's. Default
     /// [`TUNE_SETTLE_MS`].
     pub tune_settle_ms: u64,
+    /// Frames of a sweep's new view dropped after the first one whose header
+    /// names it (the server's down-converter may still hold the old view's
+    /// samples). Default [`WF_SETTLE_FRAMES`].
+    pub wf_settle_frames: u32,
     /// The receiver's status page, read once per connection for its position
     /// (bounded by `handshake_timeout_ms`); `None` reads nothing.
     pub status_url: Option<String>,
@@ -72,6 +82,7 @@ impl KiwiConfig {
             read_timeout_ms: 10_000,
             handshake_timeout_ms: 10_000,
             tune_settle_ms: TUNE_SETTLE_MS,
+            wf_settle_frames: WF_SETTLE_FRAMES,
         })
     }
 }
@@ -92,6 +103,7 @@ impl fmt::Debug for KiwiConfig {
             .field("read_timeout_ms", &self.read_timeout_ms)
             .field("handshake_timeout_ms", &self.handshake_timeout_ms)
             .field("tune_settle_ms", &self.tune_settle_ms)
+            .field("wf_settle_frames", &self.wf_settle_frames)
             .field("status_url", &self.status_url)
             .finish()
     }
@@ -117,6 +129,42 @@ impl Drop for Session {
     }
 }
 
+/// A sweep's task (`wf::run`); dropping it cancels the task, which closes the
+/// `W/F` socket.
+struct LiveSweep {
+    /// The task's rows: the reader still holds them while the task runs and the
+    /// receiver is open.
+    rows: mpsc::WeakSender<SweepRow>,
+    cancel: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl LiveSweep {
+    /// Whether the sweep still runs for a reader: its task not done with its
+    /// rows, and their receiver not dropped.
+    fn held(&self) -> bool {
+        self.rows.upgrade().is_some_and(|tx| !tx.is_closed())
+    }
+
+    /// Cancel the task and wait for it to close its socket, bounded by
+    /// [`WF_END_WAIT_MS`]; past that it is aborted, which drops the socket.
+    /// Awaited in place: a caller dropped meanwhile leaves the handle where the
+    /// next `sweep` finds it and waits again.
+    async fn end(&mut self) {
+        self.cancel.cancel();
+        let wait = Duration::from_millis(WF_END_WAIT_MS);
+        if tokio::time::timeout(wait, &mut self.task).await.is_err() {
+            self.task.abort();
+        }
+    }
+}
+
+impl Drop for LiveSweep {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 /// A KiwiSDR receiver channel as a push [`Port`]. Nothing touches the network
 /// until the first `tune`; dropping the source closes its session.
 ///
@@ -126,6 +174,9 @@ impl Drop for Session {
 /// receivers taken before a fault (the node's ring feeder) resume after a
 /// retune; a session's end is reported through [`Port::fault`], never by
 /// closing the stream.
+///
+/// A sweep ([`Port::sweep`]) runs on a `W/F` socket of its own beside the IQ
+/// session, one at a time, and touches nothing of it (`wf`'s module doc).
 pub struct KiwiSource {
     id: SourceId,
     caps: Capabilities,
@@ -135,6 +186,8 @@ pub struct KiwiSource {
     session: Mutex<Option<Session>>,
     /// Serialises `tune`, which waits on the network.
     gate: tokio::sync::Mutex<()>,
+    /// The sweep, one at a time; the lock serialises `sweep` and never `tune`.
+    sweep: tokio::sync::Mutex<Option<LiveSweep>>,
 }
 
 impl KiwiSource {
@@ -151,7 +204,16 @@ impl KiwiSource {
             push: true,
             usable_fraction: Claim::Asserted(1.0),
             depths: vec![],
-            sweep: None,
+            // Asserted: the status page names no waterfall channels, so a
+            // refused `sweep` is what corrects a wrong hope. The finest pixel is
+            // zoom 10's, 30 MHz / 2^10 / 1024.
+            sweep: Some(SweepCaps {
+                min_hz: Hz(0),
+                max_hz: Hz(TUNE_MAX_HZ),
+                bin_hz_min: Hz((TUNE_MAX_HZ >> WF_ZOOM_MAX).div_ceil(1024)),
+                rows_per_s_max: WF_FPS,
+                calibrated: true,
+            }),
         };
         Self {
             id,
@@ -161,6 +223,7 @@ impl KiwiSource {
             status: Arc::new(Mutex::new(Status::default())),
             session: Mutex::new(None),
             gate: tokio::sync::Mutex::new(()),
+            sweep: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -227,6 +290,8 @@ impl Drop for KiwiSource {
     fn drop(&mut self) {
         // Dropping the session cancels it; it sends a close frame and exits.
         self.session.lock().unwrap().take();
+        // So does the sweep's task.
+        self.sweep.get_mut().take();
     }
 }
 
@@ -346,5 +411,72 @@ impl Port for KiwiSource {
     /// The last successful status page read; `None` before the first.
     fn position(&self) -> Option<SourcePosition> {
         self.status.lock().unwrap().position
+    }
+
+    /// Opens a `W/F` socket of its own (never paired with the IQ session's) and
+    /// answers once its setup has arrived: the plan, from the Kiwi's own
+    /// `bandwidth`. A span outside 0-30 MHz (or the Kiwi's band) is
+    /// `OutOfRange`; while another sweep's rows are held it is refused (one
+    /// waterfall connection), but a sweep whose rows were dropped is ended first
+    /// (its close awaited) and does not refuse this one. The Kiwi's refusals
+    /// (`too_busy`, no waterfall channels, `badp`, `down`, a locked Kiwi, a
+    /// close before the setup, a frequency offset) are `Unsupported` with the
+    /// reason, transport failures `Io`; none touches the IQ session or
+    /// [`Port::fault`]. The connect and handshake are bounded by
+    /// `handshake_timeout_ms`, at most `wf::WF_HANDSHAKE_MAX_MS`.
+    async fn sweep(&self, req: SweepRequest) -> Result<SweepRows, PortError> {
+        wf::span_within(req.span, TUNE_MAX_HZ)?;
+        let mut live = self.sweep.lock().await;
+        if live.as_ref().is_some_and(LiveSweep::held) {
+            return Err(PortError::Unsupported(
+                "a sweep is already running on this Kiwi (one waterfall connection)".into(),
+            ));
+        }
+        // Never two sockets: the last sweep's (its rows dropped, or ended) is
+        // closed before this one connects.
+        if let Some(old) = live.as_mut() {
+            old.end().await;
+        }
+        *live = None;
+        let (rows_tx, rows) = mpsc::channel(SWEEP_ROWS_CAPACITY);
+        let (state_tx, state) = watch::channel(SweepState::Running);
+        let (ready_tx, ready) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        let weak = rows_tx.downgrade();
+        let ctx = wf::Ctx {
+            cfg: self.cfg.clone(),
+            cancel: cancel.clone(),
+            rows: rows_tx,
+            state: state_tx,
+        };
+        let task = tokio::spawn(wf::run(ctx, req, ready_tx));
+        *live = Some(LiveSweep {
+            rows: weak,
+            cancel,
+            task,
+        });
+        // The task answers within its handshake bound; this is a backstop.
+        let ms = wf::handshake_ms(&self.cfg);
+        let wait = Duration::from_millis(ms + 500);
+        let answer = match tokio::time::timeout(wait, ready).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(self.io("waterfall session ended before its setup")),
+            Err(_) => Err(self.io(&format!("no wf_setup within {ms} ms"))),
+        };
+        match answer {
+            Ok(plan) => Ok(SweepRows {
+                plan: plan.sweep_plan(),
+                rows,
+                state,
+            }),
+            Err(e) => {
+                // The task ends by itself (its rows dropped here); its close is
+                // awaited by the next sweep.
+                if let Some(l) = live.as_ref() {
+                    l.cancel.cancel();
+                }
+                Err(e)
+            }
+        }
     }
 }

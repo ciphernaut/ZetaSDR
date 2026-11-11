@@ -7,11 +7,13 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult};
-use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
+use zeta_core::port::{
+    IqBlock, IqReceiver, Port, PortError, SweepRequest, SweepRow, SweepRows, SweepState, Tuning,
+};
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::stream::Payload;
 use zeta_core::types::{Hz, PositionFrom, SourceId, SourcePosition, StreamKind};
-use zeta_source_kiwi::testing::{FakeKiwi, FakeReply, FakeScript};
+use zeta_source_kiwi::testing::{FakeKiwi, FakeReply, FakeScript, FakeWf};
 use zeta_source_kiwi::{KiwiConfig, KiwiSource};
 
 const PASSWORD: &str = "hunter2";
@@ -46,6 +48,7 @@ async fn fake(on_auth: Vec<FakeReply>, frames: Option<usize>) -> FakeKiwi {
         frames_per_connection: frames,
         frame_interval_ms: 5,
         listen_after_drop: true,
+        wf: FakeWf::default(),
     })
     .await
 }
@@ -466,6 +469,7 @@ async fn reconnect_exhausted_fails_job_with_reason() {
         frames_per_connection: Some(20),
         frame_interval_ms: 5,
         listen_after_drop: false,
+        wf: FakeWf::default(),
     })
     .await;
     let src = source(&fake, &[10, 10, 10]);
@@ -759,4 +763,563 @@ async fn no_status_and_no_flag_is_no_position() {
     assert_eq!(src.status_errors(), 0);
     let (node, _dir) = node_with(src).await;
     assert_eq!(node.source_position(&SourceId("kiwi0".into())), None);
+}
+
+// ---- The waterfall sweep (plan 36.2): one `W/F` socket of its own. ----
+
+/// The server's start unit on a 30 MHz Kiwi: `bandwidth / (1024 << 14)` Hz.
+const UNITS: f64 = 16_777_216.0 / 30_000_000.0;
+const WF_CAL: i32 = -13;
+
+/// A fake whose `W/F` sockets answer `wf` (its `wf_cal` set to [`WF_CAL`]), its
+/// `SND` ones the live handshake.
+async fn wf_fake(wf: FakeWf) -> FakeKiwi {
+    FakeKiwi::start(FakeScript {
+        on_auth: vec![FakeReply::Ok],
+        frames_per_connection: None,
+        frame_interval_ms: 5,
+        listen_after_drop: true,
+        wf: FakeWf {
+            wf_cal: WF_CAL,
+            ..wf
+        },
+    })
+    .await
+}
+
+fn whole_band() -> SweepRequest {
+    SweepRequest {
+        span: tuning(15_000_000, 30_000_000),
+        bin_hz: Hz(6_000),
+        dwell_ms: 20,
+    }
+}
+
+async fn next_row(rows: &mut SweepRows) -> SweepRow {
+    tokio::time::timeout(Duration::from_secs(3), rows.rows.recv())
+        .await
+        .expect("a row within 3 s")
+        .expect("the rows are open")
+}
+
+/// The dB the fake paints a view starting at `x_bin` with, `wf_cal` added.
+fn painted(x_bin: u32) -> f32 {
+    (100 + (x_bin / 4096) % 100) as f32 - 255.0 + WF_CAL as f32
+}
+
+/// The server's `x_bin` of the view a row of `view_hz` is centred in.
+fn x_bin_of(row: &SweepRow, view_hz: u64) -> u32 {
+    ((row.center_hz.0 - view_hz / 2) as f64 * UNITS).round() as u32
+}
+
+/// The timestamps of the paths ending `suffix`.
+fn path_ts_of(paths: &[String], suffix: &str) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(|p| p.strip_prefix('/')?.strip_suffix(suffix))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The sweep's state once `f` holds (or the last one seen after `ms`).
+async fn wait_state(rows: &SweepRows, ms: u64, f: impl Fn(&SweepState) -> bool) -> SweepState {
+    let mut seen = rows.state.borrow().clone();
+    wait_until(ms, || {
+        seen = rows.state.borrow().clone();
+        f(&seen)
+    })
+    .await;
+    seen
+}
+
+#[tokio::test]
+async fn the_wf_socket_never_uses_the_snd_timestamp() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    let _rx = src.subscribe();
+    src.tune(tuning(7_100_000, 10_000)).await.unwrap();
+    let _rows = src.sweep(whole_band()).await.unwrap();
+    let paths = fake.paths();
+    let snd = path_ts_of(&paths, "/SND");
+    let wf = path_ts_of(&paths, "/W/F");
+    assert_eq!((snd.len(), wf.len()), (1, 1), "{paths:?}");
+    assert_ne!(snd[0], wf[0], "{paths:?}");
+    for ts in [&snd[0], &wf[0]] {
+        assert!(ts.parse::<u32>().is_ok(), "{paths:?}");
+    }
+}
+
+#[tokio::test]
+async fn sweep_sends_the_exact_commands_in_order() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    let _rows = src.sweep(whole_band()).await.unwrap();
+    let want = [
+        "SET auth t=kiwi p=",
+        "SET ident_user=zetasdr",
+        "SET wf_comp=0",
+        "SET maxdb=0 mindb=-100",
+        "SET interp=10",
+        "SET wf_speed=4",
+        "SET zoom=3 cf=1875.000",
+    ];
+    assert!(wait_until(2_000, || not_keepalive(fake.commands()).len() >= want.len()).await);
+    assert_eq!(not_keepalive(fake.commands())[..want.len()], want);
+}
+
+#[tokio::test]
+async fn a_whole_band_sweep_is_eight_rows_of_1024_calibrated_bins() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    let caps = src.capabilities().sweep.clone().expect("a Kiwi sweeps");
+    assert_eq!(
+        (caps.min_hz, caps.max_hz, caps.bin_hz_min),
+        (Hz(0), Hz(30_000_000), Hz(29))
+    );
+    assert!(caps.calibrated && caps.rows_per_s_max == 23);
+    let mut rows = src.sweep(whole_band()).await.unwrap();
+    assert_eq!(rows.plan.steps, 8);
+    assert_eq!(rows.plan.step_hz, Hz(3_750_000));
+    assert_eq!(rows.plan.size, 1024);
+    assert!((rows.plan.bin_hz - 3662.1).abs() < 0.1);
+    assert_eq!(rows.plan.shift_hz, Hz(29_296));
+    let shift = rows.plan.shift_hz.0;
+    for sweep in 0..2u64 {
+        for step in 0..8u32 {
+            let row = next_row(&mut rows).await;
+            assert_eq!((row.sweep, row.step), (sweep, step));
+            assert_eq!(row.db.len(), 1024);
+            assert_eq!(row.masked, vec![[0, 2]]);
+            assert!(row.span.start_ns.0 > 0);
+            assert!(row.span.start_ns.0 <= row.span.end_ns.0);
+            let even = 1_875_000 + u64::from(step) * 3_750_000;
+            // Eight pixels lower, but for the view at 0 Hz.
+            let want = if sweep == 1 && step > 0 {
+                even - shift
+            } else {
+                even
+            };
+            assert!(
+                row.center_hz.0.abs_diff(want) <= 2,
+                "sweep {sweep} step {step}: centre {} not {want}",
+                row.center_hz.0
+            );
+            let x = x_bin_of(&row, 3_750_000);
+            assert!(
+                (row.db[5] - painted(x)).abs() < 1e-3,
+                "{} {}",
+                row.db[5],
+                painted(x)
+            );
+        }
+    }
+    assert_eq!(src.fault(), None);
+}
+
+#[tokio::test]
+async fn frames_of_another_view_and_the_settle_frame_are_dropped() {
+    // Three frames of the old view after each change, then one of the new view
+    // still holding the old view's pixels.
+    let fake = wf_fake(FakeWf {
+        lag_frames: 3,
+        ..FakeWf::default()
+    })
+    .await;
+    let src = source(&fake, &[10]);
+    let mut rows = src.sweep(whole_band()).await.unwrap();
+    for _ in 0..24 {
+        let row = next_row(&mut rows).await;
+        let even = 1_875_000 + u64::from(row.step) * 3_750_000;
+        let shifted = row.sweep % 2 == 1 && row.step > 0;
+        let want = if shifted { even - 29_296 } else { even };
+        assert!(row.center_hz.0.abs_diff(want) <= 2, "{row:?}");
+        let x = x_bin_of(&row, 3_750_000);
+        assert!(
+            (row.db[5] - painted(x)).abs() < 1e-3,
+            "sweep {} step {}: {} is another view's, not {}",
+            row.sweep,
+            row.step,
+            row.db[5],
+            painted(x)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sweep_runs_beside_the_iq_session_and_neither_ends_the_other() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    let mut rx = src.subscribe();
+    src.tune(tuning(7_100_000, 10_000)).await.unwrap();
+    next_block(&mut rx).await;
+
+    let mut rows = src.sweep(whole_band()).await.unwrap();
+    next_row(&mut rows).await;
+    next_block(&mut rx).await;
+    next_row(&mut rows).await;
+
+    // Dropping the rows closes the W/F socket, and only it.
+    drop(rows);
+    assert!(wait_until(2_000, || fake.clean_closes() == 1).await);
+    for _ in 0..5 {
+        next_block(&mut rx).await;
+    }
+    assert_eq!(src.fault(), None);
+    assert_eq!(path_ts_of(&fake.paths(), "/SND").len(), 1);
+
+    // Dropping every IQ receiver ends the SND session; the sweep carries on.
+    let mut rows = src.sweep(whole_band()).await.unwrap();
+    next_row(&mut rows).await;
+    drop(rx);
+    assert!(wait_until(2_000, || fake.clean_closes() == 2).await);
+    let queued = rows.rows.len();
+    for _ in 0..queued + 10 {
+        next_row(&mut rows).await;
+    }
+    assert_eq!(*rows.state.borrow(), SweepState::Running);
+    assert_eq!(fake.wf_connections(), 2);
+    assert_eq!(path_ts_of(&fake.paths(), "/SND").len(), 1);
+}
+
+#[tokio::test]
+async fn no_waterfall_channel_refuses_the_sweep_with_the_reason() {
+    for (wf, want) in [
+        (
+            FakeWf {
+                on_auth: vec![FakeReply::TooBusy(4)],
+                ..FakeWf::default()
+            },
+            "no waterfall channel free (too_busy: 4 channels)",
+        ),
+        (
+            FakeWf {
+                wf_chans: 0,
+                ..FakeWf::default()
+            },
+            "this Kiwi is configured without waterfall channels",
+        ),
+        (
+            FakeWf {
+                on_auth: vec![FakeReply::BadPassword(5)],
+                ..FakeWf::default()
+            },
+            "badp=5: no multiple connections from the same ip address",
+        ),
+        (
+            FakeWf {
+                on_auth: vec![FakeReply::Close],
+                ..FakeWf::default()
+            },
+            "closed the waterfall socket before its setup",
+        ),
+    ] {
+        let fake = wf_fake(wf).await;
+        let src = source(&fake, &[10]);
+        let mut rx = src.subscribe();
+        src.tune(tuning(7_100_000, 10_000)).await.unwrap();
+        let Err(e) = src.sweep(whole_band()).await else {
+            panic!("expected a refusal: {want}");
+        };
+        assert!(
+            matches!(&e, PortError::Unsupported(m) if m.contains(want)),
+            "{want}: {e:?}"
+        );
+        assert_eq!(src.fault(), None, "{want}");
+        next_block(&mut rx).await;
+        assert_eq!(fake.wf_connections(), 1, "{want}: no retry");
+    }
+}
+
+#[tokio::test]
+async fn a_second_sweep_is_refused_while_one_runs() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    let mut first = src.sweep(whole_band()).await.unwrap();
+    next_row(&mut first).await;
+    assert_eq!(
+        src.sweep(whole_band()).await.unwrap_err(),
+        PortError::Unsupported(
+            "a sweep is already running on this Kiwi (one waterfall connection)".into()
+        )
+    );
+    assert_eq!(fake.wf_connections(), 1);
+    next_row(&mut first).await;
+    drop(first);
+    assert!(wait_until(2_000, || fake.clean_closes() == 1).await);
+    let mut again = src.sweep(whole_band()).await.unwrap();
+    next_row(&mut again).await;
+    assert_eq!(fake.wf_connections(), 2);
+}
+
+/// Ruling K13: a restart drops its sweep and asks again at once.
+#[tokio::test]
+async fn a_sweep_started_right_after_one_is_dropped_is_granted() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    let mut first = src.sweep(whole_band()).await.unwrap();
+    next_row(&mut first).await;
+    drop(first);
+    let mut second = src.sweep(whole_band()).await.unwrap();
+    next_row(&mut second).await;
+    assert_eq!(fake.wf_connections(), 2);
+    assert!(
+        wait_until(2_000, || fake.clean_closes() == 1).await,
+        "the first socket closed cleanly"
+    );
+    next_row(&mut second).await;
+}
+
+/// Ruling K14: a transverter Kiwi's rows would be painted at the wrong frequencies.
+#[tokio::test]
+async fn a_kiwi_with_a_frequency_offset_refuses_the_sweep() {
+    let fake = wf_fake(FakeWf {
+        freq_offset_khz: 116_000.0,
+        ..FakeWf::default()
+    })
+    .await;
+    let src = source(&fake, &[10]);
+    assert_eq!(
+        src.sweep(whole_band()).await.unwrap_err(),
+        PortError::Unsupported("kiwi freq_offset 116000 kHz not supported".into())
+    );
+    assert_eq!(src.fault(), None);
+}
+
+#[tokio::test]
+async fn a_lost_wf_socket_says_waiting_then_resumes() {
+    let fake = wf_fake(FakeWf {
+        frames_per_connection: Some(40),
+        ..FakeWf::default()
+    })
+    .await;
+    // A long delay, so the test sees `Waiting` before the reconnect.
+    let src = source(&fake, &[400, 400, 400, 400]);
+    let mut rows = src.sweep(whole_band()).await.unwrap();
+    next_row(&mut rows).await;
+    let state = wait_state(&rows, 5_000, |s| matches!(s, SweepState::Waiting(_))).await;
+    assert!(
+        matches!(&state, SweepState::Waiting(why) if why.starts_with("connection lost (")),
+        "{state:?}"
+    );
+    let state = wait_state(&rows, 5_000, |s| *s == SweepState::Running).await;
+    assert_eq!(state, SweepState::Running);
+    // Drain what the first connection left, then read the next one's.
+    while rows.rows.try_recv().is_ok() {}
+    next_row(&mut rows).await;
+    assert!(fake.wf_connections() >= 2, "{}", fake.wf_connections());
+    assert_eq!(src.fault(), None);
+}
+
+#[tokio::test]
+async fn reconnects_spent_end_the_sweep_with_the_reason() {
+    let fake = wf_fake(FakeWf {
+        frames_per_connection: Some(40),
+        ..FakeWf::default()
+    })
+    .await;
+    let src = source(&fake, &[]);
+    let mut rows = src.sweep(whole_band()).await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        while rows.rows.recv().await.is_some() {}
+    })
+    .await;
+    assert!(closed.is_ok(), "the rows close");
+    let state = rows.state.borrow().clone();
+    assert!(
+        matches!(&state, SweepState::Ended(why)
+            if why.contains("connection lost") && why.contains("0 reconnect attempts failed")),
+        "{state:?}"
+    );
+    assert_eq!(fake.wf_connections(), 1);
+    assert_eq!(src.fault(), None);
+}
+
+/// Review focus 1: frames that never show the asked view skip each step, and a
+/// whole sweep of skips is a lost connection.
+#[tokio::test]
+async fn a_view_that_never_arrives_is_skipped_not_hung() {
+    let fake = wf_fake(FakeWf {
+        ignore_view: true,
+        ..FakeWf::default()
+    })
+    .await;
+    let src = source(&fake, &[2_000]);
+    let req = SweepRequest {
+        span: tuning(7_100_000, 300_000),
+        bin_hz: Hz(5_000),
+        dwell_ms: 20,
+    };
+    let mut rows = src.sweep(req).await.unwrap();
+    assert_eq!(rows.plan.steps, 1);
+    let state = wait_state(&rows, 5_000, |s| matches!(s, SweepState::Waiting(_))).await;
+    assert!(
+        matches!(&state, SweepState::Waiting(why) if why.contains("asked view")),
+        "{state:?}"
+    );
+    assert!(rows.rows.try_recv().is_err(), "no row");
+}
+
+#[tokio::test]
+async fn compressed_frames_are_never_rows() {
+    let fake = wf_fake(FakeWf {
+        compressed: true,
+        ..FakeWf::default()
+    })
+    .await;
+    let src = source(&fake, &[2_000]);
+    let mut rows = src.sweep(whole_band()).await.unwrap();
+    let state = wait_state(&rows, 5_000, |s| matches!(s, SweepState::Waiting(_))).await;
+    assert!(
+        matches!(&state, SweepState::Waiting(why) if why.contains("compressed")),
+        "{state:?}"
+    );
+    assert!(rows.rows.try_recv().is_err(), "no row");
+}
+
+#[tokio::test]
+async fn a_span_outside_the_band_is_out_of_range_and_connects_nothing() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    for span in [
+        tuning(29_900_000, 400_000),
+        tuning(100_000, 400_000),
+        tuning(15_000_000, 0),
+    ] {
+        let req = SweepRequest {
+            span,
+            ..whole_band()
+        };
+        let r = src.sweep(req).await;
+        assert!(
+            matches!(r, Err(PortError::OutOfRange { .. })),
+            "{span:?}: {r:?}"
+        );
+    }
+    assert_eq!(fake.wf_connections(), 0);
+}
+
+/// Carried requirement 1: the W/F handshake answers within its own bound, under
+/// the node's 5 s, and a `sweep` call dropped mid-handshake closes its socket.
+#[tokio::test]
+async fn a_handshake_that_never_completes_is_refused_within_the_bound() {
+    let fake = wf_fake(FakeWf {
+        on_auth: vec![FakeReply::NoAudioRate],
+        ..FakeWf::default()
+    })
+    .await;
+    let mut cfg = config(&fake, &[10]);
+    cfg.handshake_timeout_ms = 60_000;
+    let src = Arc::new(KiwiSource::new(SourceId("kiwi0".into()), cfg));
+    let t = std::time::Instant::now();
+    let r = tokio::time::timeout(Duration::from_secs(5), src.sweep(whole_band()))
+        .await
+        .expect("sweep answers within 5 s");
+    assert!(
+        matches!(&r, Err(PortError::Io(m)) if m.contains("wf_setup")),
+        "{r:?}"
+    );
+    assert!(
+        t.elapsed() < Duration::from_millis(4_500),
+        "{:?}",
+        t.elapsed()
+    );
+    assert!(wait_until(2_000, || fake.clean_closes() == 1).await);
+
+    // Dropped mid-handshake: the half-open socket is closed.
+    let dropped = tokio::time::timeout(Duration::from_millis(300), src.sweep(whole_band())).await;
+    assert!(dropped.is_err(), "still in its handshake");
+    assert!(wait_until(2_000, || fake.clean_closes() == 2).await);
+    assert_eq!(fake.wf_connections(), 2);
+}
+
+#[tokio::test]
+async fn dropping_the_source_closes_the_wf_socket() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    let mut rows = src.sweep(whole_band()).await.unwrap();
+    next_row(&mut rows).await;
+    drop(src);
+    assert!(wait_until(2_000, || fake.clean_closes() == 1).await);
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        while rows.rows.recv().await.is_some() {}
+    })
+    .await;
+    assert!(closed.is_ok(), "the rows close");
+    assert!(
+        matches!(&*rows.state.borrow(), SweepState::Ended(_)),
+        "{:?}",
+        rows.state.borrow()
+    );
+}
+
+#[tokio::test]
+async fn a_scan_on_a_fake_kiwi_sweeps_for_itself_beside_a_demodulator() {
+    let fake = wf_fake(FakeWf::default()).await;
+    let src = source(&fake, &[10]);
+    let (node, _dir) = node_with(src.clone()).await;
+    let OpResult::Job(measure_id) = node.apply(measure(7_100_000, 10_000)).await.unwrap() else {
+        panic!("expected a job");
+    };
+    let scan = Op::JobStart {
+        kind: JobKind::Scan,
+        source: SourceId("kiwi0".into()),
+        center_hz: Hz(15_000_000),
+        bandwidth_hz: Hz(30_000_000),
+        deviation_hz: None,
+        sideband: None,
+        dwell_ms: None,
+        average: None,
+        bits: None,
+        method: None,
+        bin_hz: None,
+        elastic: false,
+        replace: vec![],
+    };
+    let OpResult::Job(scan_id) = node.apply(scan).await.unwrap() else {
+        panic!("expected a job");
+    };
+    let record = |id: &zeta_core::types::JobId| {
+        node.job_list()
+            .into_iter()
+            .find(|j| j.id == *id)
+            .expect("the job")
+    };
+    let context = record(&scan_id).context;
+    assert_eq!(context["scan"]["method"], "source", "{context}");
+    assert_eq!(context["scan"]["steps"], 8, "{context}");
+
+    let bus = node.bus();
+    let find = || {
+        bus.list()
+            .into_iter()
+            .find(|s| s.provenance.job.as_ref() == Some(&scan_id) && s.kind == StreamKind::Event)
+    };
+    assert!(
+        wait_until(1_000, || find().is_some()).await,
+        "a scan stream"
+    );
+    let mut rx = bus.subscribe(&find().unwrap().id).unwrap();
+    let ev = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match rx.recv().await {
+                Ok(f) => match &f.payload {
+                    Payload::Event(v) => break v.clone(),
+                    _ => panic!("expected an event"),
+                },
+                Err(RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("scan stream ended: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("a scan row within 3 s");
+    assert_eq!(ev["size"], 1024, "{ev}");
+    assert_eq!(ev["calibrated"], true, "{ev}");
+
+    assert_eq!(record(&measure_id).state, JobState::Running);
+    assert_eq!(record(&scan_id).state, JobState::Running);
+    let paths = fake.paths();
+    assert_eq!(path_ts_of(&paths, "/SND").len(), 1, "{paths:?}");
+    assert_eq!(path_ts_of(&paths, "/W/F").len(), 1, "{paths:?}");
+    assert_eq!(paths.len(), 2, "{paths:?}");
 }
