@@ -808,3 +808,14 @@ A `source` scan left waiting retries every 16 s for as long as it runs; an opera
 ## Scan: the self-sweep half of `node/scan.rs` in its own module
 
 `crates/zeta-core/src/node/scan.rs` carries the stepped loop and the self-sweep's start, wait and clock. Move the self-sweep half to its own module.
+
+## Follow-ups from the live view and the plan 36 run (2026-11-12)
+
+From the first live run of plan 36 and the live-view fixes after it. Each is small.
+
+- **The rate probe under-measures on a busy host.** On the field host the probe at a node's start put all three link depths at the same cap, and a `source measure` on the idle radio an hour later put the lossy depth at twice that. A probe taken while the host is starting other work should not be cached as the radio's figure: probe when the host is quiet, or keep the best of two.
+- **`slow_tunes` under-counts calibrating tunes.** The rule is ten times the median tune; through the node a tune's median is about four times the device's own, so a calibrating tune (about eight times the median on the field host's radio) is not counted. Count against the fastest tunes, or a fixed multiple of the lower quartile.
+- **The probe's time estimate is the worst case.** The line says "up to about 108 s" where the probe takes under 30 s. Say the usual time, or count rungs as they pass.
+- **Two pages on one self-sweeping source share its one scan.** Both adopt it and each moves the other's view. Give each page its own view where the source allows a second waterfall connection, or show who moved it.
+- **A KiwiSDR pauses its own waterfall** for about two seconds every quarter of a minute under load (seen with a raw connection too). The stream rides through it; the page could mark the gap rather than stretch the last row.
+- **A Soapy test flakes under full-workspace load:** `a_cs16_device_hands_raw_blocks_only_after_the_tune_window` failed once in a workspace run and passes alone and under two CPUs.
