@@ -94,8 +94,9 @@ pub struct NodeConfig {
     /// Relaunch `Running` jobs on `open` (a long-lived node). When false, records
     /// are loaded as persisted and nothing is launched, leased or rewritten.
     pub resume: bool,
-    /// How long a `scan` job dwells on each step; normally
-    /// [`crate::ops::SCAN_DWELL_MS`], shorter in tests.
+    /// The default dwell of a `scan` step, ms: the time's worth of settled
+    /// samples each step takes (not a time waited), unless `job_start` asks for
+    /// another; [`crate::ops::SCAN_DWELL_MS`] (20), and the tests' too.
     pub scan_dwell_ms: u64,
     /// Makes the channel banks of wide sources; installed before any port is
     /// added, so resumed jobs get a bank as fresh ones do. `None`: no banks

@@ -20,6 +20,8 @@ Loader: a startup line splits a folder name at `@`; the required-field slice in 
 
 From the HackRF run on the field host, 2026-11-01 (plan series "Plan 15 status"). The HackRF One has spurs on multiples of 4 MHz whose level depends on the tune: a 3-bin spike at +4 MHz (and mostly -4 MHz) of 21-37 dB when tuned to 444, 460, 476 or 492 MHz, ±8 MHz spikes on the edge bins of every 16 Msps row, a +2 MHz spike at 462 and 470 MHz, a comb every 100 kHz around 480 MHz. The scan's quarter-step shift at a 16 MHz step is exactly 4 MHz, so one grid's +4 MHz spur lands on the other grid's centre and is painted where that grid masks its DC: the survey shows a grid of peaks that moves between sweeps (the plan's failure sign) that no mask width fixes. Wanted: a per-device spur list the scan rows mask as `masked` ranges (offsets from the tune, as the HackRF's are, plus absolute frequencies as the B210's 402.0245/402.1505/402.9005/403.1494/403.8996 MHz are: the watch's `spurs_hz` is the absolute half), measured once per device by a `zeta soapy survey` over a quiet span and kept with the source record; and a step or shift that is not a multiple of the spur spacing on a device that has one (15 MHz steps, or a shift of a third). The B210 showed no such grid.
 
+Plan 36.1 made the shift a quarter of the stride (the usable fraction of the capture, 4.5 MHz for a HackRF's 20 MHz capture at 0.9), so it is no longer a multiple of 4 MHz by construction; the entry stays open until a HackRF sweep on the new grid shows whether the spur still lands on the other grid's centre, and for the per-device spur list.
+
 ## Soapy: the HackRF's read timeouts at 1 Msps
 
 From the same run. At the 1 Msps UHF CB pin `stats.timeouts` climbs about 8 per second (71 → 412 in a minute) with the rate reading 1.1 % fast and no overflows; at 2 Msps and up it stays at 0. The HackRF is under its 2 Msps minimum there and the driver's read times out between blocks. Harmless so far (the jobs ran) but the counter is useless as a health signal at that rate: either read with a timeout scaled to the block duration, or capture at 2 Msps and decimate for a 1 MHz pin. Also: the 1 Msps capture gets no channel bank (`channel.path` `direct`, `no bank`); say why in `source list`, or give it one.
@@ -643,9 +645,25 @@ From the operator, 2026-11-07. SatNOGS (Libre Space Foundation) is the open netw
 
 Antenna caveat: the field host's 2 m / 70 cm vertical hears strong LEO passes only. Spec first; layer 1 is a plan on its own.
 
-## Worker: `sc16` on the ring
+## Worker: a deployed worker's restart count ran into the thousands
 
-The ring's hello declares `format: "cf32"`. A compact format (`sc16`, converted at the node) halves the memory bandwidth and is the natural next step for a 61.44 Msps or FPGA front end; not needed while the ring is a memcpy.
+Found by the sweep spike on the field host's B210 (plan 36, spec section 8, item 5): the deployed node's worker record for the radio showed 2395 restarts. The cause was not looked into. Read the worker's own stderr lines in the journal (prefixed `zeta-soapy-worker[<id>]: `) and the node's `soapy worker for <id>:` lines to see whether the count is a driver crash loop, the clock guard's stream restarts or a respawn loop on a faulted device, and when it climbs; plan 36.1 ships the worker's new protocol and ring, so measure the count again after the deploy first.
+
+## Soapy: the reader's read length while a scan holds the source
+
+A tune waits up to one read of the Soapy reader (10 ms: `max(16384, rate/100)` samples) before it can run, and a scan tunes every few tens of milliseconds. A shorter read while a time-shared lease holds the source would let the tune in sooner, but each shorter read costs a ring slot (a slot holds a whole block whatever its size), so the ring fills sooner. Measure the sweep with the read at 2 and 5 ms against the ring's drops before changing it.
+
+## Sources: widen a held capture by dropping its depth
+
+What was asked: a source's capture held by narrowband jobs widened by dropping its sample depth to a lossy one. The depth belongs to the whole stream, so every holder would get the coarser samples, and a sweep of the extra band would tune away from the jobs. The form that works is one wider capture at a depth that sustains it, with the jobs fed through the channel bank. It waits on plan 36.1's live numbers (`UAT.md` "Plan 36.1" check 5: each depth's measured rate, and a narrowband demodulator and a decoder compared at the source's own depth and at the lossy one).
+
+## Soapy: probe a lossy depth on first use
+
+Plan 36.1 probes every depth the link carries at open, the lossy ones included, because a source's capability record cannot change while it runs. Probing a lossy depth on its first use (a scan's `bits`) would keep a first start short, but needs a capability record that can change under a running source (and a `Port::capabilities` that is not read once).
+
+## Node: measure a struggling link again by itself
+
+The deferred half of plan 36.1's link diagnostics (spec 4.6a): the node notices recurring sample loss while streaming at a rate it measured clean (devices added around the radio on the same bus, a cable gone marginal) and measures again when the source is free, saying why. Today a measure again is the operator's call (`source_measure`, the page's "Run link diagnostics") or a change of the link's negotiated speed. `PortStats.tune_gaps` is what makes the steady-streaming loss countable: a tune's own overflows no longer count as `overflows`. It belongs with "Node: a baseline of the host's capabilities" below.
 
 ## Worker: pack small blocks into one ring slot
 

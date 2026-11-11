@@ -364,8 +364,9 @@ As one mechanism, not a B210 special:
   worker's stderr when it ends. While a worker measures, it reports progress to the node (what
   it is measuring, which depth and rate, step n of m, the time left at most); the node shows it
   in the source's `worker` record in `source_list`, prints one line when it starts ("measuring
-  what this radio's link can sustain: first start only, up to about N s, the host will be busy;
-  `max_rate_hz=` or `bits=` skips it") and one when it ends, puts both on the source's event
+  what this radio's link can sustain (up to about N s; the host will be busy; `max_rate_hz=`
+  skips it)", with a reason first inside the parentheses for a link-speed change or a
+  `source_measure`) and one when it ends ("measured in N s"), puts both on the source's event
   feed, and the page shows the same notice on the source's tab while it lasts. A start from
   cached figures measures nothing and says nothing.
 - **A measurement belongs to the link's speed** (the operator, 2026-11-11: "a host device

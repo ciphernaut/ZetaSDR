@@ -363,7 +363,9 @@ they belong to the serving node and are rejected. Source ids are unique across t
   `source <id>: <fault>`) and never ends the node; the node respawns the worker, and when the device
   is back it restores the gain and the pin and relaunches the jobs that failed with the fault, the
   `watch` and its decoders included. `source list` shows the child as `worker` (`pid`, `restarts`,
-  `since_ns`, `transport`, `transport_dropped`). A device absent at startup, or whose worker
+  `since_ns`, `transport`, `transport_dropped`, `starting`, `attachment`, `link_measure`; the
+  transport's `format` is `cf32`, or `sc16` from a device whose samples are 16-bit, which the node
+  converts). A device absent at startup, or whose worker
   crashes opening it (UHD still releasing it from a node that just stopped), attaches faulted
   when an earlier start saw it, else the
   flag is refused. A one-shot command that attaches a Soapy source starts a worker (and a UHD open)
@@ -381,6 +383,18 @@ they belong to the serving node and are rejected. Source ids are unique across t
   <requested> Hz, below the <bandwidth_hz> Hz band`). The resampler is exact up to a reduced
   ratio of 2 048 and above that snaps the input rate to the nearest one within 1 000 ppm that
   reduces under it (one stderr line per snap); past that it refuses.
+  A device whose link carries more than one sample depth (a B2xx: `sc16`, `sc12`, the lossy `sc8`)
+  is probed at each at open, `source list` shows them as `capabilities.depths` and the one in force
+  as `depth`, and the source runs the fastest lossless one unless `bits=N` in `ARGS` names another.
+  `settle_ms=N` in `ARGS` sets how long a tune takes to settle (1 ms on a B2xx, 10 ms for a radio
+  zeta has not measured) and `usable=F` the part of a capture the front end passes flat (0.9). A
+  start with no cached figures measures first (about 70-110 s for a B210's three depths, with the
+  host busy; the journal says so and when it ended); `max_rate_hz=N` skips it. The figures are cached
+  with the link's speed, so they are measured again by themselves only when the negotiated speed
+  changed. `zeta source measure --source ID` (the page's "Run link diagnostics", in the hover box under the
+  radio's tab) drops them and measures again, about a minute with the host busy; it is a `conflict`
+  naming the holders while a job or a pin holds the radio, and the new figures govern tunes at once
+  while `capabilities` shows them from the next start.
 
 ```bash
 ./target/debug/zeta --source-kiwi kiwi0=kiwisdr.example:8073 source list   # remote true, current null
@@ -785,11 +799,17 @@ spectrum job, sends `source_ensure` for the new band and restarts the job on the
 gets (a file source answers `out_of_range` and the view reverts).
 
 `scan` sweeps a span wider than one capture: `job start --kind scan --center-hz C
---bandwidth-hz W` steps the source across `C ± W/2` in captures of `min(max_bandwidth_hz,
-16 MHz, W)` (a span narrower than one capture is one step of exactly that span), dwells 250 ms
-per step, and emits one v2 spectrum row per step (frame `channel` `scan/<step>`, the row's
+--bandwidth-hz W` steps the source across `C ± W/2` in captures of the source's whole
+`max_bandwidth_hz`, each step advancing by the capture's usable part (`usable_fraction`: 0.9 on a
+SoapySDR device, `usable=F` in its args to change it, 1.0 on the other kinds; a span no wider than
+that is one step), takes 20 ms of samples on each step (`--dwell-ms`, 1-5000, never under four FFT
+frames), and emits one v2 spectrum row per step (frame `channel` `scan/<step>`, the row's
 `center_hz` that step's), wrapping until stopped; a step is moved so its capture stays inside
-the radio's tuning range. A scan time-shares the radio, so it holds the lease on
+the radio's tuning range. The sweep is paced by the radio, not by a sleep: the step tunes, waits
+for the samples of its dwell (a source delivers only samples taken after the tune settled) and
+tunes on while the FFT of the step runs beside it. Its cost is in the job context, `scan.timing`
+(`sweep_ms`, the median `step_ms`, `tune_ms`, `slow_tunes`, `skipped`, `fft_wait_ms`, `hz_per_s`),
+refreshed about once a second, so the sweep time is read there rather than counted from steps. A scan time-shares the radio, so it holds the lease on
 its whole span: while it runs every other `job_start` or `source_ensure` on that source is a
 `conflict` naming the scan (no silent pre-emption), and `source_list` shows the scan as holder
 and the step it is on as `current`. Stopping it frees the source and leaves `current` at the
@@ -801,17 +821,30 @@ Sweeps alternate between two step grids a quarter step apart (even sweeps use th
 odd sweeps shift every centre down by a quarter step, with at most one more step), so a step's
 centre and its edges in one sweep fall a quarter of the way into a row of the next: read two
 consecutive sweeps. On a local hardware receiver each row masks its centre notch (`notch_hz`,
-50 kHz) and its outer edges (`edge_mask`, 0.02 of the bins each side; keep it under 0.25, or the
-two grids' masks overlap); the row carries `masked: [[lo, hi], ...]` (bin index ranges, `hi`
+50 kHz) and its outer edges that the usable fraction leaves unused (`edge_mask`, `(1 - u) / 2` of
+the bins each side for the usable fraction `u`: 0.05 on a SoapySDR device; keep it under
+`(1 - u) / 2 + u / 8`, 0.1625 at 0.9 and 0.125 at 1.0, or the two grids' masks overlap); the row carries `masked: [[lo, hi], ...]` (bin index ranges, `hi`
 exclusive), which are no data rather than low power. A one-step scan does not alternate and gets
 no edge mask (no other sweep could fill it in). The job context's `scan.alternate` (`shift_hz`,
 `steps_shifted`) and `scan.mask` (the values in force) report both, and `graph get`, an edit of
 the scan's `fft` node (`notch_hz`, `edge_mask`) and `graph put` changes the mask.
 
+The look is the operator's: `--dwell-ms` (valid samples per step) and `--average N` (1-64: each row is
+the mean of that step's last N sweeps, counted per grid; a row's `sweeps` says how many so far). The
+default (20 ms, no averaging) is the fastest sweep and catches a burst; 20 ms averaged over 16 sweeps
+lowers the noise ripple as one 320 ms dwell does while every step is still visited each sweep; a
+250 ms dwell sees a faint steady signal in one look. The page's scan row has a select for these
+(fast, averaged, long look) and shows the last sweep's time. `--bits N` (one of `capabilities.depths`
+in `source list`) holds the source's link at that sample depth for the scan and steps at that depth's
+width, putting the source's own depth back at the end: at 8 bits a weak signal beside a strong one in
+the same capture is lost in quantisation noise, so it is a coarse survey of occupancy, never the
+default and never for faint signals; it is granted only when the scan is the source's sole holder.
+
 ```bash
 Z="./target/release/zeta --node http://field-host:7979"   # ZETA_SECRET set
 $Z job start --kind scan --source b210 --center-hz 500000000 --bandwidth-hz 1000000000
-# 42 MHz (the B210's floor) to 1 GHz in 16 MHz steps: 61 steps, one sweep about 19 s
+# the B210's whole range in 27.648 MHz steps (0.9 of its measured 30.72 Msps); read the sweep time
+$Z job context --job <scan job>      # scan.timing.sweep_ms, scan.steps, scan.step_hz
 $Z job start --kind measure --source b210 --center-hz 95300000 --bandwidth-hz 200000
 # {"error": "conflict", "holders": ["<scan job>"], "options": ["stop the scan holding the source"]}
 ```
@@ -824,10 +857,13 @@ The node logs each sizing, e.g. `zeta: ring for b210: 10.00 s at 16000000 Hz (12
 
 ## Federation
 
-Upgrading: run the same version at both ends of a `--source-node` link. `job_start` requires
-`elastic` and `replace`, which `--source-node` sends, and every `source_list` item carries `pin`,
-`gain` and `bank`; a pre-release node without them refuses this version's `job_start`, and fails
-its `source_list` round trip when it uses this node as a `--source-node`. A rigid page `spectrum` job persisted by an older
+Upgrading: run the same version at both ends of a `--source-node` link, upgrading both together
+(the far end first leaves the near node unable to read its `source_list`). `job_start` requires
+`elastic`, `replace`, `dwell_ms`, `average` and `bits`, which `--source-node` sends, and every
+`source_list` item carries `pin`, `gain`, `bank`, `depth` and the worker's `starting`, `attachment`
+and `link_measure`; a pre-release node without them refuses this version's `job_start`, and fails
+its `source_list` round trip when it uses this node as a `--source-node`. A `--source-node` source
+lists no sample depths: the far node owns its radio's depth, so a scan's `bits` on it is refused. A rigid page `spectrum` job persisted by an older
 version resumes rigid (it holds its source); the page reuses an elastic spectrum job before it,
 and stopping it from its row lets the page start an elastic one.
 

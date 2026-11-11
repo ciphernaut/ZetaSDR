@@ -3943,7 +3943,7 @@ fn job_start_takes_dwell_ms_and_average() {
 }
 
 #[test]
-fn job_start_takes_bits_and_refuses_a_depth_the_source_does_not_carry() {
+fn job_start_with_bits_is_refused_on_a_source_with_one_depth() {
     let dir = tempfile::tempdir().unwrap();
     // The file source has one sample depth.
     let out = zeta(

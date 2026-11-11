@@ -63,7 +63,11 @@ pub enum Op {
     /// `stats`, the stream's counters since it opened (`measured_rate_hz`, the
     /// rate delivered over the last 10 s, `null` before any; `overflows`,
     /// `timeouts`, `restarts`, streams reopened because their samples ran ahead
-    /// of the clock; `null` for a source that keeps none), and `worker`, the child
+    /// of the clock; `tune_gaps`, overflows the reader's own blocked tune caused,
+    /// which are not in `overflows`; `null` for a source that keeps none), and
+    /// `depth`, the sample depth in force on a link that carries more than one
+    /// (`bits`, `lossless`, `max_bandwidth_hz`, one of `capabilities.depths`;
+    /// `null` for a source with one), and `worker`, the child
     /// process the source runs in (`pid`, `restarts`, `since_ns`; `transport`,
     /// how its blocks reach the node: `path` `shm` or `pipe`, `format`,
     /// `ring_bytes`, `null` while none runs or from an older worker; and
@@ -73,7 +77,9 @@ pub enum Op {
     /// (`usb:<bus>-<path>@<speed>`, `null` where it cannot tell); and `link_measure`, the
     /// figures the latest hello measured (`max_bandwidth_hz`, `depths`) with the link
     /// speed they were measured at (`at_speed`), cached for the next start (see
-    /// `source_measure`);
+    /// `source_measure`); and `starting`, what a worker not yet live is doing
+    /// (`what` `measuring`, `detail`, `step` of `of`, `eta_ms`: the most time left),
+    /// `null` otherwise;
     /// `null` for a source that runs in the node), and `ring`, the IQ history (`seconds`, `null`
     /// before the first block; a `classify` or `iq_read` span older than it fails
     /// `too_old`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
@@ -2037,8 +2043,9 @@ impl ScanGrid {
 /// so it has at most one more step. A quarter, not a half: with rows about as
 /// wide as the stride, each grid's DC notch and step boundaries then fall at
 /// the 25 % / 75 % points of the other grid's rows, clear of its notch and of
-/// any edge mask under 0.25, so every frequency is seen clean in one of two
-/// sweeps (a half-stride shift put each notch on the other grid's step
+/// any edge mask under `(1 - u) / 2 + u / 8` for the usable fraction `u`
+/// (0.125 at 1.0, 0.1625 at 0.9), so every frequency is seen clean in one of
+/// two sweeps (a half-stride shift put each notch on the other grid's step
 /// boundary, inside both neighbours' edge masks). A one-step span does not
 /// alternate and its odd grid is a copy of the even one. Every centre is
 /// clamped to `[tune_min + w/2, tune_max - w/2]`, so no capture reaches

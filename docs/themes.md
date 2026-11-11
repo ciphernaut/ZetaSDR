@@ -220,6 +220,9 @@ Regions:
   `focus` and `focus-fallback` policies, none under `free-first` and `ask`), on the RF view and
   the Map alike. `.src-tab .default-mark`: the dot first in every source tab, shown only under
   `.src-tab.default`.
+- `#src-menu`: the hover box under a source tab whose source has a worker (a fixed `div`,
+  `hidden` otherwise), holding the source's own actions; its one entry is `.link-diag`, the
+  "Run link diagnostics" button.
 - `#rail`: the frequency-aligned rail beside the axis (present while `data-rail` is `on`).
 - `.wf-axis`: the frequency axis. `#waterfall`: the waterfall region. `.wf-canvas`: its canvas.
 - `#side`: the side column. `section.pane` is a pane in it (`#pane-transcript`, `#pane-jobs`);
@@ -244,7 +247,9 @@ Jobs:
 
 - `.job`: a job row in the jobs pane. Its parts include `.job .kind` and `.job .band` (also
   `.source`, `.state`, `.id`). `.job[data-state="running"]` and `.job[data-state="failed"]` carry
-  the job's state; a finished row also has `.finished`.
+  the job's state; a finished row also has `.finished`. A running scan's row also has
+  `.sweep-ms` (the last sweep's time) and `select.scan-look` (the look: fast, averaged, long
+  look, and coarse and fast where the source has a lossy depth).
 - `.job-tag`: a job's tag in the rail (or on its outline). Its parts are `.job-tag .kind`,
   `.short`, `.job-tag .channel`, `.job-tag .centre`, a `.dot` and a `.snippet`.
 - `.outline`: a job's band on the waterfall (`.outline-label` and `.outline-handle` inside).
