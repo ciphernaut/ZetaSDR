@@ -11,7 +11,7 @@ use zeta_core::ops::{Op, OpResult};
 use zeta_core::port::{Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{Hz, SampleFormat, SourceId};
-use zeta_source_node::{NodePort, NodeSourceConfig, open};
+use zeta_source_node::{NodePort, NodeSourceConfig, open, proxy_capabilities};
 use zeta_ws::testing::{TestServer, spawn};
 
 /// The `tone` fixture's centre frequency.
@@ -526,5 +526,75 @@ async fn restart_within_grace_keeps_the_remote_job() {
     assert!(port.current().is_some());
     drop(node);
     port.close().await;
+    srv.stop().await;
+}
+
+/// A remote source whose link has two sample depths: a proxy of it lists none
+/// (the far node owns its radio's depth), keeping the rest of the record.
+#[test]
+fn a_proxy_of_a_remote_with_depths_lists_none() {
+    use zeta_core::types::{Capabilities, Claim, Depth};
+    let remote = Capabilities {
+        tune_min_hz: Claim::Asserted(Hz(70_000_000)),
+        tune_max_hz: Claim::Asserted(Hz(6_000_000_000)),
+        max_bandwidth_hz: Claim::Measured(Hz(16_000_000)),
+        formats: vec![SampleFormat::Ci16],
+        channels: 1,
+        rx: true,
+        tx: false,
+        remote: false,
+        push: false,
+        usable_fraction: Claim::Asserted(0.9),
+        depths: vec![
+            Depth {
+                bits: 16,
+                lossless: true,
+                max_bandwidth_hz: Claim::Measured(Hz(16_000_000)),
+            },
+            Depth {
+                bits: 8,
+                lossless: false,
+                max_bandwidth_hz: Claim::Measured(Hz(32_000_000)),
+            },
+        ],
+    };
+    let caps = proxy_capabilities(&remote, 250_000);
+    assert!(caps.depths.is_empty(), "{caps:?}");
+    assert_eq!(*caps.max_bandwidth_hz.value(), Hz(250_000));
+    assert_eq!(caps.usable_fraction, remote.usable_fraction);
+    assert_eq!(caps.tune_max_hz, remote.tune_max_hz);
+    assert!(caps.remote && caps.push);
+}
+
+/// A scan asking for `bits` on a `--source-node` source is refused at
+/// `job_start` as on any source with one depth, before anything starts.
+#[tokio::test]
+async fn a_scan_with_bits_on_a_node_source_is_refused_at_job_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn(dir.path()).await;
+    let port: Arc<dyn Port> = Arc::new(open_tone(&srv).await);
+    assert!(port.capabilities().depths.is_empty());
+    let local = local_node(dir.path(), port).await;
+    let op = Op::JobStart {
+        kind: zeta_core::ops::JobKind::Scan,
+        source: SourceId("far".into()),
+        center_hz: Hz(TONE_CENTER_HZ),
+        bandwidth_hz: Hz(48_000),
+        deviation_hz: None,
+        sideband: None,
+        dwell_ms: None,
+        average: None,
+        bits: Some(8),
+        elastic: false,
+        replace: vec![],
+    };
+    match local.apply(op).await {
+        Err(zeta_core::ops::OpError::Other { message }) => {
+            assert_eq!(message, "bits 8: source far has one sample depth")
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+    assert!(local.job_list().is_empty());
+    drop(local);
     srv.stop().await;
 }

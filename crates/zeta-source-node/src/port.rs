@@ -119,10 +119,26 @@ pub async fn open(cfg: NodeSourceConfig) -> Result<NodePort, PortError> {
     NodePort::open(cfg).await
 }
 
+/// A `--source-node` source's capabilities from its remote source's: copied
+/// with `remote` and `push` set, formats `[cf32]`, `max_bandwidth_hz` capped at
+/// `max_bandwidth_hz`, and no `depths`: the far node owns its radio's sample
+/// depth and a proxy cannot change it, so a scan's `bits` on this source is
+/// refused at `job_start` as on any source with one depth.
+pub fn proxy_capabilities(remote: &Capabilities, max_bandwidth_hz: u64) -> Capabilities {
+    let remote_max = remote.max_bandwidth_hz.value().0;
+    Capabilities {
+        max_bandwidth_hz: Claim::Asserted(Hz(remote_max.min(max_bandwidth_hz))),
+        formats: vec![SampleFormat::Cf32],
+        remote: true,
+        push: true,
+        depths: Vec::new(),
+        ..remote.clone()
+    }
+}
+
 impl NodePort {
     /// One `source_list` round-trip: the remote source must exist. Its
-    /// capabilities are copied with `remote` and `push` set, formats `[cf32]`
-    /// and `max_bandwidth_hz` capped at `cfg.max_bandwidth_hz`.
+    /// capabilities are copied as [`proxy_capabilities`] says.
     pub async fn open(cfg: NodeSourceConfig) -> Result<NodePort, PortError> {
         let client =
             NodeClient::new(&cfg.url, &cfg.secret).map_err(|e| client_error(&cfg.url, e))?;
@@ -140,14 +156,7 @@ impl NodePort {
                 known.join(", ")
             )));
         };
-        let remote_max = remote.capabilities.max_bandwidth_hz.value().0;
-        let caps = Capabilities {
-            max_bandwidth_hz: Claim::Asserted(Hz(remote_max.min(cfg.max_bandwidth_hz))),
-            formats: vec![SampleFormat::Cf32],
-            remote: true,
-            push: true,
-            ..remote.capabilities.clone()
-        };
+        let caps = proxy_capabilities(&remote.capabilities, cfg.max_bandwidth_hz);
         Ok(NodePort {
             id: cfg.id.clone(),
             caps,

@@ -3,4 +3,7 @@
 
 mod port;
 
-pub use port::{NODE_DEFAULT_MAX_BANDWIDTH_HZ, NodePort, NodeSourceConfig, TUNE_TIMEOUT, open};
+pub use port::{
+    NODE_DEFAULT_MAX_BANDWIDTH_HZ, NodePort, NodeSourceConfig, TUNE_TIMEOUT, open,
+    proxy_capabilities,
+};
