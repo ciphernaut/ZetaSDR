@@ -810,6 +810,7 @@ async fn a_signal_inside_another_jobs_band_is_ignored() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     };
@@ -1461,6 +1462,7 @@ async fn watch_is_neither_elastic_nor_attachable() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: true,
         replace: vec![],
     };
@@ -1936,6 +1938,7 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![watch.clone()],
     };
@@ -2862,6 +2865,7 @@ async fn a_hand_started_decoder_inside_the_band_is_left_alone() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     };
@@ -2940,6 +2944,7 @@ async fn a_replace_of_a_span_watch_stops_its_decoders() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![watch.clone()],
     };

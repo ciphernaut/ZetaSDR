@@ -109,6 +109,7 @@ fn measure(center: u64, bw: u64) -> Op {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     }

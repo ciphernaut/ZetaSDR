@@ -113,6 +113,7 @@ async fn a_capture_job_ends_stopped_with_its_records_in_the_store() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     };

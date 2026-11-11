@@ -3941,3 +3941,37 @@ fn job_start_takes_dwell_ms_and_average() {
         .assert()
         .success();
 }
+
+#[test]
+fn job_start_takes_bits_and_refuses_a_depth_the_source_does_not_carry() {
+    let dir = tempfile::tempdir().unwrap();
+    // The file source has one sample depth.
+    let out = zeta(
+        dir.path(),
+        &[
+            "job",
+            "start",
+            "--kind",
+            "scan",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+            "--bits",
+            "8",
+        ],
+    )
+    .assert()
+    .failure()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "other", "{v}");
+    assert_eq!(
+        v["message"], "bits 8: source tone has one sample depth",
+        "{v}"
+    );
+}

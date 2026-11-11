@@ -2416,6 +2416,8 @@ impl Node {
             entry.record.clone()
         };
         self.check_watch_policy(&graph, current.tuning)?;
+        self.inner
+            .check_scan_graph(&current.kind, &current.source, &graph)?;
         let running = current.state == JobState::Running;
         // An operator's put of the node's graph with only carried params changed keeps
         // the record's rate (and so stays re-expandable).

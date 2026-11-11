@@ -481,6 +481,7 @@ fn op_name_matches_the_serialised_tag() {
             sideband: None,
             dwell_ms: None,
             average: None,
+            bits: None,
             elastic: false,
             replace: vec![],
         },
@@ -571,6 +572,7 @@ async fn read_only_ops_are_logged_without_their_result() {
             sideband: None,
             dwell_ms: None,
             average: None,
+            bits: None,
             elastic: false,
             replace: vec![],
         })
@@ -625,6 +627,7 @@ fn job_start(kind: JobKind, bandwidth_hz: u64) -> Op {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     }

@@ -247,6 +247,7 @@ fn start_op(kind: JobKind, source: &str, center_hz: u64) -> Op {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     }

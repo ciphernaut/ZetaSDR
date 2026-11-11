@@ -114,6 +114,7 @@ async fn detect_publishes_new_and_gone_for_a_synthesised_burst() {
             sideband: None,
             dwell_ms: None,
             average: None,
+            bits: None,
             elastic: false,
             replace: vec![],
         })

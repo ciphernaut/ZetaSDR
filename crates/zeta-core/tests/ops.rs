@@ -210,6 +210,7 @@ async fn job_start_passthrough_then_list_then_stop() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     };
@@ -346,6 +347,7 @@ async fn source_ensure_during_job_start_does_not_retune() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     };
@@ -443,6 +445,7 @@ async fn job_start_holds_the_gate_through_its_tune_and_lease() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     };
@@ -1023,6 +1026,7 @@ async fn conflict_reports_current_tuning_and_real_options() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     };
@@ -1127,6 +1131,7 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     };
@@ -1858,6 +1863,7 @@ fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     }
@@ -3211,6 +3217,7 @@ async fn start_on(node: &Node, source: &str, kind: JobKind, elastic: bool) -> Jo
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic,
         replace: vec![],
     };
@@ -3416,6 +3423,7 @@ async fn job_start_on_a_faulted_source_is_refused_naming_the_source() {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     };
@@ -3632,6 +3640,7 @@ fn start_look(kind: JobKind, dwell_ms: Option<u64>, average: Option<u32>) -> Op 
         sideband: None,
         dwell_ms,
         average,
+        bits: None,
         elastic: false,
         replace: vec![],
     }
@@ -3687,9 +3696,14 @@ async fn a_look_on_another_kind_is_refused() {
     )
     .await
     .unwrap();
+    let mut bits = start_look(JobKind::Spectrum, None, None);
+    if let Op::JobStart { bits, .. } = &mut bits {
+        *bits = Some(8);
+    }
     for (op, field) in [
         (start_look(JobKind::FmDemod, Some(20), None), "dwell_ms"),
         (start_look(JobKind::Spectrum, None, Some(4)), "average"),
+        (bits, "bits"),
     ] {
         match node.apply(op).await {
             Err(OpError::Other { message }) => assert!(
@@ -3712,8 +3726,11 @@ fn job_start_without_the_look_fields_still_parses() {
     .unwrap();
     match op {
         Op::JobStart {
-            dwell_ms, average, ..
-        } => assert_eq!((dwell_ms, average), (None, None)),
+            dwell_ms,
+            average,
+            bits,
+            ..
+        } => assert_eq!((dwell_ms, average, bits), (None, None, None)),
         other => panic!("{other:?}"),
     }
     // The schema lists them as required and nullable, as `deviation_hz`.
@@ -3723,7 +3740,7 @@ fn job_start_without_the_look_fields_still_parses() {
         .find(|v| v["properties"]["op"]["const"] == "job_start")
         .expect("job_start variant");
     let req = v["required"].as_array().unwrap();
-    for f in ["dwell_ms", "average"] {
+    for f in ["dwell_ms", "average", "bits"] {
         assert!(req.contains(&f.into()), "{f}: {v}");
         assert_eq!(
             v["properties"][f]["type"],

@@ -1149,6 +1149,12 @@ pub enum JobCmd {
         /// (1..=64); absent = 1
         #[arg(long, value_name = "N")]
         average: Option<u32>,
+        /// scan only: the sample depth the source's link runs at for the scan, one
+        /// of its depths (`source list`); absent = the source's own. A lossy depth
+        /// (8 on a B210) sweeps faster but loses a weak signal beside a strong
+        /// one: for a coarse survey, never for faint signals
+        #[arg(long, value_name = "BITS")]
+        bits: Option<u8>,
         /// spectrum only: follow the source's capture instead of holding it
         /// (never conflicts; relaunched under the same id on every retune)
         #[arg(long)]
@@ -1533,6 +1539,7 @@ impl Command {
                 sideband,
                 dwell_ms,
                 average,
+                bits,
                 elastic,
                 replace,
                 ..
@@ -1545,6 +1552,7 @@ impl Command {
                 sideband: sideband.map(Into::into),
                 dwell_ms,
                 average,
+                bits,
                 elastic,
                 replace: replace.into_ids(),
             },

@@ -205,6 +205,11 @@ pub struct FftParams {
     #[serde(default)]
     #[schemars(range(min = 1, max = 64))]
     pub average: Option<u32>,
+    /// A `scan`'s sample depth on its source's link, one of the source's
+    /// `depths`; absent or `null` is the source's own. Read by the scan job as
+    /// `dwell_ms` is, which checks it against the source.
+    #[serde(default)]
+    pub bits: Option<u8>,
 }
 
 impl FftParams {
@@ -836,6 +841,7 @@ mod tests {
             row_frames: None,
             dwell_ms: None,
             average: None,
+            bits: None,
         };
         assert_eq!(p(0, 0.0).check(), Ok(()));
         assert_eq!(p(300_000, 0.49).check(), Ok(()));
@@ -870,6 +876,7 @@ mod tests {
         assert_eq!(check("dwell_ms", 1), Ok(()));
         assert_eq!(check("dwell_ms", 5000), Ok(()));
         assert_eq!(check("average", 64), Ok(()));
+        assert_eq!(check("bits", 8), Ok(()));
         for (field, v) in [
             ("dwell_ms", 0),
             ("dwell_ms", 5001),

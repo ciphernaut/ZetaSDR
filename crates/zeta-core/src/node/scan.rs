@@ -5,7 +5,9 @@
 //! publishes its row on the scan's stream. There is no sleep: a step costs its
 //! tune and the time its samples take to arrive. The look is the operator's: the
 //! stored `fft` node's `dwell_ms` (the samples a step takes) and `average` (each
-//! row the mean of its step's last sweeps, [`SweepAverage`]).
+//! row the mean of its step's last sweeps, [`SweepAverage`]) and `bits` (the
+//! sample depth the source's link runs at for the scan: held for the run and
+//! put back before the lease goes, [`scan_run`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,8 +23,8 @@ use crate::job::JobRecord;
 use crate::ops::{
     JobKind, SCAN_AVERAGE_MAX, SCAN_DWELL_MAX_MS, SCAN_ROWS_DWELL_MS, SCAN_WAIT_MARGIN_MS,
     SPECTRUM_ROWS_PER_S, ScanGrid, scan_average_budget_bytes, scan_average_in_force,
-    scan_dwell_within, scan_edge_mask_in_force, scan_grid, scan_mask_default, scan_notch_in_force,
-    scan_rows_per_step, spectrum_size,
+    scan_bits_refusal, scan_capture_hz, scan_dwell_within, scan_edge_mask_in_force, scan_grid_at,
+    scan_mask_default, scan_notch_in_force, scan_rows_per_step, spectrum_size,
 };
 use crate::port::{IqBlock, Port, Tuning};
 use crate::ring::IqRing;
@@ -39,7 +41,9 @@ impl Inner {
     /// `Event` output stream. The registered `fft` stage does the spectra; of
     /// the graph only the first `fft` node's `notch_hz` and `edge_mask` (its
     /// mask) and `dwell_ms` and `average` (its look: absent, the node's dwell
-    /// and 1; out of range, clamped into it) are read. The first launch writes
+    /// and 1; out of range, clamped into it) and `bits` (a depth the source
+    /// does not carry fails the launch, before the lease; absent, the source's
+    /// own; [`scan_run`] holds the source at it) are read. The first launch writes
     /// the mask into that node from the
     /// source's capabilities ([`scan_mask_default`]); a resume or a `graph put`
     /// finds them and keeps them. A record with no `fft` node (persisted before
@@ -78,6 +82,8 @@ impl Inner {
                 .map_err(|e| NodeError::Other(format!("scan graph: {e}")))?;
         }
         graph::validate(&rec.graph, &self.registry)?;
+        let bits = check_stored_bits(port.as_ref(), &rec.graph)?;
+        let capture = capture_of(port.as_ref(), bits);
         let fft = rec
             .graph
             .nodes
@@ -88,7 +94,9 @@ impl Inner {
             && !p.contains_key("notch_hz")
         {
             let (notch, edge) = scan_mask_default(&caps);
-            let w = scan_grid(rec.tuning, &caps).even[0].bandwidth_hz.0;
+            let w = scan_grid_at(rec.tuning, &caps, capture).even[0]
+                .bandwidth_hz
+                .0;
             p.insert("notch_hz".into(), notch.into());
             p.entry("edge_mask").or_insert(edge.into());
             p.insert("size".into(), spectrum_size(w).into());
@@ -99,7 +107,13 @@ impl Inner {
             fft.params["notch_hz"].as_u64().unwrap_or(0),
             fft.params["edge_mask"].as_f64().unwrap_or(0.0),
         );
-        let layout = Layout::of(rec.tuning, &caps, mask);
+        let layout = Layout::of(
+            rec.tuning,
+            &caps,
+            capture,
+            bits_in_force(port.as_ref(), bits),
+            mask,
+        );
         let look = Look {
             dwell_ms: fft.params["dwell_ms"]
                 .as_u64()
@@ -145,6 +159,7 @@ impl Inner {
             span,
             layout,
             look,
+            bits,
             port: port.clone(),
             ctx: StageContext::new(prov.source.clone()),
             stage,
@@ -157,7 +172,7 @@ impl Inner {
         let mut set = JoinSet::new();
         let (running, steps) = (
             StageRunning::new(self.stages.clone()),
-            scan_loop(self.clone(), scan.clone(), tx),
+            scan_run(self.clone(), scan.clone(), tx),
         );
         set.spawn(async move {
             let _running = running;
@@ -187,6 +202,25 @@ impl Inner {
             e.outputs = vec![JobOutput::new(StreamKind::Event, out)];
         }
         Ok(())
+    }
+
+    /// Refuse `graph` as job `id`'s when it is a scan's whose stored `fft` node
+    /// asks for `bits` its source does not carry (as `job_start` does), so a
+    /// `graph_put` leaves the running scan as it was.
+    pub(super) fn check_scan_graph(
+        &self,
+        kind: &str,
+        source: &SourceId,
+        graph: &graph::Graph,
+    ) -> Result<(), NodeError> {
+        if kind != JobKind::Scan.name() {
+            return Ok(());
+        }
+        let port = self.ports.read().unwrap().get(source).cloned();
+        match port {
+            Some(port) => check_stored_bits(port.as_ref(), graph).map(|_| ()),
+            None => Ok(()),
+        }
     }
 
     /// The most samples `source`'s ring holds at `rate_hz`: the ring's own
@@ -246,12 +280,13 @@ impl Inner {
     }
 
     /// Write `fields` into job `id`'s `job_context.scan`, keeping its other
-    /// keys (a `dwell_ms_asked` or `average_asked` the fields no longer carry is
-    /// dropped).
+    /// keys (a `dwell_ms_asked`, `average_asked` or `bits` the fields no longer
+    /// carry is dropped).
     fn scan_context_rewrite(&self, id: &JobId, fields: serde_json::Map<String, serde_json::Value>) {
         self.scan_context_update(id, |scan| {
             scan.remove("dwell_ms_asked");
             scan.remove("average_asked");
+            scan.remove("bits");
             scan.extend(fields);
         });
     }
@@ -352,13 +387,16 @@ const TIMING_EVERY_NS: u64 = 1_000_000_000;
 
 /// A scan's steps and the mask they are masked with, built from the source's
 /// capabilities at launch and again at the start of a sweep when the source's
-/// capture (`max_bandwidth_hz`) or its usable fraction changed (a cap measured
-/// after the scan started, [`scan_loop`]).
+/// capture ([`capture_of`]: `max_bandwidth_hz`, or the cap of the depth the
+/// scan asked for), its usable fraction or its depth in force changed (a cap
+/// measured after the scan started, [`scan_loop`]).
 #[derive(Clone, Debug)]
 struct Layout {
-    /// The capabilities it was built from: `max_bandwidth_hz` and `usable_fraction`.
+    /// What it was built from: the capture, `usable_fraction` and the depth in
+    /// force ([`bits_in_force`]; `None` on a source without depths).
     capture_hz: u64,
     usable: f64,
+    bits: Option<u8>,
     grid: ScanGrid,
     /// The notch and edge mask in force: no notch on a step under four notches,
     /// and on a grid that alternates the configured edge mask or the edges the
@@ -371,13 +409,20 @@ struct Layout {
 }
 
 impl Layout {
-    fn of(span: Tuning, caps: &Capabilities, mask: (u64, f64)) -> Self {
-        let grid = scan_grid(span, caps);
+    fn of(
+        span: Tuning,
+        caps: &Capabilities,
+        capture_hz: u64,
+        bits: Option<u8>,
+        mask: (u64, f64),
+    ) -> Self {
+        let grid = scan_grid_at(span, caps, capture_hz);
         let usable = *caps.usable_fraction.value();
         let w = grid.even[0].bandwidth_hz.0;
         Layout {
-            capture_hz: caps.max_bandwidth_hz.value().0,
+            capture_hz,
             usable,
+            bits,
             notch_hz: scan_notch_in_force(w, mask.0),
             edge_mask: scan_edge_mask_in_force(grid.alternates(), mask.1, usable),
             grid,
@@ -385,10 +430,12 @@ impl Layout {
         }
     }
 
-    /// Whether `caps` would build another layout.
-    fn stale(&self, caps: &Capabilities) -> bool {
-        caps.max_bandwidth_hz.value().0 != self.capture_hz
+    /// Whether `caps`, a capture of `capture_hz` and the depth `bits` would
+    /// build another layout.
+    fn stale(&self, caps: &Capabilities, capture_hz: u64, bits: Option<u8>) -> bool {
+        capture_hz != self.capture_hz
             || *caps.usable_fraction.value() != self.usable
+            || bits != self.bits
     }
 
     /// The capture each step asks for, Hz.
@@ -424,7 +471,8 @@ impl Layout {
     /// for), `dwell_ms` (in force on a step: whole frames, never under four,
     /// never more than the ring holds), `dwell_ms_asked` when that differs,
     /// `average` (in force, [`Layout::average_in_force`]), `average_asked` when
-    /// that differs, `alternate` and `mask`.
+    /// that differs, `bits` (the depth in force, on a source with depths),
+    /// `alternate` and `mask`.
     fn context(
         &self,
         look: Look,
@@ -456,6 +504,9 @@ impl Layout {
         if average != look.average {
             scan["average_asked"] = look.average.into();
         }
+        if let Some(b) = self.bits {
+            scan["bits"] = b.into();
+        }
         match scan {
             serde_json::Value::Object(m) => m,
             _ => unreachable!("built as an object"),
@@ -474,13 +525,16 @@ struct Look {
 }
 
 /// What a running scan needs: its lease holder id, its band, the layout it
-/// launched with, its look, the `fft` stage, and its output stream.
+/// launched with, its look, the depth it asked for, the `fft` stage, and its
+/// output stream.
 struct Scan {
     id: JobId,
     port: Arc<dyn Port>,
     span: Tuning,
     layout: Layout,
     look: Look,
+    /// The sample depth asked for (`None`: the source's own).
+    bits: Option<u8>,
     stage: Arc<dyn Stage>,
     ctx: StageContext,
     prov: Provenance,
@@ -492,18 +546,103 @@ struct Scan {
 /// the step's index within that sweep's list, the layout it was stepped on (a
 /// count of the layouts the scan has built, whether its grid alternates and
 /// the `average` in force on it), the centre it was taken at, its samples, how
-/// many FFT frames they are and the mask in force on it.
+/// many FFT frames they are, the mask in force on it and the depth it was
+/// taken at (`None` on a source without depths).
 struct Step {
     sweep: u64,
     layout: u64,
     alternates: bool,
     average: u32,
+    bits: Option<u8>,
     index: usize,
     center: Hz,
     block: IqBlock,
     frames: u32,
     notch_hz: u64,
     edge_mask: f64,
+}
+
+/// The `bits` stored in a scan graph's first `fft` node, checked against
+/// `port`'s depths ([`scan_bits_refusal`]): `None` when absent or `null`.
+fn check_stored_bits(port: &dyn Port, graph: &graph::Graph) -> Result<Option<u8>, NodeError> {
+    let Some(v) = graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "fft")
+        .and_then(|n| n.params.get("bits"))
+        .and_then(|b| b.as_u64())
+    else {
+        return Ok(None);
+    };
+    match scan_bits_refusal(port.id(), port.capabilities(), v) {
+        Some(why) => Err(NodeError::Other(why)),
+        None => Ok(u8::try_from(v).ok()),
+    }
+}
+
+/// The capture a scan at `bits` steps at on `port`: the cap of that depth as
+/// the port has it in force ([`Port::depth`], which a respawn's measurement can
+/// move), else as the record lists it; without `bits`, `max_bandwidth_hz`.
+fn capture_of(port: &dyn Port, bits: Option<u8>) -> u64 {
+    match bits {
+        Some(b) => port
+            .depth()
+            .filter(|d| d.bits == b)
+            .map(|d| d.max_bandwidth_hz.value().0)
+            .unwrap_or_else(|| scan_capture_hz(port.capabilities(), Some(b))),
+        None => scan_capture_hz(port.capabilities(), None),
+    }
+}
+
+/// The depth a scan asking for `bits` reports on `port`: `bits`, else the
+/// port's depth in force; `None` on a source without depths.
+fn bits_in_force(port: &dyn Port, bits: Option<u8>) -> Option<u8> {
+    if port.capabilities().depths.is_empty() {
+        return None;
+    }
+    bits.or_else(|| port.depth().map(|d| d.bits))
+}
+
+/// The scan's step task: with `bits` asked for and another depth in force, set
+/// the source's depth to it first (the scan holds its time-shared lease, so it
+/// is the source's sole holder and nothing else is tuned meanwhile), then run
+/// [`scan_loop`]. However the loop ends (stopped, failed, the FFT task gone, the
+/// node shutting down), the depth the port had before is set again before this
+/// returns: the supervisor releases the lease only once every task of the job
+/// has ended, so no job is granted the source until it is back at its own
+/// depth. A depth that cannot be put back (the device gone) is logged; a
+/// respawned worker opens at the source's own depth.
+async fn scan_run(
+    inner: Arc<Inner>,
+    s: Arc<Scan>,
+    tx: mpsc::Sender<Step>,
+) -> Result<(), StageError> {
+    // Only a scan that asked for a depth changes it, and only that one puts it back.
+    let before = s.bits.and(s.port.depth().map(|d| d.bits));
+    let set = match s.bits {
+        Some(b) if before != Some(b) => s.port.set_depth(b).await.map(|_| ()).map_err(|e| {
+            StageError::Failed(source_fault_reason(
+                s.port.id(),
+                &format!("set_depth {b}: {e}"),
+            ))
+        }),
+        _ => Ok(()),
+    };
+    let ended = match set {
+        Ok(()) => scan_loop(inner, s.clone(), tx).await,
+        Err(e) => Err(e),
+    };
+    if let Some(b) = before
+        && s.port.depth().map(|d| d.bits) != Some(b)
+        && let Err(e) = s.port.set_depth(b).await
+    {
+        eprintln!(
+            "zeta: scan {}: source {}: could not put its {b}-bit depth back: {e}",
+            s.id.0,
+            s.port.id().0
+        );
+    }
+    ended
 }
 
 /// The `scan` job's step loop, until cancelled: tune the source to each step
@@ -518,9 +657,9 @@ struct Step {
 /// restart the ring's run and the wait goes on from there. A hand-off waits
 /// while the FFT task still has one step queued.
 /// At each sweep's start the source's capabilities are read again: when its
-/// capture or usable fraction changed (a rate cap measured after the scan
-/// started), the grid and mask are rebuilt from them and `job_context.scan`
-/// rewritten, so that sweep steps at the new width.
+/// capture ([`capture_of`]), usable fraction or depth changed (a rate cap
+/// measured after the scan started), the grid and mask are rebuilt from them
+/// and `job_context.scan` rewritten, so that sweep steps at the new width.
 /// Cancellation is checked before every tune and ends every wait. A failed
 /// tune or a port fault fails the job; the port is left at the last step.
 async fn scan_loop(
@@ -554,12 +693,17 @@ async fn scan_loop(
             sweep_start = tokio::time::Instant::now();
         }
         let step_start = tokio::time::Instant::now();
-        if i == 0 && layout.stale(s.port.capabilities()) {
-            layout = Layout::of(s.span, s.port.capabilities(), layout.mask);
-            generation += 1;
-            let ring = inner.ring_capacity_samples(source, layout.rate_hz());
-            average = layout.average_in_force(s.look, ring, budget);
-            inner.scan_context_rewrite(&s.id, layout.context(s.look, ring, budget));
+        if i == 0 {
+            let caps = s.port.capabilities();
+            let capture = capture_of(s.port.as_ref(), s.bits);
+            let bits = bits_in_force(s.port.as_ref(), s.bits);
+            if layout.stale(caps, capture, bits) {
+                layout = Layout::of(s.span, caps, capture, bits, layout.mask);
+                generation += 1;
+                let ring = inner.ring_capacity_samples(source, layout.rate_hz());
+                average = layout.average_in_force(s.look, ring, budget);
+                inner.scan_context_rewrite(&s.id, layout.context(s.look, ring, budget));
+            }
         }
         let steps = layout.grid.steps(sweep);
         let tune_start = tokio::time::Instant::now();
@@ -597,6 +741,7 @@ async fn scan_loop(
                 layout: generation,
                 alternates: layout.grid.alternates(),
                 average,
+                bits: layout.bits,
                 index: i,
                 center: got.center_hz,
                 block,
@@ -768,7 +913,8 @@ fn dwell_rows_per_s(dwell_ms: u64) -> u32 {
 /// [`SCAN_ROWS_DWELL_MS`] is one row of all its frames (`row_frames`), whose
 /// `rows_per_s` says `1000 / dwell_ms`; a longer one is cut into
 /// `SPECTRUM_ROWS_PER_S` rows a second. Rows wait in the stage's output
-/// stream (bus capacity) until the stage ends. Each row carries `sweeps`:
+/// stream (bus capacity) until the stage ends. Each row carries `bits`, the
+/// depth it was taken at (on a source with depths), and `sweeps`:
 /// with `avg` (an `average` in force over 1) it is averaged into it ([`average_row`]),
 /// else it passes as the stage made it with `sweeps: 1`.
 async fn fft_step(
@@ -784,6 +930,7 @@ async fn fft_step(
         frames,
         notch_hz,
         edge_mask,
+        bits,
         ..
     } = step;
     // The dwell is `frames` whole frames.
@@ -839,6 +986,9 @@ async fn fft_step(
         };
         if let Some(o) = v.as_object_mut() {
             o.insert("center_hz".into(), center.0.into());
+            if let Some(b) = bits {
+                o.insert("bits".into(), b.into());
+            }
             match avg.as_deref_mut() {
                 Some(avg) => average_row(avg, center, row, o),
                 None => {

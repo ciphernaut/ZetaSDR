@@ -182,6 +182,7 @@ async fn start_as(node: &Node, kind: JobKind, band: Tuning, elastic: bool) -> Jo
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic,
         replace: vec![],
     };

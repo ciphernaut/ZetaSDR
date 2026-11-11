@@ -49,6 +49,7 @@ async fn stream_tail_returns_events_from_running_job() {
             sideband: None,
             dwell_ms: None,
             average: None,
+            bits: None,
             elastic: false,
             replace: vec![],
         })

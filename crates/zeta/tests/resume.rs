@@ -110,6 +110,7 @@ async fn start(node: &Node, kind: JobKind) -> JobId {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     };

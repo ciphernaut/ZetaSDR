@@ -329,6 +329,7 @@ async fn start_measure(node: &Node) -> JobId {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     };

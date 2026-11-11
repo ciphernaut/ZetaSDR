@@ -941,6 +941,7 @@ async fn job_start_refuses_an_unavailable_graph_row() {
             sideband: None,
             dwell_ms: None,
             average: None,
+            bits: None,
             elastic: false,
             replace: vec![],
         })

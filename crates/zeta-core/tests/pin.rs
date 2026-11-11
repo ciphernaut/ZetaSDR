@@ -213,6 +213,7 @@ fn start(kind: JobKind, t: Tuning, elastic: bool, replace: Vec<JobId>) -> Op {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic,
         replace,
     }

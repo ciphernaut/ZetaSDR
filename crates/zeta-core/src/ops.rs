@@ -192,6 +192,21 @@ pub enum Op {
         #[serde(default, deserialize_with = "nullable_u32")]
         #[schemars(required, schema_with = "nullable_average")]
         average: Option<u32>,
+        /// `scan` only: the sample depth the source's link runs at for the scan, one
+        /// of `source_list`'s `capabilities.depths[].bits`; `null` is the source's own
+        /// (`depth`). The scan holds the source at it and steps at its
+        /// `max_bandwidth_hz`, and puts the source's own depth back when it ends.
+        /// A lossy depth (8 bits on a B210) sweeps faster, but a weak signal beside a
+        /// strong one in the same capture is lost in its quantisation noise: for a
+        /// coarse survey of occupancy, never for faint signals, and never the
+        /// default. A scan is its source's sole holder, so it is a conflict naming
+        /// any other holder, and a job started while it runs is one naming it.
+        /// `job_context.scan.bits` and each row's `bits` say the depth in force.
+        /// Changes on a running scan through `graph_put` (the `fft` node's `bits`).
+        /// Any other kind must pass `null`.
+        #[serde(default, deserialize_with = "nullable_u8")]
+        #[schemars(required, schema_with = "nullable_bits")]
+        bits: Option<u8>,
         /// `spectrum` only (`false` for any other kind): the job follows the
         /// source's capture instead of holding it. It never conflicts, never
         /// retunes a held source (its `tuning` is the capture it joins), is
@@ -746,6 +761,23 @@ fn nullable_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D
     <Option<u32> as Deserialize>::deserialize(d)
 }
 
+/// Deserialize a required `Option<u8>` (see [`nullable_u64`]).
+fn nullable_u8<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u8>, D::Error> {
+    <Option<u8> as Deserialize>::deserialize(d)
+}
+
+/// Schema of `job_start`'s `bits`: `["integer","null"]` (which depths are listed is
+/// the source's, checked by the node).
+fn nullable_bits(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "format": "uint8",
+        "minimum": 0,
+        "maximum": 255,
+        "description": "`scan` only: the sample depth the source's link runs at for the scan, one of its `capabilities.depths[].bits`; `null` is the source's own. A lossy depth sweeps faster but loses a weak signal beside a strong one: for a coarse survey, never the default. Any other kind must pass `null`."
+    })
+}
+
 /// Schema of `job_start`'s `dwell_ms`: `["integer","null"]` (the range is checked by
 /// the node, so a value outside it is `out_of_range` naming the field).
 fn nullable_dwell_ms(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -884,11 +916,12 @@ fn require_all_value(schema: &mut schemars::Schema) {
     }
 }
 
-/// `job_start` requires its look, `dwell_ms` and `average`, after `sideband` (the
-/// field order agents read), and like `deviation_hz` shows no default for them;
-/// they still default to `null` when a request from before them leaves them out.
+/// `job_start` requires its look, `dwell_ms`, `average` and `bits`, after `sideband`
+/// (the field order agents read), and like `deviation_hz` shows no default for
+/// them; they still default to `null` when a request from before them leaves them
+/// out.
 fn require_the_look(schema: &mut schemars::Schema) {
-    const LOOK: [&str; 2] = ["dwell_ms", "average"];
+    const LOOK: [&str; 3] = ["dwell_ms", "average", "bits"];
     if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
         req.retain(|f| !LOOK.iter().any(|l| f == l));
         let at = req
@@ -2012,7 +2045,14 @@ impl ScanGrid {
 /// outside the source's tune range (when that range is narrower than `w`, to
 /// `tune_min + w/2`), and a centre equal to the one before it is dropped.
 pub fn scan_grid(span: Tuning, caps: &Capabilities) -> ScanGrid {
-    let capture = caps.max_bandwidth_hz.value().0.max(1);
+    scan_grid_at(span, caps, caps.max_bandwidth_hz.value().0)
+}
+
+/// [`scan_grid`] at a capture of `capture_hz` in place of `caps`'
+/// `max_bandwidth_hz`: a scan at a sample depth steps at that depth's cap
+/// ([`scan_capture_hz`]).
+pub fn scan_grid_at(span: Tuning, caps: &Capabilities, capture_hz: u64) -> ScanGrid {
+    let capture = capture_hz.max(1);
     let ppb = u128::from(usable_ppb(*caps.usable_fraction.value()));
     let usable_part = u64::try_from(u128::from(capture) * ppb / 1_000_000_000)
         .unwrap_or(capture)
@@ -3595,13 +3635,15 @@ pub(crate) fn check_start_params(
     }
 }
 
-/// `job_start`'s checks of a scan's look: `dwell_ms` (1..=`SCAN_DWELL_MAX_MS`) and
-/// `average` (1..=`SCAN_AVERAGE_MAX`) are for kind `scan` only, as `deviation_hz` is
-/// for the FM demodulators; out of range is `out_of_range` naming the field.
+/// `job_start`'s checks of a scan's look: `dwell_ms` (1..=`SCAN_DWELL_MAX_MS`),
+/// `average` (1..=`SCAN_AVERAGE_MAX`) and `bits` (which the source's depths decide,
+/// [`scan_bits_refusal`]) are for kind `scan` only, as `deviation_hz` is for the FM
+/// demodulators; out of range is `out_of_range` naming the field.
 pub(crate) fn check_look(
     kind: &JobKind,
     dwell_ms: Option<u64>,
     average: Option<u32>,
+    bits: Option<u8>,
 ) -> Result<(), OpError> {
     for (field, v, max) in [
         ("dwell_ms", dwell_ms, SCAN_DWELL_MAX_MS),
@@ -3620,7 +3662,48 @@ pub(crate) fn check_look(
         }
         range(field, v, 1, max)?;
     }
+    if bits.is_some() && *kind != JobKind::Scan {
+        return Err(other(format!(
+            "bits applies only to kind scan; pass null (kind is {})",
+            kind.name()
+        )));
+    }
     Ok(())
+}
+
+/// Why a scan of `source` (with `caps`) cannot run at `bits`: `bits <n>: source <id>
+/// has one sample depth` on a source without depths, `bits <n>: source <id> carries
+/// <list>` (`16, 8`) when its depths do not list it; `None` when they do.
+pub(crate) fn scan_bits_refusal(
+    source: &SourceId,
+    caps: &Capabilities,
+    bits: u64,
+) -> Option<String> {
+    if caps.depths.is_empty() {
+        return Some(format!(
+            "bits {bits}: source {} has one sample depth",
+            source.0
+        ));
+    }
+    if caps.depths.iter().any(|d| u64::from(d.bits) == bits) {
+        return None;
+    }
+    let listed: Vec<String> = caps.depths.iter().map(|d| d.bits.to_string()).collect();
+    Some(format!(
+        "bits {bits}: source {} carries {}",
+        source.0,
+        listed.join(", ")
+    ))
+}
+
+/// The capture a scan at `bits` steps at on a source with `caps`: that depth's
+/// `max_bandwidth_hz`, or the top-level one (the source's own depth's) without
+/// `bits` or for a depth the record does not list.
+pub fn scan_capture_hz(caps: &Capabilities, bits: Option<u8>) -> u64 {
+    bits.and_then(|b| caps.depths.iter().find(|d| d.bits == b))
+        .map_or(caps.max_bandwidth_hz.value().0, |d| {
+            d.max_bandwidth_hz.value().0
+        })
 }
 
 /// An op error with the request field it is about (`plan`, `channels`, `kind`,
@@ -3928,6 +4011,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             sideband,
             dwell_ms,
             average,
+            bits,
             elastic,
             replace,
         } => {
@@ -3938,7 +4022,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 });
             }
             let deviation = check_start_params(&kind, deviation_hz, sideband)?;
-            check_look(&kind, dwell_ms, average)?;
+            check_look(&kind, dwell_ms, average, bits)?;
             // An unknown or unready mode is refused before anything is tuned.
             kind.mode_row(&node.modes())?;
             let tuning = Tuning {
@@ -3953,7 +4037,12 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                         (caps.tune_max_hz.value().0).saturating_sub(caps.tune_min_hz.value().0);
                     tune.saturating_add(caps.max_bandwidth_hz.value().0)
                 })?;
-                let capture = *port.capabilities().max_bandwidth_hz.value();
+                if let Some(why) =
+                    bits.and_then(|b| scan_bits_refusal(&source, port.capabilities(), b.into()))
+                {
+                    return Err(other(why));
+                }
+                let capture = Hz(scan_capture_hz(port.capabilities(), bits));
                 let mut graph =
                     kind.expand(&source, tuning, capture, None, None, None, &node.modes())?;
                 // The look lives on the scan's `fft` node, where `graph_put` changes
@@ -3969,6 +4058,9 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                     }
                     if let Some(a) = average {
                         p.insert("average".into(), a.into());
+                    }
+                    if let Some(b) = bits {
+                        p.insert("bits".into(), b.into());
                     }
                 }
                 // With `replace`, the named holders stop and the scan leases under

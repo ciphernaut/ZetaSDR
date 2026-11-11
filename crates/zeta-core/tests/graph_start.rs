@@ -274,6 +274,7 @@ async fn job_start_refuses_the_graph_and_bits_kinds() {
                 sideband: None,
                 dwell_ms: None,
                 average: None,
+                bits: None,
                 elastic: false,
                 replace: vec![],
             })

@@ -19,7 +19,8 @@ use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageRegistry, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{
-    Capabilities, Claim, Hz, JobId, SampleFormat, SourceId, Span, StreamId, StreamKind, Timestamp,
+    Capabilities, Claim, Depth, Hz, JobId, SampleFormat, SourceId, Span, StreamId, StreamKind,
+    Timestamp,
 };
 
 const MHZ: u64 = 1_000_000;
@@ -72,9 +73,12 @@ fn block_len(rate_hz: u64, block_ms: u64) -> usize {
 /// of that band's centre, as its [`Delivery`] says. Block timestamps advance by
 /// exactly the block's signal time, so the ring sees one contiguous run per
 /// step and a dwell reads several blocks (but where `Gapping` skips). With
-/// `fail_tune`, that tune (1-based) and every later one fails. Its record can be
+/// `fail_tune`, that tune (1-based) and every later one fails (only that one
+/// with `fail_once`). Its record can be
 /// replaced once ([`ScanPort::replace_caps`]), as a worker port's is by a
-/// respawn's hello.
+/// respawn's hello. One made [`ScanPort::with_depths`] carries two sample
+/// depths, changes depth as a Soapy source does (the tuning forgotten), bounds a
+/// tune by the depth in force and logs every `set_depth` and tune in order.
 struct ScanPort {
     id: SourceId,
     caps: Capabilities,
@@ -82,11 +86,42 @@ struct ScanPort {
     cur: Mutex<Option<Tuning>>,
     tunes: Mutex<Vec<(Tuning, Instant)>>,
     fail_tune: Option<usize>,
+    fail_once: bool,
+    /// Whether a `fail_once` tune has failed.
+    failed: AtomicBool,
+    /// The depth in force (bits), on a port with depths.
+    depth: Mutex<Option<u8>>,
+    /// Every `set_depth` and tune, in order.
+    log: Mutex<Vec<Call>>,
     /// The `t0` of every block a `Gapping` port started late.
     gaps: Mutex<Vec<u64>>,
     /// While set, no block is sent ([`ScanPort::hold`]).
     held: AtomicBool,
     tx: broadcast::Sender<IqBlock>,
+}
+
+/// A call on a [`ScanPort`], as its log keeps it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Call {
+    SetDepth(u8),
+    Tune(Tuning),
+}
+
+/// The depths of a [`ScanPort::with_depths`] port: 16 bits lossless at 16 MHz
+/// (its own) and 8 bits lossy at 32 MHz.
+fn two_depths() -> Vec<Depth> {
+    vec![
+        Depth {
+            bits: 16,
+            lossless: true,
+            max_bandwidth_hz: Claim::Measured(Hz(16 * MHZ)),
+        },
+        Depth {
+            bits: 8,
+            lossless: false,
+            max_bandwidth_hz: Claim::Measured(Hz(32 * MHZ)),
+        },
+    ]
 }
 
 /// One `block_ms` block's samples at `t`: a whole number of tone cycles for
@@ -143,6 +178,22 @@ impl ScanPort {
         Self::build(None, false, false, Delivery::Gapping, 16 * MHZ)
     }
 
+    /// A 16 MHz port at 16 bits that also carries 8 bits at 32 MHz
+    /// ([`two_depths`]); with `fail_tune`, that tune (1-based) fails, once.
+    fn with_depths(fail_tune: Option<usize>) -> Arc<Self> {
+        Self::build_with(fail_tune, false, false, Delivery::Real, 16 * MHZ, |me| {
+            me.caps.depths = two_depths();
+            me.caps.max_bandwidth_hz = Claim::Measured(Hz(16 * MHZ));
+            *me.depth.get_mut().unwrap() = Some(16);
+            me.fail_once = true;
+        })
+    }
+
+    /// Every `set_depth` and tune so far, in order.
+    fn calls(&self) -> Vec<Call> {
+        self.log.lock().unwrap().clone()
+    }
+
     fn build(
         fail_tune: Option<usize>,
         remote: bool,
@@ -150,7 +201,19 @@ impl ScanPort {
         delivery: Delivery,
         max_bandwidth_hz: u64,
     ) -> Arc<Self> {
-        let p = Arc::new(Self {
+        Self::build_with(fail_tune, remote, push, delivery, max_bandwidth_hz, |_| {})
+    }
+
+    /// [`ScanPort::build`], the port changed by `f` before it starts sending.
+    fn build_with(
+        fail_tune: Option<usize>,
+        remote: bool,
+        push: bool,
+        delivery: Delivery,
+        max_bandwidth_hz: u64,
+        f: impl FnOnce(&mut Self),
+    ) -> Arc<Self> {
+        let mut p = Self {
             id: SourceId("radio0".into()),
             caps: Capabilities {
                 tune_min_hz: Claim::Asserted(Hz(MHZ)),
@@ -169,10 +232,16 @@ impl ScanPort {
             cur: Mutex::new(None),
             tunes: Mutex::new(Vec::new()),
             fail_tune,
+            fail_once: false,
+            failed: AtomicBool::new(false),
+            depth: Mutex::new(None),
+            log: Mutex::new(Vec::new()),
             gaps: Mutex::new(Vec::new()),
             held: AtomicBool::new(false),
             tx: broadcast::channel(16).0,
-        });
+        };
+        f(&mut p);
+        let p = Arc::new(p);
         let weak = Arc::downgrade(&p);
         tokio::spawn(async move {
             let base = std::time::SystemTime::now()
@@ -252,10 +321,27 @@ impl Port for ScanPort {
     }
     async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
         let n = self.tunes.lock().unwrap().len() + 1;
-        if self.fail_tune.is_some_and(|f| n >= f) {
+        let fails = match self.fail_tune {
+            Some(f) if self.fail_once => n == f && !self.failed.swap(true, Ordering::SeqCst),
+            Some(f) => n >= f,
+            None => false,
+        };
+        if fails {
             return Err(PortError::Io(format!("tune {n} refused")));
         }
+        if let Some(d) = self.depth()
+            && t.bandwidth_hz.0 > d.max_bandwidth_hz.value().0
+        {
+            return Err(PortError::OutOfRange {
+                field: "bandwidth_hz",
+                value: t.bandwidth_hz.0,
+                min: 1,
+                max: d.max_bandwidth_hz.value().0,
+                suggested: None,
+            });
+        }
         self.tunes.lock().unwrap().push((t, Instant::now()));
+        self.log.lock().unwrap().push(Call::Tune(t));
         *self.cur.lock().unwrap() = Some(t);
         Ok(t)
     }
@@ -264,6 +350,20 @@ impl Port for ScanPort {
     }
     fn subscribe(&self) -> IqReceiver {
         self.tx.subscribe()
+    }
+    fn depth(&self) -> Option<Depth> {
+        let bits = (*self.depth.lock().unwrap())?;
+        self.caps.depths.iter().find(|d| d.bits == bits).cloned()
+    }
+    async fn set_depth(&self, bits: u8) -> Result<Depth, PortError> {
+        let Some(d) = self.caps.depths.iter().find(|d| d.bits == bits).cloned() else {
+            return Err(PortError::Unsupported(format!("no {bits}-bit depth")));
+        };
+        // As a Soapy source: the stream closes and the tuning is forgotten.
+        *self.depth.lock().unwrap() = Some(bits);
+        *self.cur.lock().unwrap() = None;
+        self.log.lock().unwrap().push(Call::SetDepth(bits));
+        Ok(d)
     }
 }
 
@@ -432,6 +532,7 @@ fn start(kind: JobKind, center_hz: u64, bandwidth_hz: u64) -> Op {
         sideband: None,
         dwell_ms: None,
         average: None,
+        bits: None,
         elastic: false,
         replace: vec![],
     }
@@ -452,6 +553,7 @@ fn start_look(
             bandwidth_hz,
             deviation_hz,
             sideband,
+            bits,
             elastic,
             replace,
             ..
@@ -464,6 +566,7 @@ fn start_look(
             sideband,
             dwell_ms,
             average,
+            bits,
             elastic,
             replace,
         },
@@ -1733,4 +1836,325 @@ async fn an_average_over_its_budget_is_lowered_to_fit() {
         .collect();
     assert_eq!(sweeps, [1, 2, 2, 2, 2, 2]);
     node.job_stop(&id).await.unwrap();
+}
+
+/// `op` (a `job_start`) asking for `bits`.
+fn with_bits(mut op: Op, b: Option<u8>) -> Op {
+    if let Op::JobStart { bits, .. } = &mut op {
+        *bits = b;
+    }
+    op
+}
+
+/// Start a scan of `bandwidth_hz` about `center_hz` at `bits`; its id and a
+/// receiver on its event stream.
+async fn start_bits(
+    node: &Node,
+    (center_hz, bandwidth_hz): (u64, u64),
+    bits: Option<u8>,
+) -> (JobId, broadcast::Receiver<Frame>) {
+    let op = with_bits(start(JobKind::Scan, center_hz, bandwidth_hz), bits);
+    let id = match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected a job, got {other:?}"),
+    };
+    let rx = event_rx(node, &id);
+    (id, rx)
+}
+
+/// The tunes in `calls`.
+fn tunes_in(calls: &[Call]) -> Vec<Tuning> {
+    calls
+        .iter()
+        .filter_map(|c| match c {
+            Call::Tune(t) => Some(*t),
+            Call::SetDepth(_) => None,
+        })
+        .collect()
+}
+
+/// The source's depth is back at its own (16 bits) before anything else tuned
+/// it: the last `set_depth` in `calls` is 16, every call after it is a tune
+/// within the 16-bit cap, and there is at least one (the next job's).
+fn restored_before_the_next_tune(calls: &[Call]) {
+    let at = calls
+        .iter()
+        .rposition(|c| matches!(c, Call::SetDepth(_)))
+        .expect("a set_depth");
+    assert_eq!(calls[at], Call::SetDepth(16), "{calls:?}");
+    let after = tunes_in(&calls[at + 1..]);
+    assert!(!after.is_empty(), "no tune after the restore: {calls:?}");
+    assert_eq!(after.len(), calls.len() - at - 1, "{calls:?}");
+    assert!(
+        after.iter().all(|t| t.bandwidth_hz.0 <= 16 * MHZ),
+        "{calls:?}"
+    );
+}
+
+/// A scan at `bits: 8` holds the source at 8 bits for its run, before its first
+/// tune, steps at that depth's 32 MHz, and says so in `job_context.scan` and on
+/// every row; its stop puts the source's 16 bits back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_at_a_lossy_depth_steps_at_that_depths_width_and_says_so() {
+    let (_dir, node, port) = open_with(ScanPort::with_depths(None)).await;
+    let (id, mut rx) = start_bits(&node, (20 * MHZ, 40 * MHZ), Some(8)).await;
+    let fft = fft_node(&graph_of(&node, &id).await).params.clone();
+    assert_eq!(fft["bits"], 8, "{fft}");
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(ctx["scan"]["bits"], 8, "{ctx}");
+    assert_eq!(ctx["scan"]["rate_hz"], 32 * MHZ, "{ctx}");
+    // 40 MHz at 32 MHz a step: two steps, not the three of 16 MHz.
+    assert_eq!(ctx["scan"]["steps"], 2, "{ctx}");
+    for f in rows(&mut rx, 6, Duration::from_secs(10)).await {
+        assert_eq!(ev(&f)["bits"], 8, "{}", ev(&f));
+        assert_eq!(ev(&f)["size"], 8192, "{}", ev(&f));
+    }
+    let calls = port.calls();
+    assert_eq!(calls[0], Call::SetDepth(8), "{calls:?}");
+    let tunes = tunes_in(&calls);
+    assert!(tunes.len() >= 2, "{calls:?}");
+    assert!(
+        tunes.iter().all(|t| t.bandwidth_hz.0 == 32 * MHZ),
+        "{calls:?}"
+    );
+    node.job_stop(&id).await.unwrap();
+    assert_eq!(port.calls().last(), Some(&Call::SetDepth(16)));
+    assert_eq!(port.depth().map(|d| d.bits), Some(16));
+}
+
+/// A scan that asks for no depth leaves the source at its own and reports it;
+/// on a source with one depth there is none to report.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_without_bits_reports_the_sources_own_depth() {
+    let (_dir, node, port) = open_with(ScanPort::with_depths(None)).await;
+    let (id, mut rx) = start_bits(&node, (20 * MHZ, 40 * MHZ), None).await;
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(ctx["scan"]["bits"], 16, "{ctx}");
+    assert_eq!(ctx["scan"]["rate_hz"], 16 * MHZ, "{ctx}");
+    for f in rows(&mut rx, 4, Duration::from_secs(10)).await {
+        assert_eq!(ev(&f)["bits"], 16, "{}", ev(&f));
+    }
+    node.job_stop(&id).await.unwrap();
+    let calls = port.calls();
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::SetDepth(_))),
+        "{calls:?}"
+    );
+
+    let (_dir, node, _port) = open().await;
+    let (id, mut rx) = start_scan(&node).await;
+    let ctx = node.job_context(&id).unwrap();
+    assert!(ctx["scan"].get("bits").is_none(), "{ctx}");
+    for f in rows(&mut rx, 2, Duration::from_secs(10)).await {
+        assert!(ev(&f).get("bits").is_none(), "{}", ev(&f));
+    }
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A lossy scan is granted only as its source's sole holder: on a held source
+/// it is a conflict naming the holders, and the depth is never touched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lossy_scan_on_a_held_source_is_a_conflict_naming_the_holders() {
+    let (_dir, node, port) = open_with(ScanPort::with_depths(None)).await;
+    let held = match node.apply(start(JobKind::Spectrum, 100 * MHZ, MHZ)).await {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected a job, got {other:?}"),
+    };
+    let op = with_bits(start(JobKind::Scan, 20 * MHZ, 40 * MHZ), Some(8));
+    match node.apply(op).await {
+        Err(OpError::Conflict { holders, .. }) => assert_eq!(holders, vec![held.clone()]),
+        other => panic!("expected a conflict naming the holder, got {other:?}"),
+    }
+    let calls = port.calls();
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::SetDepth(_))),
+        "{calls:?}"
+    );
+    assert_eq!(port.depth().map(|d| d.bits), Some(16));
+    assert_eq!(node.job_list().len(), 1);
+    node.job_stop(&held).await.unwrap();
+}
+
+/// While a lossy scan runs, a job started on its source is the usual conflict
+/// naming the scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_started_under_a_lossy_scan_is_a_conflict_naming_it() {
+    let (_dir, node, port) = open_with(ScanPort::with_depths(None)).await;
+    let (id, _rx) = start_bits(&node, (20 * MHZ, 40 * MHZ), Some(8)).await;
+    tunes_at_least(&port, 1, Duration::from_secs(5)).await;
+    for op in [
+        start(JobKind::Spectrum, 17 * MHZ, MHZ),
+        start(JobKind::FmDemod, 24 * MHZ, 12_500),
+        with_bits(start(JobKind::Scan, 100 * MHZ, 40 * MHZ), Some(8)),
+    ] {
+        match node.apply(op).await {
+            Err(OpError::Conflict { holders, .. }) => assert_eq!(holders, vec![id.clone()]),
+            other => panic!("expected a conflict naming the scan, got {other:?}"),
+        }
+    }
+    assert_eq!(port.depth().map(|d| d.bits), Some(8));
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A stopped lossy scan puts the source's depth back before its lease goes: a
+/// `job_start` sent as soon as `job_stop` returns, and one that stops the scan
+/// itself (`replace`), each tune at the source's own depth.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_the_scan_restores_the_depth_before_the_next_job_is_granted() {
+    let (_dir, node, port) = open_with(ScanPort::with_depths(None)).await;
+    let (id, _rx) = start_bits(&node, (20 * MHZ, 40 * MHZ), Some(8)).await;
+    tunes_at_least(&port, 3, Duration::from_secs(5)).await;
+    node.apply(Op::JobStop { job: id }).await.unwrap();
+    let next = match node.apply(start(JobKind::Spectrum, 100 * MHZ, MHZ)).await {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected a job, got {other:?}"),
+    };
+    restored_before_the_next_tune(&port.calls());
+    node.job_stop(&next).await.unwrap();
+
+    // The waiting request stops the scan itself.
+    let (id, _rx) = start_bits(&node, (20 * MHZ, 40 * MHZ), Some(8)).await;
+    let n = port.tunes().len();
+    tunes_at_least(&port, n + 3, Duration::from_secs(5)).await;
+    let mut op = start(JobKind::Spectrum, 100 * MHZ, MHZ);
+    if let Op::JobStart { replace, .. } = &mut op {
+        *replace = vec![id.clone()];
+    }
+    let next = match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected a job, got {other:?}"),
+    };
+    restored_before_the_next_tune(&port.calls());
+    let scan = node.job_list().into_iter().find(|r| r.id == id).unwrap();
+    assert_eq!(scan.state, JobState::Stopped);
+    node.job_stop(&next).await.unwrap();
+}
+
+/// A lossy scan that fails (a tune fault) puts the depth back too, before its
+/// lease goes: a request retried all the while is granted only after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_scan_also_restores_the_depth() {
+    let (_dir, node, port) = open_with(ScanPort::with_depths(Some(2))).await;
+    let (id, _rx) = start_bits(&node, (20 * MHZ, 40 * MHZ), Some(8)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let next = loop {
+        match node.apply(start(JobKind::Spectrum, 100 * MHZ, MHZ)).await {
+            Ok(OpResult::Job(next)) => break next,
+            Err(OpError::Conflict { holders, .. }) => assert_eq!(holders, vec![id.clone()]),
+            other => panic!("expected a job or a conflict naming the scan, got {other:?}"),
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never granted");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    };
+    match node
+        .job_list()
+        .into_iter()
+        .find(|r| r.id == id)
+        .unwrap()
+        .state
+    {
+        JobState::Failed { reason } => assert!(reason.contains("tune 2 refused"), "{reason}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let calls = port.calls();
+    assert_eq!(calls[0], Call::SetDepth(8), "{calls:?}");
+    assert!(
+        matches!(calls[1], Call::Tune(t) if t.bandwidth_hz.0 == 32 * MHZ),
+        "{calls:?}"
+    );
+    assert_eq!(calls[2], Call::SetDepth(16), "{calls:?}");
+    restored_before_the_next_tune(&calls);
+    node.job_stop(&next).await.unwrap();
+}
+
+/// `bits` the source's link does not carry is refused, naming the depths it
+/// does, before anything is leased or changed.
+#[tokio::test(flavor = "multi_thread")]
+async fn bits_the_source_does_not_carry_is_refused_naming_its_depths() {
+    let (_dir, node, port) = open_with(ScanPort::with_depths(None)).await;
+    let op = with_bits(start(JobKind::Scan, 20 * MHZ, 40 * MHZ), Some(12));
+    match node.apply(op).await {
+        Err(OpError::Other { message }) => {
+            assert_eq!(message, "bits 12: source radio0 carries 16, 8")
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+    assert!(node.job_list().is_empty());
+    assert!(port.calls().is_empty(), "{:?}", port.calls());
+}
+
+/// `bits` on a source with one sample depth is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn bits_on_a_source_with_one_depth_is_refused() {
+    let (_dir, node, port) = open().await;
+    let op = with_bits(start(JobKind::Scan, 20 * MHZ, 40 * MHZ), Some(8));
+    match node.apply(op).await {
+        Err(OpError::Other { message }) => {
+            assert_eq!(message, "bits 8: source radio0 has one sample depth")
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+    assert!(node.job_list().is_empty());
+    assert!(port.tunes().is_empty());
+}
+
+/// `graph_put` on the stored `fft` node's `bits` changes a running scan's depth:
+/// the scan restarts at it; `null` takes it back to the source's own; a depth the
+/// source does not carry is refused and the scan runs on as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_put_changes_bits_on_a_running_scan() {
+    let (_dir, node, port) = open_with(ScanPort::with_depths(None)).await;
+    let (id, _rx) = start_bits(&node, (20 * MHZ, 40 * MHZ), None).await;
+    tunes_at_least(&port, 1, Duration::from_secs(5)).await;
+    let put = |bits: Value| {
+        let (node, id) = (&node, id.clone());
+        async move {
+            let mut g = graph_of(node, &id).await;
+            let fft = g.nodes.iter_mut().find(|n| n.kind == "fft").unwrap();
+            fft.params["bits"] = bits;
+            node.apply(Op::GraphPut { job: id, graph: g }).await
+        }
+    };
+    assert!(matches!(put(8.into()).await, Ok(OpResult::Ok)));
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(
+        (
+            ctx["scan"]["bits"].as_u64(),
+            ctx["scan"]["rate_hz"].as_u64()
+        ),
+        (Some(8), Some(32 * MHZ)),
+        "{ctx}"
+    );
+    let mut rx = event_rx(&node, &id);
+    for f in rows(&mut rx, 3, Duration::from_secs(10)).await {
+        assert_eq!(ev(&f)["bits"], 8, "{}", ev(&f));
+    }
+    assert!(port.calls().contains(&Call::SetDepth(8)));
+
+    match put(12.into()).await {
+        Err(OpError::Other { message }) => {
+            assert_eq!(message, "bits 12: source radio0 carries 16, 8")
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+    let rec = node.job_list().into_iter().find(|r| r.id == id).unwrap();
+    assert_eq!(rec.state, JobState::Running);
+    assert_eq!(node.job_context(&id).unwrap()["scan"]["bits"], 8);
+
+    assert!(matches!(put(Value::Null).await, Ok(OpResult::Ok)));
+    let ctx = node.job_context(&id).unwrap();
+    assert_eq!(
+        (
+            ctx["scan"]["bits"].as_u64(),
+            ctx["scan"]["rate_hz"].as_u64()
+        ),
+        (Some(16), Some(16 * MHZ)),
+        "{ctx}"
+    );
+    let mut rx = event_rx(&node, &id);
+    for f in rows(&mut rx, 3, Duration::from_secs(10)).await {
+        assert_eq!(ev(&f)["bits"], 16, "{}", ev(&f));
+    }
+    node.job_stop(&id).await.unwrap();
+    restored_before_the_next_tune(&port.calls());
 }
