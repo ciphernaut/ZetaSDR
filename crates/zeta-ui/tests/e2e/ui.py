@@ -2253,6 +2253,23 @@ NEWEST_ROW_JS = """() => {
   const r = w.rows[(w.columns - 1) % w.rows.length];
   return r && typeof r.lo === 'number' ? {lo: r.lo, hi: r.hi} : null;
 }"""
+# R+G+B at `hz`'s row of the newest column painted from a row under 3 MHz wide (null: none).
+NARROW_COLUMN_AT_JS = """(hz) => {
+  const w = window.zetaTest.waterfall();
+  const c = document.querySelector('#waterfall canvas.wf-canvas');
+  const dpr = c.width / (c.clientWidth || 1);
+  const cw = Math.max(1, Math.min(w.column.width, c.width));
+  const shown = Math.min(w.columns, w.rows.length, Math.floor(c.width / cw));
+  for (let k = 0; k < shown; k++) {
+    const r = w.rows[(w.columns - 1 - k) % w.rows.length];
+    if (!r || typeof r.lo !== 'number' || r.hi - r.lo >= 3e6) continue;
+    const x = c.width - (k + 1) * cw;
+    const y = Math.round(w.yForHz(hz) * dpr);
+    const d = c.getContext('2d').getImageData(x, y, 1, 1).data;
+    return d[0] + d[1] + d[2];
+  }
+  return null;
+}"""
 BRIGHT = 500  # R+G+B of a carrier (the top of the ramp); the floor is well under it
 DARK = 400
 
@@ -2472,6 +2489,16 @@ def scenario_kiwi_zoom_drag_and_centre_reaim_the_scan(page, url, secret):
         assert len(log.named("job_retune")) > n, "Apply sent no job_retune"
         page.wait_for_timeout(1_500)
         shot(page, "kiwi_zoom_drag_and_centre_reaim_the_scan-3-applied")
+        # Back out to the whole range: a column of the 1 MHz view shows its own band only, so
+        # the first carrier, far below it, is background there (not the column before it
+        # repeated: a real Kiwi's history showed such streaks across the whole range).
+        apply_band(page, 15, 30_000)
+        wait_view(page, 0, 30_000_000, "back out to the whole range")
+        page.wait_for_timeout(500)
+        far = page.evaluate(NARROW_COLUMN_AT_JS, KIWI_CARRIERS[0])
+        assert far is not None, "no column of the 1 MHz view on screen"
+        assert far < 100, f"{KIWI_CARRIERS[0]} Hz in a column of the 1 MHz view reads {far}"
+        shot(page, "kiwi_zoom_drag_and_centre_reaim_the_scan-4-zoomed-out")
         assert all(r["job"] == job for r in log.named("job_retune")), log.named("job_retune")
         assert log.scan_starts() == [], f"scans started: {log.scan_starts()}"
         assert [j["id"] for j in running_scan_jobs(url, secret, "kiwi")] == [job]

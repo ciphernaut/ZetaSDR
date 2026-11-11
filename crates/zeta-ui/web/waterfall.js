@@ -183,7 +183,8 @@
 // it ends the page's own one comes back. Rows are painted as scan rows, each over its own
 // band. A zoom, an axis drag or the #band form show the new view at once (clampSweep: inside
 // the sweep range, never narrower than bin_hz_min × 1024: a drag stops at the edge) with the
-// rows already painted stretched onto it, and SWEEP_REAIM_MS after the last change send
+// rows already painted stretched onto it (each column shows its own row's band only, the
+// rest background: a column of a narrower view never repeats the one before it), and SWEEP_REAIM_MS after the last change send
 // `job_retune {job, center_hz, bandwidth_hz, bin_hz, replace: []}` on the scan (a quiet op):
 // the band becomes the new view and the rows of the new view replace the old as they come.
 // No holder is consulted: a sweep takes no lease. A refused re-aim eases back to the band
@@ -1691,9 +1692,11 @@ class Waterfall {
   }
 
   // Writes the fine `row` into this.column: in scan mode over the previous column (only the
-  // row's band changes), else over the coarse column (see Layers).
+  // row's band changes), in sweep mode over the background (a row is a whole view: past it
+  // is no data, not the column before), else over the coarse column (see Layers).
   composeColumn(row) {
     if (this.mode === "spectrum") this.column.data.set(this.coarseColumn.data);
+    else if (this.mode === "sweep") this.blankBuffer(this.column);
     this.fillColumn(row, false);
   }
 
