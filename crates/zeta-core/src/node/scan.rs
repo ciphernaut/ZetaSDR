@@ -1574,7 +1574,12 @@ fn sweep_context(
 /// that took the time since the last row; when a row of the next sweep arrives,
 /// each step the last sweep sent no row for is a skip, and the sweep (from the
 /// last row of the one before it, or the loop's start, to its own last row) is
-/// written as `job_context.scan.timing` at most once a second, else carried.
+/// written as `job_context.scan.timing` at most once a second, else carried. The
+/// write also says `rows_per_s`: the rows that arrived since the last write over
+/// the time since it (since the clock began, for the first). A re-aim
+/// ([`SweepClock::reaim`]) starts the sweep and the figures afresh on the new plan
+/// but keeps when the timing was last written and the row count since, so a
+/// re-aim never writes sooner than a second after the last write.
 struct SweepClock {
     timing: SweepTiming,
     /// When the timing was last written (ns since the epoch).
@@ -1583,17 +1588,36 @@ struct SweepClock {
     /// The sweep under way: its number, when it began and the steps it sent.
     sweep: Option<(u64, tokio::time::Instant, Vec<bool>)>,
     steps: usize,
+    /// Rows since the last write, and when that was (the clock's start, before one).
+    rows: u64,
+    since: tokio::time::Instant,
 }
 
 impl SweepClock {
     fn new(steps: u32) -> Self {
+        let now = tokio::time::Instant::now();
         SweepClock {
             timing: SweepTiming::default(),
             written_ns: 0,
-            last_row: tokio::time::Instant::now(),
+            last_row: now,
             sweep: None,
             steps: usize::try_from(steps).unwrap_or(usize::MAX),
+            rows: 0,
+            since: now,
         }
+    }
+
+    /// The sweep re-aimed at a plan of `steps` steps: the sweep under way and the
+    /// figures carried are dropped (they are the old plan's), the next sweep's
+    /// time counts from now; when the timing was last written and the rows
+    /// counted since are kept.
+    fn reaim(&mut self, steps: u32) {
+        *self = SweepClock {
+            written_ns: self.written_ns,
+            rows: self.rows,
+            since: self.since,
+            ..SweepClock::new(steps)
+        };
     }
 
     /// Count a row of step `step` of sweep `sweep`, closing the sweep before it.
@@ -1608,6 +1632,14 @@ impl SweepClock {
                 let took = self.last_row - start;
                 let mut t = self.timing.finish(s.span.bandwidth_hz.0, took);
                 t["at_ns"] = at_ns.into();
+                let secs = (now - self.since).as_secs_f64();
+                let rows_per_s = if secs > 0.0 {
+                    self.rows as f64 / secs
+                } else {
+                    0.0
+                };
+                t["rows_per_s"] = ((rows_per_s * 1000.0).round() / 1000.0).into();
+                (self.rows, self.since) = (0, now);
                 self.written_ns = at_ns;
                 inner.scan_context_update(&s.id, |scan| {
                     scan.insert("timing".into(), t);
@@ -1625,6 +1657,7 @@ impl SweepClock {
         }
         self.timing.step(Duration::ZERO, now - self.last_row, false);
         self.last_row = now;
+        self.rows += 1;
     }
 }
 
@@ -1738,7 +1771,7 @@ async fn sweep_loop(
                     alternates = plan_alternates(plan);
                     average = sweep_average(s.look, s.budget, plan);
                     averages = [0, 1].map(|_| SweepAverage::new(average));
-                    clock = SweepClock::new(plan.steps);
+                    clock.reaim(plan.steps);
                     let fields = sweep_context(plan, s.look, average, s.calibrated);
                     inner.scan_reaimed(&s.id, r.span, r.bin_hz, fields);
                     // The fields say `waiting: null`; the source's state is read again.

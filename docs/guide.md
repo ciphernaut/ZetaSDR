@@ -872,8 +872,9 @@ scan the source sweeps for itself stops nothing; if a refusal makes the scan ste
 stopped before it takes the radio; `--method source` with `--replace` is refused (`replace applies to a
 stepped scan`). Pass `--replace` only when a `conflict` named those holders. The job context of a
 `source` scan holds `method`, `steps`, `step_hz`, `bin_hz`, `dwell_ms` (`dwell_ms_asked`), `average`
-(`average_asked`), `alternate`, `mask`, `calibrated`, `waiting` and `timing`, and has no `rate_hz` and
-no `bits`; while it is `waiting` it holds only `method`, `mask`, `calibrated` and `waiting` (the plan's
+(`average_asked`), `alternate`, `mask`, `calibrated`, `waiting` and `timing` (the stepped scan's keys
+and `rows_per_s`, the rows a second since the last write, which is what to read for a one-view sweep;
+rewritten at most once a second, re-aims included), and has no `rate_hz` and no `bits`; while it is `waiting` it holds only `method`, `mask`, `calibrated` and `waiting` (the plan's
 keys arrive when the source grants the sweep, `timing` after its first sweep); a row's `calibrated` says its levels are absolute dBm, which a local radio's rows are not, so
 never compare levels across the two. A sweep a source refuses at a first start makes the scan step, and
 `scan.fallback` says why; when the source's IQ channel is held that is the usual `conflict` carrying the

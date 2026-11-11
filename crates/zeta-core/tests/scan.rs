@@ -3657,3 +3657,51 @@ async fn a_one_step_self_sweep_does_not_alternate() {
     assert!(ctx["alternate"].is_null(), "{ctx}");
     node.job_stop(&id).await.unwrap();
 }
+
+/// The `at_ns` of job `id`'s `context.scan.timing`, once written.
+fn timing_at(node: &Node, id: &JobId) -> Option<u64> {
+    timing(node, id).and_then(|t| t["at_ns"].as_u64())
+}
+
+/// A self-sweep of one view (one step: each row a sweep of its own) refreshes its
+/// `timing` as a stepped scan does, at most once a second, and keeps refreshing it
+/// across re-aims; `rows_per_s` says the rows of the last second.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_step_self_sweep_refreshes_its_timing_across_re_aims() {
+    let script = SweepScript {
+        steps: Some(1),
+        retarget: true,
+        ..Default::default()
+    };
+    let (_dir, node, _port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, _rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    until("a timing", Duration::from_secs(10), || {
+        timing_at(&node, &id).is_some()
+    })
+    .await;
+    let mut seen = vec![timing_at(&node, &id).unwrap()];
+    for k in 0..3u64 {
+        let span = (SWEEP_SPAN.0 + (k + 1) * MHZ, SWEEP_SPAN.1);
+        let r = retune_scan(&node, &id, span, None, &[]).await;
+        assert_eq!(r, Ok(OpResult::Job(id.clone())));
+        let last = *seen.last().unwrap();
+        until(
+            "the timing refreshed after a re-aim",
+            Duration::from_secs(10),
+            || timing_at(&node, &id).is_some_and(|at| at > last),
+        )
+        .await;
+        seen.push(timing_at(&node, &id).unwrap());
+    }
+    for w in seen.windows(2) {
+        assert!(
+            w[1] - w[0] >= 900_000_000,
+            "written more than once a second: {seen:?}"
+        );
+    }
+    let t = timing(&node, &id).unwrap();
+    let rps = t["rows_per_s"].as_f64().expect("rows_per_s");
+    // A row every SWEEP_ROW_MS (5 ms): well over 20 a second, under 1000.
+    assert!(rps > 20.0 && rps < 1000.0, "{t}");
+    node.job_stop(&id).await.unwrap();
+}
