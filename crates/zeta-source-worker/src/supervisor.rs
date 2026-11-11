@@ -1405,6 +1405,7 @@ mod tests {
             push: false,
             usable_fraction: Claim::Asserted(1.0),
             depths: vec![],
+            sweep: None,
         };
         let mut new = old.clone();
         new.usable_fraction = Claim::Asserted(0.9);
@@ -1440,6 +1441,7 @@ mod tests {
             push: false,
             usable_fraction: Claim::Asserted(0.9),
             depths: vec![],
+            sweep: None,
         };
         // A respawn whose probe found no rung clean at its depth asserts the
         // device's top rate: no measurement, so the measured record stays.
@@ -1471,6 +1473,7 @@ mod tests {
             push: false,
             usable_fraction: Claim::Asserted(0.9),
             depths: vec![],
+            sweep: None,
         };
         // A link measured again at a new speed: a measured cap over a measured
         // one, which the run's record keeps, is what the next start gets.

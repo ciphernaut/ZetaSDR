@@ -4001,6 +4001,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "zeta-client",
  "zeta-core",
  "zeta-vrt",

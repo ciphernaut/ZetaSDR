@@ -84,7 +84,11 @@ pub enum Op {
     /// before the first block; a `classify` or `iq_read` span older than it fails
     /// `too_old`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
     /// source reported it, `configured` from `--source-position`) where the source knows
-    /// where it is, `null` otherwise. Jobs on a faulted source fail with
+    /// where it is, `null` otherwise, and `sweeps`, the scans the source is sweeping for
+    /// by its own means (a source whose `capabilities.sweep` says it can: `min_hz`,
+    /// `max_hz`, `bin_hz_min`, `rows_per_s_max`, `calibrated`, the levels in dBm; `null`
+    /// for a source that cannot), which hold no band and are never among `holders`.
+    /// Jobs on a faulted source fail with
     /// `source ID: FAULT` as their reason; a successful tune (`source_ensure`,
     /// `job_start`) clears it. A channelised job's `job_context` holds `channel.path`:
     /// `bank` (with `bin_hz`) or `direct` (with `reason`, why not the bank).
@@ -2316,12 +2320,17 @@ pub struct SourceInfo {
         schema_with = "crate::types::nullable::<crate::types::Depth>"
     )]
     pub depth: Option<crate::types::Depth>,
+    /// The scans the source is sweeping for by its own means (`capabilities.sweep`),
+    /// which hold no band: never among `holders`. Defaults to empty when absent, so a
+    /// source of an older node still loads.
+    #[serde(default)]
+    pub sweeps: Vec<JobId>,
 }
 
 /// Schemars omits a serde-defaulted field from `required`, and `#[schemars(required)]`
-/// does not override that; every node of this version writes `worker`, `ring`, `position` and
-/// `depth`, so the published schema requires them (as `JobRecord`'s schema does its defaulted
-/// fields).
+/// does not override that; every node of this version writes `worker`, `ring`, `position`,
+/// `depth` and `sweeps`, so the published schema requires them (as `JobRecord`'s schema does
+/// its defaulted fields).
 fn require_worker(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -2329,7 +2338,7 @@ fn require_worker(schema: &mut schemars::Schema) {
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
     {
-        for field in ["worker", "ring", "position", "depth"] {
+        for field in ["worker", "ring", "position", "depth", "sweeps"] {
             if !req.iter().any(|r| r == field) {
                 req.push(field.into());
             }
@@ -3917,6 +3926,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                     worker: node.port(&id).and_then(|p| p.worker()),
                     position: node.source_position(&id),
                     depth: node.port(&id).and_then(|p| p.depth()),
+                    sweeps: node.lease_sweepers(&id),
                     ring: node.ring(&id).map(|r| RingInfo {
                         seconds: r.read().unwrap().capacity_seconds(),
                     }),
@@ -6464,6 +6474,7 @@ mod tests {
             push: false,
             usable_fraction: Claim::Asserted(1.0),
             depths: vec![],
+            sweep: None,
         }
     }
 

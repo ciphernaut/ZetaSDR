@@ -151,6 +151,7 @@ impl KiwiSource {
             push: true,
             usable_fraction: Claim::Asserted(1.0),
             depths: vec![],
+            sweep: None,
         };
         Self {
             id,

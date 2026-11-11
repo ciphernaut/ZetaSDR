@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, watch};
 
-use crate::types::{Capabilities, Claim, Depth, Hz, SourceId, Timestamp};
+use crate::types::{Capabilities, Claim, Depth, Hz, SourceId, Span, Timestamp};
 
 /// A centre frequency and the bandwidth captured around it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -274,6 +275,69 @@ pub fn sc16_sample_to_cf32(s: Complex<i16>) -> Complex<f32> {
     Complex::new(f32::from(s.re) / 32768.0, f32::from(s.im) / 32768.0)
 }
 
+/// What a scan asks a source that sweeps for itself ([`Port::sweep`]): power
+/// spectra of `span`, at bins of `bin_hz` or the nearest the source can give,
+/// each row averaged over `dwell_ms` (0: one look a step).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SweepRequest {
+    pub span: Tuning,
+    pub bin_hz: Hz,
+    pub dwell_ms: u64,
+}
+
+/// How the source chose to sweep a [`SweepRequest`]: `steps` views a sweep,
+/// `step_hz` apart, each a row of `size` bins of `bin_hz`; `dwell_ms` is the
+/// dwell in force, and `shift_hz` how far the odd sweeps place each view
+/// lower than the even ones (0: no shift).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SweepPlan {
+    pub steps: u32,
+    pub step_hz: Hz,
+    pub size: u32,
+    pub bin_hz: f64,
+    pub dwell_ms: u64,
+    pub shift_hz: Hz,
+}
+
+/// One view of a source's own sweep: step `step` of sweep `sweep` (counted
+/// from 0 at the sweep's start), centred on `center_hz`, `db` the power of
+/// each of [`SweepPlan::size`] bins of `bin_hz` from the low edge up, `masked`
+/// the `[lo, hi)` bin ranges not to be read as signal, and `span` when its
+/// samples were taken.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SweepRow {
+    pub sweep: u64,
+    pub step: u32,
+    pub center_hz: Hz,
+    pub bin_hz: f64,
+    pub db: Vec<f32>,
+    pub masked: Vec<[usize; 2]>,
+    pub span: Span,
+}
+
+/// Where a source's own sweep is: delivering rows, `Waiting` while the source
+/// retries what it lost (the reason), or `Ended` for good (the reason), which
+/// the source sets before it closes the rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SweepState {
+    Running,
+    Waiting(String),
+    Ended(String),
+}
+
+/// A sweep a source runs for itself: the plan it chose, its rows (at most
+/// [`SWEEP_ROWS_CAPACITY`] waiting) and its state.
+#[derive(Debug)]
+pub struct SweepRows {
+    pub plan: SweepPlan,
+    pub rows: mpsc::Receiver<SweepRow>,
+    pub state: watch::Receiver<SweepState>,
+}
+
+/// The rows a source's sweep holds for a reader that has not taken them; a
+/// row for a full channel is dropped.
+pub const SWEEP_ROWS_CAPACITY: usize = 64;
+
 /// A port's refusal. It serialises through [`PortErrorWire`] (`kind` names the
 /// variant) so a worker process can hand it to the node unchanged; `Display`
 /// is the same text after the trip.
@@ -510,11 +574,91 @@ pub trait Port: Send + Sync {
     async fn remeasure(&self) -> Result<(), PortError> {
         Err(PortError::Unsupported("source has no worker".into()))
     }
+    /// Sweep `req.span` by the source's own means (a source whose
+    /// [`Capabilities::sweep`] holds the span), beside its IQ stream and without
+    /// retuning it. The source chooses its own stepping and the node never
+    /// learns how: [`SweepRows::plan`] says what it chose, `dwell_ms` the dwell
+    /// in force and `shift_hz` the odd sweeps' shift (0: none).
+    ///
+    /// Contract: each [`SweepRow`]'s `db` is `plan.size` values, in dBm when
+    /// the capability says `calibrated`; `masked` is `[lo, hi)` bin pairs; a
+    /// row holds only samples taken in its own view, after the view settled (as
+    /// [`Port::tune`]'s first block after a tune does); a row for a full
+    /// channel is dropped, never queued. `state` is `Waiting` (with the reason)
+    /// while the source retries what it lost, and `Ended` (with the reason)
+    /// before the rows close. Dropping the [`SweepRows`] ends the sweep and
+    /// frees what it held upstream. What the source cannot do at once (no
+    /// view free beside its IQ session) it refuses here, with the reason; the
+    /// default refuses every sweep.
+    async fn sweep(&self, req: SweepRequest) -> Result<SweepRows, PortError> {
+        let _ = req;
+        Err(PortError::Unsupported(
+            "source does not sweep for itself".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A port that does not override `sweep`.
+    struct Plain(SourceId, Capabilities);
+
+    #[async_trait]
+    impl Port for Plain {
+        fn id(&self) -> &SourceId {
+            &self.0
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.1
+        }
+        async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+            Ok(t)
+        }
+        fn current(&self) -> Option<Tuning> {
+            None
+        }
+        fn subscribe(&self) -> IqReceiver {
+            tokio::sync::broadcast::channel(1).1
+        }
+    }
+
+    #[tokio::test]
+    async fn a_port_does_not_sweep_by_default() {
+        let port = Plain(
+            SourceId("plain".into()),
+            Capabilities {
+                tune_min_hz: Claim::Asserted(Hz(0)),
+                tune_max_hz: Claim::Asserted(Hz(30_000_000)),
+                max_bandwidth_hz: Claim::Asserted(Hz(12_000)),
+                formats: vec![crate::types::SampleFormat::Cf32],
+                channels: 1,
+                rx: true,
+                tx: false,
+                remote: false,
+                push: false,
+                usable_fraction: Claim::Asserted(1.0),
+                depths: vec![],
+                sweep: None,
+            },
+        );
+        let req = SweepRequest {
+            span: Tuning {
+                center_hz: Hz(15_000_000),
+                bandwidth_hz: Hz(30_000_000),
+            },
+            bin_hz: Hz(6_000),
+            dwell_ms: 0,
+        };
+        match port.sweep(req).await {
+            Err(e) => assert_eq!(
+                e,
+                PortError::Unsupported("source does not sweep for itself".into())
+            ),
+            Ok(rows) => panic!("expected a refusal, got {:?}", rows.plan),
+        }
+    }
 
     #[test]
     fn link_speed_is_the_part_after_the_at() {

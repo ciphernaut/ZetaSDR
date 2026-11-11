@@ -44,6 +44,7 @@ impl FixedPort {
                 push: false,
                 usable_fraction: Claim::Asserted(1.0),
                 depths: vec![],
+                sweep: None,
             },
             band: Tuning {
                 center_hz: Hz(100_000_000),

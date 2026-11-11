@@ -36,6 +36,7 @@ async fn live_llm_tunes_a_source() {
             push: false,
             usable_fraction: Claim::Asserted(1.0),
             depths: vec![],
+            sweep: None,
         },
         current: None,
         holders: vec![],
@@ -49,6 +50,7 @@ async fn live_llm_tunes_a_source() {
         ring: None,
         position: None,
         depth: None,
+        sweeps: vec![],
     }]);
     let tuning = OpResult::Tuning(Tuning {
         center_hz: Hz(101_500_000),

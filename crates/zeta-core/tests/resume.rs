@@ -122,6 +122,7 @@ impl Radio {
                 push: false,
                 usable_fraction: Claim::Asserted(1.0),
                 depths: vec![],
+                sweep: None,
             },
             cur: Mutex::new(None),
             tx: broadcast::channel(1).0,

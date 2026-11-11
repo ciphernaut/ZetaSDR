@@ -1,7 +1,9 @@
 //! Lease manager: decides who may retune a port. A held port is never
 //! retuned; a request that does not fit is a conflict naming the holders.
 //! An elastic lease (a `spectrum` job following the capture) holds nothing:
-//! rigid requests ignore it, and it never retunes a held port.
+//! rigid requests ignore it, and it never retunes a held port. A sweep claim
+//! (a scan the source sweeps for by its own means) holds nothing either, and no
+//! IQ request sees it; it only keeps the port from being idled.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -97,6 +99,10 @@ pub struct LeaseManager {
     leases: Mutex<HashMap<SourceId, Vec<Lease>>>,
     /// Per-source gate held for the whole of `ensure`, across `port.tune().await`.
     gates: Mutex<HashMap<SourceId, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// The scans each source is sweeping for by its own means ([`Port::sweep`]),
+    /// in claim order. A claim holds no band and no IQ request reads it: only
+    /// [`LeaseManager::sweepers`] and [`LeaseManager::idle_if_unheld`] do.
+    sweeps: Mutex<HashMap<SourceId, Vec<JobId>>>,
 }
 
 fn band(t: &Tuning) -> (u64, u64) {
@@ -268,13 +274,39 @@ impl LeaseManager {
     }
 
     /// Call [`Port::idle`] under the source's gate when nobody holds `port`
-    /// (after a `release`). A lease taken meanwhile wins: no idle then.
+    /// (after a `release`). A lease taken meanwhile wins: no idle then. Nor
+    /// while a sweep claim is held: the source's own sweep may need what an
+    /// idle stops upstream.
     pub async fn idle_if_unheld(&self, port: &dyn Port) {
         let gate = self.gate(port.id());
         let _guard = gate.lock().await;
-        if !self.leases.lock().unwrap().contains_key(port.id()) {
+        let leased = self.leases.lock().unwrap().contains_key(port.id());
+        if !leased && !self.sweeps.lock().unwrap().contains_key(port.id()) {
             port.idle().await;
         }
+    }
+
+    /// Record that `holder` (a scan) sweeps on `source` by the source's own
+    /// means. It never refuses (what the source cannot do at once it refuses in
+    /// [`Port::sweep`]) and takes no band: no IQ request sees it, and a stepped
+    /// scan's time-shared lease is granted beside it. A second claim by the same
+    /// holder is the same claim; [`LeaseManager::release`] drops it.
+    pub fn claim_sweep(&self, source: &SourceId, holder: JobId) {
+        let mut sweeps = self.sweeps.lock().unwrap();
+        let v = sweeps.entry(source.clone()).or_default();
+        if !v.contains(&holder) {
+            v.push(holder);
+        }
+    }
+
+    /// The jobs holding a sweep claim on `source`, in claim order.
+    pub fn sweepers(&self, source: &SourceId) -> Vec<JobId> {
+        self.sweeps
+            .lock()
+            .unwrap()
+            .get(source)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Grant `holder` the band `want` on `port`, tuning only if the port is unheld.
@@ -713,11 +745,16 @@ impl LeaseManager {
         })
     }
 
-    /// Drop every lease held by `holder`.
+    /// Drop every lease and sweep claim held by `holder`.
     pub fn release(&self, holder: &JobId) {
         let mut leases = self.leases.lock().unwrap();
         leases.retain(|_, v| {
             v.retain(|l| &l.job != holder);
+            !v.is_empty()
+        });
+        drop(leases);
+        self.sweeps.lock().unwrap().retain(|_, v| {
+            v.retain(|j| j != holder);
             !v.is_empty()
         });
     }
@@ -821,6 +858,7 @@ mod tests {
         cur: Mutex<Option<Tuning>>,
         tx: tokio::sync::broadcast::Sender<crate::port::IqBlock>,
         tunes: std::sync::atomic::AtomicUsize,
+        idles: std::sync::atomic::AtomicUsize,
         delay: bool,
         fault: Option<String>,
     }
@@ -848,10 +886,12 @@ mod tests {
                     push: false,
                     usable_fraction: Claim::Asserted(1.0),
                     depths: vec![],
+                    sweep: None,
                 },
                 cur: Mutex::new(None),
                 tx: tokio::sync::broadcast::channel(1).0,
                 tunes: std::sync::atomic::AtomicUsize::new(0),
+                idles: std::sync::atomic::AtomicUsize::new(0),
                 delay: false,
                 fault: None,
             }
@@ -882,6 +922,9 @@ mod tests {
         }
         fn fault(&self) -> Option<String> {
             self.fault.clone()
+        }
+        async fn idle(&self) {
+            self.idles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -1208,6 +1251,140 @@ mod tests {
         m.release(&j1);
         let want = t(433_000_000, 1_000_000);
         assert_eq!(m.ensure(&p, j2, want, false).await.unwrap(), want);
+    }
+
+    /// A sweep claim holds no band: every IQ request decides as on an unheld port,
+    /// and the claim is listed only by `sweepers`.
+    #[tokio::test]
+    async fn a_sweep_claim_is_invisible_to_every_iq_request() {
+        let (p, m, scan) = (Arc::new(FakePort::new()), LeaseManager::new(), JobId::new());
+        m.claim_sweep(p.id(), scan.clone());
+        // Idempotent: a second claim by the same holder is the same claim.
+        m.claim_sweep(p.id(), scan.clone());
+        assert_eq!(m.sweepers(p.id()), vec![scan.clone()]);
+        assert!(m.holders(p.id()).is_empty());
+        assert!(m.elastic_holders(p.id()).is_empty());
+        assert!(!m.time_shared(p.id()));
+        assert_eq!(m.pinned(p.id()), None);
+        let ports: Vec<Arc<dyn Port>> = vec![p.clone()];
+        assert_eq!(
+            m.free_sources(&ports, 100_000_000, 1_000_000),
+            vec![p.id().clone()]
+        );
+        {
+            let guard = m.gate_guard(p.id()).await;
+            assert!(m.unheld_locked(p.as_ref(), &[], &guard).is_ok());
+            assert_eq!(
+                m.decide(p.as_ref(), t(100_000_000, 1_000_000), &guard),
+                Decision::Tune
+            );
+        }
+        // A rigid request tunes the port as unheld.
+        let (j, want) = (JobId::new(), t(100_000_000, 1_000_000));
+        assert_eq!(
+            m.ensure(p.as_ref(), j.clone(), want, false).await.unwrap(),
+            want
+        );
+        assert_eq!(p.current(), Some(want));
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        m.release(&j);
+        // So does a tune with no lease.
+        let elsewhere = t(433_000_000, 1_000_000);
+        assert_eq!(
+            m.tune_if_unheld(p.as_ref(), elsewhere).await.unwrap(),
+            elsewhere
+        );
+        // A stepped scan's time-shared lease is granted.
+        let stepped = JobId::new();
+        m.acquire_shared(p.as_ref(), stepped.clone(), t(100_000_000, 40_000_000))
+            .await
+            .unwrap();
+        assert!(m.time_shared(p.id()));
+        assert_eq!(m.holders(p.id()).len(), 1);
+        assert_eq!(m.sweepers(p.id()), vec![scan]);
+    }
+
+    /// A claim never refuses: it is taken beside a rigid lease and beside a
+    /// time-shared one, and neither lease changes.
+    #[tokio::test]
+    async fn a_sweep_claim_is_granted_beside_a_rigid_and_a_time_shared_lease() {
+        let m = LeaseManager::new();
+        let (rigid_port, shared_port) = (FakePort::named("rigid"), FakePort::named("shared"));
+        let (demod, stepped) = (JobId::new(), JobId::new());
+        let band = t(100_000_000, 1_000_000);
+        let span = t(100_000_000, 40_000_000);
+        m.ensure(&rigid_port, demod.clone(), band, false)
+            .await
+            .unwrap();
+        m.acquire_shared(&shared_port, stepped.clone(), span)
+            .await
+            .unwrap();
+        let (a, b) = (JobId::new(), JobId::new());
+        m.claim_sweep(rigid_port.id(), a.clone());
+        m.claim_sweep(rigid_port.id(), b.clone());
+        m.claim_sweep(shared_port.id(), a.clone());
+        assert_eq!(m.sweepers(rigid_port.id()), vec![a.clone(), b]);
+        assert_eq!(m.sweepers(shared_port.id()), vec![a]);
+        assert_eq!(m.holders(rigid_port.id()), vec![(demod, band)]);
+        assert_eq!(m.holders(shared_port.id()), vec![(stepped, span)]);
+        assert!(m.time_shared(shared_port.id()));
+        assert!(!m.time_shared(rigid_port.id()));
+        assert_eq!(rigid_port.current(), Some(band));
+        assert_eq!(
+            rigid_port.tunes.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            shared_port.tunes.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    /// `release` drops the holder's claims on every source along with its leases,
+    /// and nobody else's.
+    #[tokio::test]
+    async fn release_drops_a_holders_claim() {
+        let m = LeaseManager::new();
+        let (one, two) = (FakePort::named("one"), FakePort::named("two"));
+        let (j, k) = (JobId::new(), JobId::new());
+        m.claim_sweep(one.id(), j.clone());
+        m.claim_sweep(two.id(), j.clone());
+        m.claim_sweep(two.id(), k.clone());
+        m.ensure(&one, j.clone(), t(100_000_000, 1_000_000), false)
+            .await
+            .unwrap();
+        m.release(&j);
+        assert!(m.sweepers(one.id()).is_empty());
+        assert_eq!(m.sweepers(two.id()), vec![k.clone()]);
+        assert!(m.holders(one.id()).is_empty());
+        m.release(&k);
+        assert!(m.sweepers(two.id()).is_empty());
+        // A released holder may claim again.
+        m.claim_sweep(one.id(), j.clone());
+        assert_eq!(m.sweepers(one.id()), vec![j]);
+    }
+
+    /// The last lease's release idles the port only once no claim is held either:
+    /// the source's own sweep may need what an idle stops upstream.
+    #[tokio::test]
+    async fn a_port_is_not_idled_under_a_sweep_claim() {
+        let (p, m, scan, job) = (
+            FakePort::new(),
+            LeaseManager::new(),
+            JobId::new(),
+            JobId::new(),
+        );
+        let idles = || p.idles.load(std::sync::atomic::Ordering::SeqCst);
+        m.claim_sweep(p.id(), scan.clone());
+        m.ensure(&p, job.clone(), t(100_000_000, 1_000_000), false)
+            .await
+            .unwrap();
+        m.release(&job);
+        m.idle_if_unheld(&p).await;
+        assert_eq!(idles(), 0);
+        m.release(&scan);
+        m.idle_if_unheld(&p).await;
+        assert_eq!(idles(), 1);
     }
 
     #[tokio::test]

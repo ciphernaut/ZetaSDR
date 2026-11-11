@@ -233,6 +233,7 @@ impl ScanPort {
                 push,
                 usable_fraction: Claim::Asserted(1.0),
                 depths: vec![],
+                sweep: None,
             },
             later: OnceLock::new(),
             cur: Mutex::new(None),

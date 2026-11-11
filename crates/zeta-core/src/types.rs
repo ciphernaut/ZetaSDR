@@ -122,6 +122,43 @@ pub struct Capabilities {
     /// empty when the source has one depth (or has not listed them).
     #[serde(default)]
     pub depths: Vec<Depth>,
+    /// What the source can do when it delivers power spectra itself (a
+    /// KiwiSDR's waterfall), without the node stepping its IQ capture; `null`
+    /// for a source that cannot. A scan of a span inside it asks the source for
+    /// rows ([`crate::port::Port::sweep`]). Absent reads `null`.
+    #[serde(default)]
+    #[schemars(schema_with = "nullable::<SweepCaps>")]
+    pub sweep: Option<SweepCaps>,
+}
+
+/// A source's own sweep: the spans it can deliver power spectra of (both
+/// edges inside `min_hz..=max_hz`), its finest bin, the most rows a second it
+/// delivers, and whether its levels are `calibrated` (dBm at the antenna,
+/// which a local radio's rows are not).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SweepCaps {
+    pub min_hz: Hz,
+    pub max_hz: Hz,
+    pub bin_hz_min: Hz,
+    pub rows_per_s_max: u32,
+    pub calibrated: bool,
+}
+
+impl SweepCaps {
+    /// Whether the source can sweep `span`: both its edges, `center_hz` ±
+    /// `bandwidth_hz`/2, inside `min_hz..=max_hz`.
+    pub fn holds(&self, span: crate::port::Tuning) -> bool {
+        let half = span.bandwidth_hz.0 / 2;
+        let (Some(lo), Some(hi)) = (
+            span.center_hz.0.checked_sub(half),
+            span.center_hz.0.checked_add(half),
+        ) else {
+            return false;
+        };
+        self.min_hz.0 <= lo && hi <= self.max_hz.0
+    }
 }
 
 /// [`Capabilities::usable_fraction`] when a record does not say: the whole
@@ -291,8 +328,75 @@ mod tests {
     }
 
     #[test]
+    fn a_record_without_sweep_loads_as_none() {
+        // A record as a node before `sweep` wrote it: every other field present.
+        let old = serde_json::json!({
+            "tune_min_hz": {"asserted": 10_000},
+            "tune_max_hz": {"asserted": 30_000_000},
+            "max_bandwidth_hz": {"asserted": 12_000},
+            "formats": ["cf32"],
+            "channels": 1,
+            "rx": true,
+            "tx": false,
+            "remote": true,
+            "push": true,
+            "usable_fraction": {"asserted": 1.0},
+            "depths": [],
+        });
+        let caps: Capabilities = serde_json::from_value(old).unwrap();
+        assert_eq!(caps.sweep, None);
+        // Written whole (`null` while none), and read back the same.
+        let v = serde_json::to_value(&caps).unwrap();
+        assert_eq!(v["sweep"], serde_json::Value::Null);
+        let mut caps = caps;
+        caps.sweep = Some(SweepCaps {
+            min_hz: Hz(0),
+            max_hz: Hz(30_000_000),
+            bin_hz_min: Hz(30),
+            rows_per_s_max: 23,
+            calibrated: true,
+        });
+        let v = serde_json::to_value(&caps).unwrap();
+        assert_eq!(
+            v["sweep"],
+            serde_json::json!({"min_hz": 0, "max_hz": 30_000_000, "bin_hz_min": 30,
+                               "rows_per_s_max": 23, "calibrated": true})
+        );
+        assert_eq!(serde_json::from_value::<Capabilities>(v).unwrap(), caps);
+    }
+
+    #[test]
+    fn sweep_caps_hold_a_span_inside_them_only() {
+        let caps = SweepCaps {
+            min_hz: Hz(0),
+            max_hz: Hz(30_000_000),
+            bin_hz_min: Hz(30),
+            rows_per_s_max: 23,
+            calibrated: true,
+        };
+        let span = |center_hz: u64, bandwidth_hz: u64| crate::port::Tuning {
+            center_hz: Hz(center_hz),
+            bandwidth_hz: Hz(bandwidth_hz),
+        };
+        // 15 MHz ± 15 MHz: both edges on the range's ends.
+        assert!(caps.holds(span(15_000_000, 30_000_000)));
+        assert!(caps.holds(span(7_000_000, 2_000_000)));
+        // 15 MHz ± 15.001 MHz: both edges a kilohertz outside.
+        assert!(!caps.holds(span(15_000_000, 30_002_000)));
+        // One edge outside, at either end.
+        assert!(!caps.holds(span(29_500_000, 2_000_000)));
+        let above = SweepCaps {
+            min_hz: Hz(1_000_000),
+            ..caps.clone()
+        };
+        assert!(!above.holds(span(1_500_000, 2_000_000)));
+        assert!(!caps.holds(span(u64::MAX, 4)));
+    }
+
+    #[test]
     fn schemas_require_every_non_optional_field() {
         assert_all_required::<Capabilities>();
+        assert_all_required::<SweepCaps>();
         assert_all_required::<Depth>();
         assert_all_required::<Selection>();
         assert_all_required::<Span>();

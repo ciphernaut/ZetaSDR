@@ -77,6 +77,7 @@ impl RemotePort {
                 push: false,
                 usable_fraction: Claim::Asserted(1.0),
                 depths: vec![],
+                sweep: None,
             },
             position,
             tx: tokio::sync::broadcast::channel(1).0,

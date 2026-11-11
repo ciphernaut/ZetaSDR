@@ -512,6 +512,7 @@ async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
             push: false,
             usable_fraction: Claim::Asserted(1.0),
             depths: vec![],
+            sweep: None,
         },
         band: Mutex::new(band),
         tx: broadcast::channel(64).0,
@@ -634,6 +635,7 @@ async fn measure_emits_partials_when_the_input_gaps_every_400_ms() {
             push: false,
             usable_fraction: Claim::Asserted(1.0),
             depths: vec![],
+            sweep: None,
         },
         band: Mutex::new(Tuning {
             center_hz: Hz(CENTER_HZ),

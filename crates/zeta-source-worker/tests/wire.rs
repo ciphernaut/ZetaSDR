@@ -21,6 +21,7 @@ fn caps() -> Capabilities {
         push: false,
         usable_fraction: Claim::Asserted(1.0),
         depths: vec![],
+        sweep: None,
     }
 }
 

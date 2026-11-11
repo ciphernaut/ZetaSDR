@@ -2786,6 +2786,12 @@ impl Node {
         self.inner.leases.elastic_holders(source)
     }
 
+    /// Scans holding a sweep claim on `source`: the source sweeps for them by its
+    /// own means, and they hold no band.
+    pub fn lease_sweepers(&self, source: &SourceId) -> Vec<JobId> {
+        self.inner.leases.sweepers(source)
+    }
+
     /// `source_free`: the sources, in id order, that could take the band now
     /// ([`LeaseManager::free_sources`]: a pin over the whole band admits it), and every
     /// other source that covers it with its holders, elastic jobs, pin and fault.

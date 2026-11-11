@@ -557,6 +557,7 @@ fn a_proxy_of_a_remote_with_depths_lists_none() {
                 max_bandwidth_hz: Claim::Measured(Hz(32_000_000)),
             },
         ],
+        sweep: None,
     };
     let caps = proxy_capabilities(&remote, 250_000);
     assert!(caps.depths.is_empty(), "{caps:?}");
@@ -564,6 +565,124 @@ fn a_proxy_of_a_remote_with_depths_lists_none() {
     assert_eq!(caps.usable_fraction, remote.usable_fraction);
     assert_eq!(caps.tune_max_hz, remote.tune_max_hz);
     assert!(caps.remote && caps.push);
+}
+
+/// What a remote source that sweeps for itself lists: a KiwiSDR-like record.
+fn sweeping_caps() -> zeta_core::types::Capabilities {
+    use zeta_core::types::{Capabilities, Claim, SweepCaps};
+    Capabilities {
+        tune_min_hz: Claim::Asserted(Hz(0)),
+        tune_max_hz: Claim::Asserted(Hz(30_000_000)),
+        max_bandwidth_hz: Claim::Asserted(Hz(12_000)),
+        formats: vec![SampleFormat::Cf32],
+        channels: 1,
+        rx: true,
+        tx: false,
+        remote: true,
+        push: true,
+        usable_fraction: Claim::Asserted(1.0),
+        depths: vec![],
+        sweep: Some(SweepCaps {
+            min_hz: Hz(0),
+            max_hz: Hz(30_000_000),
+            bin_hz_min: Hz(30),
+            rows_per_s_max: 23,
+            calibrated: true,
+        }),
+    }
+}
+
+/// A source whose record says it sweeps for itself; it streams nothing.
+struct Sweeping {
+    id: SourceId,
+    caps: zeta_core::types::Capabilities,
+    tx: tokio::sync::broadcast::Sender<zeta_core::port::IqBlock>,
+}
+
+#[async_trait::async_trait]
+impl Port for Sweeping {
+    fn id(&self) -> &SourceId {
+        &self.id
+    }
+    fn capabilities(&self) -> &zeta_core::types::Capabilities {
+        &self.caps
+    }
+    async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        Ok(t)
+    }
+    fn current(&self) -> Option<Tuning> {
+        None
+    }
+    fn subscribe(&self) -> zeta_core::port::IqReceiver {
+        self.tx.subscribe()
+    }
+}
+
+/// A far source's sweep is not forwarded by a `--source-node` port, so its record
+/// must not say it sweeps: every scan on it would ask a port that cannot.
+#[tokio::test]
+async fn a_node_source_does_not_claim_the_remotes_sweep() {
+    let remote = sweeping_caps();
+    let caps = proxy_capabilities(&remote, 250_000);
+    assert_eq!(caps.sweep, None, "{caps:?}");
+    assert_eq!(caps.tune_max_hz, remote.tune_max_hz);
+    assert!(caps.remote && caps.push);
+
+    // A port opened on a remote node whose `source_list` record has `sweep`.
+    let dir = tempfile::tempdir().unwrap();
+    let far: Arc<dyn Port> = Arc::new(Sweeping {
+        id: SourceId("kiwi".into()),
+        caps: remote,
+        tx: tokio::sync::broadcast::channel(1).0,
+    });
+    let far_node = Arc::new(local_node(dir.path(), far).await);
+    let server = zeta_ws::bind(
+        far_node.clone(),
+        zeta_ws::ServerConfig {
+            listen: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            secret: zeta_ws::auth::Secret::new("s3cret").unwrap(),
+            agents_md: "# test guide\n".into(),
+            limits: zeta_ws::Limits::default(),
+            llm: None,
+            speech: None,
+        },
+    )
+    .await
+    .expect("binds");
+    let url = format!("http://{}", server.local_addr());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let join = tokio::spawn(server.run(shutdown.clone()));
+    match far_node.apply(Op::SourceList {}).await.unwrap() {
+        OpResult::Sources(s) => assert!(s[0].capabilities.sweep.is_some(), "{s:?}"),
+        other => panic!("expected sources, got {other:?}"),
+    }
+    let port = open(NodeSourceConfig {
+        id: SourceId("far".to_string()),
+        url,
+        secret: "s3cret".to_string(),
+        remote_source: SourceId("kiwi".to_string()),
+        max_bandwidth_hz: 250_000,
+    })
+    .await
+    .expect("opens");
+    assert_eq!(port.capabilities().sweep, None);
+    assert_eq!(port.capabilities().tune_max_hz, sweeping_caps().tune_max_hz);
+    let req = zeta_core::port::SweepRequest {
+        span: Tuning {
+            center_hz: Hz(15_000_000),
+            bandwidth_hz: Hz(30_000_000),
+        },
+        bin_hz: Hz(6_000),
+        dwell_ms: 0,
+    };
+    assert!(
+        matches!(port.sweep(req).await, Err(PortError::Unsupported(_))),
+        "a node source does not sweep"
+    );
+    drop(port);
+    shutdown.cancel();
+    join.await.unwrap().unwrap();
+    drop(far_node);
 }
 
 /// A scan asking for `bits` on a `--source-node` source is refused at

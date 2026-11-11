@@ -61,6 +61,7 @@ impl WidePort {
                 push: false,
                 usable_fraction: Claim::Asserted(1.0),
                 depths: vec![],
+                sweep: None,
             },
             cur: Mutex::new(None),
             tx: tokio::sync::broadcast::channel(1).0,
@@ -630,7 +631,9 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                 for (name, s) in props {
                     let unit = ["freq", "rate", "bandwidth", "center"]
                         .iter()
-                        .any(|w| name.contains(w));
+                        .any(|w| name.contains(w))
+                        // A source sweep's `calibrated` says its levels are absolute.
+                        && name != "calibrated";
                     assert!(
                         !unit || name.ends_with("_hz") || name.ends_with("_baud"),
                         "{path}.{name} is a unit field without _hz/_baud"
@@ -2143,6 +2146,42 @@ async fn source_info_without_worker_deserialises_with_none() {
             .contains(&"worker".into()),
         "{si}"
     );
+}
+
+/// A `SourceInfo` from a node older than `sweeps` (a federated source listed by
+/// an older node) deserialises with no sweepers; a node of this version lists
+/// none for a source no scan sweeps on.
+#[tokio::test]
+async fn a_source_record_without_sweeps_still_parses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, file) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![file])
+        .await
+        .unwrap();
+    let Ok(OpResult::Sources(v)) = node.apply(Op::SourceList {}).await else {
+        panic!("expected sources");
+    };
+    assert!(v[0].sweeps.is_empty());
+    let mut json = serde_json::to_value(&v[0]).unwrap();
+    assert_eq!(json["sweeps"], serde_json::json!([]), "{json}");
+    json.as_object_mut().unwrap().remove("sweeps").unwrap();
+    let back: zeta_core::ops::SourceInfo = serde_json::from_value(json).unwrap();
+    assert!(back.sweeps.is_empty());
+    assert_eq!(back, v[0]);
+}
+
+/// Every node of this version writes `sweeps`, so the result schema requires it.
+#[test]
+fn the_source_list_schema_requires_sweeps() {
+    let si = &schema()["result"]["$defs"]["SourceInfo"];
+    assert!(
+        si["required"]
+            .as_array()
+            .unwrap()
+            .contains(&"sweeps".into()),
+        "{si}"
+    );
+    assert_eq!(si["properties"]["sweeps"]["type"], "array", "{si}");
 }
 
 /// `source_list` items carry `stats`: required, nullable (`null` for a source

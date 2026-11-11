@@ -123,7 +123,9 @@ pub async fn open(cfg: NodeSourceConfig) -> Result<NodePort, PortError> {
 /// with `remote` and `push` set, formats `[cf32]`, `max_bandwidth_hz` capped at
 /// `max_bandwidth_hz`, and no `depths`: the far node owns its radio's sample
 /// depth and a proxy cannot change it, so a scan's `bits` on this source is
-/// refused at `job_start` as on any source with one depth.
+/// refused at `job_start` as on any source with one depth; and no `sweep`: a
+/// far source's own sweep is not forwarded by this port (its `Port::sweep` is
+/// the default refusal), so a scan on this source steps its IQ capture.
 pub fn proxy_capabilities(remote: &Capabilities, max_bandwidth_hz: u64) -> Capabilities {
     let remote_max = remote.max_bandwidth_hz.value().0;
     Capabilities {
@@ -132,6 +134,7 @@ pub fn proxy_capabilities(remote: &Capabilities, max_bandwidth_hz: u64) -> Capab
         remote: true,
         push: true,
         depths: Vec::new(),
+        sweep: None,
         ..remote.clone()
     }
 }

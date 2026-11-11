@@ -231,6 +231,7 @@ impl FileSource {
             push: true,
             usable_fraction: Claim::Asserted(1.0),
             depths: vec![],
+            sweep: None,
         };
         let (tx, _) = broadcast::channel(64);
         let tx = Arc::new(Mutex::new(Some(tx)));

@@ -105,6 +105,7 @@ pub async fn open(cfg: VrtSourceConfig) -> Result<VrtPort, PortError> {
             push: true,
             usable_fraction: Claim::Asserted(1.0),
             depths: vec![],
+            sweep: None,
         },
         local,
         tx,

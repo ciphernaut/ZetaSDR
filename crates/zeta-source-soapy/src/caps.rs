@@ -248,6 +248,7 @@ pub fn capabilities(dev: &dyn SoapyDevice, rates: &[RangeHz]) -> Result<Capabili
         push: false,
         usable_fraction: Claim::Asserted(USABLE_DEFAULT),
         depths: vec![],
+        sweep: None,
     })
 }
 
