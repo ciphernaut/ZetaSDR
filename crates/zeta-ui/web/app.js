@@ -1359,6 +1359,8 @@ function start(api) {
     audioKind: (kind) => state.subjects?.rowOf(kind) ?? null,
     view: state.view,
     shownSource: () => state.selected ?? null,
+    applyOp,
+    depths: (id) => state.sources.find((x) => x.id === id)?.capabilities?.depths ?? [],
     countEl: $(".pane.jobs h2 .count"),
     onJobs: (jobs) => {
       state.lastJobs = jobs;

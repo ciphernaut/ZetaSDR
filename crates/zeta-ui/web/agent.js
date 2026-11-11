@@ -69,6 +69,11 @@
 //       An attached job (one with an `input` job) is a `.job.attached` row placed right
 //       under its input's row, its kind shown as `↳ <kind>`, with neither of the audio
 //       buttons. A job's `state.reason` (a failure) is also the row's tooltip.
+//       A running scan row (one `job_context` and `graph_get` per poll) shows `.sweep-ms` (the
+//       last sweep, `<n> ms` or `<n.n> s`) and a `select.scan-look` over SCAN_LOOKS (fast,
+//       averaged, long look; coarse and fast when `depths(source)` lists a lossy depth) or
+//       `custom`; a choice sets dwell_ms, average and bits on the stored fft node and applies
+//       `graph_put` through applyOp (a conflict gets its retry offer).
 //       A running row of a SQUELCH_KINDS kind is tagged `squelch` (setSquelchTag) while
 //       squelch(id) (overlays.js: the last `squelch` event seen on the job's event stream)
 //       has `open: false`.
@@ -529,10 +534,69 @@ export function setSquelchTag(row, event) {
 // Job kinds with no band of their own: `origin_lookup` refuses them.
 const NO_BAND_KINDS = ["mix", "spectrum", "scan"];
 
+// The looks a scan row offers (spec 4.5, 4.6a): dwell per step, sweeps averaged, depth. `bits:
+// null` keeps the source's own depth; `coarse` asks for its lossy depth and is offered only where
+// the source lists one.
+export const SCAN_LOOKS = [
+  { id: "fast", label: "fast", dwell_ms: 20, average: 1, bits: null },
+  { id: "averaged", label: "averaged", dwell_ms: 20, average: 16, bits: null },
+  { id: "long", label: "long look", dwell_ms: 250, average: 1, bits: null },
+  {
+    id: "coarse",
+    label: "coarse and fast",
+    dwell_ms: 20,
+    average: 1,
+    bits: "lossy",
+    title:
+      "8-bit samples: a weak signal beside a strong one in the same capture is lost. For a coarse survey of occupancy, never for faint signals.",
+  },
+];
+
+// The lossy depth's bits of a source's `capabilities.depths`, or null.
+export const lossyBits = (depths) => (depths || []).find((d) => d && d.lossless === false)?.bits ?? null;
+
+// The look a stored `fft` node's params match, else "custom".
+export function lookOf(params, lossy) {
+  const p = params || {};
+  const bits = p.bits ?? null;
+  for (const l of SCAN_LOOKS) {
+    const want = l.bits === "lossy" ? lossy : l.bits;
+    if (l.bits === "lossy" && want === null) continue;
+    if ((p.dwell_ms ?? 20) === l.dwell_ms && (p.average ?? 1) === l.average && bits === want) return l.id;
+  }
+  return "custom";
+}
+
+// A sweep time as `<n> ms` under a second, else `<n.n> s`.
+export const sweepText = (ms) => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+
+function lookSelect(job, scan, depths, onLook) {
+  const lossy = lossyBits(depths);
+  const sel = document.createElement("select");
+  sel.className = "scan-look";
+  sel.title = "the scan's look: dwell per step and sweeps averaged (graph_put on its fft node)";
+  const looks = SCAN_LOOKS.filter((l) => l.bits !== "lossy" || lossy !== null);
+  const current = lookOf(scan.params, lossy);
+  const ids = current === "custom" ? [...looks, { id: "custom", label: "custom" }] : looks;
+  for (const l of ids) {
+    const o = document.createElement("option");
+    o.value = l.id;
+    o.textContent = l.label;
+    if (l.title) o.title = l.title;
+    sel.append(o);
+  }
+  sel.value = current;
+  sel.onchange = () => {
+    const l = SCAN_LOOKS.find((x) => x.id === sel.value);
+    if (l) onLook(job, { dwell_ms: l.dwell_ms, average: l.average, bits: l.bits === "lossy" ? lossy : l.bits });
+  };
+  return sel;
+}
+
 function jobRow(
   job,
   onStop,
-  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits, onOrigins, audioKind },
+  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits, onOrigins, audioKind, scanInfo, onLook },
 ) {
   const row = document.createElement("div");
   const attached = !!job.input;
@@ -607,6 +671,14 @@ function jobRow(
     span.title = "the last position decoded, from the view's home";
     row.append(span);
   }
+  const scan = job.kind === "scan" && status === "running" && scanInfo ? scanInfo(job) : null;
+  if (scan && Number.isFinite(scan.sweep_ms)) {
+    const span = document.createElement("span");
+    span.className = "sweep-ms";
+    span.textContent = sweepText(scan.sweep_ms);
+    span.title = "the last sweep's time";
+    row.append(span);
+  }
   if (job.state && job.state.reason) row.title = job.state.reason;
   if (finished) {
     const reason = document.createElement("span");
@@ -673,6 +745,7 @@ function jobRow(
     b.onclick = () => onOrigins(job);
     actions.append(b);
   }
+  if (scan && scan.params && onLook) actions.append(lookSelect(job, scan, scan.depths, onLook));
   if (onGraph) actions.append(graphButton(job, onGraph));
   actions.append(stopButton(job, onStop));
   row.append(actions);
@@ -828,9 +901,39 @@ export function startJobs(
     activity = null,
     watchedMix = null,
     shownSource = null,
+    applyOp = null,
+    depths = null,
   } = {},
 ) {
   let timer = null;
+  // id -> {sweep_ms, params}: a running scan's last sweep time (job_context) and its stored
+  // fft node's params (graph_get), read with each job_list.
+  const scans = new Map();
+  const readScan = async (id) => {
+    const [c, g] = await Promise.all([
+      api.op({ op: "job_context", job: id }).catch(() => null),
+      api.op({ op: "graph_get", job: id }).catch(() => null),
+    ]);
+    const node = g?.value?.nodes?.find((n) => n.kind === "fft");
+    scans.set(id, { sweep_ms: c?.value?.scan?.timing?.sweep_ms ?? null, params: node?.params ?? null });
+  };
+  // A look is the stored fft node's dwell, average and depth, put back (the scan restarts).
+  const setLook = async (job, look) => {
+    try {
+      const r = await api.op({ op: "graph_get", job: job.id });
+      const graph = r && r.value;
+      const node = graph?.nodes?.find((n) => n.kind === "fft");
+      if (!node) throw new Error("no fft node");
+      node.params = { ...node.params, ...look };
+      const put = { op: "graph_put", job: job.id, graph };
+      if (applyOp) await applyOp(put);
+      else await api.op(put);
+    } catch (e) {
+      transcript.note(`graph_put: ${e.message}`, true);
+    }
+    scans.delete(job.id);
+    refresh();
+  };
   let sets = []; // set_list's entries, read with each job_list
   // A set's group: its text and a Stop that arms on the first click ("Stop set?") and sends
   // `set_stop` on a second one within SET_STOP_CONFIRM_MS (spec 5.5, 9.7). The group is kept
@@ -904,6 +1007,11 @@ export function startJobs(
     onBits,
     onOrigins,
     audioKind,
+    scanInfo: (job) => {
+      const s = scans.get(job.id);
+      return s ? { ...s, depths: depths ? depths(job.source) : [] } : null;
+    },
+    onLook: setLook,
   };
   const keepMs = () => {
     const s = view ? Number(view.get("finished_rows_s")) : 60;
@@ -1143,6 +1251,9 @@ export function startJobs(
         api.op({ op: "set_list" }).catch(() => null),
       ]);
       if (s) sets = s.value || [];
+      const running = (r.value || []).filter((j) => j.kind === "scan" && !isFinished(j));
+      await Promise.all(running.map((j) => readScan(j.id)));
+      for (const id of [...scans.keys()]) if (!running.some((j) => j.id === id)) scans.delete(id);
       if (!stopped) render(r.value || []);
     } catch {
       /* the next poll retries; op errors appear through the ops stream */

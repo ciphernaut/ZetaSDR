@@ -117,7 +117,8 @@
 //                                             fitted first, as its Decode entry)
 //   measure    Start background job › measure job_start kind=measure, deviation_hz null
 //                                             (every job_start sends sideband: null unless SSB)
-//   scan       Scan this span                 wf.release() (stops the page's own spectrum job
+//   scan       Scan this span                 (starts the default look, 20 ms x 1; the job's
+//                                             row offers the others: agent.js SCAN_LOOKS) wf.release() (stops the page's own spectrum job
 //                                             unless another job holds the source: then a
 //                                             `conflict: …` line and nothing more), job_start
 //                                             kind=scan on the selection's centre and

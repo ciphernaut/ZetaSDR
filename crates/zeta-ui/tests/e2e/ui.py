@@ -1012,6 +1012,43 @@ def scenario_scan_entry_starts_a_scan_job(page, url, secret):
     wait_waterfall_follows(page, "!!w.jobId", "back to spectrum")
 
 
+def scenario_scan_looks_and_sweep_time(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    wait_span(page, 1.5)  # drag_menu asserts at least 1 s
+    drag_menu(page, 0.0, 1.05)
+    page.click('#ctx .ctx-item[data-action="scan"]')
+    scans = []
+    try:
+        scans = wait_until(lambda: running_scan_jobs(url, secret, "tone"), 5.0, "a scan job on tone")
+        job = scans[0]["id"]
+        row = page.locator(f'#jobs .job[data-job="{job}"]')
+        select = row.locator("select.scan-look")
+        expect(select).to_be_visible(timeout=10_000)
+        # A file source lists no lossy depth: no coarse option.
+        assert select.locator('option[value="coarse"]').count() == 0, "coarse offered on a file source"
+
+        def scan_context():
+            r = http_json(url, secret, "/op", {"op": "job_context", "job": job})["value"]
+            return (r or {}).get("scan") or {}
+
+        for look, dwell, average in (("averaged", 20, 16), ("long", 250, 1), ("fast", 20, 1)):
+            select.select_option(look)
+
+            def looks_like(dwell=dwell, average=average):
+                c = scan_context()
+                asked_avg = c.get("average_asked", c.get("average"))
+                return c.get("dwell_ms_asked", c.get("dwell_ms")) == dwell and asked_avg == average and c
+
+            wait_until(looks_like, 15.0, f"the scan's context shows {look} ({dwell} ms x {average})")
+            # The row follows the stored node on the next refresh.
+            expect(select).to_have_value(look, timeout=10_000)
+            expect(row.locator(".sweep-ms")).to_have_text(
+                re.compile(r"^\d+(\.\d)? (ms|s)$"), timeout=20_000)
+    finally:
+        for j in running_scan_jobs(url, secret, "tone") or scans:
+            stop_job(url, secret, j["id"])
+
+
 def scenario_scan_of_a_sub_band_scans_just_that_band(page, url, secret):
     show_tone_waterfall(page, url, secret)
     wait_span(page, 1.5)  # drag_menu asserts at least 1 s

@@ -529,6 +529,8 @@ details.turn > pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 2px
 .job > .events { order: 7; }
 .job > .mix-now { order: 8; }
 .job > .pos { order: 9; }
+.job > .sweep-ms { order: 9; color: var(--dim); font-size: 11px; }
+.job select.scan-look { font: inherit; font-size: 11px; max-inline-size: 11em; }
 .job > .reason { order: 10; }
 .job > .id { order: 11; flex: 0 0 auto; margin-inline-start: auto; }
 .job .kind { color: var(--accent); }
