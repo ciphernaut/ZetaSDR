@@ -330,6 +330,8 @@ async fn start_measure(node: &Node) -> JobId {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };
@@ -1007,6 +1009,8 @@ async fn a_heal_does_not_wait_for_a_self_sweep() {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };

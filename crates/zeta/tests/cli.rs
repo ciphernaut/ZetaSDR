@@ -3975,3 +3975,91 @@ fn job_start_with_bits_is_refused_on_a_source_with_one_depth() {
         "{v}"
     );
 }
+
+#[test]
+fn job_start_takes_method_and_bin_hz() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = |extra: &[&str]| {
+        let mut args = vec![
+            "job",
+            "start",
+            "--kind",
+            "scan",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ];
+        args.extend_from_slice(extra);
+        zeta(dir.path(), &args)
+    };
+    let out = start(&["--method", "stepped"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let id = json(&out)["value"].as_str().expect("job id").to_owned();
+    let log = std::fs::read_to_string(dir.path().join("state").join("ops.log")).unwrap();
+    let op = log
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["op"].clone())
+        .find(|op| op["op"] == "job_start")
+        .expect("the start logged");
+    assert_eq!(op["method"], "stepped", "{op}");
+    assert!(op["bin_hz"].is_null(), "{op}");
+    let out = zeta(dir.path(), &["graph", "get", "--job", &id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let g = json(&out);
+    let fft = g["value"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .find(|n| n["kind"] == "fft")
+        .expect("an fft node")
+        .clone();
+    assert_eq!(fft["params"]["method"], "stepped", "{fft}");
+    zeta(dir.path(), &["job", "stop", "--job", &id])
+        .assert()
+        .success();
+    // The file source does not sweep for itself.
+    let out = start(&["--method", "source"])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "other", "{v}");
+    assert_eq!(
+        v["message"], "source tone does not sweep 99976000-100024000 Hz for itself",
+        "{v}"
+    );
+    // A bin asked of a stepped scan, and one out of range.
+    let out = start(&["--method", "stepped", "--bin-hz", "6000"])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(
+        v["message"], "bin_hz applies to a source that sweeps for itself",
+        "{v}"
+    );
+    let out = start(&["--bin-hz", "0"])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["error"], "out_of_range", "{v}");
+    assert_eq!(v["field"], "bin_hz", "{v}");
+}

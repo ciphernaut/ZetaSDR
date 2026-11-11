@@ -722,6 +722,8 @@ fn job_start(source: &str, kind: JobKind, t: Tuning) -> Op {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     }
@@ -1206,6 +1208,8 @@ async fn a_set_start_dropped_after_its_starts_leaves_every_job_to_set_stop() {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: true,
         replace: vec![],
     };

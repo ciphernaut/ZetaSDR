@@ -218,6 +218,27 @@ pub enum Op {
         #[serde(default, deserialize_with = "nullable_u8")]
         #[schemars(required, schema_with = "nullable_bits")]
         bits: Option<u8>,
+        /// `scan` only: how the span is swept. `stepped`: the node tunes the source's
+        /// capture across it, under a time-shared lease. `source`: the source sweeps it
+        /// for itself (a span inside `source_list`'s `capabilities.sweep`), taking no
+        /// lease, so it runs beside the demodulators on the source; a refusal is the
+        /// start's error. `null` lets the node choose: the source's own sweep when the
+        /// span is inside it, no `bits` is asked and the source accepts, else stepped
+        /// (`job_context.scan.fallback` says why the source refused; with the source's
+        /// capture held that is the usual `conflict`, the reason among its options).
+        /// `job_context.scan.method` says which runs. Changes on a running scan through
+        /// `graph_put` (the `fft` node's `method`). Any other kind must pass `null`.
+        #[serde(default, deserialize_with = "nullable_scan_method")]
+        #[schemars(required, schema_with = "nullable_method")]
+        method: Option<ScanMethod>,
+        /// `scan` only: the bin width asked of a source that sweeps for itself, Hz
+        /// (1..=1000000; the source gives the nearest it can); `null` is 6000 or the
+        /// source's finest, whichever is coarser. Refused with `method: "stepped"`.
+        /// Changes on a running scan through `graph_put` (the `fft` node's `bin_hz`).
+        /// Any other kind must pass `null`.
+        #[serde(default, deserialize_with = "nullable_u64")]
+        #[schemars(required, schema_with = "nullable_bin_hz")]
+        bin_hz: Option<u64>,
         /// `spectrum` only (`false` for any other kind): the job follows the
         /// source's capture instead of holding it. It never conflicts, never
         /// retunes a held source (its `tuning` is the capture it joins), is
@@ -789,6 +810,32 @@ fn nullable_bits(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     })
 }
 
+/// Schema of `job_start`'s `method`: `["string","null"]`, `stepped` or `source`.
+fn nullable_method(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "enum": ["stepped", "source", null],
+        "description": "`scan` only: `stepped` (the node tunes the source across the span) or `source` (the source sweeps it for itself, beside its demodulators; refused when it cannot); `null` lets the node choose, the source's own sweep where it can, else stepped. Any other kind must pass `null`."
+    })
+}
+
+/// Schema of `job_start`'s `bin_hz`: `["integer","null"]` (range as `dwell_ms`'s).
+fn nullable_bin_hz(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "format": "uint64",
+        "minimum": 0,
+        "description": "`scan` only: the bin width asked of a source that sweeps for itself, Hz (1..=1000000); `null` is 6000 or the source's finest, whichever is coarser. Refused with `method: \"stepped\"`. Any other kind must pass `null`."
+    })
+}
+
+/// Deserialize a required `Option<ScanMethod>` (see [`nullable_u64`]).
+fn nullable_scan_method<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<ScanMethod>, D::Error> {
+    <Option<ScanMethod> as Deserialize>::deserialize(d)
+}
+
 /// Schema of `job_start`'s `dwell_ms`: `["integer","null"]` (the range is checked by
 /// the node, so a value outside it is `out_of_range` naming the field).
 fn nullable_dwell_ms(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -868,6 +915,25 @@ fn nullable_attach_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema
     })
 }
 
+/// How a scan sweeps its span: `stepped`, the node tuning the source's IQ capture
+/// across it, or `source`, the source's own sweep ([`crate::port::Port::sweep`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanMethod {
+    Stepped,
+    Source,
+}
+
+impl ScanMethod {
+    /// The method as `job_context.scan.method` and the `fft` node's `method` say it.
+    pub fn name(self) -> &'static str {
+        match self {
+            ScanMethod::Stepped => "stepped",
+            ScanMethod::Source => "source",
+        }
+    }
+}
+
 /// An SSB sideband: upper (`usb`) or lower (`lsb`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -927,12 +993,12 @@ fn require_all_value(schema: &mut schemars::Schema) {
     }
 }
 
-/// `job_start` requires its look, `dwell_ms`, `average` and `bits`, after `sideband`
-/// (the field order agents read), and like `deviation_hz` shows no default for
-/// them; they still default to `null` when a request from before them leaves them
-/// out.
+/// `job_start` requires its look, `dwell_ms`, `average`, `bits`, `method` and
+/// `bin_hz`, after `sideband` (the field order agents read), and like
+/// `deviation_hz` shows no default for them; they still default to `null` when a
+/// request from before them leaves them out.
 fn require_the_look(schema: &mut schemars::Schema) {
-    const LOOK: [&str; 3] = ["dwell_ms", "average", "bits"];
+    const LOOK: [&str; 5] = ["dwell_ms", "average", "bits", "method", "bin_hz"];
     if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
         req.retain(|f| !LOOK.iter().any(|l| f == l));
         let at = req
@@ -1826,6 +1892,10 @@ pub const SCAN_WAIT_MARGIN_MS: u64 = 500;
 /// refuse its own sweep; past it the sweep is refused as `sweep start timed
 /// out`, ms.
 pub const SWEEP_START_TIMEOUT_MS: u64 = 5000;
+/// How long a scan that ran as `source` and whose source refused its sweep at a
+/// restart waits before asking again, ms: each refusal the next delay, the last
+/// repeating (the KiwiSDR session's own reconnect delays).
+pub const SWEEP_RETRY_MS: [u64; 5] = [1000, 2000, 4000, 8000, 16000];
 /// A dwell this long or longer is cut into `SPECTRUM_ROWS_PER_S` rows a second;
 /// a shorter one is one row a step, ms.
 pub const SCAN_ROWS_DWELL_MS: u64 = 100;
@@ -1835,6 +1905,8 @@ pub const SCAN_MIN_FRAMES: u64 = 4;
 pub const SCAN_DWELL_MAX_MS: u64 = 5000;
 /// The most sweeps a scan's `average` may take.
 pub const SCAN_AVERAGE_MAX: u32 = 64;
+/// The widest bin a scan's `bin_hz` may ask of a source that sweeps for itself, Hz.
+pub const SCAN_BIN_MAX_HZ: u64 = 1_000_000;
 
 /// The samples a scan step of `dwell_ms` takes at `rate_hz` with FFT frames of
 /// `size`, and the dwell they are in ms (rounded to nearest), in whole frames.
@@ -3657,14 +3729,18 @@ pub(crate) fn check_start_params(
 }
 
 /// `job_start`'s checks of a scan's look: `dwell_ms` (1..=`SCAN_DWELL_MAX_MS`),
-/// `average` (1..=`SCAN_AVERAGE_MAX`) and `bits` (which the source's depths decide,
-/// [`scan_bits_refusal`]) are for kind `scan` only, as `deviation_hz` is for the FM
-/// demodulators; out of range is `out_of_range` naming the field.
+/// `average` (1..=`SCAN_AVERAGE_MAX`), `bits` (which the source's depths decide,
+/// [`scan_bits_refusal`]), `method` and `bin_hz` (1..=`SCAN_BIN_MAX_HZ`) are for
+/// kind `scan` only, as `deviation_hz` is for the FM demodulators; out of range is
+/// `out_of_range` naming the field. A `bin_hz` with `method: "stepped"` is `other`,
+/// [`SCAN_BIN_HZ_STEPPED`].
 pub(crate) fn check_look(
     kind: &JobKind,
     dwell_ms: Option<u64>,
     average: Option<u32>,
     bits: Option<u8>,
+    method: Option<ScanMethod>,
+    bin_hz: Option<u64>,
 ) -> Result<(), OpError> {
     for (field, v, max) in [
         ("dwell_ms", dwell_ms, SCAN_DWELL_MAX_MS),
@@ -3673,6 +3749,7 @@ pub(crate) fn check_look(
             average.map(u64::from),
             u64::from(SCAN_AVERAGE_MAX),
         ),
+        ("bin_hz", bin_hz, SCAN_BIN_MAX_HZ),
     ] {
         let Some(v) = v else { continue };
         if *kind != JobKind::Scan {
@@ -3683,13 +3760,42 @@ pub(crate) fn check_look(
         }
         range(field, v, 1, max)?;
     }
-    if bits.is_some() && *kind != JobKind::Scan {
-        return Err(other(format!(
-            "bits applies only to kind scan; pass null (kind is {})",
-            kind.name()
-        )));
+    for (field, set) in [("bits", bits.is_some()), ("method", method.is_some())] {
+        if set && *kind != JobKind::Scan {
+            return Err(other(format!(
+                "{field} applies only to kind scan; pass null (kind is {})",
+                kind.name()
+            )));
+        }
+    }
+    if bin_hz.is_some() && method == Some(ScanMethod::Stepped) {
+        return Err(other(SCAN_BIN_HZ_STEPPED));
     }
     Ok(())
+}
+
+/// Why a scan's `bin_hz` is refused with `method: "stepped"`: a stepped scan's bin is
+/// its capture's over its FFT size, so only a source sweeping for itself is asked one.
+pub(crate) const SCAN_BIN_HZ_STEPPED: &str = "bin_hz applies to a source that sweeps for itself";
+
+/// Why `source` (with `caps`) cannot sweep `span` for itself: `source <id> does not
+/// sweep <lo>-<hi> Hz for itself` (the span's edges) when its `sweep` does not hold
+/// the span, or it has none; `None` when it does.
+pub(crate) fn scan_sweep_refusal(
+    source: &SourceId,
+    caps: &Capabilities,
+    span: Tuning,
+) -> Option<String> {
+    if caps.sweep.as_ref().is_some_and(|s| s.holds(span)) {
+        return None;
+    }
+    let half = span.bandwidth_hz.0 / 2;
+    Some(format!(
+        "source {} does not sweep {}-{} Hz for itself",
+        source.0,
+        span.center_hz.0.saturating_sub(half),
+        span.center_hz.0.saturating_add(half)
+    ))
 }
 
 /// Why a scan of `source` (with `caps`) cannot run at `bits`: `bits <n>: source <id>
@@ -4034,6 +4140,8 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             dwell_ms,
             average,
             bits,
+            method,
+            bin_hz,
             elastic,
             replace,
         } => {
@@ -4044,7 +4152,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 });
             }
             let deviation = check_start_params(&kind, deviation_hz, sideband)?;
-            check_look(&kind, dwell_ms, average, bits)?;
+            check_look(&kind, dwell_ms, average, bits, method, bin_hz)?;
             // An unknown or unready mode is refused before anything is tuned.
             kind.mode_row(&node.modes())?;
             let tuning = Tuning {
@@ -4061,6 +4169,13 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 })?;
                 if let Some(why) =
                     bits.and_then(|b| scan_bits_refusal(&source, port.capabilities(), b.into()))
+                {
+                    return Err(other(why));
+                }
+                // A scan made to sweep by the source's own means is refused here when
+                // the source cannot sweep the span, before anything is stopped.
+                if method == Some(ScanMethod::Source)
+                    && let Some(why) = scan_sweep_refusal(&source, port.capabilities(), tuning)
                 {
                     return Err(other(why));
                 }
@@ -4084,24 +4199,40 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                     if let Some(b) = bits {
                         p.insert("bits".into(), b.into());
                     }
+                    if let Some(m) = method {
+                        p.insert("method".into(), m.name().into());
+                    }
+                    if let Some(b) = bin_hz {
+                        p.insert("bin_hz".into(), b.into());
+                    }
                 }
-                // With `replace`, the named holders stop and the scan leases under
-                // one hold of the gate; the elastic jobs it displaces stop after.
+                // With `replace`, the named holders stop and the scan starts under one
+                // hold of the gate (the source asked to sweep, or the lease); the
+                // elastic jobs a stepped scan displaces stop after. A scan the source
+                // sweeps takes no lease: the named holders are stopped as asked and
+                // the source is idled when nothing holds it (the sweep's own end).
                 let guard = node.gate_for_replace(&source, &replace).await;
                 let g = guard.as_ref();
-                let (started, after) = match replace_under(node, &source, &replace, g).await {
-                    Ok(()) => {
-                        node.job_start_gated(kind.name(), source, tuning, graph, None, false, g)
-                            .await
-                    }
-                    Err(e) => (Err(e), AfterGate::Nothing),
-                };
+                let (started, after, replaced) =
+                    match replace_under(node, &source, &replace, g).await {
+                        Ok(()) => {
+                            let (r, after) = node
+                                .job_start_gated(kind.name(), source, tuning, graph, None, false, g)
+                                .await;
+                            (r, after, !replace.is_empty())
+                        }
+                        Err(e) => (Err(e), AfterGate::Nothing, false),
+                    };
                 drop(guard);
                 node.after_gate(after).await;
                 return match started {
                     Ok(id) => Ok(OpResult::Job(id)),
                     Err(e) => {
-                        idle_after_replace(node, port.as_ref(), &replace, &e).await;
+                        // The named holders were stopped before the start failed.
+                        match replaced {
+                            true => node.idle_if_unheld(port.as_ref()).await,
+                            false => idle_after_replace(node, port.as_ref(), &replace, &e).await,
+                        }
                         Err(node_error(node, e))
                     }
                 };

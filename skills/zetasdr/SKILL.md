@@ -162,10 +162,12 @@ Set the source's overall receive gain live (`gain_db` in dB within `source list`
 - dwell_ms: integer or null; `scan` only, in ms (1-5000)
 - average: integer or null; `scan` only, sweeps averaged (1-64)
 - bits: integer or null; `scan` only, bits per sample: one of `capabilities.depths[].bits` in `source list`
+- method: string or null; `scan` only, `stepped` or `source`; `null` lets the node choose
+- bin_hz: integer or null (Hz); `scan` only, the bin width in Hz asked of a source that sweeps for itself (1-1000000)
 - elastic: boolean
 - replace: array; ids from `job list` (strings), `[]` for none
 
-JSON: `{"op":"job_start","kind":"passthrough","source":"<id>","center_hz":144800000,"bandwidth_hz":12500,"deviation_hz":null,"sideband":null,"dwell_ms":null,"average":null,"bits":null,"elastic":false,"replace":[]}`
+JSON: `{"op":"job_start","kind":"passthrough","source":"<id>","center_hz":144800000,"bandwidth_hz":12500,"deviation_hz":null,"sideband":null,"dwell_ms":null,"average":null,"bits":null,"method":null,"bin_hz":null,"elastic":false,"replace":[]}`
 
 CLI: `zeta job start --kind passthrough --source <id> --center-hz 144800000 --bandwidth-hz 12500`
 
@@ -760,9 +762,11 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.size: integer
 - params.window: string (Window: hann|rect)
 - params.average: integer or null (optional, default null); `scan` only, sweeps averaged (1-64)
+- params.bin_hz: integer or null (optional, default null); `scan` only, the bin width asked of a source that sweeps for itself
 - params.bits: integer or null (optional, default null); `scan` only, bits per sample, one of the source's depths
 - params.dwell_ms: integer or null (optional, default null); `scan` only, in ms (1-5000)
 - params.edge_mask: number (optional, default 0.0)
+- params.method: string or null (optional, default null); `scan` only, `stepped` or `source`; `null` lets the node choose
 - params.notch_hz: integer (optional, default 0)
 - params.row_frames: integer or null (optional, default null)
 - params.rows_per_s: integer (optional, default 20)

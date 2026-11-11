@@ -14,7 +14,9 @@ use zeta_core::bank::{BankFactory, ChannelBank};
 use zeta_core::graph::{Graph, GraphError, Node as GraphNode};
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
-use zeta_core::ops::{JobKind, Op, OpError, OpResult, scan_dwell_samples, spectrum_row_boundary};
+use zeta_core::ops::{
+    JobKind, Op, OpError, OpResult, ScanMethod, scan_dwell_samples, spectrum_row_boundary,
+};
 use zeta_core::port::{
     IqBlock, IqReceiver, Port, PortError, SWEEP_ROWS_CAPACITY, SweepPlan, SweepRequest, SweepRow,
     SweepRows, SweepState, Tuning,
@@ -117,6 +119,9 @@ struct ScanPort {
     dropped: Arc<AtomicUsize>,
     /// How many times the port was idled.
     idles: AtomicUsize,
+    /// What its sweep is refused with now: the script's `refuse`, then
+    /// [`ScanPort::set_refuse`]'s.
+    refuse: Mutex<Option<String>>,
 }
 
 /// How a [`ScanPort::sweeping`] port's own sweep goes: it refuses with `refuse`;
@@ -126,7 +131,8 @@ struct ScanPort {
 /// at once (more than its channel holds), then pauses, so a reader cannot keep up
 /// and cannot be starved; with `depths` the port also carries [`two_depths`]. The
 /// first row comes after `first_row_ms` (default 5); with `hang` the call never
-/// returns. Each row's span is the next `SWEEP_ROW_MS` after the last one's.
+/// returns, and with `start_ms` it returns (or refuses) only after that long. Each
+/// row's span is the next `SWEEP_ROW_MS` after the last one's.
 #[derive(Clone, Debug, Default)]
 struct SweepScript {
     refuse: Option<String>,
@@ -137,6 +143,7 @@ struct SweepScript {
     depths: bool,
     first_row_ms: Option<u64>,
     hang: bool,
+    start_ms: Option<u64>,
 }
 
 /// Steps and bins of a [`ScanPort::sweeping`] port's plan.
@@ -254,6 +261,7 @@ impl ScanPort {
                 me.caps.max_bandwidth_hz = Claim::Measured(Hz(16 * MHZ));
                 *me.depth.get_mut().unwrap() = Some(16);
             }
+            *me.refuse.get_mut().unwrap() = script.refuse.clone();
             me.script = Some(script);
         })
     }
@@ -276,6 +284,11 @@ impl ScanPort {
     /// How many times the port was idled.
     fn idles(&self) -> usize {
         self.idles.load(Ordering::SeqCst)
+    }
+
+    /// Refuse every sweep asked for from now on with `why` (`None`: grant them).
+    fn set_refuse(&self, why: Option<&str>) {
+        *self.refuse.lock().unwrap() = why.map(Into::into);
     }
 
     /// Every `set_depth` and tune so far, in order.
@@ -336,6 +349,7 @@ impl ScanPort {
             live: Arc::new(AtomicUsize::new(0)),
             dropped: Arc::new(AtomicUsize::new(0)),
             idles: AtomicUsize::new(0),
+            refuse: Mutex::new(None),
         };
         f(&mut p);
         let p = Arc::new(p);
@@ -488,7 +502,11 @@ impl Port for ScanPort {
             ));
         };
         self.requests.lock().unwrap().push(req);
-        if let Some(why) = script.refuse {
+        if let Some(ms) = script.start_ms {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+        let refuse = self.refuse.lock().unwrap().clone();
+        if let Some(why) = refuse {
             return Err(PortError::Unsupported(why));
         }
         if script.hang {
@@ -744,6 +762,8 @@ fn start(kind: JobKind, center_hz: u64, bandwidth_hz: u64) -> Op {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     }
@@ -756,33 +776,29 @@ fn start_look(
     dwell_ms: Option<u64>,
     average: Option<u32>,
 ) -> Op {
-    match start(JobKind::Scan, center_hz, bandwidth_hz) {
-        Op::JobStart {
-            kind,
-            source,
-            center_hz,
-            bandwidth_hz,
-            deviation_hz,
-            sideband,
-            bits,
-            elastic,
-            replace,
-            ..
-        } => Op::JobStart {
-            kind,
-            source,
-            center_hz,
-            bandwidth_hz,
-            deviation_hz,
-            sideband,
-            dwell_ms,
-            average,
-            bits,
-            elastic,
-            replace,
-        },
-        _ => unreachable!(),
+    let mut op = start(JobKind::Scan, center_hz, bandwidth_hz);
+    if let Op::JobStart {
+        dwell_ms: d,
+        average: a,
+        ..
+    } = &mut op
+    {
+        (*d, *a) = (dwell_ms, average);
     }
+    op
+}
+
+/// `op` (a `job_start`) with `method` and `bin_hz`.
+fn with_method(mut op: Op, method: Option<ScanMethod>, bin_hz: Option<u64>) -> Op {
+    if let Op::JobStart {
+        method: m,
+        bin_hz: b,
+        ..
+    } = &mut op
+    {
+        (*m, *b) = (method, bin_hz);
+    }
+    op
 }
 
 /// Start a scan with a look; its id and a receiver on its event stream.
@@ -2877,4 +2893,366 @@ async fn a_sweep_start_that_never_returns_is_refused_and_the_scan_steps() {
     tunes_at_least(&port, 1, Duration::from_secs(5)).await;
     assert_eq!(scan_ctx(&node, &id)["method"], "stepped");
     node.job_stop(&id).await.unwrap();
+}
+
+// The scan's method and the fallback (plan 36.2): `method` forces `stepped` or
+// `source`; with none a refused sweep steps at a first start and says why, and a
+// scan that ran as `source` waits for its sweep instead at a restart.
+
+/// The refusal the method tests' sources give.
+const NO_WATERFALL: &str = "no waterfall channel free";
+
+/// A port that refuses every sweep with [`NO_WATERFALL`].
+fn refusing() -> Arc<ScanPort> {
+    ScanPort::sweeping(SweepScript {
+        refuse: Some(NO_WATERFALL.into()),
+        ..Default::default()
+    })
+}
+
+/// A scan's `job_start` over [`SWEEP_SPAN`] with `method` and `bin_hz`.
+fn sweep_start(method: Option<ScanMethod>, bin_hz: Option<u64>) -> Op {
+    with_method(
+        start(JobKind::Scan, SWEEP_SPAN.0, SWEEP_SPAN.1),
+        method,
+        bin_hz,
+    )
+}
+
+/// `graph_put` job `id`'s graph with its `fft` node's params changed by `f`.
+async fn put_fft(
+    node: &Node,
+    id: &JobId,
+    f: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> Result<OpResult, OpError> {
+    let mut g = graph_of(node, id).await;
+    let fft = g.nodes.iter_mut().find(|n| n.kind == "fft").unwrap();
+    f(fft.params.as_object_mut().unwrap());
+    node.apply(Op::GraphPut {
+        job: id.clone(),
+        graph: g,
+    })
+    .await
+}
+
+/// No scan job is listed.
+fn no_scan_listed(node: &Node) -> bool {
+    node.job_list().iter().all(|r| r.kind != "scan")
+}
+
+/// A sweep the source refuses at a first start steps the span instead, and the
+/// record says the method and why the source refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_sweep_falls_back_to_stepped_and_says_why() {
+    let (_dir, node, port) = open_with(refusing()).await;
+    let (id, _rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    assert_eq!(port.requests().len(), 1);
+    tunes_at_least(&port, 1, Duration::from_secs(5)).await;
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["method"], "stepped", "{ctx}");
+    assert_eq!(ctx["fallback"], NO_WATERFALL, "{ctx}");
+    assert!(node.lease_sweepers(&radio0()).is_empty());
+    assert_eq!(radio0_info(&node).await.holders, vec![id.clone()]);
+    node.job_stop(&id).await.unwrap();
+}
+
+/// With the source's capture held, the fallback is the usual conflict naming the
+/// holders, the source's reason among its options; nothing is stopped and no scan
+/// is left.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_sweep_under_a_held_channel_is_the_conflict_with_the_reason() {
+    let (_dir, node, port) = open_with(refusing()).await;
+    let rigid = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    match node
+        .apply(start(JobKind::Scan, SWEEP_SPAN.0, SWEEP_SPAN.1))
+        .await
+    {
+        Err(OpError::Conflict {
+            holders, options, ..
+        }) => {
+            assert_eq!(holders, vec![rigid.clone()]);
+            let want = format!("the source refused to sweep for itself: {NO_WATERFALL}");
+            assert!(options.contains(&want), "{options:?}");
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+    assert_eq!(port.requests().len(), 1);
+    assert!(no_scan_listed(&node), "{:?}", node.job_list());
+    assert!(node.lease_sweepers(&radio0()).is_empty());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(job_state(&node, &rigid), Some(JobState::Running));
+    assert_eq!(radio0_info(&node).await.holders, vec![rigid.clone()]);
+    node.job_stop(&rigid).await.unwrap();
+}
+
+/// `method: "stepped"` steps a span the source could sweep, never asking it.
+#[tokio::test(flavor = "multi_thread")]
+async fn method_stepped_never_asks_the_source() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let id = start_job(&node, sweep_start(Some(ScanMethod::Stepped), None)).await;
+    tunes_at_least(&port, 1, Duration::from_secs(5)).await;
+    assert!(port.requests().is_empty());
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["method"], "stepped", "{ctx}");
+    assert!(ctx.get("fallback").is_none(), "{ctx}");
+    assert_eq!(
+        fft_node(&graph_of(&node, &id).await).params["method"],
+        "stepped"
+    );
+    node.job_stop(&id).await.unwrap();
+}
+
+/// `method: "source"` and a refusal is the start's error, holding the reason: no
+/// tune, no claim, no scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn method_source_fails_instead_of_falling_back() {
+    let (_dir, node, port) = open_with(refusing()).await;
+    match node
+        .apply(sweep_start(Some(ScanMethod::Source), None))
+        .await
+    {
+        Err(OpError::Other { message }) => {
+            assert_eq!(message, format!("sweep on source radio0: {NO_WATERFALL}"))
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+    assert_eq!(port.requests().len(), 1);
+    assert!(port.tunes().is_empty(), "{:?}", port.tunes());
+    assert!(node.lease_sweepers(&radio0()).is_empty());
+    assert!(no_scan_listed(&node));
+}
+
+/// `method: "source"` on a span the source's sweep does not hold is refused naming
+/// the span, before the source is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn method_source_outside_the_sweep_is_refused_naming_the_span() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    // 0..40 MHz: under the sweep's 1 MHz floor.
+    let op = with_method(
+        start(JobKind::Scan, 20 * MHZ, 40 * MHZ),
+        Some(ScanMethod::Source),
+        None,
+    );
+    match node.apply(op).await {
+        Err(OpError::Other { message }) => assert_eq!(
+            message,
+            "source radio0 does not sweep 0-40000000 Hz for itself"
+        ),
+        other => panic!("expected Other, got {other:?}"),
+    }
+    assert!(port.requests().is_empty());
+    assert!(port.tunes().is_empty());
+    assert!(no_scan_listed(&node));
+}
+
+/// `bin_hz` is the bin asked of the source; without it the target bin (6 kHz over
+/// the source's 1 kHz floor).
+#[tokio::test(flavor = "multi_thread")]
+async fn bin_hz_goes_to_the_source() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let id = start_job(&node, sweep_start(None, Some(30_000))).await;
+    assert_eq!(port.requests()[0].bin_hz, Hz(30_000));
+    assert_eq!(
+        fft_node(&graph_of(&node, &id).await).params["bin_hz"],
+        30_000
+    );
+    assert_eq!(scan_ctx(&node, &id)["method"], "source");
+    node.job_stop(&id).await.unwrap();
+    let id = start_job(&node, sweep_start(None, None)).await;
+    assert_eq!(port.requests()[1].bin_hz, Hz(6000));
+    node.job_stop(&id).await.unwrap();
+}
+
+/// `graph_put` of the `fft` node's `method` changes a running self-sweep to stepped:
+/// its sweep ends and the radio is stepped.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_put_changes_the_method_on_a_running_scan() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let (id, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    rows(&mut rx, 4, Duration::from_secs(10)).await;
+    let put = put_fft(&node, &id, |p| {
+        p.insert("method".into(), "stepped".into());
+    });
+    assert!(matches!(put.await, Ok(OpResult::Ok)));
+    until("the source's sweep ends", Duration::from_secs(5), || {
+        port.live() == 0
+    })
+    .await;
+    tunes_at_least(&port, 1, Duration::from_secs(5)).await;
+    assert_eq!(job_state(&node, &id), Some(JobState::Running));
+    assert_eq!(scan_ctx(&node, &id)["method"], "stepped");
+    assert!(node.lease_sweepers(&radio0()).is_empty());
+    assert_eq!(port.requests().len(), 1);
+    node.job_stop(&id).await.unwrap();
+}
+
+/// A scan that ran as `source`, restarted under its id (here a `graph_put` of its
+/// dwell) while the source refuses, neither steps nor fails: it runs, its record
+/// says `waiting` with the reason and nothing is tuned; once the source grants the
+/// sweep again the rows come and `waiting` is `null`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_self_sweep_refused_waits_instead_of_stepping() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let (id, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    rows(&mut rx, 4, Duration::from_secs(10)).await;
+    port.set_refuse(Some("a sweep is already running"));
+    let put = put_fft(&node, &id, |p| {
+        p.insert("dwell_ms".into(), 40.into());
+    });
+    assert!(matches!(put.await, Ok(OpResult::Ok)));
+    until("the record says waiting", Duration::from_secs(5), || {
+        scan_ctx(&node, &id)["waiting"] == "a sweep is already running"
+    })
+    .await;
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["method"], "source", "{ctx}");
+    assert!(ctx.get("steps").is_none(), "{ctx}");
+    assert!(ctx.get("fallback").is_none(), "{ctx}");
+    assert_eq!(job_state(&node, &id), Some(JobState::Running));
+    assert_eq!(node.lease_sweepers(&radio0()), vec![id.clone()]);
+    assert!(radio0_info(&node).await.holders.is_empty());
+    // Asked again a second later: still refused, still waiting.
+    until("the source is asked again", Duration::from_secs(10), || {
+        port.requests().len() >= 3
+    })
+    .await;
+    assert!(port.tunes().is_empty(), "{:?}", port.tunes());
+    assert_eq!(job_state(&node, &id), Some(JobState::Running));
+    let mut rx = event_rx(&node, &id);
+    port.set_refuse(None);
+    until("the record stops waiting", Duration::from_secs(20), || {
+        scan_ctx(&node, &id)["waiting"].is_null()
+    })
+    .await;
+    rows(&mut rx, 4, Duration::from_secs(10)).await;
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["method"], "source", "{ctx}");
+    assert_eq!(ctx["steps"], 4, "{ctx}");
+    assert_eq!(ctx["dwell_ms"], 40, "{ctx}");
+    assert!(port.tunes().is_empty(), "{:?}", port.tunes());
+    node.job_stop(&id).await.unwrap();
+    until("the source's sweep ends", Duration::from_secs(5), || {
+        port.live() == 0
+    })
+    .await;
+    assert!(node.lease_sweepers(&radio0()).is_empty());
+}
+
+/// A `graph_put` the source cannot run is refused with `job_start`'s text before
+/// anything is stopped: `method: "source"` on a span outside the sweep, `bin_hz`
+/// with `method: "stepped"`. Each scan runs on with its method.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graph_put_the_source_cannot_sweep_is_refused_and_the_scan_runs_on() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    // 0..40 MHz: stepped, outside the sweep.
+    let (stepped, _rx) = start_scan(&node).await;
+    tunes_at_least(&port, 1, Duration::from_secs(5)).await;
+    let put = put_fft(&node, &stepped, |p| {
+        p.insert("method".into(), "source".into());
+    });
+    match put.await {
+        Err(OpError::Other { message }) => assert_eq!(
+            message,
+            "source radio0 does not sweep 0-40000000 Hz for itself"
+        ),
+        other => panic!("expected Other, got {other:?}"),
+    }
+    assert_eq!(job_state(&node, &stepped), Some(JobState::Running));
+    assert_eq!(scan_ctx(&node, &stepped)["method"], "stepped");
+    node.job_stop(&stepped).await.unwrap();
+
+    let (source, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    rows(&mut rx, 4, Duration::from_secs(10)).await;
+    let put = put_fft(&node, &source, |p| {
+        p.insert("method".into(), "stepped".into());
+        p.insert("bin_hz".into(), 30_000.into());
+    });
+    match put.await {
+        Err(OpError::Other { message }) => {
+            assert_eq!(message, "bin_hz applies to a source that sweeps for itself")
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+    assert_eq!(job_state(&node, &source), Some(JobState::Running));
+    assert_eq!(scan_ctx(&node, &source)["method"], "source");
+    // Not stopped: the same sweep runs on.
+    assert_eq!(port.requests().len(), 1);
+    assert_eq!(port.live(), 1);
+    rows(&mut rx, 4, Duration::from_secs(10)).await;
+    node.job_stop(&source).await.unwrap();
+}
+
+/// A source slow to start its sweep, under a restart of the scan (`graph_put`): the
+/// restart waits for it, one sweep runs under the scan's one claim, and a job
+/// started on the source meanwhile waits for the gate and is granted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_sweep_start_under_a_restart_runs_one_sweep() {
+    let script = SweepScript {
+        start_ms: Some(300),
+        ..Default::default()
+    };
+    let (_dir, node, port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    rows(&mut rx, 4, Duration::from_secs(10)).await;
+    let asked = Instant::now();
+    let (put, rigid) = tokio::join!(
+        put_fft(&node, &id, |p| {
+            p.insert("dwell_ms".into(), 40.into());
+        }),
+        async {
+            // Once the restart has stopped the old run and is starting the new sweep.
+            until("the restart asks again", Duration::from_secs(5), || {
+                port.requests().len() == 2
+            })
+            .await;
+            node.apply(start(JobKind::Spectrum, 100 * MHZ, MHZ)).await
+        }
+    );
+    assert!(matches!(put, Ok(OpResult::Ok)), "{put:?}");
+    assert!(asked.elapsed() >= Duration::from_millis(300));
+    let rigid = match rigid {
+        Ok(OpResult::Job(j)) => j,
+        other => panic!("expected a job, got {other:?}"),
+    };
+    let mut rx = event_rx(&node, &id);
+    rows(&mut rx, 4, Duration::from_secs(10)).await;
+    until("one sweep runs", Duration::from_secs(5), || {
+        port.live() == 1
+    })
+    .await;
+    assert_eq!(port.requests().len(), 2);
+    assert_eq!(node.lease_sweepers(&radio0()), vec![id.clone()]);
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["method"], "source", "{ctx}");
+    assert_eq!(ctx["dwell_ms"], 40, "{ctx}");
+    assert_eq!(job_state(&node, &rigid), Some(JobState::Running));
+    node.job_stop(&id).await.unwrap();
+    node.job_stop(&rigid).await.unwrap();
+}
+
+/// `replace` on a scan the source sweeps for itself stops the jobs it names, as
+/// asked, and no other; the source, held by no IQ job but under the sweep's claim,
+/// is idled when the sweep ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_sweep_with_replace_stops_only_the_named_and_idles_at_its_end() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let named = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    let follower = start_job(&node, elastic(start(JobKind::Spectrum, 100 * MHZ, MHZ))).await;
+    let mut op = start(JobKind::Scan, SWEEP_SPAN.0, SWEEP_SPAN.1);
+    if let Op::JobStart { replace, .. } = &mut op {
+        *replace = vec![named.clone()];
+    }
+    let id = start_job(&node, op).await;
+    assert_eq!(scan_ctx(&node, &id)["method"], "source");
+    assert_eq!(job_state(&node, &named), Some(JobState::Stopped));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(job_state(&node, &follower), Some(JobState::Running));
+    node.job_stop(&follower).await.unwrap();
+    let before = port.idles();
+    node.job_stop(&id).await.unwrap();
+    until("the source is idled", Duration::from_secs(5), || {
+        port.idles() > before
+    })
+    .await;
+    assert!(node.lease_sweepers(&radio0()).is_empty());
 }

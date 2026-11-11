@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use zeta_core::graph::Graph;
 use zeta_core::modes::{Family, ModeState};
-use zeta_core::ops::{JobKind, Modulation, Op, OpError, Sideband, SignalBand};
+use zeta_core::ops::{JobKind, Modulation, Op, OpError, ScanMethod, Sideband, SignalBand};
 use zeta_core::signatures::SignatureState;
 use zeta_core::station::{Antenna, AntennaKind, Station};
 use zeta_core::types::{Baud, Hz, JobId, Selection, SourceId, Span, StreamId, Timestamp};
@@ -1155,6 +1155,15 @@ pub enum JobCmd {
         /// one: for a coarse survey, never for faint signals
         #[arg(long, value_name = "BITS")]
         bits: Option<u8>,
+        /// scan only: stepped (the node tunes the source across the span) or source
+        /// (the source sweeps it for itself, beside its demodulators; refused when it
+        /// cannot); absent = the node chooses, the source's own sweep where it can
+        #[arg(long, value_enum)]
+        method: Option<ScanMethodArg>,
+        /// scan only: the bin width asked of a source that sweeps for itself, Hz
+        /// (1..=1000000); absent = 6000 or the source's finest, whichever is coarser
+        #[arg(long, value_name = "HZ")]
+        bin_hz: Option<u64>,
         /// spectrum only: follow the source's capture instead of holding it
         /// (never conflicts; relaunched under the same id on every retune)
         #[arg(long)]
@@ -1376,6 +1385,22 @@ impl From<SidebandArg> for Sideband {
     }
 }
 
+/// How a scan sweeps, mirroring `ScanMethod`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ScanMethodArg {
+    Stepped,
+    Source,
+}
+
+impl From<ScanMethodArg> for ScanMethod {
+    fn from(m: ScanMethodArg) -> Self {
+        match m {
+            ScanMethodArg::Stepped => ScanMethod::Stepped,
+            ScanMethodArg::Source => ScanMethod::Source,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct BandArgs {
     /// Source id
@@ -1540,6 +1565,8 @@ impl Command {
                 dwell_ms,
                 average,
                 bits,
+                method,
+                bin_hz,
                 elastic,
                 replace,
                 ..
@@ -1553,6 +1580,8 @@ impl Command {
                 dwell_ms,
                 average,
                 bits,
+                method: method.map(Into::into),
+                bin_hz,
                 elastic,
                 replace: replace.into_ids(),
             },

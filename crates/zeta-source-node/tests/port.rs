@@ -704,6 +704,8 @@ async fn a_scan_with_bits_on_a_node_source_is_refused_at_job_start() {
         dwell_ms: None,
         average: None,
         bits: Some(8),
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };

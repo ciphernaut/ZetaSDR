@@ -510,6 +510,8 @@ async fn start_fm(node: &Node) -> JobId {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };
@@ -678,6 +680,8 @@ async fn job_start_with_transcribe_is_refused() {
             dwell_ms: None,
             average: None,
             bits: None,
+            method: None,
+            bin_hz: None,
             elastic: false,
             replace: vec![],
         })

@@ -11,7 +11,7 @@ use zeta_core::job::JobState;
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{
-    AUDIO_RATE_HZ, JobKind, Op, OpError, OpResult, Sideband, channel_rate_hz, schema,
+    AUDIO_RATE_HZ, JobKind, Op, OpError, OpResult, ScanMethod, Sideband, channel_rate_hz, schema,
 };
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
@@ -212,6 +212,8 @@ async fn job_start_passthrough_then_list_then_stop() {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };
@@ -349,6 +351,8 @@ async fn source_ensure_during_job_start_does_not_retune() {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };
@@ -447,6 +451,8 @@ async fn job_start_holds_the_gate_through_its_tune_and_lease() {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };
@@ -1030,6 +1036,8 @@ async fn conflict_reports_current_tuning_and_real_options() {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };
@@ -1135,6 +1143,8 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };
@@ -1867,6 +1877,8 @@ fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     }
@@ -3257,6 +3269,8 @@ async fn start_on(node: &Node, source: &str, kind: JobKind, elastic: bool) -> Jo
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic,
         replace: vec![],
     };
@@ -3463,6 +3477,8 @@ async fn job_start_on_a_faulted_source_is_refused_naming_the_source() {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };
@@ -3680,6 +3696,8 @@ fn start_look(kind: JobKind, dwell_ms: Option<u64>, average: Option<u32>) -> Op 
         dwell_ms,
         average,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     }
@@ -3786,5 +3804,165 @@ fn job_start_without_the_look_fields_still_parses() {
             serde_json::json!(["integer", "null"]),
             "{f}: {v}"
         );
+    }
+}
+
+/// [`start_look`] with `method` and `bin_hz`.
+fn start_method(kind: JobKind, method: Option<ScanMethod>, bin_hz: Option<u64>) -> Op {
+    let mut op = start_look(kind, None, None);
+    if let Op::JobStart {
+        method: m,
+        bin_hz: b,
+        ..
+    } = &mut op
+    {
+        (*m, *b) = (method, bin_hz);
+    }
+    op
+}
+
+async fn wide_node(dir: &Path) -> Node {
+    Node::open(
+        cfg(dir),
+        registry(),
+        vec![Arc::new(WidePort::new("hackrf0"))],
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn method_and_bin_hz_on_another_kind_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = wide_node(dir.path()).await;
+    for (op, field) in [
+        (
+            start_method(JobKind::Spectrum, Some(ScanMethod::Stepped), None),
+            "method",
+        ),
+        (start_method(JobKind::FmDemod, None, Some(6000)), "bin_hz"),
+    ] {
+        match node.apply(op).await {
+            Err(OpError::Other { message }) => assert_eq!(
+                message,
+                format!(
+                    "{field} applies only to kind scan; pass null (kind is {})",
+                    if field == "method" {
+                        "spectrum"
+                    } else {
+                        "fm_demod"
+                    }
+                )
+            ),
+            other => panic!("{field}: expected Other, got {other:?}"),
+        }
+    }
+    assert!(node.job_list().is_empty());
+}
+
+#[tokio::test]
+async fn bin_hz_out_of_range_names_the_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = wide_node(dir.path()).await;
+    for value in [0, 1_000_001] {
+        match node
+            .apply(start_method(JobKind::Scan, None, Some(value)))
+            .await
+        {
+            Err(OpError::OutOfRange {
+                field,
+                value: v,
+                min,
+                max,
+                ..
+            }) => assert_eq!(
+                (field.as_str(), v, min, max),
+                ("bin_hz", value, 1, 1_000_000)
+            ),
+            other => panic!("bin_hz {value}: expected OutOfRange, got {other:?}"),
+        }
+    }
+    assert!(node.job_list().is_empty());
+}
+
+#[tokio::test]
+async fn bin_hz_with_method_stepped_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = wide_node(dir.path()).await;
+    let op = start_method(JobKind::Scan, Some(ScanMethod::Stepped), Some(6000));
+    match node.apply(op).await {
+        Err(OpError::Other { message }) => {
+            assert_eq!(message, "bin_hz applies to a source that sweeps for itself")
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+    assert!(node.job_list().is_empty());
+}
+
+#[test]
+fn job_start_without_method_still_parses() {
+    let op: Op = serde_json::from_value(serde_json::json!({
+        "op": "job_start", "kind": "scan", "source": "hackrf0",
+        "center_hz": 100_000_000, "bandwidth_hz": 40_000_000,
+        "deviation_hz": null, "sideband": null, "dwell_ms": null, "average": null,
+        "bits": null, "elastic": false, "replace": [],
+    }))
+    .unwrap();
+    match op {
+        Op::JobStart { method, bin_hz, .. } => assert_eq!((method, bin_hz), (None, None)),
+        other => panic!("{other:?}"),
+    }
+    let op: Op = serde_json::from_value(serde_json::json!({
+        "op": "job_start", "kind": "scan", "source": "hackrf0",
+        "center_hz": 100_000_000, "bandwidth_hz": 40_000_000,
+        "deviation_hz": null, "sideband": null, "elastic": false, "replace": [],
+        "method": "source", "bin_hz": 30000,
+    }))
+    .unwrap();
+    match op {
+        Op::JobStart { method, bin_hz, .. } => {
+            assert_eq!((method, bin_hz), (Some(ScanMethod::Source), Some(30_000)))
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_job_start_schema_requires_method_and_bin_hz_after_bits() {
+    let s = schema();
+    let v = variants(&s["op"])
+        .iter()
+        .find(|v| v["properties"]["op"]["const"] == "job_start")
+        .expect("job_start variant");
+    let req: Vec<&str> = v["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    let at = |f: &str| {
+        req.iter()
+            .position(|r| *r == f)
+            .unwrap_or_else(|| panic!("{f}: {req:?}"))
+    };
+    assert_eq!(at("method"), at("bits") + 1, "{req:?}");
+    assert_eq!(at("bin_hz"), at("bits") + 2, "{req:?}");
+    assert_eq!(
+        v["properties"]["method"]["type"],
+        serde_json::json!(["string", "null"]),
+        "{v}"
+    );
+    assert_eq!(
+        v["properties"]["method"]["enum"],
+        serde_json::json!(["stepped", "source", null]),
+        "{v}"
+    );
+    assert_eq!(
+        v["properties"]["bin_hz"]["type"],
+        serde_json::json!(["integer", "null"]),
+        "{v}"
+    );
+    for f in ["method", "bin_hz"] {
+        assert!(v["properties"][f].get("default").is_none(), "{f}: {v}");
     }
 }

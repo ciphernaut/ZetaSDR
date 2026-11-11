@@ -114,6 +114,8 @@ async fn a_capture_job_ends_stopped_with_its_records_in_the_store() {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };

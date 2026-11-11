@@ -50,6 +50,8 @@ async fn stream_tail_returns_events_from_running_job() {
             dwell_ms: None,
             average: None,
             bits: None,
+            method: None,
+            bin_hz: None,
             elastic: false,
             replace: vec![],
         })

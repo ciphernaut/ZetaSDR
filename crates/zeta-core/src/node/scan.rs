@@ -22,12 +22,13 @@ use super::launch::{AfterGate, StageRunning, supervise};
 use super::{Inner, JobOutput, NodeError, ring_seconds_for, source_fault_reason};
 use crate::graph::{self, GraphError, NodeId};
 use crate::job::JobRecord;
+use crate::lease::LeaseError;
 use crate::ops::{
-    JobKind, SCAN_AVERAGE_MAX, SCAN_DWELL_MAX_MS, SCAN_ROWS_DWELL_MS, SCAN_WAIT_MARGIN_MS,
-    SPECTRUM_BIN_TARGET_HZ, SPECTRUM_ROWS_PER_S, ScanGrid, scan_average_budget_bytes,
-    scan_average_in_force, scan_bits_refusal, scan_capture_hz, scan_dwell_within,
-    scan_edge_mask_in_force, scan_grid_at, scan_mask_default, scan_notch_in_force,
-    scan_rows_per_step, spectrum_size,
+    JobKind, SCAN_AVERAGE_MAX, SCAN_BIN_HZ_STEPPED, SCAN_BIN_MAX_HZ, SCAN_DWELL_MAX_MS,
+    SCAN_ROWS_DWELL_MS, SCAN_WAIT_MARGIN_MS, SPECTRUM_BIN_TARGET_HZ, SPECTRUM_ROWS_PER_S,
+    SWEEP_RETRY_MS, ScanGrid, ScanMethod, scan_average_budget_bytes, scan_average_in_force,
+    scan_bits_refusal, scan_capture_hz, scan_dwell_within, scan_edge_mask_in_force, scan_grid_at,
+    scan_mask_default, scan_notch_in_force, scan_rows_per_step, scan_sweep_refusal, spectrum_size,
 };
 use crate::port::{
     IqBlock, Port, PortError, SweepPlan, SweepRequest, SweepRow, SweepRows, SweepState, Tuning,
@@ -58,12 +59,19 @@ impl Inner {
     /// by the caller, see [`Inner::launch_gated`]) once the lease is granted,
     /// through `after`.
     ///
-    /// Before any of that, a scan asking no `bits` on a source whose `sweep`
-    /// holds its band asks the source to sweep it ([`Inner::start_sweep`],
-    /// under the gate: `gate`, else taken for the call), for the target bin
-    /// (`SPECTRUM_BIN_TARGET_HZ` or the source's finest, whichever is coarser)
-    /// and the look's dwell; granted, it runs as [`Inner::launch_self_sweep`]
-    /// (no lease, nobody stopped, `after` left alone), refused, it steps.
+    /// Before any of that, a scan that is not made to step (the node's `method`
+    /// `stepped`) and asks no `bits`, on a source whose `sweep` holds its band,
+    /// asks the source to sweep it ([`Inner::start_sweep`]) for the node's
+    /// `bin_hz` (absent: `SPECTRUM_BIN_TARGET_HZ` or the source's finest,
+    /// whichever is coarser) and the look's dwell; granted, it runs as
+    /// [`Inner::launch_self_sweep`] (no lease, nobody stopped, `after` left
+    /// alone). The ask and what a refusal leads to are one hold of the source's
+    /// gate (`gate`, else taken for the launch). Refused (or the span outside the
+    /// sweep): with `method: source` the launch fails (`sweep on source <id>:
+    /// <reason>`, or the span named); a scan whose record says it ran as `source`
+    /// (a resume, a restart under its id) waits for its sweep, asking again,
+    /// never stepping; any other steps, its `job_context.scan.fallback` the
+    /// source's reason, a conflict for its lease gaining it as an option.
     pub(super) async fn launch_scan(
         self: &Arc<Self>,
         rec: JobRecord,
@@ -134,32 +142,84 @@ impl Inner {
                 .as_u64()
                 .map_or(1, |a| a.clamp(1, u64::from(SCAN_AVERAGE_MAX)) as u32),
         };
-        // A source that sweeps the span for itself is asked first, unless the scan
-        // asks for IQ (`bits`): no lease, no stop of the elastic jobs. A refusal
-        // steps the span as any scan.
-        if let Some(sweep) = caps.sweep.as_ref().filter(|s| s.holds(rec.tuning))
+        let method = stored_method(&fft.params)?;
+        let bin_hz = fft.params["bin_hz"]
+            .as_u64()
+            .map(|b| b.clamp(1, SCAN_BIN_MAX_HZ));
+        // Read before this launch writes `scan`: a scan that ran as the source's own
+        // sweep (resumed, or restarted under its id) stays one.
+        let was_source = rec.context.pointer("/scan/method").and_then(|m| m.as_str())
+            == Some(ScanMethod::Source.name());
+        // A source that sweeps the span for itself is asked first, unless the scan is
+        // made to step (`method: stepped`) or asks for IQ (`bits`): no lease, no stop
+        // of the elastic jobs. The whole start decision (the sweep asked, then on a
+        // refusal the stepped scan's lease) is one hold of the source's gate. A scan
+        // on a source that cannot sweep, neither made `source` nor run as one, steps
+        // as before without asking.
+        let asks = method != Some(ScanMethod::Stepped)
             && bits.is_none()
-        {
+            && (caps.sweep.is_some() || method == Some(ScanMethod::Source) || was_source);
+        let own;
+        let gate = match gate {
+            Some(g) => Some(g),
+            None if asks => {
+                own = self.leases.gate_guard(port.id()).await;
+                Some(&own)
+            }
+            None => None,
+        };
+        // Why the source refused at a first start, which steps instead.
+        let mut fallback = None;
+        if let (true, Some(g)) = (asks, gate) {
+            let calibrated = caps.sweep.as_ref().is_some_and(|s| s.calibrated);
             let req = SweepRequest {
                 span: rec.tuning,
-                bin_hz: Hz(sweep.bin_hz_min.0.max(SPECTRUM_BIN_TARGET_HZ)),
+                bin_hz: Hz(bin_hz.unwrap_or_else(|| {
+                    caps.sweep
+                        .as_ref()
+                        .map_or(SPECTRUM_BIN_TARGET_HZ, |s| s.bin_hz_min.0)
+                        .max(SPECTRUM_BIN_TARGET_HZ)
+                })),
                 dwell_ms: look.dwell_ms,
             };
-            let rows = match gate {
-                Some(g) => self.start_sweep(port.as_ref(), &rec.id, req, g).await,
-                None => {
-                    let g = self.leases.gate_guard(port.id()).await;
-                    self.start_sweep(port.as_ref(), &rec.id, req, &g).await
+            let unheld = scan_sweep_refusal(port.id(), &caps, rec.tuning);
+            let refused = match &unheld {
+                Some(why) if method == Some(ScanMethod::Source) => {
+                    return Err(NodeError::Other(why.clone()));
                 }
+                Some(why) => why.clone(),
+                None => match self.start_sweep(port.as_ref(), &rec.id, req, g).await {
+                    Ok(rows) => {
+                        let start = SweepStart::Rows(rows);
+                        return self.launch_self_sweep(rec, port, look, calibrated, start, req);
+                    }
+                    Err(e) if method == Some(ScanMethod::Source) => {
+                        return Err(NodeError::Other(format!(
+                            "sweep on source {}: {}",
+                            rec.source.0,
+                            refusal_reason(&e)
+                        )));
+                    }
+                    Err(e) => refusal_reason(&e),
+                },
             };
-            if let Ok(rows) = rows {
-                return self.launch_self_sweep(rec, port, look, sweep.calibrated, rows);
+            // A restart of a scan that ran as `source` never steps (it would take
+            // the radio from the jobs beside it): it waits for its sweep instead.
+            if was_source {
+                self.leases.claim_sweep_locked(port.id(), rec.id.clone(), g);
+                let start = SweepStart::Waiting(refused);
+                return self.launch_self_sweep(rec, port, look, calibrated, start, req);
+            }
+            // A first start steps; a span outside the sweep is no refusal to report.
+            if unheld.is_none() {
+                fallback = Some(refused);
             }
         }
         match gate {
             Some(g) => {
                 self.leases
-                    .acquire_shared_locked(port.as_ref(), rec.id.clone(), rec.tuning, g)?;
+                    .acquire_shared_locked(port.as_ref(), rec.id.clone(), rec.tuning, g)
+                    .map_err(|e| with_fallback(e, fallback.as_deref()))?;
                 *after = AfterGate::StopElastic(rec.source.clone());
             }
             None => {
@@ -183,7 +243,11 @@ impl Inner {
         if let Some(ctx) = rec.context.as_object_mut() {
             let ring = self.ring_capacity_samples(&rec.source, layout.rate_hz());
             let budget = scan_average_budget_bytes(self.ring_budget_bytes);
-            ctx.insert("scan".into(), layout.context(look, ring, budget).into());
+            let mut scan = layout.context(look, ring, budget);
+            if let Some(why) = fallback {
+                scan.insert("fallback".into(), why.into());
+            }
+            ctx.insert("scan".into(), scan.into());
         }
         let token = self.shutdown.child_token();
         let (prov, run, ended) = self.record_running(rec, &token)?;
@@ -265,32 +329,33 @@ impl Inner {
     }
 
     /// Run a scan the source sweeps for itself: record it running with
-    /// [`sweep_loop`] as its one task under [`supervise`] (handed the port, so its
+    /// [`sweep_task`] as its one task under [`supervise`] (handed the port, so its
     /// claim is released and the port idled at the end), `blind` (it reads no
     /// fault, so a heal does not wait for it), with `job_context.scan` from the
-    /// source's plan ([`sweep_context`]). It holds no lease and stops nobody.
+    /// source's plan ([`sweep_context`]), or, `start` waiting (a restart the
+    /// source refused, the claim already taken), [`waiting_context`] until a
+    /// sweep asked again as `req` is granted. It holds no lease and stops nobody.
     fn launch_self_sweep(
         self: &Arc<Self>,
         mut rec: JobRecord,
         port: Arc<dyn Port>,
         look: Look,
         calibrated: bool,
-        rows: SweepRows,
+        start: SweepStart,
+        req: SweepRequest,
     ) -> Result<(), NodeError> {
-        let plan = rows.plan.clone();
-        let grids = if plan.shift_hz.0 != 0 { 2 } else { 1 };
-        let average = scan_average_in_force(
-            look.average,
-            scan_average_budget_bytes(self.ring_budget_bytes),
-            u64::from(plan.steps) * grids,
-            1,
-            u64::from(plan.size),
-        );
+        let budget = scan_average_budget_bytes(self.ring_budget_bytes);
         if !rec.context.is_object() {
             rec.context = serde_json::json!({});
         }
         if let Some(ctx) = rec.context.as_object_mut() {
-            let scan = sweep_context(&plan, look, average, calibrated);
+            let scan = match &start {
+                SweepStart::Rows(rows) => {
+                    let average = sweep_average(look, budget, &rows.plan);
+                    sweep_context(&rows.plan, look, average, calibrated)
+                }
+                SweepStart::Waiting(why) => waiting_context(calibrated, why),
+            };
             ctx.insert("scan".into(), scan.into());
         }
         let (id, span) = (rec.id.clone(), rec.tuning);
@@ -300,8 +365,11 @@ impl Inner {
         let sweep = SelfSweep {
             id: id.clone(),
             span,
-            average,
+            look,
+            budget,
             calibrated,
+            port: port.clone(),
+            req,
             prov,
             out: out.clone(),
             cancel: token.clone(),
@@ -309,7 +377,7 @@ impl Inner {
         let mut set = JoinSet::new();
         let (running, task) = (
             StageRunning::new(self.stages.clone()),
-            sweep_loop(self.clone(), sweep, rows),
+            sweep_task(self.clone(), sweep, start),
         );
         set.spawn(async move {
             let _running = running;
@@ -334,23 +402,44 @@ impl Inner {
         Ok(())
     }
 
-    /// Refuse `graph` as job `id`'s when it is a scan's whose stored `fft` node
-    /// asks for `bits` its source does not carry (as `job_start` does), so a
-    /// `graph_put` leaves the running scan as it was.
+    /// Refuse `graph` as the graph of a scan of `span` on `source` when its stored
+    /// `fft` node asks what `job_start` refuses: `bits` its source does not carry,
+    /// a `method` other than `stepped` or `source`, `method: "source"` on a span
+    /// the source's sweep does not hold, or a `bin_hz` with `method: "stepped"`;
+    /// with `job_start`'s texts, so a `graph_put` leaves the running scan as it was.
     pub(super) fn check_scan_graph(
         &self,
         kind: &str,
         source: &SourceId,
+        span: Tuning,
         graph: &graph::Graph,
     ) -> Result<(), NodeError> {
         if kind != JobKind::Scan.name() {
             return Ok(());
         }
-        let port = self.ports.read().unwrap().get(source).cloned();
-        match port {
-            Some(port) => check_stored_bits(port.as_ref(), graph).map(|_| ()),
-            None => Ok(()),
+        let Some(port) = self.ports.read().unwrap().get(source).cloned() else {
+            return Ok(());
+        };
+        check_stored_bits(port.as_ref(), graph)?;
+        let Some(params) = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == "fft")
+            .map(|n| &n.params)
+        else {
+            return Ok(());
+        };
+        let method = stored_method(params)?;
+        if method == Some(ScanMethod::Source)
+            && let Some(why) = scan_sweep_refusal(port.id(), port.capabilities(), span)
+        {
+            return Err(NodeError::Other(why));
         }
+        if method == Some(ScanMethod::Stepped) && params.get("bin_hz").is_some_and(|b| !b.is_null())
+        {
+            return Err(NodeError::Other(SCAN_BIN_HZ_STEPPED.into()));
+        }
+        Ok(())
     }
 
     /// The most samples `source`'s ring holds at `rate_hz`: the ring's own
@@ -711,6 +800,76 @@ fn check_stored_bits(port: &dyn Port, graph: &graph::Graph) -> Result<Option<u8>
     match scan_bits_refusal(port.id(), port.capabilities(), v) {
         Some(why) => Err(NodeError::Other(why)),
         None => Ok(u8::try_from(v).ok()),
+    }
+}
+
+/// Whether the scan `rec` launches without taking its source's capture, whatever the
+/// source answers: no `bits` stored, and `method: "source"` stored, or none stored
+/// and its record saying it ran as `source` (a refusal then fails it or makes it
+/// wait, [`Inner::launch_scan`]; it never steps).
+pub(super) fn never_steps(rec: &JobRecord) -> bool {
+    let params = rec
+        .graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "fft")
+        .map(|n| &n.params);
+    let stored = |k: &str| params.and_then(|p| p.get(k)).filter(|v| !v.is_null());
+    let ran_as_source = rec.context.pointer("/scan/method").and_then(|m| m.as_str())
+        == Some(ScanMethod::Source.name());
+    let method = params.map(stored_method).and_then(Result::ok).flatten();
+    stored("bits").is_none()
+        && match method {
+            Some(m) => m == ScanMethod::Source,
+            None => ran_as_source && stored("method").is_none(),
+        }
+}
+
+/// The `method` stored in a scan's `fft` node `params`: `None` when absent or `null`,
+/// refused (as the `fft` stage's own check words it) when neither `stepped` nor
+/// `source`.
+fn stored_method(params: &serde_json::Value) -> Result<Option<ScanMethod>, NodeError> {
+    match params.get("method") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => serde_json::from_value(v.clone())
+            .map(Some)
+            .map_err(|_| NodeError::Other("method must be stepped or source".into())),
+    }
+}
+
+/// A source's refusal of a sweep as the reason a scan reports: the message of an
+/// `unsupported` or `io` refusal, else the refusal as it reads.
+fn refusal_reason(e: &PortError) -> String {
+    match e {
+        PortError::Unsupported(m) | PortError::Io(m) => m.clone(),
+        e => e.to_string(),
+    }
+}
+
+/// `e`, a stepped scan's lease refused after its source refused to sweep for itself
+/// for `fallback`: a conflict gains the option `the source refused to sweep for
+/// itself: <reason>`, so the caller learns both why the source would not sweep and
+/// who holds the radio.
+fn with_fallback(e: LeaseError, fallback: Option<&str>) -> LeaseError {
+    match (e, fallback) {
+        (
+            LeaseError::Conflict {
+                source,
+                holders,
+                current,
+                mut options,
+            },
+            Some(why),
+        ) => {
+            options.push(format!("the source refused to sweep for itself: {why}"));
+            LeaseError::Conflict {
+                source,
+                holders,
+                current,
+                options,
+            }
+        }
+        (e, _) => e,
     }
 }
 
@@ -1141,16 +1300,119 @@ async fn fft_step(
 // the scan row shape. No lease, no tune, no FFT here.
 
 /// What a self-sweep scan needs beside its rows (which carry the plan the source
-/// chose): its id, its band, the `average` in force, whether the source's levels
-/// are `calibrated`, and its output stream.
+/// chose): its id, its band, its look and the averaging budget (the `average` in
+/// force follows from the plan, [`sweep_average`]), whether the source's levels
+/// are `calibrated`, its port and the sweep it asks for (asked again while it
+/// waits, [`wait_for_sweep`]), and its output stream.
 struct SelfSweep {
     id: JobId,
     span: Tuning,
-    average: u32,
+    look: Look,
+    budget: u64,
     calibrated: bool,
+    port: Arc<dyn Port>,
+    req: SweepRequest,
     prov: Provenance,
     out: StreamId,
     cancel: CancellationToken,
+}
+
+/// How a self-sweep scan starts: with the source's rows, or `Waiting` (the reason)
+/// for a restart the source refused, asking again ([`wait_for_sweep`]).
+enum SweepStart {
+    Rows(SweepRows),
+    Waiting(String),
+}
+
+/// The `average` in force for `look` on the source's `plan` with `budget_bytes` for
+/// the averages: one row a step, the plan's steps (twice when its odd sweeps
+/// shift) and its bins ([`scan_average_in_force`]).
+fn sweep_average(look: Look, budget_bytes: u64, plan: &SweepPlan) -> u32 {
+    let grids = if plan.shift_hz.0 != 0 { 2 } else { 1 };
+    scan_average_in_force(
+        look.average,
+        budget_bytes,
+        u64::from(plan.steps) * grids,
+        1,
+        u64::from(plan.size),
+    )
+}
+
+/// A self-sweep scan's `job_context.scan` while it waits for its source to grant a
+/// sweep: `method` (`source`), `mask` (none), `calibrated` and `waiting` (`why`).
+/// No `steps` or other key of a plan until one arrives ([`sweep_context`]).
+fn waiting_context(calibrated: bool, why: &str) -> serde_json::Map<String, serde_json::Value> {
+    let scan = serde_json::json!({
+        "method": ScanMethod::Source.name(),
+        "mask": {"notch_hz": 0, "edge_mask": 0.0},
+        "calibrated": calibrated,
+        "waiting": why,
+    });
+    match scan {
+        serde_json::Value::Object(m) => m,
+        _ => unreachable!("built as an object"),
+    }
+}
+
+/// The self-sweep scan's one task: [`sweep_loop`] over the rows `start` holds, or,
+/// waiting, over the rows of the sweep [`wait_for_sweep`] is granted.
+async fn sweep_task(inner: Arc<Inner>, s: SelfSweep, start: SweepStart) -> Result<(), StageError> {
+    let rows = match start {
+        SweepStart::Rows(rows) => rows,
+        SweepStart::Waiting(why) => match wait_for_sweep(&inner, &s, why).await {
+            Some(rows) => rows,
+            None => return Err(StageError::Cancelled),
+        },
+    };
+    sweep_loop(inner, s, rows).await
+}
+
+/// Ask the source again for the sweep it refused (`waiting`, the reason), after each
+/// of [`SWEEP_RETRY_MS`] in turn, the last repeating, until it is granted (`None`
+/// once cancelled): each ask under the source's gate ([`Inner::start_sweep`], the
+/// scan's claim kept through a refusal), skipped with the reason while the source's
+/// `sweep` does not hold the span. A new reason is written as `waiting`; granted,
+/// the plan's keys ([`sweep_context`]) with `waiting: null`. It never steps.
+async fn wait_for_sweep(inner: &Inner, s: &SelfSweep, mut waiting: String) -> Option<SweepRows> {
+    let mut k = 0usize;
+    loop {
+        let ms = SWEEP_RETRY_MS[k.min(SWEEP_RETRY_MS.len() - 1)];
+        k += 1;
+        tokio::select! {
+            _ = s.cancel.cancelled() => return None,
+            _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
+        }
+        let asked = match scan_sweep_refusal(s.port.id(), s.port.capabilities(), s.span) {
+            Some(why) => Err(why),
+            None => {
+                let gate = tokio::select! {
+                    _ = s.cancel.cancelled() => return None,
+                    g = inner.leases.gate_guard(s.port.id()) => g,
+                };
+                tokio::select! {
+                    _ = s.cancel.cancelled() => return None,
+                    r = inner.start_sweep(s.port.as_ref(), &s.id, s.req, &gate) => {
+                        r.map_err(|e| refusal_reason(&e))
+                    }
+                }
+            }
+        };
+        match asked {
+            Ok(rows) => {
+                let average = sweep_average(s.look, s.budget, &rows.plan);
+                let fields = sweep_context(&rows.plan, s.look, average, s.calibrated);
+                inner.scan_context_update(&s.id, |scan| scan.extend(fields));
+                return Some(rows);
+            }
+            Err(why) if why != waiting => {
+                waiting = why.clone();
+                inner.scan_context_update(&s.id, |scan| {
+                    scan.insert("waiting".into(), why.into());
+                });
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// A self-sweep scan's `job_context.scan` at its start: `method` (`source`), the
@@ -1307,7 +1569,8 @@ async fn sweep_loop(inner: Arc<Inner>, s: SelfSweep, rows: SweepRows) -> Result<
     } = rows;
     let rows_per_s = dwell_rows_per_s(plan.dwell_ms);
     let alternates = plan.shift_hz.0 != 0;
-    let mut averages = [0, 1].map(|_| SweepAverage::new(s.average));
+    let average = sweep_average(s.look, s.budget, &plan);
+    let mut averages = [0, 1].map(|_| SweepAverage::new(average));
     let mut clock = SweepClock::new(plan.steps);
     let mut waiting = None;
     // A state the source set before the loop began is written too.
@@ -1333,7 +1596,7 @@ async fn sweep_loop(inner: Arc<Inner>, s: SelfSweep, rows: SweepRows) -> Result<
                 };
                 clock.row(&inner, &s, row.sweep, row.step);
                 let grid = usize::from(alternates && row.sweep % 2 == 1);
-                let avg = (s.average > 1).then(|| &mut averages[grid]);
+                let avg = (average > 1).then(|| &mut averages[grid]);
                 let ev = sweep_row_event(&row, rows_per_s, s.calibrated, avg);
                 let prov = Provenance {
                     channel: Some(ChannelId(format!("scan/{}", row.step))),

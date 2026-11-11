@@ -210,14 +210,26 @@ pub struct FftParams {
     /// `dwell_ms` is, which checks it against the source.
     #[serde(default)]
     pub bits: Option<u8>,
+    /// How a `scan` sweeps: `stepped` (the node tunes the source across the span) or
+    /// `source` (the source's own sweep); absent or `null` lets the node choose. Read
+    /// by the scan job as `dwell_ms` is.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// The bin width a `scan` asks of a source that sweeps for itself, Hz
+    /// (1..=1000000); absent or `null` is the node's target bin. Read by the scan
+    /// job as `dwell_ms` is.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 1_000_000))]
+    pub bin_hz: Option<u64>,
 }
 
 impl FftParams {
     /// What the schema cannot say: `notch_hz` not negative, `edge_mask` in `0..0.5`,
-    /// `row_frames` at least 1, `dwell_ms` in `1..=SCAN_DWELL_MAX_MS` and `average` in
-    /// `1..=SCAN_AVERAGE_MAX`. The error names the field.
+    /// `row_frames` at least 1, `dwell_ms` in `1..=SCAN_DWELL_MAX_MS`, `average` in
+    /// `1..=SCAN_AVERAGE_MAX`, `method` `stepped` or `source`, and `bin_hz` in
+    /// `1..=SCAN_BIN_MAX_HZ`. The error names the field.
     pub fn check(&self) -> Result<(), String> {
-        use zeta_core::ops::{SCAN_AVERAGE_MAX, SCAN_DWELL_MAX_MS};
+        use zeta_core::ops::{SCAN_AVERAGE_MAX, SCAN_BIN_MAX_HZ, SCAN_DWELL_MAX_MS};
         if self.notch_hz < 0 {
             return Err("notch_hz must be at least 0".into());
         }
@@ -233,6 +245,17 @@ impl FftParams {
             && !(1..=SCAN_AVERAGE_MAX).contains(&a)
         {
             return Err(format!("average must be in 1..={SCAN_AVERAGE_MAX}"));
+        }
+        if let Some(m) = &self.method
+            && m != "stepped"
+            && m != "source"
+        {
+            return Err("method must be stepped or source".into());
+        }
+        if let Some(b) = self.bin_hz
+            && !(1..=SCAN_BIN_MAX_HZ).contains(&b)
+        {
+            return Err(format!("bin_hz must be in 1..={SCAN_BIN_MAX_HZ}"));
         }
         if !(0.0..0.5).contains(&self.edge_mask) {
             return Err("edge_mask must be in 0..0.5".into());
@@ -842,6 +865,8 @@ mod tests {
             dwell_ms: None,
             average: None,
             bits: None,
+            method: None,
+            bin_hz: None,
         };
         assert_eq!(p(0, 0.0).check(), Ok(()));
         assert_eq!(p(300_000, 0.49).check(), Ok(()));
@@ -877,15 +902,28 @@ mod tests {
         assert_eq!(check("dwell_ms", 5000), Ok(()));
         assert_eq!(check("average", 64), Ok(()));
         assert_eq!(check("bits", 8), Ok(()));
+        assert_eq!(check("bin_hz", 1), Ok(()));
+        assert_eq!(check("bin_hz", 1_000_000), Ok(()));
         for (field, v) in [
             ("dwell_ms", 0),
             ("dwell_ms", 5001),
             ("average", 0),
             ("average", 65),
+            ("bin_hz", 0),
+            ("bin_hz", 1_000_001),
         ] {
             let e = check(field, v).unwrap_err();
             assert!(e.contains(field), "{field} {v}: {e}");
         }
+        let method = |m: &str| {
+            stage.check_params(&serde_json::json!({"size": 1024, "window": "hann", "method": m}))
+        };
+        assert_eq!(method("stepped"), Ok(()));
+        assert_eq!(method("source"), Ok(()));
+        assert_eq!(
+            method("sideways"),
+            Err("method must be stepped or source".into())
+        );
     }
 
     #[test]

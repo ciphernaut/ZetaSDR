@@ -197,6 +197,12 @@ fn hint(op: &str, field: &str) -> Option<&'static str> {
         "bits" if op == "job_start" => Some(
             "`scan` only, bits per sample: one of `capabilities.depths[].bits` in `source list`",
         ),
+        "method" if op == "job_start" => {
+            Some("`scan` only, `stepped` or `source`; `null` lets the node choose")
+        }
+        "bin_hz" if op == "job_start" => Some(
+            "`scan` only, the bin width in Hz asked of a source that sweeps for itself (1-1000000)",
+        ),
         "source" => Some("an id from `source list`"),
         "plan" => Some("an id from `channel_plans`"),
         "set" => Some("an id from `set_list`"),
@@ -232,6 +238,12 @@ fn param_note(kind: &str, param: &str) -> Option<&'static str> {
         ("fft", "dwell_ms") => Some("`scan` only, in ms (1-5000)"),
         ("fft", "average") => Some("`scan` only, sweeps averaged (1-64)"),
         ("fft", "bits") => Some("`scan` only, bits per sample, one of the source's depths"),
+        ("fft", "method") => {
+            Some("`scan` only, `stepped` or `source`; `null` lets the node choose")
+        }
+        ("fft", "bin_hz") => {
+            Some("`scan` only, the bin width asked of a source that sweeps for itself")
+        }
         _ => None,
     }
 }

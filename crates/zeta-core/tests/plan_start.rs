@@ -218,6 +218,8 @@ fn start(kind: JobKind, t: Tuning) -> Op {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     }
@@ -807,6 +809,8 @@ async fn jobs_stop_stops_what_matches_and_keeps_the_elastic_spectrum() {
             dwell_ms: None,
             average: None,
             bits: None,
+            method: None,
+            bin_hz: None,
             elastic: true,
             replace: vec![],
         },

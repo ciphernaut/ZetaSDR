@@ -186,6 +186,8 @@ async fn python_plugin_runs_in_a_job_via_graph_put() {
             dwell_ms: None,
             average: None,
             bits: None,
+            method: None,
+            bin_hz: None,
             elastic: false,
             replace: vec![],
         })

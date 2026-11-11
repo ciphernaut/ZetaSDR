@@ -267,6 +267,8 @@ async fn capture_job(node: &Node, bursts: u32) -> JobId {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };
@@ -635,6 +637,8 @@ async fn frame_row_job(node: &Node) -> JobId {
         dwell_ms: None,
         average: None,
         bits: None,
+        method: None,
+        bin_hz: None,
         elastic: false,
         replace: vec![],
     };

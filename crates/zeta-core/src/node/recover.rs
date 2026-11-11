@@ -298,9 +298,18 @@ impl Inner {
                 .iter()
                 .filter(|r| &r.source == source && r.input.is_none() && relaunch(self, r))
                 .collect();
-            if mine.iter().any(|r| r.kind == JobKind::Scan.name()) {
+            if mine
+                .iter()
+                .any(|r| r.kind == JobKind::Scan.name() && !super::scan::never_steps(r))
+            {
                 continue;
             }
+            // A scan that never steps (the source's own sweep) takes no lease and no
+            // part of the capture: the others' is held as without it.
+            let mine: Vec<&JobRecord> = mine
+                .into_iter()
+                .filter(|r| r.kind != JobKind::Scan.name())
+                .collect();
             let rigid: Vec<Tuning> = mine
                 .iter()
                 .filter(|r| !r.elastic)
