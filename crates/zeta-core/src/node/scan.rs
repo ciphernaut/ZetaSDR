@@ -24,11 +24,12 @@ use crate::graph::{self, GraphError, NodeId};
 use crate::job::JobRecord;
 use crate::lease::LeaseError;
 use crate::ops::{
-    JobKind, SCAN_AVERAGE_MAX, SCAN_BIN_HZ_STEPPED, SCAN_BIN_MAX_HZ, SCAN_DWELL_MAX_MS,
-    SCAN_ROWS_DWELL_MS, SCAN_WAIT_MARGIN_MS, SPECTRUM_BIN_TARGET_HZ, SPECTRUM_ROWS_PER_S,
-    SWEEP_RETRY_MS, ScanGrid, ScanMethod, scan_average_budget_bytes, scan_average_in_force,
-    scan_bits_refusal, scan_capture_hz, scan_dwell_within, scan_edge_mask_in_force, scan_grid_at,
-    scan_mask_default, scan_notch_in_force, scan_rows_per_step, scan_sweep_refusal, spectrum_size,
+    JobKind, SCAN_AVERAGE_MAX, SCAN_BIN_HZ_STEPPED, SCAN_BIN_MAX_HZ, SCAN_BITS_STEPPED,
+    SCAN_DWELL_MAX_MS, SCAN_ROWS_DWELL_MS, SCAN_WAIT_MARGIN_MS, SPECTRUM_BIN_TARGET_HZ,
+    SPECTRUM_ROWS_PER_S, SWEEP_RETRY_MS, ScanGrid, ScanMethod, scan_average_budget_bytes,
+    scan_average_in_force, scan_bits_refusal, scan_capture_hz, scan_dwell_within,
+    scan_edge_mask_in_force, scan_grid_at, scan_mask_default, scan_notch_in_force,
+    scan_rows_per_step, scan_sweep_refusal, spectrum_size,
 };
 use crate::port::{
     IqBlock, Port, PortError, SweepPlan, SweepRequest, SweepRow, SweepRows, SweepState, Tuning,
@@ -72,11 +73,16 @@ impl Inner {
     /// (a resume, a restart under its id) waits for its sweep, asking again,
     /// never stepping; any other steps, its `job_context.scan.fallback` the
     /// source's reason, a conflict for its lease gaining it as an option.
+    ///
+    /// The holders `replace` names (a `job_start`'s; `gate` is held whenever it
+    /// names any) are stopped under `gate` right before the stepped scan's lease,
+    /// and only then: a sweep the source grants needs no room, so they run on.
     pub(super) async fn launch_scan(
         self: &Arc<Self>,
         rec: JobRecord,
         port: Arc<dyn Port>,
         gate: Option<&OwnedMutexGuard<()>>,
+        replace: &[JobId],
         after: &mut AfterGate,
     ) -> Result<(), NodeError> {
         let stage = self.registry.select("fft", &self.backends).ok_or_else(|| {
@@ -217,12 +223,18 @@ impl Inner {
         }
         match gate {
             Some(g) => {
+                // The stepped scan needs the radio: the holders `replace` names stop
+                // now, under the same hold as the lease.
+                if !replace.is_empty() {
+                    self.replace_holders(&rec.source, replace, g).await?;
+                }
                 self.leases
                     .acquire_shared_locked(port.as_ref(), rec.id.clone(), rec.tuning, g)
                     .map_err(|e| with_fallback(e, fallback.as_deref()))?;
                 *after = AfterGate::StopElastic(rec.source.clone());
             }
             None => {
+                debug_assert!(replace.is_empty(), "a replace is stopped under the gate");
                 self.stop_elastic(&rec.source).await;
                 self.leases
                     .acquire_shared(port.as_ref(), rec.id.clone(), rec.tuning)
@@ -405,7 +417,8 @@ impl Inner {
     /// Refuse `graph` as the graph of a scan of `span` on `source` when its stored
     /// `fft` node asks what `job_start` refuses: `bits` its source does not carry,
     /// a `method` other than `stepped` or `source`, `method: "source"` on a span
-    /// the source's sweep does not hold, or a `bin_hz` with `method: "stepped"`;
+    /// the source's sweep does not hold, a `bin_hz` with `method: "stepped"`, or a
+    /// `bits` with `method: "source"` or a `bin_hz`;
     /// with `job_start`'s texts, so a `graph_put` leaves the running scan as it was.
     pub(super) fn check_scan_graph(
         &self,
@@ -435,9 +448,12 @@ impl Inner {
         {
             return Err(NodeError::Other(why));
         }
-        if method == Some(ScanMethod::Stepped) && params.get("bin_hz").is_some_and(|b| !b.is_null())
-        {
+        let stored = |k: &str| params.get(k).is_some_and(|v| !v.is_null());
+        if method == Some(ScanMethod::Stepped) && stored("bin_hz") {
             return Err(NodeError::Other(SCAN_BIN_HZ_STEPPED.into()));
+        }
+        if stored("bits") && (method == Some(ScanMethod::Source) || stored("bin_hz")) {
+            return Err(NodeError::Other(SCAN_BITS_STEPPED.into()));
         }
         Ok(())
     }

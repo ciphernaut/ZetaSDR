@@ -2176,58 +2176,26 @@ impl Node {
             .map(|r| r.id)
     }
 
-    /// Stop the jobs `replace` names, under `source`'s gate (`guard`), so the
-    /// request that follows under the same guard finds the radio as they left
-    /// it. Every id is checked first, and nothing is stopped unless all pass:
-    /// `UnknownJob`, or `Other("job <id> does not hold source <src>")` for a job
-    /// without a rigid lease on `source` (an elastic job never holds one). Each is
-    /// then stopped as by [`Node::job_stop`] (persisted `Stopped`, streams
-    /// unregistered) but without idling the port, and its lease is gone when this
-    /// returns. A stop that cannot be persisted is `Io`, that job left running.
+    /// Stop the jobs `replace` names, under `source`'s gate (`guard`); see
+    /// [`Inner::replace_holders`].
     pub(crate) async fn replace_holders(
         &self,
         source: &SourceId,
         replace: &[JobId],
         guard: &OwnedMutexGuard<()>,
     ) -> Result<(), NodeError> {
-        let leases = &self.inner.leases;
-        leases.assert_gate(source, guard);
-        let holds = |id: &JobId| leases.holders(source).iter().any(|(j, _)| j == id);
-        for id in replace {
-            if !self.inner.jobs.lock().unwrap().contains_key(id) {
-                return Err(NodeError::UnknownJob(id.clone()));
-            }
-            if !holds(id) {
-                return Err(NodeError::Other(format!(
-                    "job {} does not hold source {}",
-                    id.0, source.0
-                )));
-            }
-        }
-        let mut seen = Vec::new();
-        for id in replace {
-            if seen.contains(&id) {
-                continue;
-            }
-            seen.push(id);
-            self.inner.stop_gated(id).await?;
-            // Another stop may have taken the supervisor, or a restart (`graph_put`)
-            // may hold the new lease on its way to the launch `record_running`
-            // refuses: either release is near (nothing before it takes the gate),
-            // and the request must not see the lease. Bounded, so a stage that
-            // never ends cannot keep the source's gate.
-            let deadline = tokio::time::Instant::now() + REPLACE_RELEASE_TIMEOUT;
-            while holds(id) {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(NodeError::Other(format!(
-                        "job {} did not release source {}",
-                        id.0, source.0
-                    )));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-        }
-        Ok(())
+        self.inner.replace_holders(source, replace, guard).await
+    }
+
+    /// Check the jobs `replace` names, under `source`'s gate (`guard`), stopping
+    /// none; see [`Inner::check_replace`].
+    pub(crate) fn check_replace(
+        &self,
+        source: &SourceId,
+        replace: &[JobId],
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(), NodeError> {
+        self.inner.check_replace(source, replace, guard)
     }
 
     /// The running watch `graph` has the policy `params` (a set's `watch` member's): its
@@ -2309,6 +2277,35 @@ impl Node {
         elastic: bool,
         guard: Option<&OwnedMutexGuard<()>>,
     ) -> (Result<JobId, NodeError>, AfterGate) {
+        self.scan_start_replacing(
+            kind,
+            source,
+            tuning,
+            graph,
+            capture_rate_hz,
+            elastic,
+            guard,
+            &[],
+        )
+        .await
+    }
+
+    /// [`Node::job_start_gated`] of a scan with the holders `replace` names, which
+    /// the launch stops under `guard` (held whenever `replace` names any) only when
+    /// the scan steps; a sweep the source grants stops none (see
+    /// [`Inner::launch_replacing`]). Any other kind takes `replace` empty.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn scan_start_replacing(
+        &self,
+        kind: &str,
+        source: SourceId,
+        tuning: Tuning,
+        graph: Graph,
+        capture_rate_hz: Option<Hz>,
+        elastic: bool,
+        guard: Option<&OwnedMutexGuard<()>>,
+        replace: &[JobId],
+    ) -> (Result<JobId, NodeError>, AfterGate) {
         if let Err(e) = self.check_watch_policy(&graph, tuning) {
             return (Err(e), AfterGate::Nothing);
         }
@@ -2329,7 +2326,7 @@ impl Node {
             owner: None,
         };
         let id = rec.id.clone();
-        let (r, after) = self.inner.launch_gated(rec, guard).await;
+        let (r, after) = self.inner.launch_replacing(rec, guard, replace).await;
         (r.map(|()| id), after)
     }
 
@@ -2838,6 +2835,73 @@ impl Node {
             })
             .collect();
         (free, busy)
+    }
+}
+
+impl Inner {
+    /// Check the jobs `replace` names under `source`'s gate (`guard`), stopping none:
+    /// `UnknownJob`, or `Other("job <id> does not hold source <src>")` for a job
+    /// without a rigid lease on `source` (an elastic job never holds one).
+    pub(crate) fn check_replace(
+        &self,
+        source: &SourceId,
+        replace: &[JobId],
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(), NodeError> {
+        self.leases.assert_gate(source, guard);
+        for id in replace {
+            if !self.jobs.lock().unwrap().contains_key(id) {
+                return Err(NodeError::UnknownJob(id.clone()));
+            }
+            if !self.leases.holders(source).iter().any(|(j, _)| j == id) {
+                return Err(NodeError::Other(format!(
+                    "job {} does not hold source {}",
+                    id.0, source.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop the jobs `replace` names, under `source`'s gate (`guard`), so the
+    /// request that follows under the same guard finds the radio as they left
+    /// it. Every id is checked first ([`Inner::check_replace`]), and nothing is
+    /// stopped unless all pass. Each is then stopped as by [`Node::job_stop`]
+    /// (persisted `Stopped`, streams unregistered) but without idling the port,
+    /// and its lease is gone when this returns. A stop that cannot be persisted
+    /// is `Io`, that job left running.
+    pub(crate) async fn replace_holders(
+        &self,
+        source: &SourceId,
+        replace: &[JobId],
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(), NodeError> {
+        self.check_replace(source, replace, guard)?;
+        let holds = |id: &JobId| self.leases.holders(source).iter().any(|(j, _)| j == id);
+        let mut seen = Vec::new();
+        for id in replace {
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            self.stop_gated(id).await?;
+            // Another stop may have taken the supervisor, or a restart (`graph_put`)
+            // may hold the new lease on its way to the launch `record_running`
+            // refuses: either release is near (nothing before it takes the gate),
+            // and the request must not see the lease. Bounded, so a stage that
+            // never ends cannot keep the source's gate.
+            let deadline = tokio::time::Instant::now() + REPLACE_RELEASE_TIMEOUT;
+            while holds(id) {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(NodeError::Other(format!(
+                        "job {} did not release source {}",
+                        id.0, source.0
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        Ok(())
     }
 }
 

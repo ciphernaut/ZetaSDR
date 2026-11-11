@@ -3966,3 +3966,22 @@ fn the_job_start_schema_requires_method_and_bin_hz_after_bits() {
         assert!(v["properties"][f].get("default").is_none(), "{f}: {v}");
     }
 }
+
+#[tokio::test]
+async fn bits_beside_method_source_or_bin_hz_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = wide_node(dir.path()).await;
+    for (method, bin_hz) in [(Some(ScanMethod::Source), None), (None, Some(6000))] {
+        let mut op = start_method(JobKind::Scan, method, bin_hz);
+        if let Op::JobStart { bits, .. } = &mut op {
+            *bits = Some(8);
+        }
+        match node.apply(op).await {
+            Err(OpError::Other { message }) => {
+                assert_eq!(message, "bits applies to a stepped scan")
+            }
+            other => panic!("{method:?} {bin_hz:?}: expected Other, got {other:?}"),
+        }
+    }
+    assert!(node.job_list().is_empty());
+}

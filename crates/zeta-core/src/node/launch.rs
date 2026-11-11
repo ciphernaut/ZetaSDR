@@ -91,8 +91,21 @@ impl Inner {
         rec: JobRecord,
         gate: Option<&OwnedMutexGuard<()>>,
     ) -> (Result<(), NodeError>, AfterGate) {
+        self.launch_replacing(rec, gate, &[]).await
+    }
+
+    /// [`Inner::launch_gated`] of a scan with the `replace` holders a `job_start`
+    /// named (`gate` held whenever it names any): stopped under `gate` only when
+    /// the scan takes the stepped path, never for a sweep its source grants
+    /// ([`Inner::launch_scan`]). Any other kind is launched with none.
+    pub(super) async fn launch_replacing(
+        self: &Arc<Self>,
+        rec: JobRecord,
+        gate: Option<&OwnedMutexGuard<()>>,
+        replace: &[JobId],
+    ) -> (Result<(), NodeError>, AfterGate) {
         let mut after = AfterGate::Nothing;
-        let r = self.launch_inner(rec, gate, &mut after).await;
+        let r = self.launch_inner(rec, gate, replace, &mut after).await;
         if r.is_err() {
             match &mut after {
                 // The port moved and the new job did not start: every elastic job follows.
@@ -109,8 +122,13 @@ impl Inner {
         self: &Arc<Self>,
         mut rec: JobRecord,
         gate: Option<&OwnedMutexGuard<()>>,
+        replace: &[JobId],
         after: &mut AfterGate,
     ) -> Result<(), NodeError> {
+        debug_assert!(
+            replace.is_empty() || rec.kind == JobKind::Scan.name(),
+            "only a scan launch stops the holders a replace names"
+        );
         let port = match rec.input.clone() {
             Some(input) => {
                 let stream = self.audio_stream(&input)?;
@@ -122,7 +140,7 @@ impl Inner {
                 let port = self.ports.read().unwrap().get(&rec.source).cloned();
                 let port = port.ok_or_else(|| NodeError::UnknownSource(rec.source.clone()))?;
                 if rec.kind == JobKind::Scan.name() {
-                    return self.launch_scan(rec, port, gate, after).await;
+                    return self.launch_scan(rec, port, gate, replace, after).await;
                 }
                 if rec.kind == JobKind::Identify.name() {
                     return self.launch_identify(rec, port, gate, after).await;

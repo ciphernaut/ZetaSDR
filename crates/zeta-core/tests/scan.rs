@@ -3230,29 +3230,117 @@ async fn a_slow_sweep_start_under_a_restart_runs_one_sweep() {
     node.job_stop(&rigid).await.unwrap();
 }
 
-/// `replace` on a scan the source sweeps for itself stops the jobs it names, as
-/// asked, and no other; the source, held by no IQ job but under the sweep's claim,
-/// is idled when the sweep ends.
+/// `op` (a `job_start`) with `replace` naming `ids`.
+fn replacing(mut op: Op, ids: &[JobId]) -> Op {
+    if let Op::JobStart { replace, .. } = &mut op {
+        *replace = ids.to_vec();
+    }
+    op
+}
+
+/// `replace` on a scan the source sweeps for itself stops nothing: the sweep takes
+/// no lease, so the named holder (and the elastic job beside it) runs on.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_self_sweep_with_replace_stops_only_the_named_and_idles_at_its_end() {
+async fn a_self_sweep_with_replace_leaves_the_named_running() {
     let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
     let named = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
     let follower = start_job(&node, elastic(start(JobKind::Spectrum, 100 * MHZ, MHZ))).await;
-    let mut op = start(JobKind::Scan, SWEEP_SPAN.0, SWEEP_SPAN.1);
-    if let Op::JobStart { replace, .. } = &mut op {
-        *replace = vec![named.clone()];
-    }
+    let op = replacing(
+        start(JobKind::Scan, SWEEP_SPAN.0, SWEEP_SPAN.1),
+        std::slice::from_ref(&named),
+    );
     let id = start_job(&node, op).await;
     assert_eq!(scan_ctx(&node, &id)["method"], "source");
-    assert_eq!(job_state(&node, &named), Some(JobState::Stopped));
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(job_state(&node, &follower), Some(JobState::Running));
-    node.job_stop(&follower).await.unwrap();
-    let before = port.idles();
+    for job in [&named, &follower, &id] {
+        assert_eq!(job_state(&node, job), Some(JobState::Running), "{}", job.0);
+    }
+    assert_eq!(radio0_info(&node).await.holders, vec![named.clone()]);
+    let band = Tuning {
+        center_hz: Hz(100 * MHZ),
+        bandwidth_hz: Hz(MHZ),
+    };
+    assert!(
+        port.tunes().iter().all(|t| *t == band),
+        "{:?}",
+        port.tunes()
+    );
     node.job_stop(&id).await.unwrap();
-    until("the source is idled", Duration::from_secs(5), || {
-        port.idles() > before
-    })
-    .await;
-    assert!(node.lease_sweepers(&radio0()).is_empty());
+    assert_eq!(job_state(&node, &named), Some(JobState::Running));
+    node.job_stop(&follower).await.unwrap();
+    node.job_stop(&named).await.unwrap();
+}
+
+/// `replace` on a scan whose source refuses to sweep is honoured for the stepped
+/// scan that follows: the named holder is stopped under the same hold and the scan
+/// steps, saying why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_sweep_with_replace_stops_the_named_and_steps() {
+    let (_dir, node, port) = open_with(refusing()).await;
+    let named = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    let op = replacing(
+        start(JobKind::Scan, SWEEP_SPAN.0, SWEEP_SPAN.1),
+        std::slice::from_ref(&named),
+    );
+    let id = start_job(&node, op).await;
+    assert_eq!(port.requests().len(), 1);
+    assert_eq!(job_state(&node, &named), Some(JobState::Stopped));
+    let ctx = scan_ctx(&node, &id);
+    assert_eq!(ctx["method"], "stepped", "{ctx}");
+    assert_eq!(ctx["fallback"], NO_WATERFALL, "{ctx}");
+    assert_eq!(radio0_info(&node).await.holders, vec![id.clone()]);
+    tunes_at_least(&port, 2, Duration::from_secs(5)).await;
+    node.job_stop(&id).await.unwrap();
+}
+
+/// `replace` with `method: "source"` is refused before anything: a sweep makes no
+/// room, so the named holder runs on and the source is not asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn method_source_with_replace_is_refused() {
+    let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
+    let named = start_job(&node, start(JobKind::Spectrum, 100 * MHZ, MHZ)).await;
+    let op = replacing(
+        sweep_start(Some(ScanMethod::Source), None),
+        std::slice::from_ref(&named),
+    );
+    match node.apply(op).await {
+        Err(OpError::Other { message }) => {
+            assert_eq!(message, "replace applies to a stepped scan")
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+    assert!(port.requests().is_empty());
+    assert!(no_scan_listed(&node));
+    assert_eq!(job_state(&node, &named), Some(JobState::Running));
+    node.job_stop(&named).await.unwrap();
+}
+
+/// A `graph_put` storing `bits` beside `method: "source"` or a `bin_hz` is refused
+/// before the stop: a depth is for a stepped scan. The self-sweep runs on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graph_put_of_bits_beside_source_or_bin_hz_is_refused() {
+    let script = SweepScript {
+        depths: true,
+        ..Default::default()
+    };
+    let (_dir, node, port) = open_with(ScanPort::sweeping(script)).await;
+    let (id, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    rows(&mut rx, 4, Duration::from_secs(10)).await;
+    for (k, v) in [("method", Value::from("source")), ("bin_hz", 30_000.into())] {
+        let put = put_fft(&node, &id, |p| {
+            p.insert("bits".into(), 8.into());
+            p.insert(k.into(), v);
+        });
+        match put.await {
+            Err(OpError::Other { message }) => {
+                assert_eq!(message, "bits applies to a stepped scan", "{k}")
+            }
+            other => panic!("{k}: expected Other, got {other:?}"),
+        }
+    }
+    assert_eq!(job_state(&node, &id), Some(JobState::Running));
+    assert_eq!(scan_ctx(&node, &id)["method"], "source");
+    assert_eq!(port.requests().len(), 1);
+    assert_eq!(port.live(), 1);
+    node.job_stop(&id).await.unwrap();
 }
