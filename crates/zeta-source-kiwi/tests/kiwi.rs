@@ -1134,8 +1134,8 @@ async fn reconnects_spent_end_the_sweep_with_the_reason() {
     assert_eq!(src.fault(), None);
 }
 
-/// Review focus 1: frames that never show the asked view skip each step, and a
-/// whole sweep of skips is a lost connection.
+/// Review focus 1: frames that never show the asked view skip each step, and no
+/// frame of the asked view for `WF_STALL_MS` (5 s) is a lost connection.
 #[tokio::test]
 async fn a_view_that_never_arrives_is_skipped_not_hung() {
     let fake = wf_fake(FakeWf {
@@ -1151,7 +1151,7 @@ async fn a_view_that_never_arrives_is_skipped_not_hung() {
     };
     let mut rows = src.sweep(req).await.unwrap();
     assert_eq!(rows.plan.steps, 1);
-    let state = wait_state(&rows, 5_000, |s| matches!(s, SweepState::Waiting(_))).await;
+    let state = wait_state(&rows, 12_000, |s| matches!(s, SweepState::Waiting(_))).await;
     assert!(
         matches!(&state, SweepState::Waiting(why) if why.contains("asked view")),
         "{state:?}"
@@ -1493,6 +1493,72 @@ async fn a_one_view_plan_holds_its_view_and_takes_every_frame() {
         "{centres:?}"
     );
     assert_eq!(views_sent(&fake), 1, "{:?}", fake.commands());
+}
+
+/// A source with the Kiwi's own read timeout (10 s), on a fake whose `W/F` stream
+/// goes silent for `pause_ms` after 40 frames of each connection.
+async fn pausing_source(pause_ms: u64) -> (FakeKiwi, Arc<KiwiSource>) {
+    let fake = wf_fake(FakeWf {
+        pause: Some((40, pause_ms)),
+        ..FakeWf::default()
+    })
+    .await;
+    let mut cfg = config(&fake, &[10, 10, 10]);
+    cfg.read_timeout_ms = 10_000;
+    let src = Arc::new(KiwiSource::new(SourceId("kiwi0".into()), cfg));
+    (fake, src)
+}
+
+/// Review I3: a live Kiwi pauses its frames by itself for about 2 s; a one-view
+/// stream rides through such a pause on the same socket.
+#[tokio::test]
+async fn a_one_view_stream_rides_through_a_server_pause_on_one_socket() {
+    let (fake, src) = pausing_source(1_500).await;
+    let mut rows = src.sweep(narrow()).await.unwrap();
+    assert_eq!(rows.plan.steps, 1);
+    // The 40 frames before the pause, then the gap, then rows again.
+    let mut last = tokio::time::Instant::now();
+    let mut gap = Duration::ZERO;
+    for _ in 0..80 {
+        tokio::time::timeout(Duration::from_secs(8), rows.rows.recv())
+            .await
+            .expect("a row within 8 s")
+            .expect("the rows are open");
+        gap = gap.max(last.elapsed());
+        last = tokio::time::Instant::now();
+    }
+    assert_eq!(fake.wf_connections(), 1, "no reconnect");
+    assert!(gap >= Duration::from_millis(1_200), "the pause was seen: {gap:?}");
+    assert_eq!(*rows.state.borrow(), SweepState::Running);
+    assert_eq!(views_sent(&fake), 1, "{:?}", fake.commands());
+}
+
+/// Review I3: a silence well past the server's pauses is a lost connection, and
+/// the sweep reconnects and goes on.
+#[tokio::test]
+async fn a_one_view_stream_silent_for_10_s_reconnects() {
+    let (fake, src) = pausing_source(10_000).await;
+    let mut rows = src.sweep(narrow()).await.unwrap();
+    // 40 frames, the first settled: 39 rows, then the silence.
+    for _ in 0..39 {
+        next_row(&mut rows).await;
+    }
+    let silent = tokio::time::Instant::now();
+    let state = wait_state(&rows, 12_000, |s| matches!(s, SweepState::Waiting(_))).await;
+    assert!(
+        matches!(&state, SweepState::Waiting(why) if why.contains("asked view")),
+        "{state:?}"
+    );
+    let waited = silent.elapsed();
+    assert!(
+        waited >= Duration::from_millis(4_000) && waited < Duration::from_millis(9_500),
+        "lost after {waited:?}, by the stall deadline, not the read timeout"
+    );
+    assert!(wait_until(5_000, || fake.wf_connections() >= 2).await);
+    tokio::time::timeout(Duration::from_secs(5), rows.rows.recv())
+        .await
+        .expect("rows again after the reconnect")
+        .expect("the rows are open");
 }
 
 #[tokio::test]

@@ -93,6 +93,10 @@ checked against a later server (v1.837); the facts below are unverified on that 
   `source` scan): a new plan from the handshake's `bandwidth`, one `SET zoom= cf=`, its sweeps counted
   from 0; the old view's frames are dropped by the zoom and `x_bin` match and the settle. A reconnect
   resumes at the last plan asked.
+- A shared Kiwi pauses its frames by itself (seen: about 2 s every 15-20 s, at 16-21 frames a second).
+  The connection is lost only after `WF_STALL_MS` (5 s) with no frame of an asked view, so a one-view
+  stream rides through those pauses on one socket; a plan of several views still skips a step whose
+  view does not come within a few frame times.
 
 ## Not verified
 

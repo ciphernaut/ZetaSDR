@@ -20,9 +20,13 @@
 //! sends the setup commands and the first view, then steps: a frame belongs to the
 //! step when its zoom is the plan's and its `x_bin` the asked view's; the first
 //! `wf_settle_frames` that belong after a change are dropped, the next
-//! `plan.frames` averaged in linear power into one [`SweepRow`]. A step with no row
-//! after [`WF_STEP_SPARE_FRAMES`] frame times more than it needs is skipped; a
-//! sweep of skips, ten bad frames in a row, a close or silence lose the connection,
+//! `plan.frames` averaged in linear power into one [`SweepRow`]. In a plan of
+//! several views a step with no row after [`WF_STEP_SPARE_FRAMES`] frame times more
+//! than it needs is skipped. The server pauses its frames by itself now and then (a
+//! shared Kiwi was seen stalling about 2 s every 15-20 s), so the connection is lost
+//! only when no frame of an asked view came for [`WF_STALL_MS`] (a sweep of skips
+//! then, or a one-view plan's view gone that long), never while frames of the asked
+//! view still arrive; ten bad frames in a row, a close or silence lose it too,
 //! which is retried after each of `reconnect_delays_ms` (the budget reset by a
 //! whole sweep delivered) while the state says `Waiting`. A refusal on a reconnect,
 //! or the budget spent, ends the sweep (`Ended`, then the rows close). The rows'
@@ -200,6 +204,10 @@ pub(crate) const WF_HANDSHAKE_MAX_MS: u64 = 3_000;
 pub(crate) const WF_END_WAIT_MS: u64 = 1_200;
 /// Frame times a step waits beyond its settle and dwell before it is skipped.
 pub(crate) const WF_STEP_SPARE_FRAMES: u32 = 10;
+/// How long the sweep as a whole may go without a frame of an asked view before
+/// its connection is lost: well past the server's own pauses (about 2 s), and
+/// under `read_timeout_ms`.
+pub(crate) const WF_STALL_MS: u64 = 5_000;
 /// How far a frame's `x_bin` may sit from the asked view's: the server parses
 /// `cf` as a 32-bit float (a 2 Hz unit at 30 MHz, over one `x_bin`) and truncates
 /// the start, at most 2 units off in an emulation of its maths; 4 leaves a margin.
@@ -494,9 +502,14 @@ impl Stepper {
         (self.view(), end)
     }
 
-    /// How long the step may go without a row: its settle and dwell, and
-    /// [`WF_STEP_SPARE_FRAMES`] more, in frame times.
+    /// How long the step may go without a frame of its view: in a plan of several
+    /// views its settle and dwell, and [`WF_STEP_SPARE_FRAMES`] more, in frame
+    /// times, after which it is skipped; a plan of one view has no step to skip to,
+    /// so it waits out the server's pauses, [`WF_STALL_MS`].
     pub fn patience(&self) -> Duration {
+        if self.plan.starts.len() == 1 {
+            return Duration::from_millis(WF_STALL_MS);
+        }
         let frames = self.settle + self.plan.frames + WF_STEP_SPARE_FRAMES;
         Duration::from_micros(u64::from(frames) * 1_000_000 / u64::from(WF_FPS))
     }
@@ -683,6 +696,9 @@ async fn connection(
     let mut setup = Setup::default();
     let mut stepper: Option<Stepper> = None;
     let mut step_deadline = Instant::now();
+    // The last frame of an asked view (or the view's asking): the sweep's stall clock.
+    let mut last_asked = Instant::now();
+    let stall = Duration::from_millis(WF_STALL_MS);
     let mut bad: u32 = 0;
     // A whole sweep delivered on this connection.
     let mut whole = false;
@@ -718,7 +734,8 @@ async fn connection(
                 // The stepper is the new plan's before the answer: every row after it is.
                 let cmd = stepper.as_mut().and_then(|s| {
                     let cmd = s.retarget(plan.clone());
-                    step_deadline = Instant::now() + s.patience();
+                    last_asked = Instant::now();
+                    step_deadline = last_asked + s.patience();
                     cmd
                 });
                 let _ = r.reply.send(Ok(plan.sweep_plan()));
@@ -735,8 +752,11 @@ async fn connection(
                 let s = stepper.as_mut().expect("stepping");
                 let (cmd, sweep_end) = s.next();
                 carry.sweep = s.next_sweep();
-                if let Some((0, _)) = sweep_end {
-                    end!(lost("no frame of the asked view in a whole sweep".into(), whole));
+                if let Some((0, _)) = sweep_end
+                    && last_asked.elapsed() >= stall
+                {
+                    let why = format!("no frame of the asked view for {WF_STALL_MS} ms");
+                    end!(lost(why, whole));
                 }
                 step_deadline = Instant::now() + s.patience();
                 if let Some(cmd) = cmd {
@@ -812,7 +832,8 @@ async fn connection(
                     let settle = cfg.wf_settle_frames;
                     let mut s = Stepper::new(plan, bandwidth, zoom_max, settle, carry.sweep);
                     let cmd = s.view();
-                    step_deadline = Instant::now() + s.patience();
+                    last_asked = Instant::now();
+                    step_deadline = last_asked + s.patience();
                     stepper = Some(s);
                     if let Some(cmd) = cmd {
                         send!(cmd);
@@ -836,8 +857,12 @@ async fn connection(
                 bad = 0;
                 match s.on_frame(&wf, setup.wf_cal, now_ns()) {
                     FrameOut::Other => {}
-                    FrameOut::Belongs => step_deadline = Instant::now() + s.patience(),
+                    FrameOut::Belongs => {
+                        last_asked = Instant::now();
+                        step_deadline = last_asked + s.patience();
+                    }
                     FrameOut::Row(row) => {
+                        last_asked = Instant::now();
                         // A full channel drops the row: the node counts it skipped.
                         if let Err(TrySendError::Closed(_)) = ctx.rows.try_send(row) {
                             end!(End::Stop);
@@ -1186,7 +1211,12 @@ wf_chans=4 wf_chans_real=4 wf_cal=-13 wf_setup";
             s.on_frame(&frame(0, 0, -50.0), 0, 3),
             FrameOut::Row(_)
         ));
-        // A whole step's patience: settle, dwell and ten spare frames.
+        // One view has no step to skip to: it waits out the server's pauses.
+        assert_eq!(s.patience(), Duration::from_millis(WF_STALL_MS));
+        // A step of several views: settle, dwell and ten spare frames.
+        let plan = wf_plan(span(0, BW), 6_000, 20, BW);
+        assert!(plan.starts.len() > 1);
+        let s = Stepper::new(plan, BW, 14, 1, 0);
         assert_eq!(s.patience(), Duration::from_micros(12 * 1_000_000 / 23));
     }
 

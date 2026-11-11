@@ -100,6 +100,9 @@ pub struct FakeWf {
     pub ignore_view: bool,
     /// Carriers drawn by frequency in every frame (none: the flat `x_bin` paint).
     pub carriers: Vec<FakeCarrier>,
+    /// `Some((n, ms))`: after `n` frames of a connection, nothing at all for `ms`
+    /// (no frame, no message), then frames again, as a busy server pauses.
+    pub pause: Option<(usize, u64)>,
 }
 
 /// A carrier the fake's waterfall draws where it sits in the view.
@@ -124,6 +127,7 @@ impl Default for FakeWf {
             compressed: false,
             ignore_view: false,
             carriers: Vec::new(),
+            pause: None,
         }
     }
 }
@@ -570,6 +574,15 @@ wf_chans={c} wf_chans_real={c} wf_cal={cal} wf_setup",
             return;
         }
         seq = seq.wrapping_add(1);
+        if let Some((n, ms)) = wf.pause
+            && seq as usize == n
+        {
+            tokio::select! {
+                _ = &mut closed => return,
+                _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
+            }
+            tick.reset();
+        }
     }
 }
 
