@@ -222,6 +222,25 @@ impl Inner {
                             refusal_reason(&e)
                         )));
                     }
+                    // Refused while another scan holds the source's own sweep (a
+                    // Kiwi has one waterfall connection): a first start does not
+                    // step instead, which would take the source's IQ channel to
+                    // look at what that sweep shows; it fails with the reason.
+                    Err(e) if !was_source && self.swept_by_another(port.id(), &rec.id) => {
+                        let others = self.leases.sweepers(port.id());
+                        let others: Vec<&str> = others
+                            .iter()
+                            .filter(|j| **j != rec.id)
+                            .map(|j| j.0.as_str())
+                            .collect();
+                        return Err(NodeError::Other(format!(
+                            "sweep on source {}: {} (scan {} sweeps it: re-aim that one with \
+                             job_retune, or ask method: stepped)",
+                            rec.source.0,
+                            refusal_reason(&e),
+                            others.join(", ")
+                        )));
+                    }
                     Err(e) => refusal_reason(&e),
                 },
             };
@@ -360,6 +379,11 @@ impl Inner {
     /// lands between it and the sweep's start. A call that has not returned after
     /// [`crate::ops::SWEEP_START_TIMEOUT_MS`] is dropped (ending the source's attempt) and
     /// read as a refusal, `sweep start timed out`: the gate is never held longer.
+    /// Whether a scan other than `id` holds a sweep claim on `source`.
+    fn swept_by_another(&self, source: &SourceId, id: &JobId) -> bool {
+        self.leases.sweepers(source).iter().any(|j| j != id)
+    }
+
     async fn start_sweep(
         &self,
         port: &dyn Port,

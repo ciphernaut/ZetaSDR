@@ -138,9 +138,12 @@ struct ScanPort {
 /// rows carry a control: a re-aim is recorded ([`ScanPort::retargets`]) and answered
 /// with the plan of the new request before the next row, which is of the new plan,
 /// sweep 0 step 0. Its plan has `steps` steps ([`SWEEP_STEPS`] when `None`) and says
-/// `shift_hz` (0 when `None`), though no row is shifted.
+/// `shift_hz` (0 when `None`), though no row is shifted. With `single` it sweeps once
+/// at a time, as a Kiwi's one waterfall connection does: a sweep asked while one's
+/// rows are live is refused with [`ONE_SWEEP`].
 #[derive(Clone, Debug, Default)]
 struct SweepScript {
+    single: bool,
     refuse: Option<String>,
     wait_after: Option<usize>,
     end_after: Option<usize>,
@@ -523,6 +526,9 @@ impl Port for ScanPort {
         let refuse = self.refuse.lock().unwrap().clone();
         if let Some(why) = refuse {
             return Err(PortError::Unsupported(why));
+        }
+        if script.single && self.live() > 0 {
+            return Err(PortError::Unsupported(ONE_SWEEP.into()));
         }
         if script.hang {
             std::future::pending::<()>().await;
@@ -3040,6 +3046,51 @@ async fn method_stepped_never_asks_the_source() {
         "stepped"
     );
     node.job_stop(&id).await.unwrap();
+}
+
+/// What a [`SweepScript::single`] port refuses a second sweep with (the Kiwi's words).
+const ONE_SWEEP: &str = "a sweep is already running on this Kiwi (one waterfall connection)";
+
+/// Review I2: a scan with no `method` whose sweep the source refuses while another
+/// scan sweeps it (a Kiwi's one waterfall connection) does not step instead, which
+/// would take the source's IQ channel: its start fails naming the reason and the
+/// sweeping scan. No tune, no lease, no claim; the first scan runs on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_refused_because_another_already_sweeps_fails_instead_of_stepping() {
+    let port = ScanPort::sweeping(SweepScript {
+        single: true,
+        ..Default::default()
+    });
+    let (_dir, node, port) = open_with(port).await;
+    let (first, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    rows(&mut rx, 2, Duration::from_secs(10)).await;
+    assert_eq!(scan_ctx(&node, &first)["method"], "source");
+    match node
+        .apply(start(JobKind::Scan, SWEEP_SPAN.0, SWEEP_SPAN.1))
+        .await
+    {
+        Err(OpError::Other { message }) => {
+            assert!(message.starts_with(&format!("sweep on source radio0: {ONE_SWEEP}")), "{message}");
+            assert!(message.contains(&first.0), "names the sweeping scan: {message}");
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+    assert_eq!(port.requests().len(), 2);
+    assert!(port.tunes().is_empty(), "{:?}", port.tunes());
+    assert!(radio0_info(&node).await.holders.is_empty());
+    assert_eq!(node.lease_sweepers(&radio0()), vec![first.clone()]);
+    let scans: Vec<JobId> = node
+        .job_list()
+        .into_iter()
+        .filter(|r| r.kind == "scan")
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(scans, vec![first.clone()]);
+    // The first runs on.
+    while rx.try_recv().is_ok() {}
+    rows(&mut rx, 2, Duration::from_secs(10)).await;
+    assert_eq!(job_state(&node, &first), Some(JobState::Running));
+    node.job_stop(&first).await.unwrap();
 }
 
 /// `method: "source"` and a refusal is the start's error, holding the reason: no
