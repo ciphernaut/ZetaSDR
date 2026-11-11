@@ -237,6 +237,13 @@ Scope estimate: the stage set about 1500-2500 lines in `zeta-dsp` with fixtures 
 - Several proposals can be pending for one signal (a capture's 0.3 and a bits job's 0.9), and accepting both gives overlapping records: fold a new proposal into a pending one of the same band (2026-11-08).
 - `LEARNED_MIN_SCORE` lets centre and bandwidth alone label a different emitter of similar width `learned`, after which the watch never captures it: require a rate or framing match too, or keep capturing learned matches now and then (2026-11-08).
 
+## Signatures: take back a wrong accept
+
+An accepted signature cannot be undone (2026-11-11). `signature_reject` refuses anything but `proposed`, there is no `signature_delete`, and the store is read only at start. A mis-clicked accept on the page (a features-only 0.3 proposal) went on labelling every matching classify `learned <name>` in the transcript. Clearing it took moving the record out of `state_dir/signatures` and restarting the node.
+- An op to retract an accepted record (to `rejected`, or a `retracted` state that keeps the provenance) and one to delete a record. Both unpin its captures unless another record holds them, drop its `learned_<id>` row from the registry, and are gated like accept (`allow.accept_signatures`).
+- On the page: an Undo on the accept's note, and the signatures listed with Retract and Delete (behind its own tab or a hover box, not on the waterfall).
+- Perhaps a confirm before accepting a features-only proposal, since its confidence is low and it labels by width and centre alone.
+
 ## Program rows on events
 
 A program row whose `decoder.input.stream` is `event` (JSON lines of a running job's events, `frame` events included, on stdin), so an operator pipes a frame row to an external parser or handler, Modbus RTU being the operator's example (2026-11-06). Today only a plugin stage on a graph row takes event input.
