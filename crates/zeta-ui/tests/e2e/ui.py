@@ -1044,6 +1044,19 @@ def scenario_scan_looks_and_sweep_time(page, url, secret):
             expect(select).to_have_value(look, timeout=10_000)
             expect(row.locator(".sweep-ms")).to_have_text(
                 re.compile(r"^\d+(\.\d)? (ms|s)$"), timeout=20_000)
+        # The page's own per-poll reads stay out of the transcript (the test's own calls show as [http]).
+        time.sleep(5.0)  # more than two polls
+        noise = page.evaluate(
+            "() => [...document.querySelectorAll('#transcript .line')].map((l) => l.textContent)"
+            ".filter((t) => /job_context|graph_get/.test(t) && !t.startsWith('['))")
+        assert not noise, f"the transcript shows the page's own reads: {noise}"
+        # A focused select is not rebuilt under the pointer by the polls.
+        handle = select.element_handle()
+        select.focus()
+        time.sleep(5.0)
+        same = page.evaluate(
+            "(el) => document.activeElement === el && el.isConnected", handle)
+        assert same, "the focused look select was replaced or lost its focus"
     finally:
         for j in running_scan_jobs(url, secret, "tone") or scans:
             stop_job(url, secret, j["id"])

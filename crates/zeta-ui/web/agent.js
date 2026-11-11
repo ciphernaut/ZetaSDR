@@ -69,11 +69,14 @@
 //       An attached job (one with an `input` job) is a `.job.attached` row placed right
 //       under its input's row, its kind shown as `↳ <kind>`, with neither of the audio
 //       buttons. A job's `state.reason` (a failure) is also the row's tooltip.
-//       A running scan row (one `job_context` and `graph_get` per poll) shows `.sweep-ms` (the
+//       A running scan row (one `job_context` per poll, a `graph_get` once per job; both are
+//       QUIET_OPS) shows `.sweep-ms` (the
 //       last sweep, `<n> ms` or `<n.n> s`) and a `select.scan-look` over SCAN_LOOKS (fast,
 //       averaged, long look; coarse and fast when `depths(source)` lists a lossy depth) or
 //       `custom`; a choice sets dwell_ms, average and bits on the stored fft node and applies
-//       `graph_put` through applyOp (a conflict gets its retry offer).
+//       `graph_put` through applyOp (a conflict shows its line naming the holders; graph_put
+//       takes no `replace`, so there is no stop-and-retry). The row whose select has the focus
+//       is left as it is across renders (an open dropdown stays open).
 //       A running row of a SQUELCH_KINDS kind is tagged `squelch` (setSquelchTag) while
 //       squelch(id) (overlays.js: the last `squelch` event seen on the job's event stream)
 //       has `open: false`.
@@ -189,6 +192,8 @@ export const QUIET_OPS = new Set([
   "signature_list",
   "station_get",
   "set_list",
+  "job_context",
+  "graph_get",
 ]);
 export const AUTO_SCAN_KEY = "zeta.autoScan";
 const MAX_LINES = 500;
@@ -906,16 +911,25 @@ export function startJobs(
   } = {},
 ) {
   let timer = null;
-  // id -> {sweep_ms, params}: a running scan's last sweep time (job_context) and its stored
-  // fft node's params (graph_get), read with each job_list.
+  // id -> {sweep_ms, params}: a running scan's last sweep time (job_context, read with each
+  // job_list) and its stored fft node's params (graph_get, read once per job and again after
+  // this page's own graph_put or when the context's asked look no longer matches the node's:
+  // a restart by someone else).
   const scans = new Map();
   const readScan = async (id) => {
-    const [c, g] = await Promise.all([
-      api.op({ op: "job_context", job: id }).catch(() => null),
-      api.op({ op: "graph_get", job: id }).catch(() => null),
-    ]);
-    const node = g?.value?.nodes?.find((n) => n.kind === "fft");
-    scans.set(id, { sweep_ms: c?.value?.scan?.timing?.sweep_ms ?? null, params: node?.params ?? null });
+    const c = await api.op({ op: "job_context", job: id }).catch(() => null);
+    const ctx = c?.value?.scan ?? {};
+    let params = scans.get(id)?.params ?? null;
+    const stale =
+      params &&
+      ((params.dwell_ms ?? 20) !== (ctx.dwell_ms_asked ?? ctx.dwell_ms ?? 20) ||
+        (params.average ?? 1) !== (ctx.average_asked ?? ctx.average ?? 1) ||
+        (params.bits ?? null) !== (ctx.bits ?? null));
+    if (!params || stale) {
+      const g = await api.op({ op: "graph_get", job: id }).catch(() => null);
+      params = g?.value?.nodes?.find((n) => n.kind === "fft")?.params ?? null;
+    }
+    scans.set(id, { sweep_ms: ctx.timing?.sweep_ms ?? null, params });
   };
   // A look is the stored fft node's dwell, average and depth, put back (the scan restarts).
   const setLook = async (job, look) => {
@@ -1219,8 +1233,15 @@ export function startJobs(
     last = jobs;
     // A job a controller (a watch) started is shown through its owner, not on its own.
     const shown = underInputs(visible(jobs)).filter((j) => !j.owner);
+    // A row whose look select has the focus stays as it is: a rebuilt one would close the
+    // open dropdown under the pointer.
+    const focused = document.activeElement?.matches?.("select.scan-look")
+      ? document.activeElement.closest(".job")
+      : null;
     const rows = shown.map((j) =>
-      jobRow(j, async (id, button) => {
+      focused && focused.dataset.job === j.id && focused.parentNode
+        ? focused
+        : jobRow(j, async (id, button) => {
         button.disabled = true;
         try {
           await api.op({ op: "job_stop", job: id });
