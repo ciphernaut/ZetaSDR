@@ -186,9 +186,10 @@ pub(crate) const WF_END_WAIT_MS: u64 = 1_200;
 pub(crate) const WF_STEP_SPARE_FRAMES: u32 = 10;
 /// How far a frame's `x_bin` may sit from the asked view's: the server parses
 /// `cf` as a 32-bit float (a 2 Hz unit at 30 MHz, over one `x_bin`) and truncates
-/// the start. Neighbouring views, and an odd sweep's shifted ones, are thousands
-/// of units apart.
-const WF_X_BIN_SLACK: u32 = 2;
+/// the start, at most 2 units off in an emulation of its maths; 4 leaves a margin.
+/// Two views of one zoom, an odd sweep's shifted ones included, are at least 128
+/// units apart (at zoom 10).
+const WF_X_BIN_SLACK: u32 = 4;
 /// The server's finest zoom when the setup does not say (`zoom_max=14`).
 const ZOOM_MAX_DEFAULT: u8 = 14;
 /// Longest redirect target echoed in a reason.
@@ -994,7 +995,7 @@ wf_chans=4 wf_chans_real=4 wf_cal=-13 wf_setup";
             s.on_frame(&frame(3, 2_097_152, -50.0), 0, 2),
             FrameOut::Other
         );
-        assert_eq!(s.on_frame(&frame(3, 3, -50.0), 0, 3), FrameOut::Other);
+        assert_eq!(s.on_frame(&frame(3, 5, -50.0), 0, 3), FrameOut::Other);
         // The settle frame, then the dwell's two.
         assert_eq!(s.on_frame(&frame(3, 0, -50.0), 0, 4), FrameOut::Belongs);
         assert_eq!(s.on_frame(&frame(3, 1, -100.0), -13, 5), FrameOut::Belongs);
@@ -1010,6 +1011,32 @@ wf_chans=4 wf_chans_real=4 wf_cal=-13 wf_setup";
             (Timestamp(5), Timestamp(6))
         );
         assert_eq!(row.db.len(), WF_PIXELS);
+    }
+
+    #[test]
+    fn a_frame_within_the_slack_counts_and_one_past_it_does_not() {
+        let plan = wf_plan(span(0, BW), 6000, 20, BW);
+        let want = plan.x_bin(plan.start(0, 1), BW, 14);
+        let mut s = Stepper::new(plan, BW, 14, 0, 0);
+        s.view();
+        s.next();
+        for x in [want - 5, want + 5] {
+            assert_eq!(
+                s.on_frame(&frame(3, x, -50.0), 0, 1),
+                FrameOut::Other,
+                "{x}"
+            );
+        }
+        assert!(matches!(
+            s.on_frame(&frame(3, want + 4, -50.0), 0, 2),
+            FrameOut::Row(_)
+        ));
+        let want = want * 2;
+        s.next();
+        assert!(matches!(
+            s.on_frame(&frame(3, want - 4, -50.0), 0, 3),
+            FrameOut::Row(_)
+        ));
     }
 
     #[test]
@@ -1076,8 +1103,8 @@ wf_chans=4 wf_chans_real=4 wf_cal=-13 wf_setup";
 
     #[test]
     fn the_wf_timestamp_is_never_the_snd_one_and_never_repeats() {
-        assert_ne!(wf_ts(), path_ts());
-        assert_eq!(wf_ts() ^ path_ts(), 0x8000_0000);
+        // Bit 31 differs whatever second each call reads (a tick moves the low bits).
+        assert_eq!((wf_ts() ^ path_ts()) & 0x8000_0000, 0x8000_0000);
         let a = fresh_wf_ts();
         let b = fresh_wf_ts();
         assert!(b > a, "{a} {b}");

@@ -68,11 +68,12 @@ impl Inner {
     /// [`Inner::launch_self_sweep`] (no lease, nobody stopped, `after` left
     /// alone). The ask and what a refusal leads to are one hold of the source's
     /// gate (`gate`, else taken for the launch). Refused (or the span outside the
-    /// sweep): with `method: source` the launch fails (`sweep on source <id>:
-    /// <reason>`, or the span named); a scan whose record says it ran as `source`
-    /// (a resume, a restart under its id) waits for its sweep, asking again,
-    /// never stepping; any other steps, its `job_context.scan.fallback` the
-    /// source's reason, a conflict for its lease gaining it as an option.
+    /// sweep): a scan whose record says it ran as `source` (a resume, a restart
+    /// under its id), whatever its stored `method`, waits for its sweep, asking
+    /// again, never stepping; else with `method: source` the launch fails (`sweep
+    /// on source <id>: <reason>`, or the span named); any other steps, its
+    /// `job_context.scan.fallback` the source's reason, a conflict for its lease
+    /// gaining it as an option.
     ///
     /// The holders `replace` names (a `job_start`'s; `gate` is held whenever it
     /// names any) are stopped under `gate` right before the stepped scan's lease,
@@ -189,8 +190,11 @@ impl Inner {
                 dwell_ms: look.dwell_ms,
             };
             let unheld = scan_sweep_refusal(port.id(), &caps, rec.tuning);
+            // A first start made `source` fails on a refusal; a restart of a scan
+            // that ran as one waits below, whatever its stored method.
+            let fails = method == Some(ScanMethod::Source) && !was_source;
             let refused = match &unheld {
-                Some(why) if method == Some(ScanMethod::Source) => {
+                Some(why) if fails => {
                     return Err(NodeError::Other(why.clone()));
                 }
                 Some(why) => why.clone(),
@@ -199,7 +203,7 @@ impl Inner {
                         let start = SweepStart::Rows(rows);
                         return self.launch_self_sweep(rec, port, look, calibrated, start, req);
                     }
-                    Err(e) if method == Some(ScanMethod::Source) => {
+                    Err(e) if fails => {
                         return Err(NodeError::Other(format!(
                             "sweep on source {}: {}",
                             rec.source.0,

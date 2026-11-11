@@ -3092,9 +3092,25 @@ async fn graph_put_changes_the_method_on_a_running_scan() {
 /// sweep again the rows come and `waiting` is `null`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_self_sweep_refused_waits_instead_of_stepping() {
+    restarted_refused_waits(None).await;
+}
+
+/// The same with `method: "source"` stored: the restart waits too, where a first
+/// start with it fails ([`method_source_fails_instead_of_falling_back`]).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_explicit_source_scan_refused_waits_instead_of_failing() {
+    restarted_refused_waits(Some(ScanMethod::Source)).await;
+}
+
+/// A self-sweep started with `method`, restarted by a `graph_put` while its source
+/// refuses: it waits, then runs once the source grants the sweep.
+async fn restarted_refused_waits(method: Option<ScanMethod>) {
     let (_dir, node, port) = open_with(ScanPort::sweeping(SweepScript::default())).await;
-    let (id, mut rx) = start_span(&node, SWEEP_SPAN.0, SWEEP_SPAN.1).await;
+    let id = start_job(&node, sweep_start(method, None)).await;
+    let mut rx = event_rx(&node, &id);
     rows(&mut rx, 4, Duration::from_secs(10)).await;
+    let stored = fft_node(&graph_of(&node, &id).await).params["method"].clone();
+    assert_eq!(stored, method.map_or(Value::Null, |m| m.name().into()));
     port.set_refuse(Some("a sweep is already running"));
     let put = put_fft(&node, &id, |p| {
         p.insert("dwell_ms".into(), 40.into());

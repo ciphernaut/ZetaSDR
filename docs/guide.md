@@ -850,13 +850,14 @@ Kiwi plays on), and `source list` lists it under `sweeps`, not `holders`. `--met
 stepped scan and `--method source` never steps. `--bin-hz` asks the source for a bin width (it picks its
 zoom and step count; the default is the coarser of 6 kHz and the source's `bin_hz_min`), `--dwell-ms` and
 `--average` apply to the source's rows, and `--bits` beside `--method source` or `--bin-hz` is refused
-(`bits applies to a stepped scan`). `--replace` on a scan stops the named jobs only when the scan has to
-step: a granted self-sweep stops nothing, and `--method source` with `--replace` is refused (`replace
-applies to a stepped scan`); do not pass `--replace` for a scan a source will sweep for itself unless a
-`conflict` asked for it, since it stops its holders before the launch decides. The job context of a
+(`bits applies to a stepped scan`). `--replace` on a scan is honoured only if the scan has to step: a
+scan the source sweeps for itself stops nothing; if a refusal makes the scan step, the named jobs are
+stopped before it takes the radio; `--method source` with `--replace` is refused (`replace applies to a
+stepped scan`). Pass `--replace` only when a `conflict` named those holders. The job context of a
 `source` scan holds `method`, `steps`, `step_hz`, `bin_hz`, `dwell_ms` (`dwell_ms_asked`), `average`
 (`average_asked`), `alternate`, `mask`, `calibrated`, `waiting` and `timing`, and has no `rate_hz` and
-no `bits`; a row's `calibrated` says its levels are absolute dBm, which a local radio's rows are not, so
+no `bits`; while it is `waiting` it holds only `method`, `mask`, `calibrated` and `waiting` (the plan's
+keys arrive when the source grants the sweep, `timing` after its first sweep); a row's `calibrated` says its levels are absolute dBm, which a local radio's rows are not, so
 never compare levels across the two. A sweep a source refuses at a first start makes the scan step, and
 `scan.fallback` says why; when the source's IQ channel is held that is the usual `conflict` carrying the
 source's reason. A scan that ran as `source` and is restarted (a node restart, a `graph_put`, a look

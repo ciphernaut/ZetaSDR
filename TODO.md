@@ -798,9 +798,9 @@ Today the waterfall follows the scan and hides the fine rows of a capture on the
 
 A `graph_put` that turns a self-sweeping scan to `stepped` while demodulators run beside it fails the scan after stopping it, since the stepped scan then needs the lease. Pre-check the lease in `graph_put` and refuse before the stop.
 
-## Sets: a scan member on a self-sweeping source still stops `replace` holders up front
+## Scan: a `source` scan left waiting
 
-Check whether a named set's member can be a scan. If it can, a set whose scan member is on a self-sweeping source stops the `replace` holders before the scan's launch decides, though a self-sweep needs none stopped.
+A `source` scan left waiting retries every 16 s for as long as it runs; an operator stops it.
 
 ## Scan: the self-sweep half of `node/scan.rs` in its own module
 

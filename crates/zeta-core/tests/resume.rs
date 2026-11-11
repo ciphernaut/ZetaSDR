@@ -112,8 +112,8 @@ struct Radio {
     tx: broadcast::Sender<IqBlock>,
     /// Every tune, in order.
     tunes: Mutex<Vec<Tuning>>,
-    /// What its sweep is refused with, after `start_ms`.
-    refuse: Option<String>,
+    /// What its sweep is refused with, after `start_ms` (`None`: granted).
+    refuse: Mutex<Option<String>>,
     start_ms: u64,
 }
 
@@ -130,13 +130,18 @@ impl Radio {
             rows_per_s_max: 200,
             calibrated: false,
         });
-        r.refuse = refuse.map(Into::into);
+        r.refuse = Mutex::new(refuse.map(Into::into));
         r.start_ms = start_ms;
         Arc::new(r)
     }
 
     fn tunes(&self) -> Vec<Tuning> {
         self.tunes.lock().unwrap().clone()
+    }
+
+    /// Refuse every sweep asked for from now on with `why` (`None`: grant them).
+    fn set_refuse(&self, why: Option<&str>) {
+        *self.refuse.lock().unwrap() = why.map(Into::into);
     }
 
     fn new() -> Arc<Self> {
@@ -159,7 +164,7 @@ impl Radio {
             cur: Mutex::new(None),
             tx: broadcast::channel(1).0,
             tunes: Mutex::new(Vec::new()),
-            refuse: None,
+            refuse: Mutex::new(None),
             start_ms: 0,
         })
     }
@@ -191,8 +196,9 @@ impl Port for Radio {
             ));
         }
         tokio::time::sleep(Duration::from_millis(self.start_ms)).await;
-        if let Some(why) = &self.refuse {
-            return Err(PortError::Unsupported(why.clone()));
+        let refuse = self.refuse.lock().unwrap().clone();
+        if let Some(why) = refuse {
+            return Err(PortError::Unsupported(why));
         }
         let step_hz = req.span.bandwidth_hz.0 / 4;
         let lo = req.span.center_hz.0 - req.span.bandwidth_hz.0 / 2;
@@ -622,5 +628,50 @@ async fn a_stored_self_sweep_refused_at_resume_waits_and_never_steps() {
     .await;
     assert_eq!(record(&node, &scan).state, JobState::Running);
     assert_eq!(radio.tunes(), vec![capture]);
+    node.job_stop(&scan).await.unwrap();
+}
+
+/// A scan stored with `method: "source"` in its `fft` node, its source refusing at
+/// resume, waits as one stored without a method does (instead of failing as a first
+/// start with it would): it runs, waiting with the reason, never tuned, and once the
+/// source grants the sweep its rows come and `waiting` is `null`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_explicit_source_scan_refused_at_resume_waits_then_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let scan = JobId::new();
+    let mut rec = self_sweep_record(&scan, 1);
+    rec.graph.nodes = vec![GraphNode {
+        id: NodeId("fft".into()),
+        kind: "fft".into(),
+        params: serde_json::json!({"method": "source"}),
+    }];
+    write_records(dir.path(), &[rec]);
+    let radio = Radio::sweeping(Some("a sweep is already running"), 0);
+    let node = Node::open(cfg(dir.path()), registry(), vec![radio.clone()])
+        .await
+        .unwrap();
+    assert_eq!(record(&node, &scan).state, JobState::Running);
+    assert_eq!(
+        record(&node, &scan).graph.nodes[0].params["method"],
+        "source"
+    );
+    let ctx = node.job_context(&scan).unwrap();
+    assert_eq!(ctx["scan"]["method"], "source", "{ctx}");
+    assert_eq!(
+        ctx["scan"]["waiting"], "a sweep is already running",
+        "{ctx}"
+    );
+    assert!(ctx["scan"].get("steps").is_none(), "{ctx}");
+    radio.set_refuse(None);
+    until("the scan stops waiting", Duration::from_secs(20), || {
+        node.job_context(&scan).unwrap()["scan"]["waiting"].is_null()
+    })
+    .await;
+    a_row(&node, &scan, Duration::from_secs(10)).await;
+    let ctx = node.job_context(&scan).unwrap();
+    assert_eq!(ctx["scan"]["steps"], 4, "{ctx}");
+    assert_eq!(record(&node, &scan).state, JobState::Running);
+    assert!(radio.tunes().is_empty(), "{:?}", radio.tunes());
+    assert!(node.lease_holders(&SourceId("radio0".into())).is_empty());
     node.job_stop(&scan).await.unwrap();
 }
