@@ -641,8 +641,10 @@ is never touched.
 On a free radio (nothing but scans holding it) with no other source to scan the view, the page's
 scan runs on the radio itself, and the view stays yours: the wheel, a drag on the axis and the
 `#band` form show the band asked at once, stopping only at the radio's tune range, with the rows
-already painted drawn on it. About 300 ms after the last change the page moves what feeds the
-view: a band one capture holds stops the page's scan and retunes the radio there; a wider one
+already painted drawn on it. The wheel keeps the frequency under the pointer where it is, zooming
+in and out, so zooming back out with the pointer at the centre widens the view around where you
+are now, not around an earlier view. About 300 ms after the last change the page moves what feeds
+the view: a band one capture holds stops the page's scan and retunes the radio there; a wider one
 replaces the scan with one over the new band, and its rows replace the old as they arrive. A scan
 someone else started on the shown radio is followed as it is: a gesture past its span stays
 inside it, with `view: the waterfall follows scan <id>, which this page did not start; …` in the

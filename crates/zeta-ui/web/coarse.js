@@ -291,7 +291,9 @@ class Coarse {
   // the source's tune range) whose span moved by more than SPAN_CHANGE from the scan's
   // replaces the scan with one over it (stopOwn, startOwn), the waterfall keeping its picture
   // meanwhile (wf.swapScan). The decision runs SCAN_DEBOUNCE_MS after the last gesture, so a
-  // drag replaces the scan once.
+  // drag replaces the scan once. Once the scan is stopped, what replaces it is chosen again
+  // for the view shown then (a gesture may have moved it during the stop): never the view
+  // the decision started from.
   async moveFallback() {
     const wf = this.wf;
     const v = wf.shown();
@@ -304,19 +306,31 @@ class Coarse {
     const s =
       this.span ||
       (tuning && { lo: tuning.center_hz - tuning.bandwidth_hz / 2, hi: tuning.center_hz + tuning.bandwidth_hz / 2 });
-    const restore = this.view.get("auto_scan_stop") === "inside" && wf.capturable(info, v.lo, v.hi);
     const range = tuneRange(info);
-    const lo = range ? Math.max(v.lo, range.lo) : v.lo;
-    const hi = range ? Math.min(v.hi, range.hi) : v.hi;
-    if (!restore && (!(hi > lo) || (s && !this.moved(s, lo, hi)))) return;
-    const target = { lo: v.lo, hi: v.hi };
+    // What feeds view `w`: {restore} (one capture holds it) or {lo, hi}, the span to scan.
+    const plan = (w) => {
+      if (this.view.get("auto_scan_stop") === "inside" && wf.capturable(info, w.lo, w.hi)) {
+        return { restore: { lo: w.lo, hi: w.hi } };
+      }
+      const lo = range ? Math.max(w.lo, range.lo) : w.lo;
+      const hi = range ? Math.min(w.hi, range.hi) : w.hi;
+      return { lo, hi };
+    };
+    const first = plan(v);
+    const still = !(first.hi > first.lo) || (s && !this.moved(s, first.lo, first.hi));
+    if (!first.restore && still) return;
     await wf.swapScan(async () => {
       if (!(await this.stopOwn())) return null; // still running: followed again, retried
-      if (restore) return { restore: target };
-      await this.startOwn(info.id, lo, hi);
+      // Planned again for the view shown now: gestures move it while the scan stops (a slow
+      // radio), and the view the decision started from must not come back.
+      const p = plan(wf.shown() || v);
+      if (p.restore) return p;
+      if (!(p.hi > p.lo)) return null;
+      await this.startOwn(info.id, p.lo, p.hi);
       if (!this.scanJobId) return null;
-      const center_hz = Math.round((lo + hi) / 2);
-      return { id: this.scanJobId, tuning: { center_hz, bandwidth_hz: Math.max(1, Math.round(hi - lo)) } };
+      const center_hz = Math.round((p.lo + p.hi) / 2);
+      const bandwidth_hz = Math.max(1, Math.round(p.hi - p.lo));
+      return { id: this.scanJobId, tuning: { center_hz, bandwidth_hz } };
     });
   }
 

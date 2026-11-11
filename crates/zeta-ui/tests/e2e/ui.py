@@ -3224,7 +3224,289 @@ def scenario_wide_view_follows_a_scan_it_did_not_start_read_only(page, url, secr
         stop_scans(url, secret)
 
 
-# ---- two layers, outlines, easing (plan 11 Task 7) -----------------------------------------
+# The band shown, the frequency at canvas CSS row `y`, one CSS pixel's worth of Hz, and what
+# feeds the waterfall.
+ZOOM_STATE_JS = """(y) => {
+  const t = window.zetaTest;
+  const wf = t.waterfall();
+  const s = wf && wf.shown();
+  return {mode: t.waterfallMode, lo: s ? s.lo : null, hi: s ? s.hi : null,
+    at: s ? wf.hzForY(y) : null, px: s ? (s.hi - s.lo) / wf.cssHeight() : null,
+    retuning: !!wf && wf.retuning, jobId: wf ? wf.jobId : null, band: wf ? wf.band : null};
+}"""
+
+
+# The page's job_stop requests answered `arg` ms late (a radio slow to stop a scan); 0 undoes it.
+SLOW_STOP_JS = """(ms) => {
+  if (!window.__zaFetch) window.__zaFetch = window.fetch;
+  const f = window.__zaFetch;
+  window.fetch = !ms ? f : async (u, o) => {
+    if (o && typeof o.body === 'string' && o.body.includes('"job_stop"')) {
+      await new Promise((r) => setTimeout(r, ms));
+    }
+    return f(u, o);
+  };
+}"""
+
+
+class ZoomSteps:
+    """Wheel notches at a chosen pointer row over the waterfall: each records the band shown
+    before and after it, the frequency under the pointer, the ops sent, the scans running on
+    `source`, and prints them. `slips` lists every notch that moved the frequency under the
+    pointer by more than a pixel's worth of Hz away from `range`'s edges, and every move of the
+    band shown between notches (nothing asked). With ZETA_UI_ZA_SHOTS=<dir>, `shot` saves a
+    screenshot `<ZETA_UI_ZA_TAG or after>-<prefix>-<label>-<name>.png`."""
+
+    def __init__(self, page, url, secret, prefix, source, range_hz):
+        self.page, self.url, self.secret = page, url, secret
+        self.prefix, self.source, self.range = prefix, source, range_hz
+        self.ops, self.seen = [], 0
+        self.slips, self.log, self.n = [], [], 0
+        self.y = None
+        self.last = None
+        self.label = ""
+        page.on("request", self.on_request)
+
+    def on_request(self, req):
+        if req.method == "POST" and req.url.endswith("/op"):
+            try:
+                self.ops.append(json.loads(req.post_data or ""))
+            except ValueError:
+                pass
+
+    def close(self):
+        self.page.remove_listener("request", self.on_request)
+
+    def pointer(self, frac):
+        """The pointer to `frac` of the canvas's height from its top."""
+        box = self.page.locator("#waterfall canvas.wf-canvas").bounding_box()
+        self.y = round(box["height"] * frac)
+        self.page.mouse.move(box["x"] + box["width"] / 2, box["y"] + self.y)
+        self.last = None
+
+    def state(self):
+        return self.page.evaluate(ZOOM_STATE_JS, self.y)
+
+    def scans(self):
+        out = []
+        for j in running_scan_jobs(self.url, self.secret, self.source):
+            t = j.get("tuning") or {}
+            if t.get("bandwidth_hz"):
+                a = t["center_hz"] - t["bandwidth_hz"] / 2
+                out.append((j["id"][-6:], round(a), round(a + t["bandwidth_hz"])))
+        return out
+
+    def at_edge(self, st):
+        """At an edge of the range, or (showing a capture: ruling R2's step out moved inside
+        it) of the capture."""
+        lo, hi = self.range
+        if st["mode"] == "spectrum" and st["band"]:
+            b = st["band"]
+            if abs(st["lo"] - b["lo"]) <= st["px"] or abs(st["hi"] - b["hi"]) <= st["px"]:
+                return True
+        return st["lo"] <= lo + st["px"] or st["hi"] >= hi - st["px"]
+
+    def still(self, st, what):
+        """Records a slip when the band shown moved from the last one recorded (nothing asked)."""
+        last = self.last
+        if last and (abs(st["lo"] - last["lo"]) > last["px"]
+                     or abs(st["hi"] - last["hi"]) > last["px"]):
+            self.slips.append(f"{self.prefix}:{self.label} {what}: the view moved by itself from "
+                              f"{last['lo']:.0f}..{last['hi']:.0f} to "
+                              f"{st['lo']:.0f}..{st['hi']:.0f}")
+
+    def notch(self, delta, settle_ms, what):
+        """One wheel notch (`delta` px), recorded `settle_ms` later."""
+        before = self.state()
+        self.still(before, f"before {what}")
+        self.page.mouse.wheel(0, delta)
+        self.page.wait_for_timeout(settle_ms)
+        after = self.state()
+        self.n += 1
+        ops = [o for o in self.ops[self.seen:]
+               if o.get("op") not in ("job_list", "source_list", "stream_list", "job_context")]
+        self.seen = len(self.ops)
+        drift = after["at"] - before["at"]
+        tol = max(before["px"], after["px"])
+        rec = {"n": self.n, "seq": self.label, "what": what, "mode": after["mode"],
+               "lo": round(after["lo"]), "hi": round(after["hi"]),
+               "centre": round((after["lo"] + after["hi"]) / 2),
+               "at_before": round(before["at"]), "at_after": round(after["at"]),
+               "drift_hz": round(drift), "px_hz": round(tol, 1),
+               "ops": [{k: o.get(k) for k in ("op", "kind", "center_hz", "bandwidth_hz", "job")
+                        if o.get(k) is not None} for o in ops],
+               "scans": self.scans()}
+        self.log.append(rec)
+        print(f"  [{self.prefix}:{self.label}] {rec}")
+        if abs(drift) > tol and not self.at_edge(after):
+            self.slips.append(f"{self.prefix}:{self.label} {what}: the pointer's "
+                              f"{before['at']:.0f} Hz moved to {after['at']:.0f} Hz "
+                              f"({drift:+.0f} Hz, a pixel is {tol:.0f} Hz); shown "
+                              f"{after['lo']:.0f}..{after['hi']:.0f}")
+        self.last = after
+        return after
+
+    def settle(self, ms, what):
+        """Waits `ms`, then records a move of the band shown meanwhile as a slip."""
+        self.page.wait_for_timeout(ms)
+        st = self.state()
+        self.still(st, what)
+        print(f"  [{self.prefix}:{self.label}] {what}: shown {st['lo']:.0f}..{st['hi']:.0f} "
+              f"mode {st['mode']} scans {self.scans()}")
+        self.last = st
+        return st
+
+    def shot(self, name):
+        shots = os.environ.get("ZETA_UI_ZA_SHOTS")
+        if shots:
+            os.makedirs(shots, exist_ok=True)
+            tag = os.environ.get("ZETA_UI_ZA_TAG", "after")
+            self.page.screenshot(
+                path=os.path.join(shots, f"{tag}-{self.prefix}-{self.label}-{name}.png"))
+
+
+def zoom_in_and_out(z, label, frac, n, pace_ms, out_frac=None, out_n=None, pause_ms=1_500):
+    """Sequence `label`: `n` notches in with the pointer at `frac` of the height, a pause of
+    `pause_ms`, then `out_n` (default `n`) out with it at `out_frac` (default where it was);
+    `pace_ms` after each notch. The band shown after zooming in and after zooming out (once
+    settled)."""
+    z.label = label
+    z.pointer(frac)
+    for i in range(n):
+        z.notch(-100, pace_ms, f"in {i + 1} at {frac}")
+    z.shot("1-in")
+    inside = z.settle(pause_ms, f"after {n} in")
+    if out_frac is not None:
+        z.pointer(out_frac)
+    for i in range(out_n if out_n is not None else n):
+        z.notch(100, pace_ms, f"out {i + 1} at {out_frac if out_frac is not None else frac}")
+    out = z.settle(1_500, "settled after zooming out")
+    z.shot("2-out")
+    return inside, out
+
+
+def centred_where_zoomed(z, inside, out):
+    """Zoomed out with the pointer at the centre: the view's centre stays where the zoomed-in
+    view's was (to 1% of the view), not an earlier view's (a tune range edge aside)."""
+    c_in = (inside["lo"] + inside["hi"]) / 2
+    c_out = (out["lo"] + out["hi"]) / 2
+    print(f"  [{z.prefix}:{z.label}] zoomed-in centre {c_in:.0f}, zoomed out {c_out:.0f}")
+    if abs(c_out - c_in) > (out["hi"] - out["lo"]) / 100 and not z.at_edge(out):
+        z.slips.append(f"{z.prefix}:{z.label}: zoomed out at the centre, the view's centre is "
+                       f"{c_out:.0f} Hz; it was zoomed in at {c_in:.0f} Hz")
+
+
+def wide_again(page, url, secret, width):
+    """The shown `retune` back to a `width` view at 250 MHz (#band) with the page's own scan
+    over it."""
+    set_band(page, 250_000_000, width)
+    lo, hi = 250_000_000 - width / 2, 250_000_000 + width / 2
+    wait_shown(page, lo, hi, "the wide view again")
+    wait_own_scan_over(page, url, secret, lo, hi, "the page's scan over the wide view again")
+    page.wait_for_timeout(500)
+
+
+def scenario_wide_view_zoom_is_anchored_on_the_pointer(page, url, secret):
+    # The operator's steps on a free radio zoomed out past its capture: wheel in with the
+    # pointer near an end of the wide view (staying wider than a capture, or down to one, where
+    # the radio retunes), then back out, with the pointer left there or at the centre, paced
+    # or quick. Every notch keeps the frequency under the pointer where it is (the tune range's
+    # edges aside), and nothing pulls the view back to an earlier one: the page's own scan of
+    # an earlier view, not yet replaced, is no edge.
+    z = None
+    width = 48_000 * 64
+    try:
+        show_retune_zoomed_out(page, url, secret, 250_000_000, width)
+        page.wait_for_timeout(1_000)
+        z = ZoomSteps(page, url, secret, "retune", "retune", (200_000_000, 300_000_000))
+        # (a) Near the top, paced (the scan moves between notches): three in, three out with
+        # the pointer where it was, two more out at the centre.
+        zoom_in_and_out(z, "a-top-paced", 0.08, 3, 700)
+        z.pointer(0.5)
+        for i in range(2):
+            z.notch(100, 700, f"out {i + 1} more at the centre")
+        z.settle(1_500, "settled")
+        # (b) Near the bottom, quick: six in, down to a capture (the radio retunes there), out
+        # six with the pointer where it was.
+        wide_again(page, url, secret, width)
+        zoom_in_and_out(z, "b-bottom-quick-capture", 0.92, 6, 120)
+        # (f) Near the top, quick: three in, at once three out at the centre (the operator's
+        # report: the view went back to the earlier wide view).
+        wide_again(page, url, secret, width)
+        centred_where_zoomed(z, *zoom_in_and_out(z, "f-top-quick-centre", 0.08, 3, 120,
+                                                 out_frac=0.5, pause_ms=0))
+        # (g) Near the bottom, quick, down to a capture, at once out at the centre.
+        wide_again(page, url, secret, width)
+        centred_where_zoomed(z, *zoom_in_and_out(z, "g-bottom-quick-capture-centre", 0.92, 6,
+                                                 120, out_frac=0.5, pause_ms=0))
+        # (h) A radio slow to stop a scan (the page's job_stop answered 1.5 s late), paced:
+        # three in near the top, at once out at the centre.
+        wide_again(page, url, secret, width)
+        page.evaluate(SLOW_STOP_JS, 1_500)
+        try:
+            centred_where_zoomed(z, *zoom_in_and_out(z, "h-slow-stop-centre", 0.08, 3, 700,
+                                                     out_frac=0.5, pause_ms=0))
+        finally:
+            page.evaluate(SLOW_STOP_JS, 0)
+        # (j) The same slow radio: quick down to a capture near the bottom, at once out at the
+        # centre (the scan's stop for the capture answered after the view widened again).
+        wide_again(page, url, secret, width)
+        page.evaluate(SLOW_STOP_JS, 1_500)
+        try:
+            centred_where_zoomed(z, *zoom_in_and_out(z, "j-slow-stop-capture-centre", 0.92, 6,
+                                                     120, out_frac=0.5, pause_ms=400))
+        finally:
+            page.evaluate(SLOW_STOP_JS, 0)
+        # (i) On the capture the radio retuned to: two in at the centre, then out with the
+        # pointer near the capture's top until the view is wider than the capture.
+        wide_again(page, url, secret, width)
+        zoom_in_and_out(z, "i-to-capture", 0.92, 6, 400, out_n=0)
+        wait_until(lambda: not running_scan_jobs(url, secret, "retune"), 5.0,
+                   "the page's scan stopped on the capture")
+        page.wait_for_function("() => window.zetaTest.waterfallMode === 'spectrum'",
+                               timeout=10_000)
+        z.settle(1_500, "on the capture")
+        zoom_in_and_out(z, "i-in-capture-out-near-top", 0.5, 2, 400, out_frac=0.1, out_n=4)
+        assert not z.slips, "\n".join(z.slips)
+        no_refusals(page, "zooming")
+    finally:
+        if z:
+            z.close()
+        page.evaluate(SLOW_STOP_JS, 0)
+        stop_scans(url, secret)
+
+
+def scenario_kiwi_zoom_is_anchored_on_the_pointer(page, url, secret):
+    # The same steps on the Kiwi's tab (its own sweep, re-aimed with the view): every notch
+    # keeps the frequency under the pointer where it is (0 Hz and 30 MHz aside), and zoomed
+    # out at the centre the view widens around where it is.
+    stop_kiwi_jobs(url, secret)
+    z = None
+    try:
+        show_kiwi(page, url, secret)
+        apply_band(page, 10, 8000)
+        wait_view(page, 6_000_000, 14_000_000, "an 8 MHz view at 10 MHz")
+        page.wait_for_timeout(1_000)
+        z = ZoomSteps(page, url, secret, "kiwi", "kiwi", (0, 30_000_000))
+        zoom_in_and_out(z, "a-top-paced", 0.08, 3, 700)
+        zoom_in_and_out(z, "b-bottom-quick", 0.92, 4, 120)
+        centred_where_zoomed(z, *zoom_in_and_out(z, "c-top-paced-centre", 0.08, 3, 700,
+                                                 out_frac=0.5))
+        centred_where_zoomed(z, *zoom_in_and_out(z, "d-top-quick-centre", 0.08, 3, 120,
+                                                 out_frac=0.5, pause_ms=0))
+        # Near 30 MHz: in near the top end, out past the width the range allows there.
+        apply_band(page, 28, 4000)
+        wait_view(page, 26_000_000, 30_000_000, "a 4 MHz view at the top")
+        z.last = None
+        zoom_in_and_out(z, "e-range-top", 0.03, 3, 400, out_n=5)
+        assert not z.slips, "\n".join(z.slips)
+    finally:
+        if z:
+            z.close()
+        stop_kiwi_jobs(url, secret)
+
+
+# ---- two layers, outlines, easing (plan 11 Task 7)-----------------------------------------
 # The coarse scan's rows are painted across the whole view under the fine capture; every rigid
 # holder's band is outlined with its kind (the capture itself with none); under `follow
 # target` the view eases to a new capture, under `free` it stays.
@@ -9062,7 +9344,7 @@ def scenarios():
 # (<s> s)` times so each block takes about the same time.
 SHARD_STARTS = {
     1: [],
-    2: ["listen_to_all_starts_one_mix_and_plays"],
+    2: ["ws_busy_is_noted_once"],
     3: ["fm_demod_does_not_poll_streams", "subjects_distance_and_sort"],
 }
 

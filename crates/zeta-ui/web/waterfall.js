@@ -197,9 +197,12 @@
 // and an Apply show the band asked at once (wf.ownScan), clamped only to the source's tune
 // range (rangeClamp; a drag stops at its edges), the rows already painted drawn again on it
 // (each on its own band), and a step reaching past the span does not widen the view. The
-// coarse layer, SCAN_DEBOUNCE_MS after the last gesture, then moves what feeds the view: a
-// band one capture holds retunes there (the scan stopped first, restoreView); a wider one
-// replaces the scan with one over it (swapScan), the picture kept until its rows come.
+// scan's span is no edge: a wheel step keeps the frequency under the pointer there in and out,
+// never moved back inside the span of a scan an earlier view started. The coarse layer,
+// SCAN_DEBOUNCE_MS after the last gesture, then moves what feeds the view: a band one capture
+// holds retunes there (the scan stopped first, restoreView); a wider one replaces the scan
+// with one over it (swapScan), the picture kept until its rows come. Which of the two is
+// chosen again once the scan has stopped, for the view shown then.
 //
 // Sweep mode (a source whose `source_list` record has `capabilities.sweep`, a KiwiSDR): the
 // tab shows the source's own waterfall. The page starts no spectrum job there; it starts a
@@ -1547,8 +1550,9 @@ class Waterfall {
     return [lo, hi];
   }
 
-  // x2 per wheel notch (WHEEL_NOTCH_PX of accumulated delta) about the pointer; a step out
-  // that fits the capture is moved inside it rather than retuning.
+  // x2 per wheel notch (WHEEL_NOTCH_PX of accumulated delta) about the pointer: the frequency
+  // under it stays there; a step out that fits the capture is moved inside it rather than
+  // retuning (not following the page's own scan, whose span is no edge).
   wheel(ev) {
     ev.preventDefault();
     const s = this.shown();
@@ -1578,8 +1582,11 @@ class Waterfall {
       return;
     }
     if (hi - lo < MIN_VIEW_HZ) return;
+    // A step out that fits the capture is moved inside it. Not following the page's own scan
+    // of the shown source: its band is only the span of the scan an earlier view started (the
+    // coarse layer moves it after the gesture), no edge; the tune range is (requestView).
     const fits = hi - lo <= (this.band.hi - this.band.lo) * (1 + 1e-9);
-    if (fits && !this.isOutside()) [lo, hi] = this.clampToBand(lo, hi);
+    if (fits && !this.isOutside() && !this.ownScan()) [lo, hi] = this.clampToBand(lo, hi);
     this.requestView(lo, hi);
   }
 
