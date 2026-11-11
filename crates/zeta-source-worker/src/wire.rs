@@ -7,28 +7,38 @@
 //! control payload is JSON; a block payload is a 28-byte [`BlockHeader`]
 //! followed by `n` complex samples as little-endian `f32` pairs.
 //!
-//! Protocol 2 adds a third kind, 2: a 40-byte [`Descriptor`] that names a
+//! Protocol 2 added a third kind, 2: a 40-byte [`Descriptor`] that names a
 //! block's slot in the shared-memory ring of `ring.rs` instead of carrying the
 //! samples, so only the descriptor crosses the pipe. The [`Hello`]'s
 //! `transport` says which path the child uses (`shm` or `pipe`), its format
 //! and the ring's size; the [`Status`]'s `transport_dropped` counts, since the
-//! child started, the blocks it dropped because the ring (or the pipe queue)
-//! was full. A protocol-1 child has no `transport` and no `transport_dropped`
-//! (both read as their defaults) and sends every block on the pipe as a kind-1
-//! frame.
+//! child started, the blocks (on the ring, the slot-sized pieces) it dropped
+//! because the ring (or the pipe queue) was full. A protocol-1 child has no
+//! `transport` and no `transport_dropped` (both read as their defaults) and
+//! sends every block on the pipe as a kind-1 frame.
 //!
-//! A child whose link carries more than one sample depth names the depth in
-//! force in its hello's and each status's `depth` (absent: `None`, a child
-//! with one depth or of an older build), and changes it on `set_depth`,
-//! answered with the depth after it. A child that can tell where its device is
-//! attached names it in its hello's `attachment` (absent: `None`).
+//! Protocol 3 is this build's. Its hello's `transport.format` is a real field:
+//! `cf32`, or `sc16` when the child writes a 16-bit device's samples to the
+//! ring unconverted (ring version 2, whose header says the same; an `sc16`
+//! descriptor's `n` counts `i16` pairs, up to twice a `cf32` slot's). The
+//! pipe's kind-1 blocks are `cf32` always. Its hello also names the depth in
+//! force (`depth`) and where the device is attached (`attachment`), and a
+//! child spawned with `--progress` may send [`Control::Progress`] before it,
+//! all three added under protocol 2's number before the version moved: a child
+//! whose link carries more than one sample depth names the depth in force in
+//! its hello's and each status's `depth` (absent: `None`, a child with one
+//! depth or of an older build), and changes it on `set_depth`, answered with
+//! the depth after it; a child that can tell where its device is attached
+//! names it in its hello's `attachment` (absent: `None`). The node speaks
+//! protocols 1 and 3: a protocol-2 child's ring is of version 1, which this
+//! node cannot read.
 //!
-//! A child spawned with `--progress` may report what it is doing before its
-//! hello, in [`Control::Progress`] frames (the rate probe of its link, up to a
-//! minute or more). Only before the hello, and only to a node that passed the
-//! flag: the hello's protocol check comes after them, so a node that does not
-//! know the message cannot be protected by it, and one after the hello is a
-//! protocol error.
+//! [`Control::Progress`] frames report what a child is doing before its hello
+//! (the rate probe of its link, up to a minute or more). Only before the
+//! hello, and only to a node that passed `--progress`: the hello's protocol
+//! check comes after them, so a node that does not know the message (it would
+//! end the child on it as a bad frame) cannot be protected by that check, and
+//! the flag stays for good; one after the hello is a protocol error.
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -39,7 +49,7 @@ use zeta_core::port::{GainInfo, IqBlock, PortError, PortStats, Starting, Transpo
 use zeta_core::types::{Capabilities, Depth, Hz, Timestamp};
 
 /// The protocol version the child announces in its [`Hello`].
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// The largest payload `read_frame` accepts (64 MiB), so a corrupt length
 /// cannot make the reader allocate without bound.
@@ -105,7 +115,8 @@ pub struct Hello {
     pub capabilities: Capabilities,
     pub gain: Option<GainInfo>,
     pub driver: String,
-    /// How blocks reach the node; `None` from a protocol-1 child.
+    /// How blocks reach the node and in what format (`cf32`, or `sc16` on the
+    /// ring); `None` from a protocol-1 child.
     #[serde(default)]
     pub transport: Option<TransportInfo>,
     /// The sample depth the child opened at (the source's own); `None` for a
@@ -298,7 +309,8 @@ impl BlockHeader {
 /// A block named by its slot in the ring, 40 bytes little endian in this
 /// order: `seq` is the block's sequence number, `slot` its ring slot, then the
 /// same `t0_ns`, `sample_rate_hz`, `center_hz` and sample count `n` as a
-/// [`BlockHeader`].
+/// [`BlockHeader`] (samples of the ring's format: in an `sc16` slot, up to
+/// twice a `cf32` slot's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Descriptor {
     pub seq: u64,

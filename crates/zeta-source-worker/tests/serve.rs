@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use zeta_core::port::{IqBlock, TransportPath, Tuning};
 use zeta_core::types::{Claim, Hz};
-use zeta_source_worker::ring::{DEFAULT_RING_BYTES, MIN_SLOTS, Ring, SLOT_SAMPLES};
+use zeta_source_worker::ring::{DEFAULT_RING_BYTES, MIN_SLOTS, Ring, SLOT_SAMPLES, SlotFormat};
 use zeta_source_worker::spawn::{RING_FD, inherit_ring_std};
 use zeta_source_worker::wire::{
     Cmd, Control, Descriptor, Frame, Hello, PROTOCOL, Reply, Request, Status, read_frame,
@@ -135,7 +135,7 @@ fn hello_is_the_first_frame_and_carries_the_capabilities() {
     let hello = read_hello(&Frames::new(stdout));
     assert_eq!(hello.driver, "fake");
     assert_eq!(hello.protocol, PROTOCOL);
-    assert_eq!(hello.protocol, 2);
+    assert_eq!(hello.protocol, 3);
     let Claim::Asserted(Hz(max)) = hello.capabilities.max_bandwidth_hz else {
         panic!("{:?}", hello.capabilities.max_bandwidth_hz);
     };
@@ -360,10 +360,10 @@ fn with_a_ring_the_hello_says_shm_and_blocks_arrive_as_descriptors() {
     let ring = Ring::create(DEFAULT_RING_BYTES).unwrap();
     let (mut child, mut stdin, frames) = spawn_ring("stream", &[], &ring);
     let hello = read_hello(&frames);
-    assert_eq!(hello.protocol, 2);
+    assert_eq!(hello.protocol, 3);
     let transport = hello
         .transport
-        .expect("a protocol-2 hello names its transport");
+        .expect("a protocol-3 hello names its transport");
     assert_eq!(transport.path, TransportPath::Shm);
     assert_eq!(transport.format, "cf32");
     assert_eq!(transport.ring_bytes, ring.bytes() as u64);
@@ -433,7 +433,7 @@ fn without_a_ring_blocks_come_on_the_pipe() {
     let hello = read_hello(&frames);
     let transport = hello
         .transport
-        .expect("a protocol-2 hello names its transport");
+        .expect("a protocol-3 hello names its transport");
     assert_eq!(transport.path, TransportPath::Pipe);
     assert_eq!(transport.format, "cf32");
     assert_eq!(transport.ring_bytes, 0);
@@ -459,7 +459,7 @@ fn no_ring_env_makes_the_fake_ignore_the_fd() {
     let hello = read_hello(&frames);
     let transport = hello
         .transport
-        .expect("a protocol-2 hello names its transport");
+        .expect("a protocol-3 hello names its transport");
     assert_eq!(transport.path, TransportPath::Pipe);
     assert_eq!(transport.ring_bytes, 0);
     send(&mut stdin, 1, tune(100_000_000, 2_000_000));
@@ -473,6 +473,104 @@ fn no_ring_env_makes_the_fake_ignore_the_fd() {
         }
     }
     child.kill().unwrap();
+}
+
+/// The next whole block on the pipe within 5 s, skipping control messages; a
+/// descriptor fails.
+fn read_block(frames: &Frames) -> IqBlock {
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "no block within 5 s"
+        );
+        match frames.next() {
+            Frame::Block(b) => return b,
+            Frame::Descriptor(d) => panic!("a descriptor without a ring: {d:?}"),
+            Frame::Control(_) => {}
+        }
+    }
+}
+
+/// Whether `samples` are the fake's 16-bit mock's, converted: `v - jv` for a
+/// running count `v` below 32768, over 32768.
+fn converted_mock_samples(samples: &[num_complex::Complex<f32>]) -> bool {
+    !samples.is_empty()
+        && samples
+            .iter()
+            .all(|s| s.im == -s.re && (0.0..1.0).contains(&s.re))
+}
+
+#[test]
+fn with_a_raw_stream_the_hello_says_sc16() {
+    // A 16-bit device: the worker writes its samples to the ring as they
+    // are, an sc16 slot holding twice a cf32 slot's, and the node converts.
+    let ring = Ring::create(DEFAULT_RING_BYTES).unwrap();
+    let (mut child, mut stdin, frames) =
+        spawn_ring("stream", &[("ZETA_FAKE_FORMAT", "sc16")], &ring);
+    let hello = read_hello(&frames);
+    let transport = hello.transport.expect("a transport");
+    assert_eq!(transport.path, TransportPath::Shm);
+    assert_eq!(transport.format, "sc16");
+    assert_eq!(transport.ring_bytes, ring.bytes() as u64);
+    // Set before the hello, so the node reads it once the hello is in.
+    assert_eq!(ring.format(), Some(SlotFormat::Sc16));
+    send(&mut stdin, 1, tune(100_000_000, 2_000_000));
+    for want in 0..3u64 {
+        let d = read_descriptor(&frames);
+        assert_eq!(d.seq, want, "{d:?}");
+        assert!(d.n as usize <= SlotFormat::Sc16.samples_per_slot(), "{d:?}");
+        let samples = ring.read(d.seq, d.slot, d.n).expect("the slot reads back");
+        assert!(
+            converted_mock_samples(&samples),
+            "{:?}",
+            &samples[..4.min(samples.len())]
+        );
+        ring.release(d.seq);
+    }
+    child.kill().unwrap();
+}
+
+#[test]
+fn without_one_it_says_cf32() {
+    // The same 16-bit device, its samples converted in the worker; and the
+    // fake's default device, whose native format is 8-bit.
+    for envs in [&[("ZETA_FAKE_FORMAT", "cf32")][..], &[]] {
+        let ring = Ring::create(DEFAULT_RING_BYTES).unwrap();
+        let (mut child, mut stdin, frames) = spawn_ring("stream", envs, &ring);
+        let transport = read_hello(&frames).transport.expect("a transport");
+        assert_eq!(transport.path, TransportPath::Shm, "{envs:?}");
+        assert_eq!(transport.format, "cf32", "{envs:?}");
+        assert_eq!(ring.format(), Some(SlotFormat::Cf32), "{envs:?}");
+        send(&mut stdin, 1, tune(100_000_000, 2_000_000));
+        let d = read_descriptor(&frames);
+        assert!(d.n as usize <= SLOT_SAMPLES, "{d:?}");
+        assert!(!ring.read(d.seq, d.slot, d.n).unwrap().is_empty());
+        child.kill().unwrap();
+    }
+}
+
+#[test]
+fn on_the_pipe_blocks_stay_cf32() {
+    // A 16-bit device with no ring: the pipe carries cf32, converted in the
+    // worker.
+    let mut child = spawn_with("stream", &[("ZETA_FAKE_FORMAT", "sc16")], None);
+    let mut stdin = child.stdin.take().unwrap();
+    let frames = Frames::new(child.stdout.take().unwrap());
+    let transport = read_hello(&frames).transport.expect("a transport");
+    assert_eq!(transport.path, TransportPath::Pipe);
+    assert_eq!(transport.format, "cf32");
+    send(&mut stdin, 1, tune(100_000_000, 2_000_000));
+    for _ in 0..3 {
+        let b = read_block(&frames);
+        assert!(
+            converted_mock_samples(&b.samples),
+            "{:?}",
+            &b.samples[..4.min(b.samples.len())]
+        );
+    }
+    child.kill().unwrap();
+    let _ = child.wait();
 }
 
 #[test]

@@ -28,9 +28,18 @@
 //! land on stderr; `ZETA_FAKE_PROTOCOL=1` serves as a protocol-1 worker would
 //! (it ignores `--ring-fd`, sends every block on the pipe, and its hello and
 //! status have no `transport` or `transport_dropped`), while any other
-//! `ZETA_FAKE_PROTOCOL=N` says hello with protocol `N` instead of serving,
-//! then waits to be killed; `ZETA_FAKE_WAIT_RUNTIME=1` ends with a plain
-//! runtime drop, which waits on the blocked stdin read.
+//! `ZETA_FAKE_PROTOCOL=N` (2, whose ring this node cannot read, among them)
+//! says hello with protocol `N` instead of serving, then waits to be killed;
+//! `ZETA_FAKE_WAIT_RUNTIME=1` ends with a plain runtime drop, which waits on
+//! the blocked stdin read.
+//!
+//! The mock's native format is `CS8`, so its blocks reach a ring as `cf32`.
+//! `ZETA_FAKE_FORMAT=sc16` makes it `CS16` and hands `serve` the source's raw
+//! path, as the real worker does for a 16-bit device: with a ring, an `sc16`
+//! ring of the samples unconverted (on the pipe still `cf32`).
+//! `ZETA_FAKE_FORMAT=cf32` makes it `CS16` with no raw path: the same samples
+//! converted in the worker, on a `cf32` ring. `ZETA_FAKE_HELLO_FORMAT=F` says
+//! `F` in the hello's `transport.format` whatever the ring holds.
 //!
 //! A mock source's hello reports `max_bandwidth_hz: Measured(N)` with
 //! `--rate-cap-hz N` (as the real worker reports a cap the node passed back),
@@ -85,13 +94,13 @@ use tokio::sync::broadcast::error::TryRecvError;
 
 use async_trait::async_trait;
 use zeta_core::port::{
-    GainInfo, IqReceiver, Port, PortError, PortStats, Tuning, cached_figures_hold, link_speed,
-    speed_changed_prefix,
+    GainInfo, IqReceiver, Port, PortError, PortStats, Sc16Receiver, Tuning, cached_figures_hold,
+    link_speed, speed_changed_prefix,
 };
 use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId};
 use zeta_source_file::{FileOpts, FileSource, read_meta};
 use zeta_source_soapy::SoapySource;
-use zeta_source_soapy::device::RangeHz;
+use zeta_source_soapy::device::{RangeHz, WireFormat};
 use zeta_source_soapy::mock::{MockDevice, MockRead};
 use zeta_source_soapy::probe::{own_depth, rung_progress};
 use zeta_source_worker::port::parse_depth_cap;
@@ -228,6 +237,17 @@ fn wire_of(bits: u8) -> Result<&'static str, String> {
     }
 }
 
+/// `ZETA_FAKE_FORMAT`: whether the mock is a 16-bit device (`sc16` or
+/// `cf32`), and whether its raw path is served (`sc16`).
+fn fake_format() -> Result<(bool, bool), String> {
+    match std::env::var("ZETA_FAKE_FORMAT").ok().as_deref() {
+        None => Ok((false, false)),
+        Some("sc16") => Ok((true, true)),
+        Some("cf32") => Ok((true, false)),
+        Some(f) => Err(format!("ZETA_FAKE_FORMAT: {f:?}: not sc16 or cf32")),
+    }
+}
+
 /// The scripted read size: `ZETA_FAKE_READ_SAMPLES`, or [`READ_SAMPLES`].
 fn read_samples() -> usize {
     std::env::var("ZETA_FAKE_READ_SAMPLES")
@@ -356,6 +376,9 @@ fn mock_source(
         .map(|(bits, _)| wire_of(*bits))
         .collect::<Result<Vec<_>, _>>()?;
     let mut dev = MockDevice::hackrf_like().with_wire_formats(&wires);
+    if fake_format()?.0 {
+        dev = dev.with_native(WireFormat::Cs16);
+    }
     // The source reads a hundredth of a second at a time: a wider scripted
     // read needs a rate at which the source's buffer holds it whole.
     let ceiling = read as f64 * 100.0;
@@ -553,7 +576,7 @@ fn crash_after(after: Duration, record: Option<&Path>) {
 }
 
 /// How the fake bends the frames `serve` writes before they reach the parent.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Bend {
     /// Speak protocol 1: no `transport` in the hello, no `transport_dropped`
     /// in the status.
@@ -564,11 +587,17 @@ struct Bend {
     stale_seq: bool,
     /// Send a progress frame right after the hello.
     late_progress: bool,
+    /// Name this format in the hello's transport.
+    hello_format: Option<String>,
 }
 
 impl Bend {
-    fn any(self) -> bool {
-        self.protocol_1 || self.bad_slot || self.stale_seq || self.late_progress
+    fn any(&self) -> bool {
+        self.protocol_1
+            || self.bad_slot
+            || self.stale_seq
+            || self.late_progress
+            || self.hello_format.is_some()
     }
 }
 
@@ -604,6 +633,12 @@ fn bend_frames(mut frames: File, bend: Bend) -> io::Result<(File, std::sync::mps
                         d.slot = 1;
                     }
                     descriptors += 1;
+                }
+                if let (Frame::Control(Control::Hello(h)), Some(format)) =
+                    (&mut f, &bend.hello_format)
+                    && let Some(t) = &mut h.transport
+                {
+                    t.format = format.clone();
                 }
                 let hello = matches!(f, Frame::Control(Control::Hello(_)));
                 let mut written = match (&f, bend.protocol_1) {
@@ -761,17 +796,24 @@ fn main() -> ExitCode {
             )
         };
         let probes = !hold || (args.rate_cap_hz.is_none() && args.depth_caps.is_empty());
-        let mock = |gone| mock_source(&args.id, gone, passed, attachment.clone(), !hold);
+        // A 16-bit mock's raw path, taken (as the real worker takes it) before
+        // the source is shared, when `ZETA_FAKE_FORMAT=sc16` serves it.
+        let mut raw: Option<Sc16Receiver> = None;
+        let mut mock = |gone| -> Result<Arc<dyn Port>, String> {
+            let src = mock_source(&args.id, gone, passed, attachment.clone(), !hold)?;
+            if fake_format()?.1 {
+                raw = src.raw_sc16();
+            }
+            Ok(src)
+        };
         // A receiver held for the life of the worker, see the `file` script.
         let mut keep: Option<IqReceiver> = None;
         let port: Result<Arc<dyn Port>, String> = match (name, arg) {
-            ("stream", _) => mock(None).map(|s| s as Arc<dyn Port>),
-            ("gone-after-ms", ms) => parse_ms(ms)
-                .and_then(|g| mock(Some(g)))
-                .map(|s| s as Arc<dyn Port>),
+            ("stream", _) => mock(None),
+            ("gone-after-ms", ms) => parse_ms(ms).and_then(|g| mock(Some(g))),
             ("crash-after-ms", ms) => parse_ms(ms).and_then(|after| {
                 crash_after(after, args.record.as_deref());
-                mock(None).map(|s| s as Arc<dyn Port>)
+                mock(None)
             }),
             ("file", spec) => {
                 let (path, crash) = match spec.split_once(',') {
@@ -821,6 +863,7 @@ fn main() -> ExitCode {
             bad_slot: std::env::var("ZETA_FAKE_BAD_SLOT").is_ok_and(|v| v == "1"),
             stale_seq: std::env::var("ZETA_FAKE_STALE_SEQ").is_ok_and(|v| v == "1"),
             late_progress: std::env::var("ZETA_FAKE_LATE_PROGRESS").is_ok_and(|v| v == "1"),
+            hello_format: std::env::var("ZETA_FAKE_HELLO_FORMAT").ok(),
         };
         if let Some(p) = protocol.filter(|p| *p != 1) {
             return wrong_hello(port.as_ref(), p, frames);
@@ -843,11 +886,11 @@ fn main() -> ExitCode {
                     return ExitCode::from(EXIT_OPEN_FAILED);
                 }
             };
-            let code = serve(port, "fake", requests, out, ring).await;
+            let code = serve(port, "fake", requests, out, ring, raw).await;
             let _ = tokio::task::spawn_blocking(move || bent.recv_timeout(BEND_FLUSH)).await;
             code
         } else {
-            serve(port, "fake", requests, frames, ring).await
+            serve(port, "fake", requests, frames, ring, raw).await
         };
         record.line("served");
         drop(keep);

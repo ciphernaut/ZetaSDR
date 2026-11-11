@@ -3,15 +3,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use num_complex::Complex;
 use tokio::sync::broadcast::error::RecvError;
 use zeta_core::job::JobState;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op};
-use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
+use zeta_core::port::{
+    IqBlock, IqReceiver, Port, PortError, Sc16Block, Sc16Receiver, Tuning, sc16_to_cf32,
+};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{Claim, Depth, Hz, SourceId};
 use zeta_source_soapy::SoapySource;
-use zeta_source_soapy::mock::{MockDevice, MockRead, STALE, UNSETTLED};
+use zeta_source_soapy::device::WireFormat;
+use zeta_source_soapy::mock::{MockDevice, MockRead, STALE, STALE_SC16, UNSETTLED, UNSETTLED_SC16};
 use zeta_source_soapy::source::{MAX_AHEAD_NS, MAX_OVERFLOW_RUN, MAX_RESTARTS};
 
 fn tuning(center: u64, bw: u64) -> Tuning {
@@ -1464,4 +1468,147 @@ fn a_source_reports_the_attachment_set_on_it() {
     assert_eq!(Port::attachment(&src), None);
     src.set_attachment(Some("usb:2-1.4@5000".into()));
     assert_eq!(Port::attachment(&src).as_deref(), Some("usb:2-1.4@5000"));
+}
+
+// The raw path of a device whose native format is 16-bit: its samples as the
+// device gives them, for the worker's `sc16` ring, beside `Port::subscribe`.
+
+/// A 16-bit device streaming in real time whose tunes leave garbage behind,
+/// as [`garbage_source`]'s does, behind a source that settles for 5 ms.
+fn sc16_garbage_source() -> (Arc<MockDevice>, Arc<SoapySource>) {
+    let dev = Arc::new(
+        MockDevice::hackrf_like()
+            .with_native(WireFormat::Cs16)
+            .with_paced_reads()
+            .with_tune_garbage(20_000, SETTLE),
+    );
+    (dev.clone(), settling_source(&dev))
+}
+
+fn raw_garbage(b: &Sc16Block) -> bool {
+    b.samples
+        .iter()
+        .any(|s| s.re == STALE_SC16 || s.re == UNSETTLED_SC16)
+}
+
+fn raw_end_ns(b: &Sc16Block) -> u64 {
+    b.t0.0 + b.samples.len() as u64 * 1_000_000_000 / b.sample_rate_hz.0
+}
+
+/// As [`next_at`], on the raw path.
+async fn next_raw_at(
+    rx: &mut Sc16Receiver,
+    center: u64,
+    within: Duration,
+    last: &mut u64,
+) -> Sc16Block {
+    tokio::time::timeout(within, async {
+        loop {
+            let b = match rx.recv().await {
+                Ok(b) => b,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => panic!("the raw stream closed"),
+            };
+            assert!(b.t0.0 >= *last, "t0 {} went back past {}", b.t0.0, *last);
+            *last = raw_end_ns(&b);
+            if b.center_hz == Hz(center) {
+                return b;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("a raw block at {center} Hz within {within:?}"))
+}
+
+#[tokio::test]
+async fn a_cs16_device_hands_raw_blocks_only_after_the_tune_window() {
+    let (_dev, src) = sc16_garbage_source();
+    // The raw receiver alone keeps the reader running: nothing takes `cf32`.
+    let mut raw = src.raw_sc16().expect("a 16-bit device has a raw path");
+    let mut last = 0;
+    src.tune(tuning(100_000_000, 12_500)).await.unwrap();
+    let a = next_raw_at(&mut raw, 100_000_000, Duration::from_secs(2), &mut last).await;
+    assert!(!raw_garbage(&a), "the first raw block at A");
+    src.tune(tuning(101_000_000, 12_500)).await.unwrap();
+    let b = next_raw_at(&mut raw, 101_000_000, Duration::from_secs(2), &mut last).await;
+    assert!(!raw_garbage(&b), "the first raw block at B");
+    for _ in 0..4 {
+        let b = next_raw_at(&mut raw, 101_000_000, Duration::from_secs(1), &mut last).await;
+        assert!(!raw_garbage(&b), "a later raw block at B");
+    }
+}
+
+#[tokio::test]
+async fn raw_and_converted_blocks_carry_the_same_samples() {
+    let dev = Arc::new(
+        MockDevice::hackrf_like()
+            .with_native(WireFormat::Cs16)
+            .with_reads(samples(8)),
+    );
+    let src = source(&dev);
+    let mut raw = src.raw_sc16().expect("a 16-bit device has a raw path");
+    let mut rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    for _ in 0..3 {
+        let r = tokio::time::timeout(Duration::from_secs(3), raw.recv())
+            .await
+            .expect("a raw block within 3 s")
+            .unwrap();
+        let c = next_block(&mut rx).await;
+        assert_eq!(
+            (r.t0, r.sample_rate_hz, r.center_hz),
+            (c.t0, c.sample_rate_hz, c.center_hz)
+        );
+        let mut want = vec![Complex::new(0.0f32, 0.0); r.samples.len()];
+        sc16_to_cf32(&r.samples, &mut want);
+        let bits = |x: &[Complex<f32>]| -> Vec<(u32, u32)> {
+            x.iter().map(|s| (s.re.to_bits(), s.im.to_bits())).collect()
+        };
+        assert_eq!(bits(&c.samples), bits(&want));
+        // The mock's scripted samples, `v - jv` for a running count `v`.
+        assert!(
+            r.samples.iter().all(|s| s.im == -s.re),
+            "{:?}",
+            &r.samples[..4]
+        );
+    }
+    // Without a raw receiver the reader reads `cf32` again, the same samples.
+    drop(raw);
+    let c = next_block(&mut rx).await;
+    assert!(c.samples.iter().all(|s| s.im == -s.re && s.re < 1.0));
+}
+
+#[tokio::test]
+async fn the_reader_runs_while_either_side_has_a_receiver() {
+    let dev = Arc::new(
+        MockDevice::hackrf_like()
+            .with_native(WireFormat::Cs16)
+            .with_reads(samples(64)),
+    );
+    let src = source(&dev);
+    let raw = src.raw_sc16().unwrap();
+    let rx = src.subscribe();
+    src.tune(tuning(100_000_000, 1_000_000)).await.unwrap();
+    drop(rx);
+    // Still read for the raw side.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !dev.calls().contains(&"deactivate".to_string()),
+        "{:?}",
+        dev.calls()
+    );
+    drop(raw);
+    assert_deactivated(&dev).await;
+}
+
+#[test]
+fn a_cs8_device_has_no_raw_path() {
+    // The 8-bit mock (a HackRF's native format), and a device that gives
+    // `cf32`: their samples reach the ring converted, as `cf32`.
+    let dev = Arc::new(MockDevice::hackrf_like());
+    let src = SoapySource::with_device(SourceId("sdr0".into()), dev).unwrap();
+    assert!(src.raw_sc16().is_none());
+    let dev = Arc::new(MockDevice::hackrf_like().with_native(WireFormat::Cf32));
+    let src = SoapySource::with_device(SourceId("sdr0".into()), dev).unwrap();
+    assert!(src.raw_sc16().is_none());
 }

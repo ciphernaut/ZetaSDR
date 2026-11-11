@@ -89,7 +89,7 @@ fn control_messages_round_trip_in_the_spec_shape() {
                 attachment: Some("usb:2-1.4@5000".into()),
             }),
             json!({"hello": {
-                "protocol": 2,
+                "protocol": 3,
                 "capabilities": serde_json::to_value(caps()).unwrap(),
                 "gain": serde_json::to_value(gain()).unwrap(),
                 "driver": "hackrf", "transport": null, "depth": null,
@@ -333,6 +333,42 @@ fn hello_carries_the_transport_and_reads_without_it() {
         panic!("expected a hello");
     };
     assert_eq!(old.transport, None);
+}
+
+#[test]
+fn a_protocol_3_hello_round_trips() {
+    // Protocol 3: the ring's format is `cf32` or `sc16`, beside the depth and
+    // the attachment the hello gained before it.
+    assert_eq!(PROTOCOL, 3);
+    let h = Hello {
+        protocol: PROTOCOL,
+        capabilities: caps(),
+        gain: Some(gain()),
+        driver: "uhd".into(),
+        transport: Some(TransportInfo {
+            path: TransportPath::Shm,
+            format: "sc16".into(),
+            ring_bytes: 65_011_776,
+        }),
+        depth: Some(depth()),
+        attachment: Some("usb:2-1.4@5000".into()),
+    };
+    let shape = json!({"hello": {
+        "protocol": 3,
+        "capabilities": serde_json::to_value(caps()).unwrap(),
+        "gain": serde_json::to_value(gain()).unwrap(),
+        "driver": "uhd",
+        "transport": {"path": "shm", "format": "sc16", "ring_bytes": 65011776},
+        "depth": {"bits": 8, "lossless": false, "max_bandwidth_hz": {"measured": 30720000}},
+        "attachment": "usb:2-1.4@5000"}});
+    let c = Control::Hello(h);
+    assert_eq!(serde_json::to_value(&c).unwrap(), shape);
+    let mut buf = Vec::new();
+    write_frame(&mut buf, &Frame::Control(c.clone())).unwrap();
+    match read_frame(&mut Cursor::new(buf)).unwrap() {
+        Some(Frame::Control(back)) => assert_eq!(back, c),
+        other => panic!("expected the hello, got {other:?}"),
+    }
 }
 
 #[test]

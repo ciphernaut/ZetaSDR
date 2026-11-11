@@ -80,4 +80,14 @@ pub trait SoapyRx: Send {
     fn abandon(self: Box<Self>);
     /// Implementations convert to cf32 inside `read`.
     fn read(&mut self, out: &mut [Complex<f32>], timeout_us: i64) -> Result<usize, ReadError>;
+    /// Read a stream opened in [`WireFormat::Cs16`] as the device gives it,
+    /// unconverted (the worker's `sc16` ring); the same samples `read` would
+    /// have converted. A stream of another format has none: `Fatal`.
+    fn read_sc16(
+        &mut self,
+        _out: &mut [Complex<i16>],
+        _timeout_us: i64,
+    ) -> Result<usize, ReadError> {
+        Err(ReadError::Fatal("this stream gives no CS16 samples".into()))
+    }
 }

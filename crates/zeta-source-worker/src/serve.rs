@@ -4,9 +4,14 @@
 //! stdin while two tasks run beside it: a block pump that forwards every block
 //! of the port's broadcast, and a status task that reports the port's health
 //! every [`STATUS_TICK`] and after every reply. With a [`Ring`] the pump copies
-//! each block into the ring, in pieces of at most [`SLOT_SAMPLES`], and sends
-//! a descriptor per piece; a piece that finds the ring full is dropped. Without
-//! one it sends each block whole on the pipe, as a protocol-1 worker did. A
+//! each block into the ring, in pieces of at most a slot, and sends a
+//! descriptor per piece; a piece that finds the ring full is dropped. The
+//! ring's format is chosen here, before the hello names it: `sc16` when the
+//! caller hands over a raw receiver (a source whose device gives 16-bit
+//! samples, [`Sc16Receiver`]), whose blocks are then written unconverted, up
+//! to `SLOT_BYTES / 4` samples a piece; `cf32` otherwise, from the port's
+//! own blocks. Without a ring the pump sends each `cf32` block whole on the
+//! pipe, as a protocol-1 worker did, and a raw receiver is dropped. A
 //! fault on the port is published and the worker exits [`EXIT_FAULTED`]:
 //! reopening the device is the parent's job, and a fresh process leaves
 //! nothing of the old driver behind.
@@ -33,10 +38,12 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Notify, broadcast, oneshot};
-use zeta_core::port::{IqBlock, Port, TransportInfo, TransportPath, Tuning};
-use zeta_core::types::Hz;
+use zeta_core::port::{
+    IqBlock, Port, Sc16Block, Sc16Receiver, TransportInfo, TransportPath, Tuning,
+};
+use zeta_core::types::{Hz, Timestamp};
 
-use crate::ring::{Ring, SLOT_SAMPLES};
+use crate::ring::{Ring, RingFull, SlotFormat};
 use crate::wire::{
     Cmd, Control, Descriptor, Frame, Hello, PROTOCOL, Reply, Request, Status, parse_request,
     write_frame, write_request,
@@ -164,13 +171,17 @@ fn status_of(port: &dyn Port, transport_dropped: u64) -> Status {
 /// arrives (both exit 0) or the port faults ([`EXIT_FAULTED`]). `driver` is the
 /// driver key the hello names, beside the port's own `attachment`. Blocks go
 /// through `ring` when there is one (the hello says `shm`), on the pipe
-/// otherwise (`pipe`).
+/// otherwise (`pipe`). With a ring, `raw` (the port's device samples as it
+/// reads them, [`zeta_core::port::Sc16Block`]) makes it an `sc16` ring fed
+/// from `raw` instead of the port's `cf32` blocks; the hello's `format` says
+/// which.
 pub async fn serve(
     port: Arc<dyn Port>,
     driver: &str,
     stdin: impl AsyncRead + Unpin + Send,
     stdout: impl Write + Send + 'static,
     ring: Option<Ring>,
+    raw: Option<Sc16Receiver>,
 ) -> ExitCode {
     let (writer, done) = match Writer::start(stdout) {
         Ok(w) => w,
@@ -179,31 +190,51 @@ pub async fn serve(
             return ExitCode::FAILURE;
         }
     };
+    // Before the hello, which names it, and before the first slot.
+    let format = match (&ring, &raw) {
+        (Some(_), Some(_)) => SlotFormat::Sc16,
+        _ => SlotFormat::Cf32,
+    };
+    let ring = ring.and_then(|r| match r.set_format(format) {
+        Ok(()) => Some(r),
+        Err(e) => {
+            eprintln!("zeta-source-worker: ring: {e}; serving on the pipe");
+            None
+        }
+    });
+    let transport = TransportInfo {
+        path: if ring.is_some() {
+            TransportPath::Shm
+        } else {
+            TransportPath::Pipe
+        },
+        format: ring
+            .as_ref()
+            .and_then(Ring::format)
+            .unwrap_or(SlotFormat::Cf32)
+            .name()
+            .into(),
+        ring_bytes: ring.as_ref().map_or(0, |r| r.bytes() as u64),
+    };
+    // Only the side the pump forwards is subscribed: a raw receiver left
+    // unread would keep the source's reader reading for no one, and a `cf32`
+    // one beside a raw path would make it convert every read.
+    let feed = match (ring, raw) {
+        (Some(ring), Some(raw)) => Feed::Sc16(raw, ring),
+        (ring, _) => Feed::Cf32(port.subscribe(), ring),
+    };
     writer.control(Control::Hello(Hello {
         protocol: PROTOCOL,
         capabilities: port.capabilities().clone(),
         gain: port.gain(),
         driver: driver.to_string(),
-        transport: Some(TransportInfo {
-            path: if ring.is_some() {
-                TransportPath::Shm
-            } else {
-                TransportPath::Pipe
-            },
-            format: "cf32".into(),
-            ring_bytes: ring.as_ref().map_or(0, |r| r.bytes() as u64),
-        }),
+        transport: Some(transport),
         depth: port.depth(),
         attachment: port.attachment(),
     }));
 
     let dropped = Arc::new(AtomicU64::new(0));
-    let pump = tokio::spawn(pump(
-        port.subscribe(),
-        writer.clone(),
-        ring,
-        dropped.clone(),
-    ));
+    let pump = tokio::spawn(pump(feed, writer.clone(), dropped.clone()));
     let replied = Arc::new(Notify::new());
     let (faulted_tx, mut faulted) = oneshot::channel();
     let status = tokio::spawn(status_loop(
@@ -269,29 +300,43 @@ pub async fn serve(
     code
 }
 
-/// Forward every block of `rx`: into `ring` as descriptors when there is one,
-/// whole on the pipe otherwise. Blocks (or ring pieces) dropped for a full
-/// ring or a full writer queue, and blocks lost to a lagging broadcast (the
-/// pump fell behind the port, so they never reached the node either), are
-/// added to `dropped` and logged at most every [`LOST_LOG_EVERY`].
-async fn pump(
-    mut rx: broadcast::Receiver<IqBlock>,
-    writer: Writer,
-    ring: Option<Ring>,
-    dropped: Arc<AtomicU64>,
-) {
+/// What the pump forwards, and where: the port's `cf32` blocks into a `cf32`
+/// ring or whole on the pipe, or a 16-bit device's raw blocks into an `sc16`
+/// ring.
+enum Feed {
+    Cf32(broadcast::Receiver<IqBlock>, Option<Ring>),
+    Sc16(Sc16Receiver, Ring),
+}
+
+/// Forward every block of `feed`: into its ring as descriptors when there is
+/// one, whole on the pipe otherwise. Blocks (or ring pieces) dropped for a
+/// full ring or a full writer queue, and blocks lost to a lagging broadcast
+/// (the pump fell behind the port, so they never reached the node either),
+/// are added to `dropped` and logged at most every [`LOST_LOG_EVERY`].
+async fn pump(mut feed: Feed, writer: Writer, dropped: Arc<AtomicU64>) {
     let mut lost: u64 = 0;
     let mut logged: Option<Instant> = None;
     // The ring's next block number: advanced per piece written, not per piece
     // dropped, since the reader releases blocks in order.
     let mut seq: u64 = 0;
     loop {
-        match rx.recv().await {
-            Ok(b) => {
-                let n = match &ring {
-                    Some(ring) => to_ring(ring, &mut seq, &b, &writer),
-                    None => u64::from(!writer.block(b)),
-                };
+        let got = match &mut feed {
+            Feed::Cf32(rx, ring) => rx.recv().await.map(|b| match ring {
+                Some(ring) => {
+                    let at = (b.t0, b.sample_rate_hz, b.center_hz);
+                    let write = (SlotFormat::Cf32, Ring::try_write as WriteFn<_>);
+                    to_ring(ring, &mut seq, at, &b.samples, write, &writer)
+                }
+                None => u64::from(!writer.block(b)),
+            }),
+            Feed::Sc16(rx, ring) => rx.recv().await.map(|b: Sc16Block| {
+                let at = (b.t0, b.sample_rate_hz, b.center_hz);
+                let write = (SlotFormat::Sc16, Ring::try_write_sc16 as WriteFn<_>);
+                to_ring(ring, &mut seq, at, &b.samples, write, &writer)
+            }),
+        };
+        match got {
+            Ok(n) => {
                 if n > 0 {
                     lost += n;
                     dropped.fetch_add(n, Ordering::Relaxed);
@@ -311,35 +356,47 @@ async fn pump(
     }
 }
 
-/// Write `b` into `ring` in pieces of at most [`SLOT_SAMPLES`], each under the
-/// next `seq`, and queue a descriptor per piece written; the number of pieces
-/// dropped for a full ring is returned.
+/// The ring's write of one format's samples.
+type WriteFn<T> = fn(&Ring, u64, &[T]) -> Result<u32, RingFull>;
+
+/// Write the `samples` of a block that starts at `t0` (`at`: `t0`, rate,
+/// centre) into `ring` with `write`'s function, in pieces of at most what a
+/// slot of its format holds, each under the next `seq`, and queue a descriptor
+/// per piece written; the number of pieces dropped for a full ring is
+/// returned.
 ///
 /// A piece starting `offset` samples into the block starts at `t0 + offset ·
 /// 1e9 / rate` ns, rounded down, computed in `u128` so `offset · 1e9` cannot
 /// overflow.
-fn to_ring(ring: &Ring, seq: &mut u64, b: &IqBlock, writer: &Writer) -> u64 {
-    let rate = b.sample_rate_hz.0;
+fn to_ring<T>(
+    ring: &Ring,
+    seq: &mut u64,
+    (t0, rate, center): (Timestamp, Hz, Hz),
+    samples: &[T],
+    (format, write): (SlotFormat, WriteFn<T>),
+    writer: &Writer,
+) -> u64 {
+    let per_slot = format.samples_per_slot();
     let mut dropped = 0;
-    for (i, piece) in b.samples.chunks(SLOT_SAMPLES).enumerate() {
-        let offset = (i * SLOT_SAMPLES) as u128;
+    for (i, piece) in samples.chunks(per_slot).enumerate() {
+        let offset = (i * per_slot) as u128;
         let offset_ns = (offset * 1_000_000_000)
-            .checked_div(u128::from(rate))
+            .checked_div(u128::from(rate.0))
             .unwrap_or(0) as u64;
-        match ring.try_write(*seq, piece) {
+        match write(ring, *seq, piece) {
             Ok(slot) => {
                 writer.descriptor(Descriptor {
                     seq: *seq,
                     slot,
-                    t0_ns: b.t0.0 + offset_ns,
-                    sample_rate_hz: rate,
-                    center_hz: b.center_hz.0,
-                    // At most `SLOT_SAMPLES`, which fits.
+                    t0_ns: t0.0 + offset_ns,
+                    sample_rate_hz: rate.0,
+                    center_hz: center.0,
+                    // At most a slot's samples, which fits.
                     n: piece.len() as u32,
                 });
                 *seq += 1;
             }
-            Err(_full) => dropped += 1,
+            Err(RingFull) => dropped += 1,
         }
     }
     dropped

@@ -208,10 +208,14 @@ mod imp {
             eprintln!("{e}");
             return ExitCode::from(EXIT_OPEN_FAILED);
         }
+        // A 16-bit device's samples go to the ring as the reader reads them, converted at
+        // the node (`serve` drops the raw path when there is no ring); taken before the
+        // source is shared, after the probe, which streams `cf32`.
+        let raw = src.raw_sc16();
         let port = Arc::new(src) as Arc<dyn Port>;
         // After the device: a ring that will not open costs the speed, not the device.
         let ring = args.ring_fd.and_then(open_ring);
-        serve(port, &driver, requests, frames, ring).await
+        serve(port, &driver, requests, frames, ring, raw).await
     }
 
     /// Write one progress frame on the node's stdout; a failed write is a stderr line (a

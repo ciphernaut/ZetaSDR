@@ -8,10 +8,11 @@ pub fn cs8_to_cf32(x: &[Complex<i8>], out: &mut [Complex<f32>]) {
     }
 }
 
+/// [`zeta_core::port::sc16_to_cf32`], the one conversion of 16-bit samples:
+/// a worker's `sc16` ring is converted at the node by the same function, so a
+/// capture is bit-identical whichever side converts.
 pub fn cs16_to_cf32(x: &[Complex<i16>], out: &mut [Complex<f32>]) {
-    for (o, s) in out.iter_mut().zip(x) {
-        *o = Complex::new(f32::from(s.re) / 32768.0, f32::from(s.im) / 32768.0);
-    }
+    zeta_core::port::sc16_to_cf32(x, out);
 }
 
 #[cfg(test)]

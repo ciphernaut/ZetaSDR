@@ -210,8 +210,10 @@ pub fn measured_line(source: &SourceId, took: std::time::Duration) -> String {
 
 /// How a worker child hands its blocks to the node: `shm` is a shared-memory
 /// ring the node maps (the wire carries only descriptors), `pipe` carries the
-/// samples in the frames themselves. `format` is the ring's sample format
-/// (`cf32`) and `ring_bytes` its size in bytes.
+/// samples in the frames themselves. `format` is the sample format the blocks
+/// travel in: `cf32`, or on the ring `sc16` from a device whose native format
+/// is 16-bit (half the bytes, so the ring holds twice the time, converted at
+/// the node by [`sc16_to_cf32`]); `ring_bytes` is the ring's size in bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -239,6 +241,30 @@ pub struct IqBlock {
 }
 
 pub type IqReceiver = tokio::sync::broadcast::Receiver<IqBlock>;
+
+/// A block of complex 16-bit samples as a device whose native format is
+/// `CS16` gives them, before conversion: what a source worker writes to its
+/// ring unconverted. [`sc16_to_cf32`] turns it into an [`IqBlock`]'s samples.
+#[derive(Clone, Debug)]
+pub struct Sc16Block {
+    pub t0: Timestamp,
+    pub sample_rate_hz: Hz,
+    pub center_hz: Hz,
+    pub samples: Arc<[Complex<i16>]>,
+}
+
+pub type Sc16Receiver = tokio::sync::broadcast::Receiver<Sc16Block>;
+
+/// The one conversion of 16-bit samples to `cf32`: each part over 32768.0, so
+/// full scale is -1.0 to 32767/32768. A source that converts in its own
+/// process and a node that converts a worker's ring use this function alike,
+/// so a capture is bit-identical either way. Converts the first
+/// `min(x.len(), out.len())` samples.
+pub fn sc16_to_cf32(x: &[Complex<i16>], out: &mut [Complex<f32>]) {
+    for (o, s) in out.iter_mut().zip(x) {
+        *o = Complex::new(f32::from(s.re) / 32768.0, f32::from(s.im) / 32768.0);
+    }
+}
 
 /// A port's refusal. It serialises through [`PortErrorWire`] (`kind` names the
 /// variant) so a worker process can hand it to the node unchanged; `Display`

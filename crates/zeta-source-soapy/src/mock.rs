@@ -9,6 +9,13 @@
 //! formats under SoapyUHD's `WIRE` stream argument
 //! ([`MockDevice::with_wire_formats`]), and a stream opened with one can
 //! overflow at a rate the others keep up with ([`MockDevice::overflow_at_wire`]).
+//!
+//! The device's native format is `CS8` unless [`MockDevice::with_native`]
+//! says otherwise. A stream opened in `CS16` gives 16-bit samples, as a
+//! driver's does: [`SoapyRx::read_sc16`] the samples themselves, `read` them
+//! converted by [`cs16_to_cf32`]. Its scripted samples are then `v - jv` for
+//! the running count `v` modulo 32768, and the tune garbage's marks
+//! [`STALE_SC16`] and [`UNSETTLED_SC16`] with the index modulo 32768.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use num_complex::Complex;
 
+use crate::convert::cs16_to_cf32;
 use crate::device::{RangeHz, ReadError, SoapyDevice, SoapyRx, WireFormat};
 
 /// With [`MockDevice::with_tune_garbage`]: the `re` of a paced sample taken
@@ -26,6 +34,11 @@ pub const STALE: f32 = -1.0;
 /// With [`MockDevice::with_tune_garbage`]: the `re` of a paced sample taken
 /// after the last `set_frequency` returned but within its settle.
 pub const UNSETTLED: f32 = -2.0;
+/// [`STALE`] on a stream opened in `CS16` (read with
+/// [`SoapyRx::read_sc16`]); it reads as -1.0 converted.
+pub const STALE_SC16: i16 = i16::MIN;
+/// [`UNSETTLED`] on a stream opened in `CS16`; it reads as -0.5 converted.
+pub const UNSETTLED_SC16: i16 = -16_384;
 
 /// What each tune leaves behind ([`MockDevice::with_tune_garbage`]).
 struct TuneGarbage {
@@ -195,6 +208,15 @@ impl MockDevice {
             short_reads: Vec::new(),
             wire: Some(wire.into()),
         });
+        self
+    }
+
+    /// The device's native format (default `CS8`), which it supports too.
+    pub fn with_native(mut self, f: WireFormat) -> Self {
+        self.native = Some(f);
+        if !self.formats.contains(&f) {
+            self.formats.push(f);
+        }
         self
     }
 
@@ -541,6 +563,9 @@ impl SoapyDevice for MockDevice {
             fails: self.fails.clone(),
             gone: self.gone.clone(),
             next: 0,
+            format,
+            scratch: Vec::new(),
+            scratch16: Vec::new(),
             paced: self.paced.clone().map(|paces| Paced {
                 rate: self.rate.clone(),
                 paces,
@@ -698,40 +723,55 @@ struct MockRx {
     fails: Arc<Mutex<Vec<(String, String)>>>,
     gone: Arc<Gone>,
     next: u64,
+    /// The format the stream was opened in: a `CS16` stream gives 16-bit
+    /// samples (see the module's notes).
+    format: WireFormat,
+    /// The samples of a `CS16` read before they are made 16-bit, and after.
+    scratch: Vec<Complex<f32>>,
+    scratch16: Vec<Complex<i16>>,
     paced: Option<Paced>,
 }
 
-impl Drop for MockRx {
-    fn drop(&mut self) {
-        self.calls.lock().unwrap().push("drop".into());
-        // Dropping a stream of a vanished device is a native call on it.
-        let _ = self.gone.touch("drop");
-    }
+/// A mock sample as a 16-bit stream gives it: the garbage marks become
+/// [`STALE_SC16`] and [`UNSETTLED_SC16`], every other part its integer value
+/// modulo 32768, sign kept (so `v - jv` stays `v - jv`).
+fn to_sc16(s: Complex<f32>) -> Complex<i16> {
+    let part = |x: f32| {
+        let k = x as i64;
+        (k.signum() * (k.abs() % 32_768)) as i16
+    };
+    let re = if s.re == STALE {
+        STALE_SC16
+    } else if s.re == UNSETTLED {
+        UNSETTLED_SC16
+    } else {
+        part(s.re)
+    };
+    Complex::new(re, part(s.im))
 }
 
-impl SoapyRx for MockRx {
-    fn activate(&mut self) -> Result<(), String> {
-        self.calls.lock().unwrap().push("activate".into());
-        self.gone.touch("activate")?;
-        take_fail(&self.fails, "activate")?;
-        Ok(())
+impl MockRx {
+    /// A `CS16` stream's read, its samples written to `out` as 16-bit: the
+    /// mock's samples (see [`MockRx::read_cf32`]) through [`to_sc16`].
+    fn read_cs16(&mut self, out: &mut [Complex<i16>], timeout_us: i64) -> Result<usize, ReadError> {
+        let mut f = std::mem::take(&mut self.scratch);
+        f.resize(out.len(), Complex::new(0.0, 0.0));
+        let r = self.read_cf32(&mut f, timeout_us);
+        if let Ok(n) = r {
+            for (o, s) in out.iter_mut().zip(&f[..n]) {
+                *o = to_sc16(*s);
+            }
+        }
+        self.scratch = f;
+        r
     }
-    fn deactivate(&mut self) -> Result<(), String> {
-        self.calls.lock().unwrap().push("deactivate".into());
-        self.gone.touch("deactivate")?;
-        Ok(())
-    }
-    fn abandon(self: Box<Self>) {
-        self.calls.lock().unwrap().push("abandon".into());
-        // As the driver: leak the stream, so its drop never runs.
-        std::mem::forget(self);
-    }
+
     /// An empty script reads as `Timeout` forever (paced samples with
     /// [`MockDevice::with_paced_reads`]). A `Timeout` step blocks for
     /// `timeout_us`, as a real device does. A `Samples` (or `Slow`) step
     /// longer than `out` fills it and leaves the rest at the front of the
     /// script, as a device keeps what a short read had no room for.
-    fn read(&mut self, out: &mut [Complex<f32>], timeout_us: i64) -> Result<usize, ReadError> {
+    fn read_cf32(&mut self, out: &mut [Complex<f32>], timeout_us: i64) -> Result<usize, ReadError> {
         if let Some(m) = self.gone.msg.lock().unwrap().clone() {
             self.gone.after.lock().unwrap().push("read".into());
             return Err(ReadError::Fatal(m));
@@ -749,7 +789,7 @@ impl SoapyRx for MockRx {
             MockRead::Slow(n, ms) => {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
                 self.reads.lock().unwrap().push_front(MockRead::Samples(n));
-                self.read(out, timeout_us)
+                self.read_cf32(out, timeout_us)
             }
             MockRead::Samples(n) => {
                 if n > out.len() {
@@ -777,6 +817,58 @@ impl SoapyRx for MockRx {
                 Err(ReadError::Fatal(m))
             }
         }
+    }
+}
+
+impl Drop for MockRx {
+    fn drop(&mut self) {
+        self.calls.lock().unwrap().push("drop".into());
+        // Dropping a stream of a vanished device is a native call on it.
+        let _ = self.gone.touch("drop");
+    }
+}
+
+impl SoapyRx for MockRx {
+    fn activate(&mut self) -> Result<(), String> {
+        self.calls.lock().unwrap().push("activate".into());
+        self.gone.touch("activate")?;
+        take_fail(&self.fails, "activate")?;
+        Ok(())
+    }
+    fn deactivate(&mut self) -> Result<(), String> {
+        self.calls.lock().unwrap().push("deactivate".into());
+        self.gone.touch("deactivate")?;
+        Ok(())
+    }
+    fn abandon(self: Box<Self>) {
+        self.calls.lock().unwrap().push("abandon".into());
+        // As the driver: leak the stream, so its drop never runs.
+        std::mem::forget(self);
+    }
+    /// The mock's samples ([`MockRx::read_cf32`]); on a `CS16` stream the
+    /// 16-bit ones converted, as a driver converts.
+    fn read(&mut self, out: &mut [Complex<f32>], timeout_us: i64) -> Result<usize, ReadError> {
+        if self.format != WireFormat::Cs16 {
+            return self.read_cf32(out, timeout_us);
+        }
+        let mut raw = std::mem::take(&mut self.scratch16);
+        raw.resize(out.len(), Complex::new(0, 0));
+        let r = self.read_cs16(&mut raw, timeout_us);
+        if let Ok(n) = r {
+            cs16_to_cf32(&raw[..n], &mut out[..n]);
+        }
+        self.scratch16 = raw;
+        r
+    }
+    /// A `CS16` stream's samples as they are; another stream has none.
+    fn read_sc16(&mut self, out: &mut [Complex<i16>], timeout_us: i64) -> Result<usize, ReadError> {
+        if self.format != WireFormat::Cs16 {
+            return Err(ReadError::Fatal(format!(
+                "mock: read_sc16 on a {:?} stream",
+                self.format
+            )));
+        }
+        self.read_cs16(out, timeout_us)
     }
 }
 

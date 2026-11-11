@@ -31,6 +31,13 @@
 //! own (the reader was blocked in the call) and counts as a tune gap
 //! ([`PortStats::tune_gaps`]), not as an overflow.
 //!
+//! A device whose native format is `CS16` also hands its samples out raw,
+//! around [`Port`], for a worker's `sc16` ring ([`SoapySource::raw_sc16`]).
+//! While a raw receiver lives the reader reads `CS16` unconverted
+//! ([`SoapyRx::read_sc16`]) and converts a read (by [`cs16_to_cf32`]) only
+//! for the port's own receivers; it runs while either side has one. The
+//! tune's window above comes before that split.
+//!
 //! The overall receive gain is read when the source opens and set by
 //! [`Port::set_gain`]: through the reader thread between reads while a stream
 //! runs (so a gain change and a retune keep their order), on the device
@@ -53,13 +60,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use num_complex::Complex;
 use tokio::sync::{broadcast, oneshot};
-use zeta_core::port::{GainInfo, IqBlock, IqReceiver, Port, PortError, PortStats, Tuning};
+use zeta_core::port::{
+    GainInfo, IqBlock, IqReceiver, Port, PortError, PortStats, Sc16Block, Sc16Receiver, Tuning,
+};
 use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId, Timestamp};
 
 use crate::caps::{
     LinkDepth, RateModel, capabilities, front_end, is_uhd, link_depths, next_rate_above,
     pick_format, pick_rate, probe_rate_ranges, uhd_ladder,
 };
+use crate::convert::cs16_to_cf32;
 use crate::device::{RangeHz, ReadError, SoapyDevice, SoapyRx, WireFormat};
 
 /// Blocks buffered per receiver.
@@ -292,6 +302,8 @@ pub struct SoapySource {
     rates: Arc<RateModel>,
     format: WireFormat,
     tx: broadcast::Sender<IqBlock>,
+    /// The raw blocks of a `CS16` stream ([`SoapySource::raw_sc16`]).
+    raw: broadcast::Sender<Sc16Block>,
     status: Arc<Mutex<Status>>,
     reader: Mutex<Option<Reader>>,
     retune_timeout: Duration,
@@ -365,6 +377,7 @@ impl SoapySource {
             rates,
             format,
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
+            raw: broadcast::channel(BROADCAST_CAPACITY).0,
             status: Arc::new(Mutex::new(status)),
             reader: Mutex::new(None),
             retune_timeout: RETUNE_ACK,
@@ -434,6 +447,16 @@ impl SoapySource {
     /// reports, before the source is shared.
     pub fn set_attachment(&mut self, a: Option<String>) {
         self.attachment = a;
+    }
+
+    /// The device's samples as it gives them, around [`Port::subscribe`], for
+    /// a worker's `sc16` ring: `Some` when the stream's format (the host's, the
+    /// one the reader reads) is `CS16`, `None` for a `CS8` or `CF32` device.
+    /// Its blocks follow the same tunes, windows and stamps as the port's, so
+    /// both obey [`Port::tune`]'s contract; while a raw receiver lives the
+    /// reader reads them unconverted and converts only for `subscribe`'s.
+    pub fn raw_sc16(&self) -> Option<Sc16Receiver> {
+        (self.format == WireFormat::Cs16).then(|| self.raw.subscribe())
     }
 
     /// The sample depths the device's link can carry, deepest first, read at
@@ -698,6 +721,7 @@ impl SoapySource {
             format: self.format,
             rates: self.rates.clone(),
             tx: self.tx.clone(),
+            raw: self.raw.clone(),
             status: self.status.clone(),
             stop: stop.clone(),
             cmds: cmds_rx,
@@ -947,6 +971,7 @@ struct Ctx {
     format: WireFormat,
     rates: Arc<RateModel>,
     tx: broadcast::Sender<IqBlock>,
+    raw: broadcast::Sender<Sc16Block>,
     status: Arc<Mutex<Status>>,
     stop: Arc<AtomicBool>,
     cmds: std_mpsc::Receiver<Cmd>,
@@ -968,6 +993,34 @@ impl Ctx {
     fn lose(&self, m: String) {
         self.fault(m);
         self.lost.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the next read is taken raw: a `CS16` stream someone takes the
+    /// raw blocks of ([`SoapySource::raw_sc16`]).
+    fn raw_read(&self) -> bool {
+        self.format == WireFormat::Cs16 && self.raw.receiver_count() > 0
+    }
+
+    /// Send the raw read `raw` stamped `(t0, rate, centre)`, and its
+    /// conversion into `cf32` (`buf`, as long) only while `subscribe` has
+    /// receivers.
+    fn send_raw(&self, at: (Timestamp, Hz, Hz), raw: &[Complex<i16>], buf: &mut [Complex<f32>]) {
+        let (t0, sample_rate_hz, center_hz) = at;
+        let _ = self.raw.send(Sc16Block {
+            t0,
+            sample_rate_hz,
+            center_hz,
+            samples: raw.into(),
+        });
+        if self.tx.receiver_count() > 0 {
+            cs16_to_cf32(raw, buf);
+            let _ = self.tx.send(IqBlock {
+                t0,
+                sample_rate_hz,
+                center_hz,
+                samples: (&*buf).into(),
+            });
+        }
     }
 }
 
@@ -1172,8 +1225,12 @@ impl Window {
     }
 }
 
-/// The reader thread. Exits on stop, on no receivers, or with a fault (set
-/// before the stream is deactivated). A fatal read, a device call failing in a
+/// The reader thread. Exits on stop, on no receivers on either side (the
+/// port's and the raw path's), or with a fault (set before the stream is
+/// deactivated). While the raw path has a receiver it reads `CS16` samples
+/// as they are and sends them, converted for the port only while it has
+/// receivers; the tune's window, the clock and the guards come before that
+/// split, so both sides get the same samples. A fatal read, a device call failing in a
 /// retune, [`QUIET_READS`] timeouts or [`MAX_OVERFLOW_RUN`] overflows mean the
 /// device is lost: the fault and `lost` are set and the stream is abandoned,
 /// with no further native call on it. Every other exit deactivates. A block
@@ -1191,6 +1248,8 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
         rate: rate.actual,
     };
     let mut buf = vec![Complex::new(0.0f32, 0.0); block_len(rate.actual)];
+    // The raw path's reads, as long as `buf` once it is used.
+    let mut buf16: Vec<Complex<i16>> = Vec::new();
     let mut quiet = 0u32;
     let mut overflow_run = 0u32;
     // Whether the device is lost, so the exit abandons the stream.
@@ -1201,7 +1260,8 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
     // The stream was just opened at its centre: its settle is dropped first.
     let mut window = Window::after(Tuned::Reopened, ctx.settle, rate.actual);
     loop {
-        if ctx.stop.load(Ordering::Relaxed) || ctx.tx.receiver_count() == 0 {
+        let listened = ctx.tx.receiver_count() > 0 || ctx.raw.receiver_count() > 0;
+        if ctx.stop.load(Ordering::Relaxed) || !listened {
             break;
         }
         if let Ok(cmd) = ctx.cmds.try_recv() {
@@ -1254,8 +1314,16 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
         let len = window
             .as_ref()
             .map_or(buf.len(), |w| w.read_len(clock.rate));
+        let raw = ctx.raw_read();
+        if raw {
+            buf16.resize(buf.len(), Complex::new(0, 0));
+        }
         let started = Instant::now();
-        match rx.read(&mut buf[..len], READ_TIMEOUT_US) {
+        let got = match raw {
+            true => rx.read_sc16(&mut buf16[..len], READ_TIMEOUT_US),
+            false => rx.read(&mut buf[..len], READ_TIMEOUT_US),
+        };
+        match got {
             Ok(n) if n > 0 => {
                 quiet = 0;
                 overflow_run = 0;
@@ -1330,14 +1398,17 @@ fn run(ctx: Ctx, mut rx: Box<dyn SoapyRx>, mut center: u64, mut picked: u64, mut
                         st.window.pop_front();
                     }
                 }
-                let block = IqBlock {
-                    t0: Timestamp(t0),
-                    sample_rate_hz: Hz(clock.rate),
-                    center_hz: Hz(center),
-                    samples: buf[..n].into(),
-                };
-                if ctx.tx.send(block).is_err() {
-                    break;
+                let at = (Timestamp(t0), Hz(clock.rate), Hz(center));
+                // A side without receivers is checked at the loop's top.
+                if raw {
+                    ctx.send_raw(at, &buf16[..n], &mut buf[..n]);
+                } else {
+                    let _ = ctx.tx.send(IqBlock {
+                        t0: at.0,
+                        sample_rate_hz: at.1,
+                        center_hz: at.2,
+                        samples: buf[..n].into(),
+                    });
                 }
             }
             // A zero-length read counts as a timeout: no samples arrived.

@@ -20,8 +20,18 @@
 //! inherits it on descriptor 3 and is told `--ring-fd 3`, and the stdout
 //! thread copies each block a descriptor names out of it and frees the slot.
 //! The ring lives as long as its `Worker` and is dropped when the worker is
-//! reaped. A worker of protocol 1 or 2 is accepted; a protocol-1 worker (or a
-//! protocol-2 one whose ring would not open) sends its blocks on the pipe.
+//! reaped. The node creates it before the child opens its device, so the child
+//! sets its format (ring version 2): `sc16` for a device whose native format
+//! is 16-bit, its samples written unconverted and converted here as each slot
+//! is copied out (by [`zeta_core::port::sc16_to_cf32`], the conversion a
+//! source in the node uses), `cf32` otherwise. A worker of protocol 1 or 3 is
+//! accepted (another is refused naming both); a protocol-1 worker, or a
+//! protocol-3 one whose ring would not open (another ring version among them),
+//! sends its `cf32` blocks on the pipe. A protocol-3 hello names the format in
+//! `transport.format`, which must be `cf32` or `sc16`, the ring header's own,
+//! and `cf32` on the pipe, or the worker is refused naming both; it also names
+//! the sample depth in force (`depth`) and where the device is attached
+//! (`attachment`), which the worker record shows.
 //!
 //! A worker measures its rate cap when it opens (the soapy worker's rate
 //! probe, at each sample depth its link carries). Once a hello has given
@@ -60,7 +70,10 @@
 //! at a spawn's first, prints `zeta: ` and [`measuring_line`]; that spawn's
 //! hello clears it and prints [`measured_line`] (a spawn that ends before its
 //! hello is cleared by the reap, and its exit line says why). A progress frame
-//! after the hello is a bad frame: the worker is ended.
+//! after the hello is a bad frame: the worker is ended. The flag stays although
+//! protocol 3 knows [`Control::Progress`]: the frames come before the hello,
+//! whose protocol check cannot guard them, so a worker sends them only to a
+//! node that asked (an older node would end it on the first as a bad frame).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -75,8 +88,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, oneshot, watch};
 use zeta_core::port::{
-    AS_ASKED_PREFIX, GainInfo, IqBlock, PortError, PortStats, Starting, TransportInfo, Tuning,
-    link_speed, measured_line, measuring_line,
+    AS_ASKED_PREFIX, GainInfo, IqBlock, PortError, PortStats, Starting, TransportInfo,
+    TransportPath, Tuning, link_speed, measured_line, measuring_line,
 };
 use zeta_core::types::{Capabilities, Claim, Depth, Hz, SourceId, Timestamp};
 
@@ -84,16 +97,51 @@ use crate::port::{
     Attach, DEPTH_CAP_FLAG, MEASURED_AT_SPEED_FLAG, PROGRESS_FLAG, RATE_CAP_FLAG, WorkerConfig,
     figure_args, parse_depth_cap,
 };
-use crate::ring::{self, Ring};
+use crate::ring::{self, Ring, SlotFormat};
 use crate::serve::{EXIT_FAULTED, EXIT_NOT_FOUND, EXIT_OPEN_FAILED};
 use crate::spawn::{RING_FD, inherit_ring};
 use crate::wire::{
     Cmd, Control, Descriptor, Frame, Hello, PROTOCOL, Reply, Request, read_frame, write_request,
 };
 
-/// The oldest worker protocol the node still speaks: protocol 1 sends every
-/// block on the pipe and has no transport in its hello.
-const PROTOCOL_MIN: u32 = 1;
+/// The old worker protocol the node still speaks beside [`PROTOCOL`]:
+/// protocol 1 sends every block on the pipe and has no transport in its hello.
+/// Protocol 2 is not spoken: its ring is of version 1.
+const PROTOCOL_PIPE: u32 = 1;
+
+/// Why a hello cannot be served, naming both sides: a protocol other than 1 or
+/// [`PROTOCOL`], a format this node does not know, a ring's format other than
+/// the hello's (`ring`: the one this spawn inherited), or a format on the pipe
+/// other than `cf32`, the only one its blocks carry. `None` for a hello the
+/// node can read.
+fn refusal(hello: &Hello, ring: Option<&Ring>) -> Option<String> {
+    if hello.protocol != PROTOCOL_PIPE && hello.protocol != PROTOCOL {
+        return Some(format!(
+            "protocol {}, expected {PROTOCOL_PIPE} or {PROTOCOL}",
+            hello.protocol
+        ));
+    }
+    let t = hello.transport.as_ref()?;
+    let Some(format) = SlotFormat::from_name(&t.format) else {
+        return Some(format!(
+            "format {}, expected {} or {}",
+            t.format,
+            SlotFormat::Cf32,
+            SlotFormat::Sc16
+        ));
+    };
+    match (t.path, ring) {
+        (TransportPath::Pipe, _) if format != SlotFormat::Cf32 => Some(format!(
+            "format {format} on the pipe, expected {}",
+            SlotFormat::Cf32
+        )),
+        (TransportPath::Shm, Some(ring)) if ring.format() != Some(format) => Some(format!(
+            "format {format}, but its ring holds {}",
+            ring.format().map_or("no format", SlotFormat::name)
+        )),
+        _ => None,
+    }
+}
 
 /// Capacity of the port's block broadcast, as `zeta-source-node` uses.
 const BROADCAST_CAPACITY: usize = 64;
@@ -551,17 +599,14 @@ impl Supervisor {
         loop {
             tokio::select! {
                 h = &mut w.hello, if hello_open => match h {
-                    Ok((hello, _)) if !(PROTOCOL_MIN..=PROTOCOL).contains(&hello.protocol) => {
+                    Ok((hello, _)) if let Some(why) = refusal(&hello, w.ring.as_deref()) => {
                         // Another build's worker (the binary replaced under a
-                        // running node): its frames cannot be trusted to mean
-                        // what ours do, so it is ended before anything is sent.
+                        // running node), or one whose blocks this node cannot
+                        // read: its frames cannot be trusted to mean what ours
+                        // do, so it is ended before anything is sent.
                         let _ = w.child.kill().await;
                         let mut ended = self.reap(w, None, None).await;
-                        ended.fault = format!(
-                            "soapy worker for {}: protocol {}, expected {PROTOCOL_MIN} or {PROTOCOL}",
-                            self.id(),
-                            hello.protocol
-                        );
+                        ended.fault = format!("soapy worker for {}: {why}", self.id());
                         ended.not_found = None;
                         ended.crashed = false;
                         return self.ended(ended);
@@ -1313,7 +1358,9 @@ fn read_stdout(
     }
 }
 
-/// Copy the block `d` names out of `ring` and free its slot.
+/// Copy the block `d` names out of `ring` and free its slot: an `sc16` slot
+/// is converted to `cf32` on the way out ([`Ring::read`]), so the port's
+/// blocks are `cf32` whatever the ring holds.
 fn from_ring(ring: &Ring, d: &Descriptor) -> Result<IqBlock, ring::RingError> {
     let samples = ring.read(d.seq, d.slot, d.n)?;
     ring.release(d.seq);

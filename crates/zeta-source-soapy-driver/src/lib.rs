@@ -225,7 +225,9 @@ impl SoapyDevice for Driver {
         }
         Ok(match format {
             WireFormat::Cs8 => Box::new(Rx::<Complex<i8>>::new(&self.dev, a, cs8_to_cf32)?),
-            WireFormat::Cs16 => Box::new(Rx::<Complex<i16>>::new(&self.dev, a, cs16_to_cf32)?),
+            WireFormat::Cs16 => {
+                Box::new(Rx16(Rx::<Complex<i16>>::new(&self.dev, a, cs16_to_cf32)?))
+            }
             WireFormat::Cf32 => Box::new(Rx::<Complex<f32>>::new(&self.dev, a, |x, o| {
                 o.copy_from_slice(x)
             })?),
@@ -279,16 +281,45 @@ impl<E: StreamSample + Default + Copy + Send> SoapyRx for Rx<E> {
             self.scratch.resize(out.len(), E::default());
         }
         let buf = &mut self.scratch[..out.len()];
-        match self.stream.read(&mut [buf], timeout_us) {
-            Ok(n) => {
-                (self.convert)(&self.scratch[..n], &mut out[..n]);
-                Ok(n)
-            }
-            Err(e) => Err(match e.code {
-                ErrorCode::Timeout => ReadError::Timeout,
-                ErrorCode::Overflow => ReadError::Overflow,
-                _ => ReadError::Fatal(e.to_string()),
-            }),
-        }
+        let n = read_stream(&mut self.stream, buf, timeout_us)?;
+        (self.convert)(&self.scratch[..n], &mut out[..n]);
+        Ok(n)
+    }
+}
+
+/// One read of `stream` into `buf`, its errors as the port names them.
+fn read_stream<E: StreamSample>(
+    stream: &mut RxStream<E>,
+    buf: &mut [E],
+    timeout_us: i64,
+) -> Result<usize, ReadError> {
+    stream
+        .read(&mut [buf], timeout_us)
+        .map_err(|e| match e.code {
+            ErrorCode::Timeout => ReadError::Timeout,
+            ErrorCode::Overflow => ReadError::Overflow,
+            _ => ReadError::Fatal(e.to_string()),
+        })
+}
+
+/// A `CS16` stream, which also reads unconverted ([`SoapyRx::read_sc16`]),
+/// straight into the caller's buffer.
+struct Rx16(Rx<Complex<i16>>);
+
+impl SoapyRx for Rx16 {
+    fn activate(&mut self) -> Result<(), String> {
+        self.0.activate()
+    }
+    fn deactivate(&mut self) -> Result<(), String> {
+        self.0.deactivate()
+    }
+    fn abandon(self: Box<Self>) {
+        Box::new(self.0).abandon()
+    }
+    fn read(&mut self, out: &mut [Complex<f32>], timeout_us: i64) -> Result<usize, ReadError> {
+        self.0.read(out, timeout_us)
+    }
+    fn read_sc16(&mut self, out: &mut [Complex<i16>], timeout_us: i64) -> Result<usize, ReadError> {
+        read_stream(&mut self.0.stream, out, timeout_us)
     }
 }

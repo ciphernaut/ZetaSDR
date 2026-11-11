@@ -687,15 +687,16 @@ async fn a_bad_band_is_refused_without_a_round_trip() {
 }
 
 #[tokio::test]
-async fn a_hello_of_another_protocol_is_refused_and_the_child_reaped() {
+async fn a_hello_of_protocol_2_is_refused_naming_both() {
     // A binary replaced under a running node says hello with its own
     // protocol; the node must name the mismatch, not decode its frames.
+    // Protocol 2 had a ring of version 1, whose slots this node cannot read.
     let dir = tempdir();
     let pidfile = dir.path().join("pid");
     let (cfg, _rec) = cfg_wrapped(
         dir.path(),
         &format!(
-            "echo $$ > '{}'\nZETA_FAKE_PROTOCOL=3 exec \"$FAKE\" --script stream \"$@\"",
+            "echo $$ > '{}'\nZETA_FAKE_PROTOCOL=2 exec \"$FAKE\" --script stream \"$@\"",
             pidfile.display()
         ),
     );
@@ -704,7 +705,7 @@ async fn a_hello_of_another_protocol_is_refused_and_the_child_reaped() {
         .await
         .err()
         .expect("refused");
-    assert_eq!(err, "soapy worker for f: protocol 3, expected 1 or 2");
+    assert_eq!(err, "soapy worker for f: protocol 2, expected 1 or 3");
     assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
     let pid: u32 = std::fs::read_to_string(&pidfile)
         .unwrap()
@@ -712,6 +713,127 @@ async fn a_hello_of_another_protocol_is_refused_and_the_child_reaped() {
         .parse()
         .unwrap();
     assert!(!alive(pid), "worker {pid} still exists");
+}
+
+/// The refusal of the first spawn of a fake run with `env` (`NAME=value`
+/// words before the fake), whose pid is checked to be reaped.
+async fn refused_with(env: &str) -> String {
+    let dir = tempdir();
+    let pidfile = dir.path().join("pid");
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        &format!(
+            "echo $$ > '{}'\n{env} exec \"$FAKE\" --script stream \"$@\"",
+            pidfile.display()
+        ),
+    );
+    let err = WorkerPort::open(cfg, None, None)
+        .await
+        .err()
+        .expect("refused");
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        wait_for(Duration::from_secs(2), || !alive(pid)).await,
+        "worker {pid} still exists"
+    );
+    err
+}
+
+#[tokio::test]
+async fn a_format_the_node_does_not_know_is_refused() {
+    let err = refused_with("ZETA_FAKE_HELLO_FORMAT=sc12").await;
+    assert_eq!(
+        err,
+        "soapy worker for f: format sc12, expected cf32 or sc16"
+    );
+}
+
+#[tokio::test]
+async fn a_format_other_than_the_rings_is_refused() {
+    // The hello says sc16, the ring's header cf32: the slots cannot be read
+    // as the hello says.
+    let err = refused_with("ZETA_FAKE_HELLO_FORMAT=sc16").await;
+    assert_eq!(
+        err,
+        "soapy worker for f: format sc16, but its ring holds cf32"
+    );
+    // On the pipe the blocks are cf32 frames, whatever a hello says.
+    let err = refused_with("ZETA_FAKE_NO_RING=1 ZETA_FAKE_HELLO_FORMAT=sc16").await;
+    assert_eq!(
+        err,
+        "soapy worker for f: format sc16 on the pipe, expected cf32"
+    );
+}
+
+#[tokio::test]
+async fn worker_info_names_the_format() {
+    let dir = tempdir();
+    let (cfg16, _rec) = cfg_wrapped(
+        dir.path(),
+        "ZETA_FAKE_FORMAT=sc16 exec \"$FAKE\" --script stream \"$@\"",
+    );
+    for (cfg, want) in [(cfg16, "sc16"), (cfg("stream"), "cf32")] {
+        let (port, _) = open(cfg, None).await;
+        let transport = port.worker().unwrap().transport.expect("a transport");
+        assert_eq!(transport.path, TransportPath::Shm);
+        assert_eq!(transport.format, want);
+        let ring_bytes = Ring::create(DEFAULT_RING_BYTES).unwrap().bytes();
+        assert_eq!(transport.ring_bytes, ring_bytes as u64);
+    }
+}
+
+/// The first block of a fake run with `ZETA_FAKE_FORMAT=format` after a tune,
+/// with the transport format its worker record names.
+async fn first_block_with(format: &str) -> (IqBlock, String) {
+    let dir = tempdir();
+    let (cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        &format!("ZETA_FAKE_FORMAT={format} exec \"$FAKE\" --script stream \"$@\""),
+    );
+    let (port, _) = open(cfg, None).await;
+    let named = port
+        .worker()
+        .unwrap()
+        .transport
+        .expect("a transport")
+        .format;
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    (next_block(&mut rx).await, named)
+}
+
+#[tokio::test]
+async fn an_sc16_ring_delivers_the_same_blocks_as_a_cf32_one() {
+    // The same 16-bit device, its samples raw on the ring and converted at the
+    // node, or converted in the worker and cf32 on the ring: one conversion,
+    // so the same bits.
+    let (raw, named) = first_block_with("sc16").await;
+    assert_eq!(named, "sc16");
+    let (converted, named) = first_block_with("cf32").await;
+    assert_eq!(named, "cf32");
+    assert_eq!(raw.center_hz, converted.center_hz);
+    assert_eq!(raw.sample_rate_hz, converted.sample_rate_hz);
+    // A block is one read, so its length is the script's business: the same
+    // stream from its first sample, as far as both blocks go.
+    let n = raw.samples.len().min(converted.samples.len());
+    assert!(n > 0);
+    let bits = |b: &IqBlock| -> Vec<(u32, u32)> {
+        b.samples[..n]
+            .iter()
+            .map(|s| (s.re.to_bits(), s.im.to_bits()))
+            .collect()
+    };
+    assert_eq!(bits(&raw), bits(&converted));
+    // Converted 16-bit samples, not the 8-bit mock's raw counts.
+    assert!(
+        raw.samples
+            .iter()
+            .all(|s| s.re.abs() < 1.0 && s.im == -s.re)
+    );
 }
 
 #[test]
@@ -778,7 +900,7 @@ async fn blocks_arrive_through_the_ring_and_the_worker_info_says_shm() {
     let w = port.worker().unwrap();
     let transport = w
         .transport
-        .expect("a protocol-2 worker names its transport");
+        .expect("a protocol-3 worker names its transport");
     assert_eq!(transport.path, TransportPath::Shm);
     assert_eq!(transport.format, "cf32");
     // The header and as many whole slots as fit.
@@ -919,7 +1041,7 @@ async fn without_a_ring_the_child_streams_on_the_pipe() {
     assert_eq!(ring_fd_arg(w.pid.unwrap()), None);
     let transport = w
         .transport
-        .expect("a protocol-2 worker names its transport");
+        .expect("a protocol-3 worker names its transport");
     assert_eq!(transport.path, TransportPath::Pipe);
     assert_eq!(transport.ring_bytes, 0);
     assert_eq!(port.ring_ino(), None);
