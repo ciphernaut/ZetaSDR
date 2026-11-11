@@ -178,9 +178,16 @@
 // `scan` with `method: "source"` of its own (kept in UI_JOBS_KEY, so it is stopped when the
 // waterfall moves to another source and on pagehide) over the view kept for the source, else
 // the whole sweep range, with `bin_hz` for ONE view (sweepBin), or reuses the one it started
-// that still runs. A scan on the source the page did not start (from the menu, another page)
-// is followed read-only in scan mode instead, and the page's own one there is stopped; when
-// it ends the page's own one comes back. Rows are painted as scan rows, each over its own
+// that still runs. Adoption: a running `method: "source"` scan on the source that the page
+// did not start (another page's, an API or agent start, one a lost pagehide left running
+// across restarts) over a span inside the sweep range is ADOPTED as the tab's own scan: the
+// page starts no second one and re-aims that one on gestures, as its own. The page stops a
+// scan on leaving (another source, pagehide) only if it started it (UI_JOBS_KEY); an adopted
+// one is left running. A stepped scan on the source (from the menu with `method: stepped`,
+// the agent) is followed read-only in scan mode instead, and the page's own sweep there is
+// stopped; when it ends the page's own one comes back. A stepped scan waiting for the source
+// (`context.scan.waiting`) is neither followed nor a reason to stop the page's sweep. The
+// menu's "Scan this span" re-aims the tab's scan (menu.js). Rows are painted as scan rows, each over its own
 // band. A zoom, an axis drag or the #band form show the new view at once (clampSweep: inside
 // the sweep range, never narrower than bin_hz_min × 1024: a drag stops at the edge) with the
 // rows already painted stretched onto it (each column shows its own row's band only, the
@@ -423,6 +430,20 @@ function scanWaiting(job) {
 // Whether `job` is a stepped scan waiting for its source.
 function waitingStepped(job) {
   return scanWaiting(job) !== null && job.context.scan.method !== "source";
+}
+
+// Whether `job` (a `job_list` entry) is a scan the source sweeps for itself (`method: "source"`).
+function sourceScan(job) {
+  return !!(job && job.kind === "scan" && job.context && job.context.scan &&
+    job.context.scan.method === "source");
+}
+
+// Whether sweep mode may adopt `job` as the tab's scan of `src` (see Sweep mode's Adoption): a
+// running source scan on `src` over a span inside the sweep range, so the page can re-aim it.
+function adoptable(src, job) {
+  if (!sourceScan(job) || job.source !== src.id || !isRunning(job)) return false;
+  const t = usableTuning(job.tuning);
+  return !!t && sweepsItself(src, t.center_hz - t.bandwidth_hz / 2, t.center_hz + t.bandwidth_hz / 2);
 }
 
 // The rigid holders of a `source_list` record: its `holders` (job ids), then `pin` when the
@@ -754,16 +775,19 @@ class Waterfall {
   syncJobs(jobs) {
     if (!this.src || !this.sub || this.retuning) return;
     if (this.mode === "sweep") {
-      // The page's own sweep ended (stopped elsewhere), or someone else's scan started on the
-      // source (followed read-only instead): start over.
+      // The tab's sweep ended (stopped elsewhere), or a stepped scan started on the source
+      // (followed read-only instead): start over. Not for a stepped scan waiting for the
+      // source (it shows nothing), nor another source scan (the source has one sweep: the
+      // tab keeps the one it has).
       const own = jobs.find((j) => j.id === this.jobId);
-      const mine = new Set(loadIds(UI_JOBS_KEY));
       const other = jobs.find(
         (j) =>
           j.kind === "scan" &&
           j.source === this.src.id &&
+          j.id !== this.jobId &&
           isRunning(j) &&
-          !mine.has(j.id) &&
+          !sourceScan(j) &&
+          !waitingStepped(j) &&
           !this.stopping.has(j.id),
       );
       if (other || (own && !isRunning(own))) this.setSource(this.src, { restart: true });
@@ -876,25 +900,33 @@ class Waterfall {
   }
 
   // Sweep mode's job on `src`, which sweeps for itself (`sw`, its capabilities.sweep): a
-  // running scan the page did not start is followed read-only (scan mode; the page's own one
-  // there is stopped); else the page's own running one is reused, or one is started with
+  // running stepped scan (not one waiting for the source) is followed read-only (scan mode;
+  // the page's own sweep there is stopped); else the page's own running source scan is
+  // reused, or another one adopted (see Sweep mode's Adoption), or one is started with
   // method "source" over the view kept (a restart), else the whole range. Null when the
   // source refuses to sweep: the caller shows its capture instead.
   async findOrStartSweep(src, sw, jobs) {
     const mine = new Set(loadIds(UI_JOBS_KEY));
     const scans = jobs.filter(
-      (j) => j.kind === "scan" && j.source === src.id && isRunning(j) && !this.stopping.has(j.id),
+      (j) =>
+        j.kind === "scan" &&
+        j.source === src.id &&
+        isRunning(j) &&
+        !waitingStepped(j) &&
+        !this.stopping.has(j.id),
     );
-    const other = scans.find((j) => !mine.has(j.id));
-    if (other) {
-      for (const j of scans) if (mine.has(j.id)) this.stopOwnJob(j.id);
+    const stepped = scans.find((j) => !sourceScan(j));
+    if (stepped) {
+      for (const j of scans) if (mine.has(j.id) && sourceScan(j)) this.stopOwnJob(j.id);
       this.mode = "scan";
-      this.tuning = usableTuning(other.tuning);
+      this.tuning = usableTuning(stepped.tuning);
       if (this.tuning) this.setBand(this.tuning.center_hz, this.tuning.bandwidth_hz);
-      return other.id;
+      return stepped.id;
     }
     this.mode = "sweep";
-    const own = scans.find((j) => mine.has(j.id));
+    const own =
+      scans.find((j) => mine.has(j.id) && adoptable(src, j)) ||
+      scans.find((j) => adoptable(src, j));
     if (own) {
       this.tuning = usableTuning(own.tuning);
       if (this.tuning) this.setBand(this.tuning.center_hz, this.tuning.bandwidth_hz);

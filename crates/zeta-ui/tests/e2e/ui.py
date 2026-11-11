@@ -2567,6 +2567,139 @@ def scenario_kiwi_view_stops_at_the_band_edge(page, url, secret):
         stop_kiwi_jobs(url, secret)
 
 
+def start_scan_job(url, secret, source, center_hz, bandwidth_hz, method=None, bin_hz=None):
+    """A `scan` started through the API with `method` and `bin_hz`; its id."""
+    return http_json(url, secret, "/op", {
+        "op": "job_start", "kind": "scan", "source": source, "center_hz": center_hz,
+        "bandwidth_hz": bandwidth_hz, "deviation_hz": None, "sideband": None, "dwell_ms": None,
+        "average": None, "bits": None, "method": method, "bin_hz": bin_hz, "elastic": False,
+        "replace": []})["value"]
+
+
+def source_scans(url, secret, source):
+    """The ids of the running `method: source` scans on `source`."""
+    return [j["id"] for j in running_scan_jobs(url, secret, source)
+            if scan_context(url, secret, j["id"]).get("method") == "source"]
+
+
+def show_kiwi_sweep(page, url, secret, not_job=None):
+    """The kiwi tab shown in sweep mode, painting from a source scan (not `not_job`): its id."""
+    select_source(page, url, secret, "kiwi")
+    job = wait_until(lambda: next((j for j in source_scans(url, secret, "kiwi") if j != not_job),
+                                  None), 10.0, "a source scan on kiwi")
+    page.wait_for_function(
+        """(job) => { const w = window.zetaTest.wf();
+          return !!w && w.jobId === job && window.zetaTest.waterfallMode === "sweep"
+            && w.painted > 5; }""",
+        arg=job, timeout=15_000)
+    return job
+
+
+def scenario_kiwi_tab_keeps_its_sweep_beside_a_waiting_stepped_scan(page, url, secret):
+    # A demodulator holds the Kiwi's IQ channel, so a stepped scan started there waits for it.
+    # The tab neither follows that scan nor stops its own sweep for it: one page scan, the same
+    # one, in sweep mode, painting, across several job polls.
+    stop_kiwi_jobs(url, secret)
+    demod = start_job(url, secret, "am_demod", "kiwi", KIWI_CARRIERS[0], 6_000)
+    stepped = None
+    log = OpLog()
+    try:
+        stepped = start_scan_job(url, secret, "kiwi", 7_000_000, 2_000_000, method="stepped")
+        wait_until(lambda: scan_context(url, secret, stepped).get("waiting"), 10.0,
+                   "the stepped scan waiting for the demodulator")
+        job = show_kiwi_sweep(page, url, secret, not_job=stepped)
+        page.route("**/op", log.route)
+        painted = page.evaluate(WF_STATE_JS)["painted"]
+        for _ in range(12):  # 6 s: several job polls
+            page.wait_for_timeout(500)
+            st = page.evaluate("""() => { const w = window.zetaTest.wf();
+              return {job: w.jobId, mode: window.zetaTest.waterfallMode}; }""")
+            assert st == {"job": job, "mode": "sweep"}, f"the tab moved: {st}"
+        assert page.evaluate(WF_STATE_JS)["painted"] > painted + 20, "the sweep stopped painting"
+        assert source_scans(url, secret, "kiwi") == [job]
+        assert scan_context(url, secret, stepped).get("waiting"), "the stepped scan still waits"
+        assert log.scan_starts() == [], f"scans started: {log.scan_starts()}"
+        assert log.named("job_stop") == [], f"jobs stopped: {log.named('job_stop')}"
+    finally:
+        page.unroute("**/op", log.route)
+        if stepped:
+            stop_job(url, secret, stepped)
+        stop_job(url, secret, demod)
+        stop_kiwi_jobs(url, secret)
+
+
+def scenario_kiwi_scan_this_span_re_aims_the_tabs_scan(page, url, secret):
+    # The menu's "Scan this span" on the Kiwi's tab re-aims the tab's own scan to the boxed
+    # span (job_retune): the Kiwi has one sweep, which that scan holds, so no second scan.
+    stop_kiwi_jobs(url, secret)
+    log = OpLog()
+    try:
+        job = show_kiwi(page, url, secret)
+        wait_ticks(page, "30.000", "0.000", "the whole 0-30 MHz")
+        page.wait_for_timeout(3_000)  # drag_menu asks for a span of at least 1 s
+        page.route("**/op", log.route)
+        menu = drag_menu(page, 0.40, 0.60)
+        page.click('#ctx .ctx-item[data-action="scan"]')
+        expect(menu).to_be_hidden()
+        # The route handler runs while Playwright waits (not in a time.sleep).
+        for _ in range(25):
+            if log.named("job_retune"):
+                break
+            page.wait_for_timeout(200)
+        assert log.named("job_retune"), f"no job_retune from the menu: {log.ops}"
+        r = log.named("job_retune")[-1]
+        assert r["job"] == job, r
+        # The middle fifth of 0-30 MHz: about 12-18 MHz.
+        assert abs(r["center_hz"] - 15_000_000) < 300_000, r
+        assert abs(r["bandwidth_hz"] - 6_000_000) < 600_000, r
+        lo, hi = r["center_hz"] - r["bandwidth_hz"] / 2, r["center_hz"] + r["bandwidth_hz"] / 2
+        wait_view(page, lo, hi, "the boxed span")
+        wait_rows_of(page, "rows of the boxed span")
+        assert log.scan_starts() == [], f"scans started: {log.scan_starts()}"
+        assert [j["id"] for j in running_scan_jobs(url, secret, "kiwi")] == [job]
+        assert page.evaluate("window.zetaTest.waterfallMode") == "sweep"
+    finally:
+        page.unroute("**/op", log.route)
+        stop_kiwi_jobs(url, secret)
+
+
+def scenario_kiwi_tab_adopts_a_source_scan_started_before_it(page, url, secret):
+    # A source scan already running on the Kiwi (an API start here; a lost pagehide's leftover
+    # on a live node) is adopted as the tab's scan: the gestures re-aim it, no second scan is
+    # started, and leaving the tab leaves it running (the page did not start it).
+    stop_kiwi_jobs(url, secret)
+    log = OpLog()
+    pre = None
+    try:
+        pre = start_scan_job(url, secret, "kiwi", 15_000_000, 30_000_000, method="source",
+                             bin_hz=29_297)
+        wait_until(lambda: pre in source_scans(url, secret, "kiwi"), 10.0, "the API's scan")
+        page.route("**/op", log.route)
+        job = show_kiwi_sweep(page, url, secret)
+        assert job == pre, f"the tab follows {job}, not the scan already running {pre}"
+        f = KIWI_CARRIERS[1]
+        wheel_at_hz(page, f, -100)
+        lo, hi = f / 2, f + (30_000_000 - f) / 2
+        wait_view(page, lo, hi, "after the zoom on the adopted scan")
+        wait_rows_of(page, "rows of the zoomed view")
+        retunes = log.named("job_retune")
+        assert retunes and all(r["job"] == pre for r in retunes), retunes
+        assert log.scan_starts() == [], f"scans started: {log.scan_starts()}"
+        assert source_scans(url, secret, "kiwi") == [pre]
+        # Leaving the tab leaves the adopted scan running.
+        page.click('.src-tab[data-id="tone"]')
+        expect(page.locator('.src-tab[data-id="tone"]')).to_have_attribute("aria-selected", "true")
+        page.wait_for_timeout(2_000)
+        stops = [o for o in log.named("job_stop") if o.get("job") == pre]
+        assert stops == [], stops
+        assert job_record(url, secret, pre)["state"]["status"] == "running"
+    finally:
+        page.unroute("**/op", log.route)
+        if pre:
+            stop_job(url, secret, pre)
+        stop_kiwi_jobs(url, secret)
+
+
 # How many times the transcript said `t`: its lines, each with its ×N fold.
 SAID_JS = """(t) => [...document.querySelectorAll('#transcript .line')]
   .filter((l) => l.textContent.includes(t))

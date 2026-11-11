@@ -124,7 +124,10 @@
 //                                             so), job_start
 //                                             kind=scan on the selection's centre and
 //                                             bandwidth, then wf.resume() (scan mode when the
-//                                             scan runs, else the spectrum job again)
+//                                             scan runs, else the spectrum job again); in
+//                                             sweep mode (a KiwiSDR's tab) it re-aims the
+//                                             tab's own scan instead (wf.requestView: a
+//                                             job_retune), starting none
 //   plan       Start plan…                    shown only when the view's plan policy names a plan
 //                                             (mountMenu's `plan()`); puts `plan start <plan>
 //                                             fm_demod transcribe` in the command line
@@ -1126,9 +1129,16 @@ class Menu {
   // and the node decides (a stepped scan on a source another job holds waits for it, its row
   // saying so, while the waterfall shows the capture); a scan that takes the source stops the
   // page's elastic spectrum job on the node, and the waterfall follows the scan after (and
-  // starts its own job again when the scan ends).
+  // starts its own job again when the scan ends). On a source that sweeps for itself, shown
+  // by the tab's own scan (sweep mode, a KiwiSDR), the entry re-aims that scan to the span
+  // (wf.requestView, a job_retune) instead: the source has one sweep, which that scan holds,
+  // and a second scan would be refused it.
   async scan(s) {
     if (this.wf.sourceId !== s.sourceId) return;
+    if (this.wf.mode === "sweep" && this.wf.jobId) {
+      this.wf.requestView(s.centerHz - s.bandwidthHz / 2, s.centerHz + s.bandwidthHz / 2);
+      return;
+    }
     if (!(await this.wf.release())) return;
     await this.applyOp({
       op: "job_start",
