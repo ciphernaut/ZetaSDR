@@ -196,7 +196,13 @@ impl Conn {
                     return;
                 }
                 KiwiMsg::FreqOffsetKhz(k) => self.freq_offset_khz = k,
-                KiwiMsg::Other(_) => {}
+                // The waterfall's setup is the waterfall session's (plan 36.2).
+                KiwiMsg::WfChans(_)
+                | KiwiMsg::WfCal(_)
+                | KiwiMsg::ZoomMax(_)
+                | KiwiMsg::Bandwidth(_)
+                | KiwiMsg::WfSetup
+                | KiwiMsg::Other(_) => {}
             }
             if !self.ready && self.sample_rate.is_some() && self.audio_rate.is_some() {
                 self.ready = true;

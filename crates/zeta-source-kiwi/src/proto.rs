@@ -1,4 +1,6 @@
-//! KiwiSDR SND-stream protocol codec: pure encode/decode, no networking.
+//! KiwiSDR protocol codec for both streams, pure encode/decode, no networking:
+//! the `SND` stream (IQ samples, the source's capture) and the `W/F` stream (the
+//! waterfall, the sweep's spectrum rows).
 //!
 //! Strings and byte offsets follow the kiwiclient reference (`kiwi/client.py`,
 //! `kiwirecorder.py`) and were confirmed against a KiwiSDR 2 running v1.837.
@@ -24,6 +26,22 @@ pub const CMD_IDENT: &str = "SET ident_user=zetasdr";
 pub const CMD_AGC: &str = "SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50";
 pub const CMD_COMPRESSION_OFF: &str = "SET compression=0";
 pub const CMD_KEEPALIVE: &str = "SET keepalive";
+/// Waterfall frames uncompressed (a compressed frame is refused by [`parse_wf`]).
+pub const CMD_WF_COMP_OFF: &str = "SET wf_comp=0";
+/// The dB window the server maps to a byte; the byte is `dB + 255` whatever it is.
+pub const CMD_WF_DB: &str = "SET maxdb=0 mindb=-100";
+/// The strongest FFT bin of each pixel, CIC compensated.
+pub const CMD_WF_INTERP: &str = "SET interp=10";
+/// 23 frames a second.
+pub const CMD_WF_SPEED: &str = "SET wf_speed=4";
+
+/// Pixels in one waterfall frame.
+pub const WF_PIXELS: usize = 1024;
+/// Bytes before the pixels in a `W/F` frame: tag 3, pad 1, `x_bin` 4, flags and
+/// zoom 4, seq 4.
+pub const WF_HEADER: usize = 16;
+/// `W/F` flag: the frame is ADPCM compressed.
+pub const WF_FLAG_COMPRESSED: u32 = 0x0001_0000;
 
 /// Bytes before the samples in an IQ-mode SND frame: tag 3, flags 1, seq 4,
 /// S-meter 2, GPS 10.
@@ -43,6 +61,10 @@ pub enum ProtoError {
     Compressed,
     #[error("kiwi SND frame has {bytes} sample bytes, not a multiple of 4")]
     OddSamples { bytes: usize },
+    #[error("kiwi W/F frame is compressed; the waterfall must be uncompressed")]
+    WfCompressed,
+    #[error("kiwi W/F frame has {bytes} pixel bytes, not 1024")]
+    WfPixels { bytes: usize },
     #[error("kiwi field {name} has bad value {value:?}")]
     BadValue { name: String, value: String },
     #[error("kiwi MSG is not UTF-8")]
@@ -88,6 +110,22 @@ pub fn cmd_mod_iq(center_hz: u64, bandwidth_hz: u64) -> String {
     )
 }
 
+/// Websocket path of the waterfall stream: `/<ts>/W/F`.
+pub fn wf_path(ts: u32) -> String {
+    format!("/{ts}/W/F")
+}
+
+/// Full websocket URL of the waterfall stream: `ws://host:port/<ts>/W/F`.
+pub fn wf_url(host: &str, port: u16, ts: u32) -> String {
+    format!("ws://{host}:{port}{}", wf_path(ts))
+}
+
+/// `SET zoom=<z> cf=<kHz>`: the view of `1024` pixels at zoom `z` centred on
+/// `cf_hz`, the centre in kHz with three decimals, formatted from integers.
+pub fn cmd_wf_view(zoom: u8, cf_hz: u64) -> String {
+    format!("SET zoom={zoom} cf={}.{:03}", cf_hz / 1000, cf_hz % 1000)
+}
+
 /// `SET AR OK in=<audio_rate> out=44100`, the reply to `MSG audio_rate=`.
 pub fn cmd_ar_ok(audio_rate: u32) -> String {
     format!("SET AR OK in={audio_rate} out=44100")
@@ -110,7 +148,18 @@ pub enum KiwiMsg {
     Redirect(String),
     /// `freq_offset=`: kHz, non-zero on transverter Kiwis.
     FreqOffsetKhz(f64),
-    /// Any other pair, verbatim.
+    /// `wf_chans=`: how many waterfall channels the Kiwi is configured with.
+    WfChans(u32),
+    /// `wf_cal=`: the waterfall's calibration, dB added to every pixel.
+    WfCal(i32),
+    /// `zoom_max=`: the finest zoom the server takes; a start counts in
+    /// `bandwidth / (1024 << zoom_max)` Hz.
+    ZoomMax(u8),
+    /// `bandwidth=`: the ADC's span in Hz, 30 or 32 MHz.
+    Bandwidth(u64),
+    /// `wf_setup`: the waterfall's setup is complete.
+    WfSetup,
+    /// Any other pair, verbatim; also a waterfall key whose value does not parse.
     Other(String),
 }
 
@@ -119,6 +168,7 @@ pub enum KiwiMsg {
 pub enum Tag {
     Msg,
     Snd,
+    Wf,
     Other([u8; 3]),
 }
 
@@ -128,6 +178,7 @@ pub fn tag(payload: &[u8]) -> Option<Tag> {
     Some(match &t {
         b"MSG" => Tag::Msg,
         b"SND" => Tag::Snd,
+        b"W/F" => Tag::Wf,
         _ => Tag::Other(t),
     })
 }
@@ -198,6 +249,21 @@ pub fn parse_msg(payload: &[u8]) -> Result<Vec<KiwiMsg>, ProtoError> {
             ("down", _) => KiwiMsg::Down,
             ("redirect", Some(v)) => KiwiMsg::Redirect(percent_decode(name, v)?),
             ("freq_offset", Some(v)) => KiwiMsg::FreqOffsetKhz(parse_finite(name, v)?),
+            // A waterfall key that does not parse is `Other`, never an error: the
+            // IQ socket sees these lines too and must not fail on them.
+            ("wf_chans", Some(v)) => v
+                .parse()
+                .map_or_else(|_| KiwiMsg::Other(pair.to_string()), KiwiMsg::WfChans),
+            ("wf_cal", Some(v)) => v
+                .parse()
+                .map_or_else(|_| KiwiMsg::Other(pair.to_string()), KiwiMsg::WfCal),
+            ("zoom_max", Some(v)) => v
+                .parse()
+                .map_or_else(|_| KiwiMsg::Other(pair.to_string()), KiwiMsg::ZoomMax),
+            ("bandwidth", Some(v)) => v
+                .parse()
+                .map_or_else(|_| KiwiMsg::Other(pair.to_string()), KiwiMsg::Bandwidth),
+            ("wf_setup", _) => KiwiMsg::WfSetup,
             _ => KiwiMsg::Other(pair.to_string()),
         };
         msgs.push(msg);
@@ -258,6 +324,44 @@ pub fn parse_snd(payload: &[u8]) -> Result<Snd, ProtoError> {
     })
 }
 
+/// One decoded waterfall frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wf {
+    /// The start of the view the frame was computed with, in `bandwidth /
+    /// (1024 << zoom_max)` Hz.
+    pub x_bin: u32,
+    /// The zoom the frame was computed with.
+    pub zoom: u8,
+    pub seq: u32,
+    /// `byte - 255` per pixel, -200..0 dB, before the server's `wf_cal`.
+    pub db: Vec<f32>,
+}
+
+/// Parses an uncompressed `W/F` payload. Offsets from the payload start:
+/// `[0..3]` `W/F`; `[3]` pad; `[4..8]` `x_bin` u32 LE; `[8..12]` flags and zoom
+/// u32 LE, the zoom its low 16 bits; `[12..16]` seq u32 LE; `[16..]` exactly
+/// [`WF_PIXELS`] bytes. The server zeroes the first pixels (2, 4 at zoom 0): the
+/// caller keeps them out of a row.
+pub fn parse_wf(payload: &[u8]) -> Result<Wf, ProtoError> {
+    expect_tag(payload, Tag::Wf, WF_HEADER)?;
+    let flags_zoom = le_u32(&payload[8..12]);
+    if flags_zoom & WF_FLAG_COMPRESSED != 0 {
+        return Err(ProtoError::WfCompressed);
+    }
+    let pixels = &payload[WF_HEADER..];
+    if pixels.len() != WF_PIXELS {
+        return Err(ProtoError::WfPixels {
+            bytes: pixels.len(),
+        });
+    }
+    Ok(Wf {
+        x_bin: le_u32(&payload[4..8]),
+        zoom: (flags_zoom & 0xffff).min(u32::from(u8::MAX)) as u8,
+        seq: le_u32(&payload[12..16]),
+        db: pixels.iter().map(|b| f32::from(*b) - 255.0).collect(),
+    })
+}
+
 /// Builds an IQ-mode SND payload with big-endian samples and zero GPS bytes.
 #[cfg(feature = "test-fake")]
 pub fn encode_snd(flags: u8, seq: u32, smeter: u16, samples: &[(i16, i16)]) -> Vec<u8> {
@@ -271,6 +375,18 @@ pub fn encode_snd(flags: u8, seq: u32, smeter: u16, samples: &[(i16, i16)]) -> V
         out.extend_from_slice(&i.to_be_bytes());
         out.extend_from_slice(&q.to_be_bytes());
     }
+    out
+}
+
+/// Builds a `W/F` payload: the 16-byte header (the pad byte a space) and `pixels`.
+#[cfg(feature = "test-fake")]
+pub fn encode_wf(x_bin: u32, zoom: u8, flags: u32, seq: u32, pixels: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(WF_HEADER + pixels.len());
+    out.extend_from_slice(b"W/F ");
+    out.extend_from_slice(&x_bin.to_le_bytes());
+    out.extend_from_slice(&(flags | u32::from(zoom)).to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(pixels);
     out
 }
 
@@ -484,7 +600,8 @@ ext_clk=0 freq_offset=0.000 abyy=A26 dx_db_name=dx has_attn=1";
     fn tags_are_recognised() {
         assert_eq!(tag(b"MSG x"), Some(Tag::Msg));
         assert_eq!(tag(b"SND"), Some(Tag::Snd));
-        assert_eq!(tag(b"W/F..."), Some(Tag::Other(*b"W/F")));
+        assert_eq!(tag(b"W/F..."), Some(Tag::Wf));
+        assert_eq!(tag(b"XYZ"), Some(Tag::Other(*b"XYZ")));
         assert_eq!(tag(b"SN"), None);
     }
 
@@ -527,5 +644,114 @@ ext_clk=0 freq_offset=0.000 abyy=A26 dx_db_name=dx has_attn=1";
             let _ = parse_msg(&msg[..len]);
             let _ = parse_snd(&msg[..len]);
         }
+    }
+
+    #[test]
+    fn parses_a_wf_frame_built_to_the_servers_format() {
+        let mut pixels = vec![200u8; WF_PIXELS];
+        pixels[0] = 55;
+        pixels[1] = 55;
+        pixels[5] = 155;
+        let frame = encode_wf(4096, 3, 0, 7, &pixels);
+        assert_eq!(frame.len(), WF_HEADER + WF_PIXELS);
+        assert_eq!(&frame[..3], b"W/F");
+        let wf = parse_wf(&frame).unwrap();
+        assert_eq!((wf.x_bin, wf.zoom, wf.seq), (4096, 3, 7));
+        assert_eq!(wf.db.len(), 1024);
+        assert_eq!(wf.db[5], -100.0);
+        assert_eq!(wf.db[0], -200.0);
+        assert_eq!(wf.db[1], -200.0);
+        assert_eq!(wf.db[2], -55.0);
+        assert_eq!(tag(&frame), Some(Tag::Wf));
+    }
+
+    #[test]
+    fn a_wf_frame_reads_zoom_from_the_low_16_bits_of_the_flags_word() {
+        let frame = encode_wf(1, 10, 0x0002_0000, 9, &[255; WF_PIXELS]);
+        let wf = parse_wf(&frame).unwrap();
+        assert_eq!(wf.zoom, 10);
+        assert!(wf.db.iter().all(|d| *d == 0.0));
+    }
+
+    #[test]
+    fn a_compressed_wf_frame_is_refused() {
+        let frame = encode_wf(0, 0, WF_FLAG_COMPRESSED, 0, &[0; WF_PIXELS]);
+        assert_eq!(parse_wf(&frame), Err(ProtoError::WfCompressed));
+    }
+
+    #[test]
+    fn a_wf_frame_of_another_width_is_refused() {
+        for n in [512, 1025] {
+            let frame = encode_wf(0, 0, 0, 0, &vec![0; n]);
+            assert_eq!(parse_wf(&frame), Err(ProtoError::WfPixels { bytes: n }));
+        }
+    }
+
+    #[test]
+    fn short_wf_frames_are_errors_not_panics() {
+        let frame = encode_wf(0, 0, 0, 0, &[0; WF_PIXELS]);
+        for len in 0..WF_HEADER {
+            assert_eq!(
+                parse_wf(&frame[..len]),
+                Err(ProtoError::Short { len }),
+                "len {len}"
+            );
+        }
+        let mut bad_tag = frame.clone();
+        bad_tag[..3].copy_from_slice(b"SND");
+        assert!(matches!(
+            parse_wf(&bad_tag),
+            Err(ProtoError::BadValue { name, .. }) if name == "tag"
+        ));
+        for len in 0..=frame.len() {
+            let _ = parse_wf(&frame[..len]);
+        }
+    }
+
+    #[test]
+    fn wf_commands_are_exact() {
+        assert_eq!(cmd_wf_view(3, 1_875_000), "SET zoom=3 cf=1875.000");
+        assert_eq!(cmd_wf_view(0, 15_000_250), "SET zoom=0 cf=15000.250");
+        assert_eq!(CMD_WF_COMP_OFF, "SET wf_comp=0");
+        assert_eq!(CMD_WF_DB, "SET maxdb=0 mindb=-100");
+        assert_eq!(CMD_WF_INTERP, "SET interp=10");
+        assert_eq!(CMD_WF_SPEED, "SET wf_speed=4");
+        assert_eq!(wf_path(1_760_000_000), "/1760000000/W/F");
+        assert_eq!(
+            wf_url("kiwisdr.local", 8073, 1_760_000_000),
+            "ws://kiwisdr.local:8073/1760000000/W/F"
+        );
+    }
+
+    #[test]
+    fn parses_the_wf_setup_msgs() {
+        let a = b"MSG center_freq=15000000 bandwidth=30000000 adc_clk_nom=66666600";
+        assert!(
+            parse_msg(a)
+                .unwrap()
+                .contains(&KiwiMsg::Bandwidth(30_000_000))
+        );
+        let b = b"MSG wf_fft_size=1024 wf_fps=23 wf_fps_max=23 zoom_max=14 rx_chans=8 wf_chans=4 wf_chans_real=4 wf_cal=-13 wf_setup";
+        let msgs = parse_msg(b).unwrap();
+        assert!(msgs.contains(&KiwiMsg::WfChans(4)));
+        assert!(msgs.contains(&KiwiMsg::WfCal(-13)));
+        assert!(msgs.contains(&KiwiMsg::ZoomMax(14)));
+        assert!(msgs.contains(&KiwiMsg::WfSetup));
+        assert!(msgs.contains(&KiwiMsg::Other("wf_chans_real=4".into())));
+    }
+
+    #[test]
+    fn a_wf_key_that_does_not_parse_is_other_and_keeps_the_lines_other_keys() {
+        assert_eq!(
+            parse_msg(b"MSG bandwidth=x wf_cal=-13").unwrap(),
+            vec![KiwiMsg::Other("bandwidth=x".into()), KiwiMsg::WfCal(-13)]
+        );
+        assert_eq!(
+            parse_msg(b"MSG zoom_max=999 wf_chans=-1").unwrap(),
+            vec![
+                KiwiMsg::Other("zoom_max=999".into()),
+                KiwiMsg::Other("wf_chans=-1".into())
+            ]
+        );
     }
 }
