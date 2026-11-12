@@ -727,7 +727,7 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   box-shadow: 0 6px 18px var(--shadow);
 }
 #src-menu[hidden] { display: none; }
-#src-menu .link-diag {
+#src-menu .link-diag, #src-menu .fit-capture {
   text-align: left;
   border: 1px solid transparent;
   background: transparent;
@@ -735,7 +735,8 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   padding: 4px 8px;
   white-space: nowrap;
 }
-#src-menu .link-diag:hover, #src-menu .link-diag:focus-visible {
+#src-menu .link-diag:hover, #src-menu .link-diag:focus-visible,
+#src-menu .fit-capture:hover, #src-menu .fit-capture:focus-visible {
   border-color: var(--accent);
   color: var(--accent);
   outline: none;

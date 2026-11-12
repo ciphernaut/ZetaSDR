@@ -28,7 +28,7 @@ From the same run. At the 1 Msps UHF CB pin `stats.timeouts` climbs about 8 per 
 
 ## Lease: follow-ups to widening a held capture
 
-`source_ensure` with `widen` moves a held capture and restarts the holders on it, and `source_set_capture` makes the widest capture a source's habit (2026-11-12). Left open:
+`source_ensure` with `widen` moves a held capture and restarts the holders on it, `source_fit` narrows it to them again, and `source_set_capture` makes the widest capture a source's habit (2026-11-12). Left open:
 
 - A widened capture is not kept across a restart: the jobs resume on their own bounding capture unless the source's policy is `widest`.
 - `job_start`, `job_retune` and `set_start` take no `widen` of their own: a caller widens with `source_ensure` first, then starts the job inside the new capture.

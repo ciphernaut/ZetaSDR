@@ -451,3 +451,54 @@ async fn the_capture_policy_is_persisted_and_applied_at_the_next_open() {
         "a held capture stays"
     );
 }
+
+async fn fit(node: &Node) -> Result<OpResult, OpError> {
+    let op = Op::SourceFit {
+        source: SourceId(RADIO.into()),
+    };
+    tokio::time::timeout(Duration::from_secs(10), node.apply(op))
+        .await
+        .expect("no deadlock")
+}
+
+#[tokio::test]
+async fn fit_narrows_a_widened_capture_to_its_holders_and_restarts_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio) = open(dir.path()).await;
+    let a = start(&node, JobKind::FmDemod, t(100_000_000, 12_500)).await;
+    let b = start(&node, JobKind::FmDemod, t(100_000_000, 10_000)).await;
+    let wide = t(100_000_000, 4_000_000);
+    assert_eq!(ensure(&node, wide, true).await, Ok(OpResult::Tuning(wide)));
+    assert_eq!(record(&node, &a).capture_rate_hz, Some(4_000_000));
+    let tunes = radio.tunes();
+    // The band bounding both holders; this radio grants exactly the band asked.
+    let fitted = t(100_000_000, 12_500);
+    assert_eq!(fit(&node).await, Ok(OpResult::Tuning(fitted)));
+    assert_eq!(radio.tunes(), tunes + 1);
+    let s = source(&node).await;
+    assert_eq!(s.current, Some(fitted));
+    assert_eq!(s.holders.len(), 2);
+    for id in [&a, &b] {
+        let rec = record(&node, id);
+        assert_eq!(rec.state, JobState::Running);
+        assert_eq!(rec.capture_rate_hz, Some(12_500));
+    }
+    // Already fitted: the same capture, and nothing restarts.
+    let graph = record(&node, &a).graph;
+    assert_eq!(fit(&node).await, Ok(OpResult::Tuning(fitted)));
+    assert_eq!(record(&node, &a).graph, graph);
+}
+
+#[tokio::test]
+async fn fit_on_a_source_nothing_holds_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio) = open(dir.path()).await;
+    let Err(OpError::Other { message }) = fit(&node).await else {
+        panic!("expected a refusal");
+    };
+    assert!(
+        message.starts_with("nothing holds source radio0"),
+        "{message}"
+    );
+    assert_eq!(radio.tunes(), 0);
+}

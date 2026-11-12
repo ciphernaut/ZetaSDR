@@ -74,6 +74,14 @@ pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
     }
     // A widened capture restarts every job holding the source: the operator's call,
     // unlocked as a `replace` is.
+    if name == "source_fit" && !allow.replace {
+        return Some(json!({
+            "error": "not_allowed",
+            "field": "op",
+            "op": name,
+            "message": "fitting a held capture restarts the jobs holding it, which is not allowed in this run: report it to the operator; they unlock it by allowing stops for the run, or fit it themselves",
+        }));
+    }
     if name == "source_ensure" && op["widen"] == json!(true) && !allow.replace {
         return Some(json!({
             "error": "not_allowed",
@@ -515,6 +523,12 @@ mod tests {
             ..Allow::default()
         };
         assert!(gate(&ensure(true), allowed).is_none());
+        let fit = json!({"op": "source_fit", "source": "radio"});
+        assert_eq!(
+            gate(&fit, Allow::default()).expect("refused")["field"],
+            "op"
+        );
+        assert!(gate(&fit, allowed).is_none());
     }
 
     #[test]

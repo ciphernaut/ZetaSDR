@@ -152,6 +152,18 @@ CLI: `zeta source gain --source <id> --db 40`
 
 Set the source's overall receive gain live (`gain_db` in dB within `source list`'s `gain.min_db..=max_db`), or `null` for the driver's automatic gain where `gain.automatic_available`. Persisted: it is re-applied when the node restarts and wins over `gain=` in the device args. A source without adjustable gain (a recording, a KiwiSDR, another node) answers `source has no adjustable gain`. On the CLI, `--auto` passes `null`.
 
+### source_fit
+
+Narrow a held source's capture to the jobs holding it: the source is retuned to its narrowest rate that holds the band bounding every holder and its pin, and each holder restarts on that capture under its id, as after a `source_ensure` with `widen` (the same gap in every stream). The way back from a widened capture, and less work for the host. When the source already runs at that capture nothing restarts. A source nothing holds is refused; one under a scan that does not give way is a `conflict`. The result is the capture.
+
+- source: string; an id from `source list`
+
+JSON: `{"op":"source_fit","source":"<id>"}`
+
+CLI: `zeta source fit --source <id>`
+
+The way back from a widened capture: the source is retuned to the narrowest rate that holds the jobs on it (and its pin) and each of them restarts on it under its id, with the same short gap and lost decoder state as a widen. Use it when the wide view is no longer wanted and the host should work less. Restarting the holders is the operator's decision: through `ask` it needs the run to allow stops, else it is refused as `not_allowed`; report that, do not retry. On the CLI, `zeta source fit --source <id>`.
+
 ### source_set_capture
 
 Set how the source's capture is chosen when a rigid job (or a set) tunes it free: `fit` (the default) takes the narrowest rate that holds the job or the set's bounding band; `widest` takes the source's whole `max_bandwidth_hz` about the same centre, so later jobs and a wider view fit beside it without a retune, the source running at its full rate throughout (more CPU and memory). It never moves a capture already held: it applies from the next tune of the free source (also at a restart's resume). An elastic job, a pin, `source_ensure` and a scan's steps tune to their own band whatever it says. Persisted in the state directory; `source_list` shows it as `capture_policy`.

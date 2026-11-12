@@ -182,6 +182,17 @@ pub enum Op {
         #[schemars(required, schema_with = "nullable_gain_db")]
         gain_db: Option<f64>,
     },
+    /// Narrow a held source's capture to the jobs holding it: the source is retuned
+    /// to its narrowest rate that holds the band bounding every holder and its pin,
+    /// and each holder restarts on that capture under its id, as after a
+    /// `source_ensure` with `widen` (the same gap in every stream). The way back
+    /// from a widened capture, and less work for the host. When the source already
+    /// runs at that capture nothing restarts. A source nothing holds is refused; one
+    /// under a scan that does not give way is a `conflict`. The result is the
+    /// capture.
+    SourceFit {
+        source: SourceId,
+    },
     /// Set how the source's capture is chosen when a rigid job (or a set) tunes it
     /// free: `fit` (the default) takes the narrowest rate that holds the job or the
     /// set's bounding band; `widest` takes the source's whole `max_bandwidth_hz`
@@ -3195,6 +3206,7 @@ impl Op {
             Op::SourceMeasure { .. } => "source_measure",
             Op::SourceFree { .. } => "source_free",
             Op::SourceSetGain { .. } => "source_set_gain",
+            Op::SourceFit { .. } => "source_fit",
             Op::SourceSetCapture { .. } => "source_set_capture",
             Op::JobStart { .. } => "job_start",
             Op::JobAttach { .. } => "job_attach",
@@ -4293,6 +4305,15 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             node.source_set_gain(&source, gain_db)
                 .await
                 .map(OpResult::Gain)
+                .map_err(|e| node_error(node, e))
+        }
+        Op::SourceFit { source } => {
+            if node.port(&source).is_none() {
+                return Err(unknown_source(node, &source));
+            }
+            node.source_fit(&source)
+                .await
+                .map(OpResult::Tuning)
                 .map_err(|e| node_error(node, e))
         }
         Op::SourceSetCapture { source, policy } => {

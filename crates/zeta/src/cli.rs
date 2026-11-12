@@ -1084,6 +1084,12 @@ pub enum SourceCmd {
         #[arg(long, value_name = "HZ")]
         bandwidth_hz: u64,
     },
+    /// Narrow a held source's capture to the jobs holding it; they restart on it
+    Fit {
+        /// Source id
+        #[arg(long)]
+        source: String,
+    },
     /// Choose how a source's capture is sized when a job tunes it free (persisted)
     Capture {
         /// Source id
@@ -1492,6 +1498,7 @@ impl Command {
                     | SourceCmd::Measure { .. }
                     | SourceCmd::Gain { .. }
                     | SourceCmd::Capture { .. }
+                    | SourceCmd::Fit { .. }
             ) | Command::Job(
                 JobCmd::Start { .. }
                     | JobCmd::Attach { .. }
@@ -1558,6 +1565,9 @@ impl Command {
                 bandwidth_hz: Hz(b.bandwidth_hz),
                 replace: replace.into_ids(),
                 widen,
+            },
+            Command::Source(SourceCmd::Fit { source }) => Op::SourceFit {
+                source: SourceId(source),
             },
             Command::Source(SourceCmd::Capture { source, policy }) => Op::SourceSetCapture {
                 source: SourceId(source),

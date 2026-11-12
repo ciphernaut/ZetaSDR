@@ -143,10 +143,44 @@ impl Node {
         want: Tuning,
         replace: &[JobId],
     ) -> Result<Tuning, NodeError> {
+        self.move_capture(source, Some(want), replace).await
+    }
+
+    /// `source_fit`: narrow `source`'s capture to the jobs holding it. Under one hold
+    /// of the source's gate the band bounding every rigid lease and the pin is asked
+    /// of the port, which grants its narrowest rate that holds it, and each holder is
+    /// relaunched on that capture as [`Node::source_widen`] does. A port that grants
+    /// the capture it already has restarts nothing. A source no job or pin holds is
+    /// `Other("nothing holds source <id>: ...")`.
+    pub async fn source_fit(&self, source: &SourceId) -> Result<Tuning, NodeError> {
+        self.move_capture(source, None, &[]).await
+    }
+
+    /// The body of [`Node::source_widen`] (`want` given) and [`Node::source_fit`]
+    /// (`None`: the band bounding the holders, read under the gate).
+    async fn move_capture(
+        &self,
+        source: &SourceId,
+        want: Option<Tuning>,
+        replace: &[JobId],
+    ) -> Result<Tuning, NodeError> {
         let port = self
             .port(source)
             .ok_or_else(|| NodeError::UnknownSource(source.clone()))?;
         let guard = self.inner.leases.gate_guard(source).await;
+        let narrow = want.is_none();
+        let want = match want {
+            Some(w) => w,
+            None => match self.inner.leases.held_band(source, &guard) {
+                Some(b) => b,
+                None => {
+                    return Err(NodeError::Other(format!(
+                        "nothing holds source {}: its capture is fitted to a job when one starts",
+                        source.0
+                    )));
+                }
+            },
+        };
         if !replace.is_empty()
             && let Err(e) = self.replace_holders(source, replace, &guard).await
         {
@@ -170,7 +204,7 @@ impl Node {
             let ((wl, wh), (cl, ch)) = (edges(&want), edges(&c));
             wl < cl || wh > ch
         });
-        if outside {
+        if outside && !narrow {
             for (id, _) in self.inner.leases.holders(source) {
                 let rec = self
                     .inner
@@ -207,7 +241,7 @@ impl Node {
         let moved = self
             .inner
             .leases
-            .widen_locked(port.as_ref(), want, &guard)
+            .widen_locked(port.as_ref(), want, narrow, &guard)
             .await;
         let (got, tuned, holders) = match moved {
             Ok(m) => m,

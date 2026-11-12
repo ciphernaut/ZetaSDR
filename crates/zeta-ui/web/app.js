@@ -481,11 +481,14 @@ function healthPairs(s) {
 // A source tab is a <button> and holds no control, so a source's own actions sit in one hover
 // box beside the strip, `div#src-menu`: shown under a tab while the pointer is on a tab whose
 // source has a `worker` record, or on the box, and hidden SRC_MENU_HIDE_MS after it left both.
-// Its one entry, "Run link diagnostics", applies `source_measure` (applyOp: a conflict gets the
-// usual stop-and-retry); when the respawn's worker says hello the transcript gets the result
-// (noteDiagnostics).
+// "Run link diagnostics" applies `source_measure` (applyOp: a conflict gets the usual
+// stop-and-retry); when the respawn's worker says hello the transcript gets the result
+// (noteDiagnostics). While jobs hold the source a second entry, "Fit capture to jobs (N jobs
+// restart)", applies `source_fit`: the capture narrowed to the jobs, the way back from a widen.
 const SRC_MENU_HIDE_MS = 300;
 const LINK_DIAG_TITLE = "measures the rates this radio's link sustains: about a minute, the host will be busy";
+const FIT_TITLE =
+  "narrows the capture to the narrowest that holds the jobs on this radio; they restart on it (a short gap)";
 const srcMenu = { el: null, source: null, tab: null, over: null, hide: null };
 
 function srcMenuEl() {
@@ -502,7 +505,18 @@ function srcMenuEl() {
     hideSrcMenu();
     if (source) applyOp({ op: "source_measure", source, replace: [] });
   };
-  el.append(diag);
+  // Shown while jobs hold the source (refreshSrcMenu): the way back from a widened capture.
+  const fit = document.createElement("button");
+  fit.className = "fit-capture";
+  fit.textContent = "Fit capture to jobs";
+  fit.title = FIT_TITLE;
+  fit.hidden = true;
+  fit.onclick = () => {
+    const source = srcMenu.source;
+    hideSrcMenu();
+    if (source) applyOp({ op: "source_fit", source });
+  };
+  el.append(diag, fit);
   el.onmouseenter = () => {
     srcMenu.over = "menu";
     clearTimeout(srcMenu.hide);
@@ -553,6 +567,10 @@ function refreshSrcMenu() {
   el.style.left = `${Math.max(0, Math.round(r.left))}px`;
   el.style.top = `${Math.round(r.bottom)}px`;
   srcMenu.source = s.id;
+  const n = (s.holders || []).length;
+  const fit = el.querySelector(".fit-capture");
+  fit.hidden = n === 0;
+  fit.textContent = `Fit capture to jobs (${n} job${n === 1 ? "" : "s"} restart${n === 1 ? "s" : ""})`;
   el.hidden = false;
 }
 
@@ -872,6 +890,10 @@ function sourceOp(src, words) {
     if (args.length) return { error: "source measure: expected no arguments" };
     return { op: { op: "source_measure", source: src.id, replace: [] } };
   }
+  if (verb === "fit") {
+    if (args.length) return { error: "source fit: expected no arguments" };
+    return { op: { op: "source_fit", source: src.id } };
+  }
   if (verb === "capture") {
     if (args.length !== 1 || !["fit", "widest"].includes(args[0])) {
       return { error: "source capture: expected fit or widest" };
@@ -897,6 +919,10 @@ function sourceReply(op, result) {
   if (op.op === "source_measure") {
     return `measuring ${op.source} again: about a minute, the host will be busy`;
   }
+  if (op.op === "source_fit") {
+    const t = (result && result.value) || {};
+    return `capture ${op.source}: ${(t.bandwidth_hz / 1e6).toFixed(2)} MHz about ${(t.center_hz / 1e6).toFixed(3)} MHz, fitted to its jobs`;
+  }
   if (op.op === "source_set_capture") {
     return op.policy === "widest"
       ? `capture ${op.source}: widest (its full width, from the next time a job tunes it free)`
@@ -908,7 +934,7 @@ function sourceReply(op, result) {
 }
 
 // `source pin [<center_hz> <bandwidth_hz>]`, `source unpin`, `source gain <db>|auto`,
-// `source measure`, `source capture fit|widest` on the shown source: {text, error} for the
+// `source measure`, `source capture fit|widest`, `source fit` on the shown source: {text, error} for the
 // transcript, or {text: null}
 // when a conflict was offered its retry line instead (offerReplace).
 export async function runSourceCommand(st, words) {
@@ -1126,7 +1152,7 @@ async function runCommand(text) {
     state.transcript.note(r.text, r.error);
     return;
   }
-  if (/^source\s+(pin|unpin|gain|measure|capture)\b/.test(text)) {
+  if (/^source\s+(pin|unpin|gain|measure|capture|fit)\b/.test(text)) {
     state.transcript.user(text);
     const r = await runSourceCommand(state, text.split(/\s+/).slice(1));
     if (r.text !== null) state.transcript.note(r.text, r.error);

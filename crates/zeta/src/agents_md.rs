@@ -73,6 +73,9 @@ fn note(op: &str) -> Option<&'static str> {
         "source_ensure" => Some(
             "`replace`: job ids that hold the source and may be stopped to make room; they are stopped under the source's gate right before the request, so nothing can take the radio in between. A `conflict` lists the holders; decide whether those jobs may stop, then retry with `replace`. The page's elastic job is never a holder, and a stepped scan never makes a conflict (it gives way and waits, see `scan` below), so there is no need to name one. `widen: true` moves a held source's capture to the band (wider, or shifted) when every holder's band and the pin's still lie inside it: a `conflict` lists `widen the capture to <centre>/<width> Hz` when the radio could capture both the request and what it holds. The source is retuned and every job holding it restarts on the new capture under its id: a short gap in each stream, each decoder's state lost, an external decoder's process started again, a transcription or other attached job relaunched on its input. That is the operator's decision, as a stop is: through `ask` it needs the run to allow stops, else it is refused as `not_allowed`; report the option, do not retry. A widened capture lasts until the node restarts (the jobs resume on their own capture); `source_set_capture` makes the wide capture the source's habit. On the CLI, `--widen`.",
         ),
+        "source_fit" => Some(
+            "The way back from a widened capture: the source is retuned to the narrowest rate that holds the jobs on it (and its pin) and each of them restarts on it under its id, with the same short gap and lost decoder state as a widen. Use it when the wide view is no longer wanted and the host should work less. Restarting the holders is the operator's decision: through `ask` it needs the run to allow stops, else it is refused as `not_allowed`; report that, do not retry. On the CLI, `zeta source fit --source <id>`.",
+        ),
         "source_set_capture" => Some(
             "How wide the source's capture is when a job or a set tunes it free. `fit` (the default) takes the narrowest rate that holds the job or the set's bounding band: the least CPU and memory. `widest` takes the source's whole `max_bandwidth_hz` about the same centre, so the page can zoom out to the radio's full instantaneous width beside the running jobs and a later job megahertz away fits without a restart; the source then runs at its full rate all the time, which costs CPU (the channel bank) and memory (the IQ history) in proportion. It applies from the next time the free source is tuned for a job (stop and start the set, or restart the node); it never moves a capture jobs hold (`source_ensure` with `widen` does that). Persisted. On the CLI, `zeta source capture --source <id> --policy widest`.",
         ),
@@ -526,6 +529,9 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
     // The CLI names this one for what it sets; `--auto` stands for `null`.
     if op == "source_set_gain" {
         return "zeta source gain --source <id> --db 40".into();
+    }
+    if op == "source_fit" {
+        return "zeta source fit --source <id>".into();
     }
     if op == "source_set_capture" {
         return "zeta source capture --source <id> --policy fit".into();

@@ -966,20 +966,50 @@ impl LeaseManager {
         }
     }
 
+    /// The band bounding every rigid lease and pin on `source` (what its capture
+    /// must hold), under the source's gate the caller holds; `None` when nothing
+    /// rigid holds it or a time-shared lease that does not give way does.
+    pub(crate) fn held_band(
+        &self,
+        source: &SourceId,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Option<Tuning> {
+        self.assert_gate(source, guard);
+        let leases = self.leases.lock().unwrap();
+        let held: Vec<&Lease> = leases
+            .get(source)?
+            .iter()
+            .filter(|l| !l.elastic && l.yields.is_none())
+            .collect();
+        if held.iter().any(|l| l.time_shared) {
+            return None;
+        }
+        let lo = held.iter().map(|l| band(&l.band).0).min()?;
+        let hi = held.iter().map(|l| band(&l.band).1).max()?;
+        Some(Tuning {
+            center_hz: Hz(lo + (hi - lo) / 2),
+            bandwidth_hz: Hz((hi - lo).max(1)),
+        })
+    }
+
     /// Move `port`'s capture to `want` though rigid leases hold it, under the
     /// source's gate the caller holds: granted when every rigid lease and pin band
     /// lies inside `want` (the port is tuned; the caller restarts each holder on the
     /// new capture, their leases kept), else a conflict as
     /// [`LeaseManager::tune_if_unheld_locked`] gives, which also decides a port no
-    /// rigid lease holds and a band already inside the capture. A time-shared lease
-    /// that does not give way is a conflict; one that does gives way. Should the port
-    /// grant a band that leaves a holder outside, it is tuned back and the request is
-    /// a conflict. Also whether it tuned the port and, when it did, the rigid
+    /// rigid lease holds and a band already inside the capture. With `narrow`
+    /// (`source_fit`) a band inside the capture moves it too: the port then grants
+    /// its narrowest rate that holds the band. A time-shared lease that does not
+    /// give way is a conflict; one that does gives way. Should the port grant a band
+    /// that leaves a holder outside, it is tuned back and the request is a conflict;
+    /// a port that grants the capture it already had tuned nothing the holders need
+    /// restarting for. Also whether it tuned the port and, when it did, the rigid
     /// holders (never a pin).
     pub(crate) async fn widen_locked(
         &self,
         port: &dyn Port,
         want: Tuning,
+        narrow: bool,
         guard: &OwnedMutexGuard<()>,
     ) -> Result<(Tuning, bool, Vec<JobId>), LeaseError> {
         let source = port.id().clone();
@@ -992,7 +1022,7 @@ impl LeaseManager {
             .map(|v| standing(v).into_iter().filter(|l| !l.elastic).collect())
             .unwrap_or_default();
         let cur = held.first().map(|l| port.current().unwrap_or(l.band));
-        let movable = cur.is_some_and(|c| !fits(&want, &c))
+        let movable = cur.is_some_and(|c| !fits(&want, &c) || (narrow && want != c))
             && !held.iter().any(|l| l.time_shared)
             && held.iter().all(|l| fits(&l.band, &want));
         let Some(cur) = cur.filter(|_| movable) else {
@@ -1003,6 +1033,9 @@ impl LeaseManager {
         };
         self.yield_shared(&mut self.leases.lock().unwrap(), &source);
         let got = port.tune(want).await?;
+        if got == cur {
+            return Ok((got, false, Vec::new()));
+        }
         if held.iter().all(|l| fits(&l.band, &got)) {
             return Ok((got, true, rigid(&held)));
         }

@@ -128,7 +128,8 @@ holds it; `widest` is the source's whole `max_bandwidth_hz` about the same centr
 can show the radio's full width beside the jobs, at the cost of running the source at its full
 rate. A capture jobs already hold moves only when asked: `source ensure --widen` (the page's
 `widen capture to <W> MHz` button on a held radio) retunes the source to a band that still holds
-every job and restarts each of them on it under its id. A resumed channel takes the shared bank (`job_context` names its `channel.path`;
+every job and restarts each of them on it under its id; `source fit` (the radio tab's "Fit
+capture to jobs") is the way back, narrowing the capture to the jobs again. A resumed channel takes the shared bank (`job_context` names its `channel.path`;
 `source_list.bank` shows `bin_hz` and `consumers`). Every transcript event of an attached
 `transcribe` job is also appended as one JSON line to `<state-dir>/transcripts.log` (`t_ns`, `job`,
 `input`, `source`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns`, `text`, `language`,
