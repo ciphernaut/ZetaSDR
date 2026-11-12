@@ -32,8 +32,9 @@ From the same run. At the 1 Msps UHF CB pin `stats.timeouts` climbs about 8 per 
 
 - A widened capture is not kept across a restart: the jobs resume on their own bounding capture unless the source's policy is `widest`.
 - `job_start`, `job_retune` and `set_start` take no `widen` of their own: a caller widens with `source_ensure` first, then starts the job inside the new capture.
-- The gap is unmeasured on real hardware: how long each stream is silent across a rate change, and whether an external decoder loses more than the frames in flight.
+- The gap is unmeasured on real hardware: how long each stream is silent across a rate change, and whether an external decoder loses more than the frames in flight. The first live widen answered in 0.7 s for nine jobs, with nothing listened to and no frames counted.
 - The page offers the widest capture the view asks for; it does not offer a middle rate, and under `widest` it offers a move of the capture when the view is dragged past its edge, each a restart of every holder.
+- `source_fit` always fits to the jobs, whatever the source's policy: under `widest` it narrows too, and nothing re-applies the policy to a held capture short of a widen.
 - `widest` is the source's full rate at its own depth. A policy naming a rate (or a fraction of the full rate) would let a host with less CPU take a middle course.
 
 ## Lease: keep a lone job's capture centre off its channel
@@ -825,6 +826,10 @@ From the first live run of plan 36 and the live-view fixes after it. Each is sma
 - **Two pages on one self-sweeping source share its one scan.** Both adopt it and each moves the other's view. Give each page its own view where the source allows a second waterfall connection, or show who moved it.
 - **A KiwiSDR pauses its own waterfall** for about two seconds every quarter of a minute under load (seen with a raw connection too). The stream rides through it; the page could mark the gap rather than stretch the last row.
 - **A Soapy test flakes under full-workspace load:** `a_cs16_device_hands_raw_blocks_only_after_the_tune_window` failed once in a workspace run and passes alone and under two CPUs.
+- **The wide view leaves a stopped `scan` row a gesture.** The page restarts its own scan (tagged AUTO) over each new view, and every one stays in the jobs pane as `stopped`. Re-aim one scan where the node can, or keep the page's own ended scans out of the pane.
+- **A view of several gigahertz fills slowly, and the canvas clears on the way back in.** The first sweep of a wide view paints step by step from blank, and zooming back in to one capture starts the waterfall over. Keep what was painted under the new rows in both directions.
+- **Inside one capture, near its edge, the wheel is not exactly on the pointer.** The view is moved inside the capture; staying on the pointer would cost a retune a notch. The operator's call, not yet made.
+- **The held radio's buttons are thinly tested in the browser.** The suite covers `move capture to <f> MHz` on a recording; `widen capture to <W> MHz` needs a source with more than one rate, and "Fit capture to jobs" under the radio's tab has no scenario. Give the harness a source with a rate ladder.
 
 ## Policies: one place for the operator's choices, and the waterfall behind the map as the first
 
