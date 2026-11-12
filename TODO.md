@@ -825,3 +825,9 @@ From the first live run of plan 36 and the live-view fixes after it. Each is sma
 - **Two pages on one self-sweeping source share its one scan.** Both adopt it and each moves the other's view. Give each page its own view where the source allows a second waterfall connection, or show who moved it.
 - **A KiwiSDR pauses its own waterfall** for about two seconds every quarter of a minute under load (seen with a raw connection too). The stream rides through it; the page could mark the gap rather than stretch the last row.
 - **A Soapy test flakes under full-workspace load:** `a_cs16_device_hands_raw_blocks_only_after_the_tune_window` failed once in a workspace run and passes alone and under two CPUs.
+
+## Policies: one place for the operator's choices, and the waterfall behind the map as the first
+
+From the operator, 2026-11-12. While the map is shown in the waterfall's place the page drops every spectrum row (`waterfall.js` `behindMap`), so the waterfall's history has a gap for as long as the map was up. Job events are not affected: they come over the source's event feed. Make it a policy the operator sets and can make their default, for example `view set behind_map pause|paint`: `pause` is today's behaviour, `paint` keeps drawing into the hidden canvas at the browser's cost.
+
+Not built on its own, because more such choices are coming and they want one home: the page's `view set` policies, the agent's radio policy and its allow gates (stops, replace, widen, capture deletes, signatures), and the per-source capture policy (`source_set_capture`) are each kept in a different place today. Design them together, possibly as part of a permissions and authorisations framework: who may set a policy, where its default lives (a page, a node, a source, an operator), and how a caller without the right is refused. Related: "UI: view policies in localStorage".
