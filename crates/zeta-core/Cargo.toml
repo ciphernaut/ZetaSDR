@@ -14,7 +14,7 @@ description = "ZetaSDR core runtime types"
 
 [dependencies]
 async-trait = "0.1.92"
-jsonschema = { version = "0.60.2", default-features = false }
+jsonschema = { version = "0.61.0", default-features = false }
 num-complex = "0.4.6"
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
