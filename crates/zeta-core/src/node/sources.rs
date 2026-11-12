@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::NodeError;
 use super::persist::io;
 use crate::port::Tuning;
-use crate::types::{Capabilities, Claim, Hz, SourceId};
+use crate::types::{Capabilities, CapturePolicy, Claim, Hz, SourceId};
 
 /// The format a source record is written in; a newer one on disk is a load error.
 pub const SOURCE_RECORD_FORMAT: u32 = 1;
@@ -43,6 +43,14 @@ pub struct SourceRecord {
     /// unknown. A worker whose link now runs at another speed measures again.
     #[serde(default)]
     pub measured_at_speed: Option<String>,
+    /// The capture policy `source_set_capture` set, applied when the node opens;
+    /// the default (`fit`) is not written.
+    #[serde(default, skip_serializing_if = "is_fit")]
+    pub capture: CapturePolicy,
+}
+
+fn is_fit(p: &CapturePolicy) -> bool {
+    *p == CapturePolicy::Fit
 }
 
 impl SourceRecord {

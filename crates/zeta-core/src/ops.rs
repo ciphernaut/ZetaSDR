@@ -97,11 +97,12 @@ pub enum Op {
     SourceList {},
     /// Check a band against the source and tune it if no job holds it. Takes
     /// no lease: an unheld source is tuned directly (a later `job_start` may
-    /// retune it); a held source is never retuned, and the request either
-    /// fits the current band (`Tuning`) or is a `Conflict`. Runs under the
+    /// retune it); a held source is not retuned without `widen`, and the request
+    /// either fits the current band (`Tuning`) or is a `Conflict`. Runs under the
     /// lease manager's per-source gate, so it never interleaves with a job's
     /// lease-and-tune. Elastic jobs do not hold the source: a tune relaunches
     /// them on the new capture.
+    #[schemars(transform = require_widen)]
     SourceEnsure {
         source: SourceId,
         center_hz: Hz,
@@ -109,6 +110,17 @@ pub enum Op {
         /// Jobs holding the source that may be stopped to make room (`[]` for
         /// none); see `job_start`.
         replace: Vec<JobId>,
+        /// Move a held source's capture to the band (wider, or shifted) when the
+        /// band of every job holding it, and its pin's, lies inside the new one:
+        /// the source is retuned and each holder restarts on the new capture under
+        /// its id (a short gap in every stream; a decoder loses its state, an
+        /// external one its process; a restart that fails leaves that job `failed`
+        /// with the reason). A band that would leave a holder outside, or wider
+        /// than `max_bandwidth_hz`, is a `conflict` as without it. The node goes
+        /// back to the jobs' own capture at its next start. `false` unless the
+        /// operator asked for the wider capture and accepts the restart.
+        #[serde(default)]
+        widen: bool,
     },
     /// Pin the source at a band: a rigid lease held by no job (`source_list`
     /// shows it as `pin`, never among `holders`), granted like a rigid
@@ -169,6 +181,20 @@ pub enum Op {
         #[serde(deserialize_with = "crate::port::nullable_f64")]
         #[schemars(required, schema_with = "nullable_gain_db")]
         gain_db: Option<f64>,
+    },
+    /// Set how the source's capture is chosen when a rigid job (or a set) tunes it
+    /// free: `fit` (the default) takes the narrowest rate that holds the job or the
+    /// set's bounding band; `widest` takes the source's whole `max_bandwidth_hz`
+    /// about the same centre, so later jobs and a wider view fit beside it without
+    /// a retune, the source running at its full rate throughout (more CPU and
+    /// memory). It never moves a capture already held: it applies from the next
+    /// tune of the free source (also at a restart's resume). An elastic job, a
+    /// pin, `source_ensure` and a scan's steps tune to their own band whatever it
+    /// says. Persisted in the state directory; `source_list` shows it as
+    /// `capture_policy`.
+    SourceSetCapture {
+        source: SourceId,
+        policy: crate::types::CapturePolicy,
     },
     #[schemars(transform = require_the_look)]
     JobStart {
@@ -1081,6 +1107,21 @@ fn require_the_look(schema: &mut schemars::Schema) {
                 p.remove("default");
             }
         }
+    }
+}
+
+/// `source_ensure` requires `widen` and shows no default for it, so a tool call
+/// always states it; a request from before the field leaves it out and reads `false`.
+fn require_widen(schema: &mut schemars::Schema) {
+    if let Some(serde_json::Value::Array(req)) = schema.get_mut("required")
+        && !req.iter().any(|f| f == "widen")
+    {
+        req.push("widen".into());
+    }
+    if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties")
+        && let Some(serde_json::Value::Object(p)) = props.get_mut("widen")
+    {
+        p.remove("default");
     }
 }
 
@@ -2479,12 +2520,17 @@ pub struct SourceInfo {
     /// empty when absent, so a source of an older node still loads.
     #[serde(default)]
     pub scans_waiting: Vec<JobId>,
+    /// How the capture is chosen when a rigid job tunes the free source
+    /// (`source_set_capture`): `fit` or `widest`. Defaults to `fit` when absent, so
+    /// a source of an older node still loads.
+    #[serde(default)]
+    pub capture_policy: crate::types::CapturePolicy,
 }
 
 /// Schemars omits a serde-defaulted field from `required`, and `#[schemars(required)]`
 /// does not override that; every node of this version writes `worker`, `ring`, `position`,
-/// `depth`, `sweeps` and `scans_waiting`, so the published schema requires them (as `JobRecord`'s schema does
-/// its defaulted fields).
+/// `depth`, `sweeps`, `scans_waiting` and `capture_policy`, so the published schema requires
+/// them (as `JobRecord`'s schema does its defaulted fields).
 fn require_worker(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -2499,6 +2545,7 @@ fn require_worker(schema: &mut schemars::Schema) {
             "depth",
             "sweeps",
             "scans_waiting",
+            "capture_policy",
         ] {
             if !req.iter().any(|r| r == field) {
                 req.push(field.into());
@@ -3148,6 +3195,7 @@ impl Op {
             Op::SourceMeasure { .. } => "source_measure",
             Op::SourceFree { .. } => "source_free",
             Op::SourceSetGain { .. } => "source_set_gain",
+            Op::SourceSetCapture { .. } => "source_set_capture",
             Op::JobStart { .. } => "job_start",
             Op::JobAttach { .. } => "job_attach",
             Op::JobRetune { .. } => "job_retune",
@@ -4135,6 +4183,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                     depth: node.port(&id).and_then(|p| p.depth()),
                     sweeps: node.lease_sweepers(&id),
                     scans_waiting: node.lease_waiting(&id),
+                    capture_policy: node.capture_policy(&id),
                     ring: node.ring(&id).map(|r| RingInfo {
                         seconds: r.read().unwrap().capacity_seconds(),
                     }),
@@ -4150,6 +4199,24 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             center_hz,
             bandwidth_hz,
             replace,
+            widen: true,
+        } => {
+            let want = Tuning {
+                center_hz,
+                bandwidth_hz,
+            };
+            checked_port(node, &source, &want)?;
+            node.source_widen(&source, want, &replace)
+                .await
+                .map(OpResult::Tuning)
+                .map_err(|e| node_error(node, e))
+        }
+        Op::SourceEnsure {
+            source,
+            center_hz,
+            bandwidth_hz,
+            replace,
+            widen: false,
         } => {
             let want = Tuning {
                 center_hz,
@@ -4226,6 +4293,14 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             node.source_set_gain(&source, gain_db)
                 .await
                 .map(OpResult::Gain)
+                .map_err(|e| node_error(node, e))
+        }
+        Op::SourceSetCapture { source, policy } => {
+            if node.port(&source).is_none() {
+                return Err(unknown_source(node, &source));
+            }
+            node.source_set_capture(&source, policy)
+                .map(|()| OpResult::Ok)
                 .map_err(|e| node_error(node, e))
         }
         Op::JobStart {
@@ -4387,7 +4462,11 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             let (granted, tuned) = match elastic {
                 true => (port.current().unwrap_or(tuning), false),
                 false => match node
-                    .tune_if_unheld(port.as_ref(), tuning, guard.as_ref())
+                    .tune_if_unheld(
+                        port.as_ref(),
+                        node.capture_for(port.as_ref(), tuning),
+                        guard.as_ref(),
+                    )
                     .await
                 {
                     Ok(t) => t,

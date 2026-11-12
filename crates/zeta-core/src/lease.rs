@@ -14,14 +14,14 @@
 //! time-shared lease holds the source, watching [`LeaseManager::changes`] (bumped by
 //! every yield and every release) rather than polling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::OwnedMutexGuard;
 use tokio_util::sync::CancellationToken;
 
 use crate::port::{Port, PortError, Tuning};
-use crate::types::{Capabilities, Hz, JobId, SourceId};
+use crate::types::{Capabilities, CapturePolicy, Hz, JobId, SourceId};
 
 #[derive(Debug)]
 pub enum LeaseError {
@@ -130,6 +130,9 @@ pub struct LeaseManager {
     waiting: Mutex<HashMap<SourceId, Vec<JobId>>>,
     /// Bumped on every yield and every release on a source ([`LeaseManager::changes`]).
     changes: Mutex<HashMap<SourceId, tokio::sync::watch::Sender<u64>>>,
+    /// The sources whose capture policy is [`CapturePolicy::Widest`]
+    /// ([`LeaseManager::set_capture_policy`]).
+    widest: Mutex<HashSet<SourceId>>,
 }
 
 fn band(t: &Tuning) -> (u64, u64) {
@@ -151,7 +154,7 @@ fn fits(want: &Tuning, cur: &Tuning) -> bool {
 /// that the caller can act on. Stopping a holder is listed only when a job
 /// holds the source (a pin alone is no holder). A request for a band (`want`
 /// given) may choose one inside `cur`, and widening is listed only when the port
-/// could capture both bands at once; no operation performs it yet. A port under a
+/// could capture both bands at once ([`LeaseManager::widen_locked`]). A port under a
 /// time-shared lease that does not give way (a scan at a lossy depth) is freed only
 /// by stopping that holder; one that gives way never makes a conflict. Then, on a
 /// `pinned` source, its unpin; last, the request again with `replace` naming the
@@ -175,9 +178,13 @@ fn conflict_options(
         options.push("choose a band inside current".to_string());
         let (wl, wh) = band(want);
         let (cl, ch) = band(cur);
-        let n = wh.max(ch) - wl.min(cl);
+        let (lo, hi) = (wl.min(cl), wh.max(ch));
+        let n = hi - lo;
         if n <= port.capabilities().max_bandwidth_hz.value().0 {
-            options.push(format!("widen capture to {n} Hz (not yet available)"));
+            options.push(format!(
+                "widen the capture to {}/{n} Hz (source_ensure with widen: the holders restart on it)",
+                lo + n / 2
+            ));
         }
     }
     if let Some(id) = pinned {
@@ -660,12 +667,19 @@ impl LeaseManager {
             // Granted: what gives way goes before the tune.
             self.yield_shared(&mut leases, &source);
         }
-        let got = port.tune(want).await?;
+        // A rigid job's tune of a free port takes the capture the source's policy
+        // gives it; an elastic job's and a pin's are the band itself.
+        let ask = match elastic || pin {
+            true => want,
+            false => self.capture_for(port, want),
+        };
+        let got = port.tune(ask).await?;
         let mut leases = self.leases.lock().unwrap();
         let v = leases.entry(source).or_default();
         v.retain(|l| l.job != holder);
-        // A pin's band is the one asked for: the capture may be wider.
-        v.push(lease(if pin { want } else { got }));
+        // A rigid lease's band is the one asked for (the capture may be wider, and
+        // may later move around it: `widen_locked`); an elastic one's is the capture.
+        v.push(lease(if elastic { got } else { want }));
         Ok((got, true))
     }
 
@@ -904,6 +918,111 @@ impl LeaseManager {
             return Ok(None);
         }
         port.tune(step).await.map(Some)
+    }
+
+    /// Set how `source`'s capture is chosen when a rigid job tunes it free
+    /// ([`LeaseManager::capture_for`]).
+    pub fn set_capture_policy(&self, source: &SourceId, policy: CapturePolicy) {
+        let mut widest = self.widest.lock().unwrap();
+        match policy {
+            CapturePolicy::Fit => widest.remove(source),
+            CapturePolicy::Widest => widest.insert(source.clone()),
+        };
+    }
+
+    /// `source`'s capture policy ([`CapturePolicy::Fit`] unless set).
+    pub fn capture_policy(&self, source: &SourceId) -> CapturePolicy {
+        match self.widest.lock().unwrap().contains(source) {
+            true => CapturePolicy::Widest,
+            false => CapturePolicy::Fit,
+        }
+    }
+
+    /// The band a rigid job's tune of the free `port` asks for when the job wants
+    /// `want`: `want` itself under [`CapturePolicy::Fit`] (the port grants the
+    /// narrowest rate that holds it); under [`CapturePolicy::Widest`] the port's
+    /// whole `max_bandwidth_hz` about `want`'s centre, so later jobs and a wider
+    /// view fit beside it without a retune. On a port a rigid lease or a pin holds
+    /// it is `want` whatever the policy.
+    pub fn capture_for(&self, port: &dyn Port, want: Tuning) -> Tuning {
+        // A source a rigid lease or a pin holds is not free: the request is decided
+        // against its capture as it stands.
+        let held = self
+            .leases
+            .lock()
+            .unwrap()
+            .get(port.id())
+            .is_some_and(|v| v.iter().any(|l| !l.elastic && l.yields.is_none()));
+        if held {
+            return want;
+        }
+        let max = *port.capabilities().max_bandwidth_hz.value();
+        match self.capture_policy(port.id()) {
+            CapturePolicy::Widest if want.bandwidth_hz.0 < max.0 => Tuning {
+                center_hz: want.center_hz,
+                bandwidth_hz: max,
+            },
+            _ => want,
+        }
+    }
+
+    /// Move `port`'s capture to `want` though rigid leases hold it, under the
+    /// source's gate the caller holds: granted when every rigid lease and pin band
+    /// lies inside `want` (the port is tuned; the caller restarts each holder on the
+    /// new capture, their leases kept), else a conflict as
+    /// [`LeaseManager::tune_if_unheld_locked`] gives, which also decides a port no
+    /// rigid lease holds and a band already inside the capture. A time-shared lease
+    /// that does not give way is a conflict; one that does gives way. Should the port
+    /// grant a band that leaves a holder outside, it is tuned back and the request is
+    /// a conflict. Also whether it tuned the port and, when it did, the rigid
+    /// holders (never a pin).
+    pub(crate) async fn widen_locked(
+        &self,
+        port: &dyn Port,
+        want: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(Tuning, bool, Vec<JobId>), LeaseError> {
+        let source = port.id().clone();
+        self.assert_gate(&source, guard);
+        let held: Vec<Lease> = self
+            .leases
+            .lock()
+            .unwrap()
+            .get(&source)
+            .map(|v| standing(v).into_iter().filter(|l| !l.elastic).collect())
+            .unwrap_or_default();
+        let cur = held.first().map(|l| port.current().unwrap_or(l.band));
+        let movable = cur.is_some_and(|c| !fits(&want, &c))
+            && !held.iter().any(|l| l.time_shared)
+            && held.iter().all(|l| fits(&l.band, &want));
+        let Some(cur) = cur.filter(|_| movable) else {
+            return self
+                .tune_if_unheld_locked(port, want, guard)
+                .await
+                .map(|(t, tuned)| (t, tuned, Vec::new()));
+        };
+        self.yield_shared(&mut self.leases.lock().unwrap(), &source);
+        let got = port.tune(want).await?;
+        if held.iter().all(|l| fits(&l.band, &got)) {
+            return Ok((got, true, rigid(&held)));
+        }
+        // The port granted another band than asked: back to the capture the holders run on.
+        port.tune(cur).await?;
+        let holders = rigid(&held);
+        let options = conflict_options(
+            port,
+            Some(&want),
+            &cur,
+            false,
+            &holders,
+            pinned_in(&held, &source),
+        );
+        Err(LeaseError::Conflict {
+            source,
+            holders,
+            current: cur,
+            options,
+        })
     }
 
     /// Tune `port` to `want` without taking a lease, under the same per-source
@@ -1255,7 +1374,7 @@ mod tests {
                 vec![
                     "stop one of the holders".to_string(),
                     "choose a band inside current".to_string(),
-                    "widen capture to 6000000 Hz (not yet available)".to_string(),
+                    "widen the capture to 102500000/6000000 Hz (source_ensure with widen: the holders restart on it)".to_string(),
                     format!("retry with replace: [{}]", j1.0),
                 ]
             ),

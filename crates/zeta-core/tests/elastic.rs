@@ -321,6 +321,7 @@ async fn source_ensure_retune_relaunches_the_elastic_job() {
             center_hz: want.center_hz,
             bandwidth_hz: want.bandwidth_hz,
             replace: vec![],
+            widen: false,
         })
         .await
         .unwrap();
@@ -536,6 +537,7 @@ async fn stop_during_a_relaunch_is_not_undone() {
                 center_hz: Hz(c),
                 bandwidth_hz: Hz(9_600),
                 replace: vec![],
+                widen: false,
             })
             .await
         })

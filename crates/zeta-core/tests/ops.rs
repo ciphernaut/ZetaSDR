@@ -146,6 +146,7 @@ async fn ensure_out_of_range_suggests_dropped_zeros() {
         center_hz: Hz(101_500),
         bandwidth_hz: Hz(200_000),
         replace: vec![],
+        widen: false,
     };
     match node.apply(op).await {
         Err(OpError::OutOfRange {
@@ -179,6 +180,7 @@ async fn ensure_unknown_source_lists_known() {
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(200_000),
         replace: vec![],
+        widen: false,
     };
     match node.apply(op).await {
         Err(OpError::Unknown {
@@ -361,6 +363,7 @@ async fn source_ensure_during_job_start_does_not_retune() {
         center_hz: Hz(433_000_000),
         bandwidth_hz: Hz(200_000),
         replace: vec![],
+        widen: false,
     };
     // `job_start` tunes twice: once (unheld) to learn the source rate, then
     // under its lease. Send `ensure` once the second, slow tune has begun, so
@@ -507,7 +510,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 46, "one schema per Op variant");
+    assert_eq!(vs.len(), 47, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -1050,6 +1053,7 @@ async fn conflict_reports_current_tuning_and_real_options() {
         center_hz: Hz(433_000_000),
         bandwidth_hz: Hz(200_000),
         replace: vec![],
+        widen: false,
     };
     match node.apply(ensure).await {
         Err(OpError::Conflict {
@@ -3650,6 +3654,7 @@ async fn refused_wide_band(cap: Claim<Hz>) -> OpError {
         center_hz: Hz(100_000_000),
         bandwidth_hz: Hz(24_000_000),
         replace: vec![],
+        widen: false,
     };
     node.apply(op).await.expect_err("24 MHz is over the cap")
 }

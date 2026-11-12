@@ -167,6 +167,22 @@ fn whole_capture() -> Claim<f64> {
     Claim::Asserted(1.0)
 }
 
+/// How a source's capture is chosen when a rigid job tunes it free
+/// (`source_set_capture`): `fit`, the narrowest rate that holds the job (or the
+/// set's bounding band), the least work for the host; or `widest`, the source's
+/// whole `max_bandwidth_hz` about the job's centre (or the bounding band's), so
+/// later jobs and a wider view fit beside it without a retune, at the cost of
+/// running the source at its full rate throughout.
+// No doc comment on a variant: schemars would then write a `oneOf` of constants,
+// which the operator docs cannot list as the values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturePolicy {
+    #[default]
+    Fit,
+    Widest,
+}
+
 /// One sample depth a source's link can carry: `bits` per I and Q sample,
 /// whether it holds every bit the ADC resolves (`lossless`), and the fastest
 /// rate the link sustains at it.

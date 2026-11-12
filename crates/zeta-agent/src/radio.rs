@@ -31,6 +31,7 @@ pub const RADIO_OPS: &[&str] = &[
     "source_ensure",
     "source_pin",
     "source_set_gain",
+    "source_set_capture",
     "source_measure",
 ];
 

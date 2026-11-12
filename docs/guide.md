@@ -121,7 +121,14 @@ error. `source gain` (the op `source_set_gain { source, gain_db: number | null }
 receive gain in dB within the source's range (`source_list.gain` reports `db`, `min_db`,
 `max_db`, `automatic`, `automatic_available`); `--auto` (`gain_db: null`) turns automatic gain
 on where the device has it. The setting is saved in the source record (`sources/<id>.json`,
-beside the pin) and re-applied at the next start, where it wins over `gain=` in the device args. A resumed channel takes the shared bank (`job_context` names its `channel.path`;
+beside the pin) and re-applied at the next start, where it wins over `gain=` in the device args.
+`source capture --policy fit|widest` (the op `source_set_capture`) chooses how wide the capture
+is when a job or a set tunes the free source: `fit`, the default, is the narrowest rate that
+holds it; `widest` is the source's whole `max_bandwidth_hz` about the same centre, so the page
+can show the radio's full width beside the jobs, at the cost of running the source at its full
+rate. A capture jobs already hold moves only when asked: `source ensure --widen` (the page's
+`widen capture to <W> MHz` button on a held radio) retunes the source to a band that still holds
+every job and restarts each of them on it under its id. A resumed channel takes the shared bank (`job_context` names its `channel.path`;
 `source_list.bank` shows `bin_hz` and `consumers`). Every transcript event of an attached
 `transcribe` job is also appended as one JSON line to `<state-dir>/transcripts.log` (`t_ns`, `job`,
 `input`, `source`, `center_hz`, `bandwidth_hz`, `start_ns`, `end_ns`, `text`, `language`,

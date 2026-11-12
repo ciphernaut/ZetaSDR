@@ -25,7 +25,8 @@
 //         that sweeps for itself, re-aimed with the view; see Sweep mode)
 //     wf.syncJobs(jobs)  a `job_list` result (app.js hands it every poll): follows a scan job
 //         that started on the shown source, or goes back to a spectrum job when it ended
-//     wf.onNotice   fn(text) for transcript lines (a refused retune); set by app.js
+//     wf.onNotice   fn(text, actions) for transcript lines (a refused retune; `actions` the
+//                   line's buttons, [{label, run}]: the widen offer); set by app.js
 //     wf.release() -> Promise<bool>  stops following the source for a scan: true. It
 //         never refuses for the source's holders: the node decides (a stepped scan on a held
 //         source waits for it, `context.scan.waiting`, and the waterfall goes on showing the
@@ -298,6 +299,11 @@ const WHEEL_NOTCH_PX = 40;
 const WHEEL_LINE_PX = 16;
 const WHEEL_PAGE_PX = 800;
 const WHEEL_IDLE_MS = 250;
+// A held source's conflict line names this many holders and counts the rest.
+const HELD_NAMED = 4;
+// A capture is offered to a held source only when it shows this much more of the view, as
+// a fraction of the present capture's width.
+const WIDEN_GAIN = 0.05;
 const STREAM_LOOKUPS = 20;
 const STREAM_LOOKUP_MS = 250;
 
@@ -485,6 +491,36 @@ export function rigidHolders(info) {
   return holders;
 }
 
+// The capture a held source could move to for the view lo..hi (widenOffer): the widest
+// one the view asks for, no wider than the source's max_bandwidth_hz and no narrower than
+// the capture it has, placed as near the view's centre as the bands of its holders allow
+// (`bands`: each rigid job's tuning and the pin; every one stays inside). null when the
+// holders span more than one capture, when nothing is known of the capture, or when the
+// result shows no more of the view than the capture it has (by WIDEN_GAIN of its width).
+export function widenTarget(info, bands, lo, hi) {
+  const cur = info && info.current;
+  const c = (info && info.capabilities) || {};
+  const max = capHz(c.max_bandwidth_hz);
+  if (!cur || max === null || !bands.length) return null;
+  const edges = bands.map((b) => [b.center_hz - b.bandwidth_hz / 2, b.center_hz + b.bandwidth_hz / 2]);
+  const hLo = Math.min(...edges.map((e) => e[0]));
+  const hHi = Math.max(...edges.map((e) => e[1]));
+  const width = Math.min(max, Math.max(hi - lo, cur.bandwidth_hz));
+  if (hHi - hLo > width) return null;
+  // The holders stay inside: the centre between hHi - width/2 and hLo + width/2.
+  let centre = Math.min(Math.max((lo + hi) / 2, hHi - width / 2), hLo + width / 2);
+  const min = capHz(c.tune_min_hz);
+  const top = capHz(c.tune_max_hz);
+  if (min !== null && centre < min) centre = min;
+  if (top !== null && centre > top) centre = top;
+  if (centre + width / 2 < hHi || centre - width / 2 > hLo) return null;
+  const target = { center_hz: Math.round(centre), bandwidth_hz: Math.round(width) };
+  // Worth a restart only when it shows clearly more of the view than the capture does.
+  const shows = (t) =>
+    Math.max(0, Math.min(hi, t.center_hz + t.bandwidth_hz / 2) - Math.max(lo, t.center_hz - t.bandwidth_hz / 2));
+  return shows(target) > shows(cur) + cur.bandwidth_hz * WIDEN_GAIN ? target : null;
+}
+
 // Whether `src` (a `source_list` record) sweeps `lo..hi` Hz for itself: its
 // `capabilities.sweep` holds the span. Such a scan takes no lease (plan 36.2).
 export function sweepsItself(src, lo, hi) {
@@ -623,6 +659,7 @@ class Waterfall {
     this.reaimBusy = false;
     this.follow = null;
     this.onNotice = null;
+    this.widenOffered = null; // the last widen offer made on its own line (offerWiden)
     this.coarseRows = []; // {row, col}: a coarse row stitched before fine column `col`
     this.coarseSpan = null; // the union of the stored coarse rows' bands
     this.coarsePainted = 0;
@@ -693,8 +730,8 @@ class Waterfall {
     if (source) this.setSource(source);
   }
 
-  notice(text) {
-    if (this.onNotice) this.onNotice(text);
+  notice(text, actions = []) {
+    if (this.onNotice) this.onNotice(text, actions);
     else console.warn(text);
   }
 
@@ -1657,15 +1694,17 @@ class Waterfall {
       if (coarseOn && (holders.length || !this.capturable(info, lo, hi))) {
         // A held source whose view no scanner can show: said at the gesture, eased back.
         if (holders.length && this.coarseCan && !(await this.coarseCan(lo, hi))) {
-          await this.heldBack(src, holders, lo, hi);
+          await this.heldBack(src, info, holders, lo, hi);
           return;
         }
-        // The coarse layer's view (spec 4.3 zoom_out scan): left past the capture.
+        // The coarse layer's view (spec 4.3 zoom_out scan): left past the capture. A held
+        // source that could capture more of it is offered once per capture it could move to.
         coarse = this.src === src;
+        if (holders.length) await this.offerWiden(src, info, holders, lo, hi);
         return;
       }
       if (holders.length) {
-        await this.heldBack(src, holders, lo, hi);
+        await this.heldBack(src, info, holders, lo, hi);
         return;
       }
       const gen = this.gen;
@@ -1695,7 +1734,9 @@ class Waterfall {
   // A held source the view lo..hi cannot leave its capture for: `conflict: source <id> held
   // by <kind> <id>, …; the view stays at its capture` (a pin named `pin`; the kinds from a
   // fresh job_list, the bare ids when it fails), and the view eases back into the capture.
-  async heldBack(src, holders, lo, hi) {
+  // The line also carries the widen offer (widenAction) when the source could capture more
+  // of the view with every holder still inside.
+  async heldBack(src, info, holders, lo, hi) {
     let jobs = [];
     try {
       jobs = (await this.api.op({ op: "job_list" })).value || [];
@@ -1707,10 +1748,92 @@ class Waterfall {
       const j = jobs.find((x) => x.id === id);
       return j ? `${j.kind} ${id}` : id;
     };
+    // Past a handful the line names the first few and counts the rest.
+    const named = holders.slice(0, HELD_NAMED).map(name);
+    if (holders.length > HELD_NAMED) named.push(`${holders.length - HELD_NAMED} more`);
+    const action = this.widenAction(src, info, holders, jobs, lo, hi);
     this.notice(
-      `conflict: source ${src.id} held by ${holders.map(name).join(", ")}; the view stays at its capture`,
+      `conflict: source ${src.id} held by ${named.join(", ")}; the view stays at its capture`,
+      action ? [action] : [],
     );
     if (this.src === src && this.band) this.easeTo(...this.clampToBand(lo, hi));
+  }
+
+  // The widen offer for the held `src` and the view lo..hi, or null: one button, `widen
+  // capture to <W> MHz (N jobs restart)`, which asks `source_ensure` with `widen` for the
+  // capture widenTarget gives (the node retunes the source and restarts each holder on it
+  // under its id), then shows the view asked for on the new capture. A holder the job list
+  // does not show is taken to need the whole capture.
+  widenAction(src, info, holders, jobs, lo, hi) {
+    const bands = holders.map((id) => {
+      if (id === "pin") return info.pin;
+      const j = jobs.find((x) => x.id === id);
+      return (j && j.tuning) || info.current;
+    });
+    if (bands.some((b) => !b)) return null;
+    const target = widenTarget(info, bands, lo, hi);
+    if (!target) return null;
+    const n = holders.filter((h) => h !== "pin").length;
+    const wider = target.bandwidth_hz > info.current.bandwidth_hz;
+    const what = wider
+      ? `widen capture to ${(target.bandwidth_hz / 1e6).toFixed(2)} MHz`
+      : `move capture to ${(target.center_hz / 1e6).toFixed(3)} MHz`;
+    return {
+      target,
+      label: `${what} (${n} job${n === 1 ? "" : "s"} restart${n === 1 ? "s" : ""})`,
+      run: () => this.widen(src, target, lo, hi),
+    };
+  }
+
+  // The widen offer on its own line, for a view left past the capture for the coarse layer:
+  // once per capture the source could move to, until its capture changes.
+  async offerWiden(src, info, holders, lo, hi) {
+    let jobs = [];
+    try {
+      jobs = (await this.api.op({ op: "job_list" })).value || [];
+    } catch {
+      return;
+    }
+    const action = this.widenAction(src, info, holders, jobs, lo, hi);
+    if (!action) return;
+    const cur = info.current;
+    const key = `${src.id}:${cur.center_hz}/${cur.bandwidth_hz}>${action.target.center_hz}/${action.target.bandwidth_hz}`;
+    if (this.widenOffered === key) return;
+    this.widenOffered = key;
+    const n = holders.filter((h) => h !== "pin").length;
+    this.notice(
+      `source ${src.id} captures ${(cur.bandwidth_hz / 1e6).toFixed(2)} MHz for ${n} job${n === 1 ? "" : "s"}; it could capture more of this view`,
+      [action],
+    );
+  }
+
+  // Runs a widen offer: `source_ensure` with `widen` for `target`, then the waterfall starts
+  // over on the new capture showing as much of lo..hi as it holds (refused: `widen refused:
+  // <error>` in the transcript, nothing changed).
+  async widen(src, target, lo, hi) {
+    const gen = this.gen;
+    let current = null;
+    try {
+      const r = await this.api.op({
+        op: "source_ensure",
+        source: src.id,
+        center_hz: target.center_hz,
+        bandwidth_hz: target.bandwidth_hz,
+        replace: [],
+        widen: true,
+      });
+      current = usableTuning(r.value);
+    } catch (e) {
+      this.notice(`widen refused: ${e.json ? errorText(e.json) : e.message}`);
+      return;
+    }
+    this.widenOffered = null;
+    if (!current || gen !== this.gen || this.src !== src) return;
+    const half = current.bandwidth_hz / 2;
+    const [cl, ch] = [current.center_hz - half, current.center_hz + half];
+    const fits = lo >= cl && hi <= ch;
+    this.pendingView = fits ? { lo, hi } : { lo: cl, hi: ch };
+    this.setSource({ ...src, current });
   }
 
   // Leaves scan mode for lo..hi (coarse.js, ruling R23: the page's own scan on the shown

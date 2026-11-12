@@ -42,7 +42,8 @@ pub const GATED_REPLACE_OPS: &[&str] = &[
 ];
 
 /// `Some(error)` when `op` would stop jobs and the run is not allowed to:
-/// a `job_stop`, or a gated op with a non-empty `replace`; likewise a
+/// a `job_stop`, or a gated op with a non-empty `replace`, or a `source_ensure`
+/// with `widen` (it restarts the holders); likewise a
 /// `capture_delete` without `delete_captures`, and a `signature_accept` or
 /// `signature_reject` without `accept_signatures`. The executor is
 /// never reached; the error goes back to the model as the call's result.
@@ -69,6 +70,16 @@ pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
             "field": "op",
             "op": name,
             "message": "accepting or rejecting a signature is the operator's decision: report the proposal to the operator; they unlock it by allowing signatures for the run",
+        }));
+    }
+    // A widened capture restarts every job holding the source: the operator's call,
+    // unlocked as a `replace` is.
+    if name == "source_ensure" && op["widen"] == json!(true) && !allow.replace {
+        return Some(json!({
+            "error": "not_allowed",
+            "field": "widen",
+            "op": name,
+            "message": "widening a held capture restarts the jobs holding it, which is not allowed in this run: report the conflict and its widen option to the operator; they unlock it by allowing stops for the run, or widen it themselves",
         }));
     }
     let field = if matches!(name, "job_stop" | "jobs_stop" | "set_stop") {
@@ -487,6 +498,24 @@ impl<E: Executor> Agent<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_widen_is_gated_as_a_replace_is() {
+        let ensure = |widen: bool| {
+            json!({"op": "source_ensure", "source": "radio", "center_hz": 100_000_000u64,
+                   "bandwidth_hz": 4_000_000, "replace": [], "widen": widen})
+        };
+        assert!(gate(&ensure(false), Allow::default()).is_none());
+        let refused = gate(&ensure(true), Allow::default()).expect("refused");
+        assert_eq!(refused["error"], "not_allowed");
+        assert_eq!(refused["field"], "widen");
+        assert_eq!(refused["op"], "source_ensure");
+        let allowed = Allow {
+            replace: true,
+            ..Allow::default()
+        };
+        assert!(gate(&ensure(true), allowed).is_none());
+    }
 
     #[test]
     fn signature_accept_and_reject_are_gated() {

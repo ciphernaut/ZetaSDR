@@ -331,6 +331,7 @@ async fn pin_is_a_rigid_holder_without_an_id() {
             center_hz: outside.center_hz,
             bandwidth_hz: outside.bandwidth_hz,
             replace: vec![],
+            widen: false,
         })
         .await,
     );

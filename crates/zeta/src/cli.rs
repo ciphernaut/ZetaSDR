@@ -1029,6 +1029,13 @@ pub struct ServeArgs {
     pub llm: LlmArgs,
 }
 
+/// `source capture --policy`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum CapturePolicyArg {
+    Fit,
+    Widest,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum SourceCmd {
     /// List sources with capabilities, current tuning and holders
@@ -1039,6 +1046,10 @@ pub enum SourceCmd {
         band: BandArgs,
         #[command(flatten)]
         replace: ReplaceArg,
+        /// Move a held source's capture to the band when every holder still fits
+        /// inside it; the holders restart on the new capture
+        #[arg(long)]
+        widen: bool,
     },
     /// Hold a source at a band without a job (persisted; restored on restart)
     Pin {
@@ -1072,6 +1083,16 @@ pub enum SourceCmd {
         /// Bandwidth, Hz
         #[arg(long, value_name = "HZ")]
         bandwidth_hz: u64,
+    },
+    /// Choose how a source's capture is sized when a job tunes it free (persisted)
+    Capture {
+        /// Source id
+        #[arg(long)]
+        source: String,
+        /// fit: the narrowest rate that holds the job or set; widest: the source's
+        /// full rate about the same centre
+        #[arg(long, value_enum)]
+        policy: CapturePolicyArg,
     },
     /// Set a source's overall receive gain (persisted; re-applied on restart)
     Gain {
@@ -1470,6 +1491,7 @@ impl Command {
                     | SourceCmd::Unpin { .. }
                     | SourceCmd::Measure { .. }
                     | SourceCmd::Gain { .. }
+                    | SourceCmd::Capture { .. }
             ) | Command::Job(
                 JobCmd::Start { .. }
                     | JobCmd::Attach { .. }
@@ -1526,11 +1548,23 @@ impl Command {
         let job = |a: JobArg| JobId(a.job);
         Ok(Some(match self {
             Command::Source(SourceCmd::List) => Op::SourceList {},
-            Command::Source(SourceCmd::Ensure { band: b, replace }) => Op::SourceEnsure {
+            Command::Source(SourceCmd::Ensure {
+                band: b,
+                replace,
+                widen,
+            }) => Op::SourceEnsure {
                 source: SourceId(b.source),
                 center_hz: Hz(b.center_hz),
                 bandwidth_hz: Hz(b.bandwidth_hz),
                 replace: replace.into_ids(),
+                widen,
+            },
+            Command::Source(SourceCmd::Capture { source, policy }) => Op::SourceSetCapture {
+                source: SourceId(source),
+                policy: match policy {
+                    CapturePolicyArg::Fit => zeta_core::types::CapturePolicy::Fit,
+                    CapturePolicyArg::Widest => zeta_core::types::CapturePolicy::Widest,
+                },
             },
             Command::Source(SourceCmd::Pin { band: b, replace }) => Op::SourcePin {
                 source: SourceId(b.source),

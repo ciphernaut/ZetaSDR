@@ -2738,6 +2738,45 @@ def scenario_held_radio_says_who_holds_it(page, url, secret):
         stop_job(url, secret, job)
         stop_scans(url, secret)
 
+def scenario_held_radio_offers_to_move_its_capture(page, url, secret):
+    # A tunable radio held by a rigid job: a view partly past its capture carries one button
+    # on the conflict line; it moves the capture (`source_ensure` with `widen`), the job
+    # restarting on it under its id, and the view asked for is then shown.
+    stop_scans(url, secret)
+    select_source(page, url, secret, "retune")
+    page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+    cur = current_capture(url, secret, "retune")
+    centre = cur["center_hz"]
+    job = start_job(url, secret, "measure", "retune", centre, 10_000)
+    try:
+        run_cmd(page, "view set zoom_out none")
+        expect(view_line(page, "zoom_out = none")).to_be_visible()
+        # 40 kHz about a point 15 kHz up: 9 kHz of it lies past the 48 kHz capture.
+        apply_band(page, (centre + 15_000) / 1e6, 40)
+        line = page.locator("#transcript .line", has_text="conflict: source retune held by")
+        expect(line.first).to_contain_text(job, timeout=10_000)
+        button = line.first.locator("button.action")
+        expect(button).to_have_count(1)
+        expect(button).to_have_text(
+            f"move capture to {(centre + 15_000) / 1e6:.3f} MHz (1 job restarts)")
+        assert current_capture(url, secret, "retune") == cur, "nothing moved before the click"
+        button.click()
+        moved = {"center_hz": centre + 15_000, "bandwidth_hz": cur["bandwidth_hz"]}
+        wait_until(lambda: source_info(url, secret, "retune")["current"] == moved, 10.0,
+                   "the capture moved")
+        wait_until(lambda: job_record(url, secret, job)["state"]["status"] == "running", 10.0,
+                   "the holder runs on the new capture")
+        assert source_info(url, secret, "retune")["holders"] == [job]
+        top = f"{(centre + 15_000 + 20_000) / 1e6:.3f}"
+        bottom = f"{(centre + 15_000 - 20_000) / 1e6:.3f}"
+        wait_ticks(page, top, bottom, "the view asked for, on the moved capture")
+        assert page.locator("#transcript .line", has_text="widen refused").count() == 0
+    finally:
+        run_cmd(page, "view set zoom_out scan")
+        stop_job(url, secret, job)
+        stop_scans(url, secret)
+
+
 def scenario_failed_auto_scan_stop_is_retried(page, url, secret):
     # A job_stop of the page's own scan that fails keeps the scan the page's own: the id stays
     # in zeta.autoScan and the stop is retried until it lands.

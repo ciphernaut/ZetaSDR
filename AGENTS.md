@@ -67,18 +67,19 @@ CLI: `zeta source list`
 
 ### source_ensure
 
-Check a band against the source and tune it if no job holds it. Takes no lease: an unheld source is tuned directly (a later `job_start` may retune it); a held source is never retuned, and the request either fits the current band (`Tuning`) or is a `Conflict`. Runs under the lease manager's per-source gate, so it never interleaves with a job's lease-and-tune. Elastic jobs do not hold the source: a tune relaunches them on the new capture.
+Check a band against the source and tune it if no job holds it. Takes no lease: an unheld source is tuned directly (a later `job_start` may retune it); a held source is not retuned without `widen`, and the request either fits the current band (`Tuning`) or is a `Conflict`. Runs under the lease manager's per-source gate, so it never interleaves with a job's lease-and-tune. Elastic jobs do not hold the source: a tune relaunches them on the new capture.
 
 - source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
 - replace: array; ids from `job list` (strings), `[]` for none
+- widen: boolean; `true` moves a held capture and restarts every job holding the source on it; `false` never retunes a held source
 
-JSON: `{"op":"source_ensure","source":"<id>","center_hz":144800000,"bandwidth_hz":12500,"replace":[]}`
+JSON: `{"op":"source_ensure","source":"<id>","center_hz":144800000,"bandwidth_hz":12500,"replace":[],"widen":false}`
 
 CLI: `zeta source ensure --source <id> --center-hz 144800000 --bandwidth-hz 12500`
 
-`replace`: job ids that hold the source and may be stopped to make room; they are stopped under the source's gate right before the request, so nothing can take the radio in between. A `conflict` lists the holders; decide whether those jobs may stop, then retry with `replace`. The page's elastic job is never a holder, and a stepped scan never makes a conflict (it gives way and waits, see `scan` below), so there is no need to name one.
+`replace`: job ids that hold the source and may be stopped to make room; they are stopped under the source's gate right before the request, so nothing can take the radio in between. A `conflict` lists the holders; decide whether those jobs may stop, then retry with `replace`. The page's elastic job is never a holder, and a stepped scan never makes a conflict (it gives way and waits, see `scan` below), so there is no need to name one. `widen: true` moves a held source's capture to the band (wider, or shifted) when every holder's band and the pin's still lie inside it: a `conflict` lists `widen the capture to <centre>/<width> Hz` when the radio could capture both the request and what it holds. The source is retuned and every job holding it restarts on the new capture under its id: a short gap in each stream, each decoder's state lost, an external decoder's process started again, a transcription or other attached job relaunched on its input. That is the operator's decision, as a stop is: through `ask` it needs the run to allow stops, else it is refused as `not_allowed`; report the option, do not retry. A widened capture lasts until the node restarts (the jobs resume on their own capture); `source_set_capture` makes the wide capture the source's habit. On the CLI, `--widen`.
 
 ### source_pin
 
@@ -145,6 +146,19 @@ JSON: `{"op":"source_set_gain","source":"<id>","gain_db":null}`
 CLI: `zeta source gain --source <id> --db 40`
 
 Set the source's overall receive gain live (`gain_db` in dB within `source list`'s `gain.min_db..=max_db`), or `null` for the driver's automatic gain where `gain.automatic_available`. Persisted: it is re-applied when the node restarts and wins over `gain=` in the device args. A source without adjustable gain (a recording, a KiwiSDR, another node) answers `source has no adjustable gain`. On the CLI, `--auto` passes `null`.
+
+### source_set_capture
+
+Set how the source's capture is chosen when a rigid job (or a set) tunes it free: `fit` (the default) takes the narrowest rate that holds the job or the set's bounding band; `widest` takes the source's whole `max_bandwidth_hz` about the same centre, so later jobs and a wider view fit beside it without a retune, the source running at its full rate throughout (more CPU and memory). It never moves a capture already held: it applies from the next tune of the free source (also at a restart's resume). An elastic job, a pin, `source_ensure` and a scan's steps tune to their own band whatever it says. Persisted in the state directory; `source_list` shows it as `capture_policy`.
+
+- source: string; an id from `source list`
+- policy: string (CapturePolicy: fit|widest)
+
+JSON: `{"op":"source_set_capture","source":"<id>","policy":"fit"}`
+
+CLI: `zeta source capture --source <id> --policy fit`
+
+How wide the source's capture is when a job or a set tunes it free. `fit` (the default) takes the narrowest rate that holds the job or the set's bounding band: the least CPU and memory. `widest` takes the source's whole `max_bandwidth_hz` about the same centre, so the page can zoom out to the radio's full instantaneous width beside the running jobs and a later job megahertz away fits without a restart; the source then runs at its full rate all the time, which costs CPU (the channel bank) and memory (the IQ history) in proportion. It applies from the next time the free source is tuned for a job (stop and start the set, or restart the node); it never moves a capture jobs hold (`source_ensure` with `widen` does that). Persisted. On the CLI, `zeta source capture --source <id> --policy widest`.
 
 ### job_start
 

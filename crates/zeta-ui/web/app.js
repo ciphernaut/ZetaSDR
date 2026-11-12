@@ -20,8 +20,8 @@
 // the transcript through the `ops` stream); `view` alone or followed by `set`, `show`,
 // `reset` or `clear` is a view command (view.js: `view set <key> <value>`, `view show`,
 // `view reset`, `view clear`), handled here before both, its answer a transcript line;
-// `source pin [<center_hz> <bandwidth_hz>]`, `source unpin`, `source gain <db>|auto` and
-// `source measure` act on the shown source the same way (runSourceCommand: `source_pin` at its
+// `source pin [<center_hz> <bandwidth_hz>]`, `source unpin`, `source gain <db>|auto`,
+// `source capture fit|widest` and `source measure` act on the shown source the same way (runSourceCommand: `source_pin` at its
 // `current` capture or the band given, `source_unpin`, `source_set_gain`, `source_measure`),
 // their reply or error a transcript line;
 // anything else (other text starting "view " or "source " included) goes to `api.ask`.
@@ -872,6 +872,12 @@ function sourceOp(src, words) {
     if (args.length) return { error: "source measure: expected no arguments" };
     return { op: { op: "source_measure", source: src.id, replace: [] } };
   }
+  if (verb === "capture") {
+    if (args.length !== 1 || !["fit", "widest"].includes(args[0])) {
+      return { error: "source capture: expected fit or widest" };
+    }
+    return { op: { op: "source_set_capture", source: src.id, policy: args[0] } };
+  }
   // gain
   if (args.length === 1 && args[0] === "auto") {
     return { op: { op: "source_set_gain", source: src.id, gain_db: null } };
@@ -891,13 +897,19 @@ function sourceReply(op, result) {
   if (op.op === "source_measure") {
     return `measuring ${op.source} again: about a minute, the host will be busy`;
   }
+  if (op.op === "source_set_capture") {
+    return op.policy === "widest"
+      ? `capture ${op.source}: widest (its full width, from the next time a job tunes it free)`
+      : `capture ${op.source}: fit (the narrowest rate that holds the jobs, from the next time a job tunes it free)`;
+  }
   const g = (result && result.value) || {};
   if (g.automatic || g.db === null || g.db === undefined) return `gain ${op.source}: automatic`;
   return `gain ${op.source}: ${g.db} dB (${g.min_db}..=${g.max_db})`;
 }
 
 // `source pin [<center_hz> <bandwidth_hz>]`, `source unpin`, `source gain <db>|auto`,
-// `source measure` on the shown source: {text, error} for the transcript, or {text: null}
+// `source measure`, `source capture fit|widest` on the shown source: {text, error} for the
+// transcript, or {text: null}
 // when a conflict was offered its retry line instead (offerReplace).
 export async function runSourceCommand(st, words) {
   let src;
@@ -1114,7 +1126,7 @@ async function runCommand(text) {
     state.transcript.note(r.text, r.error);
     return;
   }
-  if (/^source\s+(pin|unpin|gain|measure)\b/.test(text)) {
+  if (/^source\s+(pin|unpin|gain|measure|capture)\b/.test(text)) {
     state.transcript.user(text);
     const r = await runSourceCommand(state, text.split(/\s+/).slice(1));
     if (r.text !== null) state.transcript.note(r.text, r.error);
@@ -1218,7 +1230,7 @@ function start(api) {
     onConflict: (p) => offerReplace(p.op, p.error),
   });
   state.wf = mountWaterfall($("#waterfall"), api);
-  state.wf.onNotice = (text) => state.transcript?.note(text, true);
+  state.wf.onNotice = (text, actions = []) => state.transcript?.note(text, true, actions);
   state.wf.follow = () => state.view.get("follow");
   state.wf.plan = () => state.view.get("plan");
   state.coarse = mountCoarse(state.wf, api, state.view, {

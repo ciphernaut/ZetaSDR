@@ -47,8 +47,8 @@ use crate::ring::IqRing;
 use crate::stage::{Backend, MixInput, StageRegistry};
 use crate::stream::{Frame, Payload, StreamBus};
 use crate::types::{
-    Capabilities, Hz, JobId, PositionFrom, Provenance, SourceId, SourcePosition, Span, StreamId,
-    StreamKind, Timestamp,
+    Capabilities, CapturePolicy, Hz, JobId, PositionFrom, Provenance, SourceId, SourcePosition,
+    Span, StreamId, StreamKind, Timestamp,
 };
 
 pub use crate::ops::OPS_RESULT_LIMIT_BYTES;
@@ -1105,6 +1105,7 @@ impl Node {
         // Gains before anything tunes, then pins: each pinned source is held at
         // its band before any record resumes, so the records fit inside it or
         // conflict as they would live.
+        node.restore_capture_policies();
         node.restore_gains().await;
         node.restore_pins().await;
         // The records in resume order (see `Inner::resume_records`); without `resume`
@@ -1132,6 +1133,14 @@ impl Node {
             node.inner.prune_history(&mut jobs);
         }
         Ok(node)
+    }
+
+    /// Give the lease manager each source record's capture policy
+    /// ([`Node::source_set_capture`]), before anything tunes.
+    fn restore_capture_policies(&self) {
+        for (id, r) in self.inner.sources.lock().unwrap().iter() {
+            self.inner.leases.set_capture_policy(id, r.capture);
+        }
     }
 
     /// Set each attached source whose record has a gain to it (see
@@ -2769,6 +2778,30 @@ impl Node {
     /// The band `source` is pinned at, if it is.
     pub fn pinned(&self, source: &SourceId) -> Option<Tuning> {
         self.inner.leases.pinned(source)
+    }
+
+    /// Set `source`'s capture policy and persist it in `sources/<id>.json`, to be
+    /// applied again when the node opens. It governs the next tune of the free
+    /// source by a rigid job; a capture already held stays.
+    pub fn source_set_capture(
+        &self,
+        source: &SourceId,
+        policy: CapturePolicy,
+    ) -> Result<(), NodeError> {
+        self.set_source_record(source, |r| r.capture = policy)?;
+        self.inner.leases.set_capture_policy(source, policy);
+        Ok(())
+    }
+
+    /// `source`'s capture policy (`source_set_capture`).
+    pub fn capture_policy(&self, source: &SourceId) -> CapturePolicy {
+        self.inner.leases.capture_policy(source)
+    }
+
+    /// The band a rigid job's tune of the free `port` asks for; see
+    /// [`LeaseManager::capture_for`].
+    pub(crate) fn capture_for(&self, port: &dyn Port, want: Tuning) -> Tuning {
+        self.inner.leases.capture_for(port, want)
     }
 
     /// Change `source`'s record with `change` and write it; on a failed write the

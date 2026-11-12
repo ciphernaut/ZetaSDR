@@ -26,9 +26,15 @@ Plan 36.1 made the shift a quarter of the stride (the usable fraction of the cap
 
 From the same run. At the 1 Msps UHF CB pin `stats.timeouts` climbs about 8 per second (71 → 412 in a minute) with the rate reading 1.1 % fast and no overflows; at 2 Msps and up it stays at 0. The HackRF is under its 2 Msps minimum there and the driver's read times out between blocks. Harmless so far (the jobs ran) but the counter is useless as a health signal at that rate: either read with a timeout scaled to the block duration, or capture at 2 Msps and decimate for a 1 MHz pin. Also: the 1 Msps capture gets no channel bank (`channel.path` `direct`, `no bank`); say why in `source list`, or give it one.
 
-## Lease: widen a held capture around a rigid job
+## Lease: follow-ups to widening a held capture
 
-A rigid request for a band outside the capture rigid jobs hold is a conflict, and its options list `widen capture to <n> Hz (not yet available)` when the radio could capture both. Built, it would retune the source to a capture holding the old band and the new one (centred to keep the holders' channels inside, its edges off their channels), relaunching the holders on it, so a wide view or a second decoder near a running one works without stopping it. Open: who may widen (a job's start, a pin, the page's view), the holders' channel path across the retune (a bank remade at the new rate), and the elastic jobs following.
+`source_ensure` with `widen` moves a held capture and restarts the holders on it, and `source_set_capture` makes the widest capture a source's habit (2026-11-12). Left open:
+
+- A widened capture is not kept across a restart: the jobs resume on their own bounding capture unless the source's policy is `widest`.
+- `job_start`, `job_retune` and `set_start` take no `widen` of their own: a caller widens with `source_ensure` first, then starts the job inside the new capture.
+- The gap is unmeasured on real hardware: how long each stream is silent across a rate change, and whether an external decoder loses more than the frames in flight.
+- The page offers the widest capture the view asks for; it does not offer a middle rate, and under `widest` it offers a move of the capture when the view is dragged past its edge, each a restart of every holder.
+- `widest` is the source's full rate at its own depth. A policy naming a rate (or a fraction of the full rate) would let a host with less CPU take a middle course.
 
 ## Lease: keep a lone job's capture centre off its channel
 

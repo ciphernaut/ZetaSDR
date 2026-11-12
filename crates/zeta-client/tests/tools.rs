@@ -67,7 +67,7 @@ fn source_ensure_tool_shape() {
         .collect();
     assert_eq!(
         props,
-        BTreeSet::from(["source", "center_hz", "bandwidth_hz", "replace"])
+        BTreeSet::from(["source", "center_hz", "bandwidth_hz", "replace", "widen"])
     );
     assert_eq!(t.input_schema["properties"]["center_hz"]["type"], "integer");
     assert!(t.description.contains("Check a band"));

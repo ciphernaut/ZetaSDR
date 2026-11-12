@@ -376,6 +376,7 @@ async fn stop_during_a_relaunch_leaves_no_stage() {
                 center_hz: Hz(c),
                 bandwidth_hz: Hz(9_600),
                 replace: vec![],
+                widen: false,
             })
             .await
         })

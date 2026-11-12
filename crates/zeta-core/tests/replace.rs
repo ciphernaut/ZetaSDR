@@ -205,6 +205,7 @@ fn ensure(t: Tuning, replace: &[&JobId]) -> Op {
         center_hz: t.center_hz,
         bandwidth_hz: t.bandwidth_hz,
         replace: replace.iter().map(|j| (*j).clone()).collect(),
+        widen: false,
     }
 }
 

@@ -1061,6 +1061,7 @@ async fn job_start_during_scan_is_granted_and_never_a_conflict_naming_it() {
         center_hz: Hz(8 * MHZ),
         bandwidth_hz: Hz(MHZ),
         replace: vec![],
+        widen: false,
     };
     assert!(matches!(node.apply(ensure).await, Ok(OpResult::Tuning(_))));
     let job = start_job(&node, start(JobKind::Spectrum, 8 * MHZ, MHZ)).await;
@@ -3863,6 +3864,7 @@ async fn source_ensure_beside_a_stepped_scan_is_granted() {
             center_hz: want.center_hz,
             bandwidth_hz: want.bandwidth_hz,
             replace: vec![],
+            widen: false,
         })
         .await;
     assert_eq!(r, Ok(OpResult::Tuning(want)));

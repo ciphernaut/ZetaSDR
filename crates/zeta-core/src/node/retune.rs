@@ -14,7 +14,7 @@ use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
 use crate::ops::{JobKind, RETUNE_CARRIED_PARAMS};
 use crate::port::{PortError, Tuning};
-use crate::types::JobId;
+use crate::types::{JobId, SourceId};
 
 impl Node {
     /// Move the running job `id` (of the expandable `kind`) to `want` under its id.
@@ -121,6 +121,147 @@ impl Node {
         // On the input's new stream, or `failed` as `input job <id> not running`.
         self.inner.relaunch_attached(held).await;
         r
+    }
+}
+
+impl Node {
+    /// `source_ensure` with `widen`: move `source`'s capture to `want` though jobs
+    /// hold it. Under one hold of the source's gate: the `replace` jobs are stopped
+    /// (see [`Node::replace_holders`]), the move is decided and the port tuned
+    /// ([`crate::lease::LeaseManager::widen_locked`]: every holder's band inside
+    /// `want`, else a conflict and nothing changed), then each job holding the
+    /// source is relaunched on the new capture under its id, its lease kept
+    /// ([`Inner::relaunch_in_place`]: its graph is expanded again for the new rate,
+    /// its channel filters and the bank made for the new centre). A relaunch that
+    /// fails ends that job `Failed` with the reason and the others go on. Once the
+    /// gate is let go the elastic jobs are relaunched on the new capture and the
+    /// attached jobs on their inputs' new streams. A source nobody holds, or a
+    /// band inside the capture, is as `source_ensure` without `widen`.
+    pub async fn source_widen(
+        &self,
+        source: &SourceId,
+        want: Tuning,
+        replace: &[JobId],
+    ) -> Result<Tuning, NodeError> {
+        let port = self
+            .port(source)
+            .ok_or_else(|| NodeError::UnknownSource(source.clone()))?;
+        let guard = self.inner.leases.gate_guard(source).await;
+        if !replace.is_empty()
+            && let Err(e) = self.replace_holders(source, replace, &guard).await
+        {
+            drop(guard);
+            if !matches!(e, NodeError::UnknownJob(_) | NodeError::Other(_)) {
+                self.idle_if_unheld(port.as_ref()).await;
+            }
+            return Err(e);
+        }
+        // Before anything moves: a holder whose graph cannot be made for a capture of
+        // the width asked would fail at its restart, so the widen is refused instead.
+        // (The port may grant a wider rate still; the restart then decides.)
+        let outside = port.current().is_none_or(|c| {
+            let edges = |t: &Tuning| {
+                let half = t.bandwidth_hz.0 / 2;
+                (
+                    t.center_hz.0.saturating_sub(half),
+                    t.center_hz.0.saturating_add(half),
+                )
+            };
+            let ((wl, wh), (cl, ch)) = (edges(&want), edges(&c));
+            wl < cl || wh > ch
+        });
+        if outside {
+            for (id, _) in self.inner.leases.holders(source) {
+                let rec = self
+                    .inner
+                    .jobs
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .map(|e| e.record.clone());
+                let Some(rec) = rec.filter(|r| !r.operator_graph) else {
+                    continue;
+                };
+                let Some(kind) = self.inner.expandable_kind(&rec.kind) else {
+                    continue;
+                };
+                if let Err(e) = kind.reexpand(
+                    &rec.source,
+                    rec.tuning,
+                    want.bandwidth_hz,
+                    None,
+                    &rec.graph,
+                    &self.inner.modes(),
+                ) {
+                    drop(guard);
+                    if !replace.is_empty() {
+                        self.idle_if_unheld(port.as_ref()).await;
+                    }
+                    return Err(NodeError::Other(format!(
+                        "job {} ({}) cannot run on a {} Hz capture: {e}; nothing was changed",
+                        id.0, rec.kind, want.bandwidth_hz.0
+                    )));
+                }
+            }
+        }
+        let moved = self
+            .inner
+            .leases
+            .widen_locked(port.as_ref(), want, &guard)
+            .await;
+        let (got, tuned, holders) = match moved {
+            Ok(m) => m,
+            Err(e) => {
+                drop(guard);
+                let e = match e {
+                    LeaseError::Port(p) => {
+                        self.inner.note_fault_if_faulted(source);
+                        NodeError::SourcePort(source.clone(), p)
+                    }
+                    e => NodeError::Lease(e),
+                };
+                if !replace.is_empty() {
+                    self.idle_if_unheld(port.as_ref()).await;
+                }
+                return Err(e);
+            }
+        };
+        let mut afters = Vec::new();
+        let mut attached = Vec::new();
+        let mut failed = false;
+        for id in &holders {
+            // A holder that is no running job here (a band a starting set holds)
+            // has no run to restart.
+            let rec = {
+                let jobs = self.inner.jobs.lock().unwrap();
+                jobs.get(id)
+                    .filter(|e| e.cancel.is_some() && e.record.state == JobState::Running)
+                    .map(|e| e.record.clone())
+            };
+            let Some(rec) = rec else {
+                continue;
+            };
+            // Before the run stops: its attached jobs' supervisors keep them `Running`.
+            attached.extend(self.inner.hold_attached(id));
+            let (r, after) = self.inner.relaunch_in_place(rec, Some(&guard)).await;
+            failed |= r.is_err();
+            afters.push(after);
+        }
+        drop(guard);
+        for after in afters {
+            self.inner.after_gate(after).await;
+        }
+        if tuned {
+            // The holders' launches found their leases inside the new capture and
+            // tuned nothing, so nobody else relaunches the elastic jobs.
+            let _ = self.inner.relaunch_elastic(source, None).await;
+        }
+        if failed {
+            // A relaunch that failed let its lease go: perhaps the last one.
+            self.idle_if_unheld(port.as_ref()).await;
+        }
+        self.inner.relaunch_attached(attached).await;
+        Ok(got)
     }
 }
 
