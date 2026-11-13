@@ -836,3 +836,17 @@ From the first live run of plan 36 and the live-view fixes after it. Each is sma
 From the operator, 2026-11-12. While the map is shown in the waterfall's place the page drops every spectrum row (`waterfall.js` `behindMap`), so the waterfall's history has a gap for as long as the map was up. Job events are not affected: they come over the source's event feed. Make it a policy the operator sets and can make their default, for example `view set behind_map pause|paint`: `pause` is today's behaviour, `paint` keeps drawing into the hidden canvas at the browser's cost.
 
 Not built on its own, because more such choices are coming and they want one home: the page's `view set` policies, the agent's radio policy and its allow gates (stops, replace, widen, capture deletes, signatures), and the per-source capture policy (`source_set_capture`) are each kept in a different place today. Design them together, possibly as part of a permissions and authorisations framework: who may set a policy, where its default lives (a page, a node, a source, an operator), and how a caller without the right is refused. Related: "UI: view policies in localStorage".
+
+## Register answer: later stages (plan 37)
+
+From the operator, 2026-11-12, while settling plan 37 (`docs/superpowers/specs/2026-11-12-register-answer-design.md` section 6). Not built by that plan; each is a gist, not a spec:
+- **A context menu on a map site:** any operation that applies, including starting a decoder for the site's channel and emission, and turning a directional antenna that covers the band toward the site's bearing where it is on a rotator.
+- **A moving observer:** position from a live feed (a vehicle, an aircraft), and candidates ranked by how well each fits the level measured along the track.
+- **Register labels on scan rows**, and smarter decoder placement in a watch from the candidates' rank.
+- **Licence condition text and "new since" history** in the answer.
+- **Terrain** in the propagation estimate, and live conditions for ducting and skywave.
+- **Fleet questions** (which node is best placed for an emitter), **calibration references** (known frequency, power and position), **training labels** from the register, and **publishing observations outwards**.
+- **Other regulators' registers and non-regulator sources** behind the same answer type, each with its own register queries.
+- **A larger antenna azimuth database** in the register service as a refinement of the beam term; it multiplies the service's footprint, so it is the operator's to schedule.
+- **Offering proven register queries to the register service's sample-query catalogue**, and any new function there that its other clients would also use.
+- **A per-signal absolute level** from a calibrated source, to feed the verdict's level term.
