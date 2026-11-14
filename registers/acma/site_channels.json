@@ -1,0 +1,22 @@
+{
+  "id": "site_channels",
+  "provider": "acma",
+  "name": "Every channel at a site, with its licence and holder",
+  "call": "execute_sql",
+  "sql": "SELECT d.FREQUENCY AS center_hz, d.BANDWIDTH AS bandwidth_hz, d.DEVICE_TYPE AS device_type, TRIM(d.EMISSION) AS emission, d.LICENCE_NO AS licence_no, c.LICENCEE AS licensee FROM device_details d LEFT JOIN licence l ON l.LICENCE_NO = d.LICENCE_NO LEFT JOIN client c ON c.CLIENT_NO = l.CLIENT_NO WHERE d.SITE_ID = {site_id} ORDER BY d.FREQUENCY, d.DEVICE_TYPE",
+  "params": [
+    {
+      "name": "site_id",
+      "kind": "id"
+    }
+  ],
+  "limit": 500,
+  "columns": [
+    "center_hz",
+    "bandwidth_hz",
+    "device_type",
+    "emission",
+    "licence_no",
+    "licensee"
+  ]
+}

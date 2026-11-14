@@ -548,10 +548,32 @@ pub enum ParamValue {
 }
 
 /// The embedded register queries, one file each under `registers/` in the repo.
-const EMBEDDED: [(&str, &str); 1] = [(
-    "registers/acma/candidates.json",
-    include_str!("../../../registers/acma/candidates.json"),
-)];
+const EMBEDDED: [(&str, &str); 6] = [
+    (
+        "registers/acma/candidates.json",
+        include_str!("../../../registers/acma/candidates.json"),
+    ),
+    (
+        "registers/acma/area_devices.json",
+        include_str!("../../../registers/acma/area_devices.json"),
+    ),
+    (
+        "registers/acma/plan_span.json",
+        include_str!("../../../registers/acma/plan_span.json"),
+    ),
+    (
+        "registers/acma/licence_related.json",
+        include_str!("../../../registers/acma/licence_related.json"),
+    ),
+    (
+        "registers/acma/site_channels.json",
+        include_str!("../../../registers/acma/site_channels.json"),
+    ),
+    (
+        "registers/acma/link_far_end.json",
+        include_str!("../../../registers/acma/link_far_end.json"),
+    ),
+];
 
 /// The register queries by `(provider, id)`.
 #[derive(Clone, Debug, Default)]
@@ -814,10 +836,29 @@ mod tests {
     #[test]
     fn the_builtin_queries_load_and_validate() {
         let q = RegisterQueries::builtin();
-        let c = q.get("acma", "candidates").expect("candidates");
-        assert_eq!(c.call, "execute_sql");
-        c.validate().unwrap();
-        assert!(!q.for_provider("acma").is_empty());
+        let ids = [
+            "area_devices",
+            "candidates",
+            "licence_related",
+            "link_far_end",
+            "plan_span",
+            "site_channels",
+        ];
+        for id in ids {
+            let c = q.get("acma", id).unwrap_or_else(|| panic!("{id}"));
+            assert_eq!(c.call, "execute_sql");
+            c.validate().unwrap_or_else(|e| panic!("{id}: {e}"));
+            // Every declared column is selected under its alias.
+            for col in &c.columns {
+                assert!(c.sql.contains(&format!(" AS {col}")), "{id}: {col}");
+            }
+        }
+        let all: Vec<&str> = q
+            .for_provider("acma")
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(all, ids);
         assert!(q.for_provider("nowhere").is_empty());
     }
 

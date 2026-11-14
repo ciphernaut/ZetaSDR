@@ -1,0 +1,24 @@
+{
+  "id": "plan_span",
+  "provider": "acma",
+  "name": "Spectrum plan segments a band overlaps, with their services and footnote text",
+  "call": "execute_sql",
+  "sql": "SELECT p.freq_start_hz AS min_hz, p.freq_end_hz AS max_hz, p.services_json AS services_json, (SELECT json_group_array(json_object('ref', f.value, 'text', COALESCE((SELECT au.footnote_text FROM spectrum_australian_footnotes au WHERE au.footnote_ref = f.value LIMIT 1), (SELECT it.footnote_text FROM spectrum_international_footnotes it WHERE it.footnote_ref = f.value LIMIT 1)))) FROM json_each(COALESCE(p.footnotes_json, '[]')) f) AS footnotes_json FROM spectrum_allocations p WHERE p.freq_start_hz <= {hi_hz} AND p.freq_end_hz >= {lo_hz} ORDER BY p.freq_start_hz, p.freq_end_hz",
+  "params": [
+    {
+      "name": "lo_hz",
+      "kind": "number"
+    },
+    {
+      "name": "hi_hz",
+      "kind": "number"
+    }
+  ],
+  "limit": 50,
+  "columns": [
+    "min_hz",
+    "max_hz",
+    "services_json",
+    "footnotes_json"
+  ]
+}

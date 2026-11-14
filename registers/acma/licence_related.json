@@ -1,0 +1,21 @@
+{
+  "id": "licence_related",
+  "provider": "acma",
+  "name": "Every frequency on a licence",
+  "call": "execute_sql",
+  "sql": "SELECT d.FREQUENCY AS center_hz, d.BANDWIDTH AS bandwidth_hz, d.DEVICE_TYPE AS device_type, TRIM(d.EMISSION) AS emission, d.SITE_ID AS site_id FROM device_details d WHERE d.LICENCE_NO = {licence_no} ORDER BY d.FREQUENCY, d.DEVICE_TYPE",
+  "params": [
+    {
+      "name": "licence_no",
+      "kind": "id"
+    }
+  ],
+  "limit": 50,
+  "columns": [
+    "center_hz",
+    "bandwidth_hz",
+    "device_type",
+    "emission",
+    "site_id"
+  ]
+}

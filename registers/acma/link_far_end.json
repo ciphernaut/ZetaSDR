@@ -1,0 +1,24 @@
+{
+  "id": "link_far_end",
+  "provider": "acma",
+  "name": "The other end of a point-to-point link from a site on a frequency",
+  "call": "execute_sql",
+  "sql": "SELECT CASE WHEN v.site_id_a = {site_id} THEN v.site_id_b ELSE v.site_id_a END AS far_site_id, CASE WHEN v.site_id_a = {site_id} THEN v.label_b ELSE v.label_a END AS far_name, CASE WHEN v.site_id_a = {site_id} THEN v.lat_b ELSE v.lat_a END AS far_lat, CASE WHEN v.site_id_a = {site_id} THEN v.lon_b ELSE v.lon_a END AS far_lon FROM v_links v WHERE (v.site_id_a = {site_id} OR v.site_id_b = {site_id}) AND v.frequency_hz = {center_hz} ORDER BY v.id",
+  "params": [
+    {
+      "name": "site_id",
+      "kind": "id"
+    },
+    {
+      "name": "center_hz",
+      "kind": "number"
+    }
+  ],
+  "limit": 5,
+  "columns": [
+    "far_site_id",
+    "far_name",
+    "far_lat",
+    "far_lon"
+  ]
+}
