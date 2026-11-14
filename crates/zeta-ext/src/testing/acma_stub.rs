@@ -347,6 +347,10 @@ fn execute_sql(s: &Stub, id: &Value, args: &Value) -> Result<Value, Value> {
         }
     }
     let n = rows.len();
+    // The live service names no columns when a query matches no row.
+    if n == 0 {
+        columns.clear();
+    }
     Ok(
         json!({"columns": columns, "rows": rows, "truncated": truncated, "rowCount": n,
         "result_id": "r1", "_hints": []}),

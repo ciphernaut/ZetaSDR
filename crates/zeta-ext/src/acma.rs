@@ -755,7 +755,8 @@ fn emitter_of(c: &Candidate) -> Emitter {
 }
 
 /// The rows of an `execute_sql` answer keyed by column name; every one of `columns`
-/// must be among them.
+/// must be among them. An answer with no rows is empty whatever columns it names: the
+/// register service names none when a query matches no row.
 fn rows_of(v: &Value, columns: &[String]) -> Result<Vec<Row>, String> {
     let bad = || format!("unexpected answer: {}", head(v));
     let names: Vec<String> = v
@@ -765,12 +766,14 @@ fn rows_of(v: &Value, columns: &[String]) -> Result<Vec<Row>, String> {
         .iter()
         .map(|c| c.as_str().unwrap_or_default().to_string())
         .collect();
+    let rows = v.get("rows").and_then(Value::as_array).ok_or_else(bad)?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
     if let Some(missing) = columns.iter().find(|c| !names.contains(c)) {
         return Err(format!("the answer has no column `{missing}`"));
     }
-    Ok(v.get("rows")
-        .and_then(Value::as_array)
-        .ok_or_else(bad)?
+    Ok(rows
         .iter()
         .filter_map(Value::as_array)
         .map(|r| names.iter().cloned().zip(r.iter().cloned()).collect())

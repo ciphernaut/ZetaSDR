@@ -430,7 +430,9 @@ async fn an_answer_without_a_declared_column_fails_that_query_by_name() {
         .unwrap();
     assert_eq!(a.status.state, RegisterState::Partial);
     let failed: Vec<&str> = a.status.failed.iter().map(|f| f.query.as_str()).collect();
-    assert_eq!(failed, ["candidates", "area_devices"]);
+    // The area query matched no row here, and an answer with no rows names no columns
+    // to miss.
+    assert_eq!(failed, ["candidates"]);
     assert!(a.status.failed[0].reason.contains("callsign"), "{failed:?}");
     let rows = a.allocations();
     assert_eq!(rows.len(), 4);

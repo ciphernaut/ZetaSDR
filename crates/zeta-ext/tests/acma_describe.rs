@@ -402,6 +402,17 @@ async fn area_devices_are_listed_without_geometry() {
     assert!(a.candidates.iter().all(|c| c.licence.number != "9000007/1"));
 }
 
+/// The live service answers a query that matches no row with no column names: that is
+/// an empty answer, not a failed query.
+#[tokio::test]
+async fn a_band_with_nothing_licensed_is_an_ok_answer_with_no_candidates() {
+    let (a, _) = describe(Fixture::empty(), Some(station(4.0))).await;
+    assert_eq!(a.status.state, RegisterState::Ok, "{:?}", a.status);
+    assert!(a.status.failed.is_empty(), "{:?}", a.status.failed);
+    assert!(a.candidates.is_empty() && a.area_candidates.is_empty());
+    assert!(!a.plan.is_empty());
+}
+
 #[tokio::test]
 async fn duplicates_merge_before_the_cap_and_truncation_is_reported() {
     let f = Fixture::empty();
