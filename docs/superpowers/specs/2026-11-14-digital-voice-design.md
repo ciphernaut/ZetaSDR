@@ -6,6 +6,10 @@ the node frames each protocol itself, and the patented speech codec sits behind 
 program that the operator builds on their own machine against `mbelib-neo`. Section 9 records
 the calls made here that the operator did not make.
 
+Revised 2026-11-15 on the operator's word: both slots of a DMR channel are decoded at once, as
+separate audio streams of one job, each open to `transcribe`, with an audio policy for what the
+job's main stream carries (section 5.10).
+
 Builds on decoder wave 2 (plan 29, `docs/superpowers/specs/2026-11-06-decoder-wave2-design.md`:
 handlers on graph rows 4.2, what a row's job emits 4.3, the `access` marker 4.7, M17 and its
 `c2dec` vocoder 7), on `crates/zeta-dsp/src/m17_decode.rs` and `m17.rs`, on the row machinery in
@@ -53,6 +57,9 @@ arrive later as a framing module and a row each.
 5. A vocoder that crashes, hangs or is missing never fails the job or the node.
 6. Both rows are proved in CI against synthesised captures, with no vocoder present.
 7. The legal position is written down once, in `docs/vocoders.md`.
+8. A job may have more than one voice. Both slots of a DMR channel are decoded at once, each on
+   its own audio stream that can be played and transcribed, and an audio policy says what the
+   job's main stream carries: the first call, the first call then the other, or both.
 
 ### Non-goals (later plans, each a framing module and a row on this plan's pieces)
 
@@ -63,7 +70,7 @@ arrive later as a framing module and a row each.
 - Data: DMR short messages and GPS, P25 packet data.
 - FreeDV, DAB, TETRA.
 - A hardware AMBE chip in the vocoder seat. The seat must not rule it out (section 5.1).
-- A choice of DMR slot for the audio (section 5.5 says what happens with two calls at once).
+- Changing the audio policy of a running job. It is set when the job starts (section 5.10).
 - Shortening the identify dwell these rows add (section 5.8).
 
 ### Anti-goals
@@ -75,7 +82,9 @@ arrive later as a framing module and a row each.
   has no audio. The node accepts no keys, and that includes DMR's basic privacy.
 - **No region or radio assumptions.** The rows carry no channel list, no band limits from one
   country's plan and no network's talkgroup names.
-- **No second audio mechanism.** Speech leaves the stage as the voice demodulators' audio does.
+- **No second audio mechanism.** Every voice leaves the stage as an ordinary audio stream. A
+  job with several voices has several streams, told apart by the role a stage already gives an
+  output.
 
 ## 3. Constraints
 
@@ -252,8 +261,8 @@ pinned set of CLI tests (`crates/zeta/tests/cli.rs` pins `c2dec` missing and M17
 its strict M17 check.
 
 **Why a call is silent.** Every event of a call in the two new rows carries `audio` (`true` or
-`false`) and `silent`: `null` when `audio` is true, else one of `no_vocoder`, `encrypted`,
-`other_call` (the second of two simultaneous DMR calls) or `vocoder_failed`. The row's summary
+`false`) and `silent`: `null` when `audio` is true, else one of `no_vocoder`, `encrypted`
+or `vocoder_failed`. The row's summary
 and a subject column show it, so the page says why with no new page code. The context note
 under `p25.vocoder` or `dmr.vocoder` carries the detail: the program's name and the fix.
 
@@ -278,7 +287,8 @@ IQ into frames, a stage that turns frames into events and vocoder input):
 - `p25.rs` and `p25_decode.rs`, stage kind `p25_decode`.
 - `dmr.rs` and `dmr_decode.rs`, stage kind `dmr_decode`.
 
-Each stage takes `iq` and gives `event` and `audio`, as `m17_decode` does.
+The P25 stage takes `iq` and gives `event` and `audio`, as `m17_decode` does. The DMR stage
+gives `event` and three audio streams (section 5.10).
 
 **P25.** Sync, the network identifier with its BCH decode, status-symbol removal, then by data
 unit: header, LDU1 (link control, nine IMBE frames), LDU2 (encryption sync, nine IMBE frames),
@@ -289,9 +299,9 @@ parsed.
 one and from burst timing when there is not; the EMB and embedded link control; the slot type
 and BPTC for the three data types of section 4.2; three AMBE+2 frames per voice burst.
 
-**Two DMR calls at once.** A repeater can carry a call in each slot. Both are reported. The
-audio output carries one call at a time: the one that started first, until it ends. The other
-call's events say `audio: false`.
+**Two DMR calls at once.** A repeater can carry a call in each slot. Both are reported and
+both are decoded, each by its own vocoder, each on its own audio stream. Section 5.10 says which
+of them the job's main stream carries.
 
 **A channel with no call.** A P25 control channel and an idle or control-only DMR repeater
 transmit continuously and never carry a call. Each stage gives one `type: "channel"` event when
@@ -319,6 +329,8 @@ own names (`encryption`, `frame`, string callsigns) and gain nothing:
 | `emergency` | `true` or `false` |
 | `type` | `call` or `channel` |
 | `audio`, `silent` | section 5.3 |
+| `stream` | the role of the audio stream carrying the call's speech (`slot1`, `slot2`); `null` in a stage with one voice |
+| `program` | whether the call's speech is on the job's main stream: at this moment on the opening event, at any time on the closing one |
 | `frames` | voice frames received so far |
 | `errors` | bit errors the protocol's own codes corrected so far |
 | `eot` | `true` on the closing event |
@@ -331,9 +343,8 @@ Per protocol:
 An encrypted call (P25: algorithm not `0x80`; DMR: the privacy bit in the service options or a
 privacy header) gets both events and no vocoder.
 
-Nothing else in the node assumes more than this: a job has one audio output, and the page keys
-its play and Transcribe buttons on the row's static `outputs`, so they show on these jobs
-whether or not a call is audible.
+The page keys its play and Transcribe buttons on the row's static `outputs`, so they show on
+these jobs whether or not a call is audible.
 
 ### 5.6 The rows
 
@@ -341,7 +352,8 @@ whether or not a call is audible.
 
 - `family`: `two_way`. `band.bandwidth_hz`: 12500. No `centers_hz`, no `range_hz`.
 - `decoder`: a graph, `channel → p25_decode` or `channel → dmr_decode`, with the optional
-  `zeta-mbe` handler of section 5.3.
+  `zeta-mbe` handler of section 5.3. The DMR row's stage takes `"audio": "$audio_policy"`
+  (section 5.10).
 - `subject`: keyed on `src`, named `radios`, with columns for `dst`, `call`, `encrypted`,
   `silent` and the network field (`nac` or `color_code`).
 - `summary`: who is calling whom, the call type, and "encrypted" when it is.
@@ -371,8 +383,10 @@ Unit and stage tests:
 - A capture with bit errors below the codes' limits still gives the call; one joined mid-call
   gives the opening event within one superframe.
 - An encrypted call gives events and no vocoder is spawned.
-- DMR: a repeater capture with a call in each slot gives both calls, and the audio follows the
-  first.
+- DMR: a repeater capture with a call in each slot gives both calls, each slot's speech on its
+  own stream, and the main stream as each of the three policies says.
+- Voices: an attached `transcribe` reads the stream it names; an unknown name is refused; an
+  audio policy on a row with one voice is refused; a restart resumes both.
 - **A fake vocoder**, a test program reached through `ZETA_HANDLER_ZETA_MBE`: audio frames
   arrive at 48 kHz with the right spans; a fake that exits mid-call ends that call's audio and
   writes the context note; a fake that hangs is killed by the watchdog; no program at all gives
@@ -395,10 +409,10 @@ not a CI gate and not a dependency.
   a dwell of up to 2 s to identifying such a signal, 4 s together, on every host (the rows are
   ready with or without the vocoder). That grows the cost already recorded in
   `TODO.md` ("Identify dwell cost"). This plan accepts it and adds a line to that gist.
-- **The page.** No page code is written. The play and Transcribe buttons already follow a row's
-  `outputs`, the subjects table follows the row's `subject`, and the reason a call is silent
-  arrives in the event's summary and the `silent` column. Acceptance checks all three on the
-  page (section 7).
+- **The page.** The subjects table follows the row's `subject`, and the reason a call is silent
+  arrives in the event's summary and the `silent` column, with no page code. The one page
+  change is the stream picker of section 5.10. Acceptance checks all of it on the page
+  (section 7).
 - **Field craft.** "Decoding digital voice" in `docs/agents/field-craft.md` is rewritten to
   cover the three rows, the vocoder, calls without it, and encrypted calls. The third-party
   paragraph gains one sentence: these rows decode clear speech on public protocols; whose
@@ -422,16 +436,59 @@ not a CI gate and not a dependency.
 
 The install script prints the same points before it asks for `yes`.
 
+### 5.10 Voices: a job with more than one audio stream
+
+A stage already gives each of its outputs an optional role (`Stage::output_roles`), the stream
+list shows it, and both the page's player and `job_attach` take the job's audio stream that has
+no role. This plan builds on exactly that.
+
+**The streams.** A stage with several voices publishes:
+- one audio stream with no role, the job's **main stream**. It is what the play button, the
+  mix and a plain `job_attach` read today, and they keep reading it.
+- one audio stream per voice, with the voice's role. `dmr_decode` has `slot1` and `slot2`. A
+  call whose slot cannot be told (a handheld transmitting directly) uses `slot1`.
+
+Every clear call is decoded onto its voice's stream whenever a vocoder is present, whatever the
+policy. A stage states its voices through `Stage::voice_roles`, empty by default, and
+`modes_list` items gain `voices`: the list, empty for a row with one voice.
+
+**The audio policy** says what the main stream carries. It is a parameter of the stage:
+
+| Policy | The main stream carries |
+|---|---|
+| `first_active` | the call that started first, until it ends. A call that began while another held the main stream never joins it. The default. |
+| `follow` | the call that started first; when it ends and another is still going, that one, from that moment. |
+| `all` | every call, mixed. |
+
+`job_start` gains `audio_policy`, `null` for the row's default, and the CLI `--audio-policy`.
+The row's template names it as `"$audio_policy"`, a placeholder the expander fills as it fills
+`$center_hz`. On a row whose template does not name it, a policy other than `null` is refused:
+the mode has one voice. The job's record keeps it, so a restart or a retune resumes the same
+policy.
+
+**Transcribe.** `job_attach` gains `stream`, `null` for the main stream as today or a voice's
+role, and the CLI `--stream`. A role the job does not have is refused naming the roles it has.
+Transcribing both slots is two attached jobs. The attached job's record keeps `stream`, each
+transcript event and each `transcripts.log` line carries it, and a restart resumes it.
+
+**The page.** A job whose row lists `voices` gets a small picker beside its play button: main,
+then each voice. Play plays the picked stream, and Transcribe attaches to it. A transcribe job
+attached to a voice shows the voice's name beside its kind.
+
+**The mix** is unchanged: it reads each job's main stream.
+
 ## 6. Order of work
 
 1. The vocoder seat, with M17 moved onto it; optional handlers; the fake-vocoder tests.
 2. `zeta-mbe.c`, the install script, `docs/vocoders.md`.
 3. The 4-level FSK front end.
 4. P25 phase 1: module, stage, synthesiser family, row.
-5. DMR: module, stage, synthesiser family, row.
-6. Field craft, generated guides, `TODO.md`, `UAT.md`.
+5. Voices in the node: `voices`, `job_attach`'s `stream`, `job_start`'s `audio_policy`.
+6. DMR: module, stage, synthesiser family, row.
+7. The page's stream picker.
+8. Field craft, generated guides, `TODO.md`, `UAT.md`.
 
-Steps 1 and 2 are independent of each other; 4 and 5 are independent once 3 exists.
+Steps 1, 2 and 5 are independent of each other; 4 and 6 are independent once 3 exists.
 
 ## 7. Proof
 
@@ -448,7 +505,9 @@ Live, as `UAT.md` checks:
    `transcribe` gives the words spoken. The capture is kept as a fixture outside the repository.
 3. The same with the vocoder moved aside: the call appears on the page, no audio, and its line
    says `no_vocoder`.
-4. An on-air DMR repeater: two slots told apart.
+4. An on-air DMR repeater with a call in each slot: both are listed; the picker plays either;
+   a `transcribe` attached to each slot gives two transcripts; and a job started with each
+   policy in turn makes the main stream do what the policy says.
 5. P25 phase 1 on the air, where there is clear traffic to hear: NAC, talkgroup, speech. An
    encrypted call: reported, silent.
 6. M17 still decodes as before.
@@ -474,7 +533,8 @@ Live, as `UAT.md` checks:
    yet. SDRangel credits soft decisions for its weak-signal audio.
 4. **M17 is left alone.** It moves onto the shared seat and nothing else about it changes: its
    `c2dec` stays required and its events keep their names (section 5.3 says why).
-5. **One audio call at a time on DMR**, the first to start, with no slot choice.
+5. **`first_active` is the default audio policy.** The operator named the three policies
+   (2026-11-15) and listed it first; the default is this plan's reading of that.
 6. **`access: restricted`** on both new rows.
 7. **No band limits on the rows**, at the cost of more identify dwell.
 8. **The clock run does not block DMR** (section 4.2). An earlier answer in the conversation
@@ -492,6 +552,12 @@ Live, as `UAT.md` checks:
     of new page code.
 13. **`modes_list` gains `missing`**, a new public field, in place of overloading `reason`.
 14. **`--strict` fails a row whose optional handler is missing.**
+
+15. **The policy is set when the job starts**, not changed while it runs.
+16. **A handheld's call, with no slot to read, uses the `slot1` stream.**
+17. **The page gets a stream picker and no policy control**: a policy is given at `job start`
+    from the CLI, the agent or a set.
+18. **`modes_list` gains `voices`**, a second new public field.
 
 ## 10. Set aside
 

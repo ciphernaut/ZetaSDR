@@ -4,7 +4,7 @@
 
 **Goal:** Two decoder rows, `p25_decode` and `dmr_decode`, that report calls as events and publish clear speech as ordinary job audio through a vocoder program the operator builds.
 
-**Architecture:** The M17 stage's vocoder becomes one shared seat in `zeta-dsp` (`vocoder.rs`): frames to a child process, speech back. A handler may be `optional`, so a row stays ready and reports calls with no vocoder on the host. A shared 4-level FSK front end (`fsk4.rs`) feeds two framing modules (`p25.rs`, `dmr.rs`), each with a stage and a synthesiser family. The codec itself is `zeta-mbe`, one C file linked against `mbelib-neo` by `tools/install-vocoders.sh` on the operator's machine, never by cargo or CI.
+**Architecture:** The M17 stage's vocoder becomes one shared seat in `zeta-dsp` (`vocoder.rs`): frames to a child process, speech back. A handler may be `optional`, so a row stays ready and reports calls with no vocoder on the host. A shared 4-level FSK front end (`fsk4.rs`) feeds two framing modules (`p25.rs`, `dmr.rs`), each with a stage and a synthesiser family. A job may have several voices: a stage gives each its own audio stream by role beside the job's main stream, `job_attach` reads the one it names, and an audio policy set at `job_start` says what the main stream carries. The codec itself is `zeta-mbe`, one C file linked against `mbelib-neo` by `tools/install-vocoders.sh` on the operator's machine, never by cargo or CI.
 
 **Tech Stack:** Rust (tokio `process`, serde, schemars; `zeta_dsp::synth`, `nbfm`, `resample::Resampler`), the row machinery in `zeta-core/src/modes`, bash and C99 for the vocoder tooling, `mbelib-neo` and `dsd-fme` as host programs on a developer's machine only.
 
@@ -15,7 +15,8 @@
 - No codec in the tree: no vocoder source, table or binary is committed, vendored, fetched by cargo or built by CI. `deny.toml` is not edited. `mbelib-neo` (GPL-2.0-or-later) is linked only into `zeta-mbe`.
 - No decryption and no key input of any kind, DMR basic privacy included. An encrypted call gets its events and no vocoder.
 - No region or radio assumptions: the rows have empty `centers_hz` and `range_hz: null`.
-- One audio output per job; speech is published as the voice demodulators publish it (48 kHz mono `Payload::Audio`).
+- Speech is published as the voice demodulators publish it (48 kHz mono `Payload::Audio`). A job's main audio stream is the one with no role: the play button, the mix and a plain `job_attach` read it, as today. A stage with several voices adds one audio stream per voice, with a role (spec 5.10); nothing that reads the main stream changes.
+- The audio policy values are `first_active` (the default), `follow` and `all`, exactly as spec 5.10's table defines them.
 - Row fields: unknown fields are rejected, so every new field is `#[serde(default)]` and every existing embedded and operator row still loads. Every field a row's `summary` or `subject` names is in `event.schema.properties`.
 - A stage an embedded graph row names lives in `zeta-dsp` and is registered in `zeta_dsp::register_all` (`crates/zeta-dsp/src/lib.rs`).
 - `m17_decode` keeps its behaviour: `c2dec` required, event names unchanged, every existing M17 test passing unedited.
@@ -25,7 +26,7 @@
 - The repository is public: roles, never private host names or LAN addresses, in code, tests, docs and commit messages.
 - `AGENTS.md` and `skills/zetasdr/SKILL.md` are generated. After any op field, op note, row note or field-craft change, regenerate both and commit them in the same commit; never edit them by hand.
 - Tests that read asynchronous state poll for the end state (the suites' `until` helpers); none reads once after an operation.
-- Gates per task: `cargo fmt -p <crate> -- --check` for each touched crate (the nested worktree breaks `cargo fmt --all`), `cargo clippy --workspace --all-targets --all-features -- -D warnings`, the touched crates' tests. Use a private `CARGO_TARGET_DIR` and delete it when the plan's gates are done. The full gate list in `CLAUDE.md` runs in task 9.
+- Gates per task: `cargo fmt -p <crate> -- --check` for each touched crate (the nested worktree breaks `cargo fmt --all`), `cargo clippy --workspace --all-targets --all-features -- -D warnings`, the touched crates' tests. Use a private `CARGO_TARGET_DIR` and delete it when the plan's gates are done. The full gate list in `CLAUDE.md` runs in task 11.
 - One commit per task on this branch, message in the repository's style (`Area: what changed`), no trailer.
 
 ## Models per task
@@ -34,27 +35,29 @@ Opus where a task defines an interface later tasks consume, tunes a demodulator 
 
 | Task | Model | Why |
 |---|---|---|
-| 1 the vocoder seat | Opus | a lift under unchanged M17 tests, and the interface tasks 6 and 8 use |
+| 1 the vocoder seat | Opus | a lift under unchanged M17 tests, and the interface tasks 6 and 9 use |
 | 2 optional handlers and `missing` | Opus | a public op field across four crates and CI |
 | 3 `zeta-mbe` and the install script | Opus | C against a library's API, read from its header at the pinned commit |
 | 4 the 4-level FSK front end | Opus | timing and level recovery under noise and offset |
 | 5 P25 codes, frames and the `p25` family | Opus | four block codes against the standard |
 | 6 the `p25_decode` stage and row | Opus | call tracking and the seat in use |
 | 7 DMR codes, bursts and the `dmr` family | Opus | TDMA framing and BPTC against the standard |
-| 8 the `dmr_decode` stage and row | Opus | two slots, one audio output |
-| 9 guides, TODO, UAT, the oracle run, the gate | Sonnet | prose and commands, all pinned here |
+| 8 voices in the node | Opus | two public op fields, persistence and the attach path |
+| 9 the `dmr_decode` stage and row | Opus | two slots, three streams, three policies |
+| 10 the page's stream picker | Opus | the job row and an end-to-end scenario in a suite near its deadline |
+| 11 guides, TODO, UAT, the oracle run, the gate | Sonnet | prose and commands, all pinned here |
 
-Tasks 1, 2 and 3 are independent. Task 4 needs none of them. Tasks 5-6 and 7-8 are independent of each other once 1, 2 and 4 are in.
+Tasks 1, 2, 3, 4 and 8 are independent of each other. Tasks 5-6 and 7 are independent of each other once 1, 2 and 4 are in. Task 9 needs 1, 2, 7 and 8; task 10 needs 8 and 9.
 
 ## Review Focus
 
 Conditions the spec implies and a user will meet, each pinned by a test in the task named:
 
-1. **An inverted or off-centre signal.** A discriminator with inverted polarity, or a carrier 1 kHz off the job's centre, still syncs and decodes (task 4 `inverted_and_offset_signals_still_sync`; tasks 6 and 8 `a_call_1_khz_off_centre_decodes`).
-2. **A call that never ends.** The transmitter drops with no terminator: the closing event arrives after one superframe of lost sync and the vocoder's input is closed (tasks 6 and 8 `a_call_cut_short_closes_after_its_timeout`).
+1. **An inverted or off-centre signal.** A discriminator with inverted polarity, or a carrier 1 kHz off the job's centre, still syncs and decodes (task 4 `inverted_and_offset_signals_still_sync`; tasks 6 and 9 `a_call_1_khz_off_centre_decodes`).
+2. **A call that never ends.** The transmitter drops with no terminator: the closing event arrives after one superframe of lost sync and the vocoder's input is closed (tasks 6 and 9 `a_call_cut_short_closes_after_its_timeout`).
 3. **Many short calls.** Twenty calls back to back leave no vocoder child running and no growing task list (task 1 `twenty_calls_leave_no_child`).
-4. **Somebody else's 12.5 kHz signal.** Noise, NBFM speech, an M17 stream and a POCSAG burst give no event and no panic from either stage; P25 fed to DMR and DMR fed to P25 likewise (tasks 6 and 8 `other_signals_give_no_event`).
-5. **A stream that stutters or changes rate.** A lagged input or a new sample rate mid-call closes the open call with its closing event and starts clean (tasks 6 and 8 `a_lagged_input_closes_the_call`), and a rate under four samples per symbol is refused with the rate named (task 4 `a_low_rate_is_refused`).
+4. **Somebody else's 12.5 kHz signal.** Noise, NBFM speech, an M17 stream and a POCSAG burst give no event and no panic from either stage; P25 fed to DMR and DMR fed to P25 likewise (tasks 6 and 9 `other_signals_give_no_event`).
+5. **A stream that stutters or changes rate.** A lagged input or a new sample rate mid-call closes the open call with its closing event and starts clean (tasks 6 and 9 `a_lagged_input_closes_the_call`), and a rate under four samples per symbol is refused with the rate named (task 4 `a_low_rate_is_refused`).
 
 ---
 
@@ -310,12 +313,12 @@ pub fn encode_control(nac: u16, units: u32) -> Vec<u8>;
 
 **Interfaces:**
 - Consumes: `vocoder::{Vocoder, VocoderEnv, VocoderSpec, program}`, `fsk4::*`, `p25::*`.
-- Produces, in `voice_call.rs`, for task 8 as well:
+- Produces, in `voice_call.rs`, for task 9 as well:
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Silent { NoVocoder, Encrypted, OtherCall, VocoderFailed }
+pub enum Silent { NoVocoder, Encrypted, VocoderFailed }
 
 /// The shared fields of a call event (spec 5.5); a stage adds its own to the map.
 pub struct CallFields {
@@ -324,6 +327,8 @@ pub struct CallFields {
     pub call: &'static str,          // "group" | "private"
     pub encrypted: bool, pub emergency: bool,
     pub silent: Option<Silent>,      // None means audio is true
+    pub stream: Option<&'static str>, // the role of the stream carrying its speech; None in a one-voice stage
+    pub program: bool,                // on the main stream: now (opening event), at any time (closing event)
     pub frames: u32, pub errors: u32, pub eot: bool,
 }
 impl CallFields { pub fn to_json(&self) -> serde_json::Map<String, serde_json::Value>; } // includes "type": "call" and "audio"
@@ -334,7 +339,7 @@ pub fn channel_event(protocol: &'static str, control: bool) -> serde_json::Map<S
   Stage kind `p25_decode`, params `P25Params {}`, inputs `[Iq]`, outputs `[Event, Audio]`, shaped as `M17DecodeStage` is.
 
 - [ ] **Step 1: Write the failing tests** (the stage tests use a fake `zeta-mbe` through the row's handler, as the M17 stage tests use `fake_c2dec`):
-  - `a_call_gives_two_events_and_audio`: the task 5 call gives an opening event `{type: "call", protocol: "p25", nac: 291, src: 9990001, dst: 65000, call: "group", encrypted: false, audio: true, silent: null, eot: false}` and a closing one with `eot: true`, `frames: 54`; 54 audio frames of 960 samples arrive.
+  - `a_call_gives_two_events_and_audio`: the task 5 call gives an opening event `{type: "call", protocol: "p25", nac: 291, src: 9990001, dst: 65000, call: "group", encrypted: false, audio: true, silent: null, stream: null, program: true, eot: false}` and a closing one with `eot: true`, `frames: 54`; 54 audio frames of 960 samples arrive.
   - `joining_mid_call_opens_within_a_superframe`: the capture with its first 400 ms removed gives the opening event with a time inside `P25_SUPERFRAME_MS` of the first sync.
   - `an_encrypted_call_is_reported_and_silent`: `algid` `0xAA` gives both events with `encrypted: true`, `audio: false`, `silent: "encrypted"`, `algid: 170`, `kid` set; the fake vocoder was never started (it writes a marker when run).
   - `no_vocoder_gives_events_and_says_so`: with the handler absent, both events have `audio: false`, `silent: "no_vocoder"`; no audio frame; `job_context.p25.vocoder` names `zeta-mbe` and `tools/install-vocoders.sh`, written once across two calls.
@@ -421,7 +426,54 @@ pub fn encode_handheld(color_code: u8, lc: FullLc, superframes: u32) -> Vec<Opti
 - [ ] **Step 5: Run** `cargo test -p zeta-dsp` — expected: PASS.
 - [ ] **Step 6: Commit** `DMR: bursts, link control and the two-slot framing, and the dmr synthesiser family`.
 
-### Task 8: The `dmr_decode` stage and row
+### Task 8: Voices in the node: `voices`, `job_attach`'s `stream`, `job_start`'s `audio_policy`
+
+**Files:**
+- Modify: `crates/zeta-core/src/stage.rs` (`Stage::voice_roles`), `crates/zeta-core/src/ops.rs` (`AudioPolicy`, `Op::JobStart`, `Op::JobAttach`, `ModeInfo`, the job record), `crates/zeta-core/src/modes/template.rs` (the placeholder), `crates/zeta-core/src/modes/mod.rs` (`voices` at load), `crates/zeta-core/src/node/mod.rs` (`audio_stream`, the attach path), `crates/zeta-core/src/node/persist.rs`, `crates/zeta-speech` (the transcript event's `stream`), the transcripts log writer, `crates/zeta/src` (the CLI flags), `crates/zeta-mcp` and `crates/zeta-agent` (the tool schemas, if pinned), `crates/zeta/src/agents_md.rs` (the `job_start` and `job_attach` notes), `AGENTS.md`, `skills/zetasdr/SKILL.md`
+- Test: `crates/zeta-core/tests/voices.rs` (new, `required-features = ["test-fixtures"]`), `crates/zeta-core/src/test_fixtures.rs` (a two-voice test stage), `crates/zeta/tests/cli.rs`
+
+**Interfaces:**
+- Produces:
+
+```rust
+// stage.rs, on trait Stage
+/// The roles of this stage's audio outputs that are voices of their own, in output order.
+/// Empty (the default) for a stage with one voice.
+fn voice_roles(&self, _params: &serde_json::Value) -> Vec<&'static str> { Vec::new() }
+
+// ops.rs
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioPolicy { #[default] FirstActive, Follow, All }
+```
+
+  - `Op::JobStart` gains `audio_policy: Option<AudioPolicy>` (required-nullable in the schema, as `language` is on `JobAttach`); CLI `--audio-policy first_active|follow|all`.
+  - `Op::JobAttach` gains `stream: Option<String>` (required-nullable); CLI `--stream ROLE`.
+  - `ModeInfo.voices: Vec<String>` (`#[serde(default)]`, always written).
+  - Template placeholder `"$audio_policy"`, filled with the policy's snake-case name; `null` at job start fills `first_active`.
+  - Errors, as invalid-request messages: `audio_policy: <mode id> has one voice`; `stream: <job id> has no voice <role> (it has: slot1, slot2)`; `stream: <job id> has one voice` when the job's row has none.
+  - Transcript events and `transcripts.log` lines gain `stream`: `null` or the role.
+  - The test stage `two_voice_test` in `test_fixtures.rs`: outputs `[Event, Audio, Audio, Audio]`, `output_roles` `[None, None, Some("slot1"), Some("slot2")]`, `voice_roles` `["slot1", "slot2"]`, a param `audio`, publishing a distinct constant tone per stream so a reader can tell which stream it has.
+
+- [ ] **Step 1: Write the failing tests** in `tests/voices.rs` (poll for end states):
+  - `a_two_voice_row_lists_its_voices`: an operator row using `two_voice_test` has `voices == ["slot1", "slot2"]` and `outputs == ["event", "audio"]` (kinds, not one entry per stream); `m17_decode` has `voices == []`.
+  - `a_plain_attach_reads_the_main_stream`: `job_attach` with `stream: null` receives the main stream's tone.
+  - `an_attach_to_a_voice_reads_that_voice`: `stream: "slot2"` receives slot 2's tone; two attaches, one per slot, run together.
+  - `an_unknown_voice_is_refused_naming_the_voices`: `stream: "slot3"` gives the message above; `stream: "slot1"` on an NBFM job gives `has one voice`.
+  - `the_policy_reaches_the_stage`: `audio_policy: follow` starts the stage with `{"audio": "follow"}`; `null` gives `first_active`.
+  - `a_policy_on_a_one_voice_row_is_refused`: `audio_policy: all` on `m17_decode` gives `audio_policy: m17_decode has one voice`; `null` is accepted.
+  - `a_restart_resumes_the_policy_and_the_attached_stream`: after a node restart on the same state directory the job runs with `follow` and the attached job still reads `slot2`.
+  - `a_retune_keeps_the_policy`.
+  - `the_mix_reads_the_main_stream_only`.
+  - `cli.rs` `job_start_and_attach_take_the_new_flags`: `--audio-policy nonsense` is refused naming the three values; `--stream` round-trips into the op.
+  - In the transcripts log test suite: a line from an attach with `stream: "slot2"` has `"stream":"slot2"`; one from a plain attach has `"stream":null`.
+- [ ] **Step 2: Run** `cargo test -p zeta-core --features test-fixtures --test voices` — expected: FAIL.
+- [ ] **Step 3: Implement.** `audio_stream(job, stream)` takes the output with `role == stream` when one is named, and `last_audio` otherwise. `voices` is read at load from the row's terminal stage. Old state files without the two new record fields load as `null`.
+- [ ] **Step 4: Update the `job_start`, `job_attach` and `modes_list` notes** in `agents_md.rs`; regenerate `AGENTS.md` and the skill.
+- [ ] **Step 5: Run** `cargo test --workspace --features zeta-core/test-fixtures -- --skip ui_scenarios_pass_in_headless_chromium` and both guide checks — expected: PASS, clean. Fix any pinned op-schema snapshot.
+- [ ] **Step 6: Commit** `Jobs: a job may have several voices; attach reads the one it names, and a job starts with an audio policy for its main stream`.
+
+### Task 9: The `dmr_decode` stage and row
 
 **Files:**
 - Create: `crates/zeta-dsp/src/dmr_decode.rs`, `modes/dmr_decode.json`
@@ -429,50 +481,77 @@ pub fn encode_handheld(color_code: u8, lc: FullLc, superframes: u32) -> Vec<Opti
 - Test: inline in `dmr_decode.rs`
 
 **Interfaces:**
-- Consumes: `vocoder::*`, `fsk4::*`, `dmr::*`, `voice_call::{CallFields, Silent, channel_event}`.
-- Produces: stage kind `dmr_decode`, params `DmrParams {}`, inputs `[Iq]`, outputs `[Event, Audio]`.
+- Consumes: `vocoder::*`, `fsk4::*`, `dmr::*`, `voice_call::{CallFields, Silent, channel_event}`, `zeta_core::ops::AudioPolicy`, `Stage::voice_roles`.
+- Produces: stage kind `dmr_decode`, params `DmrParams { #[serde(default)] audio: AudioPolicy }`, inputs `[Iq]`, outputs `[Event, Audio, Audio, Audio]`, `output_roles` `[None, None, Some("slot1"), Some("slot2")]`, `voice_roles` `["slot1", "slot2"]`.
 
-- [ ] **Step 1: Write the failing tests:**
-  - `a_repeater_call_gives_two_events_and_audio`: opening `{type: "call", protocol: "dmr", color_code: 5, slot: 1, origin: "repeater", src: 9990001, dst: 9990, call: "group", audio: true, silent: null}`, closing with `eot: true`, `frames: 54`; 54 audio frames.
-  - `two_calls_at_once_report_both_and_play_the_first`: slot 1 starts one superframe before slot 2: four events; slot 2's have `audio: false`, `silent: "other_call"`; every audio frame's span lies inside slot 1's call. When slot 1's call ends first and slot 2's continues, slot 2's stays silent to its end.
-  - `a_handheld_call_has_a_null_slot`: `origin: "handheld"`, `slot: null`, audio present.
-  - `an_encrypted_call_is_reported_and_silent`: the service-options bit, and separately a privacy header, each give `encrypted: true`, `silent: "encrypted"`, no vocoder started.
+- [ ] **Step 1: Write the failing tests** (a fake `zeta-mbe` that returns a different constant level per process start, so streams can be told apart):
+  - `a_repeater_call_gives_two_events_and_audio`: opening `{type: "call", protocol: "dmr", color_code: 5, slot: 1, origin: "repeater", src: 9990001, dst: 9990, call: "group", audio: true, silent: null, stream: "slot1", program: true}`, closing with `eot: true`, `frames: 54`; 54 audio frames on `slot1` and 54 on the main stream; none on `slot2`.
+  - `both_slots_decode_at_once`: slot 1's call starts one superframe before slot 2's and ends two superframes before it. Under every policy: four events, both with `audio: true`, `stream` `slot1` and `slot2`, and each slot's stream carries exactly its own call's frames.
+  - `first_active_keeps_the_main_stream_on_the_first_call`: the main stream's frames all lie inside slot 1's call; slot 2's events have `program: false` on both.
+  - `follow_switches_when_the_first_call_ends`: the main stream carries slot 1's call, then slot 2's from the moment slot 1's ends to slot 2's end, with spans that never go backwards; slot 2's opening event has `program: false` and its closing one `program: true`.
+  - `all_mixes_both`: while both calls run, each main-stream frame is the sum of the two slots' frames for that span (within rounding, saturated); before and after it equals the one running.
+  - `a_handheld_call_has_a_null_slot_and_uses_slot1`: `origin: "handheld"`, `slot: null`, `stream: "slot1"`.
+  - `an_encrypted_call_is_reported_and_silent`: the service-options bit, and separately a privacy header, each give `encrypted: true`, `audio: false`, `silent: "encrypted"`, no vocoder started; under `follow` an encrypted first call does not hold the main stream.
   - `an_idle_repeater_gives_one_channel_event`: `{type: "channel", protocol: "dmr", color_code: 5, control: false}`, once.
-  - `no_vocoder_gives_events_and_says_so`, `a_dead_vocoder_marks_the_call`, `joining_mid_call_opens_within_a_superframe`, `a_call_cut_short_closes_after_its_timeout`, `a_call_1_khz_off_centre_decodes`, `other_signals_give_no_event` (including the `p25` family), `a_lagged_input_closes_the_call`, `params_are_strict`: as task 6, with `job_context.dmr.vocoder`.
+  - `no_vocoder_gives_events_and_says_so`, `a_dead_vocoder_marks_the_call`, `joining_mid_call_opens_within_a_superframe`, `a_call_cut_short_closes_after_its_timeout`, `a_call_1_khz_off_centre_decodes`, `other_signals_give_no_event` (including the `p25` family), `a_lagged_input_closes_the_call`, `params_are_strict` (an unknown `audio` value is refused): as task 6, with `job_context.dmr.vocoder`.
 - [ ] **Step 2: Run** `cargo test -p zeta-dsp dmr_decode` — expected: FAIL.
-- [ ] **Step 3: Implement the stage.** A call per slot key (`Some(1)`, `Some(2)`, `None`). The audio belongs to the call that opened first among those open; it is not handed over when that call ends. Vocoder args `["ambe3600x2450"]`, `feed_bytes` 96, `feed_samples` 160, `rate_hz` 8000, `context` `"dmr"`; each voice burst feeds three frames with 20 ms spans from the burst's time.
-- [ ] **Step 4: Write `modes/dmr_decode.json`** as task 6 step 4 with `label` `DMR`, `protocol` `dmr`, the fields `color_code`, `slot`, `origin`, `fid` in place of P25's, `catalogue` `["digital-mobile-radio-dmr"]`, subject columns `dst`, `call`, `color_code`, `slot`, `encrypted`, `silent`, and `test` `{kind: "synth", family: "dmr", color_code: 5, src: 9990001, dst: 9990, superframes: 3, expect: {src: 9990001, dst: 9990, color_code: 5}, within_ms: 5000}`.
+- [ ] **Step 3: Implement the stage.** A call per slot key (`Some(1)`, `Some(2)`, `None` treated as slot 1 for its stream). Each clear call has its own vocoder: args `["ambe3600x2450"]`, `feed_bytes` 96, `feed_samples` 160, `rate_hz` 8000, `context` `"dmr"`, publishing on its slot's stream; each voice burst feeds three frames with 20 ms spans from the burst's time. The main stream is written by a small selector fed by both slots' published frames: `first_active` and `follow` forward one slot's frames; `all` sums frames on a common 20 ms grid and passes a lone call through. A call that has no audio (encrypted, no vocoder) never holds the main stream.
+- [ ] **Step 4: Write `modes/dmr_decode.json`** as task 6 step 4 with `label` `DMR`, `protocol` `dmr`, the stage node's params `{"audio": "$audio_policy"}`, the fields `color_code`, `slot`, `origin`, `fid`, `stream`, `program` added to the schema, `catalogue` `["digital-mobile-radio-dmr"]`, subject columns `dst`, `call`, `color_code`, `slot`, `encrypted`, `silent`, `notes` naming the two voices and the three policies, and `test` `{kind: "synth", family: "dmr", color_code: 5, src: 9990001, dst: 9990, superframes: 3, expect: {src: 9990001, dst: 9990, color_code: 5}, within_ms: 5000}`.
 - [ ] **Step 5: Add the CI step and pinned line** for `dmr_decode`, as task 6 step 5.
 - [ ] **Step 6: Run** the three crates' tests and the two guide checks, regenerating — expected: PASS and clean.
-- [ ] **Step 7: Commit** `DMR: the dmr_decode stage and row; two slots reported, one heard`.
+- [ ] **Step 7: Commit** `DMR: the dmr_decode stage and row; both slots decoded at once, and three policies for the main stream`.
 
-### Task 9: Field craft, TODO, UAT, the oracle run and the gate
+### Task 10: The page's stream picker
+
+**Files:**
+- Modify: `crates/zeta-ui/web/agent.js` (the job row), `crates/zeta-ui/web/audio.js` (`audioStreamId`, `playJob`), `crates/zeta-ui/web/app.js` (`toggleAudio`, the Transcribe handler), the stylesheet the job row uses, `crates/zeta-ui/tests/e2e/ui.py`
+- Test: one new scenario in `ui.py`; the page's unit tests for `agent.js` if the file has them
+
+**Interfaces:**
+- Consumes: `ModeInfo.voices`, `Op::JobAttach.stream`, the stream list's `role`.
+- Produces: `audioStreamId(api, jobId, role = null)` (the stream of that job with `kind === "audio"` and `role` equal to `role`, `null` meaning no role); `playJob(api, job, {role, …})`; in the job row of a job whose row has `voices`, a `select.voice` with options `main` and each voice, its choice remembered per job for the page's life; a transcribe job attached to a voice shows `↳ transcribe (slot2)`.
+
+- [ ] **Step 1: Write the failing scenario** `voices_pick_a_stream`, on a file source holding the synthesised two-call DMR capture (written once by a `test-fixtures` example beside `gen_aprs`, or by the scenario's setup through the node's synthesiser), with no vocoder on the host:
+  - the `dmr_decode` job's row has `select.voice` with exactly `main`, `slot1`, `slot2`; an NBFM job's row has none;
+  - with `slot2` picked, Transcribe sends `job_attach` with `stream: "slot2"` and the attached job's row reads `↳ transcribe (slot2)`;
+  - with `slot1` picked, play subscribes to the stream whose `role` is `slot1` (assert on the subscribed stream id against the stream list);
+  - the subjects table shows both radios with `silent` `no_vocoder`.
+
+  Follow the suite's existing rules: no bare-string `wait_for_function`, poll for the end state.
+- [ ] **Step 2: Run** `ZETA_UI_ONLY=voices_pick_a_stream cargo test -p zeta --test ui -- --nocapture` — expected: FAIL (no `ui e2e skipped` line).
+- [ ] **Step 3: Implement** the picker and the two parameters. The picker is not shown for a row with no `voices`, so every other job row is unchanged.
+- [ ] **Step 4: Run** the scenario, then the whole UI suite with `ZETA_UI_PROFILE` set — expected: PASS inside the suite's deadline; record the suite's new duration in the commit body.
+- [ ] **Step 5: Commit** `Page: a job with several voices has a stream picker for play and Transcribe`.
+
+### Task 11: Field craft, TODO, UAT, the oracle run and the gate
 
 **Files:**
 - Modify: `docs/agents/field-craft.md` ("Decoding digital voice", the third-party paragraph, the `modes check` family list), `TODO.md`, `UAT.md`, `docs/superpowers/plans/2026-10-18-zetasdr-plan-series.md`, `README.md` (the modes list, if it names decoders), `AGENTS.md`, `skills/zetasdr/SKILL.md`
 
-- [ ] **Step 1: Rewrite "Decoding digital voice"** to cover the three rows: the start command for each on the measured centre with `--bandwidth-hz 12500`; the two call events and the channel event with their fields; `audio` and the four `silent` values; that P25 and DMR run with no vocoder and M17 does not; `zeta-mbe`, `tools/install-vocoders.sh` and `docs/vocoders.md`; one audio call at a time on DMR; encrypted calls reported, never decoded, no keys accepted. Replace "DMR and D-STAR have no decoder row" with "D-STAR, NXDN and System Fusion have no decoder row".
+- [ ] **Step 1: Rewrite "Decoding digital voice"** to cover the three rows: the start command for each on the measured centre with `--bandwidth-hz 12500`; the two call events and the channel event with their fields; `audio` and the three `silent` values; that P25 and DMR run with no vocoder and M17 does not; `zeta-mbe`, `tools/install-vocoders.sh` and `docs/vocoders.md`; DMR's two voices, `--audio-policy` with its three values and what each does to the main stream, `job attach --stream slot1|slot2`, and that transcribing both slots is two attached jobs; encrypted calls reported, never decoded, no keys accepted. Replace "DMR and D-STAR have no decoder row" with "D-STAR, NXDN and System Fusion have no decoder row".
 - [ ] **Step 2: Add one sentence to the third-party paragraph**: the P25 and DMR rows decode clear speech on public protocols; whose traffic it is, and whether listening to it is lawful where the node sits, is the operator's responsibility, said once when a request goes that way.
-- [ ] **Step 3: `TODO.md`.** Replace the gist "Build: an install script for the AMBE/IMBE vocoder libraries" with two lines: done in plan 38, and the kept `blip25-vocoder` paragraph. Strike "DMR voice" and "A `vocoder` handler". In "Architecture: a mode registry…", "Time", drop DMR from the modes that need true block timestamps and say why (slot timing is in the signal). Add to "Identify dwell cost": `p25_decode` and `dmr_decode` each dwell 2 s on any 12.5 kHz FM or FSK signal, on every host. Add to "Access: ACLs on restricted rows": the marker reaches events only; the audio and transcripts of a restricted row carry nothing. Add a new gist "Digital voice: the next rows" listing D-STAR (`ambe3600x2400` in `zeta-mbe`), NXDN, System Fusion, dPMR and P25 phase 2 as a framing module and a row each; a slot choice for DMR audio; `c2dec` optional for M17; trunking.
+- [ ] **Step 3: `TODO.md`.** Replace the gist "Build: an install script for the AMBE/IMBE vocoder libraries" with two lines: done in plan 38, and the kept `blip25-vocoder` paragraph. Strike "DMR voice" and "A `vocoder` handler". In "Architecture: a mode registry…", "Time", drop DMR from the modes that need true block timestamps and say why (slot timing is in the signal). Add to "Identify dwell cost": `p25_decode` and `dmr_decode` each dwell 2 s on any 12.5 kHz FM or FSK signal, on every host. Add to "Access: ACLs on restricted rows": the marker reaches events only; the audio and transcripts of a restricted row carry nothing. Add a new gist "Digital voice: the next rows" listing D-STAR (`ambe3600x2400` in `zeta-mbe`), NXDN, System Fusion, dPMR and P25 phase 2 as a framing module and a row each; changing the audio policy of a running job, and a policy control on the page; `c2dec` optional for M17; trunking.
 - [ ] **Step 4: `UAT.md`.** Add "Plan 38" with the six checks of spec section 7, worded for the field host, check 2 as: the operator's own handheld in the 70 cm amateur band into a dummy load or at low power.
 - [ ] **Step 5: The oracle run, on the developer machine.** Write the synthesised captures (`zeta` has a synth-to-file path used by `modes check`; if none is exposed, a `test-fixtures` example beside `gen_aprs`) for the `p25` family and for `dmr` in repeater, two-call and handheld forms as WAV discriminator audio or IQ as `dsd-fme` accepts, run `dsd-fme` on each, and confirm it reports NAC `123` hex, talkgroup 65000 and source 9990001 for P25, and colour code 5, target 9990 and source 9990001 with the right slot for DMR. If it disagrees, the decoder and synthesiser share an error: stop, fix it in the task that owns it, and rerun. `dsd-fme` is installed outside the repository; say in the report how.
-- [ ] **Step 6: Record the outcome** in the plan series: a "Plan 38 status" entry with the date, the pinned `mbelib-neo` tag, whether soft decisions are used, the oracle run's result line by line, and what stays open (the UAT checks).
+- [ ] **Step 6: Record the outcome** in the plan series: a "Plan 38 status" entry with the date, the pinned `mbelib-neo` tag, whether soft decisions are used, the oracle run's result line by line, the UI suite's duration, and what stays open (the UAT checks).
 - [ ] **Step 7: Regenerate** `AGENTS.md` and the skill.
-- [ ] **Step 8: Run the full gate** from `CLAUDE.md`: fmt per crate, clippy, `cargo test --workspace -- --skip ui_scenarios_pass_in_headless_chromium`, `cargo test -p zeta --test ui -- --nocapture` (no `ui e2e skipped` line), both `agents-md` checks, `bash scripts/public-check.sh`, `bash scripts/check-doc-links.sh`. Then `cargo run -q -p zeta -- modes check` and confirm `p25_decode: ok`, `dmr_decode: ok`, `m17_decode: ok`. Expected: all clean.
+- [ ] **Step 8: Run the full gate** from `CLAUDE.md`: fmt per crate, clippy, `cargo test --workspace -- --skip ui_scenarios_pass_in_headless_chromium`, the feature-gated `zeta-core` suites, `cargo test -p zeta --test ui -- --nocapture` (no `ui e2e skipped` line), both `agents-md` checks, `bash scripts/public-check.sh`, `bash scripts/check-doc-links.sh`. Then `cargo run -q -p zeta -- modes check` and confirm `p25_decode: ok`, `dmr_decode: ok`, `m17_decode: ok`. Expected: all clean.
 - [ ] **Step 9: Commit** `Plan 38: field craft, TODO, UAT and the plan series for digital voice`.
 
 ## Calls made in this plan (the builder's, on the spec's silence)
 
 1. **A shared `voice_call.rs`** holds the call event fields and `Silent`, so the two stages cannot drift and later rows reuse it.
-2. **Audio is not handed to the second DMR call when the first ends.** A call that began silent stays silent, so a listener never joins mid-sentence and a transcript never starts mid-call.
+2. **A call with no audio never holds the main stream**, under any policy: an encrypted first call does not keep a clear second one off it.
 3. **A P25 call joined mid-call opens on LDU2**, not LDU1, so its encryption state is known before any frame reaches the vocoder.
 4. **CI checks the two rows without `--strict`**, since it has no vocoder; `--strict` on the field host is their full gate.
-5. **No new end-to-end page scenario.** The suite runs near its deadline, and no page code changes; the page is checked in UAT.
+5. **One new end-to-end page scenario**, for the stream picker, run with no vocoder. The suite runs near its deadline; task 10 records the new duration.
 6. **The synthesised voice payload may be zeros** if a published silence frame cannot be confirmed. No codec runs in CI, so nothing there depends on it.
-7. **Test identities** use 999-prefixed radio IDs, which no registry assigns.
+7. **Test identities** use 999-prefixed radio IDs, believed unassigned by any registry.
+8. **The voices mechanism is proved on a test stage** (task 8) before DMR uses it, so it does not wait on the DMR framing.
+9. **`all` sums the two slots** on a 20 ms grid with saturation, with no gain change when only one call runs.
 
 ## Self-review notes
 
-- Spec coverage: 5.1 → task 1; 5.2 and 5.9 → task 3; 5.3 → task 2 (`silent` in tasks 6 and 8); 5.4 → task 4; 5.5 → tasks 5 to 8; 5.6 → tasks 6 and 8; 5.7 → each task's tests, the oracle in task 9; 5.8 → tasks 6, 8 and 9; section 7's live checks → `UAT.md` in task 9.
-- Names used across tasks: `VocoderSpec.context`, `vocoder::program`, `HandlerBlock`, `ModeInfo.missing`, `SoftDibit`, `find_sync`, `ImbeSoft`, `AmbeSoft`, `Call`, `Silent`, `CallFields`.
+- Spec coverage: 5.1 → task 1; 5.2 and 5.9 → task 3; 5.3 → task 2 (`silent` in tasks 6 and 9); 5.4 → task 4; 5.5 → tasks 5, 6, 7 and 9; 5.6 → tasks 6 and 9; 5.7 → each task's tests, the oracle in task 11; 5.8 → tasks 6, 9, 10 and 11; 5.10 → task 8 (node, ops, CLI, transcripts), task 9 (the stage and the three policies) and task 10 (the page); section 7's live checks → `UAT.md` in task 11.
+- Names used across tasks: `VocoderSpec.context`, `vocoder::program`, `HandlerBlock`, `ModeInfo.missing`, `ModeInfo.voices`, `SoftDibit`, `find_sync`, `ImbeSoft`, `AmbeSoft`, `Call`, `Silent`, `CallFields`, `AudioPolicy`, `Stage::voice_roles`, `JobAttach.stream`, `audioStreamId(api, jobId, role)`.
 - The live checks are not part of this plan's gate: they need the field host and on-air traffic.
