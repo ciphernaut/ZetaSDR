@@ -866,3 +866,6 @@ From the operator, 2026-11-12, while settling plan 37 (`docs/superpowers/specs/2
 - **`matched` counts raw rows after the query's limit**, not the devices that matched.
 - **`link_far_end` compares quoted ids through a view**, so `zeta registers check` may print `ok 0 rows` for it: check it by hand against a known link.
 - **A possible flake in the CLI test `job_start_takes_dwell_ms_and_average`** under parallel load.
+- **A flake in the scan test `a_port_that_stops_delivering_is_skipped_not_hung`** in full workspace runs (it passes alone and with its own test binary): the scan code and the test predate plan 37 and were not changed by it. Likely a timing margin under load; reproduce with `taskset -c 0,1`.
+- **The origin summary names the register's status only when nothing is lit**: when the licence list failed but an area-wide row lights a site, it lists the site without saying the list was incomplete.
+- **The watch's register wording has no case for an answer with no verdict whose licence list failed** (the page has one); not reachable while Identify always attaches a verdict.
