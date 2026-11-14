@@ -495,10 +495,8 @@ impl KnowledgeProvider for AcmaKnowledge {
             .await
     }
 
-    /// The search bound from `from` as a [`Reach`]: `km` is the bound, the class the
-    /// band's, a space band when the plan's services are space services (from
-    /// [`describe`](KnowledgeProvider::describe); a plan that failed reads as no space
-    /// band) or the antenna points up. `None` without `from`.
+    /// [`reach_of`](KnowledgeProvider::reach_of) on a fresh
+    /// [`describe`](KnowledgeProvider::describe); `None` without `from` (no lookup then).
     async fn reach_from(
         &self,
         region: &str,
@@ -512,6 +510,22 @@ impl KnowledgeProvider for AcmaKnowledge {
             bandwidth_hz,
         };
         let answer = self.describe(region, &signal, Some(from)).await?;
+        self.reach_of(&answer, &signal, Some(from))
+    }
+
+    /// The search bound behind `answer` from `from` as a [`Reach`], with no lookup:
+    /// `km` is the bound (the override, else the furthest reach under the answer's
+    /// assumptions), the class the band's, a space band when the answer's plan allocates
+    /// space services (a plan that failed reads as no space band) or the antenna serving
+    /// the band points up. `None` without `from`.
+    fn reach_of(
+        &self,
+        answer: &RegisterAnswer,
+        signal: &Signal,
+        from: Option<&Station>,
+    ) -> Option<Reach> {
+        let from = from?;
+        let center_hz = signal.center_hz;
         let space = answer.plan.iter().any(is_space);
         let mut reach = reach_for(
             center_hz,
@@ -519,7 +533,10 @@ impl KnowledgeProvider for AcmaKnowledge {
             space,
             self.override_km,
         );
-        reach.km = self.bound(Some(&observer_of(from, center_hz)), center_hz);
+        let observer = observer_of(from, center_hz);
+        reach.km = self
+            .override_km
+            .or_else(|| search_km(&observer, center_hz.0, &answer.assumptions));
         Some(reach)
     }
 }

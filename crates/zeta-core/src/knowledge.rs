@@ -182,6 +182,18 @@ pub trait KnowledgeProvider: Send + Sync {
     ) -> Option<RegisterAnswer> {
         None
     }
+    /// The reach behind `answer`, an answer this provider's
+    /// [`describe`](Self::describe) gave for `signal` from `from`, worked out from the
+    /// answer in hand without asking the register again; `None` by default and without
+    /// `from`.
+    fn reach_of(
+        &self,
+        _answer: &RegisterAnswer,
+        _signal: &Signal,
+        _from: Option<&Station>,
+    ) -> Option<Reach> {
+        None
+    }
     /// [`allocations`](Self::allocations) as seen from `from` instead of the node's
     /// station: a provider that measures distance or cuts by reach does both from
     /// `from`, and from nowhere when it is `None`. A static provider ignores it.
@@ -224,21 +236,34 @@ pub async fn nearest_allocations(
     center_hz: Hz,
     bandwidth_hz: Hz,
 ) -> Vec<Allocation> {
-    let (mut assignments, mut plans) = (Vec::new(), Vec::new());
+    let mut rows = Vec::new();
     for p in providers {
-        for a in p.allocations(region, center_hz, bandwidth_hz).await {
-            match a.kind.as_deref() == Some("assignment") {
-                true => assignments.push(a),
-                false => plans.push(a),
-            }
-        }
+        rows.extend(p.allocations(region, center_hz, bandwidth_hz).await);
     }
+    let (mut assignments, plans): (Vec<Allocation>, Vec<Allocation>) =
+        rows.into_iter().partition(assignment);
+    // A stable sort: rows without a distance keep the providers' order.
     assignments.sort_by(|a, b| match (a.distance_km, b.distance_km) {
         (Some(x), Some(y)) => x.total_cmp(&y),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
     });
+    assignments.extend(plans);
+    nearest_of(assignments)
+}
+
+/// Whether `a` is a licensed assignment (`kind` `assignment`).
+fn assignment(a: &Allocation) -> bool {
+    a.kind.as_deref() == Some("assignment")
+}
+
+/// [`nearest_allocations`]' cut of rows already fetched: the first
+/// [`NEAREST_ASSIGNMENTS`] assignments in `rows`' own order (a register answer's rank
+/// order survives), then every other row in order, uncapped.
+pub fn nearest_of(rows: Vec<Allocation>) -> Vec<Allocation> {
+    let (mut assignments, plans): (Vec<Allocation>, Vec<Allocation>) =
+        rows.into_iter().partition(assignment);
     assignments.truncate(NEAREST_ASSIGNMENTS);
     assignments.extend(plans);
     assignments
@@ -519,6 +544,18 @@ mod tests {
         // The five nearest assignments (the distance-less and the farthest dropped),
         // then the plan rows, a kind-less one among them, in provider order.
         assert_eq!(services, ["a1", "a2", "a3", "a5", "a7", "p1", "seed", "p2"]);
+    }
+
+    #[test]
+    fn nearest_of_keeps_the_rank_order_of_the_assignments_it_is_handed() {
+        // A register's rank order, the farther site first: kept, not re-sorted.
+        let mut rows = vec![row(Some("plan"), "p1", None)];
+        for (i, d) in [9.0, 3.0, 7.0, 1.0, 5.0, 2.0].into_iter().enumerate() {
+            rows.push(row(Some("assignment"), &format!("r{i}"), Some(d)));
+        }
+        let got = nearest_of(rows);
+        let services: Vec<&str> = got.iter().map(|a| a.service.as_str()).collect();
+        assert_eq!(services, ["r0", "r1", "r2", "r3", "r4", "p1"]);
     }
 
     #[tokio::test]

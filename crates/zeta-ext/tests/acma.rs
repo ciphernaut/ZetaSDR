@@ -494,3 +494,29 @@ async fn allocations_from_another_station_cuts_and_measures_from_it() {
         None
     );
 }
+
+/// The node takes the reach from the answer it already holds: no second lookup, and the
+/// same reach a lookup of its own gives.
+#[tokio::test]
+async fn the_reach_of_an_answer_in_hand_asks_the_register_nothing() {
+    let (url, stub) = serve(Mode::Normal).await;
+    let provider = provider(&url, demo_station());
+    let from = demo_station().unwrap();
+    let signal = Signal {
+        center_hz: Hz(404_025_000),
+        bandwidth_hz: Hz(16_000),
+    };
+    let answer = provider.describe("AU", &signal, Some(&from)).await.unwrap();
+    let asked = stub.queries.load(Ordering::SeqCst);
+    let reach = provider.reach_of(&answer, &signal, Some(&from));
+    assert_eq!(stub.queries.load(Ordering::SeqCst), asked);
+    let r = reach.clone().unwrap();
+    assert_eq!(r.km, Some(bound_from(&from)));
+    assert_eq!(r.class, ReachClass::Uhf);
+    let fresh = provider
+        .reach_from("AU", signal.center_hz, signal.bandwidth_hz, Some(&from))
+        .await;
+    assert_eq!(fresh, reach);
+    assert!(stub.queries.load(Ordering::SeqCst) > asked);
+    assert_eq!(provider.reach_of(&answer, &signal, None), None);
+}
