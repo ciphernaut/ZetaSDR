@@ -64,8 +64,9 @@ const DEVIATION_HZ: u64 = 3_000;
 /// own `band.bandwidth_hz` is narrower, on a channel of the row's width
 /// around the measured centre: `proved` or `no_frame`. A box narrower than
 /// [`MIN_BW_HZ`] is fitted as [`MIN_BW_HZ`] wide. Every row is considered;
-/// a proof does not stop the sweep. Upstream features are not used. The
-/// register's assignments handed to the run score [`allocation_term`].
+/// a proof does not stop the sweep. Upstream features are not used. The rows
+/// considered are chosen by the measurement alone; the register's assignments
+/// handed to the run ([`allocation_term`]) only reorder them.
 pub struct DecodeToIdentify {
     modes: ModesHandle,
 }
@@ -149,6 +150,15 @@ impl Classifier for DecodeToIdentify {
         let allocation = |m: &LoadedMode| allocation_term(m, allocations);
         // One registry for the whole run, however the handle is reloaded meanwhile.
         let modes = self.modes.get().unwrap_or_default();
+        // The rows to try are chosen by the measurement alone (the register's term at
+        // zero), so the register can only reorder them, never change the set (design 2,
+        // anti-goals); they are tried in the full score's order.
+        let chosen: Vec<&str> = score_rows(&modes, m_center, m_bw, layer1, &catalogue, &|_| 0.0)
+            .into_iter()
+            .filter(|s| s.in_range && classify_candidate(&s.mode.row))
+            .take(CLASSIFY_TRIES)
+            .map(|s| s.mode.row.id.0.as_str())
+            .collect();
         let scored = score_rows(&modes, m_center, m_bw, layer1, &catalogue, &allocation);
         // Each channel is extracted once, when the first row that runs on it does.
         let mut chans: Vec<((i64, u64), Option<(Vec<Complex<f32>>, u64)>)> = Vec::new();
@@ -156,8 +166,7 @@ impl Classifier for DecodeToIdentify {
         let mut tried = Vec::new();
         for s in scored
             .into_iter()
-            .filter(|s| s.in_range && classify_candidate(&s.mode.row))
-            .take(CLASSIFY_TRIES)
+            .filter(|s| chosen.contains(&s.mode.row.id.0.as_str()))
         {
             let row = &s.mode.row;
             let attempt = quick_attempt(row);
@@ -564,5 +573,106 @@ mod tests {
             .classify(&iq, Hz(48_000), Hz(144_800_000), band(-12_000), None)
             .await;
         assert!(below.is_empty(), "{below:?}");
+    }
+
+    /// The rows a measurement at `center`, `bw` wide and labelled `label`, puts in
+    /// classify's reach, best first, with `allocation` as the register's term.
+    fn reachable(
+        modes: &ModeRegistry,
+        center: u64,
+        bw: u64,
+        label: &str,
+        allocation: &dyn Fn(&LoadedMode) -> f32,
+    ) -> Vec<String> {
+        let catalogue = |id: &str| catalogue_score(id, center, bw, label);
+        score_rows(modes, center, bw, label, &catalogue, allocation)
+            .into_iter()
+            .filter(|s| s.in_range && classify_candidate(&s.mode.row))
+            .map(|s| s.mode.row.id.0.clone())
+            .collect()
+    }
+
+    /// The register may only reorder what classify tries (design 2, anti-goals): a
+    /// register whose candidate fits the sixth row by the measurement does not bring it
+    /// into the five tried, and does not push one of them out.
+    #[tokio::test]
+    async fn the_register_reorders_the_rows_tried_and_never_changes_the_set() {
+        let d = d();
+        let modes = d.modes.get().unwrap();
+        // A measurement on one of the rows' own channels where a register candidate
+        // fitting the sixth row by the measurement alone would lift it into the five.
+        let mut found = None;
+        'search: for m in modes.all() {
+            let Some(&center) = m.row.band.centers_hz.first() else {
+                continue;
+            };
+            let bw = m.row.band.bandwidth_hz;
+            for label in &m.row.modulation {
+                let measured = reachable(&modes, center, bw, label, &|_| 0.0);
+                let Some(sixth) = measured.get(CLASSIFY_TRIES).cloned() else {
+                    continue;
+                };
+                let row = modes.all().iter().find(|r| r.row.id.0 == sixth).unwrap();
+                let allocs = vec![Allocation {
+                    kind: Some("assignment".into()),
+                    role: Some("tx".into()),
+                    center_hz: Some(Hz(center)),
+                    bandwidth_hz: Some(Hz(row.row.band.bandwidth_hz)),
+                    ..Allocation::default()
+                }];
+                let full = reachable(&modes, center, bw, label, &|r| allocation_term(r, &allocs));
+                if full[..CLASSIFY_TRIES].contains(&sixth) {
+                    found = Some((center, bw, label.clone(), measured, full, sixth, allocs));
+                    break 'search;
+                }
+            }
+        }
+        let (center, bw, label, measured, full, sixth, allocs) =
+            found.expect("a measurement whose sixth row a register candidate would lift");
+        let m = Measurement {
+            features: FeatureRecord {
+                bandwidth_hz: Hz(bw),
+                center_hz: Hz(center),
+                symbol_rate_baud: None,
+                snr_db: 20.0,
+                burst: false,
+                duty: None,
+                bursts: None,
+                burst_ms: None,
+                period_ms: None,
+                order: None,
+                tone_spacing_hz: None,
+                symbol_rate_line: None,
+            },
+            label: Label {
+                layer: 1,
+                name: label,
+                confidence: 0.9,
+                evidence: String::new(),
+            },
+        };
+        let iq = vec![Complex::new(0.0f32, 0.0); 4 * MIN_SAMPLES];
+        let rate = Hz(48_000);
+        let (_, _, tried) = d
+            .classify_measured(
+                &iq,
+                rate,
+                Hz(center),
+                Band::whole(rate),
+                None,
+                Some(&m),
+                &allocs,
+            )
+            .await;
+        let ids: Vec<String> = tried.iter().map(|t| t.mode.clone()).collect();
+        let mut got = ids.clone();
+        got.sort();
+        let mut want = measured[..CLASSIFY_TRIES].to_vec();
+        want.sort();
+        assert_eq!(got, want, "the set tried is the measurement's: {ids:?}");
+        assert!(!ids.contains(&sixth), "{ids:?}");
+        // In the full score's order.
+        let order: Vec<String> = full.into_iter().filter(|id| ids.contains(id)).collect();
+        assert_eq!(ids, order);
     }
 }
