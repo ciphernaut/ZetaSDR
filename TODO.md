@@ -695,6 +695,15 @@ Each block takes a whole 2 MiB slot, so a B210's 10 ms blocks fill the 64 MiB ri
 
 Seen 2026-11-07 during plan 28.1, passed on rerun. Likely a timing assumption between the ring's `earliest_ns` and now.
 
+## Test: three real-time tests failed once each on a loaded host
+
+Seen 2026-11-14 in full workspace runs with the host's load average between 20 and 30 (other builds running); each passed three single reruns, and none is near the code under change that day:
+- `modes_check::an_operator_parser_row_is_checked_over_the_framing_family`: `dnp3_link: fail: no event within 10000 ms`.
+- `mix::both_tones_are_heard_and_a_continuous_tone_has_no_gaps_at_100_ms_blocks` (`mix.rs:241`).
+- `zeta-dsp` `acars::tests::acarsdec_decodes_our_fixture`: the external decoder started, printed nothing and exited.
+
+Each waits a fixed time on a real-time source or an external program. Reproduce under load (`taskset -c 0,1` plus a busy loop on each CPU) before widening a margin.
+
 ## Test: `modes_check::a_bad_synth_block_fails_its_row_and_the_rest_still_run` flaked once on a leftover scratch dir
 
 Seen 2026-11-09 in a full workspace run (the suite in parallel), six single reruns passed. The checker's `remove_dir_all` of `check-<pid>-pocsag_decode` has its result ignored (`modes_check.rs`, after `run_test`), so a node still writing its state dir as it shuts down leaves the directory for the test to find. Wait for the node to finish, or retry the removal, before reporting the row.
@@ -872,11 +881,10 @@ From the operator, 2026-11-12, while settling plan 37 (`docs/superpowers/specs/2
 - **A possible flake in the CLI test `job_start_takes_dwell_ms_and_average`** under parallel load.
 - **A flake in the scan test `a_port_that_stops_delivering_is_skipped_not_hung`** in full workspace runs (it passes alone and with its own test binary): the scan code and the test predate plan 37 and were not changed by it. Likely a timing margin under load; reproduce with `taskset -c 0,1`.
 - **The origin summary names the register's status only when nothing is lit**: when the licence list failed but an area-wide row lights a site, it lists the site without saying the list was incomplete.
-- **The `candidates` register query takes about two seconds against the live register whatever the band** (measured with `zeta registers check` on the field host, 2026-11-14; the whole answer about 2.0 s of the 5 s deadline). The overlap test on `FREQUENCY ± BANDWIDTH / 2` cannot use the frequency index: add a plain `FREQUENCY BETWEEN` prefilter widened by the widest licensed bandwidth, and check the plan with the service's query-plan call.
+- **The `candidates` register query still reads every device row** (about 0.6 s whatever the band or the box, measured against the live register on 2026-11-14; it was 0.4 s on a small box and 1.9 s on the whole globe before the query was made to start from the device table). A frequency prefilter cannot be exact: the register's widest bandwidth is far wider than any band, so "widened by the widest licensed bandwidth" filters nothing. The real fix is an index in the register service on a device's band edges, which its other clients would use too.
+- **A same-frequency network is counted by callsign, else by the holder's name** (with the centre and the emission): a network whose sites carry different callsigns and holders is not seen as one, and only an `agrees` verdict names the count. The count is unit-tested and wired into the provider, not yet seen on a live "What is this?".
+- **`knowledge lookup` prints rows only:** it has no verdict and no candidate list, so the network count is not in its output.
 - **The test stub hid a difference from the live service** until the first live run: the service names no columns for a query that matches no row. The stub now does the same; when the service's answer shape is relied on again, check it live first.
-- **A candidate's power reads 0 W where the register holds only an EIRP** (seen on the field host, 2026-11-14, on a broadcast licence: the transmitter-power column is zero and the EIRP column holds kilowatts). The register answer carries both (`power_w`, `eirp_w`), but `RegisterAnswer::allocations()` copies only `power_w` into the older `Allocation` row, so `knowledge lookup`, `origin lookup`, the map's popup and the agent all show `0 W`. Give the row the EIRP when it is the only usable figure (and say which it is), and treat a zero power as not known, as the propagation estimate already does.
-- **The expected level is not shown outside "What is this?", and strong candidates tie.** `origin lookup` and `knowledge lookup` print no expected level, so their output cannot say why one site outranks another. The origin score's reach term also saturates at 60 dB over the in-range floor (`ORIGIN_LEVEL_SPAN_DB`), so every strong nearby site scores the same and a site ten times the power does not outrank a weaker one. Print the expected level with each origin, and break ties by it.
-- **Sites of one same-frequency network cannot be told apart by the register alone:** the answer could say so ("N sites carry this licence's signal"), and show each site's polarisation, which is the practical discriminator and is already in the answer.
 - **Half of the wide-view race fix has no test.** The waterfall ignores a "capture moved" reading while the page's own scan holds the source (tested by `wide_view_keeps_the_view_while_its_scan_takes_the_radio`) and while that scan's `job_start` is still unanswered (`wf.coarseStarting`, not tested: the window cannot be forced without a hook in the page). Cover it if the page gains a test seam there.
 - **The page suite's status polls can land anywhere in a gesture.** The race above hid for two days because it needs a poll inside a half-second window; other scenarios that drive the wide view may hold the same kind of window. When one flakes, run it under load (`taskset -c 0,1` plus a busy loop on each CPU) before calling it a flake.
 - **The watch's register wording has no case for an answer with no verdict whose licence list failed** (the page has one); not reachable while Identify always attaches a verdict.
