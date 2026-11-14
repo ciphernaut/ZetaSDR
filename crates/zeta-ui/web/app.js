@@ -115,6 +115,17 @@
 // selected, and the pane shows in #pane under the waterfall while the view's `pane` is
 // `subjects` (`view set subjects on|off` is an alias). In the narrow footprint the pane is a
 // tab in the waterfall's place (<html data-pane="subjects">) that the strip's tab opens and closes.
+//
+// One selection (selection.js, plan 37 spec 3.5): state.selection, made at login and handed to
+// the subjects store, the map and the Subjects pane; nothing else holds selection state. A
+// subject is selected in the table or on the map, a register site on the map. A site
+// selection makes the Subjects tab eligible and asks `register_site` for the site's channels,
+// once per site (provider and id) for the page's life (a failed lookup is not kept, so the next
+// selection asks again): the pane's site row counts them and the waterfall marks the ones in
+// the band shown (ov.siteChannels, under the site's key); any change of the selection removes
+// the marks first. A site with no id is selected and marked on the map, nothing asked. A
+// lookup that fails notes `site <name>: <error>` and draws nothing.
+//
 // The view's `dock` (auto | bottom | right; auto the theme's `layout.dock`) moves #pane, whichever
 // pane it shows, into the side column as a third folding section in the wide footprint (applyDock).
 // The Bits pane (bits.js, #bits) is the strip's `bits` tab, eligible while a running job has a
@@ -127,7 +138,8 @@
 // failures such as a node without a speech daemon.
 //
 // Exports `state` ({api, transcript, jobs, wf, coarse, subjects, subjectsPane, panes, ov, map, menu,
-// audio, mic, sources, selected, view, lastJobs, allowStops, allowDeletes, allowSignatures}),
+// audio, mic, sources, selected, view, lastJobs, allowStops, allowDeletes, allowSignatures,
+// selection}),
 // `onSourceChange(fn)` for the later views (waterfall, audio,
 // voice), `conflictActions(err, retry)`, `runSourceCommand(state, words)` and
 // `runPlanCommand(state, words)`.
@@ -168,6 +180,7 @@ import { MixWatch, isMuted, mixCovering, muteOp } from "./mix.js";
 import { mountCoarse } from "./coarse.js";
 import { mountMap, resolveMapTiles } from "./map.js";
 import { mountSubjects, mountSubjectsPane } from "./subjects.js";
+import { Selection, isSite } from "./selection.js";
 import { mountPanes } from "./panes.js";
 import { mountExplorePane } from "./explore.js";
 import { mountBitsPane } from "./bits.js";
@@ -188,6 +201,7 @@ export const state = {
   wf: null,
   subjects: null,
   subjectsPane: null,
+  selection: null, // selection.js: the one selection the map, the pane and the waterfall share
   panes: null,
   explore: null,
   bits: null, // bits.js: the Bits pane
@@ -1233,6 +1247,55 @@ function wireCommandLine() {
   });
 }
 
+// ---- the selection (plan 37) -------------------------------------------------------------
+
+// `register_site` answers by site, for the page's life: `<provider>:<id>` (a register id holds
+// no `:`) -> {channels} | {pending: true}. A lookup that fails is dropped, so the next
+// selection asks.
+const siteAnswers = new Map();
+
+const siteKey = (sel) => `${sel.provider}:${sel.siteId}`;
+
+// What the register holds at a selected site: {channels}, {pending: true}, or null (a site
+// without an id or provider, or a lookup that failed).
+function siteAnswer(sel) {
+  if (!isSite(sel) || !sel.siteId || !sel.provider) return null;
+  return siteAnswers.get(siteKey(sel)) ?? null;
+}
+
+// The waterfall's marks follow the selection: removed on every change, drawn for a site whose
+// channels are known, asked for (once) when they are not.
+function showSelection(sel) {
+  state.ov?.clearSiteChannels();
+  applyPanes();
+  if (!isSite(sel) || !sel.siteId || !sel.provider) return;
+  const key = siteKey(sel);
+  const known = siteAnswers.get(key);
+  if (known) {
+    if (!known.pending) state.ov?.siteChannels(key, known.channels);
+    return;
+  }
+  siteAnswers.set(key, { pending: true });
+  const api = state.api;
+  api
+    .op({ op: "register_site", provider: sel.provider, site_id: sel.siteId })
+    .then((r) => {
+      const channels = r && r.value && Array.isArray(r.value.channels) ? r.value.channels : [];
+      siteAnswers.set(key, { channels });
+    })
+    .catch((e) => {
+      siteAnswers.delete(key);
+      if (state.api === api) state.transcript?.note(`site ${sel.name || sel.siteId}: ${e.message}`, true);
+    })
+    .finally(() => {
+      if (state.api !== api) return;
+      const now = state.selection?.get();
+      const answer = siteAnswers.get(key);
+      if (isSite(now) && siteKey(now) === key && answer) state.ov?.siteChannels(key, answer.channels);
+      state.subjectsPane?.render();
+    });
+}
+
 // ---- start -----------------------------------------------------------------------------
 
 function start(api) {
@@ -1265,7 +1328,9 @@ function start(api) {
     jobs: () => state.lastJobs,
   });
   state.coarse.onRow((msg) => state.wf?.addCoarseEvent(msg));
-  state.subjects = mountSubjects(api, state.view);
+  state.selection = new Selection();
+  state.selection.onChange(showSelection);
+  state.subjects = mountSubjects(api, state.view, state.selection);
   state.ov = mountOverlays($("#waterfall"), state.wf, api, {
     subjects: state.subjects,
     jobsEl: $("#jobs"),
@@ -1279,6 +1344,7 @@ function start(api) {
   state.map = mountMap($("#map"), api, state.view, {
     jobs: () => state.lastJobs,
     subjects: state.subjects,
+    selection: state.selection,
     // A row with fixed stations fades its lit sites from the last station frame (plan 35),
     // any other from the job's last event.
     lastEvent: (id) => state.ov?.lastStationEvent(id) ?? state.ov?.lastEvent(id) ?? null,
@@ -1300,6 +1366,8 @@ function start(api) {
     jobs: () => state.lastJobs,
     watching: (id) => (state.ov ? state.ov.watching(id) : true),
     footprint,
+    selection: state.selection,
+    siteChannels: siteAnswer,
   });
   state.panes = mountPanes($("#panes"), state.view, { footprint, host: $("#pane") });
   state.panes.register("subjects", "subjects", {
@@ -1932,6 +2000,7 @@ function logout(api) {
   state.bits = null;
   state.subjectsPane = null;
   state.subjects = null;
+  state.selection = null;
   state.coarse = null;
   state.menu = null;
   state.wf = null;

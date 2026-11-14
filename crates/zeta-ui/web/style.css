@@ -226,6 +226,8 @@ html[data-main="map"] #waterfall { visibility: hidden; }
    their site. */
 #map path.map-site { stroke: var(--user); fill: var(--user); stroke-width: 2; fill-opacity: calc(0.8 * var(--site-brightness, 1)); stroke-opacity: calc(0.3 + 0.7 * var(--site-brightness, 1)); }
 #map path.map-site[data-agree="disagrees"] { fill: none; }
+/* A click anywhere in a site's circle selects it, a ring with no fill included. */
+#map path.map-site { pointer-events: visible; }
 /* A heard site (plan 35: the job decoded its ground station's frames, `from`, or frames sent
    to it, `to`): filled whatever its designator says, a thin solid ring fading with the fill;
    `to` a shade fainter. Distinct from the confirmed ring below, which wins on a site that is
@@ -234,6 +236,10 @@ html[data-main="map"] #waterfall { visibility: hidden; }
 #map path.map-site[data-heard="to"] { fill-opacity: calc(0.55 * var(--site-brightness, 1)); stroke-opacity: calc(0.7 * (0.3 + 0.7 * var(--site-brightness, 1))); }
 /* A site confirmed by a heard callsign or decoded id: a ring outside it. */
 #map path.map-site[data-confirmed] { stroke: var(--map-sel); stroke-width: 5; paint-order: stroke; stroke-opacity: 1; }
+/* The selection (plan 37, selection.js): a selected site in the map's selection colour, the
+   sites a selected subject's answer matched ringed in the accent. */
+#map path.map-site.matched { stroke: var(--accent); stroke-width: 3; stroke-opacity: 1; }
+#map path.map-site.selected { stroke: var(--map-sel); stroke-width: 4; stroke-opacity: 1; stroke-dasharray: none; }
 #map path.map-bearing { stroke: var(--user); stroke-width: 1.5; fill: none; stroke-opacity: calc(0.7 * var(--site-brightness, 1)); }
 #map .map-source { width: auto; height: auto; white-space: nowrap; padding: 0 3px; font-size: 11px; color: var(--map-label-text); background: var(--label-bg); border: 1px solid var(--map-sel); }
 #map .leaflet-popup-content .map-origin + .map-origin, #map .leaflet-popup-content .map-stations, #map .leaflet-popup-content .map-lookup { margin-top: 6px; }
@@ -263,7 +269,7 @@ html[data-dock="right"][data-strip] #waterfall, html[data-dock="right"][data-str
    row sticks to it and its first column (the key) stays put when the rest is scrolled in. */
 #subjects { display: flex; flex-direction: column; }
 #subjects[hidden] { display: none; }
-#subjects .subject-job, #subjects .subject-merged { flex: 0 1 auto; min-height: 0; margin: 4px 8px; overflow: auto; }
+#subjects .subject-job, #subjects .subject-merged, #subjects .subject-site { flex: 0 1 auto; min-height: 0; margin: 4px 8px; overflow: auto; }
 #subjects h3 { position: sticky; left: 0; margin: 4px 0; font-size: 12px; font-weight: normal; color: var(--accent); }
 #subjects .not-watched { position: sticky; left: 0; color: var(--error); font-size: 11px; }
 #subjects table { min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
@@ -277,6 +283,10 @@ html[data-dock="right"][data-strip] #waterfall, html[data-dock="right"][data-str
 #subjects tr.subject.station td:first-child::before { content: "\25B4\00A0"; color: var(--dim); }
 #subjects tr.subject.selected, #subjects tr.subject.selected td:first-child { background: var(--bar); }
 #subjects tr.subject.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+/* The register site selected on the map (subjects.js drawSite): one row, marked as a
+   selected subject's is, in the map's selection colour. */
+#subjects tr.site-selected, #subjects tr.site-selected td:first-child { background: var(--bar); }
+#subjects tr.site-selected td:first-child { box-shadow: inset 2px 0 0 var(--map-sel); }
 /* the rail (overlays.js setRail): the job tags beside the axis, shown under a theme whose
    layout has one (<html data-rail="on">) */
 #waterfall #rail {
@@ -389,6 +399,13 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
   position: absolute; right: 0; width: 10px; height: 0; margin-top: -1px;
   border-top: 2px solid var(--ok);
 }
+/* A selected register site's channels (overlays.js siteChannels): a thin line across the
+   waterfall, solid for a transmitter, dashed for a receiver; never in the pointer's way. */
+#waterfall .site-channel {
+  position: absolute; left: 0; right: 0; height: 0; margin-top: -0.5px;
+  border-top: 1px solid var(--map-sel); opacity: 0.8; pointer-events: none;
+}
+#waterfall .site-channel[data-role="rx"] { border-top-style: dashed; }
 #waterfall .ov-label { left: 6px; color: var(--ok); border-color: var(--ok); }
 #waterfall .ov-label[data-layer="2"] { color: var(--accent); border-color: var(--accent); }
 #waterfall .ov-ribbon {

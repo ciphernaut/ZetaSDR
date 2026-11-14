@@ -7115,6 +7115,180 @@ def scenario_heard_sites(page, url, secret):
         stop_job(url, secret, plain)
 
 
+# ---- one selection (plan 37 Task 9) -------------------------------------------------------
+# The stub gives each of its rows a site id of its own: Example Hill's transmitter on the
+# tone is one channel at its site (the licence's `rx` stands at another id).
+
+def site_of(page, licensee):
+    """The lit site whose tooltip names `licensee`, hovering each in turn and reading the newest
+    tooltip (the one before may still be fading out)."""
+    site = page.locator("#map path.map-site")
+    for i in range(site.count()):
+        site.nth(i).hover()
+        tip = page.locator("#map .leaflet-tooltip").last
+        expect(tip).to_be_visible()
+        if licensee in (tip.text_content() or ""):
+            return site.nth(i)
+    raise AssertionError(f"no lit site of {licensee}")
+
+
+def close_popup(page):
+    """Close the map's open popup, if any, so it covers no marker the next click needs."""
+    close = page.locator("#map .leaflet-popup-close-button")
+    if close.count() > 0:
+        close.click()
+        expect(close).to_have_count(0)
+
+
+def scenario_a_map_site_can_be_selected(page, url, secret):
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    errors = page_errors(page)
+    job = None
+    selected = page.locator("#map path.map-site.selected")
+    row = page.locator("#subjects tr.site-selected")
+    marks = page.locator("#waterfall .site-channel")
+    try:
+        menu = open_menu_on_tone(page, url, secret)
+        page.click('#ctx .ctx-item[data-action="classify"]')
+        expect(menu).to_be_hidden()
+        expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=15_000)
+        # A subject with a fix, so a marker click can take the selection.
+        job = start_subject_job(page, url, secret, "fake_subjects")
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map .map-subject")).to_have_count(2, timeout=10_000)
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        hill = site_of(page, "Example Water Authority")
+        hill.click()
+        expect(hill).to_have_class(re.compile(r"\bselected\b"))
+        expect(selected).to_have_count(1)
+        # Its popup still opens on the same click.
+        expect(page.locator("#map .leaflet-popup-content")).to_contain_text("licence 0000001")
+        # The pane names it under its own heading, with the register's count of its channels.
+        open_subjects(page)
+        expect(row).to_have_count(1)
+        expect(row).to_contain_text("Example Hill")
+        expect(row).to_contain_text("Example Water Authority")
+        expect(row).to_contain_text("1 channel", timeout=10_000)
+        expect(page.locator("#subjects section.subject-site h3")).to_have_text("Site")
+        # The waterfall marks the site's channel in view, under the pointer's way.
+        expect(marks).to_have_count(1)
+        expect(marks).to_have_attribute("data-role", "tx")
+        expect(marks).to_have_attribute("title", "100.0000 MHz 16K0F1D")
+        assert marks.evaluate("(e) => getComputedStyle(e).pointerEvents") == "none"
+        # Only a channel inside the shown span is drawn, and a change of span redraws.
+        r = page.evaluate(
+            """async () => {
+              const { state } = await import('./app.js');
+              const ch = (hz, role) => ({channel: {center_hz: hz, bandwidth_hz: 16000, role,
+                                                   emission: '16K0F3E'},
+                                         licence_no: '9', licensee: 'Example Holder'});
+              const s = state.wf.shown();
+              const mid = (s.lo + s.hi) / 2;
+              const n = () => document.querySelectorAll('#waterfall .site-channel').length;
+              state.ov.siteChannels('test', [ch(mid, 'rx'), ch(s.hi + 1e6, 'tx')]);
+              const one = n();
+              const role = document.querySelector('#waterfall .site-channel').dataset.role;
+              state.wf.setView(s.lo, mid - (s.hi - s.lo) / 8);
+              const zoomed = n();
+              state.wf.setView(s.lo, s.hi);
+              const back = n();
+              state.ov.clearSiteChannels();
+              return {one, role, zoomed, back, cleared: n()};
+            }""")
+        assert r == {"one": 1, "role": "rx", "zoomed": 0, "back": 1, "cleared": 0}, r
+        # A second click on the selected site clears it, a third selects it again.
+        hill.click()
+        expect(selected).to_have_count(0)
+        expect(marks).to_have_count(0)
+        hill.click()
+        expect(selected).to_have_count(1)
+        expect(marks).to_have_count(1, timeout=10_000)
+        # Clicking a subject's marker moves the selection: the site and its marks go.
+        close_popup(page)
+        map_subject(page, "QFA1").click()
+        expect(selected).to_have_count(0)
+        expect(marks).to_have_count(0)
+        expect(row).to_have_count(0)
+        expect(page.locator("#subjects tr.subject.selected")).to_have_count(1)
+        # Escape on the map clears a selection.
+        close_popup(page)
+        hill.click()
+        expect(selected).to_have_count(1)
+        page.locator("#map").focus()
+        page.keyboard.press("Escape")
+        expect(selected).to_have_count(0)
+        expect(row).to_have_count(0)
+        # A site whose provider gives no ids is selectable; nothing is asked, nothing marked.
+        page.evaluate("""() => window.zetaTest.lightOrigin('band:noid', {
+            t_ns: Date.now() * 1e6, origins: [{score: 1, agree: 'fits', confirmed: null,
+              allocation: {lat: -27.30, lon: 153.30, licensee: 'Example Airways',
+                           site: 'Example Tower', site_id: null, provider: 'other'}}]})""")
+        close_popup(page)
+        tower = site_of(page, "Example Airways")
+        tower.click()
+        expect(tower).to_have_class(re.compile(r"\bselected\b"))
+        expect(row).to_contain_text("Example Tower")
+        expect(row).to_contain_text("no channel list")
+        expect(marks).to_have_count(0)
+        assert not errors, f"console errors: {errors}"
+        # A lookup that fails says so in the transcript and draws nothing (the browser logs
+        # the refused op, the one error allowed from here on).
+        page.evaluate("""() => window.zetaTest.lightOrigin('band:bad', {
+            t_ns: Date.now() * 1e6, origins: [{score: 1, agree: 'fits', confirmed: null,
+              allocation: {lat: -27.20, lon: 153.20, licensee: 'Example Rail',
+                           site: 'Example Yard', site_id: 'not an id', provider: 'acma'}}]})""")
+        close_popup(page)
+        yard = site_of(page, "Example Rail")
+        yard.click()
+        expect(page.locator("#transcript .line.note", has_text="site Example Yard: ")).to_have_count(
+            1, timeout=10_000)
+        expect(row).to_contain_text("no channel list")
+        expect(marks).to_have_count(0)
+        others = [e for e in errors if not re.match(r"Failed to load resource: .* 422 .*/op\)$", e)]
+        assert len(errors) - len(others) == 1 and not others, f"console errors: {errors}"
+    finally:
+        run_cmd(page, "view reset")
+        if job:
+            stop_job(url, secret, job)
+
+
+def scenario_selecting_a_subject_lights_its_sites(page, url, secret):
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    page.set_viewport_size(WIDE)
+    job = start_subject_job(page, url, secret, "fake_vdl2", bandwidth_hz=42_000)
+    matched = page.locator("#map path.map-site.matched")
+    try:
+        page.wait_for_function("(j) => window.zetaSubjects.size(j) === 3", arg=job,
+                               timeout=10_000)
+        job_row(page, job).locator("button.origins").click()
+        expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=10_000)
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        expect(matched).to_have_count(0)
+        open_subjects(page)
+        subject_row(page, "7C0000").click()
+        expect(subject_row(page, "7C0000")).to_have_class(re.compile(r"\bselected\b"))
+        # The sites of the subject's job's answer light; another set's do not.
+        page.evaluate("""() => window.zetaTest.lightOrigin('band:other', {
+            t_ns: Date.now() * 1e6, origins: [{score: 1, agree: 'fits', confirmed: null,
+              allocation: {lat: -27.30, lon: 153.30, licensee: 'Example Airways',
+                           site: 'Example Tower', site_id: null, provider: 'other'}}]})""")
+        expect(page.locator("#map path.map-site")).to_have_count(3)
+        expect(matched).to_have_count(2)
+        expect(page.locator("#map path.map-site.selected")).to_have_count(0)
+        # Escape in the pane clears the selection, and with it the match.
+        subject_row(page, "7C0000").click()
+        page.keyboard.press("Escape")
+        expect(page.locator("#subjects tr.subject.selected")).to_have_count(0)
+        expect(matched).to_have_count(0)
+        assert not errors, f"console errors: {errors}"
+    finally:
+        run_cmd(page, "view reset")
+        stop_job(url, secret, job)
+
+
 # ---- subjects (plan 23 Task 2) ----------------------------------------------------------
 # The node's `fake_subjects` row prints three aircraft in separate messages, `fake_fold` two
 # sondes (ui.rs), each 2 s into the job.

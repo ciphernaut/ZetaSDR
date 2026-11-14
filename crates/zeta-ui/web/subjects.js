@@ -4,7 +4,9 @@
 // Nothing is kept on the node: a refresh starts empty and refills from live traffic.
 //
 // Exports:
-//   mountSubjects(api, view) -> SubjectStore; sets window.zetaSubjects (null on destroy)
+//   mountSubjects(api, view, selection = new Selection()) -> SubjectStore; sets
+//       window.zetaSubjects (null on destroy). `selection` is the page's one selection
+//       (selection.js, app.js's), which the store reads and writes for its subjects.
 //   SubjectStore:
 //     store.lookup(kinds) -> Promise<bool>   the mode rows of `kinds`: `modes_list` once for
 //         the ids, one `modes_show` per kind, both cached. A kind that is no row caches null; a
@@ -36,12 +38,18 @@
 //     store.size(jobId) -> number
 //     store.lastHeard(jobId) -> subject | null   the last subject that job itself was heard on
 //     store.held(jobId, key | null) -> bool   the subject (with null, any of the group's) is not dim
-//     store.select(jobId, key), store.selected() -> {job, group, key} | null (`job` the subject's)
+//     store.select(jobId, key)   the subject becomes the page's selection ({kind: "subject",
+//         job, group, key}); a key the group does not hold clears the selection
+//     store.selected() -> {job, group, key} | null (`job` the subject's): the selection when it
+//         is a subject, null when it is none or a register site
+//     store.setSelected({job, group, key} | null)   sets the selection to that subject, or none
+//     store.selection   the shared Selection, for whoever draws a site selection
 //     store.onChange(cb)   any merge, dim or drop, and a row learned
 //     store.onLearn(cb)   a row learned, after onChange's
 //     store.onTick(cb)   each second, after dim and drop are checked
-//     store.onDrop(cb(jobId, key)) (`jobId` the subject's `job`), store.onSelect(cb(sel)),
-//     store.destroy()
+//     store.onDrop(cb(jobId, key)) (`jobId` the subject's `job`),
+//     store.onSelect(cb(sel))   each change of the selection, `sel` as selected() gives it
+//     store.destroy()   its callbacks go; the selection itself is the page's and stays
 //     A subject past view `subject_dim_s` of silence is dim, past `subject_drop_s` dropped
 //     (checked each second, from this page's clock, so a longer `subject_dim_s` un-dims it at
 //     the next check); a selection goes with its subject.
@@ -59,7 +67,8 @@
 //     `merge_skip`, `station.when`) holds on `obj`: present, non-null and
 //     `String(have) === String(v)`; false for an empty or missing `pairs` (overlays.js tests
 //     events with it, so the page has one comparison)
-//   mountSubjectsPane(el, store, view, {jobs, watching, footprint}) -> pane
+//   mountSubjectsPane(el, store, view, {jobs, watching, footprint, selection, siteChannels})
+//       -> pane
 //     A watch's kept decoders draw one `section.subject-job[data-job=<watch id>]` at the first
 //     one's place (plan 31 spec 4.7), headed `<watch kind> <id tail> · <subject name>`, its
 //     columns the key, `Channel` (`th[data-col="channel"]`: the centre, in MHz to 4 places, of
@@ -79,6 +88,14 @@
 //     its rows keep their order (a header click sorts once, a new row goes last), resuming on
 //     leave. A press (`pointerdown`) on a row selects it, so a row moving cannot lose a click, and
 //     a selection (from here or the map) scrolls its row into view.
+//     A register site selected on the map (selection.js, `opts.selection`, else the store's)
+//     draws, first in the pane, one `section.subject-site` headed `Site` with one
+//     `tr.site-selected`: the site's name, its holders (`, `-joined) and what the register
+//     holds there, `opts.siteChannels(sel)` -> `{channels: [...]}` (`1 channel`, `<n>
+//     channels`), `{pending: true}` (`asking the register`) or null (`no channel list`: a
+//     site without an id, or a lookup that failed). The pane is eligible while a site is
+//     selected. Escape pressed while the pane has focus (it takes focus on a press) clears the
+//     selection.
 //     One table across rows (plan 30 spec 4.8), a view over the per-job subjects: when two or
 //     more running jobs' rows declare `subject.merge` and share `subject.name`, one
 //     `section.subject-merged[data-name]` (MERGE_SECTION_CLASS) stands at the first one's place
@@ -107,6 +124,7 @@
 import { groupOf as watchGroupOf } from "./agent.js";
 import { MAX_POSITIONED } from "./overlays.js";
 import { distanceBearing, positionOf } from "./map.js";
+import { Selection, isSite } from "./selection.js";
 import { metricText } from "./units.js";
 import { homeOf } from "./view.js";
 
@@ -193,16 +211,22 @@ export function subjectValues(s) {
 
 // ---- the store --------------------------------------------------------------------------
 
-export function mountSubjects(api, view) {
-  const store = new SubjectStore(api, view);
+export function mountSubjects(api, view, selection = new Selection()) {
+  const store = new SubjectStore(api, view, selection);
   window.zetaSubjects = store;
   return store;
 }
 
+// The store's form of a selection: a subject's {job, group, key}, else null.
+function subjectForm(sel) {
+  return sel && sel.kind === "subject" ? { job: sel.job, group: sel.group, key: sel.key } : null;
+}
+
 class SubjectStore {
-  constructor(api, view) {
+  constructor(api, view, selection) {
     this.api = api;
     this.view = view;
+    this.selection = selection;
     this.rows = new Map(); // job kind -> row | null
     this.rowIds = null; // the mode-row ids (`modes_list`), once looked up
     this.lookingUp = false;
@@ -212,13 +236,17 @@ class SubjectStore {
     this.groups = new Map(); // a kept decoder's id -> its watch's id, as of the last sync
     this.lastJobs = [];
     this.trials = new Set(); // the running identifies' current trials
-    this.sel = null;
     this.changeCbs = [];
     this.learnCbs = [];
     this.dropCbs = [];
     this.selectCbs = [];
     this.tickCbs = [];
     this.destroyed = false;
+    selection.onChange((sel) => {
+      if (this.destroyed) return;
+      const form = subjectForm(sel);
+      for (const cb of this.selectCbs) cb(form);
+    });
     this.timer = setInterval(() => this.tick(), TICK_MS);
   }
 
@@ -426,12 +454,11 @@ class SubjectStore {
   }
 
   selected() {
-    return this.sel;
+    return subjectForm(this.selection.get());
   }
 
   setSelected(sel) {
-    this.sel = sel;
-    for (const cb of this.selectCbs) cb(sel);
+    this.selection.set(sel ? { kind: "subject", job: sel.job, group: sel.group, key: sel.key } : null);
   }
 
   onChange(cb) {
@@ -465,7 +492,8 @@ class SubjectStore {
     if (!s) return;
     subjects.delete(key);
     if (subjects.size === 0) this.jobs.delete(group);
-    if (this.sel && this.sel.group === group && this.sel.key === key) this.setSelected(null);
+    const sel = this.selected();
+    if (sel && sel.group === group && sel.key === key) this.setSelected(null);
     for (const cb of this.dropCbs) cb(s.job, key);
   }
 
@@ -495,7 +523,6 @@ class SubjectStore {
     clearInterval(this.timer);
     this.jobs.clear();
     this.groups.clear();
-    this.sel = null;
     this.changeCbs = [];
     this.learnCbs = [];
     this.dropCbs = [];
@@ -626,14 +653,36 @@ export function mountSubjectsPane(el, store, view, opts = {}) {
   return new SubjectsPane(el, store, view, opts);
 }
 
+// What the site row says the register holds there.
+function siteChannelsText(answer) {
+  if (answer && answer.pending) return "asking the register";
+  if (!answer || !Array.isArray(answer.channels)) return "no channel list";
+  const n = answer.channels.length;
+  return n === 1 ? "1 channel" : `${n} channels`;
+}
+
 class SubjectsPane {
-  constructor(el, store, view, { jobs = () => [], watching = () => true, footprint = () => "wide" } = {}) {
+  constructor(
+    el,
+    store,
+    view,
+    {
+      jobs = () => [],
+      watching = () => true,
+      footprint = () => "wide",
+      selection = store.selection,
+      siteChannels = () => null,
+    } = {},
+  ) {
     this.el = el;
     this.store = store;
     this.view = view;
     this.jobs = jobs;
     this.watching = watching;
     this.footprint = footprint;
+    this.selection = selection;
+    this.siteChannels = siteChannels;
+    this.site = null; // the selected site's section: {el, cells}, while one is selected
     // section id (a job id, or `merged:<name>`) -> {el, h3, note, table, head, body, sig,
     // rows: row id -> tr, hover, order: the row ids as last sorted}
     this.sections = new Map();
@@ -643,12 +692,20 @@ class SubjectsPane {
     this.destroyed = false;
     this.onClick = (ev) => this.click(ev);
     this.onPress = (ev) => this.press(ev);
+    this.onKey = (ev) => {
+      if (ev.key === "Escape" && this.selection.get()) this.selection.set(null);
+    };
     el.addEventListener("click", this.onClick);
     el.addEventListener("pointerdown", this.onPress);
+    el.addEventListener("keydown", this.onKey);
+    // Focusable without a tab stop, so a press in it takes the focus Escape needs.
+    if (!el.hasAttribute("tabindex")) el.tabIndex = -1;
     store.onChange(() => this.schedule());
-    store.onSelect((sel) => {
+    selection.onChange((sel) => {
       this.render();
-      if (sel) this.el.querySelector("tr.subject.selected")?.scrollIntoView({ block: "nearest" });
+      if (!sel) return;
+      const row = sel.kind === "site" ? "tr.site-selected" : "tr.subject.selected";
+      this.el.querySelector(row)?.scrollIntoView({ block: "nearest" });
     });
     view.onChange((key) => {
       if (key === "home" || key === "subjects") this.render();
@@ -677,7 +734,8 @@ class SubjectsPane {
   eligible() {
     return (
       this.subjectJobs().some((j) => this.store.rowOf(j.kind).subject.columns.length > 0) ||
-      this.heldWatches().length > 0
+      this.heldWatches().length > 0 ||
+      isSite(this.selection.get())
     );
   }
 
@@ -1065,9 +1123,50 @@ class SubjectsPane {
     return parts;
   }
 
+  // The selected site's section (`section.subject-site`), drawn or updated; null, and gone,
+  // while no site is selected.
+  drawSite() {
+    const sel = this.selection.get();
+    if (!isSite(sel)) {
+      this.site?.el.remove();
+      this.site = null;
+      return null;
+    }
+    if (!this.site) {
+      const el = document.createElement("section");
+      el.className = "subject-site";
+      const h3 = document.createElement("h3");
+      h3.textContent = "Site";
+      const table = document.createElement("table");
+      const body = document.createElement("tbody");
+      const row = document.createElement("tr");
+      row.className = "site-selected";
+      const cells = ["name", "holders", "channels"].map((col) => {
+        const td = document.createElement("td");
+        td.dataset.col = col;
+        row.append(td);
+        return td;
+      });
+      body.append(row);
+      table.append(body);
+      el.append(h3, table);
+      this.site = { el, cells };
+    }
+    const texts = [
+      sel.name || sel.siteId || "",
+      (sel.holders || []).join(", "),
+      siteChannelsText(this.siteChannels(sel)),
+    ];
+    this.site.cells.forEach((td, i) => setText(td, texts[i], texts[i]));
+    return this.site.el;
+  }
+
   render() {
     if (this.destroyed || this.isHidden()) return;
     this.lastRender = Date.now();
+    const site = this.drawSite();
+    if (site && this.el.firstElementChild !== site) this.el.prepend(site);
+    const first = site ? 1 : 0;
     const jobs = this.subjectJobs();
     const wanted = jobs
       .map((job) => ({ job, watched: this.watching(job.id) }))
@@ -1094,7 +1193,8 @@ class SubjectsPane {
       if (part.group) this.drawWatchSection(sec, part);
       else if (part.members) this.drawMergedSection(sec, part);
       else this.drawJobSection(sec, part);
-      if (this.el.children[i] !== sec.el) this.el.insertBefore(sec.el, this.el.children[i] || null);
+      const at = first + i;
+      if (this.el.children[at] !== sec.el) this.el.insertBefore(sec.el, this.el.children[at] || null);
     });
   }
 
@@ -1104,7 +1204,9 @@ class SubjectsPane {
     if (this.pending !== null) clearTimeout(this.pending);
     this.el.removeEventListener("click", this.onClick);
     this.el.removeEventListener("pointerdown", this.onPress);
+    this.el.removeEventListener("keydown", this.onKey);
     this.el.replaceChildren();
     this.sections.clear();
+    this.site = null;
   }
 }

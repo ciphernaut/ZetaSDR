@@ -34,7 +34,8 @@
 //       newer half whole: a track keeps its start and old detail coarsens with age
 //   drawnPoints(kept, latest) -> [[lat, lon]]   the line: the kept points, ending at the latest
 //       fix (`cap` at most, as `kept` is under it)
-//   mountMap(el, api, view, {jobs, subjects, lastEvent, tiles}) -> MapPane
+//   mountMap(el, api, view, {jobs, subjects, selection, lastEvent, tiles}) -> MapPane
+//       (`selection` the page's one selection, selection.js; default the store's)
 //       (`lastEvent(jobId)`: performance.now() of the job's last event on the feed,
 //       overlays.js lastEvent, or its lastStationEvent on a row with fixed stations, plan 35;
 //       `tiles()` the provider id in force, app.js resolving the
@@ -55,7 +56,9 @@
 //                               hidden, so the track is whole when it shows.
 //     map.sync()                after each jobs poll: the tracks of jobs no longer running
 //                               (stopped, failed, forgotten) are dropped with their marker
-//                               and so are the lit sets keyed by those jobs' ids
+//                               and so are the lit sets keyed by those jobs' ids; a
+//                               selection whose job is gone is cleared (a subject whose job
+//                               and group are not running, a site clicked in such a job's set)
 //     map.origin(key, answer, {activity, litAt})   light the sites of an origin answer (plan 32
 //                               spec 4.4: an `origin` event's payload, a classification's
 //                               `origins`, a job's `job_context.origins`) as the set `key`: a
@@ -109,9 +112,11 @@
 //   `subject.track_points` and `track_min_m`. The marker is always at the latest fix, redrawn at
 //   most twice a second per subject. An event
 //   with no fix refreshes the marker's face and leaves the geometry alone. Its popup names the
-//   subject and lists its values; a click selects it in the store. The store's selection marks
-//   the marker and raises it over the others, panning only when it is off the map; each of the
-//   store's ticks dims it with its subject, being heard again lights it, and a drop removes it.
+//   subject and lists its values; a click selects it in the store. A subject selection marks
+//   the marker and raises it over the others, panning only when it is off the map, and marks
+//   `matched` every site of the lit set keyed by the subject's job (or its group, a watch);
+//   each of the store's ticks dims it with its subject, being heard again lights it, and a
+//   drop removes it.
 //   A lit set draws one L.circleMarker (class `map-site`, `data-agree` fits|disagrees|unknown
 //   from its best origin, `data-confirmed` when any is confirmed, the CSS custom property
 //   `--site-brightness` 0..1, the site's best score × the set's freshness, a heard site's the
@@ -131,11 +136,18 @@
 //   old, or more than a minute ahead); its popup lists each
 //   origin there with those lines, `licence <no>`, `<power> W`, for a heard site one line per
 //   station key `<key>: heard <from>, addressed by <to>` (`*` reading `uplinks`), then the measured band and labels,
-//   the source and `from <station|source id>`, and no buttons: a click selects
-//   nothing. While a set's `from_note` is `no station set`, `div.map-note` in the map's corner
+//   the source and `from <station|source id>`, and no buttons. The same click selects the
+//   site (plan 37): the selection becomes `{kind: "site", provider, siteId, name, lat, lon,
+//   set, holders}` (selection.js; provider and id from the site's best origin with a
+//   `site_id`, else its best), and a click on the selected site clears it, as does Escape
+//   while the map has focus. A selected site's marker has class `selected` (in every lit set
+//   that holds that site) and is raised over the others; the waterfall and the Subjects pane
+//   draw the rest (app.js). While a set's `from_note` is `no station set`, `div.map-note` in
+//   the map's corner
 //   says the sites are not cut by reach, once per load. The first lit site centres the map
 //   when nothing else has (no home, no fix).
 
+import { Selection, isSite, sameSite } from "./selection.js";
 import { subjectLabel, subjectValues } from "./subjects.js";
 import { bandText, emissionWords, metricText } from "./units.js";
 import { homeOf } from "./view.js";
@@ -446,6 +458,24 @@ function sitePopup(site, answer) {
   return box;
 }
 
+// The site selection a click on `site` of lit set `set` makes (selection.js): the provider and
+// register id of its best origin that has an id, else of its best; `name` its best's site.
+function siteSelection(set, site) {
+  const named = site.origins.find((o) => o.allocation?.site_id) ?? site.best;
+  const a = named.allocation;
+  const holders = site.origins.map((o) => o.allocation?.licensee).filter((h) => h);
+  return {
+    kind: "site",
+    provider: a.provider ?? null,
+    siteId: a.site_id ?? null,
+    name: site.best.allocation.site ?? a.site ?? null,
+    lat: site.lat,
+    lon: site.lon,
+    set: set.key,
+    holders: [...new Set(holders)],
+  };
+}
+
 export function mountMap(el, api, view, opts = {}) {
   return new MapPane(el, api, view, opts);
 }
@@ -458,6 +488,7 @@ class MapPane {
     {
       jobs = () => [],
       subjects = null,
+      selection = subjects?.selection ?? new Selection(),
       lastEvent = () => null,
       tiles = () => resolveMapTiles(view.get("map_tiles"), null),
     } = {},
@@ -474,6 +505,7 @@ class MapPane {
     this.view = view;
     this.jobs = jobs;
     this.subjects = subjects;
+    this.selection = selection;
     this.lastEvent = lastEvent;
     // key -> {key, job, answer, litAt, activity, sites: [{lat, lon, origins, best}], drawn}
     this.sets = new Map();
@@ -500,8 +532,12 @@ class MapPane {
       this.markDim();
       this.tick();
     });
-    subjects?.onSelect((sel) => this.markSelected(sel));
+    selection.onChange((sel) => this.markSelected(sel));
     subjects?.onDrop((jobId, key) => this.dropSubject(jobId, key));
+    this.onKey = (ev) => {
+      if (ev.key === "Escape" && this.selection.get()) this.selection.set(null);
+    };
+    el.addEventListener("keydown", this.onKey);
     this.show();
   }
 
@@ -755,8 +791,11 @@ class MapPane {
       }
       m.bindTooltip(() => linesBox(tooltipLines(site.best, set.answer.stations)));
       m.bindPopup(() => sitePopup(site, set.answer));
+      m.on("click", () => this.clickSite(set, site));
       drawn.markers.push(m);
       part.layers.push(m);
+      part.site = site;
+      part.marker = m;
     }
     if (from && from.kind === "source" && from.source) {
       const label = document.createElement("span");
@@ -766,8 +805,35 @@ class MapPane {
     }
     set.drawn = drawn;
     this.paintSet(set);
+    this.markSites();
     const first = set.sites[0];
     this.centre([first.lat, first.lon]);
+  }
+
+  // A click on a lit site: it becomes the selection, or, already selected, none.
+  clickSite(set, site) {
+    const next = siteSelection(set, site);
+    this.selection.set(sameSite(this.selection.get(), next) ? null : next);
+  }
+
+  // The selection on the lit sites: `selected` on a selected site's markers (raised over the
+  // rest), `matched` on every site of the set keyed by a selected subject's job or group.
+  markSites() {
+    const sel = this.selection.get();
+    const subject = sel && sel.kind === "subject" ? sel : null;
+    for (const set of this.sets.values()) {
+      if (!set.drawn) continue;
+      const matched =
+        !!subject && set.job !== null && (set.job === subject.job || set.job === subject.group);
+      for (const part of set.drawn.parts) {
+        const el = part.marker.getElement();
+        if (!el) continue;
+        const on = isSite(sel) && sameSite(sel, siteSelection(set, part.site));
+        el.classList.toggle("selected", on);
+        el.classList.toggle("matched", matched);
+        if (on) part.marker.bringToFront();
+      }
+    }
   }
 
   // Each site's brightness, its best score × the set's freshness (a heard site's score counts
@@ -946,9 +1012,13 @@ class MapPane {
     for (const t of this.subjectTracks()) t.box?.classList.toggle("dim", t.subject.dim);
   }
 
+  // The selection (selection.js) on the map: a subject's marker (panned to when off the map)
+  // and the lit sites (markSites).
   markSelected(sel) {
+    this.markSites();
+    const subject = sel && sel.kind === "subject" ? sel : null;
     for (const t of this.subjectTracks()) {
-      const on = !!sel && sel.job === t.job && sel.key === t.key;
+      const on = !!subject && subject.job === t.job && subject.key === t.key;
       if (t.marker) this.markOne(t, on);
       if (!on || !this.map || this.el.hidden) continue;
       const at = t.points[t.points.length - 1];
@@ -1015,6 +1085,12 @@ class MapPane {
     }
     for (const id of [...this.seeded.keys()]) if (!running.has(id)) this.seeded.delete(id);
     if (gone) this.changed();
+    // A selection whose job is gone goes with it.
+    const sel = this.selection.get();
+    const lost =
+      (isSite(sel) && !ONE_SHOT_KEY.test(sel.set) && !running.has(sel.set)) ||
+      (sel?.kind === "subject" && !running.has(sel.job) && !running.has(sel.group));
+    if (lost) this.selection.set(null);
   }
 
   rowText(id) {
@@ -1034,6 +1110,7 @@ class MapPane {
   destroy() {
     this.destroyed = true;
     this.ro.disconnect();
+    this.el.removeEventListener("keydown", this.onKey);
     this.map?.remove();
     this.map = null;
     this.tracks.clear();

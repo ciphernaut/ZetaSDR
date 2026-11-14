@@ -1,6 +1,6 @@
 // overlays.js: channel-pinned overlays on the waterfall: layer labels, text ribbons, the
 // outlined bands of the rigid holders, the decoded-event counters of the job rows and their
-// squelch tags.
+// squelch tags, and the channels of a register site selected on the map.
 //
 // Exports:
 //   mountOverlays(el, wf, api, {jobsEl, plan, applyOp, footprint, notice, requestPoll}) -> Overlays
@@ -217,6 +217,19 @@
 //                            of startNs and endNs (wf.xForNs), tagged `text`; re-laid on every
 //                            column and view change and removed (null) once endNs left the columns
 //     ov.unspan(key)         removes the span drawn under `key`, if any
+//     ov.siteChannels(key, channels)   the channels a register holds at a selected site
+//                            (`register_site`'s `channels`: [{channel: {center_hz,
+//                            bandwidth_hz, role, emission}, licence_no, licensee}]), replacing
+//                            any drawn before: one thin full-width `.site-channel` line per
+//                            channel whose centre is inside the band shown (wf.shown), at
+//                            wf.yForHz of it, `data-role` its role (tx|rx; none when the
+//                            register gives none), its title `<MHz, 4 dp> MHz <emission>`
+//                            (the emission left out when null). Placed again on each view
+//                            change (pan, zoom, retune), when a channel leaving the band shown
+//                            goes and one entering it is drawn; pointer-transparent, so the
+//                            waterfall's drags and wheel pass through. `key` names the site
+//                            (data-site on each line).
+//     ov.clearSiteChannels()  removes them
 //     ov.squelch(jobId) -> event|null  the last `squelch` event seen for a job on the
 //                            selected source
 //     ov.lastEvent(jobId) -> ms|null  performance.now() of the last event counted in the job's
@@ -239,7 +252,7 @@
 import { SQUELCH_KINDS, setSquelchTag } from "./agent.js";
 import { channelLabel } from "./plans.js";
 import { matchesPairs, subjectLabel, subjectSummary } from "./subjects.js";
-import { bandText } from "./units.js";
+import { bandText, mhzText } from "./units.js";
 
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
@@ -403,6 +416,8 @@ class Overlays {
     this.labels = new Map(); // key -> {el, hz}
     this.outlines = new Map(); // key -> {el, labelEl (pin, capture) or tag, lo, hi, job, handles}
     this.spans = new Map(); // key -> {el, lo, hi, startNs, endNs}: a capture's cached region
+    // The selected site's channels: {key, channels, els: index -> el (the ones in view)}.
+    this.site = null;
     this.marks = new Map(); // `${job id}:${rounded centre}` -> {el, hz}: a watch's `signal new`
     this.captureOutlined = false; // the capture is outlined (no rigid holder, no pin)
     this.sourceRec = null; // the selected source's last `source_list` record (its `pin`)
@@ -1295,6 +1310,49 @@ class Overlays {
     return m.el;
   }
 
+  siteChannels(key, channels) {
+    if (this.destroyed) return;
+    this.clearSiteChannels();
+    this.site = { key: String(key), channels: Array.isArray(channels) ? channels : [], els: new Map() };
+    this.placeSiteChannels();
+  }
+
+  clearSiteChannels() {
+    if (!this.site) return;
+    for (const el of this.site.els.values()) el.remove();
+    this.site = null;
+  }
+
+  // The site's lines for the band shown: made for a channel inside it, placed, removed for one
+  // outside it.
+  placeSiteChannels() {
+    const site = this.site;
+    if (!site) return;
+    const shown = this.wf.shown();
+    site.channels.forEach((c, i) => {
+      const hz = c?.channel?.center_hz;
+      const inside = !!shown && typeof hz === "number" && hz >= shown.lo && hz <= shown.hi;
+      let el = site.els.get(i);
+      if (!inside) {
+        el?.remove();
+        site.els.delete(i);
+        return;
+      }
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "site-channel";
+        el.dataset.site = site.key;
+        const role = c.channel.role;
+        if (role === "tx" || role === "rx") el.dataset.role = role;
+        const emission = c.channel.emission ? ` ${c.channel.emission}` : "";
+        el.title = `${mhzText(hz)} MHz${emission}`;
+        this.layer.prepend(el); // under the labels and ribbons
+        site.els.set(i, el);
+      }
+      el.style.top = `${this.wf.yForHz(hz)}px`;
+    });
+  }
+
   unmark(key) {
     const m = this.marks.get(key);
     if (!m) return;
@@ -1916,6 +1974,7 @@ class Overlays {
       for (const r of this.ribbons) this.setLane(r, r.lane);
       this.fallBack();
       for (const m of this.marks.values()) m.el.style.top = `${this.yFor(m.hz)}px`;
+      this.placeSiteChannels();
       for (const l of this.labels.values()) {
         l.el.style.top = `${this.yFor(l.hz) - l.h / 2 + (l.dy || 0)}px`;
       }
@@ -1955,6 +2014,7 @@ class Overlays {
     this.closeFeed();
     for (const id of [...this.positioned.keys()]) this.unwatchPositioned(id);
     for (const [key, o] of this.outlines) if (o.tag) this.untag(o, key); // the rail's
+    this.clearSiteChannels();
     this.layer.remove();
   }
 }
