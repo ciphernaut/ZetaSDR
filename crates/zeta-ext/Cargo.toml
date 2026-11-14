@@ -14,7 +14,7 @@ description = "ZetaSDR stages backed by external decoder programs (external_deco
 
 [features]
 # The register stub other crates' tests run (`testing::acma_stub`).
-test-fake = ["dep:axum"]
+test-fake = ["dep:axum", "dep:rusqlite"]
 
 [dependencies]
 async-trait = "0.1.92"
@@ -30,6 +30,7 @@ tokio-util = "0.7.20"
 zeta-core = { path = "../zeta-core" }
 zeta-dsp = { path = "../zeta-dsp" }
 zeta-plugin = { path = "../zeta-plugin" }
+rusqlite = { version = "0.42.0", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["rt-multi-thread"] }
