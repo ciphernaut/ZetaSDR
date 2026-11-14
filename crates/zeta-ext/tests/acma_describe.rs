@@ -514,3 +514,58 @@ async fn the_operator_reach_override_bounds_the_search() {
     let b = box_of(&candidates_sql(&stub));
     assert!((b[1] - b[0] - 20.0 / 111.0).abs() < 1e-9, "{b:?}");
 }
+
+#[tokio::test]
+async fn a_sites_channels_come_from_the_site_channels_query() {
+    let (url, stub) = acma_stub::serve_fixture(fixture(), Mode::Normal).await;
+    let p = provider(&url, None, None);
+    let a = p.site("9001").await.expect("acma lists sites").unwrap();
+    assert_eq!(a.provider, "acma");
+    assert_eq!(a.site_id, "9001");
+    assert_eq!(a.as_of.as_deref(), Some("2026-01-01T00:00:00.000Z"));
+    let got: Vec<String> = a
+        .channels
+        .iter()
+        .map(|c| {
+            format!(
+                "{} {} {} {}",
+                c.channel.center_hz.0,
+                c.channel.role.as_deref().unwrap_or("-"),
+                c.licence_no.as_deref().unwrap_or("-"),
+                c.licensee.as_deref().unwrap_or("-"),
+            )
+        })
+        .collect();
+    let water = "Example Water Authority";
+    assert_eq!(
+        got,
+        [
+            format!("{CHANNEL_HZ} tx 9000001/1 {water}"),
+            format!("404600000 tx 9000006/1 {water}"),
+            format!("{PAIRED_HZ} rx 9000001/1 {water}"),
+        ]
+    );
+    let first = &a.channels[0].channel;
+    assert_eq!(first.bandwidth_hz, Some(Hz(CHANNEL_BW)));
+    assert_eq!(first.emission.as_deref(), Some("11K0F3E"));
+    let seen = stub.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(seen[0].contains("SITE_ID = '9001'"), "{}", seen[0]);
+
+    // A site the register does not hold has no channels; that is not a failure.
+    let none = p.site("9999").await.unwrap().unwrap();
+    assert!(none.channels.is_empty());
+    assert_eq!(p.errors(), 0);
+}
+
+#[tokio::test]
+async fn a_site_id_with_a_quote_is_refused_before_any_call() {
+    let (url, stub) = acma_stub::serve_fixture(fixture(), Mode::Normal).await;
+    let p = provider(&url, None, None);
+    for bad in ["9001' OR 1=1 --", "a b", ""] {
+        let e = p.site(bad).await.unwrap().unwrap_err();
+        assert!(e.contains("site_id"), "{bad}: {e}");
+    }
+    assert_eq!(stub.queries.load(Ordering::SeqCst), 0);
+    assert!(stub.seen.lock().unwrap().is_empty());
+}

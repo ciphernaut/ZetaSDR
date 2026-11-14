@@ -625,15 +625,42 @@ async fn open_into(
     Ok(node)
 }
 
+/// The register queries: the built-in ones, then the operator's from `registers_dir`
+/// (`--registers-dir`) when given. `Err` names the file that does not load.
+pub fn register_queries(
+    registers_dir: Option<&Path>,
+) -> Result<zeta_core::register::RegisterQueries, String> {
+    let builtin = zeta_core::register::RegisterQueries::builtin();
+    match registers_dir {
+        Some(dir) => builtin.with_dir(dir),
+        None => Ok(builtin),
+    }
+}
+
+/// How long the register service is given to answer one request, the startup probe
+/// included.
+pub const ACMA_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Attach the ACMA register service (`--knowledge-acma`) as a knowledge provider. The
 /// service is probed once (the client's 5 s timeout); an unreachable one is logged and
 /// the provider is attached anyway, as it logs its own failures. The provider reads the
-/// station from `state_dir` on every lookup, so a `station set` takes effect at once.
-pub async fn attach_acma(node: &Node, state_dir: &Path, flag: Option<&(String, Option<f64>)>) {
+/// station from `state_dir` on every lookup, so a `station set` takes effect at once. Its
+/// queries are [`register_queries`] of `registers_dir`; a directory that does not load is
+/// logged and the built-in queries are used.
+pub async fn attach_acma(
+    node: &Node,
+    state_dir: &Path,
+    flag: Option<&(String, Option<f64>)>,
+    registers_dir: Option<&Path>,
+) {
     let Some((url, reach_km)) = flag else {
         return;
     };
-    let client = match zeta_ext::mcp_client::McpClient::new(url, Duration::from_secs(5)) {
+    let queries = register_queries(registers_dir).unwrap_or_else(|e| {
+        eprintln!("zeta: registers: {e}; using the built-in register queries");
+        zeta_core::register::RegisterQueries::builtin()
+    });
+    let client = match zeta_ext::mcp_client::McpClient::new(url, ACMA_CLIENT_TIMEOUT) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("zeta: knowledge acma: {url} unreachable: {e}");
@@ -649,7 +676,7 @@ pub async fn attach_acma(node: &Node, state_dir: &Path, flag: Option<&(String, O
         client,
         *reach_km,
         station,
-        Arc::new(zeta_core::register::RegisterQueries::builtin()),
+        Arc::new(queries),
     )));
 }
 

@@ -5,6 +5,7 @@ mod ask;
 mod cli;
 mod modes_check;
 mod node_setup;
+mod registers_check;
 mod serve_lock;
 mod soapy_worker;
 mod sources;
@@ -68,6 +69,24 @@ async fn main() -> ExitCode {
         Ok(d) => d,
         Err(e) => return fail(&e),
     };
+    if let cli::Command::Registers(cli::RegistersCmd::Check {
+        provider,
+        center_hz,
+        bandwidth_hz,
+    }) = cli.command
+    {
+        return registers_check::run(
+            &state_dir,
+            cli.knowledge_acma.as_ref(),
+            cli.registers_dir.as_deref(),
+            provider.as_deref(),
+            zeta_core::register::Signal {
+                center_hz: zeta_core::types::Hz(center_hz),
+                bandwidth_hz: zeta_core::types::Hz(bandwidth_hz),
+            },
+        )
+        .await;
+    }
     if let cli::Command::Ops(cli::OpsCmd::Tail { lines }) = cli.command {
         return tail_log(&state_dir, "ops.log", lines, |_| true);
     }
@@ -169,7 +188,13 @@ async fn main() -> ExitCode {
         Ok(n) => n,
         Err(e) => return fail(&e),
     };
-    node_setup::attach_acma(&node, &state_dir, cli.knowledge_acma.as_ref()).await;
+    node_setup::attach_acma(
+        &node,
+        &state_dir,
+        cli.knowledge_acma.as_ref(),
+        cli.registers_dir.as_deref(),
+    )
+    .await;
     let (jobs, others) = node.load_errors_by_origin();
     for name in jobs {
         eprintln!("zeta: warning: unreadable job record {name}");

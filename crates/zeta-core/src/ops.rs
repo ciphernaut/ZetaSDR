@@ -729,6 +729,14 @@ pub enum Op {
         #[schemars(required, schema_with = "crate::types::nullable::<Vec<String>>")]
         modulation: Option<Vec<String>>,
     },
+    /// Every channel a licence register holds at one of its sites, read from the
+    /// register now.
+    RegisterSite {
+        /// A register's provider name (`acma`).
+        provider: String,
+        /// The register's site id: an allocation's `site_id`.
+        site_id: String,
+    },
     /// The channel plans the node knows, each with its channels expanded
     /// and sorted by frequency.
     ChannelPlans {},
@@ -3201,6 +3209,8 @@ pub enum OpResult {
     Signature(Box<crate::signatures::SignatureRecord>),
     /// `origin_lookup`: the lit sites, best first.
     Origins(crate::node::OriginAnswer),
+    /// `register_site`: the site's channels.
+    RegisterSite(crate::register::SiteAnswer),
     Schema(serde_json::Value),
 }
 
@@ -3247,6 +3257,7 @@ impl Op {
             Op::BitsStart { .. } => "bits_start",
             Op::KnowledgeLookup { .. } => "knowledge_lookup",
             Op::OriginLookup { .. } => "origin_lookup",
+            Op::RegisterSite { .. } => "register_site",
             Op::ChannelPlans {} => "channel_plans",
             Op::ModesList { .. } => "modes_list",
             Op::ThemesList {} => "themes_list",
@@ -3273,6 +3284,7 @@ impl Op {
                 | Op::JobContext { .. }
                 | Op::GraphGet { .. }
                 | Op::KnowledgeLookup { .. }
+                | Op::RegisterSite { .. }
                 | Op::ChannelPlans {}
                 | Op::ModesList { .. }
                 | Op::ThemesList {}
@@ -3349,6 +3361,7 @@ impl OpResult {
             OpResult::Signatures(_) => "signatures",
             OpResult::Signature(_) => "signature",
             OpResult::Origins(_) => "origins",
+            OpResult::RegisterSite(_) => "register_site",
         }
     }
 
@@ -3635,6 +3648,37 @@ pub fn schema() -> serde_json::Value {
 /// A signature record as the `signature_*` ops answer it.
 fn signature_result(r: crate::signatures::SignatureRecord) -> OpResult {
     OpResult::Signature(Box::new(r))
+}
+
+/// `register_site`: the site's channels from the provider named `provider`. The id is
+/// checked by the register id rule before any provider is asked; a provider the node
+/// lacks, or one with no sites, is `unknown` naming the registers it has; a register that
+/// fails is `other` with its reason.
+async fn register_site(
+    node: &Node,
+    provider: String,
+    site_id: String,
+) -> Result<OpResult, OpError> {
+    crate::register::check_register_id("site_id", &site_id).map_err(other)?;
+    let registers: Vec<_> = node
+        .knowledge()
+        .into_iter()
+        .filter(|p| p.gives_assignments())
+        .collect();
+    let unknown = || OpError::Unknown {
+        field: "provider".into(),
+        value: provider.clone(),
+        known: registers.iter().map(|p| p.name().to_string()).collect(),
+    };
+    let p = registers
+        .iter()
+        .find(|p| p.name() == provider)
+        .ok_or_else(unknown)?;
+    match p.site(&site_id).await {
+        None => Err(unknown()),
+        Some(Ok(answer)) => Ok(OpResult::RegisterSite(answer)),
+        Some(Err(reason)) => Err(other(format!("register_site: {provider}: {reason}"))),
+    }
 }
 
 fn other(e: impl std::fmt::Display) -> OpError {
@@ -4765,6 +4809,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             .await
             .map(OpResult::Origins)
             .map_err(|e| node_error(node, e)),
+        Op::RegisterSite { provider, site_id } => register_site(node, provider, site_id).await,
         Op::ChannelPlans {} => Ok(OpResult::ChannelPlans {
             plans: crate::plans::PLANS.iter().map(PlanInfo::from).collect(),
         }),

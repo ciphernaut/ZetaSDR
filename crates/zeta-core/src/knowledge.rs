@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::emission::Emission;
 use crate::reach::Reach;
-use crate::register::{RegisterAnswer, Signal};
+use crate::register::{RegisterAnswer, Signal, SiteAnswer};
 use crate::station::Station;
 use crate::types::{Baud, Hz};
 
@@ -180,6 +180,12 @@ pub trait KnowledgeProvider: Send + Sync {
         _signal: &Signal,
         _from: Option<&Station>,
     ) -> Option<RegisterAnswer> {
+        None
+    }
+    /// Every channel the register holds at site `site_id` (an id from an assignment's
+    /// `site_id`), read from the register now; `None` from a provider that has no sites,
+    /// `Err` with the reason when the id is not a register id or the register failed.
+    async fn site(&self, _site_id: &str) -> Option<Result<SiteAnswer, String>> {
         None
     }
     /// The reach behind `answer`, an answer this provider's

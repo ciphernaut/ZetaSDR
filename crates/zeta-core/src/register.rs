@@ -265,6 +265,35 @@ pub struct Channel {
     pub emission: Option<String>,
 }
 
+/// One channel at a register site, with the licence and holder it belongs to.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
+pub struct SiteChannel {
+    pub channel: Channel,
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub licence_no: Option<String>,
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub licensee: Option<String>,
+}
+
+/// Every channel the register holds at one site (`register_site`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
+pub struct SiteAnswer {
+    pub provider: String,
+    pub site_id: String,
+    /// By frequency; empty when the register holds nothing at the site.
+    pub channels: Vec<SiteChannel>,
+    /// The register's data as of this time, when it says.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub as_of: Option<String>,
+}
+
 /// The other end of a link: its site and how far it is from the first.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -679,6 +708,17 @@ fn placeholders(sql: &str) -> Vec<&str> {
     out
 }
 
+/// `s` checked as a register id, the only text a query's [`ParamKind::Id`] parameter
+/// accepts; the error names `field`.
+pub fn check_register_id(field: &str, s: &str) -> Result<(), String> {
+    if is_register_id(s) {
+        return Ok(());
+    }
+    Err(format!(
+        "{field}: {s:?} is not a register id (1-{MAX_ID_LEN} letters, digits, `/`, `_`, `.` or `-`)"
+    ))
+}
+
 /// Whether `s` is a register id: `^[0-9A-Za-z/_.-]{1,64}$`.
 fn is_register_id(s: &str) -> bool {
     (1..=MAX_ID_LEN).contains(&s.len())
@@ -883,6 +923,9 @@ mod tests {
             assert!(q().render(&all_values(bad)).is_err(), "{bad}");
         }
         assert!(q().render(&all_values(&"x".repeat(64))).is_ok());
+        let e = check_register_id("site_id", "9001' OR 1=1 --").unwrap_err();
+        assert!(e.starts_with("site_id: "), "{e}");
+        check_register_id("site_id", "9001").unwrap();
     }
 
     #[test]

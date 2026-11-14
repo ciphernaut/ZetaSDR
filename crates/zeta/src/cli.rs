@@ -89,6 +89,10 @@ pub struct Cli {
     /// ~/.config/zetasdr/sets]
     #[arg(long, global = true, value_name = "PATH")]
     pub sets_dir: Option<PathBuf>,
+    /// Directory of the operator's register queries (<provider>/<id>.json), read after the
+    /// built-in ones; a query with a built-in provider and id replaces it
+    #[arg(long, global = true, env = "ZETA_REGISTERS_DIR", value_name = "DIR")]
+    pub registers_dir: Option<PathBuf>,
     #[command(flatten)]
     pub speech: SpeechArgs,
     /// Every source flag parsed, file then soapy then kiwi then node then vrt (filled by
@@ -195,6 +199,9 @@ impl Cli {
             if from_env("knowledge_acma_raw") {
                 cli.knowledge_acma_raw = None;
             }
+            if from_env("registers_dir") {
+                cli.registers_dir = None;
+            }
             if from_env("bursts_keep_mb") {
                 cli.bursts_keep_mb = None;
             }
@@ -291,8 +298,8 @@ impl Cli {
     }
 
     /// Whether any flag that configures the local node (sources, plugins, state dir, modes,
-    /// themes and sets dirs, `--knowledge-acma`, `--bursts-keep-*`; with `--node` their environment variables
-    /// were already dropped by `try_parse_checked`) was given.
+    /// themes, sets and registers dirs, `--knowledge-acma`, `--bursts-keep-*`; with `--node`
+    /// their environment variables were already dropped by `try_parse_checked`) was given.
     pub fn configures_local_node(&self) -> bool {
         !self.sources.is_empty()
             || !self.plugins.is_empty()
@@ -300,6 +307,7 @@ impl Cli {
             || self.modes_dir.is_some()
             || self.themes_dir.is_some()
             || self.sets_dir.is_some()
+            || self.registers_dir.is_some()
             || self.knowledge_acma.is_some()
             || self.bursts_keep_mb.is_some()
             || self.bursts_keep_days.is_some()
@@ -329,6 +337,12 @@ pub enum Command {
     /// The licensed transmitters a signal may come from
     #[command(subcommand)]
     Origin(OriginCmd),
+    /// What a licence register holds
+    #[command(subcommand)]
+    Register(RegisterCmd),
+    /// The register queries (local; not an operation)
+    #[command(subcommand)]
+    Registers(RegistersCmd),
     /// The channel plans the node knows (e.g. uhf_cb_au) with their channels
     Plans {
         /// Only this plan
@@ -1364,6 +1378,38 @@ pub enum OriginCmd {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum RegisterCmd {
+    /// Every channel the register holds at a site, read from the register now
+    Site {
+        /// The register's provider name (acma)
+        provider: String,
+        /// The register's site id (an allocation's site_id)
+        site_id: String,
+    },
+}
+
+/// The sample signal `registers check` asks about by default: 400.5 MHz, 1 MHz wide.
+pub const REGISTERS_CHECK_CENTER_HZ: u64 = 400_500_000;
+/// See [`REGISTERS_CHECK_CENTER_HZ`].
+pub const REGISTERS_CHECK_BANDWIDTH_HZ: u64 = 1_000_000;
+
+#[derive(Debug, Subcommand)]
+pub enum RegistersCmd {
+    /// Run every register query against the configured register with sample values,
+    /// then one whole answer, and say which work and how long they take (local only)
+    Check {
+        /// Only this register's queries (acma)
+        provider: Option<String>,
+        /// The sample signal's centre, Hz
+        #[arg(long, value_name = "HZ", default_value_t = REGISTERS_CHECK_CENTER_HZ)]
+        center_hz: u64,
+        /// The sample signal's width, Hz
+        #[arg(long, value_name = "HZ", default_value_t = REGISTERS_CHECK_BANDWIDTH_HZ)]
+        bandwidth_hz: u64,
+    },
+}
+
 /// `soapy-worker --depth-cap`: checked as `BITS:HZ`, kept as given (the worker parses it
 /// again with the same function).
 fn depth_cap(s: &str) -> Result<String, String> {
@@ -1799,6 +1845,9 @@ impl Command {
             Command::Signature(SignatureCmd::Reject { id }) => Op::SignatureReject { id },
             Command::Station(StationCmd::Get) => Op::StationGet {},
             Command::Station(StationCmd::Clear) => Op::StationClear {},
+            Command::Register(RegisterCmd::Site { provider, site_id }) => {
+                Op::RegisterSite { provider, site_id }
+            }
             Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
             Command::Themes(ThemesCmd::List) => Op::ThemesList {},
@@ -1826,6 +1875,7 @@ impl Command {
             | Command::SoapyWorker(_)
             | Command::Ops(_)
             | Command::Modes(ModesCmd::Check { .. })
+            | Command::Registers(_)
             | Command::Transcripts(_)
             | Command::Events(_)
             | Command::Stream(StreamCmd::Save { .. }) => {

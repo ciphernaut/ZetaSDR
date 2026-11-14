@@ -67,6 +67,7 @@ pub async fn dispatch(cli: Cli) -> Result<ExitCode, Cli> {
             cli.sets_dir,
             speech,
             cli.knowledge_acma,
+            cli.registers_dir,
         )
         .await);
     }
@@ -86,6 +87,11 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
             "modes check runs the rows' tests on its own node: not supported with --node",
         );
     }
+    if matches!(cli.command, Command::Registers(_)) {
+        return usage(
+            "registers check asks the register from this machine: not supported with --node",
+        );
+    }
     if matches!(cli.command, Command::Transcripts(_)) {
         return usage("transcripts tail reads the state directory: not supported with --node");
     }
@@ -97,7 +103,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     }
     if cli.configures_local_node() {
         return usage(
-            "sources, plugins, modes, themes and sets are configured on the serving node: drop --source-*, --plugin, --state-dir, --modes-dir, --themes-dir, --sets-dir, --knowledge-acma and --bursts-keep-* with --node (their environment variables are ignored)",
+            "sources, plugins, modes, themes and sets are configured on the serving node: drop --source-*, --plugin, --state-dir, --modes-dir, --themes-dir, --sets-dir, --registers-dir, --knowledge-acma and --bursts-keep-* with --node (their environment variables are ignored)",
         );
     }
     let Some(secret) = cli.secret.as_deref().filter(|s| !s.is_empty()) else {
@@ -117,6 +123,7 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
             &[],
             None,
             Default::default(),
+            None,
             None,
             None,
             None,

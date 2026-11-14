@@ -2075,6 +2075,40 @@ fn knowledge_acma_from_the_environment_is_ignored_with_node() {
 }
 
 #[test]
+fn registers_dir_is_refused_with_node_and_ignored_from_the_environment() {
+    zeta_bin()
+        .args(["--node", "http://127.0.0.1:9", "--secret", "s"])
+        .args(["--registers-dir", "/nonexistent", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("configured on the serving node"));
+    let out = zeta_bin()
+        .env("ZETA_REGISTERS_DIR", "/nonexistent")
+        .args([
+            "--node",
+            "http://127.0.0.1:9",
+            "--secret",
+            "s",
+            "source",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(!text.contains("configured on the serving node"), "{text}");
+}
+
+#[test]
+fn registers_check_is_refused_with_node() {
+    zeta_bin()
+        .args(["--node", "http://127.0.0.1:9", "--secret", "s"])
+        .args(["registers", "check"])
+        .assert()
+        .code(1)
+        .stderr(contains("not supported with --node"));
+}
+
+#[test]
 fn knowledge_acma_with_a_bad_url_is_a_usage_error() {
     for bad in ["ftp://x", "http://h:1,reach_km=0", "http://h:1,reach_km=x"] {
         zeta_bin()

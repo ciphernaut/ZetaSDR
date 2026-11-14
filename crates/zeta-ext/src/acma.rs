@@ -24,6 +24,7 @@ use zeta_core::register::{
     AreaCandidate, Candidate, Channel, Device, FailedQuery, FarEnd, Holder, Licence, ParamValue,
     PlanFootnote, PlanSegment, PlanService, REGISTER_MAX_CANDIDATES, RELATED_CHANNELS, RELATED_TOP,
     RegisterAnswer, RegisterQueries, RegisterState, RegisterStatus, Related, Signal, Site,
+    SiteAnswer, SiteChannel, check_register_id,
 };
 use zeta_core::station::Station;
 use zeta_core::types::Hz;
@@ -187,26 +188,47 @@ impl AcmaKnowledge {
             .or_else(|| search_km(o, center_hz.0, &self.propagation))
     }
 
-    /// The whole register answer for `signal` as heard from `from`.
-    async fn lookup(&self, signal: &Signal, from: Option<&Station>) -> RegisterAnswer {
-        let deadline = tokio::time::Instant::now() + self.timeout;
+    /// How long one whole lookup may take.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// The values the signal-wide queries take for `signal` as heard from `from`: the
+    /// band's edges `lo_hz` and `hi_hz`, its `center_hz`, and the search box `lat_min`,
+    /// `lat_max`, `lon_min` and `lon_max` (the whole globe without `from`).
+    pub fn signal_values(
+        &self,
+        signal: &Signal,
+        from: Option<&Station>,
+    ) -> BTreeMap<&'static str, ParamValue> {
         let center = signal.center_hz;
         let half = signal.bandwidth_hz.0 / 2;
         let (lo, hi) = (center.0.saturating_sub(half), center.0.saturating_add(half));
         let observer = from.map(|s| observer_of(s, center));
         let bound = self.bound(observer.as_ref(), center);
         let b = search_box(observer.as_ref(), bound);
-
-        let int = |hz: u64| ParamValue::Int(i64::try_from(hz).unwrap_or(i64::MAX));
-        let band: BTreeMap<&str, ParamValue> = [("lo_hz", int(lo)), ("hi_hz", int(hi))].into();
-        let mut boxed = band.clone();
-        boxed.extend([
+        [
+            ("lo_hz", hz_value(lo)),
+            ("hi_hz", hz_value(hi)),
+            ("center_hz", hz_value(center.0)),
             ("lat_min", ParamValue::Number(b[0])),
             ("lat_max", ParamValue::Number(b[1])),
             ("lon_min", ParamValue::Number(b[2])),
             ("lon_max", ParamValue::Number(b[3])),
-            ("center_hz", int(center.0)),
-        ]);
+        ]
+        .into()
+    }
+
+    /// The whole register answer for `signal` as heard from `from`.
+    async fn lookup(&self, signal: &Signal, from: Option<&Station>) -> RegisterAnswer {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let center = signal.center_hz;
+        let observer = from.map(|s| observer_of(s, center));
+        let bound = self.bound(observer.as_ref(), center);
+
+        let boxed = self.signal_values(signal, from);
+        let band: BTreeMap<&str, ParamValue> =
+            ["lo_hz", "hi_hz"].map(|k| (k, boxed[k].clone())).into();
 
         let (candidates, area, plan, as_of) = tokio::join!(
             self.query_by(deadline, "candidates", &boxed),
@@ -332,10 +354,7 @@ impl AcmaKnowledge {
         let site: BTreeMap<&str, ParamValue> =
             [("site_id", ParamValue::Id(c.site.id.clone()))].into();
         let mut link = site.clone();
-        link.insert(
-            "center_hz",
-            ParamValue::Int(i64::try_from(c.device.center_hz.0).unwrap_or(i64::MAX)),
-        );
+        link.insert("center_hz", hz_value(c.device.center_hz.0));
         let (paired, channels, far) = tokio::join!(
             self.query_by(deadline, "licence_related", &licence),
             self.query_by(deadline, "site_channels", &site),
@@ -488,6 +507,45 @@ impl KnowledgeProvider for AcmaKnowledge {
         Vec::new()
     }
 
+    /// The `site_channels` query on `site_id`, and the data date, inside one deadline. An
+    /// id that is not a register id is refused before any call.
+    async fn site(&self, site_id: &str) -> Option<Result<SiteAnswer, String>> {
+        if let Err(e) = check_register_id("site_id", site_id) {
+            return Some(Err(e));
+        }
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let values: BTreeMap<&str, ParamValue> =
+            [("site_id", ParamValue::Id(site_id.into()))].into();
+        let (rows, as_of) = tokio::join!(
+            self.query_by(deadline, "site_channels", &values),
+            tokio::time::timeout_at(deadline, self.as_of()),
+        );
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(e) => {
+                let reason = format!("site_channels: {e}");
+                self.fail(&reason);
+                return Some(Err(reason));
+            }
+        };
+        let channels = rows
+            .iter()
+            .filter_map(|r| {
+                Some(SiteChannel {
+                    channel: channel_of(r)?,
+                    licence_no: text(r, "licence_no"),
+                    licensee: text(r, "licensee"),
+                })
+            })
+            .collect();
+        Some(Ok(SiteAnswer {
+            provider: ACMA_PROVIDER.into(),
+            site_id: site_id.into(),
+            channels,
+            as_of: as_of.ok().flatten(),
+        }))
+    }
+
     /// The band's reach from the station; `None` for another region or without a station.
     async fn reach(&self, region: &str, center_hz: Hz, bandwidth_hz: Hz) -> Option<Reach> {
         let station = (self.station)();
@@ -539,6 +597,11 @@ impl KnowledgeProvider for AcmaKnowledge {
             .or_else(|| search_km(&observer, center_hz.0, &answer.assumptions));
         Some(reach)
     }
+}
+
+/// A frequency as a query's integer value.
+fn hz_value(hz: u64) -> ParamValue {
+    ParamValue::Int(i64::try_from(hz).unwrap_or(i64::MAX))
 }
 
 /// Whether the register answers for `region` (Australia only).
