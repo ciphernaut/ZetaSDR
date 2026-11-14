@@ -40,10 +40,7 @@ pub(crate) const DESIGNATOR_LABELS: &[(char, &[&str])] = &[
 pub fn allocation_match<'a>(row: &LoadedMode, allocs: &'a [Allocation]) -> Option<&'a Allocation> {
     let bw = row.row.band.bandwidth_hz as f64;
     let (lo, hi) = ALLOCATION_WIDTH;
-    allocs.iter().find(|a| {
-        if a.role.as_deref() != Some("tx") || a.kind.as_deref() == Some("plan") {
-            return false;
-        }
+    allocs.iter().filter(|a| is_tx(a)).find(|a| {
         let Some(width) = row_width(a) else {
             return false;
         };
@@ -55,6 +52,12 @@ pub fn allocation_match<'a>(row: &LoadedMode, allocs: &'a [Allocation]) -> Optio
         };
         designator_fits(e.modulation, &row.row.modulation)
     })
+}
+
+/// Whether `a` is a licensed transmitter that counts toward a rank: not a receiver,
+/// not a plan row.
+fn is_tx(a: &Allocation) -> bool {
+    a.role.as_deref() == Some("tx") && a.kind.as_deref() != Some("plan")
 }
 
 /// An assignment's width: its decoded designator's `bandwidth_hz`, else its own
@@ -76,11 +79,21 @@ pub(crate) fn designator_fits(letter: char, labels: &[String]) -> bool {
         .any(|l| labels.iter().any(|m| m == l))
 }
 
-/// [`ALLOCATION_SCORE`] when [`allocation_match`] finds a `tx` assignment that fits
-/// `row`, else 0.
+/// [`ALLOCATION_SCORE`] divided by `1 + rank` when [`allocation_match`] finds a `tx`
+/// assignment that fits `row`, else 0. `rank` counts the `tx` assignments (receivers and
+/// plan rows left out) before the one that fits, in `allocs` order: a provider lists the
+/// strongest expected candidate first, so the register reorders the rows without ever
+/// outweighing the old flat bonus.
 pub fn allocation_term(row: &LoadedMode, allocs: &[Allocation]) -> f32 {
     match allocation_match(row, allocs) {
-        Some(_) => ALLOCATION_SCORE,
+        Some(hit) => {
+            let rank = allocs
+                .iter()
+                .filter(|a| is_tx(a))
+                .take_while(|a| !std::ptr::eq(*a, hit))
+                .count();
+            ALLOCATION_SCORE / (1 + rank) as f32
+        }
         None => 0.0,
     }
 }
@@ -437,5 +450,93 @@ mod tests {
             "{}",
             pocsag.score
         );
+    }
+
+    #[test]
+    fn a_row_fitting_the_top_candidate_gets_the_whole_bonus_and_lower_ranks_get_less() {
+        let modes = registry();
+        let row = |id| modes.get(id).unwrap();
+        let allocs = [
+            assignment(Some("6K00A3E"), None, "tx"),
+            assignment(Some("16K0F1D"), None, "tx"),
+        ];
+        assert_eq!(
+            allocation_term(row("acars_decode"), &allocs),
+            ALLOCATION_SCORE
+        );
+        assert_eq!(
+            allocation_term(row("pocsag_decode"), &allocs),
+            ALLOCATION_SCORE / 2.0
+        );
+    }
+
+    #[test]
+    fn the_bonus_never_exceeds_todays() {
+        let modes = registry();
+        let allocs: Vec<Allocation> = (0..7)
+            .map(|i| match i % 3 {
+                0 => assignment(Some("6K00A3E"), None, "tx"),
+                1 => assignment(Some("16K0F1D"), None, "tx"),
+                _ => assignment(None, Some(12_500), "tx"),
+            })
+            .collect();
+        for m in modes.all() {
+            let t = allocation_term(m, &allocs);
+            assert!((0.0..=ALLOCATION_SCORE).contains(&t), "{}: {t}", m.row.id.0);
+        }
+    }
+
+    #[test]
+    fn receivers_and_plan_rows_do_not_count_toward_rank() {
+        let modes = registry();
+        let mut plan = assignment(Some("6K00A3E"), None, "tx");
+        plan.kind = Some("plan".into());
+        let allocs = [
+            assignment(Some("6K00A3E"), None, "rx"),
+            plan,
+            assignment(Some("16K0F1D"), None, "tx"),
+        ];
+        assert_eq!(
+            allocation_term(modes.get("pocsag_decode").unwrap(), &allocs),
+            ALLOCATION_SCORE
+        );
+    }
+
+    #[test]
+    fn a_graded_bonus_reorders_close_rows_but_not_a_clear_lead() {
+        let modes = registry();
+        // The register's top candidate is the AM one: acars gets the whole bonus (0.2),
+        // pocsag half (0.1). Nothing else matches, so a catalogue term sets the margin.
+        let allocs = [
+            assignment(Some("6K00A3E"), None, "tx"),
+            assignment(Some("16K0F1D"), None, "tx"),
+        ];
+        let order = |pocsag_lead: f32, with: bool| -> Vec<String> {
+            let catalogue = move |id: &str| if id == "pocsag" { pocsag_lead } else { 0.0 };
+            score_rows(&modes, 1, 1, "noise", &catalogue, &|m| {
+                if with {
+                    allocation_term(m, &allocs)
+                } else {
+                    0.0
+                }
+            })
+            .iter()
+            .map(|s| s.mode.row.id.0.clone())
+            .collect()
+        };
+        let pos = |v: &[String], id: &str| v.iter().position(|x| x == id).unwrap();
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        // A lead of 0.05 is closer than the bonus: the register flips the two.
+        let (plain, graded) = (order(0.05, false), order(0.05, true));
+        assert!(pos(&plain, "pocsag_decode") < pos(&plain, "acars_decode"));
+        assert!(pos(&graded, "acars_decode") < pos(&graded, "pocsag_decode"));
+        assert_eq!(sorted(&plain), sorted(&graded), "the set never changes");
+        // A lead of 0.5 is more than the bonus: pocsag still leads.
+        let graded = order(0.5, true);
+        assert!(pos(&graded, "pocsag_decode") < pos(&graded, "acars_decode"));
     }
 }

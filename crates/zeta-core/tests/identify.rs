@@ -914,6 +914,104 @@ async fn the_verdict_carries_the_nearest_allocations_and_the_score_term() {
     assert!(acars["allocation"].is_null(), "{acars}");
 }
 
+/// A register whose answer lists one synthetic transmitter per designator, in rank order
+/// (the strongest expected level first), each on the signal's own centre.
+struct Ranked(Vec<&'static str>);
+
+#[async_trait]
+impl KnowledgeProvider for Ranked {
+    fn name(&self) -> &str {
+        "ranked"
+    }
+    fn gives_assignments(&self) -> bool {
+        true
+    }
+    async fn allocations(&self, _: &str, _: Hz, _: Hz) -> Vec<Allocation> {
+        panic!("a describing provider is not asked for its rows")
+    }
+    async fn signatures(&self, _center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Signature> {
+        vec![]
+    }
+    async fn describe(
+        &self,
+        region: &str,
+        signal: &Signal,
+        _from: Option<&zeta_core::station::Station>,
+    ) -> Option<RegisterAnswer> {
+        let mut a = RegisterAnswer::unreachable("ranked", region, String::new());
+        a.status = RegisterStatus {
+            state: RegisterState::Ok,
+            reason: None,
+            failed: vec![],
+        };
+        a.candidates = self
+            .0
+            .iter()
+            .enumerate()
+            .map(|(i, designator)| {
+                let mut c: Candidate = serde_json::from_value(serde_json::json!({
+                    "device": {"center_hz": signal.center_hz, "role": "tx", "emission": designator},
+                    "site": {"id": format!("S{i}"), "name": "Example Hill", "lat": -27.35, "lon": 153.08},
+                    "licence": {"number": format!("{i:07}")},
+                    "holder": {"name": LICENSEE},
+                }))
+                .unwrap();
+                c.device.emission_decoded = zeta_core::emission::parse_emission(designator);
+                c
+            })
+            .collect();
+        a.matched = a.candidates.len() as u32;
+        Some(a)
+    }
+}
+
+/// The ordered `(mode, score)` of an identify run on the GFSK band, with `register` when
+/// given.
+async fn tried(register: Option<Ranked>) -> Vec<(String, f64)> {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &fixtures().gfsk).await;
+    if let Some(r) = register {
+        node.add_knowledge(Arc::new(r));
+    }
+    let (id, events) = identify(&node, APRS_HZ).await;
+    let events = ended(&node, &id, events, Duration::from_secs(60)).await;
+    events
+        .iter()
+        .map(|e| {
+            (
+                e["mode"].as_str().unwrap().to_string(),
+                e["score"].as_f64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// A register ranking a 10 kHz FM transmitter (which fits the 12.5 kHz rows) above a 30 kHz
+/// one (which fits the 25 kHz rows) reorders the rows within the bonus, drops none, and leaves a
+/// row that led the measurement by more than the bonus in front.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_register_reorders_the_decoders_and_drops_none() {
+    let _one = SERIAL.lock().await;
+    let without = tried(None).await;
+    let with = tried(Some(Ranked(vec!["10K0F1D", "30K0F1D"]))).await;
+    let ids = |v: &[(String, f64)]| v.iter().map(|r| r.0.clone()).collect::<Vec<_>>();
+    let sorted = |v: &[(String, f64)]| {
+        let mut ids = ids(v);
+        ids.sort();
+        ids
+    };
+    assert_eq!(sorted(&without), sorted(&with), "the same rows are tried");
+    assert_ne!(ids(&without), ids(&with), "the order differs");
+    let pos = |v: &[(String, f64)], m: &str| v.iter().position(|r| r.0 == m).unwrap();
+    // POCSAG (12.5 kHz) fits the top candidate and passes AIS (25 kHz, which fits only the
+    // second) that it scored level with.
+    assert!(pos(&without, "ais_decode") < pos(&without, "pocsag_decode"));
+    assert!(pos(&with, "pocsag_decode") < pos(&with, "ais_decode"));
+    // The measured leader led the 25 kHz rows by 0.4, more than the bonus: still first.
+    assert_eq!(with[0].0, "aprs_decode", "{with:?}");
+    assert!(pos(&with, "aprs_decode") < pos(&with, "ais_decode"));
+}
+
 /// A register that describes every signal: one synthetic 16K0F1D transmitter licensed on
 /// the signal's own centre, counting the lookups.
 struct Describing(std::sync::atomic::AtomicUsize);
