@@ -18,9 +18,10 @@
 //   registerVerdictLine(register) -> a classification's `register` answer's verdict line, or
 //       null (no register, or no verdict on a register that answered): the node's
 //       `verdict.summary` (`register agrees: …`, `register disagrees: …`, `nothing licensed in
-//       range; …`, `register unreachable: …`; an unreachable answer with no verdict reads
-//       `register unreachable: <reason>`), then ` (register data as of <YYYY-MM-DD>)` when the
-//       answer has an `as_of`
+//       range; …`, `register unreachable: …`, `register could not list licences: …`; with no
+//       verdict, an unreachable answer reads `register unreachable: <reason>` and one whose
+//       `candidates` query failed `register could not list licences: <reason>`), then
+//       ` (register data as of <YYYY-MM-DD>)` when the answer has an `as_of`
 //   registerLines(register, {measured}) -> the transcript lines for a `register` answer
 //       ([] when it is null), in this order:
 //         - the verdict line (registerVerdictLine);
@@ -43,8 +44,11 @@
 //       origin::summary words it: "<n> sites on <f> MHz: <licensee>, <site> <d> km <agree>
 //       <score>; ..." naming the first ORIGIN_SUMMARY_SITES (the distance left out when
 //       unknown, the service when the row names neither licensee nor site); with no origins,
-//       "no register provider" (`register_rows` null), "register gave no rows" (0), else
-//       "no licensed transmitter on <f> MHz". <f> is MHz without trailing zeros.
+//       the register's status first (`register_status`: "register unreachable: <reason>", or
+//       "register could not list licences: <reason>; partial answer: <query>, … failed" when
+//       its `candidates` query failed), else "no register provider" (`register_rows` null),
+//       "register gave no rows" (0), else "no licensed transmitter on <f> MHz". <f> is MHz
+//       without trailing zeros. Keep it in step with origin.rs `summary`.
 
 // The sites originSummary names (origin.rs ORIGIN_SUMMARY_SITES).
 export const ORIGIN_SUMMARY_SITES = 3;
@@ -54,6 +58,17 @@ export function originSummary(a) {
   const f = Number.isFinite(hz) ? (hz / 1e6).toFixed(6).replace(/\.?0+$/, "") : "?";
   const origins = (a && Array.isArray(a.origins)) ? a.origins : [];
   if (origins.length === 0) {
+    const status = a?.register_status;
+    if (status?.state === "unreachable") {
+      return `register unreachable: ${status.reason || "no reason given"}`;
+    }
+    const failed = Array.isArray(status?.failed) ? status.failed : [];
+    const listing = failed.find((x) => x && x.query === "candidates");
+    if (listing) {
+      const names = failed.map((x) => x.query).join(", ");
+      const tail = status.state === "partial" ? `; partial answer: ${names} failed` : "";
+      return `register could not list licences: ${listing.reason}${tail}`;
+    }
     if (a?.register_rows === null || a?.register_rows === undefined) return "no register provider";
     if (a.register_rows === 0) return "register gave no rows";
     return `no licensed transmitter on ${f} MHz`;
@@ -95,6 +110,8 @@ export function registerVerdictLine(register) {
   if (!line && register.status?.state === "unreachable") {
     line = `register unreachable: ${register.status.reason || "no reason given"}`;
   }
+  const listing = (register.status?.failed || []).find((f) => f && f.query === "candidates");
+  if (!line && listing) line = `register could not list licences: ${listing.reason}`;
   if (!line) return null;
   const asOf = typeof register.as_of === "string" ? register.as_of : "";
   const date = asOf.match(/^\d{4}-\d{2}-\d{2}/)?.[0] || asOf;

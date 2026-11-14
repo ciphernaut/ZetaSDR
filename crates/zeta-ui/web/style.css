@@ -287,6 +287,8 @@ html[data-dock="right"][data-strip] #waterfall, html[data-dock="right"][data-str
    selected subject's is, in the map's selection colour. */
 #subjects tr.site-selected, #subjects tr.site-selected td:first-child { background: var(--bar); }
 #subjects tr.site-selected td:first-child { box-shadow: inset 2px 0 0 var(--map-sel); }
+/* The Site row's clear control (subjects.js drawSite). */
+#subjects button.site-clear { padding: 0 6px; font-size: 11px; line-height: 1.3; }
 /* the rail (overlays.js setRail): the job tags beside the axis, shown under a theme whose
    layout has one (<html data-rail="on">) */
 #waterfall #rail {

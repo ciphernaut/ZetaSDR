@@ -6912,7 +6912,8 @@ def scenario_classify_lights_sites(page, url, secret):
 # stub's data date is 2026-01-01.
 REGISTER_AS_OF = "(register data as of 2026-01-01)"
 PAIRED_MHZ = "95.4000 MHz"
-VERDICT_LINE = re.compile(r"^(register (agrees|disagrees|unreachable):|nothing licensed)")
+VERDICT_LINE = re.compile(
+    r"^(register (agrees|disagrees|unreachable|could not list licences):|nothing licensed)")
 # A candidate line: holder, site, distance and bearing, the emission in words, then what the
 # register's estimate says (left out when it has none) and whether the observer is off the beam.
 CANDIDATE_LINE = re.compile(
@@ -6987,6 +6988,60 @@ def scenario_what_is_this_shows_the_register_answer(page, url, secret):
         ], lines
         assert page.evaluate(
             "async () => (await import('./units.js')).registerLines(null)") == [], "null register"
+        # A register whose candidates query failed could not list licences: the verdict says
+        # so (and an answer with no verdict reads the same), the band line still follows, and
+        # nothing reads as "nothing licensed".
+        listing = page.evaluate(
+            """async () => {
+              const { registerLines } = await import('./units.js');
+              const a = (verdict) => ({
+                provider: 'acma', region: 'AU', as_of: null,
+                status: {state: 'partial', reason: null,
+                         failed: [{query: 'candidates', reason: 'no column `x`'}]},
+                plan: [{min_hz: 1, max_hz: 2, footnotes: [],
+                        services: [{name: 'FIXED', primary: true, qualifier: null}]}],
+                candidates: [], area_candidates: [], matched: 0, truncated: false,
+                assumptions: {}, verdict});
+              return [
+                registerLines(a({kind: 'unknown', weak: false,
+                                 summary: 'register could not list licences: no column `x`'})),
+                registerLines(a(null)),
+              ];
+            }""")
+        for got in listing:
+            assert got == [
+                "register could not list licences: no column `x`",
+                "register partly answered: candidates: no column `x`",
+                "band: FIXED",
+            ], got
+        # The origin summary words the register's status as the node's origin::summary does.
+        summaries = page.evaluate(
+            """async () => {
+              const { originSummary } = await import('./units.js');
+              const a = (register_rows, register_status) => ({
+                origins: [], band: {center_hz: 403025000, bandwidth_hz: 12500},
+                register_rows, register_status});
+              return [
+                originSummary(a(0, {state: 'unreachable', reason: 'timed out', failed: []})),
+                originSummary(a(4, {state: 'partial', reason: null,
+                  failed: [{query: 'candidates', reason: 'no column `x`'},
+                           {query: 'area_devices', reason: 'timed out'}]})),
+                originSummary(a(4, {state: 'partial', reason: null,
+                  failed: [{query: 'area_devices', reason: 'timed out'}]})),
+                originSummary(a(0, {state: 'ok', reason: null, failed: []})),
+                originSummary(a(0, undefined)),
+                originSummary(a(null, null)),
+              ];
+            }""")
+        assert summaries == [
+            "register unreachable: timed out",
+            "register could not list licences: no column `x`; partial answer: candidates, "
+            "area_devices failed",
+            "no licensed transmitter on 403.025 MHz",
+            "register gave no rows",
+            "register gave no rows",
+            "no register provider",
+        ], summaries
     finally:
         run_cmd(page, "view reset")
 
@@ -7218,6 +7273,18 @@ def scenario_a_map_site_can_be_selected(page, url, secret):
         page.keyboard.press("Escape")
         expect(selected).to_have_count(0)
         expect(row).to_have_count(0)
+        # The pane's Site row clears the selection itself: a site stays selected after its lit
+        # set fades, when no marker may be left to click.
+        close_popup(page)
+        hill.click()
+        expect(selected).to_have_count(1)
+        expect(marks).to_have_count(1, timeout=10_000)
+        clear = page.locator("#subjects tr.site-selected button.site-clear")
+        expect(clear).to_have_attribute("aria-label", "Clear site selection")
+        clear.click()
+        expect(selected).to_have_count(0)
+        expect(row).to_have_count(0)
+        expect(marks).to_have_count(0)
         # A site whose provider gives no ids is selectable; nothing is asked, nothing marked.
         page.evaluate("""() => window.zetaTest.lightOrigin('band:noid', {
             t_ns: Date.now() * 1e6, origins: [{score: 1, agree: 'fits', confirmed: null,

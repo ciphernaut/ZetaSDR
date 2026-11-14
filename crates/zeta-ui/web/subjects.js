@@ -93,9 +93,12 @@
 //     `tr.site-selected`: the site's name, its holders (`, `-joined) and what the register
 //     holds there, `opts.siteChannels(sel)` -> `{channels: [...]}` (`1 channel`, `<n>
 //     channels`), `{pending: true}` (`asking the register`) or null (`no channel list`: a
-//     site without an id, or a lookup that failed). The pane is eligible while a site is
-//     selected. Escape pressed while the pane has focus (it takes focus on a press) clears the
-//     selection.
+//     site without an id, or a lookup that failed), then a `button.site-clear` (aria-label
+//     `Clear site selection`) that clears the selection: a site stays selected after the lit
+//     set it was picked from fades (the operator selects on the map, then reads the
+//     waterfall's marks), so nothing clears it but the operator. The pane is eligible while a
+//     site is selected. Escape pressed while the pane has focus (it takes focus on a press)
+//     clears the selection.
 //     One table across rows (plan 30 spec 4.8), a view over the per-job subjects: when two or
 //     more running jobs' rows declare `subject.merge` and share `subject.name`, one
 //     `section.subject-merged[data-name]` (MERGE_SECTION_CLASS) stands at the first one's place
@@ -758,6 +761,10 @@ class SubjectsPane {
   }
 
   click(ev) {
+    if (ev.target.closest("button.site-clear")) {
+      this.selection.set(null);
+      return;
+    }
     const th = ev.target.closest("th[data-col]");
     if (!th) return;
     const el = th.closest(`section.subject-job, section.${MERGE_SECTION_CLASS}`);
@@ -1147,6 +1154,17 @@ class SubjectsPane {
         row.append(td);
         return td;
       });
+      // The selection outlives the lit set it was made from (no marker may be left to click
+      // again), so the row clears it itself.
+      const clear = document.createElement("button");
+      clear.type = "button";
+      clear.className = "site-clear";
+      clear.setAttribute("aria-label", "Clear site selection");
+      clear.title = "Clear site selection";
+      clear.textContent = "×";
+      const last = document.createElement("td");
+      last.append(clear);
+      row.append(last);
       body.append(row);
       table.append(body);
       el.append(h3, table);
