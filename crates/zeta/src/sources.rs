@@ -12,8 +12,9 @@
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use zeta_core::propagation::Propagation;
 use zeta_core::types::{PositionFrom, SourcePosition};
 use zeta_source_node::NODE_DEFAULT_MAX_BANDWIDTH_HZ;
 
@@ -408,35 +409,58 @@ pub fn parse_plugin(s: &str) -> Result<PluginSpec, String> {
     })
 }
 
-/// `--knowledge-acma URL[,reach_km=N]`: the register service's `http(s)://` URL and the
-/// optional reach override in kilometres (a positive, finite number). Errors name the flag.
-pub fn parse_knowledge_acma(s: &str) -> Result<(String, Option<f64>), String> {
-    let bad = |why: &str| format!("--knowledge-acma: {why}, expected URL[,reach_km=N]");
-    let (url, opt) = match s.split_once(',') {
-        Some((u, o)) => (u, Some(o)),
-        None => (s, None),
+/// `--knowledge-acma` parsed: the register service and the operator's overrides.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AcmaFlag {
+    /// The service's base URL, `http(s)://HOST:PORT`.
+    pub url: String,
+    /// The search bound in kilometres, replacing the propagation estimate's.
+    pub reach_km: Option<f64>,
+    /// The propagation assumptions: the defaults, with the fields of the
+    /// `propagation=PATH` file over them.
+    pub propagation: Propagation,
+}
+
+/// `--knowledge-acma URL[,reach_km=N][,propagation=PATH]`: the register service's
+/// `http(s)://` URL, the optional reach override in kilometres (a positive, finite
+/// number) and the optional propagation file (a JSON object holding any of
+/// [`Propagation`]'s fields; the rest keep their defaults), read and checked
+/// ([`Propagation::validate`]) now. The options come in any order, each at most once.
+/// Errors name the flag, and for a bad file the file and the field.
+pub fn parse_knowledge_acma(s: &str) -> Result<AcmaFlag, String> {
+    let bad = |why: &str| {
+        format!("--knowledge-acma: {why}, expected URL[,reach_km=N][,propagation=PATH]")
     };
+    let mut parts = s.split(',');
+    let url = parts.next().unwrap_or_default();
     if !(url.starts_with("http://") || url.starts_with("https://")) || url.contains(' ') {
         return Err(bad(&format!(
             "the URL must be http:// or https://, got {url:?}"
         )));
     }
-    let reach = match opt {
-        None => None,
-        Some(o) => {
-            let v = o
-                .strip_prefix("reach_km=")
-                .ok_or_else(|| bad(&format!("unknown option {o:?}")))?;
+    let (mut reach, mut propagation) = (None, None);
+    for o in parts {
+        if let Some(v) = o.strip_prefix("reach_km=") {
+            if reach.is_some() {
+                return Err(bad("reach_km is given twice"));
+            }
             match v.parse::<f64>() {
-                Ok(n) if n.is_finite() && n > 0.0 => Some(n),
+                Ok(n) if n.is_finite() && n > 0.0 => reach = Some(n),
                 _ => {
                     return Err(bad(&format!(
                         "reach_km must be a positive number, got {v:?}"
                     )));
                 }
             }
+        } else if let Some(path) = o.strip_prefix("propagation=") {
+            if propagation.is_some() {
+                return Err(bad("propagation is given twice"));
+            }
+            propagation = Some(read_propagation(Path::new(path)).map_err(|e| bad(&e))?);
+        } else {
+            return Err(bad(&format!("unknown option {o:?}")));
         }
-    };
+    }
     // The client appends `/mcp` and `/health` itself: take the base URL, and accept the
     // `.mcp.json` form with its trailing `/mcp`.
     let base = url
@@ -450,26 +474,52 @@ pub fn parse_knowledge_acma(s: &str) -> Result<(String, Option<f64>), String> {
             "the URL must be http(s)://HOST:PORT without a path (a trailing /mcp is accepted), got {url:?}"
         )));
     }
-    Ok((base.to_owned(), reach))
+    Ok(AcmaFlag {
+        url: base.to_owned(),
+        reach_km: reach,
+        propagation: propagation.unwrap_or_default(),
+    })
+}
+
+/// The propagation file at `path`: a JSON object of [`Propagation`]'s fields over the
+/// defaults, checked by [`Propagation::validate`]. Errors name the file (and the field).
+fn read_propagation(path: &Path) -> Result<Propagation, String> {
+    let shown = path.display();
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("propagation file {shown}: {e}"))?;
+    let p: Propagation =
+        serde_json::from_str(&text).map_err(|e| format!("propagation file {shown}: {e}"))?;
+    p.validate()
+        .map_err(|e| format!("propagation file {shown}: {e}"))?;
+    Ok(p)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// `--knowledge-acma` with the default propagation.
+    fn acma(url: &str, reach_km: Option<f64>) -> AcmaFlag {
+        AcmaFlag {
+            url: url.into(),
+            reach_km,
+            propagation: Propagation::default(),
+        }
+    }
+
     #[test]
     fn knowledge_acma_parses_url_and_reach() {
         assert_eq!(
             parse_knowledge_acma("http://h:1,reach_km=20"),
-            Ok(("http://h:1".into(), Some(20.0)))
+            Ok(acma("http://h:1", Some(20.0)))
         );
         assert_eq!(
             parse_knowledge_acma("https://h:2/mcp"),
-            Ok(("https://h:2".into(), None))
+            Ok(acma("https://h:2", None))
         );
         assert_eq!(
             parse_knowledge_acma("http://h:1/mcp/,reach_km=5"),
-            Ok(("http://h:1".into(), Some(5.0)))
+            Ok(acma("http://h:1", Some(5.0)))
         );
         for bad in [
             "http://h:1/other",
@@ -483,6 +533,63 @@ mod tests {
             let e = parse_knowledge_acma(bad).unwrap_err();
             assert!(e.contains("--knowledge-acma"), "{e}");
         }
+    }
+
+    #[test]
+    fn knowledge_acma_reads_a_propagation_file_over_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, body: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            p.display().to_string()
+        };
+        let some = file(
+            "some.json",
+            r#"{"search_margin": 2.5, "ground_wave_km": 80}"#,
+        );
+        let want = AcmaFlag {
+            propagation: Propagation {
+                search_margin: 2.5,
+                ground_wave_km: 80.0,
+                ..Propagation::default()
+            },
+            ..acma("http://h:1", Some(20.0))
+        };
+        // In either order with the reach.
+        for s in [
+            format!("http://h:1,propagation={some},reach_km=20"),
+            format!("http://h:1/mcp,reach_km=20,propagation={some}"),
+        ] {
+            assert_eq!(parse_knowledge_acma(&s), Ok(want.clone()), "{s}");
+        }
+        // A bad file is refused at start, naming the file and, for a bad value, the field.
+        let missing = dir.path().join("missing.json").display().to_string();
+        let cases = [
+            (missing.clone(), vec![missing.as_str()]),
+            (file("junk.json", "{"), vec!["junk.json"]),
+            (
+                file("unknown.json", r#"{"radius_km": 3}"#),
+                vec!["unknown.json", "radius_km"],
+            ),
+            (
+                file("k.json", r#"{"k_factor": -1}"#),
+                vec!["k.json", "k_factor"],
+            ),
+            (
+                file("sky.json", r#"{"skywave_min_hz": 40000000}"#),
+                vec!["sky.json", "skywave_min_hz"],
+            ),
+        ];
+        for (path, names) in cases {
+            let e = parse_knowledge_acma(&format!("http://h:1,propagation={path}")).unwrap_err();
+            assert!(e.contains("--knowledge-acma"), "{e}");
+            for n in names {
+                assert!(e.contains(n), "{n}: {e}");
+            }
+        }
+        // An option given twice is refused.
+        let twice = format!("http://h:1,propagation={some},propagation={some}");
+        assert!(parse_knowledge_acma(&twice).is_err());
     }
 
     fn kiwi(id: &str, host: &str, port: u16, pw: Option<&str>) -> SourceSpec {

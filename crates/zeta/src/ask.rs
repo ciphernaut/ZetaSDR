@@ -37,7 +37,7 @@ pub async fn run(
     themes_dir: Option<PathBuf>,
     sets_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
-    knowledge_acma: Option<(String, Option<f64>)>,
+    knowledge_acma: Option<crate::sources::AcmaFlag>,
     registers_dir: Option<PathBuf>,
 ) -> ExitCode {
     let request = match read_request(args.request.as_deref()) {

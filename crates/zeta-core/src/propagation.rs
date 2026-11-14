@@ -53,6 +53,56 @@ impl Default for Propagation {
     }
 }
 
+impl Propagation {
+    /// Whether these assumptions can drive the estimate: every number finite,
+    /// `k_factor > 0`, `beyond_horizon_db_per_km >= 0`, `off_beam_default_db >= 0`,
+    /// `ground_wave_km > 0`, `search_margin >= 1`, `assumed_site_height_m >= 0` and
+    /// `skywave_min_hz <= skywave_max_hz`. The error starts with the field it names.
+    pub fn validate(&self) -> Result<(), String> {
+        /// `x`, the value of `field`, is finite and at least `min` (above it when `strict`).
+        fn check(field: &str, x: f64, min: f64, strict: bool) -> Result<(), String> {
+            if !x.is_finite() {
+                return Err(format!("{field} must be a finite number, got {x}"));
+            }
+            match strict {
+                true if x <= min => Err(format!("{field} must be greater than {min}, got {x}")),
+                false if x < min => Err(format!("{field} must be at least {min}, got {x}")),
+                _ => Ok(()),
+            }
+        }
+        check("k_factor", self.k_factor, 0.0, true)?;
+        check(
+            "beyond_horizon_db_per_km",
+            self.beyond_horizon_db_per_km,
+            0.0,
+            false,
+        )?;
+        check("off_beam_default_db", self.off_beam_default_db, 0.0, false)?;
+        check("ground_wave_km", self.ground_wave_km, 0.0, true)?;
+        check(
+            "in_range_floor_dbm",
+            self.in_range_floor_dbm,
+            f64::MIN,
+            false,
+        )?;
+        check("search_margin", self.search_margin, 1.0, false)?;
+        check(
+            "assumed_site_height_m",
+            self.assumed_site_height_m,
+            0.0,
+            false,
+        )?;
+        // The skywave edges are whole Hz, always finite; only their order is checked.
+        if self.skywave_min_hz > self.skywave_max_hz {
+            return Err(format!(
+                "skywave_min_hz must not exceed skywave_max_hz ({}), got {}",
+                self.skywave_max_hz, self.skywave_min_hz
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Where the receiving antenna is.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Observer {
@@ -321,6 +371,61 @@ mod tests {
             beamwidth_deg: None,
             front_to_back_db: None,
         }
+    }
+
+    /// One change to the default assumptions.
+    type Change = fn(&mut Propagation);
+
+    #[test]
+    fn validate_names_the_field_that_breaks_a_rule() {
+        assert_eq!(Propagation::default().validate(), Ok(()));
+        let bad = |edit: Change| {
+            let mut p = Propagation::default();
+            edit(&mut p);
+            p.validate().unwrap_err()
+        };
+        let cases: [(Change, &str); 13] = [
+            (|p| p.k_factor = 0.0, "k_factor"),
+            (|p| p.k_factor = f64::NAN, "k_factor"),
+            (
+                |p| p.beyond_horizon_db_per_km = -0.1,
+                "beyond_horizon_db_per_km",
+            ),
+            (|p| p.off_beam_default_db = -1.0, "off_beam_default_db"),
+            (|p| p.ground_wave_km = 0.0, "ground_wave_km"),
+            (|p| p.ground_wave_km = f64::INFINITY, "ground_wave_km"),
+            (|p| p.search_margin = 0.99, "search_margin"),
+            (|p| p.assumed_site_height_m = -1.0, "assumed_site_height_m"),
+            (
+                |p| p.in_range_floor_dbm = f64::NEG_INFINITY,
+                "in_range_floor_dbm",
+            ),
+            (|p| p.in_range_floor_dbm = f64::NAN, "in_range_floor_dbm"),
+            (
+                |p| p.skywave_min_hz = p.skywave_max_hz + 1,
+                "skywave_min_hz",
+            ),
+            (
+                |p| p.beyond_horizon_db_per_km = f64::NAN,
+                "beyond_horizon_db_per_km",
+            ),
+            (|p| p.search_margin = f64::INFINITY, "search_margin"),
+        ];
+        for (edit, field) in cases {
+            let e = bad(edit);
+            assert!(e.starts_with(&format!("{field} ")), "{field}: {e}");
+        }
+        // The edges of each rule are allowed.
+        let edge = Propagation {
+            beyond_horizon_db_per_km: 0.0,
+            off_beam_default_db: 0.0,
+            search_margin: 1.0,
+            assumed_site_height_m: 0.0,
+            skywave_min_hz: 5,
+            skywave_max_hz: 5,
+            ..Propagation::default()
+        };
+        assert_eq!(edge.validate(), Ok(()));
     }
 
     #[test]

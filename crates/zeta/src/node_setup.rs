@@ -650,12 +650,13 @@ pub const ACMA_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 pub async fn attach_acma(
     node: &Node,
     state_dir: &Path,
-    flag: Option<&(String, Option<f64>)>,
+    flag: Option<&crate::sources::AcmaFlag>,
     registers_dir: Option<&Path>,
 ) {
-    let Some((url, reach_km)) = flag else {
+    let Some(flag) = flag else {
         return;
     };
+    let url = &flag.url;
     let queries = register_queries(registers_dir).unwrap_or_else(|e| {
         eprintln!("zeta: registers: {e}; using the built-in register queries");
         zeta_core::register::RegisterQueries::builtin()
@@ -672,12 +673,24 @@ pub async fn attach_acma(
     }
     let dir = state_dir.to_path_buf();
     let station: zeta_ext::acma::StationFn = Arc::new(move || zeta_core::station::load(&dir).0);
-    node.add_knowledge(Arc::new(zeta_ext::acma::AcmaKnowledge::new(
+    node.add_knowledge(Arc::new(acma_provider(
         client,
-        *reach_km,
+        flag,
         station,
         Arc::new(queries),
     )));
+}
+
+/// The `acma` provider `flag` configures over `client`: its reach override and its
+/// propagation assumptions (the defaults, or the `propagation=PATH` file's).
+pub fn acma_provider(
+    client: zeta_ext::mcp_client::McpClient,
+    flag: &crate::sources::AcmaFlag,
+    station: zeta_ext::acma::StationFn,
+    queries: Arc<zeta_core::register::RegisterQueries>,
+) -> zeta_ext::acma::AcmaKnowledge {
+    zeta_ext::acma::AcmaKnowledge::new(client, flag.reach_km, station, queries)
+        .with_propagation(flag.propagation.clone())
 }
 
 #[cfg(test)]
@@ -945,5 +958,38 @@ mod tests {
             .collect();
         assert_eq!(ours, [&format!("zeta: handlers: {reason}")], "{report:?}");
         assert_eq!(modes.get("pocsag_decode").unwrap().state, ModeState::Ready);
+    }
+
+    /// The provider `--knowledge-acma URL,propagation=PATH` configures answers under the
+    /// file's assumptions, echoed in its answer.
+    #[tokio::test]
+    async fn the_acma_provider_takes_the_flags_propagation() {
+        use zeta_core::knowledge::KnowledgeProvider;
+        use zeta_ext::testing::acma_stub::{self, Mode};
+        let (url, _stub) = acma_stub::serve(vec![], Mode::Normal).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("propagation.json");
+        std::fs::write(&file, r#"{"search_margin": 3, "in_range_floor_dbm": -110}"#).unwrap();
+        let flag =
+            crate::sources::parse_knowledge_acma(&format!("{url},propagation={}", file.display()))
+                .unwrap();
+        let client = zeta_ext::mcp_client::McpClient::new(&flag.url, ACMA_CLIENT_TIMEOUT).unwrap();
+        let p = acma_provider(
+            client,
+            &flag,
+            Arc::new(|| None),
+            Arc::new(zeta_core::register::RegisterQueries::builtin()),
+        );
+        let signal = zeta_core::register::Signal {
+            center_hz: Hz(404_025_000),
+            bandwidth_hz: Hz(12_500),
+        };
+        let a = p.describe("AU", &signal, None).await.unwrap();
+        assert_eq!(a.assumptions.search_margin, 3.0);
+        assert_eq!(a.assumptions.in_range_floor_dbm, -110.0);
+        assert_eq!(
+            a.assumptions.k_factor,
+            zeta_core::propagation::Propagation::default().k_factor
+        );
     }
 }

@@ -69,7 +69,8 @@ fn guide_covers_running_the_node_stages_and_descriptions() {
         "`source list`",
         "`job list`",
         "`AU`",
-        "no provider data",
+        // An unreachable register is not an empty band (`knowledge_lookup`'s `status`).
+        "no allocations at all, which says nothing about the band",
         // A param with a default is listed too, as optional.
         "- params.squelch: boolean (optional, default true)\n",
         "- params.squelch_db: integer or null (optional, default null)\n",

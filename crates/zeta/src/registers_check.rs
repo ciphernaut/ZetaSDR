@@ -13,7 +13,7 @@ use std::time::Instant;
 use serde_json::Value;
 use zeta_core::knowledge::KnowledgeProvider;
 use zeta_core::register::{ParamKind, ParamValue, RegisterQuery, RegisterState, Signal};
-use zeta_ext::acma::{ACMA_PROVIDER, ACMA_REGION, AcmaKnowledge, Row};
+use zeta_ext::acma::{ACMA_PROVIDER, ACMA_REGION, Row};
 use zeta_ext::mcp_client::McpClient;
 
 use crate::node_setup;
@@ -36,12 +36,12 @@ enum Outcome {
 /// nothing failed; with no register configured, print `no register configured` and fail.
 pub async fn run(
     state_dir: &Path,
-    acma: Option<&(String, Option<f64>)>,
+    acma: Option<&crate::sources::AcmaFlag>,
     registers_dir: Option<&Path>,
     only: Option<&str>,
     signal: Signal,
 ) -> ExitCode {
-    let Some((url, reach_km)) = acma else {
+    let Some(flag) = acma else {
         println!("no register configured");
         return ExitCode::FAILURE;
     };
@@ -60,7 +60,7 @@ pub async fn run(
     if let Some(e) = unreadable {
         eprintln!("zeta: {e}; checking from no station");
     }
-    let client = match McpClient::new(url, node_setup::ACMA_CLIENT_TIMEOUT) {
+    let client = match McpClient::new(&flag.url, node_setup::ACMA_CLIENT_TIMEOUT) {
         Ok(c) => c,
         Err(e) => {
             println!("{ACMA_PROVIDER}: unreachable: {e}");
@@ -72,12 +72,8 @@ pub async fn run(
         return ExitCode::FAILURE;
     }
     let at = station.clone();
-    let provider = AcmaKnowledge::new(
-        client,
-        *reach_km,
-        Arc::new(move || at.clone()),
-        queries.clone(),
-    );
+    let provider =
+        node_setup::acma_provider(client, flag, Arc::new(move || at.clone()), queries.clone());
     let sample = provider.signal_values(&signal, station.as_ref());
 
     // The candidates first: the queries that take a register id take it from them.

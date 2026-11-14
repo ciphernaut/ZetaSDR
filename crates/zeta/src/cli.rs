@@ -124,17 +124,20 @@ pub struct Cli {
     )]
     pub bursts_keep_days: Option<u32>,
     /// Attach the ACMA register service (MCP over HTTP) as a knowledge provider; `reach_km=N`
-    /// overrides its reach rule
+    /// overrides its search bound, `propagation=PATH` names a JSON file of propagation
+    /// assumptions (any of k_factor, beyond_horizon_db_per_km, off_beam_default_db,
+    /// ground_wave_km, skywave_min_hz, skywave_max_hz, in_range_floor_dbm, search_margin,
+    /// assumed_site_height_m; the rest keep their defaults)
     #[arg(
         long = "knowledge-acma",
         global = true,
         env = "ZETA_KNOWLEDGE_ACMA",
-        value_name = "URL[,reach_km=N]"
+        value_name = "URL[,reach_km=N][,propagation=PATH]"
     )]
     knowledge_acma_raw: Option<String>,
     /// `--knowledge-acma` parsed (filled by `try_parse_checked`).
     #[arg(skip)]
-    pub knowledge_acma: Option<(String, Option<f64>)>,
+    pub knowledge_acma: Option<sources::AcmaFlag>,
     /// Machine-readable JSON output (the default when stdout is not a terminal;
     /// no human format exists yet, so output is always JSON)
     #[arg(long, global = true)]
