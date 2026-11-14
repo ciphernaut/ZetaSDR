@@ -21,10 +21,10 @@ use zeta_core::propagation::{
 };
 use zeta_core::reach::{Reach, reach_for};
 use zeta_core::register::{
-    AreaCandidate, Candidate, Channel, Device, FailedQuery, FarEnd, Holder, Licence, ParamValue,
-    PlanFootnote, PlanSegment, PlanService, REGISTER_MAX_CANDIDATES, RELATED_CHANNELS, RELATED_TOP,
-    RegisterAnswer, RegisterQueries, RegisterState, RegisterStatus, Related, Signal, Site,
-    SiteAnswer, SiteChannel, check_register_id,
+    AreaCandidate, CANDIDATES_QUERY, Candidate, Channel, Device, FailedQuery, FarEnd, Holder,
+    Licence, ParamValue, PlanFootnote, PlanSegment, PlanService, REGISTER_MAX_CANDIDATES,
+    RELATED_CHANNELS, RELATED_TOP, RegisterAnswer, RegisterQueries, RegisterState, RegisterStatus,
+    Related, Signal, Site, SiteAnswer, SiteChannel, check_register_id,
 };
 use zeta_core::station::Station;
 use zeta_core::types::Hz;
@@ -231,7 +231,7 @@ impl AcmaKnowledge {
             ["lo_hz", "hi_hz"].map(|k| (k, boxed[k].clone())).into();
 
         let (candidates, area, plan, as_of) = tokio::join!(
-            self.query_by(deadline, "candidates", &boxed),
+            self.query_by(deadline, CANDIDATES_QUERY, &boxed),
             self.query_by(deadline, "area_devices", &band),
             self.query_by(deadline, "plan_span", &band),
             tokio::time::timeout_at(deadline, self.as_of()),
@@ -239,7 +239,7 @@ impl AcmaKnowledge {
         let plan = plan.and_then(|rows| rows.iter().map(plan_of).collect::<Result<Vec<_>, _>>());
         let mut failed: Vec<FailedQuery> = Vec::new();
         for (query, e) in [
-            ("candidates", candidates.as_ref().err()),
+            (CANDIDATES_QUERY, candidates.as_ref().err()),
             ("area_devices", area.as_ref().err()),
             ("plan_span", plan.as_ref().err()),
         ] {
@@ -261,7 +261,7 @@ impl AcmaKnowledge {
 
         let limit = self
             .queries
-            .get(ACMA_PROVIDER, "candidates")
+            .get(ACMA_PROVIDER, CANDIDATES_QUERY)
             .map_or(u64::MAX, |q| q.limit);
         let rows = candidates.unwrap_or_default();
         let matched = rows.len();
@@ -295,15 +295,12 @@ impl AcmaKnowledge {
                 .map(|c| self.related(c, deadline)),
         )
         .await;
-        for (c, r) in ranked.iter_mut().zip(related) {
-            match r {
-                Ok(r) => c.related = Some(r),
-                Err(fails) => {
-                    for f in fails {
-                        if !failed.iter().any(|x| x.query == f.query) {
-                            failed.push(f);
-                        }
-                    }
+        for (c, (r, fails)) in ranked.iter_mut().zip(related) {
+            c.related = r;
+            // Each failed query named once, however many candidates it failed for.
+            for f in fails {
+                if !failed.iter().any(|x| x.query == f.query) {
+                    failed.push(f);
                 }
             }
         }
@@ -343,20 +340,29 @@ impl AcmaKnowledge {
 
     /// What else the register holds about `c`: the other frequencies on its licence,
     /// its holder's other channels at its site, and the far end of a link from the site
-    /// on its frequency. A query that fails is named, and nothing is filled.
+    /// on its frequency, and the queries that failed. Each part whose query answered is
+    /// filled (a failed one is left empty and named); `None` only when all three failed.
+    /// A candidate with no licence number is not looked up by licence: its `paired` is
+    /// empty.
     async fn related(
         &self,
         c: &Candidate,
         deadline: tokio::time::Instant,
-    ) -> Result<Related, Vec<FailedQuery>> {
+    ) -> (Option<Related>, Vec<FailedQuery>) {
         let licence: BTreeMap<&str, ParamValue> =
             [("licence_no", ParamValue::Id(c.licence.number.clone()))].into();
         let site: BTreeMap<&str, ParamValue> =
             [("site_id", ParamValue::Id(c.site.id.clone()))].into();
         let mut link = site.clone();
         link.insert("center_hz", hz_value(c.device.center_hz.0));
+        let by_licence = async {
+            match c.licence.number.is_empty() {
+                true => Ok(Vec::new()),
+                false => self.query_by(deadline, "licence_related", &licence).await,
+            }
+        };
         let (paired, channels, far) = tokio::join!(
-            self.query_by(deadline, "licence_related", &licence),
+            by_licence,
             self.query_by(deadline, "site_channels", &site),
             self.query_by(deadline, "link_far_end", &link),
         );
@@ -373,9 +379,14 @@ impl AcmaKnowledge {
             })
         })
         .collect();
-        let (Ok(paired), Ok(channels), Ok(far)) = (paired, channels, far) else {
-            return Err(failed);
-        };
+        if failed.len() == 3 {
+            return (None, failed);
+        }
+        let (paired, channels, far) = (
+            paired.unwrap_or_default(),
+            channels.unwrap_or_default(),
+            far.unwrap_or_default(),
+        );
         let own_role = c.device.role.as_deref();
         let own_centre = c.device.center_hz;
 
@@ -440,12 +451,13 @@ impl AcmaKnowledge {
                 distance_km: Some(haversine_km(c.site.lat, c.site.lon, lat, lon)),
             })
         });
-        Ok(Related {
+        let related = Related {
             paired,
             holder_channels: u32::try_from(holder.len()).unwrap_or(u32::MAX),
             holder_channel_list: holder.into_iter().take(RELATED_CHANNELS).collect(),
             far_end,
-        })
+        };
+        (Some(related), failed)
     }
 }
 
@@ -553,8 +565,11 @@ impl KnowledgeProvider for AcmaKnowledge {
             .await
     }
 
-    /// [`reach_of`](KnowledgeProvider::reach_of) on a fresh
-    /// [`describe`](KnowledgeProvider::describe); `None` without `from` (no lookup then).
+    /// The reach from `from` without a whole lookup: only the `plan_span` query (the
+    /// band's space services are all the reach needs of the register), inside one
+    /// deadline; a plan that fails reads as no space band. `None` for another region or
+    /// without `from` (no call then). The node takes the reach from the answer it
+    /// already holds instead ([`reach_of`](KnowledgeProvider::reach_of)).
     async fn reach_from(
         &self,
         region: &str,
@@ -563,28 +578,55 @@ impl KnowledgeProvider for AcmaKnowledge {
         from: Option<&Station>,
     ) -> Option<Reach> {
         let from = from?;
+        if !answers(region) {
+            return None;
+        }
         let signal = Signal {
             center_hz,
             bandwidth_hz,
         };
-        let answer = self.describe(region, &signal, Some(from)).await?;
-        self.reach_of(&answer, &signal, Some(from))
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let values = self.signal_values(&signal, Some(from));
+        let band: BTreeMap<&str, ParamValue> =
+            ["lo_hz", "hi_hz"].map(|k| (k, values[k].clone())).into();
+        let plan = self
+            .query_by(deadline, "plan_span", &band)
+            .await
+            .and_then(|rows| rows.iter().map(plan_of).collect::<Result<Vec<_>, _>>())
+            .unwrap_or_else(|e| {
+                self.fail(&format!("plan_span: {e}"));
+                Vec::new()
+            });
+        Some(self.reach_with(&plan, &self.propagation, &signal, from))
     }
 
-    /// The search bound behind `answer` from `from` as a [`Reach`], with no lookup:
-    /// `km` is the bound (the override, else the furthest reach under the answer's
-    /// assumptions), the class the band's, a space band when the answer's plan allocates
-    /// space services (a plan that failed reads as no space band) or the antenna serving
-    /// the band points up. `None` without `from`.
+    /// The search bound behind `answer` from `from` as a [`Reach`], with no lookup
+    /// ([`reach_with`](Self::reach_with) on its plan and assumptions). `None` without
+    /// `from`.
     fn reach_of(
         &self,
         answer: &RegisterAnswer,
         signal: &Signal,
         from: Option<&Station>,
     ) -> Option<Reach> {
-        let from = from?;
+        Some(self.reach_with(&answer.plan, &answer.assumptions, signal, from?))
+    }
+}
+
+impl AcmaKnowledge {
+    /// The search bound from `from` as a [`Reach`]: `km` is the bound (the override, else
+    /// the furthest reach under `assumptions`), the class the band's, a space band when
+    /// `plan` allocates space services (a plan that failed is empty: no space band) or the
+    /// antenna serving the band points up.
+    fn reach_with(
+        &self,
+        plan: &[PlanSegment],
+        assumptions: &Propagation,
+        signal: &Signal,
+        from: &Station,
+    ) -> Reach {
         let center_hz = signal.center_hz;
-        let space = answer.plan.iter().any(is_space);
+        let space = plan.iter().any(is_space);
         let mut reach = reach_for(
             center_hz,
             &from.antenna_for(center_hz),
@@ -594,8 +636,8 @@ impl KnowledgeProvider for AcmaKnowledge {
         let observer = observer_of(from, center_hz);
         reach.km = self
             .override_km
-            .or_else(|| search_km(&observer, center_hz.0, &answer.assumptions));
-        Some(reach)
+            .or_else(|| search_km(&observer, center_hz.0, assumptions));
+        reach
     }
 }
 

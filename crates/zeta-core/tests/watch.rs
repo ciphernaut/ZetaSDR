@@ -1137,6 +1137,65 @@ async fn an_unknown_summary_names_the_licensee() {
     stop_all(&node).await;
 }
 
+/// A register that describes every band and cannot be reached.
+struct Unreachable;
+
+#[async_trait]
+impl KnowledgeProvider for Unreachable {
+    fn name(&self) -> &str {
+        "register"
+    }
+    fn gives_assignments(&self) -> bool {
+        true
+    }
+    async fn allocations(&self, _: &str, _: Hz, _: Hz) -> Vec<Allocation> {
+        vec![]
+    }
+    async fn signatures(&self, _: Hz, _: Hz) -> Vec<Signature> {
+        vec![]
+    }
+    async fn describe(
+        &self,
+        region: &str,
+        _: &zeta_core::register::Signal,
+        _: Option<&zeta_core::station::Station>,
+    ) -> Option<zeta_core::register::RegisterAnswer> {
+        Some(zeta_core::register::RegisterAnswer::unreachable(
+            "register",
+            region,
+            "candidates: timed out after 5000 ms".into(),
+        ))
+    }
+}
+
+/// The watch words the register as Identify does: an unreachable register reads as
+/// unreachable, never as nothing at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_summary_says_an_unreachable_register() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let src = file_source("rx", &fixtures().fsk);
+    let node = node_over(
+        dir.path(),
+        vec![(src.clone() as Arc<dyn Port>, src)],
+        Some(&fixtures().quick_modes),
+    )
+    .await;
+    node.add_knowledge(Arc::new(Unreachable));
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    until("an unknown", Duration::from_secs(60), || {
+        !events.watch("unknown").is_empty()
+    })
+    .await;
+    let e = &events.watch("unknown")[0];
+    let summary = e["summary"].as_str().unwrap();
+    let register = "; register unreachable: candidates: timed out after 5000 ms (identify 1 of";
+    assert!(summary.contains(register), "{e}");
+    stop_all(&node).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_signal_stops_its_decoder() {
     let _one = SERIAL.lock().await;

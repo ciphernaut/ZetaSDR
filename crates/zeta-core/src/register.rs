@@ -24,6 +24,9 @@ pub const REGISTER_MAX_CANDIDATES: usize = 50;
 pub const RELATED_TOP: usize = 3;
 /// The most channels listed in [`Related::holder_channel_list`].
 pub const RELATED_CHANNELS: usize = 12;
+/// The query that lists the licensed candidates. When it fails, the answer cannot say
+/// "nothing licensed" ([`RegisterStatus::licences_failed`]).
+pub const CANDIDATES_QUERY: &str = "candidates";
 /// The longest register id a query accepts.
 const MAX_ID_LEN: usize = 64;
 /// The largest row limit a query may ask for.
@@ -89,6 +92,25 @@ pub struct RegisterStatus {
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     pub reason: Option<String>,
     pub failed: Vec<FailedQuery>,
+}
+
+impl RegisterStatus {
+    /// Why the register could not list licences: the reason it was unreachable, or the
+    /// failed [`CANDIDATES_QUERY`]'s; `None` when the candidates query answered (an
+    /// empty list then means nothing is licensed).
+    pub fn licences_failed(&self) -> Option<String> {
+        if self.state == RegisterState::Unreachable {
+            return Some(
+                self.reason
+                    .clone()
+                    .unwrap_or_else(|| "no reason given".into()),
+            );
+        }
+        self.failed
+            .iter()
+            .find(|f| f.query == CANDIDATES_QUERY)
+            .map(|f| f.reason.clone())
+    }
 }
 
 /// One service a plan segment allocates.

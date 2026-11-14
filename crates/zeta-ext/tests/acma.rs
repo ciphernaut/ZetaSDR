@@ -297,27 +297,28 @@ async fn the_data_date_is_read_once_a_minute() {
     assert_eq!(stub.healths.load(Ordering::SeqCst), 1);
 }
 
+/// The node's lookups (`knowledge_lookup`, `classify`, origins, Identify) take the rows and
+/// the reach from one answer: against a hung service that is one lookup, one deadline.
 #[tokio::test]
 async fn a_hung_service_costs_one_lookup_one_deadline() {
     let (url, _) = serve(Mode::Slow).await;
     let deadline = Duration::from_millis(500);
     let provider = provider(&url, demo_station()).with_timeout(deadline);
+    let from = demo_station().unwrap();
+    let signal = Signal {
+        center_hz: Hz(404_025_000),
+        bandwidth_hz: Hz(16_000),
+    };
     let t0 = std::time::Instant::now();
-    assert!(
-        provider
-            .allocations("AU", Hz(404_025_000), Hz(16_000))
-            .await
-            .is_empty()
-    );
+    let a = provider.describe("AU", &signal, Some(&from)).await.unwrap();
+    assert_eq!(a.status.state, RegisterState::Unreachable);
+    assert!(a.allocations().is_empty());
+    let r = provider.reach_of(&a, &signal, Some(&from));
     let took = t0.elapsed();
     assert!(took < deadline + Duration::from_millis(300), "{took:?}");
-    // The reach is one more lookup, with its own deadline.
-    let r = provider.reach("AU", Hz(404_025_000), Hz(16_000)).await;
-    let took = t0.elapsed();
-    assert!(took < 2 * deadline + Duration::from_millis(300), "{took:?}");
     // The failed plan reads as no space band; the reach is the band's own.
     assert_eq!(r.map(|r| r.class), Some(ReachClass::Uhf));
-    assert_eq!(provider.errors(), 2);
+    assert_eq!(provider.errors(), 1);
 }
 
 #[tokio::test]
@@ -513,10 +514,13 @@ async fn the_reach_of_an_answer_in_hand_asks_the_register_nothing() {
     let r = reach.clone().unwrap();
     assert_eq!(r.km, Some(bound_from(&from)));
     assert_eq!(r.class, ReachClass::Uhf);
+    // A reach of its own asks for the band plan only, not a whole lookup.
     let fresh = provider
         .reach_from("AU", signal.center_hz, signal.bandwidth_hz, Some(&from))
         .await;
     assert_eq!(fresh, reach);
-    assert!(stub.queries.load(Ordering::SeqCst) > asked);
+    assert_eq!(stub.queries.load(Ordering::SeqCst), asked + 1);
+    let last = stub.seen.lock().unwrap().last().cloned().unwrap();
+    assert!(last.contains("spectrum_allocations"), "{last}");
     assert_eq!(provider.reach_of(&answer, &signal, None), None);
 }

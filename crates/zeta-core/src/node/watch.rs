@@ -2185,7 +2185,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             "unknown at {}: {label}{}{}",
             tracked.signal.mhz(),
             measured(&features),
-            register_says(&allocations),
+            register_words(&v["verdict"]),
         ),
     };
     summary.push_str(&format!(
@@ -2259,6 +2259,25 @@ fn info_word(e: &serde_json::Value) -> String {
         other => other,
     }
     .to_string()
+}
+
+/// The register's words for an identify verdict `v`, as Identify's job summary and the
+/// watch both word them: `; <the register verdict's summary>` with a register answer
+/// (`register agrees: ...`, `register unreachable: ...`, ...); `; register unreachable:
+/// <reason>` for an unreachable answer carrying no verdict; else [`register_says`] from
+/// the verdict's `allocations` (a verdict kept before the register answer).
+pub(super) fn register_words(v: &serde_json::Value) -> String {
+    let register = &v["register"];
+    if let Some(s) = register["verdict"]["summary"].as_str() {
+        return format!("; {s}");
+    }
+    if register["status"]["state"] == "unreachable" {
+        let reason = register["status"]["reason"]
+            .as_str()
+            .unwrap_or("no reason given");
+        return format!("; register unreachable: {reason}");
+    }
+    register_says(&v["allocations"])
 }
 
 /// `; register says <EMISSION> (<bw> kHz <mod> <info>) <licensee>, <site>, <d> km` for

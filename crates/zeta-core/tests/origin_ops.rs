@@ -766,6 +766,7 @@ fn schema_lists_origin_lookup_and_the_origins_result() {
         reach: None,
         t_ns: zeta_core::types::Timestamp(0),
         stations: Default::default(),
+        register_status: None,
     });
     assert_eq!(serde_json::to_value(&r).unwrap()["result"], "origins");
 }

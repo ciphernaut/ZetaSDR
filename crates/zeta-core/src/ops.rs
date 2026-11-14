@@ -3099,6 +3099,9 @@ pub enum OpResult {
         missed: u64,
     },
     Graph(Graph),
+    /// `knowledge_lookup`: every provider's allocations and signatures for the band, the
+    /// first reach, and the first describing provider's register status and data date.
+    #[schemars(transform = require_all_value)]
     Knowledge {
         allocations: Vec<Allocation>,
         signatures: Vec<Signature>,
@@ -3109,6 +3112,20 @@ pub enum OpResult {
             schema_with = "crate::types::nullable::<crate::reach::Reach>"
         )]
         reach: Option<crate::reach::Reach>,
+        /// The status of the first describing provider's register answer (`ok`,
+        /// `partial` naming the failed queries, `unreachable` with the reason), so an
+        /// unreachable register never reads as an empty band; `null` when no provider
+        /// describes the band (and from an older node).
+        #[serde(default)]
+        #[schemars(
+            required,
+            schema_with = "crate::types::nullable::<crate::register::RegisterStatus>"
+        )]
+        status: Option<crate::register::RegisterStatus>,
+        /// That answer's data date, when the register gives one.
+        #[serde(default)]
+        #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+        as_of: Option<String>,
     },
     ChannelPlans {
         plans: Vec<PlanInfo>,
@@ -4784,18 +4801,39 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             center_hz,
             bandwidth_hz,
         } => {
+            // One register lookup per provider: a provider that describes the band gives
+            // its rows and its reach from that one answer; one that does not is asked for
+            // its rows and its reach.
+            let station = node.station();
+            let signal = crate::register::Signal {
+                center_hz,
+                bandwidth_hz,
+            };
             let (mut allocations, mut signatures, mut reach) = (Vec::new(), Vec::new(), None);
+            let mut register: Option<crate::register::RegisterAnswer> = None;
             for p in node.knowledge() {
-                allocations.extend(p.allocations(&region, center_hz, bandwidth_hz).await);
+                let (rows, r) = match p.describe(&region, &signal, station.as_ref()).await {
+                    Some(a) => {
+                        let r = p.reach_of(&a, &signal, station.as_ref());
+                        let rows = a.allocations();
+                        register = register.or(Some(a));
+                        (rows, r)
+                    }
+                    None => (
+                        p.allocations(&region, center_hz, bandwidth_hz).await,
+                        p.reach(&region, center_hz, bandwidth_hz).await,
+                    ),
+                };
+                allocations.extend(rows);
                 signatures.extend(p.signatures(center_hz, bandwidth_hz).await);
-                if reach.is_none() {
-                    reach = p.reach(&region, center_hz, bandwidth_hz).await;
-                }
+                reach = reach.or(r);
             }
             Ok(OpResult::Knowledge {
                 allocations,
                 signatures,
                 reach,
+                status: register.as_ref().map(|a| a.status.clone()),
+                as_of: register.and_then(|a| a.as_of),
             })
         }
         Op::OriginLookup {

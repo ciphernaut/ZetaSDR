@@ -317,6 +317,77 @@ async fn the_top_candidates_carry_what_they_belong_to() {
     assert_eq!(range.holder_channels, 0);
 }
 
+/// A register without the links view still pairs the top candidates' licences and lists
+/// their sites' channels: the one failed query is named once, not once per candidate.
+#[tokio::test]
+async fn one_failed_related_query_keeps_the_other_two() {
+    let (url, stub) = acma_stub::serve_fixture(fixture(), Mode::Normal).await;
+    *stub.fail_matching.lock().unwrap() = Some("v_links".into());
+    let a = provider(&url, None, None)
+        .describe("AU", &signal(), Some(&station(4.0)))
+        .await
+        .unwrap();
+    assert_eq!(a.status.state, RegisterState::Partial, "{:?}", a.status);
+    let failed: Vec<&str> = a.status.failed.iter().map(|f| f.query.as_str()).collect();
+    assert_eq!(failed, ["link_far_end"]);
+    for (i, c) in a.candidates.iter().take(RELATED_TOP).enumerate() {
+        let r = c
+            .related
+            .as_ref()
+            .unwrap_or_else(|| panic!("{i}: no related"));
+        assert_eq!(r.far_end, None, "{i}");
+    }
+    let hill = a.candidates[0].related.as_ref().unwrap();
+    assert_eq!(hill.paired.len(), 1, "{hill:?}");
+    assert_eq!(hill.paired[0].center_hz, Hz(PAIRED_HZ));
+    assert_eq!(hill.holder_channels, 2, "{hill:?}");
+
+    // All three failing leave no related block at all. Only those three queries name a
+    // register id (in quotes); the first-phase queries take numbers alone.
+    let (url, stub) = acma_stub::serve_fixture(fixture(), Mode::Normal).await;
+    *stub.fail_matching.lock().unwrap() = Some("= '9".into());
+    let a = provider(&url, None, None)
+        .describe("AU", &signal(), Some(&station(4.0)))
+        .await
+        .unwrap();
+    let failed: Vec<&str> = a.status.failed.iter().map(|f| f.query.as_str()).collect();
+    assert_eq!(failed, ["licence_related", "site_channels", "link_far_end"]);
+    assert!(a.candidates.iter().all(|c| c.related.is_none()));
+    assert!(!a.candidates.is_empty());
+}
+
+/// A candidate whose licence number the register leaves empty is not looked up by licence
+/// (an empty id is not a register id): its `paired` is empty and the answer stays `ok`.
+#[tokio::test]
+async fn a_candidate_without_a_licence_number_skips_its_licence_query() {
+    let f = fixture();
+    f.sql(&format!(
+        "INSERT INTO site (SITE_ID, LATITUDE, LONGITUDE, NAME) VALUES
+           ('9002', {n2}, {LON}, 'Example Knoll');
+         INSERT INTO device_details (LICENCE_NO, FREQUENCY, BANDWIDTH, EMISSION, DEVICE_TYPE,
+           TRANSMITTER_POWER, TRANSMITTER_POWER_UNIT, SITE_ID, HEIGHT) VALUES
+           (NULL, {CHANNEL_HZ}, {CHANNEL_BW}, '11K0F3E', 'T', 50, 'W', '9002', 30);",
+        n2 = north(2.0),
+    ));
+    let (a, stub) = describe(f, Some(station(4.0))).await;
+    assert_eq!(a.status.state, RegisterState::Ok, "{:?}", a.status);
+    let knoll = a
+        .candidates
+        .iter()
+        .position(|c| c.site.id == "9002")
+        .expect("the knoll's candidate");
+    assert!(knoll < RELATED_TOP, "{:?}", sites(&a));
+    let c = &a.candidates[knoll];
+    assert_eq!(c.licence.number, "");
+    let r = c.related.as_ref().expect("its site's related block");
+    assert!(r.paired.is_empty());
+    let seen = stub.seen.lock().unwrap().clone();
+    assert!(
+        !seen.iter().any(|q| q.contains("d.LICENCE_NO = ''")),
+        "{seen:?}"
+    );
+}
+
 #[tokio::test]
 async fn area_devices_are_listed_without_geometry() {
     let (a, _) = describe(fixture(), Some(station(4.0))).await;
@@ -430,6 +501,54 @@ async fn a_failing_query_is_named_and_the_rest_stands() {
     assert_eq!(a.area_candidates.len(), 1);
 }
 
+/// A register lacking a column the candidates query declares lists no licences: the
+/// node's verdict on that answer is `unknown`, never "nothing licensed", though the plan
+/// answered.
+#[tokio::test]
+async fn a_register_without_a_candidates_column_is_unknown_not_unlicensed() {
+    use zeta_core::node::{OriginQuery, Vantage, origin_answer, verdict};
+    use zeta_core::register::VerdictKind;
+    use zeta_core::types::{SourceId, Timestamp};
+
+    let f = fixture();
+    f.drop_column("site", "SITE_PRECISION");
+    let (url, _) = acma_stub::serve_fixture(f, Mode::Normal).await;
+    let from = station(4.0);
+    let a = provider(&url, None, None)
+        .describe("AU", &signal(), Some(&from))
+        .await
+        .unwrap();
+    assert_eq!(a.status.state, RegisterState::Partial, "{:?}", a.status);
+    assert_eq!(a.plan.len(), 1);
+    let q = OriginQuery {
+        source: SourceId("radio".into()),
+        center_hz: Hz(CHANNEL_HZ),
+        bandwidth_hz: Hz(CHANNEL_BW),
+        modulation: vec!["fm".into()],
+        symbol_rate_baud: None,
+        job: None,
+        at: Timestamp(0),
+    };
+    let rows = a.allocations();
+    let n = rows.len() as u32;
+    let o = origin_answer(
+        &q,
+        rows,
+        None,
+        &Vantage::Station(from),
+        vec!["acma".into()],
+        Some(n),
+    );
+    let v = verdict(&a, &o, None);
+    assert_eq!(v.kind, VerdictKind::Unknown, "{v:?}");
+    assert!(
+        v.summary.starts_with("register could not list licences: "),
+        "{}",
+        v.summary
+    );
+    assert!(v.summary.contains("SITE_PRECISION"), "{}", v.summary);
+}
+
 #[tokio::test]
 async fn a_service_that_does_not_answer_is_unreachable_not_empty() {
     for mode in [Mode::Slow, Mode::RpcError, Mode::Html] {
@@ -513,6 +632,40 @@ async fn the_operator_reach_override_bounds_the_search() {
     assert_eq!(sites(&a), ["9001"]);
     let b = box_of(&candidates_sql(&stub));
     assert!((b[1] - b[0] - 20.0 / 111.0).abs() < 1e-9, "{b:?}");
+}
+
+/// The operator's propagation assumptions drive the search: a wider `search_margin`
+/// widens the query's box in proportion, and the answer echoes the assumptions used.
+#[tokio::test]
+async fn the_operators_propagation_moves_the_box_and_is_echoed() {
+    let width = |stub: &Stub| {
+        let b = box_of(&candidates_sql(stub));
+        b[1] - b[0]
+    };
+    let (url, stub) = acma_stub::serve_fixture(fixture(), Mode::Normal).await;
+    let a = provider(&url, None, None)
+        .describe("AU", &signal(), Some(&station(4.0)))
+        .await
+        .unwrap();
+    assert_eq!(a.assumptions, Propagation::default());
+    let base = width(&stub);
+
+    let wider = Propagation {
+        search_margin: Propagation::default().search_margin * 2.0,
+        ..Propagation::default()
+    };
+    let (url, stub) = acma_stub::serve_fixture(fixture(), Mode::Normal).await;
+    let p = provider(&url, None, None).with_propagation(wider.clone());
+    let a = p
+        .describe("AU", &signal(), Some(&station(4.0)))
+        .await
+        .unwrap();
+    assert_eq!(a.assumptions, wider);
+    let got = width(&stub);
+    assert!((got / base - 2.0).abs() < 1e-9, "{base} -> {got}");
+    // The reach the node takes from the answer follows the same assumptions.
+    let r = p.reach_of(&a, &signal(), Some(&station(4.0))).unwrap();
+    assert!((r.km.unwrap() * 2.0 / 111.0 - got).abs() < 1e-9, "{r:?}");
 }
 
 #[tokio::test]

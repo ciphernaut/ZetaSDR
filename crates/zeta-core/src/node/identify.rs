@@ -688,9 +688,9 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
 /// An identify verdict `v`'s one line, as the watch words it, `center_hz` the measured
 /// centre: a proof's `<label> at <MHz>: <the decoder's summary>`; a learned match's
 /// `learned <name> at <MHz>: <features>`; an unknown's `unknown at <MHz>: <label>
-/// <features>; <the register verdict's summary>` with a register answer, else `...;
-/// register says ...` from the nearest transmitter of `allocations` (a verdict kept
-/// before the register answer reads that way too).
+/// <features>` and the register's words ([`super::watch::register_words`]: the register
+/// verdict's summary with a register answer, else `; register says ...` from the nearest
+/// transmitter of `allocations`, as a verdict kept before the register answer reads).
 fn job_summary(v: &serde_json::Value, center_hz: u64) -> String {
     let at = format!("{:.4} MHz", center_hz as f64 / 1e6);
     let label = v["label"].as_str().unwrap_or("unknown");
@@ -702,16 +702,11 @@ fn job_summary(v: &serde_json::Value, center_hz: u64) -> String {
         None if v["learned"].is_object() => {
             format!("{label} at {at}:{}", super::watch::measured(&v["features"]))
         }
-        None => {
-            let register = match v["register"]["verdict"]["summary"].as_str() {
-                Some(s) => format!("; {s}"),
-                None => super::watch::register_says(&v["allocations"]),
-            };
-            format!(
-                "unknown at {at}: {label}{}{register}",
-                super::watch::measured(&v["features"]),
-            )
-        }
+        None => format!(
+            "unknown at {at}: {label}{}{}",
+            super::watch::measured(&v["features"]),
+            super::watch::register_words(v),
+        ),
     }
 }
 
@@ -818,6 +813,15 @@ mod tests {
         assert_eq!(
             job_summary(&new, 148_637_500),
             "unknown at 148.6375 MHz: fsk 12.5 kHz; register agrees: Example Paging"
+        );
+        // An unreachable answer with no verdict still says so, never nothing.
+        new["register"] = serde_json::json!({"verdict": null, "status": {
+            "state": "unreachable", "reason": "timed out after 5000 ms", "failed": []
+        }});
+        new["allocations"] = serde_json::json!([]);
+        assert_eq!(
+            job_summary(&new, 148_637_500),
+            "unknown at 148.6375 MHz: fsk 12.5 kHz; register unreachable: timed out after 5000 ms"
         );
     }
 

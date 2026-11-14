@@ -20,7 +20,8 @@ use crate::ops::{BITS_KIND, GRAPH_KIND, SignalBand};
 use crate::propagation::{Expected, Geometry, InRange, Propagation};
 use crate::reach::{Reach, SECTOR_DEG};
 use crate::register::{
-    Candidate, RegisterAnswer, RegisterState, Signal, Verdict, VerdictKind, emission_words,
+    Candidate, RegisterAnswer, RegisterState, RegisterStatus, Signal, Verdict, VerdictKind,
+    emission_words,
 };
 use crate::station::{Antenna, Station};
 use crate::stream::{Frame, Payload};
@@ -219,6 +220,13 @@ pub struct OriginAnswer {
     #[serde(default)]
     #[schemars(required)]
     pub stations: BTreeMap<String, StationSeen>,
+    /// The status of the register answer the origins were scored from (`ok`, `partial`
+    /// naming the failed queries, `unreachable` with the reason), so an unreachable
+    /// register never reads as an empty one; `null` when no provider describes the band,
+    /// and in an answer kept before the status was carried.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<RegisterStatus>")]
+    pub register_status: Option<RegisterStatus>,
 }
 
 /// Where a source's signals are heard from.
@@ -424,8 +432,25 @@ pub fn judged(d: &Described, origins: &OriginAnswer) -> Option<RegisterAnswer> {
     })
 }
 
-/// The deduplication key of an origin: licence, site and resolved centre.
-type SiteKey = (Option<String>, Option<String>, u64);
+/// The deduplication key of an origin: licence, site ([`SiteOf`]) and resolved centre.
+type SiteKey = (Option<String>, SiteOf, u64);
+
+/// How a row names its site for the deduplication: by its register id when it has one
+/// (two sites may share a name, or have none), else by its name.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SiteOf {
+    Id(String),
+    Name(Option<String>),
+}
+
+impl SiteOf {
+    fn of(a: &Allocation) -> SiteOf {
+        match &a.site_id {
+            Some(id) => SiteOf::Id(id.clone()),
+            None => SiteOf::Name(a.site.clone()),
+        }
+    }
+}
 
 /// A row's centre: its `center_hz`, else the middle of `min_hz..max_hz`.
 fn row_center(a: &Allocation) -> u64 {
@@ -434,8 +459,9 @@ fn row_center(a: &Allocation) -> u64 {
 
 /// Score `rows` against `q` into an answer: `tx` assignments scored ([`score_row`]),
 /// receivers (`rx` assignments) and plan rows counted, deduplicated by `(licence_no,
-/// site, centre)` (the centre as [`score_row`] resolves it; a row with neither licence
-/// nor site is never folded) keeping the best score, best first then nearest (no
+/// site, centre)` (the site by its `site_id` when it has one, else by its name; the
+/// centre as [`score_row`] resolves it; a row with neither licence nor site id nor site
+/// name is never folded) keeping the best score, best first then nearest (no
 /// distance last), at most [`ORIGIN_SITES`]. `providers` and `register_rows` are kept as given.
 pub fn answer(
     q: &OriginQuery,
@@ -506,11 +532,11 @@ fn answer_with(
         let Some(o) = score_row(&a, q, reach.as_ref(), antenna, expected_of(&a)) else {
             continue;
         };
-        if a.licence_no.is_none() && a.site.is_none() {
+        if a.licence_no.is_none() && a.site.is_none() && a.site_id.is_none() {
             unnamed.push(o);
             continue;
         }
-        let key = (a.licence_no.clone(), a.site.clone(), row_center(&a));
+        let key = (a.licence_no.clone(), SiteOf::of(&a), row_center(&a));
         if best.get(&key).is_none_or(|kept| o.score > kept.score) {
             best.insert(key, o);
         }
@@ -557,6 +583,7 @@ fn answer_with(
         reach,
         t_ns: now(),
         stations: BTreeMap::new(),
+        register_status: register.map(|r| r.status.clone()),
     }
 }
 
@@ -719,13 +746,27 @@ fn mhz(hz: Hz) -> String {
 /// One line for an answer (design 4.3): `<n> sites on <f> MHz: <licensee>, <site>
 /// <d> km <agree> <score>; ...` naming the first [`ORIGIN_SUMMARY_SITES`] (the
 /// distance left out when unknown); `no licensed transmitter on <f> MHz` when nothing
-/// is lit (whatever provider lit them). With nothing lit, `register_rows` picks the
-/// words: `no register provider` when none of the providers asked gives assignments,
-/// `register gave no rows` when they returned none at all (an attached register that
-/// is unreachable, or empty there), else `no licensed transmitter on <f> MHz`.
+/// is lit (whatever provider lit them). With nothing lit, the register's status
+/// ([`OriginAnswer::register_status`]) speaks first: `register unreachable: <reason>`, or
+/// `register could not list licences: <reason>; partial answer: <query>, ... failed` when
+/// its candidates query failed. Else `register_rows` picks the words: `no register
+/// provider` when none of the providers asked gives assignments, `register gave no rows`
+/// when they returned none at all (an answer kept without a status, or an empty
+/// register there), else `no licensed transmitter on <f> MHz`.
 pub fn summary(a: &OriginAnswer) -> String {
     let f = mhz(a.band.center_hz);
     let Some(sites) = summary_sites(a) else {
+        if let Some(status) = &a.register_status
+            && let Some(reason) = status.licences_failed()
+        {
+            return match status.state {
+                RegisterState::Unreachable => format!("register unreachable: {reason}"),
+                _ => format!(
+                    "register could not list licences: {reason}{}",
+                    status_tail(status)
+                ),
+            };
+        }
         return match a.register_rows {
             None => "no register provider".to_string(),
             Some(0) => "register gave no rows".to_string(),
@@ -780,6 +821,8 @@ fn summary_sites(a: &OriginAnswer) -> Option<String> {
 /// fits; `disagrees` when some are in range and none fits; else the same two, `weak`,
 /// over the candidates whose range the estimate cannot bound (`Possible`, or no
 /// geometry at all: no position to measure from); else `unlicensed`. A partial answer
+/// whose candidates query failed is `unknown` too (`register could not list licences:
+/// <reason>`): `unlicensed` needs the candidates query's answer. Any other partial answer
 /// names its failed queries at the end of the summary.
 pub fn verdict(
     answer: &RegisterAnswer,
@@ -792,6 +835,15 @@ pub fn verdict(
             kind: VerdictKind::Unknown,
             weak: false,
             summary: format!("register unreachable: {reason}"),
+        };
+    }
+    // Without the candidates query's answer nothing is known about licences: never
+    // "nothing licensed" (design 2, anti-goals).
+    if let Some(reason) = answer.status.licences_failed() {
+        return Verdict {
+            kind: VerdictKind::Unknown,
+            weak: false,
+            summary: format!("register could not list licences: {reason}"),
         };
     }
     let origin_of = |c: &Candidate| {
@@ -931,15 +983,15 @@ fn unlicensed_summary(answer: &RegisterAnswer) -> String {
 
 /// `; partial answer: <query>, <query> failed` for a partial answer, else nothing.
 fn partial_tail(answer: &RegisterAnswer) -> String {
-    if answer.status.state != RegisterState::Partial {
+    status_tail(&answer.status)
+}
+
+/// [`partial_tail`] of a register status.
+fn status_tail(status: &RegisterStatus) -> String {
+    if status.state != RegisterState::Partial {
         return String::new();
     }
-    let names: Vec<&str> = answer
-        .status
-        .failed
-        .iter()
-        .map(|f| f.query.as_str())
-        .collect();
+    let names: Vec<&str> = status.failed.iter().map(|f| f.query.as_str()).collect();
     format!("; partial answer: {} failed", names.join(", "))
 }
 
@@ -1865,6 +1917,7 @@ mod tests {
             reach: None,
             t_ns: Timestamp(0),
             stations: BTreeMap::new(),
+            register_status: None,
         }
     }
 
@@ -2365,6 +2418,67 @@ mod tests {
         assert_eq!(summary(&empty_answer(vec![], None)), "no register provider");
     }
 
+    #[test]
+    fn summary_tells_an_unreachable_register_from_an_empty_one() {
+        let status = |state, reason: Option<&str>, failed: &[(&str, &str)]| RegisterStatus {
+            state,
+            reason: reason.map(str::to_string),
+            failed: failed
+                .iter()
+                .map(|(q, r)| FailedQuery {
+                    query: (*q).into(),
+                    reason: (*r).into(),
+                })
+                .collect(),
+        };
+        let mut a = empty_answer(vec![], Some(0));
+        a.register_status = Some(status(
+            RegisterState::Unreachable,
+            Some("candidates: timed out after 5000 ms"),
+            &[],
+        ));
+        assert_eq!(
+            summary(&a),
+            "register unreachable: candidates: timed out after 5000 ms"
+        );
+        // The plan answered (4 plan rows) and the candidates query did not.
+        let mut a = empty_answer(vec![], Some(4));
+        a.register_status = Some(status(
+            RegisterState::Partial,
+            None,
+            &[
+                ("candidates", "no column `x`"),
+                ("area_devices", "timed out"),
+            ],
+        ));
+        assert_eq!(
+            summary(&a),
+            "register could not list licences: no column `x`; partial answer: candidates, \
+             area_devices failed"
+        );
+        // Another query failing alone leaves the finding as it was.
+        a.register_status = Some(status(
+            RegisterState::Partial,
+            None,
+            &[("area_devices", "timed out")],
+        ));
+        assert_eq!(summary(&a), "no licensed transmitter on 403.025 MHz");
+        // An answer that answered empty still says so.
+        let mut a = empty_answer(vec![], Some(0));
+        a.register_status = Some(status(RegisterState::Ok, None, &[]));
+        assert_eq!(summary(&a), "register gave no rows");
+
+        // `origins_of` carries the status of the answer it was scored from.
+        let r =
+            RegisterAnswer::unreachable("acma", "AU", "candidates: timed out after 5000 ms".into());
+        let o = origins_of(&q(&["fm"], CENTER, 12_500), &described_of(&r));
+        assert_eq!(o.register_status, Some(r.status.clone()));
+        assert_eq!(
+            summary(&o),
+            "register unreachable: candidates: timed out after 5000 ms"
+        );
+    }
+
     /// A tally entry: `from` own frames and `to` addressed ones, last seen at `last`.
     fn seen(from: u32, to: u32, last: u64) -> StationSeen {
         StationSeen {
@@ -2561,6 +2675,8 @@ mod tests {
         assert!(a.stations.is_empty());
         assert_eq!(a.origins.len(), 1);
         assert_eq!(a.origins[0].heard, None);
+        // An answer kept before the register's status was carried has none.
+        assert_eq!(a.register_status, None);
     }
 
     #[test]
@@ -3126,6 +3242,31 @@ mod tests {
         assert_eq!(ans.origins.len(), 1);
     }
 
+    #[test]
+    fn sites_fold_by_their_id_and_by_name_only_without_one() {
+        let band = q(&[], CENTER, 12_500);
+        let none = Vantage::None("x");
+        let fold = |rows: Vec<Allocation>| answer(&band, rows, None, &none, vec![], None);
+        // Two sites of one name, one licence and one centre: the ids tell them apart.
+        let mut a = tx(None, Some(12_500), CENTER, None);
+        a.site_id = Some("S1".into());
+        let mut b = a.clone();
+        b.site_id = Some("S2".into());
+        assert_eq!(fold(vec![a.clone(), b.clone()]).origins.len(), 2);
+        // Two unnamed sites with ids stay two as well.
+        let (mut c, mut d) = (a.clone(), b);
+        (c.site, d.site) = (None, None);
+        assert_eq!(fold(vec![c, d]).origins.len(), 2);
+        // One id under two names is one site.
+        let mut renamed = a.clone();
+        renamed.site = Some("Example Hill Annex".into());
+        assert_eq!(fold(vec![a.clone(), renamed]).origins.len(), 1);
+        // Without ids the name still folds.
+        let mut e = a;
+        e.site_id = None;
+        assert_eq!(fold(vec![e.clone(), e]).origins.len(), 1);
+    }
+
     /// A dirty tally last written at `written` (ns), its timer `armed`.
     fn throttle(written: Option<u64>, armed: bool) -> StationTally {
         StationTally {
@@ -3673,8 +3814,8 @@ mod tests {
 
     use crate::propagation::{Expected, Geometry, InRange, PathMode, Propagation};
     use crate::register::{
-        AreaCandidate, Candidate, PlanSegment, PlanService, RegisterAnswer, RegisterState,
-        RegisterStatus, Signal, VerdictKind,
+        AreaCandidate, Candidate, FailedQuery, PlanSegment, PlanService, RegisterAnswer,
+        RegisterState, RegisterStatus, Signal, VerdictKind,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4076,6 +4217,37 @@ mod tests {
         assert_eq!(
             v.summary,
             "register unreachable: candidates: timed out after 5000 ms"
+        );
+    }
+
+    #[test]
+    fn a_partial_answer_whose_candidates_query_failed_is_unknown_not_unlicensed() {
+        // The plan answered and the candidates query did not: nothing is known about
+        // licences, which must not read as "nothing licensed".
+        let mut a = register(vec![], vec![plan(&[("LAND MOBILE", true)])]);
+        a.status = RegisterStatus {
+            state: RegisterState::Partial,
+            reason: None,
+            failed: vec![FailedQuery {
+                query: "candidates".into(),
+                reason: "execute_sql: the answer has no column `site_precision`".into(),
+            }],
+        };
+        let v = verdict_on(&a, "fm", None);
+        assert_eq!((v.kind, v.weak), (VerdictKind::Unknown, false), "{v:?}");
+        assert_eq!(
+            v.summary,
+            "register could not list licences: execute_sql: the answer has no column \
+             `site_precision`"
+        );
+        // Another query failing alone still leaves an honest unlicensed verdict.
+        a.status.failed[0].query = "area_devices".into();
+        let v = verdict_on(&a, "fm", None);
+        assert_eq!(v.kind, VerdictKind::Unlicensed, "{v:?}");
+        assert!(
+            v.summary.ends_with("; partial answer: area_devices failed"),
+            "{}",
+            v.summary
         );
     }
 

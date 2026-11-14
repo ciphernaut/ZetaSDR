@@ -798,13 +798,30 @@ async fn knowledge_lookup_op_returns_allocations_from_provider() {
         "region": "AU", "min_hz": 1, "max_hz": 2, "service": "s", "note": null}))
     .unwrap();
     assert_eq!(a.distance_km, None);
+    // ... nor without the register's status and data date.
+    let OpResult::Knowledge {
+        status: None,
+        as_of: None,
+        ..
+    } = serde_json::from_value(serde_json::json!({
+        "result": "knowledge",
+        "value": {"allocations": [], "signatures": [], "reach": null},
+    }))
+    .unwrap()
+    else {
+        panic!("an older answer loads with no status");
+    };
     match result {
         Ok(OpResult::Knowledge {
             allocations,
             signatures,
             reach,
+            status,
+            as_of,
         }) => {
             assert_eq!(reach, None);
+            // No provider describes the band: no register status to give.
+            assert_eq!((status, as_of), (None, None));
             assert_eq!(allocations.len(), 1);
             assert_eq!(allocations[0].provider, "test");
             assert_eq!(allocations[0].region, "AU");
@@ -812,6 +829,92 @@ async fn knowledge_lookup_op_returns_allocations_from_provider() {
         }
         other => panic!("expected Knowledge, got {other:?}"),
     }
+}
+
+/// A register that describes every band with `answer`, counting what it is asked.
+struct Describing {
+    answer: zeta_core::register::RegisterAnswer,
+    describes: std::sync::atomic::AtomicUsize,
+    others: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl KnowledgeProvider for Describing {
+    fn name(&self) -> &str {
+        "register"
+    }
+    fn gives_assignments(&self) -> bool {
+        true
+    }
+    async fn allocations(&self, _: &str, _: Hz, _: Hz) -> Vec<Allocation> {
+        self.others
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        vec![]
+    }
+    async fn signatures(&self, _: Hz, _: Hz) -> Vec<Signature> {
+        vec![]
+    }
+    async fn reach(&self, _: &str, _: Hz, _: Hz) -> Option<zeta_core::reach::Reach> {
+        self.others
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    }
+    async fn describe(
+        &self,
+        _: &str,
+        _: &zeta_core::register::Signal,
+        _: Option<&zeta_core::station::Station>,
+    ) -> Option<zeta_core::register::RegisterAnswer> {
+        self.describes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(self.answer.clone())
+    }
+    fn reach_of(
+        &self,
+        _: &zeta_core::register::RegisterAnswer,
+        _: &zeta_core::register::Signal,
+        _: Option<&zeta_core::station::Station>,
+    ) -> Option<zeta_core::reach::Reach> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn knowledge_lookup_asks_a_describing_register_once_and_gives_its_status() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use zeta_core::register::{RegisterAnswer, RegisterState};
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path()), registry(), vec![])
+        .await
+        .unwrap();
+    let mut answer = RegisterAnswer::unreachable("register", "AU", "timed out".into());
+    answer.as_of = Some("2026-01-01T00:00:00.000Z".into());
+    let p = Arc::new(Describing {
+        answer,
+        describes: Default::default(),
+        others: Default::default(),
+    });
+    node.add_knowledge(p.clone());
+    let op = Op::KnowledgeLookup {
+        region: "AU".into(),
+        center_hz: Hz(144_800_000),
+        bandwidth_hz: Hz(25_000),
+    };
+    let Ok(OpResult::Knowledge {
+        allocations,
+        status,
+        as_of,
+        ..
+    }) = node.apply(op).await
+    else {
+        panic!("expected Knowledge");
+    };
+    assert_eq!((p.describes.load(SeqCst), p.others.load(SeqCst)), (1, 0));
+    assert!(allocations.is_empty());
+    let status = status.expect("the register's status");
+    assert_eq!(status.state, RegisterState::Unreachable);
+    assert_eq!(status.reason.as_deref(), Some("timed out"));
+    assert_eq!(as_of.as_deref(), Some("2026-01-01T00:00:00.000Z"));
 }
 
 #[tokio::test]
