@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use zeta_core::emission::{Emission, parse_emission};
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
+use zeta_core::propagation::{bearing_deg, haversine_km};
 use zeta_core::reach::{Reach, reach_for};
 use zeta_core::station::Station;
 use zeta_core::types::Hz;
@@ -40,8 +41,6 @@ const CALL_SIGN_UNKNOWN: u8 = 0;
 const CALL_SIGN_PRESENT: u8 = 1;
 const CALL_SIGN_ABSENT: u8 = 2;
 
-/// Mean earth radius for the haversine distance.
-const EARTH_RADIUS_KM: f64 = 6371.0088;
 /// Kilometres per degree of latitude, for the query's bounding box.
 const KM_PER_DEG_LAT: f64 = 111.0;
 /// Floor of `cos(lat)` in the bounding box, so a station near a pole stays finite.
@@ -729,23 +728,6 @@ fn emission_words(e: &Emission) -> String {
         .join(" ")
 }
 
-/// Great-circle distance in km.
-fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
-    let (dp, dl) = (p2 - p1, (lon2 - lon1).to_radians());
-    let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
-    2.0 * EARTH_RADIUS_KM * a.sqrt().asin()
-}
-
-/// Initial bearing from the first point to the second, 0-360 clockwise from north.
-fn bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
-    let dl = (lon2 - lon1).to_radians();
-    let y = dl.sin() * p2.cos();
-    let x = p1.cos() * p2.sin() - p1.sin() * p2.cos() * dl.cos();
-    y.atan2(x).to_degrees().rem_euclid(360.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,17 +749,5 @@ mod tests {
         assert_eq!(w("12K5F3E"), "12.5 kHz FM voice");
         assert_eq!(w("500HA1A"), "500 Hz AM telegraphy");
         assert_eq!(w("1M25G7W"), "1.25 MHz PM mixed");
-    }
-
-    #[test]
-    fn distance_and_bearing() {
-        // The demo station (Brisbane Airport) to a synthetic site: about 9.5 km, a little
-        // west of north.
-        let d = haversine_km(-27.3842, 153.1175, -27.300, 153.100);
-        assert!((d - 9.52).abs() < 0.05, "{d}");
-        let b = bearing_deg(-27.3842, 153.1175, -27.300, 153.100);
-        assert!((345.0..355.0).contains(&b), "{b}");
-        assert!((bearing_deg(0.0, 0.0, 1.0, 0.0) - 0.0).abs() < 1e-9);
-        assert!((bearing_deg(0.0, 0.0, 0.0, 1.0) - 90.0).abs() < 1e-9);
     }
 }

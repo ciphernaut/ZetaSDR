@@ -17,6 +17,7 @@ pub mod node;
 pub mod ops;
 pub mod plans;
 pub mod port;
+pub mod propagation;
 pub mod reach;
 pub mod ring;
 pub mod sessions;

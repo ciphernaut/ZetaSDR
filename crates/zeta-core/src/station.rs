@@ -54,7 +54,7 @@ pub struct Station {
 }
 
 impl Station {
-    /// A dipole for 0-30 MHz and a discone for 30 MHz-6 GHz, both 5 m up.
+    /// A dipole for 0-30 MHz and a discone from 30 MHz up, both 5 m up.
     pub fn default_antennas(_alt_m: f64) -> Vec<Antenna> {
         vec![
             Antenna {
@@ -70,7 +70,7 @@ impl Station {
                 id: "discone".into(),
                 kind: AntennaKind::Discone,
                 min_hz: Hz(30_000_000),
-                max_hz: Hz(6_000_000_000),
+                max_hz: Hz(u64::MAX),
                 height_m: 5.0,
                 azimuth_deg: None,
                 elevation_deg: None,

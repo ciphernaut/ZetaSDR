@@ -134,3 +134,16 @@ fn an_unknown_field_on_a_fieldless_station_op_is_rejected() {
     assert!(serde_json::from_str::<Op>(r#"{"op":"station_clear","x":1}"#).is_err());
     assert!(serde_json::from_str::<Op>(r#"{"op":"station_get"}"#).is_ok());
 }
+
+#[test]
+fn the_default_antenna_above_hf_has_no_ceiling() {
+    let s = Station {
+        lat: 0.0,
+        lon: 0.0,
+        alt_m: 0.0,
+        region: "AU".into(),
+        antennas: vec![],
+    };
+    assert_eq!(s.antenna_for(Hz(40_000_000_000)).id, "discone");
+    assert_eq!(Station::default_antennas(0.0)[1].max_hz, Hz(u64::MAX));
+}
