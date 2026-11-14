@@ -159,7 +159,7 @@ pub fn horizon_km(h1_m: f64, h2_m: f64, k_factor: f64) -> f64 {
 
 /// Free-space path loss in dB.
 fn free_space_db(km: f64, freq_hz: u64) -> f64 {
-    32.45 + 20.0 * km.max(MIN_DISTANCE_KM).log10() + 20.0 * (freq_hz as f64 / 1e6).log10()
+    32.45 + 20.0 * km.max(MIN_DISTANCE_KM).log10() + 20.0 * (freq_hz.max(1) as f64 / 1e6).log10()
 }
 
 fn observer_height_m(o: &Observer) -> f64 {
@@ -212,11 +212,14 @@ pub fn estimate(o: &Observer, e: &Emitter, p: &Propagation) -> (Geometry, Expect
     };
 
     // The radiated level, with the off-beam loss.
-    let eirp_dbm = match (e.eirp_w, e.power_w) {
+    // A zero or non-finite power is a hole in the row, not a level.
+    let usable = |w: Option<f64>| w.filter(|w| w.is_finite() && *w > 0.0);
+    let eirp_dbm = match (usable(e.eirp_w), usable(e.power_w)) {
         (Some(w), _) => Some(10.0 * (w * 1000.0).log10()),
         (None, Some(w)) => {
             miss("eirp");
-            Some(10.0 * (w * 1000.0).log10() + e.gain_dbi.unwrap_or(0.0))
+            let gain = e.gain_dbi.filter(|g| g.is_finite()).unwrap_or(0.0);
+            Some(10.0 * (w * 1000.0).log10() + gain)
         }
         (None, None) => {
             miss("eirp");
@@ -238,13 +241,15 @@ pub fn estimate(o: &Observer, e: &Emitter, p: &Propagation) -> (Geometry, Expect
         miss("level");
         None
     } else {
-        eirp_dbm.map(|eirp| {
-            let mut loss = free_space_db(distance_km, e.freq_hz) + off_beam_loss;
-            if let (PathMode::BeyondHorizon, Some(h)) = (mode, horizon) {
-                loss += p.beyond_horizon_db_per_km * (distance_km - h);
-            }
-            eirp - loss
-        })
+        eirp_dbm
+            .map(|eirp| {
+                let mut loss = free_space_db(distance_km, e.freq_hz) + off_beam_loss;
+                if let (PathMode::BeyondHorizon, Some(h)) = (mode, horizon) {
+                    loss += p.beyond_horizon_db_per_km * (distance_km - h);
+                }
+                eirp - loss
+            })
+            .filter(|l| l.is_finite())
     };
 
     let in_range = match mode {
@@ -437,6 +442,65 @@ mod tests {
         for k in ["eirp", "site_elevation", "antenna_height"] {
             assert!(e.unknown.contains(&k.to_string()));
         }
+    }
+
+    #[test]
+    fn a_zero_power_row_has_no_level_and_names_eirp() {
+        let z = Emitter {
+            eirp_w: Some(0.0),
+            power_w: Some(0.0),
+            ..site(10.0)
+        };
+        let (g, e) = estimate(&obs(4.0), &z, &Propagation::default());
+        assert_eq!(e.level_dbm, None);
+        assert!(e.unknown.contains(&"eirp".to_string()));
+        assert!(g.distance_km.is_finite() && g.bearing_deg.is_finite());
+        assert!(g.horizon_km.unwrap().is_finite());
+    }
+
+    #[test]
+    fn a_zero_eirp_falls_back_to_power_and_gain() {
+        let z = Emitter {
+            eirp_w: Some(0.0),
+            power_w: Some(25.0),
+            gain_dbi: Some(0.0),
+            ..site(10.0)
+        };
+        let (_, e) = estimate(&obs(4.0), &z, &Propagation::default());
+        assert!((e.level_dbm.unwrap() - (43.98 - 105.51)).abs() < 0.2);
+        assert!(e.unknown.contains(&"eirp".to_string()));
+    }
+
+    #[test]
+    fn a_zero_frequency_does_not_produce_an_infinity() {
+        let z = Emitter {
+            freq_hz: 0,
+            ..site(10.0)
+        };
+        let (_, e) = estimate(&obs(4.0), &z, &Propagation::default());
+        assert!(e.level_dbm.unwrap().is_finite());
+    }
+
+    #[test]
+    fn beyond_the_horizon_a_strong_signal_is_still_in_range() {
+        let strong = Emitter {
+            eirp_w: Some(1.0e6),
+            ..site(60.0)
+        };
+        let (g, e) = estimate(&obs(4.0), &strong, &Propagation::default());
+        assert!(g.beyond_horizon);
+        assert!(e.level_dbm.unwrap() >= Propagation::default().in_range_floor_dbm);
+        assert_eq!(e.in_range, InRange::Yes);
+    }
+
+    #[test]
+    fn a_ground_wave_path_beyond_its_range_is_out_of_range() {
+        let mf = Emitter {
+            freq_hz: 500_000,
+            ..site(400.0)
+        };
+        let (_, e) = estimate(&obs(4.0), &mf, &Propagation::default());
+        assert_eq!((e.mode, e.in_range), (PathMode::GroundWave, InRange::No));
     }
 
     #[test]
