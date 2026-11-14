@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use zeta_core::emission::{Emission, parse_emission};
+use zeta_core::emission::parse_emission;
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
 use zeta_core::propagation::{bearing_deg, haversine_km};
 use zeta_core::reach::{Reach, reach_for};
+use zeta_core::register::note_line;
 use zeta_core::station::Station;
 use zeta_core::types::Hz;
 
@@ -622,6 +623,7 @@ fn assignment(r: Row, here: Option<&Here>) -> Allocation {
         kind: Some("assignment".into()),
         licensee: r.licensee,
         site: r.site,
+        site_id: None,
         lat: r.lat,
         lon: r.lon,
         distance_km,
@@ -660,77 +662,10 @@ fn to_watts(p: f64, unit: &str) -> Option<f64> {
     }
 }
 
-/// `licensee, site, 10 km, 1 W, 16 kHz FM data`, the parts the row lacks dropped.
-fn note_line(
-    licensee: Option<&str>,
-    site: Option<&str>,
-    distance_km: Option<f64>,
-    power_w: Option<f64>,
-    emission: Option<&str>,
-    decoded: Option<&Emission>,
-) -> Option<String> {
-    let parts: Vec<String> = [
-        licensee.map(str::to_string),
-        site.map(str::to_string),
-        distance_km.map(|d| format!("{d:.0} km")),
-        power_w.map(|p| format!("{} W", trim_num(p))),
-        decoded.map(emission_words).or(emission.map(str::to_string)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
-/// A number with at most three decimals and no trailing zeros.
-fn trim_num(x: f64) -> String {
-    let s = format!("{x:.3}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
-/// `16K0F1D` as `16 kHz FM data`.
-fn emission_words(e: &Emission) -> String {
-    let hz = e.bandwidth_hz.0 as f64;
-    let bw = if hz < 1e3 {
-        format!("{} Hz", trim_num(hz))
-    } else if hz < 1e6 {
-        format!("{} kHz", trim_num(hz / 1e3))
-    } else {
-        format!("{} MHz", trim_num(hz / 1e6))
-    };
-    let modulation = match e.modulation {
-        'N' => "carrier",
-        'A' => "AM",
-        'H' | 'R' | 'J' => "SSB",
-        'B' => "ISB",
-        'C' => "VSB",
-        'F' => "FM",
-        'G' => "PM",
-        'D' => "AM/PM",
-        'P' | 'K' | 'L' | 'M' | 'Q' | 'V' => "pulse",
-        'W' => "mixed",
-        _ => "other",
-    };
-    let info = match e.info {
-        'A' | 'B' => "telegraphy",
-        'C' => "fax",
-        'D' => "data",
-        'E' => "voice",
-        'F' => "video",
-        'W' => "mixed",
-        'X' => "other",
-        _ => "",
-    };
-    [bw.as_str(), modulation, info]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeta_core::register::emission_words;
 
     #[test]
     fn power_units_convert_to_watts() {

@@ -19,6 +19,7 @@ pub mod plans;
 pub mod port;
 pub mod propagation;
 pub mod reach;
+pub mod register;
 pub mod ring;
 pub mod sessions;
 pub mod sets;

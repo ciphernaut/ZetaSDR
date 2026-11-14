@@ -1,0 +1,10 @@
+{
+  "id": "candidates",
+  "provider": "acma",
+  "name": "Candidate assignments near a frequency",
+  "call": "execute_sql",
+  "sql": "SELECT 1 AS center_hz",
+  "params": [],
+  "limit": 50,
+  "columns": ["center_hz"]
+}

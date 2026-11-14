@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::emission::Emission;
 use crate::reach::Reach;
+use crate::register::{RegisterAnswer, Signal};
 use crate::station::Station;
 use crate::types::{Baud, Hz};
 
@@ -68,6 +69,10 @@ pub struct Allocation {
     #[serde(default)]
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     pub callsign: Option<String>,
+    /// The register's id of the assignment's site, when it holds one.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub site_id: Option<String>,
     /// `tx` or `rx`.
     #[serde(default)]
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
@@ -161,6 +166,20 @@ pub trait KnowledgeProvider: Send + Sync {
     /// How far from the station this provider searched for the band, when it
     /// applies a reach.
     async fn reach(&self, _region: &str, _center_hz: Hz, _bandwidth_hz: Hz) -> Option<Reach> {
+        None
+    }
+    /// The regions this provider answers for; empty means any.
+    fn regions(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The register's whole answer for a signal as heard from `from`; `None` from a
+    /// provider that has none.
+    async fn describe(
+        &self,
+        _region: &str,
+        _signal: &Signal,
+        _from: Option<&Station>,
+    ) -> Option<RegisterAnswer> {
         None
     }
     /// [`allocations`](Self::allocations) as seen from `from` instead of the node's

@@ -129,6 +129,7 @@ fn row(licence: &str, licensee: &str, site: &str, emission: &str, center: u64) -
         kind: Some("assignment".into()),
         licensee: Some(licensee.into()),
         site: Some(site.into()),
+        site_id: None,
         lat: Some(-27.35),
         lon: Some(153.08),
         distance_km: None,

@@ -1438,6 +1438,7 @@ mod tests {
             kind: Some("assignment".into()),
             licensee: Some("Example Water Authority".into()),
             site: Some("Example Hill".into()),
+            site_id: None,
             lat: Some(-27.35),
             lon: Some(153.08),
             distance_km: km,
