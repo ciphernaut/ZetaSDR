@@ -19,6 +19,7 @@ test-fake = ["dep:axum", "dep:rusqlite"]
 [dependencies]
 async-trait = "0.1.92"
 axum = { version = "0.8.9", optional = true }
+futures-util = "0.3"
 num-complex = "0.4.6"
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }

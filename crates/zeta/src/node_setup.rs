@@ -646,7 +646,10 @@ pub async fn attach_acma(node: &Node, state_dir: &Path, flag: Option<&(String, O
     let dir = state_dir.to_path_buf();
     let station: zeta_ext::acma::StationFn = Arc::new(move || zeta_core::station::load(&dir).0);
     node.add_knowledge(Arc::new(zeta_ext::acma::AcmaKnowledge::new(
-        client, *reach_km, station,
+        client,
+        *reach_km,
+        station,
+        Arc::new(zeta_core::register::RegisterQueries::builtin()),
     )));
 }
 

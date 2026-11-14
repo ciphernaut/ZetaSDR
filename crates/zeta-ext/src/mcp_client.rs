@@ -1,8 +1,10 @@
 //! A minimal MCP client over streamable HTTP: one session per client, opened on
 //! first use (`initialize`, then `notifications/initialized`), `tools/call` with
-//! the `mcp-session-id` header, answers read from the SSE `data:` lines.
+//! the `mcp-session-id` header, answers read from the SSE `data:` lines. Calls on one
+//! client run concurrently, each with its own JSON-RPC id.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -15,6 +17,8 @@ pub const CLIENT_NAME: &str = "zetasdr";
 
 const SESSION_HEADER: &str = "mcp-session-id";
 const NOT_INITIALIZED: &str = "not initialized";
+/// The JSON-RPC id of the first `tools/call` (`initialize` is 1).
+const FIRST_CALL_ID: u64 = 2;
 
 /// Why a call failed.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +59,7 @@ pub struct McpClient {
     http: reqwest::Client,
     base: String,
     session: Mutex<Option<String>>,
+    next_id: AtomicU64,
 }
 
 impl McpClient {
@@ -69,6 +74,7 @@ impl McpClient {
             http,
             base: base_url.trim_end_matches('/').to_string(),
             session: Mutex::new(None),
+            next_id: AtomicU64::new(FIRST_CALL_ID),
         })
     }
 
@@ -85,33 +91,42 @@ impl McpClient {
     }
 
     /// Call `tool` with `args`: the first text content, as JSON when it parses,
-    /// else as a string. A lost session is reopened once.
+    /// else as a string. A lost session is reopened once. Only opening the session is
+    /// serialised; calls on an open session run side by side.
     pub async fn call(&self, tool: &str, args: Value) -> Result<Value, McpError> {
-        let mut session = self.session.lock().await;
         let body = json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "jsonrpc": "2.0", "id": self.next_id.fetch_add(1, Ordering::Relaxed),
+            "method": "tools/call",
             "params": {"name": tool, "arguments": args},
         });
         for attempt in 0..2 {
-            let sid = match session.as_ref() {
-                Some(s) => s.clone(),
-                None => {
-                    let s = self.open().await?;
-                    *session = Some(s.clone());
-                    s
-                }
-            };
+            let sid = self.session_id().await?;
             match self.post(&body, Some(&sid)).await {
                 Err(McpError::Rpc { message, .. })
                     if attempt == 0 && message.contains(NOT_INITIALIZED) =>
                 {
-                    *session = None;
+                    // Forget the lost session unless another call already replaced it.
+                    let mut session = self.session.lock().await;
+                    if session.as_deref() == Some(sid.as_str()) {
+                        *session = None;
+                    }
                 }
                 Err(e) => return Err(e),
                 Ok((_, v)) => return content_of(&v),
             }
         }
         unreachable!("the second attempt always returns")
+    }
+
+    /// The open session's id, opening one first when there is none.
+    async fn session_id(&self) -> Result<String, McpError> {
+        let mut session = self.session.lock().await;
+        if let Some(s) = session.as_ref() {
+            return Ok(s.clone());
+        }
+        let s = self.open().await?;
+        *session = Some(s.clone());
+        Ok(s)
     }
 
     /// `initialize` + `notifications/initialized`; the session id.

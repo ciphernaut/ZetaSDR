@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use zeta_core::knowledge::KnowledgeProvider;
+use zeta_core::propagation::{Observer, Propagation, search_km};
 use zeta_core::reach::ReachClass;
+use zeta_core::register::{RegisterQueries, RegisterState, Signal};
 use zeta_core::station::Station;
 use zeta_core::types::Hz;
 use zeta_ext::acma::AcmaKnowledge;
@@ -95,7 +97,44 @@ fn demo_station() -> Option<Station> {
 
 fn provider(url: &str, station: Option<Station>) -> AcmaKnowledge {
     let client = McpClient::new(url, Duration::from_secs(10)).unwrap();
-    AcmaKnowledge::new(client, None, Arc::new(move || station.clone()))
+    AcmaKnowledge::new(
+        client,
+        None,
+        Arc::new(move || station.clone()),
+        Arc::new(RegisterQueries::builtin()),
+    )
+}
+
+/// The search bound from `s` at 404 MHz: the propagation estimate's, with the defaults.
+fn bound_from(s: &Station) -> f64 {
+    let o = Observer {
+        lat: s.lat,
+        lon: s.lon,
+        alt_m: s.alt_m,
+        antenna_height_m: s.antenna_for(Hz(404_025_000)).height_m,
+    };
+    search_km(&o, 404_025_000, &Propagation::default()).unwrap()
+}
+
+/// The last `candidates` statement the stub ran.
+fn candidates_sql(stub: &Stub) -> String {
+    stub.seen
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|q| q.contains("s.LATITUDE BETWEEN"))
+        .cloned()
+        .expect("a candidates query")
+}
+
+/// The latitude bounds of a `candidates` statement.
+fn lat_bounds(sql: &str) -> (f64, f64) {
+    let key = "s.LATITUDE BETWEEN ";
+    let mut words = sql[sql.find(key).unwrap() + key.len()..].split_whitespace();
+    let lo = words.next().unwrap().parse().unwrap();
+    assert_eq!(words.next(), Some("AND"));
+    (lo, words.next().unwrap().parse().unwrap())
 }
 
 #[tokio::test]
@@ -126,8 +165,9 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
         .filter(|x| x.kind.as_deref() == Some("assignment"))
         .collect();
     assert_eq!(asg.len(), 4);
-    // The plan rows come first.
-    assert_eq!(a[0].kind.as_deref(), Some("plan"));
+    // The assignments come first, in rank order, then the plan rows.
+    assert_eq!(a[0].kind.as_deref(), Some("assignment"));
+    assert_eq!(a[4].kind.as_deref(), Some("plan"));
     let first = asg[0];
     assert_eq!(first.licensee.as_deref(), Some("Example Water Authority"));
     assert_eq!(first.role.as_deref(), Some("tx")); // 1 W, nearest tx
@@ -156,14 +196,20 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
         first.note.as_deref(),
         Some("Example Water Authority, Example Site Hill Rd, 10 km, 1 W, 16 kHz FM data")
     );
-    assert_eq!(asg[1].role.as_deref(), Some("rx"));
-    assert_eq!(asg[1].power_w, None);
-    assert!(asg.windows(2).all(|w| w[0].distance_km <= w[1].distance_km));
+    assert_eq!(first.site_id.as_deref(), Some("S2"));
+    assert_eq!(first.as_of.as_deref(), Some("2026-01-01T00:00:00.000Z"));
+    // Ranked by expected level: the two transmitters (the nearer stronger), then the
+    // receivers, which have no level, nearest first.
+    assert_eq!(asg[1].site.as_deref(), Some("Example Rail Site A"));
+    assert_eq!(asg[1].role.as_deref(), Some("tx"));
+    assert_eq!(asg[2].site.as_deref(), Some("Example Depot"));
+    assert_eq!(asg[2].role.as_deref(), Some("rx"));
+    assert_eq!(asg[2].power_w, None);
+    assert_eq!(asg[3].site.as_deref(), Some("Example Rail Site B"));
+    assert!(asg[2].distance_km < asg[3].distance_km);
     assert!(a.iter().all(|x| x.provider == "acma" && x.region == "AU"));
-    // The query: the overlap, the joins, a bounding box of the 150 km reach.
-    let sql = stub.sql.lock().unwrap().clone().unwrap();
-    assert_eq!(sql["limit"], 200);
-    let q = sql["sql"].as_str().unwrap();
+    // The query: the overlap, the joins, a bounding box of the search bound.
+    let q = candidates_sql(&stub);
     assert!(
         q.contains("FREQUENCY - COALESCE(d.BANDWIDTH, 0) / 2 <= 404033000"),
         "{q}"
@@ -172,16 +218,16 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
         q.contains("FREQUENCY + COALESCE(d.BANDWIDTH, 0) / 2 >= 404017000"),
         "{q}"
     );
-    assert!(q.contains("LATITUDE BETWEEN"), "{q}");
+    let bound = bound_from(&demo_station().unwrap());
+    let (lo, hi) = lat_bounds(&q);
+    assert!((hi - lo - 2.0 * bound / 111.0).abs() < 1e-9, "{q}");
 
     let r = provider
         .reach("AU", Hz(404_025_000), Hz(16_000))
         .await
         .unwrap();
-    assert_eq!((r.class, r.km), (ReachClass::Uhf, Some(150.0)));
+    assert_eq!((r.class, r.km), (ReachClass::Uhf, Some(bound)));
     assert_eq!(r.antenna, "discone");
-    // The stub read the band from the query (its rows were cut by it, not passed whole).
-    assert_eq!(stub.unbanded.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -204,12 +250,8 @@ async fn without_a_station_the_list_is_by_frequency_distance_with_null_km() {
     assert_eq!(asg[0].role.as_deref(), Some("tx"));
     assert_eq!(asg[1].role.as_deref(), Some("tx"));
     assert_eq!(asg[2].role.as_deref(), Some("rx"));
-    // No reach, so no bounding box.
-    let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(!q.contains("LATITUDE BETWEEN"), "{q}");
+    // No observer, so the box is the whole globe.
+    assert_eq!(lat_bounds(&candidates_sql(&stub)), (-90.0, 90.0));
     assert!(asg[0].note.as_deref().is_some_and(|n| !n.contains(" km")));
     assert_eq!(
         provider.reach("AU", Hz(404_030_000), Hz(16_000)).await,
@@ -241,23 +283,23 @@ async fn another_region_is_empty() {
 }
 
 #[tokio::test]
-async fn reach_reuses_the_plan_of_the_lookup_just_made() {
+async fn the_data_date_is_read_once_a_minute() {
     let (url, stub) = serve(Mode::Normal).await;
     let provider = provider(&url, demo_station());
-    provider
-        .allocations("AU", Hz(404_025_000), Hz(16_000))
-        .await;
-    let r = provider.reach("AU", Hz(404_025_000), Hz(16_000)).await;
-    assert_eq!(r.map(|r| r.class), Some(ReachClass::Uhf));
-    assert_eq!(stub.plans.load(Ordering::SeqCst), 1);
-    // Another centre has no plan answer yet: reach asks for it.
-    provider.reach("AU", Hz(404_050_000), Hz(16_000)).await;
-    assert_eq!(stub.plans.load(Ordering::SeqCst), 2);
+    for center in [404_025_000, 404_030_000] {
+        let a = provider.allocations("AU", Hz(center), Hz(16_000)).await;
+        assert!(!a.is_empty());
+        assert!(
+            a.iter()
+                .all(|x| x.as_of.as_deref() == Some("2026-01-01T00:00:00.000Z"))
+        );
+    }
+    assert_eq!(stub.healths.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn a_hung_service_costs_one_lookup_one_deadline() {
-    let (url, stub) = serve(Mode::Slow).await;
+    let (url, _) = serve(Mode::Slow).await;
     let deadline = Duration::from_millis(500);
     let provider = provider(&url, demo_station()).with_timeout(deadline);
     let t0 = std::time::Instant::now();
@@ -267,13 +309,15 @@ async fn a_hung_service_costs_one_lookup_one_deadline() {
             .await
             .is_empty()
     );
-    let r = provider.reach("AU", Hz(404_025_000), Hz(16_000)).await;
     let took = t0.elapsed();
     assert!(took < deadline + Duration::from_millis(300), "{took:?}");
+    // The reach is one more lookup, with its own deadline.
+    let r = provider.reach("AU", Hz(404_025_000), Hz(16_000)).await;
+    let took = t0.elapsed();
+    assert!(took < 2 * deadline + Duration::from_millis(300), "{took:?}");
     // The failed plan reads as no space band; the reach is the band's own.
     assert_eq!(r.map(|r| r.class), Some(ReachClass::Uhf));
-    assert_eq!(stub.plans.load(Ordering::SeqCst), 1);
-    assert_eq!(provider.errors(), 1);
+    assert_eq!(provider.errors(), 2);
 }
 
 #[tokio::test]
@@ -320,8 +364,7 @@ async fn a_device_without_a_bandwidth_is_kept() {
         .allocations("AU", Hz(404_025_000), Hz(16_000))
         .await;
     // The query matches a NULL bandwidth as 0 Hz wide instead of dropping it ...
-    let sql = stub.sql.lock().unwrap().clone().unwrap();
-    let q = sql["sql"].as_str().unwrap();
+    let q = candidates_sql(&stub);
     assert!(!q.contains(" d.BANDWIDTH / 2"), "{q}");
     assert!(q.contains("COALESCE(d.BANDWIDTH, 0) / 2"), "{q}");
     // ... and the row it answers becomes an assignment like the others.
@@ -333,7 +376,8 @@ async fn a_device_without_a_bandwidth_is_kept() {
     assert!(
         asg.iter()
             .any(|x| x.site.as_deref() == Some("Example Rail Site A")
-                && x.center_hz == Some(Hz(404_025_000))),
+                && x.center_hz == Some(Hz(404_025_000))
+                && x.bandwidth_hz.is_none()),
         "{asg:?}"
     );
 }
@@ -365,32 +409,32 @@ async fn the_sql_names_call_sign_and_a_column_fills_it() {
             .filter(|x| x.kind.as_deref() == Some("plan"))
             .all(|x| x.callsign.is_none())
     );
-    let sql = stub.sql.lock().unwrap().clone().unwrap();
-    let q = sql["sql"].as_str().unwrap();
-    assert!(q.contains("d.CALL_SIGN AS CALL_SIGN"), "{q}");
+    let q = candidates_sql(&stub);
+    assert!(q.contains("d.CALL_SIGN AS callsign"), "{q}");
 }
 
+/// A register answering without a column a query declares (here the call sign) fails
+/// that query by name; the plan still stands.
 #[tokio::test]
-async fn a_stub_without_the_column_leaves_callsign_null() {
+async fn an_answer_without_a_declared_column_fails_that_query_by_name() {
     let (url, _) = serve(Mode::NoCallSign).await;
-    let without = provider(&url, demo_station())
-        .allocations("AU", Hz(404_025_000), Hz(16_000))
-        .await;
-    let (url, _) = serve(Mode::Normal).await;
-    let with = provider(&url, demo_station())
-        .allocations("AU", Hz(404_025_000), Hz(16_000))
-        .await;
-    assert_eq!(without.len(), 8);
-    assert!(without.iter().all(|x| x.callsign.is_none()));
-    // Nothing else changes.
-    let cleared: Vec<_> = with
-        .into_iter()
-        .map(|mut x| {
-            x.callsign = None;
-            x
-        })
-        .collect();
-    assert_eq!(without, cleared);
+    let provider = provider(&url, demo_station());
+    let signal = Signal {
+        center_hz: Hz(404_025_000),
+        bandwidth_hz: Hz(16_000),
+    };
+    let a = provider
+        .describe("AU", &signal, demo_station().as_ref())
+        .await
+        .unwrap();
+    assert_eq!(a.status.state, RegisterState::Partial);
+    let failed: Vec<&str> = a.status.failed.iter().map(|f| f.query.as_str()).collect();
+    assert_eq!(failed, ["candidates", "area_devices"]);
+    assert!(a.status.failed[0].reason.contains("callsign"), "{failed:?}");
+    let rows = a.allocations();
+    assert_eq!(rows.len(), 4);
+    assert!(rows.iter().all(|x| x.kind.as_deref() == Some("plan")));
+    assert_eq!(provider.errors(), 1);
 }
 
 #[tokio::test]
@@ -407,15 +451,9 @@ async fn allocations_from_another_station_cuts_and_measures_from_it() {
         .iter()
         .filter(|x| x.kind.as_deref() == Some("assignment"))
         .collect();
-    // The rail sites, about 165 km from the north station, fall outside the 150 km
-    // reach; the hill site 9 km from the demo station is about 91 km from it.
-    assert!(
-        !asg.is_empty()
-            && asg
-                .iter()
-                .all(|x| x.licensee.as_deref() == Some("Example Water Authority")),
-        "{asg:?}"
-    );
+    // Every site lies inside the search bound from the north station (the rail sites
+    // about 165 km away); the hill site 9 km from the demo station is about 91 km from it.
+    assert_eq!(asg.len(), 4, "{asg:?}");
     let hill = asg
         .iter()
         .find(|x| x.site.as_deref() == Some("Example Site Hill Rd"))
@@ -425,20 +463,15 @@ async fn allocations_from_another_station_cuts_and_measures_from_it() {
     let b = hill.bearing_deg.unwrap();
     assert!((150.0..200.0).contains(&b), "{b}"); // about south
     // The query's box is around the north station.
-    let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let (lo, hi) = (north.lat - 150.0 / 111.0, north.lat + 150.0 / 111.0);
-    assert!(
-        q.contains(&format!("s.LATITUDE BETWEEN {lo:.6} AND {hi:.6}")),
-        "{q}"
-    );
+    let bound = bound_from(&north);
+    let (lo, hi) = lat_bounds(&candidates_sql(&stub));
+    assert!((lo - (north.lat - bound / 111.0)).abs() < 1e-9, "{lo}");
+    assert!((hi - (north.lat + bound / 111.0)).abs() < 1e-9, "{hi}");
     let r = provider
         .reach_from("AU", Hz(404_025_000), Hz(16_000), Some(&north))
         .await
         .unwrap();
-    assert_eq!(r.km, Some(150.0));
+    assert_eq!(r.km, Some(bound));
 
     // No vantage: no distances and no box, though the provider has a station.
     let a = provider
@@ -453,80 +486,11 @@ async fn allocations_from_another_station_cuts_and_measures_from_it() {
         asg.iter()
             .all(|x| x.distance_km.is_none() && x.bearing_deg.is_none())
     );
-    let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(!q.contains("LATITUDE BETWEEN"), "{q}");
+    assert_eq!(lat_bounds(&candidates_sql(&stub)), (-90.0, 90.0));
     assert_eq!(
         provider
             .reach_from("AU", Hz(404_025_000), Hz(16_000), None)
             .await,
         None
     );
-}
-
-#[tokio::test]
-async fn a_register_without_the_call_sign_column_is_probed_once_and_selects_null() {
-    for mode in [
-        Mode::NoCallSignColumnRpc,
-        Mode::NoCallSignColumnTool,
-        Mode::NoCallSignColumnGeneric,
-        Mode::NoCallSignColumnJson,
-    ] {
-        let (url, stub) = serve(mode).await;
-        let provider = provider(&url, demo_station());
-        for center in [404_025_000, 404_030_000] {
-            let a = provider.allocations("AU", Hz(center), Hz(16_000)).await;
-            let asg: Vec<_> = a
-                .iter()
-                .filter(|x| x.kind.as_deref() == Some("assignment"))
-                .collect();
-            assert_eq!(asg.len(), 4, "{mode:?}: {a:?}");
-            assert!(a.iter().all(|x| x.callsign.is_none()));
-            let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
-                .as_str()
-                .unwrap()
-                .to_string();
-            assert!(q.contains("NULL AS CALL_SIGN"), "{q}");
-        }
-        // One rejected probe, then each lookup asks once: 1 + 2 queries.
-        assert_eq!(stub.rejected.load(Ordering::SeqCst), 1);
-        assert_eq!(stub.queries.load(Ordering::SeqCst), 3);
-        assert_eq!(provider.errors(), 0);
-    }
-}
-
-#[tokio::test]
-async fn a_register_with_the_column_is_asked_once_per_lookup() {
-    let (url, stub) = serve(Mode::Normal).await;
-    let provider = provider(&url, demo_station());
-    for _ in 0..2 {
-        provider
-            .allocations("AU", Hz(404_025_000), Hz(16_000))
-            .await;
-    }
-    assert_eq!(stub.queries.load(Ordering::SeqCst), 2);
-    assert_eq!(stub.rejected.load(Ordering::SeqCst), 0);
-}
-
-/// A register that fails every query, with or without `CALL_SIGN`, settles nothing: each
-/// lookup asks twice (the probe and the retry), and the lookup fails.
-#[tokio::test]
-async fn a_register_failing_every_query_keeps_probing() {
-    let (url, stub) = serve(Mode::SqlFails).await;
-    let provider = provider(&url, demo_station());
-    for _ in 0..2 {
-        let a = provider
-            .allocations("AU", Hz(404_025_000), Hz(16_000))
-            .await;
-        assert!(a.is_empty(), "{a:?}");
-    }
-    assert_eq!(stub.queries.load(Ordering::SeqCst), 4);
-    assert_eq!(provider.errors(), 2);
-    let q = stub.sql.lock().unwrap().clone().unwrap()["sql"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(q.contains("NULL AS CALL_SIGN"), "{q}");
 }

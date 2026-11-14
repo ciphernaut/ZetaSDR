@@ -1,11 +1,11 @@
 //! A stub of the register service (the MCP server the `acma` provider asks), served on
 //! 127.0.0.1 by [`serve`] or [`serve_fixture`]: `initialize` (giving a session id),
-//! `tools/call` for `execute_sql` and `get_frequency_allocation`, and `GET /health`.
+//! `tools/call` for `execute_sql`, and `GET /health`.
 //!
 //! The register is a [`Fixture`]: a synthetic in-memory SQLite database with the service's
 //! table and column names. `execute_sql` runs the statement it is given on it, for real
-//! (`SELECT` and `WITH` only), and answers the service's envelope. `get_frequency_allocation`
-//! answers from the fixture's `spectrum_allocations`. Every row a test hands it is synthetic.
+//! (`SELECT` and `WITH` only), and answers the service's envelope. Every row a test hands it
+//! is synthetic.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -142,7 +142,7 @@ impl Fixture {
         let db = Connection::open_in_memory().expect("an in-memory register");
         db.execute_batch(SCHEMA).expect("the register schema");
         db.execute(
-            "INSERT INTO spectrum_allocations VALUES (?1, ?2, 'MHz', 50, ?3, '[]', '')",
+            "INSERT INTO spectrum_allocations VALUES (?1, ?2, 'MHz', 50, ?3, '[\"AUS29\"]', '')",
             rusqlite::params![
                 PLAN_HZ.0 as i64,
                 PLAN_HZ.1 as i64,
@@ -255,44 +255,6 @@ impl Fixture {
         }
         Ok((columns, out, truncated))
     }
-
-    /// The plan answer for `freq_hz`: the narrowest `spectrum_allocations` segment holding
-    /// it, or no entry.
-    fn plan(&self, freq_hz: Option<u64>, satellite: bool) -> Value {
-        let none = json!({"match_count": 0, "allocation": null, "regions": {}});
-        let Some(freq_hz) = freq_hz else {
-            return none;
-        };
-        let db = self.db.lock().unwrap();
-        let found = db.query_row(
-            "SELECT freq_start_hz, freq_end_hz, unit, page, services_json, footnotes_json \
-             FROM spectrum_allocations WHERE freq_start_hz <= ?1 AND freq_end_hz >= ?1 \
-             ORDER BY freq_end_hz - freq_start_hz LIMIT 1",
-            [freq_hz as i64],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                ))
-            },
-        );
-        let Ok((start, end, unit, page, services, footnotes)) = found else {
-            return none;
-        };
-        let services = if satellite {
-            plan_services(true)
-        } else {
-            serde_json::from_str(&services).unwrap_or(Value::Null)
-        };
-        let footnotes: Value = serde_json::from_str(&footnotes).unwrap_or(json!([]));
-        json!({"match_count": 1, "allocation": {"freq_start_hz": start, "freq_end_hz": end,
-            "unit": unit, "page": page, "services": services, "footnotes": footnotes,
-            "raw": ""}, "regions": {}})
-    }
 }
 
 /// How the stub misbehaves, if at all.
@@ -300,7 +262,7 @@ impl Fixture {
 pub enum Mode {
     #[default]
     Normal,
-    /// The plan entry is a satellite service.
+    /// The plan segment's services are a satellite service.
     Satellite,
     /// Every tool call is a JSON-RPC error.
     RpcError,
@@ -310,22 +272,8 @@ pub enum Mode {
     Slow,
     /// The first row without a `BANDWIDTH` (NULL in the register).
     NullBandwidth,
-    /// A service that answers no `CALL_SIGN` column.
+    /// A service whose answers lack the call sign column (`CALL_SIGN` or `callsign`).
     NoCallSign,
-    /// An older register whose `device_details` lacks `CALL_SIGN`: SQL naming
-    /// `d.CALL_SIGN` is rejected with SQLite's error as a JSON-RPC error.
-    NoCallSignColumnRpc,
-    /// The same register answering the rejection as a tool error's text.
-    NoCallSignColumnTool,
-    /// The same register wrapping the rejection as a JSON-RPC error that names no
-    /// column (`query failed`).
-    NoCallSignColumnGeneric,
-    /// The same register answering the rejection as a JSON error object in the tool's
-    /// text (`{"error":"query failed"}`).
-    NoCallSignColumnJson,
-    /// Every `execute_sql` call is a JSON-RPC error (`query failed`), with or without
-    /// `CALL_SIGN`; the plan still answers.
-    SqlFails,
 }
 
 /// What the stub answers from, and what it saw.
@@ -336,20 +284,16 @@ pub struct Stub {
     pub fixture: Fixture,
     /// Tool calls seen.
     pub calls: AtomicUsize,
-    /// `get_frequency_allocation` calls seen.
-    pub plans: AtomicUsize,
     /// The last `execute_sql` arguments.
     pub sql: Mutex<Option<Value>>,
+    /// Every `execute_sql` statement seen, in arrival order.
+    pub seen: Mutex<Vec<String>>,
     /// `execute_sql` calls seen.
     pub queries: AtomicUsize,
-    /// `execute_sql` calls rejected for naming a missing `CALL_SIGN` (every call under
-    /// [`Mode::SqlFails`]).
-    pub rejected: AtomicUsize,
-    /// Kept for tests that assert the stub never had to guess a band: the stub runs the
-    /// SQL for real now, so it stays 0.
-    pub unbanded: AtomicUsize,
     /// The body of `GET /health`.
     pub health: Mutex<Value>,
+    /// `GET /health` requests seen.
+    pub healths: AtomicUsize,
     /// An `execute_sql` whose text contains this answers an error.
     pub fail_matching: Mutex<Option<String>>,
 }
@@ -373,14 +317,8 @@ fn execute_sql(s: &Stub, id: &Value, args: &Value) -> Result<Value, Value> {
     *s.sql.lock().unwrap() = Some(args.clone());
     s.queries.fetch_add(1, Ordering::SeqCst);
     let sql = args["sql"].as_str().unwrap_or_default();
+    s.seen.lock().unwrap().push(sql.to_string());
     let limit = args["limit"].as_u64().map_or(DEFAULT_LIMIT, |n| n as usize);
-    let older = matches!(
-        s.mode,
-        Mode::NoCallSignColumnRpc
-            | Mode::NoCallSignColumnTool
-            | Mode::NoCallSignColumnGeneric
-            | Mode::NoCallSignColumnJson
-    );
     if s.fail_matching
         .lock()
         .unwrap()
@@ -392,30 +330,14 @@ fn execute_sql(s: &Stub, id: &Value, args: &Value) -> Result<Value, Value> {
             "query failed (the stub was told to fail it)",
         ));
     }
-    let answer = if s.mode == Mode::SqlFails {
-        Err("no such column: d.CALL_SIGN".to_string())
-    } else {
-        s.fixture.query(sql, limit)
-    };
-    let (mut columns, mut rows, truncated) = match answer {
-        Ok(a) => a,
-        Err(error) if s.mode == Mode::SqlFails || (older && error.contains("CALL_SIGN")) => {
-            s.rejected.fetch_add(1, Ordering::SeqCst);
-            return Err(match s.mode {
-                Mode::NoCallSignColumnRpc => json!({"jsonrpc":"2.0","id":id,
-                    "error":{"code":-32603,"message":error}}),
-                Mode::NoCallSignColumnGeneric | Mode::SqlFails => json!({"jsonrpc":"2.0","id":id,
-                    "error":{"code":-32603,"message":"query failed"}}),
-                Mode::NoCallSignColumnJson => json!({"jsonrpc":"2.0","id":id,
-                    "result":{"content":[{"type":"text",
-                        "text":json!({"error":"query failed"}).to_string()}]}}),
-                _ => tool_error(id, &error),
-            });
-        }
-        Err(error) => return Err(tool_error(id, &error)),
-    };
+    let (mut columns, mut rows, truncated) = s
+        .fixture
+        .query(sql, limit)
+        .map_err(|error| tool_error(id, &error))?;
     if s.mode == Mode::NoCallSign
-        && let Some(i) = columns.iter().position(|c| c == "CALL_SIGN")
+        && let Some(i) = columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case("CALL_SIGN") || c.eq_ignore_ascii_case("callsign"))
     {
         columns.remove(i);
         for row in &mut rows {
@@ -446,9 +368,6 @@ async fn mcp(State(s): State<Arc<Stub>>, headers: HeaderMap, body: String) -> Re
         "tools/call" => {
             assert_eq!(headers.get("mcp-session-id").unwrap(), "session-0");
             s.calls.fetch_add(1, Ordering::SeqCst);
-            if req["params"]["name"] == "get_frequency_allocation" {
-                s.plans.fetch_add(1, Ordering::SeqCst);
-            }
             match s.mode {
                 Mode::RpcError => {
                     return sse(json!({"jsonrpc":"2.0","id":id,
@@ -464,9 +383,6 @@ async fn mcp(State(s): State<Arc<Stub>>, headers: HeaderMap, body: String) -> Re
                     Ok(v) => v,
                     Err(rejection) => return sse(rejection),
                 },
-                "get_frequency_allocation" => s
-                    .fixture
-                    .plan(args["freq_hz"].as_u64(), s.mode == Mode::Satellite),
                 t => panic!("unexpected tool {t}"),
             };
             sse(json!({"jsonrpc":"2.0","id":id,
@@ -478,17 +394,14 @@ async fn mcp(State(s): State<Arc<Stub>>, headers: HeaderMap, body: String) -> Re
 
 /// Serve the stub on 127.0.0.1 (a task on the current tokio runtime, serving as long as
 /// that runs) running its queries on `fixture`; its `http://HOST:PORT` and what it sees.
-/// The modes that model an older register (`NoCallSign*`) drop `CALL_SIGN` from the
-/// fixture's `device_details` first, and `NullBandwidth` blanks the first row's bandwidth.
+/// `Satellite` makes every plan segment a satellite service first, and `NullBandwidth`
+/// blanks the first row's bandwidth.
 pub async fn serve_fixture(fixture: Fixture, mode: Mode) -> (String, Arc<Stub>) {
-    if matches!(
-        mode,
-        Mode::NoCallSignColumnRpc
-            | Mode::NoCallSignColumnTool
-            | Mode::NoCallSignColumnGeneric
-            | Mode::NoCallSignColumnJson
-    ) {
-        fixture.drop_column("device_details", "CALL_SIGN");
+    if mode == Mode::Satellite {
+        fixture.sql(&format!(
+            "UPDATE spectrum_allocations SET services_json = '{}'",
+            plan_services(true)
+        ));
     }
     if mode == Mode::NullBandwidth {
         fixture.sql(
@@ -500,12 +413,11 @@ pub async fn serve_fixture(fixture: Fixture, mode: Mode) -> (String, Arc<Stub>) 
         mode,
         fixture,
         calls: AtomicUsize::default(),
-        plans: AtomicUsize::default(),
         sql: Mutex::default(),
+        seen: Mutex::default(),
         queries: AtomicUsize::default(),
-        rejected: AtomicUsize::default(),
-        unbanded: AtomicUsize::default(),
         health: Mutex::new(json!({"status": "ok", "dataAsOf": "2026-01-01T00:00:00.000Z"})),
+        healths: AtomicUsize::default(),
         fail_matching: Mutex::default(),
     });
     let app = Router::new()
@@ -513,6 +425,7 @@ pub async fn serve_fixture(fixture: Fixture, mode: Mode) -> (String, Arc<Stub>) 
         .route(
             "/health",
             get(|State(s): State<Arc<Stub>>| async move {
+                s.healths.fetch_add(1, Ordering::SeqCst);
                 let body = s.health.lock().unwrap().to_string();
                 ([(header::CONTENT_TYPE, "application/json")], body)
             }),
@@ -546,17 +459,4 @@ pub fn serve_on_thread(rows: Vec<Value>, mode: Mode) -> String {
         });
     });
     rx.recv().expect("the register stub starts")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_plan_has_an_entry_only_inside_its_band() {
-        let f = Fixture::empty();
-        assert_eq!(f.plan(Some(404_025_000), false)["match_count"], 1);
-        assert!(f.plan(Some(100_000_000), false)["allocation"].is_null());
-        assert!(f.plan(None, false)["allocation"].is_null());
-    }
 }
