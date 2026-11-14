@@ -54,7 +54,9 @@
 //       be chosen for lo..hi with a non-empty span (both lists fetched afresh, as above), so
 //       the waterfall can tell the operator at once when a held source's view has none; and
 //       wf.coarseOwns(id) -> bool: whether `id` is the own scan (the waterfall never counts it
-//       as a holder, and follows it with the view its own).
+//       as a holder, and follows it with the view its own); and wf.coarseStarting(sourceId)
+//       -> bool: whether an own scan's job_start on that source is unanswered yet (the scan
+//       may already step the source, which the waterfall must not take for a moved capture).
 //       While the waterfall shows a source's own sweep (wf.mode "sweep", a KiwiSDR's tab) it
 //       decides nothing and starts nothing: that sweep shows any view of the source (one
 //       waterfall connection per Kiwi); its own scan, if any, is stopped and the coarse
@@ -123,6 +125,7 @@ class Coarse {
     this.lastJobs = jobs;
     this.scanJobId = loadAutoId();
     this.span = null; // {source, lo, hi} of the own scan, when this page started it
+    this.starting = null; // the source an own scan's job_start is on its way to
     this.followed = null;
     this.source = null;
     this.sub = null;
@@ -139,6 +142,7 @@ class Coarse {
     wf.coarseActive = () => view.get("zoom_out") === "scan";
     wf.coarseCan = (lo, hi) => this.canScan(lo, hi);
     wf.coarseOwns = (id) => !!id && id === this.scanJobId;
+    wf.coarseStarting = (sourceId) => !!sourceId && sourceId === this.starting;
     wf.onView(() => this.schedule());
     view.onChange((key) => {
       if (key === "zoom_out" || key === "scanner" || key === "auto_scan_stop") {
@@ -379,6 +383,8 @@ class Coarse {
 
   async startOwn(source, lo, hi) {
     let r;
+    // The scan may step the source before its id comes back: wf.coarseStarting says so.
+    this.starting = source;
     try {
       r = await this.api.op({
         op: "job_start",
@@ -394,6 +400,8 @@ class Coarse {
     } catch (e) {
       this.note(`coarse layer: scan on ${source}: ${e.json ? errorText(e.json) : e.message}`);
       return;
+    } finally {
+      this.starting = null;
     }
     if (this.destroyed) {
       this.api.op({ op: "job_stop", job: r.value }).catch(() => {});
@@ -522,5 +530,6 @@ class Coarse {
     window.removeEventListener("pagehide", this.onPageHide);
     if (this.wf.coarseActive) this.wf.coarseActive = null;
     this.wf.coarseCan = null;
+    this.wf.coarseStarting = null;
   }
 }

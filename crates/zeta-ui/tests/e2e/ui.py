@@ -3137,6 +3137,73 @@ def scenario_wide_view_on_a_free_radio_moves_with_every_gesture(page, url, secre
         stop_scans(url, secret)
 
 
+def scenario_wide_view_keeps_the_view_while_its_scan_takes_the_radio(page, url, secret):
+    # Zoomed out past the capture on a free radio, the page's own scan takes the radio and
+    # steps it while the waterfall still follows its elastic job (it moves to the scan once
+    # the job's stream is gone). A `source_list` read then shows the source at the scan's
+    # step: that is no moved capture, and the view stays the operator's. The hand-over is held
+    # (the page's stream lookups wait) and the jobs poll paused, so the read lands in that
+    # window every time; it is delivered as the poll delivers it (wf.syncSources).
+    stop_scans(url, secret)
+    held, hold = [], [True]
+
+    def streams(route):
+        if hold[0]:
+            held.append(route)
+        else:
+            route.continue_()
+
+    def release():
+        hold[0] = False
+        for r in held:
+            r.continue_()
+        held.clear()
+
+    sync_js = """async () => {
+      const wf = window.zetaTest.waterfall();
+      wf.syncSources((await wf.api.op({op: 'source_list'})).value || []);
+    }"""
+    routed = False
+    try:
+        select_source(page, url, secret, "retune")
+        page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
+        page.evaluate("window.zetaTest.pausePolling(true)")
+        page.evaluate(sync_js)  # the capture as it is: nothing moves
+        page.route("**/streams", streams)
+        routed = True
+        start = page.evaluate(WF_STATE_JS)["view"]
+        centre = (start["lo"] + start["hi"]) / 2
+        for _ in range(6):
+            wheel_at_centre(page, 100)
+            page.wait_for_timeout(250)
+        width = 48_000 * 64
+        v = wait_shown(page, centre - width / 2, centre + width / 2, "zoomed out six notches",
+                       tol=width * 0.02)
+        own = wait_until(lambda: page.evaluate(AUTO_SCAN_JS), 10.0, "the page's scan started")
+        wait_until(lambda: [j["id"] for j in running_scan_jobs(url, secret, "retune")] == [own],
+                   10.0, "the page's scan runs")
+        wait_until(lambda: source_info(url, secret, "retune")["current"]["center_hz"]
+                   != 250_000_000, 10.0, "the scan stepped the radio")
+        assert page.evaluate("window.zetaTest.waterfallMode") == "spectrum", \
+            "the hand-over to the scan was not held"
+        page.evaluate(sync_js)
+        page.wait_for_timeout(600)  # longer than an ease (EASE_MS)
+        wait_shown(page, v["lo"], v["hi"], "the view after a source_list at the scan's step",
+                   timeout=100)
+        release()
+        wait_own_scan_over(page, url, secret, v["lo"], v["hi"], "the page's scan, followed")
+        page.wait_for_timeout(500)
+        wait_shown(page, v["lo"], v["hi"], "the view once the scan is followed", timeout=100)
+        assert page.evaluate(AUTO_SCAN_JS) == own, "the page's scan was replaced or stopped"
+        no_refusals(page, "the scan taking the radio")
+    finally:
+        if routed:
+            release()
+            page.unroute("**/streams", streams)
+        page.evaluate("window.zetaTest.pausePolling(false)")
+        stop_scans(url, secret)
+
+
 def scenario_wide_view_moves_on_every_drag(page, url, secret):
     # Several drags in a row, paced and back to back, each move the view at once; the page ends
     # with one scan of its own, over where the view stopped.

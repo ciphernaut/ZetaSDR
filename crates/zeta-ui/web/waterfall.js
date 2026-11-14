@@ -58,6 +58,9 @@
 //         could show lo..hi (null counts as yes); see Band control.
 //     wf.coarseOwns null, or fn(jobId) -> bool set by coarse.js: whether the job is the page's
 //         own background scan; see Wide views on a free radio.
+//     wf.coarseStarting null, or fn(sourceId) -> bool set by coarse.js: whether the page's
+//         own scan is being started on the source (its job_start not answered yet); see
+//         Following the capture.
 //     wf.ownScan() -> whether the waterfall follows the page's own scan of the shown source
 //     wf.followScan(id, tuning)  follows the page's own scan `id` of the shown source over
 //         `tuning` ({center_hz, bandwidth_hz}) in scan mode, keeping what is painted and the
@@ -177,8 +180,11 @@
 // a `source_list` whose `current` for the shown source differs from the previous poll's and
 // from the band) moves the band; under "target" the view eases to the new capture
 // (easeTo, EASE_MS), under "free" the band shown stays exactly where it was. The page's own
-// retune (source_ensure) is not such a move: it restarts the waterfall on the new band. Rows
-// still arriving for the band left behind by a `source_list` move do not move it back.
+// retune (source_ensure) is not such a move: it restarts the waterfall on the new band. Nor
+// is a `source_list` `current` the page's own scan stepped the shown source to before the
+// waterfall follows that scan (wf.coarseOwns names a holder of the source, or
+// wf.coarseStarting the source): the view stays the operator's. Rows still arriving for
+// the band left behind by a `source_list` move do not move it back.
 //
 // Scan mode: the axis spans the scan job's `tuning`, widened to the union of the rows (a step
 // can reach past it at the span's ends); each row covers only its step's band (`center_hz` ±
@@ -653,6 +659,7 @@ class Waterfall {
     this.coarseActive = null;
     this.coarseCan = null;
     this.coarseOwns = null;
+    this.coarseStarting = null;
     this.swapping = false; // the page's own scan of the shown source being replaced (swapScan)
     this.reaimTarget = null; // sweep mode: the view the next job_retune asks for
     this.reaimTimer = null;
@@ -1243,7 +1250,9 @@ class Waterfall {
 
   // A `source_list` result: the shown source's `current` differing from the previous poll's
   // and from the band is the capture moving (captureMoved). Not in scan mode (a scan's
-  // `current` is its step) nor during the page's own retune.
+  // `current` is its step) nor during the page's own retune, nor while the page's own scan
+  // holds the source or is being started on it (coarse.js): still in spectrum mode until the
+  // waterfall follows that scan (followScan), `current` is then the scan's step.
   syncSources(sources) {
     const info = this.src && (sources || []).find((s) => s.id === this.src.id);
     const cur = info && usableTuning(info.current);
@@ -1259,6 +1268,10 @@ class Waterfall {
     if (this.mode !== "spectrum" || !this.band || this.retuning || sameBand(this.band, listed)) {
       return;
     }
+    const ownSteps =
+      rigidHolders(info).some((h) => this.ownsScan(h)) ||
+      (!!this.coarseStarting && this.coarseStarting(info.id));
+    if (ownSteps) return;
     this.staleBand = this.band;
     this.captureMoved({ lo: listed.lo, hi: listed.hi });
   }
