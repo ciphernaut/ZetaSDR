@@ -316,6 +316,10 @@ Adopt the same shape: `tools/install-vocoders.sh` that clones `mbelib`, `codecse
 
 Scope estimate: 100-150 lines of shell plus a doc section; depends on the external-decoder adaptor for the voice decoders that consume it.
 
+Status (2026-11-14): specified as plan 38 (`docs/superpowers/specs/2026-11-14-digital-voice-design.md`), with a different shape: no `codecserver`, one small program (`zeta-mbe`) on the shape of `c2dec`, built by the script against `mbelib-neo`. The plan replaces this gist when it lands.
+
+**Later: `blip25-vocoder` in the vocoder seat.** From the operator, 2026-11-14. A Rust crate (MIT, IMBE and half-rate AMBE+2, soft decisions; SDR-- uses it) that would decode in-process with no install script, as an off-by-default cargo feature that no released build enables. Set aside for now: its own `PATENT_NOTICE.md` and `ATTRIBUTION.md` say the codec core was recovered from a compiled vendor binary, and name an active patent on the half-rate codec to 2028-05-20. Revisit in a later sprint when that position is clearer; plan 38's vocoder seat is where it would go. It does not cover D-STAR's AMBE.
+
 ## Packaging: the run directory and install hints for handlers
 
 From the operator, 2026-10-28, on two plan 16 review rulings. Today a program row's fifo lives under `<state_dir>/run/<unique>` (ruling 14) and a missing handler's hint falls through `apt install` → `dnf install` → `brew install` (ruling 15; the built-in row only names the Debian package).
