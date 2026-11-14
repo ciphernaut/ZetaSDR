@@ -323,6 +323,16 @@ To look, open the pane's tab (labelled `video`, shown only while a `video_decode
 
 A digital video link never locks; see the verdict under "Where to look". The audio subcarrier is not decoded yet.
 
+### Reading a DVB-T multiplex
+
+A DVB-T multiplex is a flat-topped block 5 to 8 MHz wide, usually the strongest thing in a broadcast band. `dvbt_decode` (family `tv`) reads its signalling only: there is no picture, sound or service list yet. It needs the external `dvbt-rx` on the node's `PATH`; without it the row is `unavailable` (it is a small wrapper the operator builds around SDRangel's `modemdvb`, which `modes_show` points at). `identify` and `classify` offer the row only between 174 and 862 MHz; started by hand it runs anywhere.
+
+Centre the job on the measured middle of the block (`classify`, or the waterfall's box), never on a channel raster, with a band that covers it (the default is 8 MHz). The capture must be at least that wide, so a narrow radio refuses it `insufficient bandwidth`. The channel width is not a parameter: the receiver tries 8, 7, 6 and 5 MHz in turn and reports the one that locks as `bandwidth_hz`.
+
+The job's `event` stream carries `protocol: "dvbt"`: one event when lock is gained or lost, one every 2 s while locked and one every 5 s while searching. `locked: true` comes with `mode` (`2K` or `8K` carriers), `guard` (the guard interval, such as `1/16`), `constellation`, `code_rate`, `hierarchy` and `lp_code_rate` (`null` unless the multiplex is hierarchical) and `cell_id`. Many multiplexes send no cell id, and `cell_id` is then `null`: that is the broadcaster's choice, not a fault. Lock normally takes under a second on a clean signal, so `locked: false` after ten seconds means no DVB-T at any width: the block may be DVB-T2 (not looked for), another standard, or off-centre by more than the receiver follows.
+
+`offset_hz` is how far the multiplex's carriers sit from the job's centre and `clock_ppm` the sample clock error; both are mostly the radio's own reference error, so they agree across the multiplexes one radio hears. `snr_db` is measured on the equalised cells: it falls with multipath as well as with a weak signal, and a strong multiplex with deep ripple across its top can read lower than its level suggests. Report the signalled parameters as measured facts about the transmission; the register says who is licensed there.
+
 ### Exploring an unknown signal
 
 A signal nobody has named goes up a ladder; stop at the first rung that answers, and report what each rung found.

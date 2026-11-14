@@ -133,7 +133,7 @@ fn an_unknown_id_lists_the_known_ones() {
     assert!(
         err.contains(
             "unknown mode nope (known: acars_decode, adsb_decode, ais_decode, aprs_decode, \
-             dfm_decode, flex_decode, hfdl_decode, m17_decode, m20_decode, pocsag_decode, rds_decode, \
+             dfm_decode, dvbt_decode, flex_decode, hfdl_decode, m17_decode, m20_decode, pocsag_decode, rds_decode, \
              rs41_decode, vdl2_decode"
         ),
         "{err}"

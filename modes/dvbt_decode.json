@@ -1,0 +1,41 @@
+{
+  "id": "dvbt_decode",
+  "name": "DVB-T digital television (signalling)",
+  "family": "tv",
+  "band": { "bandwidth_hz": 8000000, "centers_hz": [], "range_hz": [174000000, 862000000], "min_hz": 5000000 },
+  "modulation": ["ofdm"],
+  "label": "DVB-T",
+  "protocol": "dvbt",
+  "decoder": {
+    "kind": "program",
+    "programs": ["dvbt-rx"],
+    "args": ["--rate", "$rate_hz", "--bandwidth", "auto"],
+    "input": { "stream": "iq", "format": "cf32", "rate_hz": 10000000, "via": "stdin" },
+    "output": { "via": "stdout", "port": null, "parser": "json_lines" },
+    "install": { "debian": null, "url": "https://github.com/f4exb/sdrangel" }
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "locked": { "type": "boolean" },
+        "lock": { "type": "string" },
+        "bandwidth_hz": { "type": ["integer", "null"] },
+        "mode": { "type": ["string", "null"] },
+        "guard": { "type": ["string", "null"] },
+        "constellation": { "type": ["string", "null"] },
+        "code_rate": { "type": ["string", "null"] },
+        "hierarchy": { "type": ["string", "null"] },
+        "lp_code_rate": { "type": ["string", "null"] },
+        "cell_id": { "type": ["integer", "null"] },
+        "offset_hz": { "type": ["integer", "null"] },
+        "clock_ppm": { "type": ["number", "null"] },
+        "snr_db": { "type": ["number", "null"] }
+      }
+    },
+    "summary": "{lock} · {mode?} {constellation?} {code_rate?} {guard?}"
+  },
+  "identify": { "proof": "field", "field": "locked", "min_events": 1, "dwell_ms": 8000, "min_span_ms": 0, "quick": null },
+  "catalogue": [],
+  "notes": "DVB-T terrestrial television, signalling only: the external dvbt-rx (a separate GPL program the operator builds: a small wrapper, not yet published, around the modemdvb receiver of SDRangel, which the install pointer names) locks to one multiplex and reports what it signals about itself: the channel width it locked at (8, 7, 6 and 5 MHz are tried in turn), 2K or 8K carriers, guard interval, constellation, code rate, hierarchy and the cell id when the multiplex sends one (many do not: cell_id is then null). No picture, sound or service names yet. Identify and classify offer the row between 174 and 862 MHz, the broadcast bands DVB-T is used in across regions; a job started by hand runs anywhere. Centre the job on the measured middle of the multiplex with a band that covers it; the capture must be at least as wide. An event comes when lock is gained or lost and every 2 s while locked; locked false means no DVB-T multiplex was found at any width (DVB-T2 is not looked for). offset_hz is the multiplex's carrier offset from the job's centre and clock_ppm the sample clock error, both as the receiver measured them; snr_db is of the equalised cells and falls with multipath."
+}

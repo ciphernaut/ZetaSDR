@@ -2943,6 +2943,8 @@ const PAGER_HANDLERS: [&str; 1] = ["ZETA_HANDLER_MULTIMON_NG"];
 
 /// The M17 row's vocoder, pinned like the others.
 const VOICE_HANDLERS: [&str; 1] = ["ZETA_HANDLER_C2DEC"];
+/// The override of the DVB-T row's handler (`dvbt_decode`).
+const TV_HANDLERS: [&str; 1] = ["ZETA_HANDLER_DVBT_RX"];
 
 /// `zeta modes list` (one-shot) prints the embedded rows, all ready; `--family`
 /// narrows it and `modes show` prints one row.
@@ -2961,6 +2963,7 @@ fn modes_list_prints_the_embedded_rows() {
         .chain(&AIRCRAFT_LINK_HANDLERS)
         .chain(&PAGER_HANDLERS)
         .chain(&VOICE_HANDLERS)
+        .chain(&TV_HANDLERS)
     {
         cmd.env(var, fake_lines());
     }
@@ -2977,6 +2980,7 @@ fn modes_list_prints_the_embedded_rows() {
             "ais_decode",
             "aprs_decode",
             "dfm_decode",
+            "dvbt_decode",
             "flex_decode",
             "hfdl_decode",
             "m17_decode",

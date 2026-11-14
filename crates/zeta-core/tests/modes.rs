@@ -21,12 +21,13 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 14] = [
+const EMBEDDED: [&str; 15] = [
     "acars_decode",
     "adsb_decode",
     "ais_decode",
     "aprs_decode",
     "dfm_decode",
+    "dvbt_decode",
     "flex_decode",
     "hfdl_decode",
     "m17_decode",
