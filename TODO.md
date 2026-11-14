@@ -595,7 +595,7 @@ Plan 32 (origins from the register lit on a Map tab, the dock, a Kiwi's position
 - Fuzzy matching of decoded names against licensee names: identity confirmation matches a callsign exactly, so only an APRS-like `src` confirms a site.
 - Demotion rules for one-transmitter services (a broadcaster with one licence on one site scores like any fit): a service-aware term in the origin score.
 - The Explore table's licensee column still reads `allocations` (the nearest transmitter), not `origins` (the best-scored site), so the two can name different licensees for one capture.
-- The CALL_SIGN probe never resets: a register upgraded to a build with the column needs a node restart before callsigns appear.
+- ~~The CALL_SIGN probe never resets: a register upgraded to a build with the column needs a node restart before callsigns appear.~~ (done in plan 37: the probe is removed; a column a query declares and the register lacks fails that query by name.)
 - The tile notice goes quiet after a partial failure, and a provider that serves blank tiles raises none: a server answering 200 with a placeholder image (CARTO's ~2 KB "API KEY REQUIRED" tile, seen on the field host 2026-11-08, which is why CARTO was dropped) is a `tileload`, not a `tileerror`, and `naturalWidth` is 256 either way. A check would sample a loaded tile's pixels (a canvas read, which needs CORS-enabled tiles) or its byte size (a fetch, outside `img-src`).
 - The console theme's kept tab is only un-dimmed, not restyled as the other themes do.
 - The dock-head Subjects count is the store count (every subject held), not the rows the table shows after its filters.
@@ -610,7 +610,7 @@ Field risks:
 
 Small:
 - `known.register` cannot say `unreachable`: `KnowledgeProvider::allocations` has no error channel, so `job_context.watch.known` holds counts only.
-- The ACMA provider caps a query at 200 rows before `band_assignments` dedupes.
+- ~~The ACMA provider caps a query at 200 rows before `band_assignments` dedupes.~~ (done in plan 37: `band_assignments` is uncapped and deduplicates by centre, tested by `band_assignments_is_uncapped_and_deduplicates_by_centre`.)
 - A seeded decoder's centre is the known centre until the first `new`.
 - A repeated `--radio` role on `zeta set start` collapses silently: the last mapping wins, with no usage error.
 - Set and plan groups on the page share sessionStorage fold keys, so a set and a plan with the same id share one fold state.
@@ -700,6 +700,8 @@ Seen 2026-11-09 in a full workspace run (the suite in parallel), six single reru
 From the operator, 2026-11-09: the desktop mouse lags, worst while the pointer is over the node's page in the browser (the browser held about a third of a core with the page open; the host itself was idle). Profile the page's pointer handlers and waterfall redraws (hover readouts, tooltips, the box menu's tracking): coalesce pointer events to one per animation frame, skip redraws when nothing under the pointer changed, and make sure the canvas path is GPU-friendly. Check with the browser's performance panel on a page with several live jobs.
 
 ## Origins: which site sent this burst
+
+Plan 37 gives each candidate an expected level (power, distance and a simple path-loss model), so the first option below has its per-site side; the per-burst comparison is still unbuilt.
 
 From the operator, 2026-11-09: when several licensed sites share one channel, the map lights every candidate and nothing says which one sent a given burst. Options, cheapest first:
 - **Per-burst strength against each candidate.** Compare a burst's received level with each candidate site's expected level (power, antenna height, distance, a simple path-loss model) and rank the sites per burst, not per band. Uses only what the register and the detector already give.
@@ -850,3 +852,12 @@ From the operator, 2026-11-12, while settling plan 37 (`docs/superpowers/specs/2
 - **A larger antenna azimuth database** in the register service as a refinement of the beam term; it multiplies the service's footprint, so it is the operator's to schedule.
 - **Offering proven register queries to the register service's sample-query catalogue**, and any new function there that its other clients would also use.
 - **A per-signal absolute level** from a calibrated source, to feed the verdict's level term.
+
+## Register answer: follow-ups from the plan 37 build
+
+- **The search box clamps at the antimeridian** instead of splitting into two longitude ranges.
+- **Area-wide devices are ordered by frequency**, not by nearness to the signal.
+- **A site selected from a "What is this?" answer stays selected after its lit set fades**, with no marker left to click.
+- **Selected and matched site styling hides the confirmed ring.**
+- **The off-site partner frequency of a signal's licence is not marked on the waterfall.**
+- **`zeta registers check` exits 0 when it skipped a query**, and prints no skipped count.
