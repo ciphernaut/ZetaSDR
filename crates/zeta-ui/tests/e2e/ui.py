@@ -6819,6 +6819,8 @@ def scenario_origins_light_sites(page, url, secret):
         hill.click()
         pop =page.locator("#map .leaflet-popup-content")
         expect(pop).to_contain_text("licence 0000001")
+        # The register's power and what its estimate expects here, as the note words them.
+        expect(pop).to_contain_text(re.compile(r"5 W.*expected about -?\d+ dBm"))
         expect(pop.locator("button")).to_have_count(0)
         run_cmd(page, "view set origin_fade_s 2")
         # fake_pos sent its last event 2 s in.
@@ -6985,7 +6987,8 @@ VERDICT_LINE = re.compile(
 # register's estimate says (left out when it has none) and whether the observer is off the beam.
 CANDIDATE_LINE = re.compile(
     r"^Example [A-Za-z ]+, Example [A-Za-z]+, \d+ km \d+°, [A-Za-z ,()-]+?"
-    r"(, expected about -?\d+ dBm)?(, pointed away)?$")
+    r"(, expected about -?\d+ dBm)?(, pointed away)?"
+    r"(, polarisation [A-Z]+)?(, one of \d+ sites on this frequency)?$")
 
 
 def register_block(page):
@@ -7031,6 +7034,11 @@ def scenario_what_is_this_shows_the_register_answer(page, url, secret):
                 site: {id: 'S9', name: 'Example ' + name, lat: 0, lon: 0},
                 licence: {number: '9'}, holder: {name: 'Example Holder'},
                 geometry, expected, related: null});
+              // One site of a same-frequency network: its polarisation is what may tell it
+              // from the others.
+              const net = c('Ridge', null, null, 60);
+              net.network_sites = 3;
+              net.device.polarisation = 'H';
               return registerLines({
                 provider: 'acma', region: 'AU', as_of: null,
                 status: {state: 'partial', reason: null,
@@ -7042,6 +7050,7 @@ def scenario_what_is_this_shows_the_register_answer(page, url, secret):
                     {mode: 'line_of_sight', level_dbm: -71.6, in_range: 'yes', unknown: []}, 60),
                   c('Tower', {distance_km: 3, bearing_deg: 90, off_beam_deg: 10,
                               horizon_km: 40, beyond_horizon: false}, null, 60),
+                  net,
                 ],
                 area_candidates: [], matched: 2, truncated: false, assumptions: {},
                 verdict: {kind: 'agrees', weak: false, summary: 'register agrees: Example Holder'}});
@@ -7052,6 +7061,8 @@ def scenario_what_is_this_shows_the_register_answer(page, url, secret):
             "Example Holder, Example Mast, 12 km 0°, Frequency modulation, telephony, "
             "expected about -72 dBm, pointed away",
             "Example Holder, Example Tower, 3 km 90°, Frequency modulation, telephony",
+            "Example Holder, Example Ridge, Frequency modulation, telephony, polarisation H, "
+            "one of 3 sites on this frequency",
         ], lines
         assert page.evaluate(
             "async () => (await import('./units.js')).registerLines(null)") == [], "null register"
@@ -7098,6 +7109,17 @@ def scenario_what_is_this_shows_the_register_answer(page, url, secret):
                 originSummary(a(0, {state: 'ok', reason: null, failed: []})),
                 originSummary(a(0, undefined)),
                 originSummary(a(null, null)),
+                // Lit sites: each with the level the register's estimate expects, when it
+                // has one.
+                originSummary({
+                  band: {center_hz: 403025000, bandwidth_hz: 12500},
+                  origins: [
+                    {allocation: {licensee: 'Example Holder', site: 'Example Mast',
+                                  distance_km: 12.4, expected_level_dbm: -71.6},
+                     agree: 'fits', score: 1},
+                    {allocation: {licensee: 'Example Holder', site: 'Example Tower'},
+                     agree: 'unknown', score: 0.8},
+                  ]}),
               ];
             }""")
         assert summaries == [
@@ -7108,7 +7130,28 @@ def scenario_what_is_this_shows_the_register_answer(page, url, secret):
             "register gave no rows",
             "register gave no rows",
             "no register provider",
+            "2 sites on 403.025 MHz: Example Holder, Example Mast 12 km fits 1.0, expected about "
+            "-72 dBm; Example Holder, Example Tower unknown 0.8",
         ], summaries
+        # A power as the node's note words it: the transmitter's, else the radiated power,
+        # marked; a zero is no figure.
+        powers = page.evaluate(
+            """async () => {
+              const { powerText, registerText } = await import('./units.js');
+              return [
+                powerText({power_w: 25, eirp_w: 50000}),
+                powerText({power_w: null, eirp_w: 50000}),
+                powerText({power_w: 0, eirp_w: 0.5}),
+                powerText({power_w: 0, eirp_w: null}),
+                registerText([{role: 'tx', licensee: 'Example Holder', site: 'Example Mast',
+                               distance_km: 42, power_w: null, eirp_w: 50000,
+                               emission: '6M70V7W'}]),
+              ];
+            }""")
+        assert powers == [
+            "25 W", "50 kW EIRP", "0.5 W EIRP", None,
+            "register says 6M70V7W Example Holder, Example Mast, 42 km, 50 kW EIRP",
+        ], powers
     finally:
         run_cmd(page, "view reset")
 

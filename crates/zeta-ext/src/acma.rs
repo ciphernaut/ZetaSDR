@@ -24,7 +24,7 @@ use zeta_core::register::{
     AreaCandidate, CANDIDATES_QUERY, Candidate, Channel, Device, FailedQuery, FarEnd, Holder,
     Licence, ParamValue, PlanFootnote, PlanSegment, PlanService, REGISTER_MAX_CANDIDATES,
     RELATED_CHANNELS, RELATED_TOP, RegisterAnswer, RegisterQueries, RegisterState, RegisterStatus,
-    Related, Signal, Site, SiteAnswer, SiteChannel, check_register_id,
+    Related, Signal, Site, SiteAnswer, SiteChannel, check_register_id, count_networks,
 };
 use zeta_core::station::Station;
 use zeta_core::types::Hz;
@@ -285,6 +285,8 @@ impl AcmaKnowledge {
             });
         }
         ranked.sort_by(|a, b| rank(a, b, center));
+        // Before the cap: a network's sites count whether or not they are all kept.
+        count_networks(&mut ranked);
         let truncated = matched as u64 >= limit || ranked.len() > REGISTER_MAX_CANDIDATES;
         ranked.truncate(REGISTER_MAX_CANDIDATES);
 
@@ -892,6 +894,7 @@ fn candidate_of(r: &Row) -> Option<Candidate> {
         geometry: None,
         expected: None,
         related: None,
+        network_sites: 1,
     })
 }
 

@@ -21,7 +21,7 @@ use crate::propagation::{Expected, Geometry, InRange, Propagation};
 use crate::reach::{Reach, SECTOR_DEG};
 use crate::register::{
     Candidate, RegisterAnswer, RegisterState, RegisterStatus, Signal, Verdict, VerdictKind,
-    emission_words,
+    emission_words, level_words,
 };
 use crate::station::{Antenna, Station};
 use crate::stream::{Frame, Payload};
@@ -588,16 +588,29 @@ fn answer_with(
 }
 
 /// The answer's order: best score first, a confirmed origin before an equal score, then
+/// the higher expected level (a row with one before a row without; the reach term stops
+/// rising [`ORIGIN_LEVEL_SPAN_DB`] over the floor, so strong sites tie on score), then
 /// nearest, then by licence, site and centre.
 fn origin_order(a: &Origin, b: &Origin) -> std::cmp::Ordering {
     let (x, y) = (&a.allocation, &b.allocation);
     b.score
         .total_cmp(&a.score)
         .then_with(|| b.confirmed.is_some().cmp(&a.confirmed.is_some()))
+        .then_with(|| strongest_first(x.expected_level_dbm, y.expected_level_dbm))
         .then_with(|| nearest_first(x.distance_km, y.distance_km))
         .then_with(|| x.licence_no.cmp(&y.licence_no))
         .then_with(|| x.site.cmp(&y.site))
         .then_with(|| x.center_hz.map(|h| h.0).cmp(&y.center_hz.map(|h| h.0)))
+}
+
+/// Known expected levels first, strongest first, compared in whole dB as they are worded.
+fn strongest_first(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => y.round().total_cmp(&x.round()),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
 }
 
 /// Known distances first, nearest first.
@@ -744,8 +757,9 @@ fn mhz(hz: Hz) -> String {
 }
 
 /// One line for an answer (design 4.3): `<n> sites on <f> MHz: <licensee>, <site>
-/// <d> km <agree> <score>; ...` naming the first [`ORIGIN_SUMMARY_SITES`] (the
-/// distance left out when unknown); `no licensed transmitter on <f> MHz` when nothing
+/// <d> km <agree> <score>, expected about <l> dBm; ...` naming the first
+/// [`ORIGIN_SUMMARY_SITES`] (the distance left out when unknown, the level when the
+/// register estimated none); `no licensed transmitter on <f> MHz` when nothing
 /// is lit (whatever provider lit them). With nothing lit, the register's status
 /// ([`OriginAnswer::register_status`]) speaks first: `register unreachable: <reason>`, or
 /// `register could not list licences: <reason>; partial answer: <query>, ... failed` when
@@ -778,7 +792,8 @@ pub fn summary(a: &OriginAnswer) -> String {
     format!("{n} {noun} on {f} MHz: {sites}")
 }
 
-/// [`summary`]'s site list, `<licensee>, <site> <d> km <agree> <score>; ...` for the
+/// [`summary`]'s site list, `<licensee>, <site> <d> km <agree> <score>[, expected about
+/// <l> dBm]; ...` for the
 /// first [`ORIGIN_SUMMARY_SITES`] origins; `None` when nothing is lit.
 fn summary_sites(a: &OriginAnswer) -> Option<String> {
     if a.origins.is_empty() {
@@ -806,7 +821,11 @@ fn summary_sites(a: &OriginAnswer) -> Option<String> {
                 Agree::Disagrees => "disagrees",
                 Agree::Unknown => "unknown",
             };
-            format!("{s} {agree} {:.1}", o.score)
+            let level = al
+                .expected_level_dbm
+                .map(|l| format!(", {}", level_words(l)))
+                .unwrap_or_default();
+            format!("{s} {agree} {:.1}{level}", o.score)
         })
         .collect();
     Some(sites.join("; "))
@@ -823,7 +842,10 @@ fn summary_sites(a: &OriginAnswer) -> Option<String> {
 /// geometry at all: no position to measure from); else `unlicensed`. A partial answer
 /// whose candidates query failed is `unknown` too (`register could not list licences:
 /// <reason>`): `unlicensed` needs the candidates query's answer. Any other partial answer
-/// names its failed queries at the end of the summary.
+/// names its failed queries at the end of the summary. An `agrees` summary on a candidate
+/// that is one site of a same-frequency network ([`Candidate::network_sites`] over 1)
+/// ends `; one of <n> sites sending it on this frequency (polarisation <p> here)`, the
+/// brackets left out when the register holds no polarisation.
 pub fn verdict(
     answer: &RegisterAnswer,
     origins: &OriginAnswer,
@@ -921,7 +943,20 @@ pub fn verdict(
             .into_iter()
             .flatten()
             .collect();
-            format!("register agrees: {}", parts.join(", "))
+            // One site of a same-frequency network: the register cannot say which of
+            // them was heard, and the polarisation is what may.
+            let network = match c.network_sites {
+                n if n > 1 => format!(
+                    "; one of {n} sites sending it on this frequency{}",
+                    c.device
+                        .polarisation
+                        .as_deref()
+                        .map(|p| format!(" (polarisation {p} here)"))
+                        .unwrap_or_default()
+                ),
+                _ => String::new(),
+            };
+            format!("register agrees: {}{network}", parts.join(", "))
         }
         _ => {
             let label = match origins.modulation.is_empty() {
@@ -1856,6 +1891,8 @@ mod tests {
             distance_km: km,
             bearing_deg: km.map(|_| 315.0),
             power_w: None,
+            eirp_w: None,
+            expected_level_dbm: None,
             center_hz: Some(Hz(center)),
             bandwidth_hz: bw.map(Hz),
             licence_no: Some("0000001".into()),
@@ -4083,6 +4120,41 @@ mod tests {
     }
 
     #[test]
+    fn strong_sites_that_tie_on_score_order_by_the_expected_level() {
+        // Both sit above the span, so the reach term saturates and the scores tie; the
+        // far site is the stronger by 10 dB and must come first, and each says its level.
+        let top = floor() + ORIGIN_LEVEL_SPAN_DB;
+        let near = Some((12.0, 90.0, InRange::Yes, Some(top + 5.0)));
+        let far = Some((60.0, 315.0, InRange::Yes, Some(top + 15.0)));
+        let a = register(
+            vec![
+                cand("0000001", "S1", CENTER, "12K5F3E", near),
+                cand("0000002", "S2", CENTER, "12K5F3E", far),
+            ],
+            vec![],
+        );
+        let o = origins_of(&q(&["fm"], CENTER, 12_500), &described_of(&a));
+        assert_eq!(o.origins[0].score, o.origins[1].score, "{o:?}");
+        let sites: Vec<_> = o
+            .origins
+            .iter()
+            .map(|x| x.allocation.site_id.as_deref().unwrap())
+            .collect();
+        assert_eq!(sites, ["S2", "S1"]);
+        assert_eq!(o.origins[0].allocation.expected_level_dbm, Some(top + 15.0));
+        let s = summary(&o);
+        let level = |x: f64| format!("expected about {x:.0} dBm");
+        assert!(
+            s.contains(&format!(" 60 km fits 1.0, {}; ", level(top + 15.0))),
+            "{s}"
+        );
+        assert!(
+            s.ends_with(&format!(" 12 km fits 1.0, {}", level(top + 5.0))),
+            "{s}"
+        );
+    }
+
+    #[test]
     fn a_station_beam_halves_the_term_of_a_site_behind_it() {
         let band = q(&[], CENTER, 12_500);
         let p = Propagation::default();
@@ -4140,6 +4212,26 @@ mod tests {
         assert_eq!(
             v.summary,
             "register agrees: Example Water Authority, Example Hill, 12.5 kHz FM voice, 12 km"
+        );
+    }
+
+    #[test]
+    fn agreeing_with_one_site_of_a_network_says_how_many_sites_send_it() {
+        let in_range = Some((12.3, 315.0, InRange::Yes, Some(-80.0)));
+        let mut c = cand("0000001", "S1", CENTER, "12K5F3E", in_range);
+        c.network_sites = 4;
+        let a = register(vec![c.clone()], vec![]);
+        let agrees =
+            "register agrees: Example Water Authority, Example Hill, 12.5 kHz FM voice, 12 km";
+        assert_eq!(
+            verdict_on(&a, "fm", None).summary,
+            format!("{agrees}; one of 4 sites sending it on this frequency")
+        );
+        c.device.polarisation = Some("H".into());
+        let a = register(vec![c], vec![]);
+        assert_eq!(
+            verdict_on(&a, "fm", None).summary,
+            format!("{agrees}; one of 4 sites sending it on this frequency (polarisation H here)")
         );
     }
 

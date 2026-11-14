@@ -9,7 +9,13 @@
 //       "6401 m", `kt`, `km_h` -> "780 km/h", `m_s` -> "+5.0 m/s" (a climb rate stays a climb
 //       rate, one decimal and its sign), `deg` -> "245°" (359.6 -> "0°"); no unit or a
 //       non-number as sent, an object as JSON; null or undefined -> ""
-//   registerText(allocations) -> "register says <EMISSION> <licensee>, <site>, <d> km, <p> W"
+//   powerText(row) -> a register row's power as the node's note words it (register.rs
+//       `watts_words`): the transmitter's "25 W", else its radiated power marked "50 kW EIRP"
+//       (kilowatts from 1000 W up); null when the row holds neither (a zero is no figure)
+//   levelText(dbm) -> "expected about <n> dBm" (register.rs `level_words`): the register's
+//       estimate, worded as one
+//   registerText(allocations) -> "register says <EMISSION> <licensee>, <site>, <d> km, <power>"
+//       (<power> as powerText gives it)
 //       for the nearest `tx` assignment of a classification's or verdict's allocations
 //       (parts it lacks left out), or null when there is none (an older node's line: a node
 //       that sends `register` gets registerLines instead)
@@ -36,14 +42,17 @@
 //           degrees, the designator when it has no words, `, measured <m> dBm` after the
 //           expected level when `measured` (dBm, a calibrated source's) is a number, `, pointed
 //           away` when its geometry's off_beam_deg exceeds half the device's beamwidth_deg;
-//           parts a candidate lacks left out;
+//           for one site of a same-frequency network (`network_sites` over 1), `, polarisation
+//           <code>` (what may tell its sites apart; left out when the register holds none)
+//           and `, one of <n> sites on this frequency`; parts a candidate lacks left out;
 //         - what the first of them belongs to, when its `related` names anything:
 //           `belongs to: licence <no>, paired with <mhz> MHz (<role>), …, <n> more channels of
 //           the holder at the site, link to <far site> <d> km`.
 //   originSummary(answer) -> one line for an `origin_lookup` answer, as the node's
 //       origin::summary words it: "<n> sites on <f> MHz: <licensee>, <site> <d> km <agree>
-//       <score>; ..." naming the first ORIGIN_SUMMARY_SITES (the distance left out when
-//       unknown, the service when the row names neither licensee nor site); with no origins,
+//       <score>, expected about <l> dBm; ..." naming the first ORIGIN_SUMMARY_SITES (the
+//       distance left out when unknown, the level when the row has none, the service when the
+//       row names neither licensee nor site); with no origins,
 //       the register's status first (`register_status`: "register unreachable: <reason>", or
 //       "register could not list licences: <reason>; partial answer: <query>, … failed" when
 //       its `candidates` query failed), else "no register provider" (`register_rows` null),
@@ -77,10 +86,29 @@ export function originSummary(a) {
     const al = o.allocation || {};
     let s = [al.licensee, al.site].filter(Boolean).join(", ") || al.service || "";
     if (typeof al.distance_km === "number") s += ` ${al.distance_km.toFixed(0)} km`;
-    return `${s} ${o.agree} ${Number(o.score).toFixed(1)}`;
+    const level = Number.isFinite(al.expected_level_dbm)
+      ? `, ${levelText(al.expected_level_dbm)}` : "";
+    return `${s} ${o.agree} ${Number(o.score).toFixed(1)}${level}`;
   });
   const n = origins.length;
   return `${n} ${n === 1 ? "site" : "sites"} on ${f} MHz: ${sites.join("; ")}`;
+}
+
+function wattsText(w) {
+  const trim = (x) => x.toFixed(3).replace(/\.?0+$/, "");
+  return w >= 1e3 ? `${trim(w / 1e3)} kW` : `${trim(w)} W`;
+}
+
+export function powerText(row) {
+  const usable = (w) => Number.isFinite(w) && w > 0;
+  if (usable(row?.power_w)) return wattsText(row.power_w);
+  if (usable(row?.eirp_w)) return `${wattsText(row.eirp_w)} EIRP`;
+  return null;
+}
+
+export function levelText(dbm) {
+  // Math.round(-0.4) is -0, which would read "-0".
+  return `expected about ${Math.round(dbm) || 0} dBm`;
 }
 
 export function registerText(allocations) {
@@ -90,7 +118,8 @@ export function registerText(allocations) {
   if (!tx) return null;
   const where = [tx.licensee, tx.site].filter((x) => typeof x === "string" && x);
   if (typeof tx.distance_km === "number") where.push(`${tx.distance_km.toFixed(0)} km`);
-  if (typeof tx.power_w === "number") where.push(`${tx.power_w} W`);
+  const power = powerText(tx);
+  if (power) where.push(power);
   const code = typeof tx.emission === "string" ? ` ${tx.emission}` : "";
   return `register says${code} ${where.join(", ")}`.trim();
 }
@@ -153,12 +182,16 @@ function candidateLine(c, measured) {
   if (words) parts.push(words);
   const level = c.expected?.level_dbm;
   if (Number.isFinite(level)) {
-    parts.push(`expected about ${Math.round(level)} dBm`);
+    parts.push(levelText(level));
     if (Number.isFinite(measured)) parts.push(`measured ${Math.round(measured)} dBm`);
   }
   if (Number.isFinite(g?.off_beam_deg) && Number.isFinite(d.beamwidth_deg)
       && g.off_beam_deg > d.beamwidth_deg / 2) {
     parts.push("pointed away");
+  }
+  if (c.network_sites > 1) {
+    if (d.polarisation) parts.push(`polarisation ${d.polarisation}`);
+    parts.push(`one of ${c.network_sites} sites on this frequency`);
   }
   return parts.join(", ");
 }

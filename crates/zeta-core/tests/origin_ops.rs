@@ -135,6 +135,8 @@ fn row(licence: &str, licensee: &str, site: &str, emission: &str, center: u64) -
         distance_km: None,
         bearing_deg: None,
         power_w: None,
+        eirp_w: None,
+        expected_level_dbm: None,
         center_hz: Some(Hz(center)),
         bandwidth_hz: None,
         licence_no: Some(licence.into()),

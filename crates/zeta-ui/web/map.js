@@ -149,7 +149,7 @@
 
 import { Selection, isSite, sameSite } from "./selection.js";
 import { subjectLabel, subjectValues } from "./subjects.js";
-import { bandText, emissionWords, metricText } from "./units.js";
+import { bandText, emissionWords, levelText, metricText, powerText } from "./units.js";
 import { homeOf } from "./view.js";
 
 const SUBJECT_DRAW_MS = 500;
@@ -430,15 +430,18 @@ function linesBox(lines, cls = "") {
   return box;
 }
 
-// The popup (spec 4.4, Click): each origin at the site with the tooltip's lines and the
-// assignment's, then what the lookup measured. Informational only: no buttons.
+// The popup (spec 4.4, Click): each origin at the site with the tooltip's lines, the licence,
+// the register's power (powerText) and the level its estimate expects here (levelText), then
+// what the lookup measured. Informational only: no buttons.
 function sitePopup(site, answer) {
   const box = document.createElement("div");
   for (const o of site.origins) {
     const a = o.allocation;
     const lines = tooltipLines(o, answer.stations);
     if (a.licence_no) lines.push(`licence ${a.licence_no}`);
-    if (Number.isFinite(a.power_w)) lines.push(`${a.power_w} W`);
+    const power = powerText(a);
+    if (power) lines.push(power);
+    if (Number.isFinite(a.expected_level_dbm)) lines.push(levelText(a.expected_level_dbm));
     box.append(linesBox(lines, "map-origin"));
   }
   if (site.origins.some((o) => o.heard)) {

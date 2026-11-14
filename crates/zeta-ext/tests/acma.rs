@@ -192,10 +192,15 @@ async fn the_404_025_lookup_names_the_plan_and_the_four_assignments() {
     assert!((9.0..10.0).contains(&d), "{d}");
     let b = first.bearing_deg.unwrap();
     assert!((270.0..360.0).contains(&b), "{b}"); // a little west of north
+    let level = first.expected_level_dbm.expect("an expected level");
     assert_eq!(
-        first.note.as_deref(),
-        Some("Example Water Authority, Example Site Hill Rd, 10 km, 1 W, 16 kHz FM data")
+        first.note,
+        Some(format!(
+            "Example Water Authority, Example Site Hill Rd, 10 km, 1 W, 16 kHz FM data, \
+             expected about {level:.0} dBm"
+        ))
     );
+    assert_eq!(first.eirp_w, None);
     assert_eq!(first.site_id.as_deref(), Some("S2"));
     assert_eq!(first.as_of.as_deref(), Some("2026-01-01T00:00:00.000Z"));
     // Ranked by expected level: the two transmitters (the nearer stronger), then the

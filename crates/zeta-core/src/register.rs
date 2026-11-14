@@ -361,6 +361,12 @@ pub struct Candidate {
     #[serde(default)]
     #[schemars(required)]
     pub related: Option<Related>,
+    /// How many of the answer's sites, this one included, send the same thing on this
+    /// frequency ([`count_networks`]): more than 1 is a same-frequency network, whose
+    /// sites the register alone cannot tell apart (their `polarisation` may). 0 in an
+    /// answer kept before the count.
+    #[serde(default)]
+    pub network_sites: u32,
 }
 
 /// A licence that covers an area rather than a site.
@@ -468,6 +474,11 @@ impl RegisterAnswer {
             let d = &c.device;
             let half = d.bandwidth_hz.map_or(0, |b| b.0 / 2);
             let distance_km = c.geometry.as_ref().map(|g| g.distance_km);
+            // A zero is the register's way of holding no figure (a broadcast licence
+            // holds an EIRP and a zero transmitter power).
+            let usable = |w: Option<f64>| w.filter(|w| w.is_finite() && *w > 0.0);
+            let (power_w, eirp_w) = (usable(d.power_w), usable(d.eirp_w));
+            let expected_level_dbm = c.expected.as_ref().and_then(|e| e.level_dbm);
             Allocation {
                 provider: self.provider.clone(),
                 region: self.region.clone(),
@@ -478,9 +489,10 @@ impl RegisterAnswer {
                     c.holder.name.as_deref(),
                     c.site.name.as_deref(),
                     distance_km,
-                    d.power_w,
+                    power_words(power_w, eirp_w),
                     d.emission.as_deref(),
                     d.emission_decoded.as_ref(),
+                    expected_level_dbm,
                 ),
                 kind: Some("assignment".into()),
                 licensee: c.holder.name.clone(),
@@ -490,7 +502,9 @@ impl RegisterAnswer {
                 lon: Some(c.site.lon),
                 distance_km,
                 bearing_deg: c.geometry.as_ref().map(|g| g.bearing_deg),
-                power_w: d.power_w,
+                power_w,
+                eirp_w,
+                expected_level_dbm,
                 center_hz: Some(d.center_hz),
                 bandwidth_hz: d.bandwidth_hz,
                 licence_no: Some(c.licence.number.clone()),
@@ -522,26 +536,89 @@ impl RegisterAnswer {
     }
 }
 
-/// `licensee, site, 10 km, 1 W, 16 kHz FM data`, the parts the row lacks dropped.
+/// Fills each candidate's [`Candidate::network_sites`]: the distinct sites among the
+/// transmitters that share its centre, its emission designator and its callsign (the
+/// holder's name where neither has a callsign). A receiver, and a transmitter with
+/// neither a callsign nor a holder's name, counts only itself.
+pub fn count_networks(candidates: &mut [Candidate]) {
+    // What a transmitter sends, as far as the register says: `None` for a row that
+    // cannot be joined to another.
+    fn sent(c: &Candidate) -> Option<(u64, Option<&str>, bool, &str)> {
+        let d = &c.device;
+        if d.role.as_deref() != Some("tx") {
+            return None;
+        }
+        let (by_callsign, name) = match (d.callsign.as_deref(), c.holder.name.as_deref()) {
+            (Some(cs), _) if !cs.is_empty() => (true, cs),
+            (_, Some(h)) if !h.is_empty() => (false, h),
+            _ => return None,
+        };
+        Some((d.center_hz.0, d.emission.as_deref(), by_callsign, name))
+    }
+    let counts: Vec<u32> = candidates
+        .iter()
+        .map(|c| {
+            let Some(key) = sent(c) else {
+                return 1;
+            };
+            let sites: std::collections::BTreeSet<&str> = candidates
+                .iter()
+                .filter(|o| sent(o) == Some(key))
+                .map(|o| o.site.id.as_str())
+                .collect();
+            u32::try_from(sites.len()).unwrap_or(u32::MAX)
+        })
+        .collect();
+    for (c, n) in candidates.iter_mut().zip(counts) {
+        c.network_sites = n;
+    }
+}
+
+/// `licensee, site, 10 km, 1 W, 16 kHz FM data, expected about -95 dBm`, the parts the
+/// row lacks dropped; `power` as [`power_words`] gives it.
 pub fn note_line(
     licensee: Option<&str>,
     site: Option<&str>,
     distance_km: Option<f64>,
-    power_w: Option<f64>,
+    power: Option<String>,
     emission: Option<&str>,
     decoded: Option<&Emission>,
+    expected_level_dbm: Option<f64>,
 ) -> Option<String> {
     let parts: Vec<String> = [
         licensee.map(str::to_string),
         site.map(str::to_string),
         distance_km.map(|d| format!("{d:.0} km")),
-        power_w.map(|p| format!("{} W", trim_num(p))),
+        power,
         decoded.map(emission_words).or(emission.map(str::to_string)),
+        expected_level_dbm.map(level_words),
     ]
     .into_iter()
     .flatten()
     .collect();
     (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// A row's power in words: the transmitter's (`25 W`), else its radiated power, marked
+/// (`50 kW EIRP`); `None` when it holds neither.
+pub fn power_words(power_w: Option<f64>, eirp_w: Option<f64>) -> Option<String> {
+    power_w
+        .map(watts_words)
+        .or(eirp_w.map(|p| format!("{} EIRP", watts_words(p))))
+}
+
+/// A power in watts as `25 W`, or `50 kW` from a kilowatt up.
+pub fn watts_words(w: f64) -> String {
+    if w >= 1e3 {
+        format!("{} kW", trim_num(w / 1e3))
+    } else {
+        format!("{} W", trim_num(w))
+    }
+}
+
+/// An expected level as `expected about -95 dBm`: an estimate, worded as one.
+pub fn level_words(dbm: f64) -> String {
+    format!("expected about {dbm:.0} dBm")
 }
 
 /// A number with at most three decimals and no trailing zeros.
@@ -1153,6 +1230,7 @@ mod tests {
             }),
             expected: None,
             related: None,
+            network_sites: 0,
         }
     }
 
@@ -1231,6 +1309,102 @@ mod tests {
         );
         assert_eq!(rows[3].service, "FIXED (secondary)");
         assert_eq!(rows[3].note, None);
+    }
+
+    /// An `ok` answer holding `candidates`.
+    fn answer_of(candidates: Vec<Candidate>) -> RegisterAnswer {
+        let mut a = RegisterAnswer::unreachable("acma", "AU", String::new());
+        a.status = RegisterStatus {
+            state: RegisterState::Ok,
+            reason: None,
+            failed: Vec::new(),
+        };
+        a.candidates = candidates;
+        a
+    }
+
+    #[test]
+    fn a_row_with_only_an_eirp_carries_it_and_a_zero_power_is_not_known() {
+        // A broadcast licence as the register holds it: no transmitter power, an EIRP.
+        let mut c = candidate(613_500_000, "9000003/1", Some(42.0));
+        c.device.power_w = Some(0.0);
+        c.device.eirp_w = Some(50_000.0);
+        let row = &answer_of(vec![c.clone()]).allocations()[0];
+        assert_eq!(row.power_w, None);
+        assert_eq!(row.eirp_w, Some(50_000.0));
+        assert_eq!(
+            row.note.as_deref(),
+            Some("Example Pty Ltd, Hill, 42 km, 50 kW EIRP, 16 kHz FM data")
+        );
+        // Both held: the note keeps the transmitter power, the row carries both.
+        c.device.power_w = Some(25.0);
+        let row = &answer_of(vec![c.clone()]).allocations()[0];
+        assert_eq!((row.power_w, row.eirp_w), (Some(25.0), Some(50_000.0)));
+        assert!(row.note.as_deref().unwrap().contains(", 25 W, "), "{row:?}");
+        // Neither usable: no figure, and none in the note.
+        c.device.power_w = Some(0.0);
+        c.device.eirp_w = Some(0.0);
+        let row = &answer_of(vec![c]).allocations()[0];
+        assert_eq!((row.power_w, row.eirp_w), (None, None));
+        assert_eq!(
+            row.note.as_deref(),
+            Some("Example Pty Ltd, Hill, 42 km, 16 kHz FM data")
+        );
+    }
+
+    #[test]
+    fn a_row_carries_its_candidates_expected_level() {
+        let mut c = candidate(450_000_000, "9000001/1", Some(10.4));
+        c.expected = Some(Expected {
+            mode: crate::propagation::PathMode::LineOfSight,
+            level_dbm: Some(-42.4),
+            in_range: crate::propagation::InRange::Yes,
+            unknown: Vec::new(),
+        });
+        let rows = answer_of(vec![c, candidate(450_100_000, "9000002/1", None)]).allocations();
+        assert_eq!(rows[0].expected_level_dbm, Some(-42.4));
+        assert_eq!(
+            rows[0].note.as_deref(),
+            Some("Example Pty Ltd, Hill, 10 km, 1 W, 16 kHz FM data, expected about -42 dBm")
+        );
+        assert_eq!(rows[1].expected_level_dbm, None);
+    }
+
+    #[test]
+    fn sites_sending_the_same_thing_on_one_frequency_are_counted_as_a_network() {
+        // One licence per site, as a register holds a broadcast network: what joins
+        // them is the frequency, the emission and the callsign.
+        let site = |licence: &str, id: &str, callsign: Option<&str>| {
+            let mut c = candidate(613_500_000, licence, Some(10.0));
+            c.site.id = id.into();
+            c.device.callsign = callsign.map(str::to_string);
+            c
+        };
+        let mut other_holder = site("5/1", "S5", None);
+        other_holder.holder.name = Some("Another Pty Ltd".into());
+        let mut receiver = site("6/1", "S6", Some("NET1"));
+        receiver.device.role = Some("rx".into());
+        let mut cs = vec![
+            site("1/1", "S1", Some("NET1")),
+            site("2/1", "S2", Some("NET1")),
+            // The same site twice is one site.
+            site("2/2", "S2", Some("NET1")),
+            site("3/1", "S3", Some("NET2")),
+            // No callsign: the holder's name joins them.
+            site("4/1", "S4", None),
+            site("4/2", "S7", None),
+            other_holder,
+            receiver,
+            // Another frequency is another network.
+            {
+                let mut c = site("8/1", "S8", Some("NET1"));
+                c.device.center_hz = Hz(620_500_000);
+                c
+            },
+        ];
+        count_networks(&mut cs);
+        let counts: Vec<u32> = cs.iter().map(|c| c.network_sites).collect();
+        assert_eq!(counts, [2, 2, 2, 1, 2, 2, 1, 1, 1]);
     }
 
     #[test]

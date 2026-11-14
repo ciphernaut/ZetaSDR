@@ -52,10 +52,21 @@ pub struct Allocation {
     #[serde(default)]
     #[schemars(required, schema_with = "crate::types::nullable::<f64>")]
     pub bearing_deg: Option<f64>,
-    /// Transmitter power in watts, converted from the register's unit.
+    /// Transmitter power in watts, converted from the register's unit; `null` when the
+    /// register holds none or a zero.
     #[serde(default)]
     #[schemars(required, schema_with = "crate::types::nullable::<f64>")]
     pub power_w: Option<f64>,
+    /// Radiated power (EIRP) in watts, the only figure some licences hold (broadcast);
+    /// `null` when the register holds none or a zero.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<f64>")]
+    pub eirp_w: Option<f64>,
+    /// The level the register's estimate expects at the place it was heard from, dBm:
+    /// an estimate from its records, never a measurement. `null` without one.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<f64>")]
+    pub expected_level_dbm: Option<f64>,
     #[serde(default)]
     #[schemars(required, schema_with = "crate::types::nullable::<Hz>")]
     pub center_hz: Option<Hz>,
