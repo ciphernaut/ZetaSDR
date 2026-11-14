@@ -63,6 +63,7 @@ pub mod synth;
 pub mod util;
 pub mod vad;
 pub mod video_fm;
+pub mod vocoder;
 pub mod wfm;
 pub mod worker;
 

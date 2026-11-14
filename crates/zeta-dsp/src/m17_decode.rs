@@ -23,7 +23,6 @@
 //! next LSF starts it again.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,13 +30,12 @@ use async_trait::async_trait;
 use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
-use zeta_core::types::{Hz, Provenance, Span, StreamId, StreamKind, Timestamp};
+use zeta_core::types::{Provenance, Span, StreamId, StreamKind, Timestamp};
 
 use crate::m17::{
     DATA_TYPE_VOICE, DATA_TYPE_VOICE_DATA, ENCRYPTION_NONE, EOT, FRAME_BITS, FRAME_SYMBOLS,
@@ -46,9 +44,9 @@ use crate::m17::{
     encryption_name, gnss_position, lich_assemble, symbols_to_bits, type_name, word_symbols,
 };
 use crate::nbfm::nbfm_demod;
-use crate::resample::Resampler;
 use crate::synth::{M17_BAUD, M17_DEVIATION_HZ, M17_RRC_ALPHA, RRC_SPAN_SYMBOLS, rrc};
 use crate::util::{StreamingFir, event};
+use crate::vocoder::{Vocoder, VocoderEnv, VocoderSpec};
 use crate::{Input, run_map_ending, sps_check};
 
 /// The stage's kind and the row's id.
@@ -66,7 +64,7 @@ pub const M17_TRACK_TIMEOUT_FRAMES: u64 = 3;
 /// Codec 2's speech rate, Hz.
 pub const C2_RATE_HZ: u64 = 8_000;
 /// The rate of the stage's audio, Hz.
-pub const AUDIO_RATE_HZ: u64 = 48_000;
+pub use crate::vocoder::AUDIO_RATE_HZ;
 /// The vocoder's program (the row's handler 0).
 pub const C2DEC: &str = "c2dec";
 /// How long the vocoders of a finished input may take to hand back their speech.
@@ -527,149 +525,6 @@ fn fields(lsf: &Lsf, frame: u16, eot: bool) -> serde_json::Value {
     })
 }
 
-/// What a vocoder needs from its stage.
-#[derive(Clone)]
-struct VocoderEnv {
-    program: PathBuf,
-    bus: Arc<StreamBus>,
-    out: StreamId,
-    ctx: StageContext,
-    /// The reader tasks of finished vocoders, awaited when the input ends.
-    drains: Arc<Mutex<Vec<JoinHandle<()>>>>,
-}
-
-/// One stream's `c2dec`: frames in on its stdin, speech out on its stdout to the audio
-/// output.
-struct Vocoder {
-    frames: Option<mpsc::UnboundedSender<Vec<u8>>>,
-    spans: Option<mpsc::UnboundedSender<Span>>,
-    /// The payload bytes of each frame that are speech.
-    bytes: usize,
-    closing: Arc<AtomicBool>,
-    writer: Option<JoinHandle<()>>,
-    reader: Option<JoinHandle<()>>,
-}
-
-impl Vocoder {
-    /// `c2dec <mode> - -` for a stream, publishing on `env.out` with `prov`.
-    fn spawn(env: &VocoderEnv, mode: &str, bytes: usize, prov: Provenance) -> Result<Self, String> {
-        let mut child = tokio::process::Command::new(&env.program)
-            .args([mode, "-", "-"])
-            .env_clear()
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("{C2DEC} failed to start: {e}"))?;
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        let (frames, mut frames_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (spans, mut spans_rx) = mpsc::unbounded_channel::<Span>();
-        let closing = Arc::new(AtomicBool::new(false));
-        let writer = tokio::spawn(async move {
-            while let Some(b) = frames_rx.recv().await {
-                if stdin.write_all(&b).await.is_err() {
-                    break;
-                }
-            }
-        });
-        let (bus, out, ctx, done) = (
-            env.bus.clone(),
-            env.out.clone(),
-            env.ctx.clone(),
-            closing.clone(),
-        );
-        let reader = tokio::spawn(async move {
-            let mut resampler = Resampler::new(C2_RATE_HZ, AUDIO_RATE_HZ).expect("fixed rates");
-            let mut raw = Vec::new();
-            let mut speech: Vec<f32> = Vec::new();
-            let mut buf = [0u8; 4096];
-            let mut last_end = 0u64;
-            loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => raw.extend_from_slice(&buf[..n]),
-                }
-                let whole = raw.len() / 2 * 2;
-                speech.extend(
-                    raw.drain(..whole)
-                        .collect::<Vec<u8>>()
-                        .chunks(2)
-                        .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32_768.0),
-                );
-                while speech.len() >= C2_FRAME_SAMPLES {
-                    let chunk: Vec<f32> = speech.drain(..C2_FRAME_SAMPLES).collect();
-                    let span = spans_rx.try_recv().unwrap_or(Span {
-                        start_ns: Timestamp(last_end),
-                        end_ns: Timestamp(last_end + FRAME_NS),
-                    });
-                    last_end = span.end_ns.0;
-                    let samples = resampler.process(&chunk);
-                    if samples.is_empty() {
-                        continue;
-                    }
-                    let mut p = prov.clone();
-                    p.span = span;
-                    bus.publish(Frame::new(
-                        out.clone(),
-                        p,
-                        Payload::Audio {
-                            sample_rate_hz: Hz(AUDIO_RATE_HZ),
-                            channels: 1,
-                            samples: samples.into(),
-                        },
-                    ));
-                }
-            }
-            let status = child.wait().await;
-            let why = match status {
-                Ok(s) if s.success() && done.load(Ordering::SeqCst) => return,
-                Ok(s) => s.to_string(),
-                Err(e) => e.to_string(),
-            };
-            ctx.note(serde_json::json!({"m17": {"vocoder": format!("{C2DEC} exited: {why}")}}));
-        });
-        Ok(Self {
-            frames: Some(frames),
-            spans: Some(spans),
-            bytes,
-            closing,
-            writer: Some(writer),
-            reader: Some(reader),
-        })
-    }
-
-    /// Hand a stream frame's speech to the vocoder.
-    fn feed(&self, span: Span, payload: &[u8; STREAM_PAYLOAD_BYTES]) {
-        if let (Some(s), Some(f)) = (&self.spans, &self.frames) {
-            let _ = s.send(span);
-            let _ = f.send(payload[..self.bytes].to_vec());
-        }
-    }
-
-    /// Close the vocoder's input; its reader, still handing back speech, is returned.
-    fn finish(&mut self) -> Option<JoinHandle<()>> {
-        self.closing.store(true, Ordering::SeqCst);
-        self.frames = None;
-        self.spans = None;
-        self.writer = None;
-        self.reader.take()
-    }
-}
-
-impl Drop for Vocoder {
-    fn drop(&mut self) {
-        // Not finished: the stage failed or was cancelled, so the child goes too.
-        for h in [self.writer.take(), self.reader.take()]
-            .into_iter()
-            .flatten()
-        {
-            h.abort();
-        }
-    }
-}
-
 /// The stream the stage is following.
 struct Open {
     /// The LSF, once announced.
@@ -683,6 +538,8 @@ struct Open {
 /// The stage's streams: frames in, events out, speech to the vocoder.
 struct Streams {
     env: VocoderEnv,
+    /// The vocoder program (the row's handler 0).
+    program: PathBuf,
     open: Option<Open>,
 }
 
@@ -701,7 +558,16 @@ impl Streams {
         if let Some((mode, bytes)) = codec(&lsf)
             && encryption_name(&lsf).is_none()
         {
-            match Vocoder::spawn(&self.env, mode, bytes, prov.clone()) {
+            let spec = VocoderSpec {
+                name: C2DEC,
+                program: self.program.clone(),
+                args: vec![mode.into(), "-".into(), "-".into()],
+                feed_bytes: bytes,
+                feed_samples: C2_FRAME_SAMPLES,
+                rate_hz: C2_RATE_HZ,
+                context: "m17",
+            };
+            match Vocoder::spawn(&self.env, &spec, prov.clone()) {
                 Ok(v) => open.vocoder = Some(v),
                 Err(e) => self
                     .env
@@ -775,13 +641,15 @@ impl Streams {
                 if let Some(lsf) = open.pending_lsf.take() {
                     self.announce(&mut open, lsf, frame_number, t, prov, events);
                 }
-                if let Some(v) = &open.vocoder {
+                if let (Some(v), Some((_, bytes))) =
+                    (&open.vocoder, open.lsf.as_ref().and_then(codec))
+                {
                     v.feed(
                         Span {
                             start_ns: Timestamp(t),
                             end_ns: Timestamp(t + FRAME_NS),
                         },
-                        &payload,
+                        &payload[..bytes],
                     );
                 }
                 self.open = Some(open);
@@ -791,16 +659,6 @@ impl Streams {
             }
             M17Frame::Eot => self.close(t, events),
         }
-    }
-}
-
-/// The vocoder program for the stage's row (its handler 0), else `c2dec` found the same
-/// way for a stage run without one.
-fn vocoder_program(ctx: &StageContext) -> Result<PathBuf, String> {
-    match &ctx.mode {
-        Some(row) => zeta_core::modes::handlers::resolve(row, 0),
-        None => zeta_core::modes::handlers::find_handler(&[C2DEC.to_string()])
-            .ok_or_else(|| format!("{M17_DECODE_KIND}: handler {C2DEC} not found (tried {C2DEC})")),
     }
 }
 
@@ -859,16 +717,18 @@ impl Stage for M17DecodeStage {
             return Err(StageError::Failed("expected 2 outputs".into()));
         };
         let events_out = events_out.clone();
-        let program = vocoder_program(&ctx).map_err(StageError::Failed)?;
+        let program = crate::vocoder::program(&ctx, 0, C2DEC, true)
+            .map_err(StageError::Failed)?
+            .expect("a required handler");
         let drains = Arc::new(Mutex::new(Vec::new()));
         let mut streams = Streams {
             env: VocoderEnv {
-                program,
                 bus: bus.clone(),
                 out: audio_out.clone(),
                 ctx: ctx.clone(),
                 drains: drains.clone(),
             },
+            program,
             open: None,
         };
         let mut demod: Option<M17Demod> = None;
