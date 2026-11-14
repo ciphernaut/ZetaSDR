@@ -104,11 +104,13 @@ async fn classify_span(
             tried,
             allocations,
             origins,
+            register,
         }) => Classification {
             labels,
             tried,
             allocations,
             origins,
+            register: register.map(|r| *r),
         },
         other => panic!("expected a classification, got {other:?}"),
     };

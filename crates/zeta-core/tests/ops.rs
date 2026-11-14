@@ -667,7 +667,9 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                         && name != "started"
                         && name != "ended"
                         // A worker record's `starting` is what its start is doing.
-                        && name != "starting";
+                        && name != "starting"
+                        // A register link's `far_end` is the site at its other end.
+                        && name != "far_end";
                     // `_ns` is an instant; `_ms` a duration (a timeout), plain integer.
                     assert!(
                         !time || name.ends_with("_ns") || name.ends_with("_ms"),
@@ -873,11 +875,14 @@ async fn classify_op_runs_stub_and_returns_empty_labels() {
         tried,
         allocations,
         origins,
+        register,
     }) = node.apply(Op::Classify { selection }).await
     else {
         panic!("expected Classification");
     };
     assert!(labels.is_empty() && tried.is_empty() && allocations.is_empty());
+    // No provider describes the band: no register answer.
+    assert!(register.is_none());
     // Every classify scores its origins; with no register there are none to light.
     let origins = origins.expect("origins");
     assert!(origins.origins.is_empty() && origins.register_rows.is_none());
@@ -962,6 +967,22 @@ async fn classify_lists_allocations_beside_the_labels() {
     let stored: zeta_core::classify::Classification =
         serde_json::from_value(serde_json::json!({"labels": [], "tried": []})).unwrap();
     assert!(stored.origins.is_none());
+    // One stored before the register answer (every other field, no `register`) loads
+    // with `None`, as does the op's answer from such a node.
+    let stored: zeta_core::classify::Classification = serde_json::from_value(
+        serde_json::json!({"labels": [], "tried": [], "allocations": [], "origins": null}),
+    )
+    .unwrap();
+    assert!(stored.register.is_none());
+    let old: OpResult = serde_json::from_value(serde_json::json!({
+        "result": "classification",
+        "value": {"labels": [], "tried": [], "allocations": [], "origins": null},
+    }))
+    .unwrap();
+    assert!(matches!(
+        old,
+        OpResult::Classification { register: None, .. }
+    ));
 }
 
 #[tokio::test]

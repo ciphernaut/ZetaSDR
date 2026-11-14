@@ -20,6 +20,7 @@ use zeta_core::modes::score::score_rows;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::port::{IqReceiver, Port, PortError, Tuning};
+use zeta_core::register::{Candidate, RegisterAnswer, RegisterState, RegisterStatus, Signal};
 use zeta_core::stage::{
     Backend, PassthroughStage, Stage, StageContext, StageError, StageRegistry, StageSpec,
 };
@@ -911,6 +912,103 @@ async fn the_verdict_carries_the_nearest_allocations_and_the_score_term() {
     // that) has no allocation.
     let acars = outcome(&events, "acars_decode").expect("acars_decode considered");
     assert!(acars["allocation"].is_null(), "{acars}");
+}
+
+/// A register that describes every signal: one synthetic 16K0F1D transmitter licensed on
+/// the signal's own centre, counting the lookups.
+struct Describing(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl KnowledgeProvider for Describing {
+    fn name(&self) -> &str {
+        "describing"
+    }
+    fn gives_assignments(&self) -> bool {
+        true
+    }
+    async fn allocations(&self, _: &str, _: Hz, _: Hz) -> Vec<Allocation> {
+        panic!("a describing provider is not asked for its rows")
+    }
+    async fn signatures(&self, _center_hz: Hz, _bandwidth_hz: Hz) -> Vec<Signature> {
+        vec![]
+    }
+    async fn describe(
+        &self,
+        region: &str,
+        signal: &Signal,
+        _from: Option<&zeta_core::station::Station>,
+    ) -> Option<RegisterAnswer> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let mut a = RegisterAnswer::unreachable("describing", region, String::new());
+        a.status = RegisterStatus {
+            state: RegisterState::Ok,
+            reason: None,
+            failed: vec![],
+        };
+        let mut c: Candidate = serde_json::from_value(serde_json::json!({
+            "device": {"center_hz": signal.center_hz, "role": "tx", "emission": "16K0F1D"},
+            "site": {"id": "S1", "name": "Example Hill", "lat": -27.35, "lon": 153.08},
+            "licence": {"number": "0000001"},
+            "holder": {"name": LICENSEE},
+        }))
+        .unwrap();
+        c.device.emission_decoded = zeta_core::emission::parse_emission("16K0F1D");
+        a.candidates = vec![c];
+        a.matched = 1;
+        Some(a)
+    }
+}
+
+/// With a register that describes the band, an identify verdict carries its answer with
+/// the node's verdict on it, the allocations come from that answer, the job's summary
+/// gives the verdict, and the register was asked once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_verdict_carries_the_register_answer_and_its_verdict() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &fixtures().gfsk).await;
+    let register = Arc::new(Describing(Default::default()));
+    node.add_knowledge(register.clone());
+    let (id, events) = identify(&node, APRS_HZ).await;
+    let stream = node
+        .bus()
+        .list()
+        .into_iter()
+        .find(|s| s.provenance.job.as_ref() == Some(&id) && s.kind == StreamKind::Event)
+        .unwrap()
+        .id;
+    let mut tap = node.bus().subscribe(&stream).unwrap();
+    ended(&node, &id, events, Duration::from_secs(60)).await;
+    assert_eq!(register.0.load(Ordering::SeqCst), 1, "one register lookup");
+    let ctx = node.job_context(&id).unwrap();
+    let verdict = &ctx["identify"]["verdict"];
+    let answer = &verdict["register"];
+    assert_eq!(answer["provider"], "describing", "{ctx}");
+    assert_eq!(answer["candidates"][0]["holder"]["name"], LICENSEE, "{ctx}");
+    // No station: no geometry, so whatever the verdict is it is weak.
+    let kind = answer["verdict"]["kind"].as_str().expect("a verdict");
+    assert!(["agrees", "disagrees"].contains(&kind), "{ctx}");
+    assert_eq!(answer["verdict"]["weak"], true, "{ctx}");
+    let said = answer["verdict"]["summary"].as_str().unwrap();
+    assert!(said.starts_with(&format!("register {kind}")), "{said}");
+    // The allocations are the answer's rows.
+    assert_eq!(verdict["allocations"][0]["licensee"], LICENSEE, "{ctx}");
+    assert_eq!(
+        verdict["origins"]["providers"],
+        serde_json::json!(["learned", "describing"])
+    );
+    // The verdict event carries the answer, and its summary the register's verdict.
+    let mut last = None;
+    while let Ok(f) = tap.try_recv() {
+        if let Payload::Event(v) = f.payload {
+            last = Some(v);
+        }
+    }
+    let last = last.expect("events");
+    assert_eq!(last["register"], *answer, "{last}");
+    let summary = last["summary"].as_str().unwrap();
+    assert!(summary.ends_with(&format!("; {said}")), "{summary}");
+    assert!(!summary.contains("register says"), "{summary}");
 }
 
 /// An identify run publishes one `origin` event after its lookup, and its verdict (and the

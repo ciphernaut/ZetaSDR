@@ -13,7 +13,7 @@ const MIN_DISTANCE_KM: f64 = 0.01;
 /// Every assumption of the estimate. `Default` gives the values noted on each field.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::knowledge::require_all)]
 pub struct Propagation {
     /// Effective earth radius factor; 4/3 is the standard atmosphere.
     pub k_factor: f64,

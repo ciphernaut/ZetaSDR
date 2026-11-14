@@ -23,12 +23,12 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::launch::{AfterGate, StageRunning, supervise};
-use super::origin::{OriginQuery, measured_modulation, origins};
+use super::origin::{OriginQuery, described, judged, measured_modulation, origins_of};
 use super::persist::now;
 use super::{Inner, NodeError, source_fault_reason};
 use crate::classify::{Band, Measurement, Outcome};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
-use crate::knowledge::{Allocation, DEFAULT_REGION, nearest_allocations};
+use crate::knowledge::{Allocation, nearest_of};
 use crate::learned::{LEARNED_VERDICT_MIN, label_score, learned_match};
 use crate::modes::Proof;
 use crate::modes::score::{allocation_match, allocation_term, score_rows};
@@ -181,30 +181,13 @@ impl Inner {
     /// Record the run's verdict (`{"identify": ...}`) in its context and, for an owned
     /// run, hand it to the owner too: the owned record goes as soon as the run ends. The
     /// verdict is also published as one `verdict` event (`mode`, `label`, `center_hz`,
-    /// `job`, `allocations`, `summary`): a proof's `<label> at <MHz>: <the decoder's
-    /// summary>`, an unknown's `unknown at <MHz>: <label> <features>; register says ...`
-    /// (with a learned match `learned <name> at <MHz>: <features>`) as the watch words it,
-    /// `center_hz` the measured centre. A proof (a `mode`) on the band `tuning` (the
-    /// proved child's) supersedes the accepted signatures it overlaps
-    /// ([`Inner::supersede_by`]).
+    /// `job`, `allocations`, `register`, `summary` [`job_summary`]), `center_hz` the
+    /// measured centre. A proof (a `mode`) on the band `tuning` (the proved child's)
+    /// supersedes the accepted signatures it overlaps ([`Inner::supersede_by`]).
     fn verdict(&self, r: &Run, verdict: serde_json::Value, center_hz: u64, tuning: Tuning) {
         let v = &verdict["identify"]["verdict"];
-        let at = format!("{:.4} MHz", center_hz as f64 / 1e6);
         let label = v["label"].as_str().unwrap_or("unknown");
-        let summary = match v["mode"].as_str() {
-            Some(_) => format!(
-                "{label} at {at}: {}",
-                v["summary"].as_str().unwrap_or("proved")
-            ),
-            None if v["learned"].is_object() => {
-                format!("{label} at {at}:{}", super::watch::measured(&v["features"]))
-            }
-            None => format!(
-                "unknown at {at}: {label}{}{}",
-                super::watch::measured(&v["features"]),
-                super::watch::register_says(&v["allocations"]),
-            ),
-        };
+        let summary = job_summary(v, center_hz);
         let t = now();
         if let Some(mode) = v["mode"].as_str() {
             self.supersede_by(mode, tuning, t.0);
@@ -216,6 +199,7 @@ impl Inner {
             "center_hz": center_hz,
             "job": v["job"],
             "allocations": v["allocations"],
+            "register": v["register"],
             "summary": summary,
             "t_ns": t.0,
         });
@@ -494,8 +478,9 @@ impl Inner {
 
 /// The `identify` job's body: (1) measure [`IDENTIFY_MEASURE_MS`] of the ring over
 /// the band with the node's layer-1 classifiers, and ask the knowledge providers once
-/// for the band's allocations ([`nearest_allocations`]; the station's region, else
-/// [`DEFAULT_REGION`]);
+/// about the measured band ([`described`]): its allocations ([`nearest_of`]), its
+/// origins ([`origins_of`]) and the register answer with its verdict ([`judged`]),
+/// all carried on the verdict;
 /// (2) score the rows ([`score_rows`], the measured centre, the job's own band, the
 /// register's [`allocation_term`]; no catalogue term, which lives with the
 /// classifiers) and publish `skipped_band` for those wider than the band and
@@ -559,25 +544,9 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
             .as_ref()
             .map(|m| (m.features.center_hz.0, m.label.name.as_str())),
     );
-    let region = inner
-        .station
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map_or_else(|| DEFAULT_REGION.to_string(), |s| s.region.clone());
-    let providers = inner.knowledge.read().unwrap().clone();
-    let lookup = nearest_allocations(
-        &providers,
-        &region,
-        r.tuning.center_hz,
-        r.tuning.bandwidth_hz,
-    );
-    let allocations = tokio::select! {
-        a = lookup => a,
-        _ = r.cancel.cancelled() => return Err(StageError::Cancelled),
-    };
-    // The origins of the measured band, scored on the measured label; one `origin`
-    // event after the lookup, and `origins` in the job's context.
+    // One register lookup for the measured band: the allocations, the origins (scored on
+    // the measured label; one `origin` event after the lookup, and `origins` in the
+    // job's context) and the register answer with its verdict all read it.
     let q = OriginQuery {
         source: r.port.id().clone(),
         center_hz: Hz(m_center),
@@ -589,10 +558,13 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         job: Some(r.id.clone()),
         at: now(),
     };
-    let origins = tokio::select! {
-        a = origins(&inner, &q) => a,
+    let d = tokio::select! {
+        d = described(&inner, &q.source, q.center_hz, q.bandwidth_hz) => d,
         _ = r.cancel.cancelled() => return Err(StageError::Cancelled),
     };
+    let allocations = nearest_of(d.rows.clone());
+    let origins = origins_of(&q, &d);
+    let register = judged(&d, &origins);
     // The answer is already in hand for the verdict: a failed merge (the job was removed
     // under the run) only loses the context copy and the event, so the run goes on.
     let _ = inner.keep_origin(&r.id, r.port.id(), &origins);
@@ -680,6 +652,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                         "allocations": allocations,
                         "learned": null,
                         "origins": origins,
+                        "register": register,
                     },
                     "attempts": attempts,
                 }});
@@ -704,11 +677,42 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
             "allocations": allocations,
             "learned": learned_json,
             "origins": origins,
+            "register": register,
         },
         "attempts": attempts,
     }});
     inner.verdict(&r, verdict, m_center, trial);
     Ok(())
+}
+
+/// An identify verdict `v`'s one line, as the watch words it, `center_hz` the measured
+/// centre: a proof's `<label> at <MHz>: <the decoder's summary>`; a learned match's
+/// `learned <name> at <MHz>: <features>`; an unknown's `unknown at <MHz>: <label>
+/// <features>; <the register verdict's summary>` with a register answer, else `...;
+/// register says ...` from the nearest transmitter of `allocations` (a verdict kept
+/// before the register answer reads that way too).
+fn job_summary(v: &serde_json::Value, center_hz: u64) -> String {
+    let at = format!("{:.4} MHz", center_hz as f64 / 1e6);
+    let label = v["label"].as_str().unwrap_or("unknown");
+    match v["mode"].as_str() {
+        Some(_) => format!(
+            "{label} at {at}: {}",
+            v["summary"].as_str().unwrap_or("proved")
+        ),
+        None if v["learned"].is_object() => {
+            format!("{label} at {at}:{}", super::watch::measured(&v["features"]))
+        }
+        None => {
+            let register = match v["register"]["verdict"]["summary"].as_str() {
+                Some(s) => format!("; {s}"),
+                None => super::watch::register_says(&v["allocations"]),
+            };
+            format!(
+                "unknown at {at}: {label}{}{register}",
+                super::watch::measured(&v["features"]),
+            )
+        }
+    }
 }
 
 /// The band each trial job runs on, and whether it is re-centred: the identify band's
@@ -788,6 +792,33 @@ mod tests {
             center_hz: Hz(center_hz),
             bandwidth_hz: Hz(bandwidth_hz),
         }
+    }
+
+    #[test]
+    fn an_identify_verdict_kept_before_the_register_answer_still_reads() {
+        // An unknown verdict as a node before the register answer kept it: no `register`.
+        let old = serde_json::json!({
+            "mode": null,
+            "label": "fsk",
+            "features": {"bandwidth_hz": 12_500},
+            "recentred": false,
+            "allocations": [{"role": "tx", "licensee": "Example Paging", "distance_km": 12.3}],
+            "learned": null,
+            "origins": null,
+        });
+        assert_eq!(
+            job_summary(&old, 148_637_500),
+            "unknown at 148.6375 MHz: fsk 12.5 kHz; register says Example Paging, 12 km"
+        );
+        // With a register answer its verdict's summary takes the register's place.
+        let mut new = old.clone();
+        new["register"] = serde_json::json!({"verdict": {
+            "kind": "agrees", "weak": false, "summary": "register agrees: Example Paging"
+        }});
+        assert_eq!(
+            job_summary(&new, 148_637_500),
+            "unknown at 148.6375 MHz: fsk 12.5 kHz; register agrees: Example Paging"
+        );
     }
 
     #[test]

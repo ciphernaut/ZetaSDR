@@ -8,13 +8,14 @@ mod launch;
 pub use launch::DRAIN_TIMEOUT_MS;
 mod origin;
 pub use origin::{
-    Agree, Confirmed, From as OriginFrom, FromKind, Grade, Heard, ORIGIN_MODULATION_FITS,
-    ORIGIN_MODULATION_UNKNOWN, ORIGIN_NO_BAND_KINDS, ORIGIN_REACH_FLOOR, ORIGIN_REACH_IN,
-    ORIGIN_REACH_UNKNOWN, ORIGIN_SITES, ORIGIN_SUMMARY_SITES, ORIGIN_WIDTH_FULL, ORIGIN_WIDTH_HALF,
-    ORIGIN_WIDTH_LOOSE, ORIGIN_WIDTH_NONE, ORIGIN_WIDTH_RANGE, Origin, OriginAnswer, OriginQuery,
-    STATION_ANONYMOUS, STATION_REPUBLISH_MS, StationSeen, Terms, Vantage, answer as origin_answer,
-    apply_stations, confirm, confirm_identity, heard_of, identity_value, job_modulation, score_row,
-    station_frame, station_summary, summary,
+    Agree, Confirmed, Described, From as OriginFrom, FromKind, Grade, Heard, ORIGIN_LEVEL_SPAN_DB,
+    ORIGIN_MODULATION_FITS, ORIGIN_MODULATION_UNKNOWN, ORIGIN_NO_BAND_KINDS, ORIGIN_REACH_FLOOR,
+    ORIGIN_REACH_IN, ORIGIN_REACH_UNKNOWN, ORIGIN_SITES, ORIGIN_SUMMARY_SITES, ORIGIN_WIDTH_FULL,
+    ORIGIN_WIDTH_HALF, ORIGIN_WIDTH_LOOSE, ORIGIN_WIDTH_NONE, ORIGIN_WIDTH_RANGE, Origin,
+    OriginAnswer, OriginQuery, STATION_ANONYMOUS, STATION_REPUBLISH_MS, StationSeen, Terms,
+    VERDICT_LEVEL_TOLERANCE_DB, Vantage, answer as origin_answer, apply_stations, confirm,
+    confirm_identity, heard_of, identity_value, job_modulation, judged, origins_of, score_row,
+    station_frame, station_summary, summary, verdict,
 };
 mod persist;
 mod propose;

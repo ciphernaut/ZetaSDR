@@ -15,7 +15,7 @@ use crate::capture::{CaptureMeta, write_cf32};
 use crate::classify::{Band, Classification, Label, Tried};
 use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::{JobRecord, JobState};
-use crate::knowledge::{Allocation, DEFAULT_REGION, Signature, nearest_allocations};
+use crate::knowledge::{Allocation, Signature, nearest_of};
 use crate::lease::{Decision, LeaseError};
 use crate::modes::{
     Access, Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow,
@@ -3121,8 +3121,8 @@ pub enum OpResult {
     },
     /// `classify`: every classifier's labels, the modes decode-to-identify
     /// considered with their score and outcome, and the allocations the knowledge
-    /// providers hold for the selection's band in the station's region (the nearest
-    /// assignments, then the plan rows: [`nearest_allocations`]).
+    /// providers hold for the selection's band from its source's vantage (the first
+    /// assignments in the register's rank order, then the plan rows: [`nearest_of`]).
     #[schemars(transform = require_all_value)]
     Classification {
         labels: Vec<Label>,
@@ -3138,6 +3138,15 @@ pub enum OpResult {
             schema_with = "crate::types::nullable::<crate::node::OriginAnswer>"
         )]
         origins: Option<crate::node::OriginAnswer>,
+        /// The register's answer for the band from the same lookup as `origins`, with
+        /// the node's verdict; `null` with no describing provider, and from an older
+        /// node.
+        #[serde(default)]
+        #[schemars(
+            required,
+            schema_with = "crate::types::nullable::<crate::register::RegisterAnswer>"
+        )]
+        register: Option<Box<crate::register::RegisterAnswer>>,
     },
     /// A source's gain after `source_set_gain`.
     Gain(GainInfo),
@@ -6672,6 +6681,7 @@ async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
         tried,
         allocations,
         origins,
+        register,
     } = node.classify_capture_scored(&rec).await.map_err(other)?;
     let band = Tuning {
         center_hz: rec.center_hz,
@@ -6683,6 +6693,7 @@ async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
         tried,
         allocations,
         origins,
+        register: register.map(Box::new),
     })
 }
 
@@ -6724,12 +6735,12 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         offset_hz: sel.center_hz.0 as i64 - center.0 as i64,
         bandwidth_hz: sel.bandwidth_hz,
     };
-    // Asked once per run, before the classifiers: a dead register costs its deadline once.
-    let region = node
-        .station()
-        .map_or_else(|| DEFAULT_REGION.to_string(), |s| s.region);
-    let allocations =
-        nearest_allocations(&node.knowledge(), &region, sel.center_hz, sel.bandwidth_hz).await;
+    // Asked once per run, before the classifiers: a dead register costs its deadline
+    // once, and the classifiers, the origins and the verdict read the same answer.
+    let d = node
+        .described(&sel.source, sel.center_hz, sel.bandwidth_hz)
+        .await;
+    let allocations = nearest_of(d.rows.clone());
     let classified = node
         .classifiers()
         .run_all(&samples, rate, center, band, None, allocations)
@@ -6739,9 +6750,8 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         tried,
         allocations,
         origins,
-    } = node
-        .score_classification(classified, &sel.source, sel.center_hz, sel.bandwidth_hz)
-        .await;
+        register,
+    } = node.score_classification(classified, &sel.source, sel.center_hz, sel.bandwidth_hz, &d);
     let band = Tuning {
         center_hz: sel.center_hz,
         bandwidth_hz: sel.bandwidth_hz,
@@ -6752,6 +6762,7 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         tried,
         allocations,
         origins,
+        register: register.map(Box::new),
     })
 }
 

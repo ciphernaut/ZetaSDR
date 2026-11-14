@@ -17,7 +17,11 @@ use crate::knowledge::{Allocation, DEFAULT_REGION, KnowledgeProvider};
 use crate::modes::score::{designator_fits, row_width};
 use crate::modes::{Identity, ModeRegistry};
 use crate::ops::{BITS_KIND, GRAPH_KIND, SignalBand};
-use crate::reach::Reach;
+use crate::propagation::{Expected, Geometry, InRange, Propagation};
+use crate::reach::{Reach, SECTOR_DEG};
+use crate::register::{
+    Candidate, RegisterAnswer, RegisterState, Signal, Verdict, VerdictKind, emission_words,
+};
 use crate::station::{Antenna, Station};
 use crate::stream::{Frame, Payload};
 use crate::types::{Baud, Hz, JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
@@ -51,6 +55,13 @@ pub const ORIGIN_REACH_UNKNOWN: f32 = 0.1;
 pub const ORIGIN_SCORE_DECIMALS: i32 = 2;
 /// How many sites [`summary`] names.
 pub const ORIGIN_SUMMARY_SITES: usize = 3;
+/// How far above the register's in-range floor (`in_range_floor_dbm`) an expected level
+/// must be for the full reach term: the term rises from [`ORIGIN_REACH_FLOOR`]'s share
+/// at the floor to the whole of [`ORIGIN_REACH_IN`] this many dB above it.
+pub const ORIGIN_LEVEL_SPAN_DB: f64 = 60.0;
+/// How far a measured level may sit from a candidate's expected one and still fit it:
+/// wide, since the expected level is an estimate, not a prediction.
+pub const VERDICT_LEVEL_TOLERANCE_DB: f64 = 20.0;
 
 /// The signal as measured or declared, to find the transmitters it may come from.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -262,12 +273,41 @@ pub fn vantage_for(inner: &Inner, source: &SourceId) -> Vantage {
     }
 }
 
-/// Ask every provider for `q`'s band from `q.source`'s vantage, all at once, and score
-/// the rows into an answer ([`answer`]); the reach is that of the first provider (in
-/// order) that has one. The region is the vantage's, else the station's, else
-/// [`DEFAULT_REGION`].
-pub async fn origins(inner: &Inner, q: &OriginQuery) -> OriginAnswer {
-    let vantage = vantage_for(inner, &q.source);
+/// What every provider said about a band from a source's vantage, fetched once
+/// ([`described`]): the rows and reach the origins are scored from ([`origins_of`]), and
+/// the register answer the verdict is made on ([`verdict`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Described {
+    pub vantage: Vantage,
+    pub region: String,
+    /// The providers asked, in order.
+    pub providers: Vec<String>,
+    /// The answer of the first provider, in order, that describes the band.
+    pub register: Option<RegisterAnswer>,
+    /// Every provider's rows, in provider order; a describing provider's are its
+    /// answer's ([`RegisterAnswer::allocations`]: the candidates in rank order, then the
+    /// plan).
+    pub rows: Vec<Allocation>,
+    /// The reach of the first provider, in order, that has one.
+    pub reach: Option<Reach>,
+    /// As [`OriginAnswer::register_rows`].
+    pub register_rows: Option<u32>,
+}
+
+/// Ask every provider about `center_hz`/`bandwidth_hz` from `source`'s vantage, all at
+/// once, one register lookup each: a provider that describes the band
+/// ([`KnowledgeProvider::describe`]) gives its answer, its rows and its reach from that
+/// answer ([`KnowledgeProvider::reach_of`]) and is not asked again; one that does not is
+/// asked `allocations_from` and `reach_from`. A provider whose regions
+/// ([`KnowledgeProvider::regions`]) do not hold the region is not asked at all. The
+/// region is the vantage's, else the station's, else [`DEFAULT_REGION`].
+pub async fn described(
+    inner: &Inner,
+    source: &SourceId,
+    center_hz: Hz,
+    bandwidth_hz: Hz,
+) -> Described {
+    let vantage = vantage_for(inner, source);
     let region = match vantage.station() {
         Some(s) => s.region.clone(),
         None => inner
@@ -277,27 +317,50 @@ pub async fn origins(inner: &Inner, q: &OriginQuery) -> OriginAnswer {
             .as_ref()
             .map_or_else(|| DEFAULT_REGION.to_string(), |s| s.region.clone()),
     };
-    let providers: Vec<Arc<dyn KnowledgeProvider>> = inner.knowledge.read().unwrap().clone();
+    let providers: Vec<Arc<dyn KnowledgeProvider>> = inner
+        .knowledge
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|p| {
+            let regions = p.regions();
+            regions.is_empty() || regions.iter().any(|r| r.eq_ignore_ascii_case(&region))
+        })
+        .cloned()
+        .collect();
     let names = providers.iter().map(|p| p.name().to_string()).collect();
     let registers = providers.iter().any(|p| p.gives_assignments());
     let from = vantage.station().cloned();
+    let signal = Signal {
+        center_hz,
+        bandwidth_hz,
+    };
     // A JoinSet aborts the lookups still running when the caller is dropped.
     let mut set = tokio::task::JoinSet::new();
     let mut ids = HashMap::new();
     for (i, p) in providers.iter().enumerate() {
-        let (p, region, from) = (p.clone(), region.clone(), from.clone());
-        let (c, b) = (q.center_hz, q.bandwidth_hz);
+        let (p, region, from, signal) = (p.clone(), region.clone(), from.clone(), signal.clone());
         let handle = set.spawn(async move {
-            let rows = p.allocations_from(&region, c, b, from.as_ref()).await;
-            let reach = p.reach_from(&region, c, b, from.as_ref()).await;
-            (i, rows, reach)
+            let (c, b) = (signal.center_hz, signal.bandwidth_hz);
+            match p.describe(&region, &signal, from.as_ref()).await {
+                Some(a) => {
+                    let reach = p.reach_of(&a, &signal, from.as_ref());
+                    (i, a.allocations(), reach, Some(a))
+                }
+                None => {
+                    let rows = p.allocations_from(&region, c, b, from.as_ref()).await;
+                    let reach = p.reach_from(&region, c, b, from.as_ref()).await;
+                    (i, rows, reach, None)
+                }
+            }
         });
         ids.insert(handle.id(), i);
     }
-    let mut answers: Vec<Option<(Vec<Allocation>, Option<Reach>)>> = vec![None; providers.len()];
+    type Said = (Vec<Allocation>, Option<Reach>, Option<RegisterAnswer>);
+    let mut answers: Vec<Option<Said>> = vec![None; providers.len()];
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok((i, r, re)) => answers[i] = Some((r, re)),
+            Ok((i, r, re, a)) => answers[i] = Some((r, re, a)),
             // A provider that failed answers nothing; say which.
             Err(e) => {
                 let name = ids.get(&e.id()).map_or("?", |&i| providers[i].name());
@@ -305,18 +368,60 @@ pub async fn origins(inner: &Inner, q: &OriginQuery) -> OriginAnswer {
             }
         }
     }
-    let (mut rows, mut reach, mut register_rows) = (Vec::new(), None, 0);
+    let (mut rows, mut reach, mut register, mut register_rows) = (Vec::new(), None, None, 0);
     for (p, a) in providers.iter().zip(answers) {
-        let Some((r, re)) = a else { continue };
+        let Some((r, re, a)) = a else { continue };
         if p.gives_assignments() {
             register_rows += r.len() as u32;
         }
         rows.extend(r);
-        // The first provider, in order, that has a reach.
+        // The first provider, in order, that has a reach, and the first that describes.
         reach = reach.or(re);
+        register = register.or(a);
     }
-    let register_rows = registers.then_some(register_rows);
-    answer(q, rows, reach, &vantage, names, register_rows)
+    Described {
+        vantage,
+        region,
+        providers: names,
+        register,
+        rows,
+        reach,
+        register_rows: registers.then_some(register_rows),
+    }
+}
+
+/// [`described`] for `q`'s band from `q.source`, scored into an answer ([`origins_of`]).
+pub async fn origins(inner: &Inner, q: &OriginQuery) -> OriginAnswer {
+    origins_of(
+        q,
+        &described(inner, &q.source, q.center_hz, q.bandwidth_hz).await,
+    )
+}
+
+/// `d`'s rows scored against `q` into an answer ([`answer`]); a row of the register
+/// answer's (found by licence, site id and centre) has its reach term graded from that
+/// candidate's geometry and expected level ([`score_row`]).
+pub fn origins_of(q: &OriginQuery, d: &Described) -> OriginAnswer {
+    answer_with(
+        q,
+        d.rows.clone(),
+        d.reach.clone(),
+        &d.vantage,
+        d.providers.clone(),
+        d.register_rows,
+        d.register.as_ref(),
+    )
+}
+
+/// `d`'s register answer with its [`verdict`] on `origins` (the answer [`origins_of`]
+/// scored from `d`); `None` when no provider describes the band.
+pub fn judged(d: &Described, origins: &OriginAnswer) -> Option<RegisterAnswer> {
+    d.register.clone().map(|mut a| {
+        // No caller holds an absolute level yet: `classify` and Identify measure only a
+        // signal-to-noise ratio (design 3.3, "Level"), so the level is not compared.
+        a.verdict = Some(verdict(&a, origins, None));
+        a
+    })
 }
 
 /// The deduplication key of an origin: licence, site and resolved centre.
@@ -340,15 +445,55 @@ pub fn answer(
     providers: Vec<String>,
     register_rows: Option<u32>,
 ) -> OriginAnswer {
+    answer_with(q, rows, reach, vantage, providers, register_rows, None)
+}
+
+/// [`answer`], a row that is one of `register`'s candidates (the same provider, licence,
+/// site id and centre) scored with that candidate's geometry and expected level under
+/// the answer's assumptions. The station's antenna is the one the reach was computed
+/// for; with no reach at all, the vantage's antenna for the band
+/// ([`Station::antenna_for`]).
+fn answer_with(
+    q: &OriginQuery,
+    rows: Vec<Allocation>,
+    reach: Option<Reach>,
+    vantage: &Vantage,
+    providers: Vec<String>,
+    register_rows: Option<u32>,
+    register: Option<&RegisterAnswer>,
+) -> OriginAnswer {
     let (mut receivers, mut plans) = (0, 0);
     let mut best: HashMap<SiteKey, Origin> = HashMap::new();
     let mut unnamed: Vec<Origin> = Vec::new();
-    // The vantage's antenna the reach was computed for.
-    let antenna = reach.as_ref().and_then(|r| {
-        vantage
-            .station()
-            .and_then(|s| s.antennas.iter().find(|a| a.id == r.antenna))
+    // The vantage's antenna the reach was computed for, else the one for the band.
+    let antenna: Option<Antenna> = vantage.station().and_then(|s| {
+        reach
+            .as_ref()
+            .and_then(|r| s.antennas.iter().find(|a| a.id == r.antenna).cloned())
+            .or_else(|| reach.is_none().then(|| s.antenna_for(q.center_hz)))
     });
+    let antenna = antenna.as_ref();
+    let candidates: HashMap<(&str, &str, u64), &Candidate> = register
+        .map(|r| {
+            r.candidates
+                .iter()
+                .map(|c| {
+                    let key = (c.licence.number.as_str(), c.site.id.as_str());
+                    ((key.0, key.1, c.device.center_hz.0), c)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let expected_of = |a: &Allocation| {
+        let r = register.filter(|r| r.provider == a.provider)?;
+        let key = (
+            a.licence_no.as_deref()?,
+            a.site_id.as_deref()?,
+            row_center(a),
+        );
+        let c = candidates.get(&key)?;
+        Some((c.geometry.as_ref()?, c.expected.as_ref()?, &r.assumptions))
+    };
     for a in rows {
         if a.kind.as_deref() != Some("assignment") {
             plans += 1;
@@ -358,7 +503,7 @@ pub fn answer(
             receivers += 1;
             continue;
         }
-        let Some(o) = score_row(&a, q, reach.as_ref(), antenna) else {
+        let Some(o) = score_row(&a, q, reach.as_ref(), antenna, expected_of(&a)) else {
             continue;
         };
         if a.licence_no.is_none() && a.site.is_none() {
@@ -452,11 +597,20 @@ fn nearest_first(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
 /// `ORIGIN_REACH_IN * (1 - (1 - ORIGIN_REACH_FLOOR) * distance / reach)` and rounded
 /// (0.2 at the station, 0.1 at the limit, 0 beyond). A reach with no radius, or none at
 /// all, holds any known distance at the full term.
+///
+/// With `expected` (the row's register candidate: its geometry, its expected level and
+/// the assumptions behind it) the reach term is graded from that instead (design 3.3):
+/// `InRange::No` 0; `Possible` [`ORIGIN_REACH_UNKNOWN`]; `Yes` with a level
+/// `ORIGIN_REACH_IN * (ORIGIN_REACH_FLOOR + (1 - ORIGIN_REACH_FLOOR) * s)`, `s` the level's
+/// height over `in_range_floor_dbm` in [`ORIGIN_LEVEL_SPAN_DB`], clamped to 0..1; `Yes`
+/// without one the full term. Then, when `antenna` has an azimuth and the site's bearing
+/// is more than [`SECTOR_DEG`] off it, the term is halved; rounded like the score.
 pub fn score_row(
     a: &Allocation,
     q: &OriginQuery,
     reach: Option<&Reach>,
     antenna: Option<&Antenna>,
+    expected: Option<(&Geometry, &Expected, &Propagation)>,
 ) -> Option<Origin> {
     if a.kind.as_deref() != Some("assignment") || a.role.as_deref() != Some("tx") {
         return None;
@@ -497,9 +651,10 @@ pub fn score_row(
         },
         _ => (Agree::Unknown, ORIGIN_MODULATION_UNKNOWN),
     };
-    let reach_term = match a.distance_km {
-        None => ORIGIN_REACH_UNKNOWN,
-        Some(d) => match reach.and_then(|r| match (a.bearing_deg, antenna) {
+    let reach_term = match (expected, a.distance_km) {
+        (Some((g, e, p)), _) => expected_reach(g, e, p, antenna),
+        (None, None) => ORIGIN_REACH_UNKNOWN,
+        (None, Some(d)) => match reach.and_then(|r| match (a.bearing_deg, antenna) {
             (Some(b), Some(ant)) => r.km_toward(b, ant),
             _ => r.km,
         }) {
@@ -526,6 +681,26 @@ pub fn score_row(
         confirmed: None,
         heard: None,
     })
+}
+
+/// [`score_row`]'s reach term from a candidate's geometry `g` and expected level `e`
+/// under the assumptions `p`, halved for a site behind `antenna`'s beam.
+fn expected_reach(g: &Geometry, e: &Expected, p: &Propagation, antenna: Option<&Antenna>) -> f32 {
+    let term = match e.in_range {
+        InRange::No => 0.0,
+        InRange::Possible => ORIGIN_REACH_UNKNOWN,
+        InRange::Yes => match e.level_dbm {
+            Some(level) => {
+                let s = ((level - p.in_range_floor_dbm) / ORIGIN_LEVEL_SPAN_DB).clamp(0.0, 1.0);
+                ORIGIN_REACH_IN * (ORIGIN_REACH_FLOOR + (1.0 - ORIGIN_REACH_FLOOR) * s as f32)
+            }
+            None => ORIGIN_REACH_IN,
+        },
+    };
+    let behind = antenna.and_then(|a| a.azimuth_deg).is_some_and(|az| {
+        ((g.bearing_deg - az + 180.0).rem_euclid(360.0) - 180.0).abs() > SECTOR_DEG
+    });
+    round_score(if behind { term / 2.0 } else { term })
 }
 
 /// `score` to [`ORIGIN_SCORE_DECIMALS`] places, so equal sums of the terms compare
@@ -594,6 +769,178 @@ fn summary_sites(a: &OriginAnswer) -> Option<String> {
         })
         .collect();
     Some(sites.join("; "))
+}
+
+/// What the node makes of `answer` against the signal `origins` was scored on (design
+/// 3.3): `unknown` when the register could not be asked. Else, over the transmitter
+/// candidates (only a transmitter can be the signal), a candidate *fits* when its origin
+/// (by licence, site id and centre) has a width term above 0 and does not disagree on
+/// modulation, and, with `measured_dbm` and an expected level, the two lie within
+/// [`VERDICT_LEVEL_TOLERANCE_DB`]. `agrees` when a candidate in range (`InRange::Yes`)
+/// fits; `disagrees` when some are in range and none fits; else the same two, `weak`,
+/// over the candidates whose range the estimate cannot bound (`Possible`, or no
+/// geometry at all: no position to measure from); else `unlicensed`. A partial answer
+/// names its failed queries at the end of the summary.
+pub fn verdict(
+    answer: &RegisterAnswer,
+    origins: &OriginAnswer,
+    measured_dbm: Option<f64>,
+) -> Verdict {
+    if answer.status.state == RegisterState::Unreachable {
+        let reason = answer.status.reason.as_deref().unwrap_or("no reason given");
+        return Verdict {
+            kind: VerdictKind::Unknown,
+            weak: false,
+            summary: format!("register unreachable: {reason}"),
+        };
+    }
+    let origin_of = |c: &Candidate| {
+        origins.origins.iter().find(|o| {
+            let a = &o.allocation;
+            a.licence_no.as_deref() == Some(c.licence.number.as_str())
+                && a.site_id.as_deref() == Some(c.site.id.as_str())
+                && row_center(a) == c.device.center_hz.0
+        })
+    };
+    let fits = |c: &Candidate| {
+        let Some(o) = origin_of(c) else {
+            return false;
+        };
+        let level = match (measured_dbm, c.expected.as_ref().and_then(|e| e.level_dbm)) {
+            (Some(m), Some(e)) => (m - e).abs() <= VERDICT_LEVEL_TOLERANCE_DB,
+            _ => true,
+        };
+        o.terms.width > 0.0 && o.agree != Agree::Disagrees && level
+    };
+    let (mut strong, mut weak): (Vec<&Candidate>, Vec<&Candidate>) = (vec![], vec![]);
+    for c in answer
+        .candidates
+        .iter()
+        .filter(|c| c.device.role.as_deref() == Some("tx"))
+    {
+        match c.expected.as_ref().map(|e| e.in_range) {
+            Some(InRange::Yes) => strong.push(c),
+            Some(InRange::Possible) | None => weak.push(c),
+            Some(InRange::No) => {}
+        }
+    }
+    let pick = |set: &[&Candidate]| -> Option<(VerdictKind, usize)> {
+        if set.is_empty() {
+            return None;
+        }
+        Some(match set.iter().position(|c| fits(c)) {
+            Some(i) => (VerdictKind::Agrees, i),
+            None => (VerdictKind::Disagrees, 0),
+        })
+    };
+    let (kind, weak, c) = match (pick(&strong), pick(&weak)) {
+        (Some((k, i)), _) => (k, false, strong[i]),
+        (None, Some((k, i))) => (k, true, weak[i]),
+        (None, None) => {
+            return Verdict {
+                kind: VerdictKind::Unlicensed,
+                weak: false,
+                summary: format!("{}{}", unlicensed_summary(answer), partial_tail(answer)),
+            };
+        }
+    };
+    let holder = c
+        .holder
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("licence {}", c.licence.number));
+    let emission = c
+        .device
+        .emission_decoded
+        .as_ref()
+        .map(emission_words)
+        .or_else(|| c.device.emission.clone())
+        .unwrap_or_else(|| "an unstated emission".into());
+    let mut summary = match kind {
+        VerdictKind::Agrees => {
+            let parts: Vec<String> = [
+                Some(holder),
+                c.site.name.clone(),
+                Some(emission),
+                c.geometry
+                    .as_ref()
+                    .map(|g| format!("{:.0} km", g.distance_km)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            format!("register agrees: {}", parts.join(", "))
+        }
+        _ => {
+            let label = match origins.modulation.is_empty() {
+                true => "unknown".to_string(),
+                false => origins.modulation.join("/"),
+            };
+            let width = origins.band.bandwidth_hz.0 as f64 / 1e3;
+            format!(
+                "register disagrees: licensed here as {emission} ({holder}); measured {label}, \
+                 {width:.1} kHz"
+            )
+        }
+    };
+    if weak {
+        summary.push_str(match c.expected {
+            Some(_) => " (range cannot be bounded on this band)",
+            None => " (range not known: no position to measure from)",
+        });
+    }
+    summary.push_str(&partial_tail(answer));
+    Verdict {
+        kind,
+        weak,
+        summary,
+    }
+}
+
+/// `nothing licensed in range; the band is <primary services>`, every service when the
+/// plan names no primary one, and `; <n> area-wide licence(s) cover it` when there are
+/// area candidates.
+fn unlicensed_summary(answer: &RegisterAnswer) -> String {
+    let services = |primary_only: bool| {
+        let mut names: Vec<&str> = Vec::new();
+        for s in answer.plan.iter().flat_map(|p| p.services.iter()) {
+            if (s.primary || !primary_only) && !names.contains(&s.name.as_str()) {
+                names.push(&s.name);
+            }
+        }
+        names
+    };
+    let mut names = services(true);
+    if names.is_empty() {
+        names = services(false);
+    }
+    let mut out = match names.is_empty() {
+        true => "nothing licensed in range; the register gave no band plan".to_string(),
+        false => format!(
+            "nothing licensed in range; the band is {}",
+            names.join(", ")
+        ),
+    };
+    match answer.area_candidates.len() {
+        0 => {}
+        1 => out.push_str("; 1 area-wide licence covers it"),
+        n => out.push_str(&format!("; {n} area-wide licences cover it")),
+    }
+    out
+}
+
+/// `; partial answer: <query>, <query> failed` for a partial answer, else nothing.
+fn partial_tail(answer: &RegisterAnswer) -> String {
+    if answer.status.state != RegisterState::Partial {
+        return String::new();
+    }
+    let names: Vec<&str> = answer
+        .status
+        .failed
+        .iter()
+        .map(|f| f.query.as_str())
+        .collect();
+    format!("; partial answer: {} failed", names.join(", "))
 }
 
 /// The newest evidence in a tally (design 4.3): the newest `last_ns` of the keys with
@@ -989,15 +1336,17 @@ pub fn measured_modulation(label: Option<&str>) -> Vec<String> {
 }
 
 impl Inner {
-    /// `c` with its origins scored: the band `center_hz` and `bandwidth_hz` of `source`,
-    /// the modulation `c` measured ([`measured_modulation`]). A `source` the node no
-    /// longer has reads as local ([`vantage_for`]).
-    pub(crate) async fn score_classification(
+    /// `c` with its origins scored from `d` ([`origins_of`]), the band `center_hz` and
+    /// `bandwidth_hz` of `source` (`d` was fetched for), the modulation `c` measured
+    /// ([`measured_modulation`]), and `d`'s register answer with its verdict
+    /// ([`judged`]). A `source` the node no longer has reads as local ([`vantage_for`]).
+    pub(crate) fn score_classification(
         &self,
         mut c: Classification,
         source: &SourceId,
         center_hz: Hz,
         bandwidth_hz: Hz,
+        d: &Described,
     ) -> Classification {
         let q = OriginQuery {
             source: source.clone(),
@@ -1013,36 +1362,47 @@ impl Inner {
             job: None,
             at: now(),
         };
-        c.origins = Some(origins(self, &q).await);
+        let origins = origins_of(&q, d);
+        c.register = judged(d, &origins);
+        c.origins = Some(origins);
         c
     }
 
-    /// [`crate::ops::classify_capture`] with the origins scored from the capture's own
-    /// source and band.
+    /// [`crate::ops::classify_capture`] with the origins and the register answer from one
+    /// lookup ([`described`]) of the capture's own source and band.
     pub(crate) async fn classify_capture_scored(
         &self,
         rec: &CaptureRecord,
     ) -> Result<Classification, String> {
         let set = self.classifiers.read().unwrap().clone();
         let c = crate::ops::classify_capture(&set, rec).await?;
-        Ok(self
-            .score_classification(c, &rec.source, rec.center_hz, rec.bandwidth_hz)
-            .await)
+        let d = described(self, &rec.source, rec.center_hz, rec.bandwidth_hz).await;
+        Ok(self.score_classification(c, &rec.source, rec.center_hz, rec.bandwidth_hz, &d))
     }
 }
 
 impl Node {
+    /// [`described`] from this node.
+    pub(crate) async fn described(
+        &self,
+        source: &SourceId,
+        center_hz: Hz,
+        bandwidth_hz: Hz,
+    ) -> Described {
+        described(&self.inner, source, center_hz, bandwidth_hz).await
+    }
+
     /// [`Inner::score_classification`].
-    pub(crate) async fn score_classification(
+    pub(crate) fn score_classification(
         &self,
         c: Classification,
         source: &SourceId,
         center_hz: Hz,
         bandwidth_hz: Hz,
+        d: &Described,
     ) -> Classification {
         self.inner
-            .score_classification(c, source, center_hz, bandwidth_hz)
-            .await
+            .score_classification(c, source, center_hz, bandwidth_hz, d)
     }
 
     /// [`Inner::classify_capture_scored`].
@@ -1517,6 +1877,7 @@ mod tests {
                 &tx(Some("16K0F1D"), None, CENTER + 10_000, None),
                 &band,
                 None,
+                None,
                 None
             )
             .is_some()
@@ -1526,6 +1887,7 @@ mod tests {
             score_row(
                 &tx(Some("16K0F1D"), Some(1_000), CENTER + 10_000, None),
                 &band,
+                None,
                 None,
                 None
             )
@@ -1537,21 +1899,49 @@ mod tests {
                 &tx(None, Some(20_000), CENTER + 10_000, None),
                 &band,
                 None,
+                None,
                 None
             )
             .is_some()
         );
         // No width at all: 0 + 6250 < 7000.
-        assert!(score_row(&tx(None, None, CENTER + 7_000, None), &band, None, None).is_none());
-        assert!(score_row(&tx(None, None, CENTER + 6_000, None), &band, None, None).is_some());
-        assert!(score_row(&tx(None, None, CENTER - 6_000, None), &band, None, None).is_some());
+        assert!(
+            score_row(
+                &tx(None, None, CENTER + 7_000, None),
+                &band,
+                None,
+                None,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            score_row(
+                &tx(None, None, CENTER + 6_000, None),
+                &band,
+                None,
+                None,
+                None
+            )
+            .is_some()
+        );
+        assert!(
+            score_row(
+                &tx(None, None, CENTER - 6_000, None),
+                &band,
+                None,
+                None,
+                None
+            )
+            .is_some()
+        );
     }
 
     #[test]
     fn width_grades_are_0_4_0_2_0_and_0_1() {
         let band = q(&[], CENTER, 12_500);
         let width = |bw: Option<u64>| {
-            score_row(&tx(None, bw, CENTER, None), &band, None, None)
+            score_row(&tx(None, bw, CENTER, None), &band, None, None, None)
                 .unwrap()
                 .terms
                 .width
@@ -1578,6 +1968,7 @@ mod tests {
                 &tx(Some("200KF8E"), None, center, Some(10.0)),
                 &band,
                 Some(&reach(Some(100.0))),
+                None,
                 None,
             )
             .unwrap()
@@ -1618,6 +2009,7 @@ mod tests {
                 &band,
                 Some(&r),
                 None,
+                None,
             )
             .unwrap()
         };
@@ -1646,6 +2038,7 @@ mod tests {
             &band,
             Some(&reach(None)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(any.terms.reach, ORIGIN_REACH_IN);
@@ -1661,20 +2054,20 @@ mod tests {
             let designator = format!("16K0{letter}3E");
             let row = tx(Some(&designator), None, CENTER, None);
             assert_eq!(row.emission_decoded.as_ref().unwrap().modulation, *letter);
-            let fit = score_row(&row, &q(&[labels[0]], CENTER, 16_000), None, None).unwrap();
+            let fit = score_row(&row, &q(&[labels[0]], CENTER, 16_000), None, None, None).unwrap();
             assert_eq!(
                 (fit.agree, fit.terms.modulation),
                 (Agree::Fits, ORIGIN_MODULATION_FITS),
                 "{letter}"
             );
             let other = all.iter().find(|l| !labels.contains(l)).unwrap();
-            let bad = score_row(&row, &q(&[other], CENTER, 16_000), None, None).unwrap();
+            let bad = score_row(&row, &q(&[other], CENTER, 16_000), None, None, None).unwrap();
             assert_eq!(
                 (bad.agree, bad.terms.modulation),
                 (Agree::Disagrees, 0.0),
                 "{letter}"
             );
-            let none = score_row(&row, &q(&[], CENTER, 16_000), None, None).unwrap();
+            let none = score_row(&row, &q(&[], CENTER, 16_000), None, None, None).unwrap();
             assert_eq!(
                 (none.agree, none.terms.modulation),
                 (Agree::Unknown, ORIGIN_MODULATION_UNKNOWN)
@@ -1683,6 +2076,7 @@ mod tests {
         let bare = score_row(
             &tx(None, Some(16_000), CENTER, None),
             &q(&["fm"], CENTER, 16_000),
+            None,
             None,
             None,
         )
@@ -1698,7 +2092,7 @@ mod tests {
     fn a_wfm_band_agrees_with_an_f8e_row_and_keyed_a_rows_with_ook() {
         let fits = |designator: &str, label: &str, bw: u64| {
             let row = tx(Some(designator), None, 97_900_000, Some(5.0));
-            score_row(&row, &q(&[label], 97_900_000, bw), None, None)
+            score_row(&row, &q(&[label], 97_900_000, bw), None, None, None)
                 .unwrap()
                 .agree
         };
@@ -1717,10 +2111,16 @@ mod tests {
         let band = q(&[], CENTER, 12_500);
         let r = reach(Some(50.0));
         let term = |km: Option<f64>| {
-            score_row(&tx(None, Some(12_500), CENTER, km), &band, Some(&r), None)
-                .unwrap()
-                .terms
-                .reach
+            score_row(
+                &tx(None, Some(12_500), CENTER, km),
+                &band,
+                Some(&r),
+                None,
+                None,
+            )
+            .unwrap()
+            .terms
+            .reach
         };
         assert_eq!(term(Some(0.0)), ORIGIN_REACH_IN);
         // 9 km of 50: 0.2 * (1 - 0.5 * 0.18).
@@ -1732,6 +2132,7 @@ mod tests {
             &tx(Some("12K5F3E"), None, CENTER, Some(0.0)),
             &q(&["fm"], CENTER, 12_500),
             Some(&r),
+            None,
             None,
         )
         .unwrap();
@@ -1745,6 +2146,7 @@ mod tests {
             &q(&["fm"], CENTER, 12_500),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(o.agree, Agree::Unknown);
@@ -1756,10 +2158,10 @@ mod tests {
     fn a_receiver_or_plan_row_is_never_an_origin() {
         let mut rx = tx(None, Some(12_500), CENTER, None);
         rx.role = Some("rx".into());
-        assert!(score_row(&rx, &q(&[], CENTER, 12_500), None, None).is_none());
+        assert!(score_row(&rx, &q(&[], CENTER, 12_500), None, None, None).is_none());
         let mut plan = tx(None, Some(12_500), CENTER, None);
         plan.kind = Some("plan".into());
-        assert!(score_row(&plan, &q(&[], CENTER, 12_500), None, None).is_none());
+        assert!(score_row(&plan, &q(&[], CENTER, 12_500), None, None, None).is_none());
     }
 
     #[test]
@@ -1838,10 +2240,17 @@ mod tests {
     #[test]
     fn confirm_sets_score_one_and_keeps_terms() {
         let band = q(&["fm"], CENTER, 12_500);
-        let plain = score_row(&tx(None, Some(12_500), CENTER, None), &band, None, None).unwrap();
+        let plain = score_row(
+            &tx(None, Some(12_500), CENTER, None),
+            &band,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let mut row = tx(Some("16K0F3E"), None, CENTER, Some(17.0));
         row.callsign = Some("XX4EX".into());
-        let marked = score_row(&row, &band, None, None).unwrap();
+        let marked = score_row(&row, &band, None, None, None).unwrap();
         let mut a = empty_answer(vec![plain, marked.clone()], Some(2));
         let before = a.clone();
         assert!(confirm(&mut a, "callsign", "XX4ZZ").is_empty());
@@ -1890,7 +2299,14 @@ mod tests {
         let query = serde_json::to_value(schemars::schema_for!(OriginQuery)).unwrap();
         assert_eq!(query["required"].as_array().unwrap().len(), 7);
         let band = q(&["fm"], CENTER, 12_500);
-        let o = score_row(&tx(Some("16K0F3E"), None, CENTER, None), &band, None, None).unwrap();
+        let o = score_row(
+            &tx(Some("16K0F3E"), None, CENTER, None),
+            &band,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let a = answer(
             &band,
             vec![o.allocation.clone()],
@@ -1925,7 +2341,7 @@ mod tests {
         second.licence_no = Some("0000002".into());
         let mut origins: Vec<Origin> = [near, second.clone(), second.clone(), second]
             .iter()
-            .map(|r| score_row(r, &band, Some(&reach(Some(150.0))), None).unwrap())
+            .map(|r| score_row(r, &band, Some(&reach(Some(150.0))), None, None).unwrap())
             .collect();
         origins[0].score = 0.9;
         let a = empty_answer(origins, Some(4));
@@ -1967,7 +2383,14 @@ mod tests {
     fn vhf_answer() -> OriginAnswer {
         let f = 136_975_000;
         let band = q(&[], f, 25_000);
-        let mut o = score_row(&tx(None, Some(25_000), f, Some(17.2)), &band, None, None).unwrap();
+        let mut o = score_row(
+            &tx(None, Some(25_000), f, Some(17.2)),
+            &band,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         o.score = 0.9;
         let mut a = empty_answer(vec![o], Some(1));
         a.band.center_hz = Hz(f);
@@ -2014,7 +2437,7 @@ mod tests {
         second.licence_no = Some("0000002".into());
         let origins = [tx(None, Some(12_500), CENTER, Some(5.0)), second]
             .iter()
-            .map(|r| score_row(r, &band, None, None).unwrap())
+            .map(|r| score_row(r, &band, None, None, None).unwrap())
             .collect();
         let mut a = empty_answer(origins, Some(2));
         assert!(a.origins.iter().all(|o| o.heard.is_none()));
@@ -2186,7 +2609,7 @@ mod tests {
         marked.callsign = Some("XX4EX".into());
         let origins: Vec<Origin> = [best, marked]
             .iter()
-            .map(|r| score_row(r, &band, None, None).unwrap())
+            .map(|r| score_row(r, &band, None, None, None).unwrap())
             .collect();
         let fresh = empty_answer(origins, Some(2));
         // The kept answer was confirmed while the fresh lookup was out.
@@ -2226,7 +2649,7 @@ mod tests {
         second.distance_km = Some(9.0);
         let origins = [best, marked, second]
             .iter()
-            .map(|r| score_row(r, &band, None, None).unwrap())
+            .map(|r| score_row(r, &band, None, None, None).unwrap())
             .collect();
         let mut a = empty_answer(origins, Some(3));
         assert_eq!(confirm_identity(&mut a, "src", "XX4ZZ"), None);
@@ -2542,7 +2965,10 @@ mod tests {
         // the graded term, 0.2 * (1 - 0.5 * 0.9)).
         let row = tx(None, Some(12_500), CENTER, Some(90.0));
         let term = |row: &Allocation, ant: Option<&Antenna>| {
-            score_row(row, &band, Some(&r), ant).unwrap().terms.reach
+            score_row(row, &band, Some(&r), ant, None)
+                .unwrap()
+                .terms
+                .reach
         };
         assert_eq!(term(&row, Some(&beam)), 0.11);
         // Without the antenna, or without a bearing, `reach.km` (50) decides.
@@ -2643,8 +3069,8 @@ mod tests {
         let near = tx(None, None, CENTER, Some(5.0));
         let r = reach(Some(150.0));
         let (x, y) = (
-            score_row(&near, &band, Some(&r), None).unwrap(),
-            score_row(&far, &band, Some(&r), None).unwrap(),
+            score_row(&near, &band, Some(&r), None, None).unwrap(),
+            score_row(&far, &band, Some(&r), None, None).unwrap(),
         );
         assert_eq!((x.score, y.score), (0.5, 0.5));
         for rows in [
@@ -3243,5 +3669,451 @@ mod tests {
             "the count waits for the supervisor's flush"
         );
         assert_eq!(e.stations.seen["GS1"].from, 2);
+    }
+
+    use crate::propagation::{Expected, Geometry, InRange, PathMode, Propagation};
+    use crate::register::{
+        AreaCandidate, Candidate, PlanSegment, PlanService, RegisterAnswer, RegisterState,
+        RegisterStatus, Signal, VerdictKind,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A register candidate on licence `licence` at site `site`, licensed `emission` at
+    /// `center`; with `range`, heard `km` away on `bearing` and expected at `level`
+    /// (a skywave path for `Possible`); with none, no geometry at all.
+    fn cand(
+        licence: &str,
+        site: &str,
+        center: u64,
+        emission: &str,
+        range: Option<(f64, f64, InRange, Option<f64>)>,
+    ) -> Candidate {
+        let mut c: Candidate = serde_json::from_value(serde_json::json!({
+            "device": {"center_hz": center, "role": "tx", "emission": emission},
+            "site": {"id": site, "name": "Example Hill", "lat": -27.35, "lon": 153.08},
+            "licence": {"number": licence},
+            "holder": {"name": "Example Water Authority"},
+        }))
+        .unwrap();
+        c.device.emission_decoded = parse_emission(emission);
+        if let Some((km, bearing, in_range, level)) = range {
+            c.geometry = Some(Geometry {
+                distance_km: km,
+                bearing_deg: bearing,
+                off_beam_deg: None,
+                horizon_km: None,
+                beyond_horizon: false,
+            });
+            c.expected = Some(Expected {
+                mode: match in_range {
+                    InRange::Possible => PathMode::Skywave,
+                    _ => PathMode::LineOfSight,
+                },
+                level_dbm: level,
+                in_range,
+                unknown: vec![],
+            });
+        }
+        c
+    }
+
+    /// A plan segment around [`CENTER`] allocating `services` (name, primary).
+    fn plan(services: &[(&str, bool)]) -> PlanSegment {
+        PlanSegment {
+            min_hz: Hz(CENTER - 1_000_000),
+            max_hz: Hz(CENTER + 1_000_000),
+            services: services
+                .iter()
+                .map(|(name, primary)| PlanService {
+                    name: (*name).into(),
+                    primary: *primary,
+                    qualifier: None,
+                })
+                .collect(),
+            footnotes: vec![],
+        }
+    }
+
+    /// An `ok` register answer holding `candidates` and `plan`.
+    fn register(candidates: Vec<Candidate>, plan: Vec<PlanSegment>) -> RegisterAnswer {
+        let mut a = RegisterAnswer::unreachable("acma", "AU", String::new());
+        a.status = RegisterStatus {
+            state: RegisterState::Ok,
+            reason: None,
+            failed: vec![],
+        };
+        a.matched = candidates.len() as u32;
+        a.candidates = candidates;
+        a.plan = plan;
+        a
+    }
+
+    /// What one describing provider gave for `a`, from the demo station.
+    fn described_of(a: &RegisterAnswer) -> Described {
+        let rows = a.allocations();
+        Described {
+            vantage: Vantage::Station(demo_station()),
+            region: "AU".into(),
+            providers: vec!["acma".into()],
+            register_rows: Some(rows.len() as u32),
+            rows,
+            reach: Some(reach(Some(150.0))),
+            register: Some(a.clone()),
+        }
+    }
+
+    /// The verdict on `a` for a signal measured `label`, 12.5 kHz wide on [`CENTER`].
+    fn verdict_on(a: &RegisterAnswer, label: &str, measured_dbm: Option<f64>) -> Verdict {
+        let o = origins_of(&q(&[label], CENTER, 12_500), &described_of(a));
+        verdict(a, &o, measured_dbm)
+    }
+
+    /// The register floor of the default assumptions.
+    fn floor() -> f64 {
+        Propagation::default().in_range_floor_dbm
+    }
+
+    /// A describing register: answers `answer` to every `describe`, counting the calls,
+    /// and counts any `allocations_from` (which a describing provider is never asked).
+    struct Describing {
+        answer: RegisterAnswer,
+        describes: AtomicUsize,
+        rows: AtomicUsize,
+    }
+
+    impl Describing {
+        fn new(answer: RegisterAnswer) -> Self {
+            Self {
+                answer,
+                describes: AtomicUsize::new(0),
+                rows: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl KnowledgeProvider for Describing {
+        fn name(&self) -> &str {
+            "acma"
+        }
+        fn gives_assignments(&self) -> bool {
+            true
+        }
+        fn regions(&self) -> Vec<String> {
+            vec!["AU".into()]
+        }
+        async fn allocations(&self, _: &str, _: Hz, _: Hz) -> Vec<Allocation> {
+            self.rows.fetch_add(1, Ordering::SeqCst);
+            vec![]
+        }
+        async fn allocations_from(
+            &self,
+            _: &str,
+            _: Hz,
+            _: Hz,
+            _: Option<&Station>,
+        ) -> Vec<Allocation> {
+            self.rows.fetch_add(1, Ordering::SeqCst);
+            vec![]
+        }
+        async fn signatures(&self, _: Hz, _: Hz) -> Vec<crate::knowledge::Signature> {
+            vec![]
+        }
+        async fn describe(
+            &self,
+            _: &str,
+            _: &Signal,
+            _: Option<&Station>,
+        ) -> Option<RegisterAnswer> {
+            self.describes.fetch_add(1, Ordering::SeqCst);
+            Some(self.answer.clone())
+        }
+        fn reach_of(&self, _: &RegisterAnswer, _: &Signal, _: Option<&Station>) -> Option<Reach> {
+            Some(reach(Some(150.0)))
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_and_origins_share_one_register_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = node(dir.path()).await;
+        let in_range = Some((12.0, 315.0, InRange::Yes, Some(-80.0)));
+        let a = register(
+            vec![cand("0000001", "S1", CENTER, "12K5F3E", in_range)],
+            vec![plan(&[("LAND MOBILE", true)])],
+        );
+        let p = Arc::new(Describing::new(a));
+        n.add_knowledge(p.clone());
+        let rec = n
+            .inner
+            .bursts
+            .write(
+                crate::bursts::NewCapture {
+                    source: SourceId("radio".into()),
+                    set: JobId("set".into()),
+                    center_hz: Hz(CENTER),
+                    bandwidth_hz: Hz(12_500),
+                    sample_rate_hz: Hz(48_000),
+                    start_ns: 1,
+                    end_ns: 1_000_000_001,
+                    features: serde_json::json!({}),
+                    signal: None,
+                    job: JobId("cap".into()),
+                    watch: None,
+                    allocations: serde_json::json!([]),
+                },
+                &vec![num_complex::Complex::new(0.1f32, 0.0); 480],
+            )
+            .unwrap();
+        let c = n.inner.classify_capture_scored(&rec).await.unwrap();
+        // One register lookup gave the origins and the register answer alike; the
+        // describing provider was never asked for its rows separately.
+        assert_eq!(p.describes.load(Ordering::SeqCst), 1);
+        assert_eq!(p.rows.load(Ordering::SeqCst), 0);
+        let origins = c.origins.expect("origins");
+        assert_eq!(origins.origins.len(), 1);
+        assert_eq!(origins.register_rows, Some(2));
+        assert_eq!(origins.reach, Some(reach(Some(150.0))));
+        let register = c.register.expect("the register answer");
+        assert_eq!(register.candidates.len(), 1);
+        assert!(register.verdict.is_some(), "{register:?}");
+        // An origin lookup is one lookup too.
+        let _ = origins_of_lookup(&n).await;
+        assert_eq!(p.describes.load(Ordering::SeqCst), 2);
+        assert_eq!(p.rows.load(Ordering::SeqCst), 0);
+    }
+
+    /// One `origins` call on [`CENTER`] from the local radio.
+    async fn origins_of_lookup(n: &super::super::Node) -> OriginAnswer {
+        origins(&n.inner, &q(&["fm"], CENTER, 12_500)).await
+    }
+
+    #[test]
+    fn the_reach_term_follows_the_expected_level_when_there_is_geometry() {
+        let band = q(&[], CENTER, 12_500);
+        let p = Propagation::default();
+        // 400 km: far outside the 50 km reach, which the geometry overrides.
+        let row = tx(None, Some(12_500), CENTER, Some(400.0));
+        let r = reach(Some(50.0));
+        let g = Geometry {
+            distance_km: 400.0,
+            bearing_deg: 315.0,
+            off_beam_deg: None,
+            horizon_km: Some(450.0),
+            beyond_horizon: false,
+        };
+        let term = |in_range, level| {
+            let e = Expected {
+                mode: PathMode::LineOfSight,
+                level_dbm: level,
+                in_range,
+                unknown: vec![],
+            };
+            score_row(&row, &band, Some(&r), None, Some((&g, &e, &p)))
+                .unwrap()
+                .terms
+                .reach
+        };
+        let f = floor();
+        assert_eq!(
+            term(InRange::Yes, Some(f + ORIGIN_LEVEL_SPAN_DB)),
+            ORIGIN_REACH_IN
+        );
+        assert_eq!(term(InRange::Yes, Some(f + 100.0)), ORIGIN_REACH_IN);
+        assert_eq!(
+            term(InRange::Yes, Some(f)),
+            round_score(ORIGIN_REACH_IN * ORIGIN_REACH_FLOOR)
+        );
+        assert_eq!(term(InRange::Yes, Some(f + 30.0)), 0.15);
+        assert_eq!(term(InRange::Yes, None), ORIGIN_REACH_IN);
+        assert_eq!(term(InRange::No, Some(f + 60.0)), 0.0);
+        assert_eq!(term(InRange::Possible, None), ORIGIN_REACH_UNKNOWN);
+        // No geometry: today's distance over the reach (9 km of 50: 0.18).
+        let near = tx(None, Some(12_500), CENTER, Some(9.0));
+        let today = score_row(&near, &band, Some(&r), None, None).unwrap();
+        assert_eq!(today.terms.reach, 0.18);
+
+        // `origins_of` joins each row to its candidate: a site 400 km away, in range
+        // at the top of the span, keeps the whole term against a 150 km reach.
+        let far = Some((400.0, 315.0, InRange::Yes, Some(f + ORIGIN_LEVEL_SPAN_DB)));
+        let a = register(vec![cand("0000001", "S1", CENTER, "12K5F3E", far)], vec![]);
+        let o = origins_of(&q(&["fm"], CENTER, 12_500), &described_of(&a));
+        assert_eq!(o.origins[0].terms.reach, ORIGIN_REACH_IN, "{o:?}");
+    }
+
+    #[test]
+    fn a_station_beam_halves_the_term_of_a_site_behind_it() {
+        let band = q(&[], CENTER, 12_500);
+        let p = Propagation::default();
+        let beam = Antenna {
+            id: "yagi".into(),
+            kind: crate::station::AntennaKind::Yagi,
+            min_hz: Hz(400_000_000),
+            max_hz: Hz(410_000_000),
+            height_m: 10.0,
+            azimuth_deg: Some(0.0),
+            elevation_deg: None,
+        };
+        let e = Expected {
+            mode: PathMode::LineOfSight,
+            level_dbm: Some(floor() + ORIGIN_LEVEL_SPAN_DB),
+            in_range: InRange::Yes,
+            unknown: vec![],
+        };
+        let term = |bearing: f64, ant: Option<&Antenna>| {
+            let g = Geometry {
+                distance_km: 20.0,
+                bearing_deg: bearing,
+                off_beam_deg: None,
+                horizon_km: Some(50.0),
+                beyond_horizon: false,
+            };
+            let mut row = tx(None, Some(12_500), CENTER, Some(20.0));
+            row.bearing_deg = Some(bearing);
+            score_row(&row, &band, None, ant, Some((&g, &e, &p)))
+                .unwrap()
+                .terms
+                .reach
+        };
+        let ahead = term(0.0, Some(&beam));
+        assert_eq!(ahead, ORIGIN_REACH_IN);
+        assert_eq!(term(180.0, Some(&beam)), round_score(ahead / 2.0));
+        // The sector's edge is still inside it.
+        assert_eq!(term(SECTOR_DEG, Some(&beam)), ahead);
+        // An antenna with no azimuth, or none at all, favours no bearing.
+        let mut omni = beam.clone();
+        omni.azimuth_deg = None;
+        assert_eq!(term(180.0, Some(&omni)), ahead);
+        assert_eq!(term(180.0, None), ahead);
+    }
+
+    #[test]
+    fn a_fitting_candidate_in_range_agrees() {
+        let in_range = Some((12.3, 315.0, InRange::Yes, Some(-80.0)));
+        let a = register(
+            vec![cand("0000001", "S1", CENTER, "12K5F3E", in_range)],
+            vec![plan(&[("LAND MOBILE", true)])],
+        );
+        let v = verdict_on(&a, "fm", None);
+        assert_eq!((v.kind, v.weak), (VerdictKind::Agrees, false), "{v:?}");
+        assert_eq!(
+            v.summary,
+            "register agrees: Example Water Authority, Example Hill, 12.5 kHz FM voice, 12 km"
+        );
+    }
+
+    #[test]
+    fn candidates_in_range_that_do_not_fit_disagree_and_the_summary_names_both() {
+        let in_range = Some((12.0, 315.0, InRange::Yes, Some(-80.0)));
+        let a = register(
+            vec![cand("0000001", "S1", CENTER, "16K0F1D", in_range)],
+            vec![plan(&[("LAND MOBILE", true)])],
+        );
+        // Measured as AM: the licence is FM.
+        let v = verdict_on(&a, "am", None);
+        assert_eq!((v.kind, v.weak), (VerdictKind::Disagrees, false), "{v:?}");
+        assert_eq!(
+            v.summary,
+            "register disagrees: licensed here as 16 kHz FM data (Example Water Authority); \
+             measured am, 12.5 kHz"
+        );
+        // A licence far wider than the signal does not fit either.
+        let a = register(
+            vec![cand("0000001", "S1", CENTER, "200KF3E", in_range)],
+            vec![],
+        );
+        let v = verdict_on(&a, "fm", None);
+        assert_eq!(v.kind, VerdictKind::Disagrees, "{v:?}");
+        assert!(v.summary.contains("200 kHz FM voice"), "{}", v.summary);
+        assert!(v.summary.contains("measured fm, 12.5 kHz"), "{}", v.summary);
+    }
+
+    #[test]
+    fn no_candidate_in_range_is_unlicensed_and_gives_the_band_purpose() {
+        let out = Some((400.0, 315.0, InRange::No, Some(-150.0)));
+        let services = [("LAND MOBILE", true), ("FIXED", true), ("AMATEUR", false)];
+        let mut a = register(
+            vec![cand("0000001", "S1", CENTER, "12K5F3E", out)],
+            vec![plan(&services)],
+        );
+        let v = verdict_on(&a, "fm", None);
+        assert_eq!((v.kind, v.weak), (VerdictKind::Unlicensed, false), "{v:?}");
+        assert_eq!(
+            v.summary,
+            "nothing licensed in range; the band is LAND MOBILE, FIXED"
+        );
+        // Area-wide licences are counted.
+        let area: AreaCandidate = serde_json::from_value(serde_json::json!({
+            "device": {"center_hz": CENTER, "role": "tx"},
+            "licence": {"number": "0000009"},
+            "holder": {},
+        }))
+        .unwrap();
+        a.area_candidates = vec![area.clone()];
+        let v = verdict_on(&a, "fm", None);
+        assert_eq!(
+            v.summary,
+            "nothing licensed in range; the band is LAND MOBILE, FIXED; \
+             1 area-wide licence covers it"
+        );
+        a.area_candidates = vec![area.clone(), area];
+        assert!(
+            verdict_on(&a, "fm", None)
+                .summary
+                .ends_with("; 2 area-wide licences cover it")
+        );
+        // No candidate at all reads the same.
+        let empty = register(vec![], vec![plan(&services)]);
+        assert_eq!(verdict_on(&empty, "fm", None).kind, VerdictKind::Unlicensed);
+    }
+
+    #[test]
+    fn an_unreachable_register_is_unknown_not_unlicensed() {
+        let a =
+            RegisterAnswer::unreachable("acma", "AU", "candidates: timed out after 5000 ms".into());
+        let v = verdict_on(&a, "fm", None);
+        assert_eq!((v.kind, v.weak), (VerdictKind::Unknown, false), "{v:?}");
+        assert_eq!(
+            v.summary,
+            "register unreachable: candidates: timed out after 5000 ms"
+        );
+    }
+
+    #[test]
+    fn on_a_skywave_band_the_verdict_is_weak() {
+        let possible = Some((900.0, 315.0, InRange::Possible, None));
+        let a = register(
+            vec![cand("0000001", "S1", CENTER, "12K5F3E", possible)],
+            vec![],
+        );
+        let v = verdict_on(&a, "fm", None);
+        assert_eq!((v.kind, v.weak), (VerdictKind::Agrees, true), "{v:?}");
+        assert!(
+            v.summary
+                .ends_with(" (range cannot be bounded on this band)"),
+            "{}",
+            v.summary
+        );
+        let v = verdict_on(&a, "am", None);
+        assert_eq!((v.kind, v.weak), (VerdictKind::Disagrees, true), "{v:?}");
+        // With no geometry at all (no station) every candidate counts, weakly.
+        let a = register(vec![cand("0000001", "S1", CENTER, "12K5F3E", None)], vec![]);
+        let v = verdict_on(&a, "fm", None);
+        assert_eq!((v.kind, v.weak), (VerdictKind::Agrees, true), "{v:?}");
+    }
+
+    #[test]
+    fn a_measured_level_far_from_the_expected_one_does_not_fit() {
+        let in_range = Some((12.0, 315.0, InRange::Yes, Some(-80.0)));
+        let a = register(
+            vec![cand("0000001", "S1", CENTER, "12K5F3E", in_range)],
+            vec![],
+        );
+        let far = verdict_on(&a, "fm", Some(-80.0 - 40.0));
+        assert_eq!(far.kind, VerdictKind::Disagrees, "{far:?}");
+        let near = verdict_on(&a, "fm", Some(-80.0 - VERDICT_LEVEL_TOLERANCE_DB + 1.0));
+        assert_eq!(near.kind, VerdictKind::Agrees, "{near:?}");
+        // No measured level: the level is not considered.
+        assert_eq!(verdict_on(&a, "fm", None).kind, VerdictKind::Agrees);
     }
 }

@@ -133,6 +133,15 @@ pub struct Classification {
         schema_with = "crate::types::nullable::<crate::node::OriginAnswer>"
     )]
     pub origins: Option<crate::node::OriginAnswer>,
+    /// The register's answer for the band (the first provider that describes it), from
+    /// the same lookup as `origins`, with the node's verdict; `None` with no describing
+    /// provider, and for a value stored before the field.
+    #[serde(default)]
+    #[schemars(
+        required,
+        schema_with = "crate::types::nullable::<crate::register::RegisterAnswer>"
+    )]
+    pub register: Option<crate::register::RegisterAnswer>,
 }
 
 /// The band a classifier analyses within an IQ block: its centre's offset
