@@ -610,7 +610,7 @@ Field risks:
 
 Small:
 - `known.register` cannot say `unreachable`: `KnowledgeProvider::allocations` has no error channel, so `job_context.watch.known` holds counts only.
-- ~~The ACMA provider caps a query at 200 rows before `band_assignments` dedupes.~~ (done in plan 37: `band_assignments` is uncapped and deduplicates by centre, tested by `band_assignments_is_uncapped_and_deduplicates_by_centre`.)
+- ~~The ACMA provider caps a query at 200 rows before `band_assignments` dedupes.~~ (changed in plan 37: the provider fetches up to the `candidates` query's limit, merges duplicates, then keeps the 50 strongest candidates. A very wide watch band can still lose centres past that limit.)
 - A seeded decoder's centre is the known centre until the first `new`.
 - A repeated `--radio` role on `zeta set start` collapses silently: the last mapping wins, with no usage error.
 - Set and plan groups on the page share sessionStorage fold keys, so a set and a plan with the same id share one fold state.
@@ -857,7 +857,12 @@ From the operator, 2026-11-12, while settling plan 37 (`docs/superpowers/specs/2
 
 - **The search box clamps at the antimeridian** instead of splitting into two longitude ranges.
 - **Area-wide devices are ordered by frequency**, not by nearness to the signal.
-- **A site selected from a "What is this?" answer stays selected after its lit set fades**, with no marker left to click.
 - **Selected and matched site styling hides the confirmed ring.**
 - **The off-site partner frequency of a signal's licence is not marked on the waterfall.**
 - **`zeta registers check` exits 0 when it skipped a query**, and prints no skipped count.
+- **The station antenna's azimuth weighs the origin score but not the candidate rank** that Identify and the page's top three use.
+- **The identify verdict event and the job context carry the whole register answer**: cap what the event carries.
+- **A ground-wave candidate gets a free-space level.**
+- **`matched` counts raw rows after the query's limit**, not the devices that matched.
+- **`link_far_end` compares quoted ids through a view**, so `zeta registers check` may print `ok 0 rows` for it: check it by hand against a known link.
+- **A possible flake in the CLI test `job_start_takes_dwell_ms_and_average`** under parallel load.
