@@ -25,6 +25,7 @@ import base64
 import json
 import os
 import re
+import socket
 import struct
 import subprocess
 import sys
@@ -5371,13 +5372,14 @@ def record_and_stop(page, hold_ms):
     expect(mic).not_to_have_class(re.compile(r"\brecording\b"))
 
 
-def start_node(build, state_dir, meta, secret, port=0):
-    """Start `zeta serve` (ZETA_BIN) on 127.0.0.1:`port` with build id `build`; (proc, url)."""
+def start_node(build, state_dir, meta, secret, port=0, extra=()):
+    """Start `zeta serve` (ZETA_BIN) on 127.0.0.1:`port` with build id `build`, the node's
+    `extra` flags before `serve`; (proc, url)."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("ZETA_")}
     env["ZETA_BUILD_ID"] = build
     proc = subprocess.Popen(
         [os.environ["ZETA_BIN"], "--state-dir", state_dir, "--source-file", f"tone={meta}",
-         "serve", "--listen", f"127.0.0.1:{port}", "--secret", secret],
+         *extra, "serve", "--listen", f"127.0.0.1:{port}", "--secret", secret],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     deadline = time.monotonic() + 20
     while True:
@@ -6783,30 +6785,25 @@ def scenario_origins_light_sites(page, url, secret):
             stop_job(url, secret, other)
 
 
-def scenario_origins_from_the_menu_and_bits(page, url, secret):
+def scenario_origins_from_what_is_this_and_bits(page, url, secret):
     page.route(TILE_HOSTS, lambda r: r.abort())
     clear_captures(url, secret)
     stop_bits_jobs(url, secret)
     try:
-        # A labelled box: What is this labels the FM tone (layer 1: fm); its lit set is
-        # dropped so only the menu's own answer is on the map.
+        # The box menu has no Origins entry (plan 37): What is this? on the box answers it,
+        # lighting the classification's own origins, the box's measured label named.
         menu = open_menu_on_tone(page, url, secret)
+        expect(menu.locator('.ctx-item[data-action="origins"]')).to_have_count(0)
         page.click('#ctx .ctx-item[data-action="classify"]')
+        expect(menu).to_be_hidden()
         expect(page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
                .first).to_be_visible(timeout=15_000)
-        for k in page.evaluate("() => window.zetaTest.litKeys()"):
-            page.evaluate("(k) => window.zetaTest.lightOrigin(k, {origins: []})", k)
-        assert page.evaluate("() => window.zetaTest.litKeys()") == []
-        # The box menu's entry: the band form, the label's modulation named.
-        drag_menu(page)
-        page.click('#ctx .ctx-item[data-action="origins"]')
-        expect(menu).to_be_hidden()
         expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=10_000)
         keys = page.evaluate("() => window.zetaTest.litKeys()")
-        assert len(keys) == 1 and keys[0].startswith("band:"), keys
-        # Spec 4.8: the entry says what it found in the transcript, as the node words it.
-        expect(page.locator("#transcript .line.note", has_text=re.compile(
-            r"^2 sites on [\d.]+ MHz: Example "))).to_have_count(1, timeout=5_000)
+        assert len(keys) == 1 and keys[0].startswith("classify:"), keys
+        # It says what it found in the transcript: the register's answer, its sites named.
+        block = wait_until(lambda: register_block(page), 5, "the register's verdict line")
+        assert sum(1 for line in block if line.startswith("Example ")) == 2, block
         page.locator("#tabs .src-tab.map-tab").click()
         expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
         # The tone's label is `carrier`, which neither stub transmitter (FM, AM) fits: the
@@ -6907,6 +6904,114 @@ def scenario_classify_lights_sites(page, url, secret):
         assert page.evaluate("() => window.zetaTest.litKeys()") == []
     finally:
         run_cmd(page, "view reset")
+
+
+# ---- the register's answer (plan 37 Task 8) -----------------------------------------------
+# ui.rs serve_register: the rows above, a band plan segment about the tone (FIXED and MOBILE
+# primary, RADIOLOCATION secondary) and the hill licence's `rx` 4.6 MHz below the tone; the
+# stub's data date is 2026-01-01.
+REGISTER_AS_OF = "(register data as of 2026-01-01)"
+PAIRED_MHZ = "95.4000 MHz"
+VERDICT_LINE = re.compile(r"^(register (agrees|disagrees|unreachable):|nothing licensed)")
+# A candidate line: holder, site, distance and bearing, the emission in words, then what the
+# register's estimate says (left out when it has none) and whether the observer is off the beam.
+CANDIDATE_LINE = re.compile(
+    r"^Example [A-Za-z ]+, Example [A-Za-z]+, \d+ km \d+°, [A-Za-z ,()-]+?"
+    r"(, expected about -?\d+ dBm)?(, pointed away)?$")
+
+
+def register_block(page):
+    """The transcript's notes from its last verdict line on, or None before one came."""
+    notes = page.locator("#transcript .line.note").all_text_contents()
+    at = [i for i, t in enumerate(notes) if VERDICT_LINE.match(t)]
+    return notes[at[-1]:] if at else None
+
+
+def scenario_what_is_this_shows_the_register_answer(page, url, secret):
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    try:
+        menu = open_menu_on_tone(page, url, secret)
+        # Origins left the box menu: What is this? answers it.
+        expect(page.locator('#ctx [data-action="origins"]')).to_have_count(0)
+        page.click('#ctx .ctx-item[data-action="classify"]')
+        expect(menu).to_be_hidden()
+        block = wait_until(lambda: register_block(page), 15, "the register's verdict line")
+        verdict, band, rest = block[0], block[1], block[2:]
+        assert re.match(r"^register (agrees|disagrees): ", verdict), block
+        assert verdict.endswith(f" {REGISTER_AS_OF}"), block
+        assert band.startswith("band: FIXED, MOBILE"), block
+        cands = [line for line in rest if CANDIDATE_LINE.match(line)]
+        assert 1 <= len(cands) <= 3 and rest[:len(cands)] == cands, block
+        assert cands[0].startswith("Example Water Authority, Example Hill, 9 km "), block
+        assert "Frequency modulation" in cands[0], block
+        assert any(", expected about " in c for c in cands), block
+        after = rest[len(cands)]
+        assert after.startswith("belongs to: ") and PAIRED_MHZ in after, block
+        # The sites are on the map, as What is this? lit them before.
+        expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=5_000)
+        page.locator("#tabs .src-tab.map-tab").click()
+        expect(page.locator("#map path.map-site")).to_have_count(2, timeout=10_000)
+        # The wording the stub's data does not reach: a beam pointed away, a partial answer,
+        # no expected level, no register at all.
+        lines = page.evaluate(
+            """async () => {
+              const { registerLines } = await import('./units.js');
+              const c = (name, geometry, expected, beamwidth_deg) => ({
+                device: {center_hz: 1e8, emission: '16K0F3E', beamwidth_deg,
+                         emission_decoded: {modulation_name: 'Frequency modulation',
+                                            info_name: 'telephony'}},
+                site: {id: 'S9', name: 'Example ' + name, lat: 0, lon: 0},
+                licence: {number: '9'}, holder: {name: 'Example Holder'},
+                geometry, expected, related: null});
+              return registerLines({
+                provider: 'acma', region: 'AU', as_of: null,
+                status: {state: 'partial', reason: null,
+                         failed: [{query: 'plan_span', reason: 'timed out'}]},
+                plan: [],
+                candidates: [
+                  c('Mast', {distance_km: 12.4, bearing_deg: 359.7, off_beam_deg: 80,
+                             horizon_km: 40, beyond_horizon: false},
+                    {mode: 'line_of_sight', level_dbm: -71.6, in_range: 'yes', unknown: []}, 60),
+                  c('Tower', {distance_km: 3, bearing_deg: 90, off_beam_deg: 10,
+                              horizon_km: 40, beyond_horizon: false}, null, 60),
+                ],
+                area_candidates: [], matched: 2, truncated: false, assumptions: {},
+                verdict: {kind: 'agrees', weak: false, summary: 'register agrees: Example Holder'}});
+            }""")
+        assert lines == [
+            "register agrees: Example Holder",
+            "register partly answered: plan_span: timed out",
+            "Example Holder, Example Mast, 12 km 0°, Frequency modulation, telephony, "
+            "expected about -72 dBm, pointed away",
+            "Example Holder, Example Tower, 3 km 90°, Frequency modulation, telephony",
+        ], lines
+        assert page.evaluate(
+            "async () => (await import('./units.js')).registerLines(null)") == [], "null register"
+    finally:
+        run_cmd(page, "view reset")
+
+
+def scenario_an_unreachable_register_says_so(page, url, secret):
+    """A node whose register is a closed port: What is this? says the register is unreachable,
+    never that nothing is licensed."""
+    here = os.path.dirname(os.environ["ZETA_UI_STATE_DIR"])
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        closed = s.getsockname()[1]
+    proc, node = start_node("test-build-unreachable", os.path.join(here, "unreachable-state"),
+                            os.path.join(here, "tone.sigmf-meta"), secret,
+                            extra=["--knowledge-acma", f"http://127.0.0.1:{closed}"])
+    try:
+        set_demo_station(node, secret)
+        menu = open_menu_on_tone(page, node, secret)
+        page.click('#ctx .ctx-item[data-action="classify"]')
+        expect(menu).to_be_hidden()
+        block = wait_until(lambda: register_block(page), 20, "the register's verdict line")
+        assert block[0].startswith("register unreachable: "), block
+        notes = page.locator("#transcript .line.note").all_text_contents()
+        assert not any("nothing licensed" in t for t in notes), notes
+    finally:
+        stop_node(proc)
 
 
 # ---- heard sites (plan 35 Task 4) -------------------------------------------------------

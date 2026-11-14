@@ -11,7 +11,34 @@
 //       non-number as sent, an object as JSON; null or undefined -> ""
 //   registerText(allocations) -> "register says <EMISSION> <licensee>, <site>, <d> km, <p> W"
 //       for the nearest `tx` assignment of a classification's or verdict's allocations
-//       (parts it lacks left out), or null when there is none
+//       (parts it lacks left out), or null when there is none (an older node's line: a node
+//       that sends `register` gets registerLines instead)
+//   emissionWords(decoded) -> an emission designator's words from its decoded parts
+//       (`emission_decoded`): "Frequency modulation, data"; "" when it has none
+//   registerVerdictLine(register) -> a classification's `register` answer's verdict line, or
+//       null (no register, or no verdict on a register that answered): the node's
+//       `verdict.summary` (`register agrees: …`, `register disagrees: …`, `nothing licensed in
+//       range; …`, `register unreachable: …`; an unreachable answer with no verdict reads
+//       `register unreachable: <reason>`), then ` (register data as of <YYYY-MM-DD>)` when the
+//       answer has an `as_of`
+//   registerLines(register, {measured}) -> the transcript lines for a `register` answer
+//       ([] when it is null), in this order:
+//         - the verdict line (registerVerdictLine);
+//         - for a `partial` status, `register partly answered: <query>: <reason>` per failed
+//           query;
+//         - unless unreachable: `band: <primary services>` with `; secondary <others>` (each
+//           service's qualifier in brackets after it; every service when none is primary; no
+//           line for an empty plan);
+//         - the first REGISTER_TOP candidates that are not receivers (only a transmitter can be
+//           the signal), each `<holder>, <site>, <d> km <bearing>°, <emission words>, expected
+//           about <n> dBm`: the holder `licence <no>` when unnamed, whole kilometres and
+//           degrees, the designator when it has no words, `, measured <m> dBm` after the
+//           expected level when `measured` (dBm, a calibrated source's) is a number, `, pointed
+//           away` when its geometry's off_beam_deg exceeds half the device's beamwidth_deg;
+//           parts a candidate lacks left out;
+//         - what the first of them belongs to, when its `related` names anything:
+//           `belongs to: licence <no>, paired with <mhz> MHz (<role>), …, <n> more channels of
+//           the holder at the site, link to <far site> <d> km`.
 //   originSummary(answer) -> one line for an `origin_lookup` answer, as the node's
 //       origin::summary words it: "<n> sites on <f> MHz: <licensee>, <site> <d> km <agree>
 //       <score>; ..." naming the first ORIGIN_SUMMARY_SITES (the distance left out when
@@ -51,6 +78,117 @@ export function registerText(allocations) {
   if (typeof tx.power_w === "number") where.push(`${tx.power_w} W`);
   const code = typeof tx.emission === "string" ? ` ${tx.emission}` : "";
   return `register says${code} ${where.join(", ")}`.trim();
+}
+
+// The candidates registerLines names.
+export const REGISTER_TOP = 3;
+
+export function emissionWords(e) {
+  if (!e) return "";
+  return [e.modulation_name, e.info_name].filter((x) => typeof x === "string" && x).join(", ");
+}
+
+export function registerVerdictLine(register) {
+  if (!register) return null;
+  const v = register.verdict;
+  let line = v && typeof v.summary === "string" && v.summary ? v.summary : null;
+  if (!line && register.status?.state === "unreachable") {
+    line = `register unreachable: ${register.status.reason || "no reason given"}`;
+  }
+  if (!line) return null;
+  const asOf = typeof register.as_of === "string" ? register.as_of : "";
+  const date = asOf.match(/^\d{4}-\d{2}-\d{2}/)?.[0] || asOf;
+  return date ? `${line} (register data as of ${date})` : line;
+}
+
+// The `band:` line of a register answer's plan segments, or null for an empty plan.
+function bandLine(plan) {
+  const services = (plan || []).flatMap((p) => (p && Array.isArray(p.services) ? p.services : []));
+  const names = (keep) => {
+    const out = [];
+    for (const s of services) {
+      if (!s || typeof s.name !== "string" || !keep(s)) continue;
+      const name = s.qualifier ? `${s.name} (${s.qualifier})` : s.name;
+      if (!out.includes(name)) out.push(name);
+    }
+    return out;
+  };
+  const primary = names((s) => s.primary);
+  const secondary = names((s) => !s.primary).filter((n) => !primary.includes(n));
+  if (primary.length === 0) return secondary.length ? `band: ${secondary.join(", ")}` : null;
+  const tail = secondary.length ? `; secondary ${secondary.join(", ")}` : "";
+  return `band: ${primary.join(", ")}${tail}`;
+}
+
+// One candidate's line (see registerLines).
+function candidateLine(c, measured) {
+  const d = c.device || {};
+  const g = c.geometry;
+  const parts = [];
+  const holder = c.holder?.name || (c.licence?.number ? `licence ${c.licence.number}` : "");
+  if (holder) parts.push(holder);
+  if (c.site?.name) parts.push(c.site.name);
+  if (g && Number.isFinite(g.distance_km)) {
+    const b = Number.isFinite(g.bearing_deg) ? ` ${Math.round(g.bearing_deg) % 360}°` : "";
+    parts.push(`${Math.round(g.distance_km)} km${b}`);
+  }
+  const words = emissionWords(d.emission_decoded) || d.emission;
+  if (words) parts.push(words);
+  const level = c.expected?.level_dbm;
+  if (Number.isFinite(level)) {
+    parts.push(`expected about ${Math.round(level)} dBm`);
+    if (Number.isFinite(measured)) parts.push(`measured ${Math.round(measured)} dBm`);
+  }
+  if (Number.isFinite(g?.off_beam_deg) && Number.isFinite(d.beamwidth_deg)
+      && g.off_beam_deg > d.beamwidth_deg / 2) {
+    parts.push("pointed away");
+  }
+  return parts.join(", ");
+}
+
+// What candidate `c` belongs to (see registerLines), or null when its `related` names nothing.
+function belongsLine(c) {
+  const r = c.related;
+  if (!r) return null;
+  const paired = (r.paired || []).map(
+    (ch) => `${mhzText(ch.center_hz)} MHz${ch.role ? ` (${ch.role})` : ""}`,
+  );
+  const more = Number.isFinite(r.holder_channels) ? r.holder_channels : 0;
+  const far = r.far_end && r.far_end.site;
+  if (paired.length === 0 && more === 0 && !far) return null;
+  const parts = c.licence?.number ? [`licence ${c.licence.number}`] : [];
+  if (paired.length) parts.push(`paired with ${paired.join(", ")}`);
+  if (more) {
+    parts.push(`${more} more ${more === 1 ? "channel" : "channels"} of the holder at the site`);
+  }
+  if (far) {
+    const d = r.far_end.distance_km;
+    parts.push(`link to ${far.name || far.id}${Number.isFinite(d) ? ` ${Math.round(d)} km` : ""}`);
+  }
+  return `belongs to: ${parts.join(", ")}`;
+}
+
+export function registerLines(register, { measured } = {}) {
+  if (!register) return [];
+  const lines = [];
+  const verdict = registerVerdictLine(register);
+  if (verdict) lines.push(verdict);
+  const status = register.status || {};
+  if (status.state === "partial") {
+    for (const f of status.failed || []) {
+      lines.push(`register partly answered: ${f.query}: ${f.reason}`);
+    }
+  }
+  if (status.state === "unreachable") return lines;
+  const band = bandLine(register.plan);
+  if (band) lines.push(band);
+  const top = (register.candidates || [])
+    .filter((c) => c && c.device?.role !== "rx")
+    .slice(0, REGISTER_TOP);
+  for (const c of top) lines.push(candidateLine(c, measured));
+  const belongs = top[0] ? belongsLine(top[0]) : null;
+  if (belongs) lines.push(belongs);
+  return lines;
 }
 
 export function mhzText(hz) {

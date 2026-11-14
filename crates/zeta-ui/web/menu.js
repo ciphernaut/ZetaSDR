@@ -6,9 +6,9 @@
 //   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command, muteFor, onOrigins,
 //                  sets, sources})
 //       -> Menu   (`onOrigins(key, answer)`: What is this's classification `origins`, keyed
-//       `classify:<t_ns>`, and the Origins entry's band-form answer, keyed
-//       `band:<source>:<centre Hz>` and noted in the transcript as units.js originSummary
-//       words it, for the map to light)
+//       `classify:<t_ns>`, for the map to light; the box menu has no Origins entry of its
+//       own: What is this? answers it, and the job rows' and the Bits pane's Origins buttons
+//       ask by job)
 //       Opens #ctx at the pointer after each wf.onSelect. `applyOp(op) -> Promise<result|null>`
 //       is app.js's command-line op path (shows its outcome per ruling R6; null when it
 //       failed, the failure already reported); `attachOp(jobId)` the `job_attach` op that
@@ -60,7 +60,13 @@
 //                                             label is listed in the transcript as
 //                                             `L<layer> <name> <confidence>`, then each
 //                                             mode decode-to-identify considered as
-//                                             `tried <mode> <score> <outcome>`
+//                                             `tried <mode> <score> <outcome>`, then the
+//                                             register's answer as units.js registerLines
+//                                             words it (the verdict with the data's date,
+//                                             the band, the top candidates, what the first
+//                                             belongs to; an older node without `register`:
+//                                             the registerText line), and its `origins`
+//                                             light the map (onOrigins)
 //   identify   Identify (thorough)            job_start kind=identify, bandwidth_hz at least
 //                                             IDENTIFY_MIN_BANDWIDTH_HZ; each `candidate`
 //                                             event shows as a ribbon (its `summary`, class
@@ -220,7 +226,7 @@
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
 // as for #ctx.
 
-import { bandText, mhzText, originSummary, registerText } from "./units.js";
+import { bandText, mhzText, registerLines, registerText } from "./units.js";
 import { capHz } from "./waterfall.js";
 
 // How far past the ring's earliest sample a `too_old` retry starts, as the front moves on.
@@ -301,7 +307,6 @@ function denoiseNode(job) {
 
 const ENTRIES = [
   ["classify", "What is this?"],
-  ["origins", "Origins"],
   ["capture", "Capture bursts"],
   ["identify", "Identify (thorough)"],
   ["watch", "Watch this band"],
@@ -532,7 +537,6 @@ class Menu {
     this.videoRefused = null; // why "Decode video" cannot start on the open box (videoRefusal)
     this.fitGen = 0;
     this.labelKeys = [];
-    this.boxLabel = null; // the last classification's top layer-1 label {centerHz, bandwidthHz, name}
     this.pointer = { x: 0, y: 0 };
 
     this.el = document.createElement("div");
@@ -991,27 +995,6 @@ class Menu {
       return;
     }
     this.close();
-    if (action === "origins") {
-      // The band form; the box's layer-1 label (when it was classified) names its modulation.
-      const bl = this.boxLabel;
-      // A `noise` label measures no modulation (the node's measured_modulation drops it too).
-      // The label counts for a selection centred inside the classified box.
-      const inBox = bl && Math.abs(bl.centerHz - s.centerHz) <= bl.bandwidthHz / 2;
-      const named = inBox && bl.name !== "noise" ? bl.name : null;
-      const r = await this.applyOp({
-        op: "origin_lookup",
-        job: null,
-        source: s.sourceId,
-        center_hz: s.centerHz,
-        bandwidth_hz: s.bandwidthHz,
-        modulation: named ? [named] : null,
-      });
-      if (r && r.value) {
-        this.t.note(originSummary(r.value));
-        this.onOrigins(`band:${s.sourceId}:${Math.round(s.centerHz)}`, r.value);
-      }
-      return;
-    }
     const selection = {
       source: s.sourceId,
       span: { start_ns: s.startNs, end_ns: s.endNs },
@@ -1027,8 +1010,11 @@ class Menu {
         for (const t of r.value.tried || []) {
           this.t.note(`tried ${t.mode} ${Number(t.score).toFixed(2)} ${t.outcome}`);
         }
-        const reg = registerText(r.value.allocations);
-        if (reg) this.t.note(reg);
+        // An older node sends no `register`: its allocations' one line.
+        const reg = r.value.register
+          ? registerLines(r.value.register)
+          : [registerText(r.value.allocations)].filter(Boolean);
+        for (const line of reg) this.t.note(line);
         const o = r.value.origins;
         if (o) this.onOrigins(`classify:${o.t_ns}`, o);
       }
@@ -1172,7 +1158,6 @@ class Menu {
         : LABEL_FALLBACK_STEP_HZ;
     // Only the top layer-2 label is drawn; the others appear in the transcript.
     const l1 = labels.filter((l) => l.layer !== 2);
-    this.boxLabel = l1[0] ? { centerHz: s.centerHz, bandwidthHz: s.bandwidthHz, name: l1[0].name } : null;
     const top2 = labels
       .filter((l) => l.layer === 2)
       .reduce((a, b) => (a && (a.confidence ?? 0) >= (b.confidence ?? 0) ? a : b), null);

@@ -137,7 +137,7 @@
 //   when nothing else has (no home, no fix).
 
 import { subjectLabel, subjectValues } from "./subjects.js";
-import { bandText, metricText } from "./units.js";
+import { bandText, emissionWords, metricText } from "./units.js";
 import { homeOf } from "./view.js";
 
 const SUBJECT_DRAW_MS = 500;
@@ -348,12 +348,6 @@ function sitesOf(origins) {
     s.origins.sort((x, y) => (y.score ?? 0) - (x.score ?? 0));
     return { ...s, best: s.origins[0] };
   });
-}
-
-// An emission designator's words: `Frequency modulation, data` from its decoded parts.
-function emissionWords(e) {
-  if (!e) return "";
-  return [e.modulation_name, e.info_name].filter((x) => typeof x === "string" && x).join(", ");
 }
 
 // The tooltip's lines for one origin (spec 4.4, Hover); `stations` its answer's tally.

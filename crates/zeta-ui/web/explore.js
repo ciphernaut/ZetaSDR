@@ -38,7 +38,7 @@
 //   reload never takes the pane back from the stored one (spec 5.7, auto-selected the first
 //   time a capture appears, never again).
 
-import { bandText, khzText, registerText } from "./units.js";
+import { bandText, khzText, registerText, registerVerdictLine } from "./units.js";
 
 export const EXPLORE_POLL_MS = 2000;
 export const DELETE_CONFIRM_MS = 3000;
@@ -428,7 +428,8 @@ class ExplorePane {
       for (const t of v.tried || []) {
         this.t.note(`tried ${t.mode} ${Number(t.score).toFixed(2)} ${t.outcome}`);
       }
-      const reg = registerText(v.allocations);
+      // The register's verdict when the node sends one; an older node's allocations' line.
+      const reg = registerVerdictLine(v.register) ?? registerText(v.allocations);
       if (reg) this.t.note(`${id}: ${reg}`);
       if (v.origins) this.onOrigins?.(`capture:${id}`, v.origins);
     } catch (e) {

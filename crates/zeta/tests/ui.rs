@@ -18,8 +18,8 @@
 //! frequencies passed to ui.py in `ZETA_UI_KIWI_CARRIERS`); the node's state directory is passed to ui.py in
 //! `ZETA_UI_STATE_DIR`. That node's station is the demo station ([`DEMO_STATION`],
 //! `station_set` once it is up), and its `--knowledge-acma` is zeta-ext's register stub
-//! (`testing::acma_stub`) on 127.0.0.1 answering [`fake_register_rows`] (the tone's band
-//! only). That node has a fake
+//! (`testing::acma_stub`) on 127.0.0.1 ([`serve_register`]: [`fake_register_rows`] and a band
+//! plan segment about the tone). That node has a fake
 //! `voiced` (`--stt-socket`, zeta-speech's `FakeDaemon`) answering `ok:what sources are there`
 //! to every valid staged WAV; a second node without a speech daemon, with only the `speech`
 //! fixture, is passed in `ZETA_UI_URL_NOSTT`; a third node with the `cb` fixture whose
@@ -452,10 +452,18 @@ fn from_demo_station(north_km: f64, east_km: f64) -> (f64, f64) {
     (lat + lat_deg, lon + lon_deg)
 }
 
-/// What the register stub answers (`acma_stub::COLUMNS` order), all on the tone's band and
-/// synthetic: a `tx` `16K0F1D` 9 km north-west of the demo station with callsign `XX4EX`, a
-/// `tx` `12K5A3E` 20 km east, and an `rx` row (never lit). The stub answers nothing on
-/// another band.
+/// How far below the tone the hill licence's second frequency sits (its `rx`, well outside the
+/// tone's band, so never a candidate there).
+const PAIRED_OFFSET_HZ: u64 = 4_600_000;
+/// The stub's band plan segment about the tone reaches this far either side of it.
+const PLAN_HALF_SPAN_HZ: u64 = 1_000_000;
+/// The services of that segment (synthetic), in the register's `services_json` shape.
+const PLAN_SERVICES: &str = r#"[{"name": "FIXED", "primary": true}, {"name": "MOBILE", "primary": true}, {"name": "RADIOLOCATION", "primary": false}]"#;
+
+/// What the register stub answers (`acma_stub::COLUMNS` order), synthetic: on the tone's band
+/// a `tx` `16K0F1D` 9 km north-west of the demo station with callsign `XX4EX`, a `tx`
+/// `12K5A3E` 20 km east, and an `rx` row (never lit); and the hill licence's `rx` frequency
+/// [`PAIRED_OFFSET_HZ`] below the tone (its `related.paired`). Nothing else.
 fn fake_register_rows() -> Vec<serde_json::Value> {
     use serde_json::json;
     let diagonal = SITE_HILL_KM * std::f64::consts::FRAC_1_SQRT_2;
@@ -505,7 +513,46 @@ fn fake_register_rows() -> Vec<serde_json::Value> {
             "Example Water Authority",
             null
         ]),
+        json!([
+            TONE_HZ - PAIRED_OFFSET_HZ,
+            16000,
+            "16K0F1D",
+            "R",
+            null,
+            "W",
+            "0000001",
+            "Example Hill",
+            hill.0,
+            hill.1,
+            "Example Water Authority",
+            null
+        ]),
     ]
+}
+
+/// The register stub on a thread of its own: [`fake_register_rows`] plus a band plan segment
+/// of [`PLAN_SERVICES`] [`PLAN_HALF_SPAN_HZ`] either side of the tone (the stub's own segment
+/// lies elsewhere); its URL. It serves as long as the test process lives.
+fn serve_register() -> String {
+    let fixture = acma_stub::Fixture::from_rows(&fake_register_rows());
+    fixture.sql(&format!(
+        "INSERT INTO spectrum_allocations VALUES ({}, {}, 'MHz', 1, '{PLAN_SERVICES}', '[]', '')",
+        TONE_HZ - PLAN_HALF_SPAN_HZ,
+        TONE_HZ + PLAN_HALF_SPAN_HZ,
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("register stub runtime");
+        rt.block_on(async move {
+            let (url, _stub) = acma_stub::serve_fixture(fixture, Mode::Normal).await;
+            tx.send(url).expect("hand the stub's url over");
+            std::future::pending::<()>().await;
+        });
+    });
+    rx.recv().expect("the register stub starts")
 }
 
 /// `station_set` the demo station on the node at `url`.
@@ -1025,7 +1072,7 @@ impl Nodes {
         // not the host has dump1090 (a CI runner has none; the ADS-B width scenario needs it).
         let fake_dump1090 = repo_root().join("crates/zeta-ext/tests/fake_dump1090");
         let fake_dump1090 = fake_dump1090.to_str().expect("fake_dump1090 path is UTF-8");
-        let register = acma_stub::serve_on_thread(fake_register_rows(), Mode::Normal);
+        let register = serve_register();
         let (kiwi_rt, kiwi) = start_fake_kiwi();
         let kiwi_flag = format!("kiwi={}", kiwi.addr());
         let serve = ServeProc::start_full(
