@@ -836,7 +836,9 @@ impl RowError {
     }
 }
 
-/// The placeholders a graph template may use, each with the dummy value it is checked with.
+/// The integer placeholders a graph template may use, each with the dummy value it is
+/// checked with; `"$audio_policy"` ([`super::template::AUDIO_POLICY_PLACEHOLDER`]) is the
+/// one string placeholder, checked with the default policy's name.
 const GRAPH_PLACEHOLDERS: [(&str, u64); 3] = [
     ("$center_hz", 100_000_000),
     ("$bandwidth_hz", 12_500),
@@ -1364,12 +1366,17 @@ fn validate_graph(nodes: &[Node], edges: &[Edge], stages: &StageRegistry) -> Res
 fn fill(v: &mut serde_json::Value, field: &str) -> Result<(), RowError> {
     use serde_json::Value;
     match v {
+        // The audio policy is a string: checked with the default policy's name.
+        Value::String(s) if s == super::template::AUDIO_POLICY_PLACEHOLDER => {
+            *v = crate::ops::AudioPolicy::default().name().into();
+        }
         Value::String(s) if s.starts_with('$') => {
             let (_, dummy) = GRAPH_PLACEHOLDERS
                 .iter()
                 .find(|(p, _)| p == s)
                 .ok_or_else(|| {
-                    let known: Vec<&str> = GRAPH_PLACEHOLDERS.iter().map(|(p, _)| *p).collect();
+                    let mut known: Vec<&str> = GRAPH_PLACEHOLDERS.iter().map(|(p, _)| *p).collect();
+                    known.push(super::template::AUDIO_POLICY_PLACEHOLDER);
                     RowError::new(
                         field,
                         format!("unknown placeholder {s} (known: {})", known.join(", ")),

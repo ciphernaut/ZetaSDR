@@ -221,6 +221,17 @@ pub trait Stage: Send + Sync {
     fn output_roles(&self, params: &serde_json::Value) -> Vec<Option<&'static str>> {
         vec![None; self.outputs_for(params).len()]
     }
+    /// The roles of this stage's audio outputs that are voices of their own, in output order.
+    /// Empty (the default) for a stage with one voice.
+    ///
+    /// A stage with several voices (a DMR stage's two time slots) publishes its main audio
+    /// stream with no role (what the play button, the mix and a plain `job_attach` read)
+    /// and one audio output per voice whose [`output_roles`](Stage::output_roles) entry is
+    /// the voice's role; this lists those roles. `job_attach`'s `stream` names one, and a
+    /// mode row whose terminal stage lists any reports them as its `voices`.
+    fn voice_roles(&self, _params: &serde_json::Value) -> Vec<&'static str> {
+        Vec::new()
+    }
     /// Check `params` (already valid against `spec().params_schema`) for what the schema
     /// cannot say, so a bad node is refused when the graph is validated instead of
     /// failing its job at run time; the error names the field. By default nothing more.
@@ -277,6 +288,15 @@ impl StageRegistry {
             .iter()
             .find(|s| s.spec().kind == kind)
             .map_or(Ok(()), |s| s.check_params(params))
+    }
+
+    /// [`Stage::voice_roles`] of the first implementation registered for `kind` with
+    /// `params` (empty for an unknown kind).
+    pub fn voice_roles(&self, kind: &str, params: &serde_json::Value) -> Vec<&'static str> {
+        self.stages
+            .iter()
+            .find(|s| s.spec().kind == kind)
+            .map_or_else(Vec::new, |s| s.voice_roles(params))
     }
 
     /// [`Stage::readiness`] of the first implementation registered for `kind` (`None` for

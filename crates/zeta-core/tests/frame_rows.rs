@@ -185,6 +185,7 @@ async fn start(node: &Node, kind: JobKind) -> JobId {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -257,7 +258,7 @@ fn a_frame_row_expands_to_the_chain() {
         bandwidth_hz: Hz(BANDWIDTH_HZ),
     };
     template::check_band(&row, tuning, RATE_HZ as u64).unwrap();
-    let g = template::expand(&row, tuning, RATE_HZ as u64).unwrap();
+    let g = template::expand(&row, tuning, RATE_HZ as u64, Default::default()).unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(
         kinds,

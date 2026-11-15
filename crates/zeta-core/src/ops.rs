@@ -286,6 +286,18 @@ pub enum Op {
         #[serde(default, deserialize_with = "nullable_u64")]
         #[schemars(required, schema_with = "nullable_bin_hz")]
         bin_hz: Option<u64>,
+        /// A mode whose row lists `voices` only (`modes_list`; a DMR row's two time
+        /// slots): what the job's main audio stream carries, the one the play button, the
+        /// mix and a plain `job_attach` read. `first_active`: the call that started first,
+        /// until it ends (a call that began while another held the stream never joins it).
+        /// `follow`: the call that started first; when it ends and another is still going,
+        /// that one, from that moment. `all`: every call, mixed. `null` is `first_active`.
+        /// Each voice is also on its own stream whatever the policy. The job's record keeps
+        /// it (`audio_policy`), so a restart or a retune resumes it. On any other kind a
+        /// policy is refused, `audio_policy: <kind> has one voice`.
+        #[serde(default, deserialize_with = "nullable_audio_policy")]
+        #[schemars(required, schema_with = "nullable_audio_policy_schema")]
+        audio_policy: Option<AudioPolicy>,
         /// `spectrum` only (`false` for any other kind): the job follows the
         /// source's capture instead of holding it. It never conflicts, never
         /// retunes a held source (its `tuning` is the capture it joins), is
@@ -311,6 +323,7 @@ pub enum Op {
     /// `stopped` when the input job stops or fails for its own reason. On a node restart
     /// it resumes after its input, or is `failed` with `input job <id> not running` when
     /// the input does not run.
+    #[schemars(transform = require_attach_stream)]
     JobAttach {
         kind: JobKind,
         job: JobId,
@@ -318,6 +331,15 @@ pub enum Op {
         #[serde(deserialize_with = "nullable_string_value")]
         #[schemars(required, schema_with = "nullable_language")]
         language: Option<String>,
+        /// The voice of `job` to read, one of its row's `voices` (`modes_list`): a DMR
+        /// job's `slot1` or `slot2`. `null` reads the job's main audio stream, as above.
+        /// A role the job does not have is refused, `stream: <job> has no voice <role>
+        /// (it has: slot1, slot2)`, or `stream: <job> has one voice` when it has none.
+        /// The attached job's record keeps it (`stream`), each of its `transcript` events
+        /// and `transcripts.log` lines carries it, and a relaunch reads the same voice.
+        #[serde(default, deserialize_with = "nullable_string_value")]
+        #[schemars(required, schema_with = "nullable_voice_schema")]
+        stream: Option<String>,
     },
     /// Retune a running job on the radio to a new band under the same id: under the
     /// source's gate its lease is moved to `center_hz`/`bandwidth_hz` (inside the current
@@ -1026,6 +1048,61 @@ impl ScanMethod {
     }
 }
 
+/// What a job's main audio stream carries when its stage has several voices (a DMR
+/// stage's two time slots), each also on its own stream: set at `job_start` and kept in
+/// the job's record, so a restart or a retune resumes it. The row's template names it as
+/// `"$audio_policy"`, filled with [`AudioPolicy::name`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioPolicy {
+    // (Plain comments, not docs: the schema stays a plain string enum.)
+    // The call that started first, until it ends; a call that began while another held
+    // the main stream never joins it.
+    #[default]
+    FirstActive,
+    // The call that started first; when it ends and another is still going, that one,
+    // from that moment.
+    Follow,
+    // Every call, mixed.
+    All,
+}
+
+impl AudioPolicy {
+    /// The policy's snake-case name, as `job_start` takes it and the template fills it.
+    pub fn name(self) -> &'static str {
+        match self {
+            AudioPolicy::FirstActive => "first_active",
+            AudioPolicy::Follow => "follow",
+            AudioPolicy::All => "all",
+        }
+    }
+}
+
+/// Deserialize a required `Option<AudioPolicy>` (see [`nullable_u64`]).
+fn nullable_audio_policy<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<AudioPolicy>, D::Error> {
+    <Option<AudioPolicy> as Deserialize>::deserialize(d)
+}
+
+/// Schema of `job_start`'s `audio_policy`: `["string","null"]`, the three policies or
+/// `null`.
+fn nullable_audio_policy_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "enum": ["first_active", "follow", "all", null],
+        "description": "A mode whose row lists `voices` only (`modes_list`): what the job's main audio stream carries, `first_active` (the call that started first, until it ends), `follow` (that call, then whichever is still going when it ends) or `all` (every call, mixed); `null` is `first_active`. Any other kind must pass `null`."
+    })
+}
+
+/// Schema of `job_attach`'s `stream`: `["string","null"]`.
+fn nullable_voice_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "description": "The voice of `job` to read, one of its row's `voices` (`modes_list`: `slot1`, `slot2`); `null` reads the job's main audio stream."
+    })
+}
+
 /// An SSB sideband: upper (`usb`) or lower (`lsb`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1104,12 +1181,37 @@ fn require_retune_bin_hz(schema: &mut schemars::Schema) {
     }
 }
 
+/// `job_attach` requires its `stream`, after `language`, and shows no default for it;
+/// it still defaults to `null` when a request from before it leaves it out.
+fn require_attach_stream(schema: &mut schemars::Schema) {
+    if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
+        req.retain(|f| f != "stream");
+        let at = req
+            .iter()
+            .position(|f| f == "language")
+            .map_or(req.len(), |i| i + 1);
+        req.insert(at, "stream".into());
+    }
+    if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties")
+        && let Some(serde_json::Value::Object(p)) = props.get_mut("stream")
+    {
+        p.remove("default");
+    }
+}
+
 /// `job_start` requires its look, `dwell_ms`, `average`, `bits`, `method` and
-/// `bin_hz`, after `sideband` (the field order agents read), and like
-/// `deviation_hz` shows no default for them; they still default to `null` when a
+/// `bin_hz`, then `audio_policy`, after `sideband` (the field order agents read), and
+/// like `deviation_hz` shows no default for them; they still default to `null` when a
 /// request from before them leaves them out.
 fn require_the_look(schema: &mut schemars::Schema) {
-    const LOOK: [&str; 5] = ["dwell_ms", "average", "bits", "method", "bin_hz"];
+    const LOOK: [&str; 6] = [
+        "dwell_ms",
+        "average",
+        "bits",
+        "method",
+        "bin_hz",
+        "audio_policy",
+    ];
     if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
         req.retain(|f| !LOOK.iter().any(|l| f == l));
         let at = req
@@ -1441,24 +1543,27 @@ impl JobKind {
     }
 
     /// The graph of an attached job of this kind reading `input_stream` (an audio stream)
-    /// of `input_job`: `stream_in` then the kind's chain, joined by audio edges. For
-    /// `transcribe`: `stream_in -> denoise -> vad -> transcribe {"language"}`, without the
-    /// `denoise` when `input_denoised` (the input's demodulator runs RNNoise itself: see
-    /// [`graph_denoises`]). A kind that is not [`attachable`](Self::attachable) is
-    /// `other("<kind> is not attachable")`.
+    /// of `input_job`, its voice `voice` (`None`: its main stream): `stream_in` then the
+    /// kind's chain, joined by audio edges. For `transcribe`: `stream_in -> denoise -> vad
+    /// -> transcribe {"language"}` (and `"stream"`, the voice its events then carry, when
+    /// one is named), without the `denoise` when `input_denoised` (the input's
+    /// demodulator runs RNNoise itself: see [`graph_denoises`]). A kind that is not
+    /// [`attachable`](Self::attachable) is `other("<kind> is not attachable")`.
     pub fn expand_attached(
         &self,
         input_job: &JobId,
         input_stream: &StreamId,
+        voice: Option<&str>,
         language: &str,
         input_denoised: bool,
     ) -> Result<Graph, OpError> {
         let chain: Vec<(&str, serde_json::Value)> = match self {
             JobKind::Transcribe => {
-                let mut chain = vec![
-                    ("vad", serde_json::json!({})),
-                    ("transcribe", serde_json::json!({"language": language})),
-                ];
+                let mut transcribe = serde_json::json!({"language": language});
+                if let Some(v) = voice {
+                    transcribe["stream"] = v.into();
+                }
+                let mut chain = vec![("vad", serde_json::json!({})), ("transcribe", transcribe)];
                 if !input_denoised {
                     chain.insert(0, ("denoise", serde_json::json!({})));
                 }
@@ -1524,7 +1629,9 @@ impl JobKind {
     /// `channel_hz`, and a channel's `wide_hz` (as `graph_put` may have set them) are
     /// carried to the node of the same stage kind when `expand` writes the key (absent
     /// from `stored`: the defaults `expand` writes). A `watch`'s `detect` node keeps its
-    /// stored params whole.
+    /// stored params whole. A row naming `"$audio_policy"` is filled with `audio_policy`,
+    /// the job record's (`null`: `first_active`).
+    #[allow(clippy::too_many_arguments)]
     pub fn reexpand(
         &self,
         source: &SourceId,
@@ -1532,6 +1639,7 @@ impl JobKind {
         source_rate_hz: Hz,
         bank_bin_rate_hz: Option<u64>,
         stored: &Graph,
+        audio_policy: Option<AudioPolicy>,
         modes: &ModeRegistry,
     ) -> Result<Graph, OpError> {
         self.reexpand_carrying(
@@ -1540,6 +1648,7 @@ impl JobKind {
             source_rate_hz,
             bank_bin_rate_hz,
             stored,
+            audio_policy,
             modes,
             &CARRIED_PARAMS,
         )
@@ -1557,7 +1666,8 @@ impl JobKind {
 
     /// [`JobKind::reexpand`] carrying only the params named in `carried` (a retune
     /// passes [`RETUNE_CARRIED_PARAMS`]); the rest take the values `expand` derives.
-    /// `deviation_hz` and `sideband` are read back from `stored` whatever `carried` says.
+    /// `deviation_hz` and `sideband` are read back from `stored` whatever `carried` says;
+    /// the audio policy is the record's, `audio_policy`.
     #[allow(clippy::too_many_arguments)]
     pub fn reexpand_carrying(
         &self,
@@ -1566,18 +1676,18 @@ impl JobKind {
         source_rate_hz: Hz,
         bank_bin_rate_hz: Option<u64>,
         stored: &Graph,
+        audio_policy: Option<AudioPolicy>,
         modes: &ModeRegistry,
         carried: &[&str],
     ) -> Result<Graph, OpError> {
         let (deviation_hz, sideband) = self.start_params(stored);
         let deviation_hz = deviation_hz.map(Hz);
-        let mut g = self.expand(
+        let mut g = self.expand_voiced(
             source,
             tuning,
             source_rate_hz,
             bank_bin_rate_hz,
-            deviation_hz,
-            sideband,
+            (deviation_hz, sideband, audio_policy),
             modes,
         )?;
         for n in &mut g.nodes {
@@ -1642,15 +1752,41 @@ impl JobKind {
     /// [`JobKind::mode_row`] and [`template::expand`]). A `scan` takes
     /// `source_rate_hz` as the source's capture (its `max_bandwidth_hz`; 0:
     /// not known), for the size its stored `fft` node says.
+    ///
+    /// A row naming `"$audio_policy"` gets `first_active`; see
+    /// [`JobKind::expand_voiced`] for another policy.
     #[allow(clippy::too_many_arguments)]
     pub fn expand(
         &self,
-        _source: &SourceId,
+        source: &SourceId,
         tuning: Tuning,
         source_rate_hz: Hz,
         bank_bin_rate_hz: Option<u64>,
         deviation_hz: Option<Hz>,
         sideband: Option<Sideband>,
+        modes: &ModeRegistry,
+    ) -> Result<Graph, OpError> {
+        self.expand_voiced(
+            source,
+            tuning,
+            source_rate_hz,
+            bank_bin_rate_hz,
+            (deviation_hz, sideband, None),
+            modes,
+        )
+    }
+
+    /// [`JobKind::expand`] with the start params `deviation_hz`, `sideband` and
+    /// `audio_policy`: a mode row naming `"$audio_policy"` is filled with the policy's
+    /// name (`null`: `first_active`). `job_start` refuses a policy for a kind
+    /// whose row does not name it before anything is expanded.
+    pub fn expand_voiced(
+        &self,
+        _source: &SourceId,
+        tuning: Tuning,
+        source_rate_hz: Hz,
+        bank_bin_rate_hz: Option<u64>,
+        (deviation_hz, sideband, audio_policy): (Option<Hz>, Option<Sideband>, Option<AudioPolicy>),
         modes: &ModeRegistry,
     ) -> Result<Graph, OpError> {
         if !self.startable() {
@@ -1681,7 +1817,7 @@ impl JobKind {
         }
         if let Some(row) = row {
             template::check_band(row, tuning, source_rate_hz.0)?;
-            return template::expand(row, tuning, out);
+            return template::expand(row, tuning, out, audio_policy.unwrap_or_default());
         }
         Ok(match self {
             JobKind::Transcribe | JobKind::Mix => unreachable!("refused above: not startable"),
@@ -2901,6 +3037,11 @@ pub struct ModeInfo {
     /// The stream kinds a job of the row emits (`event`, `audio`, ...); a row whose
     /// `outputs` lists `audio` can be played and transcribed. Empty for a broken row.
     pub outputs: Vec<StreamKind>,
+    /// The voices of a job of the row, each on an audio stream of its own beside the main
+    /// one (a DMR row's `slot1` and `slot2`): what `job_attach`'s `stream` may name, and
+    /// the rows `job_start`'s `audio_policy` applies to. Empty for a row with one voice.
+    #[serde(default)]
+    pub voices: Vec<String>,
 }
 
 impl From<&LoadedMode> for ModeInfo {
@@ -2921,6 +3062,7 @@ impl From<&LoadedMode> for ModeInfo {
             subject: m.row.subject.clone(),
             access: m.row.access,
             outputs: m.outputs.clone(),
+            voices: m.voices.clone(),
         }
     }
 }
@@ -3797,6 +3939,7 @@ fn node_error(node: &Node, e: NodeError) -> OpError {
         NodeError::NoAudioStream(j) => OpError::Other {
             message: format!("job {} has no audio stream", j.0),
         },
+        e @ NodeError::NoVoice { .. } => other(e),
         NodeError::Expand(e) => e,
         NodeError::Other(message) => OpError::Other { message },
         e @ (NodeError::Io(_) | NodeError::DuplicateSource(_) | NodeError::Stopped(_)) => other(e),
@@ -3872,7 +4015,7 @@ async fn reconcile_rate(
     id: &JobId,
     kind: JobKind,
     tuning: Tuning,
-    (deviation_hz, sideband): (Option<Hz>, Option<Sideband>),
+    start_params: (Option<Hz>, Option<Sideband>, Option<AudioPolicy>),
     mut expected: Hz,
 ) -> Result<(), OpError> {
     if !kind.channelised() {
@@ -3901,13 +4044,12 @@ async fn reconcile_rate(
                 options: vec!["retry job_start".into(), "stop one of the holders".into()],
             });
         }
-        let graph = match kind.expand(
+        let graph = match kind.expand_voiced(
             port.id(),
             tuning,
             leased.bandwidth_hz,
             node.bank_bin_rate(port.id(), leased),
-            deviation_hz,
-            sideband,
+            start_params,
             &node.modes(),
         ) {
             Ok(g) => g,
@@ -3948,6 +4090,23 @@ pub(crate) fn check_start_params(
             Ok(Some(Hz(d)))
         }
     }
+}
+
+/// `job_start`'s check of `audio_policy`: only a mode whose row `row` names
+/// `"$audio_policy"` (a stage with several voices) takes one; any other kind is refused,
+/// `audio_policy: <kind> has one voice`. `null` is always accepted.
+pub(crate) fn check_audio_policy(
+    kind: &JobKind,
+    row: Option<&ModeRow>,
+    audio_policy: Option<AudioPolicy>,
+) -> Result<(), OpError> {
+    if audio_policy.is_some() && !row.is_some_and(template::names_audio_policy) {
+        return Err(other(format!(
+            "audio_policy: {} has one voice",
+            kind.name()
+        )));
+    }
+    Ok(())
 }
 
 /// `job_start`'s checks of a scan's look: `dwell_ms` (1..=`SCAN_DWELL_MAX_MS`),
@@ -4413,6 +4572,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             bits,
             method,
             bin_hz,
+            audio_policy,
             elastic,
             replace,
         } => {
@@ -4428,8 +4588,9 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             if method == Some(ScanMethod::Source) && !replace.is_empty() {
                 return Err(other(SCAN_REPLACE_STEPPED));
             }
-            // An unknown or unready mode is refused before anything is tuned.
-            kind.mode_row(&node.modes())?;
+            // An unknown or unready mode is refused before anything is tuned, and so is
+            // a policy for a mode with one voice.
+            check_audio_policy(&kind, kind.mode_row(&node.modes())?, audio_policy)?;
             let tuning = Tuning {
                 center_hz,
                 bandwidth_hz,
@@ -4582,13 +4743,12 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 },
             };
             let bin_rate = node.bank_bin_rate(&source, granted);
-            let (started, after) = match kind.expand(
+            let (started, after) = match kind.expand_voiced(
                 &source,
                 tuning,
                 granted.bandwidth_hz,
                 bin_rate,
-                deviation,
-                sideband,
+                (deviation, sideband, audio_policy),
                 &node.modes(),
             ) {
                 Ok(graph) => {
@@ -4600,6 +4760,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                             graph,
                             Some(granted.bandwidth_hz),
                             elastic,
+                            audio_policy,
                             guard.as_ref(),
                         )
                         .await;
@@ -4637,7 +4798,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 &id,
                 kind,
                 tuning,
-                (deviation, sideband),
+                (deviation, sideband, audio_policy),
                 granted.bandwidth_hz,
             )
             .await?;
@@ -4647,7 +4808,8 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             kind,
             job,
             language,
-        } => job_attach(node, kind, job, language).await,
+            stream,
+        } => job_attach(node, kind, job, language, stream).await,
         Op::JobRetune {
             job,
             center_hz,
@@ -4961,12 +5123,14 @@ async fn jobs_stop(
     Ok(OpResult::JobsStopped { stopped, failed })
 }
 
-/// `job_attach`: check the kind and language, then attach to `job`'s audio stream.
+/// `job_attach`: check the kind and language, then attach to `job`'s audio stream (its
+/// voice `stream`, when named).
 async fn job_attach(
     node: &Node,
     kind: JobKind,
     job: JobId,
     language: Option<String>,
+    stream: Option<String>,
 ) -> Result<OpResult, OpError> {
     if !kind.attachable() {
         return Err(other(format!("{} is not attachable", kind.name())));
@@ -4989,7 +5153,7 @@ async fn job_attach(
             r.reason.unwrap_or_else(|| "not ready".into())
         )));
     }
-    attach_one(node, &kind, &job, &language)
+    attach_one(node, &kind, &job, &language, stream.as_deref())
         .await
         .map(OpResult::Job)
 }
@@ -5213,6 +5377,7 @@ pub(crate) async fn plan_start_channels(
                         graph,
                         Some(granted.bandwidth_hz),
                         false,
+                        None,
                         Some(guard),
                     )
                     .await;
@@ -5277,7 +5442,7 @@ pub(crate) async fn plan_attach(
         ));
     }
     for s in started.iter_mut().filter(|s| !no_voice(s.channel)) {
-        match attach_one(node, attach, &s.job, language).await {
+        match attach_one(node, attach, &s.job, language, None).await {
             Ok(id) => s.attached = Some(id),
             Err(e) => s.attach_error = Some(e),
         }
@@ -5288,7 +5453,7 @@ pub(crate) async fn plan_attach(
         .iter_mut()
         .filter(|e| e.attached.is_none() && !no_voice(e.channel))
     {
-        match attach_one(node, attach, &e.job, language).await {
+        match attach_one(node, attach, &e.job, language, None).await {
             Ok(id) => e.attached = Some(id),
             Err(err) => warnings.push(format!("ch{}: attach failed: {err}", e.channel)),
         }
@@ -5761,6 +5926,7 @@ async fn start_set_job(
             graph,
             Some(capture.bandwidth_hz),
             false,
+            None,
             Some(guard),
         )
         .await;
@@ -6539,20 +6705,22 @@ async fn attach_one(
     kind: &JobKind,
     job: &JobId,
     language: &str,
+    voice: Option<&str>,
 ) -> Result<JobId, OpError> {
     let Some(input) = node.job_list().into_iter().find(|r| &r.id == job) else {
         return Err(unknown_job(node, job));
     };
     let stream = node
-        .job_audio_stream(job)
+        .job_voice_stream(job, voice)
         .map_err(|e| node_error(node, e))?;
     let graph = kind.expand_attached(
         job,
         &stream,
+        voice,
         language,
         JobKind::graph_denoises(&input.graph),
     )?;
-    node.job_attach(kind.name(), job, graph)
+    node.job_attach(kind.name(), job, voice, graph)
         .await
         .map_err(|e| node_error(node, e))
 }

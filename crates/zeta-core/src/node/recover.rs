@@ -168,7 +168,10 @@ impl Inner {
             (JobState::Running, _) => true,
             (JobState::Failed { reason }, Some(input)) => {
                 *reason == NodeError::InputNotRunning(input.clone()).to_string()
-                    && !matches!(self.audio_stream(input), Err(NodeError::InputNotRunning(_)))
+                    && !matches!(
+                        self.audio_stream(input, rec.stream.as_deref()),
+                        Err(NodeError::InputNotRunning(_))
+                    )
             }
             (JobState::Failed { reason }, None) => {
                 reason.starts_with("source ")

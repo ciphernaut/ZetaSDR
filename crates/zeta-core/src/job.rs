@@ -4,6 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::graph::Graph;
+use crate::ops::AudioPolicy;
 use crate::port::Tuning;
 use crate::types::{JobId, SourceId, Timestamp};
 
@@ -71,12 +72,25 @@ pub struct JobRecord {
     #[serde(default)]
     #[schemars(schema_with = "crate::types::nullable::<JobId>")]
     pub owner: Option<JobId>,
+    /// The `audio_policy` the job was started with (a mode whose stage has several
+    /// voices): what its main audio stream carries, filled into its graph at every
+    /// expansion, so a restart or a retune resumes it. `null`: the row's default
+    /// (`first_active`), and for every other job.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::modes::nullable_enum::<AudioPolicy>")]
+    pub audio_policy: Option<AudioPolicy>,
+    /// The voice of its input an attached job reads (`job_attach`'s `stream`: a role
+    /// among the input row's `voices`); `null` for the input's main audio stream, and for
+    /// a job on the radio. A relaunch reads the same voice.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<String>")]
+    pub stream: Option<String>,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
 /// cannot override that for deserialisation); a record is always written with
-/// `format`, `input`, `capture_rate_hz`, `elastic`, `operator_graph` and `owner`, so the
-/// published schema requires them.
+/// `format`, `input`, `capture_rate_hz`, `elastic`, `operator_graph`, `owner`,
+/// `audio_policy` and `stream`, so the published schema requires them.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -91,6 +105,8 @@ fn require_format(schema: &mut schemars::Schema) {
             "elastic",
             "operator_graph",
             "owner",
+            "audio_policy",
+            "stream",
         ] {
             if !req.iter().any(|r| r == f) {
                 req.push(f.into());
@@ -148,5 +164,10 @@ mod tests {
             serde_json::to_value(&r).unwrap()["input"],
             serde_json::Value::Null
         );
+        // A record from before voices: no policy and the main stream, written as `null`.
+        assert_eq!((r.audio_policy, r.stream.as_deref()), (None, None));
+        let written = serde_json::to_value(&r).unwrap();
+        assert_eq!(written["audio_policy"], serde_json::Value::Null);
+        assert_eq!(written["stream"], serde_json::Value::Null);
     }
 }

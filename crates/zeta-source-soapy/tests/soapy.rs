@@ -676,6 +676,7 @@ fn passthrough() -> Op {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     }

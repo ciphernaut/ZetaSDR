@@ -1142,6 +1142,8 @@ impl Inner {
             elastic: false,
             operator_graph: false,
             owner: Some(r.id.clone()),
+            audio_policy: None,
+            stream: None,
         };
         let id = rec.id.clone();
         w.current = Some((id.clone(), t.signal.center_hz));
@@ -1226,6 +1228,8 @@ impl Inner {
                     elastic: false,
                     operator_graph: with_sink,
                     owner: None,
+                    audio_policy: None,
+                    stream: None,
                 };
                 let id = rec.id.clone();
                 // In its own task, as identify's children: `launch`'s future runs this.

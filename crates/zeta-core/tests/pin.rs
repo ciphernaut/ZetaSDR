@@ -217,6 +217,7 @@ fn start(kind: JobKind, t: Tuning, elastic: bool, replace: Vec<JobId>) -> Op {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic,
         replace,
     }
@@ -554,6 +555,8 @@ fn running(kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord {
         elastic: false,
         operator_graph: false,
         owner: None,
+        audio_policy: None,
+        stream: None,
     }
 }
 

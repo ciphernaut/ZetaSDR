@@ -86,6 +86,10 @@ pub struct LoadedMode {
     /// The stream kinds a job of the row emits (see [`template::outputs`]); empty for a
     /// broken row.
     pub outputs: Vec<StreamKind>,
+    /// The voices a job of the row has beside its main audio stream (see
+    /// [`template::voices`]): empty for a row with one voice, and for a broken row.
+    #[serde(default)]
+    pub voices: Vec<String>,
 }
 
 /// Deserialize a required `Option<T>`: a missing key is an error, `null` is `None`.
@@ -287,6 +291,7 @@ impl ModeRegistry {
             return self.add_broken(&id, Some(row), file, e);
         }
         let outputs = template::outputs(&row, stages);
+        let voices = template::voices(&row, stages);
         let loaded = LoadedMode {
             row,
             state: ModeState::Ready,
@@ -296,6 +301,7 @@ impl ModeRegistry {
             checked: None,
             missing: Vec::new(),
             outputs,
+            voices,
         };
         match self.modes.iter_mut().find(|m| m.row.id == loaded.row.id) {
             Some(m) => *m = loaded,
@@ -326,6 +332,7 @@ impl ModeRegistry {
             checked: None,
             missing: Vec::new(),
             outputs: Vec::new(),
+            voices: Vec::new(),
         });
     }
 

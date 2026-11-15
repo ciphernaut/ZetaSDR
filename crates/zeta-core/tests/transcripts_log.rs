@@ -1,6 +1,6 @@
 //! The transcript log: the node's tee writes every `transcript` event of a `transcribe`
-//! job to `<state_dir>/transcripts.log` with the job, its input, the source and the
-//! channel's tuning. The real `denoise`, `vad` and `transcribe` stages live in other
+//! job to `<state_dir>/transcripts.log` with the job, its input, the voice of the input it
+//! reads (`stream`), the source and the channel's tuning. The real `denoise`, `vad` and `transcribe` stages live in other
 //! crates; inline stand-ins take their kinds here.
 
 use std::path::{Path, PathBuf};
@@ -222,6 +222,8 @@ fn registry(emitter_kind: &'static str, emit: Emit, sent: Arc<AtomicBool>) -> St
         emit,
         sent,
     }));
+    // An input with two voices, for `job_attach`'s `stream`.
+    r.register(Arc::new(zeta_core::test_fixtures::TwoVoiceTestStage::new()));
     r
 }
 
@@ -316,18 +318,25 @@ async fn attached(dir: &Path, emit: Emit) -> (Node, JobId, JobId) {
         )
         .await
         .unwrap();
-    let id = match node
+    let id = attach(&node, &input, None).await;
+    (node, input, id)
+}
+
+/// A `transcribe` job attached to `input`, reading its voice `stream` (`None`: its main
+/// audio stream).
+async fn attach(node: &Node, input: &JobId, stream: Option<&str>) -> JobId {
+    match node
         .apply(Op::JobAttach {
             kind: JobKind::Transcribe,
             job: input.clone(),
             language: None,
+            stream: stream.map(String::from),
         })
         .await
     {
         Ok(OpResult::Job(id)) => id,
         other => panic!("attach: {other:?}"),
-    };
-    (node, input, id)
+    }
 }
 
 fn record(node: &Node, id: &JobId) -> JobRecord {
@@ -378,6 +387,7 @@ async fn every_transcript_event_is_one_line_with_the_jobs_tuning() {
         "t_ns",
         "job",
         "input",
+        "stream",
         "source",
         "center_hz",
         "bandwidth_hz",
@@ -400,6 +410,8 @@ async fn every_transcript_event_is_one_line_with_the_jobs_tuning() {
         assert!(l["t_ns"].as_u64().unwrap() > 0);
         assert_eq!(l["job"], id.0);
         assert_eq!(l["input"], input.0);
+        // A plain attach reads the input's main stream.
+        assert_eq!(l["stream"], serde_json::Value::Null);
         assert_eq!(l["source"], "tone");
         assert_eq!(l["center_hz"], inrec.tuning.center_hz.0);
         assert_eq!(l["bandwidth_hz"], inrec.tuning.bandwidth_hz.0);
@@ -506,4 +518,53 @@ async fn unwritable_transcripts_log_does_not_fail_the_job() {
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].starts_with("transcripts.log: "), "{errors:?}");
     assert_eq!(record(&node, &id).state, JobState::Running);
+}
+
+#[tokio::test]
+async fn a_line_names_the_voice_its_job_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let node = Node::open(
+        cfg(dir.path()),
+        registry("transcribe", Emit::Three, Arc::default()),
+        vec![port],
+    )
+    .await
+    .unwrap();
+    src.start();
+    let input = node
+        .job_start(
+            "two",
+            tone(),
+            tuning(),
+            chain(&["two_voice_test"]),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let slot2 = attach(&node, &input, Some("slot2")).await;
+    let main = attach(&node, &input, None).await;
+    let path = log_path(dir.path());
+    let of = |job: &JobId| -> Vec<serde_json::Value> {
+        lines(&path)
+            .into_iter()
+            .filter(|l| l["job"] == job.0)
+            .collect()
+    };
+    assert!(
+        until(2_000, || of(&slot2).len() >= 3 && of(&main).len() >= 3).await,
+        "3 lines from each within 2 s: {:?}",
+        lines(&path)
+    );
+    for l in of(&slot2) {
+        assert_eq!(l["stream"], "slot2", "{l}");
+    }
+    for l in of(&main) {
+        assert_eq!(l["stream"], serde_json::Value::Null, "{l}");
+    }
+    // The raw line: `"stream":"slot2"`, as the brief's readers grep for it.
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"stream\":\"slot2\""), "{text}");
+    assert!(text.contains("\"stream\":null"), "{text}");
 }

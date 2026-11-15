@@ -251,6 +251,7 @@ fn start_op(kind: JobKind, source: &str, center_hz: u64) -> Op {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     }
@@ -267,6 +268,7 @@ async fn attach(node: &Node, input: &JobId) -> JobId {
         kind: JobKind::Transcribe,
         job: input.clone(),
         language: None,
+        stream: None,
     };
     job_of(node, op).await.unwrap()
 }

@@ -377,6 +377,8 @@ impl Inner {
             elastic: false,
             operator_graph: false,
             owner: r.owner.clone(),
+            audio_policy: None,
+            stream: None,
         };
         let child = rec.id.clone();
         // Recorded first, so a run resumed after a restart can stop it (see `stale`).

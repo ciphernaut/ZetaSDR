@@ -332,6 +332,7 @@ async fn start_measure(node: &Node) -> JobId {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -499,6 +500,8 @@ async fn a_record_failed_in_an_earlier_episode_is_not_recovered() {
         elastic: false,
         operator_graph: false,
         owner: None,
+        audio_policy: None,
+        stream: None,
     };
     let jobs = dir.path().join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();
@@ -560,6 +563,7 @@ async fn an_attached_job_comes_back_with_its_input() {
         kind: JobKind::Transcribe,
         job: input.clone(),
         language: None,
+        stream: None,
     };
     let attached = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -608,6 +612,7 @@ async fn a_held_fault_does_not_wait_for_a_job_with_no_forwarder() {
         kind: JobKind::Transcribe,
         job: idle.clone(),
         language: None,
+        stream: None,
     };
     let attached = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -1011,6 +1016,7 @@ async fn a_heal_does_not_wait_for_a_self_sweep() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };

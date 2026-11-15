@@ -134,6 +134,8 @@ async fn start(
         elastic: false,
         operator_graph: false,
         owner: Some(r.id.clone()),
+        audio_policy: None,
+        stream: None,
     };
     let id = rec.id.clone();
     w.capturing.push((id.clone(), signal.clone()));

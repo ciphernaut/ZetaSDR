@@ -1,10 +1,11 @@
 //! A mode row's decoder expanded to a job graph.
 //!
 //! A `graph` row's template has its placeholders (`"$center_hz"`, `"$bandwidth_hz"`,
-//! `"$out_rate_hz"`) filled with the job's integers; a `program` row becomes a `channel`
-//! at the same rate into [`EXTERNAL_DECODE_KIND`], which resamples to the program's
-//! `input.rate_hz` (an audio row's channel runs through its `demod`, an `nbfm_demod`
-//! with the squelch off, first). A `frame` row becomes `channel → resample → <demod> →
+//! `"$out_rate_hz"`) filled with the job's integers, and `"$audio_policy"` with the job's
+//! [`AudioPolicy`] by name (a row naming it is one whose stage has several voices); a
+//! `program` row becomes a `channel` at the same rate into [`EXTERNAL_DECODE_KIND`],
+//! which resamples to the program's `input.rate_hz` (an audio row's channel runs through
+//! its `demod`, an `nbfm_demod` with the squelch off, first). A `frame` row becomes `channel → resample → <demod> →
 //! clock_recover → slicer → frame_decode` (the resampler left out when the channel is
 //! already at the chain rate). Every node and the graph get fresh ids, as the built-in
 //! kinds' graphs do: a re-expansion carries params by stage kind, never by node id.
@@ -13,7 +14,7 @@ use std::collections::HashMap;
 
 use super::{Decoder, Demod, FrameBlock, InputStream, ModeRow};
 use crate::graph::{Edge, Graph, GraphId, Node, NodeId};
-use crate::ops::OpError;
+use crate::ops::{AudioPolicy, OpError};
 use crate::port::Tuning;
 use crate::stage::StageRegistry;
 use crate::types::StreamKind;
@@ -21,15 +22,26 @@ use crate::types::StreamKind;
 /// The stage kind that runs a program row's decoder; its params are `{"mode": <id>}`.
 pub const EXTERNAL_DECODE_KIND: &str = "external_decode";
 
+/// The placeholder a graph row's template names a stage's audio policy param with,
+/// filled with the job's [`AudioPolicy::name`] (a string, where the others are integers).
+pub const AUDIO_POLICY_PLACEHOLDER: &str = "$audio_policy";
+
 /// `row`'s graph for `tuning` with its channel output at `out_rate_hz`, the narrowest
 /// exact divisor of the source rate that `expand` picks, for both kinds of row (the
 /// `channel` stage decimates by an integer only; a program row's adaptor resamples from
-/// it to the program's `input.rate_hz`).
-pub fn expand(row: &ModeRow, tuning: Tuning, out_rate_hz: u64) -> Result<Graph, OpError> {
+/// it to the program's `input.rate_hz`). A graph row's `"$audio_policy"` is filled with
+/// `audio_policy`'s name.
+pub fn expand(
+    row: &ModeRow,
+    tuning: Tuning,
+    out_rate_hz: u64,
+    audio_policy: AudioPolicy,
+) -> Result<Graph, OpError> {
     let values = [
-        ("$center_hz", tuning.center_hz.0),
-        ("$bandwidth_hz", tuning.bandwidth_hz.0),
-        ("$out_rate_hz", out_rate_hz),
+        ("$center_hz", tuning.center_hz.0.into()),
+        ("$bandwidth_hz", tuning.bandwidth_hz.0.into()),
+        ("$out_rate_hz", out_rate_hz.into()),
+        (AUDIO_POLICY_PLACEHOLDER, audio_policy.name().into()),
     ];
     match &row.decoder {
         Decoder::Graph { nodes, edges, .. } => {
@@ -149,6 +161,46 @@ pub fn outputs(row: &ModeRow, stages: &StageRegistry) -> Vec<StreamKind> {
     out
 }
 
+/// Whether `row`'s template names `"$audio_policy"` anywhere in its nodes' params: the
+/// rows `job_start` takes an `audio_policy` for (any other has one voice).
+pub fn names_audio_policy(row: &ModeRow) -> bool {
+    fn names(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::String(s) => s == AUDIO_POLICY_PLACEHOLDER,
+            serde_json::Value::Object(m) => m.values().any(names),
+            serde_json::Value::Array(a) => a.iter().any(names),
+            _ => false,
+        }
+    }
+    match &row.decoder {
+        Decoder::Graph { nodes, .. } => nodes.iter().any(|n| names(&n.params)),
+        Decoder::Program(_) | Decoder::Frame(_) => false,
+    }
+}
+
+/// The voices a job of `row` has beside its main audio stream: the [`Stage::voice_roles`]
+/// of a graph row's terminal nodes (no edge leaves them) with their template params, in
+/// node order, each once. Empty for a program or frame row, and for a row with one voice.
+///
+/// [`Stage::voice_roles`]: crate::stage::Stage::voice_roles
+pub fn voices(row: &ModeRow, stages: &StageRegistry) -> Vec<String> {
+    let Decoder::Graph { nodes, edges, .. } = &row.decoder else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for n in nodes
+        .iter()
+        .filter(|n| !edges.iter().any(|e| e.from == n.id))
+    {
+        for role in stages.voice_roles(&n.kind, &n.params) {
+            if !out.iter().any(|r| r == role) {
+                out.push(role.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// A frame row's chain: `channel` at `out_rate_hz`, `resample` to the chain rate
 /// ([`crate::bits::chain_rate_hz`]; left out when the channel is at it), the three
 /// [`crate::bits::decision_nodes`], `frame_decode` with the row's framing, and
@@ -259,13 +311,13 @@ pub fn check_band(row: &ModeRow, tuning: Tuning, source_rate_hz: u64) -> Result<
     })
 }
 
-/// Replace every string in `v` that is one of `values`' placeholders by its integer.
-fn fill(v: &mut serde_json::Value, values: &[(&str, u64)]) {
+/// Replace every string in `v` that is one of `values`' placeholders by its value.
+fn fill(v: &mut serde_json::Value, values: &[(&str, serde_json::Value)]) {
     use serde_json::Value;
     match v {
         Value::String(s) => {
             if let Some((_, n)) = values.iter().find(|(p, _)| p == s) {
-                *v = (*n).into();
+                *v = n.clone();
             }
         }
         Value::Object(m) => m.values_mut().for_each(|x| fill(x, values)),

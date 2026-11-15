@@ -216,6 +216,7 @@ async fn job_start_passthrough_then_list_then_stop() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -355,6 +356,7 @@ async fn source_ensure_during_job_start_does_not_retune() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -456,6 +458,7 @@ async fn job_start_holds_the_gate_through_its_tune_and_lease() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -1165,6 +1168,7 @@ async fn conflict_reports_current_tuning_and_real_options() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -1273,6 +1277,7 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -1326,7 +1331,7 @@ fn job_attach_schema_has_a_nullable_language() {
         .filter_map(Value::as_str)
         .collect();
     req.sort();
-    assert_eq!(req, ["job", "kind", "language", "op"]);
+    assert_eq!(req, ["job", "kind", "language", "op", "stream"]);
     assert_eq!(
         v["properties"]["language"]["type"],
         serde_json::json!(["string", "null"])
@@ -1340,7 +1345,8 @@ fn job_attach_schema_has_a_nullable_language() {
         Op::JobAttach {
             kind: JobKind::Transcribe,
             job: JobId("j".into()),
-            language: None
+            language: None,
+            stream: None,
         }
     );
     // `language` is required, if only as null.
@@ -1354,7 +1360,7 @@ fn job_attach_schema_has_a_nullable_language() {
 fn transcribe_expands_attached_to_stream_in_denoise_vad_transcribe() {
     let (job, stream) = (JobId("in".into()), StreamId("s".into()));
     let g = JobKind::Transcribe
-        .expand_attached(&job, &stream, "de", false)
+        .expand_attached(&job, &stream, None, "de", false)
         .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["stream_in", "denoise", "vad", "transcribe"]);
@@ -1372,7 +1378,7 @@ fn transcribe_expands_attached_to_stream_in_denoise_vad_transcribe() {
         assert_eq!(e.to, g.nodes[i + 1].id);
     }
     assert_eq!(
-        JobKind::WfmDemod.expand_attached(&job, &stream, "en", false),
+        JobKind::WfmDemod.expand_attached(&job, &stream, None, "en", false),
         Err(OpError::Other {
             message: "wfm_demod is not attachable".into()
         })
@@ -2007,6 +2013,7 @@ fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     }
@@ -2112,7 +2119,7 @@ fn demod_graphs_carry_the_squelch_params() {
             m.params["squelch"] = false.into();
         }
         let again = kind
-            .reexpand(&src, tuning, Hz(96_000), None, &stored, &modes())
+            .reexpand(&src, tuning, Hz(96_000), None, &stored, None, &modes())
             .unwrap();
         let n = again.nodes.iter().find(|n| n.kind == demod).expect(demod);
         assert_eq!(n.params["squelch_db"], -70, "{kind:?}");
@@ -2125,7 +2132,7 @@ fn demod_graphs_carry_the_squelch_params() {
             o.remove("squelch");
         }
         let again = kind
-            .reexpand(&src, tuning, Hz(96_000), None, &old, &modes())
+            .reexpand(&src, tuning, Hz(96_000), None, &old, None, &modes())
             .unwrap();
         let n = again.nodes.iter().find(|n| n.kind == demod).expect(demod);
         assert_eq!(n.params["squelch"], true, "{kind:?}");
@@ -3014,7 +3021,7 @@ fn reexpand_carries_the_guard_params() {
         n.params["guard_db"] = 20.into();
     }
     let again = JobKind::FmDemod
-        .reexpand(&src, tuning, Hz(512_000), None, &stored, &modes())
+        .reexpand(&src, tuning, Hz(512_000), None, &stored, None, &modes())
         .unwrap();
     let demod = &again.nodes[1].params;
     assert!(
@@ -3035,7 +3042,7 @@ fn reexpand_carries_the_guard_params() {
         old.nodes[1].params.as_object_mut().unwrap().remove(k);
     }
     let again = JobKind::FmDemod
-        .reexpand(&src, tuning, Hz(512_000), None, &old, &modes())
+        .reexpand(&src, tuning, Hz(512_000), None, &old, None, &modes())
         .unwrap();
     assert_eq!(again.nodes[1].params["guard_hz"], 12_500);
     assert_eq!(again.nodes[0].params["wide_hz"], 37_500);
@@ -3059,6 +3066,7 @@ fn retune_expand(tuning: Tuning) -> zeta_core::graph::Graph {
             Hz(1_024_000),
             Some(256_000),
             &operator_stored(),
+            None,
             &modes(),
             &zeta_core::ops::RETUNE_CARRIED_PARAMS,
         )
@@ -3399,6 +3407,7 @@ async fn start_on(node: &Node, source: &str, kind: JobKind, elastic: bool) -> Jo
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic,
         replace: vec![],
     };
@@ -3607,6 +3616,7 @@ async fn job_start_on_a_faulted_source_is_refused_naming_the_source() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -3655,10 +3665,17 @@ fn demod_graphs_carry_denoise_and_the_voice_shaping() {
         }
         for carried in [None, Some(&zeta_core::ops::RETUNE_CARRIED_PARAMS[..])] {
             let again = match carried {
-                None => kind.reexpand(&src, tuning, Hz(96_000), None, &stored, &modes()),
-                Some(c) => {
-                    kind.reexpand_carrying(&src, tuning, Hz(96_000), None, &stored, &modes(), c)
-                }
+                None => kind.reexpand(&src, tuning, Hz(96_000), None, &stored, None, &modes()),
+                Some(c) => kind.reexpand_carrying(
+                    &src,
+                    tuning,
+                    Hz(96_000),
+                    None,
+                    &stored,
+                    None,
+                    &modes(),
+                    c,
+                ),
             }
             .unwrap();
             let n = again.nodes.iter().find(|n| n.kind == demod).expect(demod);
@@ -3684,13 +3701,13 @@ fn demod_graphs_carry_denoise_and_the_voice_shaping() {
 fn an_attached_transcribe_skips_its_own_denoise_when_the_input_denoises() {
     let (job, stream) = (JobId("in".into()), StreamId("s".into()));
     let g = JobKind::Transcribe
-        .expand_attached(&job, &stream, "en", true)
+        .expand_attached(&job, &stream, None, "en", true)
         .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["stream_in", "vad", "transcribe"]);
     assert_eq!(g.edges.len(), 2);
     let g = JobKind::Transcribe
-        .expand_attached(&job, &stream, "en", false)
+        .expand_attached(&job, &stream, None, "en", false)
         .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["stream_in", "denoise", "vad", "transcribe"]);
@@ -3827,6 +3844,7 @@ fn start_look(kind: JobKind, dwell_ms: Option<u64>, average: Option<u32>) -> Op 
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     }

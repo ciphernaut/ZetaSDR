@@ -75,6 +75,11 @@ pub struct TranscribeParams {
     /// speech daemon had no free slot for 30 s).
     #[serde(default = "d700")]
     pub min_utterance_ms: u32,
+    /// The voice of the input job this stage hears (`job_attach`'s `stream`: `slot1`,
+    /// `slot2`), which every `transcript` event carries as `stream`; `null` (the default)
+    /// for the input's main audio stream.
+    #[serde(default)]
+    pub stream: Option<String>,
 }
 
 /// A closed utterance: 16 kHz mono samples and the time they span.
@@ -286,6 +291,8 @@ struct Worker {
     timeout: Duration,
     bus: Arc<StreamBus>,
     out: StreamId,
+    /// The voice of the input the events are of (`null`: its main stream), on each event.
+    stream: Option<String>,
     /// Provenance of the latest input frame; events carry it with their own span.
     prov: Option<Provenance>,
     queue: VecDeque<Job>,
@@ -294,11 +301,12 @@ struct Worker {
 }
 
 impl Worker {
-    fn publish(&self, span: &Span, event: serde_json::Value) {
+    fn publish(&self, span: &Span, mut event: serde_json::Value) {
         let Some(mut prov) = self.prov.clone() else {
             return;
         };
         prov.span = span.clone();
+        event["stream"] = serde_json::json!(self.stream);
         self.bus
             .publish(Frame::new(self.out.clone(), prov, Payload::Event(event)));
     }
@@ -476,6 +484,7 @@ impl Stage for TranscribeStage {
             timeout: self.timeout,
             bus,
             out,
+            stream: params.stream.clone(),
             prov: None,
             queue: VecDeque::new(),
             in_flight: None,

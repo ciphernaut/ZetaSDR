@@ -185,6 +185,7 @@ async fn start_as(node: &Node, kind: JobKind, band: Tuning, elastic: bool) -> Jo
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic,
         replace: vec![],
     };

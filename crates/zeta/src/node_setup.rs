@@ -816,7 +816,9 @@ mod tests {
                     zeta_core::types::JobId::new(),
                     zeta_core::types::StreamId::new(),
                 );
-                let g = kind.expand_attached(&job, &stream, "en", false).unwrap();
+                let g = kind
+                    .expand_attached(&job, &stream, None, "en", false)
+                    .unwrap();
                 validate(&g, &registry).unwrap_or_else(|e| panic!("{kind:?} attached: {e}"));
                 continue;
             }

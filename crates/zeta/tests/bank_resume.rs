@@ -100,6 +100,7 @@ async fn start(node: &Node, center_hz: u64) -> JobId {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };

@@ -1,15 +1,19 @@
-//! Ports for tests, behind the `test-fixtures` feature so the integration tests of this
-//! crate and of the crates above it share them.
+//! Ports and stages for tests, behind the `test-fixtures` feature so the integration tests
+//! of this crate and of the crates above it share them.
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use crate::port::{
     GainInfo, IqReceiver, LinkMeasure, Port, PortError, PortStats, SWEEP_ROWS_CAPACITY, Starting,
     SweepPlan, SweepRequest, SweepRow, SweepRows, SweepState, Tuning, WorkerInfo,
 };
-use crate::types::{Capabilities, Hz, SourceId, Span, SweepCaps, Timestamp};
+use crate::stage::{Backend, Stage, StageContext, StageError, StageSpec};
+use crate::stream::{Frame, Payload, StreamBus};
+use crate::types::{Capabilities, Hz, SourceId, Span, StreamId, StreamKind, SweepCaps, Timestamp};
 
 /// The gain range a [`FaultablePort`] reports, a HackRF-like 0..=76 dB.
 const GAIN_RANGE_DB: (f64, f64) = (0.0, 76.0);
@@ -267,5 +271,135 @@ impl Port for FaultablePort {
             state,
             control: None,
         })
+    }
+}
+
+/// The stage kind of [`TwoVoiceTestStage`].
+pub const TWO_VOICE_TEST_KIND: &str = "two_voice_test";
+
+/// The constant tone [`TwoVoiceTestStage`] publishes on each of its audio streams, Hz: the
+/// main stream, `slot1`, `slot2`.
+pub const TWO_VOICE_TONES_HZ: [f32; 3] = [500.0, 900.0, 1300.0];
+
+/// The audio rate [`TwoVoiceTestStage`] publishes at, Hz.
+pub const TWO_VOICE_RATE_HZ: u64 = 48_000;
+
+/// A stage with two voices, for the node's voices: outputs `[event, audio, audio, audio]`,
+/// the main stream (no role) then `slot1` and `slot2`, both voices of their own
+/// ([`Stage::voice_roles`]). For each IQ block it reads it publishes an event
+/// `{"protocol": "two_voice_test", "audio": <its audio param>}` and, on each audio stream,
+/// as long a stretch of its constant tone ([`TWO_VOICE_TONES_HZ`]) at 48 kHz, so a reader
+/// can tell which stream it has. Its one param, `audio`, is an audio policy's name
+/// (`first_active`, the default, `follow` or `all`); a row passes `"$audio_policy"`.
+pub struct TwoVoiceTestStage {
+    spec: StageSpec,
+}
+
+impl TwoVoiceTestStage {
+    pub fn new() -> Self {
+        Self {
+            spec: StageSpec {
+                kind: TWO_VOICE_TEST_KIND,
+                inputs: vec![StreamKind::Iq],
+                outputs: vec![
+                    StreamKind::Event,
+                    StreamKind::Audio,
+                    StreamKind::Audio,
+                    StreamKind::Audio,
+                ],
+                params_schema: schemars::json_schema!({
+                    "type": "object",
+                    "properties": {
+                        "audio": {
+                            "type": "string",
+                            "enum": ["first_active", "follow", "all"],
+                            "default": "first_active"
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        }
+    }
+}
+
+impl Default for TwoVoiceTestStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Stage for TwoVoiceTestStage {
+    fn spec(&self) -> &StageSpec {
+        &self.spec
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    fn output_roles(&self, _params: &serde_json::Value) -> Vec<Option<&'static str>> {
+        vec![None, None, Some("slot1"), Some("slot2")]
+    }
+    fn voice_roles(&self, _params: &serde_json::Value) -> Vec<&'static str> {
+        vec!["slot1", "slot2"]
+    }
+    async fn run(
+        &self,
+        params: serde_json::Value,
+        mut inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        let (Some(rx), [event, audio @ ..]) = (inputs.first_mut(), outputs.as_slice()) else {
+            return Err(StageError::Failed("expected 1 input and 4 outputs".into()));
+        };
+        let policy = params
+            .get("audio")
+            .cloned()
+            .unwrap_or_else(|| "first_active".into());
+        // Each stream's tone runs on from block to block.
+        let mut n: u64 = 0;
+        loop {
+            let frame = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                r = rx.recv() => match r {
+                    Ok(frame) => frame,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
+            };
+            let Payload::Iq(block) = &frame.payload else {
+                continue;
+            };
+            let rate = block.sample_rate_hz.0.max(1);
+            let len = block.samples.len() as u64 * TWO_VOICE_RATE_HZ / rate;
+            bus.publish(Frame::new(
+                event.clone(),
+                frame.provenance.clone(),
+                Payload::Event(serde_json::json!({
+                    "protocol": TWO_VOICE_TEST_KIND,
+                    "audio": policy,
+                })),
+            ));
+            for (out, hz) in audio.iter().zip(TWO_VOICE_TONES_HZ) {
+                let w = 2.0 * std::f64::consts::PI * f64::from(hz) / TWO_VOICE_RATE_HZ as f64;
+                let samples: Vec<f32> = (n..n + len)
+                    .map(|i| (0.5 * (w * i as f64).sin()) as f32)
+                    .collect();
+                bus.publish(Frame::new(
+                    out.clone(),
+                    frame.provenance.clone(),
+                    Payload::Audio {
+                        sample_rate_hz: Hz(TWO_VOICE_RATE_HZ),
+                        channels: 1,
+                        samples: Arc::from(samples),
+                    },
+                ));
+            }
+            n += len;
+        }
     }
 }

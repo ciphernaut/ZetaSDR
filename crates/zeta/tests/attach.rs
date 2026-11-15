@@ -82,6 +82,7 @@ async fn start(node: &Node, kind: JobKind, bandwidth_hz: u64) -> JobId {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -96,6 +97,7 @@ async fn attach(node: &Node, job: &JobId) -> Result<OpResult, OpError> {
         kind: JobKind::Transcribe,
         job: job.clone(),
         language: None,
+        stream: None,
     })
     .await
 }
@@ -281,6 +283,7 @@ async fn job_start_with_transcribe_is_refused() {
             bits: None,
             method: None,
             bin_hz: None,
+            audio_policy: None,
             elastic: false,
             replace: vec![],
         })

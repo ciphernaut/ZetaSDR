@@ -202,6 +202,7 @@ fn start(kind: JobKind, t: Tuning, elastic: bool) -> Op {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic,
         replace: vec![],
     }

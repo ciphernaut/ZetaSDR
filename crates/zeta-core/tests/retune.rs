@@ -186,6 +186,7 @@ async fn start_as(node: &Node, kind: JobKind, band: Tuning, elastic: bool) -> Jo
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic,
         replace: vec![],
     };
@@ -548,6 +549,7 @@ async fn refusals_name_the_kind_the_state_and_the_id() {
             kind: JobKind::Transcribe,
             job: fm.clone(),
             language: None,
+            stream: None,
         })
         .await
     {

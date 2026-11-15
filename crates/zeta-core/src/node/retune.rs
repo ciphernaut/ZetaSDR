@@ -78,6 +78,7 @@ impl Node {
             capture.bandwidth_hz,
             bin_rate,
             &rec.graph,
+            rec.audio_policy,
             &self.inner.modes(),
             &RETUNE_CARRIED_PARAMS,
         ) {
@@ -225,6 +226,7 @@ impl Node {
                     want.bandwidth_hz,
                     None,
                     &rec.graph,
+                    rec.audio_policy,
                     &self.inner.modes(),
                 ) {
                     drop(guard);

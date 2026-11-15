@@ -289,6 +289,8 @@ fn running(id: &JobId, kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord
         elastic: false,
         operator_graph: false,
         owner: None,
+        audio_policy: None,
+        stream: None,
     }
 }
 
@@ -442,6 +444,7 @@ async fn job_start_records_the_capture_rate() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };

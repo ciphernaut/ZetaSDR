@@ -41,7 +41,8 @@ use crate::knowledge::KnowledgeProvider;
 use crate::lease::{Decision, LeaseError, LeaseManager};
 use crate::modes::{MODES_CHECKED_FILE, ModeRegistry, ModesHandle};
 use crate::ops::{
-    FM_DEVIATION_DEFAULT_HZ, JobKind, Op, OpError, OpResult, Sideband, WFM_DEVIATION_DEFAULT_HZ,
+    AudioPolicy, FM_DEVIATION_DEFAULT_HZ, JobKind, Op, OpError, OpResult, Sideband,
+    WFM_DEVIATION_DEFAULT_HZ,
 };
 use crate::port::{GainInfo, Port, PortError, Tuning};
 use crate::ring::IqRing;
@@ -148,6 +149,14 @@ pub enum NodeError {
     /// An attached job's input job runs but has no audio stream to read.
     #[error("input job {} has no audio stream", .0.0)]
     NoAudioStream(JobId),
+    /// A `job_attach` (or an attached job's relaunch) names a voice `role` its input job
+    /// `job` does not have; `voices` are the ones it has (none: it has one voice).
+    #[error("{}", no_voice(.job, .role, .voices))]
+    NoVoice {
+        job: JobId,
+        role: String,
+        voices: Vec<String>,
+    },
     /// A built-in job's graph could not be re-expanded for its leased capture's rate.
     #[error("{0}")]
     Expand(OpError),
@@ -227,6 +236,36 @@ struct JobEntry {
     reaim: Option<tokio::sync::mpsc::Sender<scan::Reaim>>,
 }
 
+/// A new `Running` record of an operator's job of `kind` on the radio: a fresh id, an
+/// empty context, no input, owner or audio policy.
+fn running_record(
+    kind: &str,
+    source: SourceId,
+    tuning: Tuning,
+    graph: Graph,
+    capture_rate_hz: Option<Hz>,
+    elastic: bool,
+) -> JobRecord {
+    JobRecord {
+        format: JOB_RECORD_FORMAT,
+        id: JobId::new(),
+        kind: kind.to_string(),
+        graph,
+        source,
+        tuning,
+        state: JobState::Running,
+        context: serde_json::json!({}),
+        created_ns: now(),
+        input: None,
+        capture_rate_hz: capture_rate_hz.map(|r| r.0),
+        elastic,
+        operator_graph: false,
+        owner: None,
+        audio_policy: None,
+        stream: None,
+    }
+}
+
 impl JobEntry {
     /// The entry of a record that is not running in this process (loaded from disk and
     /// not launched, or whose launch failed), ended at `ended_ns` for the history prune.
@@ -275,7 +314,8 @@ impl LogFile {
     }
 }
 
-/// The last audio stream of `outputs` (a job's, in graph order): what is read of the job.
+/// The last audio stream of `outputs` (a job's, in graph order) with no role: the job's
+/// main stream, what is read of the job (played, mixed, attached to by default).
 fn last_audio(outputs: &[JobOutput]) -> Option<StreamId> {
     outputs
         .iter()
@@ -284,13 +324,44 @@ fn last_audio(outputs: &[JobOutput]) -> Option<StreamId> {
         .map(|o| o.id.clone())
 }
 
-/// An output stream of a job: its kind and the role its stage gave it, if any. A
-/// composite (a video demodulator's) is audio only in kind, so `last_audio` skips it.
+/// The voices among `outputs` (a job's): the roles of its audio outputs that are voices
+/// of their own ([`Stage::voice_roles`](crate::stage::Stage::voice_roles)), in output
+/// order, each once.
+fn voices(outputs: &[JobOutput]) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = Vec::new();
+    for o in outputs.iter().filter(|o| o.voice) {
+        if let Some(r) = o.role
+            && !v.contains(&r)
+        {
+            v.push(r);
+        }
+    }
+    v
+}
+
+/// [`NodeError::NoVoice`]'s text: `stream: <job> has no voice <role> (it has: <voices>)`,
+/// or `stream: <job> has one voice` when it has none.
+fn no_voice(job: &JobId, role: &str, voices: &[String]) -> String {
+    match voices.is_empty() {
+        true => format!("stream: {} has one voice", job.0),
+        false => format!(
+            "stream: {} has no voice {role} (it has: {})",
+            job.0,
+            voices.join(", ")
+        ),
+    }
+}
+
+/// An output stream of a job: its kind, the role its stage gave it, if any, and whether
+/// that role is a voice of its own ([`Stage::voice_roles`](crate::stage::Stage::voice_roles)).
+/// A composite (a video demodulator's) and a voice are audio with a role, so `last_audio`
+/// skips both.
 #[derive(Clone, Debug)]
 pub(crate) struct JobOutput {
     pub kind: StreamKind,
     pub id: StreamId,
     pub role: Option<&'static str>,
+    pub voice: bool,
 }
 
 impl JobOutput {
@@ -299,6 +370,7 @@ impl JobOutput {
             kind,
             id,
             role: None,
+            voice: false,
         }
     }
 }
@@ -767,17 +839,34 @@ impl Inner {
         persist(&self.jobs_dir, &entry.record)
     }
 
-    /// The audio stream an attached job reads from `job`: the last audio output stream
-    /// in its graph order (an audio edge between two of its stages does not count).
-    /// `InputNotRunning` unless `job` runs in this node (a record loaded without resume
-    /// does not), `NoAudioStream` when it outputs no audio.
-    fn audio_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
+    /// The audio stream an attached job reads from `job`: with `stream` (a voice's role)
+    /// the output of that voice, else the job's main stream, the last audio output stream
+    /// with no role in its graph order (an audio edge between two of its stages does not
+    /// count). `InputNotRunning` unless `job` runs in this node (a record loaded without
+    /// resume does not), `NoVoice` for a role that is none of its voices (naming those it
+    /// has), `NoAudioStream` when it outputs no main audio.
+    fn audio_stream(&self, job: &JobId, stream: Option<&str>) -> Result<StreamId, NodeError> {
         let jobs = self.jobs.lock().unwrap();
         let entry = jobs
             .get(job)
             .filter(|e| e.record.state == JobState::Running && e.cancel.is_some())
             .ok_or_else(|| NodeError::InputNotRunning(job.clone()))?;
-        last_audio(&entry.outputs).ok_or_else(|| NodeError::NoAudioStream(job.clone()))
+        let Some(role) = stream else {
+            return last_audio(&entry.outputs).ok_or_else(|| NodeError::NoAudioStream(job.clone()));
+        };
+        entry
+            .outputs
+            .iter()
+            .find(|o| o.kind == StreamKind::Audio && o.voice && o.role == Some(role))
+            .map(|o| o.id.clone())
+            .ok_or_else(|| NodeError::NoVoice {
+                job: job.clone(),
+                role: role.to_string(),
+                voices: voices(&entry.outputs)
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            })
     }
 
     /// What a `mix` stage of the job `except` may read: the audio output of every job
@@ -1792,22 +1881,7 @@ impl Node {
         elastic: bool,
     ) -> Result<JobId, NodeError> {
         self.check_watch_policy(&graph, tuning)?;
-        let rec = JobRecord {
-            format: JOB_RECORD_FORMAT,
-            id: JobId::new(),
-            kind: kind.to_string(),
-            graph,
-            source,
-            tuning,
-            state: JobState::Running,
-            context: serde_json::json!({}),
-            created_ns: now(),
-            input: None,
-            capture_rate_hz: capture_rate_hz.map(|r| r.0),
-            elastic,
-            operator_graph: false,
-            owner: None,
-        };
+        let rec = running_record(kind, source, tuning, graph, capture_rate_hz, elastic);
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
         Ok(id)
@@ -1816,12 +1890,15 @@ impl Node {
     /// Start a job of `kind` on `graph` attached to the job `input`: recorded with
     /// `input`, the input's `source` and `tuning`, and launched without a lease (see
     /// [`crate::stream_in`]); the launch points every `stream_in` node at the input's
-    /// audio stream. `UnknownJob` for an unknown input; `InputNotRunning` and
-    /// `NoAudioStream` as [`Node::job_audio_stream`]; on error nothing is recorded.
+    /// audio stream, or with `voice` the stream of that voice of the input, which the
+    /// record keeps as its `stream`. `UnknownJob` for an unknown input; `InputNotRunning`,
+    /// `NoVoice` and `NoAudioStream` as [`Node::job_voice_stream`]; on error nothing is
+    /// recorded.
     pub async fn job_attach(
         &self,
         kind: &str,
         input: &JobId,
+        voice: Option<&str>,
         graph: Graph,
     ) -> Result<JobId, NodeError> {
         let (source, tuning) = {
@@ -1846,6 +1923,8 @@ impl Node {
             elastic: false,
             operator_graph: false,
             owner: None,
+            audio_policy: None,
+            stream: voice.map(String::from),
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -1897,6 +1976,8 @@ impl Node {
             elastic: false,
             operator_graph: false,
             owner: None,
+            audio_policy: None,
+            stream: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2004,6 +2085,8 @@ impl Node {
             elastic: false,
             operator_graph: true,
             owner: None,
+            audio_policy: None,
+            stream: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2096,6 +2179,8 @@ impl Node {
             elastic: false,
             operator_graph: true,
             owner: None,
+            audio_policy: None,
+            stream: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2107,7 +2192,18 @@ impl Node {
     /// `job` runs in this node (a one-shot node runs only what it started),
     /// `NoAudioStream` when it outputs no audio.
     pub fn job_audio_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
-        self.inner.audio_stream(job)
+        self.inner.audio_stream(job, None)
+    }
+
+    /// [`Node::job_audio_stream`], or with `voice` (a role among the voices of `job`'s
+    /// stage, [`crate::stage::Stage::voice_roles`]) that voice's audio stream:
+    /// `NoVoice` when `job` has no such voice, naming those it has.
+    pub fn job_voice_stream(
+        &self,
+        job: &JobId,
+        voice: Option<&str>,
+    ) -> Result<StreamId, NodeError> {
+        self.inner.audio_stream(job, voice)
     }
 
     /// The output streams (those no edge of its graph consumes) of `job`'s current run,
@@ -2279,7 +2375,8 @@ impl Node {
     /// [`Node::job_start`], with `guard` under `source`'s gate: the lease is taken
     /// without letting the gate go. What must wait for the gate to be released
     /// (relaunching the elastic jobs a tune moved, stopping those a scan
-    /// displaces) is returned, for [`Node::after_gate`] once the guard is dropped.
+    /// displaces) is returned, for [`Node::after_gate`] once the guard is dropped. The
+    /// record keeps `audio_policy`, the one `graph` was expanded with.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn job_start_gated(
         &self,
@@ -2289,19 +2386,14 @@ impl Node {
         graph: Graph,
         capture_rate_hz: Option<Hz>,
         elastic: bool,
+        audio_policy: Option<AudioPolicy>,
         guard: Option<&OwnedMutexGuard<()>>,
     ) -> (Result<JobId, NodeError>, AfterGate) {
-        self.scan_start_replacing(
-            kind,
-            source,
-            tuning,
-            graph,
-            capture_rate_hz,
-            elastic,
-            guard,
-            &[],
-        )
-        .await
+        let rec = JobRecord {
+            audio_policy,
+            ..running_record(kind, source, tuning, graph, capture_rate_hz, elastic)
+        };
+        self.start_record_gated(rec, guard, &[]).await
     }
 
     /// [`Node::job_start_gated`] of a scan with the holders `replace` names, which
@@ -2320,25 +2412,21 @@ impl Node {
         guard: Option<&OwnedMutexGuard<()>>,
         replace: &[JobId],
     ) -> (Result<JobId, NodeError>, AfterGate) {
-        if let Err(e) = self.check_watch_policy(&graph, tuning) {
+        let rec = running_record(kind, source, tuning, graph, capture_rate_hz, elastic);
+        self.start_record_gated(rec, guard, replace).await
+    }
+
+    /// The body of [`Node::job_start_gated`] and [`Node::scan_start_replacing`]: check the
+    /// watch policy of the new record `rec`, then launch it under `guard`.
+    async fn start_record_gated(
+        &self,
+        rec: JobRecord,
+        guard: Option<&OwnedMutexGuard<()>>,
+        replace: &[JobId],
+    ) -> (Result<JobId, NodeError>, AfterGate) {
+        if let Err(e) = self.check_watch_policy(&rec.graph, rec.tuning) {
             return (Err(e), AfterGate::Nothing);
         }
-        let rec = JobRecord {
-            format: JOB_RECORD_FORMAT,
-            id: JobId::new(),
-            kind: kind.to_string(),
-            graph,
-            source,
-            tuning,
-            state: JobState::Running,
-            context: serde_json::json!({}),
-            created_ns: now(),
-            input: None,
-            capture_rate_hz: capture_rate_hz.map(|r| r.0),
-            elastic,
-            operator_graph: false,
-            owner: None,
-        };
         let id = rec.id.clone();
         let (r, after) = self.inner.launch_replacing(rec, guard, replace).await;
         (r.map(|()| id), after)
@@ -2409,6 +2497,7 @@ impl Node {
                 rate,
                 bin_rate,
                 graph,
+                rec.audio_policy,
                 &self.inner.modes(),
             )
             .is_ok_and(|g| graph::same_pipeline(&g, graph))
@@ -2980,6 +3069,8 @@ mod tests {
             elastic: false,
             operator_graph: false,
             owner,
+            audio_policy: None,
+            stream: None,
         }
     }
 

@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use zeta_core::graph::Graph;
 use zeta_core::modes::{Family, ModeState};
-use zeta_core::ops::{JobKind, Modulation, Op, OpError, ScanMethod, Sideband, SignalBand};
+use zeta_core::ops::{
+    AudioPolicy, JobKind, Modulation, Op, OpError, ScanMethod, Sideband, SignalBand,
+};
 use zeta_core::signatures::SignatureState;
 use zeta_core::station::{Antenna, AntennaKind, Station};
 use zeta_core::types::{Baud, Hz, JobId, Selection, SourceId, Span, StreamId, Timestamp};
@@ -1208,6 +1210,12 @@ pub enum JobCmd {
         /// (1..=1000000); absent = 6000 or the source's finest, whichever is coarser
         #[arg(long, value_name = "HZ")]
         bin_hz: Option<u64>,
+        /// A mode whose row lists voices only (`modes list`): what the job's main audio
+        /// stream carries: first_active (the call that started first, until it ends),
+        /// follow (that call, then whichever is still going when it ends) or all (every
+        /// call, mixed); absent = first_active
+        #[arg(long, value_enum)]
+        audio_policy: Option<AudioPolicyArg>,
         /// spectrum only: follow the source's capture instead of holding it
         /// (never conflicts; relaunched under the same id on every retune)
         #[arg(long)]
@@ -1237,6 +1245,10 @@ pub enum JobCmd {
         /// BCP-47 language code of the speech (en, de, pt-BR); absent = en
         #[arg(long, value_name = "CODE")]
         language: Option<String>,
+        /// The voice of the job to read, one of its row's voices (`modes list`: slot1,
+        /// slot2); absent = the job's main audio stream
+        #[arg(long, value_name = "ROLE")]
+        stream: Option<String>,
     },
     /// Move a running job to another band under the same id (its attached jobs follow)
     Retune {
@@ -1465,6 +1477,25 @@ impl From<SidebandArg> for Sideband {
     }
 }
 
+/// What a voiced job's main audio stream carries, mirroring `AudioPolicy`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum AudioPolicyArg {
+    FirstActive,
+    Follow,
+    All,
+}
+
+impl From<AudioPolicyArg> for AudioPolicy {
+    fn from(p: AudioPolicyArg) -> Self {
+        match p {
+            AudioPolicyArg::FirstActive => AudioPolicy::FirstActive,
+            AudioPolicyArg::Follow => AudioPolicy::Follow,
+            AudioPolicyArg::All => AudioPolicy::All,
+        }
+    }
+}
+
 /// How a scan sweeps, mirroring `ScanMethod`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ScanMethodArg {
@@ -1664,6 +1695,7 @@ impl Command {
                 bits,
                 method,
                 bin_hz,
+                audio_policy,
                 elastic,
                 replace,
                 ..
@@ -1679,6 +1711,7 @@ impl Command {
                 bits,
                 method: method.map(Into::into),
                 bin_hz,
+                audio_policy: audio_policy.map(Into::into),
                 elastic,
                 replace: replace.into_ids(),
             },
@@ -1686,10 +1719,12 @@ impl Command {
                 kind,
                 job,
                 language,
+                stream,
             }) => Op::JobAttach {
                 kind: kind.into(),
                 job: JobId(job),
                 language,
+                stream,
             },
             Command::Job(JobCmd::Retune {
                 job,

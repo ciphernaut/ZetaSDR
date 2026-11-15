@@ -279,6 +279,8 @@ fn running() -> JobRecord {
         elastic: false,
         operator_graph: false,
         owner: None,
+        audio_policy: None,
+        stream: None,
     }
 }
 

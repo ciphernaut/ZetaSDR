@@ -765,6 +765,7 @@ fn job_start(source: &str, kind: JobKind, t: Tuning) -> Op {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     }
@@ -1251,6 +1252,7 @@ async fn a_set_start_dropped_after_its_starts_leaves_every_job_to_set_stop() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: true,
         replace: vec![],
     };

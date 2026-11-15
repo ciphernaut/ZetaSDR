@@ -642,6 +642,64 @@ fn job_retune_bin_hz_flag_round_trips_to_the_op() {
 }
 
 #[test]
+fn job_start_and_attach_take_the_new_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = |policy: &str| {
+        zeta(
+            dir.path(),
+            &[
+                "job",
+                "start",
+                "--kind",
+                "passthrough",
+                "--source",
+                "tone",
+                "--center-hz",
+                "100000000",
+                "--bandwidth-hz",
+                "48000",
+                "--audio-policy",
+                policy,
+            ],
+        )
+    };
+    // A value that is no policy is a usage error naming the three.
+    start("nonsense").assert().code(1).stderr(
+        contains("invalid value 'nonsense' for '--audio-policy")
+            .and(contains("[possible values: first_active, follow, all]")),
+    );
+    // A policy reaches the op, which a kind with one voice refuses.
+    let out = start("follow").assert().code(2).get_output().stdout.clone();
+    let v = json(&out);
+    assert_eq!(
+        v["message"], "audio_policy: passthrough has one voice",
+        "{v}"
+    );
+    let op = last_logged_op(dir.path());
+    assert_eq!(op["op"], "job_start", "{op}");
+    assert_eq!(op["audio_policy"], "follow", "{op}");
+    // `--stream` round-trips into `job_attach` (the job is unknown, so it is refused).
+    let attach = |extra: &[&str]| {
+        let mut args = vec![
+            "job",
+            "attach",
+            "--kind",
+            "transcribe",
+            "--job",
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+        ];
+        args.extend_from_slice(extra);
+        zeta(dir.path(), &args)
+    };
+    attach(&["--stream", "slot2"]).assert().code(2);
+    let op = last_logged_op(dir.path());
+    assert_eq!(op["op"], "job_attach", "{op}");
+    assert_eq!(op["stream"], "slot2", "{op}");
+    attach(&[]).assert().code(2);
+    assert!(last_logged_op(dir.path())["stream"].is_null());
+}
+
+#[test]
 fn iq_read_one_shot_writes_capture() {
     let dir = tempfile::tempdir().unwrap();
     let out = zeta(

@@ -131,7 +131,7 @@ impl Inner {
         );
         let port = match rec.input.clone() {
             Some(input) => {
-                let stream = self.audio_stream(&input)?;
+                let stream = self.audio_stream(&input, rec.stream.as_deref())?;
                 point_stream_in(&mut rec.graph, &input, &stream);
                 None
             }
@@ -307,6 +307,21 @@ impl Inner {
                 st.output_roles(&n.params).get(at).copied().flatten()
             })
             .collect();
+        // Whether an edge's role is a voice of its stage's own (see `Stage::voice_roles`).
+        let edge_voices: Vec<bool> = graph
+            .edges
+            .iter()
+            .zip(&edge_roles)
+            .map(|(e, role)| {
+                let Some(role) = role else { return false };
+                graph
+                    .nodes
+                    .iter()
+                    .zip(&stages)
+                    .find(|(n, _)| n.id == e.from)
+                    .is_some_and(|(n, st)| st.voice_roles(&n.params).contains(role))
+            })
+            .collect();
         let edge_streams: Vec<_> = graph
             .edges
             .iter()
@@ -349,9 +364,16 @@ impl Inner {
             let mut inputs = Vec::new();
             let mut leaving: Vec<(StreamKind, StreamId)> = Vec::new();
             let roles = stage.output_roles(&n.params);
+            let voices = stage.voice_roles(&n.params);
             // This node's job outputs: its edges into a sink, then its own streams.
             let first_output = job_outputs.len();
-            for ((e, sid), role) in graph.edges.iter().zip(&edge_streams).zip(&edge_roles) {
+            for (((e, sid), role), voice) in graph
+                .edges
+                .iter()
+                .zip(&edge_streams)
+                .zip(&edge_roles)
+                .zip(&edge_voices)
+            {
                 if e.to == n.id {
                     inputs.push(self.bus.subscribe(sid).expect("registered"));
                 }
@@ -362,6 +384,7 @@ impl Inner {
                             kind: e.kind,
                             id: sid.clone(),
                             role: *role,
+                            voice: *voice,
                         });
                     }
                 }
@@ -382,6 +405,7 @@ impl Inner {
                     kind: k,
                     id: sid.clone(),
                     role,
+                    voice: role.is_some_and(|r| voices.contains(&r)),
                 });
                 sid
             });
@@ -467,8 +491,9 @@ impl Inner {
     }
 
     /// Append every `transcript` event of `rec`'s `Event` outputs among `outputs`
-    /// to `transcripts.log`, one task per output, each subscribed before this
-    /// returns. A tee ends when its stream is unregistered at the job's end or on
+    /// to `transcripts.log` (with the record's `job`, `input`, `stream`, the voice of the
+    /// input it reads or `null`, `source` and tuning), one task per output, each
+    /// subscribed before this returns. A tee ends when its stream is unregistered at the job's end or on
     /// `token` (draining what is buffered); it is not one of the job's stages, so
     /// it never ends the job. A lag is recorded once per tee in `persist_errors`.
     pub(super) fn tee_transcripts(
@@ -484,6 +509,7 @@ impl Inner {
             let job = serde_json::json!({
                 "job": rec.id.0,
                 "input": rec.input.as_ref().map(|j| j.0.clone()),
+                "stream": rec.stream,
                 "source": rec.source.0,
                 "center_hz": rec.tuning.center_hz.0,
                 "bandwidth_hz": rec.tuning.bandwidth_hz.0,
@@ -824,11 +850,30 @@ impl Inner {
         }
         let bin_rate = self.bank_bin_rate(&rec.source, band);
         let modes = &self.modes();
-        let graph = kind.reexpand(&rec.source, rec.tuning, rate, bin_rate, &rec.graph, modes);
+        let policy = rec.audio_policy;
+        let graph = kind.reexpand(
+            &rec.source,
+            rec.tuning,
+            rate,
+            bin_rate,
+            &rec.graph,
+            policy,
+            modes,
+        );
         // At the same rate the stored graph stands while one of today's expansions (on
         // the bank or the source rate) still gives it, or when none can be made.
         if rec.capture_rate_hz == Some(rate.0) {
-            let unbanked = || kind.reexpand(&rec.source, rec.tuning, rate, None, &rec.graph, modes);
+            let unbanked = || {
+                kind.reexpand(
+                    &rec.source,
+                    rec.tuning,
+                    rate,
+                    None,
+                    &rec.graph,
+                    policy,
+                    modes,
+                )
+            };
             let current = |g: &Result<Graph, _>| {
                 g.as_ref()
                     .is_ok_and(|g| graph::same_pipeline(g, &rec.graph))
@@ -872,6 +917,7 @@ impl Inner {
                 band.bandwidth_hz,
                 bin_rate,
                 &rec.graph,
+                rec.audio_policy,
                 &self.modes(),
             )
             .map_err(NodeError::Expand)?;

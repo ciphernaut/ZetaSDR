@@ -82,6 +82,7 @@ async fn fm_demod_job_produces_audio_with_tone() {
             bits: None,
             method: None,
             bin_hz: None,
+            audio_policy: None,
             elastic: false,
             replace: vec![],
         })
@@ -195,6 +196,7 @@ async fn aprs_decode_job_decodes_fixture_packet() {
             bits: None,
             method: None,
             bin_hz: None,
+            audio_policy: None,
             elastic: false,
             replace: vec![],
         })
@@ -294,6 +296,7 @@ async fn start(node: &Node, kind: JobKind, center_hz: u64, bandwidth_hz: u64) ->
             bits: None,
             method: None,
             bin_hz: None,
+            audio_policy: None,
             elastic: false,
             replace: vec![],
         })

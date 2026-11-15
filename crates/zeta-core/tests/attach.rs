@@ -271,6 +271,7 @@ async fn attach(node: &Node, job: &JobId) -> Result<OpResult, OpError> {
         kind: JobKind::Transcribe,
         job: job.clone(),
         language: None,
+        stream: None,
     })
     .await
 }
@@ -512,6 +513,7 @@ async fn start_fm(node: &Node) -> JobId {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -624,6 +626,7 @@ async fn attach_refuses_non_running_or_audio_less_input() {
             kind: JobKind::WfmDemod,
             job: running.clone(),
             language: None,
+            stream: None,
         })
         .await;
     assert_eq!(not_attachable, Err(other("wfm_demod is not attachable")));
@@ -633,6 +636,7 @@ async fn attach_refuses_non_running_or_audio_less_input() {
                 kind: JobKind::Transcribe,
                 job: running.clone(),
                 language: Some(bad.into()),
+                stream: None,
             })
             .await;
         assert!(
@@ -646,6 +650,7 @@ async fn attach_refuses_non_running_or_audio_less_input() {
                 kind: JobKind::Transcribe,
                 job: running.clone(),
                 language: Some(good.into()),
+                stream: None,
             })
             .await;
         let Ok(OpResult::Job(id)) = r else {
@@ -683,6 +688,7 @@ async fn job_start_with_transcribe_is_refused() {
             bits: None,
             method: None,
             bin_hz: None,
+            audio_policy: None,
             elastic: false,
             replace: vec![],
         })

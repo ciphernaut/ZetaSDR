@@ -44,3 +44,7 @@ required-features = ["test-fixtures"]
 [[test]]
 name = "watch"
 required-features = ["test-fixtures"]
+
+[[test]]
+name = "voices"
+required-features = ["test-fixtures"]

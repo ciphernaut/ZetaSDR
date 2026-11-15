@@ -113,6 +113,7 @@ async fn start(node: &Node, kind: JobKind) -> JobId {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -155,6 +156,8 @@ async fn resume_reexpands_a_builtin_graph_for_the_actual_rate() {
         elastic: false,
         operator_graph: false,
         owner: None,
+        audio_policy: None,
+        stream: None,
     };
     let jobs = dir.path().join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();
@@ -374,6 +377,8 @@ async fn resume_fills_in_the_squelch_params_of_a_pre_squelch_record() {
             elastic: false,
             operator_graph: false,
             owner: None,
+            audio_policy: None,
+            stream: None,
         };
         std::fs::write(
             jobs.join(format!("{}.json", rec.id.0)),
@@ -555,6 +560,8 @@ fn write_plan12_ch59(dir: &Path, rate_hz: u64) -> JobId {
         elastic: false,
         operator_graph: false,
         owner: None,
+        audio_policy: None,
+        stream: None,
     };
     let jobs = dir.join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();
@@ -661,6 +668,8 @@ fn write_old_adsb(dir: &Path, operator_graph: bool) -> JobId {
         elastic: false,
         operator_graph,
         owner: None,
+        audio_policy: None,
+        stream: None,
     };
     let jobs = dir.join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();

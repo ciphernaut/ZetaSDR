@@ -117,6 +117,7 @@ async fn detect_publishes_new_and_gone_for_a_synthesised_burst() {
             bits: None,
             method: None,
             bin_hz: None,
+            audio_policy: None,
             elastic: false,
             replace: vec![],
         })

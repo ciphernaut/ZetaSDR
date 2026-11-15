@@ -813,6 +813,7 @@ async fn a_signal_inside_another_jobs_band_is_ignored() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -1526,6 +1527,7 @@ async fn watch_is_neither_elastic_nor_attachable() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: true,
         replace: vec![],
     };
@@ -1535,6 +1537,7 @@ async fn watch_is_neither_elastic_nor_attachable() {
         kind: JobKind::Watch,
         job: JobId::new(),
         language: None,
+        stream: None,
     };
     let e = node.apply(op).await.unwrap_err();
     assert!(e.to_string().contains("watch is not attachable"), "{e}");
@@ -2004,6 +2007,7 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![watch.clone()],
     };
@@ -2933,6 +2937,7 @@ async fn a_hand_started_decoder_inside_the_band_is_left_alone() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![],
     };
@@ -3014,6 +3019,7 @@ async fn a_replace_of_a_span_watch_stops_its_decoders() {
         bits: None,
         method: None,
         bin_hz: None,
+        audio_policy: None,
         elastic: false,
         replace: vec![watch.clone()],
     };

@@ -396,7 +396,7 @@ fn an_audio_program_row_expands_to_channel_nbfm_external() {
     };
     // An audio row takes any band its channel can cut.
     template::check_band(&m.row, tuning, 2_400_000).unwrap();
-    let g = template::expand(&m.row, tuning, 48_000).unwrap();
+    let g = template::expand(&m.row, tuning, 48_000, Default::default()).unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["channel", "nbfm_demod", "external_decode"]);
     assert_eq!(
@@ -962,6 +962,7 @@ async fn job_start_refuses_an_unavailable_graph_row() {
             bits: None,
             method: None,
             bin_hz: None,
+            audio_policy: None,
             elastic: false,
             replace: vec![],
         })
