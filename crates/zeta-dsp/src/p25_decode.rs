@@ -548,8 +548,11 @@ impl Calls {
         }
         // The two encryption words, each standing until its own kind says otherwise: a
         // decodable link control (or one itself encrypted) sets or clears `protected`, an
-        // encryption sync replaces `enc`. Either is a word about this unit, and the speech
-        // is settled on them before any of its frames is fed.
+        // encryption sync that counts replaces `enc` (the framer gives no other: one that
+        // needed too many corrections, or is the all-zero word a carrier decodes to, comes
+        // as `None` and leaves the call as it was, held if nothing had told it). Either is
+        // a word about this unit, and the speech is settled on them before any of its
+        // frames is fed.
         if lc.is_some() || protected {
             open.protected = protected;
         }
@@ -786,7 +789,10 @@ mod tests {
     use zeta_core::types::{Hz, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 
     use super::*;
-    use crate::p25::{Call, LcMark, encode_call, encode_call_lc, encode_control};
+    use crate::p25::{
+        Call, LcMark, coded_sync, damaged_sync, encode_call, encode_call_lc, encode_call_syncs,
+        encode_control,
+    };
     use crate::synth::{awgn, c4fm_modulate, parse_params, synthesise};
     use crate::voice_call::fake_mbe;
 
@@ -1508,6 +1514,128 @@ mod tests {
         assert!(
             first.unwrap().abs_diff(cleared) < 2_000_000,
             "{first:?} vs {cleared}"
+        );
+    }
+
+    /// A call of three superframes, `enc` in its header, whose LDU2s send `sync(superframe,
+    /// their own coded sync)`; its link control is marked by algorithm.
+    fn synced(enc: EncSync, sync: &dyn Fn(u32, Vec<u8>) -> Vec<u8>) -> Vec<u8> {
+        encode_call_syncs(NAC, group(), enc, 3, LcMark::ByAlgorithm, sync)
+    }
+
+    /// `second`'s dibits with its header cut off, after a clear call of two superframes cut
+    /// short and [`CUT_GAP_MS`] of carrier; and when `second`'s first sync is, ns.
+    fn after_a_cut_call(second: &[u8]) -> (Vec<Complex<f32>>, u64) {
+        let first = encode_call(NAC, group(), clear(), 2);
+        let mut iq = on_air(&first[..first.len() - TDULC_DIBITS], RATE);
+        iq.extend(carrier(CUT_GAP_MS));
+        let at = T0 + iq.len() as u64 * 1_000_000_000 / RATE;
+        iq.extend(on_air(&second[HDU_DIBITS..], RATE));
+        (iq, at)
+    }
+
+    /// The speech frames that start at or after `t`, by start.
+    fn starts_from(audio: &[Frame], t: u64) -> Vec<u64> {
+        let mut s: Vec<u64> = audio
+            .iter()
+            .map(|f| f.provenance.span.start_ns.0)
+            .filter(|&s| s >= t)
+            .collect();
+        s.sort_unstable();
+        s
+    }
+
+    /// A clear call with its header, one LDU2 sending `sync`: the sync decides nothing, so
+    /// the call stays clear and is heard whole.
+    async fn stays_clear(sync: Vec<u8>) {
+        let mbe = Mbe::installed();
+        let mut h = Harness::start(&mbe, 4096);
+        let dibits = synced(clear(), &|sf, es| if sf == 1 { sync.clone() } else { es });
+        h.send(&on_air(&dibits, RATE), RATE);
+        let r = h
+            .end(|h| h.events.len() >= 2 && h.audio.len() >= 3 * SUPERFRAME_FRAMES)
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(eots(&h.events), [false, true], "{:?}", h.events);
+        has(
+            &h.events[1],
+            json!({"encrypted": false, "algid": 128, "audio": true, "silent": null, "frames": 54}),
+        );
+        assert_eq!(h.audio.len(), 3 * SUPERFRAME_FRAMES);
+    }
+
+    /// A clear call joined after its header whose first LDU2 sends `sync`: that sync
+    /// licenses nothing, so the call's speech is held until the next LDU2's, and its first
+    /// frame heard is that LDU2's.
+    async fn licensed_only_later(sync: Vec<u8>) {
+        let mbe = Mbe::installed();
+        let mut h = Harness::start(&mbe, 4096);
+        let second = synced(clear(), &|sf, es| if sf == 0 { sync.clone() } else { es });
+        let (iq, at) = after_a_cut_call(&second);
+        h.send(&iq, RATE);
+        let r = h
+            .end(|h| h.events.len() >= 4 && h.audio.len() >= 2 * SUPERFRAME_FRAMES + 27)
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(
+            eots(&h.events),
+            [false, true, false, true],
+            "{:?}",
+            h.events
+        );
+        has(&h.events[3], json!({"encrypted": false, "audio": true}));
+        // The second superframe's LDU2 and the third superframe: 27 frames, none before.
+        let later = starts_from(&h.audio, at);
+        assert_eq!(later.len(), 27, "{later:?}");
+        let licensed = at + 3 * LDU_NS;
+        assert!(
+            later[0].abs_diff(licensed) < 2_000_000,
+            "{later:?} vs {licensed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_all_zero_encryption_sync_neither_marks_nor_licenses_a_call() {
+        stays_clear(coded_sync(None)).await;
+        licensed_only_later(coded_sync(None)).await;
+    }
+
+    #[tokio::test]
+    async fn an_encryption_sync_past_the_correction_limit_decides_nothing() {
+        // 3 symbols wrong: within the code's reach (4), past the limit (2).
+        stays_clear(damaged_sync(coded_sync(Some(AES_ENC)), &[0, 9, 18])).await;
+        licensed_only_later(damaged_sync(coded_sync(Some(clear())), &[0, 9, 18])).await;
+    }
+
+    #[tokio::test]
+    async fn an_encrypted_call_goes_silent_at_its_first_trustworthy_sync() {
+        let mbe = Mbe::installed();
+        let mut h = Harness::start(&mbe, 4096);
+        // Clear in its header and its link control. The second superframe's LDU2 names AES
+        // past the correction limit, the third's within it.
+        let dibits = synced(clear(), &|sf, es| match sf {
+            0 => es,
+            1 => damaged_sync(coded_sync(Some(AES_ENC)), &[0, 9, 18]),
+            _ => coded_sync(Some(AES_ENC)),
+        });
+        h.send(&on_air(&dibits, RATE), RATE);
+        let r = h
+            .end(|h| h.events.len() >= 2 && h.audio.len() >= 2 * SUPERFRAME_FRAMES + 9)
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(eots(&h.events), [false, true], "{:?}", h.events);
+        has(&h.events[0], json!({"encrypted": false, "audio": true}));
+        has(
+            &h.events[1],
+            json!({"encrypted": true, "algid": 170, "kid": 7, "silent": "encrypted", "frames": 54}),
+        );
+        // Every frame up to the third superframe's LDU2, and none from it on.
+        let turned = T0 + ((HDU_DIBITS + 5 * LDU_DIBITS) * SPD) as u64 * 1_000_000_000 / RATE;
+        assert_eq!(h.audio.len(), 2 * SUPERFRAME_FRAMES + 9);
+        assert!(
+            audio_end(&h.audio) <= turned + SLACK_NS,
+            "{} > {turned}",
+            audio_end(&h.audio)
         );
     }
 

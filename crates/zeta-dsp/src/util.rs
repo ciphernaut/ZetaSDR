@@ -198,3 +198,12 @@ pub fn power_db(x: &[Complex<f32>]) -> f32 {
 pub fn crc16_x25(data: &[u8]) -> u16 {
     crate::crc::crc(&crate::crc::CRC16_X25, data) as u16
 }
+
+/// One SplitMix64 step (Steele, Lea and Flood, 2014) of `n`: the encoders' source of varied,
+/// reproducible bits (the P25 and DMR voice payloads, fill).
+pub(crate) fn splitmix64(n: u64) -> u64 {
+    let mut z = n.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}

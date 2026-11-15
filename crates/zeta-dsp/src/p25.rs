@@ -177,10 +177,31 @@ const IMBE_MASK_SEED: u32 = 16;
 const IMBE_MASK_MUL: u32 = 173;
 const IMBE_MASK_ADD: u32 = 13849;
 const IMBE_MASK_TOP: u32 = 0x8000;
-/// The voice payload of a synthesised call: zeros. A silence frame is widely quoted from
-/// captures, but no public source that states the standard's value was found, so it is
-/// not used. Zeros are a valid frame of the lowest gain.
-const VOICE_PAYLOAD: [u16; 8] = [0; 8];
+/// Bytes of an IMBE frame's 88 bits, [`voice_payload`]'s.
+const IMBE_PAYLOAD_BYTES: usize = 11;
+
+/// The 88 bits (`u0` to `u7`, each top bit first, as [`imbe_vectors`] splits them) of a
+/// synthesised call's `index`-th IMBE frame: SplitMix64 steps ([`crate::util::splitmix64`])
+/// `2 × index` (64 bits) and `2 × index + 1` (its top 24). Varied from frame to frame, so
+/// that every word of the frame, and every bit of each, carries something a decoder can
+/// check; it is not speech, and no codec made it. (A silence frame is widely quoted from
+/// captures, but no public source that states the standard's value was found.)
+pub(crate) fn voice_payload(index: u32) -> [u8; IMBE_PAYLOAD_BYTES] {
+    let first = crate::util::splitmix64(2 * u64::from(index)).to_be_bytes();
+    let second = crate::util::splitmix64(2 * u64::from(index) + 1).to_be_bytes();
+    std::array::from_fn(|i| if i < 8 { first[i] } else { second[i - 8] })
+}
+
+/// 88 bits, top bit first, as `u0` to `u7` ([`IMBE_VECTOR_BITS`] each).
+pub(crate) fn imbe_vectors(bits: &[u8; IMBE_PAYLOAD_BYTES]) -> [u16; 8] {
+    let bit = |k: usize| u16::from(bits[k / 8] >> (7 - k % 8) & 1);
+    let mut at = 0;
+    IMBE_VECTOR_BITS.map(|n| {
+        let v = (0..n as usize).fold(0, |v, k| v << 1 | bit(at + k));
+        at += n as usize;
+        v
+    })
+}
 
 /// Where each voice frame starts among an LDU's information bits.
 const LDU_VOICE_AT: [usize; 9] = [112, 256, 440, 624, 808, 992, 1176, 1360, 1536];
@@ -210,6 +231,17 @@ const SVC_PROTECTED: u8 = 0x40;
 const LC_HEXBITS: usize = 12;
 const ES_HEXBITS: usize = 16;
 const HEADER_HEXBITS: usize = 20;
+/// The most Reed-Solomon symbols an LDU2's encryption sync may have needed corrected and
+/// still count: 2 of the (24,16,9) code's 4. A word of random hexbits decodes within 2
+/// symbols of a codeword with a chance of about 4 × 10⁻⁹ (Σ C(24,i)·63^i for i ≤ 2, over
+/// 64⁸), within 4 with one of about 6 × 10⁻⁴: a fade or a carrier would decide a call's
+/// encryption once in some 1700 LDU2s at the code's full reach, and practically never at
+/// half. The Hamming words' corrections need no limit of their own: a word they could not
+/// mend, or mended wrongly, is a symbol the Reed-Solomon code counts.
+const ES_TRUSTED_SYMBOLS: u32 = 2;
+/// The same for the header's encryption fields: 4 of the (36,20,17) code's 8 (a random
+/// word within 4 symbols of a codeword: about 10⁻¹⁷; within 8: about 10⁻⁷).
+const HEADER_TRUSTED_SYMBOLS: u32 = 4;
 const HEXBIT_MASK: u8 = 0x3F;
 
 /// Whether a group or a unit-to-unit call (shared with the other voice stages).
@@ -245,7 +277,9 @@ pub type ImbeSoft = [u8; IMBE_FEED_BYTES];
 /// IMBE frames' Golay and Hamming words).
 #[derive(Clone, Debug, PartialEq)]
 pub enum P25Unit {
-    /// The header: its encryption sync and talkgroup.
+    /// The header: its encryption sync and talkgroup. `enc` is `None` too when the sync
+    /// does not count: it needed more than `HEADER_TRUSTED_SYMBOLS` corrected, or its
+    /// MI, ALGID and KID are all zero (as an LDU2's, `parse_es`).
     Header {
         enc: Option<EncSync>,
         dst: Option<u32>,
@@ -260,6 +294,10 @@ pub enum P25Unit {
         errors: u32,
     },
     Ldu2 {
+        /// The encryption sync, when it counts: it decoded with at most
+        /// `ES_TRUSTED_SYMBOLS` corrected and is not the all-zero word (`parse_es`).
+        /// A sync that does not count is `None`, as one that does not decode: it says
+        /// nothing about the call.
         enc: Option<EncSync>,
         voice: Box<[ImbeSoft; 9]>,
         errors: u32,
@@ -395,13 +433,13 @@ fn decode_unit(duid: u8, bits: &[u8], nid_errors: u32) -> P25Unit {
         DUID_HDU => {
             let (mut hex, _) = hdu_hexbits(&body[..HDU_CODED_BITS]);
             match RS_HEADER.decode(&mut hex) {
-                Some(_) => {
+                Some(symbols) => {
                     let w = word_of(&hex[..HEADER_HEXBITS]);
+                    // MI (72 bits) above MFID, ALGID, KID and TGID (8, 8, 16, 16).
+                    let (mi, algid, kid) = (w >> 48, (w >> 32) as u8, (w >> 16) as u16);
+                    let counts = symbols <= HEADER_TRUSTED_SYMBOLS && (mi, algid, kid) != (0, 0, 0);
                     P25Unit::Header {
-                        enc: Some(EncSync {
-                            algid: (w >> 32) as u8,
-                            kid: (w >> 16) as u16,
-                        }),
+                        enc: counts.then_some(EncSync { algid, kid }),
                         dst: Some(u32::from(w as u16)),
                     }
                 }
@@ -427,7 +465,8 @@ fn decode_unit(duid: u8, bits: &[u8], nid_errors: u32) -> P25Unit {
                 (&RS_ES, ES_HEXBITS)
             };
             let before = hex.clone();
-            let fixed = rs.decode(&mut hex).map(|_| &hex[..k]);
+            let symbols = rs.decode(&mut hex);
+            let fixed = symbols.map(|_| &hex[..k]);
             let rs_bits: u32 = match fixed {
                 Some(_) => before
                     .iter()
@@ -446,7 +485,9 @@ fn decode_unit(duid: u8, bits: &[u8], nid_errors: u32) -> P25Unit {
                 }
             } else {
                 P25Unit::Ldu2 {
-                    enc: fixed.and_then(parse_es),
+                    enc: fixed
+                        .filter(|_| symbols.is_some_and(|s| s <= ES_TRUSTED_SYMBOLS))
+                        .and_then(parse_es),
                     voice,
                     errors,
                 }
@@ -467,8 +508,8 @@ fn decode_unit(duid: u8, bits: &[u8], nid_errors: u32) -> P25Unit {
 // ---- encoding ----
 
 /// A clear or encrypted call as dibits: header, `superframes` × (LDU1, LDU2), terminator
-/// with link control. The voice frames carry one fixed payload (`VOICE_PAYLOAD`); the
-/// message indicator is zero.
+/// with link control. The voice frames carry the voice payload in order (`voice_payload`
+/// of 0, 1, 2 …); the message indicator is zero.
 pub fn encode_call(nac: u16, lc: LinkControl, enc: EncSync, superframes: u32) -> Vec<u8> {
     encode_call_lc(nac, lc, enc, superframes, LcMark::ByAlgorithm)
 }
@@ -494,6 +535,48 @@ pub(crate) fn encode_call_lc(
     superframes: u32,
     mark: LcMark,
 ) -> Vec<u8> {
+    encode_call_with(nac, lc, enc, superframes, mark, &|_, es| es)
+}
+
+/// [`encode_call_lc`] with each superframe's LDU2 sending `sync(superframe, the coded sync
+/// it would send)` as its 24 coded hexbits: for tests of syncs that are damaged or
+/// replaced.
+#[cfg(test)]
+pub(crate) fn encode_call_syncs(
+    nac: u16,
+    lc: LinkControl,
+    enc: EncSync,
+    superframes: u32,
+    mark: LcMark,
+    sync: &dyn Fn(u32, Vec<u8>) -> Vec<u8>,
+) -> Vec<u8> {
+    encode_call_with(nac, lc, enc, superframes, mark, sync)
+}
+
+/// An encryption sync's 24 coded hexbits: `enc`'s (its MI zero), or with `None` the
+/// all-zero word, what a carrier decodes to.
+#[cfg(test)]
+pub(crate) fn coded_sync(enc: Option<EncSync>) -> Vec<u8> {
+    RS_ES.encode(&hexbits(enc.as_ref().map_or(0, es_word), ES_HEXBITS))
+}
+
+/// A coded sync with its hexbits at `at` changed: as many symbols wrong.
+#[cfg(test)]
+pub(crate) fn damaged_sync(mut sync: Vec<u8>, at: &[usize]) -> Vec<u8> {
+    for &i in at {
+        sync[i] ^= 0x15;
+    }
+    sync
+}
+
+fn encode_call_with(
+    nac: u16,
+    lc: LinkControl,
+    enc: EncSync,
+    superframes: u32,
+    mark: LcMark,
+    sync: &dyn Fn(u32, Vec<u8>) -> Vec<u8>,
+) -> Vec<u8> {
     let by_algorithm = enc.algid != P25_ALGID_CLEAR;
     let mut word = lc_word(&lc, by_algorithm && mark != LcMark::Unmarked);
     if mark == LcMark::Encrypted {
@@ -506,16 +589,19 @@ pub(crate) fn encode_call_lc(
         Call::Private => 0,
     };
     let header_hex = RS_HEADER.encode(&hexbits(header_word(&enc, tgid), HEADER_HEXBITS));
-    let voice = imbe_encode(&VOICE_PAYLOAD);
+    let mut frame = 0;
 
     let mut hdu = header_bits(nac, DUID_HDU);
     hdu.extend(hdu_bits(&header_hex));
     let mut out = unit_symbols(hdu, HDU_INFO_BITS, STATUS_TALKAROUND);
-    for _ in 0..superframes {
+    for sf in 0..superframes {
+        let es_hex = sync(sf, es_hex.clone());
         for (duid, hex) in [(DUID_LDU1, &lc_hex), (DUID_LDU2, &es_hex)] {
             let mut bits = header_bits(nac, duid);
             bits.resize(LDU_INFO_BITS, 0);
             for at in LDU_VOICE_AT {
+                let voice = imbe_encode(&imbe_vectors(&voice_payload(frame)));
+                frame += 1;
                 bits[at..at + IMBE_FRAME_BITS].copy_from_slice(&imbe_tx_bits(&voice));
             }
             let lc_bits = ldu_lc_bits(hex);
@@ -651,8 +737,15 @@ fn es_word(enc: &EncSync) -> u128 {
     u128::from(enc.algid) << 16 | u128::from(enc.kid)
 }
 
+/// The encryption sync in 16 hexbits, unless it is the all-zero word (MI, ALGID and KID
+/// all zero): what a carrier or a dead input decodes to, and what no transmission sends (a
+/// clear one says ALGID `$80`; an encrypted one names a key stream's MI, zero only by a
+/// one-in-2⁷² chance, or a nonzero ALGID).
 fn parse_es(hex: &[u8]) -> Option<EncSync> {
     let w = word_of(hex);
+    if w == 0 {
+        return None;
+    }
     Some(EncSync {
         algid: (w >> 16) as u8,
         kid: w as u16,
@@ -1411,6 +1504,35 @@ mod tests {
         cells
     }
 
+    /// Over a call's frames, every bit of every word `u0` to `u7` is set in some frame and
+    /// clear in another, so a frame layout checked against the payload is checked whole;
+    /// the 88 bits split top bit first.
+    #[test]
+    fn the_voice_payload_exercises_every_bit() {
+        let frames: Vec<[u16; 8]> = (0..54).map(|n| imbe_vectors(&voice_payload(n))).collect();
+        for (i, &n) in IMBE_VECTOR_BITS.iter().enumerate() {
+            let all = (1u16 << n) - 1;
+            assert_eq!(
+                frames.iter().fold(0, |a, u| a | u[i]),
+                all,
+                "u{i} never sets a bit"
+            );
+            assert_eq!(
+                frames.iter().fold(all, |a, u| a & u[i]),
+                0,
+                "u{i} never clears one"
+            );
+        }
+        assert!(frames.windows(2).all(|w| w[0] != w[1]));
+        let mut bits = [0u8; IMBE_PAYLOAD_BYTES];
+        bits[0] = 0x80; // the top bit: u0's top bit
+        bits[10] = 0x01; // the last: u7's bottom bit
+        assert_eq!(imbe_vectors(&bits), [0x800, 0, 0, 0, 0, 0, 0, 1]);
+        bits = [0; IMBE_PAYLOAD_BYTES];
+        bits[1] = 0x08; // bit 12: u1's top bit
+        assert_eq!(imbe_vectors(&bits), [0, 0x800, 0, 0, 0, 0, 0, 0]);
+    }
+
     #[test]
     fn an_imbe_frame_survives_its_own_coding() {
         let u: [u16; 8] = [0xA5C, 0x3F1, 0x812, 0x0FF, 0x5AA, 0x123, 0x7FE, 0x55];
@@ -1686,7 +1808,13 @@ mod tests {
                     dst: Some(DST)
                 }
             );
-            let silence = imbe_decode(&imbe_encode(&[0; 8])).0;
+            // The n-th frame of the call carries the n-th payload, no bit corrected.
+            let carries = |voice: &[ImbeSoft], first: u32| {
+                voice
+                    .iter()
+                    .zip(first..)
+                    .all(|(f, n)| imbe_decode(f) == (imbe_vectors(&voice_payload(n)), 0))
+            };
             for sf in 0..3 {
                 let P25Unit::Ldu1 {
                     lc,
@@ -1698,16 +1826,71 @@ mod tests {
                     panic!("{:?}", units[1 + 2 * sf]);
                 };
                 assert_eq!((*lc, *protected, *errors), (Some(group()), false, 0));
-                assert!(voice.iter().all(|f| imbe_decode(f) == (silence, 0)));
-                let P25Unit::Ldu2 { enc, errors, .. } = &units[2 + 2 * sf].2 else {
+                assert_eq!(voice.len(), 9);
+                assert!(
+                    carries(&voice[..], 18 * sf as u32),
+                    "LDU1 of superframe {sf}"
+                );
+                let P25Unit::Ldu2 { enc, voice, errors } = &units[2 + 2 * sf].2 else {
                     panic!("{:?}", units[2 + 2 * sf]);
                 };
                 assert_eq!((*enc, *errors), (Some(clear), 0));
+                assert_eq!(voice.len(), 9);
+                assert!(
+                    carries(&voice[..], 18 * sf as u32 + 9),
+                    "LDU2 of superframe {sf}"
+                );
             }
             assert_eq!(units[7].2, P25Unit::Terminator { lc: Some(group()) });
             // Each unit's position is its sync's, a whole unit after the last.
             let sps = 10.0;
             assert!((units[2].0 - units[1].0 - LDU_DIBITS as f64 * sps).abs() < 2.0 * sps);
         }
+    }
+
+    #[test]
+    fn an_encryption_sync_counts_only_when_it_can_be_trusted() {
+        let clear = EncSync {
+            algid: P25_ALGID_CLEAR,
+            kid: 0,
+        };
+        // Superframe 0's LDU2 sends the all-zero sync, 1's its own with 2 symbols wrong
+        // (within the limit), 2's with 3 wrong (within the code's reach of 4, past the
+        // limit).
+        let call = encode_call_syncs(
+            NAC,
+            group(),
+            clear,
+            3,
+            LcMark::ByAlgorithm,
+            &|sf, es| match sf {
+                0 => coded_sync(None),
+                1 => damaged_sync(es, &[0, 9]),
+                _ => damaged_sync(es, &[0, 9, 18]),
+            },
+        );
+        let units = receive(&on_air(&call, false), &mut P25Framer::new());
+        let syncs: Vec<Option<EncSync>> = units
+            .iter()
+            .filter_map(|u| match &u.2 {
+                P25Unit::Ldu2 { enc, .. } => Some(*enc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(syncs, [None, Some(clear), None]);
+        // A header of zeros (MI, ALGID and KID) does not count either; its talkgroup does.
+        let zero = EncSync { algid: 0, kid: 0 };
+        let units = receive(
+            &on_air(&encode_call(NAC, group(), zero, 1), false),
+            &mut P25Framer::new(),
+        );
+        assert_eq!(
+            units[0].2,
+            P25Unit::Header {
+                enc: None,
+                dst: Some(DST)
+            }
+        );
+        assert!(matches!(units[2].2, P25Unit::Ldu2 { enc: None, .. }));
     }
 }

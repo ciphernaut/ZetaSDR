@@ -2777,12 +2777,15 @@ mod tests {
         // each held to its measured figure with one call of margin. Failed by the header's
         // run (a coast that ran out, or a lock found false on one level's share, inside the
         // call): 1, 2 and 1, all false on share after weak evidence. Not keeping exactly
-        // one lock in all: 7, 7 and 8, the rest a stretch's eye closing past HOLD_CLOSURE
-        // mid-call or a false lock at the start. No coast ran out (with a coast of 28, one
-        // unit-to-unit call's did): none may, and the coasts the sweep needed must leave
-        // P25_COAST_SEARCHES its margins (8 over a proven lock's, 4 over a probation's).
+        // one lock in all: 4, 9 and 8 with the calls' varied voice payload (7, 7 and 8
+        // when it was all zeros, the rest then a stretch's eye closing past HOLD_CLOSURE
+        // mid-call or a false lock at the start; not re-examined since). No coast ran out
+        // (with a coast of 28, one unit-to-unit call's did): none may, and the coasts the
+        // sweep needed (proven 20, 23 and 24, on probation 26, 27 and 30: the header's,
+        // as P25_COAST_SEARCHES records them) must leave it its margins (8 over a proven
+        // lock's, 4 over a probation's).
         for ((name, call), (by_run, not_one)) in
-            clear_p25_calls().into_iter().zip([(1, 7), (2, 7), (1, 8)])
+            clear_p25_calls().into_iter().zip([(1, 4), (2, 9), (1, 8)])
         {
             let (mut run_failed, mut not_kept, mut ran_out) = (0, 0, 0);
             let (mut proven, mut on_probation) = (0, 0);

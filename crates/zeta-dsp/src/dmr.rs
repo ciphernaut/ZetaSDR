@@ -111,9 +111,11 @@
 //!   type's Golay (20,8) (B.4), though -1 does not say the vocoder uses it. A test
 //!   compares it with [`crate::m17`]'s Golay (24,12) encoder.
 //! - **The voice payload** of an encoded call is coded here from 49 parameter bits that
-//!   differ from frame to frame (`voice_payload`, a SplitMix64 step of the frame's
-//!   number): not speech, and no codec made it, but varied as speech's frames are, so no
-//!   burst sits on one level, which the receiver would refuse as a carrier. A DMR silence
+//!   differ from frame to frame and from slot to slot (`voice_payload`, a SplitMix64 step
+//!   of the slot's index and the frame's number): not speech, and no codec made it,
+//!   but varied as speech's frames are, so no burst sits on one level, which the receiver
+//!   would refuse as a carrier, and two calls at once never carry the same frames (a
+//!   receiver may take a burst that repeats the last one for a stuck carrier). A DMR silence
 //!   frame is widely quoted, from hotspot software, but no public source that states it as
 //!   the standard's was found, so it is not used.
 //!
@@ -172,6 +174,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::fsk4::{SoftDibit, sync_dibits};
+use crate::util::splitmix64;
 
 /// Whether a group or a unit-to-unit call (shared with the other voice stages).
 pub use crate::voice_call::Call;
@@ -1201,7 +1204,8 @@ pub struct SlotPlan {
 
 /// A repeater's continuous downlink with CACH: both slots, each a call, control blocks or
 /// idle. A call is a voice LC header, a privacy header when `lc.encrypted`, `superframes`
-/// voice superframes of the voice payload (`voice_payload`), a terminator; a slot that
+/// voice superframes of the voice payload (`voice_payload`, seeded with the slot's index,
+/// so the two slots' calls never carry the same frames), a terminator; a slot that
 /// finishes first idles until the other does. The CACHs carry the Null short LC. Dibits.
 pub fn encode_repeater(color_code: u8, slots: [SlotPlan; 2]) -> Vec<u8> {
     encode_repeater_aliased(color_code, slots, [false; 2])
@@ -1231,6 +1235,7 @@ pub fn encode_repeater_aliased(
                 plan.superframes,
                 Origin::Repeater,
                 alias.then(talker_alias_bytes),
+                s as u32,
             ),
             None => vec![idle_burst(color_code); call_bursts_len(plan.superframes, false)],
         }
@@ -1260,6 +1265,7 @@ pub fn encode_handheld_aliased(
         superframes,
         Origin::Handheld,
         talker_alias.then(talker_alias_bytes),
+        0,
     ))
 }
 
@@ -1298,13 +1304,15 @@ fn call_bursts_len(superframes: u32, encrypted: bool) -> usize {
 /// `superframes` × bursts A to F, the terminator with link control. With `interleave`
 /// (another embedded message's 9 octets: a talker alias, GPS) the second superframe and
 /// every second one after it carry it in B to E instead of the link control. The EMB's PI
-/// bit is 0 throughout: it is not an encryption mark (see the module doc).
+/// bit is 0 throughout: it is not an encryption mark (see the module doc). The voice
+/// frames are `voice_payload(seed, 0, 1, 2 …)`.
 fn call_bursts(
     cc: u8,
     lc: &FullLc,
     superframes: u32,
     origin: Origin,
     interleave: Option<[u8; LC_BYTES]>,
+    seed: u32,
 ) -> Vec<[u8; BURST_BITS]> {
     let data_sync = sync_word(origin, Kind::Data);
     let data = |dt, mask| {
@@ -1319,7 +1327,7 @@ fn call_bursts(
     let emb = |lcss| emb_word(cc, false, lcss);
     let mut frame = 0;
     let mut socket = || {
-        let frames = std::array::from_fn(|i| ambe_encode(&voice_payload(frame + i as u32)));
+        let frames = std::array::from_fn(|i| ambe_encode(&voice_payload(seed, frame + i as u32)));
         frame += 3;
         voice_socket(&frames)
     };
@@ -1352,26 +1360,22 @@ fn call_bursts(
     out
 }
 
-/// The 49 parameter bits of a call's `n`-th voice frame: one SplitMix64 step (Steele, Lea
-/// and Flood, 2014) of `n`, its top 49 bits split 12, 12, 11 and 14. Varied from frame to
-/// frame so that no burst sits on one level, as speech's frames do not; it is not speech,
-/// and no codec made it.
-pub(crate) fn voice_payload(n: u32) -> [u16; 4] {
-    let z = splitmix64(u64::from(n));
+/// The 49 parameter bits of the `n`-th voice frame of a call seeded `seed` (its slot's
+/// index: 0 for slot 1 and a handheld, 1 for slot 2): one SplitMix64 step
+/// ([`splitmix64`]) of `seed` above `n`, its top 49 bits split 12, 12, 11 and 14. Varied
+/// from frame to frame so that no burst sits on one level, as speech's frames do not, and
+/// between the slots so that two calls at once never carry the same frames, as no two
+/// talkers do; it is not speech, and no codec made it. Seed 0 is the payload the
+/// receiver's sweeps were measured on (the coasts' budgets, `DMR_COAST_SEARCHES`), which a
+/// seed per call would change.
+pub(crate) fn voice_payload(seed: u32, n: u32) -> [u16; 4] {
+    let z = splitmix64(u64::from(seed) << 32 | u64::from(n));
     [
         (z >> 52) as u16 & 0xFFF,
         (z >> 40) as u16 & 0xFFF,
         (z >> 29) as u16 & 0x7FF,
         (z >> 15) as u16 & 0x3FFF,
     ]
-}
-
-/// One SplitMix64 step (Steele, Lea and Flood, 2014) of `n`.
-fn splitmix64(n: u64) -> u64 {
-    let mut z = n.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 /// A repeater's Idle burst: table D.2's fill bits.
@@ -2204,8 +2208,8 @@ pub(crate) mod build {
     /// One burst's 264 bits (0 or 1).
     pub(crate) type Burst = [u8; BURST_BITS];
 
-    /// A call's bursts as [`encode_repeater_aliased`] sends them: the voice LC header, a
-    /// privacy header when `lc.encrypted`, the superframes, the terminator.
+    /// A call's bursts as [`encode_repeater_aliased`] sends them on slot 1: the voice LC
+    /// header, a privacy header when `lc.encrypted`, the superframes, the terminator.
     pub(crate) fn call(
         cc: u8,
         lc: &FullLc,
@@ -2219,6 +2223,7 @@ pub(crate) mod build {
             superframes,
             origin,
             talker_alias.then(talker_alias_bytes),
+            0,
         )
     }
 
@@ -2228,7 +2233,7 @@ pub(crate) mod build {
     pub(crate) fn call_with_gps(cc: u8, lc: &FullLc, superframes: u32) -> Vec<Burst> {
         let mut gps = [0u8; LC_BYTES];
         gps[0] = FLCO_GPS_INFO;
-        call_bursts(cc, lc, superframes, Origin::Repeater, Some(gps))
+        call_bursts(cc, lc, superframes, Origin::Repeater, Some(gps), 0)
     }
 
     pub(crate) fn idle(cc: u8) -> Burst {
@@ -3016,6 +3021,8 @@ mod tests {
     /// no bit corrected), the terminator, each a slot period after the last.
     fn is_a_call(bursts: &[&DmrBurst], lc: FullLc, superframes: usize, slot: Option<u8>) {
         let headers = 1 + usize::from(lc.encrypted);
+        // The payload's seed is the slot's index (a handheld's is slot 1's).
+        let seed = u32::from(slot.map_or(0, |s| s - 1));
         assert_eq!(bursts.len(), headers + 1 + 6 * superframes, "{bursts:#?}");
         assert!(bursts.iter().all(|b| b.slot == slot));
         assert_eq!(bursts[0].content, DmrContent::VoiceHeader(Some(lc)));
@@ -3047,7 +3054,8 @@ mod tests {
             assert_eq!(*errors, 0, "burst {i}");
             assert_eq!(b.color_code, (i % 6 != 0).then_some(CC), "burst {i}");
             for (f, frame) in voice.iter().enumerate() {
-                assert_eq!(ambe_decode(frame), (voice_payload((3 * i + f) as u32), 0));
+                let n = (3 * i + f) as u32;
+                assert_eq!(ambe_decode(frame), (voice_payload(seed, n), 0));
             }
         }
         assert_eq!(
@@ -3205,9 +3213,30 @@ mod tests {
                 "burst {i}: {counts:?}"
             );
         }
-        // The payload differs from frame to frame.
-        let frames: Vec<[u16; 4]> = (0..54).map(voice_payload).collect();
-        assert!(frames.windows(2).all(|w| w[0] != w[1]));
+        // The payload differs from frame to frame, and from slot to slot.
+        let frames = |seed| (0..54).map(|n| voice_payload(seed, n)).collect::<Vec<_>>();
+        assert!(frames(0).windows(2).all(|w| w[0] != w[1]));
+        assert!(frames(0).iter().zip(frames(1)).all(|(a, b)| *a != b));
+    }
+
+    /// Two calls at once on a repeater never send a burst whose payload repeats the burst
+    /// before it, which a receiver (an established decoder does) may take for a stuck
+    /// carrier and drop.
+    #[test]
+    fn two_calls_at_once_never_repeat_a_burst() {
+        let other = FullLc {
+            src: SRC_2,
+            dst: DST_2,
+            ..group()
+        };
+        let downlink = encode_repeater(CC, [plan(Some(group()), 3), plan(Some(other), 3)]);
+        let payloads: Vec<&[u8]> = downlink
+            .chunks(144)
+            .map(|slot| &slot[12..12 + 54])
+            .collect();
+        for (i, w) in payloads.windows(2).enumerate() {
+            assert_ne!(w[0], w[1], "burst {} repeats burst {i}", i + 1);
+        }
     }
 
     #[test]
@@ -3306,8 +3335,8 @@ mod tests {
             ..group()
         };
         // Two calls back to back on slot 1, no terminator and no header between them.
-        let first = call_bursts(CC, &group(), 2, Origin::Repeater, None);
-        let second = call_bursts(CC, &other, 2, Origin::Repeater, None);
+        let first = call_bursts(CC, &group(), 2, Origin::Repeater, None, 0);
+        let second = call_bursts(CC, &other, 2, Origin::Repeater, None, 0);
         let slot1: Vec<[u8; BURST_BITS]> = first[..first.len() - 1]
             .iter()
             .chain(&second[1..])
@@ -3434,8 +3463,8 @@ mod tests {
             pairs.push((lc(z), lc(z >> 16 ^ z << 7)));
         }
         for (i, (a, b)) in pairs.into_iter().enumerate() {
-            let one = call_bursts(CC, &a, 2, Origin::Repeater, None);
-            let two = call_bursts(CC, &b, 2, Origin::Repeater, None);
+            let one = call_bursts(CC, &a, 2, Origin::Repeater, None, 0);
+            let two = call_bursts(CC, &b, 2, Origin::Repeater, None, 0);
             let slot1: Vec<[u8; BURST_BITS]> = one[..one.len() - 1]
                 .iter()
                 .chain(&two[1..])
@@ -3472,7 +3501,7 @@ mod tests {
     /// A repeater call (slot 1) and a handheld call of `superframes`, each cut short with no
     /// terminator, on air.
     fn cut_calls(superframes: u32) -> [(&'static str, Vec<Complex<f32>>); 2] {
-        let mut repeater = call_bursts(CC, &group(), superframes, Origin::Repeater, None);
+        let mut repeater = call_bursts(CC, &group(), superframes, Origin::Repeater, None, 0);
         repeater.pop();
         let idle = vec![idle_burst(CC); repeater.len()];
         let repeater = on_air(&downlink(CC, &[repeater, idle], [true, false]), false);
@@ -3529,7 +3558,7 @@ mod tests {
     #[test]
     fn a_voice_header_then_noise_is_not_voice() {
         // The header's link control is in hand, the phase never known.
-        let header = call_bursts(CC, &group(), 1, Origin::Repeater, None)[..1].to_vec();
+        let header = call_bursts(CC, &group(), 1, Origin::Repeater, None, 0)[..1].to_vec();
         let repeater = on_air(
             &downlink(CC, &[header, vec![idle_burst(CC)]], [true, false]),
             false,
