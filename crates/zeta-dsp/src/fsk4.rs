@@ -19,7 +19,8 @@
 //!   [`crate::synth::c4fm_modulate`] is the transmitter.
 //!
 //! The TIA clause number is not cited: TIA-102.BAAA is not freely published and was not to
-//! hand. The constants above are the ones its C4FM clause names.
+//! hand. The P25 constants above are taken from published descriptions of its C4FM clause
+//! and are not yet checked against the document.
 //!
 //! Both map dibits to levels alike ([`DIBIT_LEVELS`]): 01 → +3, 00 → +1, 10 → −1,
 //! 11 → −3. The first bit is the sign (1 for negative), the second whether the symbol is an

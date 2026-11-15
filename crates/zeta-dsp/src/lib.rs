@@ -51,6 +51,7 @@ pub mod mix;
 pub mod nbfm;
 pub mod offline;
 pub mod ook;
+pub mod p25;
 pub mod parsers;
 pub mod pfb;
 pub mod pocsag;

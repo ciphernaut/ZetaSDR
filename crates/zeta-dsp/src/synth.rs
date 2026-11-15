@@ -1,5 +1,5 @@
 //! Signal generators: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 / APRS, POCSAG, RDS, Mode S,
-//! ACARS, AIS, FLEX, M17, C4FM, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
+//! ACARS, AIS, FLEX, M17, C4FM and P25, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
 //! `zeta modes check` runs the rows' tests on them. The test-only helpers stay in
 //! `fixtures`, behind feature `test-fixtures`.
 
@@ -1337,6 +1337,63 @@ fn m17_iq(src: &str, dst: &str, can: u8, frames: u32, rate_hz: u32) -> Vec<Compl
     rrc_modulate_4fsk(&symbols, M17_BAUD, M17_DEVIATION_HZ, rate_hz, M17_RRC_ALPHA)
 }
 
+/// The largest P25 network access code (12 bits).
+const P25_NAC_MAX: u16 = 0xFFF;
+/// The largest P25 radio ID (24 bits).
+const P25_SRC_MAX: u32 = 0xFF_FFFF;
+/// The largest P25 talkgroup (16 bits).
+const P25_TALKGROUP_MAX: u32 = 0xFFFF;
+/// Superframes the `p25` family sends at most (7.2 s).
+const P25_SUPERFRAMES_MAX: u32 = 20;
+/// The carrier off after the transmission, ms, so a receiver's filters give out its
+/// last symbols.
+const P25_TAIL_MS: u32 = 10;
+
+/// A P25 phase 1 group call or, with `control`, a control channel of the same length
+/// ([`crate::p25`]), C4FM at 4800 baud and ±1800 Hz, then [`P25_TAIL_MS`] of nothing.
+fn p25_iq(
+    nac: u16,
+    src: u32,
+    dst: u32,
+    superframes: u32,
+    encrypted: bool,
+    control: bool,
+    rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    use crate::p25::{
+        Call, EncSync, LDU_DIBITS, LinkControl, P25_ALGID_AES, P25_ALGID_CLEAR, P25_BAUD,
+        P25_DEVIATION_HZ, TSDU_DIBITS, encode_call, encode_control,
+    };
+    let dibits = if control {
+        let units = (2 * superframes as usize * LDU_DIBITS).div_ceil(TSDU_DIBITS);
+        encode_control(nac, units as u32)
+    } else {
+        let lc = LinkControl {
+            call: Call::Group,
+            dst,
+            src,
+            mfid: 0,
+            emergency: false,
+        };
+        let enc = if encrypted {
+            EncSync {
+                algid: P25_ALGID_AES,
+                kid: 1,
+            }
+        } else {
+            EncSync {
+                algid: P25_ALGID_CLEAR,
+                kid: 0,
+            }
+        };
+        encode_call(nac, lc, enc, superframes)
+    };
+    let mut iq = c4fm_modulate(&dibits, P25_BAUD, P25_DEVIATION_HZ, rate_hz);
+    let tail = (rate_hz * P25_TAIL_MS / 1000) as usize;
+    iq.extend(std::iter::repeat_n(Complex::new(0.0, 0.0), tail));
+    iq
+}
+
 /// Bounds on the generic families' numbers, so a bad row is an error, not an abort or
 /// a huge allocation. `deviation_hz` is given for `fsk`, whose tones must fit the rate.
 fn generic_params(
@@ -1738,6 +1795,22 @@ pub enum SynthSpec {
         can: u8,
         frames: u32,
     },
+    /// A P25 phase 1 group call ([`crate::p25`]) on network access code `nac` (12 bits)
+    /// from radio `src` (24 bits) to talkgroup `dst` (16 bits): the header, `superframes`
+    /// voice superframes (1..=20, 360 ms each) of a fixed voice payload, the terminator;
+    /// C4FM at 4800 baud, ±1800 Hz. `encrypted` names AES instead of clear speech (the
+    /// voice is not encrypted: nothing here makes a key stream). `control` sends a control
+    /// channel instead: trunking signalling units for as long as the call would last.
+    P25 {
+        nac: u16,
+        src: u32,
+        dst: u32,
+        superframes: u32,
+        #[serde(default)]
+        encrypted: bool,
+        #[serde(default)]
+        control: bool,
+    },
     /// AIS: per repeat a type 1 position report (`mmsi`, the position, `sog_kt`,
     /// `cog_deg`; [`crate::ais_msg::position_report_bits`]) and, with `name`, a type 5
     /// static report, GMSK at 9600 baud, frames `gap_ms` apart (50 by default).
@@ -2070,6 +2143,26 @@ impl SynthSpec {
                     return Err(format!("frames: 1..={M17_FRAMES_MAX}"));
                 }
             }
+            SynthSpec::P25 {
+                nac,
+                src,
+                dst,
+                superframes,
+                ..
+            } => {
+                if *nac > P25_NAC_MAX {
+                    return Err(format!("nac: 0..={P25_NAC_MAX}"));
+                }
+                if *src > P25_SRC_MAX {
+                    return Err(format!("src: 0..={P25_SRC_MAX}"));
+                }
+                if *dst > P25_TALKGROUP_MAX {
+                    return Err(format!("dst: a talkgroup, 0..={P25_TALKGROUP_MAX}"));
+                }
+                if !(1..=P25_SUPERFRAMES_MAX).contains(superframes) {
+                    return Err(format!("superframes: 1..={P25_SUPERFRAMES_MAX}"));
+                }
+            }
             SynthSpec::Video {
                 deviation_hz,
                 subcarrier_hz,
@@ -2105,7 +2198,7 @@ impl SynthSpec {
     }
 
     /// The sample rate the family's capture is synthesised at: the one each decoder is
-    /// proven at (APRS, POCSAG, ACARS, AIS, FLEX and M17 at 48 kHz, which the `channel` stage divides
+    /// proven at (APRS, POCSAG, ACARS, AIS, FLEX, M17 and P25 at 48 kHz, which the `channel` stage divides
     /// down; RDS at 240 kHz; Mode S at 2.4 MHz; a bare NBFM tone at 48 kHz).
     pub fn rate_hz(&self) -> u32 {
         match self {
@@ -2119,7 +2212,8 @@ impl SynthSpec {
             | SynthSpec::M20 { .. }
             | SynthSpec::Flex { .. }
             | SynthSpec::Ais { .. }
-            | SynthSpec::M17 { .. } => 48_000,
+            | SynthSpec::M17 { .. }
+            | SynthSpec::P25 { .. } => 48_000,
             SynthSpec::Fsk {
                 symbol_rate_baud, ..
             }
@@ -2331,6 +2425,26 @@ pub fn synthesise(
             frames,
         } => {
             let mut iq = m17_iq(src, dst, *can, *frames, rate_hz);
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::P25 {
+            nac,
+            src,
+            dst,
+            superframes,
+            encrypted,
+            control,
+        } => {
+            let mut iq = p25_iq(
+                *nac,
+                *src,
+                *dst,
+                *superframes,
+                *encrypted,
+                *control,
+                rate_hz,
+            );
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -3126,6 +3240,49 @@ mod tests {
                 v
             })
             .is_ok()
+        );
+    }
+
+    fn p25_json() -> serde_json::Value {
+        serde_json::json!({
+            "family": "p25", "nac": 291, "src": 9990001, "dst": 65000, "superframes": 3
+        })
+    }
+
+    #[test]
+    fn p25_family_validates() {
+        let parse = |v: serde_json::Value| parse_params(v.as_object().unwrap().clone());
+        let bad = |key: &str, val: serde_json::Value| {
+            let mut v = p25_json();
+            v[key] = val;
+            parse(v).unwrap_err()
+        };
+        let (spec, imp) = parse(p25_json()).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        assert!(matches!(
+            spec,
+            SynthSpec::P25 {
+                encrypted: false,
+                control: false,
+                ..
+            }
+        ));
+        assert_eq!(bad("superframes", 0.into()), "superframes: 1..=20");
+        assert_eq!(bad("superframes", 21.into()), "superframes: 1..=20");
+        assert_eq!(bad("nac", 4096.into()), "nac: 0..=4095");
+        assert_eq!(bad("src", (1 << 24).into()), "src: 0..=16777215");
+        assert!(bad("dst", 65536.into()).starts_with("dst:"));
+
+        // Header, three superframes and the terminator, then the 10 ms tail.
+        let iq = synthesise(&spec, &imp, 48_000, 450_000_000);
+        assert_eq!(iq.len(), (396 + 3 * 2 * 864 + 216) * 10 + 480);
+        let mut control = p25_json();
+        control["control"] = true.into();
+        let (spec, imp) = parse(control).unwrap();
+        // 3 superframes of trunking units: 15 units of 360 dibits.
+        assert_eq!(
+            synthesise(&spec, &imp, 48_000, 0).len(),
+            15 * 360 * 10 + 480
         );
     }
 
