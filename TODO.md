@@ -696,6 +696,20 @@ What is on air in 2026, to order the rows:
 
 Spec first. The first question is the target: a text row (Inmarsat) proves the program and its status with no new output, an image row (Meteor LRPT) needs the artefact path.
 
+## Feature: GEO DVB-S2 reception and measurement
+
+From the operator, 2026-11-15. Motivated by "Don't Look Up: There Are Sensitive Internal Links in the Clear on GEO Satellites" (Zhang, Dai, Ryan, Levin, Heninger, Schulman; ACM CCS '25, https://doi.org/10.1145/3719027.3765198), a passive scan of 39 GEO satellites / 411 transponders with ~US$600 of consumer kit that found about half of GEO IP links carry cleartext third-party traffic (cellular backhaul with call audio, SMS, IMSIs and keys; banking; grid; military tracking). The lesson is that operators should encrypt; the receive-and-measure half of that is a clean capability for this node, on the same L-band front end as the GOES/Inmarsat work in the SatDump gist.
+
+Scope is the signal, not other people's payloads:
+
+- **L-band dish front end.** A dish + LNB downconverts Ku/C to an L-band IF the B210 can take; shared with the GOES/Elektro HRIT and Inmarsat rows. A source concern, not a decoder one.
+- **A `dvbs2_measure` row.** SatDump's DVB-S2 pipelines or `gr-dvbs2rx` as an external program (the same operator-installed, never-linked model as `dvbt-rx`): lock, MODCOD, symbol rate, roll-off and Es/No as events. "What is on this transponder and how strong", stopping at the signal boundary — no GSE/MPE decapsulation, no IP reassembly. This is the part worth building first and it needs no new output path.
+- **Public content on the same dish.** The HRIT/Inmarsat SatDump pipelines are the legitimate decoded content; those already sit in the SatDump gist above.
+
+Deliberately not built: a general "decapsulate GSE/MPE and reassemble every IP flow on the transponder" stage. A transponder multiplexes dozens of independent networks into one downlink, so such a stage intercepts all of them at once; that is interception of third-party communications regardless of their lack of encryption (and, for the field host, an offence under the AU Telecommunications (Interception and Access) Act and the Radiocommunications Act's provisions on intercepted content, encryption or not). An ACL on which node caller may run it does not change what it captures when run, so a login does not turn it into a self-audit.
+
+The one defensive case that is legitimate, if it is ever wanted, is narrower and is a different feature: verifying that **a carrier the operator is authorised over** (an own or leased forward link, not a shared transponder) is not carrying the operator's own data in the clear. That version is scoped by authorisation over the carrier and by filtering to the operator's own identifiers before anything is stored or shown, and it would ride the restricted-row ACL work (`## Access: ACLs on restricted rows`), not stand in front of a general harvester. Spec on its own, with the authorisation story first, if it is ever picked up. Until then this section is the measurement row and the dish, nothing that reassembles payloads.
+
 ## Worker: a deployed worker's restart count ran into the thousands
 
 Found by the sweep spike on the field host's B210 (plan 36, spec section 8, item 5): the deployed node's worker record for the radio showed 2395 restarts. The cause was not looked into. Read the worker's own stderr lines in the journal (prefixed `zeta-soapy-worker[<id>]: `) and the node's `soapy worker for <id>:` lines to see whether the count is a driver crash loop, the clock guard's stream restarts or a respawn loop on a faulted device, and when it climbs; plan 36.1 ships the worker's new protocol and ring, so measure the count again after the deploy first.
