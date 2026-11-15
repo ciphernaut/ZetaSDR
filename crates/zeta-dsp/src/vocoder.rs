@@ -475,6 +475,8 @@ done"#;
         let limit = Duration::from_millis(VOCODER_WATCHDOG_MS + 1_000);
         assert!(until(limit, || !v.alive()).await, "alive after {limit:?}");
         assert!(fed.elapsed() >= Duration::from_millis(VOCODER_WATCHDOG_MS));
+        // The note follows the exit.
+        assert!(until(Duration::from_secs(5), || !s.vocoder_notes().is_empty()).await);
         let notes = s.vocoder_notes();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("stopped answering"), "{notes:?}");

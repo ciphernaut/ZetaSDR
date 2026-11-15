@@ -302,6 +302,8 @@ impl Calls {
         m.insert("mfid".into(), lc.mfid.into());
         m.insert("algid".into(), enc.algid.into());
         m.insert("kid".into(), enc.kid.into());
+        // The summary's channel text: none on a call, which reads as who calls whom.
+        m.insert("network".into(), serde_json::Value::Null);
         serde_json::Value::Object(m)
     }
 
@@ -431,9 +433,7 @@ impl Calls {
         let now = (nac, self.control_nac == Some(nac));
         if self.channel != Some(now) {
             self.channel = Some(now);
-            let mut m = channel_event(PROTOCOL, now.1);
-            m.insert("nac".into(), nac.into());
-            events.push((t, serde_json::Value::Object(m)));
+            events.push((t, channel_fields(now.0, now.1)));
         }
     }
 
@@ -444,6 +444,21 @@ impl Calls {
             "packet_units": self.packet_units,
         }}));
     }
+}
+
+/// A channel event's fields: [`channel_event`]'s, the NAC, and `network`, the text the
+/// row's summary shows for it (`channel, NAC 291` or `control channel, NAC 291`; a call
+/// event's `network` is null, so its summary reads `src > dst: call silent`).
+fn channel_fields(nac: u16, control: bool) -> serde_json::Value {
+    let mut m = channel_event(PROTOCOL, control);
+    m.insert("nac".into(), nac.into());
+    let kind = if control {
+        "control channel"
+    } else {
+        "channel"
+    };
+    m.insert("network".into(), format!("{kind}, NAC {nac}").into());
+    serde_json::Value::Object(m)
 }
 
 /// `t0` plus `samples` (maybe negative) at `rate_hz`, ns.
@@ -1136,8 +1151,45 @@ mod tests {
             json!({"type": "channel", "protocol": "p25", "nac": 291, "control": true}),
         );
         assert!(e.get("src").is_none(), "{e}");
+        assert_eq!(e["summary"], "control channel, NAC 291", "{e}");
         assert_eq!(h.trunking_units(), Some(40));
         assert!(h.vocoder_notes().is_empty(), "{:?}", h.vocoder_notes());
+    }
+
+    #[tokio::test]
+    async fn every_summary_reads_without_null() {
+        // A call's two events, and a control channel's event (each from a receiver of its
+        // own: the front end misses a control channel that follows a call).
+        let mbe = Mbe::absent();
+        let mut events = Vec::new();
+        for iq in [call(clear(), 1), on_air(&encode_control(NAC, 10), RATE)] {
+            let mut h = Harness::start(&mbe, 4096);
+            h.send(&iq, RATE);
+            let r = h.end(|_| true).await;
+            assert!(r.is_ok(), "{r:?}");
+            events.extend(h.events);
+        }
+        let summaries: Vec<&str> = events
+            .iter()
+            .map(|e| e["summary"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                "9990001 > 65000: group no_vocoder",
+                "9990001 > 65000: group no_vocoder",
+                "control channel, NAC 291"
+            ]
+        );
+        // A channel with no trunking seen, through the row's envelope.
+        let row = mbe.row();
+        let e = zeta_core::modes::summary::envelope(&row, 0, channel_fields(NAC, false));
+        summaries
+            .iter()
+            .copied()
+            .chain([e["summary"].as_str().unwrap()])
+            .for_each(|s| assert!(!s.contains("null"), "{s}"));
+        assert_eq!(e["summary"], "channel, NAC 291", "{e}");
     }
 
     #[tokio::test]

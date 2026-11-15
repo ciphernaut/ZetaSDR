@@ -426,18 +426,18 @@ async fn identify_on_pocsag_ends_with_a_verdict_and_one_running_child() {
     assert_eq!(aprs["outcome"], "no_frame", "{aprs}");
     assert_eq!(pocsag["outcome"], "proved", "{pocsag}");
     // The attempts (those with a child job) in score order: APRS scores over POCSAG here,
-    // P25 and M17 (their empty centre lists score anywhere) tie APRS, P25 (two_way) ahead
-    // of it and M17 (amateur_voice) after it; AIS lives on its two channels at 162 MHz,
-    // so it is skipped here, never tried.
+    // M17 and P25 (their empty centre lists score anywhere) tie APRS and go after it, P25
+    // last of the three (priority -1); AIS lives on its two channels at 162 MHz, so it is
+    // skipped here, never tried.
     let tried: Vec<&Value> = events.iter().filter(|e| !e["job"].is_null()).collect();
     assert_eq!(tried.len(), 4, "{events:#?}");
-    assert_eq!(tried[0]["mode"], "p25_decode");
-    assert_eq!(tried[0]["outcome"], "no_frame");
-    assert_eq!(tried[1]["mode"], "aprs_decode");
-    assert_eq!(tried[2]["mode"], "m17_decode");
+    assert_eq!(tried[0]["mode"], "aprs_decode");
+    assert_eq!(tried[1]["mode"], "m17_decode");
+    assert_eq!(tried[1]["outcome"], "no_frame");
+    assert_eq!(tried[2]["mode"], "p25_decode");
     assert_eq!(tried[2]["outcome"], "no_frame");
     assert_eq!(tried[3]["mode"], "pocsag_decode");
-    assert!(tried[1]["score"].as_f64() >= tried[3]["score"].as_f64());
+    assert!(tried[0]["score"].as_f64() >= tried[3]["score"].as_f64());
     let ais = outcome(&events, "ais_decode").expect("ais_decode listed");
     assert_eq!(ais["outcome"], "skipped_band", "{ais}");
     assert!(
@@ -531,20 +531,17 @@ async fn a_proof_leaves_one_named_child() {
     let node = node_over(dir.path(), &fixtures().pocsag).await;
     let (id, events) = identify(&node, POCSAG_HZ).await;
     let events = ended(&node, &id, events, Duration::from_secs(15)).await;
-    // POCSAG scores first at its own centre, tied with P25 (its empty centre list scores
-    // anywhere), whose family (two_way) is tried first: P25 finds nothing, POCSAG proves.
+    // POCSAG scores first at its own centre: the one attempt, and it proves.
     let tried: Vec<&Value> = events.iter().filter(|e| !e["job"].is_null()).collect();
-    assert_eq!(tried.len(), 2, "{events:#?}");
-    assert_eq!(tried[0]["mode"], "p25_decode");
-    assert_eq!(tried[0]["outcome"], "no_frame");
-    assert_eq!(tried[1]["mode"], "pocsag_decode");
-    assert_eq!(tried[1]["outcome"], "proved");
+    assert_eq!(tried.len(), 1, "{events:#?}");
+    assert_eq!(tried[0]["mode"], "pocsag_decode");
+    assert_eq!(tried[0]["outcome"], "proved");
     let ctx = node.job_context(&id).unwrap();
     let child = ctx["identify"]["verdict"]["job"]
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(tried[1]["job"], child.as_str());
+    assert_eq!(tried[0]["job"], child.as_str());
     assert_eq!(running(&node), [(child.clone(), "pocsag_decode".into())]);
     let holders: Vec<String> = node
         .lease_holders(&rx())
@@ -1019,10 +1016,8 @@ async fn the_register_reorders_the_decoders_and_drops_none() {
     // second) that it scored level with.
     assert!(pos(&without, "ais_decode") < pos(&without, "pocsag_decode"));
     assert!(pos(&with, "pocsag_decode") < pos(&with, "ais_decode"));
-    // The measured leaders (P25, its empty centre list scoring anywhere, tied with APRS and
-    // ahead of it by family) led the 25 kHz rows by 0.4, more than the bonus: still first.
-    assert_eq!(with[0].0, "p25_decode", "{with:?}");
-    assert_eq!(with[1].0, "aprs_decode", "{with:?}");
+    // The measured leader led the 25 kHz rows by 0.4, more than the bonus: still first.
+    assert_eq!(with[0].0, "aprs_decode", "{with:?}");
     assert!(pos(&with, "aprs_decode") < pos(&with, "ais_decode"));
 }
 
