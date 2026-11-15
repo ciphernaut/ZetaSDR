@@ -800,6 +800,36 @@ fn a_graph_row_with_its_handler_found_records_its_pass() {
     assert!(checked.get("pocsag_decode").is_none(), "{text}");
 }
 
+/// A row whose only missing handler is optional runs its check without it and passes,
+/// with no `checked` recorded (not every handler was found); `--strict` fails it naming
+/// the program.
+#[test]
+fn an_optional_handler_missing_passes_and_strict_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut row: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/m17_decode.json")).unwrap();
+    row["decoder"]["handlers"] = serde_json::json!([{
+        "programs": ["zeta-no-such-handler"],
+        "optional": true,
+        "install": {"url": "https://example.invalid"}
+    }]);
+    write_whole_row(dir.path(), "m17_voc", row);
+    let (out, code) = stdout(&mut check(dir.path(), &["m17_voc"]));
+    assert_eq!(out.trim(), "m17_voc: ok", "{out}");
+    assert_eq!(code, 0);
+    assert!(
+        !dir.path().join("state/modes-checked.json").exists(),
+        "a pass without every handler is not recorded"
+    );
+    let (out, code) = stdout(&mut check(dir.path(), &["--strict", "m17_voc"]));
+    assert_eq!(
+        out.trim(),
+        "m17_voc: fail: zeta-no-such-handler missing",
+        "{out}"
+    );
+    assert_ne!(code, 0);
+}
+
 #[test]
 fn video_decode_check_passes_on_the_synth() {
     let dir = tempfile::tempdir().unwrap();

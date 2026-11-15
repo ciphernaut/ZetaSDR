@@ -88,9 +88,10 @@ pub fn is_executable(p: &Path) -> bool {
 pub fn resolve(row: &ModeRow, index: usize) -> Result<PathBuf, String> {
     let id = &row.id.0;
     let blocks = row.decoder.handler_blocks();
-    let (programs, _) = blocks
+    let programs = blocks
         .get(index)
-        .ok_or_else(|| format!("{id}: no handler {index}"))?;
+        .ok_or_else(|| format!("{id}: no handler {index}"))?
+        .programs;
     find_handler(programs).ok_or_else(|| {
         format!(
             "{id}: handler {} not found (tried {})",

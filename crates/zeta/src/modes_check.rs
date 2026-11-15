@@ -90,8 +90,10 @@ enum Outcome {
 }
 
 /// Check the rows (only `only`, when given) and print `<id>: ok|fail|skipped: <reason>`
-/// for each. Exit 0 iff no row failed; with `strict` a row without a test, or a program
-/// row whose program is missing, fails instead of being skipped. A pass of a program row is recorded in
+/// for each. Exit 0 iff no row failed; with `strict` a row without a test, or a row
+/// whose program or one of whose handlers is missing, fails instead of being skipped (a
+/// row missing only optional handlers runs without them, and fails only with `strict`).
+/// A pass of a row with handlers, every one of them found, is recorded in
 /// `modes-checked.json` in `state_dir`.
 pub async fn run(
     state_dir: PathBuf,
@@ -140,7 +142,7 @@ pub async fn run(
         println!("{line}");
         match outcome {
             Outcome::Ok => {
-                if !m.row.decoder.handler_blocks().is_empty() {
+                if !m.row.decoder.handler_blocks().is_empty() && m.missing.is_empty() {
                     let at = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs());
@@ -181,12 +183,26 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
         let blocks = m.row.decoder.handler_blocks();
         let missing = blocks
             .iter()
-            .find(|(p, _)| zeta_ext::proc::find_handler(p).is_none())
+            .filter(|b| !b.optional)
+            .find(|b| zeta_ext::proc::find_handler(b.programs).is_none())
             .or(blocks.first());
         let handler = missing
-            .and_then(|(p, _)| p.first())
+            .and_then(|b| b.programs.first())
             .map_or("program", String::as_str);
         return skip(format!("{handler} missing"));
+    }
+    if strict && !m.missing.is_empty() {
+        // The first optional handler not on this host (the first optional one when all
+        // are found now: the probe said otherwise).
+        let blocks = m.row.decoder.handler_blocks();
+        let optional: Vec<_> = blocks.iter().filter(|b| b.optional).collect();
+        let handler = optional
+            .iter()
+            .find(|b| zeta_ext::proc::find_handler(b.programs).is_none())
+            .or(optional.first())
+            .and_then(|b| b.programs.first())
+            .map_or("program", String::as_str);
+        return Outcome::Fail(format!("{handler} missing"));
     }
     if let TestSpec::Fixture { path } = &test.kind
         && let Err(why) = fixture_path(path)

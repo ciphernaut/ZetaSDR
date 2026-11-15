@@ -538,8 +538,9 @@ struct Open {
 /// The stage's streams: frames in, events out, speech to the vocoder.
 struct Streams {
     env: VocoderEnv,
-    /// The vocoder program (the row's handler 0).
-    program: PathBuf,
+    /// The vocoder program (the row's handler 0); `None` when a row marks it optional
+    /// and it is not on the host: the streams are then reported with no audio.
+    program: Option<PathBuf>,
     open: Option<Open>,
 }
 
@@ -555,12 +556,13 @@ impl Streams {
         events: &mut Vec<(u64, serde_json::Value)>,
     ) {
         events.push((t, fields(&lsf, frame, false)));
-        if let Some((mode, bytes)) = codec(&lsf)
+        if let Some(program) = &self.program
+            && let Some((mode, bytes)) = codec(&lsf)
             && encryption_name(&lsf).is_none()
         {
             let spec = VocoderSpec {
                 name: C2DEC,
-                program: self.program.clone(),
+                program: program.clone(),
                 args: vec![mode.into(), "-".into(), "-".into()],
                 feed_bytes: bytes,
                 feed_samples: C2_FRAME_SAMPLES,
@@ -717,9 +719,7 @@ impl Stage for M17DecodeStage {
             return Err(StageError::Failed("expected 2 outputs".into()));
         };
         let events_out = events_out.clone();
-        let program = crate::vocoder::program(&ctx, 0, C2DEC, true)
-            .map_err(StageError::Failed)?
-            .expect("a required handler");
+        let program = crate::vocoder::program(&ctx, 0, C2DEC, true).map_err(StageError::Failed)?;
         let drains = Arc::new(Mutex::new(Vec::new()));
         let mut streams = Streams {
             env: VocoderEnv {

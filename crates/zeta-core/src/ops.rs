@@ -2853,10 +2853,11 @@ impl From<&crate::plans::ChannelPlan> for PlanInfo {
     }
 }
 
-/// One mode as `modes_list` reports it.
+/// One mode as `modes_list` reports it. (`missing` may be left out of what is read, but
+/// is always written: the schema requires every property.)
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::modes::require_all)]
 pub struct ModeInfo {
     pub id: ModeId,
     pub name: String,
@@ -2882,6 +2883,11 @@ pub struct ModeInfo {
     #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub checked: Option<u64>,
+    /// The optional handlers not found on this host, which a ready row runs without:
+    /// one line each, `<program>: missing (<hint>; <url>) — <what is lost>`
+    /// (`voice silent` for a vocoder); empty when every handler is found.
+    #[serde(default)]
+    pub missing: Vec<String>,
     /// What the mode's events are about, its table columns and how the page folds it;
     /// `null` for a mode with none.
     #[schemars(required, schema_with = "crate::types::nullable::<Subject>")]
@@ -2911,6 +2917,7 @@ impl From<&LoadedMode> for ModeInfo {
             file: m.file.clone(),
             program: m.program.as_ref().map(|p| p.display().to_string()),
             checked: m.checked,
+            missing: m.missing.clone(),
             subject: m.row.subject.clone(),
             access: m.row.access,
             outputs: m.outputs.clone(),

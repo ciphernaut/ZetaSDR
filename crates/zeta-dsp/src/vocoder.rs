@@ -254,8 +254,19 @@ pub fn program(
 ) -> Result<Option<PathBuf>, String> {
     use zeta_core::modes::handlers::{find_handler, resolve};
     match &ctx.mode {
-        // Every row handler is required until rows can mark one optional.
-        Some(row) => resolve(row, index).map(Some),
+        Some(row) => match resolve(row, index) {
+            Ok(p) => Ok(Some(p)),
+            Err(_)
+                if row
+                    .decoder
+                    .handler_blocks()
+                    .get(index)
+                    .is_some_and(|b| b.optional) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        },
         None => match find_handler(&[fallback.to_string()]) {
             Some(p) => Ok(Some(p)),
             None if required => Err(format!(
@@ -545,5 +556,27 @@ done"#;
         let e = program(&ctx, 0, "zeta-no-such-vocoder", true).unwrap_err();
         assert!(e.contains("handler zeta-no-such-vocoder not found"), "{e}");
         assert_eq!(program(&ctx, 0, "zeta-no-such-vocoder", false), Ok(None));
+    }
+
+    /// The M17 row with its handler made optional and named so no host has it.
+    fn optional_row(optional: bool) -> Arc<zeta_core::modes::ModeRow> {
+        let mut v: serde_json::Value =
+            serde_json::from_str(include_str!("../../../modes/m17_decode.json")).unwrap();
+        v["decoder"]["handlers"] = serde_json::json!([{
+            "programs": ["zeta-no-such-handler"],
+            "optional": optional,
+            "install": {"url": "https://example.invalid"}
+        }]);
+        Arc::new(zeta_core::modes::parse(&v.to_string()).unwrap())
+    }
+
+    #[test]
+    fn an_optional_handler_absent_is_none() {
+        let ctx = StageContext::new(SourceId("s".into())).with_mode(optional_row(true));
+        assert_eq!(program(&ctx, 0, "x", false), Ok(None));
+        // Required, the same handler absent is the row's error.
+        let ctx = StageContext::new(SourceId("s".into())).with_mode(optional_row(false));
+        let e = program(&ctx, 0, "x", false).unwrap_err();
+        assert!(e.contains("handler zeta-no-such-handler not found"), "{e}");
     }
 }

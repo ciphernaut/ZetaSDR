@@ -373,7 +373,8 @@ pub enum Decoder {
         nodes: Vec<Node>,
         edges: Vec<Edge>,
         /// Programs a stage of the graph needs on the host, probed at startup as a
-        /// program row's program is: a missing one makes the row `unavailable`.
+        /// program row's program is: a missing one makes the row `unavailable`, unless
+        /// it is `optional`.
         #[serde(default)]
         handlers: Vec<Handler>,
     },
@@ -402,18 +403,35 @@ impl Decoder {
     }
 
     /// The programs the row needs on the host, each with where to get it: a program
-    /// row's one block, a graph row's `handlers` in order; none for a plain graph row
-    /// or a frame row (its chain is all in-process stages).
-    pub fn handler_blocks(&self) -> Vec<(&[String], &Install)> {
+    /// row's one block (never optional), a graph row's `handlers` in order; none for a
+    /// plain graph row or a frame row (its chain is all in-process stages).
+    pub fn handler_blocks(&self) -> Vec<HandlerBlock<'_>> {
         match self {
-            Decoder::Program(p) => vec![(p.programs.as_slice(), &p.install)],
+            Decoder::Program(p) => vec![HandlerBlock {
+                programs: &p.programs,
+                install: &p.install,
+                optional: false,
+            }],
             Decoder::Graph { handlers, .. } => handlers
                 .iter()
-                .map(|h| (h.programs.as_slice(), &h.install))
+                .map(|h| HandlerBlock {
+                    programs: &h.programs,
+                    install: &h.install,
+                    optional: h.optional,
+                })
                 .collect(),
             Decoder::Frame(_) => vec![],
         }
     }
+}
+
+/// One program list a row needs on the host, as [`Decoder::handler_blocks`] gives it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HandlerBlock<'a> {
+    pub programs: &'a [String],
+    pub install: &'a Install,
+    /// The row runs without it (a stage then does without what it gives).
+    pub optional: bool,
 }
 
 /// A program a stage of a graph row needs on the host.
@@ -424,6 +442,11 @@ pub struct Handler {
     /// Names tried on `PATH` in order (or an absolute path), the first found used.
     pub programs: Vec<String>,
     pub install: Install,
+    /// Whether the row runs without it: a missing optional handler leaves the row
+    /// `ready`, listed in its `missing`, rather than `unavailable` (`false` when left
+    /// out).
+    #[serde(default)]
+    pub optional: bool,
 }
 
 /// A frame row's decoder: the demodulator, the framing and what reads each frame.
@@ -721,7 +744,29 @@ pub struct Install {
     pub fedora: Option<String>,
     #[serde(default)]
     pub brew: Option<String>,
+    /// A script in this repository that builds and installs the program, run from a
+    /// source checkout (`tools/install-vocoders.sh`); `null` when absent.
+    #[serde(default)]
+    pub script: Option<String>,
     pub url: String,
+}
+
+impl Install {
+    /// How to get the program, ahead of the URL: `bash <script>` when the row names a
+    /// script, else the first of `apt install <debian>`, `dnf install <fedora>`,
+    /// `brew install <brew>`; `None` when the row names neither.
+    pub fn hint(&self) -> Option<String> {
+        if let Some(s) = &self.script {
+            return Some(format!("bash {s}"));
+        }
+        [
+            ("apt", &self.debian),
+            ("dnf", &self.fedora),
+            ("brew", &self.brew),
+        ]
+        .into_iter()
+        .find_map(|(tool, pkg)| pkg.as_ref().map(|p| format!("{tool} install {p}")))
+    }
 }
 
 /// A row's check: the signal (`kind`) plus the event it must produce.
@@ -742,7 +787,7 @@ pub struct RowTest {
 /// Make every property of an object schema required, without a `default`: a field a row
 /// file may leave out (`#[serde(default)]`) is always present, `null` when absent, in
 /// what the node reports.
-fn require_all(schema: &mut schemars::Schema) {
+pub(crate) fn require_all(schema: &mut schemars::Schema) {
     let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) else {
         return;
     };
@@ -822,7 +867,7 @@ pub fn parse(text: &str) -> Result<ModeRow, RowError> {
             return RowError::new(field, msg);
         }
         if msg.contains("invalid")
-            && let Some(field) = bad_track_field(text)
+            && let Some(field) = bad_track_field(text).or_else(|| bad_handler_field(text))
         {
             return RowError::new(field, msg);
         }
@@ -900,6 +945,18 @@ fn bad_track_field(text: &str) -> Option<String> {
         return Some("subject.track_min_m".into());
     }
     None
+}
+
+/// The handler field holding what its type cannot (`decoder.handlers[<i>].optional`, a
+/// boolean), read from the row's JSON.
+fn bad_handler_field(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let handlers = v.pointer("/decoder/handlers")?.as_array()?;
+    handlers.iter().enumerate().find_map(|(i, h)| {
+        h.get("optional")
+            .is_some_and(|o| !o.is_boolean())
+            .then(|| format!("decoder.handlers[{i}].optional"))
+    })
 }
 
 /// Check what serde cannot: the id's spelling, unit-suffixed fields holding integers,
@@ -2472,8 +2529,8 @@ mod tests {
         assert!(e.error.contains("unknown stage kind"), "{e}");
         let blocks = row.decoder.handler_blocks();
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].0, ["c2dec"]);
-        assert_eq!(blocks[0].1.debian.as_deref(), Some("codec2"));
+        assert_eq!(blocks[0].programs, ["c2dec"]);
+        assert_eq!(blocks[0].install.debian.as_deref(), Some("codec2"));
         let Decoder::Graph { handlers, .. } = &parse(POCSAG).unwrap().decoder else {
             panic!("graph row");
         };
@@ -2483,7 +2540,10 @@ mod tests {
         let adsb = parse(ADSB).unwrap();
         let blocks = adsb.decoder.handler_blocks();
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].0.first().map(String::as_str), Some("dump1090"));
+        assert_eq!(
+            blocks[0].programs.first().map(String::as_str),
+            Some("dump1090")
+        );
     }
 
     #[test]
@@ -2505,6 +2565,56 @@ mod tests {
         );
         let e = parse(&text).unwrap_err();
         assert!(e.field.contains("bogus"), "{e}");
+    }
+
+    const M17: &str = include_str!("../../../../modes/m17_decode.json");
+
+    #[test]
+    fn an_optional_handler_parses_and_defaults_false() {
+        let handlers = |row: &ModeRow| match &row.decoder {
+            Decoder::Graph { handlers, .. } => handlers.clone(),
+            _ => panic!("graph row"),
+        };
+        let row = parse(M17).unwrap();
+        assert!(!handlers(&row)[0].optional);
+        assert!(!row.decoder.handler_blocks()[0].optional);
+        let row = parse(&edited(M17, |v| {
+            v["decoder"]["handlers"][0]["optional"] = true.into()
+        }))
+        .unwrap();
+        assert!(handlers(&row)[0].optional);
+        assert!(row.decoder.handler_blocks()[0].optional);
+        let e = parse(&edited(M17, |v| {
+            v["decoder"]["handlers"][0]["optional"] = 1.into()
+        }))
+        .unwrap_err();
+        assert_eq!(e.field, "decoder.handlers[0].optional", "{e}");
+        // A program row's block is never optional.
+        assert!(!parse(ADSB).unwrap().decoder.handler_blocks()[0].optional);
+    }
+
+    #[test]
+    fn an_install_script_is_optional_in_a_row() {
+        let row = parse(&edited(M17, |v| {
+            v["decoder"]["handlers"][0]["install"]["script"] = "tools/install-vocoders.sh".into()
+        }))
+        .unwrap();
+        let blocks = row.decoder.handler_blocks();
+        assert_eq!(
+            blocks[0].install.script.as_deref(),
+            Some("tools/install-vocoders.sh")
+        );
+        assert_eq!(
+            blocks[0].install.hint().as_deref(),
+            Some("bash tools/install-vocoders.sh")
+        );
+        let row = parse(M17).unwrap();
+        let blocks = row.decoder.handler_blocks();
+        assert_eq!(blocks[0].install.script, None);
+        assert_eq!(
+            blocks[0].install.hint().as_deref(),
+            Some("apt install codec2")
+        );
     }
 
     #[test]

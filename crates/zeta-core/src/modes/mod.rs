@@ -27,20 +27,21 @@ use serde::{Deserialize, Serialize};
 use crate::stage::StageRegistry;
 use crate::types::StreamKind;
 
-pub(crate) use row::FRAME_DECODE_STAGE;
 pub use row::{
     Access, AltUnit, Band, Container, Decoder, DecoderKind, Demod, Derive, ENVELOPE_FIELDS, Event,
-    Extractor, FRAME_PARSERS, Family, FieldPath, FrameBlock, FrameDemod, Handler,
+    Extractor, FRAME_PARSERS, Family, FieldPath, FrameBlock, FrameDemod, Handler, HandlerBlock,
     IDENTITY_REGISTERS, IDENTITY_STRIPS, Identify, Identity, InputStream, InputVia, Install,
     ModeId, ModeRow, OutputVia, Parser, PositionMap, ProgramBlock, ProgramInput, ProgramOutput,
     Proof, QUICK_ATTEMPTS, RowError, RowTest, SampleFormat, Station, Subject, SubjectColumn,
     SubjectUnit, SubjectWaterfall, TestSpec, center_khz_text, is_mode_id, parse, validate,
 };
+pub(crate) use row::{FRAME_DECODE_STAGE, require_all};
 
 /// Where a loaded row stands: `ready` (parsed, validated and, for a program row or a
-/// graph row with `handlers`, its programs found), `broken` (the row does not parse or
-/// validate; `reason` names the field) or `unavailable` (a row whose program, or one of
-/// whose handlers, is not on this host; `reason` says which).
+/// graph row with `handlers`, its required programs found; an optional one missing is
+/// listed in `missing`), `broken` (the row does not parse or validate; `reason` names the
+/// field) or `unavailable` (a row whose program, or one of whose required handlers, is not
+/// on this host; `reason` says which).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModeState {
@@ -49,10 +50,11 @@ pub enum ModeState {
     Unavailable,
 }
 
-/// One row as the registry holds it.
+/// One row as the registry holds it. (`missing` may be left out of what is read, but is
+/// always written: the schema requires every property.)
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
 pub struct LoadedMode {
     /// The row. A broken file's row is what parsed, or a placeholder carrying only
     /// its id when nothing did; a broken file that meant to replace a row is listed
@@ -76,6 +78,11 @@ pub struct LoadedMode {
     #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
     #[serde(deserialize_with = "nullable")]
     pub checked: Option<u64>,
+    /// The optional handlers not found on this host, one line each,
+    /// `<program>: missing (<hint>; <url>) — <what is lost>`: the row runs without them.
+    /// Empty until probed, and when every handler is found.
+    #[serde(default)]
+    pub missing: Vec<String>,
     /// The stream kinds a job of the row emits (see [`template::outputs`]); empty for a
     /// broken row.
     pub outputs: Vec<StreamKind>,
@@ -283,6 +290,7 @@ impl ModeRegistry {
             file,
             program: None,
             checked: None,
+            missing: Vec::new(),
             outputs,
         };
         match self.modes.iter_mut().find(|m| m.row.id == loaded.row.id) {
@@ -312,6 +320,7 @@ impl ModeRegistry {
             file,
             program: None,
             checked: None,
+            missing: Vec::new(),
             outputs: Vec::new(),
         });
     }
@@ -336,9 +345,11 @@ impl ModeRegistry {
         self.modes.iter().map(|m| m.row.id.0.clone()).collect()
     }
 
-    /// Record the program a row with handlers runs after probing (a program row's
-    /// program, a graph row's first handler): found, the row is ready; not found
-    /// (`None`), it is unavailable with `reason`. A broken row stays broken.
+    /// Record what probing found for a row with handlers: its program (a program row's
+    /// program, a graph row's first handler, `None` when that one is missing) and, when
+    /// a required handler is missing, `reason`, which makes the row unavailable (else it
+    /// is ready). It starts the row's probe over: `missing` is cleared, for
+    /// [`ModeRegistry::set_missing`] to fill. A broken row stays broken.
     pub fn set_program(&mut self, id: &str, program: Option<PathBuf>, reason: Option<String>) {
         let Some(m) = self.modes.iter_mut().find(|m| m.row.id.0 == id) else {
             return;
@@ -346,17 +357,31 @@ impl ModeRegistry {
         if m.state == ModeState::Broken {
             return;
         }
-        m.state = match program {
-            Some(_) => ModeState::Ready,
-            None => ModeState::Unavailable,
+        m.state = match reason {
+            None => ModeState::Ready,
+            Some(_) => ModeState::Unavailable,
         };
         m.program = program;
         m.reason = reason;
+        m.missing.clear();
+    }
+
+    /// Add `line` to a row's `missing` (an optional handler probing did not find), after
+    /// its [`ModeRegistry::set_program`]. The row's state is left as it is; a broken
+    /// row's list stays empty.
+    pub fn set_missing(&mut self, id: &str, line: String) {
+        if let Some(m) = self
+            .modes
+            .iter_mut()
+            .find(|m| m.row.id.0 == id && m.state != ModeState::Broken)
+        {
+            m.missing.push(line);
+        }
     }
 
     /// Carry what probing found from `old` (the registry this one replaces) to each
     /// row with handlers (a program row, a graph row naming `handlers`) of the same id:
-    /// its `program`, `state` and `reason`, so a reload keeps the probe's answer
+    /// its `program`, `state`, `reason` and `missing`, so a reload keeps the probe's answer
     /// without probing again. Only where both rows have the same decoder block (an
     /// edited block's answer may no longer hold: such a row stays as loaded, its
     /// programs looked up at launch) and neither is broken.
@@ -374,6 +399,7 @@ impl ModeRegistry {
             m.program = o.program.clone();
             m.state = o.state;
             m.reason = o.reason.clone();
+            m.missing = o.missing.clone();
         }
     }
 
@@ -504,5 +530,26 @@ mod tests {
         std::fs::write(&path, "garbage").unwrap();
         modes.load_checked(&path);
         assert!(modes.all().iter().all(|m| m.checked.is_none()), "bad file");
+    }
+
+    /// An optional handler not found is listed in `missing` and leaves the row ready;
+    /// a required one missing still makes it unavailable. (The program row validates
+    /// with no stages, so it stands in for a graph row with handlers here.)
+    #[test]
+    fn a_missing_optional_handler_leaves_the_row_ready() {
+        let stages = crate::stage::StageRegistry::new();
+        let mut modes = ModeRegistry::load(&stages, None);
+        let id = "adsb_decode";
+        modes.set_program(id, Some("/stand-in".into()), None);
+        let line = "zeta-mbe: missing (bash tools/x.sh; https://example.invalid) — voice silent";
+        modes.set_missing(id, line.into());
+        let m = modes.get(id).unwrap();
+        assert_eq!(m.state, ModeState::Ready);
+        assert_eq!(m.reason, None);
+        assert_eq!(m.missing, [line]);
+        modes.set_program(id, None, Some("dump1090: missing".into()));
+        assert_eq!(modes.get(id).unwrap().state, ModeState::Unavailable);
+        // A re-probe starts from an empty list.
+        assert!(modes.get(id).unwrap().missing.is_empty());
     }
 }

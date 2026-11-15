@@ -1019,7 +1019,7 @@ fn the_m17_row_names_c2dec() {
     assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
     let blocks = m.row.decoder.handler_blocks();
     assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0].0, ["c2dec".to_string()]);
+    assert_eq!(blocks[0].programs, ["c2dec".to_string()]);
     let v = serde_json::to_value(&m.row).unwrap();
     assert_eq!(v["family"], "amateur_voice");
     assert_eq!(v["band"]["bandwidth_hz"], 12500);
