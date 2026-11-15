@@ -17,7 +17,7 @@ use zeta_core::types::{ChannelId, Hz, Provenance, StreamId, StreamKind, Timestam
 
 use crate::util::lowpass_taps;
 use crate::video_fm::DropNote;
-use crate::worker::{VIDEO_QUEUE_DEPTH, run_map_threaded};
+use crate::worker::run_map_threaded;
 use crate::{Input, frame_span, note_lag, run_map};
 
 /// Fewest and most taps of the channel low-pass filter.
@@ -57,12 +57,16 @@ pub enum ChannelError {
 #[derive(Debug, Default)]
 pub struct ChannelState {
     key: Option<(u64, i64, u64, u64)>,
-    taps: Vec<f32>,
+    /// The low-pass taps, last first (the order [`dot`] meets them in a window), [`padded`].
+    reversed: Vec<f32>,
     decim: usize,
     /// NCO phase in cycles, in `[0, 1)`.
     phase: f64,
-    /// Last `taps.len() - 1` shifted samples, oldest first.
+    /// The shifted samples the filter has yet to leave behind (one fewer than its
+    /// [`padded`] taps), oldest first.
     history: Vec<Complex<f32>>,
+    /// The work buffer of a block (the history, then the block shifted), kept for the next.
+    ext: Vec<Complex<f32>>,
     /// Index in the next block of the next sample to output.
     next: usize,
 }
@@ -104,41 +108,193 @@ pub fn extract_offset_streaming(
         let taps = lowpass_taps(bandwidth_hz as f64 / 2.0, rate_hz as f64, taps_for(decim));
         *state = ChannelState {
             key: Some(key),
-            history: vec![Complex::new(0.0, 0.0); taps.len() - 1],
-            taps,
+            history: vec![Complex::new(0.0, 0.0); padded(taps.clone()).len() - 1],
+            reversed: padded(taps),
+            ext: Vec::new(),
             decim,
             phase: 0.0,
             next: 0,
         };
     }
 
+    // Both halves are written for a wide channel at a radio's full rate (a multiplex cut
+    // from 30.72 Msps), where a `sin_cos` a sample and a sum the compiler cannot
+    // vectorise ran at under half of real time: the shift is `shift_into`'s phasor
+    // recurrence, and each output is a dot product over a forward window.
     let step = -(offset_hz as f64) / rate_hz as f64;
     let h = state.history.len();
-    let mut ext = Vec::with_capacity(h + iq.len());
-    ext.extend_from_slice(&state.history);
-    ext.extend(iq.iter().enumerate().map(|(k, &x)| {
-        let cycles = (state.phase + k as f64 * step).rem_euclid(1.0);
-        let (s, c) = (2.0 * std::f64::consts::PI * cycles).sin_cos();
-        x * Complex::new(c as f32, s as f32)
-    }));
-    state.phase = (state.phase + iq.len() as f64 * step).rem_euclid(1.0);
+    // The buffer is kept between blocks: a fresh one a block was zeroed first, which at a
+    // wide rate cost as much as the shift.
+    let mut ext = std::mem::take(&mut state.ext);
+    ext.resize(h + iq.len(), Complex::new(0.0, 0.0));
+    ext[..h].copy_from_slice(&state.history);
+    shift_into(iq, &mut state.phase, step, &mut ext[h..]);
 
-    let out: Vec<Complex<f32>> = (state.next..iq.len())
-        .step_by(state.decim)
-        .map(|n| {
-            state
-                .taps
-                .iter()
-                .enumerate()
-                .fold(Complex::new(0.0, 0.0), |acc, (j, &t)| {
-                    acc + ext[h + n - j] * t
-                })
-        })
-        .collect();
+    // Output `n` is the sum of `ext[h + n - j] * taps[j]`: the window `ext[n..=n + h]`
+    // against the taps reversed.
+    let out = filter(&ext, &state.reversed, state.next, state.decim);
     // Outputs cover every index from `next` up to the block end, so this cannot underflow.
     state.next = state.next + out.len() * state.decim - iq.len();
     state.history.copy_from_slice(&ext[ext.len() - h..]);
+    state.ext = ext;
     Ok((out, out_rate_hz))
+}
+
+/// Floats [`dot`] sums side by side: independent partial sums, alternately of real and
+/// imaginary parts, so the loop is one multiply and one add down a vector.
+const DOT_LANES: usize = 16;
+/// Floats the wide build's [`filter_avx2`] takes a step: four vectors of eight.
+const WIDE_STEP: usize = 32;
+
+/// `taps` last first, with zero taps before them (against samples older than the filter
+/// reaches) up to a whole number of [`WIDE_STEP`] floats, so the wide build runs in whole
+/// steps with nothing left over. The output is the unpadded filter's.
+fn padded(taps: Vec<f32>) -> Vec<f32> {
+    let whole = WIDE_STEP / 2;
+    let mut reversed = vec![0.0; taps.len().next_multiple_of(whole) - taps.len()];
+    reversed.extend(taps.into_iter().rev());
+    reversed
+}
+
+/// `x` as its floats, each sample's real part then its imaginary part.
+fn floats(x: &[Complex<f32>]) -> &[f32] {
+    // SAFETY: `Complex<f32>` is `repr(C)` of two `f32` (num-complex guarantees the layout
+    // of an array of two), so `x` is `2 * x.len()` initialised floats with `f32`'s alignment.
+    unsafe { std::slice::from_raw_parts(x.as_ptr().cast::<f32>(), x.len() * 2) }
+}
+
+/// The low-pass taps as [`dot`] and [`filter_avx2`] meet them: each written twice, once
+/// for a sample's real part and once for its imaginary part.
+fn doubled(reversed: &[f32]) -> Vec<f32> {
+    reversed.iter().flat_map(|&t| [t, t]).collect()
+}
+
+/// The sum of `window[i] * taps[i]`: `window` as its [`floats`] and `doubled` the taps
+/// [`doubled`], the two as long as each other. The additions are in [`DOT_LANES`] partial
+/// sums, so their order differs from a plain fold's by rounding only.
+fn dot(window: &[f32], doubled: &[f32]) -> Complex<f32> {
+    let mut acc = [0.0_f32; DOT_LANES];
+    let mut ws = window.chunks_exact(DOT_LANES);
+    let mut ts = doubled.chunks_exact(DOT_LANES);
+    for (w, t) in (&mut ws).zip(&mut ts) {
+        for k in 0..DOT_LANES {
+            acc[k] += w[k] * t[k];
+        }
+    }
+    for (k, (w, t)) in ws.remainder().iter().zip(ts.remainder()).enumerate() {
+        acc[k] += w * t;
+    }
+    let (mut re, mut im) = (0.0_f32, 0.0_f32);
+    for pair in acc.chunks_exact(2) {
+        re += pair[0];
+        im += pair[1];
+    }
+    Complex::new(re, im)
+}
+
+/// The low-pass over `ext` (the carried history, then a block): an output for every
+/// `decim`-th input from `next`, each the [`dot`] of the window ending at that input with
+/// the `reversed` taps. The build every CPU runs.
+fn filter_base(
+    ext: &[Complex<f32>],
+    reversed: &[f32],
+    next: usize,
+    decim: usize,
+) -> Vec<Complex<f32>> {
+    let h = reversed.len() - 1;
+    let doubled = doubled(reversed);
+    let samples = floats(ext);
+    (next..ext.len() - h)
+        .step_by(decim)
+        .map(|n| dot(&samples[2 * n..2 * (n + h + 1)], &doubled))
+        .collect()
+}
+
+/// [`filter_base`] in AVX2 and FMA instructions, for taps of [`padded`] length: four
+/// running sums of eight floats, each step a fused multiply-add into every one, so a
+/// 64-tap window is four steps. Rounding differs from the baseline's (fused, and summed
+/// in another order), by no more than that.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+fn filter_avx2(
+    ext: &[Complex<f32>],
+    reversed: &[f32],
+    next: usize,
+    decim: usize,
+) -> Vec<Complex<f32>> {
+    use std::arch::x86_64::{
+        _mm256_add_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+    let h = reversed.len() - 1;
+    let doubled = doubled(reversed);
+    let samples = floats(ext);
+    let len = doubled.len();
+    assert!(len.is_multiple_of(WIDE_STEP) && ext.len() > h);
+    let end = ext.len() - h;
+    let mut out = Vec::with_capacity(end.saturating_sub(next).div_ceil(decim));
+    let taps = doubled.as_ptr();
+    let mut n = next;
+    while n < end {
+        // The window of output `n`: `len` floats from `2 * n`, inside `samples` since
+        // `n < end` gives `2 * n + len <= 2 * ext.len()`.
+        let window = samples[2 * n..2 * n + len].as_ptr();
+        let mut sums = [_mm256_setzero_ps(); 4];
+        let mut i = 0;
+        while i < len {
+            for (k, sum) in sums.iter_mut().enumerate() {
+                // SAFETY: `i + 8 * k + 8 <= len` (`len` is a multiple of 32 and `i` steps
+                // by 32 below it), and `window` and `taps` each point at `len` floats.
+                *sum = unsafe {
+                    _mm256_fmadd_ps(
+                        _mm256_loadu_ps(window.add(i + 8 * k)),
+                        _mm256_loadu_ps(taps.add(i + 8 * k)),
+                        *sum,
+                    )
+                };
+            }
+            i += WIDE_STEP;
+        }
+        let sum = _mm256_add_ps(
+            _mm256_add_ps(sums[0], sums[1]),
+            _mm256_add_ps(sums[2], sums[3]),
+        );
+        let mut lanes = [0.0_f32; 8];
+        // SAFETY: `lanes` is eight floats.
+        unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), sum) };
+        out.push(Complex::new(
+            lanes[0] + lanes[2] + lanes[4] + lanes[6],
+            lanes[1] + lanes[3] + lanes[5] + lanes[7],
+        ));
+        n += decim;
+    }
+    out
+}
+
+/// Whether this CPU runs the AVX2 and FMA builds of the kernels ([`filter`], [`shift_into`]).
+/// The binary is built for the baseline CPU, so the wider build is chosen as it runs.
+pub fn wide_kernels() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// The low-pass, in the widest build this CPU runs (the wide one needs taps of [`padded`]
+/// length, which [`ChannelState`]'s are).
+fn filter(ext: &[Complex<f32>], reversed: &[f32], next: usize, decim: usize) -> Vec<Complex<f32>> {
+    #[cfg(target_arch = "x86_64")]
+    if wide_kernels()
+        && (2 * reversed.len()).is_multiple_of(WIDE_STEP)
+        && ext.len() >= reversed.len()
+    {
+        // SAFETY: AVX2 and FMA were detected on this CPU just above.
+        return unsafe { filter_avx2(ext, reversed, next, decim) };
+    }
+    filter_base(ext, reversed, next, decim)
 }
 
 /// Whether a band of `bandwidth_hz` cut at `out_rate_hz` from `rate_hz` skips the
@@ -165,8 +321,26 @@ const SHIFT_LANES: usize = 8;
 /// (as long as `iq`) and advance `phase` past the block. A phasor recurrence:
 /// [`SHIFT_LANES`] phasors step by `exp(j2π·LANES·step)` side by side, and every
 /// [`SHIFT_SEED`] samples they are re-seeded from an exact `sin_cos`, so the error stays near
-/// f32 rounding however long the run.
+/// f32 rounding however long the run. Run in the widest build this CPU has ([`wide_kernels`]).
 fn shift_into(iq: &[Complex<f32>], phase: &mut f64, step: f64, out: &mut [Complex<f32>]) {
+    #[cfg(target_arch = "x86_64")]
+    if wide_kernels() {
+        // SAFETY: AVX2 and FMA were detected on this CPU just above.
+        return unsafe { shift_avx2(iq, phase, step, out) };
+    }
+    shift_body(iq, phase, step, out)
+}
+
+/// [`shift_body`] built for AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn shift_avx2(iq: &[Complex<f32>], phase: &mut f64, step: f64, out: &mut [Complex<f32>]) {
+    shift_body(iq, phase, step, out)
+}
+
+/// The body both builds of [`shift_into`] share.
+#[inline(always)]
+fn shift_body(iq: &[Complex<f32>], phase: &mut f64, step: f64, out: &mut [Complex<f32>]) {
     let at = |cycles: f64| {
         let (s, c) = (std::f64::consts::TAU * cycles.rem_euclid(1.0)).sin_cos();
         Complex::new(c as f32, s as f32)
@@ -486,8 +660,11 @@ impl Stage for ChannelStage {
 /// capture), so a full-rate block holds no runtime worker.
 pub const THREADED_RATE_HZ: u64 = 10_000_000;
 
+/// Inputs the direct path's thread may have waiting before the newest is dropped.
+pub const DIRECT_QUEUE_DEPTH: usize = 64;
+
 /// The direct path on a thread of its own ([`run_map_threaded`], drop-on-full queue of
-/// [`VIDEO_QUEUE_DEPTH`]): the thread's drops are noted in the job's `channel` context
+/// [`DIRECT_QUEUE_DEPTH`]): the thread's drops are noted in the job's `channel` context
 /// as `"dropped": N` when they grow, at most once a second. An error from a block (the
 /// capture left the channel) ends the stage with that error.
 async fn run_direct_threaded(
@@ -509,7 +686,7 @@ async fn run_direct_threaded(
         inputs,
         bus,
         stop,
-        VIDEO_QUEUE_DEPTH,
+        DIRECT_QUEUE_DEPTH,
         dropped,
         move |input| {
             if stopping.is_cancelled() {
@@ -823,6 +1000,167 @@ mod tests {
         for (a, b) in parts.iter().zip(&whole) {
             assert!((a - b).norm() < 1e-4, "{a} vs {b}");
         }
+    }
+
+    /// The extraction as first written: an exact phase and a `sin_cos` for every sample,
+    /// and each output a plain sum over the taps. What the fast path must reproduce.
+    fn reference_extract(
+        iq: &[Complex<f32>],
+        rate_hz: u64,
+        offset_hz: i64,
+        bandwidth_hz: u64,
+        out_rate_hz: u64,
+    ) -> Vec<Complex<f32>> {
+        let decim = (rate_hz / out_rate_hz) as usize;
+        let taps = lowpass_taps(bandwidth_hz as f64 / 2.0, rate_hz as f64, taps_for(decim));
+        let step = -(offset_hz as f64) / rate_hz as f64;
+        let h = taps.len() - 1;
+        let mut ext = vec![Complex::new(0.0, 0.0); h];
+        ext.extend(iq.iter().enumerate().map(|(k, &x)| {
+            let (s, c) = (std::f64::consts::TAU * (k as f64 * step).rem_euclid(1.0)).sin_cos();
+            x * Complex::new(c as f32, s as f32)
+        }));
+        (0..iq.len())
+            .step_by(decim)
+            .map(|n| {
+                taps.iter()
+                    .enumerate()
+                    .fold(Complex::new(0.0, 0.0), |acc, (j, &t)| {
+                        acc + ext[h + n - j] * t
+                    })
+            })
+            .collect()
+    }
+
+    /// A wide channel cut from a radio's full rate (a television multiplex from a
+    /// 30.72 Msps capture) equals the reference, whatever the block lengths.
+    #[test]
+    fn a_wide_channel_from_the_full_rate_matches_the_reference() {
+        const FULL: u64 = 30_720_000;
+        let iq: Vec<Complex<f32>> = (0..40_000)
+            .map(|n: u64| {
+                let re = ((n * 7919) % 1013) as f32 / 1013.0 - 0.5;
+                let im = ((n * 104_729) % 2039) as f32 / 2039.0 - 0.5;
+                Complex::new(re, im)
+            })
+            .collect();
+        let want = reference_extract(&iq, FULL, 7_000_000, 7_000_000, 10_240_000);
+        let mut st = ChannelState::new();
+        let mut got = Vec::new();
+        for chunk in [&iq[..16_384], &iq[16_384..16_389], &iq[16_389..]] {
+            let (o, r) =
+                extract_offset_streaming(&mut st, chunk, FULL, 7_000_000, 7_000_000, 10_240_000)
+                    .unwrap();
+            assert_eq!(r, 10_240_000);
+            got.extend(o);
+        }
+        assert_eq!(got.len(), want.len());
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0_f32, f32::max);
+        assert!(worst < 1e-4, "worst difference {worst}");
+    }
+
+    /// The wide builds of the kernels give what the baseline builds give (on a CPU without
+    /// them both sides run the same code, and the test says nothing).
+    #[test]
+    fn the_wide_kernels_match_the_baseline_ones() {
+        let iq: Vec<Complex<f32>> = (0..10_007)
+            .map(|n: u64| {
+                let re = ((n * 7919) % 1013) as f32 / 1013.0 - 0.5;
+                let im = ((n * 104_729) % 2039) as f32 / 2039.0 - 0.5;
+                Complex::new(re, im)
+            })
+            .collect();
+        let step = -7.0e6 / 30.72e6;
+        let (mut wide, mut base) = (
+            vec![Complex::default(); iq.len()],
+            vec![Complex::default(); iq.len()],
+        );
+        let (mut wide_phase, mut base_phase) = (0.37, 0.37);
+        shift_into(&iq, &mut wide_phase, step, &mut wide);
+        shift_body(&iq, &mut base_phase, step, &mut base);
+        assert_eq!(wide_phase, base_phase);
+        let worst = |a: &[Complex<f32>], b: &[Complex<f32>]| {
+            assert_eq!(a.len(), b.len());
+            a.iter()
+                .zip(b)
+                .map(|(a, b)| (a - b).norm())
+                .fold(0.0_f32, f32::max)
+        };
+        assert!(worst(&wide, &base) < 1e-6, "shift: {}", worst(&wide, &base));
+        let reversed = padded(lowpass_taps(3.5e6, 30.72e6, 63));
+        for (next, decim) in [(0, 1), (2, 3), (1, 64)] {
+            let (a, b) = (
+                filter(&base, &reversed, next, decim),
+                filter_base(&base, &reversed, next, decim),
+            );
+            assert!(worst(&a, &b) < 1e-5, "filter by {decim}: {}", worst(&a, &b));
+        }
+    }
+
+    /// How fast the direct path cuts a wide channel from the full rate, against real
+    /// time. Not a gate (it measures the host): run it by hand,
+    /// `cargo test -p zeta-dsp --release --lib full_rate_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn full_rate_speed() {
+        const FULL: u64 = 30_720_000;
+        let block: Vec<Complex<f32>> = (0..65_536)
+            .map(|n| {
+                Complex::new(
+                    ((n * 31) % 97) as f32 / 97.0 - 0.5,
+                    ((n * 17) % 89) as f32 / 89.0 - 0.5,
+                )
+            })
+            .collect();
+        let blocks = 100;
+        let signal = (blocks * block.len()) as f64 / FULL as f64;
+        // The best of a few runs, as a share of real time: the host is rarely idle.
+        let best = |f: &mut dyn FnMut()| {
+            (0..7)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    for _ in 0..blocks {
+                        f();
+                    }
+                    start.elapsed().as_secs_f64()
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let mut st = ChannelState::new();
+        let whole = best(&mut || {
+            std::hint::black_box(
+                extract_offset_streaming(&mut st, &block, FULL, 7_000_000, 7_000_000, 10_240_000)
+                    .unwrap(),
+            );
+        });
+        println!(
+            "the cut: {:.2}x real time (wide kernels: {})",
+            signal / whole,
+            wide_kernels()
+        );
+        let reversed = padded(lowpass_taps(3.5e6, FULL as f64, 63));
+        let step = -7.0e6 / FULL as f64;
+        let mut ext = vec![Complex::new(0.0, 0.0); 63 + block.len()];
+        let mut phase = 0.0;
+        let shift = best(&mut || shift_into(&block, &mut phase, step, &mut ext[63..]));
+        let shift_base = best(&mut || shift_body(&block, &mut phase, step, &mut ext[63..]));
+        let fir = best(&mut || {
+            std::hint::black_box(filter(&ext, &reversed, 0, 3));
+        });
+        let fir_base = best(&mut || {
+            std::hint::black_box(filter_base(&ext, &reversed, 0, 3));
+        });
+        println!(
+            "shift: {:.1}x real time, baseline {:.1}x; filter by 3: {:.1}x, baseline {:.1}x",
+            signal / shift,
+            signal / shift_base,
+            signal / fir,
+            signal / fir_base
+        );
     }
 
     #[test]
