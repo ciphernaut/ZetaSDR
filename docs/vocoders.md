@@ -32,8 +32,9 @@ build-essential`), and names the package of any that is missing. Then it:
 3. builds the library as a static library with `cmake` (its build also fetches the FFT code it
    compiles in, PFFFT, from the same authors, checked against a pinned checksum), then compiles
    [`tools/vocoder/zeta-mbe.c`](../tools/vocoder/zeta-mbe.c) against it;
-4. installs `zeta-mbe` under the prefix, `~/.local/bin/zeta-mbe` by default;
-5. tests it: 50 frames of silence in for each codec, 160 samples out for each frame;
+4. tests it: 50 frames of silence in for each codec, 160 samples out for each frame (a program
+   that fails is not installed);
+5. installs `zeta-mbe` under the prefix, `~/.local/bin/zeta-mbe` by default;
 6. prints what it built, from which commit, and where it put it.
 
 The build happens in a temporary directory, which the script removes when it ends.

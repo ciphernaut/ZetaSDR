@@ -3,7 +3,7 @@
 #
 # The project ships no IMBE or AMBE implementation. This script downloads mbelib-neo from its
 # authors at one pinned commit, builds it here as a static library, links
-# tools/vocoder/zeta-mbe.c against it, installs the program under --prefix and tests it.
+# tools/vocoder/zeta-mbe.c against it, tests the program and installs it under --prefix.
 # Nothing it builds belongs to, or is redistributed with, this project: docs/vocoders.md.
 #
 #   bash tools/install-vocoders.sh [--yes] [--src DIR] [--prefix DIR]
@@ -151,20 +151,26 @@ echo "install-vocoders: compiling zeta-mbe"
 "$cc" -std=c99 -O2 -Wall -Wextra -I"$src/include" -I"$work/build/include" \
   -o "$work/zeta-mbe" "$source_c" "$lib" -lm
 
-mkdir -p "$prefix/bin"
-install -m 755 "$work/zeta-mbe" "$prefix/bin/zeta-mbe"
-bin="$prefix/bin/zeta-mbe"
-
+# The self-test runs before the install, so a program that fails it never replaces one the
+# node may already use.
+built="$work/zeta-mbe"
 for codec in imbe7200x4400:$IMBE_FEED_BYTES ambe3600x2450:$AMBE_FEED_BYTES; do
   name=${codec%%:*}
   feed=${codec##*:}
   want=$((SELFTEST_FRAMES * FRAME_OUT_BYTES))
-  got=$(head -c $((SELFTEST_FRAMES * feed)) /dev/zero | "$bin" "$name" | wc -c)
+  got=$(head -c $((SELFTEST_FRAMES * feed)) /dev/zero | "$built" "$name" | wc -c) ||
+    die "self-test $name: zeta-mbe failed; nothing installed"
   got=$((got))
   [ "$got" -eq "$want" ] ||
-    die "self-test $name: $SELFTEST_FRAMES frames in, $got bytes out, not $want"
+    die "self-test $name: $SELFTEST_FRAMES frames in, $got bytes out, not $want; nothing installed"
   echo "install-vocoders: self-test $name: $SELFTEST_FRAMES frames in, $got bytes out: ok"
 done
+
+mkdir -p "$prefix/bin"
+# Absolute, so the ZETA_HANDLER_ZETA_MBE line below is one the node accepts.
+prefix=$(cd "$prefix" && pwd)
+bin="$prefix/bin/zeta-mbe"
+install -m 755 "$built" "$bin"
 
 cat <<EOF
 
