@@ -35,7 +35,9 @@
 //! 3. the matched filter for the shape;
 //! 4. per symbol, at an interpolated position: the slice against the tracked levels, then
 //!    the level and timing updates;
-//! 5. per block of [`SEARCH_SYMBOLS`], a timing search.
+//! 5. every [`SEARCH_EVERY`] symbols, a search of the last [`SEARCH_SYMBOLS`] for a signal;
+//! 6. the symbols given out: at once while a signal is held, otherwise
+//!    [`PENDING_SYMBOLS`] behind, so they can be sliced again when one is found.
 //!
 //! **Levels.** Two numbers place all four: their centre, which is the carrier offset (the
 //! DC), and the outer amplitude, the inner levels held at a third of it as the standards
@@ -51,15 +53,26 @@
 //! 0.2. Each symbol moves the next sample by at most [`MAX_TIMING_STEP`] of a symbol, so
 //! [`SoftDibit::at`] steps by a symbol within 4 % while the loop holds.
 //!
-//! **Acquisition.** The loop pulls in slowly from far off, so a search tries
-//! [`SEARCH_SYMBOLS`] symbols at each of 16 phases across a symbol, fits each phase's
-//! samples to the levels (least squares on its own decisions) and scores how far the eye
-//! has closed. The first block is searched before any symbol is given out, and its best
-//! phase and fit start the receiver. After that, each block just given out is searched,
-//! and the receiver jumps only when its eye has closed (after a gap, or a new carrier)
-//! and another fit does at least twice as well. Such a jump moves [`SoftDibit::at`] by up
-//! to half a symbol.
+//! **Acquisition.** On air every transmission starts after noise, carrier or nothing, and
+//! a P25 one has no preamble: its first frame sync is its first 24 symbols. So:
+//! - A search fits a stretch's samples to the levels (least squares on their own
+//!   decisions) at each of 16 phases across a symbol. It takes the fit for a signal when
+//!   the eye is open, no level holds most of the stretch (a carrier sits on one), and the
+//!   amplitude is near the declared deviation ([`SIGNAL_AMPLITUDE`]). That last test is
+//!   what tells noise, which fits at 1.2 to 2.1 whatever its power, from a weak signal.
+//! - A full search's fit must also explain the next search's stretch, since a stretch
+//!   part noise or carrier can fit with a false centre.
+//! - While no signal is held, symbols wait [`PENDING_SYMBOLS`] behind. When one is found,
+//!   every symbol not yet given out is sliced again on its timing and levels, back to the
+//!   signal's first symbol.
+//! - A fresh lock is on probation for [`PROBATION`] searches, its symbols still held:
+//!   held to the acquisition standard, and refitted at every phase, so a false one is
+//!   undone before anything it sliced goes out.
+//!
+//! [`SoftDibit::at`] never goes backwards. It steps by a symbol within 4 % while a lock
+//! holds, and by more where a signal is found anew.
 
+use std::collections::VecDeque;
 use std::f64::consts::PI;
 
 use num_complex::Complex;
@@ -104,18 +117,49 @@ const LEVEL_POWER: f64 = 5.0 / 9.0;
 const TIMING_GAIN: f64 = 0.05;
 /// The most one symbol moves the next one's sample, in symbols.
 pub const MAX_TIMING_STEP: f64 = 0.04;
-/// Symbols in a block, the stretch one timing search looks at.
+/// Symbols one search looks back over.
 pub const SEARCH_SYMBOLS: usize = 32;
-/// Phases across one symbol a timing search tries.
+/// Symbols between searches.
+pub const SEARCH_EVERY: usize = 8;
+/// Searches in a row without a signal after which a search tries every phase; before,
+/// the signal last held is taken to be the same one, its timing standing.
+pub const FULL_SEARCH_AFTER: usize = 4;
+/// Searches a fresh lock must hold before its symbols are given out: until then a false
+/// lock (noise that fitted, just before a signal) can still be undone.
+pub const PROBATION: usize = 2;
+/// The eye closure under which held levels are not refitted: a quarter of the way from a
+/// level to its threshold.
+pub const REFIT_FLOOR: f64 = 1.0 / 144.0;
+/// How much better a refit must close the eye for its levels to replace the held ones.
+pub const REFIT_RATIO: f64 = 0.5;
+/// Least-squares rounds in a fit.
+const FIT_ROUNDS: usize = 4;
+/// Phases across one symbol a search tries.
 const SEARCH_PHASES: i32 = 16;
-/// The eye closure (mean square distance of the samples from their levels, outer levels
-/// at ±1) under which the timing is left to the loop: a third of the way from a level to
-/// its threshold.
-pub const SEARCH_FLOOR: f64 = 1.0 / 81.0;
-/// How much better another phase must close the eye for the search to jump to it.
-const SEARCH_RATIO: f64 = 0.5;
-/// The fewest phases away a jump goes; nearer is the loop's to correct.
+/// The fewest phases away from the tracked one a search moves the timing; nearer is the
+/// loop's to correct.
 const SEARCH_MIN_JUMP: i32 = 2;
+/// The most eye closure (mean square distance of the samples from their levels, outer
+/// levels at ±1) a held signal may show: three fifths of the way from a level to its
+/// threshold.
+pub const HOLD_CLOSURE: f64 = 1.0 / 25.0;
+/// The most eye closure a stretch may show to be taken for a new signal: half the way
+/// from a level to its threshold. Noise alone, fitted, shows 0.017 to 0.04, so this alone
+/// does not tell them apart ([`SIGNAL_AMPLITUDE`] does).
+pub const ACQUIRE_CLOSURE: f64 = 1.0 / 36.0;
+/// The largest share of a stretch's symbols one level may take in a signal. A carrier
+/// sits on one level, and a stretch mostly carrier nearly so; random data puts at most
+/// about half its 32 symbols on one level, a 48-bit sync of outer symbols 54 %.
+pub const SIGNAL_SHARE: f64 = 0.6;
+/// The outer amplitude a new signal shows, in declared outer deviations. Noise alone,
+/// fitted, shows 1.2 to 2.1 (1st to 99th percentile) whatever its level, since a
+/// discriminator's output on noise does not depend on its power; that is what tells the
+/// two apart. A transmitter further off its declared deviation is not acquired.
+pub const SIGNAL_AMPLITUDE: (f64, f64) = (0.75, 1.15);
+/// Symbols held back while no signal is held or a lock is on probation: as many as a
+/// signal's start can be found behind (a search's stretch, the confirming search, a false
+/// lock's probation, with room), so they can be sliced again once it is.
+pub const PENDING_SYMBOLS: usize = 96;
 
 /// The receive filter: matched to the transmitter's pulse.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -170,8 +214,22 @@ pub struct Fsk4Demod {
     base: u64,
     /// Where the next symbol's centre is expected, in matched-filter samples.
     next: f64,
-    /// Whether the first block's search has set the timing and the levels.
-    acquired: bool,
+    /// Whether the last search found the signal (and the levels and timing on it).
+    locked: bool,
+    /// Searches in a row that found no signal.
+    unheld: usize,
+    /// Searches the lock has held since it was taken.
+    proven: usize,
+    /// A full search's signal-like fit (with where its stretch started) awaiting the
+    /// next search's confirmation.
+    candidate: Option<(f64, Fit)>,
+    /// Symbols until the next search.
+    until_search: usize,
+    /// Symbols sliced but not given out: held while not locked or on probation, so a
+    /// signal found behind them can have them sliced again.
+    pending: VecDeque<SoftDibit>,
+    /// The matched-filter position of the last symbol given out.
+    given: f64,
     /// The levels: their centre (the carrier offset) and the outer amplitude, raw units.
     centre: f64,
     amplitude: f64,
@@ -179,17 +237,50 @@ pub struct Fsk4Demod {
     sign: f64,
     /// The last symbol's sample (outer levels at ±1) and decided level, for the timing.
     last: (f64, f64),
-    /// Where the next block starts, and with it the next timing search.
-    block_at: f64,
 }
 
-/// A block of symbol samples fitted to the four levels.
+/// A stretch of symbol samples against a set of levels.
 #[derive(Clone, Copy, Debug)]
 struct Fit {
     centre: f64,
     amplitude: f64,
     /// Mean square distance from the levels, outer levels at ±1.
     closure: f64,
+    /// The largest share of the samples any one level takes.
+    share: f64,
+}
+
+impl Fit {
+    /// `ys` (raw samples) sliced at `centre` and `amplitude`.
+    fn of(ys: &[f64], centre: f64, amplitude: f64, sign: f64) -> Self {
+        let n = ys.len() as f64;
+        let ls = levels(ys, centre, amplitude, sign);
+        let mut counts = [0usize; 4];
+        for l in &ls {
+            // Levels ±1/3, ±1 to 0..=3.
+            counts[((l * 3.0 + 3.0) / 2.0).round() as usize] += 1;
+        }
+        Self {
+            centre,
+            amplitude,
+            closure: ys
+                .iter()
+                .zip(&ls)
+                .map(|(y, l)| ((y - centre) / amplitude - l).powi(2))
+                .sum::<f64>()
+                / n,
+            share: counts.iter().copied().max().unwrap_or(0) as f64 / n,
+        }
+    }
+
+    /// Whether the stretch looks like 4FSK on these levels: the eye open to within
+    /// `closure`, no one level taking most of it, and an amplitude near the declared
+    /// deviation.
+    fn is_signal(&self, closure: f64) -> bool {
+        self.closure < closure
+            && self.share <= SIGNAL_SHARE
+            && (SIGNAL_AMPLITUDE.0..=SIGNAL_AMPLITUDE.1).contains(&self.amplitude)
+    }
 }
 
 impl Fsk4Demod {
@@ -219,8 +310,6 @@ impl Fsk4Demod {
             .collect();
         let sum: f64 = taps.iter().sum();
         let delay = (n / 2) as f64 + reach as f64;
-        // Half a symbol in, so the search's earliest phase is the first sample.
-        let first = delay + sps / 2.0;
         Ok(Self {
             rate_hz,
             deviation_hz: params.deviation_hz,
@@ -231,13 +320,19 @@ impl Fsk4Demod {
             delay,
             buf: Vec::new(),
             base: 0,
-            next: first,
-            acquired: false,
+            // Half a symbol in, so a search's earliest phase is the first sample.
+            next: delay + sps / 2.0,
+            locked: false,
+            unheld: FULL_SEARCH_AFTER,
+            proven: 0,
+            candidate: None,
+            until_search: SEARCH_SYMBOLS,
+            pending: VecDeque::new(),
+            given: f64::NEG_INFINITY,
             centre: 0.0,
             amplitude: 1.0,
             sign: 1.0,
             last: (0.0, 0.0),
-            block_at: first,
         })
     }
 
@@ -253,33 +348,33 @@ impl Fsk4Demod {
         freq.iter_mut().for_each(|x| *x *= headroom);
         self.buf.extend(self.matched.process(&freq));
         let mut out = Vec::new();
-        let block = SEARCH_SYMBOLS as f64 * self.sps;
-        loop {
-            if !self.acquired {
-                // Acquisition: the first block, searched before any symbol is given out.
-                // The search reaches half a symbol past the block's last symbol.
-                if !self.holds(self.next + block) {
-                    break;
-                }
-                self.search(self.next);
-                self.block_at = self.next + block - self.sps / 2.0;
+        while self.holds(self.next) {
+            // The stretch ends half a symbol before the next symbol, so it is all held.
+            if self.until_search == 0 {
+                self.until_search = SEARCH_EVERY;
+                self.search();
             }
-            if !self.holds(self.next) {
-                break;
+            if self.holds(self.next) {
+                let d = self.symbol();
+                self.pending.push_back(d);
+                self.until_search -= 1;
             }
-            if self.next >= self.block_at {
-                // The block just given out, every sample of it held now the next is.
-                self.search(self.next - block);
-                self.block_at = self.next + block - self.sps / 2.0;
-                if !self.holds(self.next) {
-                    break;
-                }
+            // Locked past probation, every symbol goes out; otherwise they wait their turn.
+            let hold = if self.locked && self.proven >= PROBATION {
+                0
+            } else {
+                PENDING_SYMBOLS
+            };
+            while self.pending.len() > hold {
+                let d = self.pending.pop_front().expect("pending");
+                self.given = d.at + self.delay;
+                out.push(d);
             }
-            out.push(self.symbol());
         }
-        // Keep from the next search's earliest phase: half a symbol before the block
-        // behind the next symbol.
-        let keep = (self.next - block - self.sps / 2.0).floor().max(0.0) as u64;
+        // Keep what a search or a slice again reaches: a search's stretch, at its earliest
+        // phase, and every symbol not given out.
+        let window = self.next - (SEARCH_SYMBOLS as f64 + 1.5) * self.sps;
+        let keep = (window.min(self.given) - 1.0).floor().max(0.0) as u64;
         let n = (keep.saturating_sub(self.base) as usize).min(self.buf.len());
         self.buf.drain(..n);
         self.base += n as u64;
@@ -287,9 +382,17 @@ impl Fsk4Demod {
     }
 
     /// Set by the framer once sync tells the polarity: `true` slices the discriminator
-    /// upside down.
+    /// upside down, from the next symbol given out (held ones are turned too).
     pub fn invert(&mut self, inverted: bool) {
-        self.sign = if inverted { -1.0 } else { 1.0 };
+        let sign = if inverted { -1.0 } else { 1.0 };
+        if sign != self.sign {
+            for d in &mut self.pending {
+                d.dibit ^= 0b10;
+                d.soft[0] = 255 - d.soft[0];
+            }
+        }
+        self.sign = sign;
+        self.last = (0.0, 0.0);
     }
 
     /// Whether the samples to interpolate at `pos` are held.
@@ -297,77 +400,178 @@ impl Fsk4Demod {
         pos.floor() as u64 + 1 < self.base + self.buf.len() as u64
     }
 
-    /// The timing search over the block of symbols from `from`: each of [`SEARCH_PHASES`]
-    /// phases across a symbol, its samples fitted to the levels. The first block takes the
-    /// best phase and its fit outright (acquisition). A later block acts only when the eye
-    /// the tracked levels see has closed past [`SEARCH_FLOOR`] and the best fit closes it
-    /// by [`SEARCH_RATIO`] or better, as after a gap or a jump in carrier: it takes that
-    /// fit's levels, and its phase too when that is at least [`SEARCH_MIN_JUMP`] away (a
-    /// timing the loop cannot pull back). A jump moves the symbols after it.
-    fn search(&mut self, from: f64) {
-        let fits: Vec<(i32, Fit, f64)> = (-SEARCH_PHASES / 2..SEARCH_PHASES / 2)
-            .map(|i| {
-                let d = f64::from(i) / f64::from(SEARCH_PHASES) * self.sps;
-                let ys: Vec<f64> = (0..SEARCH_SYMBOLS)
-                    .map(|j| self.y(from + d + j as f64 * self.sps))
-                    .collect();
-                let tracked = closure(&ys, self.centre, self.amplitude, self.sign);
-                (i, self.fit(&ys), tracked)
-            })
-            .collect();
-        let best = *fits
-            .iter()
-            .min_by(|a, b| a.1.closure.total_cmp(&b.1.closure))
-            .expect("phases");
-        let current = *fits.iter().find(|f| f.0 == 0).expect("phase 0");
-        let take = if !self.acquired {
-            Some(best)
-        } else if current.2 > SEARCH_FLOOR && best.1.closure < SEARCH_RATIO * current.2 {
-            Some(if best.0.abs() >= SEARCH_MIN_JUMP {
-                best
-            } else {
-                current
-            })
-        } else {
-            None
+    /// The search over the last [`SEARCH_SYMBOLS`] symbols' stretch, every
+    /// [`SEARCH_EVERY`] symbols.
+    ///
+    /// Locked:
+    /// - a fit afresh that closes the eye at least [`REFIT_RATIO`] better than the held
+    ///   levels shows them wrong (taken from a stretch part noise or carrier), and is taken
+    ///   instead: at any phase while the lock is on probation, at the tracked phase after;
+    /// - otherwise the lock holds while the held levels still see a signal
+    ///   ([`Fit::is_signal`], to [`ACQUIRE_CLOSURE`] on probation and [`HOLD_CLOSURE`]
+    ///   after).
+    ///
+    /// Not holding, the stretch is fitted: at the tracked phase alone while a signal was
+    /// held within [`FULL_SEARCH_AFTER`] searches (the same one, faded or hit), at each of
+    /// [`SEARCH_PHASES`] phases otherwise or after a false lock. A full search's fit must
+    /// also explain the next search's stretch before it is taken, as a stretch half
+    /// carrier or noise can fit falsely. A fit taken locks the receiver ([`Self::adopt`]);
+    /// none, and symbols are held.
+    fn search(&mut self) {
+        let from = self.next - SEARCH_SYMBOLS as f64 * self.sps;
+        if from - self.sps / 2.0 < self.base as f64 {
+            return;
+        }
+        let stretch = |d: f64| -> Vec<f64> {
+            (0..SEARCH_SYMBOLS)
+                .map(|j| self.y(from + d + j as f64 * self.sps))
+                .collect()
         };
-        if let Some((phase, fit, _)) = take {
-            self.next += f64::from(phase) / f64::from(SEARCH_PHASES) * self.sps;
-            self.centre = fit.centre;
-            self.amplitude = fit.amplitude;
-            self.last = (0.0, 0.0);
-            self.acquired = true;
+        let offset = |i: i32| f64::from(i) / f64::from(SEARCH_PHASES) * self.sps;
+        let every = -SEARCH_PHASES / 2..SEARCH_PHASES / 2;
+        // Each phase's fit, the closest first.
+        let fits = |phases: std::ops::Range<i32>| -> Vec<(i32, Fit)> {
+            let mut fits: Vec<(i32, Fit)> =
+                phases.map(|i| (i, self.fit(&stretch(offset(i))))).collect();
+            fits.sort_by(|a, b| a.1.closure.total_cmp(&b.1.closure));
+            fits
+        };
+        let held = Fit::of(&stretch(0.0), self.centre, self.amplitude, self.sign);
+        let probation = self.proven < PROBATION;
+        if self.locked && held.closure > REFIT_FLOOR {
+            let (phase, refit) = fits(if probation { every.clone() } else { 0..1 })[0];
+            if refit.is_signal(ACQUIRE_CLOSURE) && refit.closure < REFIT_RATIO * held.closure {
+                let proven = self.proven;
+                self.adopt(from + offset(phase), refit);
+                self.proven = proven;
+                self.unheld = 0;
+                return;
+            }
+        }
+        let limit = if probation {
+            ACQUIRE_CLOSURE
+        } else {
+            HOLD_CLOSURE
+        };
+        if self.locked && held.is_signal(limit) {
+            self.unheld = 0;
+            self.proven += 1;
+            return;
+        }
+        let false_lock = self.locked && probation;
+        let full = false_lock || self.unheld >= FULL_SEARCH_AFTER;
+        let fits = fits(if full { every } else { 0..1 });
+        let best = fits[0];
+        // The tracked phase, if the best is too near it to be worth a jump.
+        let (phase, fit) = match fits.iter().find(|f| f.0 == 0) {
+            Some(&tracked)
+                if best.0.abs() < SEARCH_MIN_JUMP && tracked.1.is_signal(ACQUIRE_CLOSURE) =>
+            {
+                tracked
+            }
+            _ => best,
+        };
+        let start = from + offset(phase);
+        let signal = fit.is_signal(ACQUIRE_CLOSURE);
+        // The last full search's fit, if it explains this stretch on its own grid; of it and
+        // this search's fit, the one explaining this stretch better is taken.
+        let confirmed = self.candidate.and_then(|(at, c)| {
+            let d = at + ((from - at) / self.sps).round() * self.sps - from;
+            let again = Fit::of(&stretch(d), c.centre, c.amplitude, self.sign);
+            again
+                .is_signal(ACQUIRE_CLOSURE)
+                .then_some((from + d, again))
+        });
+        let taken = match confirmed {
+            Some(again) if !signal || again.1.closure < fit.closure => Some(again),
+            Some(_) => Some((start, fit)),
+            None if !full && signal => Some((start, fit)),
+            None => None,
+        };
+        self.candidate = (full && signal).then_some((start, fit));
+        self.locked = taken.is_some();
+        if let Some((start, fit)) = taken {
+            self.unheld = 0;
+            self.candidate = None;
+            self.adopt(start, fit);
+        } else if false_lock {
+            self.unheld = FULL_SEARCH_AFTER;
+        } else {
+            self.unheld += 1;
+        }
+    }
+
+    /// Lock on `fit`, whose stretch starts at `start`: the levels from it and the timing on
+    /// its grid. Every symbol after the last one given out is sliced again: those before
+    /// the stretch as the fit says (they may be the signal's first, or nothing), those
+    /// from it on tracked as usual, up to where the receiver had got.
+    fn adopt(&mut self, start: f64, fit: Fit) {
+        let reached = self.next;
+        self.centre = fit.centre;
+        self.amplitude = fit.amplitude;
+        self.last = (0.0, 0.0);
+        self.proven = 0;
+        self.pending.clear();
+        let after = self.given + self.sps / 2.0;
+        // As far back as the samples go, before anything is given out.
+        let floor = after.max(self.base as f64 + 1.0);
+        let behind = ((start - floor) / self.sps).ceil().max(0.0) as usize;
+        for k in (1..behind).rev() {
+            let t = start - k as f64 * self.sps;
+            if t - 1.0 >= self.base as f64 {
+                let z = self.sign * (self.y(t) - self.centre) / self.amplitude;
+                let (dibit, soft) = slice(z);
+                self.pending.push_back(SoftDibit {
+                    dibit,
+                    soft,
+                    at: t - self.delay,
+                });
+            }
+        }
+        self.next = start;
+        while self.next < reached - self.sps / 2.0 && self.holds(self.next) {
+            let d = self.symbol();
+            if d.at + self.delay > after {
+                self.pending.push_back(d);
+            }
         }
     }
 
     /// `ys` (raw samples) fitted to the levels: slice, then the least-squares centre and
-    /// amplitude for those decisions, twice. The first block starts from the samples'
-    /// mean, later ones from the tracked levels. One level alone keeps the amplitude.
+    /// amplitude for those decisions, [`FIT_ROUNDS`] times. It starts from the samples'
+    /// mean or the tracked centre, and from the declared or the tracked amplitude (which
+    /// noise drags off), and the closest fit is kept. One level alone keeps the amplitude.
     fn fit(&self, ys: &[f64]) -> Fit {
         let n = ys.len() as f64;
         let mean = ys.iter().sum::<f64>() / n;
-        let mut centre = if self.acquired { self.centre } else { mean };
-        let mut amplitude = self.amplitude;
-        for _ in 0..2 {
-            let ls = levels(ys, centre, amplitude, self.sign);
-            let lm = ls.iter().sum::<f64>() / n;
-            let var = ls.iter().map(|l| (l - lm).powi(2)).sum::<f64>() / n;
-            if var > 1e-3 {
-                let cov = ys
-                    .iter()
-                    .zip(&ls)
-                    .map(|(y, l)| (y - mean) * (l - lm))
-                    .sum::<f64>()
-                    / n;
-                amplitude = (cov / var).clamp(AMPLITUDE_RANGE.0, AMPLITUDE_RANGE.1);
+        let from = |mut centre: f64, mut amplitude: f64| {
+            for _ in 0..FIT_ROUNDS {
+                let ls = levels(ys, centre, amplitude, self.sign);
+                let lm = ls.iter().sum::<f64>() / n;
+                let var = ls.iter().map(|l| (l - lm).powi(2)).sum::<f64>() / n;
+                if var > 1e-3 {
+                    let cov = ys
+                        .iter()
+                        .zip(&ls)
+                        .map(|(y, l)| (y - mean) * (l - lm))
+                        .sum::<f64>()
+                        / n;
+                    amplitude = (cov / var).clamp(AMPLITUDE_RANGE.0, AMPLITUDE_RANGE.1);
+                }
+                centre = mean - amplitude * lm;
             }
-            centre = mean - amplitude * lm;
-        }
-        Fit {
-            centre,
-            amplitude,
-            closure: closure(ys, centre, amplitude, self.sign),
-        }
+            Fit::of(ys, centre, amplitude, self.sign)
+        };
+        [
+            (mean, 1.0),
+            (mean, self.amplitude),
+            (self.centre, 1.0),
+            (self.centre, self.amplitude),
+        ]
+        .into_iter()
+        .map(|(c, a)| from(c, a))
+        .min_by(|a, b| a.closure.total_cmp(&b.closure))
+        .expect("starts")
     }
 
     /// The matched filter's output at `pos`, linearly interpolated (every sample held).
@@ -415,16 +619,6 @@ fn levels(ys: &[f64], centre: f64, amplitude: f64, sign: f64) -> Vec<f64> {
     ys.iter()
         .map(|&y| sign * level_of(sign * (y - centre) / amplitude))
         .collect()
-}
-
-/// How far the eye has closed for raw samples `ys` sliced at `centre` and `amplitude`:
-/// the mean square distance from their levels, outer levels at ±1.
-fn closure(ys: &[f64], centre: f64, amplitude: f64, sign: f64) -> f64 {
-    ys.iter()
-        .zip(levels(ys, centre, amplitude, sign))
-        .map(|(y, l)| ((y - centre) / amplitude - l).powi(2))
-        .sum::<f64>()
-        / ys.len() as f64
 }
 
 /// The C4FM receive filter's response at `f` symbol rates: the integrate-and-dump's
@@ -765,6 +959,244 @@ mod tests {
                 assert!((step - sps).abs() < 0.05 * sps, "step {step} of {sps}");
             }
         }
+    }
+
+    /// The rate and samples per symbol the acquisition tests run at.
+    const RATE: u32 = 48_000;
+    const SPS: f64 = 10.0;
+    /// The SNR the acquisition tests' signals sit at, in 12.5 kHz.
+    const SIGNAL_SNR_DB: f64 = 15.0;
+
+    /// Noise at `snr_db` in 12.5 kHz below a unit carrier, whatever `iq` holds there.
+    fn noise_under_unit(iq: &mut [Complex<f32>], snr_db: f64, seed: u64) {
+        // `awgn` takes an all-zero buffer's power as 1.
+        let mut n = vec![Complex::new(0.0f32, 0.0); iq.len()];
+        noise(&mut n, snr_db, RATE, seed);
+        iq.iter_mut().zip(n).for_each(|(s, v)| *s += v);
+    }
+
+    /// One transmission in a scene: where its first symbol starts, its dibits, and the
+    /// indices that must come out right.
+    struct Sent {
+        start: usize,
+        dibits: Vec<u8>,
+        check: std::ops::Range<usize>,
+    }
+
+    /// A capture and what was sent in it.
+    struct Scene {
+        name: String,
+        iq: Vec<Complex<f32>>,
+        sent: Vec<Sent>,
+    }
+
+    /// `n` samples of unmodulated carrier at the signal's level, at `iq`'s last phase.
+    fn carrier_after(iq: &mut Vec<Complex<f32>>, n: usize) {
+        let last = iq.last().copied().unwrap_or(Complex::new(1.0, 0.0));
+        iq.extend(std::iter::repeat_n(last, n));
+    }
+
+    /// Lead-in `lead` (already in `iq`), then 600 dibits from `seed`, then 20 ms of carrier
+    /// so the receive filters give out the last symbols undisturbed.
+    fn after_lead(name: &str, mut iq: Vec<Complex<f32>>, params: Fsk4Params, seed: u64) -> Scene {
+        let start = iq.len();
+        let dibits = dibits(600, seed);
+        iq.extend(modulate(&dibits, params, RATE));
+        carrier_after(&mut iq, RATE as usize / 50);
+        noise_under_unit(&mut iq, SIGNAL_SNR_DB, seed + 100);
+        Scene {
+            name: name.into(),
+            iq,
+            sent: vec![Sent {
+                start,
+                dibits,
+                check: 2..600,
+            }],
+        }
+    }
+
+    fn after_noise(params: Fsk4Params, seed: u64) -> Scene {
+        let lead = vec![Complex::new(0.0, 0.0); RATE as usize];
+        after_lead("1 s of noise", lead, params, seed)
+    }
+
+    fn after_carrier(params: Fsk4Params, ms: usize, seed: u64) -> Scene {
+        let lead = vec![Complex::new(1.0, 0.0); RATE as usize * ms / 1000];
+        after_lead(&format!("{ms} ms of carrier"), lead, params, seed)
+    }
+
+    /// Ten bursts of 132 dibits, each followed by 156 symbol periods of nothing.
+    fn bursts(params: Fsk4Params, seed: u64) -> Scene {
+        let mut iq = Vec::new();
+        let mut sent = Vec::new();
+        for b in 0..10 {
+            let start = iq.len();
+            let dibits = dibits(132, 70 + b);
+            iq.extend(modulate(&dibits, params, RATE));
+            iq.extend(std::iter::repeat_n(
+                Complex::new(0.0, 0.0),
+                156 * SPS as usize,
+            ));
+            sent.push(Sent {
+                start,
+                dibits,
+                check: 2..130,
+            });
+        }
+        noise_under_unit(&mut iq, SIGNAL_SNR_DB, seed);
+        Scene {
+            name: "bursts".into(),
+            iq,
+            sent,
+        }
+    }
+
+    /// 600 dibits, 500 ms of noise alone, 600 more 300 Hz away.
+    fn second_after_gap(params: Fsk4Params, seed: u64) -> Scene {
+        let mut iq = modulate(&dibits(600, 64), params, RATE);
+        iq.extend(std::iter::repeat_n(
+            Complex::new(0.0, 0.0),
+            RATE as usize / 2,
+        ));
+        let start = iq.len();
+        let second = dibits(600, 65);
+        let mut tail = modulate(&second, params, RATE);
+        carrier_after(&mut tail, RATE as usize / 50);
+        for (n, s) in tail.iter_mut().enumerate() {
+            let phase = std::f64::consts::TAU * 300.0 * n as f64 / f64::from(RATE);
+            *s *= Complex::from_polar(1.0, phase as f32);
+        }
+        iq.extend(tail);
+        noise_under_unit(&mut iq, SIGNAL_SNR_DB, seed);
+        Scene {
+            name: "a second signal after 500 ms".into(),
+            iq,
+            sent: vec![Sent {
+                start,
+                dibits: second,
+                check: 2..600,
+            }],
+        }
+    }
+
+    /// What `rx` got wrong of `scene`'s checked dibits: per transmission, the wrong (or
+    /// missing) indices.
+    fn misses(scene: &Scene, rx: &[SoftDibit]) -> Vec<String> {
+        scene
+            .sent
+            .iter()
+            .enumerate()
+            .filter_map(|(n, s)| {
+                let mut got = vec![None; s.dibits.len()];
+                for d in rx {
+                    let k = ((d.at - s.start as f64) / SPS - 0.5).round();
+                    if k >= 0.0 && (k as usize) < got.len() {
+                        got[k as usize] = Some(d.dibit);
+                    }
+                }
+                let wrong: Vec<usize> = s
+                    .check
+                    .clone()
+                    .filter(|&k| got[k] != Some(s.dibits[k]))
+                    .collect();
+                (!wrong.is_empty()).then(|| {
+                    let first_right = wrong.last().map_or(0, |w| w + 1);
+                    format!(
+                        "{}: transmission {n}: {} wrong {:?}; right from {first_right}",
+                        scene.name,
+                        wrong.len(),
+                        &wrong[..wrong.len().min(12)]
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn assert_decoded(scenes: impl Fn(Fsk4Params) -> Vec<Scene>) {
+        for params in [dmr(), c4fm()] {
+            for scene in scenes(params) {
+                let mut demod = Fsk4Demod::new(u64::from(RATE), params).expect("rate");
+                let rx = feed_all(&mut demod, &scene.iq);
+                let misses = misses(&scene, &rx);
+                assert!(misses.is_empty(), "{:?}: {misses:#?}", params.shape);
+            }
+        }
+    }
+
+    #[test]
+    fn a_signal_after_noise_is_decoded_from_its_start() {
+        assert_decoded(|p| vec![after_noise(p, 61)]);
+    }
+
+    #[test]
+    fn a_signal_after_carrier_is_decoded_from_its_start() {
+        assert_decoded(|p| vec![after_carrier(p, 200, 62), after_carrier(p, 1000, 62)]);
+    }
+
+    #[test]
+    fn bursts_with_silence_between_are_each_decoded() {
+        assert_decoded(|p| vec![bursts(p, 63)]);
+    }
+
+    #[test]
+    fn a_second_signal_after_a_gap_is_decoded_from_its_start() {
+        assert_decoded(|p| vec![second_after_gap(p, 66)]);
+    }
+
+    #[test]
+    fn positions_never_go_backwards() {
+        for params in [dmr(), c4fm()] {
+            for scene in [
+                after_noise(params, 61),
+                after_carrier(params, 200, 62),
+                after_carrier(params, 1000, 62),
+                bursts(params, 63),
+                second_after_gap(params, 66),
+            ] {
+                let mut demod = Fsk4Demod::new(u64::from(RATE), params).expect("rate");
+                let rx = feed_all(&mut demod, &scene.iq);
+                for w in rx.windows(2) {
+                    assert!(
+                        w[1].at > w[0].at,
+                        "{:?} {}: {} after {}",
+                        params.shape,
+                        scene.name,
+                        w[1].at,
+                        w[0].at
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_of_one_symbol_leaves_the_dibits_after_it() {
+        let mut tx = dibits(500, 81);
+        tx.extend(std::iter::repeat_n(1u8, 300));
+        tx.extend(dibits(500, 82));
+        assert_decoded(|params| {
+            let mut iq = modulate(&tx, params, RATE);
+            carrier_after(&mut iq, RATE as usize / 50);
+            noise_under_unit(&mut iq, SIGNAL_SNR_DB, 83);
+            vec![Scene {
+                name: "a run of 300".into(),
+                iq,
+                sent: vec![Sent {
+                    start: 0,
+                    dibits: tx.clone(),
+                    check: 800..1300,
+                }],
+            }]
+        });
+    }
+
+    #[test]
+    fn invert_resets_the_timing_detector() {
+        let mut demod = Fsk4Demod::new(u64::from(RATE), dmr()).expect("rate");
+        demod.feed(&modulate(&dibits(300, 91), dmr(), RATE));
+        assert_ne!(demod.last, (0.0, 0.0));
+        demod.invert(true);
+        assert_eq!(demod.last, (0.0, 0.0));
     }
 
     #[test]
