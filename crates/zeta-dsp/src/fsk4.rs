@@ -56,21 +56,31 @@
 //! **Acquisition.** On air every transmission starts after noise, carrier or nothing, and
 //! a P25 one has no preamble: its first frame sync is its first 24 symbols. So:
 //! - A search fits a stretch's samples to the levels (least squares on their own
-//!   decisions) at each of 16 phases across a symbol. It takes the fit for a signal when
-//!   the eye is open, no level holds most of the stretch (a carrier sits on one), and the
-//!   amplitude is near the declared deviation ([`SIGNAL_AMPLITUDE`]). That last test is
-//!   what tells noise, which fits at 1.2 to 2.1 whatever its power, from a weak signal.
+//!   decisions) at each of 16 phases across a symbol, each phase from one start and the
+//!   closest two from every start.
+//! - It takes a fit for a signal when the eye is open, no level holds most of the stretch
+//!   (a carrier sits on one), and the eye depends on the timing: its contrast, the
+//!   closure half a symbol off over the closure on time, is high. Noise's eye barely
+//!   depends on the timing. Where noise also fits (an amplitude over [`NOISE_AMPLITUDE`]
+//!   of the declared deviation; noise fits at 1.15 to 2.1, whatever its power) the eye
+//!   must be far more open or the contrast far higher. So a transmitter well off its
+//!   declared deviation is still taken: 0.6 to 2.0 of it at 15 dB.
+//! - A fit with an amplitude outside [`SIGNAL_AMPLITUDE`] is not taken but counted
+//!   ([`Fsk4Counters::off_deviation`]), so a stage can say why a signal is not decoded.
 //! - A full search's fit must also explain the next search's stretch, since a stretch
 //!   part noise or carrier can fit with a false centre.
 //! - While no signal is held, symbols wait [`PENDING_SYMBOLS`] behind. When one is found,
 //!   every symbol not yet given out is sliced again on its timing and levels, back to the
 //!   signal's first symbol.
-//! - A fresh lock is on probation for [`PROBATION`] searches, its symbols still held:
-//!   held to the acquisition standard, and refitted at every phase, so a false one is
-//!   undone before anything it sliced goes out.
+//! - A fresh lock is on probation, its symbols still held: [`PROBATION`] searches if
+//!   taken on strong evidence, [`WEAK_PROBATION`] on weak (what noise can rarely pass
+//!   for), each search held to that standard and refitted at every phase, so a false lock
+//!   is undone before anything it sliced goes out. Once proven, a last fit of a stretch
+//!   wholly in the signal slices those symbols again.
+//! - [`Fsk4Demod::flush`] gives out whatever is still held when the input ends.
 //!
-//! [`SoftDibit::at`] never goes backwards. It steps by a symbol within 4 % while a lock
-//! holds, and by more where a signal is found anew.
+//! [`SoftDibit::at`] is never negative and never goes backwards. It steps by a symbol
+//! within 4 % while a lock holds, and by more where a signal is found anew.
 
 use std::collections::VecDeque;
 use std::f64::consts::PI;
@@ -127,6 +137,9 @@ pub const FULL_SEARCH_AFTER: usize = 4;
 /// Searches a fresh lock must hold before its symbols are given out: until then a false
 /// lock (noise that fitted, just before a signal) can still be undone.
 pub const PROBATION: usize = 2;
+/// Searches a lock taken on weak evidence ([`Verdict::Weak`]) must hold: noise has been
+/// seen to pass for a weak signal four searches in a row, never this many.
+pub const WEAK_PROBATION: usize = 8;
 /// The eye closure under which held levels are not refitted: a quarter of the way from a
 /// level to its threshold.
 pub const REFIT_FLOOR: f64 = 1.0 / 144.0;
@@ -134,28 +147,50 @@ pub const REFIT_FLOOR: f64 = 1.0 / 144.0;
 pub const REFIT_RATIO: f64 = 0.5;
 /// Least-squares rounds in a fit.
 const FIT_ROUNDS: usize = 4;
+/// Least-squares rounds in a search's first fit of each phase.
+const COARSE_ROUNDS: usize = 2;
 /// Phases across one symbol a search tries.
 const SEARCH_PHASES: i32 = 16;
 /// The fewest phases away from the tracked one a search moves the timing; nearer is the
 /// loop's to correct.
 const SEARCH_MIN_JUMP: i32 = 2;
+/// Phases a search fits from every start, the closest from one start first.
+const REFINED_PHASES: usize = 2;
 /// The most eye closure (mean square distance of the samples from their levels, outer
 /// levels at ±1) a held signal may show: three fifths of the way from a level to its
 /// threshold.
 pub const HOLD_CLOSURE: f64 = 1.0 / 25.0;
+/// How far a held signal's amplitude may drift from the one its lock was taken at. Noise
+/// after the signal drags the tracked amplitude off (up to noise's 1.2 to 2.1).
+pub const HOLD_DRIFT: f64 = 0.2;
 /// The most eye closure a stretch may show to be taken for a new signal: half the way
 /// from a level to its threshold. Noise alone, fitted, shows 0.017 to 0.04, so this alone
-/// does not tell them apart ([`SIGNAL_AMPLITUDE`] does).
+/// does not tell them apart.
 pub const ACQUIRE_CLOSURE: f64 = 1.0 / 36.0;
 /// The largest share of a stretch's symbols one level may take in a signal. A carrier
 /// sits on one level, and a stretch mostly carrier nearly so; random data puts at most
 /// about half its 32 symbols on one level, a 48-bit sync of outer symbols 54 %.
 pub const SIGNAL_SHARE: f64 = 0.6;
-/// The outer amplitude a new signal shows, in declared outer deviations. Noise alone,
-/// fitted, shows 1.2 to 2.1 (1st to 99th percentile) whatever its level, since a
-/// discriminator's output on noise does not depend on its power; that is what tells the
-/// two apart. A transmitter further off its declared deviation is not acquired.
-pub const SIGNAL_AMPLITUDE: (f64, f64) = (0.75, 1.15);
+/// The outer amplitude a new signal may show, in declared outer deviations: a stretch
+/// with a signal's eye outside it is counted ([`Fsk4Counters::off_deviation`]), not taken.
+pub const SIGNAL_AMPLITUDE: (f64, f64) = (0.5, 2.0);
+/// The fitted amplitude up to which noise hardly ever fits: noise alone, fitted, shows
+/// 1.15 to 2.1 (1st to 99th percentile, all three modes), whatever its power, since a
+/// discriminator's output on noise does not depend on it.
+pub const NOISE_AMPLITUDE: f64 = 1.1;
+/// The contrast (closure half a symbol off over the closure on time) every signal must
+/// show. Noise shows 1.65 (median); a signal at 10 dB, 0.8 of its deviation, 3.5 to 3.9
+/// (median).
+pub const LOW_CONTRAST: f64 = 2.0;
+/// The contrast that makes a stretch strong evidence at any amplitude. Noise showed at
+/// most 4.7 in 7500 stretches; a signal at 10 dB, 1.2 of its deviation, 6.6 to 7.7
+/// (median).
+pub const HIGH_CONTRAST: f64 = 5.0;
+/// The eye closure noise alone seldom fits to (its 1st percentile is 0.017). Below it,
+/// with [`LOW_CONTRAST`], a stretch is strong evidence up to [`NOISE_AMPLITUDE`] and
+/// weak evidence above, where runs of noise have been seen to reach it. A signal at
+/// 10 dB, 1.2 of its deviation, fits 0.007 (median).
+pub const NOISE_CLOSURE: f64 = 1.0 / 64.0;
 /// Symbols held back while no signal is held or a lock is on probation: as many as a
 /// signal's start can be found behind (a search's stretch, the confirming search, a false
 /// lock's probation, with room), so they can be sliced again once it is.
@@ -197,6 +232,23 @@ pub fn dibit_symbol(dibit: u8) -> u8 {
     ((DIBIT_LEVELS[usize::from(dibit & 3)] + 3) / 2) as u8
 }
 
+/// What a receiver has seen, for a stage to put in its job's context. Every count is
+/// since the receiver was made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fsk4Counters {
+    /// Signals locked on (refits of a held one not counted).
+    pub locks: u64,
+    /// Locks undone on probation: a stretch that fitted like a signal and then did not
+    /// hold (noise, or a fit to a stretch part noise or carrier).
+    pub false_locks: u64,
+    /// Proven locks lost: the signal ended or faded.
+    pub losses: u64,
+    /// Stretches whose eye was open as a signal's but whose amplitude lay outside
+    /// [`SIGNAL_AMPLITUDE`], so they were not taken: a transmitter that far off the
+    /// declared deviation shows here and nowhere else.
+    pub off_deviation: u64,
+}
+
 /// A streaming 4FSK receiver over one channel's IQ; state carries across
 /// [`feed`](Self::feed) calls, so feeding in pieces equals feeding whole.
 pub struct Fsk4Demod {
@@ -209,6 +261,8 @@ pub struct Fsk4Demod {
     matched: StreamingFir,
     /// The channel and matched filters' delay, samples.
     delay: f64,
+    /// Input samples fed.
+    fed: u64,
     /// Matched-filter output from sample `base`, outer deviation at ±1.
     buf: Vec<f32>,
     base: u64,
@@ -218,8 +272,14 @@ pub struct Fsk4Demod {
     locked: bool,
     /// Searches in a row that found no signal.
     unheld: usize,
-    /// Searches the lock has held since it was taken.
+    /// Searches the lock has held since it was taken, and the searches it must hold to be
+    /// proven ([`PROBATION`] or [`WEAK_PROBATION`]).
     proven: usize,
+    probation: usize,
+    /// The evidence the lock was taken on, which it must keep showing on probation.
+    lock_class: Verdict,
+    /// The amplitude the lock was taken at.
+    lock_amplitude: f64,
     /// A full search's signal-like fit (with where its stretch started) awaiting the
     /// next search's confirmation.
     candidate: Option<(f64, Fit)>,
@@ -237,6 +297,7 @@ pub struct Fsk4Demod {
     sign: f64,
     /// The last symbol's sample (outer levels at ±1) and decided level, for the timing.
     last: (f64, f64),
+    counters: Fsk4Counters,
 }
 
 /// A stretch of symbol samples against a set of levels.
@@ -248,6 +309,28 @@ struct Fit {
     closure: f64,
     /// The largest share of the samples any one level takes.
     share: f64,
+    /// The closure half a symbol away on the same levels, over this one: how much the eye
+    /// depends on the timing. Noise's barely does. Zero until measured.
+    contrast: f64,
+}
+
+/// What a stretch looks like.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Verdict {
+    /// A signal noise hardly ever passes for.
+    Strong,
+    /// A signal as weak as noise can look (noise below [`NOISE_AMPLITUDE`] is rare, not
+    /// unknown): a lock on it serves [`WEAK_PROBATION`].
+    Weak,
+    /// A signal's eye, but an amplitude outside [`SIGNAL_AMPLITUDE`].
+    OffDeviation,
+    Not,
+}
+
+impl Verdict {
+    fn is_signal(self) -> bool {
+        matches!(self, Self::Strong | Self::Weak)
+    }
 }
 
 impl Fit {
@@ -270,16 +353,53 @@ impl Fit {
                 .sum::<f64>()
                 / n,
             share: counts.iter().copied().max().unwrap_or(0) as f64 / n,
+            contrast: 0.0,
         }
     }
 
-    /// Whether the stretch looks like 4FSK on these levels: the eye open to within
-    /// `closure`, no one level taking most of it, and an amplitude near the declared
-    /// deviation.
-    fn is_signal(&self, closure: f64) -> bool {
-        self.closure < closure
-            && self.share <= SIGNAL_SHARE
-            && (SIGNAL_AMPLITUDE.0..=SIGNAL_AMPLITUDE.1).contains(&self.amplitude)
+    /// Whether the stretch is a new signal on these levels. It must have the eye open to
+    /// within [`ACQUIRE_CLOSURE`], no one level taking most of it, and a contrast of
+    /// [`LOW_CONTRAST`]. Then it is:
+    /// - strong if its contrast reaches [`HIGH_CONTRAST`], or its eye is open past
+    ///   [`NOISE_CLOSURE`] at an amplitude noise rarely fits at (up to
+    ///   [`NOISE_AMPLITUDE`]): noise hardly ever shows either;
+    /// - weak if its eye is open past [`NOISE_CLOSURE`] at a higher amplitude, or its
+    ///   amplitude is that low but its eye no more than open: noise can, rarely, and runs
+    ///   of it a few searches long have been seen;
+    /// - [`Verdict::OffDeviation`] instead of either if its amplitude lies outside
+    ///   [`SIGNAL_AMPLITUDE`].
+    fn verdict(&self) -> Verdict {
+        if self.closure >= ACQUIRE_CLOSURE
+            || self.share > SIGNAL_SHARE
+            || self.contrast < LOW_CONTRAST
+        {
+            return Verdict::Not;
+        }
+        let low = self.amplitude <= NOISE_AMPLITUDE;
+        let open = self.closure < NOISE_CLOSURE;
+        let strong = self.contrast >= HIGH_CONTRAST || (open && low);
+        if !strong && !open && !low {
+            Verdict::Not
+        } else if !(SIGNAL_AMPLITUDE.0..=SIGNAL_AMPLITUDE.1).contains(&self.amplitude) {
+            Verdict::OffDeviation
+        } else if strong {
+            Verdict::Strong
+        } else {
+            Verdict::Weak
+        }
+    }
+
+    /// Whether the stretch still shows the signal a lock taken at amplitude `taken` holds:
+    /// the amplitude within [`HOLD_DRIFT`] of `taken`, and then, on probation, the
+    /// evidence the lock was taken on (`on_probation`: strong, or weak or better), after
+    /// it, the eye open to within [`HOLD_CLOSURE`] with no one level taking most of it.
+    fn holds(&self, taken: f64, on_probation: Option<Verdict>) -> bool {
+        (self.amplitude / taken - 1.0).abs() <= HOLD_DRIFT
+            && match on_probation {
+                Some(Verdict::Strong) => self.verdict() == Verdict::Strong,
+                Some(_) => self.verdict().is_signal(),
+                None => self.closure < HOLD_CLOSURE && self.share <= SIGNAL_SHARE,
+            }
     }
 }
 
@@ -318,6 +438,7 @@ impl Fsk4Demod {
             prev: Complex::new(0.0, 0.0),
             matched: StreamingFir::new(taps.iter().map(|t| (t / sum) as f32).collect()),
             delay,
+            fed: 0,
             buf: Vec::new(),
             base: 0,
             // Half a symbol in, so a search's earliest phase is the first sample.
@@ -325,6 +446,9 @@ impl Fsk4Demod {
             locked: false,
             unheld: FULL_SEARCH_AFTER,
             proven: 0,
+            probation: PROBATION,
+            lock_class: Verdict::Strong,
+            lock_amplitude: 1.0,
             candidate: None,
             until_search: SEARCH_SYMBOLS,
             pending: VecDeque::new(),
@@ -333,20 +457,16 @@ impl Fsk4Demod {
             amplitude: 1.0,
             sign: 1.0,
             last: (0.0, 0.0),
+            counters: Fsk4Counters::default(),
         })
     }
 
-    /// The symbols `iq` completes.
+    /// The symbols `iq` completes, in position order. While no signal is held (and while
+    /// a fresh lock is on probation) symbols are held back, up to [`PENDING_SYMBOLS`], so
+    /// a symbol can come out that much later than the samples that complete it.
     pub fn feed(&mut self, iq: &[Complex<f32>]) -> Vec<SoftDibit> {
-        let headroom = DISCRIMINATOR_HEADROOM as f32;
-        let mut freq = nbfm_demod(
-            &self.channel.process(iq),
-            self.rate_hz,
-            (self.deviation_hz * DISCRIMINATOR_HEADROOM as f64).round() as u64,
-            &mut self.prev,
-        );
-        freq.iter_mut().for_each(|x| *x *= headroom);
-        self.buf.extend(self.matched.process(&freq));
+        self.fed += iq.len() as u64;
+        self.filter(iq);
         let mut out = Vec::new();
         while self.holds(self.next) {
             // The stretch ends half a symbol before the next symbol, so it is all held.
@@ -360,16 +480,12 @@ impl Fsk4Demod {
                 self.until_search -= 1;
             }
             // Locked past probation, every symbol goes out; otherwise they wait their turn.
-            let hold = if self.locked && self.proven >= PROBATION {
+            let hold = if self.locked && self.proven >= self.probation {
                 0
             } else {
                 PENDING_SYMBOLS
             };
-            while self.pending.len() > hold {
-                let d = self.pending.pop_front().expect("pending");
-                self.given = d.at + self.delay;
-                out.push(d);
-            }
+            self.give(hold, &mut out);
         }
         // Keep what a search or a slice again reaches: a search's stretch, at its earliest
         // phase, and every symbol not given out.
@@ -381,18 +497,65 @@ impl Fsk4Demod {
         out
     }
 
+    /// Every symbol still held back, and the last ones the filters still owe, as if the
+    /// input were followed by silence: for a stage to call when its input ends. Symbols
+    /// whose centres lie past the last sample fed are not made up. The receiver can be fed
+    /// again after, its filters then holding that silence.
+    pub fn flush(&mut self) -> Vec<SoftDibit> {
+        let silence = (self.delay + 2.0 * self.sps).ceil() as usize;
+        self.filter(&vec![Complex::new(0.0, 0.0); silence]);
+        let end = self.fed as f64;
+        while self.holds(self.next) && self.next - self.delay < end {
+            let d = self.symbol();
+            self.pending.push_back(d);
+        }
+        let mut out = Vec::new();
+        self.give(0, &mut out);
+        out
+    }
+
+    /// What the receiver has seen so far.
+    pub fn counters(&self) -> Fsk4Counters {
+        self.counters
+    }
+
     /// Set by the framer once sync tells the polarity: `true` slices the discriminator
-    /// upside down, from the next symbol given out (held ones are turned too).
+    /// upside down, from the next symbol given out (held ones are turned too). The same
+    /// polarity again changes nothing.
     pub fn invert(&mut self, inverted: bool) {
         let sign = if inverted { -1.0 } else { 1.0 };
-        if sign != self.sign {
-            for d in &mut self.pending {
-                d.dibit ^= 0b10;
-                d.soft[0] = 255 - d.soft[0];
-            }
+        if sign == self.sign {
+            return;
+        }
+        for d in &mut self.pending {
+            d.dibit ^= 0b10;
+            d.soft[0] = 255 - d.soft[0];
         }
         self.sign = sign;
         self.last = (0.0, 0.0);
+    }
+
+    /// `iq` through the channel low-pass, the discriminator and the matched filter, onto
+    /// the end of the buffer.
+    fn filter(&mut self, iq: &[Complex<f32>]) {
+        let headroom = DISCRIMINATOR_HEADROOM as f32;
+        let mut freq = nbfm_demod(
+            &self.channel.process(iq),
+            self.rate_hz,
+            (self.deviation_hz * DISCRIMINATOR_HEADROOM as f64).round() as u64,
+            &mut self.prev,
+        );
+        freq.iter_mut().for_each(|x| *x *= headroom);
+        self.buf.extend(self.matched.process(&freq));
+    }
+
+    /// Give out the held symbols beyond the last `hold`.
+    fn give(&mut self, hold: usize, out: &mut Vec<SoftDibit>) {
+        while self.pending.len() > hold {
+            let d = self.pending.pop_front().expect("pending");
+            self.given = d.at + self.delay;
+            out.push(d);
+        }
     }
 
     /// Whether the samples to interpolate at `pos` are held.
@@ -407,16 +570,16 @@ impl Fsk4Demod {
     /// - a fit afresh that closes the eye at least [`REFIT_RATIO`] better than the held
     ///   levels shows them wrong (taken from a stretch part noise or carrier), and is taken
     ///   instead: at any phase while the lock is on probation, at the tracked phase after;
-    /// - otherwise the lock holds while the held levels still see a signal
-    ///   ([`Fit::is_signal`], to [`ACQUIRE_CLOSURE`] on probation and [`HOLD_CLOSURE`]
-    ///   after).
+    /// - otherwise the lock holds while the held levels still see its signal
+    ///   ([`Fit::holds`]: to [`ACQUIRE_CLOSURE`] and with contrast on probation, to
+    ///   [`HOLD_CLOSURE`] after).
     ///
     /// Not holding, the stretch is fitted: at the tracked phase alone while a signal was
     /// held within [`FULL_SEARCH_AFTER`] searches (the same one, faded or hit), at each of
     /// [`SEARCH_PHASES`] phases otherwise or after a false lock. A full search's fit must
-    /// also explain the next search's stretch before it is taken, as a stretch half
-    /// carrier or noise can fit falsely. A fit taken locks the receiver ([`Self::adopt`]);
-    /// none, and symbols are held.
+    /// be a signal ([`Fit::verdict`]) and also explain the next search's stretch before it
+    /// is taken, as a stretch half carrier or noise can fit falsely. A fit taken locks the
+    /// receiver ([`Self::adopt`]); none, and symbols are held.
     fn search(&mut self) {
         let from = self.next - SEARCH_SYMBOLS as f64 * self.sps;
         if from - self.sps / 2.0 < self.base as f64 {
@@ -427,20 +590,42 @@ impl Fsk4Demod {
                 .map(|j| self.y(from + d + j as f64 * self.sps))
                 .collect()
         };
+        // `fit` with its contrast: the closure half a symbol on, on the same levels.
+        let timed = |d: f64, mut fit: Fit| -> Fit {
+            let off = Fit::of(
+                &stretch(d + self.sps / 2.0),
+                fit.centre,
+                fit.amplitude,
+                self.sign,
+            );
+            fit.contrast = off.closure / fit.closure.max(f64::MIN_POSITIVE);
+            fit
+        };
         let offset = |i: i32| f64::from(i) / f64::from(SEARCH_PHASES) * self.sps;
         let every = -SEARCH_PHASES / 2..SEARCH_PHASES / 2;
-        // Each phase's fit, the closest first.
+        // Each phase's fit, the closest first: each phase from one start, then the
+        // closest few from every start.
         let fits = |phases: std::ops::Range<i32>| -> Vec<(i32, Fit)> {
-            let mut fits: Vec<(i32, Fit)> =
-                phases.map(|i| (i, self.fit(&stretch(offset(i))))).collect();
+            let mut fits: Vec<(i32, Fit)> = phases
+                .map(|i| (i, self.fit(&stretch(offset(i)), false)))
+                .collect();
+            fits.sort_by(|a, b| a.1.closure.total_cmp(&b.1.closure));
+            for f in fits.iter_mut().take(REFINED_PHASES) {
+                f.1 = self.fit(&stretch(offset(f.0)), true);
+            }
             fits.sort_by(|a, b| a.1.closure.total_cmp(&b.1.closure));
             fits
         };
-        let held = Fit::of(&stretch(0.0), self.centre, self.amplitude, self.sign);
-        let probation = self.proven < PROBATION;
+        let held = timed(
+            0.0,
+            Fit::of(&stretch(0.0), self.centre, self.amplitude, self.sign),
+        );
+        let was_locked = self.locked;
+        let probation = self.proven < self.probation;
         if self.locked && held.closure > REFIT_FLOOR {
             let (phase, refit) = fits(if probation { every.clone() } else { 0..1 })[0];
-            if refit.is_signal(ACQUIRE_CLOSURE) && refit.closure < REFIT_RATIO * held.closure {
+            let refit = timed(offset(phase), refit);
+            if refit.verdict().is_signal() && refit.closure < REFIT_RATIO * held.closure {
                 let proven = self.proven;
                 self.adopt(from + offset(phase), refit);
                 self.proven = proven;
@@ -448,14 +633,23 @@ impl Fsk4Demod {
                 return;
             }
         }
-        let limit = if probation {
-            ACQUIRE_CLOSURE
-        } else {
-            HOLD_CLOSURE
-        };
-        if self.locked && held.is_signal(limit) {
+        let holding = held.holds(self.lock_amplitude, probation.then_some(self.lock_class));
+        if self.locked && holding {
+            // Proven now: this stretch is all signal, which the one the lock was taken from
+            // may not have been. Its best fit, if any better, slices again every symbol not
+            // yet given out.
+            let better = (self.proven + 1 == self.probation)
+                .then(|| {
+                    let (phase, refit) = fits(every)[0];
+                    (phase, timed(offset(phase), refit))
+                })
+                .filter(|(_, r)| r.verdict().is_signal() && r.closure < held.closure);
             self.unheld = 0;
             self.proven += 1;
+            if let Some((phase, refit)) = better {
+                self.adopt(from + offset(phase), refit);
+                self.proven = self.probation;
+            }
             return;
         }
         let false_lock = self.locked && probation;
@@ -464,23 +658,23 @@ impl Fsk4Demod {
         let best = fits[0];
         // The tracked phase, if the best is too near it to be worth a jump.
         let (phase, fit) = match fits.iter().find(|f| f.0 == 0) {
-            Some(&tracked)
-                if best.0.abs() < SEARCH_MIN_JUMP && tracked.1.is_signal(ACQUIRE_CLOSURE) =>
+            Some(&(_, tracked))
+                if best.0.abs() < SEARCH_MIN_JUMP && timed(0.0, tracked).verdict().is_signal() =>
             {
-                tracked
+                (0, tracked)
             }
             _ => best,
         };
         let start = from + offset(phase);
-        let signal = fit.is_signal(ACQUIRE_CLOSURE);
+        let fit = timed(offset(phase), fit);
+        let verdict = fit.verdict();
+        let signal = verdict.is_signal();
         // The last full search's fit, if it explains this stretch on its own grid; of it and
         // this search's fit, the one explaining this stretch better is taken.
         let confirmed = self.candidate.and_then(|(at, c)| {
             let d = at + ((from - at) / self.sps).round() * self.sps - from;
-            let again = Fit::of(&stretch(d), c.centre, c.amplitude, self.sign);
-            again
-                .is_signal(ACQUIRE_CLOSURE)
-                .then_some((from + d, again))
+            let again = timed(d, Fit::of(&stretch(d), c.centre, c.amplitude, self.sign));
+            again.verdict().is_signal().then_some((from + d, again))
         });
         let taken = match confirmed {
             Some(again) if !signal || again.1.closure < fit.closure => Some(again),
@@ -488,16 +682,32 @@ impl Fsk4Demod {
             None if !full && signal => Some((start, fit)),
             None => None,
         };
+        self.counters.false_locks += u64::from(false_lock);
+        self.counters.off_deviation += u64::from(verdict == Verdict::OffDeviation);
         self.candidate = (full && signal).then_some((start, fit));
         self.locked = taken.is_some();
         if let Some((start, fit)) = taken {
+            if !was_locked || false_lock {
+                self.counters.locks += 1;
+            }
             self.unheld = 0;
             self.candidate = None;
             self.adopt(start, fit);
-        } else if false_lock {
-            self.unheld = FULL_SEARCH_AFTER;
+            self.lock_class = fit.verdict();
+            self.probation = if self.lock_class == Verdict::Strong {
+                PROBATION
+            } else {
+                WEAK_PROBATION
+            };
         } else {
-            self.unheld += 1;
+            if was_locked && !probation {
+                self.counters.losses += 1;
+            }
+            self.unheld = if false_lock {
+                FULL_SEARCH_AFTER
+            } else {
+                self.unheld + 1
+            };
         }
     }
 
@@ -509,12 +719,14 @@ impl Fsk4Demod {
         let reached = self.next;
         self.centre = fit.centre;
         self.amplitude = fit.amplitude;
+        self.lock_amplitude = fit.amplitude;
         self.last = (0.0, 0.0);
         self.proven = 0;
         self.pending.clear();
         let after = self.given + self.sps / 2.0;
-        // As far back as the samples go, before anything is given out.
-        let floor = after.max(self.base as f64 + 1.0);
+        // As far back as the samples go, before anything is given out, and never before
+        // the input's first sample.
+        let floor = after.max(self.base as f64 + 1.0).max(self.delay);
         let behind = ((start - floor) / self.sps).ceil().max(0.0) as usize;
         for k in (1..behind).rev() {
             let t = start - k as f64 * self.sps;
@@ -531,21 +743,28 @@ impl Fsk4Demod {
         self.next = start;
         while self.next < reached - self.sps / 2.0 && self.holds(self.next) {
             let d = self.symbol();
-            if d.at + self.delay > after {
+            if d.at + self.delay > after && d.at >= 0.0 {
                 self.pending.push_back(d);
             }
         }
     }
 
     /// `ys` (raw samples) fitted to the levels: slice, then the least-squares centre and
-    /// amplitude for those decisions, [`FIT_ROUNDS`] times. It starts from the samples'
-    /// mean or the tracked centre, and from the declared or the tracked amplitude (which
-    /// noise drags off), and the closest fit is kept. One level alone keeps the amplitude.
-    fn fit(&self, ys: &[f64]) -> Fit {
+    /// amplitude for those decisions, round after round. With `every_start`, for
+    /// [`FIT_ROUNDS`] from the samples' mean or the tracked centre and from the declared or
+    /// the tracked amplitude (which noise drags off), the closest fit kept; otherwise for
+    /// [`COARSE_ROUNDS`] from the mean and the declared amplitude alone. One level alone
+    /// keeps the amplitude.
+    fn fit(&self, ys: &[f64], every_start: bool) -> Fit {
         let n = ys.len() as f64;
         let mean = ys.iter().sum::<f64>() / n;
+        let rounds = if every_start {
+            FIT_ROUNDS
+        } else {
+            COARSE_ROUNDS
+        };
         let from = |mut centre: f64, mut amplitude: f64| {
-            for _ in 0..FIT_ROUNDS {
+            for _ in 0..rounds {
                 let ls = levels(ys, centre, amplitude, self.sign);
                 let lm = ls.iter().sum::<f64>() / n;
                 let var = ls.iter().map(|l| (l - lm).powi(2)).sum::<f64>() / n;
@@ -562,16 +781,21 @@ impl Fsk4Demod {
             }
             Fit::of(ys, centre, amplitude, self.sign)
         };
-        [
-            (mean, 1.0),
-            (mean, self.amplitude),
-            (self.centre, 1.0),
-            (self.centre, self.amplitude),
-        ]
-        .into_iter()
-        .map(|(c, a)| from(c, a))
-        .min_by(|a, b| a.closure.total_cmp(&b.closure))
-        .expect("starts")
+        let starts: &[(f64, f64)] = if every_start {
+            &[
+                (mean, 1.0),
+                (mean, self.amplitude),
+                (self.centre, 1.0),
+                (self.centre, self.amplitude),
+            ]
+        } else {
+            &[(mean, 1.0)]
+        };
+        starts
+            .iter()
+            .map(|&(c, a)| from(c, a))
+            .min_by(|a, b| a.closure.total_cmp(&b.closure))
+            .expect("starts")
     }
 
     /// The matched filter's output at `pos`, linearly interpolated (every sample held).
@@ -961,11 +1185,69 @@ mod tests {
         }
     }
 
-    /// The rate and samples per symbol the acquisition tests run at.
+    /// The rate the acquisition tests run at.
     const RATE: u32 = 48_000;
-    const SPS: f64 = 10.0;
     /// The SNR the acquisition tests' signals sit at, in 12.5 kHz.
     const SIGNAL_SNR_DB: f64 = 15.0;
+    /// A DMR handheld's burst and the gap after it, s.
+    const BURST_S: f64 = 0.0275;
+    const BURST_GAP_S: f64 = 0.0325;
+
+    /// A 2400-baud mode in a 6.25 kHz channel (NXDN and dPMR's rate).
+    fn half() -> Fsk4Params {
+        Fsk4Params {
+            symbol_rate_baud: 2400,
+            deviation_hz: 1050.0,
+            shape: Shape::Rrc { alpha: 0.2 },
+        }
+    }
+
+    /// How a scene's signal goes out: a mode, its transmitter's deviation as a share of
+    /// the mode's, the SNR in 12.5 kHz, and the noise's seed.
+    #[derive(Clone, Copy, Debug)]
+    struct Tx {
+        params: Fsk4Params,
+        deviation: f64,
+        snr_db: f64,
+        seed: u64,
+    }
+
+    impl Tx {
+        fn new(params: Fsk4Params, seed: u64) -> Self {
+            Self {
+                params,
+                deviation: 1.0,
+                snr_db: SIGNAL_SNR_DB,
+                seed,
+            }
+        }
+
+        fn off(self, deviation: f64, snr_db: f64) -> Self {
+            Self {
+                deviation,
+                snr_db,
+                ..self
+            }
+        }
+
+        /// `dibits` as this transmitter sends them.
+        fn modulate(&self, dibits: &[u8]) -> Vec<Complex<f32>> {
+            let sent = Fsk4Params {
+                deviation_hz: self.params.deviation_hz * self.deviation,
+                ..self.params
+            };
+            modulate(dibits, sent, RATE)
+        }
+
+        fn sps(&self) -> f64 {
+            f64::from(RATE) / f64::from(self.params.symbol_rate_baud)
+        }
+
+        /// Symbols in `s` seconds.
+        fn symbols(&self, s: f64) -> usize {
+            (f64::from(self.params.symbol_rate_baud) * s).round() as usize
+        }
+    }
 
     /// Noise at `snr_db` in 12.5 kHz below a unit carrier, whatever `iq` holds there.
     fn noise_under_unit(iq: &mut [Complex<f32>], snr_db: f64, seed: u64) {
@@ -983,9 +1265,10 @@ mod tests {
         check: std::ops::Range<usize>,
     }
 
-    /// A capture and what was sent in it.
+    /// A capture and what was sent in it, for the receiver of `tx.params`.
     struct Scene {
         name: String,
+        tx: Tx,
         iq: Vec<Complex<f32>>,
         sent: Vec<Sent>,
     }
@@ -996,16 +1279,19 @@ mod tests {
         iq.extend(std::iter::repeat_n(last, n));
     }
 
-    /// Lead-in `lead` (already in `iq`), then 600 dibits from `seed`, then 20 ms of carrier
-    /// so the receive filters give out the last symbols undisturbed.
-    fn after_lead(name: &str, mut iq: Vec<Complex<f32>>, params: Fsk4Params, seed: u64) -> Scene {
+    /// Lead-in `iq`, then 600 dibits, then 20 ms of carrier. The carrier lets the receive
+    /// filters give out the signal's last symbols undisturbed: a capture that ends at its
+    /// last symbol cannot give its last few through a 12-symbol filter, and noise right
+    /// after them reaches them through its tail.
+    fn after_lead(name: &str, mut iq: Vec<Complex<f32>>, tx: Tx) -> Scene {
         let start = iq.len();
-        let dibits = dibits(600, seed);
-        iq.extend(modulate(&dibits, params, RATE));
+        let dibits = dibits(600, tx.seed);
+        iq.extend(tx.modulate(&dibits));
         carrier_after(&mut iq, RATE as usize / 50);
-        noise_under_unit(&mut iq, SIGNAL_SNR_DB, seed + 100);
+        noise_under_unit(&mut iq, tx.snr_db, tx.seed + 100);
         Scene {
             name: name.into(),
+            tx,
             iq,
             sent: vec![Sent {
                 start,
@@ -1015,61 +1301,72 @@ mod tests {
         }
     }
 
-    fn after_noise(params: Fsk4Params, seed: u64) -> Scene {
-        let lead = vec![Complex::new(0.0, 0.0); RATE as usize];
-        after_lead("1 s of noise", lead, params, seed)
+    /// `s` seconds of noise alone, then a signal ([`after_lead`]: 20 ms of carrier after).
+    fn after_noise_for(tx: Tx, s: f64) -> Scene {
+        let lead = vec![Complex::new(0.0, 0.0); (f64::from(RATE) * s) as usize];
+        after_lead(&format!("{s} s of noise"), lead, tx)
     }
 
-    fn after_carrier(params: Fsk4Params, ms: usize, seed: u64) -> Scene {
+    fn after_noise(tx: Tx) -> Scene {
+        after_noise_for(tx, 1.0)
+    }
+
+    /// `ms` of carrier, then a signal ([`after_lead`]: 20 ms of carrier after).
+    fn after_carrier(tx: Tx, ms: usize) -> Scene {
         let lead = vec![Complex::new(1.0, 0.0); RATE as usize * ms / 1000];
-        after_lead(&format!("{ms} ms of carrier"), lead, params, seed)
+        after_lead(&format!("{ms} ms of carrier"), lead, tx)
     }
 
-    /// Ten bursts of 132 dibits, each followed by 156 symbol periods of nothing.
-    fn bursts(params: Fsk4Params, seed: u64) -> Scene {
+    /// Ten bursts, each [`BURST_S`] of symbols then [`BURST_GAP_S`] of nothing (132 and
+    /// 156 symbol periods at 4800 baud), the noise throughout.
+    fn bursts(tx: Tx) -> Scene {
+        let (n, gap) = (tx.symbols(BURST_S), tx.symbols(BURST_GAP_S));
         let mut iq = Vec::new();
         let mut sent = Vec::new();
         for b in 0..10 {
             let start = iq.len();
-            let dibits = dibits(132, 70 + b);
-            iq.extend(modulate(&dibits, params, RATE));
+            let dibits = dibits(n, 70 + b);
+            iq.extend(tx.modulate(&dibits));
             iq.extend(std::iter::repeat_n(
                 Complex::new(0.0, 0.0),
-                156 * SPS as usize,
+                (gap as f64 * tx.sps()) as usize,
             ));
             sent.push(Sent {
                 start,
                 dibits,
-                check: 2..130,
+                check: 2..n - 2,
             });
         }
-        noise_under_unit(&mut iq, SIGNAL_SNR_DB, seed);
+        noise_under_unit(&mut iq, tx.snr_db, tx.seed);
         Scene {
             name: "bursts".into(),
+            tx,
             iq,
             sent,
         }
     }
 
-    /// 600 dibits, 500 ms of noise alone, 600 more 300 Hz away.
-    fn second_after_gap(params: Fsk4Params, seed: u64) -> Scene {
-        let mut iq = modulate(&dibits(600, 64), params, RATE);
+    /// 600 dibits, 500 ms of noise alone, 600 more 300 Hz away, then 20 ms of carrier (as in
+    /// [`after_lead`]).
+    fn second_after_gap(tx: Tx) -> Scene {
+        let mut iq = tx.modulate(&dibits(600, 64));
         iq.extend(std::iter::repeat_n(
             Complex::new(0.0, 0.0),
             RATE as usize / 2,
         ));
         let start = iq.len();
         let second = dibits(600, 65);
-        let mut tail = modulate(&second, params, RATE);
+        let mut tail = tx.modulate(&second);
         carrier_after(&mut tail, RATE as usize / 50);
         for (n, s) in tail.iter_mut().enumerate() {
             let phase = std::f64::consts::TAU * 300.0 * n as f64 / f64::from(RATE);
             *s *= Complex::from_polar(1.0, phase as f32);
         }
         iq.extend(tail);
-        noise_under_unit(&mut iq, SIGNAL_SNR_DB, seed);
+        noise_under_unit(&mut iq, tx.snr_db, tx.seed);
         Scene {
             name: "a second signal after 500 ms".into(),
+            tx,
             iq,
             sent: vec![Sent {
                 start,
@@ -1082,6 +1379,7 @@ mod tests {
     /// What `rx` got wrong of `scene`'s checked dibits: per transmission, the wrong (or
     /// missing) indices.
     fn misses(scene: &Scene, rx: &[SoftDibit]) -> Vec<String> {
+        let sps = scene.tx.sps();
         scene
             .sent
             .iter()
@@ -1089,7 +1387,7 @@ mod tests {
             .filter_map(|(n, s)| {
                 let mut got = vec![None; s.dibits.len()];
                 for d in rx {
-                    let k = ((d.at - s.start as f64) / SPS - 0.5).round();
+                    let k = ((d.at - s.start as f64) / sps - 0.5).round();
                     if k >= 0.0 && (k as usize) < got.len() {
                         got[k as usize] = Some(d.dibit);
                     }
@@ -1102,8 +1400,9 @@ mod tests {
                 (!wrong.is_empty()).then(|| {
                     let first_right = wrong.last().map_or(0, |w| w + 1);
                     format!(
-                        "{}: transmission {n}: {} wrong {:?}; right from {first_right}",
+                        "{} ({:?}): transmission {n}: {} wrong {:?}; right from {first_right}",
                         scene.name,
+                        scene.tx,
                         wrong.len(),
                         &wrong[..wrong.len().min(12)]
                     )
@@ -1112,59 +1411,244 @@ mod tests {
             .collect()
     }
 
-    fn assert_decoded(scenes: impl Fn(Fsk4Params) -> Vec<Scene>) {
-        for params in [dmr(), c4fm()] {
-            for scene in scenes(params) {
-                let mut demod = Fsk4Demod::new(u64::from(RATE), params).expect("rate");
-                let rx = feed_all(&mut demod, &scene.iq);
-                let misses = misses(&scene, &rx);
-                assert!(misses.is_empty(), "{:?}: {misses:#?}", params.shape);
-            }
+    /// `scene` through a receiver for its mode, flushed at its end as a stage does when
+    /// its input ends.
+    fn decode(scene: &Scene) -> (Fsk4Demod, Vec<SoftDibit>) {
+        let mut demod = Fsk4Demod::new(u64::from(RATE), scene.tx.params).expect("rate");
+        let mut rx = feed_all(&mut demod, &scene.iq);
+        rx.extend(demod.flush());
+        (demod, rx)
+    }
+
+    fn assert_decoded(scenes: impl IntoIterator<Item = Scene>) {
+        for scene in scenes {
+            let misses = misses(&scene, &decode(&scene).1);
+            assert!(misses.is_empty(), "{misses:#?}");
         }
     }
 
     #[test]
     fn a_signal_after_noise_is_decoded_from_its_start() {
-        assert_decoded(|p| vec![after_noise(p, 61)]);
+        assert_decoded([dmr(), c4fm()].map(|p| after_noise(Tx::new(p, 61))));
     }
 
     #[test]
     fn a_signal_after_carrier_is_decoded_from_its_start() {
-        assert_decoded(|p| vec![after_carrier(p, 200, 62), after_carrier(p, 1000, 62)]);
+        assert_decoded(
+            [dmr(), c4fm()]
+                .into_iter()
+                .flat_map(|p| [200, 1000].map(|ms| after_carrier(Tx::new(p, 62), ms))),
+        );
     }
 
     #[test]
     fn bursts_with_silence_between_are_each_decoded() {
-        assert_decoded(|p| vec![bursts(p, 63)]);
+        assert_decoded([dmr(), c4fm()].map(|p| bursts(Tx::new(p, 63))));
     }
 
     #[test]
     fn a_second_signal_after_a_gap_is_decoded_from_its_start() {
-        assert_decoded(|p| vec![second_after_gap(p, 66)]);
+        assert_decoded([dmr(), c4fm()].map(|p| second_after_gap(Tx::new(p, 66))));
+    }
+
+    #[test]
+    fn at_2400_baud_a_signal_after_noise_and_bursts_are_decoded() {
+        assert_decoded([
+            after_noise(Tx::new(half(), 61)),
+            bursts(Tx::new(half(), 63)),
+        ]);
+    }
+
+    /// The transmitters off their mode's deviation the tests try: 0.8 and 1.2 of it, at 15
+    /// and 10 dB.
+    fn off_deviation(p: Fsk4Params, seed: u64) -> impl Iterator<Item = Tx> {
+        [0.8, 1.2]
+            .into_iter()
+            .flat_map(move |dev| [15.0, 10.0].map(|snr| Tx::new(p, seed).off(dev, snr)))
+    }
+
+    #[test]
+    fn a_transmitter_off_its_deviation_is_decoded_from_its_start() {
+        // At 15 dB every dibit after the first 2. At 10 dB the symbols err at their own
+        // rate wherever they are (0.8 of the deviation sits near 8 dB on the mode's own:
+        // 0.9 % for DMR, 1.4 % for C4FM), so a run without an error is a matter of the
+        // seed; `at_10_db_a_start_errs_no_more_than_the_middle` holds those starts to
+        // their own rate instead.
+        assert_decoded(
+            [dmr(), c4fm()]
+                .into_iter()
+                .flat_map(|p| off_deviation(p, 61))
+                .filter(|tx| tx.snr_db >= SIGNAL_SNR_DB)
+                .flat_map(|tx| [after_noise(tx), bursts(tx)]),
+        );
+    }
+
+    /// The wrong (or missing) dibits among each of `scene`'s transmissions' `2..50`, and
+    /// how many were checked.
+    fn start_errors(scene: &Scene) -> (usize, usize) {
+        let (_, rx) = decode(scene);
+        let sps = scene.tx.sps();
+        let mut wrong = 0;
+        for s in &scene.sent {
+            let mut got = [None; 50];
+            for d in &rx {
+                let k = ((d.at - s.start as f64) / sps - 0.5).round();
+                if (0.0..50.0).contains(&k) {
+                    got[k as usize] = Some(d.dibit);
+                }
+            }
+            wrong += (2..50).filter(|&k| got[k] != Some(s.dibits[k])).count();
+        }
+        (wrong, 48 * scene.sent.len())
+    }
+
+    #[test]
+    fn at_10_db_a_start_errs_no_more_than_the_middle() {
+        for tx in [dmr(), c4fm()]
+            .into_iter()
+            .flat_map(|p| off_deviation(p, 5))
+            .filter(|tx| tx.snr_db < SIGNAL_SNR_DB)
+        {
+            // The rate in the middle of a long signal.
+            let sent = dibits(20_000, 7);
+            let mut iq = tx.modulate(&sent);
+            noise_under_unit(&mut iq, tx.snr_db, 8);
+            let mut demod = Fsk4Demod::new(u64::from(RATE), tx.params).expect("rate");
+            let middle = pair(&feed_all(&mut demod, &iq), &sent, 0, tx.sps());
+            let middle = errors(&middle) as f64 / middle.len() as f64;
+            // The first 48 dibits of signals after 1 s of noise and of bursts, 20 seeds each.
+            let (mut wrong, mut checked) = (0, 0);
+            for seed in 0..20 {
+                let tx = Tx {
+                    seed: 2000 + seed,
+                    ..tx
+                };
+                for scene in [after_noise(tx), bursts(tx)] {
+                    let (w, c) = start_errors(&scene);
+                    wrong += w;
+                    checked += c;
+                }
+            }
+            // Twice the middle's rate, and 3 errors for chance.
+            let bound = 2.0 * middle * checked as f64 + 3.0;
+            assert!(
+                wrong as f64 <= bound,
+                "{tx:?}: {wrong} of {checked} wrong at the start ({:.3} %), {:.3} % in the middle",
+                wrong as f64 * 100.0 / checked as f64,
+                middle * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn a_transmitter_off_its_deviation_holds_its_lock() {
+        for tx in [dmr(), c4fm()]
+            .into_iter()
+            .flat_map(|p| off_deviation(p, 67))
+        {
+            let mut iq = vec![Complex::new(0.0f32, 0.0); RATE as usize];
+            let start = iq.len();
+            iq.extend(tx.modulate(&dibits(5000, tx.seed)));
+            noise_under_unit(&mut iq, tx.snr_db, tx.seed);
+            let mut demod = Fsk4Demod::new(u64::from(RATE), tx.params).expect("rate");
+            feed_all(&mut demod, &iq[..start]);
+            let before = demod.counters();
+            feed_all(&mut demod, &iq[start..]);
+            let after = demod.counters();
+            // One lock that stands, none lost, and held at the end.
+            let kept = |c: Fsk4Counters| c.locks - c.false_locks;
+            assert_eq!(
+                kept(after) - kept(before),
+                1,
+                "{tx:?}: {before:?} then {after:?}"
+            );
+            assert_eq!(
+                after.losses, before.losses,
+                "{tx:?}: {before:?} then {after:?}"
+            );
+            assert!(demod.locked && demod.proven >= demod.probation, "{tx:?}");
+        }
+    }
+
+    #[test]
+    fn a_signal_after_5_s_of_noise_is_decoded_from_its_start() {
+        assert_decoded(
+            [dmr(), c4fm(), half()].into_iter().flat_map(|p| {
+                (0..20).map(move |seed| after_noise_for(Tx::new(p, 1000 + seed), 5.0))
+            }),
+        );
+    }
+
+    #[test]
+    fn flush_gives_out_a_signal_that_ends_with_the_input() {
+        for p in [dmr(), c4fm(), half()] {
+            let tx = Tx::new(p, 68);
+            // Noise alone: held back until the flush.
+            let mut iq = vec![Complex::new(0.0f32, 0.0); RATE as usize / 10];
+            noise_under_unit(&mut iq, tx.snr_db, tx.seed);
+            let mut demod = Fsk4Demod::new(u64::from(RATE), p).expect("rate");
+            let fed = feed_all(&mut demod, &iq).len();
+            let flushed = demod.flush();
+            assert!(!flushed.is_empty(), "{p:?}: nothing held");
+            assert!(
+                (fed + flushed.len()) as f64 >= iq.len() as f64 / tx.sps() - 2.0,
+                "{p:?}: {fed} fed and {} flushed of {} symbols",
+                flushed.len(),
+                iq.len() as f64 / tx.sps()
+            );
+            // A signal ending with the input: all of it but its last 2.
+            let dibits = dibits(600, tx.seed);
+            let mut iq = tx.modulate(&dibits);
+            noise_under_unit(&mut iq, tx.snr_db, tx.seed);
+            let mut demod = Fsk4Demod::new(u64::from(RATE), p).expect("rate");
+            let mut rx = feed_all(&mut demod, &iq);
+            rx.extend(demod.flush());
+            let scene = Scene {
+                name: "a signal to the end of the input".into(),
+                tx,
+                iq,
+                sent: vec![Sent {
+                    start: 0,
+                    dibits,
+                    check: 0..598,
+                }],
+            };
+            let misses = misses(&scene, &rx);
+            assert!(misses.is_empty(), "{misses:#?}");
+            assert!(rx.windows(2).all(|w| w[1].at > w[0].at), "{p:?}");
+        }
     }
 
     #[test]
     fn positions_never_go_backwards() {
-        for params in [dmr(), c4fm()] {
-            for scene in [
-                after_noise(params, 61),
-                after_carrier(params, 200, 62),
-                after_carrier(params, 1000, 62),
-                bursts(params, 63),
-                second_after_gap(params, 66),
-            ] {
-                let mut demod = Fsk4Demod::new(u64::from(RATE), params).expect("rate");
-                let rx = feed_all(&mut demod, &scene.iq);
-                for w in rx.windows(2) {
-                    assert!(
-                        w[1].at > w[0].at,
-                        "{:?} {}: {} after {}",
-                        params.shape,
-                        scene.name,
-                        w[1].at,
-                        w[0].at
-                    );
-                }
+        let scenes = [dmr(), c4fm()]
+            .into_iter()
+            .flat_map(|p| {
+                [
+                    after_noise(Tx::new(p, 61)),
+                    after_carrier(Tx::new(p, 62), 200),
+                    after_carrier(Tx::new(p, 62), 1000),
+                    bursts(Tx::new(p, 63)),
+                    second_after_gap(Tx::new(p, 66)),
+                    bursts(Tx::new(p, 63).off(1.2, 10.0)),
+                ]
+            })
+            .chain([
+                after_noise(Tx::new(half(), 61)),
+                bursts(Tx::new(half(), 63)),
+            ]);
+        for scene in scenes {
+            let (_, rx) = decode(&scene);
+            assert!(rx[0].at >= 0.0, "{}: {}", scene.name, rx[0].at);
+            for w in rx.windows(2) {
+                assert!(
+                    w[1].at > w[0].at,
+                    "{} ({:?}): {} after {}",
+                    scene.name,
+                    scene.tx,
+                    w[1].at,
+                    w[0].at
+                );
             }
         }
     }
@@ -1174,20 +1658,21 @@ mod tests {
         let mut tx = dibits(500, 81);
         tx.extend(std::iter::repeat_n(1u8, 300));
         tx.extend(dibits(500, 82));
-        assert_decoded(|params| {
+        assert_decoded([dmr(), c4fm()].map(|params| {
             let mut iq = modulate(&tx, params, RATE);
             carrier_after(&mut iq, RATE as usize / 50);
             noise_under_unit(&mut iq, SIGNAL_SNR_DB, 83);
-            vec![Scene {
+            Scene {
                 name: "a run of 300".into(),
+                tx: Tx::new(params, 83),
                 iq,
                 sent: vec![Sent {
                     start: 0,
                     dibits: tx.clone(),
                     check: 800..1300,
                 }],
-            }]
-        });
+            }
+        }));
     }
 
     #[test]
@@ -1197,6 +1682,12 @@ mod tests {
         assert_ne!(demod.last, (0.0, 0.0));
         demod.invert(true);
         assert_eq!(demod.last, (0.0, 0.0));
+        // The same polarity again changes nothing.
+        demod.feed(&modulate(&dibits(100, 92), dmr(), RATE));
+        let last = demod.last;
+        assert_ne!(last, (0.0, 0.0));
+        demod.invert(true);
+        assert_eq!(demod.last, last);
     }
 
     #[test]

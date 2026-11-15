@@ -102,6 +102,8 @@ struct Receiver {
     demod: Fsk4Demod,
     framer: P25Framer,
     fed: u64,
+    /// The last block's start time and first sample, which a flush's units are timed by.
+    last: Option<(Timestamp, u64)>,
 }
 
 impl Receiver {
@@ -116,6 +118,7 @@ impl Receiver {
                 .map_err(|e| format!("{P25_DECODE_KIND}: {e}"))?,
             framer: P25Framer::new(),
             fed: 0,
+            last: None,
         })
     }
 
@@ -123,14 +126,29 @@ impl Receiver {
     fn feed(&mut self, block: &zeta_core::port::IqBlock) -> Vec<(u64, u16, P25Unit)> {
         let start = self.fed;
         self.fed += block.samples.len() as u64;
+        self.last = Some((block.t0, start));
         let dibits = self.demod.feed(&block.samples);
-        let units = self.framer.push(&dibits);
+        self.units(&dibits)
+    }
+
+    /// The units the front end still held when the input ended.
+    fn flush(&mut self) -> Vec<(u64, u16, P25Unit)> {
+        let dibits = self.demod.flush();
+        self.units(&dibits)
+    }
+
+    /// The units `dibits` complete, timed from the last block.
+    fn units(&mut self, dibits: &[crate::fsk4::SoftDibit]) -> Vec<(u64, u16, P25Unit)> {
+        let units = self.framer.push(dibits);
         self.demod.invert(self.framer.inverted().unwrap_or(false));
         let rate = self.demod.rate_hz;
+        let Some((t0, start)) = self.last else {
+            return Vec::new();
+        };
         units
             .into_iter()
             .map(|(at, nac, u)| {
-                let t = time_of(block.t0, at.round() as i64 - start as i64, rate);
+                let t = time_of(t0, at.round() as i64 - start as i64, rate);
                 (t, nac, u)
             })
             .collect()
@@ -572,8 +590,14 @@ impl Stage for P25DecodeStage {
                     return Ok(publish(&ctx, &events_out, last_prov.as_ref(), events));
                 }
                 None => {
-                    // The input ended mid-call: it closes at its last unit, and its speech
-                    // so far is still handed back.
+                    // The input ended: the units the front end still held (a terminator
+                    // among them, perhaps) first, then a call still open closes at its last
+                    // unit, and its speech so far is still handed back.
+                    if let (Some(r), Some(prov)) = (&mut rx, last_prov.as_ref()) {
+                        for (t, nac, unit) in r.flush() {
+                            calls.unit(t, nac, unit, prov, &mut events);
+                        }
+                    }
                     calls.interrupt(&mut events);
                     return Ok(publish(&ctx, &events_out, last_prov.as_ref(), events));
                 }
@@ -1464,6 +1488,34 @@ mod tests {
         let r = h.end(|_| true).await;
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(h.events.len(), 2, "{:?}", h.events);
+    }
+
+    #[tokio::test]
+    async fn a_call_ending_with_its_input_closes_at_its_terminator() {
+        let mbe = Mbe::installed();
+        let mut h = Harness::start(&mbe, 4096);
+        // The call, 50 ms of carrier, then its terminator, and there the input ends: no
+        // samples after it for the receive filters. The carrier puts the terminator 50 ms
+        // past the last LDU's end, where the input's end alone would close the call.
+        let dibits = encode_call(NAC, group(), clear(), 3);
+        let body = HDU_DIBITS + 6 * LDU_DIBITS;
+        let mut iq = c4fm_modulate(&dibits[..body], P25_BAUD, P25_DEVIATION_HZ, RATE as u32);
+        let last = *iq.last().unwrap();
+        let gap = RATE as usize / 20;
+        iq.extend(std::iter::repeat_n(last, gap));
+        let terminator = c4fm_modulate(&dibits[body..], P25_BAUD, P25_DEVIATION_HZ, RATE as u32);
+        iq.extend(terminator.into_iter().map(|s| s * last));
+        h.send(&iq, RATE);
+        let r = h.end(|h| h.events.len() >= 2).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(h.events.len(), 2, "{:?}", h.events);
+        let b = &h.events[1];
+        has(b, json!({"src": SRC, "eot": true, "frames": 54}));
+        let at = T0 + (body * SPD + gap) as u64 * 1_000_000_000 / RATE;
+        assert!(
+            t_ns(b).abs_diff(at) < 2_000_000,
+            "{b}: the terminator is at {at}"
+        );
     }
 
     #[tokio::test]
