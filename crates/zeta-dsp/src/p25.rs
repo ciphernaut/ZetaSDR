@@ -91,12 +91,17 @@ pub const P25_DEVIATION_HZ: f64 = 1800.0;
 /// carries P25's longest run of one dibit: its message indicator, manufacturer and key IDs
 /// are zero, and the talkgroup's high bits too for a low talkgroup (none at all for a
 /// unit-to-unit call), and the header's systematic Reed-Solomon and Golay codes keep zero
-/// data zero. Measured on the synthesised clear header (a receiver whose coast never runs
-/// out, 30 seeds each, at 15 dB and at 0.8 of the deviation and 10 dB), the most searches
-/// a proven lock coasted in a row: 20 for talkgroup 65000, 23 for talkgroup 1, 24 for a
-/// unit-to-unit call. The worst, 24, and a stretch's 4 searches more at each end, where
-/// noise tips a stretch of 18 or 19 on the level over: 32.
-pub const P25_COAST_SEARCHES: u32 = 32;
+/// data zero. Measured on the synthesised clear calls (a receiver whose coast never runs
+/// out, 100 seeds each at 0.8 of the deviation and 10 dB, the 15 dB figures no higher):
+/// - the most searches a proven lock coasted in a row: 20 for talkgroup 65000, 23 for
+///   talkgroup 1, 24 for a unit-to-unit call;
+/// - the most a lock on probation coasted in all (its budget runs over the whole
+///   probation): 26, 27 and 30.
+///
+/// The bound is the larger of the proven worst and a stretch's 4 searches more at each
+/// end, where noise tips a stretch of 18 or 19 on the level over (24 + 8 = 32), and the
+/// probation worst and one stretch more (30 + 4 = 34): 34.
+pub const P25_COAST_SEARCHES: u32 = 34;
 /// The 48-bit frame sync, first bit first from bit 47.
 pub const P25_SYNC: u64 = 0x5575_F5FF_77FF;
 /// The algorithm ID of clear (unencrypted) speech.
@@ -527,9 +532,10 @@ pub(crate) fn encode_call_lc(
 }
 
 /// A control channel: `units` trunking signalling units of three blocks. Each unit's
-/// blocks carry pseudo-random bits ([`control_fill`]), not trellis coded or interleaved,
-/// so they decode as no valid block: they stand for the unit's length, and for a real
-/// channel's coded signalling in carrying no long run of one dibit (null bits would).
+/// blocks carry pseudo-random bits ([`control_fill`]), not a valid trellis-coded,
+/// interleaved block (nothing here parses trunking blocks; [`P25Framer`] counts the unit):
+/// they stand for the unit's length, and for a real channel's coded signalling in carrying
+/// no long run of one dibit (null bits would).
 pub fn encode_control(nac: u16, units: u32) -> Vec<u8> {
     (0..units)
         .flat_map(|unit| {

@@ -276,7 +276,7 @@ pub const PENDING_SYMBOLS: usize = 96;
 /// It is 200 symbols: 42 ms at 4800 baud, 83 ms at 2400. A receiver holds one search's
 /// symbols more for each search its mode lets a lock on probation coast
 /// ([`Fsk4Params::coast_searches`]), so that the guarantee covers a coasted probation:
-/// 456 symbols (95 ms) for P25's 32, 296 (62 ms) for DMR's 12.
+/// 472 symbols (98 ms) for P25's 34, 296 (62 ms) for DMR's 12.
 pub const HELD_MAX: usize = 2 * PENDING_SYMBOLS + SEARCH_EVERY;
 // A lock re-slices from the last symbol given out to where the receiver had got, which can
 // be one search past `PENDING_SYMBOLS`: hence the margin.
@@ -2723,21 +2723,35 @@ mod tests {
         // At 0.8 of the deviation and 10 dB, over 30 calls per header (seeds 8000 on),
         // each held to its measured figure with one call of margin. Failed by the header's
         // run (a coast that ran out, or a lock found false on one level's share, inside the
-        // call): 1, 2 and 1, all false on share after weak evidence, none a coast run out
-        // (with a coast of 28, one unit-to-unit call ran out). Not keeping exactly one lock
-        // in all: 7, 7 and 8, the rest a stretch's eye closing past HOLD_CLOSURE mid-call
-        // or a false lock at the start.
+        // call): 1, 2 and 1, all false on share after weak evidence. Not keeping exactly
+        // one lock in all: 7, 7 and 8, the rest a stretch's eye closing past HOLD_CLOSURE
+        // mid-call or a false lock at the start. No coast ran out (with a coast of 28, one
+        // unit-to-unit call's did): none may, and the coasts the sweep needed must leave
+        // P25_COAST_SEARCHES its margins (8 over a proven lock's, 4 over a probation's).
         for ((name, call), (by_run, not_one)) in
             clear_p25_calls().into_iter().zip([(1, 7), (2, 7), (1, 8)])
         {
-            let (mut run_failed, mut not_kept) = (0, 0);
+            let (mut run_failed, mut not_kept, mut ran_out) = (0, 0, 0);
+            let (mut proven, mut on_probation) = (0, 0);
             for seed in 0..30 {
                 let tx = Tx::new(c4fm(), 8000 + seed).off(0.8, 10.0);
                 let (scene, end) = after_200_ms_of_noise(name, tx, call.clone());
                 let (before, after, paths, _) = counted(&scene, end);
                 run_failed += u32::from(paths.coasts_ended > 0 || paths.false_on_share > 0);
                 not_kept += u32::from(!one_lock(before, after));
+                ran_out += paths.coasts_ended;
+                proven = proven.max(paths.most_coasted_proven);
+                on_probation = on_probation.max(paths.most_coasted_on_probation);
             }
+            assert_eq!(ran_out, 0, "{name}: coasts ran out");
+            assert!(
+                proven + 8 <= P25_COAST_SEARCHES,
+                "{name}: a proven lock coasted {proven}"
+            );
+            assert!(
+                on_probation + 4 <= P25_COAST_SEARCHES,
+                "{name}: a lock on probation coasted {on_probation}"
+            );
             assert!(
                 run_failed <= by_run + 1,
                 "{name}: {run_failed} of 30 failed by the run, {by_run} measured"
