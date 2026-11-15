@@ -454,22 +454,33 @@ fn decode_unit(duid: u8, bits: &[u8], nid_errors: u32) -> P25Unit {
 /// with link control. The voice frames carry one fixed payload (`VOICE_PAYLOAD`); the
 /// message indicator is zero.
 pub fn encode_call(nac: u16, lc: LinkControl, enc: EncSync, superframes: u32) -> Vec<u8> {
-    encode_call_lc(nac, lc, enc, superframes, false)
+    encode_call_lc(nac, lc, enc, superframes, LcMark::ByAlgorithm)
 }
 
-/// [`encode_call`], the link control's format marked protected when `lc_encrypted` (as a
-/// radio that encrypts its link control sends it; the word itself is left as it is, which
-/// nothing here could tell from a key stream).
+/// How [`encode_call_lc`] marks the link control's encryption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LcMark {
+    /// The service options' protected bit when the algorithm is not clear
+    /// ([`encode_call`]'s way).
+    ByAlgorithm,
+    /// No mark, whatever the algorithm (a radio that does not set it).
+    Unmarked,
+    /// The format's protected bit, as a radio that encrypts its link control sends it (the
+    /// word itself is left as it is, which nothing here could tell from a key stream).
+    Encrypted,
+}
+
+/// [`encode_call`], the link control's encryption marked as `mark` says.
 pub(crate) fn encode_call_lc(
     nac: u16,
     lc: LinkControl,
     enc: EncSync,
     superframes: u32,
-    lc_encrypted: bool,
+    mark: LcMark,
 ) -> Vec<u8> {
-    let protected = enc.algid != P25_ALGID_CLEAR;
-    let mut word = lc_word(&lc, protected);
-    if lc_encrypted {
+    let by_algorithm = enc.algid != P25_ALGID_CLEAR;
+    let mut word = lc_word(&lc, by_algorithm && mark != LcMark::Unmarked);
+    if mark == LcMark::Encrypted {
         word |= u128::from(LCF_PROTECTED) << 64;
     }
     let lc_hex = RS_LC.encode(&hexbits(word, LC_HEXBITS));
@@ -1544,17 +1555,18 @@ mod tests {
             kid: 0,
         };
         let hdu = 396;
-        for (enc, lc_encrypted, want_lc, want) in [
-            (clear, false, Some(group()), false),
-            (aes, false, Some(group()), true),
-            (aes, true, None, true),
+        for (enc, mark, want_lc, want) in [
+            (clear, LcMark::ByAlgorithm, Some(group()), false),
+            (aes, LcMark::ByAlgorithm, Some(group()), true),
+            (aes, LcMark::Unmarked, Some(group()), false),
+            (aes, LcMark::Encrypted, None, true),
         ] {
-            let call = encode_call_lc(NAC, group(), enc, 1, lc_encrypted);
+            let call = encode_call_lc(NAC, group(), enc, 1, mark);
             let units = P25Framer::new().push(&soft(&call[hdu..hdu + LDU_DIBITS]));
             let (_, _, P25Unit::Ldu1 { lc, protected, .. }) = &units[0] else {
                 panic!("{:?}", units[0]);
             };
-            assert_eq!((*lc, *protected), (want_lc, want), "{enc:?} {lc_encrypted}");
+            assert_eq!((*lc, *protected), (want_lc, want), "{enc:?} {mark:?}");
         }
         // A link control that does not decode says nothing.
         let call = encode_call(NAC, group(), aes, 1);
