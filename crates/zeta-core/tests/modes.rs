@@ -21,7 +21,7 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 15] = [
+const EMBEDDED: [&str; 16] = [
     "acars_decode",
     "adsb_decode",
     "ais_decode",
@@ -32,6 +32,7 @@ const EMBEDDED: [&str; 15] = [
     "hfdl_decode",
     "m17_decode",
     "m20_decode",
+    "p25_decode",
     "pocsag_decode",
     "rds_decode",
     "rs41_decode",
@@ -534,7 +535,7 @@ fn flex_ais_and_aprs_are_tried_only_where_they_live() {
 }
 
 #[test]
-fn only_the_pager_rows_are_restricted() {
+fn only_the_pager_and_digital_voice_rows_are_restricted() {
     let reg = ModeRegistry::load(&stages(), None);
     let restricted: Vec<&str> = reg
         .all()
@@ -542,7 +543,7 @@ fn only_the_pager_rows_are_restricted() {
         .filter(|m| m.row.access == Some(Access::Restricted))
         .map(|m| m.row.id.0.as_str())
         .collect();
-    assert_eq!(restricted, ["flex_decode", "pocsag_decode"]);
+    assert_eq!(restricted, ["flex_decode", "p25_decode", "pocsag_decode"]);
 }
 
 #[test]
@@ -1001,8 +1002,8 @@ fn every_embedded_row_emits_events_today() {
     let reg = ModeRegistry::load(&stages(), None);
     for m in reg.all() {
         let want: &[StreamKind] = match m.row.id.0.as_str() {
-            // M17's speech is ordinary job audio beside its events.
-            "m17_decode" => &[StreamKind::Event, StreamKind::Audio],
+            // M17's and P25's speech is ordinary job audio beside their events.
+            "m17_decode" | "p25_decode" => &[StreamKind::Event, StreamKind::Audio],
             // Video is its own stream kind, the fields and the lock events beside it.
             "video_decode" => &[StreamKind::Video, StreamKind::Event],
             _ => &[StreamKind::Event],

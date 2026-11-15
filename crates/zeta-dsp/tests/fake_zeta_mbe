@@ -1,0 +1,24 @@
+#!/bin/sh
+# A stand-in for `zeta-mbe imbe7200x4400` in the p25_decode stage's tests: for every
+# 184-byte IMBE frame on stdin it writes 160 silent 16-bit samples (320 zero bytes) to
+# stdout. The tests run it through a link in a temporary directory, so "$0" is that link:
+# each run appends `start` to "$0.log", and `eof` when its input ends (it then exits 0).
+# When "$0.die" exists, this run removes it and exits 1 after 10 frames. The stage
+# starts it with an empty environment, so the PATH is its own.
+PATH=/usr/bin:/bin
+echo start >> "$0.log"
+left=-1
+if [ -e "$0.die" ]; then
+    rm -f "$0.die"
+    left=10
+fi
+while [ "$left" -ne 0 ]; do
+    n=$(dd bs=184 count=1 iflag=fullblock 2>/dev/null | wc -c)
+    if [ "$n" -eq 0 ]; then
+        echo eof >> "$0.log"
+        exit 0
+    fi
+    head -c 320 /dev/zero
+    left=$((left - 1))
+done
+exit 1

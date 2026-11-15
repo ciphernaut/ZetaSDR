@@ -2985,6 +2985,7 @@ fn modes_list_prints_the_embedded_rows() {
             "hfdl_decode",
             "m17_decode",
             "m20_decode",
+            "p25_decode",
             "pocsag_decode",
             "rds_decode",
             "rs41_decode",

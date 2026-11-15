@@ -196,12 +196,8 @@ const ES_HEXBITS: usize = 16;
 const HEADER_HEXBITS: usize = 20;
 const HEXBIT_MASK: u8 = 0x3F;
 
-/// Whether a group or a unit-to-unit call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Call {
-    Group,
-    Private,
-}
+/// Whether a group or a unit-to-unit call (shared with the other voice stages).
+pub use crate::voice_call::Call;
 
 /// A voice call's link control: who is calling whom. `dst` is the talkgroup (16 bits)
 /// of a group call or the called radio (24 bits) of a private one; `src` the calling

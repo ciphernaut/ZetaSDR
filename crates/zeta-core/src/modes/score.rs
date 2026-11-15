@@ -238,9 +238,13 @@ mod tests {
             &|_| 0.0,
             &|_| 0.0,
         ));
-        assert_eq!(got[0].0, "aprs_decode");
+        // P25's empty centre list scores anywhere: it ties APRS, and its family (two_way)
+        // sorts it first.
+        assert_eq!(got[0].0, "p25_decode");
         assert!((got[0].1 - 1.0).abs() < 1e-6, "{got:?}");
-        assert!(got[0].2, "{got:?}");
+        assert_eq!(got[1].0, "aprs_decode");
+        assert!((got[1].1 - 1.0).abs() < 1e-6, "{got:?}");
+        assert!(got[1].2, "{got:?}");
         // POCSAG: bandwidth and modulation, not the centre.
         let pocsag = got.iter().find(|g| g.0 == "pocsag_decode").unwrap();
         assert!((pocsag.1 - 0.6).abs() < 1e-6, "{got:?}");
@@ -371,10 +375,10 @@ mod tests {
     #[test]
     fn equal_scores_order_by_family_then_id() {
         let modes = registry();
-        // Nothing matches but the empty centre lists of video, rds and m17.
+        // Nothing matches but the empty centre lists of video, rds, p25 and m17.
         let got = ids(&score_rows(&modes, 1, 1, "noise", &|_| 0.0, &|_| 0.0));
         let order: Vec<&str> = got.iter().map(|g| g.0.as_str()).collect();
-        // video, rds and m17 at 0.4 (tv, broadcast, then amateur_voice); then at 0 rs41 (priority 1),
+        // video, rds, p25 and m17 at 0.4 (tv, broadcast, two_way, then amateur_voice); then at 0 rs41 (priority 1),
         // then tv (dvbt, outside its range), aviation (acars, adsb, hfdl, vdl2), maritime (ais),
         // pagers (flex, pocsag), weather_science (dfm, m20), amateur_digital.
         assert_eq!(
@@ -382,6 +386,7 @@ mod tests {
             [
                 "video_decode",
                 "rds_decode",
+                "p25_decode",
                 "m17_decode",
                 "rs41_decode",
                 "dvbt_decode",

@@ -25,6 +25,8 @@ const NO_MULTIMON: (&str, &str) = (
 );
 /// The M17 row's vocoder, pinned to a path none lives at, whatever the host has.
 const NO_C2DEC: (&str, &str) = ("ZETA_HANDLER_C2DEC", "/nonexistent/zeta-test/c2dec");
+/// The P25 row's vocoder, pinned to a path none lives at: its check runs without it.
+const NO_ZETA_MBE: (&str, &str) = ("ZETA_HANDLER_ZETA_MBE", "/nonexistent/zeta-test/zeta-mbe");
 const NO_AIRCRAFT_LINKS: [(&str, &str); 2] = [
     ("ZETA_HANDLER_DUMPVDL2", "/nonexistent/zeta-test/dumpvdl2"),
     ("ZETA_HANDLER_DUMPHFDL", "/nonexistent/zeta-test/dumphfdl"),
@@ -32,7 +34,7 @@ const NO_AIRCRAFT_LINKS: [(&str, &str); 2] = [
 
 /// `zeta --state-dir <dir>/state --modes-dir <dir>/modes modes check <args>` with no
 /// remote node, no operator rows but the test's own, and dump1090, the sonde decoders,
-/// dumpvdl2 and dumphfdl missing.
+/// dumpvdl2, dumphfdl, multimon-ng, c2dec and zeta-mbe missing.
 fn check(dir: &Path, args: &[&str]) -> Command {
     let modes = dir.join("modes");
     std::fs::create_dir_all(&modes).unwrap();
@@ -47,6 +49,7 @@ fn check(dir: &Path, args: &[&str]) -> Command {
         .envs(NO_AIRCRAFT_LINKS)
         .env(NO_MULTIMON.0, NO_MULTIMON.1)
         .env(NO_C2DEC.0, NO_C2DEC.1)
+        .env(NO_ZETA_MBE.0, NO_ZETA_MBE.1)
         .arg("--state-dir")
         .arg(dir.join("state"))
         .arg("--modes-dir")
@@ -72,6 +75,8 @@ fn modes_check_passes_the_in_crate_rows() {
         "acars_decode",
         "ais_decode",
         "aprs_decode",
+        // Its vocoder is optional and pinned missing here: the calls are decoded silent.
+        "p25_decode",
         "pocsag_decode",
         "rds_decode",
     ] {
@@ -133,7 +138,7 @@ fn an_unknown_id_lists_the_known_ones() {
     assert!(
         err.contains(
             "unknown mode nope (known: acars_decode, adsb_decode, ais_decode, aprs_decode, \
-             dfm_decode, dvbt_decode, flex_decode, hfdl_decode, m17_decode, m20_decode, pocsag_decode, rds_decode, \
+             dfm_decode, dvbt_decode, flex_decode, hfdl_decode, m17_decode, m20_decode, p25_decode, pocsag_decode, rds_decode, \
              rs41_decode, vdl2_decode"
         ),
         "{err}"

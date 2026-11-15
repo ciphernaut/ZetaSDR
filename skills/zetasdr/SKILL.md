@@ -180,7 +180,7 @@ How wide the source's capture is when a job or a set tunes it free. `fit` (the d
 
 ### job_start
 
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|dvbt_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|rs41_decode|vdl2_decode|video_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|dvbt_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|p25_decode|rs41_decode|vdl2_decode|video_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - source: string; an id from `source list`
 - center_hz: integer (Hz)
 - bandwidth_hz: integer (Hz)
@@ -204,7 +204,7 @@ CLI: `zeta job start --kind passthrough --source <id> --center-hz 144800000 --ba
 
 Attach a job of an attachable `kind` (`transcribe`) to the running job `job`, a job whose kind emits audio: the voice demodulators and any mode row whose `outputs` lists `audio`. It reads that job's audio output stream (the last one in its graph order when it has several; audio passed between two of its stages does not count) instead of the radio, holds no lease, copies the job's `source` and `tuning`, and records it as its `input`. It follows its input through a `job_retune` or a `graph_put` restart: it is relaunched under its own id on the input's new stream once the input runs again (`failed` with the reason when it cannot be). It ends `stopped` when the input job stops or fails for its own reason. On a node restart it resumes after its input, or is `failed` with `input job <id> not running` when the input does not run.
 
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|dvbt_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|rs41_decode|vdl2_decode|video_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|dvbt_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|p25_decode|rs41_decode|vdl2_decode|video_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - job: string; an id from `job list`
 - language: string or null
 
@@ -391,7 +391,7 @@ Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or o
 
 - plan: string; an id from `channel_plans`
 - channels: array or null; channel numbers of the plan (integers), `null` for all
-- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|dvbt_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|rs41_decode|vdl2_decode|video_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
+- kind: string (JobKind: passthrough|spectrum|fm_demod|wfm_demod|am_demod|ssb_demod|aprs_decode|pocsag_decode|rds_decode|acars_decode|adsb_decode|measure|scan|identify|watch|transcribe|mix|capture|ais_decode|dfm_decode|dvbt_decode|flex_decode|hfdl_decode|m17_decode|m20_decode|p25_decode|rs41_decode|vdl2_decode|video_decode; the built-in kinds and the embedded mode rows, a node's own `schema` adds its operator rows)
 - source: string; an id from `source list`
 - deviation_hz: integer or null (Hz)
 - sideband: string or null
@@ -880,6 +880,11 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - outputs: audio
 - params.symbol_rate_baud: integer
 
+### p25_decode
+
+- inputs: iq
+- outputs: event, audio
+
 ### passthrough
 
 - inputs: iq, audio, video, text, event, sink
@@ -995,6 +1000,7 @@ The built-in decoder rows with notes (`modes_show` has every row in full; an ope
 - `hfdl_decode`: HFDL (PSK on a 1440 Hz subcarrier, 300-1800 bit/s) between airliners and ground stations at 2.8-22.1 MHz, decoded by dumphfdl, typically on a KiwiSDR's 12 kHz band. Start the job with center_hz on the listed (dial) frequency: the signal sits 1.44 kHz above it, inside the 6 kHz band. Take the frequencies from a list (dumphfdl's system table, or the operator's own), not a raster; they change with the hour. Each ground station sends a squitter every 32 s, so a squitter (pdu absent, gs_id set) within a minute proves the channel even when no aircraft is heard. An aircraft is keyed on its ICAO address once dumphfdl has heard its logon. src_type is the LPDU's source as dumphfdl prints it, Aircraft or Ground station. Without a structured pos, an Aircraft frame whose ACARS text is a position report (labels H1, 80, 16, 3L, QQ) carries lat, lon and a position (no altitude): the aircraft's own report, typically a few minutes old by the time it is relayed; a ground station's uplinks are never parsed. Neither dumpvdl2 nor dumphfdl is in Debian or Ubuntu: the OpenWebRX+ apt repository packages dumpvdl2, dumphfdl and libacars2, and both build from source in a few minutes (libacars first).
 - `m17_decode`: M17 (4FSK, 4800 baud, Codec 2) on any 2 m or 70 cm simplex or repeater channel, 12500 Hz band; start it on the measured centre. Its audio is ordinary job audio: listen to it or attach transcribe. Encrypted streams are reported, not decoded. It needs c2dec (package codec2) on the node's host.
 - `m20_decode`: Meteomodem M20 radiosondes anywhere in 400.05-406 MHz; start the job on the measured centre. One job decodes one sonde. m20mod 1.8.1 (sonde-decoders) takes --json only: it has no --ecc or --crc (an unknown option is read as the input file, error: open).
+- `p25_decode`: P25 phase 1 digital voice (C4FM, 4800 baud, IMBE) on any 12500 Hz channel; start it on the measured centre. Each call gives two events, one when its link control is in hand (at its header, or within a superframe when the job joins mid-call) and one at its end (`eot`), naming the calling radio (`src`), the talkgroup or called radio (`dst`), the network access code (`nac`) and the call type; a control channel gives one `type: channel` event instead. Its audio is ordinary job audio: listen to it or attach transcribe. The speech needs zeta-mbe, which the operator builds with `bash tools/install-vocoders.sh` from a source checkout; without it the calls are still reported with `audio: false` and `silent: no_vocoder`, and `job_context.p25.vocoder` says how to install it. Encrypted calls are reported (`silent: encrypted`), never decoded.
 - `rs41_decode`: Vaisala RS41 radiosondes (GFSK, 4800 baud, one frame a second) anywhere in 400.05-406 MHz; the frequency varies by flight, so start the job on the measured centre, not a raster. One job decodes one sonde.
 - `vdl2_decode`: VDL Mode 2 (D8PSK, 10.5 kbaud) in 25 kHz channels at 136.725-136.975 MHz, decoded by dumpvdl2; every AVLC frame is an event keyed on its source address, and an ADS-C report riding an ACARS downlink carries the aircraft's position. Without one, an aircraft frame whose ACARS text is a position report (labels H1, 80, 16, 3L, QQ) carries lat, lon, sometimes alt_ft, and a position: the aircraft's own report, typically a few minutes old by the time it is relayed; a ground station's uplinks are never parsed. A ground station gets its own row, whose ACARS columns name the aircraft of each uplink. Beside ACARS on one radio the order matters, because a running capture cannot widen: pin the radio at 133 500 000 Hz with 8 000 000 Hz first, then start the ACARS plan, then the VDL2 job (136 975 000 Hz, 25 000 Hz); started the other way round, VDL2 is a conflict naming the ACARS jobs. Neither dumpvdl2 nor dumphfdl is in Debian or Ubuntu: the OpenWebRX+ apt repository packages dumpvdl2, dumphfdl and libacars2, and both build from source in a few minutes (libacars first). A ground station's frames, and the aircraft frames addressed to it (`dst`), light the register's transmitter sites on the channel as `heard`; `job_context.stations` counts them.
 - `video_decode`: Analog FM video (FPV, reverse cameras, analog HDMI senders): luma only; sync negative; a digital link (OFDM, no line structure) never locks and is reported as not yet decodable.

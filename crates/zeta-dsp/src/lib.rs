@@ -52,6 +52,7 @@ pub mod nbfm;
 pub mod offline;
 pub mod ook;
 pub mod p25;
+pub mod p25_decode;
 pub mod parsers;
 pub mod pfb;
 pub mod pocsag;
@@ -66,6 +67,7 @@ pub mod util;
 pub mod vad;
 pub mod video_fm;
 pub mod vocoder;
+pub mod voice_call;
 pub mod wfm;
 pub mod worker;
 
@@ -94,6 +96,7 @@ pub fn register_all(reg: &mut zeta_core::stage::StageRegistry) {
     reg.register(Arc::new(rds::RdsDecodeStage::new()));
     reg.register(Arc::new(acars::AcarsDecodeStage::new()));
     reg.register(Arc::new(m17_decode::M17DecodeStage::new()));
+    reg.register(Arc::new(p25_decode::P25DecodeStage::new()));
     reg.register(Arc::new(measure::MeasureStage::new()));
     reg.register(Arc::new(detect::DetectStage::new()));
     reg.register(Arc::new(burst_capture::BurstCaptureStage::new()));

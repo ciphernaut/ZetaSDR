@@ -1,0 +1,106 @@
+{
+  "id": "p25_decode",
+  "name": "P25 phase 1 digital voice",
+  "family": "two_way",
+  "band": {
+    "bandwidth_hz": 12500,
+    "centers_hz": [],
+    "min_hz": null,
+    "range_hz": null
+  },
+  "modulation": ["fsk", "fm"],
+  "label": "P25",
+  "protocol": "p25",
+  "decoder": {
+    "kind": "graph",
+    "nodes": [
+      {
+        "id": "channel",
+        "kind": "channel",
+        "params": {
+          "center_hz": "$center_hz",
+          "bandwidth_hz": "$bandwidth_hz",
+          "out_rate_hz": "$out_rate_hz"
+        }
+      },
+      {
+        "id": "decode",
+        "kind": "p25_decode",
+        "params": {}
+      }
+    ],
+    "edges": [
+      { "from": "channel", "to": "decode", "kind": "iq" }
+    ],
+    "handlers": [
+      {
+        "programs": ["zeta-mbe"],
+        "optional": true,
+        "install": { "script": "tools/install-vocoders.sh", "url": "https://github.com/arancormonk/mbelib-neo" }
+      }
+    ]
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "type": { "type": "string", "enum": ["call", "channel"] },
+        "nac": { "type": "integer" },
+        "src": { "type": "integer" },
+        "dst": { "type": "integer" },
+        "call": { "type": "string", "enum": ["group", "private"] },
+        "encrypted": { "type": "boolean" },
+        "emergency": { "type": "boolean" },
+        "audio": { "type": "boolean" },
+        "silent": { "type": ["string", "null"], "enum": ["no_vocoder", "encrypted", "vocoder_failed", null] },
+        "stream": { "type": ["string", "null"] },
+        "program": { "type": "boolean" },
+        "frames": { "type": "integer" },
+        "errors": { "type": "integer" },
+        "eot": { "type": "boolean" },
+        "mfid": { "type": "integer" },
+        "algid": { "type": "integer" },
+        "kid": { "type": "integer" },
+        "control": { "type": "boolean" }
+      }
+    },
+    "summary": "{src} > {dst}: {call} {silent?}"
+  },
+  "position": null,
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 2000,
+    "min_span_ms": 0,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": ["project-25-p25"],
+  "access": "restricted",
+  "subject": {
+    "key": "src",
+    "name": "radios",
+    "waterfall": "fold",
+    "columns": [
+      { "field": "dst", "label": "Destination", "unit": null },
+      { "field": "call", "label": "Call", "unit": null },
+      { "field": "nac", "label": "NAC", "unit": null },
+      { "field": "encrypted", "label": "Encrypted", "unit": null },
+      { "field": "silent", "label": "Silent", "unit": null }
+    ],
+    "heading": null,
+    "label": null
+  },
+  "notes": "P25 phase 1 digital voice (C4FM, 4800 baud, IMBE) on any 12500 Hz channel; start it on the measured centre. Each call gives two events, one when its link control is in hand (at its header, or within a superframe when the job joins mid-call) and one at its end (`eot`), naming the calling radio (`src`), the talkgroup or called radio (`dst`), the network access code (`nac`) and the call type; a control channel gives one `type: channel` event instead. Its audio is ordinary job audio: listen to it or attach transcribe. The speech needs zeta-mbe, which the operator builds with `bash tools/install-vocoders.sh` from a source checkout; without it the calls are still reported with `audio: false` and `silent: no_vocoder`, and `job_context.p25.vocoder` says how to install it. Encrypted calls are reported (`silent: encrypted`), never decoded.",
+  "test": {
+    "kind": "synth",
+    "family": "p25",
+    "nac": 291,
+    "src": 9990001,
+    "dst": 65000,
+    "superframes": 3,
+    "expect": { "src": 9990001, "dst": 65000, "nac": 291 },
+    "within_ms": 5000
+  }
+}

@@ -189,8 +189,9 @@ impl Vocoder {
                     Err(e) => format!("{name} exited: {e}"),
                 }
             };
-            ctx.note(serde_json::json!({ context: {"vocoder": why} }));
+            // Not alive before the note: a stage that has seen the note sees the exit.
             live.store(false, Ordering::SeqCst);
+            ctx.note(serde_json::json!({ context: {"vocoder": why} }));
         });
         Ok(Self {
             feeds: Some(feeds),
