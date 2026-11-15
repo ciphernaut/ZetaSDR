@@ -1599,6 +1599,11 @@ mod tests {
                 symbol_rate_baud: P25_BAUD,
                 deviation_hz: P25_DEVIATION_HZ,
                 shape: Shape::C4fm,
+                // The longest run of one dibit P25 sends is a clear call's header: its zero
+                // message indicator, manufacturer and key IDs code to 117 dibits of 00,
+                // which fill 20 searches' stretches in a row; a stretch's 4 searches more
+                // at each end, where noise tips a stretch of 18 or 19 on the level over.
+                coast_searches: 28,
             },
         )
         .expect("rate")

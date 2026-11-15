@@ -2732,6 +2732,12 @@ mod tests {
                     shape: Shape::Rrc {
                         alpha: DMR_RRC_ALPHA,
                     },
+                    // The longest run of one dibit DMR sends is a voice burst's 48-bit
+                    // centre, the EMB and a null embedded field at colour code 0: 24
+                    // dibits, filling 4 searches' stretches in a row; a stretch's 4
+                    // searches more at each end, where noise tips a stretch of 18 or 19 on
+                    // the level over.
+                    coast_searches: 12,
                 },
             )
             .expect("rate");

@@ -129,6 +129,11 @@ impl Receiver {
             symbol_rate_baud: P25_BAUD,
             deviation_hz: P25_DEVIATION_HZ,
             shape: Shape::C4fm,
+            // The longest run of one dibit P25 sends is a clear call's header: its zero
+            // message indicator, manufacturer and key IDs code to 117 dibits of 00, which
+            // fill 20 searches' stretches in a row; a stretch's 4 searches more at each
+            // end, where noise tips a stretch of 18 or 19 on the level over.
+            coast_searches: 28,
         };
         Ok(Self {
             demod: Fsk4Demod::new(rate_hz, params)
@@ -1834,6 +1839,10 @@ mod tests {
             assert!(c[k].is_u64(), "{k}: {c}");
         }
         assert_eq!(c["off_deviation"], 0, "{c}");
+        // The clear call's header run does not drop or undo its lock: none false, and the
+        // one loss is the call's end, read after the input ends.
+        assert_eq!(c["losses"], 1, "{c}");
+        assert_eq!(c["false_locks"], 0, "{c}");
         // A transmitter at well under a third of P25's deviation: refused, and counted.
         let mut h = Harness::start(&mbe, 4096);
         let dibits = encode_call(NAC, group(), clear(), 2);
