@@ -65,6 +65,15 @@
 //!   of the declared deviation; noise fits at 1.15 to 2.1, whatever its power) the eye
 //!   must be far more open or the contrast far higher. So a transmitter well off its
 //!   declared deviation is still taken: 0.6 to 2.0 of it at 15 dB.
+//! - **One level's share.** A stretch with more than [`SIGNAL_SHARE`] of its 32 symbols
+//!   on one level (that is, 20 or more) is refused, for acquiring and for holding alike. A
+//!   carrier, or a stretch mostly carrier, sits on one level, and a fit can then put that
+//!   level anywhere: the limit is what keeps a carrier from being taken for a signal.
+//!   Random data puts about 8 of 32 on each level and rarely more than 15 on one; the
+//!   48-bit syncs of P25 and DMR put 12 or 13 of their 24 on one level. A transmission
+//!   whose stretches are mostly one symbol (a long run of one dibit, or the synthesised
+//!   all-zero DMR voice burst, 100 of its 132 at +1) is not acquired, and a lock that
+//!   meets such a stretch is lost.
 //! - A fit with an amplitude outside [`SIGNAL_AMPLITUDE`] is not taken but counted
 //!   ([`Fsk4Counters::off_deviation`]), so a stage can say why a signal is not decoded.
 //! - A full search's fit must also explain the next search's stretch, since a stretch
@@ -77,11 +86,12 @@
 //!   on weak (what noise can rarely pass for). A stretch that does not hold ends it at
 //!   once; otherwise it is judged on its mean evidence over the probation, as a weak
 //!   signal's scatters from stretch to stretch. A strong lock whose mean is weak serves a
-//!   weak lock's probation instead of being called false. On probation it may be refitted
-//!   at any phase, on strong evidence only.
+//!   weak lock's probation instead of being called false. It may be refitted on strong
+//!   evidence only: at any phase on probation, at the tracked phase after.
 //! - Once proven, the lock's levels are fitted again over all its own symbols and every
 //!   held symbol is sliced again on them: levels from one 32-symbol stretch, at 10 dB,
-//!   sit a tenth of a decision distance off.
+//!   sit a tenth of a decision distance off. (If the proving search's own best fit
+//!   corrects the levels instead, that fit slices them, and this refit is not made.)
 //! - A taken phase is refined between the 16 searched ones, from the closures either side.
 //! - [`Fsk4Demod::flush`] gives out whatever is still held when the input ends; it is
 //!   final.
@@ -182,9 +192,9 @@ pub const HOLD_DRIFT: f64 = 0.2;
 /// from a level to its threshold. Noise alone, fitted, shows 0.017 to 0.04, so this alone
 /// does not tell them apart.
 pub const ACQUIRE_CLOSURE: f64 = 1.0 / 36.0;
-/// The largest share of a stretch's symbols one level may take in a signal. A carrier
-/// sits on one level, and a stretch mostly carrier nearly so; random data puts at most
-/// about half its 32 symbols on one level, a 48-bit sync of outer symbols 54 %.
+/// The largest share of a stretch's symbols one level may take in a signal: 19 of 32.
+/// A carrier sits on one level, and a stretch mostly carrier nearly so; random data puts
+/// at most about half its 32 symbols on one level, a 48-bit sync of outer symbols 54 %.
 pub const SIGNAL_SHARE: f64 = 0.6;
 /// The outer amplitude a new signal may show, in declared outer deviations: a stretch
 /// with a signal's eye outside it is counted ([`Fsk4Counters::off_deviation`]), not taken.
@@ -222,9 +232,23 @@ pub const PENDING_SYMBOLS: usize = 96;
 /// sliced them, older ones than its stretch included. And when a second lock is taken
 /// before the first's held symbols are out (two on probation in a row), more than this
 /// may be held, and the oldest then go out as they stand.
-pub const HELD_MAX: usize = 2 * PENDING_SYMBOLS;
-const _: () =
-    assert!(PENDING_SYMBOLS + (WEAK_PROBATION + FULL_SEARCH_AFTER) * SEARCH_EVERY <= HELD_MAX);
+///
+/// The way this loses a signal: a burst whose lock never proves (weak, or too short for
+/// its probation: a lone 72-symbol P25 terminator cannot serve [`WEAK_PROBATION`]) is
+/// held whole, and a noise lock taken before it is out, with no real lock after, gives
+/// it out on noise's levels. Measured over 200 lone bursts each, after and before 200 ms
+/// of noise: none lost at 15 dB at the declared deviation or 0.8 of it; at 10 dB none at
+/// the declared deviation, and at 0.8 of it 0 to 1 % of 132-symbol bursts and 5 to 8 %
+/// of 72-symbol ones.
+///
+/// It is 200 symbols: 42 ms at 4800 baud, 83 ms at 2400.
+pub const HELD_MAX: usize = 2 * PENDING_SYMBOLS + SEARCH_EVERY;
+// A lock re-slices from the last symbol given out to where the receiver had got, which can
+// be one search past `PENDING_SYMBOLS`: hence the margin.
+const _: () = assert!(
+    PENDING_SYMBOLS + SEARCH_EVERY + (WEAK_PROBATION + FULL_SEARCH_AFTER) * SEARCH_EVERY
+        <= HELD_MAX
+);
 
 /// The receive filter: matched to the transmitter's pulse.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -336,6 +360,30 @@ pub struct Fsk4Demod {
     /// The last symbol's sample (outer levels at ±1) and decided level, for the timing.
     last: (f64, f64),
     counters: Fsk4Counters,
+    /// Which of the acquisition's transitions were taken, for the tests.
+    #[cfg(test)]
+    paths: std::cell::Cell<Paths>,
+}
+
+/// How often each of the acquisition's rarer transitions was taken.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Paths {
+    /// A strong lock whose mean evidence was weak, demoted to a weak lock's probation.
+    demoted: u32,
+    /// Locks taken in the search that found the last one false.
+    relocked: u32,
+    /// Locks taken in the searches after a false lock while every symbol is held.
+    in_grace: u32,
+    /// Refits on probation that closed the eye far better but only weakly: refused.
+    weak_refit_refused: u32,
+    /// Fits at proving that closed the eye better but moved the levels too far: refused.
+    proven_refit_refused: u32,
+    /// Fits in `settle` that moved the levels too far: refused.
+    settle_refused: u32,
+    /// Proving refits taken, and `settle`s run.
+    proven_refits: u32,
+    settles: u32,
 }
 
 /// A stretch of symbol samples against a set of levels.
@@ -496,12 +544,17 @@ impl Fsk4Demod {
             sign: 1.0,
             last: (0.0, 0.0),
             counters: Fsk4Counters::default(),
+            #[cfg(test)]
+            paths: std::cell::Cell::new(Paths::default()),
         })
     }
 
-    /// The symbols `iq` completes, in position order. While no signal is held (and while
-    /// a fresh lock is on probation) symbols are held back, up to [`PENDING_SYMBOLS`], so
-    /// a symbol can come out that much later than the samples that complete it.
+    /// The symbols `iq` completes, in position order. A symbol can come out later than
+    /// the samples that complete it: while no signal is held, by up to
+    /// [`PENDING_SYMBOLS`] (20 ms at 4800 baud, 40 ms at 2400); while a lock is on
+    /// probation or just failed it, by up to [`HELD_MAX`] (42 ms at 4800 baud, 83 ms at
+    /// 2400); add the filters' delay, about 7 symbols. A proven lock gives each symbol out
+    /// as it is sliced.
     pub fn feed(&mut self, iq: &[Complex<f32>]) -> Vec<SoftDibit> {
         if self.flushed {
             return Vec::new();
@@ -520,7 +573,6 @@ impl Fsk4Demod {
                 self.pending.push_back(d);
                 self.until_search -= 1;
             }
-            // Locked past probation, every symbol goes out; otherwise they wait their turn.
             // Locked past probation, every symbol goes out. On probation, and a few
             // searches after a lock that failed it, every symbol is held, so the next lock
             // can still slice again what a false one sliced. Otherwise they wait their turn.
@@ -609,6 +661,14 @@ impl Fsk4Demod {
         }
     }
 
+    /// Note a transition taken, for the tests.
+    #[cfg(test)]
+    fn note(&self, f: impl FnOnce(&mut Paths)) {
+        let mut paths = self.paths.get();
+        f(&mut paths);
+        self.paths.set(paths);
+    }
+
     /// Whether the samples to interpolate at `pos` are held.
     fn holds(&self, pos: f64) -> bool {
         pos.floor() as u64 + 1 < self.base + self.buf.len() as u64
@@ -617,20 +677,28 @@ impl Fsk4Demod {
     /// The search over the last [`SEARCH_SYMBOLS`] symbols' stretch, every
     /// [`SEARCH_EVERY`] symbols.
     ///
-    /// Locked:
-    /// - a fit afresh that closes the eye at least [`REFIT_RATIO`] better than the held
-    ///   levels shows them wrong (taken from a stretch part noise or carrier), and is taken
-    ///   instead: at any phase while the lock is on probation, at the tracked phase after;
-    /// - otherwise the lock holds while the held levels still see its signal
-    ///   ([`Fit::holds`]: to [`ACQUIRE_CLOSURE`] and with contrast on probation, to
-    ///   [`HOLD_CLOSURE`] after).
+    /// Locked, in this order:
+    /// - a fit afresh on strong evidence that closes the eye at least [`REFIT_RATIO`]
+    ///   better than the held levels shows them wrong (taken from a stretch part noise or
+    ///   carrier), and is taken instead: at any phase on probation, at the tracked phase
+    ///   after it;
+    /// - otherwise the lock holds while its stretch does ([`Fit::holds`]: the eye within
+    ///   [`HOLD_CLOSURE`], no level taking most of it, the amplitude within
+    ///   [`HOLD_DRIFT`]). On probation, at its last search, the mean evidence over the
+    ///   probation must also be what the lock was taken on: a strong lock whose mean is
+    ///   weak is demoted to [`WEAK_PROBATION`] instead. At proving, the best fit of the
+    ///   stretch slices the held symbols again if it is a correction of the levels
+    ///   ([`proving_refit`]); if not, [`Self::settle`] refits them over the lock's own
+    ///   symbols.
     ///
-    /// Not holding, the stretch is fitted: at the tracked phase alone while a signal was
-    /// held within [`FULL_SEARCH_AFTER`] searches (the same one, faded or hit), at each of
-    /// [`SEARCH_PHASES`] phases otherwise or after a false lock. A full search's fit must
-    /// be a signal ([`Fit::verdict`]) and also explain the next search's stretch before it
-    /// is taken, as a stretch half carrier or noise can fit falsely. A fit taken locks the
-    /// receiver ([`Self::adopt`]); none, and symbols are held.
+    /// Not holding (and a lock on probation that did not hold is false), the stretch is
+    /// fitted: at the tracked phase alone while a signal was held within
+    /// [`FULL_SEARCH_AFTER`] searches (the same one, faded or hit), at each of
+    /// [`SEARCH_PHASES`] phases otherwise or after a false lock. A full search's fit must be
+    /// a signal ([`Fit::verdict`]) and also explain the next search's stretch before it is
+    /// taken, as a stretch half carrier or noise can fit falsely; so no lock is taken in
+    /// the search that finds one false. A fit taken locks the receiver ([`Self::adopt`]);
+    /// none, and symbols are held.
     fn search(&mut self) {
         let from = self.next - SEARCH_SYMBOLS as f64 * self.sps;
         if from - self.sps / 2.0 < self.base as f64 {
@@ -691,9 +759,15 @@ impl Fsk4Demod {
         if self.locked && held.closure > REFIT_FLOOR {
             let (phase, refit) = fits(if probation { every.clone() } else { 0..1 })[0];
             let refit = timed(offset(phase), refit);
-            // Only on strong evidence: a stretch part signal, part the noise after it, can fit
-            // far better than the held levels and weakly, and would slice the signal again.
-            if refit.verdict() == Verdict::Strong && refit.closure < REFIT_RATIO * held.closure {
+            // Only on strong evidence, on probation and after it: a stretch part signal, part
+            // the noise after it, can fit far better than the held levels and weakly, and
+            // would slice the signal again.
+            let better = refit.closure < REFIT_RATIO * held.closure;
+            #[cfg(test)]
+            if better && refit.verdict() == Verdict::Weak && probation {
+                self.note(|p| p.weak_refit_refused += 1);
+            }
+            if better && refit.verdict() == Verdict::Strong {
                 let at = from + fine(offset(phase), &refit);
                 let (proven, trial) = (self.proven, self.trial);
                 self.adopt(at, refit);
@@ -729,20 +803,23 @@ impl Fsk4Demod {
             // Proven now: this stretch is all signal, which the one the lock was taken from
             // may not have been. Its best fit, if any better, slices again every symbol not
             // yet given out.
-            let better = (last && !demote)
-                .then(|| {
-                    let (phase, refit) = fits(every)[0];
-                    let refit = timed(offset(phase), refit);
-                    (from + fine(offset(phase), &refit), refit)
-                })
-                .filter(|(_, r)| {
-                    // A correction of the held levels, not other ones: a weak signal's
-                    // stretch can fit more closely to levels that merge two of its own.
-                    r.verdict().is_signal()
-                        && r.closure < PROVEN_REFIT_RATIO * held.closure
-                        && (r.amplitude / self.amplitude - 1.0).abs() <= PROVEN_REFIT_DRIFT
-                        && (r.centre - self.centre).abs() < PROVEN_REFIT_DRIFT * self.amplitude
-                });
+            let refit = (last && !demote).then(|| {
+                let (phase, refit) = fits(every)[0];
+                let refit = timed(offset(phase), refit);
+                (from + fine(offset(phase), &refit), refit)
+            });
+            let decided =
+                refit.map(|(at, r)| (at, r, proving_refit(&held, &r, self.centre, self.amplitude)));
+            #[cfg(test)]
+            let refused = decided.is_some_and(|(_, _, (_, refused))| refused);
+            let better = decided
+                .filter(|(_, _, (take, _))| *take)
+                .map(|(at, r, _)| (at, r));
+            #[cfg(test)]
+            {
+                self.note(|p| p.proven_refit_refused += u32::from(refused));
+                self.note(|p| p.demoted += u32::from(demote));
+            }
             if probation {
                 self.trial.0 += held.closure;
                 self.trial.1 += held.contrast;
@@ -753,11 +830,16 @@ impl Fsk4Demod {
                 self.lock_class = Verdict::Weak;
                 self.probation = WEAK_PROBATION;
             }
+            // Proven: the levels fitted again over the lock's own symbols, unless the proving
+            // fit has just sliced them again on a stretch of its own.
             if let Some((at, refit)) = better {
                 self.adopt(at, refit);
                 self.proven = self.probation;
-            }
-            if last && !demote {
+                #[cfg(test)]
+                {
+                    self.note(|p| p.proven_refits += 1);
+                }
+            } else if last && !demote {
                 self.settle();
             }
             return;
@@ -798,6 +880,11 @@ impl Fsk4Demod {
         self.candidate = (full && signal).then_some((start, fit));
         self.locked = taken.is_some();
         if let Some((start, fit)) = taken {
+            #[cfg(test)]
+            {
+                self.note(|p| p.relocked += u32::from(false_lock));
+                self.note(|p| p.in_grace += u32::from(!false_lock && self.grace > 0));
+            }
             if !was_locked || false_lock {
                 self.counters.locks += 1;
             }
@@ -841,10 +928,16 @@ impl Fsk4Demod {
             return;
         }
         let fit = self.fit(&ys, true);
-        if (fit.amplitude / self.amplitude - 1.0).abs() > PROVEN_REFIT_DRIFT
-            || (fit.centre - self.centre).abs() >= PROVEN_REFIT_DRIFT * self.amplitude
-        {
+        if !levels_near(&fit, self.centre, self.amplitude) {
+            #[cfg(test)]
+            {
+                self.note(|p| p.settle_refused += 1);
+            }
             return;
+        }
+        #[cfg(test)]
+        {
+            self.note(|p| p.settles += 1);
         }
         let (base, end) = (self.base as f64, self.base + self.buf.len() as u64);
         for i in 0..self.pending.len() {
@@ -978,6 +1071,24 @@ impl Fsk4Demod {
             at: t - self.delay,
         }
     }
+}
+
+/// Whether `fit`'s levels lie within [`PROVEN_REFIT_DRIFT`] of `centre` and `amplitude`:
+/// the amplitude within that share of it, the centre within that share of the amplitude.
+fn levels_near(fit: &Fit, centre: f64, amplitude: f64) -> bool {
+    (fit.amplitude / amplitude - 1.0).abs() <= PROVEN_REFIT_DRIFT
+        && (fit.centre - centre).abs() < PROVEN_REFIT_DRIFT * amplitude
+}
+
+/// Whether the best fit at a lock's proving, `refit`, slices the held symbols again, and
+/// whether it was refused for its levels: (taken, refused). It must be a signal and close
+/// the eye by [`PROVEN_REFIT_RATIO`] on the held levels' `held`, and be a correction of
+/// the tracked levels (`centre`, `amplitude`), not other ones ([`levels_near`]): a weak
+/// signal's stretch can fit more closely to levels that merge two of its own.
+fn proving_refit(held: &Fit, refit: &Fit, centre: f64, amplitude: f64) -> (bool, bool) {
+    let closer = refit.verdict().is_signal() && refit.closure < PROVEN_REFIT_RATIO * held.closure;
+    let near = levels_near(refit, centre, amplitude);
+    (closer && near, closer && !near)
 }
 
 /// The level `z` (outer levels at ±1) slices to.
@@ -1635,9 +1746,10 @@ mod tests {
     /// the 50th.
     const START_CHECKED: std::ops::Range<usize> = START_TAIL..50;
     /// The first dibits of a signal after noise that the noise before it reaches through
-    /// the receive filter's tail. At 10 dB and 0.8 of the deviation, dibits 2 and 3 err two
-    /// to four times as often as those after them (DMR 22 and 13 against about 6 per
-    /// index, in 660 starts); dibits 0 and 1 the scenes leave out already.
+    /// the receive filter's tail. At 10 dB and 0.8 of the deviation, in 660 starts, dibits
+    /// 2 and 3 erred 17 and 13 times for DMR against 5.7 expected per index at the steady
+    /// state, while dibits 4 to 49 together erred at the steady state's rate (292 against
+    /// 262, +1.8 standard deviations); dibits 0 and 1 the scenes leave out already.
     const START_TAIL: usize = 4;
     /// The most wrong dibits one start may have in [`START_CHECKED`]: more than any of
     /// 4320 windows of that length in the steady state showed (at most 7, at 0.8 of the
@@ -1822,14 +1934,17 @@ mod tests {
     }
 
     #[test]
-    fn a_transmitter_far_off_its_deviation_is_counted_and_not_decoded() {
+    fn a_transmitter_far_off_its_deviation_is_counted_and_not_acquired() {
         for p in [dmr(), c4fm()] {
             for deviation in [2.5, 0.4] {
                 let scene = after_noise(Tx::new(p, 69).off(deviation, SIGNAL_SNR_DB));
-                let (demod, rx) = decode(&scene);
-                assert!(
-                    !misses(&scene, &rx).is_empty(),
-                    "{:?} at {deviation}: decoded",
+                let (demod, _) = decode(&scene);
+                // Not acquired: no lock taken stands. (The unlocked tracker may still slice
+                // much of it right; that is not acquisition.)
+                let c = demod.counters();
+                assert_eq!(
+                    c.locks, c.false_locks,
+                    "{:?} at {deviation}: {c:?}",
                     p.shape
                 );
                 assert!(
@@ -1916,6 +2031,262 @@ mod tests {
         assert_ne!(last, (0.0, 0.0));
         demod.invert(true);
         assert_eq!(demod.last, last);
+    }
+
+    /// A lone burst of `n` dibits, 200 ms of noise alone before and after.
+    fn lone_burst(tx: Tx, n: usize) -> Scene {
+        let gap = vec![Complex::new(0.0f32, 0.0); RATE as usize / 5];
+        let mut iq = gap.clone();
+        let start = iq.len();
+        let dibits = dibits(n, tx.seed + 7);
+        iq.extend(tx.modulate(&dibits));
+        iq.extend(gap);
+        noise_under_unit(&mut iq, tx.snr_db, tx.seed);
+        Scene {
+            name: format!("a lone {n}-dibit burst"),
+            tx,
+            iq,
+            sent: vec![Sent {
+                start,
+                dibits,
+                check: 2..n - 2,
+            }],
+        }
+    }
+
+    /// Each of `scene`'s transmissions' wrong (or missing) dibits over its checked range.
+    fn errors_per_sent(scene: &Scene, rx: &[SoftDibit]) -> Vec<usize> {
+        let sps = scene.tx.sps();
+        scene
+            .sent
+            .iter()
+            .map(|s| {
+                let mut got = vec![None; s.dibits.len()];
+                for d in rx {
+                    let k = ((d.at - s.start as f64) / sps - 0.5).round();
+                    if k >= 0.0 && (k as usize) < got.len() {
+                        got[k as usize] = Some(d.dibit);
+                    }
+                }
+                s.check
+                    .clone()
+                    .filter(|&k| got[k] != Some(s.dibits[k]))
+                    .count()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn noise_alone_proves_no_lock() {
+        let mut taken = 0;
+        for p in [dmr(), c4fm(), half()] {
+            let mut iq = vec![Complex::new(0.0f32, 0.0); RATE as usize * 20];
+            noise_under_unit(&mut iq, SIGNAL_SNR_DB, 1201);
+            let mut demod = Fsk4Demod::new(u64::from(RATE), p).expect("rate");
+            feed_all(&mut demod, &iq);
+            let c = demod.counters();
+            assert_eq!(c.locks, c.false_locks, "{:?}: {c:?}", p.shape);
+            assert_eq!(c.losses, 0, "{:?}: {c:?}", p.shape);
+            taken += c.locks;
+        }
+        // Noise did take locks, so probation was what undid them.
+        assert!(taken > 0);
+    }
+
+    #[test]
+    fn every_burst_of_a_train_is_decoded() {
+        let over = |dev: f64, snr: f64| -> Vec<String> {
+            (0..50)
+                .flat_map(|seed| {
+                    let scene = bursts(Tx::new(dmr(), 6000 + seed).off(dev, snr));
+                    let (_, rx) = decode(&scene);
+                    errors_per_sent(&scene, &rx)
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, e)| *e > START_ERRORS_MAX)
+                        .map(move |(b, e)| format!("seed {} burst {b}: {e} wrong", 6000 + seed))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        for (dev, snr) in [(1.0, 15.0), (1.0, 10.0), (0.8, 15.0)] {
+            let over = over(dev, snr);
+            assert!(over.is_empty(), "{dev} at {snr} dB: {over:?}");
+        }
+        // 0.8 of the deviation at 10 dB (about 8 dB on the mode's own): 3 of these 500
+        // bursts are not acquired well enough, a known shortfall; held to that rate.
+        let over = over(0.8, 10.0);
+        assert!(over.len() <= 3, "0.8 at 10 dB: {over:?}");
+    }
+
+    /// Of 200 lone bursts of `n` dibits from `p` at `snr`, those decoded within
+    /// [`START_ERRORS_MAX`] errors over their checked range.
+    fn lone_bursts_decoded(p: Fsk4Params, n: usize, snr: f64) -> usize {
+        (0..200)
+            .filter(|seed| {
+                let scene = lone_burst(Tx::new(p, 5000 + seed).off(1.0, snr), n);
+                let (_, rx) = decode(&scene);
+                errors_per_sent(&scene, &rx)[0] <= START_ERRORS_MAX
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_lone_132_dibit_burst_is_decoded() {
+        // A DMR handheld's burst on its own, noise before and after.
+        assert_eq!(lone_bursts_decoded(dmr(), 132, 15.0), 200);
+        assert!(lone_bursts_decoded(dmr(), 132, 10.0) >= 198);
+    }
+
+    #[test]
+    fn a_lone_72_dibit_burst_is_decoded() {
+        // A P25 terminator's length on its own, noise before and after.
+        assert_eq!(lone_bursts_decoded(c4fm(), 72, 15.0), 200);
+        assert!(lone_bursts_decoded(c4fm(), 72, 10.0) >= 198);
+    }
+
+    /// A lone 132-dibit burst with `share` of its dibits on one level (00, at +1), spread
+    /// evenly so every 32-dibit stretch has its share within one, the rest on the other
+    /// three levels.
+    fn skewed_burst(tx: Tx, share: f64) -> Scene {
+        let mut scene = lone_burst(tx, 132);
+        let mut other = dibits(132, tx.seed + 9).into_iter();
+        let skewed: Vec<u8> = (0..132)
+            .map(|i| {
+                let on = ((i + 1) as f64 * share).floor() > (i as f64 * share).floor();
+                if on {
+                    0
+                } else {
+                    // One of 01, 10 and 11.
+                    1 + other.next().expect("dibits") % 3
+                }
+            })
+            .collect();
+        let start = scene.sent[0].start;
+        let mut iq = vec![Complex::new(0.0f32, 0.0); start];
+        iq.extend(tx.modulate(&skewed));
+        iq.extend(std::iter::repeat_n(
+            Complex::new(0.0, 0.0),
+            RATE as usize / 5,
+        ));
+        noise_under_unit(&mut iq, tx.snr_db, tx.seed);
+        scene.iq = iq;
+        scene.sent[0].dibits = skewed;
+        scene
+    }
+
+    #[test]
+    fn the_share_one_level_may_take_is_pinned() {
+        for p in [dmr(), c4fm()] {
+            // 18 of a stretch's 32 on one level, give or take one: under 60 %, locked.
+            let scene = skewed_burst(Tx::new(p, 71), 0.5625);
+            let (demod, rx) = decode(&scene);
+            let c = demod.counters();
+            assert!(c.locks > c.false_locks, "{:?} at 56 %: {c:?}", p.shape);
+            let misses = misses(&scene, &rx);
+            assert!(misses.is_empty(), "{:?} at 56 %: {misses:#?}", p.shape);
+            // 80 %: refused. (A fit can split the one level between two of its own and be
+            // taken for a moment; no lock stands.)
+            let scene = skewed_burst(Tx::new(p, 71), 0.8);
+            let (demod, _) = decode(&scene);
+            let c = demod.counters();
+            assert_eq!(c.locks, c.false_locks, "{:?} at 80 %: {c:?}", p.shape);
+        }
+    }
+
+    /// A train of DMR bursts at 0.8 of the deviation and 10 dB, decoded: its transitions
+    /// and each burst's errors.
+    fn weak_train(seed: u64) -> (Paths, Vec<usize>) {
+        let scene = bursts(Tx::new(dmr(), seed).off(0.8, 10.0));
+        let (demod, rx) = decode(&scene);
+        (demod.paths.get(), errors_per_sent(&scene, &rx))
+    }
+
+    #[test]
+    fn a_strong_lock_with_weak_mean_evidence_is_demoted_not_dropped() {
+        // A scene found to take the transition (the seed is the scene's, not tuned).
+        let (paths, errors) = weak_train(7000);
+        assert!(paths.demoted > 0, "{paths:?}");
+        let worst = errors.iter().copied().max().unwrap_or(0);
+        assert!(worst <= START_ERRORS_MAX, "{errors:?}");
+    }
+
+    #[test]
+    fn a_lock_taken_after_a_false_one_slices_its_symbols_again() {
+        // A scene found to take a lock in the searches after a false one, and to refuse a
+        // weak refit on probation. No lock is taken in the very search that finds one
+        // false: a full search needs the last one's candidate to confirm it, and searches on
+        // probation make none.
+        let (paths, errors) = weak_train(7003);
+        assert!(paths.in_grace > 0, "{paths:?}");
+        assert!(paths.weak_refit_refused > 0, "{paths:?}");
+        assert_eq!(paths.relocked, 0, "{paths:?}");
+        let worst = errors.iter().copied().max().unwrap_or(0);
+        assert!(worst <= START_ERRORS_MAX, "{errors:?}");
+    }
+
+    #[test]
+    fn a_proving_fit_is_taken_only_as_a_correction_of_the_levels() {
+        let fit = |closure: f64, centre: f64, amplitude: f64| Fit {
+            centre,
+            amplitude,
+            closure,
+            share: 0.3,
+            contrast: 10.0,
+        };
+        let held = fit(0.02, 0.0, 1.0);
+        // Closer and near the tracked levels: taken.
+        assert_eq!(
+            proving_refit(&held, &fit(0.01, 0.05, 1.05), 0.0, 1.0),
+            (true, false)
+        );
+        // Closer but on other levels: refused.
+        assert_eq!(
+            proving_refit(&held, &fit(0.01, 0.15, 1.0), 0.0, 1.0),
+            (false, true)
+        );
+        assert_eq!(
+            proving_refit(&held, &fit(0.01, 0.0, 1.15), 0.0, 1.0),
+            (false, true)
+        );
+        // Not closer by enough: neither.
+        assert_eq!(
+            proving_refit(&held, &fit(0.016, 0.0, 1.0), 0.0, 1.0),
+            (false, false)
+        );
+    }
+
+    /// A receiver fed a lone burst at 15 dB until a lock is on probation, a search past
+    /// its taking.
+    fn on_probation() -> Fsk4Demod {
+        let scene = lone_burst(Tx::new(dmr(), 73), 132);
+        let mut demod = Fsk4Demod::new(u64::from(RATE), dmr()).expect("rate");
+        for chunk in scene.iq.chunks(24) {
+            demod.feed(chunk);
+            if demod.locked && demod.proven == 1 {
+                return demod;
+            }
+        }
+        panic!("no lock on probation");
+    }
+
+    #[test]
+    fn settle_refuses_levels_far_from_the_tracked_ones() {
+        // Tracked levels 25 % off what the held symbols fit: the fit moves them too far.
+        let mut demod = on_probation();
+        demod.amplitude *= 1.25;
+        let before: Vec<u8> = demod.pending.iter().map(|d| d.dibit).collect();
+        demod.settle();
+        let after: Vec<u8> = demod.pending.iter().map(|d| d.dibit).collect();
+        assert_eq!(demod.paths.get().settle_refused, 1);
+        assert_eq!(demod.paths.get().settles, 0);
+        assert_eq!(before, after);
+        // 5 % off: the fit corrects them, and the held symbols are sliced again on it.
+        let mut demod = on_probation();
+        demod.amplitude *= 1.05;
+        demod.settle();
+        assert_eq!(demod.paths.get().settle_refused, 0);
+        assert_eq!(demod.paths.get().settles, 1);
     }
 
     #[test]
