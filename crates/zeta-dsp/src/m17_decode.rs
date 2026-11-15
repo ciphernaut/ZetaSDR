@@ -24,14 +24,12 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
@@ -45,7 +43,7 @@ use crate::m17::{
 };
 use crate::nbfm::nbfm_demod;
 use crate::synth::{M17_BAUD, M17_DEVIATION_HZ, M17_RRC_ALPHA, RRC_SPAN_SYMBOLS, rrc};
-use crate::util::{StreamingFir, event};
+use crate::util::{StreamingFir, event, time_of};
 use crate::vocoder::{Vocoder, VocoderEnv, VocoderSpec};
 use crate::{Input, run_map_ending, sps_check};
 
@@ -68,7 +66,7 @@ pub use crate::vocoder::AUDIO_RATE_HZ;
 /// The vocoder's program (the row's handler 0).
 pub const C2DEC: &str = "c2dec";
 /// How long the vocoders of a finished input may take to hand back their speech.
-pub const VOCODER_DRAIN: Duration = Duration::from_secs(2);
+pub use crate::vocoder::VOCODER_DRAIN;
 /// One frame (192 symbols at 4800 baud), ns.
 const FRAME_NS: u64 = FRAME_SYMBOLS as u64 * 1_000_000_000 / M17_BAUD as u64;
 /// Codec 2 speech samples per stream frame (40 ms at 8 kHz).
@@ -588,10 +586,8 @@ impl Streams {
         if let Some(lsf) = &open.lsf {
             events.push((t, fields(lsf, open.last_fn, true)));
         }
-        if let Some(h) = open.vocoder.as_mut().and_then(Vocoder::finish) {
-            let mut d = self.env.drains.lock().unwrap();
-            d.retain(|h| !h.is_finished());
-            d.push(h);
+        if let Some(v) = open.vocoder.take() {
+            self.env.park(v);
         }
     }
 
@@ -664,12 +660,6 @@ impl Streams {
     }
 }
 
-/// `t0` plus `samples` (maybe negative) at `rate_hz`, ns.
-fn time_of(t0: Timestamp, samples: i64, rate_hz: u64) -> u64 {
-    let dt = i128::from(samples) * 1_000_000_000 / i128::from(rate_hz);
-    (i128::from(t0.0) + dt).clamp(0, i128::from(u64::MAX)) as u64
-}
-
 /// Decodes M17 from a channel's IQ: two events per stream and its speech.
 pub struct M17DecodeStage {
     spec: StageSpec,
@@ -720,14 +710,14 @@ impl Stage for M17DecodeStage {
         };
         let events_out = events_out.clone();
         let program = crate::vocoder::program(&ctx, 0, C2DEC, true).map_err(StageError::Failed)?;
-        let drains = Arc::new(Mutex::new(Vec::new()));
+        let env = VocoderEnv {
+            bus: bus.clone(),
+            out: audio_out.clone(),
+            ctx: ctx.clone(),
+            drains: Arc::new(Mutex::new(Vec::new())),
+        };
         let mut streams = Streams {
-            env: VocoderEnv {
-                bus: bus.clone(),
-                out: audio_out.clone(),
-                ctx: ctx.clone(),
-                drains: drains.clone(),
-            },
+            env: env.clone(),
             program,
             open: None,
         };
@@ -775,18 +765,7 @@ impl Stage for M17DecodeStage {
             Ok(publish(&ctx, &events_out, Some(&frame.provenance), events))
         })
         .await;
-        let mut pending: Vec<JoinHandle<()>> = std::mem::take(&mut *drains.lock().unwrap());
-        if result.is_ok() {
-            // Every reader gets the one deadline; any still running after it is aborted
-            // (its child is killed with it).
-            let _ = tokio::time::timeout(VOCODER_DRAIN, async {
-                for h in pending.iter_mut() {
-                    let _ = h.await;
-                }
-            })
-            .await;
-        }
-        pending.iter().for_each(JoinHandle::abort);
+        env.drain_all(&result).await;
         result
     }
 }

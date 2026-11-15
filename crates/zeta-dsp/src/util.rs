@@ -4,6 +4,13 @@ use std::f64::consts::PI;
 
 use num_complex::Complex;
 use zeta_core::stage::StageContext;
+use zeta_core::types::Timestamp;
+
+/// `t0` plus `samples` (maybe negative) at `rate_hz`, ns, clamped to the `u64` range.
+pub fn time_of(t0: Timestamp, samples: i64, rate_hz: u64) -> u64 {
+    let dt = i128::from(samples) * 1_000_000_000 / i128::from(rate_hz);
+    (i128::from(t0.0) + dt).clamp(0, i128::from(u64::MAX)) as u64
+}
 
 /// A decoder stage's event payload: `fields` in the job's mode-row envelope (`protocol`,
 /// `summary`, `t_ns`) when the context has the row, else `fields` with `protocol` alone.

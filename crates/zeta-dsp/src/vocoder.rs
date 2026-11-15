@@ -21,7 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use zeta_core::stage::StageContext;
+use zeta_core::stage::{StageContext, StageError};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, Provenance, Span, StreamId, Timestamp};
 
@@ -32,6 +32,8 @@ use crate::resample::Resampler;
 pub const VOCODER_WATCHDOG_MS: u64 = 2000;
 /// The rate of the speech the seat publishes, Hz.
 pub const AUDIO_RATE_HZ: u64 = 48_000;
+/// How long the vocoders of a finished input may take to hand back their speech.
+pub const VOCODER_DRAIN: Duration = Duration::from_secs(2);
 
 /// What a stage states about the vocoder for one call.
 #[derive(Clone, Debug)]
@@ -59,6 +61,34 @@ pub struct VocoderEnv {
     pub ctx: StageContext,
     /// The reader tasks of finished vocoders, awaited when the input ends.
     pub drains: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl VocoderEnv {
+    /// End `v`'s call: close its input and keep its reader, still publishing the speech
+    /// in flight, for [`drain_all`](Self::drain_all).
+    pub fn park(&self, mut v: Vocoder) {
+        if let Some(h) = v.finish() {
+            let mut d = self.drains.lock().unwrap();
+            d.retain(|h| !h.is_finished());
+            d.push(h);
+        }
+    }
+
+    /// At the stage's end: after a clean end (`result` ok) every parked reader gets the one
+    /// [`VOCODER_DRAIN`] deadline; any still running after it, or every one after a failed
+    /// or cancelled run, is aborted (its child is killed with it).
+    pub async fn drain_all(&self, result: &Result<(), StageError>) {
+        let mut pending: Vec<JoinHandle<()>> = std::mem::take(&mut *self.drains.lock().unwrap());
+        if result.is_ok() {
+            let _ = tokio::time::timeout(VOCODER_DRAIN, async {
+                for h in pending.iter_mut() {
+                    let _ = h.await;
+                }
+            })
+            .await;
+        }
+        pending.iter().for_each(JoinHandle::abort);
+    }
 }
 
 /// One call's vocoder: feeds in on its stdin, speech out on its stdout to the audio

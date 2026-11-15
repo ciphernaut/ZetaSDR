@@ -236,6 +236,10 @@ pub enum P25Unit {
     },
     Ldu1 {
         lc: Option<LinkControl>,
+        /// The link control says the speech is encrypted: its format's protected bit (the
+        /// rest of it is then encrypted too, and `lc` is `None`) or, in a link control that
+        /// decodes, its service options' protected bit. `false` when it does not decode.
+        protected: bool,
         voice: Box<[ImbeSoft; 9]>,
         errors: u32,
     },
@@ -420,6 +424,7 @@ fn decode_unit(duid: u8, bits: &[u8], nid_errors: u32) -> P25Unit {
             if duid == DUID_LDU1 {
                 P25Unit::Ldu1 {
                     lc: fixed.and_then(parse_lc),
+                    protected: fixed.is_some_and(lc_protected),
                     voice,
                     errors,
                 }
@@ -449,8 +454,25 @@ fn decode_unit(duid: u8, bits: &[u8], nid_errors: u32) -> P25Unit {
 /// with link control. The voice frames carry one fixed payload (`VOICE_PAYLOAD`); the
 /// message indicator is zero.
 pub fn encode_call(nac: u16, lc: LinkControl, enc: EncSync, superframes: u32) -> Vec<u8> {
+    encode_call_lc(nac, lc, enc, superframes, false)
+}
+
+/// [`encode_call`], the link control's format marked protected when `lc_encrypted` (as a
+/// radio that encrypts its link control sends it; the word itself is left as it is, which
+/// nothing here could tell from a key stream).
+pub(crate) fn encode_call_lc(
+    nac: u16,
+    lc: LinkControl,
+    enc: EncSync,
+    superframes: u32,
+    lc_encrypted: bool,
+) -> Vec<u8> {
     let protected = enc.algid != P25_ALGID_CLEAR;
-    let lc_hex = RS_LC.encode(&hexbits(lc_word(&lc, protected), LC_HEXBITS));
+    let mut word = lc_word(&lc, protected);
+    if lc_encrypted {
+        word |= u128::from(LCF_PROTECTED) << 64;
+    }
+    let lc_hex = RS_LC.encode(&hexbits(word, LC_HEXBITS));
     let es_hex = RS_ES.encode(&hexbits(es_word(&enc), ES_HEXBITS));
     let tgid = match lc.call {
         Call::Group => lc.dst as u16,
@@ -563,6 +585,16 @@ fn parse_lc(hex: &[u8]) -> Option<LinkControl> {
         mfid: (w >> 56) as u8,
         emergency: (w >> 48) as u8 & SVC_EMERGENCY != 0,
     })
+}
+
+/// Whether the link control in 12 hexbits says the speech is encrypted: the format's
+/// protected bit, else (the word in the clear, a voice channel user's) the service
+/// options' protected bit.
+fn lc_protected(hex: &[u8]) -> bool {
+    let w = word_of(hex);
+    let lcf = (w >> 64) as u8;
+    let voice_user = matches!(lcf & LCO_MASK, LCO_GROUP | LCO_PRIVATE);
+    lcf & LCF_PROTECTED != 0 || (voice_user && (w >> 48) as u8 & SVC_PROTECTED != 0)
 }
 
 /// The 96-bit encryption sync: MI (zero here), ALGID, KID.
@@ -1499,6 +1531,44 @@ mod tests {
         assert_eq!(lc, None);
     }
 
+    /// An LDU1 says its call is encrypted by its service options (`lc` decodes) or by its
+    /// format's protected bit (`lc` is `None`); a clear one says neither.
+    #[test]
+    fn an_ldu1_says_when_its_link_control_is_protected() {
+        let aes = EncSync {
+            algid: P25_ALGID_AES,
+            kid: 1,
+        };
+        let clear = EncSync {
+            algid: P25_ALGID_CLEAR,
+            kid: 0,
+        };
+        let hdu = 396;
+        for (enc, lc_encrypted, want_lc, want) in [
+            (clear, false, Some(group()), false),
+            (aes, false, Some(group()), true),
+            (aes, true, None, true),
+        ] {
+            let call = encode_call_lc(NAC, group(), enc, 1, lc_encrypted);
+            let units = P25Framer::new().push(&soft(&call[hdu..hdu + LDU_DIBITS]));
+            let (_, _, P25Unit::Ldu1 { lc, protected, .. }) = &units[0] else {
+                panic!("{:?}", units[0]);
+            };
+            assert_eq!((*lc, *protected), (want_lc, want), "{enc:?} {lc_encrypted}");
+        }
+        // A link control that does not decode says nothing.
+        let call = encode_call(NAC, group(), aes, 1);
+        let mut raw: Vec<u8> = call[hdu..hdu + LDU_DIBITS].to_vec();
+        for d in &mut raw[200..LDU_DIBITS - 40] {
+            *d ^= 0b11;
+        }
+        let units = P25Framer::new().push(&soft(&raw));
+        let Some((_, _, P25Unit::Ldu1 { lc, protected, .. })) = units.first() else {
+            panic!("{units:?}");
+        };
+        assert_eq!((*lc, *protected), (None, false));
+    }
+
     /// `dibits` through the C4FM modulator at 48 kHz, followed by 10 ms with the carrier
     /// off so the receive filters give out the last symbols, conjugated when `invert`.
     fn on_air(dibits: &[u8], invert: bool) -> Vec<Complex<f32>> {
@@ -1567,10 +1637,16 @@ mod tests {
             );
             let silence = imbe_decode(&imbe_encode(&[0; 8])).0;
             for sf in 0..3 {
-                let P25Unit::Ldu1 { lc, voice, errors } = &units[1 + 2 * sf].2 else {
+                let P25Unit::Ldu1 {
+                    lc,
+                    protected,
+                    voice,
+                    errors,
+                } = &units[1 + 2 * sf].2
+                else {
                     panic!("{:?}", units[1 + 2 * sf]);
                 };
-                assert_eq!((*lc, *errors), (Some(group()), 0));
+                assert_eq!((*lc, *protected, *errors), (Some(group()), false, 0));
                 assert!(voice.iter().all(|f| imbe_decode(f) == (silence, 0)));
                 let P25Unit::Ldu2 { enc, errors, .. } = &units[2 + 2 * sf].2 else {
                     panic!("{:?}", units[2 + 2 * sf]);

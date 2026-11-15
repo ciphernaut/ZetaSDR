@@ -3,8 +3,10 @@
 //! turns those into call and channel events and the call's speech.
 //!
 //! **Calls.** One open call at a time. A header opens one; so does a voice unit (LDU1,
-//! LDU2) when none is open, or when its network access code or its link control names
-//! another call. Two `type: call` events per call ([`crate::voice_call`]):
+//! LDU2) when none is open, or when it does not follow on from the open call: another
+//! network access code, another link control, or a sync more than [`CONTIGUOUS_NS`] after
+//! the open call's last unit ended (another call, its header and the open call's terminator
+//! both lost). Two `type: call` events per call ([`crate::voice_call`]):
 //! - the opening one when its link control and its encryption are both in hand: at the
 //!   first LDU1 after a header (the header carries no calling radio), or within a
 //!   superframe when the job joins mid-call;
@@ -14,10 +16,15 @@
 //! The header's talkgroup is not reported: it is 0 for a private call, and the link control
 //! names the destination of either kind.
 //!
-//! **Encryption.** A call is encrypted when the last encryption sync seen (the header's, then
-//! each LDU2's) names an algorithm other than [`P25_ALGID_CLEAR`]. A call joined mid-call is
-//! held silent until its first encryption sync: its first LDU1 feeds nothing and it opens on
-//! the LDU2. An encrypted call gets its events and no vocoder; nothing here decrypts.
+//! **Encryption.** A call is encrypted when the last word about it says so: an encryption
+//! sync (the header's, then each LDU2's) naming an algorithm other than
+//! [`P25_ALGID_CLEAR`], or an LDU1's link control marked protected (its format's bit, or
+//! its service options'), which is settled before any of that LDU1's frames is fed. A call
+//! opened by a voice unit is held silent until one of those words: a clear LDU1 feeds
+//! nothing and the call opens on its LDU2. A call that turns encrypted closes its vocoder's
+//! input at once (the speech fed before is still handed back); one that turns clear starts
+//! one. An encrypted call gets its events and no vocoder; nothing here decrypts. A call
+//! whose link control is itself encrypted names no radio and gives no event.
 //!
 //! **Speech.** `zeta-mbe imbe7200x4400` (the row's handler 0, optional) is looked up when a
 //! call's encryption is first known to be clear, so a program installed while the job runs is
@@ -36,13 +43,11 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
@@ -53,7 +58,7 @@ use crate::p25::{
     EncSync, IMBE_FEED_BYTES, LDU_DIBITS, LinkControl, P25_ALGID_CLEAR, P25_BAUD, P25_DEVIATION_HZ,
     P25_SUPERFRAME_MS, P25Framer, P25Unit,
 };
-use crate::util::event;
+use crate::util::{event, time_of};
 use crate::vocoder::{Vocoder, VocoderEnv, VocoderSpec};
 use crate::voice_call::{
     CallFields, MBE_FRAME_SAMPLES, MBE_RATE_HZ, Silent, ZETA_MBE, channel_event, no_vocoder_note,
@@ -66,8 +71,11 @@ pub const P25_DECODE_KIND: &str = "p25_decode";
 const PROTOCOL: &str = "p25";
 /// `zeta-mbe`'s argument for P25's full-rate IMBE.
 pub const IMBE_CODEC: &str = "imbe7200x4400";
-/// How long the vocoders of a finished input may take to hand back their speech.
-pub const VOCODER_DRAIN: Duration = Duration::from_secs(2);
+/// How much later than the open call's last unit ended a voice unit's sync may be and
+/// still follow on from it, ns (48 symbols: the timing's wander, never a lost unit).
+/// A voice unit later than that starts a new call, held silent until its own encryption
+/// is known.
+pub const CONTIGUOUS_NS: u64 = 10_000_000;
 /// One IMBE frame, ns (20 ms).
 const IMBE_FRAME_NS: u64 = MBE_FRAME_SAMPLES as u64 * 1_000_000_000 / MBE_RATE_HZ;
 /// One LDU, ns (180 ms): the span of a call event.
@@ -143,6 +151,9 @@ struct Open {
     lc: Option<LinkControl>,
     /// The last encryption sync seen.
     enc: Option<EncSync>,
+    /// The last decodable link control said the speech is encrypted (an encryption sync
+    /// seen after it clears this: it is the later word).
+    protected: bool,
     voice: Voice,
     announced: bool,
     frames: u32,
@@ -159,6 +170,7 @@ impl Open {
             nac,
             lc: None,
             enc: None,
+            protected: false,
             voice: Voice::Held,
             announced: false,
             frames: 0,
@@ -168,8 +180,14 @@ impl Open {
         }
     }
 
+    /// Whether anything has told the call's encryption yet: an encryption sync, or a link
+    /// control marked protected.
+    fn known(&self) -> bool {
+        self.enc.is_some() || self.protected
+    }
+
     fn encrypted(&self) -> bool {
-        self.enc.is_some_and(|e| e.algid != P25_ALGID_CLEAR)
+        self.protected || self.enc.is_some_and(|e| e.algid != P25_ALGID_CLEAR)
     }
 
     /// Why its speech is not heard now; `None` while a live vocoder has it.
@@ -183,11 +201,16 @@ impl Open {
         }
     }
 
-    /// Whether a unit with `nac` and link control `lc` belongs to this call.
-    fn takes(&self, nac: u16, lc: Option<&LinkControl>) -> bool {
+    /// Whether a voice unit at `t` with `nac` and link control `lc` follows on from this
+    /// call: the same network, no other link control, and no later than
+    /// [`CONTIGUOUS_NS`] after this call's last unit ended (a later one may be another
+    /// call whose header and this call's terminator were both lost).
+    fn takes(&self, t: u64, nac: u16, lc: Option<&LinkControl>) -> bool {
         let same =
             |a: &LinkControl, b: &LinkControl| (a.call, a.src, a.dst) == (b.call, b.src, b.dst);
-        nac == self.nac && !matches!((&self.lc, lc), (Some(a), Some(b)) if !same(a, b))
+        nac == self.nac
+            && t <= self.end_ns + CONTIGUOUS_NS
+            && !matches!((&self.lc, lc), (Some(a), Some(b)) if !same(a, b))
     }
 }
 
@@ -227,14 +250,20 @@ impl Calls {
         found
     }
 
-    /// Settle `open`'s speech on its encryption, now known: stop a vocoder when it turns
-    /// encrypted, start one when it is (or turns) clear.
+    /// Settle `open`'s speech on its encryption, once anything has told it: stop a vocoder
+    /// when the call turns encrypted, start one when it is (or turns) clear. A call nothing
+    /// has told stays held.
     fn settle(&mut self, open: &mut Open, prov: &Provenance) {
+        if !open.known() {
+            return;
+        }
         let encrypted = open.encrypted();
         let voice = std::mem::replace(&mut open.voice, Voice::Held);
         open.voice = match (voice, encrypted) {
+            // Its input closed before this unit's frames: what it was fed came from units
+            // nothing had yet marked encrypted, and that speech is still handed back.
             (Voice::Heard(v), true) => {
-                self.drain(v);
+                self.env.park(v);
                 Voice::Silent(Silent::Encrypted)
             }
             (_, true) => Voice::Silent(Silent::Encrypted),
@@ -268,19 +297,11 @@ impl Calls {
         }
     }
 
-    /// Close `v`'s input; its reader, still publishing, is awaited when the input ends.
-    fn drain(&self, mut v: Vocoder) {
-        if let Some(h) = v.finish() {
-            let mut d = self.env.drains.lock().unwrap();
-            d.retain(|h| !h.is_finished());
-            d.push(h);
-        }
-    }
-
-    /// `open`'s event; `eot` for its closing one.
+    /// `open`'s event; `eot` for its closing one. `algid` and `kid` are null until an
+    /// encryption sync is seen (a call a protected link control marked encrypted).
     fn call_event(open: &Open, eot: bool) -> serde_json::Value {
-        let (Some(lc), Some(enc)) = (open.lc, open.enc) else {
-            unreachable!("a call is announced with its link control and encryption")
+        let Some(lc) = open.lc else {
+            unreachable!("a call is announced with its link control")
         };
         let silent = open.silent();
         let mut m = CallFields {
@@ -300,8 +321,8 @@ impl Calls {
         .to_json();
         m.insert("nac".into(), open.nac.into());
         m.insert("mfid".into(), lc.mfid.into());
-        m.insert("algid".into(), enc.algid.into());
-        m.insert("kid".into(), enc.kid.into());
+        m.insert("algid".into(), open.enc.map(|e| e.algid).into());
+        m.insert("kid".into(), open.enc.map(|e| e.kid).into());
         // The summary's channel text: none on a call, which reads as who calls whom.
         m.insert("network".into(), serde_json::Value::Null);
         serde_json::Value::Object(m)
@@ -316,7 +337,7 @@ impl Calls {
             events.push((t, Self::call_event(&open, true)));
         }
         if let Voice::Heard(v) = open.voice {
-            self.drain(v);
+            self.env.park(v);
         }
     }
 
@@ -378,14 +399,20 @@ impl Calls {
         prov: &Provenance,
         events: &mut Events,
     ) {
-        let (lc, enc, voice, errors) = match unit {
-            P25Unit::Ldu1 { lc, voice, errors } => (lc, None, voice, errors),
-            P25Unit::Ldu2 { enc, voice, errors } => (None, enc, voice, errors),
+        let (lc, protected, enc, voice, errors) = match unit {
+            P25Unit::Ldu1 {
+                lc,
+                protected,
+                voice,
+                errors,
+            } => (lc, protected, None, voice, errors),
+            P25Unit::Ldu2 { enc, voice, errors } => (None, false, enc, voice, errors),
             _ => return,
         };
         let mut open = match self.open.take() {
-            Some(o) if o.takes(nac, lc.as_ref()) => o,
+            Some(o) if o.takes(t, nac, lc.as_ref()) => o,
             other => {
+                // Not this call's: a new one, held until its own encryption is known.
                 self.open = other;
                 self.close(t, events);
                 Open::new(nac)
@@ -397,10 +424,16 @@ impl Calls {
         if let Some(lc) = lc {
             open.lc = Some(lc);
         }
+        // A link control that decoded (or is itself encrypted) speaks for the speech, until
+        // the next encryption sync; settled before any of this unit's frames is fed.
+        if lc.is_some() || protected {
+            open.protected = protected;
+        }
         if let Some(enc) = enc {
             open.enc = Some(enc);
-            self.settle(&mut open, prov);
+            open.protected = false;
         }
+        self.settle(&mut open, prov);
         if let Voice::Heard(v) = &open.voice {
             if v.alive() {
                 for (k, frame) in voice.iter().enumerate() {
@@ -461,12 +494,6 @@ fn channel_fields(nac: u16, control: bool) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
-/// `t0` plus `samples` (maybe negative) at `rate_hz`, ns.
-fn time_of(t0: Timestamp, samples: i64, rate_hz: u64) -> u64 {
-    let dt = i128::from(samples) * 1_000_000_000 / i128::from(rate_hz);
-    (i128::from(t0.0) + dt).clamp(0, i128::from(u64::MAX)) as u64
-}
-
 /// Decodes P25 phase 1 from a channel's IQ: two events per call, its speech, and a
 /// channel event for a network with no call.
 pub struct P25DecodeStage {
@@ -517,14 +544,14 @@ impl Stage for P25DecodeStage {
             return Err(StageError::Failed("expected 2 outputs".into()));
         };
         let events_out = events_out.clone();
-        let drains = Arc::new(Mutex::new(Vec::new()));
+        let env = VocoderEnv {
+            bus: bus.clone(),
+            out: audio_out.clone(),
+            ctx: ctx.clone(),
+            drains: Arc::new(Mutex::new(Vec::new())),
+        };
         let mut calls = Calls {
-            env: VocoderEnv {
-                bus: bus.clone(),
-                out: audio_out.clone(),
-                ctx: ctx.clone(),
-                drains: drains.clone(),
-            },
+            env: env.clone(),
             open: None,
             said_missing: false,
             channel: None,
@@ -580,18 +607,7 @@ impl Stage for P25DecodeStage {
             Ok(publish(&ctx, &events_out, Some(&frame.provenance), events))
         })
         .await;
-        let mut pending: Vec<JoinHandle<()>> = std::mem::take(&mut *drains.lock().unwrap());
-        if result.is_ok() {
-            // Every reader gets the one deadline; any still running after it is aborted
-            // (its child is killed with it).
-            let _ = tokio::time::timeout(VOCODER_DRAIN, async {
-                for h in pending.iter_mut() {
-                    let _ = h.await;
-                }
-            })
-            .await;
-        }
-        pending.iter().for_each(JoinHandle::abort);
+        env.drain_all(&result).await;
         result
     }
 }
@@ -640,7 +656,7 @@ mod tests {
     use zeta_core::types::{Hz, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 
     use super::*;
-    use crate::p25::{Call, encode_call, encode_control};
+    use crate::p25::{Call, encode_call, encode_call_lc, encode_control};
     use crate::synth::{awgn, c4fm_modulate, parse_params, synthesise};
 
     const RATE: u64 = 48_000;
@@ -1158,18 +1174,16 @@ mod tests {
 
     #[tokio::test]
     async fn every_summary_reads_without_null() {
-        // A call's two events, and a control channel's event (each from a receiver of its
-        // own: the front end misses a control channel that follows a call).
+        // A call, then a control channel on its NAC: the call's two events, then the
+        // channel's.
         let mbe = Mbe::absent();
-        let mut events = Vec::new();
-        for iq in [call(clear(), 1), on_air(&encode_control(NAC, 10), RATE)] {
-            let mut h = Harness::start(&mbe, 4096);
-            h.send(&iq, RATE);
-            let r = h.end(|_| true).await;
-            assert!(r.is_ok(), "{r:?}");
-            events.extend(h.events);
-        }
-        let summaries: Vec<&str> = events
+        let mut h = Harness::start(&mbe, 4096);
+        h.send(&call(clear(), 1), RATE);
+        h.send(&on_air(&encode_control(NAC, 10), RATE), RATE);
+        let r = h.end(|_| true).await;
+        assert!(r.is_ok(), "{r:?}");
+        let summaries: Vec<&str> = h
+            .events
             .iter()
             .map(|e| e["summary"].as_str().unwrap())
             .collect();
@@ -1190,6 +1204,233 @@ mod tests {
             .chain([e["summary"].as_str().unwrap()])
             .for_each(|s| assert!(!s.contains("null"), "{s}"));
         assert_eq!(e["summary"], "channel, NAC 291", "{e}");
+    }
+
+    /// Dibits in a terminator with link control.
+    const TDULC_DIBITS: usize = 216;
+    /// The gap of carrier between the two calls of [`two_calls_cut`], ms.
+    const CUT_GAP_MS: usize = 50;
+    const AES_ENC: EncSync = EncSync {
+        algid: 0xAA,
+        kid: 7,
+    };
+
+    /// A clear call of two superframes with its terminator cut off, [`CUT_GAP_MS`] of
+    /// carrier, then a call of two superframes encrypted with `enc` (its link control
+    /// itself encrypted with `lc_encrypted`) with its header cut off; and the time the
+    /// second call's first sync is at, ns.
+    fn two_calls_cut(enc: EncSync, lc_encrypted: bool) -> (Vec<Complex<f32>>, u64) {
+        let first = encode_call(NAC, group(), clear(), 2);
+        let mut iq = on_air(&first[..first.len() - TDULC_DIBITS], RATE);
+        iq.extend(carrier(CUT_GAP_MS));
+        let at = T0 + iq.len() as u64 * 1_000_000_000 / RATE;
+        let second = encode_call_lc(NAC, group(), enc, 2, lc_encrypted);
+        iq.extend(on_air(&second[HDU_DIBITS..], RATE));
+        (iq, at)
+    }
+
+    /// How far a unit's time (its sync's first symbol centre, as the front end finds it) may
+    /// sit from where the test placed it, ns: well under one frame (20 ms).
+    const SLACK_NS: u64 = 1_000_000;
+
+    /// The latest end of any audio frame's span.
+    fn audio_end(audio: &[Frame]) -> u64 {
+        audio
+            .iter()
+            .map(|f| f.provenance.span.end_ns.0)
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn an_encrypted_call_that_follows_a_cut_one_is_never_heard() {
+        let mbe = Mbe::installed();
+        let mut h = Harness::start(&mbe, 4096);
+        let (iq, second) = two_calls_cut(AES_ENC, false);
+        h.send(&iq, RATE);
+        let r = h
+            .end(|h| h.events.len() >= 4 && h.audio.len() >= 2 * SUPERFRAME_FRAMES)
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        // Two calls, though the second has the first's radio and talkgroup.
+        assert_eq!(
+            eots(&h.events),
+            [false, true, false, true],
+            "{:?}",
+            h.events
+        );
+        has(
+            &h.events[1],
+            json!({"audio": true, "silent": null, "frames": 36}),
+        );
+        for e in &h.events[2..] {
+            has(
+                e,
+                json!({"src": SRC, "encrypted": true, "audio": false, "silent": "encrypted"}),
+            );
+        }
+        has(&h.events[3], json!({"algid": 170, "kid": 7}));
+        // Every frame of speech is the first call's.
+        assert_eq!(h.audio.len(), 2 * SUPERFRAME_FRAMES);
+        assert!(
+            audio_end(&h.audio) <= second + SLACK_NS,
+            "{} > {second}",
+            audio_end(&h.audio)
+        );
+        assert_eq!(mbe.log(), "start\neof\n", "one vocoder, the first call's");
+    }
+
+    #[tokio::test]
+    async fn a_call_with_its_link_control_encrypted_is_never_heard() {
+        let mbe = Mbe::installed();
+        let mut h = Harness::start(&mbe, 4096);
+        let (iq, second) = two_calls_cut(AES_ENC, true);
+        h.send(&iq, RATE);
+        let r = h
+            .end(|h| h.events.len() >= 2 && h.audio.len() >= 2 * SUPERFRAME_FRAMES)
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        // The first call closes whole and clear; the second, with no radio to name, gives
+        // no event.
+        assert_eq!(eots(&h.events), [false, true], "{:?}", h.events);
+        has(
+            &h.events[1],
+            json!({"audio": true, "silent": null, "encrypted": false, "frames": 36}),
+        );
+        assert_eq!(h.audio.len(), 2 * SUPERFRAME_FRAMES);
+        assert!(
+            audio_end(&h.audio) <= second + SLACK_NS,
+            "{} > {second}",
+            audio_end(&h.audio)
+        );
+        assert_eq!(mbe.log(), "start\neof\n", "one vocoder, the first call's");
+    }
+
+    #[tokio::test]
+    async fn a_clear_call_that_follows_a_cut_one_is_heard_from_its_first_ldu2() {
+        let mbe = Mbe::installed();
+        let mut h = Harness::start(&mbe, 4096);
+        let (iq, second) = two_calls_cut(clear(), false);
+        h.send(&iq, RATE);
+        // The second call: its first LDU1 held, then 27 frames heard.
+        let r = h
+            .end(|h| h.events.len() >= 4 && h.audio.len() >= 2 * SUPERFRAME_FRAMES + 27)
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(
+            eots(&h.events),
+            [false, true, false, true],
+            "{:?}",
+            h.events
+        );
+        has(&h.events[2], json!({"audio": true, "silent": null}));
+        has(&h.events[3], json!({"audio": true, "frames": 36}));
+        let later: Vec<u64> = h
+            .audio
+            .iter()
+            .map(|f| f.provenance.span.start_ns.0)
+            .filter(|&s| s >= second)
+            .collect();
+        assert_eq!(later.len(), 27, "{later:?}");
+        let first_ldu2 = second + LDU_NS;
+        assert!(
+            later.iter().min().unwrap().abs_diff(first_ldu2) < 2_000_000,
+            "{later:?} vs {first_ldu2}"
+        );
+    }
+
+    /// A call of `first` for one superframe that goes on, the same radio to the same
+    /// talkgroup with no break, as `then` for another; and when the second superframe's
+    /// LDU1 and LDU2 start, ns.
+    fn turning(first: EncSync, then: EncSync) -> (Vec<Complex<f32>>, u64, u64) {
+        let a = encode_call(NAC, group(), first, 1);
+        let b = encode_call(NAC, group(), then, 1);
+        let mut dibits = a[..HDU_DIBITS + 2 * LDU_DIBITS].to_vec();
+        dibits.extend(&b[HDU_DIBITS..]);
+        let at = |dibit: usize| T0 + (dibit * SPD) as u64 * 1_000_000_000 / RATE;
+        let ldu1 = HDU_DIBITS + 2 * LDU_DIBITS;
+        (on_air(&dibits, RATE), at(ldu1), at(ldu1 + LDU_DIBITS))
+    }
+
+    #[tokio::test]
+    async fn a_call_that_turns_encrypted_stops_feeding_at_once() {
+        let mbe = Mbe::installed();
+        let mut h = Harness::start(&mbe, 4096);
+        let (iq, turned, _) = turning(clear(), AES_ENC);
+        h.send(&iq, RATE);
+        let r = h
+            .end(|h| h.events.len() >= 2 && h.audio.len() >= SUPERFRAME_FRAMES)
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(eots(&h.events), [false, true], "{:?}", h.events);
+        has(&h.events[0], json!({"audio": true, "encrypted": false}));
+        has(
+            &h.events[1],
+            json!({
+                "encrypted": true, "audio": false, "silent": "encrypted", "algid": 170,
+                "frames": 36, "program": true
+            }),
+        );
+        // The first superframe's speech, all of it handed back, and none from the
+        // protected LDU1 on: its frames never reached the vocoder.
+        assert_eq!(h.audio.len(), SUPERFRAME_FRAMES);
+        assert!(
+            audio_end(&h.audio) <= turned + SLACK_NS,
+            "{} > {turned}",
+            audio_end(&h.audio)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_encrypted_call_that_turns_clear_is_heard_from_then() {
+        let mbe = Mbe::installed();
+        let mut h = Harness::start(&mbe, 4096);
+        let (iq, _, cleared) = turning(AES_ENC, clear());
+        h.send(&iq, RATE);
+        let r = h.end(|h| h.events.len() >= 2 && h.audio.len() >= 9).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(eots(&h.events), [false, true], "{:?}", h.events);
+        has(&h.events[0], json!({"audio": false, "silent": "encrypted"}));
+        has(
+            &h.events[1],
+            json!({"encrypted": false, "audio": true, "silent": null, "program": true}),
+        );
+        // The second superframe's LDU2, whose encryption sync says clear, and nothing before.
+        assert_eq!(h.audio.len(), 9);
+        let first = h.audio.iter().map(|f| f.provenance.span.start_ns.0).min();
+        assert!(
+            first.unwrap().abs_diff(cleared) < 2_000_000,
+            "{first:?} vs {cleared}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_after_a_lead_in_opens_at_its_header() {
+        let mut noise = carrier(1000);
+        awgn(&mut noise, -10.0, 7);
+        for (name, lead) in [("noise", noise), ("carrier", carrier(200))] {
+            let mbe = Mbe::installed();
+            let mut h = Harness::start(&mbe, 4096);
+            let mut iq = lead.clone();
+            iq.extend(call(clear(), 3));
+            h.send(&iq, RATE);
+            let r = h
+                .end(|h| h.events.len() >= 2 && h.audio.len() >= 3 * SUPERFRAME_FRAMES)
+                .await;
+            assert!(r.is_ok(), "{name}: {r:?}");
+            assert_eq!(eots(&h.events), [false, true], "{name}: {:?}", h.events);
+            // Opened at the first LDU1 after the header (the mid-call path opens on an LDU2,
+            // 18 frames in).
+            has(&h.events[0], json!({"frames": 9, "audio": true}));
+            let ldu1 = T0 + (lead.len() + HDU_DIBITS * SPD) as u64 * 1_000_000_000 / RATE;
+            assert!(
+                t_ns(&h.events[0]).abs_diff(ldu1) < 2_000_000,
+                "{name}: {}",
+                h.events[0]
+            );
+            has(&h.events[1], json!({"frames": 54}));
+            assert_eq!(h.audio.len(), 54, "{name}");
+        }
     }
 
     #[tokio::test]
