@@ -790,8 +790,8 @@ mod tests {
 
     use super::*;
     use crate::p25::{
-        Call, LcMark, coded_sync, damaged_sync, encode_call, encode_call_lc, encode_call_syncs,
-        encode_control,
+        Call, LcMark, coded_sync, damaged_sync, encode_call, encode_call_header, encode_call_lc,
+        encode_call_syncs, encode_control, level_blocks,
     };
     use crate::synth::{awgn, c4fm_modulate, parse_params, synthesise};
     use crate::voice_call::fake_mbe;
@@ -1545,12 +1545,25 @@ mod tests {
         s
     }
 
-    /// A clear call with its header, one LDU2 sending `sync`: the sync decides nothing, so
-    /// the call stays clear and is heard whole.
-    async fn stays_clear(sync: Vec<u8>) {
+    /// A clear call of three superframes with its header, superframe `sf`'s LDU2 sending
+    /// `sync` as its coded encryption sync.
+    fn sync_in(sf: u32, sync: Vec<u8>) -> Vec<u8> {
+        synced(clear(), &|n, es| if n == sf { sync.clone() } else { es })
+    }
+
+    /// A clear call of three superframes with its header, superframe `sf`'s LDU2 sending
+    /// its encryption sync's blocks as `dibit` throughout (a carrier at that level).
+    fn level_in(sf: usize, dibit: u8) -> Vec<u8> {
+        let mut dibits = encode_call(NAC, group(), clear(), 3);
+        level_blocks(&mut dibits, 2 * sf + 1, dibit);
+        dibits
+    }
+
+    /// `dibits`, a clear call with its header whose second superframe's LDU2 sync decides
+    /// nothing: the call stays clear and is heard whole.
+    async fn stays_clear(dibits: Vec<u8>) {
         let mbe = Mbe::installed();
         let mut h = Harness::start(&mbe, 4096);
-        let dibits = synced(clear(), &|sf, es| if sf == 1 { sync.clone() } else { es });
         h.send(&on_air(&dibits, RATE), RATE);
         let r = h
             .end(|h| h.events.len() >= 2 && h.audio.len() >= 3 * SUPERFRAME_FRAMES)
@@ -1564,13 +1577,12 @@ mod tests {
         assert_eq!(h.audio.len(), 3 * SUPERFRAME_FRAMES);
     }
 
-    /// A clear call joined after its header whose first LDU2 sends `sync`: that sync
-    /// licenses nothing, so the call's speech is held until the next LDU2's, and its first
-    /// frame heard is that LDU2's.
-    async fn licensed_only_later(sync: Vec<u8>) {
+    /// `second`, a clear call joined after its header whose first LDU2 sync licenses
+    /// nothing: the call's speech is held until the next LDU2's, and its first frame heard
+    /// is that LDU2's.
+    async fn licensed_only_later(second: Vec<u8>) {
         let mbe = Mbe::installed();
         let mut h = Harness::start(&mbe, 4096);
-        let second = synced(clear(), &|sf, es| if sf == 0 { sync.clone() } else { es });
         let (iq, at) = after_a_cut_call(&second);
         h.send(&iq, RATE);
         let r = h
@@ -1596,15 +1608,67 @@ mod tests {
 
     #[tokio::test]
     async fn an_all_zero_encryption_sync_neither_marks_nor_licenses_a_call() {
-        stays_clear(coded_sync(None)).await;
-        licensed_only_later(coded_sync(None)).await;
+        stays_clear(sync_in(1, coded_sync(None))).await;
+        licensed_only_later(sync_in(0, coded_sync(None))).await;
     }
 
     #[tokio::test]
     async fn an_encryption_sync_past_the_correction_limit_decides_nothing() {
         // 3 symbols wrong: within the code's reach (4), past the limit (2).
-        stays_clear(damaged_sync(coded_sync(Some(AES_ENC)), &[0, 9, 18])).await;
-        licensed_only_later(damaged_sync(coded_sync(Some(clear())), &[0, 9, 18])).await;
+        let wrong = [0, 9, 18];
+        stays_clear(sync_in(1, damaged_sync(coded_sync(Some(AES_ENC)), &wrong))).await;
+        licensed_only_later(sync_in(0, damaged_sync(coded_sync(Some(clear())), &wrong))).await;
+    }
+
+    #[tokio::test]
+    async fn a_carrier_at_an_outer_level_neither_marks_nor_licenses_a_call() {
+        // Dibit 01 is +3, 11 is -3: a carrier at +1800 or -1800 Hz for the sync's blocks.
+        for dibit in [0b01, 0b11] {
+            stays_clear(level_in(1, dibit)).await;
+            licensed_only_later(level_in(0, dibit)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_header_past_its_correction_limit_licenses_nothing() {
+        // The header's encryption fields need 5 or 8 symbols corrected: within the code's
+        // reach (8), past the limit (4). The header then says nothing, the clear LDU1 after
+        // it feeds nothing, and the speech starts at the first LDU2, whose sync counts.
+        let cases: [&[usize]; 2] = [&[0, 3, 6, 9, 12], &[0, 2, 4, 6, 8, 10, 12, 14]];
+        for wrong in cases {
+            let mbe = Mbe::installed();
+            let mut h = Harness::start(&mbe, 4096);
+            let dibits =
+                encode_call_header(NAC, group(), clear(), 3, &|hex| damaged_sync(hex, wrong));
+            h.send(&on_air(&dibits, RATE), RATE);
+            let r = h
+                .end(|h| h.events.len() >= 2 && h.audio.len() >= 2 * SUPERFRAME_FRAMES + 9)
+                .await;
+            assert!(r.is_ok(), "{r:?}");
+            let n = wrong.len();
+            assert_eq!(eots(&h.events), [false, true], "{n}: {:?}", h.events);
+            // Opened at the first LDU2, its 18th frame, once its sync said clear.
+            has(
+                &h.events[0],
+                json!({"frames": 18, "audio": true, "silent": null, "algid": 128}),
+            );
+            has(&h.events[1], json!({"frames": 54, "audio": true}));
+            // The first LDU1's 9 frames never fed; every frame from the first LDU2 on.
+            assert_eq!(
+                h.audio.len(),
+                2 * SUPERFRAME_FRAMES + 9,
+                "{n} symbols wrong"
+            );
+            let ldu2 = T0 + ((HDU_DIBITS + LDU_DIBITS) * SPD) as u64 * 1_000_000_000 / RATE;
+            let starts = starts_from(&h.audio, 0);
+            assert!(
+                starts[0].abs_diff(ldu2) < 2_000_000,
+                "{n}: {:?} vs {ldu2}",
+                starts.first()
+            );
+            assert_eq!(t_ns(&h.events[0]), starts[0], "{n}");
+            assert_eq!(runs(&mbe), 1, "{n}: {}", mbe.log());
+        }
     }
 
     #[tokio::test]

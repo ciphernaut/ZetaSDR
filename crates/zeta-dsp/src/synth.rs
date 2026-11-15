@@ -1390,11 +1390,28 @@ fn p25_iq(
     control: bool,
     rate_hz: u32,
 ) -> Vec<Complex<f32>> {
+    use crate::p25::{P25_BAUD, P25_DEVIATION_HZ};
+    let dibits = p25_dibits(nac, src, dst, superframes, encrypted, control);
+    let mut iq = c4fm_modulate(&dibits, P25_BAUD, P25_DEVIATION_HZ, rate_hz);
+    let tail = (rate_hz * P25_TAIL_MS / 1000) as usize;
+    iq.extend(std::iter::repeat_n(Complex::new(0.0, 0.0), tail));
+    iq
+}
+
+/// The dibits [`p25_iq`] modulates.
+fn p25_dibits(
+    nac: u16,
+    src: u32,
+    dst: u32,
+    superframes: u32,
+    encrypted: bool,
+    control: bool,
+) -> Vec<u8> {
     use crate::p25::{
-        Call, EncSync, LDU_DIBITS, LinkControl, P25_ALGID_AES, P25_ALGID_CLEAR, P25_BAUD,
-        P25_DEVIATION_HZ, TSDU_DIBITS, encode_call, encode_control,
+        Call, EncSync, LDU_DIBITS, LinkControl, P25_ALGID_AES, P25_ALGID_CLEAR, TSDU_DIBITS,
+        encode_call, encode_control,
     };
-    let dibits = if control {
+    if control {
         let units = (2 * superframes as usize * LDU_DIBITS).div_ceil(TSDU_DIBITS);
         encode_control(nac, units as u32)
     } else {
@@ -1417,11 +1434,7 @@ fn p25_iq(
             }
         };
         encode_call(nac, lc, enc, superframes)
-    };
-    let mut iq = c4fm_modulate(&dibits, P25_BAUD, P25_DEVIATION_HZ, rate_hz);
-    let tail = (rate_hz * P25_TAIL_MS / 1000) as usize;
-    iq.extend(std::iter::repeat_n(Complex::new(0.0, 0.0), tail));
-    iq
+    }
 }
 
 /// The largest DMR colour code (4 bits).
@@ -1452,45 +1465,20 @@ struct DmrCall {
 /// control blocks; slot 2 `second` or idle) or a handheld's bursts with the carrier off
 /// between them; 4FSK at 4800 baud and ±1944 Hz, then [`DMR_TAIL_MS`] of nothing.
 fn dmr_iq(call: &DmrCall, rate_hz: u32) -> Vec<Complex<f32>> {
-    use crate::dmr::{
-        Call, DMR_BAUD, DMR_DEVIATION_HZ, DMR_RRC_ALPHA, FullLc, Origin, SlotPlan,
-        encode_handheld_aliased, encode_repeater_aliased,
-    };
+    use crate::dmr::{DMR_BAUD, DMR_DEVIATION_HZ, DMR_RRC_ALPHA, Origin};
     use crate::fsk4::dibit_symbol;
-    let lc = |src, dst, encrypted| FullLc {
-        call: Call::Group,
-        dst,
-        src,
-        fid: 0,
-        encrypted,
-        emergency: false,
-    };
-    let first = lc(call.src, call.dst, call.encrypted);
     let mut iq = match call.origin {
         Origin::Repeater => {
-            let slots = [
-                SlotPlan {
-                    lc: (!call.idle).then_some(first),
-                    superframes: call.superframes,
-                    control: call.control,
-                },
-                SlotPlan {
-                    lc: call.second.map(|c| lc(c.src, c.dst, c.encrypted)),
-                    superframes: call.superframes,
-                    control: false,
-                },
-            ];
-            let symbols: Vec<u8> =
-                encode_repeater_aliased(call.color_code, slots, [call.talker_alias, false])
-                    .into_iter()
-                    .map(dibit_symbol)
-                    .collect();
+            let symbols: Vec<u8> = dmr_repeater_dibits(call)
+                .into_iter()
+                .map(dibit_symbol)
+                .collect();
             rrc_modulate_4fsk(&symbols, DMR_BAUD, DMR_DEVIATION_HZ, rate_hz, DMR_RRC_ALPHA)
         }
         Origin::Handheld => {
-            let symbols: Vec<Option<u8>> = encode_handheld_aliased(
+            let symbols: Vec<Option<u8>> = crate::dmr::encode_handheld_aliased(
                 call.color_code,
-                first,
+                dmr_lc(call.src, call.dst, call.encrypted),
                 call.superframes,
                 call.talker_alias,
             )
@@ -1503,6 +1491,36 @@ fn dmr_iq(call: &DmrCall, rate_hz: u32) -> Vec<Complex<f32>> {
     let tail = (rate_hz * DMR_TAIL_MS / 1000) as usize;
     iq.extend(std::iter::repeat_n(Complex::new(0.0, 0.0), tail));
     iq
+}
+
+/// The `dmr` family's link control: a group call from `src` to `dst`.
+fn dmr_lc(src: u32, dst: u32, encrypted: bool) -> crate::dmr::FullLc {
+    crate::dmr::FullLc {
+        call: crate::dmr::Call::Group,
+        dst,
+        src,
+        fid: 0,
+        encrypted,
+        emergency: false,
+    }
+}
+
+/// The dibits [`dmr_iq`] modulates for a repeater's downlink.
+fn dmr_repeater_dibits(call: &DmrCall) -> Vec<u8> {
+    use crate::dmr::SlotPlan;
+    let slots = [
+        SlotPlan {
+            lc: (!call.idle).then_some(dmr_lc(call.src, call.dst, call.encrypted)),
+            superframes: call.superframes,
+            control: call.control,
+        },
+        SlotPlan {
+            lc: call.second.map(|c| dmr_lc(c.src, c.dst, c.encrypted)),
+            superframes: call.superframes,
+            control: false,
+        },
+    ];
+    crate::dmr::encode_repeater_aliased(call.color_code, slots, [call.talker_alias, false])
 }
 
 /// Bounds on the generic families' numbers, so a bad row is an error, not an abort or
@@ -3736,5 +3754,136 @@ mod tests {
             assert_eq!(frame.lich.unwrap().1 as usize, n % LICH_CHUNKS);
             assert_eq!(frame.payload, [0; 16]);
         }
+    }
+
+    /// FNV-1a, 64 bits, over `bytes`: a digest with no dependency.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    /// The dibits (0..=3, one per byte) the `p25` family or the `dmr` family's repeater
+    /// downlink modulates for `spec`.
+    fn family_dibits(spec: &SynthSpec) -> Vec<u8> {
+        match spec {
+            SynthSpec::P25 {
+                nac,
+                src,
+                dst,
+                superframes,
+                encrypted,
+                control,
+            } => p25_dibits(*nac, *src, *dst, *superframes, *encrypted, *control),
+            SynthSpec::Dmr {
+                color_code,
+                src,
+                dst,
+                superframes,
+                origin: crate::dmr::Origin::Repeater,
+                second,
+                encrypted,
+                idle,
+                control,
+                talker_alias,
+            } => dmr_repeater_dibits(&DmrCall {
+                color_code: *color_code,
+                src: *src,
+                dst: *dst,
+                superframes: *superframes,
+                origin: crate::dmr::Origin::Repeater,
+                second: *second,
+                encrypted: *encrypted,
+                idle: *idle,
+                control: *control,
+                talker_alias: *talker_alias,
+            }),
+            other => panic!("no dibits for {other:?}"),
+        }
+    }
+
+    /// A DMR repeater capture of the `gen_voice_wav` example: colour code 5, radio 9990001
+    /// to talkgroup 9990 on slot 1, three superframes, clear, with `second` on slot 2.
+    fn dmr_capture(second: Option<DmrSecondCall>) -> SynthSpec {
+        SynthSpec::Dmr {
+            color_code: 5,
+            src: 9_990_001,
+            dst: 9_990,
+            superframes: 3,
+            origin: crate::dmr::Origin::Repeater,
+            second,
+            encrypted: false,
+            idle: false,
+            control: false,
+            talker_alias: false,
+        }
+    }
+
+    /// Pins the dibits of the `p25_group` capture, as the `gen_voice_wav` example
+    /// synthesises it (NAC 291, radio 9990001 to talkgroup 65000, three superframes,
+    /// clear), by length and FNV-1a 64 digest. Those dibits were decoded by dsd-fme
+    /// (commit `33d6cdfb54dffdb5f3ca65eedb6314d716b70645`, an independent decoder run by
+    /// hand, outside this tree) with every field as sent and every IMBE frame equal to its
+    /// payload bit for bit, nothing corrected. Most of the P25 codes are otherwise only
+    /// checked against their own inverse here, so a change made alike to a table and its
+    /// inverse would pass every other test: one that moves any dibit fails this one, and
+    /// its dibits must be checked against an independent decoder again before the digest
+    /// is updated.
+    #[test]
+    fn the_p25_group_capture_is_the_one_checked_against_another_decoder() {
+        let spec = SynthSpec::P25 {
+            nac: 0x123,
+            src: 9_990_001,
+            dst: 65_000,
+            superframes: 3,
+            encrypted: false,
+            control: false,
+        };
+        let dibits = family_dibits(&spec);
+        assert_eq!(
+            (dibits.len(), fnv1a64(&dibits)),
+            (5796, 0x0850_4791_e33a_8461)
+        );
+    }
+
+    /// Pins the dibits of the `dmr_slot1` capture, as the `gen_voice_wav` example
+    /// synthesises it (a repeater's downlink, colour code 5, radio 9990001 to talkgroup
+    /// 9990 on slot 1 for three superframes, slot 2 idle, clear), by length and FNV-1a 64
+    /// digest. Those dibits were decoded by dsd-fme (commit
+    /// `33d6cdfb54dffdb5f3ca65eedb6314d716b70645`, an independent decoder run by hand,
+    /// outside this tree) with every field as sent and every AMBE+2 frame equal to its
+    /// payload bit for bit, nothing corrected. Most of the DMR codes are otherwise only
+    /// checked against their own inverse here, so a change made alike to a table and its
+    /// inverse would pass every other test: one that moves any dibit fails this one, and
+    /// its dibits must be checked against an independent decoder again before the digest
+    /// is updated.
+    #[test]
+    fn the_dmr_slot1_capture_is_the_one_checked_against_another_decoder() {
+        let dibits = family_dibits(&dmr_capture(None));
+        assert_eq!(
+            (dibits.len(), fnv1a64(&dibits)),
+            (5760, 0x03aa_1bb1_a8c4_a97f)
+        );
+    }
+
+    /// Pins the dibits of the `dmr_two_calls` capture, as the `gen_voice_wav` example
+    /// synthesises it ([`the_dmr_slot1_capture_is_the_one_checked_against_another_decoder`]'s
+    /// call on slot 1, and radio 9990002 to talkgroup 9991 on slot 2, clear), by length
+    /// and FNV-1a 64 digest. dsd-fme (the same commit) decoded both slots with every field
+    /// as sent and every AMBE+2 frame of each equal to its payload bit for bit. A change
+    /// that moves any dibit fails this test, and its dibits must be checked against an
+    /// independent decoder again before the digest is updated.
+    #[test]
+    fn the_dmr_two_calls_capture_is_the_one_checked_against_another_decoder() {
+        let second = DmrSecondCall {
+            src: 9_990_002,
+            dst: 9_991,
+            encrypted: false,
+        };
+        let dibits = family_dibits(&dmr_capture(Some(second)));
+        assert_eq!(
+            (dibits.len(), fnv1a64(&dibits)),
+            (5760, 0x4d1c_9c74_a0fd_8dc0)
+        );
     }
 }

@@ -539,7 +539,7 @@ pub(crate) fn encode_call_lc(
     superframes: u32,
     mark: LcMark,
 ) -> Vec<u8> {
-    encode_call_with(nac, lc, enc, superframes, mark, &|_, es| es)
+    encode_call_with(nac, lc, enc, superframes, mark, &|_, es| es, &|h| h)
 }
 
 /// [`encode_call_lc`] with each superframe's LDU2 sending `sync(superframe, the coded sync
@@ -554,7 +554,37 @@ pub(crate) fn encode_call_syncs(
     mark: LcMark,
     sync: &dyn Fn(u32, Vec<u8>) -> Vec<u8>,
 ) -> Vec<u8> {
-    encode_call_with(nac, lc, enc, superframes, mark, sync)
+    encode_call_with(nac, lc, enc, superframes, mark, sync, &|h| h)
+}
+
+/// [`encode_call`] with its header sending `header(the coded header it would send)` as its
+/// 36 coded hexbits: for tests of headers that are damaged.
+#[cfg(test)]
+pub(crate) fn encode_call_header(
+    nac: u16,
+    lc: LinkControl,
+    enc: EncSync,
+    superframes: u32,
+    header: &dyn Fn(Vec<u8>) -> Vec<u8>,
+) -> Vec<u8> {
+    let (mark, sync) = (LcMark::ByAlgorithm, |_, es| es);
+    encode_call_with(nac, lc, enc, superframes, mark, &sync, header)
+}
+
+/// `call` (an [`encode_call`] call) with the 240 bits of link control or encryption sync
+/// of its LDU `index` (0 its first LDU1) sent as `dibit` throughout, the voice frames
+/// between them left as they are: what a carrier held at that dibit's level for those
+/// blocks slices to.
+#[cfg(test)]
+pub(crate) fn level_blocks(call: &mut [u8], index: usize, dibit: u8) {
+    let unit = HDU_DIBITS + index * LDU_DIBITS;
+    for at in LDU_LC_AT {
+        for bit in (at..at + LDU_LC_BLOCK_BITS).step_by(2) {
+            // The information dibit's place among the unit's dibits, status symbols in.
+            let info = bit / 2;
+            call[unit + info + info / (STATUS_PERIOD - 1)] = dibit;
+        }
+    }
 }
 
 /// An encryption sync's 24 coded hexbits: `enc`'s (its MI zero), or with `None` the
@@ -564,7 +594,7 @@ pub(crate) fn coded_sync(enc: Option<EncSync>) -> Vec<u8> {
     RS_ES.encode(&hexbits(enc.as_ref().map_or(0, es_word), ES_HEXBITS))
 }
 
-/// A coded sync with its hexbits at `at` changed: as many symbols wrong.
+/// A coded sync (or header) with its hexbits at `at` changed: as many symbols wrong.
 #[cfg(test)]
 pub(crate) fn damaged_sync(mut sync: Vec<u8>, at: &[usize]) -> Vec<u8> {
     for &i in at {
@@ -580,6 +610,7 @@ fn encode_call_with(
     superframes: u32,
     mark: LcMark,
     sync: &dyn Fn(u32, Vec<u8>) -> Vec<u8>,
+    header: &dyn Fn(Vec<u8>) -> Vec<u8>,
 ) -> Vec<u8> {
     let by_algorithm = enc.algid != P25_ALGID_CLEAR;
     let mut word = lc_word(&lc, by_algorithm && mark != LcMark::Unmarked);
@@ -596,7 +627,7 @@ fn encode_call_with(
     let mut frame = 0;
 
     let mut hdu = header_bits(nac, DUID_HDU);
-    hdu.extend(hdu_bits(&header_hex));
+    hdu.extend(hdu_bits(&header(header_hex)));
     let mut out = unit_symbols(hdu, HDU_INFO_BITS, STATUS_TALKAROUND);
     for sf in 0..superframes {
         let es_hex = sync(sf, es_hex.clone());
@@ -1896,5 +1927,62 @@ mod tests {
             }
         );
         assert!(matches!(units[2].2, P25Unit::Ldu2 { enc: None, .. }));
+    }
+
+    /// The header's encryption fields count when they needed at most
+    /// `HEADER_TRUSTED_SYMBOLS` (4) corrected, and not when they needed 5 to 8, still
+    /// within the (36,20,17) code's reach; its talkgroup is read either way.
+    #[test]
+    fn a_header_counts_only_within_its_correction_limit() {
+        let clear = EncSync {
+            algid: P25_ALGID_CLEAR,
+            kid: 0,
+        };
+        // Hexbits among the first 16: the message indicator, MFID, ALGID and KID.
+        let cases: [(&[usize], bool); 4] = [
+            (&[0, 4, 8, 13], true),
+            (&[0, 3, 6, 9, 12], false),
+            (&[0, 2, 4, 6, 8, 10, 13], false),
+            (&[0, 2, 4, 6, 8, 10, 12, 14], false),
+        ];
+        for (wrong, counts) in cases {
+            let call = encode_call_header(NAC, group(), clear, 1, &|h| damaged_sync(h, wrong));
+            let units = receive(&on_air(&call, false), &mut P25Framer::new());
+            assert_eq!(
+                units[0].2,
+                P25Unit::Header {
+                    enc: counts.then_some(clear),
+                    dst: Some(DST)
+                },
+                "{} symbols wrong",
+                wrong.len()
+            );
+        }
+    }
+
+    /// A carrier held at either outer level (dibit 01 at +3, 11 at −3) in place of an
+    /// LDU2's encryption sync slices to one dibit throughout its blocks: it never counts,
+    /// as the all-zero word a carrier at 0 Hz decodes to does not.
+    #[test]
+    fn a_carrier_at_an_outer_level_is_no_encryption_sync() {
+        let clear = EncSync {
+            algid: P25_ALGID_CLEAR,
+            kid: 0,
+        };
+        for dibit in [0b01, 0b11] {
+            let mut call = encode_call(NAC, group(), clear, 1);
+            level_blocks(&mut call, 1, dibit);
+            let units = receive(&on_air(&call, false), &mut P25Framer::new());
+            assert_eq!(units.len(), 4, "dibit {dibit:02b}: {units:?}");
+            assert!(
+                matches!(units[1].2, P25Unit::Ldu1 { lc: Some(_), .. }),
+                "dibit {dibit:02b}: {:?}",
+                units[1]
+            );
+            let P25Unit::Ldu2 { enc, .. } = &units[2].2 else {
+                panic!("dibit {dibit:02b}: {:?}", units[2]);
+            };
+            assert_eq!(*enc, None, "dibit {dibit:02b}");
+        }
     }
 }
