@@ -501,6 +501,12 @@ pub struct Identify {
     /// Among rows of equal score, the higher priority is tried first (0 when absent).
     #[serde(default)]
     pub priority: i32,
+    /// Tried on the `identify` band as it was asked, never re-centred on the measured
+    /// centre: for a decoder that places itself inside its band and needs all of it (a
+    /// first-layer measurement of an uneven wide signal can be of a part of it). `false`
+    /// when absent.
+    #[serde(default)]
+    pub as_asked: bool,
 }
 
 /// What counts as proof: any event, or an event whose `identify.field` is true.

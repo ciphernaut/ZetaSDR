@@ -32,7 +32,7 @@ use crate::knowledge::{Allocation, nearest_of};
 use crate::learned::{LEARNED_VERDICT_MIN, label_score, learned_match};
 use crate::modes::Proof;
 use crate::modes::score::{allocation_match, allocation_term, score_rows};
-use crate::modes::{LoadedMode, ModeState};
+use crate::modes::{Identify, LoadedMode, ModeState};
 use crate::ops::{IDENTIFY_MEASURE_MS, JobKind};
 use crate::port::{Port, Tuning};
 use crate::stage::StageError;
@@ -632,6 +632,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
             return Err(faulted(f));
         }
         let id = mode.row.id.0.as_str();
+        let (trial, recentred) = row_trial(&mode.row.identify, r.tuning, trial, recentred);
         let child = match inner.start_child(&r, mode, trial).await {
             Ok(Some(c)) => c,
             Ok(None) => return Err(StageError::Cancelled),
@@ -774,6 +775,15 @@ fn trial_tuning(band: Tuning, capture: Tuning, measured: Option<(u64, &str)>) ->
     }
 }
 
+/// The band one row's trial runs on, and whether it is re-centred: the run's `trial` band
+/// ([`trial_tuning`]), or for a row tried `as_asked` the identify `band` itself.
+fn row_trial(rule: &Identify, band: Tuning, trial: Tuning, recentred: bool) -> (Tuning, bool) {
+    match rule.as_asked {
+        true => (band, false),
+        false => (trial, recentred),
+    }
+}
+
 /// The child the loop is trying. Stopped by [`ChildGuard::stop`], or, on any other exit
 /// of the loop with one set (an error, a panic), from a task the drop spawns: a gated
 /// stop (its lease goes without waiting on the source's gate), then the port's idle.
@@ -857,6 +867,28 @@ mod tests {
             ..measured.clone()
         };
         assert_eq!(decoded_query(&fm, &[], &locked).modulation, ["fm"]);
+    }
+
+    /// A row tried `as_asked` runs on the identify band itself, whatever the measurement
+    /// moved the other rows' trials to; any other row takes the run's trial.
+    #[test]
+    fn a_row_tried_as_asked_is_not_recentred() {
+        let rule = |as_asked| Identify {
+            proof: Proof::Field,
+            field: Some("locked".into()),
+            min_events: 1,
+            dwell_ms: 8_000,
+            min_span_ms: 0,
+            quick: None,
+            priority: 0,
+            as_asked,
+        };
+        // The band as asked, and the trial a measurement of the upper half of a wide
+        // uneven signal moved it to.
+        let (band, trial) = (t(634_500_000, 7_100_000), t(635_690_000, 7_100_000));
+        assert_eq!(row_trial(&rule(true), band, trial, true), (band, false));
+        assert_eq!(row_trial(&rule(false), band, trial, true), (trial, true));
+        assert_eq!(row_trial(&rule(false), band, band, false), (band, false));
     }
 
     #[test]
