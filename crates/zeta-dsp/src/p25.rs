@@ -4,9 +4,12 @@
 //!
 //! **Sources.** TIA-102.BAAA (the common air interface) and TIA-102.BABA (the IMBE vocoder)
 //! are not freely published and were not to hand, so no clause number is cited and none
-//! could be confirmed against them. The values below come from a published description and
-//! are cross-checked, value by value, against open-source decoders used as oracles. The
-//! code and its structure are this module's own; no decoder's functions were copied.
+//! could be confirmed against them. Some values below come from a published description
+//! and were also compared, value by value, with open-source decoders used as oracles;
+//! others have no published description to hand and are taken from where the named
+//! decoders agree. Each list says which. The code and its structure are this module's
+//! own; no decoder's functions were copied, and the interleave, the mask and the Hamming
+//! (15,11) check bits are written as derivations, not tables.
 //! - **Published description:** Daniels Electronics, *TG-001 P25 Radio Systems* training
 //!   guide, revision 2-0-0 (January 2007), chapter 4 "Anatomy of the Common Air
 //!   Interface" and chapters 1 and 3. It gives the frame sync `$5575F5FF77FF`; the network
@@ -16,26 +19,37 @@
 //!   layout (HDU 792 bits, LDU1 and LDU2 1728, TDU 144, TDU with link control 432) with the
 //!   parameters of every code; the link control formats `$00` (group) and `$03` (unit to
 //!   unit) and the emergency bit; the encryption sync (MI 72, ALGID 8, KID 16 bits),
-//!   ALGID `$80` for clear speech and `$84` for AES; the dibit-to-deviation mapping.
-//! - **Derived from those parameters:** the BCH generator (the narrow-sense primitive code
-//!   of designed distance 23 over GF(2^6) with `x^6 + x + 1`, [`BCH_GENERATOR`], checked
-//!   by a test against that definition) and the Reed-Solomon generators (roots `α^1` to
-//!   `α^(n-k)` in the same field).
-//! - **Oracles** (tables compared entry by entry by hand; none is in this tree):
+//!   ALGID `$80` for clear speech and `$84` for AES; the dibit-to-deviation mapping; the
+//!   order of an LDU's blocks. The sync, the NID and its parity bits, the status symbols'
+//!   places, the units' lengths, the fields' order and the LDU's blocks were also compared
+//!   with OP25 (and the parity bits with DSD); the ALGIDs and the mapping were not.
+//! - **No published description to hand; taken from where the decoders below agree:**
+//!   the field GF(2^6) with `x^6 + x + 1`; the BCH generator as the narrow-sense primitive
+//!   code of designed distance 23 in that field (`BCH_GENERATOR`, which a test re-derives
+//!   from that definition); the NID parity bit of DUIDs no unit is defined for (0); the
+//!   Reed-Solomon generators' roots `α^1` to `α^(n-k)`, systematic, data first; the Golay
+//!   generator `0xC75` and its bit order (data in the top bits, the extended code's parity
+//!   bit last); the Hamming (15,11) and (10,6,3) check bits; the IMBE pseudo-random mask
+//!   and the words it covers; the 8 × 23 frame's orientation (which row and column holds
+//!   each bit); the IMBE interleave; every bit position inside an LDU.
+//! - **The decoders** (compared entry by entry by hand; none is in this tree):
 //!   OP25 (`gr-op25_repeater`, GPL-3): the BCH generator and the NID encoder's rows
 //!   (parity bit included), the Golay (23,12) and (24,12) tables, the Hamming (15,11) and
-//!   (10,6,3) tables, the three Reed-Solomon generator matrices, the pseudo-random mask
-//!   generator, and every bit position of an LDU (voice, link control, low-speed data).
-//!   DSD (ISC licence): the IMBE interleave schedule (`p25p1_const.h`), the Hamming
-//!   (10,6,3) generator matrix and the NID parity table. mbelib-neo 2.6.11 (GPL-2.0+, the
-//!   library `zeta-mbe` links): the 8 × 23 frame it takes, its Golay and Hamming bit order
-//!   and where the mask lies.
+//!   (10,6,3) tables, the three Reed-Solomon generator matrices, the mask generator, and
+//!   every bit position of an LDU (voice, link control, low-speed data). DSD (ISC
+//!   licence): the IMBE interleave schedule (`p25p1_const.h`), the Hamming (10,6,3)
+//!   generator matrix and the NID parity table. mbelib-neo 2.6.11 (GPL-2.0+, the library
+//!   `zeta-mbe` links): the 8 × 23 frame it takes, its Golay and Hamming tables and bit
+//!   order, and the mask and where it lies. The Hamming (10,6,3) check bits are the one
+//!   table here taken as data (`HAMMING10_CHECKS`, six values, as OP25 and DSD both
+//!   give them); the Golay (24,12) code also matches the matrix M17's specification
+//!   prints (a test compares them).
 //!
 //! **The signal.** 4800 dibits/s, C4FM at ±1800 and ±600 Hz ([`crate::fsk4`]). Each data
 //! unit starts with the 24-dibit frame sync and the 32-dibit NID. From the sync's first
 //! dibit, every 36th dibit (index 35, 71, …) is a status symbol, removed before anything is
 //! decoded; the counts below are the unit's information bits, status symbols taken out.
-//! - **NID**: NAC and DUID (16 bits), the 47 check bits, the parity bit. [`nid_decode`]
+//! - **NID**: NAC and DUID (16 bits), the 47 check bits, the parity bit. `nid_decode`
 //!   corrects up to 11 errors over all 64 bits (Berlekamp–Massey, then the parity bit
 //!   checked against the DUID) and refuses more.
 //! - **HDU** (`0x0`): MI, MFID, ALGID, KID, TGID (120 bits, 20 hexbits) → Reed-Solomon
@@ -67,7 +81,6 @@
 use std::sync::OnceLock;
 
 use crate::fsk4::{SoftDibit, find_sync, sync_dibits};
-use crate::m17::{golay24_decode, golay24_encode};
 
 /// P25 phase 1's symbol rate, baud.
 pub const P25_BAUD: u32 = 4800;
@@ -437,7 +450,7 @@ fn decode_unit(duid: u8, bits: &[u8], nid_errors: u32) -> P25Unit {
 // ---- encoding ----
 
 /// A clear or encrypted call as dibits: header, `superframes` × (LDU1, LDU2), terminator
-/// with link control. The voice frames carry one fixed payload ([`VOICE_PAYLOAD`]); the
+/// with link control. The voice frames carry one fixed payload (`VOICE_PAYLOAD`); the
 /// message indicator is zero.
 pub fn encode_call(nac: u16, lc: LinkControl, enc: EncSync, superframes: u32) -> Vec<u8> {
     let protected = enc.algid != P25_ALGID_CLEAR;
@@ -636,8 +649,8 @@ fn tdulc_hexbits(bits: &[u8]) -> (Vec<u8>, u32) {
     let hex = words_of(bits, 24)
         .flat_map(|w| {
             let d = match golay24_decode(w) {
-                Some(d) => {
-                    errors += (golay24_encode(d) ^ w).count_ones();
+                Some((d, e)) => {
+                    errors += e;
                     d
                 }
                 None => (w >> GOLAY_DATA_BITS) as u16,
@@ -659,9 +672,9 @@ fn hdu_hexbits(bits: &[u8]) -> (Vec<u8>, u32) {
     let mut errors = 0;
     let hex = words_of(bits, 18)
         .map(
-            |w| match golay24_decode(w).filter(|&d| d <= u16::from(HEXBIT_MASK)) {
-                Some(d) => {
-                    errors += (golay24_encode(d) ^ w).count_ones();
+            |w| match golay24_decode(w).filter(|&(d, _)| d <= u16::from(HEXBIT_MASK)) {
+                Some((d, e)) => {
+                    errors += e;
                     d as u8
                 }
                 None => (w >> GOLAY_DATA_BITS) as u8 & HEXBIT_MASK,
@@ -934,13 +947,13 @@ fn golay23_table() -> &'static [u32] {
         for a in 0..n {
             for b in a..n {
                 for c in b..n {
-                    // Repeated positions give the weight 1 and 2 patterns.
-                    let e = (1u32 << a) ^ (1 << b) ^ (1 << c);
+                    // OR, not XOR: a repeated position must stay set, so a = b, b = c
+                    // give the weight 2 patterns and a = b = c the weight 1 ones.
+                    let e = (1u32 << a) | (1 << b) | (1 << c);
                     t[golay23_syndrome(e) as usize] = e;
                 }
             }
         }
-        t[0] = 0;
         t
     })
 }
@@ -950,6 +963,21 @@ fn golay23_table() -> &'static [u32] {
 fn golay23_decode(word: u32) -> (u16, u32) {
     let e = golay23_table()[golay23_syndrome(word) as usize];
     (((word ^ e) >> GOLAY23_CHECK_BITS) as u16, e.count_ones())
+}
+
+/// The Golay (24,12,8) word of `data`: its (23,12) word, then an even-parity bit.
+fn golay24_encode(data: u16) -> u32 {
+    let w = golay23_encode(data);
+    w << 1 | (w.count_ones() & 1)
+}
+
+/// The data of a Golay (24,12,8) word with up to three errors corrected, and the bits
+/// corrected; `None` for four (always detected) or more that it sees.
+fn golay24_decode(word: u32) -> Option<(u16, u32)> {
+    let word = word & 0xFF_FFFF;
+    let (data, _) = golay23_decode(word >> 1);
+    let errors = (golay24_encode(data) ^ word).count_ones();
+    (errors <= 3).then_some((data, errors))
 }
 
 /// The IMBE Hamming (15,11) check bits of each data bit, the top one first: the 4-bit
@@ -1350,6 +1378,12 @@ mod tests {
             hit[23 * 2 + col] ^= 255;
         }
         assert_eq!(imbe_decode(&hit), (u, 3));
+        // Two in c0, whose data seeds the mask over the rest.
+        let mut hit = frame;
+        for col in [4, 17] {
+            hit[col] ^= 255;
+        }
+        assert_eq!(imbe_decode(&hit), (u, 2));
     }
 
     #[test]
@@ -1394,10 +1428,47 @@ mod tests {
     }
 
     #[test]
-    fn the_terminator_golay_is_the_imbe_golay_with_a_parity_bit() {
+    fn the_terminator_golay_is_the_m17_specifications_golay() {
+        // The IMBE Golay (23,12) with a parity bit is the code M17's specification writes
+        // out as a generator matrix: a check of the polynomial against an independent table.
         for data in 0..1u16 << GOLAY_DATA_BITS {
-            let w = golay23_encode(data);
-            assert_eq!(golay24_encode(data), w << 1 | (w.count_ones() & 1));
+            assert_eq!(golay24_encode(data), crate::m17::golay24_encode(data));
+        }
+    }
+
+    /// Every error pattern of `weight` bits among the low `n`.
+    fn patterns(n: u32, weight: u32) -> Vec<u32> {
+        (0..1u32 << n)
+            .filter(|e| e.count_ones() == weight)
+            .collect()
+    }
+
+    #[test]
+    fn golay_23_corrects_every_pattern_of_three_or_fewer_errors() {
+        for data in [0u16, 0xFFF, 0xA5C, 0x3F1, 0x812] {
+            let word = golay23_encode(data);
+            assert_eq!(golay23_decode(word), (data, 0));
+            for weight in 1..=3 {
+                for e in patterns(23, weight) {
+                    assert_eq!(golay23_decode(word ^ e), (data, weight), "error {e:06x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn golay_24_corrects_three_errors_and_detects_four() {
+        for data in [0u16, 0xFFF, 0x5A3, 0x03F] {
+            let word = golay24_encode(data);
+            assert_eq!(golay24_decode(word), Some((data, 0)));
+            for weight in 1..=3 {
+                for e in patterns(24, weight) {
+                    assert_eq!(golay24_decode(word ^ e), Some((data, weight)), "{e:06x}");
+                }
+            }
+            for e in patterns(24, 4) {
+                assert_eq!(golay24_decode(word ^ e), None, "error {e:06x}");
+            }
         }
     }
 
