@@ -1,5 +1,5 @@
 //! Signal generators: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 / APRS, POCSAG, RDS, Mode S,
-//! ACARS, AIS, FLEX, M17, C4FM and P25, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
+//! ACARS, AIS, FLEX, M17, C4FM and P25, DMR, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
 //! `zeta modes check` runs the rows' tests on them. The test-only helpers stay in
 //! `fixtures`, behind feature `test-fixtures`.
 
@@ -1172,6 +1172,36 @@ pub fn rrc_modulate_4fsk(
     )
 }
 
+/// [`rrc_modulate_4fsk`] of bursts: each run of `Some` symbols is modulated on its own and
+/// each `None` is a symbol period of nothing (zero amplitude), so a radio's bursts with
+/// its carrier off between them. `symbols.len() * rate_hz / symbol_rate_baud` samples.
+pub fn rrc_modulate_4fsk_gated(
+    symbols: &[Option<u8>],
+    symbol_rate_baud: u32,
+    deviation_hz: f64,
+    rate_hz: u32,
+    alpha: f64,
+) -> Vec<Complex<f32>> {
+    let sps = f64::from(rate_hz) / f64::from(symbol_rate_baud);
+    let sample = |k: usize| (k as f64 * sps) as usize;
+    let mut out = vec![Complex::new(0.0, 0.0); sample(symbols.len())];
+    let mut k = 0;
+    while k < symbols.len() {
+        let run: Vec<u8> = symbols[k..].iter().map_while(|s| *s).collect();
+        if run.is_empty() {
+            k += 1;
+            continue;
+        }
+        let iq = rrc_modulate_4fsk(&run, symbol_rate_baud, deviation_hz, rate_hz, alpha);
+        let end = k + run.len();
+        for (o, s) in out[sample(k)..sample(end)].iter_mut().zip(iq) {
+            *o = s;
+        }
+        k = end;
+    }
+    out
+}
+
 /// C4FM's Nyquist raised-cosine roll-off (TIA-102.BAAA: flat to 1920 Hz, nothing past
 /// 2880 Hz at 4800 baud).
 pub const C4FM_ROLLOFF: f64 = 0.2;
@@ -1390,6 +1420,81 @@ fn p25_iq(
     };
     let mut iq = c4fm_modulate(&dibits, P25_BAUD, P25_DEVIATION_HZ, rate_hz);
     let tail = (rate_hz * P25_TAIL_MS / 1000) as usize;
+    iq.extend(std::iter::repeat_n(Complex::new(0.0, 0.0), tail));
+    iq
+}
+
+/// The largest DMR colour code (4 bits).
+const DMR_COLOR_CODE_MAX: u8 = 15;
+/// The largest DMR radio ID or talkgroup (24 bits).
+const DMR_ID_MAX: u32 = 0xFF_FFFF;
+/// Superframes the `dmr` family sends at most (7.2 s).
+const DMR_SUPERFRAMES_MAX: u32 = 20;
+/// The carrier off after the transmission, ms, so a receiver's filters give out its
+/// last symbols.
+const DMR_TAIL_MS: u32 = 10;
+
+/// The `dmr` family's call on slot 1 (or a handheld's).
+struct DmrCall {
+    color_code: u8,
+    src: u32,
+    dst: u32,
+    superframes: u32,
+    encrypted: bool,
+}
+
+/// A DMR call ([`crate::dmr`]): a repeater's downlink (the call on slot 1, `second` on
+/// slot 2, slot 1 idle when `idle`) or a handheld's bursts with the carrier off between
+/// them; 4FSK at 4800 baud and ±1944 Hz, then [`DMR_TAIL_MS`] of nothing.
+fn dmr_iq(
+    call: &DmrCall,
+    origin: crate::dmr::Origin,
+    second: Option<DmrSecondCall>,
+    idle: bool,
+    rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    use crate::dmr::{
+        Call, DMR_BAUD, DMR_DEVIATION_HZ, DMR_RRC_ALPHA, FullLc, Origin, SlotPlan, encode_handheld,
+        encode_repeater,
+    };
+    use crate::fsk4::dibit_symbol;
+    let lc = |src, dst| FullLc {
+        call: Call::Group,
+        dst,
+        src,
+        fid: 0,
+        encrypted: call.encrypted,
+        emergency: false,
+    };
+    let first = lc(call.src, call.dst);
+    let mut iq = match origin {
+        Origin::Repeater => {
+            let slots = [
+                SlotPlan {
+                    lc: (!idle).then_some(first),
+                    superframes: call.superframes,
+                },
+                SlotPlan {
+                    lc: second.map(|c| lc(c.src, c.dst)),
+                    superframes: call.superframes,
+                },
+            ];
+            let symbols: Vec<u8> = encode_repeater(call.color_code, slots)
+                .into_iter()
+                .map(dibit_symbol)
+                .collect();
+            rrc_modulate_4fsk(&symbols, DMR_BAUD, DMR_DEVIATION_HZ, rate_hz, DMR_RRC_ALPHA)
+        }
+        Origin::Handheld => {
+            let symbols: Vec<Option<u8>> =
+                encode_handheld(call.color_code, first, call.superframes)
+                    .into_iter()
+                    .map(|d| d.map(dibit_symbol))
+                    .collect();
+            rrc_modulate_4fsk_gated(&symbols, DMR_BAUD, DMR_DEVIATION_HZ, rate_hz, DMR_RRC_ALPHA)
+        }
+    };
+    let tail = (rate_hz * DMR_TAIL_MS / 1000) as usize;
     iq.extend(std::iter::repeat_n(Complex::new(0.0, 0.0), tail));
     iq
 }
@@ -1811,6 +1916,29 @@ pub enum SynthSpec {
         #[serde(default)]
         control: bool,
     },
+    /// A DMR group call ([`crate::dmr`]) on colour code `color_code` (0..=15) from radio
+    /// `src` to talkgroup `dst` (24 bits each): the voice LC header, `superframes` voice
+    /// superframes (1..=20, 360 ms each) of a fixed voice payload, the terminator; 4FSK at
+    /// 4800 baud, ±1944 Hz. `origin` `repeater` (the default) sends a repeater's continuous
+    /// downlink, the call on slot 1 and CACH between the bursts; `handheld` sends a
+    /// handheld's bursts, one every 60 ms with the carrier off between. `second` puts
+    /// another call on slot 2 (a repeater's only). `encrypted` sets the privacy bit (the
+    /// voice is not encrypted: nothing here makes a key stream). `idle` leaves slot 1 idle,
+    /// so with no `second` an idle repeater (a repeater's only).
+    Dmr {
+        color_code: u8,
+        src: u32,
+        dst: u32,
+        superframes: u32,
+        #[serde(default)]
+        origin: crate::dmr::Origin,
+        #[serde(default)]
+        second: Option<DmrSecondCall>,
+        #[serde(default)]
+        encrypted: bool,
+        #[serde(default)]
+        idle: bool,
+    },
     /// AIS: per repeat a type 1 position report (`mmsi`, the position, `sog_kt`,
     /// `cog_deg`; [`crate::ais_msg::position_report_bits`]) and, with `name`, a type 5
     /// static report, GMSK at 9600 baud, frames `gap_ms` apart (50 by default).
@@ -1826,6 +1954,15 @@ pub enum SynthSpec {
         #[serde(default = "default_gap_ms")]
         gap_ms: u64,
     },
+}
+
+/// The `dmr` family's call on slot 2: radio `src` to talkgroup `dst`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct DmrSecondCall {
+    pub src: u32,
+    pub dst: u32,
 }
 
 /// Impairments applied to a synthesised signal; each defaults to none.
@@ -2163,6 +2300,43 @@ impl SynthSpec {
                     return Err(format!("superframes: 1..={P25_SUPERFRAMES_MAX}"));
                 }
             }
+            SynthSpec::Dmr {
+                color_code,
+                src,
+                dst,
+                superframes,
+                origin,
+                second,
+                idle,
+                ..
+            } => {
+                if *color_code > DMR_COLOR_CODE_MAX {
+                    return Err(format!("color_code: 0..={DMR_COLOR_CODE_MAX}"));
+                }
+                let ids = [("src", *src), ("dst", *dst)].into_iter().chain(
+                    second
+                        .iter()
+                        .flat_map(|c| [("second.src", c.src), ("second.dst", c.dst)]),
+                );
+                for (key, id) in ids {
+                    if id > DMR_ID_MAX {
+                        return Err(format!("{key}: 0..={DMR_ID_MAX}"));
+                    }
+                }
+                if !(1..=DMR_SUPERFRAMES_MAX).contains(superframes) {
+                    return Err(format!("superframes: 1..={DMR_SUPERFRAMES_MAX}"));
+                }
+                if *origin == crate::dmr::Origin::Handheld {
+                    if second.is_some() {
+                        return Err(
+                            "second: a second call is a repeater's (origin repeater)".into()
+                        );
+                    }
+                    if *idle {
+                        return Err("idle: an idle slot is a repeater's (origin repeater)".into());
+                    }
+                }
+            }
             SynthSpec::Video {
                 deviation_hz,
                 subcarrier_hz,
@@ -2198,7 +2372,7 @@ impl SynthSpec {
     }
 
     /// The sample rate the family's capture is synthesised at: the one each decoder is
-    /// proven at (APRS, POCSAG, ACARS, AIS, FLEX, M17 and P25 at 48 kHz, which the `channel` stage divides
+    /// proven at (APRS, POCSAG, ACARS, AIS, FLEX, M17, P25 and DMR at 48 kHz, which the `channel` stage divides
     /// down; RDS at 240 kHz; Mode S at 2.4 MHz; a bare NBFM tone at 48 kHz).
     pub fn rate_hz(&self) -> u32 {
         match self {
@@ -2213,7 +2387,8 @@ impl SynthSpec {
             | SynthSpec::Flex { .. }
             | SynthSpec::Ais { .. }
             | SynthSpec::M17 { .. }
-            | SynthSpec::P25 { .. } => 48_000,
+            | SynthSpec::P25 { .. }
+            | SynthSpec::Dmr { .. } => 48_000,
             SynthSpec::Fsk {
                 symbol_rate_baud, ..
             }
@@ -2445,6 +2620,27 @@ pub fn synthesise(
                 *control,
                 rate_hz,
             );
+            shift(&mut iq, off, rate_hz);
+            iq
+        }
+        SynthSpec::Dmr {
+            color_code,
+            src,
+            dst,
+            superframes,
+            origin,
+            second,
+            encrypted,
+            idle,
+        } => {
+            let call = DmrCall {
+                color_code: *color_code,
+                src: *src,
+                dst: *dst,
+                superframes: *superframes,
+                encrypted: *encrypted,
+            };
+            let mut iq = dmr_iq(&call, *origin, *second, *idle, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -3284,6 +3480,73 @@ mod tests {
             synthesise(&spec, &imp, 48_000, 0).len(),
             15 * 360 * 10 + 480
         );
+    }
+
+    fn dmr_json() -> serde_json::Value {
+        serde_json::json!({
+            "family": "dmr", "color_code": 5, "src": 9990001, "dst": 9990, "superframes": 3
+        })
+    }
+
+    #[test]
+    fn dmr_family_validates() {
+        use crate::dmr::Origin;
+        let parse = |v: serde_json::Value| parse_params(v.as_object().unwrap().clone());
+        let with = |key: &str, val: serde_json::Value| {
+            let mut v = dmr_json();
+            v[key] = val;
+            v
+        };
+        let bad = |key: &str, val: serde_json::Value| parse(with(key, val)).unwrap_err();
+        let (spec, imp) = parse(dmr_json()).unwrap();
+        assert_eq!(spec.rate_hz(), 48_000);
+        assert!(matches!(
+            spec,
+            SynthSpec::Dmr {
+                origin: Origin::Repeater,
+                second: None,
+                encrypted: false,
+                idle: false,
+                ..
+            }
+        ));
+        assert_eq!(bad("color_code", 16.into()), "color_code: 0..=15");
+        assert_eq!(bad("src", (1 << 24).into()), "src: 0..=16777215");
+        assert_eq!(bad("dst", (1 << 24).into()), "dst: 0..=16777215");
+        assert_eq!(bad("superframes", 0.into()), "superframes: 1..=20");
+        assert_eq!(bad("superframes", 21.into()), "superframes: 1..=20");
+        let second = serde_json::json!({"src": 9990002, "dst": 1 << 24});
+        assert_eq!(bad("second", second), "second.dst: 0..=16777215");
+        assert!(
+            parse(with(
+                "second",
+                serde_json::json!({"src": 1, "dst": 2, "x": 3})
+            ))
+            .is_err()
+        );
+        let handheld = |key: &str, val: serde_json::Value| {
+            let mut v = with("origin", "handheld".into());
+            v[key] = val;
+            parse(v).unwrap_err()
+        };
+        assert!(handheld("second", serde_json::json!({"src": 1, "dst": 2})).starts_with("second:"));
+        assert!(handheld("idle", true.into()).starts_with("idle:"));
+
+        // Twenty 60 ms TDMA frames (header, 18 voice bursts, terminator), then the tail.
+        let len = 20 * 288 * 10 + 480;
+        let iq = synthesise(&spec, &imp, 48_000, 450_000_000);
+        assert_eq!(iq.len(), len);
+        assert!(
+            iq[..len - 480]
+                .iter()
+                .all(|s| (s.norm() - 1.0).abs() < 1e-3)
+        );
+        // A handheld's: as long, its carrier off 32.5 ms in every 60.
+        let (spec, imp) = parse(with("origin", "handheld".into())).unwrap();
+        let iq = synthesise(&spec, &imp, 48_000, 0);
+        assert_eq!(iq.len(), len);
+        let off = iq.iter().filter(|s| s.norm() < 1e-6).count();
+        assert_eq!(off, 20 * 156 * 10 + 480);
     }
 
     #[test]

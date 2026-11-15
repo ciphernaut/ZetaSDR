@@ -32,6 +32,7 @@ pub mod crc;
 pub mod denoise;
 pub mod detect;
 pub mod dfm_frame;
+pub mod dmr;
 pub mod fft;
 pub mod flex_frame;
 pub mod frame_decode;
