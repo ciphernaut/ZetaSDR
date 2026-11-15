@@ -268,6 +268,9 @@ const FLCO_PRIVATE: u8 = 0x03;
 /// The talker alias header's FLCO (-2 table 5.4, 7.1.1.4) and its 7-bit format (7.2.18).
 const FLCO_TALKER_ALIAS_HEADER: u8 = 0b00_0100;
 const TA_FORMAT_7BIT: u8 = 0b00;
+/// The GPS Info message's FLCO (-2 table 5.4, 7.1.1.3).
+#[cfg(test)]
+const FLCO_GPS_INFO: u8 = 0b00_1000;
 /// The alias the encoder sends: invented, at most 7 characters (one header, -2 5.4.3).
 const TALKER_ALIAS: &str = "ZETA";
 const SVC_EMERGENCY: u8 = 0x80;
@@ -1222,7 +1225,13 @@ pub fn encode_repeater_aliased(
                     .map(|i| csbk_burst(color_code, &preamble_csbk(&lc, n - 1 - i)))
                     .collect()
             }
-            Some(lc) => call_bursts(color_code, &lc, plan.superframes, Origin::Repeater, alias),
+            Some(lc) => call_bursts(
+                color_code,
+                &lc,
+                plan.superframes,
+                Origin::Repeater,
+                alias.then(talker_alias_bytes),
+            ),
             None => vec![idle_burst(color_code); call_bursts_len(plan.superframes, false)],
         }
     });
@@ -1250,7 +1259,7 @@ pub fn encode_handheld_aliased(
         &lc,
         superframes,
         Origin::Handheld,
-        talker_alias,
+        talker_alias.then(talker_alias_bytes),
     ))
 }
 
@@ -1286,16 +1295,16 @@ fn call_bursts_len(superframes: u32, encrypted: bool) -> usize {
 }
 
 /// A call's bursts on one slot: the voice LC header, a privacy header when encrypted,
-/// `superframes` × bursts A to F, the terminator with link control. With `talker_alias`
-/// the second superframe and every second one after it carry a talker alias header in B to
-/// E instead of the link control. The EMB's PI bit is 0 throughout: it is not an
-/// encryption mark (see the module doc).
+/// `superframes` × bursts A to F, the terminator with link control. With `interleave`
+/// (another embedded message's 9 octets: a talker alias, GPS) the second superframe and
+/// every second one after it carry it in B to E instead of the link control. The EMB's PI
+/// bit is 0 throughout: it is not an encryption mark (see the module doc).
 fn call_bursts(
     cc: u8,
     lc: &FullLc,
     superframes: u32,
     origin: Origin,
-    talker_alias: bool,
+    interleave: Option<[u8; LC_BYTES]>,
 ) -> Vec<[u8; BURST_BITS]> {
     let data_sync = sync_word(origin, Kind::Data);
     let data = |dt, mask| {
@@ -1306,7 +1315,7 @@ fn call_bursts(
         )
     };
     let fragments = embedded_encode(&lc_bytes(lc));
-    let alias = embedded_encode(&talker_alias_bytes());
+    let other = interleave.map(|b| embedded_encode(&b));
     let emb = |lcss| emb_word(cc, false, lcss);
     let mut frame = 0;
     let mut socket = || {
@@ -1328,10 +1337,9 @@ fn call_bursts(
             &socket(),
             &sync_centre(sync_word(origin, Kind::Voice)),
         ));
-        let embedded = if talker_alias && sf % 2 == 1 {
-            &alias
-        } else {
-            &fragments
+        let embedded = match &other {
+            Some(other) if sf % 2 == 1 => other,
+            _ => &fragments,
         };
         for (fragment, lcss) in embedded.iter().zip(EMBEDDED_LCSS) {
             out.push(voice_burst(&socket(), &emb_centre(emb(lcss), fragment)));
@@ -2205,7 +2213,22 @@ pub(crate) mod build {
         origin: Origin,
         talker_alias: bool,
     ) -> Vec<Burst> {
-        call_bursts(cc, lc, superframes, origin, talker_alias)
+        call_bursts(
+            cc,
+            lc,
+            superframes,
+            origin,
+            talker_alias.then(talker_alias_bytes),
+        )
+    }
+
+    /// As [`call`], every second superframe carrying a GPS Info message (-2 7.1.1.3,
+    /// table 7.3: FLCO `001000`, FID 0) in place of the link control, its position fields
+    /// all zero.
+    pub(crate) fn call_with_gps(cc: u8, lc: &FullLc, superframes: u32) -> Vec<Burst> {
+        let mut gps = [0u8; LC_BYTES];
+        gps[0] = FLCO_GPS_INFO;
+        call_bursts(cc, lc, superframes, Origin::Repeater, Some(gps))
     }
 
     pub(crate) fn idle(cc: u8) -> Burst {
@@ -3283,8 +3306,8 @@ mod tests {
             ..group()
         };
         // Two calls back to back on slot 1, no terminator and no header between them.
-        let first = call_bursts(CC, &group(), 2, Origin::Repeater, false);
-        let second = call_bursts(CC, &other, 2, Origin::Repeater, false);
+        let first = call_bursts(CC, &group(), 2, Origin::Repeater, None);
+        let second = call_bursts(CC, &other, 2, Origin::Repeater, None);
         let slot1: Vec<[u8; BURST_BITS]> = first[..first.len() - 1]
             .iter()
             .chain(&second[1..])
@@ -3411,8 +3434,8 @@ mod tests {
             pairs.push((lc(z), lc(z >> 16 ^ z << 7)));
         }
         for (i, (a, b)) in pairs.into_iter().enumerate() {
-            let one = call_bursts(CC, &a, 2, Origin::Repeater, false);
-            let two = call_bursts(CC, &b, 2, Origin::Repeater, false);
+            let one = call_bursts(CC, &a, 2, Origin::Repeater, None);
+            let two = call_bursts(CC, &b, 2, Origin::Repeater, None);
             let slot1: Vec<[u8; BURST_BITS]> = one[..one.len() - 1]
                 .iter()
                 .chain(&two[1..])
@@ -3449,7 +3472,7 @@ mod tests {
     /// A repeater call (slot 1) and a handheld call of `superframes`, each cut short with no
     /// terminator, on air.
     fn cut_calls(superframes: u32) -> [(&'static str, Vec<Complex<f32>>); 2] {
-        let mut repeater = call_bursts(CC, &group(), superframes, Origin::Repeater, false);
+        let mut repeater = call_bursts(CC, &group(), superframes, Origin::Repeater, None);
         repeater.pop();
         let idle = vec![idle_burst(CC); repeater.len()];
         let repeater = on_air(&downlink(CC, &[repeater, idle], [true, false]), false);
@@ -3506,7 +3529,7 @@ mod tests {
     #[test]
     fn a_voice_header_then_noise_is_not_voice() {
         // The header's link control is in hand, the phase never known.
-        let header = call_bursts(CC, &group(), 1, Origin::Repeater, false)[..1].to_vec();
+        let header = call_bursts(CC, &group(), 1, Origin::Repeater, None)[..1].to_vec();
         let repeater = on_air(
             &downlink(CC, &[header, vec![idle_burst(CC)]], [true, false]),
             false,

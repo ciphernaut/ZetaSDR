@@ -414,6 +414,10 @@ async fn a_two_voice_row_lists_its_voices() {
     assert_eq!(two.voices, ["slot1", "slot2"]);
     // Kinds, not one entry per stream.
     assert_eq!(two.outputs, [StreamKind::Event, StreamKind::Audio]);
+    // The embedded DMR row: a slot each.
+    let dmr = modes.iter().find(|m| m.id.0 == "dmr_decode").unwrap();
+    assert_eq!(dmr.voices, ["slot1", "slot2"]);
+    assert_eq!(dmr.outputs, [StreamKind::Event, StreamKind::Audio]);
     let m17 = modes.iter().find(|m| m.id.0 == "m17_decode").unwrap();
     assert!(m17.voices.is_empty(), "{:?}", m17.voices);
     // Always written, even empty.

@@ -354,6 +354,59 @@ pub struct Fsk4Counters {
     pub off_deviation: u64,
 }
 
+impl std::ops::Add for Fsk4Counters {
+    type Output = Self;
+
+    fn add(self, b: Self) -> Self {
+        Fsk4Counters {
+            locks: self.locks + b.locks,
+            false_locks: self.false_locks + b.false_locks,
+            losses: self.losses + b.losses,
+            off_deviation: self.off_deviation + b.off_deviation,
+        }
+    }
+}
+
+/// A stage's receiver counts over its job: every receiver it has had (a lagged input or a
+/// new rate makes a new one), noted under `{<protocol>: {"receiver": …}}` in the job's
+/// context when they change.
+#[derive(Default)]
+pub struct Fsk4Tally {
+    /// The sums of the receivers already replaced.
+    done: Fsk4Counters,
+    /// The totals last noted.
+    noted: Fsk4Counters,
+}
+
+impl Fsk4Tally {
+    /// A receiver with these counts is replaced: they join the sums.
+    pub fn retire(&mut self, gone: Option<Fsk4Counters>) {
+        if let Some(c) = gone {
+            self.done = self.done + c;
+        }
+    }
+
+    /// Note the totals, with the current receiver's `current`, under `protocol` when they
+    /// changed since last noted.
+    pub fn note(
+        &mut self,
+        ctx: &zeta_core::stage::StageContext,
+        protocol: &str,
+        current: Option<Fsk4Counters>,
+    ) {
+        let now = current.map_or(self.done, |c| self.done + c);
+        if now != self.noted {
+            self.noted = now;
+            ctx.note(serde_json::json!({protocol: {"receiver": {
+                "locks": now.locks,
+                "false_locks": now.false_locks,
+                "losses": now.losses,
+                "off_deviation": now.off_deviation,
+            }}}));
+        }
+    }
+}
+
 /// A streaming 4FSK receiver over one channel's IQ; state carries across
 /// [`feed`](Self::feed) calls, so feeding in pieces equals feeding whole.
 pub struct Fsk4Demod {

@@ -116,6 +116,11 @@ impl MainStream {
         Some((main, task))
     }
 
+    /// The audio policy it chooses by.
+    pub fn policy(&self) -> AudioPolicy {
+        self.policy
+    }
+
     fn send(&self, c: Command) {
         let _ = self.tx.send(c);
     }

@@ -44,6 +44,9 @@
 //!   fed. A superframe whose word never comes is never fed. A link control is never taken
 //!   from a superframe before the call's.
 //!
+//! Under a header's licence, a link control that turns the call encrypted mid-superframe
+//! stops it from that burst, after at most bursts A-D of that superframe.
+//!
 //! **Speech.** Each slot has its own audio stream (`slot1`, `slot2`, output roles of the
 //! same names; a handheld's speech is on `slot1`) and each clear call its own vocoder,
 //! `zeta-mbe ambe3600x2450` (the row's handler 0, optional), looked up when the call is
@@ -52,27 +55,32 @@
 //! burst's time, through the vocoder seat ([`crate::vocoder`]). Without the program every
 //! call is reported with `audio: false`, `silent: "no_vocoder"`, and `job_context.dmr.vocoder`
 //! says how to install it, once. A vocoder that fails mid-call ends that call's audio
-//! (`silent: "vocoder_failed"` on its closing event); the next call starts it again.
+//! (`silent: "vocoder_failed"` on its closing event), whatever its speech does after (held
+//! again, encrypted, clear again); the next call starts it again.
 //!
 //! **The main stream.** The job's audio stream with no role carries what the job's audio
 //! policy (the `audio` param) says, from both slots' speech ([`crate::main_stream`]): a call
-//! holds or joins it from its first frame fed and leaves it when its audio ends; a call
-//! with no audio never holds it. A call held again after a lost burst keeps its place (it
-//! is the same call). Each call event's `stream` names its slot's stream, and `program`
-//! says whether its speech is on the main stream: now on the opening event, at any time on
-//! the closing one.
+//! holds or joins it from its first frame fed and leaves it when its audio ends (its call
+//! ends, turns encrypted or its vocoder fails); a call with no audio never holds it, so a
+//! call whose speech has not yet been fed (held, encrypted, without a vocoder) is never
+//! given it. A call held again after a lost burst has had audio and is the same call: under
+//! `first_active` and `follow` it keeps its place, so one lost burst does not hand the main
+//! stream to the other slot mid-sentence; under `all` it is mixed while its speech flows,
+//! and while held it holds nothing back (the other slot's speech is mixed on without it, and
+//! its own fed later reaches only its slot's stream). Each call event's `stream` names its
+//! slot's stream, and `program` says whether its speech is on the main stream: now on the
+//! opening event, at any time on the closing one.
 //!
 //! **A channel with no call.** A data burst decoded with no call open on any slot (an idle
 //! burst, a control block, a stray terminator), on a repeater once both slots' latest bursts
 //! were such (so a call whose start was missed on the other slot is not taken for an idle
-//! repeater), gives one `type: channel` event for its colour code, and another only when the colour code changes or control blocks are first
-//! seen on it (`control`); a call's events name the colour code too, so a repeater going
-//! idle after a call gives none.
+//! repeater), gives one `type: channel` event for its colour code, and another only when
+//! the colour code changes or control blocks are first seen on it (`control`): a repeater
+//! idle after a call gives one, the first time.
 //!
 //! **The receiver.** The front end's counters over the job are in `job_context.dmr.receiver`
 //! (`locks`, `false_locks`, `losses`, `off_deviation`), updated when they change.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -89,12 +97,13 @@ use crate::dmr::{
     AMBE_FEED_BYTES, AmbeSoft, DMR_BAUD, DMR_COAST_SEARCHES, DMR_DEVIATION_HZ, DMR_RRC_ALPHA,
     DMR_SUPERFRAME_MS, DmrBurst, DmrContent, DmrFramer, FullLc, Origin,
 };
-use crate::fsk4::{Fsk4Counters, Fsk4Demod, Fsk4Params, Shape};
+use crate::fsk4::{Fsk4Demod, Fsk4Params, Fsk4Tally, Shape};
 use crate::main_stream::MainStream;
-use crate::util::{event, time_of};
+use crate::util::time_of;
 use crate::vocoder::{Vocoder, VocoderEnv, VocoderSpec};
 use crate::voice_call::{
-    CallFields, MBE_FRAME_SAMPLES, MBE_RATE_HZ, Silent, ZETA_MBE, channel_event, no_vocoder_note,
+    CallFields, Events, MBE_FRAME_SAMPLES, MBE_RATE_HZ, ProgramLookup, Silent, ZETA_MBE,
+    channel_event, publish,
 };
 use crate::{Input, run_map_ending};
 
@@ -212,48 +221,6 @@ impl Receiver {
     }
 }
 
-/// The front end's counters over the job, every receiver it has had (a lagged input or a
-/// new rate makes a new one), into `job_context.dmr.receiver` when they change.
-#[derive(Default)]
-struct Tally {
-    /// The sums of the receivers already replaced.
-    done: Fsk4Counters,
-    /// The totals last noted.
-    noted: Fsk4Counters,
-}
-
-impl Tally {
-    /// `r` is replaced: its counts join the sums.
-    fn retire(&mut self, r: Option<Receiver>) {
-        if let Some(r) = r {
-            self.done = add(self.done, r.demod.counters());
-        }
-    }
-
-    /// Note the totals, with `current`'s, when they changed since last noted.
-    fn note(&mut self, ctx: &StageContext, current: Option<&Receiver>) {
-        let now = current.map_or(self.done, |r| add(self.done, r.demod.counters()));
-        if now != self.noted {
-            self.noted = now;
-            ctx.note(serde_json::json!({PROTOCOL: {"receiver": {
-                "locks": now.locks,
-                "false_locks": now.false_locks,
-                "losses": now.losses,
-                "off_deviation": now.off_deviation,
-            }}}));
-        }
-    }
-}
-
-fn add(a: Fsk4Counters, b: Fsk4Counters) -> Fsk4Counters {
-    Fsk4Counters {
-        locks: a.locks + b.locks,
-        false_locks: a.false_locks + b.false_locks,
-        losses: a.losses + b.losses,
-        off_deviation: a.off_deviation + b.off_deviation,
-    }
-}
-
 /// What a call's speech is doing.
 enum Voice {
     /// Nothing has told its encryption yet: nothing is fed.
@@ -297,6 +264,9 @@ struct Open {
     /// The burst A of the superframe last licensed by its own word.
     licensed: Option<u64>,
     voice: Voice,
+    /// Its vocoder failed (to start, or during the call): it stays silent to its end,
+    /// whatever its speech does after (held, encrypted, clear again).
+    failed: bool,
     /// Frames of bursts not yet licensed, with their bursts' times, oldest first.
     held: Vec<(u64, Box<[AmbeSoft; 3]>)>,
     /// The burst A of the latest superframe whose phase is known.
@@ -330,6 +300,7 @@ impl Open {
             licence,
             licensed: None,
             voice: Voice::Held,
+            failed: false,
             held: Vec::new(),
             phase: None,
             since: t,
@@ -401,6 +372,11 @@ impl Open {
         }
     }
 
+    /// Whether its speech is held now: its latest burst waits for a word.
+    fn held_now(&self) -> bool {
+        self.licence == Licence::Superframe && !self.in_licensed(self.last_at)
+    }
+
     /// Whether the burst at `t` is in the superframe last licensed by its own word.
     fn in_licensed(&self, t: u64) -> bool {
         self.licensed
@@ -415,8 +391,6 @@ fn slot_key(slot: Option<u8>) -> usize {
         _ => 0,
     }
 }
-
-type Events = Vec<(u64, serde_json::Value)>;
 
 /// A voice burst.
 struct VoiceBurst {
@@ -437,9 +411,8 @@ struct Calls {
     main: MainStream,
     /// The open call of each slot: a handheld's, slot 1's, slot 2's.
     slots: [Option<Open>; 3],
-    /// Whether the missing vocoder has been noted since it was last found.
-    said_missing: bool,
-    /// The colour code and `control` an event last named.
+    lookup: ProgramLookup,
+    /// The colour code and `control` the last channel event named.
     reported: Option<(u8, bool)>,
     /// The colour code control blocks were last seen on.
     control_cc: Option<u8>,
@@ -451,27 +424,9 @@ struct Calls {
 }
 
 impl Calls {
-    /// The program to speak a clear call with, looked up now; `None` noted once.
-    fn program(&mut self) -> Option<PathBuf> {
-        let found = crate::vocoder::program(&self.ctx, 0, ZETA_MBE, false)
-            .ok()
-            .flatten();
-        match &found {
-            Some(_) => self.said_missing = false,
-            None if !self.said_missing => {
-                self.said_missing = true;
-                let note = no_vocoder_note(&self.ctx);
-                self.ctx
-                    .note(serde_json::json!({PROTOCOL: {"vocoder": note}}));
-            }
-            None => {}
-        }
-        found
-    }
-
     /// A vocoder for a clear call on `voice`, or why there is none.
     fn start(&mut self, voice: usize, prov: &Provenance) -> Voice {
-        let Some(program) = self.program() else {
+        let Some(program) = self.lookup.find(&self.ctx, PROTOCOL) else {
             return Voice::Silent(Silent::NoVocoder);
         };
         let spec = VocoderSpec {
@@ -512,11 +467,17 @@ impl Calls {
                 Voice::Silent(Silent::Encrypted)
             }
             (_, true) => Voice::Silent(Silent::Encrypted),
+            (Voice::Held | Voice::Silent(Silent::Encrypted), false) if o.failed => {
+                Voice::Silent(Silent::VocoderFailed)
+            }
             (Voice::Held | Voice::Silent(Silent::Encrypted), false) => {
                 self.start(o.voice_index(), prov)
             }
             (other, false) => other,
         };
+        if matches!(o.voice, Voice::Silent(Silent::VocoderFailed)) {
+            o.failed = true;
+        }
     }
 
     /// Feed a burst's frames from `t` to `o`'s vocoder, if it has a live one.
@@ -529,6 +490,7 @@ impl Calls {
             // It exited or stopped answering (the seat noted why): this call stays silent,
             // the next starts it again.
             o.voice = Voice::Silent(Silent::VocoderFailed);
+            o.failed = true;
             self.main.gone(voice, o.fed_end);
             self.end_audio(o);
             return;
@@ -549,7 +511,7 @@ impl Calls {
     }
 
     /// `o`'s event; `eot` for its closing one.
-    fn call_event(&mut self, o: &Open, eot: bool) -> serde_json::Value {
+    fn call_event(&self, o: &Open, eot: bool) -> serde_json::Value {
         let Some(lc) = o.lc else {
             unreachable!("a call is announced with its link control")
         };
@@ -584,9 +546,6 @@ impl Calls {
         m.insert("fid".into(), lc.fid.into());
         // The summary's channel text: none on a call, which reads as who calls whom.
         m.insert("network".into(), serde_json::Value::Null);
-        if let Some(cc) = o.color_code {
-            self.reported = Some((cc, self.control_cc == Some(cc)));
-        }
         serde_json::Value::Object(m)
     }
 
@@ -831,7 +790,8 @@ impl Calls {
 
     /// A data burst at `t` on slot `key` that is no call's: the channel event, when no
     /// call is open, a repeater's other slot's latest burst was one of no call too (not a
-    /// call whose start was missed), and its colour code is not the one last named.
+    /// call whose start was missed), and its colour code is not the one the last channel
+    /// event named.
     fn no_call(&mut self, key: usize, t: u64, cc: Option<u8>, events: &mut Events) {
         let both = key == 0 || (self.quiet[1] && self.quiet[2]);
         if !both || self.slots.iter().any(Option::is_some) {
@@ -852,12 +812,20 @@ impl Calls {
     /// starts after the latest one (give or take a period) and no more than [`LATE_NS`]
     /// before `now`; a held frame may still be fed; a call whose audio is live may end
     /// where its last frame fed does.
+    ///
+    /// Under `all` a call whose speech is held holds nothing back: the mix goes on with the
+    /// other slot, and what the held call is fed later than the mix was written reaches
+    /// only its slot's stream.
     fn note_known(&mut self, now: u64) {
         let mut until = self
             .last_burst
             .saturating_sub(PERIOD_NS)
             .max(now.saturating_sub(LATE_NS));
+        let mixing = self.main.policy() == AudioPolicy::All;
         for o in self.slots.iter().flatten() {
+            if mixing && o.held_now() {
+                continue;
+            }
             if let Some((at, _)) = o.held.first() {
                 until = until.min(*at);
             }
@@ -970,14 +938,14 @@ impl Stage for DmrDecodeStage {
             ctx: ctx.clone(),
             main,
             slots: [None, None, None],
-            said_missing: false,
+            lookup: ProgramLookup::default(),
             reported: None,
             control_cc: None,
             quiet: [false; 3],
             last_burst: 0,
         };
         let mut rx: Option<Receiver> = None;
-        let mut tally = Tally::default();
+        let mut tally = Fsk4Tally::default();
         let mut last_prov: Option<Provenance> = None;
         let result = run_map_ending(self.spec().kind, inputs, bus, cancel, |input| {
             let mut events = Vec::new();
@@ -985,9 +953,16 @@ impl Stage for DmrDecodeStage {
                 Some(Input::Frame(f)) => f,
                 Some(Input::Lagged { .. }) => {
                     // Start clean: the samples missed broke the symbol clock and the calls.
-                    tally.retire(rx.take());
+                    tally.retire(rx.take().map(|r| r.demod.counters()));
                     calls.interrupt(&mut events);
-                    return Ok(publish(&ctx, &events_out, last_prov.as_ref(), events));
+                    return Ok(publish(
+                        &ctx,
+                        &events_out,
+                        last_prov.as_ref(),
+                        PROTOCOL,
+                        events,
+                        PERIOD_NS,
+                    ));
                 }
                 None => {
                     // The input ended: the bursts the front end still held (a terminator
@@ -998,9 +973,16 @@ impl Stage for DmrDecodeStage {
                             calls.burst(t, b, prov, &mut events);
                         }
                     }
-                    tally.note(&ctx, rx.as_ref());
+                    tally.note(&ctx, PROTOCOL, rx.as_ref().map(|r| r.demod.counters()));
                     calls.interrupt(&mut events);
-                    return Ok(publish(&ctx, &events_out, last_prov.as_ref(), events));
+                    return Ok(publish(
+                        &ctx,
+                        &events_out,
+                        last_prov.as_ref(),
+                        PROTOCOL,
+                        events,
+                        PERIOD_NS,
+                    ));
                 }
             };
             let Payload::Iq(block) = &frame.payload else {
@@ -1011,7 +993,7 @@ impl Stage for DmrDecodeStage {
             let rate = block.sample_rate_hz.0;
             if rx.as_ref().is_some_and(|r| r.demod.rate_hz != rate) {
                 // A new rate: the calls so far close and the receiver starts again.
-                tally.retire(rx.take());
+                tally.retire(rx.take().map(|r| r.demod.counters()));
                 calls.interrupt(&mut events);
             }
             let r = match &mut rx {
@@ -1025,9 +1007,16 @@ impl Stage for DmrDecodeStage {
             let now = time_of(block.t0, block.samples.len() as i64, rate);
             calls.expire(now, &mut events);
             calls.note_known(now);
-            tally.note(&ctx, rx.as_ref());
+            tally.note(&ctx, PROTOCOL, rx.as_ref().map(|r| r.demod.counters()));
             last_prov = Some(frame.provenance.clone());
-            Ok(publish(&ctx, &events_out, Some(&frame.provenance), events))
+            Ok(publish(
+                &ctx,
+                &events_out,
+                Some(&frame.provenance),
+                PROTOCOL,
+                events,
+                PERIOD_NS,
+            ))
         })
         .await;
         // Both slots' vocoders share one drain; then the main stream writes what it holds.
@@ -1042,36 +1031,8 @@ impl Stage for DmrDecodeStage {
     }
 }
 
-/// The events `(t, fields)` as frames on `out`, each in the row's envelope.
-fn publish(
-    ctx: &StageContext,
-    out: &StreamId,
-    prov: Option<&Provenance>,
-    events: Events,
-) -> Vec<Frame> {
-    let Some(prov) = prov else {
-        return Vec::new();
-    };
-    events
-        .into_iter()
-        .map(|(t, fields)| {
-            let mut p = prov.clone();
-            p.span = Span {
-                start_ns: Timestamp(t),
-                end_ns: Timestamp(t + PERIOD_NS),
-            };
-            Frame::new(
-                out.clone(),
-                p,
-                Payload::Event(event(ctx, t, PROTOCOL, fields)),
-            )
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1093,6 +1054,7 @@ mod tests {
     use crate::synth::{
         awgn, parse_params, rrc_modulate_4fsk, rrc_modulate_4fsk_gated, synthesise,
     };
+    use crate::voice_call::fake_mbe;
 
     const RATE: u64 = 48_000;
     /// The test identities: invented, outside registered ranges.
@@ -1246,51 +1208,14 @@ mod tests {
         )
     }
 
-    /// The fake `zeta-mbe` (`tests/fake_zeta_mbe`) as the row's handler: a link in a
-    /// temporary directory, absent until installed, so no test sets the process's
-    /// environment and none sees another's program. Each run of it speaks at its own
-    /// level.
-    struct Mbe {
-        _dir: tempfile::TempDir,
-        link: PathBuf,
+    /// The fake `zeta-mbe` as the dmr_decode row's handler ([`crate::voice_call::fake_mbe`]).
+    struct DmrRow;
+
+    impl fake_mbe::Row for DmrRow {
+        const JSON: &'static str = include_str!("../../../modes/dmr_decode.json");
     }
 
-    impl Mbe {
-        fn absent() -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let link = dir.path().join(ZETA_MBE);
-            Self { _dir: dir, link }
-        }
-
-        fn installed() -> Self {
-            let m = Self::absent();
-            let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_zeta_mbe");
-            std::os::unix::fs::symlink(fake, &m.link).unwrap();
-            m
-        }
-
-        fn beside(&self, suffix: &str) -> PathBuf {
-            PathBuf::from(format!("{}.{suffix}", self.link.display()))
-        }
-
-        /// The fake's next run exits 1 after 10 frames.
-        fn die_once(&self) {
-            std::fs::write(self.beside("die"), "").unwrap();
-        }
-
-        /// What the fake's runs logged: `start` per run, `eof` per input closed.
-        fn log(&self) -> String {
-            std::fs::read_to_string(self.beside("log")).unwrap_or_default()
-        }
-
-        /// The DMR row with its handler at the link.
-        fn row(&self) -> Arc<zeta_core::modes::ModeRow> {
-            let mut v: Value =
-                serde_json::from_str(include_str!("../../../modes/dmr_decode.json")).unwrap();
-            v["decoder"]["handlers"][0]["programs"] = json!([self.link.to_str().unwrap()]);
-            Arc::new(zeta_core::modes::parse(&v.to_string()).unwrap())
-        }
-    }
+    type Mbe = fake_mbe::Mbe<DmrRow>;
 
     /// The stage over the DMR row, and what it has published so far: the events, the main
     /// stream and each slot's.
@@ -1302,7 +1227,10 @@ mod tests {
         stage: Option<JoinHandle<Result<(), StageError>>>,
         /// The next block's time, ns.
         t: u64,
+        /// The call events.
         events: Vec<Value>,
+        /// The channel events.
+        channels: Vec<Value>,
         main: Vec<Frame>,
         slot1: Vec<Frame>,
         slot2: Vec<Frame>,
@@ -1345,6 +1273,7 @@ mod tests {
                 stage: Some(stage),
                 t: T0,
                 events: vec![],
+                channels: vec![],
                 main: vec![],
                 slot1: vec![],
                 slot2: vec![],
@@ -1375,7 +1304,11 @@ mod tests {
                 let Payload::Event(v) = f.payload else {
                     panic!("expected an event")
                 };
-                self.events.push(v);
+                if v["type"] == "channel" {
+                    self.channels.push(v);
+                } else {
+                    self.events.push(v);
+                }
             }
             let [m, a, b] = &mut self.audio_rx;
             for (rx, into) in [
@@ -1562,6 +1495,13 @@ mod tests {
         assert!(h.vocoder_notes().is_empty(), "{:?}", h.vocoder_notes());
         // One vocoder, its input closed at the terminator.
         assert_eq!(mbe.log(), "start\neof\n");
+        // Slot 2 idle throughout, slot 1 idle after the call: the idle repeater, once.
+        assert_eq!(h.channels.len(), 1, "{:?}", h.channels);
+        has(
+            &h.channels[0],
+            json!({"type": "channel", "color_code": 5, "control": false}),
+        );
+        assert!(t_ns(&h.channels[0]) > t_ns(b), "{}", h.channels[0]);
     }
 
     /// Slot 1's call of three superframes from the first TDMA frame; slot 2's of four from
@@ -1819,6 +1759,9 @@ mod tests {
             let r = h.end(|h| h.events.len() >= 2).await;
             assert!(r.is_ok(), "{what}: {r:?}");
             silent_and_encrypted(&h, &mbe, what);
+            if let Some(c) = h.channels.first() {
+                assert!(t_ns(c) > t_ns(&h.events[1]), "{what}: {c}");
+            }
         }
 
         // Under follow an encrypted call that started first does not hold the main
@@ -1868,10 +1811,11 @@ mod tests {
             let mbe = Mbe::absent();
             let mut h = Harness::start(&mbe, 4096, "first_active");
             h.send(&synth(p), RATE);
-            let r = h.end(|h| !h.events.is_empty()).await;
+            let r = h.end(|h| !h.channels.is_empty()).await;
             assert!(r.is_ok(), "{r:?}");
-            assert_eq!(h.events.len(), 1, "{:?}", h.events);
-            let e = &h.events[0];
+            assert!(h.events.is_empty(), "{:?}", h.events);
+            assert_eq!(h.channels.len(), 1, "{:?}", h.channels);
+            let e = &h.channels[0];
             has(
                 e,
                 json!({
@@ -2095,6 +2039,7 @@ mod tests {
             let r = h.end(|_| true).await;
             assert!(r.is_ok(), "{name}: {r:?}");
             assert!(h.events.is_empty(), "{name}: {:?}", h.events);
+            assert!(h.channels.is_empty(), "{name}: {:?}", h.channels);
             assert!(
                 h.slot1.is_empty() && h.slot2.is_empty() && h.main.is_empty(),
                 "{name}"
@@ -2317,13 +2262,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_talker_alias_is_not_a_new_call() {
-        // The second superframe carries a talker alias in place of the link control: with
-        // the header, and joined after it, where only the first superframe's link control
-        // licenses the alias's.
+        // The second superframe carries a talker alias, or GPS, in place of the link
+        // control: with the header, and joined after it, where only the first superframe's
+        // link control licenses the alias's.
         let aliased = build::call(CC, &group(), 3, Origin::Repeater, true);
-        let mut joined = aliased.clone();
-        joined[0] = lost();
-        for (what, bursts) in [("header", aliased), ("joined", joined)] {
+        let gps = build::call_with_gps(CC, &group(), 3);
+        let joined = |mut b: Vec<Burst>| {
+            b[0] = lost();
+            b
+        };
+        for (what, bursts) in [
+            ("talker alias, header", aliased.clone()),
+            ("talker alias, joined", joined(aliased)),
+            ("gps, header", gps.clone()),
+            ("gps, joined", joined(gps)),
+        ] {
             let mbe = Mbe::installed();
             let mut h = Harness::start(&mbe, 4096, "first_active");
             h.send(&repeater(bursts, idles(20)), RATE);
@@ -2338,6 +2291,138 @@ mod tests {
             has(&h.events[1], json!({"frames": 54}));
             assert_eq!(mbe.log(), "start\neof\n", "{what}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_call_opened_by_a_privacy_header_is_reported_and_silent() {
+        // No voice header (lost), a privacy header, then the voice under a link control that
+        // says clear: the privacy header alone marks it.
+        let mut bursts = call(group(), 2);
+        bursts[0] = lost();
+        bursts.insert(1, build::privacy_header(CC, Origin::Repeater));
+        let mbe = Mbe::installed();
+        let mut h = Harness::start(&mbe, 4096, "first_active");
+        h.send(&repeater(bursts, idles(16)), RATE);
+        let r = h.end(|h| h.events.len() >= 2).await;
+        assert!(r.is_ok(), "{r:?}");
+        silent_and_encrypted(&h, &mbe, "privacy header first");
+    }
+
+    #[tokio::test]
+    async fn a_header_call_that_turns_encrypted_mid_superframe_stops_from_that_burst() {
+        // A header's call: one clear superframe, then one whose link control (at its E)
+        // says encrypted, then its terminator. Bursts A to D of the second were fed under
+        // the header's licence; none from E on.
+        let clear = call(group(), 1);
+        let turned = call(encrypted(group()), 1);
+        let mut slot1 = clear[..7].to_vec();
+        slot1.extend(&turned[2..]);
+        let e = burst_at(7 + 4, 1);
+        let mbe = Mbe::installed();
+        let mut h = Harness::start(&mbe, 4096, "first_active");
+        h.send(&repeater(slot1, idles(16)), RATE);
+        let r = h
+            .end(|h| h.events.len() >= 2 && mbe.log().contains("eof"))
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        // The speech first: the first superframe and at most four bursts of the second.
+        assert!(
+            h.slot1.len() <= SUPERFRAME_FRAMES + 4 * 3,
+            "{}",
+            h.slot1.len()
+        );
+        assert!(
+            starts(&h.slot1).iter().all(|&s| s + SLACK_NS < e),
+            "{:?} vs {e}",
+            starts(&h.slot1)
+        );
+        assert_eq!(h.slot1.len(), SUPERFRAME_FRAMES + 4 * 3);
+        // One vocoder, its input closed at E.
+        assert_eq!(mbe.log(), "start\neof\n");
+        assert_eq!(eots(&h.events), [false, true], "{:?}", h.events);
+        has(&h.events[0], json!({"encrypted": false, "audio": true}));
+        has(
+            &h.events[1],
+            json!({"encrypted": true, "silent": "encrypted", "frames": 36}),
+        );
+    }
+
+    /// Slot 1's call with its second superframe's burst C lost, so its speech is held from
+    /// D to the third superframe's E; slot 2's call from the fourth TDMA frame. With
+    /// `slot1` false slot 1 is idle.
+    fn held_beside(slot1: bool) -> Vec<Complex<f32>> {
+        let mut one = call(group(), 3);
+        build::lose(&mut one[1 + 6 + 2]);
+        let mut two = idles(3);
+        two.extend(call(other(), 3));
+        if !slot1 {
+            one = idles(one.len());
+        }
+        repeater(one, two)
+    }
+
+    #[tokio::test]
+    async fn under_all_a_held_call_does_not_stall_the_mix() {
+        // Read up to slot 1's third superframe's C, while slot 1 is held: slot 2's speech
+        // reaches the main stream as far as the stage can know it, as when slot 1 is idle.
+        let cut = 15 * TDMA;
+        let read_to = T0 + ns(cut);
+        let bound = read_to - LATE_NS - PERIOD_NS;
+        for slot1 in [false, true] {
+            let mbe = Mbe::installed();
+            let mut h = Harness::start(&mbe, 4096, "all");
+            h.send_paced(&held_beside(slot1)[..cut], RATE).await;
+            assert!(
+                h.until(|h| audio_end(&h.main) >= bound).await,
+                "slot 1 {}: the main stream reached {} of {bound}",
+                if slot1 { "held" } else { "idle" },
+                audio_end(&h.main)
+            );
+            if slot1 {
+                // Slot 1 was held throughout: nothing of its has been fed since its loss.
+                let lost_at = burst_at(9, 1);
+                assert!(
+                    starts(&h.slot1).iter().all(|&s| s < lost_at),
+                    "{:?}",
+                    starts(&h.slot1)
+                );
+            }
+            let r = h.end(|_| true).await;
+            assert!(r.is_ok(), "{r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_vocoder_stays_failed_for_the_call() {
+        // A header's call whose vocoder dies after 10 frames; its second superframe turns
+        // it encrypted and its third clear again: no vocoder is started again in the call.
+        let mbe = Mbe::installed();
+        mbe.die_once();
+        let clear = call(group(), 3);
+        let turned = call(encrypted(group()), 1);
+        let mut slot1 = clear[..7].to_vec();
+        slot1.extend(&turned[2..8]);
+        slot1.extend(&clear[13..]);
+        let iq = repeater(slot1, idles(20));
+        let mut h = Harness::start(&mbe, 4096, "first_active");
+        let split = 8 * TDMA;
+        h.send(&iq[..split], RATE);
+        assert!(
+            h.until(|h| h.vocoder_notes().iter().any(|n| n.contains("exited")))
+                .await,
+            "{:?}",
+            h.vocoder_notes()
+        );
+        h.send(&iq[split..], RATE);
+        let r = h.end(|h| h.events.len() >= 2 && h.slot1.len() >= 10).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(h.slot1.len(), 10);
+        assert_eq!(eots(&h.events), [false, true], "{:?}", h.events);
+        has(
+            &h.events[1],
+            json!({"silent": "vocoder_failed", "audio": false, "frames": 54}),
+        );
+        assert_eq!(mbe.log().matches("start").count(), 1, "{}", mbe.log());
     }
 
     #[test]

@@ -41,7 +41,8 @@
 //! job's audio. Without the program every call is reported with `audio: false`,
 //! `silent: "no_vocoder"`, and `job_context.p25.vocoder` says how to install it, once. A
 //! vocoder that fails mid-call ends that call's audio (`silent: "vocoder_failed"` on its
-//! closing event); the next call starts it again.
+//! closing event), held again or turned encrypted and clear again as the call may be; the
+//! next call starts it again.
 //!
 //! **A channel with no call.** A unit decoded with no call open (a trunking signalling unit,
 //! a packet data unit, a stray terminator) gives one `type: channel` event, and another only
@@ -54,7 +55,6 @@
 //! transmitter the receiver refuses for its deviation shows in `off_deviation` and nowhere
 //! else.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -66,15 +66,16 @@ use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Provenance, Span, StreamId, StreamKind, Timestamp};
 
-use crate::fsk4::{Fsk4Counters, Fsk4Demod, Fsk4Params, Shape};
+use crate::fsk4::{Fsk4Demod, Fsk4Params, Fsk4Tally, Shape};
 use crate::p25::{
     EncSync, IMBE_FEED_BYTES, LDU_DIBITS, LinkControl, P25_ALGID_CLEAR, P25_BAUD,
     P25_COAST_SEARCHES, P25_DEVIATION_HZ, P25_SUPERFRAME_MS, P25Framer, P25Unit,
 };
-use crate::util::{event, time_of};
+use crate::util::time_of;
 use crate::vocoder::{Vocoder, VocoderEnv, VocoderSpec};
 use crate::voice_call::{
-    CallFields, MBE_FRAME_SAMPLES, MBE_RATE_HZ, Silent, ZETA_MBE, channel_event, no_vocoder_note,
+    CallFields, Events, MBE_FRAME_SAMPLES, MBE_RATE_HZ, ProgramLookup, Silent, ZETA_MBE,
+    channel_event, publish,
 };
 use crate::{Input, run_map_ending};
 
@@ -173,48 +174,6 @@ impl Receiver {
     }
 }
 
-/// The front end's counters over the job, every receiver it has had (a lagged input or a
-/// new rate makes a new one), into `job_context.p25.receiver` when they change.
-#[derive(Default)]
-struct Tally {
-    /// The sums of the receivers already replaced.
-    done: Fsk4Counters,
-    /// The totals last noted.
-    noted: Fsk4Counters,
-}
-
-impl Tally {
-    /// `r` is replaced: its counts join the sums.
-    fn retire(&mut self, r: Option<Receiver>) {
-        if let Some(r) = r {
-            self.done = add(self.done, r.demod.counters());
-        }
-    }
-
-    /// Note the totals, with `current`'s, when they changed since last noted.
-    fn note(&mut self, ctx: &StageContext, current: Option<&Receiver>) {
-        let now = current.map_or(self.done, |r| add(self.done, r.demod.counters()));
-        if now != self.noted {
-            self.noted = now;
-            ctx.note(serde_json::json!({PROTOCOL: {"receiver": {
-                "locks": now.locks,
-                "false_locks": now.false_locks,
-                "losses": now.losses,
-                "off_deviation": now.off_deviation,
-            }}}));
-        }
-    }
-}
-
-fn add(a: Fsk4Counters, b: Fsk4Counters) -> Fsk4Counters {
-    Fsk4Counters {
-        locks: a.locks + b.locks,
-        false_locks: a.false_locks + b.false_locks,
-        losses: a.losses + b.losses,
-        off_deviation: a.off_deviation + b.off_deviation,
-    }
-}
-
 /// What a call's speech is doing.
 enum Voice {
     /// No encryption word covers its units yet: nothing is fed. `was` is why it was silent
@@ -277,6 +236,9 @@ struct Open {
     /// its speech stays held.
     told: bool,
     voice: Voice,
+    /// Its vocoder failed (to start, or during the call): it stays silent to its end,
+    /// whatever its speech does after (held again, encrypted, clear again).
+    failed: bool,
     announced: bool,
     frames: u32,
     errors: u32,
@@ -297,6 +259,7 @@ impl Open {
             protected: false,
             told: false,
             voice: Voice::Held { was: None },
+            failed: false,
             announced: false,
             frames: 0,
             errors: 0,
@@ -358,6 +321,7 @@ impl Open {
         let was = match voice {
             Voice::Heard(v) => {
                 let was = (!v.alive()).then_some(Silent::VocoderFailed);
+                self.failed |= was.is_some();
                 env.park(v);
                 was
             }
@@ -373,8 +337,7 @@ impl Open {
 struct Calls {
     env: VocoderEnv,
     open: Option<Open>,
-    /// Whether the missing vocoder has been noted since it was last found.
-    said_missing: bool,
+    lookup: ProgramLookup,
     /// The last channel event's NAC and `control`.
     channel: Option<(u16, bool)>,
     /// The NAC trunking signalling was last seen on.
@@ -383,28 +346,7 @@ struct Calls {
     packet_units: u64,
 }
 
-type Events = Vec<(u64, serde_json::Value)>;
-
 impl Calls {
-    /// The program to speak a clear call with, looked up now; `None` noted once.
-    fn program(&mut self) -> Option<PathBuf> {
-        let found = crate::vocoder::program(&self.env.ctx, 0, ZETA_MBE, false)
-            .ok()
-            .flatten();
-        match &found {
-            Some(_) => self.said_missing = false,
-            None if !self.said_missing => {
-                self.said_missing = true;
-                let note = no_vocoder_note(&self.env.ctx);
-                self.env
-                    .ctx
-                    .note(serde_json::json!({PROTOCOL: {"vocoder": note}}));
-            }
-            None => {}
-        }
-        found
-    }
-
     /// Settle `open`'s speech on its encryption, once anything has told it: stop a vocoder
     /// when the call turns encrypted, start one when it is (or turns) clear. A call nothing
     /// has told stays held.
@@ -422,14 +364,20 @@ impl Calls {
                 Voice::Silent(Silent::Encrypted)
             }
             (_, true) => Voice::Silent(Silent::Encrypted),
+            (Voice::Held { .. } | Voice::Silent(Silent::Encrypted), false) if open.failed => {
+                Voice::Silent(Silent::VocoderFailed)
+            }
             (Voice::Held { .. } | Voice::Silent(Silent::Encrypted), false) => self.start(prov),
             (other, false) => other,
         };
+        if matches!(open.voice, Voice::Silent(Silent::VocoderFailed)) {
+            open.failed = true;
+        }
     }
 
     /// A vocoder for a clear call, or why there is none.
     fn start(&mut self, prov: &Provenance) -> Voice {
-        let Some(program) = self.program() else {
+        let Some(program) = self.lookup.find(&self.env.ctx, PROTOCOL) else {
             return Voice::Silent(Silent::NoVocoder);
         };
         let spec = VocoderSpec {
@@ -628,6 +576,7 @@ impl Calls {
                 // It exited or stopped answering (the seat noted why): this call stays
                 // silent, the next starts it again.
                 open.voice = Voice::Silent(Silent::VocoderFailed);
+                open.failed = true;
             }
         }
         if !open.announced && open.lc.is_some() && !matches!(open.voice, Voice::Held { .. }) {
@@ -732,14 +681,14 @@ impl Stage for P25DecodeStage {
         let mut calls = Calls {
             env: env.clone(),
             open: None,
-            said_missing: false,
+            lookup: ProgramLookup::default(),
             channel: None,
             control_nac: None,
             trunking_units: 0,
             packet_units: 0,
         };
         let mut rx: Option<Receiver> = None;
-        let mut tally = Tally::default();
+        let mut tally = Fsk4Tally::default();
         let mut last_prov: Option<Provenance> = None;
         let result = run_map_ending(self.spec().kind, inputs, bus, cancel, move |input| {
             let mut events = Vec::new();
@@ -747,9 +696,16 @@ impl Stage for P25DecodeStage {
                 Some(Input::Frame(f)) => f,
                 Some(Input::Lagged { .. }) => {
                     // Start clean: the samples missed broke the symbol clock and the call.
-                    tally.retire(rx.take());
+                    tally.retire(rx.take().map(|r| r.demod.counters()));
                     calls.interrupt(&mut events);
-                    return Ok(publish(&ctx, &events_out, last_prov.as_ref(), events));
+                    return Ok(publish(
+                        &ctx,
+                        &events_out,
+                        last_prov.as_ref(),
+                        PROTOCOL,
+                        events,
+                        LDU_NS,
+                    ));
                 }
                 None => {
                     // The input ended: the units the front end still held (a terminator
@@ -760,9 +716,16 @@ impl Stage for P25DecodeStage {
                             calls.unit(t, nac, unit, prov, &mut events);
                         }
                     }
-                    tally.note(&ctx, rx.as_ref());
+                    tally.note(&ctx, PROTOCOL, rx.as_ref().map(|r| r.demod.counters()));
                     calls.interrupt(&mut events);
-                    return Ok(publish(&ctx, &events_out, last_prov.as_ref(), events));
+                    return Ok(publish(
+                        &ctx,
+                        &events_out,
+                        last_prov.as_ref(),
+                        PROTOCOL,
+                        events,
+                        LDU_NS,
+                    ));
                 }
             };
             let Payload::Iq(block) = &frame.payload else {
@@ -773,7 +736,7 @@ impl Stage for P25DecodeStage {
             let rate = block.sample_rate_hz.0;
             if rx.as_ref().is_some_and(|r| r.demod.rate_hz != rate) {
                 // A new rate: the call so far closes and the receiver starts again.
-                tally.retire(rx.take());
+                tally.retire(rx.take().map(|r| r.demod.counters()));
                 calls.interrupt(&mut events);
             }
             let r = match &mut rx {
@@ -790,9 +753,16 @@ impl Stage for P25DecodeStage {
             if counts != (calls.trunking_units, calls.packet_units) {
                 calls.note_counts();
             }
-            tally.note(&ctx, rx.as_ref());
+            tally.note(&ctx, PROTOCOL, rx.as_ref().map(|r| r.demod.counters()));
             last_prov = Some(frame.provenance.clone());
-            Ok(publish(&ctx, &events_out, Some(&frame.provenance), events))
+            Ok(publish(
+                &ctx,
+                &events_out,
+                Some(&frame.provenance),
+                PROTOCOL,
+                events,
+                LDU_NS,
+            ))
         })
         .await;
         env.drain_all(&result).await;
@@ -800,36 +770,8 @@ impl Stage for P25DecodeStage {
     }
 }
 
-/// The events `(t, fields)` as frames on `out`, each in the row's envelope.
-fn publish(
-    ctx: &StageContext,
-    out: &StreamId,
-    prov: Option<&Provenance>,
-    events: Events,
-) -> Vec<Frame> {
-    let Some(prov) = prov else {
-        return Vec::new();
-    };
-    events
-        .into_iter()
-        .map(|(t, fields)| {
-            let mut p = prov.clone();
-            p.span = Span {
-                start_ns: Timestamp(t),
-                end_ns: Timestamp(t + LDU_NS),
-            };
-            Frame::new(
-                out.clone(),
-                p,
-                Payload::Event(event(ctx, t, PROTOCOL, fields)),
-            )
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -846,6 +788,7 @@ mod tests {
     use super::*;
     use crate::p25::{Call, LcMark, encode_call, encode_call_lc, encode_control};
     use crate::synth::{awgn, c4fm_modulate, parse_params, synthesise};
+    use crate::voice_call::fake_mbe;
 
     const RATE: u64 = 48_000;
     const NAC: u16 = 291;
@@ -928,55 +871,14 @@ mod tests {
         )
     }
 
-    /// The fake `zeta-mbe` (`tests/fake_zeta_mbe`) as the row's handler: a link in a
-    /// temporary directory, absent until installed, so no test sets the process's
-    /// environment and none sees another's program.
-    struct Mbe {
-        _dir: tempfile::TempDir,
-        link: PathBuf,
+    /// The fake `zeta-mbe` as the p25_decode row's handler ([`crate::voice_call::fake_mbe`]).
+    struct P25Row;
+
+    impl fake_mbe::Row for P25Row {
+        const JSON: &'static str = include_str!("../../../modes/p25_decode.json");
     }
 
-    impl Mbe {
-        fn absent() -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let link = dir.path().join(ZETA_MBE);
-            Self { _dir: dir, link }
-        }
-
-        fn installed() -> Self {
-            let m = Self::absent();
-            m.install();
-            m
-        }
-
-        fn install(&self) {
-            let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_zeta_mbe");
-            std::os::unix::fs::symlink(fake, &self.link).unwrap();
-        }
-
-        /// The file the fake keeps beside its link.
-        fn beside(&self, suffix: &str) -> PathBuf {
-            PathBuf::from(format!("{}.{suffix}", self.link.display()))
-        }
-
-        /// The fake's next run exits 1 after 10 frames.
-        fn die_once(&self) {
-            std::fs::write(self.beside("die"), "").unwrap();
-        }
-
-        /// What the fake's runs logged: `start` per run, `eof` per input closed.
-        fn log(&self) -> String {
-            std::fs::read_to_string(self.beside("log")).unwrap_or_default()
-        }
-
-        /// The P25 row with its handler at the link.
-        fn row(&self) -> Arc<zeta_core::modes::ModeRow> {
-            let mut v: Value =
-                serde_json::from_str(include_str!("../../../modes/p25_decode.json")).unwrap();
-            v["decoder"]["handlers"][0]["programs"] = json!([self.link.to_str().unwrap()]);
-            Arc::new(zeta_core::modes::parse(&v.to_string()).unwrap())
-        }
-    }
+    type Mbe = fake_mbe::Mbe<P25Row>;
 
     /// The stage over the P25 row, and what it has published so far.
     struct Harness {
@@ -1692,6 +1594,37 @@ mod tests {
         );
         assert_eq!(h.audio.len(), 45);
         assert!(h.vocoder_notes().is_empty(), "{:?}", h.vocoder_notes());
+    }
+
+    #[tokio::test]
+    async fn a_failed_vocoder_stays_failed_for_the_call() {
+        // The vocoder dies after 10 frames of the first superframe; the second superframe's
+        // LDU2 is lost, so the call is held again until the third's LDU2 says clear: no
+        // vocoder is started again in the call.
+        let mbe = Mbe::installed();
+        mbe.die_once();
+        let mut dibits = encode_call(NAC, group(), clear(), 3);
+        lose(&mut dibits, 3);
+        let iq = on_air(&dibits, RATE);
+        let mut h = Harness::start(&mbe, 4096);
+        let split = (HDU_DIBITS + 2 * LDU_DIBITS + 60) * SPD;
+        h.send(&iq[..split], RATE);
+        assert!(
+            h.until(|h| h.vocoder_notes().iter().any(|n| n.contains("exited")))
+                .await,
+            "{:?}",
+            h.vocoder_notes()
+        );
+        h.send(&iq[split..], RATE);
+        let r = h.end(|h| h.events.len() >= 2 && h.audio.len() >= 10).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(h.audio.len(), 10);
+        assert_eq!(eots(&h.events), [false, true], "{:?}", h.events);
+        has(
+            &h.events[1],
+            json!({"silent": "vocoder_failed", "audio": false, "frames": 45}),
+        );
+        assert_eq!(runs(&mbe), 1, "{}", mbe.log());
     }
 
     #[tokio::test]

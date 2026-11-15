@@ -6,9 +6,13 @@
 //! A call's events say whether its speech is heard (`audio`) and, when it is not, why
 //! (`silent`, design 38, 5.3).
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 use serde_json::{Map, Value};
 use zeta_core::stage::StageContext;
+use zeta_core::stream::{Frame, Payload};
+use zeta_core::types::{Provenance, Span, StreamId, Timestamp};
 
 /// The vocoder program the voice rows name as their handler 0 (`tools/vocoder/zeta-mbe.c`).
 pub const ZETA_MBE: &str = "zeta-mbe";
@@ -43,6 +47,67 @@ pub fn no_vocoder_note(ctx: &StageContext) -> String {
         "{ZETA_MBE} not found: calls are reported with no audio (silent: no_vocoder); \
          {how}; the node finds it on PATH or by {var}, from the next call on"
     )
+}
+
+/// The vocoder looked up at each call (so a program installed while the job runs is used
+/// from the next call), its absence noted once in the job's context until it is found.
+#[derive(Default)]
+pub struct ProgramLookup {
+    /// Whether the missing vocoder has been noted since it was last found.
+    said_missing: bool,
+}
+
+impl ProgramLookup {
+    /// The row's handler 0 ([`ZETA_MBE`] without a row), looked up now; when it is absent
+    /// and not noted yet, [`no_vocoder_note`] under `{<protocol>: {"vocoder": …}}`.
+    pub fn find(&mut self, ctx: &StageContext, protocol: &str) -> Option<PathBuf> {
+        let found = crate::vocoder::program(ctx, 0, ZETA_MBE, false)
+            .ok()
+            .flatten();
+        match &found {
+            Some(_) => self.said_missing = false,
+            None if !self.said_missing => {
+                self.said_missing = true;
+                let note = no_vocoder_note(ctx);
+                ctx.note(serde_json::json!({protocol: {"vocoder": note}}));
+            }
+            None => {}
+        }
+        found
+    }
+}
+
+/// A stage's events: each `(t_ns, fields)`.
+pub type Events = Vec<(u64, Value)>;
+
+/// The events as frames on `out`, each in the row's envelope with `prov` spanning
+/// `span_ns` from its time; none before the stage has a provenance.
+pub fn publish(
+    ctx: &StageContext,
+    out: &StreamId,
+    prov: Option<&Provenance>,
+    protocol: &str,
+    events: Events,
+    span_ns: u64,
+) -> Vec<Frame> {
+    let Some(prov) = prov else {
+        return Vec::new();
+    };
+    events
+        .into_iter()
+        .map(|(t, fields)| {
+            let mut p = prov.clone();
+            p.span = Span {
+                start_ns: Timestamp(t),
+                end_ns: Timestamp(t + span_ns),
+            };
+            Frame::new(
+                out.clone(),
+                p,
+                Payload::Event(crate::util::event(ctx, t, protocol, fields)),
+            )
+        })
+        .collect()
 }
 
 /// Whether a group or a unit-to-unit call.
@@ -134,6 +199,77 @@ pub fn channel_event(protocol: &'static str, control: bool) -> Map<String, Value
     m.insert("protocol".into(), protocol.into());
     m.insert("control".into(), control.into());
     m
+}
+
+/// The voice stages' tests' vocoder: the fake `zeta-mbe` (`tests/fake_zeta_mbe`) as a row's
+/// handler, through a link in a temporary directory, absent until installed, so no test
+/// sets the process's environment and none sees another's program.
+#[cfg(test)]
+pub(crate) mod fake_mbe {
+    use std::marker::PhantomData;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use serde_json::{Value, json};
+
+    use super::ZETA_MBE;
+
+    /// The mode row a stage's tests run it under.
+    pub(crate) trait Row {
+        /// The row's JSON text.
+        const JSON: &'static str;
+    }
+
+    pub(crate) struct Mbe<R: Row> {
+        _dir: tempfile::TempDir,
+        link: PathBuf,
+        _row: PhantomData<R>,
+    }
+
+    impl<R: Row> Mbe<R> {
+        pub(crate) fn absent() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join(ZETA_MBE);
+            Self {
+                _dir: dir,
+                link,
+                _row: PhantomData,
+            }
+        }
+
+        pub(crate) fn installed() -> Self {
+            let m = Self::absent();
+            m.install();
+            m
+        }
+
+        pub(crate) fn install(&self) {
+            let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_zeta_mbe");
+            std::os::unix::fs::symlink(fake, &self.link).unwrap();
+        }
+
+        /// The file the fake keeps beside its link.
+        pub(crate) fn beside(&self, suffix: &str) -> PathBuf {
+            PathBuf::from(format!("{}.{suffix}", self.link.display()))
+        }
+
+        /// The fake's next run exits 1 after 10 frames.
+        pub(crate) fn die_once(&self) {
+            std::fs::write(self.beside("die"), "").unwrap();
+        }
+
+        /// What the fake's runs logged: `start` per run, `eof` per input closed.
+        pub(crate) fn log(&self) -> String {
+            std::fs::read_to_string(self.beside("log")).unwrap_or_default()
+        }
+
+        /// The row with its handler at the link.
+        pub(crate) fn row(&self) -> Arc<zeta_core::modes::ModeRow> {
+            let mut v: Value = serde_json::from_str(R::JSON).unwrap();
+            v["decoder"]["handlers"][0]["programs"] = json!([self.link.to_str().unwrap()]);
+            Arc::new(zeta_core::modes::parse(&v.to_string()).unwrap())
+        }
+    }
 }
 
 #[cfg(test)]
