@@ -1,5 +1,5 @@
 //! Signal generators: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 / APRS, POCSAG, RDS, Mode S,
-//! ACARS, AIS, FLEX, M17, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
+//! ACARS, AIS, FLEX, M17, C4FM, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
 //! `zeta modes check` runs the rows' tests on them. The test-only helpers stay in
 //! `fixtures`, behind feature `test-fixtures`.
 
@@ -1158,21 +1158,133 @@ pub fn rrc_modulate_4fsk(
     rate_hz: u32,
     alpha: f64,
 ) -> Vec<Complex<f32>> {
-    if symbols.is_empty() {
+    let levels: Vec<f64> = symbols
+        .iter()
+        .map(|&s| f64::from(s.min(3)) * 2.0 - 3.0)
+        .collect();
+    shaped_4fsk(
+        &levels,
+        symbol_rate_baud,
+        deviation_hz,
+        rate_hz,
+        RRC_SPAN_SYMBOLS,
+        |t| rrc(t, alpha),
+    )
+}
+
+/// C4FM's Nyquist raised-cosine roll-off (TIA-102.BAAA: flat to 1920 Hz, nothing past
+/// 2880 Hz at 4800 baud).
+pub const C4FM_ROLLOFF: f64 = 0.2;
+/// Symbols the C4FM pulse spans: its inverse-sinc boost leaves tails that an 8-symbol
+/// cut would turn into intersymbol interference.
+const C4FM_SPAN_SYMBOLS: f64 = 16.0;
+/// Points per symbol period in the tabulated C4FM pulse.
+const C4FM_TABLE_PER_SYMBOL: usize = 64;
+/// Simpson steps over a pulse's band in [`even_pulse`].
+const PULSE_INTEGRAL_STEPS: usize = 240;
+
+/// The C4FM transmit pulse at `t` symbol periods from its centre: the inverse Fourier
+/// transform of the raised-cosine Nyquist filter (roll-off [`C4FM_ROLLOFF`]) times the
+/// shaping filter `P(f) = πf / sin(πf)`, frequencies in symbol rates (TIA-102.BAAA's
+/// C4FM modulator: `P(f) = (πf/4800) / sin(πf/4800)` at 4800 baud). The receiver's
+/// integrate-and-dump filter, `sin(πf) / πf`, cancels `P(f)` and leaves the raised
+/// cosine, so the symbol centres are free of intersymbol interference.
+fn c4fm_pulse(t: f64) -> f64 {
+    let (lo, hi) = ((1.0 - C4FM_ROLLOFF) / 2.0, (1.0 + C4FM_ROLLOFF) / 2.0);
+    even_pulse(t, hi, |f| {
+        let nyquist = if f <= lo {
+            1.0
+        } else {
+            0.5 * (1.0 + (PI * (f - lo) / (hi - lo)).cos())
+        };
+        let shaping = if f < 1e-12 {
+            1.0
+        } else {
+            PI * f / (PI * f).sin()
+        };
+        nyquist * shaping
+    })
+}
+
+/// The real, even impulse response at `t` symbol periods of the frequency response
+/// `spectrum` (of frequency in symbol rates, even, nothing past `band`):
+/// `2 ∫_0^band spectrum(f) cos(2πft) df`, by Simpson's rule.
+pub(crate) fn even_pulse(t: f64, band: f64, spectrum: impl Fn(f64) -> f64) -> f64 {
+    let n = PULSE_INTEGRAL_STEPS;
+    let h = band / n as f64;
+    let sum: f64 = (0..=n)
+        .map(|i| {
+            let w = if i == 0 || i == n {
+                1.0
+            } else if i % 2 == 1 {
+                4.0
+            } else {
+                2.0
+            };
+            let f = i as f64 * h;
+            w * spectrum(f) * (2.0 * PI * f * t).cos()
+        })
+        .sum();
+    2.0 * sum * h / 3.0
+}
+
+/// 4FSK of `symbols`, dibits with 01 → +3, 00 → +1, 10 → −1, 11 → −3 (P25's mapping,
+/// [`crate::fsk4::DIBIT_LEVELS`]), at `baud`, sampled at `rate_hz`: impulses at the
+/// symbol centres through the C4FM filter ([`c4fm_pulse`], spanning
+/// [`C4FM_SPAN_SYMBOLS`], unit DC gain), frequency modulated so the outer symbols sit at
+/// ±`deviation_hz`. P25 phase 1's modulator. `symbols.len() * rate_hz / baud` samples.
+pub fn c4fm_modulate(
+    symbols: &[u8],
+    baud: u32,
+    deviation_hz: f64,
+    rate_hz: u32,
+) -> Vec<Complex<f32>> {
+    let per = C4FM_TABLE_PER_SYMBOL as f64;
+    let half = (C4FM_SPAN_SYMBOLS / 2.0 * per) as i64;
+    let table: Vec<f64> = (-half..=half).map(|i| c4fm_pulse(i as f64 / per)).collect();
+    let pulse = |t: f64| {
+        let x = (t * per + half as f64).clamp(0.0, (2 * half) as f64);
+        let i = (x.floor() as usize).min(table.len() - 2);
+        let f = x - i as f64;
+        table[i] * (1.0 - f) + table[i + 1] * f
+    };
+    let levels: Vec<f64> = symbols
+        .iter()
+        .map(|&d| f64::from(crate::fsk4::DIBIT_LEVELS[usize::from(d & 3)]))
+        .collect();
+    shaped_4fsk(
+        &levels,
+        baud,
+        deviation_hz,
+        rate_hz,
+        C4FM_SPAN_SYMBOLS,
+        pulse,
+    )
+}
+
+/// 4FSK of `levels` (±1, ±3) at `symbol_rate_baud`, sampled at `rate_hz`: impulses at
+/// the symbol centres through `pulse` (a function of time in symbol periods, spanning
+/// `span_symbols`, scaled to unit DC gain), frequency modulated so a level of 3 sits at
+/// `deviation_hz`.
+fn shaped_4fsk(
+    levels: &[f64],
+    symbol_rate_baud: u32,
+    deviation_hz: f64,
+    rate_hz: u32,
+    span_symbols: f64,
+    pulse: impl Fn(f64) -> f64,
+) -> Vec<Complex<f32>> {
+    if levels.is_empty() {
         return Vec::new();
     }
     let sps = f64::from(rate_hz) / f64::from(symbol_rate_baud);
-    let half = RRC_SPAN_SYMBOLS / 2.0;
+    let half = span_symbols / 2.0;
     let reach = (half * sps).floor() as isize;
     // Unit DC gain: the pulse's area in symbol periods (its taps at whole-sample
     // offsets, per sample period).
-    let gain: f64 = (-reach..=reach)
-        .map(|j| rrc(j as f64 / sps, alpha))
-        .sum::<f64>()
-        / sps;
-    let level = |s: u8| f64::from(s.min(3)) * 2.0 - 3.0;
-    let n = (symbols.len() as f64 * sps) as usize;
-    let last = symbols.len() - 1;
+    let gain: f64 = (-reach..=reach).map(|j| pulse(j as f64 / sps)).sum::<f64>() / sps;
+    let n = (levels.len() as f64 * sps) as usize;
+    let last = levels.len() - 1;
     let mut phase = 0.0f64;
     (0..n)
         .map(|i| {
@@ -1181,7 +1293,7 @@ pub fn rrc_modulate_4fsk(
             let lo = (t - 0.5 - half).ceil().max(0.0) as usize;
             let hi = ((t - 0.5 + half).floor().max(0.0) as usize).min(last);
             let shaped: f64 = (lo..=hi)
-                .map(|k| level(symbols[k]) * rrc(t - k as f64 - 0.5, alpha))
+                .map(|k| levels[k] * pulse(t - k as f64 - 0.5))
                 .sum::<f64>()
                 / gain;
             phase += 2.0 * PI * shaped * deviation_hz / 3.0 / f64::from(rate_hz);

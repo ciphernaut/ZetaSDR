@@ -39,6 +39,7 @@ pub mod frame_parse;
 pub mod frame_quick;
 pub mod framing;
 pub mod fsk;
+pub mod fsk4;
 #[cfg(feature = "gpu")]
 pub mod gpu_fft;
 pub mod identify;
