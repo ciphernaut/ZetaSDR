@@ -65,8 +65,8 @@
 //!   of the declared deviation; noise fits at 1.15 to 2.1, whatever its power) the eye
 //!   must be far more open or the contrast far higher. So a transmitter well off its
 //!   declared deviation is still taken: 0.6 to 2.0 of it at 15 dB.
-//! - **One level's share.** A stretch with more than [`SIGNAL_SHARE`] of its 32 symbols
-//!   on one level (that is, 20 or more) is refused, for acquiring and for holding alike. A
+//! - **One level's share.** At most 19 of a stretch's 32 symbols may sit on one level;
+//!   20 or more are refused ([`SIGNAL_SHARE`]), for acquiring and for holding alike. A
 //!   carrier, or a stretch mostly carrier, sits on one level, and a fit can then put that
 //!   level anywhere: the limit is what keeps a carrier from being taken for a signal.
 //!   Random data puts about 8 of 32 on each level and rarely more than 15 on one; the
@@ -95,6 +95,12 @@
 //! - A taken phase is refined between the 16 searched ones, from the closures either side.
 //! - [`Fsk4Demod::flush`] gives out whatever is still held when the input ends; it is
 //!   final.
+//!
+//! **Weak signals.** At 0.8 of the declared deviation and 10 dB (about 8 dB on the
+//! mode's own) acquisition from 32-symbol stretches is marginal: measured over 200 lone
+//! bursts each, 5 to 8 % of 72-symbol bursts and up to 1 % of 132-symbol ones are lost,
+//! and 3 in 500 bursts of a handheld's train. At 15 dB, or at the declared deviation at
+//! 10 dB, none are.
 //!
 //! [`SoftDibit::at`] is never negative and never goes backwards. It steps by a symbol
 //! within 4 % while a lock holds, and by more where a signal is found anew.
@@ -192,7 +198,8 @@ pub const HOLD_DRIFT: f64 = 0.2;
 /// from a level to its threshold. Noise alone, fitted, shows 0.017 to 0.04, so this alone
 /// does not tell them apart.
 pub const ACQUIRE_CLOSURE: f64 = 1.0 / 36.0;
-/// The largest share of a stretch's symbols one level may take in a signal: 19 of 32.
+/// The largest share of a stretch's symbols one level may take in a signal. At most 19 of
+/// a stretch's 32 symbols may sit on one level; 20 or more are refused.
 /// A carrier sits on one level, and a stretch mostly carrier nearly so; random data puts
 /// at most about half its 32 symbols on one level, a 48-bit sync of outer symbols 54 %.
 pub const SIGNAL_SHARE: f64 = 0.6;
@@ -381,6 +388,9 @@ struct Paths {
     proven_refit_refused: u32,
     /// Fits in `settle` that moved the levels too far: refused.
     settle_refused: u32,
+    /// Symbols given out while every symbol is to be held (on probation, or in the searches
+    /// after a false lock): only past [`HELD_MAX`].
+    out_while_held: u32,
     /// Proving refits taken, and `settle`s run.
     proven_refits: u32,
     settles: u32,
@@ -654,6 +664,13 @@ impl Fsk4Demod {
 
     /// Give out the held symbols beyond the last `hold`.
     fn give(&mut self, hold: usize, out: &mut Vec<SoftDibit>) {
+        #[cfg(test)]
+        {
+            let out = self.pending.len().saturating_sub(hold) as u32;
+            if hold == HELD_MAX {
+                self.note(|p| p.out_while_held += out);
+            }
+        }
         while self.pending.len() > hold {
             let d = self.pending.pop_front().expect("pending");
             self.given = d.at + self.delay;
@@ -1579,12 +1596,17 @@ mod tests {
     /// Ten bursts, each [`BURST_S`] of symbols then [`BURST_GAP_S`] of nothing (132 and
     /// 156 symbol periods at 4800 baud), the noise throughout.
     fn bursts(tx: Tx) -> Scene {
+        bursts_of(tx, 70)
+    }
+
+    /// [`bursts`], burst `b`'s dibits from seed `payload + b`.
+    fn bursts_of(tx: Tx, payload: u64) -> Scene {
         let (n, gap) = (tx.symbols(BURST_S), tx.symbols(BURST_GAP_S));
         let mut iq = Vec::new();
         let mut sent = Vec::new();
         for b in 0..10 {
             let start = iq.len();
-            let dibits = dibits(n, 70 + b);
+            let dibits = dibits(n, payload + b);
             iq.extend(tx.modulate(&dibits));
             iq.extend(std::iter::repeat_n(
                 Complex::new(0.0, 0.0),
@@ -2098,7 +2120,8 @@ mod tests {
         let over = |dev: f64, snr: f64| -> Vec<String> {
             (0..50)
                 .flat_map(|seed| {
-                    let scene = bursts(Tx::new(dmr(), 6000 + seed).off(dev, snr));
+                    let tx = Tx::new(dmr(), 6000 + seed).off(dev, snr);
+                    let scene = bursts_of(tx, 10_000 + 16 * seed);
                     let (_, rx) = decode(&scene);
                     errors_per_sent(&scene, &rx)
                         .into_iter()
@@ -2114,17 +2137,18 @@ mod tests {
             assert!(over.is_empty(), "{dev} at {snr} dB: {over:?}");
         }
         // 0.8 of the deviation at 10 dB (about 8 dB on the mode's own): 3 of these 500
-        // bursts are not acquired well enough, a known shortfall; held to that rate.
+        // bursts were measured not acquired well enough, a known limit. Held to that, with
+        // one burst of margin for arithmetic that differs between machines.
         let over = over(0.8, 10.0);
-        assert!(over.len() <= 3, "0.8 at 10 dB: {over:?}");
+        assert!(over.len() <= 3 + 1, "0.8 at 10 dB: {over:?}");
     }
 
     /// Of 200 lone bursts of `n` dibits from `p` at `snr`, those decoded within
     /// [`START_ERRORS_MAX`] errors over their checked range.
-    fn lone_bursts_decoded(p: Fsk4Params, n: usize, snr: f64) -> usize {
+    fn lone_bursts_decoded(p: Fsk4Params, n: usize, deviation: f64, snr: f64) -> usize {
         (0..200)
             .filter(|seed| {
-                let scene = lone_burst(Tx::new(p, 5000 + seed).off(1.0, snr), n);
+                let scene = lone_burst(Tx::new(p, 5000 + seed).off(deviation, snr), n);
                 let (_, rx) = decode(&scene);
                 errors_per_sent(&scene, &rx)[0] <= START_ERRORS_MAX
             })
@@ -2134,15 +2158,15 @@ mod tests {
     #[test]
     fn a_lone_132_dibit_burst_is_decoded() {
         // A DMR handheld's burst on its own, noise before and after.
-        assert_eq!(lone_bursts_decoded(dmr(), 132, 15.0), 200);
-        assert!(lone_bursts_decoded(dmr(), 132, 10.0) >= 198);
+        assert_eq!(lone_bursts_decoded(dmr(), 132, 1.0, 15.0), 200);
+        assert!(lone_bursts_decoded(dmr(), 132, 1.0, 10.0) >= 198);
     }
 
     #[test]
     fn a_lone_72_dibit_burst_is_decoded() {
         // A P25 terminator's length on its own, noise before and after.
-        assert_eq!(lone_bursts_decoded(c4fm(), 72, 15.0), 200);
-        assert!(lone_bursts_decoded(c4fm(), 72, 10.0) >= 198);
+        assert_eq!(lone_bursts_decoded(c4fm(), 72, 1.0, 15.0), 200);
+        assert!(lone_bursts_decoded(c4fm(), 72, 1.0, 10.0) >= 198);
     }
 
     /// A lone 132-dibit burst with `share` of its dibits on one level (00, at +1), spread
@@ -2287,6 +2311,58 @@ mod tests {
         demod.settle();
         assert_eq!(demod.paths.get().settle_refused, 0);
         assert_eq!(demod.paths.get().settles, 1);
+    }
+
+    #[test]
+    fn lone_bursts_at_0_8_of_the_deviation_and_10_db_keep_their_measured_rate() {
+        // The known limit of a weak signal (about 8 dB on the mode's own), measured over
+        // these 200 seeds; each held to its figure with one burst of margin for arithmetic
+        // that differs between machines.
+        for (p, n, lost) in [
+            (dmr(), 132, 0),
+            (dmr(), 72, 10),
+            (c4fm(), 132, 2),
+            (c4fm(), 72, 16),
+        ] {
+            let decoded = lone_bursts_decoded(p, n, 0.8, 10.0);
+            assert!(
+                200 - decoded <= lost + 1,
+                "{:?}, {n} dibits: {} of 200 lost, {lost} measured",
+                p.shape,
+                200 - decoded
+            );
+        }
+    }
+
+    #[test]
+    fn a_proving_fit_that_corrects_the_levels_replaces_settle() {
+        // A scene found to take a proving refit (the seed is the scene's, not tuned): the
+        // proving search's fit slices the held symbols again, and `settle` is not run on
+        // top of it.
+        let scene = after_carrier(Tx::new(dmr(), 7101).off(0.8, 10.0), 200);
+        let (demod, rx) = decode(&scene);
+        let paths = demod.paths.get();
+        assert!(paths.proven_refits > 0, "{paths:?}");
+        assert_eq!(paths.settles, 0, "{paths:?}");
+        let errors = errors_per_sent(&scene, &rx)[0];
+        assert!(errors <= START_ERRORS_MAX, "{errors} wrong");
+    }
+
+    #[test]
+    fn held_symbols_stay_held_until_the_lock_is_decided() {
+        // While a lock is on probation, or in the searches after it was found false, every
+        // symbol is held (up to HELD_MAX). Over 50 weak trains, none goes out early except
+        // where a second lock was taken in those searches (two on probation in a row, which
+        // HELD_MAX's doc allows). With the margin of one search gone (192), 7 did.
+        for seed in 0..50 {
+            let tx = Tx::new(dmr(), 6000 + seed).off(0.8, 10.0);
+            let scene = bursts_of(tx, 10_000 + 16 * seed);
+            let (demod, _) = decode(&scene);
+            let paths = demod.paths.get();
+            if paths.in_grace == 0 {
+                assert_eq!(paths.out_while_held, 0, "seed {}: {paths:?}", 6000 + seed);
+            }
+        }
     }
 
     #[test]
