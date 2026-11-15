@@ -48,7 +48,7 @@ die() {
 
 yes=0
 src=""
-prefix="${HOME:-}/.local"
+prefix=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --yes) yes=1 ;;
@@ -73,7 +73,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-[ -n "$prefix" ] || die "no --prefix and no HOME"
+if [ -z "$prefix" ]; then
+  [ -n "${HOME:-}" ] || die "no --prefix and no HOME: give --prefix DIR"
+  prefix=$HOME/.local
+fi
 
 # The tools, by the Debian package that has each, before anything is asked or fetched.
 cc=${CC:-cc}

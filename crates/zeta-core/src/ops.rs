@@ -4696,9 +4696,26 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                     .filter(|j| !replace.contains(j))
             {
                 drop(guard);
+                // The policy is not part of what makes a job identical: say the running
+                // one's, and how to change it.
+                let policy = match kind.mode_row(&node.modes()) {
+                    Ok(Some(row)) if template::names_audio_policy(row) => {
+                        let running = node
+                            .job_list()
+                            .into_iter()
+                            .find(|r| r.id == job)
+                            .and_then(|r| r.audio_policy)
+                            .unwrap_or_default();
+                        format!(
+                            " (audio_policy {}; a start with replace naming it changes the policy)",
+                            running.name()
+                        )
+                    }
+                    _ => String::new(),
+                };
                 return Err(OpError::Duplicate {
                     message: format!(
-                        "an identical {} already runs on {} at {}/{} Hz as job {}",
+                        "an identical {} already runs on {} at {}/{} Hz as job {}{policy}",
                         kind.name(),
                         source.0,
                         tuning.center_hz.0,

@@ -601,6 +601,72 @@ async fn a_retune_keeps_the_policy() {
     assert_eq!(heard(&node, &t).await, "slot1");
 }
 
+/// The refusal's text for a start on `center_hz` that repeats `job`, running `policy`.
+fn duplicate_message(center_hz: u64, job: &JobId, policy: &str) -> String {
+    format!(
+        "an identical {ROW} already runs on tone at {center_hz}/12500 Hz as job {} \
+         (audio_policy {policy}; a start with replace naming it changes the policy)",
+        job.0
+    )
+}
+
+#[tokio::test]
+async fn a_start_with_another_policy_is_refused_naming_the_running_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let job = start_two_voice(&node, 100_000_000, Some(AudioPolicy::Follow)).await;
+    let before = node.job_list().len();
+    assert_eq!(
+        start(
+            &node,
+            start_op(two_voice(), 100_000_000, Some(AudioPolicy::All))
+        )
+        .await,
+        Err(OpError::Duplicate {
+            message: duplicate_message(100_000_000, &job, "follow"),
+            job: job.clone(),
+        })
+    );
+    // A job started with no policy runs the row's default, and says so.
+    let default = start_two_voice(&node, 100_015_000, None).await;
+    assert_eq!(
+        start(
+            &node,
+            start_op(two_voice(), 100_015_000, Some(AudioPolicy::Follow))
+        )
+        .await,
+        Err(OpError::Duplicate {
+            message: duplicate_message(100_015_000, &default, "first_active"),
+            job: default.clone(),
+        })
+    );
+    // Nothing started, nothing changed.
+    assert_eq!(node.job_list().len(), before + 1);
+    assert_eq!(record(&node, &job).audio_policy, Some(AudioPolicy::Follow));
+    assert_eq!(record(&node, &job).state, JobState::Running);
+}
+
+#[tokio::test]
+async fn a_start_replacing_the_running_job_changes_its_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let job = start_two_voice(&node, 100_000_000, Some(AudioPolicy::Follow)).await;
+    let mut replacing = start_op(two_voice(), 100_000_000, Some(AudioPolicy::All));
+    if let Op::JobStart { replace, .. } = &mut replacing {
+        *replace = vec![job.clone()];
+    }
+    let new = start(&node, replacing).await.unwrap();
+    assert_ne!(new, job);
+    until("the replaced job stopped", || {
+        record(&node, &job).state == JobState::Stopped
+    })
+    .await;
+    assert_eq!(record(&node, &new).state, JobState::Running);
+    assert_eq!(record(&node, &new).audio_policy, Some(AudioPolicy::All));
+    assert_eq!(graph_policy(&node, &new), "all");
+    assert_eq!(event(&node, &new, "two_voice_test").await["audio"], "all");
+}
+
 #[tokio::test]
 async fn the_mix_reads_the_main_stream_only() {
     let dir = tempfile::tempdir().unwrap();

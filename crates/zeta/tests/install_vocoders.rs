@@ -155,6 +155,48 @@ fn without_yes_it_stops_before_downloading() {
 }
 
 #[test]
+fn without_home_or_prefix_it_stops_naming_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let marker = dir.path().join("tool-ran");
+    // Fakes for every tool the script needs, each leaving the marker if it runs.
+    for tool in ["git", "cmake", "cc"] {
+        write_executable(
+            &bin.join(tool),
+            &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        );
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg(script())
+        .arg("--yes")
+        .current_dir(dir.path())
+        .env("PATH", path)
+        .env("TMPDIR", dir.path())
+        .env_remove("HOME")
+        .env_remove("CC")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "it went on without HOME: {text}");
+    assert!(
+        text.contains("--prefix"),
+        "the refusal does not name --prefix: {text}"
+    );
+    assert!(!marker.exists(), "a tool ran: {text}");
+}
+
+#[test]
 fn the_script_passes_bash_n() {
     let out = Command::new("bash")
         .arg("-n")
