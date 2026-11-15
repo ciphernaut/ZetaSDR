@@ -156,6 +156,8 @@ ZetaSDR is licensed under the Apache License 2.0 ([LICENSE](LICENSE)). It bundle
 catalogue, a map library and fonts under their own licences, listed in [NOTICE](NOTICE);
 [docs/licensing.md](docs/licensing.md) says why Apache-2.0 and how GPL decoders are kept apart.
 
+P25 and DMR speech needs a patented vocoder that this project does not ship; [docs/vocoders.md](docs/vocoders.md) says how to build one on your own machine and what that leaves to you.
+
 ## Feedback and contributions
 
 At this stage ZetaSDR takes feedback and ideas as issues, and code as gists rather than pull
