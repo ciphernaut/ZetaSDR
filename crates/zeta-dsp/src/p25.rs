@@ -86,6 +86,17 @@ use crate::fsk4::{SoftDibit, find_sync, sync_dibits};
 pub const P25_BAUD: u32 = 4800;
 /// The outer symbols' deviation, Hz (the inner ones a third of it).
 pub const P25_DEVIATION_HZ: f64 = 1800.0;
+/// The most searches a P25 receiver's 4-level FSK lock coasts through stretches that sit
+/// on one level ([`crate::fsk4::Fsk4Params::coast_searches`]). A clear call's header
+/// carries P25's longest run of one dibit: its message indicator, manufacturer and key IDs
+/// are zero, and the talkgroup's high bits too for a low talkgroup (none at all for a
+/// unit-to-unit call), and the header's systematic Reed-Solomon and Golay codes keep zero
+/// data zero. Measured on the synthesised clear header (a receiver whose coast never runs
+/// out, 30 seeds each, at 15 dB and at 0.8 of the deviation and 10 dB), the most searches
+/// a proven lock coasted in a row: 20 for talkgroup 65000, 23 for talkgroup 1, 24 for a
+/// unit-to-unit call. The worst, 24, and a stretch's 4 searches more at each end, where
+/// noise tips a stretch of 18 or 19 on the level over: 32.
+pub const P25_COAST_SEARCHES: u32 = 32;
 /// The 48-bit frame sync, first bit first from bit 47.
 pub const P25_SYNC: u64 = 0x5575_F5FF_77FF;
 /// The algorithm ID of clear (unencrypted) speech.
@@ -515,12 +526,33 @@ pub(crate) fn encode_call_lc(
     out
 }
 
-/// A control channel: `units` trunking signalling units of three blocks with idle
-/// content. The blocks are null bits, not trellis-coded signalling: nothing here parses
-/// them, so they stand only for the unit's length.
+/// A control channel: `units` trunking signalling units of three blocks. Each unit's
+/// blocks carry pseudo-random bits ([`control_fill`]), not trellis coded or interleaved,
+/// so they decode as no valid block: they stand for the unit's length, and for a real
+/// channel's coded signalling in carrying no long run of one dibit (null bits would).
 pub fn encode_control(nac: u16, units: u32) -> Vec<u8> {
     (0..units)
-        .flat_map(|_| unit_symbols(header_bits(nac, DUID_TSDU), TSDU_INFO_BITS, STATUS_IDLE))
+        .flat_map(|unit| {
+            let mut bits = header_bits(nac, DUID_TSDU);
+            let fill = TSDU_INFO_BITS - bits.len();
+            bits.extend(control_fill(nac, unit, fill));
+            unit_symbols(bits, TSDU_INFO_BITS, STATUS_IDLE)
+        })
+        .collect()
+}
+
+/// `n` pseudo-random bits for control unit `unit` of `nac`: a 64-bit linear congruential
+/// generator (Knuth's MMIX multiplier and increment) seeded with the NAC above the unit's
+/// index, its top bit taken at each step.
+fn control_fill(nac: u16, unit: u32, n: usize) -> Vec<u8> {
+    let mut state = u64::from(nac) << 32 | u64::from(unit);
+    (0..n)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 63) as u8
+        })
         .collect()
 }
 
@@ -1599,11 +1631,7 @@ mod tests {
                 symbol_rate_baud: P25_BAUD,
                 deviation_hz: P25_DEVIATION_HZ,
                 shape: Shape::C4fm,
-                // The longest run of one dibit P25 sends is a clear call's header: its zero
-                // message indicator, manufacturer and key IDs code to 117 dibits of 00,
-                // which fill 20 searches' stretches in a row; a stretch's 4 searches more
-                // at each end, where noise tips a stretch of 18 or 19 on the level over.
-                coast_searches: 28,
+                coast_searches: P25_COAST_SEARCHES,
             },
         )
         .expect("rate")

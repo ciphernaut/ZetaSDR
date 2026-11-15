@@ -68,8 +68,8 @@ use zeta_core::types::{Provenance, Span, StreamId, StreamKind, Timestamp};
 
 use crate::fsk4::{Fsk4Counters, Fsk4Demod, Fsk4Params, Shape};
 use crate::p25::{
-    EncSync, IMBE_FEED_BYTES, LDU_DIBITS, LinkControl, P25_ALGID_CLEAR, P25_BAUD, P25_DEVIATION_HZ,
-    P25_SUPERFRAME_MS, P25Framer, P25Unit,
+    EncSync, IMBE_FEED_BYTES, LDU_DIBITS, LinkControl, P25_ALGID_CLEAR, P25_BAUD,
+    P25_COAST_SEARCHES, P25_DEVIATION_HZ, P25_SUPERFRAME_MS, P25Framer, P25Unit,
 };
 use crate::util::{event, time_of};
 use crate::vocoder::{Vocoder, VocoderEnv, VocoderSpec};
@@ -129,11 +129,7 @@ impl Receiver {
             symbol_rate_baud: P25_BAUD,
             deviation_hz: P25_DEVIATION_HZ,
             shape: Shape::C4fm,
-            // The longest run of one dibit P25 sends is a clear call's header: its zero
-            // message indicator, manufacturer and key IDs code to 117 dibits of 00, which
-            // fill 20 searches' stretches in a row; a stretch's 4 searches more at each
-            // end, where noise tips a stretch of 18 or 19 on the level over.
-            coast_searches: 28,
+            coast_searches: P25_COAST_SEARCHES,
         };
         Ok(Self {
             demod: Fsk4Demod::new(rate_hz, params)
@@ -1839,8 +1835,10 @@ mod tests {
             assert!(c[k].is_u64(), "{k}: {c}");
         }
         assert_eq!(c["off_deviation"], 0, "{c}");
-        // The clear call's header run does not drop or undo its lock: none false, and the
-        // one loss is the call's end, read after the input ends.
+        // The clear call's header run does not drop or undo its lock: one lock that stood,
+        // none false, and the one loss comes from the zero tail after the call, read after
+        // the input ends (the carrier gone).
+        assert_eq!(c["locks"], 1, "{c}");
         assert_eq!(c["losses"], 1, "{c}");
         assert_eq!(c["false_locks"], 0, "{c}");
         // A transmitter at well under a third of P25's deviation: refused, and counted.

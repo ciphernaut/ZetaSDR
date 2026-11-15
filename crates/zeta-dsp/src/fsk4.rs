@@ -71,12 +71,14 @@
 //!   level anywhere: the limit is what keeps a carrier from being taken for a signal.
 //!   Random data puts about 8 of 32 on each level and rarely more than 15 on one; the
 //!   48-bit syncs of P25 and DMR put 12 or 13 of their 24 on one level. A stretch mostly
-//!   one symbol is never acquired on. But signals do send long runs of one dibit: every
-//!   clear P25 call's header carries 117 dibits of 00 (its zero message indicator and key
-//!   ID, coded), and a DMR voice burst's centre can carry 24. So a lock that meets such a
-//!   stretch coasts through it ([`Fsk4Params::coast_searches`], set by each mode from its
-//!   longest run), bounded because within a stretch a run and a carrier on that level
-//!   cannot be told apart.
+//!   one symbol is never acquired on. But signals do send long runs of one dibit. Every
+//!   clear P25 call's header carries one: its zero message indicator, manufacturer and key
+//!   IDs (and a low talkgroup's high bits) code to zeros, which keep 20 to 24 searches'
+//!   stretches in a row on one level (talkgroup 65000, talkgroup 1, a unit-to-unit call;
+//!   [`crate::p25::P25_COAST_SEARCHES`]). A DMR voice burst's centre can carry 24 dibits of
+//!   00. So a lock that meets such a stretch coasts through it
+//!   ([`Fsk4Params::coast_searches`], set by each mode from its longest run), bounded
+//!   because within a stretch a run and a carrier on that level cannot be told apart.
 //! - A fit with an amplitude outside [`SIGNAL_AMPLITUDE`] is not taken but counted
 //!   ([`Fsk4Counters::off_deviation`]), so a stage can say why a signal is not decoded.
 //! - A full search's fit must also explain the next search's stretch, since a stretch
@@ -274,7 +276,7 @@ pub const PENDING_SYMBOLS: usize = 96;
 /// It is 200 symbols: 42 ms at 4800 baud, 83 ms at 2400. A receiver holds one search's
 /// symbols more for each search its mode lets a lock on probation coast
 /// ([`Fsk4Params::coast_searches`]), so that the guarantee covers a coasted probation:
-/// 424 symbols (88 ms) for P25's 28, 296 (62 ms) for DMR's 12.
+/// 456 symbols (95 ms) for P25's 32, 296 (62 ms) for DMR's 12.
 pub const HELD_MAX: usize = 2 * PENDING_SYMBOLS + SEARCH_EVERY;
 // A lock re-slices from the last symbol given out to where the receiver had got, which can
 // be one search past `PENDING_SYMBOLS`: hence the margin.
@@ -452,6 +454,11 @@ struct Paths {
     false_on_share: u32,
     /// Searches made.
     searches: u32,
+    /// The most searches a proven lock coasted in a row, and a lock on probation in all.
+    most_coasted_proven: u32,
+    most_coasted_on_probation: u32,
+    /// Refits taken on probation.
+    probation_refits: u32,
 }
 
 /// A stretch of symbol samples against a set of levels.
@@ -841,7 +848,16 @@ impl Fsk4Demod {
             self.unheld = 0;
             #[cfg(test)]
             {
-                self.note(|p| p.coasts += 1);
+                let coasted = self.coasted as u32;
+                self.note(|p| {
+                    p.coasts += 1;
+                    let most = if probation {
+                        &mut p.most_coasted_on_probation
+                    } else {
+                        &mut p.most_coasted_proven
+                    };
+                    *most = (*most).max(coasted);
+                });
             }
             return;
         }
@@ -905,9 +921,15 @@ impl Fsk4Demod {
             }
             if better && refit.verdict() == Verdict::Strong {
                 let at = from + fine(offset(phase), &refit);
-                let (proven, trial) = (self.proven, self.trial);
+                #[cfg(test)]
+                if probation {
+                    self.note(|p| p.probation_refits += 1);
+                }
+                // The same lock refitted: its probation's searches, evidence and coasts
+                // stand.
+                let (proven, trial, coasted) = (self.proven, self.trial, self.coasted);
                 self.adopt(at, refit);
-                (self.proven, self.trial) = (proven, trial);
+                (self.proven, self.trial, self.coasted) = (proven, trial, coasted);
                 self.unheld = 0;
                 return;
             }
@@ -1333,15 +1355,16 @@ mod tests {
     const DMR_DEVIATION_HZ: f64 = 1944.0;
     /// DMR's root-raised-cosine roll-off.
     const DMR_ALPHA: f64 = 0.2;
-    /// What the P25 and DMR stages set [`Fsk4Params::coast_searches`] to (their
-    /// constructions say how each is sized).
-    const P25_COAST_SEARCHES: u32 = 28;
-    const DMR_COAST_SEARCHES: u32 = 12;
+    use crate::dmr::DMR_COAST_SEARCHES;
+    use crate::p25::P25_COAST_SEARCHES;
     /// Dibits in a P25 header data unit, status symbols included.
     const P25_HEADER_DIBITS: usize = 396;
     /// The scenes of `held_symbols_stay_held_until_the_lock_is_decided` measured with no
     /// lock in the grace.
     const MEASURED_CHECKED: usize = 42;
+    /// The calls of `held_symbols_stay_held_through_a_clear_p25_header` measured with no
+    /// lock in the grace.
+    const MEASURED_P25_CHECKED: usize = 79;
     /// The channel the tests' SNRs are measured in, Hz.
     const VOICE_BANDWIDTH_HZ: f64 = 12_500.0;
     /// P25's 48-bit frame sync.
@@ -2486,10 +2509,11 @@ mod tests {
         let scene = lone_burst(Tx::new(dmr(), 73), 132);
         let mut demod = on_probation();
         demod.amplitude *= 1.05;
-        let fed = demod.fed as usize;
-        let mut rx: Vec<SoftDibit> = demod.pending.iter().copied().collect();
+        let mut fed = demod.fed as usize;
+        let mut rx = Vec::new();
         for chunk in scene.iq[fed..].chunks(24) {
             rx.extend(demod.feed(chunk));
+            fed += chunk.len();
             if demod.proven >= demod.probation {
                 break;
             }
@@ -2498,6 +2522,34 @@ mod tests {
         assert!(demod.proven >= demod.probation, "{paths:?}");
         assert_eq!(paths.proven_refits, 1, "{paths:?}");
         assert_eq!(paths.settles, 0, "{paths:?}");
+        // And the burst comes out right, its held symbols sliced again on the fit.
+        rx.extend(feed_all(&mut demod, &scene.iq[fed..]));
+        rx.extend(demod.flush());
+        let errors = errors_per_sent(&scene, &rx)[0];
+        assert!(errors <= START_ERRORS_MAX, "{errors} wrong");
+    }
+
+    #[test]
+    fn a_refit_on_probation_keeps_the_coast_budget_spent() {
+        // A lock on probation that has coasted 5 searches, its tracked amplitude 30 % off,
+        // fed to its next search: that search refits it (any phase, strong evidence), and
+        // the 5 searches stay spent, as its probation's searches and evidence do.
+        let scene = lone_burst(Tx::new(dmr(), 73), 132);
+        let mut demod = on_probation();
+        demod.amplitude *= 1.3;
+        demod.coasted = 5;
+        let (proven, searches) = (demod.proven, demod.paths.get().searches);
+        let fed = demod.fed as usize;
+        for chunk in scene.iq[fed..].chunks(24) {
+            demod.feed(chunk);
+            if demod.paths.get().searches > searches {
+                break;
+            }
+        }
+        let paths = demod.paths.get();
+        assert_eq!(paths.probation_refits, 1, "{paths:?}");
+        assert_eq!(demod.proven, proven, "{paths:?}");
+        assert_eq!(demod.coasted, 5, "{paths:?}");
     }
 
     #[test]
@@ -2545,36 +2597,34 @@ mod tests {
     }
 
     /// `scene` decoded: the counters when its transmission starts and when it ends, the
-    /// receiver at the end of the input, and every dibit given out.
-    fn counted(
-        scene: &Scene,
-        end: usize,
-    ) -> (Fsk4Counters, Fsk4Counters, Fsk4Demod, Vec<SoftDibit>) {
+    /// transitions taken by its end, and every dibit given out.
+    fn counted(scene: &Scene, end: usize) -> (Fsk4Counters, Fsk4Counters, Paths, Vec<SoftDibit>) {
         let start = scene.sent[0].start;
         let mut demod = Fsk4Demod::new(u64::from(RATE), scene.tx.params).expect("rate");
         let mut rx = feed_all(&mut demod, &scene.iq[..start]);
         let before = demod.counters();
         rx.extend(feed_all(&mut demod, &scene.iq[start..end]));
-        let after = demod.counters();
+        let (after, paths) = (demod.counters(), demod.paths.get());
         rx.extend(feed_all(&mut demod, &scene.iq[end..]));
         rx.extend(demod.flush());
-        (before, after, demod, rx)
+        (before, after, paths, rx)
     }
 
-    /// One lock that stands from `before` to `after`, none false and none lost.
+    /// One lock that stands from `before` to `after`, none false and none lost. (Signed:
+    /// a lock held at `before` that is found false after leaves fewer standing.)
     fn one_lock(before: Fsk4Counters, after: Fsk4Counters) -> bool {
-        let kept = |c: Fsk4Counters| c.locks - c.false_locks;
+        let kept = |c: Fsk4Counters| c.locks as i64 - c.false_locks as i64;
         kept(after) - kept(before) == 1
             && after.false_locks == before.false_locks
             && after.losses == before.losses
     }
 
-    #[test]
-    fn a_clear_p25_call_keeps_one_lock_through_its_header() {
+    /// A clear P25 call of 2 superframes to `dst`, a talkgroup or (`private`) a radio.
+    fn clear_p25_call(dst: u32, private: bool) -> Vec<u8> {
         use crate::p25::{Call, EncSync, LinkControl, P25_ALGID_CLEAR, encode_call};
         let lc = LinkControl {
-            call: Call::Group,
-            dst: 65_000,
+            call: if private { Call::Private } else { Call::Group },
+            dst,
             src: 9_990_001,
             mfid: 0,
             emergency: false,
@@ -2583,44 +2633,118 @@ mod tests {
             algid: P25_ALGID_CLEAR,
             kid: 0,
         };
-        let call = encode_call(0x293, lc, clear, 2);
-        // The header: frame sync, NID and the header code words, 117 dibits of 00 among
-        // them (its zero message indicator and key ID).
+        encode_call(0x293, lc, clear, 2)
+    }
+
+    /// The clear headers the tests run: talkgroup 65000, talkgroup 1 (the usual
+    /// conventional default, whose header carries a longer run) and a unit-to-unit call
+    /// (talkgroup 0 in the header, the longest).
+    fn clear_p25_calls() -> [(&'static str, Vec<u8>); 3] {
+        [
+            ("talkgroup 65000", clear_p25_call(65_000, false)),
+            ("talkgroup 1", clear_p25_call(1, false)),
+            ("a unit-to-unit call", clear_p25_call(9_990_002, true)),
+        ]
+    }
+
+    #[test]
+    fn held_symbols_stay_held_through_a_clear_p25_header() {
+        // A weak lock on probation coasts through the header's run with every symbol held,
+        // its coasts bounded over the whole probation so the hold covers them. Over 30
+        // calls per header at 0.8 of the deviation and 10 dB, none gives a symbol out while
+        // held, except where a second lock was taken in the grace (as HELD_MAX allows).
+        let (mut checked, mut refits) = (0, 0);
+        for (name, call) in clear_p25_calls() {
+            for seed in 0..30 {
+                let tx = Tx::new(c4fm(), 8000 + seed).off(0.8, 10.0);
+                let (scene, _) = after_200_ms_of_noise(name, tx, call.clone());
+                let (demod, _) = decode(&scene);
+                let paths = demod.paths.get();
+                refits += paths.probation_refits;
+                if paths.in_grace == 0 {
+                    assert_eq!(
+                        paths.out_while_held,
+                        0,
+                        "{name}, seed {}: {paths:?}",
+                        8000 + seed
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked + 1 >= MEASURED_P25_CHECKED,
+            "{checked} calls checked"
+        );
+        assert!(refits > 0, "no refit on probation");
+    }
+
+    #[test]
+    fn a_clear_p25_call_keeps_one_lock_through_its_header() {
+        // Each header's run keeps 20 (talkgroup 65000), 23 (talkgroup 1) or 24 (a
+        // unit-to-unit call) searches' stretches on one level in a row.
         let header = 2..P25_HEADER_DIBITS;
-        // Over 50 seeds (8000 on; this is the first): at 15 dB none took a false lock or
-        // lost one. At 0.8 of the deviation and 10 dB, 41 kept one lock throughout; 7 lost
-        // it once mid-call (a stretch's eye closing past HOLD_CLOSURE, not a run) and 3
-        // took a false lock on probation at the call's start, 1 of them on the header's
-        // run after weak evidence.
-        for (tx, header_errors) in [
-            (Tx::new(c4fm(), 8000), 0),
-            // At the steady state's rate (1.33 %, 5.2 expected), within 3 standard
-            // deviations.
-            (
-                Tx::new(c4fm(), 8000).off(0.8, 10.0),
-                poisson_quantile(0.0133 * 392.0, 0.99865),
-            ),
-        ] {
-            let (scene, end) = after_200_ms_of_noise("a clear P25 call", tx, call.clone());
-            let (before, after, demod, rx) = counted(&scene, end);
-            assert!(one_lock(before, after), "{tx:?}: {before:?} then {after:?}");
-            // The header's run made it coast.
-            assert!(demod.paths.get().coasts > 0, "{tx:?}");
-            let sent = &scene.sent[0];
-            let header_scene = Scene {
-                name: "the header".into(),
-                tx,
-                iq: Vec::new(),
-                sent: vec![Sent {
-                    start: sent.start,
-                    dibits: sent.dibits.clone(),
-                    check: header.clone(),
-                }],
-            };
-            let wrong = errors_per_sent(&header_scene, &rx)[0];
+        for (name, call) in clear_p25_calls() {
+            for (tx, header_errors) in [
+                (Tx::new(c4fm(), 8000), 0),
+                // At the steady state's rate (1.33 %, 5.2 expected), within 3 standard
+                // deviations.
+                (
+                    Tx::new(c4fm(), 8000).off(0.8, 10.0),
+                    poisson_quantile(0.0133 * 392.0, 0.99865),
+                ),
+            ] {
+                let (scene, end) = after_200_ms_of_noise(name, tx, call.clone());
+                let (before, after, paths, rx) = counted(&scene, end);
+                assert!(
+                    one_lock(before, after),
+                    "{name}, {tx:?}: {before:?} then {after:?}"
+                );
+                // The header's run made it coast.
+                assert!(paths.coasts > 0, "{name}, {tx:?}");
+                let sent = &scene.sent[0];
+                let header_scene = Scene {
+                    name: "the header".into(),
+                    tx,
+                    iq: Vec::new(),
+                    sent: vec![Sent {
+                        start: sent.start,
+                        dibits: sent.dibits.clone(),
+                        check: header.clone(),
+                    }],
+                };
+                let wrong = errors_per_sent(&header_scene, &rx)[0];
+                assert!(
+                    wrong <= header_errors,
+                    "{name}, {tx:?}: {wrong} of the header's dibits wrong"
+                );
+            }
+        }
+        // At 0.8 of the deviation and 10 dB, over 30 calls per header (seeds 8000 on),
+        // each held to its measured figure with one call of margin. Failed by the header's
+        // run (a coast that ran out, or a lock found false on one level's share, inside the
+        // call): 1, 2 and 1, all false on share after weak evidence, none a coast run out
+        // (with a coast of 28, one unit-to-unit call ran out). Not keeping exactly one lock
+        // in all: 7, 7 and 8, the rest a stretch's eye closing past HOLD_CLOSURE mid-call
+        // or a false lock at the start.
+        for ((name, call), (by_run, not_one)) in
+            clear_p25_calls().into_iter().zip([(1, 7), (2, 7), (1, 8)])
+        {
+            let (mut run_failed, mut not_kept) = (0, 0);
+            for seed in 0..30 {
+                let tx = Tx::new(c4fm(), 8000 + seed).off(0.8, 10.0);
+                let (scene, end) = after_200_ms_of_noise(name, tx, call.clone());
+                let (before, after, paths, _) = counted(&scene, end);
+                run_failed += u32::from(paths.coasts_ended > 0 || paths.false_on_share > 0);
+                not_kept += u32::from(!one_lock(before, after));
+            }
             assert!(
-                wrong <= header_errors,
-                "{tx:?}: {wrong} of the header's dibits wrong"
+                run_failed <= by_run + 1,
+                "{name}: {run_failed} of 30 failed by the run, {by_run} measured"
+            );
+            assert!(
+                not_kept <= not_one + 1,
+                "{name}: {not_kept} of 30 not one lock, {not_one} measured"
             );
         }
     }
@@ -2636,8 +2760,9 @@ mod tests {
             encrypted: false,
             emergency: false,
         };
+        // At colour code 0, where a voice burst's centre can be 24 dibits of 00.
         let downlink = encode_repeater(
-            5,
+            0,
             [
                 SlotPlan {
                     lc: Some(lc),
@@ -2651,13 +2776,13 @@ mod tests {
                 },
             ],
         );
-        // Over 50 seeds each, none took a false lock or lost one.
+        // Over 30 seeds each, none took a false lock or lost one.
         for tx in [Tx::new(dmr(), 8100), Tx::new(dmr(), 8100).off(1.0, 10.0)] {
             let (scene, end) = after_200_ms_of_noise("a repeater's call", tx, downlink.clone());
-            let (before, after, demod, _) = counted(&scene, end);
+            let (before, after, paths, _) = counted(&scene, end);
             assert!(one_lock(before, after), "{tx:?}: {before:?} then {after:?}");
             // Its call bursts made it coast.
-            assert!(demod.paths.get().coasts > 0, "{tx:?}");
+            assert!(paths.coasts > 0, "{tx:?}");
         }
     }
 

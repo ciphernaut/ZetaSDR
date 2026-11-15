@@ -175,6 +175,15 @@ pub const DMR_BAUD: u32 = 4800;
 pub const DMR_DEVIATION_HZ: f64 = 1944.0;
 /// The root-raised-cosine roll-off (-1 10.2.2.2).
 pub const DMR_RRC_ALPHA: f64 = 0.2;
+/// The most searches a DMR receiver's 4-level FSK lock coasts through stretches that sit
+/// on one level ([`crate::fsk4::Fsk4Params::coast_searches`]). A voice burst's 48-bit
+/// centre (the EMB and the embedded field) can be 24 dibits of 00 at colour code 0, where
+/// the EMB's QR code of zero data is zero. Measured on the synthesised repeater call at
+/// colour code 0 (a receiver whose coast never runs out, 30 seeds each, at 15 and 10 dB and
+/// at 0.8 of the deviation and 10 dB), the most searches a proven lock coasted in a row: 4.
+/// That, and a stretch's 4 searches more at each end, where noise tips a stretch of 18 or
+/// 19 on the level over: 12.
+pub const DMR_COAST_SEARCHES: u32 = 12;
 /// Bytes of one AMBE+2 frame as the vocoder takes it: 4 rows of 24, one per bit.
 pub const AMBE_FEED_BYTES: usize = 96;
 /// A voice superframe, ms: six bursts of a slot (-1 5.1.2.1).
@@ -2732,12 +2741,7 @@ mod tests {
                     shape: Shape::Rrc {
                         alpha: DMR_RRC_ALPHA,
                     },
-                    // The longest run of one dibit DMR sends is a voice burst's 48-bit
-                    // centre, the EMB and a null embedded field at colour code 0: 24
-                    // dibits, filling 4 searches' stretches in a row; a stretch's 4
-                    // searches more at each end, where noise tips a stretch of 18 or 19 on
-                    // the level over.
-                    coast_searches: 12,
+                    coast_searches: DMR_COAST_SEARCHES,
                 },
             )
             .expect("rate");
