@@ -125,7 +125,6 @@
 //     pane.destroy()
 
 import { groupOf as watchGroupOf } from "./agent.js";
-import { MAX_POSITIONED } from "./overlays.js";
 import { distanceBearing, positionOf } from "./map.js";
 import { Selection, isSite } from "./selection.js";
 import { metricText } from "./units.js";
@@ -984,7 +983,7 @@ class SubjectsPane {
     const h3 = document.createElement("h3");
     const note = document.createElement("div");
     note.className = "not-watched";
-    note.textContent = `not watched (limit ${MAX_POSITIONED})`;
+    note.textContent = "not watched (its source has no event feed)";
     const table = document.createElement("table");
     const thead = document.createElement("thead");
     const head = document.createElement("tr");

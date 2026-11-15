@@ -7938,9 +7938,10 @@ def scenario_subjects_survive_a_source_switch(page, url, secret):
                 stop_job(url, secret, job)
 
 
-def scenario_subjects_name_the_jobs_not_watched(page, url, secret):
-    # Every job on the shown source is watched (its feed): the cap in play is MAX_POSITIONED,
-    # on the positioned jobs of the other sources, so the five run on `retune`.
+def scenario_subjects_follow_every_job_on_another_source(page, url, secret):
+    # Every job on the shown source is watched (its feed), and so is every subject job on
+    # another source, on that source's feed: five decoders on `retune` cost one socket more
+    # (ops + waterfall + feed + retune's feed), none is "not watched", all fill their tables.
     select_source(page, url, secret, "tone")
     jobs = []
     try:
@@ -7950,15 +7951,21 @@ def scenario_subjects_name_the_jobs_not_watched(page, url, secret):
         open_subjects(page)
         sections = page.locator("#subjects section.subject-job")
         expect(sections).to_have_count(5, timeout=10_000)
-        marked = page.locator("#subjects section.subject-job .not-watched")
-        expect(marked).to_have_count(1)
-        expect(marked).to_have_text("not watched (limit 4)")
-        oldest = page.locator(f'#subjects section.subject-job[data-job="{jobs[0]}"]')
-        expect(oldest.locator(".not-watched")).to_have_count(1)
-        for job in jobs[1:]:
+        for job in jobs:
             rows = page.locator(f'#subjects section.subject-job[data-job="{job}"] tr.subject')
             expect(rows).to_have_count(3, timeout=10_000)
+        expect(page.locator("#subjects section.subject-job .not-watched")).to_have_count(0)
+        counts = stable_ws_connections(url, secret)
+        assert max(counts) <= 4, f"ws_connections {counts}"
+        # A node that lists no feed for the other source: its jobs say so.
+        page.evaluate("window.zetaTest.hideFeeds(true)")
+        page.evaluate("window.zetaTest.dropOtherFeeds()")
+        page.evaluate("window.zetaTest.poll()")
+        marked = page.locator("#subjects section.subject-job .not-watched")
+        expect(marked).to_have_count(5, timeout=10_000)
+        expect(marked.first).to_have_text("not watched (its source has no event feed)")
     finally:
+        page.evaluate("window.zetaTest.hideFeeds(false)")
         for job in jobs:
             stop_job(url, secret, job)
 

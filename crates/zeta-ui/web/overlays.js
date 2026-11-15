@@ -104,25 +104,28 @@
 //                            poll); a job whose context holds no gate (its squelch off) or
 //                            whose read failed is not asked again until its graph changes
 //                            or ov.reseedAll runs.
-//                            Then the positioned jobs: the MAX_POSITIONED most recent
-//                            running jobs on the other sources whose kind is a mode row
-//                            with a `position` map or a `subject` (spec 7.2: the map follows
-//                            every positioned job, e.g. a decoder on a second radio while
-//                            this page shows the watching one; plan 23: so does the Subjects
-//                            pane) are subscribed too, for ov.onEvent only: no outline,
-//                            ribbon, label, mark or counter. Every running kind goes to
-//                            the `subjects` store's row cache (store.lookup); a job is
-//                            subscribed only once its row is known, so an event never
-//                            arrives before it, and what the lookup learns is applied at
-//                            once by a second sync. A positioned job whose source becomes
-//                            the selected one is left to the feed.
+//                            Then the positioned jobs: every running job on the other
+//                            sources whose kind is a mode row with a `position` map or a
+//                            `subject` (spec 7.2: the map follows every positioned job,
+//                            e.g. a decoder on a second radio while this page shows the
+//                            watching one; plan 23: so does the Subjects pane) is followed
+//                            too, for ov.onEvent only: no outline, ribbon, label, mark or
+//                            counter. They come on their source's feed, one subscription
+//                            per other source with such a job (closed when it has none),
+//                            so a set of decoders on a second radio costs one socket, not
+//                            one each. Every running kind goes to the `subjects` store's
+//                            row cache (store.lookup); a frame of a job no poll has listed
+//                            yet, or whose row is not yet known, is held (at most
+//                            PENDING_MAX, a poll asked for) and handed on by the next sync
+//                            that knows it. A source whose feed becomes the selected one's
+//                            is left to that feed.
 //     ov.follows(jobId) -> bool  whether the job's events reach ov.onEvent: a running job on
 //                            the selected source (the feed), or a positioned job on another
-//                            source subscribed here; false for any other (a `bits` job on
-//                            source `node`, a plain job on another source)
-//     ov.watching(jobId) -> bool  false for a positioned job on another source over
-//                            MAX_POSITIONED, so its events are not seen (the Subjects pane
-//                            says so); true for every job on the selected source
+//                            source whose feed is subscribed here; false for any other (a
+//                            `bits` job on source `node`, a plain job on another source)
+//     ov.watching(jobId) -> bool  false for a positioned job on another source the node
+//                            lists no feed for (an older node), so its events are not seen
+//                            (the Subjects pane says so); true for every other job
 //     ov.render(job, payload, {positionOnly})  draws one event of `job` by payload shape (so
 //                            by `protocol`); `positionOnly` (a positioned job's) stops after
 //                            ov.onEvent:
@@ -256,7 +259,6 @@ import { bandText, mhzText } from "./units.js";
 
 export const RIBBON_TTL_MS = 60_000;
 export const OTHER_EVENT_CHARS = 80;
-export const MAX_POSITIONED = 4;
 // At most this many `job_context` reads seeding squelch gates are in flight at once; the
 // reads chain, each answer sends the next.
 export const SEED_IN_FLIGHT = 4;
@@ -423,10 +425,13 @@ class Overlays {
     this.sourceRec = null; // the selected source's last `source_list` record (its `pin`)
     this.ribbons = []; // {el, bodyEl, countEl, text, cls, hz, band, w, h, top, lane, right, born, count, key, held}
     this.eventFns = []; // ov.onEvent listeners
-    this.positioned = new Map(); // job id -> {job, ids, subs, closed, positionOnly: true}
-    this.resolvingPositioned = false; // a GET /streams for unwatched positioned jobs
+    this.followed = new Map(); // job id -> job: the positioned jobs on the other sources
+    this.otherFeeds = new Map(); // source id -> {id, source, sub}: their sources' feeds
+    this.otherOpening = new Set(); // sources whose feed a GET /streams is resolving
+    this.otherNoFeed = new Set(); // other sources the node listed no feed for
+    this.otherPending = []; // {source, frame, seen}: frames of jobs not yet followed
     this.subjects = subjects; // the row cache and the subjects (subjects.js)
-    this.overCap = new Set(); // positioned job ids on other sources over MAX_POSITIONED
+    this.overCap = new Set(); // positioned job ids on other sources that have no feed
     this.destroyed = false;
     // Above zero inside a pass over many outlines (ov.layout, ov.sync, ov.syncOutlines):
     // layoutTags only marks the tags dirty, and the pass lays them out once at its end.
@@ -459,9 +464,7 @@ class Overlays {
     this.stationEvents.clear();
     this.squelches.clear();
     this.gateless.clear();
-    for (const [jobId, rec] of [...this.positioned]) {
-      if (rec.job.source === id) this.unwatchPositioned(jobId);
-    }
+    this.closeOtherFeed(id); // the shown source's own feed carries its jobs now
     for (const r of this.ribbons) r.el.remove();
     this.ribbons = [];
     for (const l of this.labels.values()) l.el.remove();
@@ -716,65 +719,99 @@ class Overlays {
   }
 
   follows(jobId) {
-    return this.activity(jobId).watched || this.positioned.has(jobId);
+    const j = this.followed.get(jobId);
+    return this.activity(jobId).watched || (!!j && this.otherFeeds.has(j.source));
   }
 
-  // The running jobs on the other sources whose mode row carries a `position` or a `subject`,
-  // newest first, up to MAX_POSITIONED: subscribed for ov.onEvent alone.
+  // The running jobs on the other sources whose mode row carries a `position` or a `subject`:
+  // followed for ov.onEvent alone, on their sources' feeds (one subscription per source).
   syncPositioned(jobs) {
     if (this.destroyed) return;
-    const others = jobs.filter(
-      (j) => j.source !== this.sourceId && j.kind !== "spectrum" && isRunning(j),
+    const followed = jobs.filter((j) => {
+      if (j.source === this.sourceId || j.kind === "spectrum" || !isRunning(j)) return false;
+      const row = this.subjects ? this.subjects.rowOf(j.kind) : null;
+      return !!row && !!(row.position || row.subject);
+    });
+    this.followed = new Map(followed.map((j) => [j.id, j]));
+    const sources = new Set(followed.map((j) => j.source));
+    for (const source of [...this.otherFeeds.keys()]) {
+      if (!sources.has(source)) this.closeOtherFeed(source);
+    }
+    for (const source of sources) this.openOtherFeed(source);
+    this.overCap = new Set(
+      followed.filter((j) => this.otherNoFeed.has(j.source)).map((j) => j.id),
     );
-    const followed = others
-      .filter((j) => {
-        const row = this.subjects ? this.subjects.rowOf(j.kind) : null;
-        return row && (row.position || row.subject);
-      })
-      .sort((a, b) => (b.created_ns ?? 0) - (a.created_ns ?? 0));
-    const want = followed.slice(0, MAX_POSITIONED);
-    this.overCap = new Set(followed.slice(MAX_POSITIONED).map((j) => j.id));
-    const ids = new Set(want.map((j) => j.id));
-    for (const id of [...this.positioned.keys()]) if (!ids.has(id)) this.unwatchPositioned(id);
-    for (const j of want) {
-      const known = this.positioned.get(j.id);
-      if (known) known.job = j;
+    // Frames held for a job this sync knows; one not listed by a second sync is dropped.
+    const held = this.otherPending;
+    this.otherPending = [];
+    for (const h of held) {
+      const job = this.followed.get(h.frame.job);
+      if (job && job.source === h.source) {
+        this.render(job, h.frame.payload, { positionOnly: true });
+      } else if (++h.seen < 2 && sources.has(h.source)) {
+        this.otherPending.push(h);
+      }
     }
-    const fresh = want.filter((j) => !this.positioned.has(j.id));
-    if (fresh.length > 0) this.resolvePositioned(fresh);
   }
 
-  // One GET /streams for the positioned jobs not yet subscribed.
-  async resolvePositioned(jobs) {
-    if (this.resolvingPositioned) return;
-    this.resolvingPositioned = true;
-    let streams = null;
+  // Subscribes another source's feed, once; a source the node lists no feed for (an older
+  // node) is remembered in `otherNoFeed`, its positioned jobs are not watched, and it is asked
+  // again on each sync.
+  async openOtherFeed(source) {
+    if (this.otherFeeds.has(source) || this.otherOpening.has(source)) return;
+    this.otherOpening.add(source);
+    let id;
     try {
-      streams = await this.api.streams();
+      id = await this.findFeed(source);
     } catch {
-      streams = null;
+      return; // a failed request: the next sync asks again
     } finally {
-      this.resolvingPositioned = false;
+      this.otherOpening.delete(source);
     }
-    if (!streams || this.destroyed) return;
-    for (const j of jobs) {
-      if (j.source === this.sourceId || this.positioned.has(j.id)) continue;
-      const ids = streams
-        .filter((x) => x.kind === "event" && x.provenance && x.provenance.job === j.id)
-        .map((x) => x.id);
-      if (ids.length === 0) continue;
-      const rec = { job: j, ids, subs: [], closed: false, positionOnly: true };
-      this.positioned.set(j.id, rec);
-      ids.forEach((_, slot) => this.subscribe(rec, slot));
+    if (this.destroyed || source === this.sourceId || this.otherFeeds.has(source)) return;
+    if (![...this.followed.values()].some((j) => j.source === source)) return;
+    if (id === null) {
+      this.otherNoFeed.add(source);
+      return;
     }
+    this.otherNoFeed.delete(source);
+    const feed = { id, source, sub: null };
+    feed.sub = this.api.streamText(id, (msg) => this.onOtherFeedMessage(feed, msg), null, {
+      onReconnect: async () => {
+        const next = await this.findFeed(source);
+        if (next) feed.id = next;
+        return next;
+      },
+    });
+    this.otherFeeds.set(source, feed);
   }
 
-  unwatchPositioned(jobId) {
-    const rec = this.positioned.get(jobId);
-    if (!rec) return;
-    rec.closed = true;
-    for (const sub of rec.subs) sub.close();
-    this.positioned.delete(jobId);
+  closeOtherFeed(source) {
+    const feed = this.otherFeeds.get(source);
+    if (!feed) return;
+    feed.sub.close();
+    this.otherFeeds.delete(source);
+    this.otherPending = this.otherPending.filter((h) => h.source !== source);
+  }
+
+  // A frame of another source's feed: a followed job's goes to ov.onEvent (the map and the
+  // Subjects pane); one of a job not followed yet (started since the last poll, or its row
+  // not yet known) is held for the next sync; any other job's (a demodulator's, a plain
+  // decoder's on that source) is nothing to this page.
+  onOtherFeedMessage(feed, msg) {
+    if (this.destroyed || this.otherFeeds.get(feed.source) !== feed) return;
+    if (msg.type !== "frame") return;
+    const job = this.followed.get(msg.job);
+    if (job) {
+      if (job.source === feed.source) this.render(job, msg.payload, { positionOnly: true });
+      return;
+    }
+    if (this.lastJobs.some((j) => j.id === msg.job && this.rowKnown(j))) return;
+    this.otherPending.push({ source: feed.source, frame: msg, seen: 0 });
+    if (this.otherPending.length > PENDING_MAX) {
+      this.otherPending.splice(0, this.otherPending.length - PENDING_MAX);
+    }
+    this.askPoll();
   }
 
   // The rigid holders' bands (the source's pin among them) outlined, or the capture when
@@ -857,34 +894,6 @@ class Overlays {
       }
     }
     this.seedPass(this.shownJobs());
-  }
-
-  // A positioned job's event stream `slot` (another source's job: the map's alone).
-  subscribe(rec, slot) {
-    rec.subs[slot] = this.api.streamText(
-      rec.ids[slot],
-      (msg) => {
-        if (!rec.closed && msg.type === "frame") {
-          this.render(rec.job, msg.payload, { positionOnly: rec.positionOnly });
-        }
-      },
-      null,
-      { onReconnect: () => this.lookupStream(rec, slot) },
-    );
-  }
-
-  // The id for subscription `slot` of `rec` after a drop: its stream if still listed, else
-  // one of the job's event streams no other slot holds (the job restarted with new ids).
-  async lookupStream(rec, slot) {
-    const streams = await this.api.streams();
-    const ev = streams
-      .filter((x) => x.kind === "event" && x.provenance && x.provenance.job === rec.job.id)
-      .map((x) => x.id);
-    if (ev.includes(rec.ids[slot])) return rec.ids[slot];
-    const held = new Set(rec.ids.filter((_, i) => i !== slot));
-    const id = ev.find((x) => !held.has(x)) ?? null;
-    if (id) rec.ids[slot] = id;
-    return id;
   }
 
   render(job, p, { positionOnly = false } = {}) {
@@ -2012,7 +2021,7 @@ class Overlays {
     clearInterval(this.timer);
     this.ro.disconnect();
     this.closeFeed();
-    for (const id of [...this.positioned.keys()]) this.unwatchPositioned(id);
+    for (const source of [...this.otherFeeds.keys()]) this.closeOtherFeed(source);
     for (const [key, o] of this.outlines) if (o.tag) this.untag(o, key); // the rail's
     this.clearSiteChannels();
     this.layer.remove();

@@ -2245,6 +2245,11 @@ window.zetaTest = {
   hideFeeds(on) {
     if (state.ov) state.ov.hideFeeds = !!on;
   },
+  // Close the other sources' feeds (the positioned jobs'): the next sync resolves them again.
+  dropOtherFeeds() {
+    if (!state.ov) return;
+    for (const source of [...state.ov.otherFeeds.keys()]) state.ov.closeOtherFeed(source);
+  },
   // Tell the shown source's feed it lagged (a `lagged` message), or drop its socket so it
   // reconnects.
   feedLag() {
