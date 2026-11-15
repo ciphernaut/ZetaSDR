@@ -2868,6 +2868,94 @@ mod tests {
         }
     }
 
+    /// DMR handheld bursts of a group call at colour code `cc` (`superframes` of voice),
+    /// each sent as it is with nothing between, after 200 ms of noise: the transitions taken.
+    fn dmr_handheld_paths(tx: Tx, cc: u8, superframes: u32) -> Paths {
+        use crate::dmr::{Call, FullLc, encode_handheld};
+        let lc = FullLc {
+            call: Call::Group,
+            dst: 9990,
+            src: 9_990_001,
+            fid: 0,
+            encrypted: false,
+            emergency: false,
+        };
+        let dibits = encode_handheld(cc, lc, superframes);
+        let mut iq = vec![Complex::new(0.0f32, 0.0); RATE as usize / 5];
+        let off = (tx.sps() as usize).max(1);
+        let mut i = 0;
+        while i < dibits.len() {
+            if dibits[i].is_none() {
+                iq.extend(std::iter::repeat_n(Complex::new(0.0, 0.0), off));
+                i += 1;
+                continue;
+            }
+            let burst: Vec<u8> = dibits[i..].iter().map_while(|d| *d).collect();
+            i += burst.len();
+            iq.extend(tx.modulate(&burst));
+        }
+        noise_under_unit(&mut iq, tx.snr_db, tx.seed);
+        let mut demod = Fsk4Demod::new(u64::from(RATE), tx.params).expect("rate");
+        feed_all(&mut demod, &iq);
+        demod.paths.get()
+    }
+
+    #[test]
+    fn the_dmr_coast_keeps_its_margins_at_colour_code_0() {
+        // Colour code 0, where a voice burst's centre can be 24 dibits of 00. Over 100
+        // seeds each, a proven lock coasted at most 4 searches in a row, a lock on
+        // probation at most 5 in all (handheld bursts at 0.8 of the deviation and 10 dB,
+        // first reached at seed 8240), and no coast ran out. This sweep reaches both: 42
+        // seeds of handheld bursts (3 superframes) and 3 repeater calls each at 15 and
+        // 10 dB. A change that needs more coast than DMR_COAST_SEARCHES's margins allow (8
+        // over a proven lock's, 4 over a probation's) fails here.
+        use crate::dmr::{Call, FullLc, SlotPlan, encode_repeater};
+        let mut swept: Vec<Paths> = (0..42)
+            .map(|seed| dmr_handheld_paths(Tx::new(dmr(), 8200 + seed).off(0.8, 10.0), 0, 3))
+            .collect();
+        let lc = FullLc {
+            call: Call::Group,
+            dst: 9990,
+            src: 9_990_001,
+            fid: 0,
+            encrypted: false,
+            emergency: false,
+        };
+        let plan = |lc| SlotPlan {
+            lc,
+            superframes: 6,
+            control: false,
+        };
+        let downlink = encode_repeater(0, [plan(Some(lc)), plan(None)]);
+        for snr in [15.0, 10.0] {
+            for seed in 0..3 {
+                let tx = Tx::new(dmr(), 8100 + seed).off(1.0, snr);
+                let (scene, end) = after_200_ms_of_noise("a repeater's call", tx, downlink.clone());
+                swept.push(counted(&scene, end).2);
+            }
+        }
+        let proven = swept
+            .iter()
+            .map(|p| p.most_coasted_proven)
+            .max()
+            .unwrap_or(0);
+        let on_probation = swept
+            .iter()
+            .map(|p| p.most_coasted_on_probation)
+            .max()
+            .unwrap_or(0);
+        let ran_out: u32 = swept.iter().map(|p| p.coasts_ended).sum();
+        assert_eq!(ran_out, 0, "coasts ran out");
+        assert!(
+            proven + 8 <= DMR_COAST_SEARCHES,
+            "a proven lock coasted {proven}"
+        );
+        assert!(
+            on_probation + 4 <= DMR_COAST_SEARCHES,
+            "a lock on probation coasted {on_probation}"
+        );
+    }
+
     #[test]
     fn sync_words_split_into_dibits_first_bit_first() {
         assert_eq!(&sync_dibits(P25_SYNC, 48)[..6], &[1, 1, 1, 1, 1, 3]);
