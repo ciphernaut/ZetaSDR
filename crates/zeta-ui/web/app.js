@@ -74,8 +74,10 @@
 // Job rows: ▶ on a row of an audio kind (agent.js AUDIO_KINDS) plays its audio (audio.js; one
 // job at a time, ■ stops it, and it stops when the job leaves the running list or the secret
 // is rejected); Transcribe on a running one applies `job_attach {kind: "transcribe", job,
-// language: null}` through the command-line op path (its outcome, an error too, reaches the
-// transcript); `graph` opens the job's graph view (graph.js).
+// stream, language: null}` through the command-line op path (its outcome, an error too, reaches
+// the transcript); `graph` opens the job's graph view (graph.js). Both act on the stream the
+// row's picker names (agent.js: a row whose mode lists `voices`), `stream` null and the main
+// stream otherwise.
 //
 // Listen to all (#listen-all, and the typed `mix` or `mix ID[,ID]` with every id a source):
 // `mix_start` (null: every source) and plays the mix it answers, a single stream of every
@@ -862,9 +864,10 @@ async function askOrigins(id) {
   state.transcript?.note(`${job ? job.kind : "job"} ${String(id).slice(-6)}: ${originSummary(a)}`);
 }
 
-// The op attaching a transcription to job `id` (the language left to the backend).
-function attachOp(id) {
-  return { op: "job_attach", kind: "transcribe", job: id, language: null };
+// The op attaching a transcription to job `id` (the language left to the backend), reading
+// its voice `stream` (null: its main stream).
+function attachOp(id, stream = null) {
+  return { op: "job_attach", kind: "transcribe", job: id, stream, language: null };
 }
 
 // ---- source commands (spec 4.2) -------------------------------------------------------
@@ -1490,7 +1493,7 @@ function start(api) {
       syncListen();
     },
     onPlay: toggleAudio,
-    onTranscribe: (job) => applyOp(attachOp(job.id)),
+    onTranscribe: (job, { role = null } = {}) => applyOp(attachOp(job.id, role)),
     onGraph: (job) => showGraph(api, job.id),
     onOrigins: (job) => askOrigins(job.id),
     playing: (id) => !!state.audio && state.audio.jobId === id,
@@ -2018,16 +2021,18 @@ function stopAudio() {
   syncListen();
 }
 
-// ▶ on a job row: plays that job (stopping any other); ■ on the playing row stops it.
+// ▶ on a job row: plays that job's `role` stream (null: its main stream), stopping any other;
+// ■ on the playing row stops it, and another role of the playing job plays that one instead.
 // `ctx`: an AudioContext made earlier in the gesture (audio.js playJob).
-function toggleAudio(job, { ctx = null } = {}) {
-  const same = state.audio && state.audio.jobId === job.id;
+function toggleAudio(job, { ctx = null, role = null } = {}) {
+  const same = state.audio && state.audio.jobId === job.id && state.audio.role === role;
   stopAudio();
   if (!same && state.api) {
-    const entry = { jobId: job.id, mix: job.kind === "mix", seen: !ctx, player: null };
+    const entry = { jobId: job.id, role, mix: job.kind === "mix", seen: !ctx, player: null };
     state.audio = entry;
     entry.player = playJob(state.api, job, {
       ctx,
+      role,
       onError: (message) => state.transcript.note(message, true),
       onEnd: () => {
         if (state.audio === entry) state.audio = null;

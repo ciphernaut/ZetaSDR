@@ -132,7 +132,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (13 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (14 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -224,7 +224,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 3, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (13 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (14 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -250,7 +250,7 @@ def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
     for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2",
-                   "kiwi"):
+                   "dmr", "kiwi"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -545,7 +545,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (13 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (14 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -5455,6 +5455,70 @@ def scenario_transcribe_without_backend_fails_visibly(page, url, secret):
         assert attached_jobs(nostt, secret, demod) == [], "no attached job on a node without STT"
     finally:
         stop_job(nostt, secret, demod)
+
+
+# The `dmr` source loops a synthesised repeater (ui.rs `dmr_fixture`): radio 9990001 on slot 1
+# and 9990002 on slot 2. No vocoder is installed, so both calls are `silent` `no_vocoder`.
+DMR_HZ = 450_000_000
+
+
+def audio_streams_of(url, secret, job):
+    """role (None: the main stream) -> id, for the job's audio streams."""
+    return {s.get("role"): s["id"] for s in http_json(url, secret, "/streams")
+            if s["kind"] == "audio" and s["provenance"].get("job") == job}
+
+
+def scenario_voices_pick_a_stream(page, url, secret):
+    """A job whose row lists voices has a stream picker: play and Transcribe use the pick."""
+    select_source(page, url, secret, "dmr")
+    dmr = start_job(url, secret, "dmr_decode", "dmr", DMR_HZ, 12_500)
+    nbfm = start_job(url, secret, "fm_demod", "dmr", DMR_HZ + 15_000, 10_000, deviation_hz=2500)
+    attached = None
+    try:
+        row = job_row(page, dmr)
+        pick = row.locator("select.voice")
+        expect(pick.locator("option")).to_have_text(["main", "slot1", "slot2"], timeout=10_000)
+        expect(pick).to_have_value("")
+        other = job_row(page, nbfm)
+        expect(other.locator("button.play")).to_have_count(1)
+        expect(other.locator("select.voice")).to_have_count(0)
+        # Transcribe on slot 2 attaches to that voice, and the attached row names it.
+        pick.select_option("slot2")
+        page.evaluate("window.zetaTest.poll()")
+        expect(job_row(page, dmr).locator("select.voice")).to_have_value("slot2")
+        job_row(page, dmr).locator("button.transcribe").click()
+        job = wait_attached(url, secret, dmr)
+        attached = job["id"]
+        assert job["stream"] == "slot2", f"attached job {job}"
+        expect(page.locator("#transcript .line.op", has_text=re.compile(
+            r"^job_attach kind=transcribe job=" + dmr + r" stream=slot2 .*→ job ")).first
+        ).to_be_visible()
+        expect(job_row(page, attached).locator(".kind")).to_have_text("↳ transcribe (slot2)")
+        # Play on slot 1 subscribes to the stream whose role is slot1.
+        streams = audio_streams_of(url, secret, dmr)
+        assert set(streams) == {None, "slot1", "slot2"}, streams
+        job_row(page, dmr).locator("select.voice").select_option("slot1")
+        with page.expect_websocket(lambda ws: "format=binary" in ws.url) as audio:
+            job_row(page, dmr).locator("button.play").click()
+        played = re.search(r"/stream/([^/?]+)\?", audio.value.url).group(1)
+        assert played == streams["slot1"], f"subscribed {played}, streams {streams}"
+        assert page.evaluate("window.zetaAudio.playing") == dmr
+        # A pick while it plays plays the picked stream at once.
+        with page.expect_websocket(lambda ws: "format=binary" in ws.url) as audio:
+            job_row(page, dmr).locator("select.voice").select_option("")
+        played = re.search(r"/stream/([^/?]+)\?", audio.value.url).group(1)
+        assert played == streams[None], f"subscribed {played}, streams {streams}"
+        job_row(page, dmr).locator("button.play").click()
+        wait_until(lambda: page.evaluate("window.zetaAudio.playing") is None, 3.0, "stopped")
+        # Both radios are in the subjects table, silent for want of a vocoder.
+        open_subjects(page)
+        for key in ("9990001", "9990002"):
+            expect(subject_row(page, key).locator('td[data-col="silent"]')).to_have_text(
+                "no_vocoder", timeout=10_000)
+    finally:
+        for j in (attached, nbfm, dmr):
+            if j:
+                stop_job(url, secret, j)
 
 
 # ---- voice (Task 11) -----------------------------------------------------------------------

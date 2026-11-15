@@ -15,7 +15,8 @@
 //         other's true asks again).
 //     store.rowOf(kind) -> row | null | undefined (undefined: not yet known); the row is
 //         `modes_show`'s `mode.row` with the mode's `outputs` (the stream kinds its job emits)
-//         beside its fields, so `rowOf(kind).outputs` answers whether the job plays audio
+//         and `voices` (the roles of its voices' audio streams, empty for one voice) beside its
+//         fields, so `rowOf(kind).outputs` answers whether the job plays audio
 //     store.event(job, payload) -> subject | null   merges the event: non-null, non-blank fields
 //         into `state`, the fix into `position`, `count` and `last_seen`. Null when the job's row has
 //         no subject, the job has an `owner` (a watch's run or its trial) or is a running identify's
@@ -269,8 +270,12 @@ class SubjectStore {
         if (this.rowIds.has(kind)) {
           const r = await this.api.op({ op: "modes_show", id: kind });
           const mode = r && r.value && r.value.mode;
-          // `outputs` sits beside `row` on the mode; the jobs list's audio rule reads it.
-          row = mode && mode.row ? { ...mode.row, outputs: mode.outputs ?? [] } : null;
+          // `outputs` and `voices` sit beside `row` on the mode; the jobs list's audio rule
+          // and its stream picker read them.
+          row =
+            mode && mode.row
+              ? { ...mode.row, outputs: mode.outputs ?? [], voices: mode.voices ?? [] }
+              : null;
         }
         this.rows.set(kind, row);
         learned = true;

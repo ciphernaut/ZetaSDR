@@ -552,6 +552,8 @@ details.turn > pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 2px
 /* A scan waiting for its source: a note, not a fault. */
 .job > .waiting { order: 9; color: var(--dim); font-style: italic; font-size: 11px; }
 .job select.scan-look { font: inherit; font-size: 11px; max-inline-size: 11em; }
+/* The stream picker of a job with several voices, beside its ▶. */
+.job select.voice { font: inherit; font-size: 11px; max-inline-size: 7em; }
 .job > .reason { order: 10; }
 .job > .id { order: 11; flex: 0 0 auto; margin-inline-start: auto; }
 .job .kind { color: var(--accent); }

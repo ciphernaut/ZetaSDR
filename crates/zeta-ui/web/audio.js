@@ -11,11 +11,15 @@
 //       De-interleaves audio into at most two channels: mono stays one, stereo is two, and
 //       anything above 2 keeps only the first two (a downmix by dropping the rest). A trailing
 //       partial frame is ignored.
-//   playJob(api, job, {onError, onEnd, ctx}) -> {stop}
+//   audioStreamId(api, jobId, role = null) -> Promise<id | null>
+//       The GET /streams entry with provenance.job == jobId, kind "audio" and `role` equal to
+//       `role` (null: the job's main stream, the one with no role; a voice's role, such as
+//       `slot1`, its own stream), or null when there is none.
+//   playJob(api, job, {role, onError, onEnd, ctx}) -> {stop}
 //       Creates an AudioContext at once (inside the click that asked for it; with `ctx` given
 //       it plays on that one instead, which a click made before awaiting the op that starts
 //       the job, as browsers tie autoplay to the gesture), finds the job's
-//       audio stream (the GET /streams entry with provenance.job == job.id and kind "audio",
+//       audio stream (audioStreamId with `role`, null by default: the main stream,
 //       looked up STREAM_LOOKUPS times STREAM_LOOKUP_MS apart while the job starts), opens it
 //       with api.streamBinary (credits 256, top-up 128, as zeta-client) and plays every frame
 //       as one AudioBufferSourceNode at the header's payload.sample_rate_hz (one buffer
@@ -90,13 +94,15 @@ export function splitChannels(samples, channels) {
   return split;
 }
 
-async function audioStreamId(api, jobId) {
+export async function audioStreamId(api, jobId, role = null) {
   const list = await api.streams();
-  const s = list.find((i) => i.kind === "audio" && !i.role && i.provenance && i.provenance.job === jobId);
+  const s = list.find(
+    (i) => i.kind === "audio" && (i.role ?? null) === role && i.provenance && i.provenance.job === jobId,
+  );
   return s ? s.id : null;
 }
 
-export function playJob(api, job, { onError = () => {}, onEnd = () => {}, ctx = null } = {}) {
+export function playJob(api, job, { role = null, onError = () => {}, onEnd = () => {}, ctx = null } = {}) {
   ctx = ctx || new AudioContext();
   ctx.resume().catch(() => {});
   let sub = null;
@@ -190,20 +196,20 @@ export function playJob(api, job, { onError = () => {}, onEnd = () => {}, ctx = 
     for (let i = 0; i < STREAM_LOOKUPS && !stopped && !id; i++) {
       if (i > 0) await sleep(STREAM_LOOKUP_MS);
       try {
-        id = await audioStreamId(api, job.id);
+        id = await audioStreamId(api, job.id, role);
       } catch {
         id = null;
       }
     }
     if (stopped) return;
     if (!id) {
-      fail(`audio: job ${job.id} has no audio stream`);
+      fail(`audio: job ${job.id} has no ${role ? `${role} ` : ""}audio stream`);
       return;
     }
     sub = api.streamBinary(id, play, {
       credits: 256,
       topup: 128,
-      onReconnect: () => audioStreamId(api, job.id),
+      onReconnect: () => audioStreamId(api, job.id, role),
     });
   })();
 

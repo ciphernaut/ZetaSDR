@@ -10,7 +10,8 @@
 //! `source_list` but its range does not contain 100 MHz) and `cb` (the `tone` recording
 //! relabelled at 476.9 MHz, channel 20 of the CB plan), `quiet` (1 s of low complex noise at
 //! 20 MHz, which `measure` labels `noise`; see [`quiet_fixture`]), `fsk` (framed 2-FSK at
-//! 433.92 MHz, the Bits pane's; see [`fsk_fixture`]), and `--modes-dir` holding the
+//! 433.92 MHz, the Bits pane's; see [`fsk_fixture`]), `dmr` (a DMR repeater with a call on
+//! each slot, at 450 MHz; see [`dmr_fixture`]), and `--modes-dir` holding the
 //! `fake_pos` program row (zeta-ext's `fake_lines`, printing two fixes of one sonde 2 s into a
 //! job; see [`fake_pos_row`]) and `--sets-dir` holding [`fake_sets`]' `two_sources`, and
 //! `kiwi`, a KiwiSDR on 127.0.0.1 (zeta-source-kiwi's `FakeKiwi`, see [`start_fake_kiwi`]),
@@ -298,6 +299,35 @@ fn fsk_fixture(dir: &Path) -> PathBuf {
         433_920_000,
     );
     zeta_dsp::fixtures::write_fixture(dir, "fsk", &iq, 48_000, 433_920_000)
+}
+
+/// The `dmr` fixture's centre.
+const DMR_CENTER_HZ: u64 = 450_000_000;
+
+/// A DMR repeater's recording, as the synthesiser makes it (the `dmr` family), at 48 kHz
+/// labelled at [`DMR_CENTER_HZ`]: colour code 5, a call from radio 9990001 to talkgroup 9990
+/// on slot 1 and one from 9990002 to 9991 on slot 2, both clear (under 1 MB in `dir`); the
+/// meta path.
+fn dmr_fixture(dir: &Path) -> PathBuf {
+    use zeta_dsp::synth::{DmrSecondCall, Impairments, SynthSpec, synthesise};
+    let spec = SynthSpec::Dmr {
+        color_code: 5,
+        src: 9_990_001,
+        dst: 9990,
+        superframes: 3,
+        origin: zeta_dsp::dmr::Origin::Repeater,
+        second: Some(DmrSecondCall {
+            src: 9_990_002,
+            dst: 9991,
+            encrypted: false,
+        }),
+        encrypted: false,
+        idle: false,
+        control: false,
+        talker_alias: false,
+    };
+    let iq = synthesise(&spec, &Impairments::default(), 48_000, DMR_CENTER_HZ);
+    zeta_dsp::fixtures::write_fixture(dir, "dmr", &iq, 48_000, DMR_CENTER_HZ)
 }
 
 /// An analog PAL video recording, as gen_video writes it: 26 fields (13 whole frames, so the
@@ -1052,6 +1082,8 @@ impl Nodes {
         let quiet = format!("quiet={}", quiet_fixture(dir.path()).display());
         // Framed 2-FSK at 433.92 MHz: the Bits pane's stream, hypotheses and sync hits.
         let fsk = format!("fsk={}", fsk_fixture(dir.path()).display());
+        // A DMR repeater with a call on each slot: the job row's stream picker.
+        let dmr = format!("dmr={}", dmr_fixture(dir.path()).display());
         // Two sources carry the same analog video recording (the video scenarios).
         let video_meta = video_fixture(dir.path());
         let video = format!("video={}", video_meta.display());
@@ -1105,6 +1137,8 @@ impl Nodes {
                 &quiet,
                 "--source-file",
                 &fsk,
+                "--source-file",
+                &dmr,
                 "--source-file",
                 &video,
                 "--source-file",

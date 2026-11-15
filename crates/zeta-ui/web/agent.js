@@ -65,12 +65,18 @@
 //       `context.scan.method`, or its fft node's `method`, is `source`) carries a `.tag.method`
 //       reading `source`. Each row shows kind, source,
 //       state, id, an `.events` cell (filled by overlays.js: a count of the job's events seen on its source's feed), on rows of an AUDIO_KINDS kind a
-//       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job) and, while
-//       running, a `button.transcribe` (Transcribe) calling onTranscribe(job) (ruling R14), a
-//       `button.graph` calling onGraph(job), and a Stop button applying `job_stop`.
+//       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job, {role}) and, while
+//       running, a `button.transcribe` (Transcribe) calling onTranscribe(job, {role}) (ruling
+//       R14), a `button.graph` calling onGraph(job), and a Stop button applying `job_stop`.
+//       `role` is null (the job's main stream) unless the job's mode row (audioKind) lists
+//       `voices`: such a row has a stream picker, a `select.voice` after ▶ with the options
+//       `main` (value "") and each voice, and `role` is the voice picked (remembered per job
+//       for the page's life; main until one is picked). A pick while the job plays calls
+//       onPlay(job, {role}) with the new voice at once.
 //       An attached job (one with an `input` job) is a `.job.attached` row placed right
-//       under its input's row, its kind shown as `↳ <kind>`, with neither of the audio
-//       buttons. A job's `state.reason` (a failure) is also the row's tooltip.
+//       under its input's row, its kind shown as `↳ <kind>` (`↳ <kind> (<stream>)` when it
+//       reads a voice: the job's `stream`), with neither of the audio buttons. A job's
+//       `state.reason` (a failure) is also the row's tooltip.
 //       A running scan waiting for its source (`context.scan.waiting`: it gave way to another
 //       request, or the source was held when it started) shows `.waiting`, `waiting: <the
 //       reason>` in the note colour.
@@ -82,7 +88,8 @@
 //       sweep's) or
 //       `custom`; a choice sets dwell_ms, average and bits on the stored fft node and applies
 //       `graph_put` through applyOp (a conflict shows its line naming the holders; graph_put
-//       takes no `replace`, so there is no stop-and-retry). While a row's select has the focus
+//       takes no `replace`, so there is no stop-and-retry). While a row's select (the look
+//       or the stream picker) has the focus
 //       the select stays as it is across renders (an open dropdown stays open) and the row's
 //       state and sweep time are updated in place; a choice blurs it.
 //       A running row of a SQUELCH_KINDS kind is tagged `squelch` (setSquelchTag) while
@@ -620,10 +627,30 @@ function lookSelect(job, scan, depths, onLook) {
   return sel;
 }
 
+// A row's stream picker: `main` (the main stream, value "") then each of `voices`, `role`
+// (null: main) chosen; a choice calls onVoice(job, role).
+function voiceSelect(job, voices, role, onVoice) {
+  const sel = document.createElement("select");
+  sel.className = "voice";
+  sel.title = "the stream ▶ plays and Transcribe attaches to: the main stream or one voice";
+  for (const [value, label] of [["", "main"], ...voices.map((v) => [v, v])]) {
+    const o = document.createElement("option");
+    o.value = value;
+    o.textContent = label;
+    sel.append(o);
+  }
+  sel.value = role ?? "";
+  sel.onchange = () => {
+    sel.blur(); // the next render may replace the row
+    onVoice(job, sel.value || null);
+  };
+  return sel;
+}
+
 function jobRow(
   job,
   onStop,
-  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits, onOrigins, audioKind, scanInfo, onLook },
+  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits, onOrigins, audioKind, scanInfo, onLook, voiceOf, onVoice },
 ) {
   const row = document.createElement("div");
   const attached = !!job.input;
@@ -639,7 +666,7 @@ function jobRow(
   const status = job.state && job.state.status ? job.state.status : "?";
   row.dataset.state = status;
   const cells = [
-    ["kind", attached ? `↳ ${job.kind}` : job.kind],
+    ["kind", attached ? `↳ ${job.kind}${job.stream ? ` (${job.stream})` : ""}` : job.kind],
     ["source", job.source],
     ["state", status],
     ["id", job.id.slice(-6)],
@@ -745,22 +772,28 @@ function jobRow(
     return row;
   }
   const audio = !attached && isAudioJob(job, audioKind);
+  // The voice play and Transcribe use: the picked one of a row with voices, else the main
+  // stream (null).
+  const voices = audio ? (audioKind?.(job.kind)?.voices ?? []) : [];
+  const picked = voices.length > 0 && voiceOf ? voiceOf(job.id) : null;
+  const role = voices.includes(picked) ? picked : null;
   if (audio && onPlay) {
     const on = playing ? playing(job.id) : false;
     const play = document.createElement("button");
     play.className = "play";
     play.textContent = on ? "■" : "▶";
-    play.title = on ? "stop the audio" : "play the audio";
+    play.title = `${on ? "stop" : "play"} the audio${role ? ` (${role})` : ""}`;
     play.setAttribute("aria-pressed", String(on));
-    play.onclick = () => onPlay(job);
+    play.onclick = () => onPlay(job, { role });
     actions.append(play);
   }
+  if (voices.length > 0 && onVoice) actions.append(voiceSelect(job, voices, role, onVoice));
   if (audio && onTranscribe && status === "running") {
     const tr = document.createElement("button");
     tr.className = "transcribe";
     tr.textContent = "Transcribe";
-    tr.title = `job_attach kind=transcribe job=${job.id}`;
-    tr.onclick = () => onTranscribe(job);
+    tr.title = `job_attach kind=transcribe job=${job.id}${role ? ` stream=${role}` : ""}`;
+    tr.onclick = () => onTranscribe(job, { role });
     actions.append(tr);
   }
   const m = mute && status === "running" ? mute(job) : null;
@@ -1042,9 +1075,19 @@ export function startJobs(
   let last = null;
   // id -> performance.now() when this page first saw the job finished (-Infinity: cleared).
   const finishedAt = new Map();
+  // id -> the voice picked on the job's row (its stream picker), for the page's life; a job
+  // not in it uses its main stream.
+  const picks = new Map();
   const buttons = {
     onPlay,
     onTranscribe,
+    voiceOf: (id) => picks.get(id) ?? null,
+    // A pick while the job plays plays the picked stream at once.
+    onVoice: (job, role) => {
+      picks.set(job.id, role);
+      if (onPlay && playing?.(job.id)) onPlay(job, { role });
+      redraw();
+    },
     onGraph,
     playing,
     squelch,
@@ -1273,9 +1316,9 @@ export function startJobs(
     last = jobs;
     // A job a controller (a watch) started is shown through its owner, not on its own.
     const shown = underInputs(visible(jobs)).filter((j) => !j.owner);
-    // A row whose look select has the focus stays as it is: a rebuilt one would close the
-    // open dropdown under the pointer.
-    const focused = document.activeElement?.matches?.("select.scan-look")
+    // A row whose look select or stream picker has the focus stays as it is: a rebuilt one
+    // would close the open dropdown under the pointer.
+    const focused = document.activeElement?.matches?.("select.scan-look, select.voice")
       ? document.activeElement.closest(".job")
       : null;
     const keep = (fresh) => {
