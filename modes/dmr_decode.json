@@ -1,0 +1,108 @@
+{
+  "id": "dmr_decode",
+  "name": "DMR digital voice",
+  "family": "two_way",
+  "band": {
+    "bandwidth_hz": 12500,
+    "centers_hz": [],
+    "min_hz": null,
+    "range_hz": null
+  },
+  "modulation": ["fsk", "fm"],
+  "label": "DMR",
+  "protocol": "dmr",
+  "decoder": {
+    "kind": "graph",
+    "nodes": [
+      {
+        "id": "channel",
+        "kind": "channel",
+        "params": {
+          "center_hz": "$center_hz",
+          "bandwidth_hz": "$bandwidth_hz",
+          "out_rate_hz": "$out_rate_hz"
+        }
+      },
+      {
+        "id": "decode",
+        "kind": "dmr_decode",
+        "params": { "audio": "$audio_policy" }
+      }
+    ],
+    "edges": [
+      { "from": "channel", "to": "decode", "kind": "iq" }
+    ],
+    "handlers": [
+      {
+        "programs": ["zeta-mbe"],
+        "optional": true,
+        "install": { "script": "tools/install-vocoders.sh", "url": "https://github.com/arancormonk/mbelib-neo" }
+      }
+    ]
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": { "type": "string" },
+        "type": { "type": "string", "enum": ["call", "channel"] },
+        "color_code": { "type": ["integer", "null"] },
+        "slot": { "type": ["integer", "null"] },
+        "origin": { "type": "string", "enum": ["repeater", "handheld"] },
+        "src": { "type": "integer" },
+        "dst": { "type": "integer" },
+        "call": { "type": "string", "enum": ["group", "private"] },
+        "encrypted": { "type": "boolean" },
+        "emergency": { "type": "boolean" },
+        "audio": { "type": "boolean" },
+        "silent": { "type": ["string", "null"], "enum": ["no_vocoder", "encrypted", "vocoder_failed", null] },
+        "stream": { "type": ["string", "null"] },
+        "program": { "type": "boolean" },
+        "frames": { "type": "integer" },
+        "errors": { "type": "integer" },
+        "eot": { "type": "boolean" },
+        "fid": { "type": "integer" },
+        "control": { "type": "boolean" },
+        "network": { "type": ["string", "null"] }
+      }
+    },
+    "summary": "{network?src} > {dst?}: {call?} {silent?}"
+  },
+  "position": null,
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 2000,
+    "min_span_ms": 0,
+    "quick": null,
+    "priority": -1
+  },
+  "catalogue": ["digital-mobile-radio-dmr"],
+  "access": "restricted",
+  "subject": {
+    "key": "src",
+    "name": "radios",
+    "waterfall": "fold",
+    "columns": [
+      { "field": "dst", "label": "Destination", "unit": null },
+      { "field": "call", "label": "Call", "unit": null },
+      { "field": "color_code", "label": "Colour code", "unit": null },
+      { "field": "slot", "label": "Slot", "unit": null },
+      { "field": "encrypted", "label": "Encrypted", "unit": null },
+      { "field": "silent", "label": "Silent", "unit": null }
+    ],
+    "heading": null,
+    "label": null
+  },
+  "notes": "DMR digital voice (4FSK, 4800 baud, AMBE+2) on any 12500 Hz channel, a repeater's two time slots or a handheld's bursts; start it on the measured centre. Each call gives two events, one when its link control is in hand (at its header, or within a superframe when the job joins mid-call) and one at its end (`eot`), naming the calling radio (`src`), the talkgroup or called radio (`dst`), the call type, the colour code (`color_code`), the slot (`slot`, null for a handheld) and `origin`; an idle or control-only repeater gives one `type: channel` event instead. Both slots are decoded at once and the job has two voices, `slot1` and `slot2` (a handheld's speech is on `slot1`): attach transcribe to one with `stream`. Its main audio stream, what play, the mix and a plain attach hear, follows the job's `audio_policy`: `first_active` (the default) the call that started first, until it ends; `follow` that call, then the one still going when it ends; `all` both mixed. Each call event's `stream` names its slot's voice and `program` says whether it is on the main stream. The speech needs zeta-mbe, which the operator builds with `bash tools/install-vocoders.sh` from a source checkout; without it the calls are still reported with `audio: false` and `silent: no_vocoder`, and `job_context.dmr.vocoder` says how to install it. Encrypted calls are reported (`silent: encrypted`), never decoded.",
+  "test": {
+    "kind": "synth",
+    "family": "dmr",
+    "color_code": 5,
+    "src": 9990001,
+    "dst": 9990,
+    "superframes": 3,
+    "expect": { "src": 9990001, "dst": 9990, "color_code": 5 },
+    "within_ms": 5000
+  }
+}

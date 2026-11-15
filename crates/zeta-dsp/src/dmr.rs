@@ -63,6 +63,13 @@
 //!   column parity, read out column by column as four 32-bit fragments, carried by bursts
 //!   B to E with LCSS first, continuation, continuation, last; burst F carries the Null
 //!   embedded message (D.1: all zero, LCSS single fragment).
+//! - **Other embedded messages** (-2 5.2.1.2, 5.2.2.2, tables 5.4 and 5.6; 7.1.1.3 to
+//!   7.1.1.5): in some superframes a radio sends a talker alias (FLCO `000100` to `000111`)
+//!   or its position (GPS, `001000`) in bursts B to E in place of the link control, coded
+//!   the same way. The framer reports such a message by its FLCO ([`DmrContent::Voice`]'s
+//!   `other`) and keeps the call's link control. The encoder can send a talker alias
+//!   header (7.1.1.4, table 7.4: the 7-bit format of 7.2.18, an invented alias) in every
+//!   second superframe ([`encode_repeater_aliased`]).
 //! - **Voice superframe** (-1 5.1.2): an optional voice LC header, superframes of bursts A to
 //!   F (360 ms), then a terminator with link control. Idle bursts carry table D.2's 96 fill
 //!   bits.
@@ -80,7 +87,7 @@
 //! privacy header after its voice LC header (-1 5.1.2.2, figure 5.6). The EMB's PI bit is
 //! not an encryption mark: -1 V2.5.1 names it the pre-emption and power control indicator
 //! (9.3.2, table 9.19: 1 means the embedded signalling carries reverse channel information
-//! for the other logical channel; the table's caption, and earlier editions, call it the
+//! for the other logical channel; the table's caption and earlier editions call it the
 //! privacy indicator). [`DmrContent::Voice`]'s `pi` is that bit as received; the encoder
 //! sends 0. Nothing here decrypts.
 //!
@@ -258,6 +265,11 @@ const LC_PF: u8 = 0x80;
 const FLCO_MASK: u8 = 0x3F;
 const FLCO_GROUP: u8 = 0x00;
 const FLCO_PRIVATE: u8 = 0x03;
+/// The talker alias header's FLCO (-2 table 5.4, 7.1.1.4) and its 7-bit format (7.2.18).
+const FLCO_TALKER_ALIAS_HEADER: u8 = 0b00_0100;
+const TA_FORMAT_7BIT: u8 = 0b00;
+/// The alias the encoder sends: invented, at most 7 characters (one header, -2 5.4.3).
+const TALKER_ALIAS: &str = "ZETA";
 const SVC_EMERGENCY: u8 = 0x80;
 const SVC_PRIVACY: u8 = 0x40;
 const ID_MASK: u32 = 0xFF_FFFF;
@@ -370,15 +382,21 @@ pub type AmbeSoft = [u8; AMBE_FEED_BYTES];
 #[derive(Clone, Debug, PartialEq)]
 pub enum DmrContent {
     VoiceHeader(Option<FullLc>),
-    /// A voice burst: `first` for burst A (the sync); `lc` the embedded link control, on
-    /// the burst that completes it (E, or, while the call's is not yet in hand, B or D
-    /// across a superframe's boundary); `pi` the EMB's PI bit (`false` on burst A, which has
-    /// no EMB), the pre-emption and power control indicator, not an encryption mark;
-    /// `errors` the bits corrected by the EMB's code, the embedded link control's and the
-    /// three frames' Golay words.
+    /// A voice burst: `first` for burst A (the sync); `letter` its place in its superframe,
+    /// 0 for A to 5 for F, once the superframe's phase is known (burst A's is 0); `lc` the
+    /// embedded link control, on the burst that completes it (E, or, while the call's is
+    /// not yet in hand, B or D across a superframe's boundary); `other` the FLCO of an
+    /// embedded message that is not a voice channel user's link control (a talker alias or
+    /// GPS, -2 table 5.4), on the burst that completes it, the call's link control standing
+    /// as it was; `pi` the EMB's PI bit (`false` on burst A, which has no EMB), the
+    /// pre-emption and power control indicator, not an encryption mark; `errors` the bits
+    /// corrected by the EMB's code, the embedded link control's and the three frames' Golay
+    /// words.
     Voice {
         first: bool,
+        letter: Option<u8>,
         lc: Option<FullLc>,
+        other: Option<u8>,
         pi: bool,
         voice: Box<[AmbeSoft; 3]>,
         errors: u32,
@@ -511,12 +529,12 @@ impl Track {
         self.fragments.clear();
     }
 
-    /// The link control from the four latest fragments when they are the four places in
+    /// The embedded message of the four latest fragments when they are the four places in
     /// order, B to E: of one superframe, or, while the call's link control is not yet in
     /// hand, across a superframe's boundary in the two orders the row code makes safe
     /// (C, D, E then B; E then B, C, D). The embedded code's row and column parity and its
     /// checksum decide.
-    fn assemble(&self) -> Option<(FullLc, u32)> {
+    fn assemble(&self) -> Option<Embedded> {
         let phase = self.phase?;
         let six = VOICE_BURSTS as i64;
         let placed: Vec<(i64, usize, &Vec<u8>)> = self
@@ -547,7 +565,10 @@ impl Track {
         if across && errors != 0 {
             return None;
         }
-        parse_lc(&bytes).map(|lc| (lc, errors))
+        match parse_lc(&bytes) {
+            Some(lc) => Some(Embedded::Lc(lc, errors)),
+            None => other_flco(&bytes).map(|flco| Embedded::Other(flco, errors)),
+        }
     }
 
     /// The burst at `period`, which has no sync, read by the flywheel: its EMB's data and
@@ -616,31 +637,44 @@ impl Track {
         if emb_errors == 0 {
             self.last_good = period;
         }
-        let mut lc = None;
+        let mut message = None;
         if lcss != LCSS_SINGLE {
             self.fragments.push((period, embedded.to_vec()));
             if self.fragments.len() > KEPT_FRAGMENTS {
                 self.fragments.remove(0);
             }
-            lc = self.assemble();
-            if let Some((found, _)) = lc {
+            message = self.assemble();
+            // Another message (a talker alias, GPS) leaves the call's link control as it was.
+            if let Some(Embedded::Lc(found, _)) = message {
                 self.lc = Some(found);
             }
         }
         Some(FlywheelRead {
             emb: data,
             emb_errors,
-            lc,
+            letter: self.letter(period),
+            message,
         })
     }
 }
 
-/// What the flywheel took from a burst: its EMB's data and the bits it corrected, and the
-/// link control the burst completed with the bits that took.
+/// An embedded message assembled from bursts B to E.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Embedded {
+    /// A voice channel user's link control, and the bits that took.
+    Lc(FullLc, u32),
+    /// Another message, by its FLCO (-2 table 5.4: a talker alias, GPS), and the bits that
+    /// took.
+    Other(u8, u32),
+}
+
+/// What the flywheel took from a burst: its EMB's data and the bits it corrected, its
+/// letter once the phase is known, and the embedded message the burst completed.
 struct FlywheelRead {
     emb: u32,
     emb_errors: u32,
-    lc: Option<(FullLc, u32)>,
+    letter: Option<usize>,
+    message: Option<Embedded>,
 }
 
 /// The symbol period, measured from the dibits' positions.
@@ -959,7 +993,9 @@ impl DmrFramer {
                     color_code: None,
                     content: DmrContent::Voice {
                         first: true,
+                        letter: Some(0),
                         lc: None,
+                        other: None,
                         pi: false,
                         voice,
                         errors,
@@ -1029,14 +1065,19 @@ impl DmrFramer {
         let FlywheelRead {
             emb: data,
             emb_errors,
-            lc,
+            letter,
+            message,
         } = read?;
         let cc = (data >> 3) as u8;
         if emb_errors == 0 {
             self.color_codes[key] = Some(cc);
         }
         let (voice, ambe_errors) = voice_frames(&bits);
-        let lc_errors = lc.map_or(0, |(_, e)| e);
+        let (lc, lc_errors, other) = match message {
+            Some(Embedded::Lc(lc, e)) => (Some(lc), e, None),
+            Some(Embedded::Other(flco, e)) => (None, e, Some(flco)),
+            None => (None, 0, None),
+        };
         Some(DmrBurst {
             at: centre - LEFT_DIBITS as f64 * sps,
             slot,
@@ -1044,7 +1085,9 @@ impl DmrFramer {
             color_code: Some(cc),
             content: DmrContent::Voice {
                 first: false,
-                lc: lc.map(|(lc, _)| lc),
+                letter: letter.map(|l| l as u8),
+                lc,
+                other,
                 pi: data >> 2 & 1 == 1,
                 voice,
                 errors: emb_errors + lc_errors + ambe_errors,
@@ -1158,15 +1201,30 @@ pub struct SlotPlan {
 /// voice superframes of the voice payload (`voice_payload`), a terminator; a slot that
 /// finishes first idles until the other does. The CACHs carry the Null short LC. Dibits.
 pub fn encode_repeater(color_code: u8, slots: [SlotPlan; 2]) -> Vec<u8> {
-    let bursts = slots.map(|plan| match plan.lc {
-        Some(lc) if plan.control => {
-            let n = call_bursts_len(plan.superframes, false);
-            (0..n)
-                .map(|i| csbk_burst(color_code, &preamble_csbk(&lc, n - 1 - i)))
-                .collect()
+    encode_repeater_aliased(color_code, slots, [false; 2])
+}
+
+/// [`encode_repeater`], each slot's call carrying a talker alias when `talker_alias` says
+/// so: its second superframe, and every second one after it, sends a talker alias header
+/// (-2 5.4.3, 7.1.1.4) in bursts B to E in place of the link control, as radios interleave
+/// them.
+pub fn encode_repeater_aliased(
+    color_code: u8,
+    slots: [SlotPlan; 2],
+    talker_alias: [bool; 2],
+) -> Vec<u8> {
+    let bursts: [Vec<[u8; BURST_BITS]>; 2] = std::array::from_fn(|s| {
+        let (plan, alias) = (slots[s], talker_alias[s]);
+        match plan.lc {
+            Some(lc) if plan.control => {
+                let n = call_bursts_len(plan.superframes, false);
+                (0..n)
+                    .map(|i| csbk_burst(color_code, &preamble_csbk(&lc, n - 1 - i)))
+                    .collect()
+            }
+            Some(lc) => call_bursts(color_code, &lc, plan.superframes, Origin::Repeater, alias),
+            None => vec![idle_burst(color_code); call_bursts_len(plan.superframes, false)],
         }
-        Some(lc) => call_bursts(color_code, &lc, plan.superframes, Origin::Repeater),
-        None => vec![idle_burst(color_code); call_bursts_len(plan.superframes, false)],
     });
     let busy = slots.map(|plan| plan.lc.is_some());
     downlink(color_code, &bursts, busy)
@@ -1176,9 +1234,31 @@ pub fn encode_repeater(color_code: u8, slots: [SlotPlan; 2]) -> Vec<u8> {
 /// [`encode_repeater`]'s, with the handheld's syncs and no CACH; each burst is followed by
 /// the rest of its 60 ms as `None`.
 pub fn encode_handheld(color_code: u8, lc: FullLc, superframes: u32) -> Vec<Option<u8>> {
+    encode_handheld_aliased(color_code, lc, superframes, false)
+}
+
+/// [`encode_handheld`], the call carrying a talker alias as [`encode_repeater_aliased`]'s
+/// do when `talker_alias`.
+pub fn encode_handheld_aliased(
+    color_code: u8,
+    lc: FullLc,
+    superframes: u32,
+    talker_alias: bool,
+) -> Vec<Option<u8>> {
+    handheld_air(&call_bursts(
+        color_code,
+        &lc,
+        superframes,
+        Origin::Handheld,
+        talker_alias,
+    ))
+}
+
+/// A handheld's bursts on the air: each followed by the rest of its 60 ms as `None`.
+fn handheld_air(bursts: &[[u8; BURST_BITS]]) -> Vec<Option<u8>> {
     let mut out = Vec::new();
-    for burst in call_bursts(color_code, &lc, superframes, Origin::Handheld) {
-        out.extend(dibits_of(&burst).into_iter().map(Some));
+    for burst in bursts {
+        out.extend(dibits_of(burst).into_iter().map(Some));
         out.extend(std::iter::repeat_n(None, SLOT_PERIOD_DIBITS - BURST_DIBITS));
     }
     out
@@ -1206,9 +1286,17 @@ fn call_bursts_len(superframes: u32, encrypted: bool) -> usize {
 }
 
 /// A call's bursts on one slot: the voice LC header, a privacy header when encrypted,
-/// `superframes` × bursts A to F, the terminator with link control. The EMB's PI bit is 0
-/// throughout: it is not an encryption mark (see the module doc).
-fn call_bursts(cc: u8, lc: &FullLc, superframes: u32, origin: Origin) -> Vec<[u8; BURST_BITS]> {
+/// `superframes` × bursts A to F, the terminator with link control. With `talker_alias`
+/// the second superframe and every second one after it carry a talker alias header in B to
+/// E instead of the link control. The EMB's PI bit is 0 throughout: it is not an
+/// encryption mark (see the module doc).
+fn call_bursts(
+    cc: u8,
+    lc: &FullLc,
+    superframes: u32,
+    origin: Origin,
+    talker_alias: bool,
+) -> Vec<[u8; BURST_BITS]> {
     let data_sync = sync_word(origin, Kind::Data);
     let data = |dt, mask| {
         data_burst(
@@ -1218,6 +1306,7 @@ fn call_bursts(cc: u8, lc: &FullLc, superframes: u32, origin: Origin) -> Vec<[u8
         )
     };
     let fragments = embedded_encode(&lc_bytes(lc));
+    let alias = embedded_encode(&talker_alias_bytes());
     let emb = |lcss| emb_word(cc, false, lcss);
     let mut frame = 0;
     let mut socket = || {
@@ -1234,12 +1323,17 @@ fn call_bursts(cc: u8, lc: &FullLc, superframes: u32, origin: Origin) -> Vec<[u8
             &bptc_encode(&pi_header_info()),
         ));
     }
-    for _ in 0..superframes {
+    for sf in 0..superframes {
         out.push(voice_burst(
             &socket(),
             &sync_centre(sync_word(origin, Kind::Voice)),
         ));
-        for (fragment, lcss) in fragments.iter().zip(EMBEDDED_LCSS) {
+        let embedded = if talker_alias && sf % 2 == 1 {
+            &alias
+        } else {
+            &fragments
+        };
+        for (fragment, lcss) in embedded.iter().zip(EMBEDDED_LCSS) {
             out.push(voice_burst(&socket(), &emb_centre(emb(lcss), fragment)));
         }
         // Burst F: the Null embedded message.
@@ -1480,6 +1574,29 @@ fn parse_lc(b: &[u8; LC_BYTES]) -> Option<FullLc> {
         encrypted: b[2] & SVC_PRIVACY != 0,
         emergency: b[2] & SVC_EMERGENCY != 0,
     })
+}
+
+/// The FLCO of an embedded message in 9 octets that is not a voice channel user's link
+/// control (a talker alias or GPS, -2 table 5.4), when PF is clear.
+fn other_flco(b: &[u8; LC_BYTES]) -> Option<u8> {
+    let flco = b[0] & FLCO_MASK;
+    (b[0] & LC_PF == 0 && flco != FLCO_GROUP && flco != FLCO_PRIVATE).then_some(flco)
+}
+
+/// The encoder's talker alias header (-2 7.1.1.4, table 7.4): FLCO `000100`, FID 0, the
+/// 7-bit format (7.2.18), the length in characters (7.2.19) and [`TALKER_ALIAS`] in 7 bits
+/// a character, the rest of the 49 data bits zero.
+fn talker_alias_bytes() -> [u8; LC_BYTES] {
+    let chars = TALKER_ALIAS.as_bytes();
+    // Format (2), length (5), then the 49 data bits: 56 bits from octet 2.
+    let mut bits = u64::from(TA_FORMAT_7BIT) << 54 | (chars.len() as u64) << 49;
+    for (i, &c) in chars.iter().enumerate() {
+        bits |= u64::from(c & 0x7F) << (42 - 7 * i);
+    }
+    let mut b = [0u8; LC_BYTES];
+    b[0] = FLCO_TALKER_ALIAS_HEADER;
+    b[2..].copy_from_slice(&bits.to_be_bytes()[1..]);
+    b
 }
 
 /// The 96 information bits of a header or terminator: the link control, then its
@@ -2067,6 +2184,61 @@ fn ambe_from_bits(bits: &[u8]) -> AmbeSoft {
         f[usize::from(c)] = b;
     }
     f
+}
+
+/// The encoder's pieces, for the `dmr_decode` stage's tests to put calls together burst by
+/// burst: calls on each slot starting and ending when a test says, a header or a privacy
+/// header left out or added, a burst lost.
+#[cfg(test)]
+pub(crate) mod build {
+    use super::*;
+
+    /// One burst's 264 bits (0 or 1).
+    pub(crate) type Burst = [u8; BURST_BITS];
+
+    /// A call's bursts as [`encode_repeater_aliased`] sends them: the voice LC header, a
+    /// privacy header when `lc.encrypted`, the superframes, the terminator.
+    pub(crate) fn call(
+        cc: u8,
+        lc: &FullLc,
+        superframes: u32,
+        origin: Origin,
+        talker_alias: bool,
+    ) -> Vec<Burst> {
+        call_bursts(cc, lc, superframes, origin, talker_alias)
+    }
+
+    pub(crate) fn idle(cc: u8) -> Burst {
+        idle_burst(cc)
+    }
+
+    /// The privacy header a call encrypted sends after its voice header.
+    pub(crate) fn privacy_header(cc: u8, origin: Origin) -> Burst {
+        data_burst(
+            sync_word(origin, Kind::Data),
+            slot_type(cc, DT_PI_HEADER),
+            &bptc_encode(&pi_header_info()),
+        )
+    }
+
+    /// `burst` lost: its centre field (the sync, or the EMB and the embedded bits) made a
+    /// word no code decodes and no sync, so the framer reads nothing there.
+    pub(crate) fn lose(burst: &mut Burst) {
+        let bad = (0..1u32 << 16).find(|&w| QR16.decode(w).is_none()).unwrap();
+        let centre = emb_centre(bad, &[1; EMBEDDED_BITS]);
+        burst[HALF_BITS..HALF_BITS + CENTRE_BITS].copy_from_slice(&centre);
+    }
+
+    /// A repeater's downlink of the two slots' bursts, a CACH before each; a slot that runs
+    /// out idles. Dibits.
+    pub(crate) fn downlink(cc: u8, slots: [Vec<Burst>; 2]) -> Vec<u8> {
+        super::downlink(cc, &slots, [true; 2])
+    }
+
+    /// A handheld's bursts on the air, the rest of each 60 ms empty.
+    pub(crate) fn handheld(bursts: &[Burst]) -> Vec<Option<u8>> {
+        handheld_air(bursts)
+    }
 }
 
 #[cfg(test)]
@@ -2834,7 +3006,9 @@ mod tests {
         {
             let DmrContent::Voice {
                 first,
+                letter,
                 lc: embedded,
+                other,
                 pi,
                 voice,
                 errors,
@@ -2843,7 +3017,9 @@ mod tests {
                 panic!("burst {i}: {b:?}");
             };
             assert_eq!(*first, i % 6 == 0, "burst {i}");
+            assert_eq!(*letter, Some((i % 6) as u8), "burst {i}");
             assert_eq!(*embedded, (i % 6 == 4).then_some(lc), "burst {i}");
+            assert_eq!(*other, None, "burst {i}");
             assert!(!pi, "burst {i}");
             assert_eq!(*errors, 0, "burst {i}");
             assert_eq!(b.color_code, (i % 6 != 0).then_some(CC), "burst {i}");
@@ -2883,6 +3059,61 @@ mod tests {
                 && b.content == DmrContent::Idle
                 && b.color_code == Some(CC)));
         }
+    }
+
+    #[test]
+    fn a_talker_alias_superframe_names_its_message_and_keeps_the_link_control() {
+        // Table 7.4: PF 0, reserved 0, FLCO 000100, FID 0, format 00 (7 bit), length 4,
+        // then "ZETA" in 7-bit characters from the data's first bit.
+        let b = talker_alias_bytes();
+        assert_eq!(b[..2], [0b0000_0100, 0]);
+        assert_eq!(b[2] >> 6, 0b00);
+        assert_eq!(b[2] >> 1 & 0x1F, 4);
+        let data =
+            u64::from_be_bytes([0, b[2], b[3], b[4], b[5], b[6], b[7], b[8]]) & ((1 << 49) - 1);
+        let chars: Vec<u8> = (0..4)
+            .map(|i| (data >> (42 - 7 * i) & 0x7F) as u8)
+            .collect();
+        assert_eq!(chars, b"ZETA");
+        assert_eq!(parse_lc(&b), None);
+        assert_eq!(other_flco(&b), Some(FLCO_TALKER_ALIAS_HEADER));
+        assert_eq!(other_flco(&lc_bytes(&group())), None);
+
+        let call =
+            encode_repeater_aliased(CC, [plan(Some(group()), 3), plan(None, 3)], [true, false]);
+        let bursts = receive(&on_air(&call, false), &mut DmrFramer::new());
+        let voice: Vec<&DmrBurst> = bursts
+            .iter()
+            .filter(|b| b.slot == Some(1) && is_voice(b))
+            .collect();
+        assert_eq!(voice.len(), 18);
+        for (i, b) in voice.iter().enumerate() {
+            let DmrContent::Voice { lc, other, .. } = &b.content else {
+                unreachable!()
+            };
+            // The second superframe's burst E completes the alias, the others' the call's
+            // link control.
+            let (want_lc, want_other) = match i {
+                4 | 16 => (Some(group()), None),
+                10 => (None, Some(FLCO_TALKER_ALIAS_HEADER)),
+                _ => (None, None),
+            };
+            assert_eq!((*lc, *other), (want_lc, want_other), "burst {i}");
+        }
+        assert_eq!(
+            bursts
+                .iter()
+                .rfind(|b| b.slot == Some(1))
+                .map(|b| &b.content),
+            Some(&DmrContent::Terminator(Some(group())))
+        );
+        // Joined in the alias superframe: the alias, then the link control a superframe on.
+        let join = (8.0 * SLOT_PERIOD + 1300.0) as usize;
+        let bursts = receive(&on_air(&call, false)[join..], &mut DmrFramer::new());
+        let first = bursts.iter().find(|b| lc_of(b).is_some()).unwrap();
+        let third = 13.0 * SLOT_PERIOD - join as f64;
+        assert!(first.at > third, "{} {third}", first.at);
+        assert!(bursts.iter().filter_map(lc_of).all(|lc| lc == group()));
     }
 
     #[test]
@@ -3052,8 +3283,8 @@ mod tests {
             ..group()
         };
         // Two calls back to back on slot 1, no terminator and no header between them.
-        let first = call_bursts(CC, &group(), 2, Origin::Repeater);
-        let second = call_bursts(CC, &other, 2, Origin::Repeater);
+        let first = call_bursts(CC, &group(), 2, Origin::Repeater, false);
+        let second = call_bursts(CC, &other, 2, Origin::Repeater, false);
         let slot1: Vec<[u8; BURST_BITS]> = first[..first.len() - 1]
             .iter()
             .chain(&second[1..])
@@ -3180,8 +3411,8 @@ mod tests {
             pairs.push((lc(z), lc(z >> 16 ^ z << 7)));
         }
         for (i, (a, b)) in pairs.into_iter().enumerate() {
-            let one = call_bursts(CC, &a, 2, Origin::Repeater);
-            let two = call_bursts(CC, &b, 2, Origin::Repeater);
+            let one = call_bursts(CC, &a, 2, Origin::Repeater, false);
+            let two = call_bursts(CC, &b, 2, Origin::Repeater, false);
             let slot1: Vec<[u8; BURST_BITS]> = one[..one.len() - 1]
                 .iter()
                 .chain(&two[1..])
@@ -3218,7 +3449,7 @@ mod tests {
     /// A repeater call (slot 1) and a handheld call of `superframes`, each cut short with no
     /// terminator, on air.
     fn cut_calls(superframes: u32) -> [(&'static str, Vec<Complex<f32>>); 2] {
-        let mut repeater = call_bursts(CC, &group(), superframes, Origin::Repeater);
+        let mut repeater = call_bursts(CC, &group(), superframes, Origin::Repeater, false);
         repeater.pop();
         let idle = vec![idle_burst(CC); repeater.len()];
         let repeater = on_air(&downlink(CC, &[repeater, idle], [true, false]), false);
@@ -3275,7 +3506,7 @@ mod tests {
     #[test]
     fn a_voice_header_then_noise_is_not_voice() {
         // The header's link control is in hand, the phase never known.
-        let header = call_bursts(CC, &group(), 1, Origin::Repeater)[..1].to_vec();
+        let header = call_bursts(CC, &group(), 1, Origin::Repeater, false)[..1].to_vec();
         let repeater = on_air(
             &downlink(CC, &[header, vec![idle_burst(CC)]], [true, false]),
             false,

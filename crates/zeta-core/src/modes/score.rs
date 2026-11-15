@@ -365,8 +365,8 @@ mod tests {
             &|_| 0.0,
             &|_| 0.0,
         ));
-        // Only the other priority -1 row that scores here (p25_decode, a later family)
-        // follows it.
+        // Only the other priority -1 rows that score here (dmr_decode and p25_decode, a
+        // later family) follow it.
         let after: Vec<&str> = got
             .iter()
             .skip_while(|g| g.0 != "a_low")
@@ -374,7 +374,7 @@ mod tests {
             .filter(|g| g.1 > 0.0)
             .map(|g| g.0.as_str())
             .collect();
-        assert_eq!(after, ["p25_decode"], "{got:?}");
+        assert_eq!(after, ["dmr_decode", "p25_decode"], "{got:?}");
     }
 
     /// On a 12.5 kHz FM signal at a centre a row names, that row is tried before
@@ -401,11 +401,11 @@ mod tests {
     #[test]
     fn equal_scores_order_by_family_then_id() {
         let modes = registry();
-        // Nothing matches but the empty centre lists of video, rds, m17 and p25.
+        // Nothing matches but the empty centre lists of video, rds, m17, dmr and p25.
         let got = ids(&score_rows(&modes, 1, 1, "noise", &|_| 0.0, &|_| 0.0));
         let order: Vec<&str> = got.iter().map(|g| g.0.as_str()).collect();
-        // video, rds and m17 at 0.4 (tv, broadcast, then amateur_voice), then p25 at 0.4 with
-        // priority -1; then at 0 rs41 (priority 1),
+        // video, rds and m17 at 0.4 (tv, broadcast, then amateur_voice), then dmr and p25
+        // (two_way, by id) at 0.4 with priority -1; then at 0 rs41 (priority 1),
         // then tv (dvbt, outside its range), aviation (acars, adsb, hfdl, vdl2), maritime (ais),
         // pagers (flex, pocsag), weather_science (dfm, m20), amateur_digital.
         assert_eq!(
@@ -414,6 +414,7 @@ mod tests {
                 "video_decode",
                 "rds_decode",
                 "m17_decode",
+                "dmr_decode",
                 "p25_decode",
                 "rs41_decode",
                 "dvbt_decode",

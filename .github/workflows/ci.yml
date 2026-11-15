@@ -69,10 +69,12 @@ jobs:
         run: |
           cargo run -q -p zeta -- --state-dir "$RUNNER_TEMP/zeta-check" modes check --strict flex_decode
           cargo run -q -p zeta -- --state-dir "$RUNNER_TEMP/zeta-check" modes check --strict m17_decode
-      # The P25 row's vocoder is built by the operator, never by CI: its check runs the row
-      # without it (its calls are reported silent), so it is not strict.
+      # The P25 and DMR rows' vocoder is built by the operator, never by CI: their checks run
+      # the rows without it (their calls are reported silent), so they are not strict.
       - name: The P25 row without its vocoder
         run: cargo run -q -p zeta -- --state-dir "$RUNNER_TEMP/zeta-check" modes check p25_decode
+      - name: The DMR row without its vocoder
+        run: cargo run -q -p zeta -- --state-dir "$RUNNER_TEMP/zeta-check" modes check dmr_decode
 
   ui:
     runs-on: ubuntu-24.04

@@ -427,18 +427,18 @@ async fn identify_on_pocsag_ends_with_a_verdict_and_one_running_child() {
     assert_eq!(aprs["outcome"], "no_frame", "{aprs}");
     assert_eq!(pocsag["outcome"], "proved", "{pocsag}");
     // The attempts (those with a child job) in score order: APRS scores over POCSAG here,
-    // M17 and P25 (their empty centre lists score anywhere) tie APRS and go after it, P25
-    // last of the three (priority -1); AIS lives on its two channels at 162 MHz, so it is
-    // skipped here, never tried.
+    // M17, DMR and P25 (their empty centre lists score anywhere) tie APRS and go after it,
+    // DMR and P25 last of the four (priority -1); AIS lives on its two channels at 162 MHz,
+    // so it is skipped here, never tried.
     let tried: Vec<&Value> = events.iter().filter(|e| !e["job"].is_null()).collect();
-    assert_eq!(tried.len(), 4, "{events:#?}");
+    assert_eq!(tried.len(), 5, "{events:#?}");
     assert_eq!(tried[0]["mode"], "aprs_decode");
-    assert_eq!(tried[1]["mode"], "m17_decode");
-    assert_eq!(tried[1]["outcome"], "no_frame");
-    assert_eq!(tried[2]["mode"], "p25_decode");
-    assert_eq!(tried[2]["outcome"], "no_frame");
-    assert_eq!(tried[3]["mode"], "pocsag_decode");
-    assert!(tried[0]["score"].as_f64() >= tried[3]["score"].as_f64());
+    for (k, mode) in [(1, "m17_decode"), (2, "dmr_decode"), (3, "p25_decode")] {
+        assert_eq!(tried[k]["mode"], mode);
+        assert_eq!(tried[k]["outcome"], "no_frame");
+    }
+    assert_eq!(tried[4]["mode"], "pocsag_decode");
+    assert!(tried[0]["score"].as_f64() >= tried[4]["score"].as_f64());
     let ais = outcome(&events, "ais_decode").expect("ais_decode listed");
     assert_eq!(ais["outcome"], "skipped_band", "{ais}");
     assert!(
@@ -454,7 +454,7 @@ async fn identify_on_pocsag_ends_with_a_verdict_and_one_running_child() {
     assert_eq!(verdict["mode"], "pocsag_decode", "{ctx}");
     assert_eq!(verdict["label"], "POCSAG", "{ctx}");
     assert_eq!(verdict["job"], pocsag["job"], "{ctx}");
-    assert_eq!(ctx["identify"]["attempts"], 4, "{ctx}");
+    assert_eq!(ctx["identify"]["attempts"], 5, "{ctx}");
     let child = verdict["job"].as_str().unwrap().to_string();
     assert_eq!(running(&node), [(child.clone(), "pocsag_decode".into())]);
     let holders: Vec<String> = node
@@ -477,8 +477,9 @@ async fn identify_on_a_tone_ends_unknown_with_a_label() {
     let tried: Vec<&Value> = events.iter().filter(|e| !e["job"].is_null()).collect();
     let modes: Vec<&str> = tried.iter().map(|e| e["mode"].as_str().unwrap()).collect();
     // AIS (162 MHz only) is not tried at 144.8 MHz.
-    assert_eq!(modes.len(), 5, "{events:#?}");
+    assert_eq!(modes.len(), 6, "{events:#?}");
     for m in [
+        "dmr_decode",
         "p25_decode",
         "aprs_decode",
         "m17_decode",
@@ -496,7 +497,7 @@ async fn identify_on_a_tone_ends_unknown_with_a_label() {
     let label = verdict["label"].as_str().unwrap();
     assert!(label == "carrier" || label == "fm", "{ctx}");
     assert!(verdict["features"]["bandwidth_hz"].is_u64(), "{ctx}");
-    assert_eq!(ctx["identify"]["attempts"], 5, "{ctx}");
+    assert_eq!(ctx["identify"]["attempts"], 6, "{ctx}");
     assert!(running(&node).is_empty(), "{:?}", running(&node));
     assert!(node.lease_holders(&rx()).is_empty());
 }

@@ -3038,6 +3038,7 @@ fn modes_list_prints_the_embedded_rows() {
             "ais_decode",
             "aprs_decode",
             "dfm_decode",
+            "dmr_decode",
             "dvbt_decode",
             "flex_decode",
             "hfdl_decode",

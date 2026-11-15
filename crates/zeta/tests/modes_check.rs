@@ -75,7 +75,8 @@ fn modes_check_passes_the_in_crate_rows() {
         "acars_decode",
         "ais_decode",
         "aprs_decode",
-        // Its vocoder is optional and pinned missing here: the calls are decoded silent.
+        // Their vocoder is optional and pinned missing here: the calls are decoded silent.
+        "dmr_decode",
         "p25_decode",
         "pocsag_decode",
         "rds_decode",
@@ -138,7 +139,7 @@ fn an_unknown_id_lists_the_known_ones() {
     assert!(
         err.contains(
             "unknown mode nope (known: acars_decode, adsb_decode, ais_decode, aprs_decode, \
-             dfm_decode, dvbt_decode, flex_decode, hfdl_decode, m17_decode, m20_decode, p25_decode, pocsag_decode, rds_decode, \
+             dfm_decode, dmr_decode, dvbt_decode, flex_decode, hfdl_decode, m17_decode, m20_decode, p25_decode, pocsag_decode, rds_decode, \
              rs41_decode, vdl2_decode"
         ),
         "{err}"

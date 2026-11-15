@@ -1445,6 +1445,7 @@ struct DmrCall {
     encrypted: bool,
     idle: bool,
     control: bool,
+    talker_alias: bool,
 }
 
 /// A DMR call ([`crate::dmr`]): a repeater's downlink (slot 1 the call, or idle, or
@@ -1452,8 +1453,8 @@ struct DmrCall {
 /// between them; 4FSK at 4800 baud and ±1944 Hz, then [`DMR_TAIL_MS`] of nothing.
 fn dmr_iq(call: &DmrCall, rate_hz: u32) -> Vec<Complex<f32>> {
     use crate::dmr::{
-        Call, DMR_BAUD, DMR_DEVIATION_HZ, DMR_RRC_ALPHA, FullLc, Origin, SlotPlan, encode_handheld,
-        encode_repeater,
+        Call, DMR_BAUD, DMR_DEVIATION_HZ, DMR_RRC_ALPHA, FullLc, Origin, SlotPlan,
+        encode_handheld_aliased, encode_repeater_aliased,
     };
     use crate::fsk4::dibit_symbol;
     let lc = |src, dst, encrypted| FullLc {
@@ -1479,18 +1480,23 @@ fn dmr_iq(call: &DmrCall, rate_hz: u32) -> Vec<Complex<f32>> {
                     control: false,
                 },
             ];
-            let symbols: Vec<u8> = encode_repeater(call.color_code, slots)
-                .into_iter()
-                .map(dibit_symbol)
-                .collect();
+            let symbols: Vec<u8> =
+                encode_repeater_aliased(call.color_code, slots, [call.talker_alias, false])
+                    .into_iter()
+                    .map(dibit_symbol)
+                    .collect();
             rrc_modulate_4fsk(&symbols, DMR_BAUD, DMR_DEVIATION_HZ, rate_hz, DMR_RRC_ALPHA)
         }
         Origin::Handheld => {
-            let symbols: Vec<Option<u8>> =
-                encode_handheld(call.color_code, first, call.superframes)
-                    .into_iter()
-                    .map(|d| d.map(dibit_symbol))
-                    .collect();
+            let symbols: Vec<Option<u8>> = encode_handheld_aliased(
+                call.color_code,
+                first,
+                call.superframes,
+                call.talker_alias,
+            )
+            .into_iter()
+            .map(|d| d.map(dibit_symbol))
+            .collect();
             rrc_modulate_4fsk_gated(&symbols, DMR_BAUD, DMR_DEVIATION_HZ, rate_hz, DMR_RRC_ALPHA)
         }
     };
@@ -1927,7 +1933,10 @@ pub enum SynthSpec {
     /// header after its voice header (the voice is not encrypted: nothing here makes a key
     /// stream). `idle` leaves slot 1 idle, so with no `second` an idle repeater; `control`
     /// sends control blocks (Preamble CSBKs from `src` to `dst`) on slot 1 instead of the
-    /// call, for as long (both a repeater's only, and not together).
+    /// call, for as long (both a repeater's only, and not together). `talker_alias` makes
+    /// slot 1's call carry a talker alias header (-2 5.4.3, 7.1.1.4; the invented alias
+    /// `ZETA`) in bursts B to E of its second superframe and every second one after it, in
+    /// place of the link control, as radios interleave them.
     Dmr {
         color_code: u8,
         src: u32,
@@ -1943,6 +1952,8 @@ pub enum SynthSpec {
         idle: bool,
         #[serde(default)]
         control: bool,
+        #[serde(default)]
+        talker_alias: bool,
     },
     /// AIS: per repeat a type 1 position report (`mmsi`, the position, `sog_kt`,
     /// `cog_deg`; [`crate::ais_msg::position_report_bits`]) and, with `name`, a type 5
@@ -2317,6 +2328,7 @@ impl SynthSpec {
                 second,
                 idle,
                 control,
+                talker_alias,
                 ..
             } => {
                 if *color_code > DMR_COLOR_CODE_MAX {
@@ -2352,6 +2364,9 @@ impl SynthSpec {
                 }
                 if *idle && *control {
                     return Err("control: slot 1 is idle or control, not both".into());
+                }
+                if *talker_alias && (*idle || *control) {
+                    return Err("talker_alias: slot 1 carries no call".into());
                 }
             }
             SynthSpec::Video {
@@ -2650,6 +2665,7 @@ pub fn synthesise(
             encrypted,
             idle,
             control,
+            talker_alias,
         } => {
             let call = DmrCall {
                 color_code: *color_code,
@@ -2661,6 +2677,7 @@ pub fn synthesise(
                 encrypted: *encrypted,
                 idle: *idle,
                 control: *control,
+                talker_alias: *talker_alias,
             };
             let mut iq = dmr_iq(&call, rate_hz);
             shift(&mut iq, off, rate_hz);
@@ -3557,6 +3574,22 @@ mod tests {
         let mut both = with("idle", true.into());
         both["control"] = true.into();
         assert!(parse(both).unwrap_err().starts_with("control:"));
+        // A talker alias rides on a call: not on an idle or control slot.
+        for key in ["idle", "control"] {
+            let mut v = with("talker_alias", true.into());
+            v[key] = true.into();
+            assert_eq!(
+                parse(v).unwrap_err(),
+                "talker_alias: slot 1 carries no call"
+            );
+        }
+        assert!(matches!(
+            parse(with("talker_alias", true.into())).unwrap().0,
+            SynthSpec::Dmr {
+                talker_alias: true,
+                ..
+            }
+        ));
         // The second call is clear unless it says otherwise, whatever the first's.
         let mut v = with("encrypted", true.into());
         v["second"] = serde_json::json!({"src": 9990002, "dst": 9991});
