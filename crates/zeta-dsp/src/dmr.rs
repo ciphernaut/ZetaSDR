@@ -129,21 +129,22 @@
 //!   corrected, never from one the code corrected, since the code turns about a quarter of
 //!   all words into a valid one.
 //! - **The embedded link control** is assembled from the four latest fragments when they
-//!   are the four places B to E in order: within a superframe or, while the call's link
-//!   control is not yet in hand (at a join), across a superframe's boundary (C, D, E then
-//!   B; D, E then B, C; E then B, C, D), so a receiver has it within one superframe of the
-//!   first sync it hears. Once the link control is in hand only a whole superframe's B to E
-//!   are taken, so a call that changes at a boundary gives the new link control at its own
-//!   burst E. Across a boundary no row may need a correction, and then the row code decides
-//!   which mixes can pass. A fragment holds four of the 16 columns (B 0 to 3, C 4 to 7, D 8
-//!   to 11, E 12 to 15), and a mixed row is the old row with the new one's columns, so it is
-//!   a code word only when the two rows' difference on those columns is one. With B new and
-//!   C, D, E old, or B, C, D new and E old, no non-zero code word lies inside the columns
-//!   concerned (a test enumerates them), so a mix that passes is the old or the new link
-//!   control exactly: no wrong one can come out. With B, C new and D, E old, code words do
-//!   lie inside columns 0 to 7, so a mix of two link controls whose rows differ there by
-//!   such words would pass the rows, and the checksum is the last guard. That needs a call
-//!   to change at the very boundary where the receiver joined.
+//!   are the four places B to E in order. Within a superframe that is always so. Across a
+//!   superframe's boundary it is so only while the call's link control is not yet in hand
+//!   (at a join), with no row needing a correction, and only for two of the three orders:
+//!   C, D, E then B, and E then B, C, D. The third, D, E then B, C, is never assembled.
+//!   The reason is the row code. A fragment holds four of the 16 columns (B 0 to 3, C 4 to
+//!   7, D 8 to 11, E 12 to 15), and a mixed row is the old row with the new one's columns,
+//!   so it is a code word only when the two rows' difference on those columns is one. No
+//!   non-zero code word lies inside columns 0 to 3 or inside 12 to 15 (a test enumerates
+//!   them), so in the two orders kept a mix that passes is the old or the new link control
+//!   exactly. Code words do lie inside columns 0 to 7, so in the third order a mix of two
+//!   link controls could pass every row and be held back by the 5-bit checksum alone; a
+//!   test builds such a pair, whose mix passes the checksum too and names neither call.
+//!   Once the link control is in hand only a whole superframe's B to E are taken, so a call
+//!   that changes at a boundary gives the new link control at its own burst E. Dropping
+//!   the third order costs a receiver that joins just past a burst C's fragment: it has
+//!   the link control at the next superframe's D instead of its C.
 //!
 //! Polarity: a data burst whose slot type and BPTC both check tells it, and
 //! [`DmrFramer::inverted`] says it, as P25's framer does.
@@ -282,6 +283,9 @@ const FLYWHEEL_PERIODS: i64 = 2 * VOICE_BURSTS as i64;
 const UNANCHORED_MAX_DIFFER: usize = 4;
 /// Embedded fragments a track keeps: two superframes' worth.
 const KEPT_FRAGMENTS: usize = 8;
+/// The letters a cross-boundary assembly may end on: B (C, D, E then B) and D (E then B, C,
+/// D). Not C: D, E then B, C can mix two link controls (module doc).
+const CROSS_BOUNDARY_ENDS: [usize; 2] = [1, 3];
 /// Each burst's LCSS by its letter, A to F (A has a sync, not an EMB).
 const EXPECTED_LCSS: [Option<u8>; VOICE_BURSTS] = [
     None,
@@ -480,8 +484,9 @@ impl Track {
 
     /// The link control from the four latest fragments when they are the four places in
     /// order, B to E: of one superframe, or, while the call's link control is not yet in
-    /// hand, across a superframe's boundary (C, D, E then B; D, E then B, C; E then B, C,
-    /// D). The embedded code's row and column parity and its checksum decide.
+    /// hand, across a superframe's boundary in the two orders the row code makes safe
+    /// (C, D, E then B; E then B, C, D). The embedded code's row and column parity and its
+    /// checksum decide.
     fn assemble(&self) -> Option<(FullLc, u32)> {
         let phase = self.phase?;
         let six = VOICE_BURSTS as i64;
@@ -497,7 +502,10 @@ impl Track {
             })
             .collect();
         let &(last, last_letter, _) = placed.last()?;
-        if last_letter != EMB_LC_FRAGMENTS && self.lc.is_some() {
+        // Across a boundary only where the newer superframe gives B alone or B, C and D:
+        // there the row code leaves no mix but the old or the new link control (module doc).
+        let across = last_letter != EMB_LC_FRAGMENTS;
+        if across && (self.lc.is_some() || !CROSS_BOUNDARY_ENDS.contains(&last_letter)) {
             return None;
         }
         let mut by_letter: Vec<Vec<u8>> = vec![Vec::new(); EMB_LC_FRAGMENTS];
@@ -507,7 +515,7 @@ impl Track {
         }
         let (bytes, errors) = embedded_decode(&by_letter)?;
         // Across a boundary every row must be a code word as received (see the module doc).
-        if last_letter != EMB_LC_FRAGMENTS && errors != 0 {
+        if across && errors != 0 {
             return None;
         }
         parse_lc(&bytes).map(|lc| (lc, errors))
@@ -2668,6 +2676,11 @@ mod tests {
     const SUPERFRAME: f64 = DMR_SUPERFRAME_MS as f64 * 48.0;
     /// A burst, samples (27.5 ms).
     const BURST: f64 = 1320.0;
+    /// How soon a repeater call joined anywhere has its link control, samples: the worst of
+    /// the six offsets measured, 423 ms (a join just past burst C's fragment, which waits
+    /// for the next superframe's D, since D, E then B, C is not assembled), and one burst
+    /// (60 ms) of margin.
+    const JOIN_LC_BOUND: f64 = (423.0 + 60.0) * 48.0;
 
     fn plan(lc: Option<FullLc>, superframes: u32) -> SlotPlan {
         SlotPlan {
@@ -2831,7 +2844,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeater_call_joined_anywhere_has_the_lc_within_420_ms() {
+    fn a_repeater_call_joined_anywhere_has_the_lc_within_483_ms() {
         let call = encode_repeater(CC, [plan(Some(group()), 4), plan(None, 4)]);
         let iq = on_air(&call, false);
         // The second superframe starts after the header's frame and the first six.
@@ -2846,7 +2859,7 @@ mod tests {
                 .expect("a link control");
             assert_eq!(lc_of(found), Some(group()), "join {k}");
             let in_hand = found.at + BURST;
-            assert!(in_hand <= SUPERFRAME + SLOT_PERIOD, "join {k}: {in_hand}");
+            assert!(in_hand <= JOIN_LC_BOUND, "join {k}: {in_hand}");
             assert!(bursts.iter().filter_map(lc_of).all(|lc| lc == group()));
         }
     }
@@ -2959,6 +2972,126 @@ mod tests {
                 "frame {frame}: {seen:?}"
             );
             assert!(seen.contains(&other), "frame {frame}: {seen:?}");
+        }
+    }
+
+    /// Two link controls whose mix in the order D, E then B, C passes every row as received
+    /// and the checksum, and names neither call: the second's dst middle octet differs from
+    /// the first's by a row code word inside columns 0 to 7 of row 3 (that octet's bits) and
+    /// by a multiple of 31, and its src's last bit (row 6, column 9, D's) differs too.
+    fn a_mixable_pair() -> (FullLc, FullLc, FullLc) {
+        let (b, p) = (0..=255u32)
+            .flat_map(|b| (1..=255u32).map(move |p| (b, p)))
+            .find(|&(b, p)| {
+                HAMMING16.encode(p << 3) & 0x1F == 0
+                    && ((b ^ p) as i32 - b as i32).rem_euclid(31) == 0
+            })
+            .expect("a pair");
+        let first = FullLc {
+            dst: b << 8 | 0x06,
+            ..group()
+        };
+        let second = FullLc {
+            dst: (b ^ p) << 8 | 0x06,
+            src: SRC ^ 1,
+            ..group()
+        };
+        let mixed = FullLc {
+            dst: second.dst,
+            ..first
+        };
+        (first, second, mixed)
+    }
+
+    #[test]
+    fn the_dropped_join_order_would_mix_two_link_controls() {
+        // What D, E then B, C would give for the pair: a third link control, every row a
+        // code word as received and the checksum passing.
+        let (first, second, mixed) = a_mixable_pair();
+        let old = embedded_encode(&lc_bytes(&first));
+        let new = embedded_encode(&lc_bytes(&second));
+        let fragments: Vec<Vec<u8>> = [new[0], new[1], old[2], old[3]]
+            .iter()
+            .map(|f| certain(f))
+            .collect();
+        assert_eq!(embedded_decode(&fragments), Some((lc_bytes(&mixed), 0)));
+        assert!(mixed != first && mixed != second);
+        // The two orders kept: a mix taken as received either fails or is exactly one of the
+        // two link controls, for this pair and for many others.
+        let mut pairs = vec![(first, second)];
+        for n in 0..256u64 {
+            let z = splitmix64(n);
+            let lc = |bits: u64| FullLc {
+                dst: (bits & 0xFF_FFFF) as u32,
+                src: (bits >> 24 & 0xFF_FFFF) as u32,
+                ..group()
+            };
+            // Half the pairs differ in a few low bits only, as neighbouring IDs do.
+            let other = if n % 2 == 0 {
+                z >> 13 ^ z << 5
+            } else {
+                z ^ (n >> 1 & 0xFF)
+            };
+            pairs.push((lc(z), lc(other)));
+        }
+        for (a, b) in pairs {
+            let old = embedded_encode(&lc_bytes(&a));
+            let new = embedded_encode(&lc_bytes(&b));
+            for frags in [
+                [new[0], old[1], old[2], old[3]],
+                [new[0], new[1], new[2], old[3]],
+            ] {
+                let f: Vec<Vec<u8>> = frags.iter().map(|f| certain(f)).collect();
+                if let Some((bytes, 0)) = embedded_decode(&f) {
+                    let lc = parse_lc(&bytes);
+                    assert!(lc == Some(a) || lc == Some(b), "{a:?} {b:?}: {lc:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_call_that_changes_where_a_receiver_joins_never_gives_a_mixed_lc() {
+        // Call pairs back to back on slot 1 (no terminator, no header between), joined just
+        // past the first call's last burst C's fragment, so D, E of the first and B, C of the
+        // second come first: the mixable pair and 64 others.
+        let (first, second, _) = a_mixable_pair();
+        let mut pairs = vec![(first, second)];
+        for n in 0..64u64 {
+            let z = splitmix64(n ^ 0xD3);
+            let lc = |bits: u64| FullLc {
+                dst: (bits & 0xFF_FFFF) as u32,
+                src: (bits >> 24 & 0xFF_FFFF) as u32,
+                ..group()
+            };
+            pairs.push((lc(z), lc(z >> 16 ^ z << 7)));
+        }
+        for (i, (a, b)) in pairs.into_iter().enumerate() {
+            let one = call_bursts(CC, &a, 2, Origin::Repeater);
+            let two = call_bursts(CC, &b, 2, Origin::Repeater);
+            let slot1: Vec<[u8; BURST_BITS]> = one[..one.len() - 1]
+                .iter()
+                .chain(&two[1..])
+                .copied()
+                .collect();
+            let idle = vec![idle_burst(CC); slot1.len()];
+            let dibits = downlink(CC, &[slot1, idle], [true, false]);
+            // The first call's second superframe's C is TDMA frame 9.
+            let join = 9 * 288 + 12 + 54 + 24 + 10;
+            let joined: Vec<Option<u8>> = dibits[join..].iter().map(|&d| Some(d)).collect();
+            let bursts = DmrFramer::new().push(&clean(&joined));
+            let seen: Vec<FullLc> = bursts
+                .iter()
+                .filter_map(|x| match x.content {
+                    DmrContent::Terminator(lc) => lc,
+                    _ => lc_of(x),
+                })
+                .collect();
+            assert!(
+                seen.iter().all(|&lc| lc == a || lc == b),
+                "pair {i}: {seen:?}"
+            );
+            assert!(seen.contains(&b), "pair {i}: {seen:?}");
         }
     }
 
@@ -3107,7 +3240,7 @@ mod tests {
         // B new, C to E old; B to D new, E old: no word, so no mix passes.
         assert!(!words.iter().any(|&w| inside(w, 0..4)));
         assert!(!words.iter().any(|&w| inside(w, 12..16)));
-        // B and C new, D and E old: there are words, which the module doc says.
+        // B and C new, D and E old: there are words, so that order is not assembled.
         assert!(words.iter().any(|&w| inside(w, 0..8)));
     }
 
