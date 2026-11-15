@@ -305,7 +305,7 @@ Operator-visible nits from the plan 24 reviews, none blocking. The rail's label 
 Plan 23 delivered the ADS-B request: a row names its subject (`key`, columns, `waterfall`, `heading`, `label`), the page folds by key, the Subjects tab lists one row per aircraft, the waterfall shows one line, and the map tracks per subject (`adsb_decode` has a `position`; plan 32 gave the map its own tab and the dock took the pane host, so the map half of this note is done). Left from the original note:
 
 - ~~POCSAG has no subject~~ (done in plan 31: `pocsag_decode` has an addresses table keyed by address).
-- AIS vessels (MMSI as key) when the AIS row lands; it needs only a row.
+- ~~AIS vessels (MMSI as key)~~ (done in plan 29: `ais_decode` has a vessels table keyed by MMSI).
 - The node-side half is a separate gist ("Subjects: a running job keeps its tables on the node").
 
 ## Build: an install script for the AMBE/IMBE vocoder libraries
@@ -654,7 +654,17 @@ Direction: the sizes are the operator's layout, not a theme's look, so they must
 
 From the plan 34 UAT (2026-11-10). A plain-ACARS downlink with label `MA` carries a MIAM-compressed payload, which often wraps an ARINC 622 message: an ADS-C position report, or CPDLC. dumpvdl2 and dumphfdl decode these through libacars, so their events get the ADS-C fix; the in-process `acars_decode` stage publishes the compressed text as is, so the same aircraft's position on plain ACARS is lost. Ideas: run libacars on the block (its MIAM and ARINC 622 decoders; behind a `cfg` as `soapy` is, check its licence), or a Rust MIAM core decoder (the framing plus deflate) feeding the ADS-C shapes the VDL2 row already reads. Either way the decoded basic report fills `lat`, `lon` and `alt_ft` as structured fields, so it wins over the text derive of plan 34.
 
-## AIS: not yet proven on air
+## AIS: first decode on air, positions not yet seen
+
+2026-11-15 on the field host's B210: `plan_start ais_vhf` with `ais_decode` gave a CRC-clean frame on channel B within three minutes, the first AIS frame off air, and four in eight minutes. All four read as type 12 with noise for text: the decoder unpacked each frame byte least significant bit first. Unpacked most significant bit first they are type 3 position reports (one vessel at anchor, one under way), which is how the decoder now reads them. Still open: the fixed decoder seen on the field host with positions on the map (UAT plan 29 item 1).
+
+The generator had the mirrored error, so `zeta modes check` and the tests could not see it. Wanted: the synthesised AIS frame checked by a decoder from outside the crate (as `flex_decode` is against multimon-ng), or a short off-air capture kept as a fixture with its sentences from another decoder.
+
+The same session showed why the decoder looked missing. Asked for AIS, the agent started a bare `watch` on channel A, which reported no signals for six minutes on a channel carrying traffic: the detector announces a signal after `persist_ms` (3000 by default) and an AIS message is one burst of about 27 ms. The `ais` set and its field-craft line now steer to the decoder. Ideas for the watch itself: a row could carry the detector policy its signal needs (a burst mode's `persist_ms`), so a watch with `modes` naming it sets it; or a watch over a band where every plausible row is a burst mode could say so in its context instead of reading as an empty band.
+
+The first run also listed one MMSI twice, once per channel's job; the row now merges on `mmsi` (one table row per vessel). The map does not merge: it keeps a track per job and key, so a vessel heard on both channels draws two markers and two half-density tracks. Wanted: the map draws the merged group the Subjects table shows (the same holds for an aircraft on two ACARS channels).
+
+The earlier note, for the record:
 
 From the 2026-11-08 live acceptance: 15 min on the HackRF (indoor antenna) and 11 min on the B210 at 161.975/162.025 MHz gave no events; a ring cut showed one 25 ms burst about 12 dB over the floor in 9.5 s, which did not decode. The channels are nearly empty at the field host, so this says little about the decoder. Decode the kept cut with another AIS decoder offline, and retry from a site in view of shipping.
 

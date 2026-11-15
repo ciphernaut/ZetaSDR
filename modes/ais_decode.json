@@ -83,6 +83,7 @@
     ],
     "heading": "cog_deg",
     "label": "name",
+    "merge": ["mmsi"],
     "track_points": 200,
     "track_min_m": 50
   },

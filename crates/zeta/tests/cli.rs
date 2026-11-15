@@ -3255,7 +3255,13 @@ fn zeta_sets_prints_the_two_builtin_sets() {
     let ids: Vec<&str> = rows.iter().filter_map(|s| s["id"].as_str()).collect();
     assert_eq!(
         ids,
-        ["airband", "airband_vhf", "airband_vhf_and_sos", "pagers_au"],
+        [
+            "airband",
+            "airband_vhf",
+            "airband_vhf_and_sos",
+            "ais",
+            "pagers_au"
+        ],
         "{v}"
     );
     assert!(rows.iter().all(|s| s["state"] == "ready"), "{v}");

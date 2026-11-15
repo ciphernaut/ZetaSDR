@@ -1,7 +1,7 @@
 //! AIS decode stage: GMSK at 9600 baud from a channel's IQ (the FM discriminator, a DC
 //! blocker, a low-pass at [`AIS_LOWPASS_FACTOR`] of the symbol rate, a [`BitSync`] bit
 //! clock), NRZI decode, HDLC deframing with the CRC-16/X.25, each frame's bytes
-//! bit-reversed into the payload and read by [`crate::ais_msg`] (design 5.2).
+//! unpacked most significant bit first into the payload and read by [`crate::ais_msg`] (design 5.2).
 
 use std::sync::Arc;
 

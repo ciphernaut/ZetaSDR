@@ -7,7 +7,8 @@
 //! sentence in the tests is the one that description uses; pyais read it as the oracle.
 //!
 //! The payload is a string of bits read most significant bit first. On air it rides in an
-//! HDLC frame whose bytes go least significant bit first ([`payload_to_hdlc_bytes`],
+//! HDLC frame: eight payload bits to a byte, the first the most significant, and each byte
+//! sent least significant bit first ([`payload_to_hdlc_bytes`],
 //! [`hdlc_bytes_to_payload`]); in a sentence it is armoured six bits to a character
 //! ([`armour`], [`unarmour`]).
 
@@ -298,24 +299,26 @@ pub fn encode_sentences(bits: &[u8], channel: Option<char>) -> Vec<String> {
         .collect()
 }
 
-/// The payload's bytes as HDLC sends them: each byte's bits reversed, so the first
-/// payload bit is the least significant (the last byte padded with zeros to eight bits).
+/// The payload's bytes as the HDLC frame carries them: eight payload bits to a byte, the
+/// first the most significant (the last byte padded with zeros to eight bits). HDLC then
+/// sends each byte least significant bit first, so on air every byte's bits run backwards
+/// against the payload: the eighth payload bit is the first sent.
 pub fn payload_to_hdlc_bytes(bits: &[u8]) -> Vec<u8> {
     bits.chunks(8)
         .map(|c| {
             c.iter()
                 .enumerate()
-                .fold(0u8, |a, (i, &b)| a | ((b & 1) << i))
+                .fold(0u8, |a, (i, &b)| a | ((b & 1) << (7 - i)))
         })
         .collect()
 }
 
 /// The inverse of [`payload_to_hdlc_bytes`]: a deframed frame's bytes as payload bits,
-/// eight per byte, least significant bit first.
+/// eight per byte, most significant bit first.
 pub fn hdlc_bytes_to_payload(bytes: &[u8]) -> Vec<u8> {
     bytes
         .iter()
-        .flat_map(|b| (0..8).map(move |i| (b >> i) & 1))
+        .flat_map(|b| (0..8).rev().map(move |i| (b >> i) & 1))
         .collect()
 }
 
@@ -523,16 +526,37 @@ mod tests {
             .collect();
         let bytes = payload_to_hdlc_bytes(&bits);
         assert_eq!(bytes.len(), 4);
-        // The first payload bit is the first sent: the byte's least significant bit.
-        assert_eq!(bytes[0] & 1, bits[0]);
+        // The first payload bit is the byte's most significant, so the last of it sent.
+        assert_eq!(bytes[0] >> 7, bits[0]);
         let back: Vec<u8> = bytes
             .iter()
-            .flat_map(|b| (0..8).map(move |i| (b >> i) & 1))
+            .flat_map(|b| (0..8).map(move |i| (b >> (7 - i)) & 1))
             .collect();
         let mut padded = bits.clone();
         padded.resize(32, 0);
         assert_eq!(back, padded);
         assert_eq!(hdlc_bytes_to_payload(&bytes), padded);
+    }
+
+    /// The order on air, from frames received off air (2026-11-15): a class A position
+    /// report's first frame byte is its type in the top six bits and the repeat indicator
+    /// below, so a type 1 with repeat 0 starts 0x04 and a type 3 starts 0x0c. Read the
+    /// other way round, every type 3 off air came out as a type 12 of noise.
+    #[test]
+    fn a_frame_byte_holds_its_payload_bits_most_significant_first() {
+        let bits = position_report_bits(503_000_001, -27.3842, 153.1175, 12.3, 45.0);
+        let bytes = payload_to_hdlc_bytes(&bits);
+        assert_eq!(bytes.len(), 21);
+        assert_eq!(bytes[0] >> 2, 1, "{:#04x}", bytes[0]);
+        // A deframed type 3 header (type 3, repeat 0, then the top of an MMSI).
+        let msg = decode(&hdlc_bytes_to_payload(&{
+            let mut f = bytes.clone();
+            f[0] = 0x0c | (f[0] & 0x03);
+            f
+        }))
+        .unwrap();
+        assert_eq!(msg.msg_type, 3);
+        assert_eq!(msg.mmsi, 503_000_001);
     }
 
     #[test]

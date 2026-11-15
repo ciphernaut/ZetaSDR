@@ -608,6 +608,22 @@ fn the_rows_thin_their_tracks_as_planned() {
     }
 }
 
+/// AIS runs one decoder per channel and a vessel alternates between the two, so the row
+/// merges on `mmsi`: one row per vessel across both jobs, not one per channel.
+#[test]
+fn ais_merges_a_vessel_across_its_two_channels() {
+    let reg = ModeRegistry::load(&stages(), None);
+    let row = &reg
+        .all()
+        .iter()
+        .find(|m| m.row.id.0 == "ais_decode")
+        .unwrap()
+        .row;
+    let sub = row.subject.as_ref().unwrap();
+    assert_eq!(sub.key, "mmsi");
+    assert_eq!(sub.merge, ["mmsi"]);
+}
+
 #[test]
 fn the_rows_name_the_planned_subjects() {
     type Plan = (

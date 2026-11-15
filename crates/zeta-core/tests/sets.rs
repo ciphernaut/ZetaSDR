@@ -169,7 +169,13 @@ fn the_builtin_sets_parse_validate_and_are_ready() {
     let sets = load(None);
     assert_eq!(
         sets.ids(),
-        ["airband", "airband_vhf", "airband_vhf_and_sos", "pagers_au"]
+        [
+            "airband",
+            "airband_vhf",
+            "airband_vhf_and_sos",
+            "ais",
+            "pagers_au"
+        ]
     );
     for s in sets.all() {
         assert_eq!(s.state, SetState::Ready, "{s:?}");
@@ -192,6 +198,28 @@ fn pagers_au_stays_on_148_5_mhz_and_names_the_spur() {
     let notes = &pagers.set.notes;
     assert!(
         notes.contains("148.500 MHz") && notes.contains("spur") && notes.contains("b210"),
+        "{notes}"
+    );
+}
+
+/// ais is the `ais_vhf` plan stored: one role, one `plan_start` of `ais_decode` on every
+/// channel, and notes that steer away from a watch (a burst is too short for its detector).
+#[test]
+fn ais_is_the_ais_vhf_plan_with_ais_decode_on_one_radio() {
+    let sets = load(None);
+    let ais = sets.get("ais").unwrap();
+    assert_eq!(ais.file, "sets/ais.json");
+    let roles: Vec<&str> = ais.set.radios.iter().map(|(r, _)| r.as_str()).collect();
+    assert_eq!(roles, ["radio"]);
+    assert_eq!(ais.set.members.len(), 1);
+    let m = serde_json::to_value(&ais.set.members[0]).unwrap();
+    assert_eq!(m["op"], "plan_start", "{m}");
+    assert_eq!(m["plan"], "ais_vhf", "{m}");
+    assert_eq!(m["kind"], "ais_decode", "{m}");
+    assert!(m["channels"].is_null(), "{m}");
+    let notes = &ais.set.notes;
+    assert!(
+        notes.contains("Not a watch") && notes.contains("ships"),
         "{notes}"
     );
 }
@@ -450,7 +478,13 @@ async fn set_list_lists_the_sets_with_their_members_and_no_instance() {
     let ids: Vec<&str> = sets.iter().map(|s| s.id.as_str()).collect();
     assert_eq!(
         ids,
-        ["airband", "airband_vhf", "airband_vhf_and_sos", "pagers_au"]
+        [
+            "airband",
+            "airband_vhf",
+            "airband_vhf_and_sos",
+            "ais",
+            "pagers_au"
+        ]
     );
     let airband = &sets[0];
     assert_eq!(airband.state, SetState::Ready);
@@ -480,7 +514,7 @@ async fn set_list_lists_the_sets_with_their_members_and_no_instance() {
     assert!(airband.members.iter().all(|m| !m.summary.is_empty()));
     assert!(sets.iter().all(|s| s.running.is_none()));
     // A read: the JSON names every field.
-    let v = serde_json::to_value(&sets[3]).unwrap();
+    let v = serde_json::to_value(&sets[4]).unwrap();
     assert_eq!(v["running"], serde_json::Value::Null, "{v}");
     assert_eq!(v["members"][0]["kind"], "watch", "{v}");
 }
@@ -491,7 +525,13 @@ async fn a_node_without_a_sets_dir_lists_the_builtins() {
     let node = open(dir.path(), None).await;
     assert_eq!(
         node.sets().ids(),
-        ["airband", "airband_vhf", "airband_vhf_and_sos", "pagers_au"]
+        [
+            "airband",
+            "airband_vhf",
+            "airband_vhf_and_sos",
+            "ais",
+            "pagers_au"
+        ]
     );
 
     // With an operator directory, its sets are listed beside the built-ins.
@@ -513,6 +553,7 @@ async fn a_node_without_a_sets_dir_lists_the_builtins() {
             "airband",
             "airband_vhf",
             "airband_vhf_and_sos",
+            "ais",
             "mine",
             "pagers_au"
         ]

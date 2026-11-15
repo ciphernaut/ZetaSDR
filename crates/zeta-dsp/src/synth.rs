@@ -914,7 +914,7 @@ const AIS_NAME_MAX: usize = 20;
 const AIS_REPEAT_MAX: u32 = 60;
 
 /// One AIS frame's line levels: the training, then the HDLC frame (flags and stuffing
-/// from [`hdlc_frame_bits`]) of the payload's bytes least significant bit first with the
+/// from [`hdlc_frame_bits`]) of the payload's bytes (eight bits each, the first the most significant) with the
 /// CRC-16/X.25 appended little-endian, as [`ax25_ui_frame`] appends it; NRZI-encoded.
 fn ais_frame_levels(payload: &[u8]) -> Vec<u8> {
     let mut frame = crate::ais_msg::payload_to_hdlc_bytes(payload);

@@ -257,9 +257,11 @@ One stage, `ais_decode`, IQ in, `event` out (the anti-goal in section 2 rules ou
 would carry). Inside: `nbfm_demod` discriminator (deviation 2400 Hz: GMSK with modulation index
 0.5 at 9600 baud), a low-pass at 0.6 of the symbol rate, a bit clock at 9600 baud pulled by the
 transitions as `Afsk1200Demod` does, NRZI decode, `HdlcDeframer`, then each frame's bytes
-bit-reversed (HDLC sends bytes least significant bit first, the AIS payload is read most
-significant bit first; the convention is pinned by the self-check in section 12 and by the
-published sentence in `nmea.rs`'s test) and parsed by a new library module `ais_msg.rs`:
+unpacked most significant bit first (HDLC sends bytes least significant bit first and the
+deframer rebuilds them so; the AIS payload is each byte read most significant bit first. As
+first built the bytes were unpacked least significant bit first, which the self-check in
+section 12 could not catch since the generator mirrored it: corrected 2026-11-15 from frames off
+air, see `2026-11-15-ais-set-design.md`) and parsed by a new library module `ais_msg.rs`:
 
 - message types 1, 2, 3 (class A position), 4 (base station), 5 (class A static and voyage), 18
   (class B position), 21 (aid to navigation), 24 (class B static, parts A and B: class B boats
@@ -312,7 +314,7 @@ twenty lines and the acceptance in section 12 wants both channels).
 Family `ais`: `{ "mmsi": 503000001, "lat": -27.3842, "lon": 153.1175, "sog_kt": 12.3,
 "cog_deg": 45.0, "name": "ZETA TEST" | null, "repeat": 3 }`. It builds a type 1 position report
 (168 bits) and, with `name`, a type 5 static report after it; each frame is 24 bits of training
-(`0101...`), the start flag, the payload bytes least significant bit first, the CRC-16/X.25, the end
+(`0101...`), the start flag, the payload bytes (each sent least significant bit first), the CRC-16/X.25, the end
 flag (`hdlc_frame_bits`), NRZI (`nrzi_encode`), GMSK at 9600 baud and 2400 Hz deviation
 (`gfsk_modulate`; AIS transmitters use BT 0.4, the receiver filter is 0.5: builder's call whether
 `gfsk_modulate` gains a `bt` argument), 26.7 ms slots at 48 kHz, `repeat` frames `gap_ms` apart.

@@ -1,0 +1,12 @@
+{
+  "id": "ais",
+  "name": "AIS vessel traffic",
+  "notes": "AIS on both channels (161.975 MHz, channel A, and 162.025 MHz, channel B) in one capture of one radio: one `ais_decode` per channel through the `ais_vhf` plan. Start this one to decode AIS or to track ships: vessels land in the Subjects table and on the map, keyed by MMSI. Not a watch: an AIS message is one burst of about 27 ms, too short for a watch's detector to announce, so a watch on these channels starts no decoder.",
+  "radios": {
+    "radio": {"note": "a radio that captures 161.9625-162.0375 MHz at once (75 kHz)"}
+  },
+  "members": [
+    {"id": "ais", "radio": "radio", "op": "plan_start", "plan": "ais_vhf", "channels": null,
+     "kind": "ais_decode", "deviation_hz": null, "sideband": null, "attach": null, "language": null}
+  ]
+}

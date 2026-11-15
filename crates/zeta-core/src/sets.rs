@@ -23,7 +23,7 @@ use crate::stage::StageRegistry;
 use crate::types::Hz;
 
 /// The embedded sets, one file each under `sets/` in the repo.
-const EMBEDDED: [(&str, &str); 4] = [
+const EMBEDDED: [(&str, &str); 5] = [
     (
         "sets/airband.json",
         include_str!("../../../sets/airband.json"),
@@ -36,6 +36,7 @@ const EMBEDDED: [(&str, &str); 4] = [
         "sets/airband_vhf_and_sos.json",
         include_str!("../../../sets/airband_vhf_and_sos.json"),
     ),
+    ("sets/ais.json", include_str!("../../../sets/ais.json")),
     (
         "sets/pagers_au.json",
         include_str!("../../../sets/pagers_au.json"),
