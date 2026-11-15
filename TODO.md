@@ -667,6 +667,35 @@ From the operator, 2026-11-07. SatNOGS (Libre Space Foundation) is the open netw
 
 Antenna caveat: the field host's 2 m / 70 cm vertical hears strong LEO passes only. Spec first; layer 1 is a plan on its own.
 
+## Feature: SatDump as an external decoder
+
+From the operator, 2026-11-15. SatDump is the satellite data suite: a few hundred pipelines (weather imagery, Inmarsat, Orbcomm) defined as JSON, GPL-3.0, C++ only with no C API or bindings. It fits as an operator-installed program a row feeds live IQ on stdin, as `dvbt_decode` runs `dvbt-rx`; it is never linked or shipped (`docs/licensing.md`). Nothing was run: the facts are read from SatDump's repository and the other projects' sources, and SatDump's docs site was unreachable.
+
+What the others did:
+
+- **OpenWebRX+** pipes live cf32 into `satdump live <pipeline> <dir> --source file --file_path /dev/stdin --samplerate N --frequency F --baseband_format f32`, for Meteor LRPT (150 kS/s), Elektro LRIT (400 kS/s) and NOAA APT, labelled for experts only. This is the form a program row can run.
+- **SatNOGS stations and Ground Station** record the pass as IQ and run the offline pipeline on the file afterwards (`satdump <pipeline> baseband <file> <dir> --samplerate N --baseband_format s16`).
+- **raspberry-noaa-v2 and autotrack stations** let SatDump own the radio, with its own TLEs, schedule, Doppler and rotator control. The lease model rules this out here.
+- **SDR++ and SDRangel** have their own decoders and do not call SatDump. Nobody links it as a library.
+- SatDump also takes live IQ over rtl_tcp, SpyServer and raw cf32 on UDP or nng (`net_source`); no third-party server was found feeding it so, and the node serves none of these.
+
+What a row lacks today:
+
+- **Images and products.** SatDump writes PNGs, a `dataset.json` and a `product.cbor` per instrument into a directory, and a program row's output is text lines only. This is the gap the DVB-T gist records for pictures: one stored-artefact path (kept in the state directory, served by id as captures are, listed on the page) could serve both.
+- **Status.** Lock, BER and frame counts come from `--http_server` (`GET /api`, JSON), not from stdout, so a row needs a small wrapper or a way to poll a program's status port. What SatDump prints on stdout is unchecked.
+- **Passes.** No TLEs, pass prediction or Doppler following exist: layer 1 of the SatNOGS gist above. SatDump's `--timeout` ends a live run; whether the row's job should end with the pass or be started by a pass job is open.
+- **Versions.** 1.2.2 (2024-11) is the last stable release. The 2.0 alpha moved live mode to `satdump legacy live` and marks its stats and timeout partly broken; the offline form became `satdump pipeline ...`. Target 1.2.2 and keep the arguments in the row.
+- **A check for each row.** A recorded fixture, or the offline pipeline on one. Whether the offline form reads a FIFO is unconfirmed (the 1.2.2 file reader uses the file size).
+- **Rows from SatDump's own list.** The pipeline files carry names, frequencies and default sample rates, so rows could be generated from them; many of the files hold comments a strict JSON parser refuses.
+
+What is on air in 2026, to order the rows:
+
+- **137 MHz:** Meteor-M N2-3 and N2-4 LRPT only. NOAA-15, 18 and 19 were decommissioned in 2025, so APT is over and the APT entries in the digital-modes and SatNOGS gists serve recordings only.
+- **L-band with a patch antenna:** Inmarsat STD-C and Aero. Their output is text, so these rows may need no image path and could come first.
+- **L-band with a dish:** GOES and Elektro HRIT, then Meteor and Metop HRPT, which need tracking.
+
+Spec first. The first question is the target: a text row (Inmarsat) proves the program and its status with no new output, an image row (Meteor LRPT) needs the artefact path.
+
 ## Worker: a deployed worker's restart count ran into the thousands
 
 Found by the sweep spike on the field host's B210 (plan 36, spec section 8, item 5): the deployed node's worker record for the radio showed 2395 restarts. The cause was not looked into. Read the worker's own stderr lines in the journal (prefixed `zeta-soapy-worker[<id>]: `) and the node's `soapy worker for <id>:` lines to see whether the count is a driver crash loop, the clock guard's stream restarts or a respawn loop on a faulted device, and when it climbs; plan 36.1 ships the worker's new protocol and ring, so measure the count again after the deploy first.
