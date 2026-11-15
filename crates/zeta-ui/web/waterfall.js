@@ -8,9 +8,11 @@
 //     wf.setSource(sourceInfo)  a `source_list` record (or null). Reuses a running `spectrum`
 //         job on that source from `job_list` (an elastic one first), else starts one, `elastic: true` (spec 4.1: it
 //         follows the capture, holds no lease, never conflicts and is relaunched by the node
-//         under the same id, with new streams, on every retune), on the source's `current`
-//         band (its whole capture) or, when `current` is null, on the centre of its tune range
-//         with its max_bandwidth_hz. While a `scan` job runs on the source, the waterfall follows
+//         under the same id, with new streams, on every retune), on the capture this tab last
+//         showed on the source (`lastCapture`: after a scan that borrowed the radio the tab
+//         comes back to where it was), else on the source's `current` band (its whole capture)
+//         or, when `current` is null, on the centre of its tune range with its
+//         max_bandwidth_hz. While a `scan` job runs on the source, the waterfall follows
 //         that job instead and starts none (scan mode, below); a stepped scan waiting for the
 //         source (`context.scan.waiting`: it gave way to another request) is not followed. UI-started job ids go in
 //         sessionStorage[UI_JOBS_KEY]; they are stopped on `pagehide` (fetch keepalive, with
@@ -655,6 +657,7 @@ class Waterfall {
     this.band = null; // the capture {lo, hi} Hz (a scan: its span)
     this.view = null; // the sub-range shown {lo, hi}, null for the whole band
     this.pendingView = null; // the view to apply when the band is next set (a retune)
+    this.lastCapture = null; // {src, center_hz, bandwidth_hz}: the last capture shown (setBand)
     this.retuning = false;
     this.coarseActive = null;
     this.coarseCan = null;
@@ -788,6 +791,9 @@ class Waterfall {
     // A restart on the same source keeps the band shown as the view until the band is known
     // again (or for good when the restart fails): the coarse layer goes on painting across it.
     const keep = restart && src && this.src && src.id === this.src.id ? this.shown() : null;
+    // A new record (the source selected, the page's own retune answered) says where the
+    // radio is; the same record again (a restart) is as old as its selection.
+    if (src !== this.src) this.lastCapture = null;
     this.src = src;
     this.clear();
     if (keep) {
@@ -1023,7 +1029,13 @@ class Waterfall {
       if (this.tuning) this.setBand(this.tuning.center_hz, this.tuning.bandwidth_hz);
       return running.id;
     }
-    const band = sourceBand(src);
+    // The capture this tab last showed on the source since `src` was handed over: `src` is
+    // the record of that moment, and on a restart after a scan that borrowed the radio
+    // (another tab's, a manual one) its `current` is where the radio was back then.
+    const last = this.lastCapture && this.lastCapture.src === src ? this.lastCapture : null;
+    const band = last
+      ? { center_hz: Math.round(last.center_hz), bandwidth_hz: Math.round(last.bandwidth_hz) }
+      : sourceBand(src);
     if (!band) throw new Error("no tuning or tune range to show");
     let r;
     try {
@@ -1213,6 +1225,11 @@ class Waterfall {
   // already known that changes outside scan mode is the capture moving (captureMoved), unless
   // it is the band a `source_list` move left behind (late rows of the old capture).
   setBand(centerHz, spanHz) {
+    // Remembered only for the job being followed: while a source is being selected
+    // (`jobId` null) a late row of the source just left must not pass for this one's capture.
+    if (this.mode === "spectrum" && this.src && this.jobId) {
+      this.lastCapture = { src: this.src, center_hz: centerHz, bandwidth_hz: spanHz };
+    }
     const lo = centerHz - spanHz / 2;
     const hi = centerHz + spanHz / 2;
     const next = { lo, hi };

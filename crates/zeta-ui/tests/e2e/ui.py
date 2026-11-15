@@ -929,9 +929,11 @@ def scenario_zoom_beyond_capture_on_a_file_source_shows_out_of_range(page, url, 
 
 
 def scenario_zoom_on_held_source_shows_conflict(page, url, secret):
-    # A rigid job holds the shown source: zooming out never retunes it. Under zoom_out scan the
-    # view leaves the capture and the coarse layer scans it on the scanner; under none the
-    # view stays inside the capture with a conflict line.
+    # A rigid job holds the shown source: zooming out never retunes it, and under `scanner
+    # auto` no other radio is borrowed for the view (a free `scanner` stays untouched): the
+    # view stays inside the capture with a conflict line. With a scanner named, under zoom_out
+    # scan, the view leaves the capture and the coarse layer scans it there; under none the
+    # view stays inside the capture with a conflict line again.
     stop_scans(url, secret)
     fresh_spectrum_jobs(url, secret)
     job = start_job(url, secret, "measure", "wfm", 104_900_000, 10_000)
@@ -941,6 +943,15 @@ def scenario_zoom_on_held_source_shows_conflict(page, url, secret):
                                timeout=15_000)
         before = ticks(page)
         wheel_at_centre(page, 100)
+        held = page.locator("#transcript .line", has_text="conflict: source wfm held by")
+        expect(held.first).to_be_visible()
+        wait_ticks(page, before[0], before[4], "the view stays at the held capture")
+        page.wait_for_timeout(1_000)
+        assert running_scan_jobs(url, secret, "scanner") == [], "auto borrowed another radio"
+        said = held.count()
+        run_cmd(page, "view set scanner scanner")
+        expect(view_line(page, "scanner = scanner")).to_be_visible()
+        wheel_at_centre(page, 100)
         wait_ticks(page, "105.140", "104.660", "the view leaves the held capture")
         scans = wait_until(lambda: running_scan_jobs(url, secret, "scanner"), 3.0,
                            "an automatic scan on scanner beside the held wfm")
@@ -949,13 +960,12 @@ def scenario_zoom_on_held_source_shows_conflict(page, url, secret):
         wait_ticks(page, before[0], before[4], "back inside the held capture")
         wait_until(lambda: not running_scan_jobs(url, secret, "scanner"), 3.0,
                    "the automatic scan stopped")
-        assert page.locator("#transcript .line", has_text="conflict: source wfm").count() == 0
+        assert held.count() == said, "a conflict line with a scanner named"
         run_cmd(page, "view set zoom_out none")
         expect(view_line(page, "zoom_out = none")).to_be_visible()
         wheel_at_centre(page, 100)
-        line = page.locator("#transcript .line", has_text="conflict: source wfm held by")
-        expect(line.first).to_be_visible()
-        expect(line.first).to_contain_text(job)
+        expect(held).to_have_count(said + 1)
+        expect(held.first).to_contain_text(job)
         wait_ticks(page, before[0], before[4], "view not reverted")
         page.wait_for_timeout(1_000)
         assert ensure_lines(page) == 0, "source_ensure issued on a source held by another job"
@@ -2070,12 +2080,16 @@ def scenario_source_pin_unpin_and_gain_commands(page, url, secret):
 
 
 # ---- automatic scans on the scanner source (plan 11 Task 6) ---------------------------------
-# A view past the fine capture starts the page's own scan on a free source (`scanner`, the only
-# free source whose range holds 100 MHz); a scan the page did not start is never touched.
+# A view past the fine capture starts the page's own scan on the tab's scanner: the shown source
+# under `scanner auto`, the source named otherwise (`scanner` here, whose range holds 100 MHz);
+# a scan the page did not start is never touched.
 
 def zoom_tone_out(page, url, secret):
-    """Show `tone` and zoom x2 out past its capture (the caller stopped stray scans)."""
+    """Show `tone`, name `scanner` as the tab's scanner (auto never borrows another radio)
+    and zoom x2 out past the capture (the caller stopped stray scans)."""
     show_tone_waterfall(page, url, secret)
+    run_cmd(page, "view set scanner scanner")
+    expect(view_line(page, "scanner = scanner")).to_be_visible()
     page.wait_for_function("() => window.zetaTest.wf().painted > 5")
     wait_ticks(page, "100.024", "99.976", "before zooming")
     wheel_at_centre(page, 100)
@@ -2114,6 +2128,22 @@ def scenario_zoom_out_starts_and_stops_an_auto_scan(page, url, secret):
         zoom_tone_in(page)
         wait_until(lambda: stopped(url, secret, own["id"]), 3.0, "the automatic scan stopped")
         assert running_scan_jobs(url, secret, "scanner") == [], "a scan still runs on scanner"
+    finally:
+        stop_scans(url, secret)
+
+
+def scenario_auto_scanner_never_borrows_another_radio(page, url, secret):
+    # A tab's operations run on its own radio: under `scanner auto` a view past the capture of
+    # a free shown source starts nothing on another radio, though `scanner` is free and its
+    # range holds the view.
+    stop_scans(url, secret)
+    try:
+        show_tone_waterfall(page, url, secret)
+        page.wait_for_function("() => window.zetaTest.wf().painted > 5")
+        assert "scanner auto" in view_show(page)
+        wheel_at_centre(page, 100)
+        page.wait_for_timeout(1_500)
+        assert running_scan_jobs(url, secret, "scanner") == [], "auto borrowed another radio"
     finally:
         stop_scans(url, secret)
 
@@ -2825,6 +2855,8 @@ def scenario_auto_scan_is_followed_after_failed_stream_lookups(page, url, secret
     stop_scans(url, secret)
     try:
         show_tone_waterfall(page, url, secret)
+        run_cmd(page, "view set scanner scanner")
+        expect(view_line(page, "scanner = scanner")).to_be_visible()
         page.wait_for_function("() => window.zetaTest.wf().painted > 5")
         page.route("**/streams", lambda r: r.abort())
         wheel_at_centre(page, 100)

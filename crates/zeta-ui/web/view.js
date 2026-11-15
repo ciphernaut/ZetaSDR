@@ -11,7 +11,7 @@
 //         zoom_out         scan | none (default scan)
 //         auto_scan_stop   inside | keep (default inside)
 //         finished_rows_s  a non-negative integer of seconds, 0 = never shown (default 60)
-//         scanner          auto | a source id (default auto)
+//         scanner          auto (the shown source) | a source id (default auto; coarse.js)
 //         plan             auto | none | a loaded channel plan id (default auto; plans.js)
 //         main             rf | map (default rf): what #main shows, the waterfall or the map
 //                          (app.js applyMain; the Map tab of the sources strip sets it); a
@@ -185,7 +185,7 @@ export const POLICIES = [
     key: "scanner",
     parse: (t) => (SOURCE_ID.test(t) ? t : undefined),
     default_: "auto",
-    describe: "auto, a source id",
+    describe: "auto (the shown source), a source id",
   },
   {
     key: "plan",

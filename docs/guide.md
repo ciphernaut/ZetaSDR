@@ -643,9 +643,12 @@ does not shrink the view; one outside it retunes the radio and the page's job fo
 meets offers "stop <kind> <id> and retry" (on a pinned source, `unpin <src> and retry`). Finished rows leave the job list after a while.
 
 Two layers sit in the waterfall: the fine capture of the source, and, when the view is zoomed out
-past it on a source with a scanner (a second source with a wider tune range, or a file source with
-`--source-file ID=PATH,tune_min_hz=N,tune_max_hz=M`), a coarse layer from an automatic `scan`
-drawn underneath. Rigid bands are outlined. The scan is started about 300 ms after the last zoom
+past it, a coarse layer from an automatic `scan` drawn underneath. A tab's scan runs on its own
+radio: under `scanner auto` the shown source scans for itself when no job or pin holds it, and
+another radio is never borrowed, so what a tab shows, selects and starts is always its own
+source's. `view set scanner <id>` names another source as this tab's scanner (a second radio with
+a wider tune range, or a file source with `--source-file ID=PATH,tune_min_hz=N,tune_max_hz=M`):
+the coarse rows are then that source's, while selections and jobs stay the shown source's. Rigid bands are outlined. The scan is started about 300 ms after the last zoom
 or pan, spans the visible range clamped to the scanner's tune range, is replaced when the span
 changes and stopped when the view returns inside the fine capture. A scan the page did not start
 is never touched.
@@ -690,7 +693,7 @@ View policies shape this, set from the command line and kept in the tab's `sessi
 | `zoom_out` | `scan`, `none` |
 | `auto_scan_stop` | `inside` (stop when back inside the capture), `keep` |
 | `finished_rows_s` | seconds a finished job stays listed, `60`; `0` never shows them |
-| `scanner` | `auto`, or a source id |
+| `scanner` | `auto` (the shown source, when nothing holds it), or a source id (that source scans for this tab) |
 | `theme` | a ready theme's id, set on `<html data-theme>`: the built-ins `console` (default), `plain` (tags on the outlines, level ribbons), `cyberpunk`, `terminal`, `psytrance`, `vibecoder` (the light one), and any operator theme in `--themes-dir` (`zeta themes list`; `docs/themes.md` is the author's guide) |
 | `side` | `both`, `transcript`, `jobs`, `none`: which of the side panes show |
 | `dock` | `auto` (the theme's `layout.dock`, else `bottom`), `bottom` (the selected pane under the waterfall or map), `right` (the selected pane as a third folding section of the side column) |

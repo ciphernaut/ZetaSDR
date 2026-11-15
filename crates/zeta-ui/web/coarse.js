@@ -11,16 +11,17 @@
 //       Listens to wf.onView ({lo, hi, outside}) and view.onChange (zoom_out, auto_scan_stop,
 //       scanner). SCAN_DEBOUNCE_MS after the last change, with the view outside the fine
 //       capture and zoom_out "scan", it chooses the scanner (view.get("scanner")):
-//         auto   the first source in `source_list` order that is not the shown one, is not
-//                faulted, has no rigid holder (a running scan holding it, the page's own or a
-//                manual one, is not rigid; a `pin` is) and whose tune range contains the
-//                view's centre; else the shown source itself when it has no rigid holder
-//                (a running scan is none, the page's own included) and no pin (the
-//                shown-source fallback: the scan stops the page's elastic job, which
-//                restarts when it ends); a source whose `capabilities.sweep` holds
-//                the view sweeps it for itself and is a scanner whatever holds or pins it,
-//                the shown one included (plan 36.2: no lease, the node decides)
-//         <id>   that source, as given
+//         auto   the shown source, never another: a tab's operations run on its own radio.
+//                It scans when it is not faulted and has no rigid holder (a running scan
+//                holding it, the page's own or a manual one, is not rigid; a `pin` is): the
+//                scan stops the page's elastic job, which restarts when it ends. A shown
+//                source whose `capabilities.sweep` holds the view sweeps it for itself and
+//                is the scanner whatever holds or pins it (plan 36.2: no lease, the node
+//                decides). A shown source that is held has no scanner: the view stays at
+//                its capture
+//         <id>   that source, as given: the one way another radio paints this tab's wide
+//                view (its rows are that radio's, while selections and jobs stay the shown
+//                source's)
 //       The span is the view clamped to the scanner's tune_min_hz..tune_max_hz. A manual scan
 //       (one not in sessionStorage[AUTO_SCAN_KEY]) running on the scanner is followed
 //       read-only and nothing is started. Otherwise the page's scan is started:
@@ -362,18 +363,10 @@ class Coarse {
     const scans = new Set(jobs.filter((j) => j.kind === "scan" && isRunning(j)).map((j) => j.id));
     if (this.scanJobId) scans.add(this.scanJobId);
     const rigid = (s) => rigidHolders(s).filter((h) => !scans.has(h));
-    const centre = (v.lo + v.hi) / 2;
     // A source that sweeps the view itself is a scanner whatever holds or pins it.
     const sweeps = (s) => !s.fault && sweepsItself(s, v.lo, v.hi);
-    const other = srcs.find((s) => {
-      if (s.id === shown || s.fault) return false;
-      if (sweeps(s)) return true;
-      if (rigid(s).length) return false;
-      const r = tuneRange(s);
-      return !!r && r.lo <= centre && centre <= r.hi;
-    });
-    if (other) return other;
-    // The shown source itself when nothing but a scan holds it (the page's own included).
+    // The shown source, never another radio (a tab's scan runs on its own radio), when
+    // nothing but a scan holds it (the page's own included).
     const self = srcs.find((s) => s.id === shown);
     if (self && (sweeps(self) || (!self.fault && rigid(self).length === 0))) {
       return self;
