@@ -113,18 +113,28 @@
 //! **The framer.** It searches the four syncs and takes the rest of a burst by position:
 //! each dibit's [`SoftDibit::at`], never a count of dibits, since the front end gives held
 //! symbols out late and a handheld's bursts each start a fresh acquisition. The symbol
-//! period is measured from the spacing of the dibits' positions. A repeater's burst takes
-//! its slot from the CACH before it; a handheld's has none (`slot` is `None`).
+//! period is measured from the spacing of the dibits' positions. A handheld's burst has no
+//! slot (`slot` is `None`).
+//! - **A repeater's slots.** The first sync takes its slot from the CACH's TC. Once both
+//!   slots are timed (below), a sync's slot is the grid's: the slot whose bursts fall within
+//!   a few symbols of it. A TACT is a Hamming (7,4) word, and that code is perfect, so two
+//!   wrong bits decode to a wrong word that can name the other slot; a misread TC must not
+//!   move a slot's timing or end its call. Only when the TC names the other slot on three
+//!   syncs running (`GRID_OVERRIDE_SYNCS`) is it trusted and the grid rebuilt from it, so a
+//!   repeater that was re-timed is followed.
 //! - **The flywheel.** Any sync sets its slot's timing, and on a repeater the other slot's
 //!   too (half a period off, its slot the other one). From then on each slot's bursts are
 //!   read every 60 ms by position, with or without a burst A. A burst there with no sync
-//!   is reported as voice only when its EMB decodes, names the slot's colour code and, once
-//!   the superframe's phase is known, carries the LCSS of its letter (B first, C and D
-//!   continuation, E last, F single). In a superframe whose burst A was not heard, its
-//!   embedded bits must also be the known link control's (or burst F's null message), so
-//!   noise after a call is not taken for voice. A slot's timing is dropped after two
-//!   superframes with neither a sync nor a valid EMB; after a data burst other than a
-//!   header no voice is read without a new sync.
+//!   is reported as voice only when its EMB decodes, names the colour code (on a repeater,
+//!   either slot's: a repeater has one) and, once the superframe's phase is known, carries
+//!   the LCSS of its letter (B first, C and D continuation, E last, F single). In a
+//!   superframe whose burst A was not heard it must also, with a link control in hand,
+//!   carry that link control's fragment for its letter or, the phase unknown, for the place
+//!   its LCSS names (burst F's: the null message), within 4 of 32 bits; with no link control
+//!   in hand, its EMB must decode with no bit corrected. So noise after a call is not taken
+//!   for voice. A slot's timing is kept alive only by a sync or an EMB as sent (not by one
+//!   the code corrected) and dropped after two superframes without either; after a data
+//!   burst other than a header no voice is read without a new sync.
 //! - **Colour code.** Learnt from a slot type, or from an EMB that decoded with no bit
 //!   corrected, never from one the code corrected, since the code turns about a quarter of
 //!   all words into a valid one.
@@ -286,6 +296,11 @@ const KEPT_FRAGMENTS: usize = 8;
 /// The letters a cross-boundary assembly may end on: B (C, D, E then B) and D (E then B, C,
 /// D). Not C: D, E then B, C can mix two link controls (module doc).
 const CROSS_BOUNDARY_ENDS: [usize; 2] = [1, 3];
+/// Repeater syncs running whose CACH names the other slot than the timing grid before the
+/// grid is rebuilt from the CACH: three, so one or two misread TACTs (both slots' syncs
+/// count) never move a slot, and a repeater that was re-timed is followed within about
+/// 90 ms of its idle bursts.
+const GRID_OVERRIDE_SYNCS: usize = 3;
 /// Each burst's LCSS by its letter, A to F (A has a sync, not an EMB).
 const EXPECTED_LCSS: [Option<u8>; VOICE_BURSTS] = [
     None,
@@ -342,7 +357,7 @@ pub type AmbeSoft = [u8; AMBE_FEED_BYTES];
 pub enum DmrContent {
     VoiceHeader(Option<FullLc>),
     /// A voice burst: `first` for burst A (the sync); `lc` the embedded link control, on
-    /// the burst that completes it (E, or, while the call's is not yet in hand, B, C or D
+    /// the burst that completes it (E, or, while the call's is not yet in hand, B or D
     /// across a superframe's boundary); `pi` the EMB's PI bit (`false` on burst A, which has
     /// no EMB), the pre-emption and power control indicator, not an encryption mark;
     /// `errors` the bits corrected by the EMB's code, the embedded link control's and the
@@ -525,7 +540,8 @@ impl Track {
     /// the bits it corrected, and the link control it completes with the bits that took.
     /// `None` when the EMB does not decode, names another colour code than `known`, or does
     /// not fit the burst's letter; in a superframe whose burst A was not heard, when the
-    /// embedded bits are not the known link control's (or burst F's null message).
+    /// embedded bits are not the known link control's fragment (or burst F's null message)
+    /// or, with no link control in hand, when the EMB needed a correction.
     fn flywheel(
         &mut self,
         bits: &[u8; BURST_BITS],
@@ -538,36 +554,54 @@ impl Track {
         }
         let lcss = (data & 3) as u8;
         let embedded = &bits[HALF_BITS + EMB_HALF_BITS..][..EMBEDDED_BITS];
-        match self.letter(period) {
-            Some(letter) => {
-                if EXPECTED_LCSS[letter] != Some(lcss) {
-                    return None;
-                }
-                if !self.anchored(period)
-                    && let Some(lc) = self.lc
-                {
-                    let want = match letter {
-                        1..=4 => embedded_encode(&lc_bytes(&lc))[letter - 1],
-                        _ => [0; EMBEDDED_BITS],
+        let letter = self.letter(period);
+        if letter.is_some_and(|l| EXPECTED_LCSS[l] != Some(lcss)) {
+            return None;
+        }
+        if !self.anchored(period) {
+            match self.lc {
+                // The embedded bits must be the link control's fragment for the letter or, the
+                // phase unknown, for the place the LCSS names (burst F's: the null message).
+                Some(lc) => {
+                    let fragments = embedded_encode(&lc_bytes(&lc));
+                    let places: &[usize] = match (letter, lcss) {
+                        (Some(l @ 1..=4), _) => &[l - 1][..],
+                        (Some(_), _) | (None, LCSS_SINGLE) => &[EMB_LC_FRAGMENTS][..],
+                        (None, LCSS_FIRST) => &[0][..],
+                        (None, LCSS_LAST) => &[3][..],
+                        (None, _) => &[1, 2][..],
                     };
-                    let differ = embedded
-                        .iter()
-                        .zip(want)
-                        .filter(|&(s, w)| u8::from(*s >= 128) != w)
-                        .count();
-                    if differ > UNANCHORED_MAX_DIFFER {
+                    let matches = |place: &usize| {
+                        let want = fragments.get(*place).copied().unwrap_or([0; EMBEDDED_BITS]);
+                        let differ = embedded
+                            .iter()
+                            .zip(want)
+                            .filter(|&(s, w)| u8::from(*s >= 128) != w)
+                            .count();
+                        differ <= UNANCHORED_MAX_DIFFER
+                    };
+                    if !places.iter().any(matches) {
                         return None;
                     }
                 }
+                // With nothing to compare, only an EMB as sent.
+                None if emb_errors != 0 => return None,
+                None => {}
             }
-            None => match lcss {
+        }
+        if letter.is_none() {
+            match lcss {
                 LCSS_FIRST => self.phase = Some(period - 1),
                 LCSS_LAST => self.phase = Some(period - 4),
                 _ => {}
-            },
+            }
         }
         self.state = TrackState::Voice;
-        self.last_good = period;
+        // Only an EMB as sent keeps the timing alive: the code turns about a quarter of all
+        // words into one it corrects.
+        if emb_errors == 0 {
+            self.last_good = period;
+        }
         let mut lc = None;
         if lcss != LCSS_SINGLE {
             self.fragments.push((period, embedded.to_vec()));
@@ -660,6 +694,8 @@ pub struct DmrFramer {
     /// The colour code learnt on each slot (no slot, 1, 2): from a slot type, or an EMB
     /// with no bit corrected.
     color_codes: [Option<u8>; 3],
+    /// Repeater syncs running whose CACH named the other slot than the grid's.
+    disagreements: usize,
 }
 
 impl DmrFramer {
@@ -816,6 +852,37 @@ impl DmrFramer {
         }
     }
 
+    /// The slot of a repeater's sync at `centre` whose CACH names slot `tc`. Once both slots
+    /// are timed the grid decides: the slot whose track has a burst within
+    /// [`SAME_BURST_SYMBOLS`] of the sync, since a TACT with two bits wrong decodes, the
+    /// Hamming (7,4) code being perfect, and can name the other slot. When the TC disagrees
+    /// with the grid on [`GRID_OVERRIDE_SYNCS`] syncs running, the TC is trusted and the grid
+    /// rebuilt from it: the repeater was re-timed.
+    fn repeater_slot(&mut self, tc: u8, centre: f64, sps: f64) -> u8 {
+        let period = SLOT_PERIOD_DIBITS as f64 * sps;
+        let on_grid = |t: &&Track| {
+            let periods = (centre - t.anchor) / period;
+            (periods - periods.round()).abs() * period <= SAME_BURST_SYMBOLS * sps
+        };
+        let timed = |t: &&Track| t.origin == Origin::Repeater && t.slot.is_some();
+        let tracks: Vec<&Track> = self.tracks.iter().filter(timed).collect();
+        let grid = match tracks.as_slice() {
+            [_, _] => tracks.iter().copied().find(on_grid).and_then(|t| t.slot),
+            _ => None,
+        };
+        let Some(grid) = grid.filter(|&g| g != tc) else {
+            self.disagreements = 0;
+            return tc;
+        };
+        self.disagreements += 1;
+        if self.disagreements < GRID_OVERRIDE_SYNCS {
+            return grid;
+        }
+        self.disagreements = 0;
+        self.tracks.retain(|t| t.origin != Origin::Repeater);
+        tc
+    }
+
     /// The burst at sync `i`.
     fn sync_burst(
         &mut self,
@@ -847,7 +914,10 @@ impl DmrFramer {
                 }
             }
         }
-        let slot = (origin == Origin::Repeater).then(|| (cach_tact(&cach).0 >> 2 & 1) + 1);
+        let slot = (origin == Origin::Repeater).then(|| {
+            let tc = (cach_tact(&cach).0 >> 2 & 1) + 1;
+            self.repeater_slot(tc, centre, sps)
+        });
         let at = centre - LEFT_DIBITS as f64 * sps;
         let k = self.track(slot, origin, centre, sps);
         let track = &mut self.tracks[k];
@@ -926,7 +996,11 @@ impl DmrFramer {
     fn flywheel_burst(&mut self, k: usize, centre: f64, sps: f64) -> Option<DmrBurst> {
         let (bits, _) = self.read(centre, sps);
         let key = slot_key(self.tracks[k].slot);
-        let known = self.color_codes[key];
+        // A repeater has one colour code: the other slot's stands in until this one's is heard.
+        let known = match key {
+            1 | 2 => self.color_codes[key].or(self.color_codes[3 - key]),
+            _ => self.color_codes[key],
+        };
         let track = &mut self.tracks[k];
         let period = track.next;
         track.next += 1;
@@ -1166,7 +1240,7 @@ fn call_bursts(cc: u8, lc: &FullLc, superframes: u32, origin: Origin) -> Vec<[u8
 /// and Flood, 2014) of `n`, its top 49 bits split 12, 12, 11 and 14. Varied from frame to
 /// frame so that no burst sits on one level, as speech's frames do not; it is not speech,
 /// and no codec made it.
-fn voice_payload(n: u32) -> [u16; 4] {
+pub(crate) fn voice_payload(n: u32) -> [u16; 4] {
     let z = splitmix64(u64::from(n));
     [
         (z >> 52) as u16 & 0xFFF,
@@ -2641,32 +2715,56 @@ mod tests {
         iq
     }
 
-    /// The bursts of `iq`, fed in uneven pieces as a stage would, the demodulator turned
-    /// when the framer says the polarity changed, flushed at the end.
-    fn receive(iq: &[Complex<f32>], framer: &mut DmrFramer) -> Vec<DmrBurst> {
-        let mut demod = Fsk4Demod::new(
-            48_000,
-            Fsk4Params {
-                symbol_rate_baud: DMR_BAUD,
-                deviation_hz: DMR_DEVIATION_HZ,
-                shape: Shape::Rrc {
-                    alpha: DMR_RRC_ALPHA,
+    /// A stage's receive path: the front end, the framer fed in uneven pieces, the front
+    /// end turned when the framer says the polarity changed.
+    struct Receiver {
+        demod: Fsk4Demod,
+        turned: bool,
+    }
+
+    impl Receiver {
+        fn new() -> Self {
+            let demod = Fsk4Demod::new(
+                48_000,
+                Fsk4Params {
+                    symbol_rate_baud: DMR_BAUD,
+                    deviation_hz: DMR_DEVIATION_HZ,
+                    shape: Shape::Rrc {
+                        alpha: DMR_RRC_ALPHA,
+                    },
                 },
-            },
-        )
-        .expect("rate");
-        let mut turned = false;
-        let mut bursts = Vec::new();
-        for chunk in iq.chunks(777) {
-            bursts.extend(framer.push(&demod.feed(chunk)));
-            if let Some(inverted) = framer.inverted()
-                && inverted != turned
-            {
-                demod.invert(inverted);
-                turned = inverted;
+            )
+            .expect("rate");
+            Receiver {
+                demod,
+                turned: false,
             }
         }
-        bursts.extend(framer.push(&demod.flush()));
+
+        fn feed(&mut self, iq: &[Complex<f32>], framer: &mut DmrFramer) -> Vec<DmrBurst> {
+            let mut bursts = Vec::new();
+            for chunk in iq.chunks(777) {
+                bursts.extend(framer.push(&self.demod.feed(chunk)));
+                if let Some(inverted) = framer.inverted()
+                    && inverted != self.turned
+                {
+                    self.demod.invert(inverted);
+                    self.turned = inverted;
+                }
+            }
+            bursts
+        }
+
+        fn flush(&mut self, framer: &mut DmrFramer) -> Vec<DmrBurst> {
+            framer.push(&self.demod.flush())
+        }
+    }
+
+    /// The bursts of `iq`, received and flushed at the end.
+    fn receive(iq: &[Complex<f32>], framer: &mut DmrFramer) -> Vec<DmrBurst> {
+        let mut rx = Receiver::new();
+        let mut bursts = rx.feed(iq, framer);
+        bursts.extend(rx.flush(framer));
         bursts
     }
 
@@ -3095,28 +3193,210 @@ mod tests {
         }
     }
 
-    #[test]
-    fn after_a_signal_ends_the_flywheel_stops_and_noise_is_not_voice() {
-        // Calls cut short, with no terminator, then two seconds of noise.
-        let mut repeater_call = call_bursts(CC, &group(), 3, Origin::Repeater);
-        repeater_call.pop();
-        let idle = vec![idle_burst(CC); repeater_call.len()];
-        let repeater = on_air(&downlink(CC, &[repeater_call, idle], [true, false]), false);
-        let mut handheld = encode_handheld(CC, group(), 3);
+    /// `seconds` of noise (white, the carrier 40 dB under it) from `seed`.
+    fn noise(seconds: f64, seed: u64) -> Vec<Complex<f32>> {
+        let mut x = vec![Complex::new(1.0f32, 0.0); (seconds * 48_000.0) as usize];
+        crate::synth::awgn(&mut x, -40.0, seed);
+        x
+    }
+
+    /// A repeater call (slot 1) and a handheld call of `superframes`, each cut short with no
+    /// terminator, on air.
+    fn cut_calls(superframes: u32) -> [(&'static str, Vec<Complex<f32>>); 2] {
+        let mut repeater = call_bursts(CC, &group(), superframes, Origin::Repeater);
+        repeater.pop();
+        let idle = vec![idle_burst(CC); repeater.len()];
+        let repeater = on_air(&downlink(CC, &[repeater, idle], [true, false]), false);
+        let mut handheld = encode_handheld(CC, group(), superframes);
         handheld.truncate(handheld.len() - 288);
-        let handheld = on_air_gated(&handheld);
-        for (name, mut iq) in [("repeater", repeater), ("handheld", handheld)] {
+        [
+            ("repeater", repeater),
+            ("handheld", on_air_gated(&handheld)),
+        ]
+    }
+
+    /// How soon after a signal ends the flywheel lets go of its slots, samples: two
+    /// superframes without a sync or an EMB as sent, counted from the last burst, plus the
+    /// front end's latency on the noise that follows.
+    const TRACKS_GONE_WITHIN: f64 = 2.0 * SUPERFRAME + 2.0 * SLOT_PERIOD;
+
+    #[test]
+    fn after_a_signal_ends_the_flywheel_stops_within_two_superframes() {
+        for (name, iq) in cut_calls(3) {
+            let mut framer = DmrFramer::new();
+            let mut rx = Receiver::new();
+            let mut bursts = rx.feed(&iq, &mut framer);
+            assert!(!framer.tracks.is_empty(), "{name}");
+            bursts.extend(rx.feed(&noise(TRACKS_GONE_WITHIN / 48_000.0, 11), &mut framer));
+            assert!(
+                framer.tracks.is_empty(),
+                "{name}: {} left",
+                framer.tracks.len()
+            );
+            bursts.extend(rx.feed(&noise(1.0, 12), &mut framer));
+            bursts.extend(rx.flush(&mut framer));
+            assert_eq!(bursts.iter().filter(|b| is_voice(b)).count(), 18, "{name}");
+            assert!(bursts.iter().all(|b| b.at < iq.len() as f64), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_minute_of_noise_after_a_call_is_never_voice() {
+        for seed in 1..=3 {
+            for (name, iq) in cut_calls(3) {
+                let end = iq.len() as f64;
+                let mut framer = DmrFramer::new();
+                let mut rx = Receiver::new();
+                let mut bursts = rx.feed(&iq, &mut framer);
+                bursts.extend(rx.feed(&noise(60.0, seed), &mut framer));
+                bursts.extend(rx.flush(&mut framer));
+                let late: Vec<&DmrBurst> = bursts.iter().filter(|b| b.at >= end).collect();
+                assert!(late.is_empty(), "{name} seed {seed}: {late:?}");
+                assert_eq!(bursts.iter().filter(|b| is_voice(b)).count(), 18, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_voice_header_then_noise_is_not_voice() {
+        // The header's link control is in hand, the phase never known.
+        let header = call_bursts(CC, &group(), 1, Origin::Repeater)[..1].to_vec();
+        let repeater = on_air(
+            &downlink(CC, &[header, vec![idle_burst(CC)]], [true, false]),
+            false,
+        );
+        let handheld: Vec<Option<u8>> = encode_handheld(CC, group(), 1)[..288].to_vec();
+        for (name, iq) in [
+            ("repeater", repeater),
+            ("handheld", on_air_gated(&handheld)),
+        ] {
+            for seed in 1..=3 {
+                let mut iq = iq.clone();
+                let end = iq.len() as f64;
+                iq.extend(noise(2.0, seed));
+                let mut framer = DmrFramer::new();
+                let bursts = receive(&iq, &mut framer);
+                assert!(
+                    bursts.iter().all(|b| !is_voice(b)),
+                    "{name} {seed}: {bursts:?}"
+                );
+                assert!(bursts.iter().all(|b| b.at < end), "{name} {seed}");
+                assert!(framer.tracks.is_empty(), "{name} {seed}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_call_joined_too_late_for_its_link_control_then_noise_is_not_voice() {
+        // A repeater call cut short, joined just past its last superframe's burst B: its C
+        // to F come with no link control in hand, then noise.
+        let [(_, iq), _] = cut_calls(3);
+        let join = (14.0 * SLOT_PERIOD + 1300.0) as usize;
+        for seed in 1..=3 {
+            let mut iq = iq[join..].to_vec();
             let end = iq.len() as f64;
-            let mut noise = vec![Complex::new(1.0f32, 0.0); 2 * 48_000];
-            crate::synth::awgn(&mut noise, -40.0, 11);
-            iq.extend(noise);
+            iq.extend(noise(2.0, seed));
             let mut framer = DmrFramer::new();
             let bursts = receive(&iq, &mut framer);
+            assert!(bursts.iter().all(|b| lc_of(b).is_none()), "seed {seed}");
             let voice: Vec<&DmrBurst> = bursts.iter().filter(|b| is_voice(b)).collect();
-            assert_eq!(voice.len(), 18, "{name}");
-            assert!(bursts.iter().all(|b| b.at < end), "{name}: {bursts:?}");
-            assert!(framer.tracks.is_empty(), "{name}");
+            assert_eq!(voice.len(), 4, "seed {seed}: {voice:?}");
+            assert!(bursts.iter().all(|b| b.at < end), "seed {seed}");
+            assert!(framer.tracks.is_empty(), "seed {seed}");
         }
+    }
+
+    /// `dibits` with the CACH at `at` given two bit errors in its TACT that the Hamming
+    /// (7,4) code takes for a word naming the other slot.
+    fn misread_tc(dibits: &mut [u8], at: usize) {
+        let bits: Vec<u8> = dibits[at..at + 12]
+            .iter()
+            .flat_map(|d| [d >> 1, d & 1])
+            .collect();
+        let tc = cach_tact(&certain(&bits)).0 >> 2 & 1;
+        let (i, j) = (0..7)
+            .flat_map(|i| (i + 1..7).map(move |j| (i, j)))
+            .find(|&(i, j)| {
+                let mut hit = bits.clone();
+                hit[TACT_PLACES[i]] ^= 1;
+                hit[TACT_PLACES[j]] ^= 1;
+                cach_tact(&certain(&hit)).0 >> 2 & 1 != tc
+            })
+            .expect("two errors that flip TC");
+        let mut hit = bits;
+        hit[TACT_PLACES[i]] ^= 1;
+        hit[TACT_PLACES[j]] ^= 1;
+        dibits[at..at + 12].copy_from_slice(&dibits_of(&hit));
+    }
+
+    #[test]
+    fn a_misread_tc_moves_no_slot() {
+        // Slot 2's idle burst in TDMA frame 9 (the second superframe's C), and slot 1's
+        // burst A in frame 7, each behind a CACH whose TC two bit errors flip.
+        for (frame, slot) in [(9usize, 2usize), (7, 1)] {
+            let mut call = encode_repeater(CC, [plan(Some(group()), 3), plan(None, 3)]);
+            misread_tc(&mut call, frame * 288 + (slot - 1) * 144);
+            let bursts = receive(&on_air(&call, false), &mut DmrFramer::new());
+            let voice: Vec<&DmrBurst> = bursts.iter().filter(|b| is_voice(b)).collect();
+            assert!(voice.iter().all(|b| b.slot == Some(1)), "frame {frame}");
+            let frames: Vec<usize> = voice
+                .iter()
+                .map(|b| ((b.at - 120.0) / SLOT_PERIOD).round() as usize)
+                .collect();
+            assert_eq!(frames, (1..19).collect::<Vec<_>>(), "frame {frame}");
+            for b in &voice {
+                let DmrContent::Voice { errors, .. } = b.content else {
+                    unreachable!()
+                };
+                assert_eq!(errors, 0, "frame {frame}: {b:?}");
+            }
+            // The link control at every burst E, the one after the misread included.
+            let lcs: Vec<usize> = voice
+                .iter()
+                .zip(&frames)
+                .filter(|(b, _)| lc_of(b) == Some(group()))
+                .map(|(_, &f)| f)
+                .collect();
+            assert_eq!(lcs, [5, 11, 17], "frame {frame}");
+            let idle = bursts.iter().filter(|b| b.content == DmrContent::Idle);
+            assert!(idle.clone().all(|b| b.slot == Some(2)), "frame {frame}");
+            assert_eq!(idle.count(), 20, "frame {frame}");
+        }
+    }
+
+    #[test]
+    fn a_re_timed_repeater_is_followed_after_three_syncs() {
+        // A repeater cut half a TDMA frame into frame 10, then another downlink: its slot 1
+        // falls on the first's slot 2 grid, and its CACHs say so on every sync.
+        let other = FullLc {
+            src: SRC_2,
+            dst: DST_2,
+            ..group()
+        };
+        let first = encode_repeater(CC, [plan(Some(group()), 2), plan(None, 2)]);
+        let second = encode_repeater(CC, [plan(Some(other), 2), plan(None, 2)]);
+        let cut = 10 * 288 + 144;
+        let dibits: Vec<u8> = first[..cut].iter().chain(&second).copied().collect();
+        let bursts = receive(&on_air(&dibits, false), &mut DmrFramer::new());
+        // From the second downlink's burst A (its TDMA frame 1) on: its slots as it names
+        // them, its call whole.
+        let from = (cut + 288) as f64 * 10.0;
+        let after: Vec<&DmrBurst> = bursts.iter().filter(|b| b.at >= from).collect();
+        let one: Vec<&DmrBurst> = after
+            .iter()
+            .copied()
+            .filter(|b| b.slot == Some(1))
+            .collect();
+        assert!(
+            after
+                .iter()
+                .all(|b| b.slot == Some(1) || b.content == DmrContent::Idle)
+        );
+        assert_eq!(one.len(), 13, "{one:?}");
+        assert!(one[..12].iter().all(|b| is_voice(b)));
+        assert_eq!(one[12].content, DmrContent::Terminator(Some(other)));
+        let lcs: Vec<FullLc> = one.iter().filter_map(|b| lc_of(b)).collect();
+        assert_eq!(lcs, [other, other]);
     }
 
     #[test]
