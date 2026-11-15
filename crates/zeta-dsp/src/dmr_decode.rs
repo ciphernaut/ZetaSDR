@@ -65,11 +65,14 @@
 //! call whose speech has not yet been fed (held, encrypted, without a vocoder) is never
 //! given it. A call held again after a lost burst has had audio and is the same call: under
 //! `first_active` and `follow` it keeps its place, so one lost burst does not hand the main
-//! stream to the other slot mid-sentence; under `all` it is mixed while its speech flows,
-//! and while held it holds nothing back (the other slot's speech is mixed on without it, and
-//! its own fed later reaches only its slot's stream). Each call event's `stream` names its
-//! slot's stream, and `program` says whether its speech is on the main stream: now on the
-//! opening event, at any time on the closing one.
+//! stream to the other slot mid-sentence; under `all` it stays in the mix. Either way every
+//! frame a call is fed reaches the main stream when the policy puts it there: while a call's
+//! speech is held the main stream waits for it, at most the four periods and [`GRID_NS`] a
+//! held frame is kept, and never stalls. After one lost burst a call is licensed superframe
+//! by superframe for the rest of the call, each superframe's speech waiting for its own
+//! word: about 240 ms of added latency from then on, on every stream. Each call event's
+//! `stream` names its slot's stream, and `program` says whether its speech is on the main
+//! stream: now on the opening event, at any time on the closing one.
 //!
 //! **A channel with no call.** A data burst decoded with no call open on any slot (an idle
 //! burst, a control block, a stray terminator), on a repeater once both slots' latest bursts
@@ -813,9 +816,12 @@ impl Calls {
     /// before `now`; a held frame may still be fed; a call whose audio is live may end
     /// where its last frame fed does.
     ///
-    /// Under `all` a call whose speech is held holds nothing back: the mix goes on with the
-    /// other slot, and what the held call is fed later than the mix was written reaches
-    /// only its slot's stream.
+    /// A held frame always holds the bound back, so no speech a call is fed is ever missing
+    /// from the main stream; held frames are kept at most four periods and [`GRID_NS`]
+    /// back, so a held call delays the main stream by at most that and never stalls it.
+    /// Under `all` a call whose speech is held does not hold the bound back by its last
+    /// frame fed (its end decides nothing for the mix); under `first_active` and `follow`
+    /// it does, since where it ends decides who holds the main stream next.
     fn note_known(&mut self, now: u64) {
         let mut until = self
             .last_burst
@@ -823,13 +829,10 @@ impl Calls {
             .max(now.saturating_sub(LATE_NS));
         let mixing = self.main.policy() == AudioPolicy::All;
         for o in self.slots.iter().flatten() {
-            if mixing && o.held_now() {
-                continue;
-            }
             if let Some((at, _)) = o.held.first() {
                 until = until.min(*at);
             }
-            if o.audio.is_some() {
+            if o.audio.is_some() && !(mixing && o.held_now()) {
                 until = until.min(o.fed_end);
             }
         }
@@ -1299,6 +1302,17 @@ mod tests {
             }
         }
 
+        /// As [`send`](Self::send), each 100 ms block sent when its time has come, as a
+        /// radio's would be: where the main stream's cursor stands depends on how far the
+        /// input has got, which the faster helpers outrun.
+        async fn send_real_time(&mut self, iq: &[Complex<f32>], rate: u64) {
+            let start = tokio::time::Instant::now();
+            for (k, chunk) in iq.chunks(rate as usize / 10).enumerate() {
+                tokio::time::sleep_until(start + Duration::from_millis(100 * k as u64)).await;
+                self.send(chunk, rate);
+            }
+        }
+
         fn collect(&mut self) {
             while let Ok(f) = self.events_rx.try_recv() {
                 let Payload::Event(v) = f.payload else {
@@ -1622,17 +1636,6 @@ mod tests {
         let (_mbe, h) = run_two_slots("all").await;
         // The speech first: each main sample is the sum of the slots' samples there,
         // saturated; before slot 2's call and after slot 1's, the one running alone.
-        // Each slot's samples by their index at 48 kHz, a later frame's over an earlier's.
-        let place = |audio: &[Frame]| {
-            let mut at = std::collections::HashMap::new();
-            for f in audio {
-                let first = sample_index(f.provenance.span.start_ns.0);
-                for (k, &s) in samples(f).iter().enumerate() {
-                    at.insert(first + k as u128, s);
-                }
-            }
-            at
-        };
         let (one, two) = (place(&h.slot1), place(&h.slot2));
         let covered = |audio: &[Frame], i: u128| {
             audio.iter().any(|f| {
@@ -2362,22 +2365,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn under_all_a_held_call_does_not_stall_the_mix() {
-        // Read up to slot 1's third superframe's C, while slot 1 is held: slot 2's speech
-        // reaches the main stream as far as the stage can know it, as when slot 1 is idle.
+    async fn under_all_a_held_call_delays_the_mix_at_most_its_hold() {
+        // Read in real time up to slot 1's third superframe's C, while slot 1 is held: the
+        // mix is behind where it is with slot 1 idle by at most the held frames' reach.
         let cut = 15 * TDMA;
         let read_to = T0 + ns(cut);
-        let bound = read_to - LATE_NS - PERIOD_NS;
+        let hold = 4 * PERIOD_NS + GRID_NS;
+        let mut reach = Vec::new();
         for slot1 in [false, true] {
             let mbe = Mbe::installed();
             let mut h = Harness::start(&mbe, 4096, "all");
-            h.send_paced(&held_beside(slot1)[..cut], RATE).await;
+            h.send_real_time(&held_beside(slot1)[..cut], RATE).await;
+            let low = match reach.first() {
+                None => read_to - LATE_NS - PERIOD_NS,
+                Some(&idle) => idle - hold,
+            };
             assert!(
-                h.until(|h| audio_end(&h.main) >= bound).await,
-                "slot 1 {}: the main stream reached {} of {bound}",
+                h.until(|h| audio_end(&h.main) >= low).await,
+                "slot 1 {}: the mix reached {} of {low}",
                 if slot1 { "held" } else { "idle" },
                 audio_end(&h.main)
             );
+            // Settled: what the stage has made final is written.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            h.collect();
+            reach.push(audio_end(&h.main));
             if slot1 {
                 // Slot 1 was held throughout: nothing of its has been fed since its loss.
                 let lost_at = burst_at(9, 1);
@@ -2389,6 +2401,119 @@ mod tests {
             }
             let r = h.end(|_| true).await;
             assert!(r.is_ok(), "{r:?}");
+        }
+        assert!(reach[1] + hold >= reach[0], "{reach:?}");
+    }
+
+    /// Slot 1's call of four superframes with its second superframe's burst C lost, beside
+    /// slot 2's of five from the fourth TDMA frame, running on after it.
+    fn lost_beside() -> Vec<Complex<f32>> {
+        let mut one = call(group(), 4);
+        build::lose(&mut one[1 + 6 + 2]);
+        let mut two = idles(3);
+        two.extend(call(other(), 5));
+        repeater(one, two)
+    }
+
+    /// Each slot's samples by their index at 48 kHz, a later frame's over an earlier's.
+    fn place(audio: &[Frame]) -> std::collections::HashMap<u128, f32> {
+        let mut at = std::collections::HashMap::new();
+        for f in audio {
+            let first = sample_index(f.provenance.span.start_ns.0);
+            for (k, &s) in samples(f).iter().enumerate() {
+                at.insert(first + k as u128, s);
+            }
+        }
+        at
+    }
+
+    /// The frames of `of` whose every sample is in the mix: the slots' sum there.
+    fn mixed<'a>(h: &Harness, of: &'a [Frame]) -> Vec<&'a Frame> {
+        let (main, one, two) = (place(&h.main), place(&h.slot1), place(&h.slot2));
+        of.iter()
+            .filter(|f| {
+                let first = sample_index(f.provenance.span.start_ns.0);
+                (first..first + 960).all(|i| {
+                    let want = (one.get(&i).unwrap_or(&0.0) + two.get(&i).unwrap_or(&0.0))
+                        .clamp(-1.0, 1.0);
+                    main.get(&i).is_some_and(|m| (m - want).abs() < 1e-6)
+                })
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn under_all_no_speech_a_held_call_is_fed_is_lost_from_the_mix() {
+        // In real time: slot 1 held after a lost burst (from then on each superframe waits
+        // for its own word), and slot 1 joined without its voice header (each superframe
+        // waits from the first), each beside slot 2's running call.
+        let mut joined = call(group(), 3);
+        joined[0] = lost();
+        let mut two = idles(3);
+        two.extend(call(other(), 4));
+        for (what, iq, from) in [
+            ("a lost burst", lost_beside(), burst_at(9, 1)),
+            ("joined", repeater(joined, two), T0),
+        ] {
+            let mbe = Mbe::installed();
+            let mut h = Harness::start(&mbe, 4096, "all");
+            h.send_real_time(&iq, RATE).await;
+            let r = h
+                .end(|h| h.events.len() >= 4 && !h.slot1.is_empty() && !h.slot2.is_empty())
+                .await;
+            assert!(r.is_ok(), "{what}: {r:?}");
+            let fed: Vec<Frame> = h
+                .slot1
+                .iter()
+                .filter(|f| f.provenance.span.start_ns.0 >= from)
+                .cloned()
+                .collect();
+            assert!(
+                fed.len() >= 2 * SUPERFRAME_FRAMES,
+                "{what}: {} fed",
+                fed.len()
+            );
+            let got = mixed(&h, &fed).len();
+            assert_eq!(
+                got,
+                fed.len(),
+                "{what}: {got} of {} fed in the mix",
+                fed.len()
+            );
+            // Slot 2's too, all of it.
+            assert_eq!(mixed(&h, &h.slot2).len(), h.slot2.len(), "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn under_follow_and_first_active_the_holder_loses_nothing() {
+        // In real time, slot 1 holding the main stream and held after a lost burst: every
+        // frame it is fed is on the main stream as it was published.
+        for policy in ["first_active", "follow"] {
+            let mbe = Mbe::installed();
+            let mut h = Harness::start(&mbe, 4096, policy);
+            h.send_real_time(&lost_beside(), RATE).await;
+            let r = h
+                .end(|h| h.events.len() >= 4 && !h.slot1.is_empty() && !h.slot2.is_empty())
+                .await;
+            assert!(r.is_ok(), "{policy}: {r:?}");
+            assert!(
+                h.slot1.len() >= 3 * SUPERFRAME_FRAMES,
+                "{policy}: {}",
+                h.slot1.len()
+            );
+            let on_main: Vec<&Frame> = h
+                .main
+                .iter()
+                .filter(|m| {
+                    h.slot1
+                        .iter()
+                        .any(|f| f.provenance.span == m.provenance.span && samples(f) == samples(m))
+                })
+                .collect();
+            assert_eq!(on_main.len(), h.slot1.len(), "{policy}");
+            let s = starts(&h.main);
+            assert!(s.windows(2).all(|w| w[1] > w[0]), "{policy}: {s:?}");
         }
     }
 
