@@ -98,6 +98,10 @@ pub const P25_DEVIATION_HZ: f64 = 1800.0;
 /// - the most a lock on probation coasted in all (its budget runs over the whole
 ///   probation): 26, 27 and 30.
 ///
+/// The voice payload does not move them: the same figures over 10 payloads for each
+/// header (`voice_payload`'s generator with 10 seeds), 100 noise seeds each; the longest
+/// runs are the header's, before any voice frame.
+///
 /// The bound is the larger of the proven worst and a stretch's 4 searches more at each
 /// end, where noise tips a stretch of 18 or 19 on the level over (24 + 8 = 32), and the
 /// probation worst and one stretch more (30 + 4 = 34): 34.

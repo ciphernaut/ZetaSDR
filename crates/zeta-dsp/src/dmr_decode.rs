@@ -137,7 +137,7 @@ const EXPIRE_NS: u64 = SUPERFRAME_NS + 2 * PERIOD_NS;
 /// the timing's wander, far less than the 30 ms to the other slot's bursts.
 pub const GRID_NS: u64 = 10_000_000;
 /// How long before the input's latest sample a burst not yet handed on can have started,
-/// ns: the burst (27.5 ms) and the front end's held symbols (296 for DMR, 62 ms) once
+/// ns: the burst (27.5 ms) and the front end's held symbols (320 for DMR, 67 ms) once
 /// whole, with margin.
 const LATE_NS: u64 = 3 * PERIOD_NS;
 /// Bursts of a superframe before E, whose fragments (B to E) complete a link control on E.

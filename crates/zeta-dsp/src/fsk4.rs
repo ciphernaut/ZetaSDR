@@ -276,7 +276,7 @@ pub const PENDING_SYMBOLS: usize = 96;
 /// It is 200 symbols: 42 ms at 4800 baud, 83 ms at 2400. A receiver holds one search's
 /// symbols more for each search its mode lets a lock on probation coast
 /// ([`Fsk4Params::coast_searches`]), so that the guarantee covers a coasted probation:
-/// 472 symbols (98 ms) for P25's 34, 296 (62 ms) for DMR's 12.
+/// 472 symbols (98 ms) for P25's 34, 320 (67 ms) for DMR's 15.
 pub const HELD_MAX: usize = 2 * PENDING_SYMBOLS + SEARCH_EVERY;
 // A lock re-slices from the last symbol given out to where the receiver had got, which can
 // be one search past `PENDING_SYMBOLS`: hence the margin.
@@ -2924,14 +2924,15 @@ mod tests {
         }
     }
 
-    /// DMR handheld bursts of a group call at colour code `cc` (`superframes` of voice),
-    /// each sent as it is with nothing between, after 200 ms of noise: the transitions taken.
-    fn dmr_handheld_paths(tx: Tx, cc: u8, superframes: u32) -> Paths {
+    /// DMR handheld bursts of a group call from `src` (which seeds its voice payload) at
+    /// colour code `cc` (`superframes` of voice), each sent as it is with nothing between,
+    /// after 200 ms of noise: the transitions taken.
+    fn dmr_handheld_paths(tx: Tx, src: u32, cc: u8, superframes: u32) -> Paths {
         use crate::dmr::{Call, FullLc, encode_handheld};
         let lc = FullLc {
             call: Call::Group,
             dst: 9990,
-            src: 9_990_001,
+            src,
             fid: 0,
             encrypted: false,
             emergency: false,
@@ -2958,16 +2959,25 @@ mod tests {
 
     #[test]
     fn the_dmr_coast_keeps_its_margins_at_colour_code_0() {
-        // Colour code 0, where a voice burst's centre can be 24 dibits of 00. Over 100
-        // seeds each, a proven lock coasted at most 4 searches in a row, a lock on
-        // probation at most 5 in all (handheld bursts at 0.8 of the deviation and 10 dB,
-        // first reached at seed 8240), and no coast ran out. This sweep reaches both: 42
-        // seeds of handheld bursts (3 superframes) and 3 repeater calls each at 15 and
-        // 10 dB. A change that needs more coast than DMR_COAST_SEARCHES's margins allow (8
-        // over a proven lock's, 4 over a probation's) fails here.
+        // Colour code 0, where a voice burst's centre can be 24 dibits of 00. Handheld
+        // bursts (3 superframes) at 0.8 of the deviation and 10 dB over 100 noise seeds for
+        // each of 20 calls (sources, each seeding its call's voice payload): a proven lock
+        // coasted at most 5 searches in a row, a lock on probation at most 10 in all (the
+        // most varies with the payload: 4 for most sources, 9 for 9990001, 10 for 12345),
+        // and no coast ran out (DMR_COAST_SEARCHES has the figures). This sweep reaches
+        // both, 5 sources whose payloads coast the longest for 14 noise seeds each, with
+        // 3 repeater calls each at 15 and 10 dB. A change that needs more coast than
+        // DMR_COAST_SEARCHES's margins allow (8 over a proven lock's, 4 over a
+        // probation's) fails here.
         use crate::dmr::{Call, FullLc, SlotPlan, encode_repeater};
-        let mut swept: Vec<Paths> = (0..42)
-            .map(|seed| dmr_handheld_paths(Tx::new(dmr(), 8200 + seed).off(0.8, 10.0), 0, 3))
+        let sources = [9_990_001, 12_345, 5_550_123, 8_765_432, 9_992_002];
+        let mut swept: Vec<Paths> = sources
+            .iter()
+            .flat_map(|&src| {
+                (0..14).map(move |seed| {
+                    dmr_handheld_paths(Tx::new(dmr(), 8200 + seed).off(0.8, 10.0), src, 0, 3)
+                })
+            })
             .collect();
         let lc = FullLc {
             call: Call::Group,
