@@ -36,6 +36,16 @@ impl Driver {
             })
             .map_err(|e| format!("soapy open {args:?}: {e}"))
     }
+
+    /// Listen on receive antenna `name`, one of the names the device lists for
+    /// the channel; another is refused, naming them.
+    fn set_rx_antenna(&self, name: &str) -> Result<(), String> {
+        let have = self.dev.antennas(Direction::Rx, CH).map_err(s)?;
+        if !have.iter().any(|a| a == name) {
+            return Err(format!("not one of {}", have.join(", ")));
+        }
+        self.dev.set_antenna(Direction::Rx, CH, name).map_err(s)
+    }
 }
 
 /// Open the device matching `args` as a [`SoapySource`]. A `gain=DB` key is
@@ -46,12 +56,18 @@ impl Driver {
 /// zeta's too: [`SoapySource::with_ppm`], and so is `settle_ms=N`
 /// ([`SoapySource::with_settle`], in place of the radio's default), and
 /// `usable=F` ([`SoapySource::with_usable`], the part of a capture a scan
-/// advances by). So are
+/// advances by), and `antenna=NAME` (the receive port, set before anything
+/// streams; a name the device does not list is refused). So are
 /// `max_rate_hz=N` and `bits=N`, removed here and read by the worker (the rate
 /// cap it reports, the link depth it runs at).
 pub fn open(id: SourceId, args: &str) -> Result<SoapySource, PortError> {
     let (args, zeta) = zeta_source_soapy::split_zeta_args(args).map_err(PortError::Io)?;
     let d = Driver::new(&args).map_err(PortError::Io)?;
+    if let Some(name) = &zeta.antenna {
+        d.set_rx_antenna(name)
+            .map_err(|e| PortError::Io(format!("soapy {}: antenna={name}: {e}", id.0)))?;
+        eprintln!("zeta: antenna for {}: {name}", id.0);
+    }
     let mut src = SoapySource::with_device_args(id.clone(), std::sync::Arc::new(d), &args)?;
     if let Some(ppm) = zeta.ppm {
         src = src.with_ppm(ppm);

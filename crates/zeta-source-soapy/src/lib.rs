@@ -28,7 +28,7 @@ pub mod source;
 pub use source::SoapySource;
 
 /// zeta's own keys in SoapySDR device args, taken out by [`split_zeta_args`].
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ZetaArgs {
     /// `gain=DB`: the overall receive gain in dB to set after opening (`None`:
     /// leave the driver's default).
@@ -53,6 +53,10 @@ pub struct ZetaArgs {
     /// place of the narrowest lossless one that measures as wide as the widest
     /// (see [`probe::own_depth`]); a lossy depth only this way.
     pub bits: Option<u8>,
+    /// `antenna=NAME`: the receive port to listen on, one of the names the
+    /// device lists for its receive channel (a LimeSDR's `LNAW`, a B2xx's
+    /// `RX2`), in place of the driver's choice.
+    pub antenna: Option<String>,
 }
 
 /// The longest `settle_ms=` accepted (10 s): far past any radio's settle, and
@@ -63,12 +67,13 @@ pub const SETTLE_MS_MAX: f64 = 10_000.0;
 pub const BITS_MAX: u8 = 32;
 
 /// Take zeta's own `gain=DB`, `ppm=N`, `max_rate_hz=N`, `settle_ms=N`,
-/// `usable=F` and `bits=N` keys out of SoapySDR device `args`: the args to
+/// `usable=F`, `bits=N` and `antenna=NAME` keys out of SoapySDR device `args`: the args to
 /// hand the driver, and the values to apply after opening. A gain or ppm that
 /// is not a finite number, a rate that is not a positive whole number of Hz,
 /// a settle that is not a number of ms from 0 to [`SETTLE_MS_MAX`], a usable
 /// fraction that is not a number from 0.5 to 1, or a depth that is not a
-/// whole number of bits from 1 to [`BITS_MAX`], is an error.
+/// whole number of bits from 1 to [`BITS_MAX`], or an empty antenna name, is
+/// an error (whether the device has that antenna is checked at open).
 pub fn split_zeta_args(args: &str) -> Result<(String, ZetaArgs), String> {
     let mut z = ZetaArgs::default();
     let mut rest = Vec::new();
@@ -92,6 +97,13 @@ pub fn split_zeta_args(args: &str) -> Result<(String, ZetaArgs), String> {
                 z.bits = Some(b.ok_or_else(|| {
                     format!("bits={v}: not a number of bits from 1 to {BITS_MAX}")
                 })?);
+            }
+            Some((k, v)) if k.trim() == "antenna" => {
+                let name = v.trim();
+                if name.is_empty() {
+                    return Err("antenna=: no antenna named".into());
+                }
+                z.antenna = Some(name.to_string());
             }
             Some((k, v)) if k.trim() == "usable" => {
                 let u = v.trim().parse().ok();
@@ -150,6 +162,7 @@ mod tests {
                     settle_ms: None,
                     usable: None,
                     bits: None,
+                    antenna: None,
                 }
             )
         );
@@ -186,6 +199,18 @@ mod tests {
             "settle_ms=10001: not a number of ms from 0 to 10000"
         );
         assert!(split_zeta_args("settle_ms=1e300").is_err());
+    }
+
+    #[test]
+    fn antenna_is_taken_out_of_the_device_args() {
+        let (rest, z) = split_zeta_args("driver=lime,antenna=LNAW,gain=40").unwrap();
+        assert_eq!(rest, "driver=lime");
+        assert_eq!(z.antenna.as_deref(), Some("LNAW"));
+        assert_eq!(split_zeta_args("driver=lime").unwrap().1.antenna, None);
+        assert_eq!(
+            split_zeta_args("driver=lime,antenna=").unwrap_err(),
+            "antenna=: no antenna named"
+        );
     }
 
     #[test]

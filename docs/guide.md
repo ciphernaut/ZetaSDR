@@ -396,7 +396,9 @@ they belong to the serving node and are rejected. Source ids are unique across t
   is probed at each at open, `source list` shows them as `capabilities.depths` and the one in force
   as `depth`, and the source runs the narrowest lossless one that measures as wide as the widest (a B210's 12 bits carry all its converter gives, in fewer bytes than 16, so 12-bit wins when it measured as wide as 16-bit) unless `bits=N` in `ARGS` names another.
   `settle_ms=N` in `ARGS` sets how long a tune takes to settle (1 ms on a B2xx, 10 ms for a radio
-  zeta has not measured) and `usable=F` the part of a capture the front end passes flat (0.9). A
+  zeta has not measured) and `usable=F` the part of a capture the front end passes flat (0.9).
+  `antenna=NAME` picks the receive port by the device's own name for it (a LimeSDR's `LNAW`, a
+  B2xx's `RX2`); without it the driver chooses, which is not always the port the antenna is on. A
   start with no cached figures measures first (about 70-110 s for a B210's three depths, with the
   host busy; the journal says so and when it ended); `max_rate_hz=N` skips it. The figures are cached
   with the link's speed, so they are measured again by themselves only when the negotiated speed
