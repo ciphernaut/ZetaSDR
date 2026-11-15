@@ -69,12 +69,20 @@
 //! - **Vocoder socket** (-1 6.1): 216 bits, VS(215) first; three 72-bit frames, VF(1)'s
 //!   most significant bit first.
 //!
-//! **PI and privacy.** -1 V2.5.1 names the EMB's PI bit the "pre-emption and power control
-//! indicator" (9.3.2; table 9.19's caption, and earlier editions, call it the privacy
-//! indicator). [`DmrContent::Voice`]'s `privacy` is that bit as received, named for the
-//! earlier use; the encoder sets it on an encrypted call. [`FullLc::encrypted`] is the
-//! privacy bit of the service options (-2 table 7.11), which -2 does not define further.
-//! Nothing here decrypts.
+//! - **Privacy header and CSBK** (-1 6.2, 7.2, 9.1.8, B.3.8, table B.21): 80 bits and a
+//!   CRC-CCITT (`x^16 + x^12 + x^5 + 1`, initial remainder 0, inverted) under the data
+//!   type's mask (`6969`, `A5A5`), then BPTC (196,96). The framer reports them by their data
+//!   type and does not read them. The encoder's privacy header carries 80 pseudo-random
+//!   bits, since -1 does not define its contents; its control blocks are Preamble CSBKs (-2 7.1.2.5).
+//!
+//! **Encryption.** [`FullLc::encrypted`] is the privacy bit of the service options (-2
+//! table 7.11, which does not define privacy further); an encrypted call also sends a
+//! privacy header after its voice LC header (-1 5.1.2.2, figure 5.6). The EMB's PI bit is
+//! not an encryption mark: -1 V2.5.1 names it the pre-emption and power control indicator
+//! (9.3.2, table 9.19: 1 means the embedded signalling carries reverse channel information
+//! for the other logical channel; the table's caption, and earlier editions, call it the
+//! privacy indicator). [`DmrContent::Voice`]'s `pi` is that bit as received; the encoder
+//! sends 0. Nothing here decrypts.
 //!
 //! **The AMBE+2 frame: decoders' values, not the standard's.** -1 places whole 72-bit
 //! frames (6.1) and says nothing of their inside. [`AmbeSoft`] holds a frame as
@@ -95,17 +103,48 @@
 //!   The Golay code is P25's, generator `0xC75`: the polynomial -1 gives for the slot
 //!   type's Golay (20,8) (B.4), though -1 does not say the vocoder uses it. A test
 //!   compares it with [`crate::m17`]'s Golay (24,12) encoder.
-//! - **The voice payload** of an encoded call is a frame coded here from 49 zero bits. A
-//!   DMR silence frame is widely quoted, from hotspot software, but no public source that
-//!   states it as the standard's was found, so it is not used.
+//! - **The voice payload** of an encoded call is coded here from 49 parameter bits that
+//!   differ from frame to frame (`voice_payload`, a SplitMix64 step of the frame's
+//!   number): not speech, and no codec made it, but varied as speech's frames are, so no
+//!   burst sits on one level, which the receiver would refuse as a carrier. A DMR silence
+//!   frame is widely quoted, from hotspot software, but no public source that states it as
+//!   the standard's was found, so it is not used.
 //!
 //! **The framer.** It searches the four syncs and takes the rest of a burst by position:
 //! each dibit's [`SoftDibit::at`], never a count of dibits, since the front end gives held
 //! symbols out late and a handheld's bursts each start a fresh acquisition. The symbol
 //! period is measured from the spacing of the dibits' positions. A repeater's burst takes
-//! its slot from the CACH before it; a handheld's has none (`slot` is `None`). Bursts B to F
-//! have no sync: after a burst A the framer expects them a slot period apart and reads
-//! each one's EMB, refusing one whose EMB does not decode or names another colour code.
+//! its slot from the CACH before it; a handheld's has none (`slot` is `None`).
+//! - **The flywheel.** Any sync sets its slot's timing, and on a repeater the other slot's
+//!   too (half a period off, its slot the other one). From then on each slot's bursts are
+//!   read every 60 ms by position, with or without a burst A. A burst there with no sync
+//!   is reported as voice only when its EMB decodes, names the slot's colour code and, once
+//!   the superframe's phase is known, carries the LCSS of its letter (B first, C and D
+//!   continuation, E last, F single). In a superframe whose burst A was not heard, its
+//!   embedded bits must also be the known link control's (or burst F's null message), so
+//!   noise after a call is not taken for voice. A slot's timing is dropped after two
+//!   superframes with neither a sync nor a valid EMB; after a data burst other than a
+//!   header no voice is read without a new sync.
+//! - **Colour code.** Learnt from a slot type, or from an EMB that decoded with no bit
+//!   corrected, never from one the code corrected, since the code turns about a quarter of
+//!   all words into a valid one.
+//! - **The embedded link control** is assembled from the four latest fragments when they
+//!   are the four places B to E in order: within a superframe or, while the call's link
+//!   control is not yet in hand (at a join), across a superframe's boundary (C, D, E then
+//!   B; D, E then B, C; E then B, C, D), so a receiver has it within one superframe of the
+//!   first sync it hears. Once the link control is in hand only a whole superframe's B to E
+//!   are taken, so a call that changes at a boundary gives the new link control at its own
+//!   burst E. Across a boundary no row may need a correction, and then the row code decides
+//!   which mixes can pass. A fragment holds four of the 16 columns (B 0 to 3, C 4 to 7, D 8
+//!   to 11, E 12 to 15), and a mixed row is the old row with the new one's columns, so it is
+//!   a code word only when the two rows' difference on those columns is one. With B new and
+//!   C, D, E old, or B, C, D new and E old, no non-zero code word lies inside the columns
+//!   concerned (a test enumerates them), so a mix that passes is the old or the new link
+//!   control exactly: no wrong one can come out. With B, C new and D, E old, code words do
+//!   lie inside columns 0 to 7, so a mix of two link controls whose rows differ there by
+//!   such words would pass the rows, and the checksum is the last guard. That needs a call
+//!   to change at the very boundary where the receiver joined.
+//!
 //! Polarity: a data burst whose slot type and BPTC both check tells it, and
 //! [`DmrFramer::inverted`] says it, as P25's framer does.
 
@@ -234,8 +273,38 @@ const AMBE_MASK_SEED: u32 = 16;
 const AMBE_MASK_MUL: u32 = 173;
 const AMBE_MASK_ADD: u32 = 13849;
 const AMBE_MASK_TOP: u32 = 0x8000;
-/// The 49 parameter bits of an encoded call's voice, by row: zeros.
-const VOICE_PAYLOAD: [u16; 4] = [0; 4];
+
+/// The flywheel (see [`DmrFramer`]): periods without a sync or a valid EMB before a slot's
+/// timing is dropped (two superframes).
+const FLYWHEEL_PERIODS: i64 = 2 * VOICE_BURSTS as i64;
+/// Embedded bits that may differ from the known link control's in a superframe whose burst
+/// A was not heard.
+const UNANCHORED_MAX_DIFFER: usize = 4;
+/// Embedded fragments a track keeps: two superframes' worth.
+const KEPT_FRAGMENTS: usize = 8;
+/// Each burst's LCSS by its letter, A to F (A has a sync, not an EMB).
+const EXPECTED_LCSS: [Option<u8>; VOICE_BURSTS] = [
+    None,
+    Some(LCSS_FIRST),
+    Some(LCSS_CONTINUATION),
+    Some(LCSS_CONTINUATION),
+    Some(LCSS_LAST),
+    Some(LCSS_SINGLE),
+];
+
+/// A CSBK or a privacy header: 80 bits, then a 16-bit CRC-CCITT (-1 table 9.9, B.3.8).
+const BLOCK_DATA_BYTES: usize = 10;
+/// `x^16 + x^12 + x^5 + 1` (B.18).
+const CRC_CCITT_POLY: u16 = 0x1021;
+/// The CRC masks of the privacy header and the CSBK (-1 table B.21).
+const MASK_PI_HEADER: u16 = 0x6969;
+const MASK_CSBK: u16 = 0xA5A5;
+/// A CSBK's last block bit, the Preamble CSBK's opcode, its group target bit (-2 table 7.7).
+const CSBK_LAST_BLOCK: u8 = 0x80;
+const CSBKO_PREAMBLE: u8 = 0b11_1101;
+const CSBK_GROUP: u8 = 0x40;
+/// The SplitMix64 input of the encoder's privacy header contents.
+const PI_HEADER_SEED: u64 = 0x5049;
 
 /// Who sent a burst: a repeater (BS-sourced syncs, a CACH between bursts) or a handheld
 /// (MS-sourced syncs).
@@ -269,13 +338,15 @@ pub type AmbeSoft = [u8; AMBE_FEED_BYTES];
 pub enum DmrContent {
     VoiceHeader(Option<FullLc>),
     /// A voice burst: `first` for burst A (the sync); `lc` the embedded link control, on
-    /// the burst that completes it (E); `privacy` the EMB's PI bit (`false` on burst A,
-    /// which has no EMB); `errors` the bits corrected by the EMB's code, the embedded link
-    /// control's and the three frames' Golay words.
+    /// the burst that completes it (E, or, while the call's is not yet in hand, B, C or D
+    /// across a superframe's boundary); `pi` the EMB's PI bit (`false` on burst A, which has
+    /// no EMB), the pre-emption and power control indicator, not an encryption mark;
+    /// `errors` the bits corrected by the EMB's code, the embedded link control's and the
+    /// three frames' Golay words.
     Voice {
         first: bool,
         lc: Option<FullLc>,
-        privacy: bool,
+        pi: bool,
         voice: Box<[AmbeSoft; 3]>,
         errors: u32,
     },
@@ -316,22 +387,204 @@ fn sync_word(origin: Origin, kind: Kind) -> u64 {
     }
 }
 
-/// A voice superframe in progress on one slot: bursts B to F are expected after its A.
-struct Superframe {
-    slot: Option<u8>,
-    origin: Origin,
-    /// Burst A's centre field, a sample position.
-    sync_at: f64,
-    /// The burst expected next: 1 for B to 5 for F.
-    next: usize,
-    /// Embedded fragments so far, from burst B on.
-    fragments: Vec<Vec<u8>>,
+/// What is known of a slot's call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrackState {
+    /// Timing only, from the other slot's sync: a call may be in progress.
+    Unknown,
+    /// A call is in progress: a voice sync, a voice LC header or a valid EMB was heard.
+    Voice,
+    /// The slot's last sync was a data burst's other than a header's: no call.
+    Data,
 }
 
-impl Superframe {
-    fn expected(&self, sps: f64) -> f64 {
-        self.sync_at + (self.next * SLOT_PERIOD_DIBITS) as f64 * sps
+/// A slot's timing between syncs (the flywheel), and what is known of the call on it.
+/// Bursts are numbered by period (60 ms) from the first heard.
+struct Track {
+    slot: Option<u8>,
+    origin: Origin,
+    /// The centre field of one of the slot's bursts, heard or placed, and its period.
+    anchor: f64,
+    anchor_period: i64,
+    /// The period of the next burst to read.
+    next: i64,
+    /// The last period with a sync or a valid EMB.
+    last_good: i64,
+    state: TrackState,
+    /// The period of a burst A, which sets every burst's letter, when known.
+    phase: Option<i64>,
+    /// The period of the last burst A whose sync was heard.
+    heard_a: Option<i64>,
+    /// The call's link control, from its header or its embedded signalling.
+    lc: Option<FullLc>,
+    /// Embedded fragments (from bursts B to E), each with its period, oldest first.
+    fragments: Vec<(i64, Vec<u8>)>,
+}
+
+impl Track {
+    fn new(slot: Option<u8>, origin: Origin, anchor: f64, state: TrackState) -> Self {
+        Track {
+            slot,
+            origin,
+            anchor,
+            anchor_period: 0,
+            next: 1,
+            last_good: 0,
+            state,
+            phase: None,
+            heard_a: None,
+            lc: None,
+            fragments: Vec::new(),
+        }
     }
+
+    /// Where `period`'s centre field is.
+    fn place(&self, period: i64, sps: f64) -> f64 {
+        self.anchor + ((period - self.anchor_period) * SLOT_PERIOD_DIBITS as i64) as f64 * sps
+    }
+
+    /// A sync heard on the slot at `centre`: its period, the anchor moved to it.
+    fn heard(&mut self, centre: f64, sps: f64) -> i64 {
+        let periods = (centre - self.anchor) / (SLOT_PERIOD_DIBITS as f64 * sps);
+        let period = self.anchor_period + periods.round() as i64;
+        self.anchor = centre;
+        self.anchor_period = period;
+        self.next = period + 1;
+        self.last_good = period;
+        period
+    }
+
+    /// `period`'s burst in its superframe: 0 for A to 5 for F, when the phase is known.
+    fn letter(&self, period: i64) -> Option<usize> {
+        self.phase
+            .map(|p| (period - p).rem_euclid(VOICE_BURSTS as i64) as usize)
+    }
+
+    /// Whether `period`'s superframe began with a burst A whose sync was heard.
+    fn anchored(&self, period: i64) -> bool {
+        let (Some(phase), Some(a)) = (self.phase, self.heard_a) else {
+            return false;
+        };
+        let six = VOICE_BURSTS as i64;
+        a == phase + (period - phase).div_euclid(six) * six
+    }
+
+    /// A data burst heard: no call follows unless it is a voice LC header.
+    fn data(&mut self, state: TrackState, lc: Option<FullLc>) {
+        self.state = state;
+        self.lc = lc;
+        self.phase = None;
+        self.heard_a = None;
+        self.fragments.clear();
+    }
+
+    /// The link control from the four latest fragments when they are the four places in
+    /// order, B to E: of one superframe, or, while the call's link control is not yet in
+    /// hand, across a superframe's boundary (C, D, E then B; D, E then B, C; E then B, C,
+    /// D). The embedded code's row and column parity and its checksum decide.
+    fn assemble(&self) -> Option<(FullLc, u32)> {
+        let phase = self.phase?;
+        let six = VOICE_BURSTS as i64;
+        let placed: Vec<(i64, usize, &Vec<u8>)> = self
+            .fragments
+            .iter()
+            .filter_map(|(period, f)| {
+                let rel = period - phase;
+                let letter = rel.rem_euclid(six) as usize;
+                (1..=EMB_LC_FRAGMENTS)
+                    .contains(&letter)
+                    .then(|| (rel.div_euclid(six) * 4 + letter as i64 - 1, letter, f))
+            })
+            .collect();
+        let &(last, last_letter, _) = placed.last()?;
+        if last_letter != EMB_LC_FRAGMENTS && self.lc.is_some() {
+            return None;
+        }
+        let mut by_letter: Vec<Vec<u8>> = vec![Vec::new(); EMB_LC_FRAGMENTS];
+        for place in last - 3..=last {
+            let (_, letter, f) = placed.iter().rev().find(|(p, ..)| *p == place)?;
+            by_letter[letter - 1] = f.to_vec();
+        }
+        let (bytes, errors) = embedded_decode(&by_letter)?;
+        // Across a boundary every row must be a code word as received (see the module doc).
+        if last_letter != EMB_LC_FRAGMENTS && errors != 0 {
+            return None;
+        }
+        parse_lc(&bytes).map(|lc| (lc, errors))
+    }
+
+    /// The burst at `period`, which has no sync, read by the flywheel: its EMB's data and
+    /// the bits it corrected, and the link control it completes with the bits that took.
+    /// `None` when the EMB does not decode, names another colour code than `known`, or does
+    /// not fit the burst's letter; in a superframe whose burst A was not heard, when the
+    /// embedded bits are not the known link control's (or burst F's null message).
+    fn flywheel(
+        &mut self,
+        bits: &[u8; BURST_BITS],
+        known: Option<u8>,
+        period: i64,
+    ) -> Option<FlywheelRead> {
+        let (data, emb_errors) = QR16.decode(emb_word_of(bits))?;
+        if known.is_some_and(|cc| u32::from(cc) != data >> 3) {
+            return None;
+        }
+        let lcss = (data & 3) as u8;
+        let embedded = &bits[HALF_BITS + EMB_HALF_BITS..][..EMBEDDED_BITS];
+        match self.letter(period) {
+            Some(letter) => {
+                if EXPECTED_LCSS[letter] != Some(lcss) {
+                    return None;
+                }
+                if !self.anchored(period)
+                    && let Some(lc) = self.lc
+                {
+                    let want = match letter {
+                        1..=4 => embedded_encode(&lc_bytes(&lc))[letter - 1],
+                        _ => [0; EMBEDDED_BITS],
+                    };
+                    let differ = embedded
+                        .iter()
+                        .zip(want)
+                        .filter(|&(s, w)| u8::from(*s >= 128) != w)
+                        .count();
+                    if differ > UNANCHORED_MAX_DIFFER {
+                        return None;
+                    }
+                }
+            }
+            None => match lcss {
+                LCSS_FIRST => self.phase = Some(period - 1),
+                LCSS_LAST => self.phase = Some(period - 4),
+                _ => {}
+            },
+        }
+        self.state = TrackState::Voice;
+        self.last_good = period;
+        let mut lc = None;
+        if lcss != LCSS_SINGLE {
+            self.fragments.push((period, embedded.to_vec()));
+            if self.fragments.len() > KEPT_FRAGMENTS {
+                self.fragments.remove(0);
+            }
+            lc = self.assemble();
+            if let Some((found, _)) = lc {
+                self.lc = Some(found);
+            }
+        }
+        Some(FlywheelRead {
+            emb: data,
+            emb_errors,
+            lc,
+        })
+    }
+}
+
+/// What the flywheel took from a burst: its EMB's data and the bits it corrected, and the
+/// link control the burst completed with the bits that took.
+struct FlywheelRead {
+    emb: u32,
+    emb_errors: u32,
+    lc: Option<(FullLc, u32)>,
 }
 
 /// The symbol period, measured from the dibits' positions.
@@ -395,8 +648,9 @@ pub struct DmrFramer {
     searched: usize,
     inverted: Option<bool>,
     spacing: Spacing,
-    superframes: Vec<Superframe>,
-    /// The colour code last read on each slot (no slot, 1, 2).
+    tracks: Vec<Track>,
+    /// The colour code learnt on each slot (no slot, 1, 2): from a slot type, or an EMB
+    /// with no bit corrected.
     color_codes: [Option<u8>; 3],
 }
 
@@ -427,10 +681,10 @@ impl DmrFramer {
             };
             let sync_at = sync.map(|(i, ..)| self.buf[i].at);
             let next = self
-                .superframes
+                .tracks
                 .iter()
                 .enumerate()
-                .map(|(k, s)| (k, s.expected(sps)))
+                .map(|(k, t)| (k, t.place(t.next, sps)))
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((k, at)) = next
                 && sync_at.is_none_or(|s| at < s - SAME_BURST_SYMBOLS * sps)
@@ -439,21 +693,17 @@ impl DmrFramer {
                     self.searched = resume;
                     break;
                 }
-                out.extend(self.expected_burst(k, at, sps));
+                out.extend(self.flywheel_burst(k, at, sps));
                 continue;
             }
             let Some((i, origin, kind)) = sync else {
                 self.searched = resume;
                 break;
             };
-            let at = self.buf[i].at;
-            if !self.covers(at, sps) {
+            if !self.covers(self.buf[i].at, sps) {
                 self.searched = resume;
                 break;
             }
-            // A sync where a burst was expected ends that superframe.
-            self.superframes
-                .retain(|s| (s.expected(sps) - at).abs() > SAME_BURST_SYMBOLS * sps);
             out.extend(self.sync_burst(i, origin, kind, applied, sps));
             self.searched = i + SYNC_DIBITS;
         }
@@ -533,6 +783,31 @@ impl DmrFramer {
         (bits, cach)
     }
 
+    /// The track of `slot`, made when there is none, with its timing from a sync at
+    /// `centre`; on a repeater the other slot's too, half a period off.
+    fn track(&mut self, slot: Option<u8>, origin: Origin, centre: f64, sps: f64) -> usize {
+        if origin == Origin::Repeater
+            && let Some(other) = slot.map(|s| 3 - s)
+            && !self.tracks.iter().any(|t| t.slot == Some(other))
+        {
+            let half = (SLOT_PERIOD_DIBITS / 2) as f64 * sps;
+            self.tracks.push(Track::new(
+                Some(other),
+                origin,
+                centre - half,
+                TrackState::Unknown,
+            ));
+        }
+        match self.tracks.iter().position(|t| t.slot == slot) {
+            Some(k) => k,
+            None => {
+                let state = TrackState::Unknown;
+                self.tracks.push(Track::new(slot, origin, centre, state));
+                self.tracks.len() - 1
+            }
+        }
+    }
+
     /// The burst at sync `i`.
     fn sync_burst(
         &mut self,
@@ -556,7 +831,7 @@ impl DmrFramer {
                     let from = self.index_at(centre - back);
                     self.buf[from..].iter_mut().for_each(flip);
                     self.inverted = Some(!applied);
-                    self.superframes.clear();
+                    self.tracks.clear();
                     (bits, cach, kind) = (turned, turned_cach, Kind::Data);
                 } else if kind == Kind::Data {
                     // Unknown polarity and codes that do not check: not read.
@@ -566,16 +841,24 @@ impl DmrFramer {
         }
         let slot = (origin == Origin::Repeater).then(|| (cach_tact(&cach).0 >> 2 & 1) + 1);
         let at = centre - LEFT_DIBITS as f64 * sps;
-        self.superframes.retain(|s| s.slot != slot);
+        let k = self.track(slot, origin, centre, sps);
+        let track = &mut self.tracks[k];
+        track.origin = origin;
+        let period = track.heard(centre, sps);
         match kind {
             Kind::Voice => {
-                self.superframes.push(Superframe {
-                    slot,
-                    origin,
-                    sync_at: centre,
-                    next: 1,
-                    fragments: Vec::new(),
-                });
+                let six = VOICE_BURSTS as i64;
+                if track
+                    .phase
+                    .is_some_and(|p| (period - p).rem_euclid(six) != 0)
+                {
+                    // Another superframe grid: another call.
+                    track.fragments.clear();
+                    track.lc = None;
+                }
+                track.state = TrackState::Voice;
+                track.phase = Some(period);
+                track.heard_a = Some(period);
                 let (voice, errors) = voice_frames(&bits);
                 Some(DmrBurst {
                     at,
@@ -585,7 +868,7 @@ impl DmrFramer {
                     content: DmrContent::Voice {
                         first: true,
                         lc: None,
-                        privacy: false,
+                        pi: false,
                         voice,
                         errors,
                     },
@@ -594,20 +877,30 @@ impl DmrFramer {
             Kind::Data => {
                 let (data, _) = GOLAY20.decode(slot_type_word(&bits))?;
                 let (cc, dt) = ((data >> 4) as u8, (data & 0xF) as u8);
-                self.color_codes[slot_key(slot)] = Some(cc);
                 let lc = |mask| {
                     bptc_decode(&info_bits(&bits))
                         .and_then(|(info, _)| lc_decode(&info, mask))
                         .map(|(lc, _)| lc)
                 };
                 let content = match dt {
-                    DT_VOICE_LC_HEADER => DmrContent::VoiceHeader(lc(MASK_VOICE_LC_HEADER)),
-                    DT_TERMINATOR_LC => DmrContent::Terminator(lc(MASK_TERMINATOR_LC)),
+                    DT_VOICE_LC_HEADER => {
+                        let header = lc(MASK_VOICE_LC_HEADER);
+                        track.data(TrackState::Voice, header);
+                        DmrContent::VoiceHeader(header)
+                    }
+                    // A privacy header comes between a call's header and its voice.
                     DT_PI_HEADER => DmrContent::PrivacyHeader,
-                    DT_CSBK => DmrContent::Control,
-                    DT_IDLE => DmrContent::Idle,
-                    other => DmrContent::Other(other),
+                    other => {
+                        track.data(TrackState::Data, None);
+                        match other {
+                            DT_TERMINATOR_LC => DmrContent::Terminator(lc(MASK_TERMINATOR_LC)),
+                            DT_CSBK => DmrContent::Control,
+                            DT_IDLE => DmrContent::Idle,
+                            d => DmrContent::Other(d),
+                        }
+                    }
                 };
+                self.color_codes[slot_key(slot)] = Some(cc);
                 Some(DmrBurst {
                     at,
                     slot,
@@ -619,44 +912,35 @@ impl DmrFramer {
         }
     }
 
-    /// Superframe `k`'s next burst (B to F), its centre field at `centre`; `None` when its
-    /// EMB does not decode or names another colour code.
-    fn expected_burst(&mut self, k: usize, centre: f64, sps: f64) -> Option<DmrBurst> {
+    /// Track `k`'s next burst, its centre field at `centre`, read by position: a voice burst
+    /// when the flywheel takes it ([`Track::flywheel`]). A track that has had neither a sync
+    /// nor a valid EMB for two superframes is dropped.
+    fn flywheel_burst(&mut self, k: usize, centre: f64, sps: f64) -> Option<DmrBurst> {
         let (bits, _) = self.read(centre, sps);
-        let sf = &mut self.superframes[k];
-        sf.next += 1;
-        let (slot, origin) = (sf.slot, sf.origin);
-        let known = self.color_codes[slot_key(slot)];
-        let emb = QR16
-            .decode(emb_word_of(&bits))
-            .filter(|&(d, _)| known.is_none_or(|cc| u32::from(cc) == d >> 3));
-        let mut lc = None;
-        let mut lc_errors = 0;
-        if let Some((data, _)) = emb {
-            let embedded = bits[HALF_BITS + EMB_HALF_BITS..][..EMBEDDED_BITS].to_vec();
-            match (data & 3) as u8 {
-                LCSS_FIRST => sf.fragments = vec![embedded],
-                LCSS_CONTINUATION if !sf.fragments.is_empty() => sf.fragments.push(embedded),
-                LCSS_LAST if !sf.fragments.is_empty() => {
-                    sf.fragments.push(embedded);
-                    if let Some((b, e)) = embedded_decode(&sf.fragments) {
-                        lc = parse_lc(&b);
-                        lc_errors = e;
-                    }
-                    sf.fragments.clear();
-                }
-                _ => sf.fragments.clear(),
-            }
-        } else {
-            sf.fragments.clear();
+        let key = slot_key(self.tracks[k].slot);
+        let known = self.color_codes[key];
+        let track = &mut self.tracks[k];
+        let period = track.next;
+        track.next += 1;
+        let (slot, origin) = (track.slot, track.origin);
+        let read = match track.state {
+            TrackState::Data => None,
+            _ => track.flywheel(&bits, known, period),
+        };
+        if period - track.last_good > FLYWHEEL_PERIODS {
+            self.tracks.remove(k);
         }
-        if sf.next >= VOICE_BURSTS {
-            self.superframes.remove(k);
-        }
-        let (data, emb_errors) = emb?;
+        let FlywheelRead {
+            emb: data,
+            emb_errors,
+            lc,
+        } = read?;
         let cc = (data >> 3) as u8;
-        self.color_codes[slot_key(slot)] = Some(cc);
+        if emb_errors == 0 {
+            self.color_codes[key] = Some(cc);
+        }
         let (voice, ambe_errors) = voice_frames(&bits);
+        let lc_errors = lc.map_or(0, |(_, e)| e);
         Some(DmrBurst {
             at: centre - LEFT_DIBITS as f64 * sps,
             slot,
@@ -664,8 +948,8 @@ impl DmrFramer {
             color_code: Some(cc),
             content: DmrContent::Voice {
                 first: false,
-                lc,
-                privacy: data >> 2 & 1 == 1,
+                lc: lc.map(|(lc, _)| lc),
+                pi: data >> 2 & 1 == 1,
                 voice,
                 errors: emb_errors + lc_errors + ambe_errors,
             },
@@ -673,7 +957,7 @@ impl DmrFramer {
     }
 
     /// Drops the dibits nothing can reach any more: those before the CACH of a burst whose
-    /// sync starts at `searched`, or of the next expected burst.
+    /// sync starts at `searched`, or of a track's next burst.
     fn trim(&mut self, sps: f64) {
         let back = (LEFT_DIBITS + CACH_DIBITS + 2) as f64 * sps;
         let search_at = self
@@ -682,9 +966,9 @@ impl DmrFramer {
             .or(self.buf.last())
             .map_or(f64::INFINITY, |d| d.at);
         let needed = self
-            .superframes
+            .tracks
             .iter()
-            .map(|s| s.expected(sps))
+            .map(|t| t.place(t.next, sps))
             .fold(search_at, f64::min);
         let n = self.index_at(needed - back).min(self.searched);
         self.buf.drain(..n);
@@ -763,35 +1047,33 @@ fn voice_frames(bits: &[u8; BURST_BITS]) -> (Box<[AmbeSoft; 3]>, u32) {
 
 // ---- encoding ----
 
-/// One slot of [`encode_repeater`]: a call of `superframes` with link control `lc`, or,
-/// with `None`, Idle bursts for as long as such a call would last.
+/// One slot of [`encode_repeater`]: a call of `superframes` with link control `lc`; with
+/// `control`, Preamble CSBKs (-2 7.1.2.5) from `lc.src` to `lc.dst` instead, for as long
+/// as the call would last; with `lc: None`, Idle bursts for as long.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotPlan {
     pub lc: Option<FullLc>,
     pub superframes: u32,
+    pub control: bool,
 }
 
-/// A repeater's continuous downlink with CACH: both slots, each a call or idle. A call is
-/// a voice LC header, `superframes` voice superframes of a fixed voice payload, a
-/// terminator; a slot that finishes first idles until the other does. The CACHs carry the
-/// Null short LC. Dibits.
+/// A repeater's continuous downlink with CACH: both slots, each a call, control blocks or
+/// idle. A call is a voice LC header, a privacy header when `lc.encrypted`, `superframes`
+/// voice superframes of the voice payload (`voice_payload`), a terminator; a slot that
+/// finishes first idles until the other does. The CACHs carry the Null short LC. Dibits.
 pub fn encode_repeater(color_code: u8, slots: [SlotPlan; 2]) -> Vec<u8> {
-    let idle = idle_burst(color_code);
     let bursts = slots.map(|plan| match plan.lc {
-        Some(lc) => call_bursts(color_code, &lc, plan.superframes, Origin::Repeater),
-        None => vec![idle; call_bursts_len(plan.superframes)],
-    });
-    let frames = bursts.iter().map(Vec::len).max().unwrap_or(0);
-    let mut out = Vec::with_capacity(frames * SLOT_PERIOD_DIBITS);
-    for f in 0..frames {
-        for (s, list) in bursts.iter().enumerate() {
-            let busy = slots[s].lc.is_some() && f < list.len();
-            let lcss = SHORT_LC_LCSS[(2 * f + s) % SHORT_LC_LCSS.len()];
-            out.extend(dibits_of(&cach_bits(busy, s as u8, lcss)));
-            out.extend(dibits_of(list.get(f).unwrap_or(&idle)));
+        Some(lc) if plan.control => {
+            let n = call_bursts_len(plan.superframes, false);
+            (0..n)
+                .map(|i| csbk_burst(color_code, &preamble_csbk(&lc, n - 1 - i)))
+                .collect()
         }
-    }
-    out
+        Some(lc) => call_bursts(color_code, &lc, plan.superframes, Origin::Repeater),
+        None => vec![idle_burst(color_code); call_bursts_len(plan.superframes, false)],
+    });
+    let busy = slots.map(|plan| plan.lc.is_some());
+    downlink(color_code, &bursts, busy)
 }
 
 /// A handheld's bursts: one slot in two, silence (no symbols) between. The call is as
@@ -806,41 +1088,92 @@ pub fn encode_handheld(color_code: u8, lc: FullLc, superframes: u32) -> Vec<Opti
     out
 }
 
-fn call_bursts_len(superframes: u32) -> usize {
-    2 + VOICE_BURSTS * superframes as usize
+/// The downlink of two slots' bursts, a CACH before each (TC naming the slot, AT busy
+/// while `busy` and the slot's bursts last); a slot that runs out idles.
+fn downlink(cc: u8, bursts: &[Vec<[u8; BURST_BITS]>; 2], busy: [bool; 2]) -> Vec<u8> {
+    let idle = idle_burst(cc);
+    let frames = bursts.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = Vec::with_capacity(frames * SLOT_PERIOD_DIBITS);
+    for f in 0..frames {
+        for (s, list) in bursts.iter().enumerate() {
+            let at = busy[s] && f < list.len();
+            let lcss = SHORT_LC_LCSS[(2 * f + s) % SHORT_LC_LCSS.len()];
+            out.extend(dibits_of(&cach_bits(at, s as u8, lcss)));
+            out.extend(dibits_of(list.get(f).unwrap_or(&idle)));
+        }
+    }
+    out
 }
 
-/// A call's bursts on one slot: the voice LC header, `superframes` × bursts A to F, the
-/// terminator with link control.
+fn call_bursts_len(superframes: u32, encrypted: bool) -> usize {
+    2 + usize::from(encrypted) + VOICE_BURSTS * superframes as usize
+}
+
+/// A call's bursts on one slot: the voice LC header, a privacy header when encrypted,
+/// `superframes` × bursts A to F, the terminator with link control. The EMB's PI bit is 0
+/// throughout: it is not an encryption mark (see the module doc).
 fn call_bursts(cc: u8, lc: &FullLc, superframes: u32, origin: Origin) -> Vec<[u8; BURST_BITS]> {
+    let data_sync = sync_word(origin, Kind::Data);
     let data = |dt, mask| {
         data_burst(
-            sync_word(origin, Kind::Data),
+            data_sync,
             slot_type(cc, dt),
             &bptc_encode(&lc_info(lc, mask)),
         )
     };
-    let vs = voice_socket(&[ambe_encode(&VOICE_PAYLOAD); 3]);
     let fragments = embedded_encode(&lc_bytes(lc));
-    let emb = |lcss| emb_word(cc, lc.encrypted, lcss);
-    let mut out = Vec::with_capacity(call_bursts_len(superframes));
+    let emb = |lcss| emb_word(cc, false, lcss);
+    let mut frame = 0;
+    let mut socket = || {
+        let frames = std::array::from_fn(|i| ambe_encode(&voice_payload(frame + i as u32)));
+        frame += 3;
+        voice_socket(&frames)
+    };
+    let mut out = Vec::with_capacity(call_bursts_len(superframes, lc.encrypted));
     out.push(data(DT_VOICE_LC_HEADER, MASK_VOICE_LC_HEADER));
+    if lc.encrypted {
+        out.push(data_burst(
+            data_sync,
+            slot_type(cc, DT_PI_HEADER),
+            &bptc_encode(&pi_header_info()),
+        ));
+    }
     for _ in 0..superframes {
         out.push(voice_burst(
-            &vs,
+            &socket(),
             &sync_centre(sync_word(origin, Kind::Voice)),
         ));
         for (fragment, lcss) in fragments.iter().zip(EMBEDDED_LCSS) {
-            out.push(voice_burst(&vs, &emb_centre(emb(lcss), fragment)));
+            out.push(voice_burst(&socket(), &emb_centre(emb(lcss), fragment)));
         }
         // Burst F: the Null embedded message.
-        out.push(voice_burst(
-            &vs,
-            &emb_centre(emb(LCSS_SINGLE), &[0; EMBEDDED_BITS]),
-        ));
+        let null = emb_centre(emb(LCSS_SINGLE), &[0; EMBEDDED_BITS]);
+        out.push(voice_burst(&socket(), &null));
     }
     out.push(data(DT_TERMINATOR_LC, MASK_TERMINATOR_LC));
     out
+}
+
+/// The 49 parameter bits of a call's `n`-th voice frame: one SplitMix64 step (Steele, Lea
+/// and Flood, 2014) of `n`, its top 49 bits split 12, 12, 11 and 14. Varied from frame to
+/// frame so that no burst sits on one level, as speech's frames do not; it is not speech,
+/// and no codec made it.
+fn voice_payload(n: u32) -> [u16; 4] {
+    let z = splitmix64(u64::from(n));
+    [
+        (z >> 52) as u16 & 0xFFF,
+        (z >> 40) as u16 & 0xFFF,
+        (z >> 29) as u16 & 0x7FF,
+        (z >> 15) as u16 & 0x3FFF,
+    ]
+}
+
+/// One SplitMix64 step (Steele, Lea and Flood, 2014) of `n`.
+fn splitmix64(n: u64) -> u64 {
+    let mut z = n.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// A repeater's Idle burst: table D.2's fill bits.
@@ -851,6 +1184,72 @@ fn idle_burst(cc: u8) -> [u8; BURST_BITS] {
         slot_type(cc, DT_IDLE),
         &bptc_encode(&info),
     )
+}
+
+/// A privacy header's information bits: -1 does not define its 80 bits of contents
+/// (table 6.1's note), filled here from SplitMix64 so the burst is not one level, then
+/// their CRC-CCITT under the PI header's mask.
+fn pi_header_info() -> [u8; BPTC_INFO_BITS] {
+    let fill = splitmix64(PI_HEADER_SEED).to_be_bytes();
+    let block: [u8; BLOCK_DATA_BYTES] = std::array::from_fn(|i| fill[i % fill.len()] ^ i as u8);
+    crc_block(&block, MASK_PI_HEADER)
+}
+
+/// A Preamble CSBK (-2 table 7.7): LB, PF 0, CSBKO `111101`, FID 0, CSBK content to
+/// follow, a group target, `follow` blocks to follow, the target and source addresses.
+fn preamble_csbk(lc: &FullLc, follow: usize) -> [u8; BLOCK_DATA_BYTES] {
+    let [_, d2, d1, d0] = (lc.dst & ID_MASK).to_be_bytes();
+    let [_, s2, s1, s0] = (lc.src & ID_MASK).to_be_bytes();
+    let gi = if lc.call == Call::Group {
+        CSBK_GROUP
+    } else {
+        0
+    };
+    [
+        CSBK_LAST_BLOCK | CSBKO_PREAMBLE,
+        0,
+        gi,
+        follow.min(255) as u8,
+        d2,
+        d1,
+        d0,
+        s2,
+        s1,
+        s0,
+    ]
+}
+
+/// A repeater's CSBK burst (-1 7.2, table 9.9): the block, its CRC-CCITT under the CSBK
+/// mask, BPTC (196,96).
+fn csbk_burst(cc: u8, block: &[u8; BLOCK_DATA_BYTES]) -> [u8; BURST_BITS] {
+    let info = crc_block(block, MASK_CSBK);
+    data_burst(
+        DMR_SYNC_BS_DATA,
+        slot_type(cc, DT_CSBK),
+        &bptc_encode(&info),
+    )
+}
+
+/// 80 bits of a block and their CRC-CCITT under `mask`, as 96 information bits.
+fn crc_block(block: &[u8; BLOCK_DATA_BYTES], mask: u16) -> [u8; BPTC_INFO_BITS] {
+    let crc = crc_ccitt(block) ^ mask;
+    let bytes: Vec<u8> = block.iter().copied().chain(crc.to_be_bytes()).collect();
+    std::array::from_fn(|i| bytes[i / 8] >> (7 - i % 8) & 1)
+}
+
+/// The CRC-CCITT of B.3.8: the remainder of `x^16 M(x)` by `x^16 + x^12 + x^5 + 1`
+/// (initial remainder 0), inverted.
+fn crc_ccitt(data: &[u8]) -> u16 {
+    let rem = data.iter().fold(0u16, |crc, &byte| {
+        (0..8).fold(crc ^ u16::from(byte) << 8, |c, _| {
+            if c & 0x8000 != 0 {
+                c << 1 ^ CRC_CCITT_POLY
+            } else {
+                c << 1
+            }
+        })
+    });
+    rem ^ 0xFFFF
 }
 
 fn slot_type(cc: u8, dt: u8) -> u32 {
@@ -2265,34 +2664,66 @@ mod tests {
 
     /// Samples from one burst of a slot to the next (60 ms at 48 kHz).
     const SLOT_PERIOD: f64 = 2880.0;
+    /// A voice superframe, samples.
+    const SUPERFRAME: f64 = DMR_SUPERFRAME_MS as f64 * 48.0;
+    /// A burst, samples (27.5 ms).
+    const BURST: f64 = 1320.0;
 
-    /// `bursts` are a call of `superframes` with link control `lc` on slot `slot`: the
-    /// header, the voice bursts (the sync on every sixth, the embedded link control on
-    /// every burst E), the terminator, each a slot period after the last.
+    fn plan(lc: Option<FullLc>, superframes: u32) -> SlotPlan {
+        SlotPlan {
+            lc,
+            superframes,
+            control: false,
+        }
+    }
+
+    /// The embedded link control a burst gives, if any.
+    fn lc_of(b: &DmrBurst) -> Option<FullLc> {
+        match b.content {
+            DmrContent::Voice { lc, .. } => lc,
+            _ => None,
+        }
+    }
+
+    fn is_voice(b: &DmrBurst) -> bool {
+        matches!(b.content, DmrContent::Voice { .. })
+    }
+
+    /// `bursts` are a call of `superframes` with link control `lc` on slot `slot`, whole:
+    /// the header (and a privacy header when encrypted), the voice bursts (the sync on every
+    /// sixth, the embedded link control on every burst E, PI clear, the payload's frames,
+    /// no bit corrected), the terminator, each a slot period after the last.
     fn is_a_call(bursts: &[&DmrBurst], lc: FullLc, superframes: usize, slot: Option<u8>) {
-        assert_eq!(bursts.len(), 2 + 6 * superframes, "{bursts:#?}");
+        let headers = 1 + usize::from(lc.encrypted);
+        assert_eq!(bursts.len(), headers + 1 + 6 * superframes, "{bursts:#?}");
         assert!(bursts.iter().all(|b| b.slot == slot));
         assert_eq!(bursts[0].content, DmrContent::VoiceHeader(Some(lc)));
-        assert_eq!(bursts[0].color_code, Some(CC));
-        for (i, b) in bursts[1..=6 * superframes].iter().enumerate() {
+        if lc.encrypted {
+            assert_eq!(bursts[1].content, DmrContent::PrivacyHeader);
+        }
+        assert!(bursts[..headers].iter().all(|b| b.color_code == Some(CC)));
+        for (i, b) in bursts[headers..headers + 6 * superframes]
+            .iter()
+            .enumerate()
+        {
             let DmrContent::Voice {
                 first,
                 lc: embedded,
-                privacy,
+                pi,
                 voice,
-                ..
+                errors,
             } = &b.content
             else {
                 panic!("burst {i}: {b:?}");
             };
             assert_eq!(*first, i % 6 == 0, "burst {i}");
             assert_eq!(*embedded, (i % 6 == 4).then_some(lc), "burst {i}");
-            assert_eq!(*privacy, lc.encrypted, "burst {i}");
+            assert!(!pi, "burst {i}");
+            assert_eq!(*errors, 0, "burst {i}");
             assert_eq!(b.color_code, (i % 6 != 0).then_some(CC), "burst {i}");
-            assert!(
-                voice.iter().all(|f| ambe_decode(f).0 == [0; 4]),
-                "burst {i}"
-            );
+            for (f, frame) in voice.iter().enumerate() {
+                assert_eq!(ambe_decode(frame), (voice_payload((3 * i + f) as u32), 0));
+            }
         }
         assert_eq!(
             bursts.last().unwrap().content,
@@ -2310,19 +2741,7 @@ mod tests {
 
     #[test]
     fn a_repeater_call_decodes_to_its_bursts() {
-        let call = encode_repeater(
-            CC,
-            [
-                SlotPlan {
-                    lc: Some(group()),
-                    superframes: 3,
-                },
-                SlotPlan {
-                    lc: None,
-                    superframes: 3,
-                },
-            ],
-        );
+        let call = encode_repeater(CC, [plan(Some(group()), 3), plan(None, 3)]);
         // Twenty TDMA frames of 60 ms: CACH, slot 1, CACH, slot 2.
         assert_eq!(call.len(), 20 * 288);
         for invert in [false, true] {
@@ -2333,12 +2752,6 @@ mod tests {
             let one: Vec<&DmrBurst> = bursts.iter().filter(|b| b.slot == Some(1)).collect();
             let two: Vec<&DmrBurst> = bursts.iter().filter(|b| b.slot != Some(1)).collect();
             is_a_call(&one, group(), 3, Some(1));
-            for b in &one[1..19] {
-                let DmrContent::Voice { errors, .. } = b.content else {
-                    unreachable!()
-                };
-                assert_eq!(errors, 0, "invert {invert}: {b:?}");
-            }
             assert_eq!(two.len(), 20, "invert {invert}");
             assert!(two.iter().all(|b| b.slot == Some(2)
                 && b.content == DmrContent::Idle
@@ -2353,81 +2766,13 @@ mod tests {
             dst: DST_2,
             ..group()
         };
-        let call = encode_repeater(
-            CC,
-            [
-                SlotPlan {
-                    lc: Some(group()),
-                    superframes: 2,
-                },
-                SlotPlan {
-                    lc: Some(other),
-                    superframes: 2,
-                },
-            ],
-        );
+        let call = encode_repeater(CC, [plan(Some(group()), 2), plan(Some(other), 2)]);
         let bursts = receive(&on_air(&call, false), &mut DmrFramer::new());
         for (slot, lc) in [(1, group()), (2, other)] {
             let mine: Vec<&DmrBurst> = bursts.iter().filter(|b| b.slot == Some(slot)).collect();
             is_a_call(&mine, lc, 2, Some(slot));
         }
         assert_eq!(bursts.len(), 2 * 14);
-    }
-
-    /// `bursts` from a handheld's call of `superframes` with link control `lc`, each in its
-    /// 60 ms: every one but bursts F, which may be missing (below), and each as
-    /// [`is_a_call`] has it.
-    ///
-    /// Burst F carries the Null embedded message and the zero voice payload, so 100 of its
-    /// 132 symbols sit on one level, and the 4FSK front end does not acquire it as a burst
-    /// on its own (a burst B, 92 of 132 on one level, it does): reported to the front
-    /// end's owner, not worked around here.
-    fn is_a_handheld_call(bursts: &[DmrBurst], lc: FullLc, superframes: usize) {
-        assert!(
-            bursts
-                .iter()
-                .all(|b| b.origin == Origin::Handheld && b.slot.is_none())
-        );
-        let total = 2 + 6 * superframes;
-        let mut seen = vec![false; total];
-        for b in bursts {
-            let k = (b.at / SLOT_PERIOD).round() as usize;
-            assert!(k < total && !seen[k], "burst at {}", b.at);
-            assert!(
-                (b.at - k as f64 * SLOT_PERIOD).abs() < 10.0,
-                "burst at {}",
-                b.at
-            );
-            seen[k] = true;
-            let want = match k {
-                0 => DmrContent::VoiceHeader(Some(lc)),
-                k if k == total - 1 => DmrContent::Terminator(Some(lc)),
-                k => {
-                    let letter = (k - 1) % 6;
-                    let DmrContent::Voice { voice, errors, .. } = &b.content else {
-                        panic!("burst {k}: {b:?}");
-                    };
-                    assert!(
-                        voice.iter().all(|f| ambe_decode(f).0 == [0; 4]),
-                        "burst {k}"
-                    );
-                    assert_eq!(b.color_code, (letter != 0).then_some(CC), "burst {k}");
-                    DmrContent::Voice {
-                        first: letter == 0,
-                        lc: (letter == 4).then_some(lc),
-                        privacy: letter != 0 && lc.encrypted,
-                        voice: voice.clone(),
-                        errors: *errors,
-                    }
-                }
-            };
-            assert_eq!(b.content, want, "burst {k}");
-        }
-        let missing: Vec<usize> = (0..total).filter(|&k| !seen[k]).collect();
-        assert!(
-            missing.iter().all(|k| k % 6 == 0 && *k > 0),
-            "missing {missing:?}"
-        );
     }
 
     #[test]
@@ -2437,8 +2782,17 @@ mod tests {
         assert_eq!(call.len(), 20 * 288);
         assert_eq!(call.iter().filter(|d| d.is_some()).count(), 20 * 132);
         let bursts = receive(&on_air_gated(&call), &mut DmrFramer::new());
-        is_a_handheld_call(&bursts, group(), 3);
-        // An encrypted call says so in its link control and in every EMB.
+        assert!(bursts.iter().all(|b| b.origin == Origin::Handheld));
+        is_a_call(&bursts.iter().collect::<Vec<_>>(), group(), 3, None);
+        for (k, b) in bursts.iter().enumerate() {
+            assert!(
+                (b.at - k as f64 * SLOT_PERIOD).abs() < 10.0,
+                "burst {k} at {}",
+                b.at
+            );
+        }
+        // An encrypted call says so in its link control and with a privacy header; its
+        // EMBs' PI bits stay clear.
         let lc = FullLc {
             encrypted: true,
             ..group()
@@ -2447,60 +2801,314 @@ mod tests {
             &on_air_gated(&encode_handheld(CC, lc, 1)),
             &mut DmrFramer::new(),
         );
-        is_a_handheld_call(&bursts, lc, 1);
+        is_a_call(&bursts.iter().collect::<Vec<_>>(), lc, 1, None);
     }
 
     #[test]
-    fn a_mid_call_join_has_the_lc_within_a_superframe() {
-        let call = encode_repeater(
-            CC,
-            [
-                SlotPlan {
-                    lc: Some(group()),
-                    superframes: 3,
-                },
-                SlotPlan {
-                    lc: None,
-                    superframes: 3,
-                },
-            ],
-        );
+    fn no_burst_sits_on_one_level() {
+        let lc = FullLc {
+            encrypted: true,
+            ..group()
+        };
+        let repeater = encode_repeater(CC, [plan(Some(lc), 3), plan(None, 3)]);
+        let handheld = encode_handheld(CC, lc, 3);
+        let handheld: Vec<u8> = handheld.into_iter().flatten().collect();
+        let bursts = repeater
+            .chunks(144)
+            .map(|c| &c[12..])
+            .chain(handheld.chunks(132));
+        for (i, burst) in bursts.enumerate() {
+            let mut counts = [0usize; 4];
+            burst.iter().for_each(|&d| counts[usize::from(d)] += 1);
+            assert!(
+                counts.iter().all(|&c| c <= 132 / 2),
+                "burst {i}: {counts:?}"
+            );
+        }
+        // The payload differs from frame to frame.
+        let frames: Vec<[u16; 4]> = (0..54).map(voice_payload).collect();
+        assert!(frames.windows(2).all(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    fn a_repeater_call_joined_anywhere_has_the_lc_within_420_ms() {
+        let call = encode_repeater(CC, [plan(Some(group()), 4), plan(None, 4)]);
         let iq = on_air(&call, false);
-        // Join inside the second superframe's burst C, past its burst B.
-        let join = (1 + 6 + 2) * SLOT_PERIOD as usize + 1300;
+        // The second superframe starts after the header's frame and the first six.
+        let second = 7.0 * SLOT_PERIOD;
+        for k in 0..6 {
+            // Just past the centre field of slot 1's burst, so that burst's fragment is lost.
+            let join = (second + k as f64 * SLOT_PERIOD + 1300.0) as usize;
+            let bursts = receive(&iq[join..], &mut DmrFramer::new());
+            let found = bursts
+                .iter()
+                .find(|b| lc_of(b).is_some())
+                .expect("a link control");
+            assert_eq!(lc_of(found), Some(group()), "join {k}");
+            let in_hand = found.at + BURST;
+            assert!(in_hand <= SUPERFRAME + SLOT_PERIOD, "join {k}: {in_hand}");
+            assert!(bursts.iter().filter_map(lc_of).all(|lc| lc == group()));
+        }
+    }
+
+    #[test]
+    fn a_handheld_call_joined_mid_superframe_has_the_lc_within_a_superframe_of_its_first_sync() {
+        let call = encode_handheld(CC, group(), 3);
+        let iq = on_air_gated(&call);
+        // Inside the second superframe's burst C, past its centre field.
+        let join = (9.0 * SLOT_PERIOD + 900.0) as usize;
         let bursts = receive(&iq[join..], &mut DmrFramer::new());
-        let voice = |b: &&DmrBurst| matches!(b.content, DmrContent::Voice { .. });
         let sync = bursts
             .iter()
-            .filter(voice)
-            .find(|b| matches!(b.content, DmrContent::Voice { first: true, .. }))
-            .expect("a voice sync");
-        let with_lc = bursts
+            .find(|b| !matches!(b.content, DmrContent::Voice { first: false, .. }))
+            .expect("a sync");
+        let found = bursts
             .iter()
-            .find(|b| matches!(b.content, DmrContent::Voice { lc: Some(_), .. }))
-            .expect("the embedded link control");
-        let DmrContent::Voice { lc, .. } = with_lc.content else {
-            unreachable!()
-        };
-        assert_eq!(lc, Some(group()));
-        let superframe = DMR_SUPERFRAME_MS as f64 * 48.0;
+            .find(|b| lc_of(b).is_some())
+            .expect("a link control");
+        assert_eq!(lc_of(found), Some(group()));
         assert!(
-            with_lc.at - sync.at < superframe,
+            found.at + BURST - sync.at <= SUPERFRAME,
             "{} {}",
             sync.at,
-            with_lc.at
+            found.at
         );
-        assert!(with_lc.at < 2.0 * superframe, "{}", with_lc.at);
-        assert_eq!(
-            bursts.last().map(|b| &b.content),
-            Some(&DmrContent::Idle),
-            "the last burst is slot 2's"
-        );
-        assert!(
+    }
+
+    /// `dibits` with slot 1's centre field in TDMA frame `frame` overwritten by `centre`
+    /// (dibits) from its dibit `from`.
+    fn overwrite(dibits: &mut [u8], frame: usize, from: usize, centre: &[u8]) {
+        let at = frame * 288 + 12 + 54 + from;
+        dibits[at..at + centre.len()].copy_from_slice(centre);
+    }
+
+    #[test]
+    fn a_lost_burst_a_or_emb_loses_only_its_own_burst() {
+        // A word the EMB's code cannot decode.
+        let bad = (0..1u32 << 16).find(|&w| QR16.decode(w).is_none()).unwrap();
+        let bad: Vec<u8> = (0..8).map(|i| (bad >> (14 - 2 * i) & 3) as u8).collect();
+        // The second superframe's A is TDMA frame 7, its C frame 9.
+        for lost in [7usize, 9] {
+            let mut call = encode_repeater(CC, [plan(Some(group()), 3), plan(None, 3)]);
+            if lost == 7 {
+                // Inner levels only: no dibit of any sync.
+                let noise: Vec<u8> = (0..24).map(|i| [0b00, 0b10][i % 2]).collect();
+                overwrite(&mut call, lost, 0, &noise);
+            } else {
+                overwrite(&mut call, lost, 0, &bad[..4]);
+                overwrite(&mut call, lost, 20, &bad[4..]);
+            }
+            let bursts = receive(&on_air(&call, false), &mut DmrFramer::new());
+            let voice: Vec<&DmrBurst> = bursts
+                .iter()
+                .filter(|b| b.slot == Some(1) && is_voice(b))
+                .collect();
+            let frames: Vec<usize> = voice
+                .iter()
+                .map(|b| ((b.at - 120.0) / SLOT_PERIOD).round() as usize)
+                .collect();
+            let want: Vec<usize> = (1..19).filter(|&f| f != lost).collect();
+            assert_eq!(frames, want, "lost {lost}");
+            for b in &voice {
+                let DmrContent::Voice { errors, .. } = b.content else {
+                    unreachable!()
+                };
+                assert_eq!(errors, 0, "lost {lost}: {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_link_control_that_changes_at_a_boundary_is_never_mixed() {
+        let other = FullLc {
+            src: SRC_2,
+            dst: DST_2,
+            ..group()
+        };
+        // Two calls back to back on slot 1, no terminator and no header between them.
+        let first = call_bursts(CC, &group(), 2, Origin::Repeater);
+        let second = call_bursts(CC, &other, 2, Origin::Repeater);
+        let slot1: Vec<[u8; BURST_BITS]> = first[..first.len() - 1]
+            .iter()
+            .chain(&second[1..])
+            .copied()
+            .collect();
+        let idle = vec![idle_burst(CC); slot1.len()];
+        let iq = on_air(&downlink(CC, &[slot1, idle], [true, false]), false);
+        let lcs = |bursts: &[DmrBurst]| -> Vec<FullLc> {
             bursts
                 .iter()
-                .any(|b| b.content == DmrContent::Terminator(Some(group())))
+                .filter_map(|b| match b.content {
+                    DmrContent::VoiceHeader(lc) | DmrContent::Terminator(lc) => lc,
+                    _ => lc_of(b),
+                })
+                .collect()
+        };
+        // From the start: the first call's, then the second's.
+        let seen = lcs(&receive(&iq, &mut DmrFramer::new()));
+        let changes = seen.iter().position(|&lc| lc == other).expect("the second");
+        assert!(seen[..changes].iter().all(|&lc| lc == group()), "{seen:?}");
+        assert!(seen[changes..].iter().all(|&lc| lc == other), "{seen:?}");
+        // Joined just past each burst's centre field across the change (TDMA frames 7 to
+        // 18: the first call's second superframe, the second call's first).
+        for frame in 7..19 {
+            let join = (frame as f64 * SLOT_PERIOD + 1300.0) as usize;
+            let seen = lcs(&receive(&iq[join..], &mut DmrFramer::new()));
+            assert!(
+                seen.iter().all(|&lc| lc == group() || lc == other),
+                "frame {frame}: {seen:?}"
+            );
+            assert!(seen.contains(&other), "frame {frame}: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn after_a_signal_ends_the_flywheel_stops_and_noise_is_not_voice() {
+        // Calls cut short, with no terminator, then two seconds of noise.
+        let mut repeater_call = call_bursts(CC, &group(), 3, Origin::Repeater);
+        repeater_call.pop();
+        let idle = vec![idle_burst(CC); repeater_call.len()];
+        let repeater = on_air(&downlink(CC, &[repeater_call, idle], [true, false]), false);
+        let mut handheld = encode_handheld(CC, group(), 3);
+        handheld.truncate(handheld.len() - 288);
+        let handheld = on_air_gated(&handheld);
+        for (name, mut iq) in [("repeater", repeater), ("handheld", handheld)] {
+            let end = iq.len() as f64;
+            let mut noise = vec![Complex::new(1.0f32, 0.0); 2 * 48_000];
+            crate::synth::awgn(&mut noise, -40.0, 11);
+            iq.extend(noise);
+            let mut framer = DmrFramer::new();
+            let bursts = receive(&iq, &mut framer);
+            let voice: Vec<&DmrBurst> = bursts.iter().filter(|b| is_voice(b)).collect();
+            assert_eq!(voice.len(), 18, "{name}");
+            assert!(bursts.iter().all(|b| b.at < end), "{name}: {bursts:?}");
+            assert!(framer.tracks.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_control_channel_gives_control_bursts() {
+        let control = SlotPlan {
+            lc: Some(group()),
+            superframes: 1,
+            control: true,
+        };
+        let channel = encode_repeater(CC, [control, plan(None, 1)]);
+        let bursts = receive(&on_air(&channel, false), &mut DmrFramer::new());
+        let one: Vec<&DmrBurst> = bursts.iter().filter(|b| b.slot == Some(1)).collect();
+        assert_eq!(one.len(), 8);
+        assert!(one.iter().all(|b| b.content == DmrContent::Control));
+        // Each a Preamble CSBK whose CRC-CCITT checks under the CSBK mask.
+        for (i, burst) in channel.chunks(288).enumerate() {
+            let bits: Vec<u8> = burst[12..144]
+                .iter()
+                .flat_map(|d| [255 * (d >> 1), 255 * (d & 1)])
+                .collect();
+            let bits: [u8; BURST_BITS] = bits.try_into().unwrap();
+            let (info, _) = bptc_decode(&info_bits(&bits)).expect("BPTC");
+            let mut bytes = [0u8; 12];
+            for (j, &b) in info.iter().enumerate() {
+                bytes[j / 8] |= b << (7 - j % 8);
+            }
+            assert_eq!(&bytes[..4], &[0xBD, 0x00, 0x40, (7 - i) as u8]);
+            let crc = u16::from_be_bytes([bytes[10], bytes[11]]);
+            assert_eq!(crc ^ MASK_CSBK, crc_ccitt(&bytes[..10]));
+        }
+    }
+
+    #[test]
+    fn the_crc_ccitt_is_b_3_8s() {
+        // x^16 + x^12 + x^5 + 1, initial remainder 0, inverted: the CRC catalogue's
+        // CRC-16/GSM, whose check value over "123456789" is CE3C.
+        assert_eq!(crc_ccitt(b"123456789"), 0xCE3C);
+        let spec = crate::crc::CrcSpec {
+            name: "b.3.8",
+            width: 16,
+            poly: 0x1021,
+            init: 0,
+            refin: false,
+            refout: false,
+            xorout: 0xFFFF,
+            check: 0xCE3C,
+        };
+        for data in [&b""[..], b"\x00", b"DMR", &[0xA5; 10]] {
+            assert_eq!(u64::from(crc_ccitt(data)), crate::crc::crc(&spec, data));
+        }
+    }
+
+    /// Clean soft dibits, one sample apart, the gaps left out.
+    fn clean(dibits: &[Option<u8>]) -> Vec<SoftDibit> {
+        dibits
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| {
+                d.map(|d| SoftDibit {
+                    dibit: d,
+                    soft: [255 * (d >> 1), 255 * (d & 1)],
+                    at: i as f64,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn another_data_type_is_reported_as_other() {
+        // A handheld's data header (data type 0110), between a call's bursts.
+        let mut call = encode_handheld(CC, group(), 1);
+        let header = data_burst(
+            DMR_SYNC_MS_DATA,
+            slot_type(CC, 0b0110),
+            &bptc_encode(&[1; 96]),
         );
+        for (d, x) in call[..132].iter_mut().zip(dibits_of(&header)) {
+            *d = Some(x);
+        }
+        let bursts = DmrFramer::new().push(&clean(&call));
+        assert_eq!(bursts[0].content, DmrContent::Other(0b0110));
+        assert_eq!(bursts[0].color_code, Some(CC));
+    }
+
+    #[test]
+    fn a_colour_code_is_learnt_only_from_a_slot_type_or_a_clean_emb() {
+        // A handheld's call from its burst A (no header, so no slot type), burst B's EMB
+        // colour code 9's with two bits wrong, which the code takes for colour code 9's.
+        let mut call = encode_handheld(CC, group(), 1)[288..].to_vec();
+        let wrong = QR16.encode(9 << 3 | u32::from(LCSS_FIRST)) ^ 0b101;
+        assert_eq!(
+            QR16.decode(wrong),
+            Some((9 << 3 | u32::from(LCSS_FIRST), 2))
+        );
+        let emb: Vec<Option<u8>> = (0..8)
+            .map(|i| Some((wrong >> (14 - 2 * i) & 3) as u8))
+            .collect();
+        let centre = 288 + 54;
+        call[centre..centre + 4].copy_from_slice(&emb[..4]);
+        call[centre + 20..centre + 24].copy_from_slice(&emb[4..]);
+        let bursts = DmrFramer::new().push(&clean(&call));
+        let codes: Vec<Option<u8>> = bursts
+            .iter()
+            .filter(|b| is_voice(b))
+            .map(|b| b.color_code)
+            .collect();
+        assert_eq!(
+            codes,
+            [None, Some(9), Some(CC), Some(CC), Some(CC), Some(CC)]
+        );
+    }
+
+    #[test]
+    fn no_row_code_word_lies_inside_one_fragments_columns() {
+        // A fragment holds four columns of the embedded matrix (B 0 to 3, ..., E 12 to 15);
+        // column c is bit 15 - c of a row's word.
+        let words: Vec<u32> = (1..1u32 << 11).map(|d| HAMMING16.encode(d)).collect();
+        let inside = |w: u32, cols: std::ops::Range<u32>| {
+            (0..16).all(|c| w >> (15 - c) & 1 == 0 || cols.contains(&c))
+        };
+        // B new, C to E old; B to D new, E old: no word, so no mix passes.
+        assert!(!words.iter().any(|&w| inside(w, 0..4)));
+        assert!(!words.iter().any(|&w| inside(w, 12..16)));
+        // B and C new, D and E old: there are words, which the module doc says.
+        assert!(words.iter().any(|&w| inside(w, 0..8)));
     }
 
     /// Table E.1 of TS 102 361-1 V2.5.1 (the general data burst with SYNC), symbol by

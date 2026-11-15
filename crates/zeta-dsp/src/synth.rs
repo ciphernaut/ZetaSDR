@@ -1434,49 +1434,49 @@ const DMR_SUPERFRAMES_MAX: u32 = 20;
 /// last symbols.
 const DMR_TAIL_MS: u32 = 10;
 
-/// The `dmr` family's call on slot 1 (or a handheld's).
+/// The `dmr` family's parameters, for [`dmr_iq`].
 struct DmrCall {
     color_code: u8,
     src: u32,
     dst: u32,
     superframes: u32,
-    encrypted: bool,
-}
-
-/// A DMR call ([`crate::dmr`]): a repeater's downlink (the call on slot 1, `second` on
-/// slot 2, slot 1 idle when `idle`) or a handheld's bursts with the carrier off between
-/// them; 4FSK at 4800 baud and ±1944 Hz, then [`DMR_TAIL_MS`] of nothing.
-fn dmr_iq(
-    call: &DmrCall,
     origin: crate::dmr::Origin,
     second: Option<DmrSecondCall>,
+    encrypted: bool,
     idle: bool,
-    rate_hz: u32,
-) -> Vec<Complex<f32>> {
+    control: bool,
+}
+
+/// A DMR call ([`crate::dmr`]): a repeater's downlink (slot 1 the call, or idle, or
+/// control blocks; slot 2 `second` or idle) or a handheld's bursts with the carrier off
+/// between them; 4FSK at 4800 baud and ±1944 Hz, then [`DMR_TAIL_MS`] of nothing.
+fn dmr_iq(call: &DmrCall, rate_hz: u32) -> Vec<Complex<f32>> {
     use crate::dmr::{
         Call, DMR_BAUD, DMR_DEVIATION_HZ, DMR_RRC_ALPHA, FullLc, Origin, SlotPlan, encode_handheld,
         encode_repeater,
     };
     use crate::fsk4::dibit_symbol;
-    let lc = |src, dst| FullLc {
+    let lc = |src, dst, encrypted| FullLc {
         call: Call::Group,
         dst,
         src,
         fid: 0,
-        encrypted: call.encrypted,
+        encrypted,
         emergency: false,
     };
-    let first = lc(call.src, call.dst);
-    let mut iq = match origin {
+    let first = lc(call.src, call.dst, call.encrypted);
+    let mut iq = match call.origin {
         Origin::Repeater => {
             let slots = [
                 SlotPlan {
-                    lc: (!idle).then_some(first),
+                    lc: (!call.idle).then_some(first),
                     superframes: call.superframes,
+                    control: call.control,
                 },
                 SlotPlan {
-                    lc: second.map(|c| lc(c.src, c.dst)),
+                    lc: call.second.map(|c| lc(c.src, c.dst, c.encrypted)),
                     superframes: call.superframes,
+                    control: false,
                 },
             ];
             let symbols: Vec<u8> = encode_repeater(call.color_code, slots)
@@ -1918,13 +1918,16 @@ pub enum SynthSpec {
     },
     /// A DMR group call ([`crate::dmr`]) on colour code `color_code` (0..=15) from radio
     /// `src` to talkgroup `dst` (24 bits each): the voice LC header, `superframes` voice
-    /// superframes (1..=20, 360 ms each) of a fixed voice payload, the terminator; 4FSK at
+    /// superframes (1..=20, 360 ms each) of a varied voice payload, the terminator; 4FSK at
     /// 4800 baud, ±1944 Hz. `origin` `repeater` (the default) sends a repeater's continuous
     /// downlink, the call on slot 1 and CACH between the bursts; `handheld` sends a
     /// handheld's bursts, one every 60 ms with the carrier off between. `second` puts
-    /// another call on slot 2 (a repeater's only). `encrypted` sets the privacy bit (the
-    /// voice is not encrypted: nothing here makes a key stream). `idle` leaves slot 1 idle,
-    /// so with no `second` an idle repeater (a repeater's only).
+    /// another call on slot 2 (a repeater's only), with its own `encrypted`. `encrypted`
+    /// marks slot 1's call encrypted: the privacy bit of its link control and a privacy
+    /// header after its voice header (the voice is not encrypted: nothing here makes a key
+    /// stream). `idle` leaves slot 1 idle, so with no `second` an idle repeater; `control`
+    /// sends control blocks (Preamble CSBKs from `src` to `dst`) on slot 1 instead of the
+    /// call, for as long (both a repeater's only, and not together).
     Dmr {
         color_code: u8,
         src: u32,
@@ -1938,6 +1941,8 @@ pub enum SynthSpec {
         encrypted: bool,
         #[serde(default)]
         idle: bool,
+        #[serde(default)]
+        control: bool,
     },
     /// AIS: per repeat a type 1 position report (`mmsi`, the position, `sog_kt`,
     /// `cog_deg`; [`crate::ais_msg::position_report_bits`]) and, with `name`, a type 5
@@ -1956,13 +1961,16 @@ pub enum SynthSpec {
     },
 }
 
-/// The `dmr` family's call on slot 2: radio `src` to talkgroup `dst`.
+/// The `dmr` family's call on slot 2: radio `src` to talkgroup `dst`, encrypted (its link
+/// control's privacy bit and a privacy header) when `encrypted`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct DmrSecondCall {
     pub src: u32,
     pub dst: u32,
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 /// Impairments applied to a synthesised signal; each defaults to none.
@@ -2308,6 +2316,7 @@ impl SynthSpec {
                 origin,
                 second,
                 idle,
+                control,
                 ..
             } => {
                 if *color_code > DMR_COLOR_CODE_MAX {
@@ -2335,6 +2344,14 @@ impl SynthSpec {
                     if *idle {
                         return Err("idle: an idle slot is a repeater's (origin repeater)".into());
                     }
+                    if *control {
+                        return Err(
+                            "control: control blocks are a repeater's (origin repeater)".into()
+                        );
+                    }
+                }
+                if *idle && *control {
+                    return Err("control: slot 1 is idle or control, not both".into());
                 }
             }
             SynthSpec::Video {
@@ -2632,15 +2649,20 @@ pub fn synthesise(
             second,
             encrypted,
             idle,
+            control,
         } => {
             let call = DmrCall {
                 color_code: *color_code,
                 src: *src,
                 dst: *dst,
                 superframes: *superframes,
+                origin: *origin,
+                second: *second,
                 encrypted: *encrypted,
+                idle: *idle,
+                control: *control,
             };
-            let mut iq = dmr_iq(&call, *origin, *second, *idle, rate_hz);
+            let mut iq = dmr_iq(&call, rate_hz);
             shift(&mut iq, off, rate_hz);
             iq
         }
@@ -3498,7 +3520,7 @@ mod tests {
             v
         };
         let bad = |key: &str, val: serde_json::Value| parse(with(key, val)).unwrap_err();
-        let (spec, imp) = parse(dmr_json()).unwrap();
+        let (spec, _) = parse(dmr_json()).unwrap();
         assert_eq!(spec.rate_hz(), 48_000);
         assert!(matches!(
             spec,
@@ -3531,9 +3553,29 @@ mod tests {
         };
         assert!(handheld("second", serde_json::json!({"src": 1, "dst": 2})).starts_with("second:"));
         assert!(handheld("idle", true.into()).starts_with("idle:"));
+        assert!(handheld("control", true.into()).starts_with("control:"));
+        let mut both = with("idle", true.into());
+        both["control"] = true.into();
+        assert!(parse(both).unwrap_err().starts_with("control:"));
+        // The second call is clear unless it says otherwise, whatever the first's.
+        let mut v = with("encrypted", true.into());
+        v["second"] = serde_json::json!({"src": 9990002, "dst": 9991});
+        let (spec, _) = parse(v).unwrap();
+        assert!(matches!(
+            spec,
+            SynthSpec::Dmr {
+                encrypted: true,
+                second: Some(DmrSecondCall {
+                    encrypted: false,
+                    ..
+                }),
+                ..
+            }
+        ));
 
         // Twenty 60 ms TDMA frames (header, 18 voice bursts, terminator), then the tail.
         let len = 20 * 288 * 10 + 480;
+        let (spec, imp) = parse(dmr_json()).unwrap();
         let iq = synthesise(&spec, &imp, 48_000, 450_000_000);
         assert_eq!(iq.len(), len);
         assert!(
@@ -3547,6 +3589,12 @@ mod tests {
         assert_eq!(iq.len(), len);
         let off = iq.iter().filter(|s| s.norm() < 1e-6).count();
         assert_eq!(off, 20 * 156 * 10 + 480);
+        // Control blocks last as long as the call would; an encrypted call has its privacy
+        // header too.
+        let (spec, imp) = parse(with("control", true.into())).unwrap();
+        assert_eq!(synthesise(&spec, &imp, 48_000, 0).len(), len);
+        let (spec, imp) = parse(with("encrypted", true.into())).unwrap();
+        assert_eq!(synthesise(&spec, &imp, 48_000, 0).len(), len + 288 * 10);
     }
 
     #[test]
