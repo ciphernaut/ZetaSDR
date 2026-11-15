@@ -19,10 +19,16 @@ const ALLOCATION_WIDTH: (f64, f64) = (0.5, 1.5);
 /// The layer-1 labels each emission designator's modulation letter is compatible with:
 /// `F` also with `wfm` (broadcast F3E/F8E), `A` also with `ook` (keyed A1A/A1D/A2D).
 /// `carrier` stays `N`'s alone, so a bare carrier or spur does not agree with every AM row.
+/// `ofdm` goes with the letters registers file multicarrier transmissions under: `D`
+/// (amplitude and angle together), and the catch-alls `V`, `W` and `X`, which nothing
+/// narrower is licensed as.
 pub(crate) const DESIGNATOR_LABELS: &[(char, &[&str])] = &[
     ('F', &["fm", "fsk", "wfm"]),
     ('G', &["fm", "fsk", "psk"]),
-    ('D', &["psk"]),
+    ('D', &["psk", "ofdm"]),
+    ('V', &["ofdm"]),
+    ('W', &["ofdm"]),
+    ('X', &["ofdm"]),
     ('A', &["am", "ssb", "ook"]),
     ('H', &["am", "ssb"]),
     ('J', &["am", "ssb"]),

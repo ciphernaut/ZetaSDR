@@ -49,3 +49,23 @@ on a 1.5 s capture from the field host's B210 locked in about 0.2 s, at a quarte
   program gives alone. A debug build skips input at this rate and never locks.
 - `dvbt-rx` on noise: `searching` every 5 s, never a lock.
 - Live acceptance is UAT.md, plan 39.
+
+## After the first live run (2026-11-15)
+
+Five multiplexes locked on the field host; three weaker ones beside them did not, and identify's
+register reading on a decoded multiplex said `disagrees`. What changed:
+
+- **A channel filter in `dvbt-rx`**, not in the node. The node's channel stage leaves a band that
+  is most of the capture unfiltered, and its filter at these rates is wider than the gap between
+  multiplexes (about 5 % of the channel). The program knows the width it is trying, so it
+  low-passes to it in the frequency domain (1025 taps, 80 dB, about 7 % of a core at 10 Msps).
+  Measured on the capture with synthetic neighbours: no effect up to 10 dB above the wanted
+  multiplex; from 20 dB the unfiltered receiver takes the neighbours' timing and the filtered one
+  does not notice them.
+- **`ripple_db` and `resyncs`** in each event, and `snr_db` explained: it is the unweighted mean
+  error of the equalised pilots, so a strong multiplex with deep multipath reads low.
+- **The register is judged against the decode.** An identify verdict whose decoder proved asks
+  the register about the row's `modulation` and the proving event's `bandwidth_hz`
+  (`decoded_query`, `node/identify.rs`), with the lookup already made. `ofdm` goes with the
+  emission letters `D`, `V`, `W` and `X` (`modes/score.rs`), which also gives the row the
+  register's score term on a licensed multiplex.

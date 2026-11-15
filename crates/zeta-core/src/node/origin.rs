@@ -4215,6 +4215,30 @@ mod tests {
         );
     }
 
+    /// A multicarrier licence (a catch-all emission letter) agrees with a decoded OFDM
+    /// signal of its channel's width; a narrowband label on the same band does not.
+    #[test]
+    fn a_multicarrier_licence_agrees_with_a_decoded_ofdm_signal_of_its_width() {
+        let in_range = Some((12.3, 315.0, InRange::Yes, Some(-80.0)));
+        let a = register(
+            vec![cand("0000001", "S1", CENTER, "6M70V7W", in_range)],
+            vec![],
+        );
+        let on = |labels: &[&str], bw: u64| {
+            let o = origins_of(&q(labels, CENTER, bw), &described_of(&a));
+            verdict(&a, &o, None)
+        };
+        let v = on(&["ofdm"], 7_000_000);
+        assert_eq!((v.kind, v.weak), (VerdictKind::Agrees, false), "{v:?}");
+        let v = on(&["fm"], 7_000_000);
+        assert_eq!(v.kind, VerdictKind::Disagrees, "{v:?}");
+        // What layer 1 makes of the same multiplex before a decoder proves: no label, and
+        // a width under a quarter of the licence's.
+        let v = on(&[], 1_500_000);
+        assert_eq!(v.kind, VerdictKind::Disagrees, "{v:?}");
+        assert!(v.summary.ends_with("measured unknown, 1500.0 kHz"), "{v:?}");
+    }
+
     #[test]
     fn agreeing_with_one_site_of_a_network_says_how_many_sites_send_it() {
         let in_range = Some((12.3, 315.0, InRange::Yes, Some(-80.0)));

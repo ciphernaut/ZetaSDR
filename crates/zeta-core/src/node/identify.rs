@@ -63,9 +63,28 @@ struct Run {
     candidates: Option<Vec<String>>,
 }
 
+/// `q` as the register is asked about a signal a decoder proved: the row's `modulation`
+/// in place of the measured label (kept when the row lists none), and the proving
+/// `event`'s `bandwidth_hz` in place of the measured width when the event has one.
+fn decoded_query(q: &OriginQuery, modulation: &[String], event: &serde_json::Value) -> OriginQuery {
+    let mut decoded = q.clone();
+    if !modulation.is_empty() {
+        decoded.modulation = modulation.to_vec();
+    }
+    if let Some(width) = event["bandwidth_hz"].as_u64().filter(|w| *w > 0) {
+        decoded.bandwidth_hz = Hz(width);
+    }
+    decoded
+}
+
 /// How one attempt ended.
 enum Attempt {
-    Proved { evidence: String, summary: String },
+    /// `event` is the event that completed the proof, as the decoder published it.
+    Proved {
+        evidence: String,
+        summary: String,
+        event: serde_json::Value,
+    },
     NoFrame(String),
     Cancelled,
 }
@@ -438,6 +457,7 @@ impl Inner {
                                 return Attempt::Proved {
                                     evidence: format!("decode {}: {summary}", row.id.0),
                                     summary,
+                                    event: v,
                                 };
                             }
                         }
@@ -636,11 +656,23 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
                 let job = Some(&child);
                 inner.candidate(&r, id, score, Outcome::NoFrame, &evidence, job, fit);
             }
-            Attempt::Proved { evidence, summary } => {
+            Attempt::Proved {
+                evidence,
+                summary,
+                event,
+            } => {
                 // The proved child outlives the job.
                 current.child = None;
                 let job = Some(&child);
                 inner.candidate(&r, id, score, Outcome::Proved, &evidence, job, fit);
+                // What the decoder proved replaces what layer 1 measured in the
+                // register's comparison (layer 1 has no label for many signals and
+                // under-reads a wide flat one): the row's modulation, and the width the
+                // proving event names (`bandwidth_hz`) when it names one. The lookup is
+                // the one already made, and the `origin` event stays the measured one.
+                let decoded = decoded_query(&q, &mode.row.modulation, &event);
+                let origins = origins_of(&decoded, &d);
+                let register = judged(&d, &origins);
                 let verdict = serde_json::json!({"identify": {
                     "verdict": {
                         "mode": id,
@@ -787,6 +819,44 @@ mod tests {
             center_hz: Hz(center_hz),
             bandwidth_hz: Hz(bandwidth_hz),
         }
+    }
+
+    /// A proof replaces the measured label and width in the register's question: the
+    /// row's modulation, and the proving event's `bandwidth_hz` when it names one.
+    #[test]
+    fn a_proof_asks_the_register_about_what_was_decoded() {
+        let measured = OriginQuery {
+            source: crate::types::SourceId("radio".into()),
+            center_hz: Hz(600_000_000),
+            bandwidth_hz: Hz(1_500_000),
+            modulation: vec![],
+            symbol_rate_baud: None,
+            job: None,
+            at: Timestamp(0),
+        };
+        let ofdm = ["ofdm".to_string()];
+        let locked = serde_json::json!({"locked": true, "bandwidth_hz": 7_000_000});
+        let q = decoded_query(&measured, &ofdm, &locked);
+        assert_eq!(
+            (q.modulation, q.bandwidth_hz),
+            (ofdm.to_vec(), Hz(7_000_000))
+        );
+        assert_eq!(q.center_hz, measured.center_hz);
+        // An event with no width, a null one or zero keeps the measured width; a row
+        // with no modulation keeps the measured label.
+        for event in [
+            serde_json::json!({"id": "S1234567"}),
+            serde_json::json!({"bandwidth_hz": null}),
+            serde_json::json!({"bandwidth_hz": 0}),
+        ] {
+            let q = decoded_query(&measured, &ofdm, &event);
+            assert_eq!(q.bandwidth_hz, measured.bandwidth_hz, "{event}");
+        }
+        let fm = OriginQuery {
+            modulation: vec!["fm".into()],
+            ..measured.clone()
+        };
+        assert_eq!(decoded_query(&fm, &[], &locked).modulation, ["fm"]);
     }
 
     #[test]
