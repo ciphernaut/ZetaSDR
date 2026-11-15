@@ -556,7 +556,7 @@ Live, as `UAT.md` checks:
 15. **The policy is set when the job starts**, not changed while it runs.
 16. **A handheld's call, with no slot to read, uses the `slot1` stream.**
 17. **The page gets a stream picker and no policy control**: a policy is given at `job start`
-    from the CLI, the agent or a set.
+    from the CLI or the agent.
 18. **`modes_list` gains `voices`**, a second new public field.
 
 ## 10. Set aside
@@ -594,6 +594,16 @@ sections above are left as written; where they differ, this section is right.
 - **5.5: a P25 call's opening event** comes at the first link control after the header (the
   header names no calling radio), and `algid` and `kid` are `null` on an opening event marked
   encrypted only by the link control.
+- **Section 3 and 5.5: two exceptions to "an encrypted call gets no vocoder".** In both, what
+  reaches the vocoder is ciphertext, which plays as noise, and nothing is decrypted.
+  - DMR: a call licensed by its voice header whose embedded link control turns it encrypted
+    mid-superframe, with no gap. At most bursts A to D of that superframe are fed before the
+    link control stops it. The strict alternative, holding every superframe until its own link
+    control, would add about 240 ms to every clear call.
+  - P25: two LDU streams within `CONTIGUOUS_NS` of each other with no terminator or header
+    between them, whose second stream's first LDU1 link control does not decode. The second
+    stream is taken as the same call, and up to nine frames (one LDU, 180 ms) of it are fed
+    before its LDU2's encryption sync stops it.
 - **5.5: a P25 call whose link control is itself encrypted** names no radio and gives no events.
   Reporting it is deferred (`TODO.md`, "Digital voice: the next rows").
 - **5.10: `all`.** A held call may delay the mix by at most its hold (about 250 ms); it never

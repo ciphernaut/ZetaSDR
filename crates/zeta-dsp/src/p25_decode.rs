@@ -12,8 +12,9 @@
 //! closed by another call's unit or a header closes at its own last unit's end. Two
 //! `type: call` events per call ([`crate::voice_call`]):
 //! - the opening one when its link control and its encryption are both in hand: at the
-//!   first LDU1 after a header (the header carries no calling radio), or within a
-//!   superframe when the job joins mid-call;
+//!   first LDU1 after a header (the header carries no calling radio), or within about one
+//!   and a half superframes when the job joins mid-call (at worst an LDU2 for the
+//!   encryption, then an LDU1 for the radio);
 //! - the closing one (`eot: true`) at its terminator, when no unit has come for longer than
 //!   [`P25_SUPERFRAME_MS`] (noticed one unit's length later, when a unit that began within
 //!   it would be whole), at a lagged input, a new sample rate or the input's end.
@@ -31,8 +32,12 @@
 //! nothing and the speech starts at the LDU2. A call that turns encrypted closes its
 //! vocoder's input at once (the speech fed before is still handed back); one that turns
 //! clear starts one. An encrypted call gets its events and no vocoder; nothing here
-//! decrypts. A call whose link control is itself encrypted names no radio and gives no event
-//! (reporting it is left for later).
+//! decrypts. One case feeds an encrypted call's frames: a second transmission whose first
+//! LDU starts within [`CONTIGUOUS_NS`] of the open call's last unit, with no terminator or
+//! header between them, and whose first LDU1's link control does not decode, is taken as
+//! the open call, so up to nine frames of it (one LDU, 180 ms) reach the vocoder, as
+//! ciphertext, before its LDU2's encryption sync stops it. A call whose link control is
+//! itself encrypted names no radio and gives no event (reporting it is left for later).
 //!
 //! **Speech.** `zeta-mbe imbe7200x4400` (the row's handler 0, optional) is looked up when a
 //! call's encryption is first known to be clear, so a program installed while the job runs is

@@ -1926,7 +1926,7 @@ pub enum SynthSpec {
     },
     /// A P25 phase 1 group call ([`crate::p25`]) on network access code `nac` (12 bits)
     /// from radio `src` (24 bits) to talkgroup `dst` (16 bits): the header, `superframes`
-    /// voice superframes (1..=20, 360 ms each) of a fixed voice payload, the terminator;
+    /// voice superframes (1..=20, 360 ms each) of a varied voice payload, the terminator;
     /// C4FM at 4800 baud, ±1800 Hz. `encrypted` names AES instead of clear speech (the
     /// voice is not encrypted: nothing here makes a key stream). `control` sends a control
     /// channel instead: trunking signalling units for as long as the call would last.

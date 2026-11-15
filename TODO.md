@@ -318,10 +318,11 @@ Done in plan 38: `tools/install-vocoders.sh` builds `zeta-mbe` against `mbelib-n
 
 Plan 38 left these. Each new protocol is a framing module and a row on plan 38's pieces (the vocoder seat, `fsk4.rs`, `voice_call.rs`, voices).
 - **More rows.** D-STAR (GMSK, AMBE: `ambe3600x2400` is a codec added to `zeta-mbe` and nowhere else), NXDN (`fsk4.rs` takes 2400 baud), System Fusion, dPMR, and P25 phase 2.
-- **The audio policy of a running job.** Changing it without a restart, and a policy control on the page. Today it is given at `job start` from the CLI, the agent or a set.
+- **The audio policy of a running job.** Changing it without a restart, and a policy control on the page. Today it is given at `job start` from the CLI or the agent.
+- **An audio policy in a set.** A set's member cannot carry one: `start_set_job` passes `None` and `sets.rs` has no field for it, so a set's voice row runs `first_active`.
 - **`c2dec` optional for M17**, as `zeta-mbe` is for P25 and DMR. A one-line row change, but it puts M17's 5 s dwell into every identify on a host without `c2dec` and moves pinned CLI tests.
 - **Trunking.** Following a P25 or DMR Tier III control channel to its voice channels (see "Architecture: a mode registry...", Trunking). P25 trunking blocks are counted, not parsed.
-- **P25: a call whose link control is itself encrypted** gives no events. Reporting it needs `src` and `dst` nullable in the shared call schema (`voice_call.rs`).
+- **Calls heard but never reported.** Three kinds of call give no event: a P25 call whose link control is itself encrypted (it names no radio); a P25 call whose LDU2 sync never counts within `ES_TRUSTED_SYMBOLS`, which on a weak signal shows as frames arriving and nothing reported; a DMR call whose embedded link control never completes. Reporting the first needs `src` and `dst` nullable in the shared call schema (`voice_call.rs`). A cheap first step for the others: announce a call that has its link control after one superframe held, which needs a `silent` value for "not yet known".
 - **DMR.** A handheld call and a slot-1 call at the same time both map to voice index 0 on the main stream. The zero-correction EMB rule costs a weak repeater join about 2 of up to 5 bursts before the first sync, at 3 % bit errors. `GRID_OVERRIDE_SYNCS` (3) is not pinned by a test against 2. One learnt colour code per repeater, cleared on a grid rebuild.
 - **M17's LICH Golay table** has the XOR defect P25's had: two-bit errors are detected, not corrected (`m17::golay_table`). A one-character fix, frozen by plan 38, which kept M17's behaviour.
 - **A shared codes module.** Three Golay(24,12) implementations and two mask generators exist (`m17.rs`, `p25.rs`, `dmr.rs`).
@@ -329,7 +330,32 @@ Plan 38 left these. Each new protocol is a framing module and a row on plan 38's
   - the weak, off-deviation corner: acquisition over longer stretches, or soft decisions, would help;
   - a coasting lock's levels are refreshed only at acquisition, so a long over that drifts about 180 Hz or 10 % may drop and relock once;
   - a carrier between the levels, met while a lock is on probation, is held up to about 47 ms longer;
+  - a DMR handheld at 0.8 of its deviation and 10 dB counts 34 false locks over 360 bursts, though the bursts it loses stay about 3 in 500;
   - sync search uses hard dibit distance where the spec suggested soft correlation.
+- **Left from plan 38's reviews**, one line each:
+  - a parked vocoder that ignores the end of its input is waited for until the job ends: nothing bounds the child once its input is closed;
+  - a row that is `unavailable` can still list `missing`;
+  - `modes check`'s fallback for an unavailable row can name an optional handler;
+  - `synth.rs` and `fsk4.rs` depend on each other;
+  - the P25 header's shortened Golay (18,6) code has no test of its own;
+  - the P25 framer's polarity flag flips once only when two flipped syncs land in one push;
+  - every P25 event's span is one LDU, closing and channel events included;
+  - a P25 terminator 360 to 540 ms after the call's last unit closes the call at the terminator's time;
+  - a new sample rate drops the P25 and DMR receivers without a flush;
+  - `ProgramLookup::find` reports a required handler's error as `no_vocoder`;
+  - the P25 stage has no test of a private call or an emergency call (clear to encrypted and back are tested);
+  - with one timed DMR track a misread TC bit is still trusted (the slot could come from any one timed track);
+  - the DMR 60 s noise test covers few flywheel reads for its cost; a front-end-free test of many random bursts would cover more;
+  - DMR talker alias or GPS superframes are dropped when their burst A is lost;
+  - row validation lets `"center_hz": "$audio_policy"` through;
+  - a `graph_put` can change a job's audio policy without its record following;
+  - the DMR channel event can be proved by one data burst behind a weak Golay (20,8) check, so a foreign 4-level signal may rarely give a false channel event: require two agreeing bursts;
+  - P25 link control is accepted for any MFID: a manufacturer's format under LCO 0 or 3 could give a wrong `dst` (check on air);
+  - how often a real LDU2 sync needs 3 or 4 corrections at 0.8 of its deviation and 10 dB: measure it and put the figure in `ES_TRUSTED_SYMBOLS`'s doc;
+  - the raised P25 lock figures at talkgroup 1 are not classified;
+  - the DMR coast test guards 14 where the constant is 15 (the case that coasts 11 comes from a payload the handheld encoder cannot build);
+  - the real-time pacing tests can pass falsely on a loaded runner;
+  - the page's `picks` map (the stream picker's choice per job) is never pruned.
 
 **Later: `blip25-vocoder` in the vocoder seat.** From the operator, 2026-11-14. A Rust crate (MIT, IMBE and half-rate AMBE+2, soft decisions; SDR-- uses it) that would decode in-process with no install script, as an off-by-default cargo feature that no released build enables. Set aside for now: its own `PATENT_NOTICE.md` and `ATTRIBUTION.md` say the codec core was recovered from a compiled vendor binary, and name an active patent on the half-rate codec to 2028-05-20. Revisit in a later sprint when that position is clearer; plan 38's vocoder seat is where it would go. It does not cover D-STAR's AMBE.
 
@@ -775,7 +801,7 @@ Seen again during plan 38 (2026-11-14 to 2026-11-16), each passing when re-run a
 
 ## Test: the UI suite's heavier shard is near its deadline
 
-After plan 38's stream-picker scenario the heavier of the two shards has about 65 s left of its 450 s `DEADLINE` (`crates/zeta/tests/ui.rs`). The next scenarios should rebalance `SHARD_STARTS` or add a shard before the deadline is raised.
+After plan 38's stream-picker scenario the heavier of the two shards has about 67 s left of its 450 s `DEADLINE` (382.7 s of it used) (`crates/zeta/tests/ui.rs`). The next scenarios should rebalance `SHARD_STARTS` or add a shard before the deadline is raised.
 
 ## Test: `modes_check::a_bad_synth_block_fails_its_row_and_the_rest_still_run` flaked once on a leftover scratch dir
 

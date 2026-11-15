@@ -102,7 +102,11 @@
 //!   receiver that never coasts lets it go, one on a level after the bound. A lock on
 //!   probation counts the bound over its whole probation, and coasts only while its
 //!   evidence so far is a signal's, since a lock on the wrong levels can show one of them
-//!   taking most of a stretch.
+//!   taking most of a stretch. Two limits follow. A coasting lock's levels are refreshed
+//!   only at acquisition and settling, so a long over whose carrier drifts about 180 Hz, or
+//!   its deviation about 10 %, drops its lock once and relocks. Coasting on probation has
+//!   no drift gate, so a carrier between two levels met on probation is held up to about
+//!   47 ms longer before the lock is called false.
 //! - Once proven, the lock's levels are fitted again over all its own symbols and every
 //!   held symbol is sliced again on them: levels from one 32-symbol stretch, at 10 dB,
 //!   sit a tenth of a decision distance off. (If the proving search's own best fit
@@ -118,7 +122,9 @@
 //! when one stretch's eye closes past [`HOLD_CLOSURE`], about once in 4000 searches, and
 //! taken again: 7 of 50 clear P25 calls of two superframes and 7 of 50 DMR repeater
 //! calls of six counted such a loss, and 3 of the 50 P25 calls a false lock at their
-//! start. At 15 dB, or at the declared deviation at 10 dB, none of these happened.
+//! start. A handheld's train there counts 34 false locks over 360 bursts (ten calls of six
+//! superframes), though the bursts it loses stay about 3 in 500. At 15 dB, or at the
+//! declared deviation at 10 dB, none of these happened.
 //!
 //! [`SoftDibit::at`] is never negative and never goes backwards. It steps by a symbol
 //! within 4 % while a lock holds, and by more where a signal is found anew.

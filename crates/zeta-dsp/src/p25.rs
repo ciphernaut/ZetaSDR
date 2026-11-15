@@ -773,9 +773,10 @@ fn es_word(enc: &EncSync) -> u128 {
 }
 
 /// The encryption sync in 16 hexbits, unless it is the all-zero word (MI, ALGID and KID
-/// all zero): what a carrier or a dead input decodes to, and what no transmission sends (a
-/// clear one says ALGID `$80`; an encrypted one names a key stream's MI, zero only by a
-/// one-in-2⁷² chance, or a nonzero ALGID).
+/// all zero): what a carrier or a dead input decodes to, and what no transmission sends. A
+/// clear one says ALGID `$80`; an encrypted one carries its key stream's initialisation
+/// vector as a nonzero message indicator, zero only by a one-in-2⁷² chance. (The rule does
+/// not rest on the ALGID: `$00` is an assigned algorithm.)
 fn parse_es(hex: &[u8]) -> Option<EncSync> {
     let w = word_of(hex);
     if w == 0 {
