@@ -162,6 +162,8 @@ Gaps, roughly in order of field value on a HackRF with a 2 m / 70 cm antenna in 
 - HF digital via KiwiSDR: RTTY, PSK31, FT8/FT4 (`wsjtx` externally), WSPR, Olivia, CW.
 - Trunking: control-channel following (P25, DMR Tier III) needs a second lease model: a voice channel hop per call. Big; out of scope for a first wave.
 
+Status (plan 38): M17, P25 phase 1 and DMR decode, with their speech through `c2dec` and the operator-built `zeta-mbe`; D-STAR and the rest are in "Digital voice: the next rows".
+
 Status (plan 16): modes are now rows (`modes/*.json`, operator rows in `--modes-dir`), so a new mode is a row plus its decoder, not an enum variant; in-crate decoders are graph rows, external ones program rows through `external_decode`, and each row carries its `classify`/`identify` hook and synthesiser test. Plan 17 needs from the synthesiser (`zeta-dsp` `fixtures.rs`, `zeta modes check`): generic `fsk`/`psk`/`ook` families (symbol rate, deviation or order, framing) so a row declares its test signal without new Rust, and the deferred echo impairment (multipath). Rows with audio-input programs also arrive then (`decoder.input.stream: audio` is refused today).
 
 Original shape, now carried by rows: one job kind per mode, graph-expanded like the plan-9 decoders; external decoders through `zeta-ext` where a mature tool exists (dsd-fme / DSD+, radiosonde_auto_rx, wsjtx), in-crate `zeta-dsp` where the mode is small (M17, AIS, FLEX, RTTY). `classify` gains each mode's decode-to-identify (CRC/sync-word pass) and the catalogue entries gain their `decoder`.
@@ -264,7 +266,7 @@ A program row whose `decoder.input.stream` is `event` (JSON lines of a running j
 Open work left from plan 16's mode registry (delivered; see the plan series):
 
 - **Feeds.** `sink` stage kinds for the standard feeds (APRS-IS, SBS/Beast, AIS NMEA, PSK Reporter, WSPRnet, KISS TNC) so results leave the node the way other tools expect.
-- **Time.** UTC-slotted modes (FT8/FT4 15 s, WSPR 2 min, JT65 1 min) and TDMA (DMR, TETRA) need true block timestamps. The HackRF timestamp bug is fixed (plan 14); the 2 h clock run that would clear the WSJT family is still outstanding (plan series, "Outcome").
+- **Time.** UTC-slotted modes (FT8/FT4 15 s, WSPR 2 min, JT65 1 min) and TETRA need true block timestamps. DMR does not (plan 38): its slot timing comes from the sync patterns in the channel's own samples. The HackRF timestamp bug is fixed (plan 14); the 2 h clock run that would clear the WSJT family is still outstanding (plan series, "Outcome").
 - **Trunking.** Span decoding is plan 31's (a watch with `modes`). Trunking (P25, DMR Tier III, MPT1327) needs a control-channel follower that starts voice jobs from control-channel events inside the capture; it plugs into the watch's known-channels seam.
 - **Vocoders.** Codec 2 (M17, FreeDV) runs as the external `c2dec` (the operator's decision, plan 29; no copyleft dependency in-crate); AMBE/IMBE only through a handler on an external `mbelib` build, never shipped; HD Radio HDC off.
 - **UI.** A flat menu of 100+ modes is unusable: pick modes through `knowledge_lookup` by band (what is plausible here) with a search fallback.
@@ -310,13 +312,24 @@ Plan 23 delivered the ADS-B request: a row names its subject (`key`, columns, `w
 
 ## Build: an install script for the AMBE/IMBE vocoder libraries
 
-From the operator, 2026-10-27. Digital voice (DMR, P25, NXDN, D-STAR, Yaesu Fusion) needs AMBE/IMBE vocoders that cannot be shipped: `mbelib` is patent-encumbered and OpenWebRX+ builds it on the user's machine. Their `buildall.sh` (`/Projects/ham/openwebrxplus/openwebrx/buildall.sh`) clones and builds `jketterl/codecserver` (plus `codecserver-softmbe` and `mbelib`) into debs with an interactive prompt per component.
+Done in plan 38: `tools/install-vocoders.sh` builds `zeta-mbe` against `mbelib-neo` at a pinned commit, on the operator's machine at the operator's request; `docs/vocoders.md` has the steps and the legal position. The `blip25-vocoder` paragraph moved to "Digital voice: the next rows".
 
-Adopt the same shape: `tools/install-vocoders.sh` that clones `mbelib`, `codecserver` and `codecserver-softmbe` at pinned tags, builds, installs under a prefix the node finds, and prints what it did; `zeta doctor` (or the decoder's job failure reason) names the script when the library is missing, the way `adsb_decode` names dump1090. Codec 2 (M17, FreeDV) is free and goes in-crate or as a normal dependency instead. Note the legal position in `docs/` once, as OnAir does in "Good to know".
+## Digital voice: the next rows
 
-Scope estimate: 100-150 lines of shell plus a doc section; depends on the external-decoder adaptor for the voice decoders that consume it.
-
-Status (2026-11-14): specified as plan 38 (`docs/superpowers/specs/2026-11-14-digital-voice-design.md`), with a different shape: no `codecserver`, one small program (`zeta-mbe`) on the shape of `c2dec`, built by the script against `mbelib-neo`. The plan replaces this gist when it lands.
+Plan 38 left these. Each new protocol is a framing module and a row on plan 38's pieces (the vocoder seat, `fsk4.rs`, `voice_call.rs`, voices).
+- **More rows.** D-STAR (GMSK, AMBE: `ambe3600x2400` is a codec added to `zeta-mbe` and nowhere else), NXDN (`fsk4.rs` takes 2400 baud), System Fusion, dPMR, and P25 phase 2.
+- **The audio policy of a running job.** Changing it without a restart, and a policy control on the page. Today it is given at `job start` from the CLI, the agent or a set.
+- **`c2dec` optional for M17**, as `zeta-mbe` is for P25 and DMR. A one-line row change, but it puts M17's 5 s dwell into every identify on a host without `c2dec` and moves pinned CLI tests.
+- **Trunking.** Following a P25 or DMR Tier III control channel to its voice channels (see "Architecture: a mode registry...", Trunking). P25 trunking blocks are counted, not parsed.
+- **P25: a call whose link control is itself encrypted** gives no events. Reporting it needs `src` and `dst` nullable in the shared call schema (`voice_call.rs`).
+- **DMR.** A handheld call and a slot-1 call at the same time both map to voice index 0 on the main stream. The zero-correction EMB rule costs a weak repeater join about 2 of up to 5 bursts before the first sync, at 3 % bit errors. `GRID_OVERRIDE_SYNCS` (3) is not pinned by a test against 2. One learnt colour code per repeater, cleared on a grid rebuild.
+- **M17's LICH Golay table** has the XOR defect P25's had: two-bit errors are detected, not corrected (`m17::golay_table`). A one-character fix, frozen by plan 38, which kept M17's behaviour.
+- **A shared codes module.** Three Golay(24,12) implementations and two mask generators exist (`m17.rs`, `p25.rs`, `dmr.rs`).
+- **Front-end limits** (documented in `fsk4.rs`):
+  - the weak, off-deviation corner: acquisition over longer stretches, or soft decisions, would help;
+  - a coasting lock's levels are refreshed only at acquisition, so a long over that drifts about 180 Hz or 10 % may drop and relock once;
+  - a carrier between the levels, met while a lock is on probation, is held up to about 47 ms longer;
+  - sync search uses hard dibit distance where the spec suggested soft correlation.
 
 **Later: `blip25-vocoder` in the vocoder seat.** From the operator, 2026-11-14. A Rust crate (MIT, IMBE and half-rate AMBE+2, soft decisions; SDR-- uses it) that would decode in-process with no install script, as an off-by-default cargo feature that no released build enables. Set aside for now: its own `PATENT_NOTICE.md` and `ATTRIBUTION.md` say the codec core was recovered from a compiled vendor binary, and name an active patent on the half-rate codec to 2028-05-20. Revisit in a later sprint when that position is clearer; plan 38's vocoder seat is where it would go. It does not cover D-STAR's AMBE.
 
@@ -333,7 +346,7 @@ Scope estimate: 50-100 lines in `crates/zeta-ext/src/proc.rs` and `node_setup.rs
 
 Plan 29 shipped AIS, FLEX, M17, M20 synthesis and APRS positions (see "Decoder wave 2: leftovers from plan 29"). What stays:
 
-- **DMR voice** (4FSK, AMBE+2 through the vocoder libraries, see the install-script gist above): an audio-output row on the shape of `m17_decode` with a `vocoder` handler.
+- ~~**DMR voice**~~ (done in plan 38: `dmr_decode`, with P25 phase 1 beside it).
 - ~~**Whole-span POCSAG and APRS**~~ (done in plan 31: a `watch` with `modes`, and the `pagers_au` set).
 - **Stereo** for `wfm_demod` (see the stereo gist above) now that audio rows exist to consume it.
 - **DFM serial.** `dfm_decode` keeps `test: null` (it prints `skipped: no test`, and `--strict` fails it). Plan 29 task 9 built `crates/zeta-dsp/src/dfm_frame.rs` and the `dfm` family, and `dfm09mod --json --ecc` decodes their position, climb, time and satellites through the row's own chain, but the id stays `DFM-xxxxxxxx`: the serial's place in the sensor (configuration) field is not settled (channels 4-15, half layouts `half << 8 | index` and others, sequential or fixed-plus-alternating sensor sequences and runs up to 1200 frames all left the placeholder). The operator's ruling at the fallback was to leave `test: null` rather than a position-only test. Next: a public description of the DFM-09 configuration channels (the TH Koeln thesis's appendix A "From a Frame to a Data Packet" was not in the published excerpt), then set the row's `test` (`expect {id, lat}`, `within_ms` about 15000).
@@ -345,8 +358,8 @@ Plan 29 shipped AIS, FLEX, M17, M20 synthesis and APRS positions (see "Decoder w
 - **M17:** packet-mode content; the 1600 mode's data bytes, and the 1600 mode against `c2dec`; a real M17 capture (no recording is in the repository, so the decoder has only been proven against its own synthesiser).
 - **AIS:** message types beyond 1-5, 18, 21 and 24; per-burst AFC beyond about 1.5 kHz of offset; `gfsk_modulate`'s BT if the stage wanted 0.4 (it runs at 0.5).
 - **Classify tie-break.** POCSAG off any row's centre loses its slot to AIS: maritime ties sort before pagers, so AIS takes the fifth `CLASSIFY_TRIES` slot. Break the tie on modulation or label, or try more rows.
-- **Identify dwell cost.** Plan 29 added three dwells to every identify and to each signal a watch reports, tried before POCSAG and the rest: `m17_decode` scores 1.0 on every 12.5 kHz FM/FSK signal anywhere (its row has no `band.range_hz`) and dwells 5 s; `ais_decode` scores 0.6 on any FM signal 12.5-37.5 kHz wide and dwells 10 s; `flex_decode` dwells 15 s when `multimon-ng` is installed, and its band range, 151.8-932 MHz, makes it a candidate across the pager and UHF bands. That is up to about 15 s more per narrow FM signal, 30 s with FLEX in range. Narrow the ranges or shorten the dwells if watches feel it; an amateur-band `range_hz` for M17 is the operator's call (a spec change). Two smaller edges: `flex_decode` still scores where it is unavailable (no `multimon-ng`), costing a skipped slot; and `c2dec` is spawned with `env_clear`, so a snap or relocated install that needs its environment fails with only an exit status (its stderr goes to null).
-- **A `vocoder` handler** for AMBE/IMBE on the M17 stage's shape (ties to the install-script gist).
+- **Identify dwell cost.** Plan 29 added three dwells to every identify and to each signal a watch reports, tried before POCSAG and the rest: `m17_decode` scores 1.0 on every 12.5 kHz FM/FSK signal anywhere (its row has no `band.range_hz`) and dwells 5 s; `ais_decode` scores 0.6 on any FM signal 12.5-37.5 kHz wide and dwells 10 s; `flex_decode` dwells 15 s when `multimon-ng` is installed, and its band range, 151.8-932 MHz, makes it a candidate across the pager and UHF bands. That is up to about 15 s more per narrow FM signal, 30 s with FLEX in range. Narrow the ranges or shorten the dwells if watches feel it; an amateur-band `range_hz` for M17 is the operator's call (a spec change). Two smaller edges: `flex_decode` still scores where it is unavailable (no `multimon-ng`), costing a skipped slot; and `c2dec` is spawned with `env_clear`, so a snap or relocated install that needs its environment fails with only an exit status (its stderr goes to null). Plan 38 added two more: `p25_decode` and `dmr_decode` each dwell 2 s on any 12.5 kHz FM or FSK signal, on every host (they are ready with or without the vocoder), at priority -1, after any row whose centre matches.
+- ~~**A `vocoder` handler**~~ (done in plan 38: the vocoder seat, `zeta-mbe` as an optional handler).
 - **Feeds out** for AIS and APRS (the Feeds gist under the sink architecture below).
 - **The FLEX synthesiser** at 3200 and 6400 bps.
 - **Deferred minors from review**, each small: `reload_modes` never probes new or edited rows (a new graph row with a missing handler fails inside the stage, not at `job_start`); APRS parser guards (13+ character garbage may read as a compressed fix, Mic-E accepts A-K in destination characters 4-6, items under 3 characters are accepted); AIS type 21 name extension joins only when the base is 20 characters; the DFM and M20 generators' small edges (`dfm_dat_field` never rolls the day, M20 altitude clamps negative to 0, fixed east velocity undocumented); M17 `rrc_modulate_4fsk` does not validate baud or alpha and address round trips drop trailing spaces.
@@ -361,7 +374,7 @@ From the operator, 2026-11-06. Pager events and the rows that produce them (`poc
 - the level stated in `GET /health`;
 - the Subjects tab's text column, which shows pager text today (plan 31's `pocsag_decode` addresses table).
 
-Plan 29 landed the marker on both pager rows and `summary::envelope`, which inserts it on every event of a marked row. Plan 31 added a new place where pager text shows: the pager addresses table in the Subjects tab. Still nothing reads the marker.
+Plan 29 landed the marker on both pager rows and `summary::envelope`, which inserts it on every event of a marked row. Plan 31 added a new place where pager text shows: the pager addresses table in the Subjects tab. Plan 38 marked `p25_decode` and `dmr_decode` too; the marker reaches their events only, and their audio and an attached transcribe job's transcripts carry nothing. Still nothing reads the marker.
 
 Until then the README's Legal paragraph is the guard.
 
@@ -757,6 +770,12 @@ Seen 2026-11-14 in full workspace runs with the host's load average between 20 a
 - `scan::a_port_that_stops_delivering_is_skipped_not_hung` (`scan.rs:1547`, `a step with no samples waited only ...`), 2026-11-15: twice in full workspace runs at a load average of 10 to 15, never alone (three single reruns and three runs of its whole suite on a quiet host passed). It reads the last two tune times once and asserts their gap.
 
 Each waits a fixed time on a real-time source or an external program. Reproduce under load (`taskset -c 0,1` plus a busy loop on each CPU) before widening a margin.
+
+Seen again during plan 38 (2026-11-14 to 2026-11-16), each passing when re-run alone: `acars::tests::acarsdec_decodes_our_fixture`, `mix::both_tones_are_heard_and_a_continuous_tone_has_no_gaps_at_100_ms_blocks`, the composite video test `a_gap_in_the_input_time_keeps_the_lock_costs_a_field_and_counts` (`zeta-dsp/tests/composite.rs`), and the page scenario `job_row_two_lines`. That scenario measures with a one-shot `bounding_box()` right after `start_job`: wait for the row before measuring.
+
+## Test: the UI suite's heavier shard is near its deadline
+
+After plan 38's stream-picker scenario the heavier of the two shards has about 65 s left of its 450 s `DEADLINE` (`crates/zeta/tests/ui.rs`). The next scenarios should rebalance `SHARD_STARTS` or add a shard before the deadline is raised.
 
 ## Test: `modes_check::a_bad_synth_block_fails_its_row_and_the_rest_still_run` flaked once on a leftover scratch dir
 

@@ -566,3 +566,37 @@ would fill the seat in-process with no install script. It was read on 2026-11-14
 its own `PATENT_NOTICE.md` and `ATTRIBUTION.md` say its codec core was recovered from a compiled
 vendor binary, and name an active patent on the half-rate codec running to 2028-05-20. Revisit
 when that position is clearer. The vocoder seat is the place it would go.
+
+## 11. Corrections after building (2026-11-16)
+
+What the build found that this spec, written before it, says otherwise or leaves out. The
+sections above are left as written; where they differ, this section is right.
+
+- **Section 4 and the plan's constraints: the standards.** TIA-102.BAAA is not freely readable.
+  The P25 constants were checked against published descriptions. Several values come from where
+  the open-source decoders agree, not from the standard: the IMBE pseudo-random mask, the Golay
+  and Hamming bit order, the interleave, the 8 x 23 orientation, the LDU bit positions and more,
+  as the module doc of `crates/zeta-dsp/src/p25.rs` lists. The proof is an independent decoder's
+  bit-exact agreement (the plan series, "Plan 38 status").
+- **4.2: the EMB's PI bit** is the pre-emption and power control indicator in the current edition
+  of ETSI TS 102 361-1, not a privacy indicator. A DMR call is marked encrypted by its link
+  control's service options or by a privacy header.
+- **4.2: DMR needs no true block timestamps.** Slot timing is in the signal, as 4.2 already says;
+  this stands.
+- **5.3: `reload_modes` does not probe handlers again.** `missing` empties after a node restart,
+  not after a reload.
+- **5.3 and 5.5: the call events.** `silent` has three values, `no_vocoder`, `encrypted` and
+  `vocoder_failed`; there is no `other_call`. The events also carry `stream` and `program`
+  (5.10), and `network`, the text a channel event's summary shows (`null` on a call event).
+- **5.5: a DMR join mid-call.** The opening event comes within one superframe of the first sync
+  of any kind heard on the channel, not of the job's start; a repeater join was measured at up
+  to 423 ms.
+- **5.5: a P25 call's opening event** comes at the first link control after the header (the
+  header names no calling radio), and `algid` and `kid` are `null` on an opening event marked
+  encrypted only by the link control.
+- **5.5: a P25 call whose link control is itself encrypted** names no radio and gives no events.
+  Reporting it is deferred (`TODO.md`, "Digital voice: the next rows").
+- **5.10: `all`.** A held call may delay the mix by at most its hold (about 250 ms); it never
+  drops speech from the mix.
+- **5.1: the vocoder seat.** The watchdog is 2 s (`VOCODER_WATCHDOG_MS`), and the program is
+  looked up per call.

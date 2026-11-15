@@ -500,6 +500,38 @@ Queued behind them, specs first, in the operator's order of interest: colour (ch
 host-capabilities baseline (`TODO.md` "Node: a baseline of the host's capabilities"), VTX channel
 tables from the open VTX firmware (`TODO.md` "Plans: VTX channel tables").
 
+## Plan 38 status
+
+Built subagent-driven on `worktree-digital-voice-spec` (commits 7b93d0bf..dd08fa23 for the code, then the docs commit), 2026-11-14 to 2026-11-16; not yet on `main`, nothing deployed and no live check run. Spec `docs/superpowers/specs/2026-11-14-digital-voice-design.md` (its section 11 lists what the build corrected).
+
+What landed:
+- **The vocoder seat** (`zeta-dsp/src/vocoder.rs`): one child process per call, frames in and speech out at 48 kHz with each frame's span, a 2 s watchdog, the program looked up at each call. M17 moved onto it unchanged (`c2dec` still required).
+- **Optional handlers.** A row whose only missing handlers are optional is `ready` and lists them under `missing`; an install hint may name a script. `modes check` passes such a row without them and fails it only with `--strict`.
+- **`zeta-mbe` and `tools/install-vocoders.sh`.** One C file (Apache-2.0) the script builds on the operator's machine against mbelib-neo **v2.6.11** (`ec8f7d1353d2e234daf61790402866d13a5fd706`), with a self-test; `docs/vocoders.md` has the legal note. **Soft decisions are used:** the pinned library has soft-decision frame functions, and `zeta-mbe` passes it the demodulator's confidence per bit.
+- **A 4-level FSK front end** (`fsk4.rs`): soft dibits, sync in both polarities, acquisition off the nominal deviation and at 2400 baud, a bounded coast through one-level stretches (`P25_COAST_SEARCHES` 34, `DMR_COAST_SEARCHES` 15, each sized over many voice payloads).
+- **The rows** `p25_decode` and `dmr_decode`, graph rows on any 12.5 kHz channel, `access: restricted`, identify priority -1: two call events per call, a channel event for a channel with no call, `silent` saying why a call has no audio (`no_vocoder`, `encrypted`, `vocoder_failed`), encrypted calls reported and never decoded.
+- **Voices.** A job may have several voices (`modes_list` `voices`); `dmr_decode` decodes both slots onto `slot1` and `slot2` beside the main stream; `job_start` `audio_policy` (`first_active`, `follow`, `all`) says what the main stream carries; `job_attach` `stream` reads one voice.
+- **The page.** A stream picker beside the play button of a job with voices, for Play and Transcribe.
+
+The independent check (spec 5.7; task 11a). dsd-fme `33d6cdf` (branch `audio_work`, linked against lwvmobile/mbelib `ambe_tones` `30dc790`, since dsd-fme does not build against mbelib-neo v2.6.11) and libsndfile 1.2.2, built from source outside the repository, decoded eight synthesised captures written by `cargo run -p zeta-dsp --features test-fixtures --example gen_voice_wav`, as 48 kHz discriminator audio (P25 with `-f1`, DMR with `-fs -mg`) and as dsd-fme symbol files of the encoders' dibits. It agrees with every checked value:
+- `p25_group`: NAC `123` hex, talkgroup 65000, source 9990001, ALGID 0x80 and KID 0, units HDU, three LDU1 and LDU2 pairs and a TDULC.
+- `p25_tg1`: talkgroup 1, NAC, source and ALGID as above.
+- `p25_private`: unit to unit, target 9990002, source 9990001.
+- `p25_encrypted`: ALGID 0xAA, KID 7, marked encrypted, in the header and every LDU2.
+- `dmr_slot1`: colour code 5, target 9990, source 9990001, group call, on slot 1 with slot 2 idle.
+- `dmr_two_calls`: slot 1 target 9990 source 9990001, slot 2 target 9991 source 9990002, each on its own slot, every voice burst of both slots decoded.
+- `dmr_handheld`: read as a handheld (MS sync), colour code 5, target 9990, source 9990001.
+- `dmr_encrypted`: service options 0x40 (group encrypted call), and the privacy header decoded clean.
+- **Frames, bit for bit, on the dibit path:** 54 of 54 IMBE frames of each P25 call and 54 of 54 AMBE+2 frames of each DMR call and slot equal the synthesised payload, with 0 bits corrected. The P25 and DMR frame layouts (bit order, interleave, Golay and Hamming generators, masks) therefore agree whole with another decoder.
+- **What the audio path showed about the oracle, not about this code:** dsd-fme's point-sampling slicer corrects a few bits of C4FM on the WAV path (50 of 54 P25 frames bit-exact there; this node's receiver decodes the same signal with 0 corrections); DMR needs dsd-fme's GFSK slicer (`-mg`); dsd-fme loses each capture's first burst while it acquires.
+- On the way it found two weak test captures (both DMR slots carrying the same payload; an all-zero P25 payload), fixed by varying the payload per call (592244b6, dd08fa23), and a decoder weakness: a dead carrier after a cut could decode as an all-zero encryption sync and mark a clear P25 call encrypted. An encryption sync now counts only within 2 corrected Reed-Solomon symbols and when it is not all zero (592244b6).
+
+The gate (2026-11-16), all clean: fmt per crate, workspace clippy, `cargo test --workspace --features zeta-core/test-fixtures,zeta-dsp/test-fixtures` (2926 passed, 0 failed), `zeta-agent` with `test-fake`, both `agents-md` checks, `public-check` and `doc-links`. The UI suite ran 386.2 s for its two shards (scenario sums 351.9 s and 382.7 s, so the heavier shard has about 67 s of its 450 s limit left), with no skipped line. `zeta modes check` printed `p25_decode: ok`, `dmr_decode: ok` and `m17_decode: ok` with no vocoder on the host (the two rows run without their optional `zeta-mbe`; `--strict` on a host with it is their full check).
+
+Documented limits (field craft, `fsk4.rs`, `TODO.md` "Digital voice: the next rows"): a call's first speech is held up to about 98 ms (P25) or 67 ms (DMR); after one lost burst a DMR call is released superframe by superframe (about 240 ms more latency); a weak transmitter about 20 % under its deviation at 10 dB loses about 0.5 % of its bursts; a P25 call whose link control is itself encrypted gives no events.
+
+Open: the live checks (`UAT.md` "Plan 38", 38.1 to 38.8), and `TODO.md` "Digital voice: the next rows" (more rows, changing a running job's policy, `c2dec` optional, trunking, the M17 Golay table, a shared codes module, the front-end limits).
+
 ## Plan 36.1 status
 
 Built subagent-driven on `worktree-sweep-rate` (commits 95db97c5..6a14a5fd for the code, then the docs and the UAT checks), not yet on `main`; nothing deployed and no live check run. Spec `docs/superpowers/specs/2026-11-10-sweep-rate-design.md`, plan `docs/superpowers/plans/2026-11-11-sweep-rate-stepped.md`.
