@@ -82,7 +82,7 @@ pub enum Op {
     /// `null` otherwise;
     /// `null` for a source that runs in the node), and `ring`, the IQ history (`seconds`, `null`
     /// before the first block; a `classify` or `iq_read` span older than it fails
-    /// `too_old`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
+    /// `too_old`, one across a gap in the capture `gap`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
     /// source reported it, `configured` from `--source-position`) where the source knows
     /// where it is, `null` otherwise, and `sweeps`, the scans the source is sweeping for
     /// by its own means, which hold no band and are never among `holders` (`sweeps` is
@@ -2647,7 +2647,8 @@ pub struct SourceInfo {
     pub worker: Option<WorkerInfo>,
     /// The source's IQ history (`seconds`, the length it was sized to by the
     /// memory budget); `null` before its first block. A `classify` or `iq_read`
-    /// span older than this fails `too_old`.
+    /// span older than this fails `too_old`, one that crosses a gap in
+    /// the capture fails `gap`.
     #[serde(default)]
     #[schemars(required, schema_with = "crate::types::nullable::<RingInfo>")]
     pub ring: Option<RingInfo>,

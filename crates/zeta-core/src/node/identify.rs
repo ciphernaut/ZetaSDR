@@ -268,7 +268,7 @@ impl Inner {
             if let Some(ring) = ring {
                 let ring = ring.read().unwrap();
                 if let (Some(center), Some(earliest), Some(latest)) =
-                    (ring.center_hz(), ring.earliest(), ring.latest())
+                    (ring.center_hz(), ring.latest_run_start(), ring.latest())
                     && center == capture.center_hz
                     && (late || latest.0.saturating_sub(earliest.0) >= want_ns)
                     && latest.0 > earliest.0

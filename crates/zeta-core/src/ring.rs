@@ -10,6 +10,7 @@ use crate::port::IqBlock;
 use crate::types::{Hz, Span, Timestamp};
 
 const NS: u128 = 1_000_000_000;
+const MAX_SEGMENTS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "cause", rename_all = "snake_case", deny_unknown_fields)]
@@ -30,15 +31,35 @@ pub enum RingError {
         start_ns: Timestamp,
         end_ns: Timestamp,
     },
+    #[error(
+        "span {start_ns:?}..{end_ns:?} crosses a gap in the history, between {gap_start_ns:?} and {gap_end_ns:?}"
+    )]
+    Gap {
+        start_ns: Timestamp,
+        end_ns: Timestamp,
+        gap_start_ns: Timestamp,
+        gap_end_ns: Timestamp,
+    },
     #[error("ring is empty")]
     Empty,
 }
 
-/// Sample history for one source, bounded to a number of seconds.
+/// A contiguous run of the retained samples: where its first sample sits in
+/// the stream (counted from the ring's start, as `dropped + index`) and when
+/// that sample was taken.
+#[derive(Clone, Copy, Debug)]
+struct Segment {
+    origin_ns: u64,
+    start: u64,
+}
+
+/// Sample history for one input, bounded to a number of seconds.
 ///
-/// Blocks are assumed contiguous; a block that does not start where the ring
-/// expects (within one sample) is treated as a gap and restarts the ring, as
-/// is a change of sample rate or centre frequency.
+/// Blocks are assumed contiguous. A block that does not start where the ring
+/// expects (within one sample) is a gap: it starts a new segment with its own
+/// origin, and the history before it stays, so a read inside either side is
+/// served and only a read across the gap is refused. A change of sample rate
+/// or centre frequency restarts the ring.
 pub struct IqRing {
     capacity_seconds: f64,
     sample_rate_hz: u64,
@@ -46,9 +67,11 @@ pub struct IqRing {
     center_hz: Option<Hz>,
     capacity: usize,
     buf: VecDeque<Complex<f32>>,
-    /// Timestamp of the first sample of the current contiguous run.
-    origin_ns: u64,
-    /// Samples dropped from the front of the run so far.
+    /// The segments of `buf`, oldest first; never empty while `buf` is not.
+    /// The front one may start before the retained samples (its front was
+    /// trimmed); every other starts at or after them.
+    segments: VecDeque<Segment>,
+    /// Samples dropped from the front of the buffer so far.
     dropped: u64,
 }
 
@@ -60,7 +83,7 @@ impl IqRing {
             center_hz: None,
             capacity: Self::capacity_for(capacity_seconds, sample_rate_hz.0),
             buf: VecDeque::new(),
-            origin_ns: 0,
+            segments: VecDeque::new(),
             dropped: 0,
         }
     }
@@ -70,15 +93,36 @@ impl IqRing {
         (seconds * rate as f64).ceil() as usize
     }
 
-    /// Time of the sample `n` samples after the run origin, rounded to the nearest ns.
-    fn time_of(&self, n: u64) -> u64 {
+    /// Time of the stream sample `idx` (counted as `Segment::start` is), taken
+    /// from its segment `seg`, rounded to the nearest ns.
+    fn time_of(&self, seg: &Segment, idx: u64) -> u64 {
         let rate = self.sample_rate_hz.max(1) as u128;
-        self.origin_ns + ((n as u128 * NS + rate / 2) / rate) as u64
+        seg.origin_ns + (((idx - seg.start) as u128 * NS + rate / 2) / rate) as u64
+    }
+
+    /// Segment `i`'s retained samples as stream indices `[first, end)`.
+    fn bounds(&self, i: usize) -> (u64, u64) {
+        let first = self.segments[i].start.max(self.dropped);
+        let end = self
+            .segments
+            .get(i + 1)
+            .map_or(self.dropped + self.buf.len() as u64, |s| s.start);
+        (first, end)
     }
 
     fn clear(&mut self) {
         self.buf.clear();
+        self.segments.clear();
         self.dropped = 0;
+    }
+
+    /// Drop the oldest `excess` samples, and the segments they leave empty.
+    fn trim(&mut self, excess: usize) {
+        self.buf.drain(..excess);
+        self.dropped += excess as u64;
+        while self.segments.len() > 1 && self.segments[1].start <= self.dropped {
+            self.segments.pop_front();
+        }
     }
 
     pub fn push(&mut self, block: &IqBlock) {
@@ -92,28 +136,37 @@ impl IqRing {
             // expression would allocate the new one while the old one is still live.
             self.buf = VecDeque::new();
             self.buf.reserve(self.capacity);
+            self.segments.clear();
             self.dropped = 0;
         }
         if self.center_hz != Some(block.center_hz) {
             self.center_hz = Some(block.center_hz);
             self.clear();
         }
-        if !self.buf.is_empty() {
-            let expected = self.time_of(self.dropped + self.buf.len() as u64);
-            let tolerance = NS.div_ceil(self.sample_rate_hz.max(1) as u128) as u64;
-            if block.t0.0.abs_diff(expected) > tolerance {
-                self.clear();
+        let next = self.dropped + self.buf.len() as u64;
+        let new_segment = match self.segments.back() {
+            None => true,
+            Some(last) => {
+                let expected = self.time_of(last, next);
+                let tolerance = NS.div_ceil(self.sample_rate_hz.max(1) as u128) as u64;
+                block.t0.0.abs_diff(expected) > tolerance
             }
-        }
-        if self.buf.is_empty() {
-            self.origin_ns = block.t0.0;
-            self.dropped = 0;
+        };
+        if new_segment {
+            self.segments.push_back(Segment {
+                origin_ns: block.t0.0,
+                start: next,
+            });
+            // An input that gaps on every block must not grow the list without
+            // limit: past the cap the oldest segment goes, samples and all.
+            if self.segments.len() > MAX_SEGMENTS {
+                let keep_from = self.segments[1].start;
+                self.trim((keep_from - self.dropped) as usize);
+            }
         }
         self.buf.extend(block.samples.iter().copied());
         if self.buf.len() > self.capacity {
-            let excess = self.buf.len() - self.capacity;
-            self.buf.drain(..excess);
-            self.dropped += excess as u64;
+            self.trim(self.buf.len() - self.capacity);
         }
     }
 
@@ -125,9 +178,7 @@ impl IqRing {
         self.capacity_seconds = seconds;
         self.capacity = Self::capacity_for(seconds, self.sample_rate_hz);
         if self.buf.len() > self.capacity {
-            let excess = self.buf.len() - self.capacity;
-            self.buf.drain(..excess);
-            self.dropped += excess as u64;
+            self.trim(self.buf.len() - self.capacity);
         }
         self.buf.shrink_to_fit();
     }
@@ -166,20 +217,50 @@ impl IqRing {
 
     /// Timestamp of the oldest retained sample.
     pub fn earliest(&self) -> Option<Timestamp> {
-        (!self.buf.is_empty()).then(|| Timestamp(self.time_of(self.dropped)))
+        let seg = self.segments.front()?;
+        Some(Timestamp(self.time_of(seg, self.bounds(0).0)))
     }
 
     /// Timestamp of the newest retained sample.
     pub fn latest(&self) -> Option<Timestamp> {
-        (!self.buf.is_empty())
-            .then(|| Timestamp(self.time_of(self.dropped + self.buf.len() as u64 - 1)))
+        let i = self.segments.len().checked_sub(1)?;
+        Some(Timestamp(
+            self.time_of(&self.segments[i], self.bounds(i).1 - 1),
+        ))
+    }
+
+    /// Timestamp of the first sample of the newest segment: the start of the
+    /// longest span ending at [`IqRing::latest`] that a read can serve.
+    pub fn latest_run_start(&self) -> Option<Timestamp> {
+        let i = self.segments.len().checked_sub(1)?;
+        Some(Timestamp(self.time_of(&self.segments[i], self.bounds(i).0)))
+    }
+
+    /// The gaps inside the retained history: the segments less one.
+    pub fn gaps(&self) -> usize {
+        self.segments.len().saturating_sub(1)
+    }
+
+    /// Seconds from the oldest retained sample to the newest, gaps included:
+    /// how far back a read can reach (a read across a gap is refused).
+    pub fn held_s(&self) -> f64 {
+        match (self.earliest(), self.latest()) {
+            (Some(e), Some(l)) => l.0.saturating_sub(e.0) as f64 / NS as f64,
+            _ => 0.0,
+        }
     }
 
     /// The first `samples` samples at `center` starting at `after` (at the
     /// ring's earliest when `after` is `None` or older), as one block; `None`
-    /// while the ring holds fewer from there or holds another centre. The ring
-    /// holds one contiguous run (a gap restarts it), so the block is contiguous,
-    /// and a block ending at `t` is followed by the one asked for `after: t`.
+    /// while the ring holds fewer from there or holds another centre.
+    ///
+    /// A block is contiguous: it never straddles a gap. When the segment
+    /// `after` falls in holds fewer than `samples` from there and a gap follows
+    /// (or `after` lies inside the gap), the answer is the first `samples` of
+    /// the next segment that holds them, so the caller sees `t0` jump, as a
+    /// scan's FFT steps need whole blocks. Within one segment a block ending
+    /// at `t` is followed by the one asked for `after: t`. Its one caller is
+    /// the scan's dwell (`node/scan.rs`, through `Inner::ring_run_after`).
     pub fn run_after(
         &self,
         center: Hz,
@@ -189,30 +270,50 @@ impl IqRing {
         if self.center_hz != Some(center) || self.buf.is_empty() {
             return None;
         }
-        // Samples since the run's origin at `after`, rounded to the nearest, so a
-        // time a nanosecond either side of a sample's lands on it.
-        let from = match after {
-            Some(t) if t.0 > self.origin_ns => {
-                let rate = self.sample_rate_hz as u128;
-                let n = ((t.0 - self.origin_ns) as u128 * rate + NS / 2) / NS;
-                usize::try_from(n.saturating_sub(self.dropped as u128)).ok()?
+        // The segment `after` falls in (the first when it is older than all),
+        // and the sample there, rounded to the nearest so a time a nanosecond
+        // either side of a sample's lands on it.
+        let (seg, from) = match after.and_then(|t| self.segment_at(t.0).map(|i| (i, t.0))) {
+            Some((i, t)) => {
+                let at = self.time_of(&self.segments[i], self.bounds(i).0);
+                (i, self.offset(t - at))
             }
-            _ => 0,
+            None => (0, 0),
         };
-        let to = from.checked_add(samples)?;
-        if to > self.buf.len() {
-            return None;
+        for i in seg..self.segments.len() {
+            let (first, end) = self.bounds(i);
+            let skip = if i == seg { from } else { 0 };
+            let len = (end - first) as usize;
+            if len.saturating_sub(skip) >= samples {
+                let at = first + skip as u64;
+                let lo = (at - self.dropped) as usize;
+                return Some(IqBlock {
+                    t0: Timestamp(self.time_of(&self.segments[i], at)),
+                    sample_rate_hz: Hz(self.sample_rate_hz),
+                    center_hz: center,
+                    samples: self.buf.range(lo..lo + samples).copied().collect(),
+                });
+            }
         }
-        Some(IqBlock {
-            t0: Timestamp(self.time_of(self.dropped + from as u64)),
-            sample_rate_hz: Hz(self.sample_rate_hz),
-            center_hz: center,
-            samples: self.buf.range(from..to).copied().collect(),
-        })
+        None
+    }
+
+    /// The newest segment whose first retained sample is at or before `t`.
+    fn segment_at(&self, t: u64) -> Option<usize> {
+        (0..self.segments.len())
+            .rev()
+            .find(|&i| self.time_of(&self.segments[i], self.bounds(i).0) <= t)
+    }
+
+    /// Samples in `ns` nanoseconds, rounded to the nearest.
+    fn offset(&self, ns: u64) -> usize {
+        ((ns as u128 * self.sample_rate_hz as u128 + NS / 2) / NS) as usize
     }
 
     /// Samples covering the half-open span `[start_ns, end_ns)`, or an error;
-    /// never partial. A span whose end is not after its start is `BadSpan`.
+    /// never partial. A span whose end is not after its start is `BadSpan`. A
+    /// span wholly inside one segment is served from it; one that crosses a gap,
+    /// or starts inside one, is `Gap`.
     pub fn read(&self, span: Span) -> Result<Vec<Complex<f32>>, RingError> {
         if span.end_ns.0 <= span.start_ns.0 {
             return Err(RingError::BadSpan {
@@ -224,23 +325,40 @@ impl IqRing {
             (Some(e), Some(l)) => (e, l),
             _ => return Err(RingError::Empty),
         };
+        let too_old = RingError::TooOld {
+            requested_ns: span.start_ns,
+            earliest_ns: earliest,
+        };
         if span.start_ns.0 < earliest.0 {
-            return Err(RingError::TooOld {
-                requested_ns: span.start_ns,
-                earliest_ns: earliest,
+            return Err(too_old);
+        }
+        let Some(i) = self.segment_at(span.start_ns.0) else {
+            return Err(too_old);
+        };
+        let (first, end) = self.bounds(i);
+        let seg = &self.segments[i];
+        let at = self.time_of(seg, first);
+        let len = (end - first) as usize;
+        let (from, to) = (
+            self.offset(span.start_ns.0 - at),
+            self.offset(span.end_ns.0.saturating_sub(at)),
+        );
+        if to > len || from >= len {
+            if i + 1 == self.segments.len() {
+                return Err(RingError::Future {
+                    requested_ns: span.end_ns,
+                    latest_ns: latest,
+                });
+            }
+            return Err(RingError::Gap {
+                start_ns: span.start_ns,
+                end_ns: span.end_ns,
+                gap_start_ns: Timestamp(self.time_of(seg, end - 1)),
+                gap_end_ns: Timestamp(self.time_of(&self.segments[i + 1], end)),
             });
         }
-        let rate = self.sample_rate_hz as u128;
-        let offset =
-            |t: u64| -> usize { (((t - earliest.0) as u128 * rate + NS / 2) / NS) as usize };
-        let (from, to) = (offset(span.start_ns.0), offset(span.end_ns.0));
-        if to > self.buf.len() {
-            return Err(RingError::Future {
-                requested_ns: span.end_ns,
-                latest_ns: latest,
-            });
-        }
-        Ok(self.buf.range(from..to).copied().collect())
+        let lo = (first - self.dropped) as usize;
+        Ok(self.buf.range(lo + from..lo + to).copied().collect())
     }
 }
 
@@ -448,21 +566,6 @@ mod tests {
     }
 
     #[test]
-    fn gap_clears_ring() {
-        let mut ring = IqRing::new(10.0, Hz(RATE));
-        ring.push(&block(0));
-        ring.push(&block(1));
-        ring.push(&block_at(5_000 * MS, 5000, 1000));
-        assert_eq!(ring.earliest(), Some(Timestamp(5_000 * MS)));
-        assert_eq!(ring.latest(), Some(Timestamp(5_999 * MS)));
-        assert!(matches!(
-            ring.read(span(0, 1)),
-            Err(RingError::TooOld { .. })
-        ));
-        assert_eq!(ring.read(span(5, 6)).unwrap().len(), 1000);
-    }
-
-    #[test]
     fn centre_change_clears_ring_and_is_tracked() {
         let mut ring = IqRing::new(10.0, Hz(RATE));
         assert_eq!(ring.center_hz(), None);
@@ -496,11 +599,11 @@ mod tests {
         let mut ring = wrapped();
         let got = ring.run_after(Hz(100_000_000), Some(Timestamp(MS)), 10);
         assert_eq!(got.map(|b| b.t0), Some(Timestamp(3_000 * MS)));
-        // After a gap the ring's run restarts, and so do the samples it gives.
+        // A gap starts a segment; a run that does not fit before it is the next one's.
         ring.push(&block_at(9_000 * MS, 9000, 500));
-        let got = ring.run_after(Hz(100_000_000), None, 500).unwrap();
-        assert_eq!(got.t0, Timestamp(9_000 * MS));
-        assert_eq!(values(&got), (9000..9500).collect::<Vec<u64>>());
+        let got = ring.run_after(Hz(100_000_000), None, 1500).unwrap();
+        assert_eq!(got.t0, Timestamp(3_500 * MS));
+        assert!(ring.run_after(Hz(100_000_000), None, 1501).is_none());
     }
 
     #[test]
@@ -551,5 +654,166 @@ mod tests {
             );
             assert_eq!(ring.read(span_ns(0, 2_000 * MS)).unwrap().len(), 2000);
         }
+    }
+
+    /// A ring of 10 s: blocks 0 and 1, a gap, then blocks 5 and 6.
+    fn gapped() -> IqRing {
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        ring.push(&block(0));
+        ring.push(&block(1));
+        ring.push(&block(5));
+        ring.push(&block(6));
+        ring
+    }
+
+    #[test]
+    fn a_gap_keeps_the_history_before_it() {
+        let ring = gapped();
+        assert_eq!(ring.earliest(), Some(Timestamp(0)));
+        assert_eq!(ring.latest(), Some(Timestamp(6_999 * MS)));
+        assert_eq!(ring.gaps(), 1);
+        // Each side is served from its own segment.
+        assert_eq!(ring.read(span(0, 2)).unwrap().len(), 2000);
+        assert_eq!(ring.read(span(5, 7)).unwrap().len(), 2000);
+        let got = ring.read(span_ns(1_500 * MS, 1_600 * MS)).unwrap();
+        assert_eq!(got[0], Complex::new(1500.0, 0.0));
+        let got = ring.read(span_ns(5_500 * MS, 5_600 * MS)).unwrap();
+        assert_eq!(got[0], Complex::new(5500.0, 0.0));
+        assert!((ring.held_s() - 6.999).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_read_across_a_gap_is_refused_with_its_bounds() {
+        let ring = gapped();
+        let gap = RingError::Gap {
+            start_ns: Timestamp(1_500 * MS),
+            end_ns: Timestamp(5_500 * MS),
+            gap_start_ns: Timestamp(1_999 * MS),
+            gap_end_ns: Timestamp(5_000 * MS),
+        };
+        assert_eq!(ring.read(span_ns(1_500 * MS, 5_500 * MS)), Err(gap));
+        // One sample past the first segment's end is already across.
+        assert!(matches!(
+            ring.read(span_ns(1_500 * MS, 2_001 * MS)),
+            Err(RingError::Gap { .. })
+        ));
+        // A start inside the gap has no samples.
+        assert!(matches!(
+            ring.read(span_ns(3_000 * MS, 3_100 * MS)),
+            Err(RingError::Gap {
+                gap_start_ns: Timestamp(t0),
+                gap_end_ns: Timestamp(t1),
+                ..
+            }) if t0 == 1_999 * MS && t1 == 5_000 * MS
+        ));
+        // Too old and future keep their meaning against the whole ring.
+        assert!(matches!(
+            ring.read(span_ns(7_000 * MS, 7_100 * MS)),
+            Err(RingError::Future { .. })
+        ));
+        let json = serde_json::to_value(RingError::Gap {
+            start_ns: Timestamp(1),
+            end_ns: Timestamp(9),
+            gap_start_ns: Timestamp(2),
+            gap_end_ns: Timestamp(5),
+        })
+        .unwrap();
+        assert_eq!(json["cause"], "gap");
+        assert_eq!(json["gap_start_ns"], 2);
+        assert_eq!(json["gap_end_ns"], 5);
+        assert_eq!(json["start_ns"], 1);
+    }
+
+    #[test]
+    fn trimming_drops_whole_old_segments() {
+        let mut ring = IqRing::new(3.0, Hz(RATE));
+        ring.push(&block(0));
+        ring.push(&block(5));
+        ring.push(&block(6));
+        assert_eq!(ring.gaps(), 1);
+        // 3000 samples held: all three blocks fit.
+        assert_eq!(ring.earliest(), Some(Timestamp(0)));
+        ring.push(&block(7));
+        // Block 0 went: its segment with it, and the ring reads as unbroken.
+        assert_eq!(ring.gaps(), 0);
+        assert_eq!(ring.earliest(), Some(Timestamp(5_000 * MS)));
+        assert_eq!(ring.latest(), Some(Timestamp(7_999 * MS)));
+        assert!(matches!(
+            ring.read(span(0, 1)),
+            Err(RingError::TooOld { .. })
+        ));
+        assert_eq!(ring.read(span(5, 8)).unwrap().len(), 3000);
+        // A partly trimmed first segment keeps its own times.
+        ring.push(&block_at(20_000 * MS, 0, 500));
+        assert_eq!(ring.gaps(), 1);
+        assert_eq!(ring.earliest(), Some(Timestamp(5_500 * MS)));
+        assert_eq!(
+            ring.read(span_ns(5_500 * MS, 5_600 * MS)).unwrap()[0],
+            Complex::new(5500.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_new_rate_or_centre_still_restarts_the_ring() {
+        let mut ring = gapped();
+        let moved = IqBlock {
+            center_hz: Hz(433_000_000),
+            ..block(8)
+        };
+        ring.push(&moved);
+        assert_eq!(ring.gaps(), 0);
+        assert_eq!(ring.earliest(), Some(Timestamp(8_000 * MS)));
+        let mut ring = gapped();
+        let mut b = block(8);
+        b.sample_rate_hz = Hz(2 * RATE);
+        ring.push(&b);
+        assert_eq!(ring.gaps(), 0);
+        assert_eq!(ring.earliest(), Some(Timestamp(8_000 * MS)));
+    }
+
+    #[test]
+    fn the_segment_list_is_bounded() {
+        let mut ring = IqRing::new(10_000.0, Hz(RATE));
+        // A gap every block, far more blocks than the cap.
+        for i in 0..(MAX_SEGMENTS as u64 * 3) {
+            ring.push(&block_at(i * 10_000 * MS, i * 100, 100));
+        }
+        assert_eq!(ring.gaps(), MAX_SEGMENTS - 1);
+        let last = MAX_SEGMENTS as u64 * 3 - 1;
+        assert_eq!(ring.latest(), Some(Timestamp(last * 10_000 * MS + 99 * MS)));
+        let first = last + 1 - MAX_SEGMENTS as u64;
+        assert_eq!(ring.earliest(), Some(Timestamp(first * 10_000 * MS)));
+        // The samples of dropped segments went with them.
+        assert_eq!(
+            ring.read(span_ns(first * 10_000 * MS, first * 10_000 * MS + 100 * MS))
+                .unwrap()[0],
+            Complex::new((first * 100) as f32, 0.0)
+        );
+    }
+
+    #[test]
+    fn run_after_never_straddles_a_gap() {
+        let ring = gapped();
+        let c = Hz(100_000_000);
+        let end = |b: &IqBlock| Timestamp(b.t0.0 + b.samples.len() as u64 * MS);
+        let first = ring.run_after(c, None, 1500).unwrap();
+        assert_eq!(first.t0, Timestamp(0));
+        assert_eq!(values(&first), (0..1500).collect::<Vec<u64>>());
+        // 500 samples are left before the gap: too few for 1500, so the next
+        // run is the next segment's first 1500, and the caller sees t0 jump.
+        let next = ring.run_after(c, Some(end(&first)), 1500).unwrap();
+        assert_eq!(next.t0, Timestamp(5_000 * MS));
+        assert_eq!(values(&next), (5000..6500).collect::<Vec<u64>>());
+        // What fits before the gap is still served from there.
+        let fits = ring.run_after(c, Some(end(&first)), 500).unwrap();
+        assert_eq!(fits.t0, Timestamp(1_500 * MS));
+        // A time inside the gap continues in the next segment.
+        let from_gap = ring.run_after(c, Some(Timestamp(3_000 * MS)), 100).unwrap();
+        assert_eq!(from_gap.t0, Timestamp(5_000 * MS));
+        // Nothing more past the last segment's end.
+        assert!(
+            ring.run_after(c, Some(Timestamp(6_500 * MS)), 1000)
+                .is_none()
+        );
     }
 }

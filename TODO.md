@@ -861,6 +861,8 @@ The B210 sits on a chipset USB controller, shared with a webcam and an idle seco
 2. Run the rate probe again (re-probe a radio: stop the node, drop the `capabilities` key from its source record, start it), and count the overflows a minute against today's.
 3. Report the overflow rate on the source (`stats.overflows` is cumulative), so a regression shows without a stopwatch.
 
+The same question at lower rates: the field host's B210 also overflowed every few seconds at 10 and 30 Msps (found while recording a multiplex for plan 39, 2026-11-14). The IQ history no longer loses what it held to each overflow (it keeps it as segments), so this is now only about the lost samples: `stats.overflows` counts them.
+
 ## Video: `sharp` runs at about 1 frame a second
 
 UAT 28.2: `sharp` (full width) showed about 1 frame a second on the bench, which is a slideshow. The spec's profile allows up to 5 a second, and `smooth` keeps up.
@@ -976,7 +978,3 @@ The other receivers surveyed stay candidates for the later steps, each for the r
 - **OnAir, for its rate of change.** A receiver with tests for frequency offset, lock, quantisation and combined impairments, several releases in the first half of November touching DVB-T and DVB-T2, a headless server its own docs say is untried on a real radio, and no documented pipe form. GPL-3.0-or-later.
 
 A copyleft receiver runs as a separate program the operator builds, never linked into the node, shipped with it or kept in this repository (`docs/licensing.md`).
-
-## Source: the IQ history restarts on every timestamp gap
-
-Found while recording a multiplex for plan 39, 2026-11-14. `IqRing::push` clears the ring when a block's time is more than a sample from the expected one, so each overflow on a wide capture throws the history away: on the field host's B210 the ring held between nothing and about two seconds at 10 and 30 Msps, though it is sized for ten, and `iq read` of a few seconds mostly answered `too_old`. Keeping the history across a gap (segments with their own origins, a read refused only when its span crosses one) would make `iq read`, burst captures and anything else that reads back from a wide capture dependable. Reproduce: pin a wide band, wait ten seconds, ask `iq read` for the last four. Why the B210 overflows every few seconds at 10 Msps is a second question (`stats.overflows` counts them).
