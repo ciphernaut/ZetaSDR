@@ -11,7 +11,6 @@
 //! (no pilot, or too weak to trust) both channels carry L+R. The reading is noted to the
 //! job as `job_context.wfm` (`pilot_db`, `stereo`).
 
-use std::f64::consts::PI;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,7 +25,7 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, StreamId, StreamKind};
 
 use crate::nbfm::{AudioFilter, nbfm_demod};
-use crate::rds::{Biquad, PILOT_HZ};
+use crate::rds::PilotPll;
 use crate::util::{StreamingFir, lowpass_taps};
 use crate::{Input, frame_span, run_map};
 
@@ -67,13 +66,8 @@ pub const PILOT_AVERAGE_S: f64 = 0.1;
 pub const STEREO_MIN_RATE_HZ: u64 = 120_000;
 /// Floor of the reading, dB (no pilot over a silent MPX).
 const PILOT_DB_FLOOR: f64 = -120.0;
-/// Half-width of the pilot band-pass, Hz, and the pilot PLL's natural frequency (Hz)
-/// and damping: as `rds_decode`'s.
-const PILOT_BW_HZ: f64 = 100.0;
-const PLL_WN_HZ: f64 = 20.0;
-const PLL_ZETA: f64 = 0.707;
-/// Time constant of the band-passed pilot's power that normalises the PLL's phase
-/// detector, s (`rds_decode`'s, at its 240 kHz).
+/// Time constant of the band-passed pilot's power that normalises the [`PilotPll`]'s
+/// phase detector, s (`rds_decode`'s, at its 240 kHz).
 const PLL_LEVEL_S: f64 = 0.042;
 /// How often the reading is noted to the job when it has not changed state.
 const PILOT_NOTE_EVERY: Duration = Duration::from_secs(5);
@@ -120,17 +114,7 @@ pub struct Pilot {
 /// The pilot PLL and the reading that decides stereo, at one stage rate.
 #[derive(Debug)]
 struct PilotLock {
-    bp: Biquad,
-    /// Smoothed power of the band-passed pilot, normalising the phase detector.
-    bp_pow: f64,
-    level_alpha: f64,
-    /// PLL phase (cycles of the pilot, wrapped), frequency (cycles a sample) and the
-    /// integrator's correction to it.
-    theta: f64,
-    freq: f64,
-    integ: f64,
-    kp: f64,
-    ki: f64,
+    pll: PilotPll,
     /// Smoothed `2 p sin(phase)`: the amplitude of the pilot in phase with the lock.
     coherent: f64,
     /// Smoothed power of the MPX.
@@ -145,18 +129,9 @@ struct PilotLock {
 impl PilotLock {
     fn new(rate_hz: u64) -> Self {
         let fs = rate_hz as f64;
-        let wn = 2.0 * PI * PLL_WN_HZ / fs;
         let alpha = |tau_s: f64| 1.0 - (-1.0 / (tau_s * fs)).exp();
         Self {
-            bp: Biquad::bandpass(PILOT_HZ, PILOT_HZ / (2.0 * PILOT_BW_HZ), fs),
-            bp_pow: 0.0,
-            level_alpha: alpha(PLL_LEVEL_S),
-            theta: 0.0,
-            freq: PILOT_HZ / fs,
-            integ: 0.0,
-            // Loop gains in cycles: phase error e (radians) / 2π.
-            kp: 2.0 * PLL_ZETA * wn / (2.0 * PI),
-            ki: wn * wn / (2.0 * PI),
+            pll: PilotPll::new(fs, alpha(PLL_LEVEL_S)),
             coherent: 0.0,
             mpx_pow: 0.0,
             alpha: alpha(PILOT_AVERAGE_S),
@@ -169,18 +144,8 @@ impl PilotLock {
     /// One MPX sample `x` through the lock and the reading: the 38 kHz carrier
     /// `sin(2 phase)` for it, in phase with L-R as transmitted.
     fn step(&mut self, x: f64) -> f64 {
-        let p = self.bp.run(x);
-        self.bp_pow += self.level_alpha * (p * p - self.bp_pow);
-        let amp = (2.0 * self.bp_pow).sqrt();
-        // NCO estimate sin(2π θ) of the pilot; p · cos ≈ (A/2) sin(phase error).
-        let (sn, cs) = (2.0 * PI * self.theta).sin_cos();
-        let e = if amp > 1e-9 {
-            (2.0 * p * cs / amp).clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        self.integ += self.ki * e;
-        self.theta = (self.theta + self.freq + self.integ + self.kp * e).rem_euclid(1.0);
+        let (p, phase) = self.pll.step(x);
+        let (sn, cs) = phase.sin_cos();
         self.coherent += self.alpha * (2.0 * p * sn - self.coherent);
         self.mpx_pow += self.alpha * (x * x - self.mpx_pow);
         // Compared without the log: the pilot's power A²/2 against the threshold's
@@ -574,7 +539,7 @@ mod tests {
         use crate::synth::{STEREO_PILOT_LEVEL, stereo_mpx, tone, wfm_modulate_composite};
         let left = tone(240_000, 240_000, 1_000.0, 0.4);
         let right = tone(240_000, 240_000, 3_000.0, 0.4);
-        let pilot = tone(240_000, 240_000, PILOT_HZ, STEREO_PILOT_LEVEL);
+        let pilot = tone(240_000, 240_000, crate::rds::PILOT_HZ, STEREO_PILOT_LEVEL);
         let mut mpx = stereo_mpx(&left, &right, 240_000, 0.0);
         for (m, p) in mpx.iter_mut().zip(&pilot).skip(120_000) {
             *m += p;

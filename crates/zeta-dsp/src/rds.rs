@@ -52,6 +52,9 @@ const DECIM: usize = 10;
 /// Pilot PLL natural frequency and damping.
 const PLL_WN_HZ: f64 = 20.0;
 const PLL_ZETA: f64 = 0.707;
+/// RDS's smoothing of the pilot's power in [`PilotPll`], a sample at [`RDS_RATE_HZ`]
+/// (a time constant of about 42 ms).
+const PILOT_POW_ALPHA: f64 = 1e-4;
 /// Early-late gate: correction per symbol as a fraction of a symbol, times
 /// the normalised (late - early) error.
 const TIMING_GAIN: f64 = 0.02;
@@ -115,10 +118,9 @@ pub fn block_offset(block: u32) -> Option<Offset> {
     Offset::ALL.into_iter().find(|o| o.word() == syn)
 }
 
-/// Transposed direct-form II biquad (RBJ cookbook designs), run in f64. `wfm_demod`'s
-/// stereo pilot lock uses its band-pass too.
+/// Transposed direct-form II biquad (RBJ cookbook designs), run in f64.
 #[derive(Clone, Debug)]
-pub(crate) struct Biquad {
+struct Biquad {
     b: [f64; 3],
     a: [f64; 2],
     z: [f64; 2],
@@ -134,7 +136,7 @@ impl Biquad {
     }
 
     /// Band-pass, 0 dB and zero phase at `f0`, quality `q`.
-    pub(crate) fn bandpass(f0: f64, q: f64, rate: f64) -> Self {
+    fn bandpass(f0: f64, q: f64, rate: f64) -> Self {
         let w = 2.0 * PI * f0 / rate;
         let alpha = w.sin() / (2.0 * q);
         Self::from_rbj(
@@ -155,7 +157,7 @@ impl Biquad {
         )
     }
 
-    pub(crate) fn run(&mut self, x: f64) -> f64 {
+    fn run(&mut self, x: f64) -> f64 {
         let y = self.b[0] * x + self.z[0];
         self.z[0] = self.b[1] * x - self.a[0] * y + self.z[1];
         self.z[1] = self.b[2] * x - self.a[1] * y;
@@ -169,6 +171,63 @@ fn butter4(fc: f64, rate: f64) -> [Biquad; 2] {
         Biquad::lowpass(fc, 0.541_196_1, rate),
         Biquad::lowpass(fc, 1.306_563, rate),
     ]
+}
+
+/// The 19 kHz stereo pilot's PLL, shared by RDS (57 kHz is its third harmonic) and
+/// `wfm_demod`'s stereo decode (38 kHz is its second): a band-pass of the pilot
+/// (±[`PILOT_BW_HZ`]) feeds a second-order loop ([`PLL_WN_HZ`], [`PLL_ZETA`]) whose
+/// phase detector is normalised by the band-passed pilot's smoothed power. Locked,
+/// `sin(phase)` follows the pilot as transmitted.
+#[derive(Clone, Debug)]
+pub(crate) struct PilotPll {
+    bp: Biquad,
+    /// Smoothed power of the band-passed pilot, and its smoothing factor a sample.
+    pow: f64,
+    pow_alpha: f64,
+    /// PLL phase (cycles of the pilot, wrapped) and frequency (cycles a sample).
+    theta: f64,
+    freq: f64,
+    integ: f64,
+    kp: f64,
+    ki: f64,
+}
+
+impl PilotPll {
+    /// A loop for a composite at `rate_hz`, its pilot power smoothed by `pow_alpha` a
+    /// sample.
+    pub(crate) fn new(rate_hz: f64, pow_alpha: f64) -> Self {
+        let wn = 2.0 * PI * PLL_WN_HZ / rate_hz;
+        PilotPll {
+            bp: Biquad::bandpass(PILOT_HZ, PILOT_HZ / (2.0 * PILOT_BW_HZ), rate_hz),
+            pow: 0.0,
+            pow_alpha,
+            theta: 0.0,
+            freq: PILOT_HZ / rate_hz,
+            integ: 0.0,
+            // Loop gains in cycles: phase error e (radians) / 2π.
+            kp: 2.0 * PLL_ZETA * wn / (2.0 * PI),
+            ki: wn * wn / (2.0 * PI),
+        }
+    }
+
+    /// One composite sample `s` through the loop: the band-passed pilot `p` and the
+    /// loop's phase for this sample, radians (`sin(phase)` estimates the pilot), before
+    /// the loop moves on to the next.
+    pub(crate) fn step(&mut self, s: f64) -> (f64, f64) {
+        let p = self.bp.run(s);
+        self.pow += self.pow_alpha * (p * p - self.pow);
+        let amp = (2.0 * self.pow).sqrt();
+        // NCO estimate sin(2π θ); p · cos ≈ (A/2) sin(phase error).
+        let phase = 2.0 * PI * self.theta;
+        let e = if amp > 1e-9 {
+            (2.0 * p * phase.cos() / amp).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.integ += self.ki * e;
+        self.theta = (self.theta + self.freq + self.integ + self.kp * e).rem_euclid(1.0);
+        (p, phase)
+    }
 }
 
 /// Streaming RDS demodulator: composite (discriminator output, ±1 at 75 kHz
@@ -190,14 +249,7 @@ fn butter4(fc: f64, rate: f64) -> [Biquad; 2] {
 /// together, so the output does not depend on it.
 pub struct RdsDemod {
     resampler: Option<Resampler>,
-    pilot_bp: Biquad,
-    pilot_pow: f64,
-    /// PLL phase (cycles of the pilot, wrapped) and frequency (cycles a sample).
-    theta: f64,
-    freq: f64,
-    integ: f64,
-    kp: f64,
-    ki: f64,
+    pilot: PilotPll,
     rds_bp: Biquad,
     lp_re: [Biquad; 2],
     lp_im: [Biquad; 2],
@@ -237,20 +289,12 @@ impl RdsDemod {
             Some(Resampler::new(rate_hz, RDS_RATE_HZ)?)
         };
         let fs = RDS_RATE_HZ as f64;
-        let wn = 2.0 * PI * PLL_WN_HZ / fs;
         let dec_rate = fs / DECIM as f64;
         let sps = dec_rate / BAUD;
         let half = (sps / 2.0).round() as usize;
         Ok(RdsDemod {
             resampler,
-            pilot_bp: Biquad::bandpass(PILOT_HZ, PILOT_HZ / (2.0 * PILOT_BW_HZ), fs),
-            pilot_pow: 0.0,
-            theta: 0.0,
-            freq: PILOT_HZ / fs,
-            integ: 0.0,
-            // Loop gains in cycles: phase error e (radians) / 2π.
-            kp: 2.0 * PLL_ZETA * wn / (2.0 * PI),
-            ki: wn * wn / (2.0 * PI),
+            pilot: PilotPll::new(fs, PILOT_POW_ALPHA),
             rds_bp: Biquad::bandpass(SUBCARRIER_HZ, SUBCARRIER_HZ / (2.0 * RDS_BW_HZ), fs),
             lp_re: butter4(RDS_BW_HZ, fs),
             lp_im: butter4(RDS_BW_HZ, fs),
@@ -294,19 +338,7 @@ impl RdsDemod {
     /// One composite sample through the pilot PLL and the RDS mixer; the
     /// low-passed complex baseband on every `DECIM`th sample.
     fn mix(&mut self, s: f64) -> Option<Complex<f64>> {
-        let p = self.pilot_bp.run(s);
-        self.pilot_pow += 1e-4 * (p * p - self.pilot_pow);
-        let amp = (2.0 * self.pilot_pow).sqrt();
-        // NCO estimate sin(2π θ); p · cos ≈ (A/2) sin(phase error).
-        let phase = 2.0 * PI * self.theta;
-        let e = if amp > 1e-9 {
-            (2.0 * p * phase.cos() / amp).clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        self.integ += self.ki * e;
-        self.theta = (self.theta + self.freq + self.integ + self.kp * e).rem_euclid(1.0);
-
+        let (_, phase) = self.pilot.step(s);
         let r = self.rds_bp.run(s);
         let (sn, cs) = (3.0 * phase).sin_cos();
         let (mut re, mut im) = (r * sn, r * cs);
@@ -868,6 +900,34 @@ mod tests {
         assert_eq!(chunked, whole);
         // All but the first group (acquisition) and the last (cut short).
         assert!(RdsSync::default().feed(&whole).len() >= 58);
+    }
+
+    #[test]
+    fn the_pilot_lock_and_mixer_are_pinned() {
+        // A checksum of every decimated baseband sample over a noisy station, taken
+        // before the pilot PLL was shared with `wfm_demod`: the lock's arithmetic must
+        // stay exactly as it was.
+        let mut iq = rds_station_iq(PI_CODE, PS, RT, 240_000);
+        awgn(&mut iq, 20.0, 5);
+        let mut prev = Complex::new(0.0, 0.0);
+        let comp = nbfm_demod(&iq, 240_000, DEVIATION_HZ, &mut prev);
+        let mut d = RdsDemod::new(240_000).unwrap();
+        let (mut h, mut n) = (0xcbf2_9ce4_8422_2325u64, 0usize);
+        for &s in &comp {
+            if let Some(z) = d.mix(s as f64) {
+                for b in
+                    z.re.to_bits()
+                        .to_le_bytes()
+                        .iter()
+                        .chain(&z.im.to_bits().to_le_bytes())
+                {
+                    h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+                }
+                n += 1;
+            }
+        }
+        eprintln!("rds baseband checksum {h:#018x} ({n})");
+        assert_eq!((h, n), (0x08d6_454c_18db_240e, 126_113));
     }
 
     #[test]
