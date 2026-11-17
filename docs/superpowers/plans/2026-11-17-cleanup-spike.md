@@ -10,7 +10,7 @@ Round 0 was estimated at about 150k tokens and its subagents used about 940k: im
 
 The test rule that applies from Round 1 on: per fix, only its new test and the tests beside it; a touched crate's whole suite once per batch; the workspace and page suites once on the merged branch; a repeat loop only where the brief asks for one (a race fix).
 
-Budget per round from these figures: an XS item about 50k with its review; an S item about 150k to 250k. Round 1 about 0.8M to 1M, Round 2 about 1.5M, Round 3 about 1M, Round 4 about 100k to 200k per section.
+Budget per round from these figures: an XS item about 50k with its review; an S item about 150k to 250k. Round 1 was budgeted at 0.8M to 1M and used about 2.3M for twelve S entries (about 190k each, everything included). So from Round 2 on, budget about 200k per S item, and about 0.4M per round for the whole-branch review, its fix wave and their re-reviews. That puts Round 2 (eight items) near 2M, Round 3 (six page items, with UI runs) near 1.6M, and Round 4 about 100k to 200k per section.
 
 ## Round 0: the XS sweep (done 2026-11-17)
 
@@ -38,7 +38,44 @@ Outcome: thirteen items landed; A6 needed no change (the ring's seconds already 
 - C3. "Test: `modes_check::a_bad_synth_block_fails_its_row_and_the_rest_still_run` flaked once on a leftover scratch dir": the checker retries the removal or waits for the node to finish.
 - C4. "Test: the UI suite's heavier shard is near its deadline": rebalance `SHARD_STARTS` so the two shards finish closer together.
 
-## Round 1: small node and worker fixes (S each)
+## Round 1: small node and worker fixes (S each, done 2026-11-17)
+
+Built subagent-driven on `worktree-cleanup-r1` in five batches, run one after another, with a batch's review overlapping the next batch's build where the files were apart. Each batch had one implementer and one review, a fix round with a scoped re-review where the review asked for one, then a whole-branch review, one fix wave and the full gate. Every fix carries a test that fails without it; the refactors carry none.
+
+Outcome: all twelve entries landed, plus two items from the same code: "Jobs: an attached job whose relaunch fails keeps its input's old tuning", and a `held_s` in the ring report.
+
+The reviews changed five things:
+- Batch E: a `graph_put` takes its restart lock before it reads the record. Two overlapping puts had left the second graph stored but not run.
+- Batch G: `held_s` counts the samples held, and a new `run_s` gives the newest contiguous run. A backward time jump still restarts the ring.
+- Batch H: a sink restart waits for its decoder's restart lock cancellably. Without that, a capture move relaunching the watch could hold the source's gate for good.
+- Batch H: `--then-tail` picks the decoder structurally rather than by node order, and the watch's sink is fed by the same pick.
+- The final review: the ring report's new fields default when an older node omits them, so `--source-node` still opens an older node.
+
+Left over, in `TODO.md`:
+- the page's classify retry knows only `too_old`;
+- an ungated `job_stop` during a restart's teardown is undone by the relaunch;
+- per-client fairness for the stream pool.
+
+**Rollback:** every job record now carries `sinks`. The previous binary skips such records, so it resumes none of them, and none are deleted. Rolling forward again recovers them. A `set_start` under the old binary prunes the set instances it cannot see.
+
+Batches:
+- D, the worker (Opus): the watchdog; control frames ahead of IQ.
+- E, restarts (Opus): the restart lock; the failed relaunch's tuning; heal watchers after the resume; the job history (a re-run replaces its predecessor, cap 50).
+- F, refactors (Sonnet): the source-record helper with the shared test fixtures; `node/self_sweep.rs`; `--max-streams`.
+- G, the ring (Sonnet, reviewed by Opus): segments across gaps; `held_s`, `run_s`, `gaps`.
+- H, the watch's sinks (Opus): the `gated_stop` token; `--then-tail`; sinks stored beside the row's expansion; the generic `sink` param.
+
+Actuals, subagents only (about 2.3M against an estimate of 1.4M to 1.8M):
+
+| stage | per batch | total |
+|---|---|---|
+| implementer | 124k to 353k (Sonnet 124-140k, Opus 157-353k) | 1.06M |
+| review | Sonnet 71k; Opus 110-154k | 0.62M |
+| fix round | 22-52k | 0.10M |
+| scoped re-review | 56-61k, however small the fix | 0.18M |
+| whole-branch review, fix wave and its re-review | | about 0.36M |
+
+The full gate ran once, about 30 minutes of wall clock.
 
 - "Worker: a parent-side status-silence watchdog".
 - "Worker: control frames queue behind IQ blocks".
