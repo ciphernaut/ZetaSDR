@@ -2127,11 +2127,15 @@ mod tests {
 
     #[test]
     fn merge_round_trips_defaults_empty_and_names_schema_fields() {
-        let row = parse(ADSB).unwrap();
+        // A row that leaves `merge` out has none; the ADS-B row merges on `icao`.
+        let bare = edited(ADSB, |v| {
+            v["subject"].as_object_mut().unwrap().remove("merge");
+        });
+        let row = parse(&bare).unwrap();
         assert!(row.subject.as_ref().unwrap().merge.is_empty());
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["subject"]["merge"], serde_json::json!([]));
-        let text = edited(ADSB, |v| {
+        let text = edited(&bare, |v| {
             v["subject"]["merge"] = serde_json::json!(["icao"])
         });
         let row = parse(&text).unwrap();
@@ -2141,7 +2145,7 @@ mod tests {
             vec!["icao".to_string()]
         );
         assert_eq!(parse(&serde_json::to_string(&row).unwrap()).unwrap(), row);
-        let text = edited(ADSB, |v| {
+        let text = edited(&bare, |v| {
             v["subject"]["merge"] = serde_json::json!(["callsign", "nope"])
         });
         let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();

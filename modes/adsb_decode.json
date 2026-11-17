@@ -89,6 +89,7 @@
     ],
     "heading": "track_deg",
     "label": "callsign",
+    "merge": ["icao"],
     "track_points": 100,
     "track_min_m": 500
   }

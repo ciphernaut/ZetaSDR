@@ -473,6 +473,11 @@ async fn modes_list_and_show_carry_the_subject() {
         |id: &str| serde_json::to_value(modes.iter().find(|m| m.id.0 == id).unwrap()).unwrap();
     assert_eq!(info("adsb_decode")["subject"]["key"], "icao");
     assert_eq!(info("adsb_decode")["subject"]["waterfall"], "summary");
+    // An aircraft heard by ADS-B is the same subject as the one VDL2 names by its address.
+    assert_eq!(
+        info("adsb_decode")["subject"]["merge"],
+        serde_json::json!(["icao"])
+    );
     assert_eq!(info("pocsag_decode")["subject"]["key"], "address");
     let Ok(OpResult::Mode { mode }) = node
         .apply(Op::ModesShow {
