@@ -22,6 +22,7 @@ mod propose;
 mod recover;
 mod retune;
 mod scan;
+mod self_sweep;
 mod sources;
 pub mod watch;
 
@@ -232,8 +233,8 @@ struct JobEntry {
     /// from the record's context, so a new entry (every launch) continues the counts.
     stations: origin::StationTally,
     /// Set at launch for a scan its source sweeps for itself: where `job_retune` hands
-    /// its re-aims ([`scan::Reaim`]) to the run's task.
-    reaim: Option<tokio::sync::mpsc::Sender<scan::Reaim>>,
+    /// its re-aims ([`self_sweep::Reaim`]) to the run's task.
+    reaim: Option<tokio::sync::mpsc::Sender<self_sweep::Reaim>>,
 }
 
 /// A new `Running` record of an operator's job of `kind` on the radio: a fresh id, an

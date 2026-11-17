@@ -459,7 +459,7 @@ impl Inner {
 impl Node {
     /// Re-aim the running scan `id` that its source sweeps for itself at `want` (and
     /// `bin_hz`, when given), under one hold of its source's gate. The run's task asks
-    /// the source to re-aim its running sweep ([`super::scan::Reaim`],
+    /// the source to re-aim its running sweep ([`super::self_sweep::Reaim`],
     /// [`crate::port::SweepRows::retarget`]); granted, the job keeps its id, stream,
     /// claim and `timing`, its record following the new plan. A source that cannot
     /// re-aim (or a scan still waiting for its sweep) is `Unsupported`: the scan is then
@@ -509,7 +509,7 @@ impl Node {
         let answer = match reaim {
             Some(tx) => {
                 let (reply, answer) = tokio::sync::oneshot::channel();
-                let asked = super::scan::Reaim {
+                let asked = super::self_sweep::Reaim {
                     span: want,
                     bin_hz,
                     reply,

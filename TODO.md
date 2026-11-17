@@ -911,10 +911,6 @@ Today the waterfall follows the scan and hides the fine rows of a capture on the
 
 A `source` scan left waiting retries every 16 s for as long as it runs; an operator stops it.
 
-## Scan: the self-sweep half of `node/scan.rs` in its own module
-
-`crates/zeta-core/src/node/scan.rs` carries the stepped loop and the self-sweep's start, wait and clock. Move the self-sweep half to its own module.
-
 ## Follow-ups from the live view and the plan 36 run (2026-11-12)
 
 From the first live run of plan 36 and the live-view fixes after it. Each is small.
