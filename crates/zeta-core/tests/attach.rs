@@ -413,6 +413,63 @@ async fn overlapping_graph_puts_of_the_input_keep_the_attached_job() {
     assert_eq!(attached_to(&node, &input), vec![id]);
 }
 
+/// Two `graph_put`s of the input with different graphs at once take turns: the second,
+/// arriving while the first's restart has the record briefly `stopped`, still restarts
+/// the job, so the graph that runs at the end is the one stored last, and the attached
+/// job never leaves `Running`.
+#[tokio::test]
+async fn overlapping_graph_puts_of_the_input_run_the_last_graph_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let input = start_audio(&node).await;
+    let id = attach_ok(&node, &input).await;
+    assert!(event(&node, &id, "transcript", 2000).await.is_some());
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let landed = || done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut seen = Vec::new();
+    let watch = async {
+        while done.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            let state = record(&node, &id).state;
+            if state != JobState::Running {
+                seen.push(state);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    // The second graph's `two_out` publishes `two` events: they show which graph runs.
+    let (a, b, ()) = tokio::join!(
+        async {
+            let r = node
+                .job_graph_put(&input, node_graph("audio_src", serde_json::json!({})))
+                .await;
+            landed();
+            r
+        },
+        async {
+            let r = node
+                .job_graph_put(&input, node_graph("two_out", serde_json::json!({})))
+                .await;
+            landed();
+            r
+        },
+        watch,
+    );
+    assert!(a.is_ok() && b.is_ok(), "both land: {a:?} {b:?}");
+    assert!(seen.is_empty(), "attached job seen {seen:?}");
+    assert_eq!(record(&node, &input).graph.nodes[0].kind, "two_out");
+    assert_eq!(record(&node, &input).state, JobState::Running);
+    assert!(
+        event(&node, &input, "two", 2000).await.is_some(),
+        "the stored graph runs"
+    );
+    assert_running_for(&node, &id, 500).await;
+    assert!(event(&node, &id, "transcript", 2000).await.is_some());
+}
+
 /// The ids of the records attached to `input`.
 fn attached_to(node: &Node, input: &JobId) -> Vec<JobId> {
     node.job_list()

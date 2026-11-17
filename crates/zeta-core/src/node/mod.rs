@@ -668,7 +668,8 @@ impl Inner {
     }
 
     /// Store `graph` as job `id`'s (`capture_rate_hz` as in [`Node::job_graph_set`]) and,
-    /// when it `running`, restart it under the same id.
+    /// when it `running`, restart it under the same id. The caller holds the job's
+    /// restart lock ([`Inner::restart_guard`]) from before it read `running`.
     pub(crate) async fn swap_graph(
         self: &Arc<Self>,
         id: &JobId,
@@ -676,9 +677,8 @@ impl Inner {
         capture_rate_hz: Option<Option<u64>>,
         running: bool,
     ) -> Result<(), NodeError> {
-        // The restart and its attached jobs' relaunch under the job's restart lock,
-        // taken before any gate: another restart of it waits its turn.
-        let _restart = self.restart_guard(id).await;
+        // The caller holds the job's restart lock (taken before any gate, before it read
+        // `running`): the restart and its attached jobs' relaunch happen under it.
         // Before the stop: the jobs attached to it follow the restart (see
         // `Inner::relaunch_attached`), relaunched once it runs again or failed to.
         let held = match running {
@@ -700,6 +700,15 @@ impl Inner {
                 .launch_task(rec)
                 .await
                 .map_err(|e| NodeError::Other(format!("launch task: {e}")));
+            if !matches!(r, Ok(Ok(()))) {
+                // The restart is over, its launch refused: the stopped record is no
+                // longer one mid-restart (see `Inner::prune_history`).
+                if let Some(e) = self.jobs.lock().unwrap().get_mut(id)
+                    && e.record.state != JobState::Running
+                {
+                    e.restarting = false;
+                }
+            }
             self.relaunch_attached(held).await;
             r??;
         }
@@ -2658,6 +2667,10 @@ impl Node {
         let mut graph = graph;
         crate::ops::fill_squelch_params(&mut graph);
         graph::validate(&graph, &self.inner.registry)?;
+        // The restart lock before the record is read: a restart of the job meanwhile
+        // (briefly `stopped` inside it) has ended, so `running` and the checks below read
+        // the record as it stands. Held through the restart (see `Inner::swap_graph`).
+        let _restart = self.inner.restart_guard(id).await;
         let current = {
             let jobs = self.inner.jobs.lock().unwrap();
             let entry = jobs
