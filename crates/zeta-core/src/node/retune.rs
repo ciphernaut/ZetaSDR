@@ -37,6 +37,9 @@ impl Node {
         want: Tuning,
         replace: &[JobId],
     ) -> Result<(), NodeError> {
+        // The restart and its attached jobs' relaunch under the job's restart lock,
+        // taken before the gate: another restart of it waits its turn.
+        let _restart = self.inner.restart_guard(id).await;
         let rec = {
             let jobs = self.inner.jobs.lock().unwrap();
             let e = jobs
@@ -168,7 +171,9 @@ impl Node {
         let port = self
             .port(source)
             .ok_or_else(|| NodeError::UnknownSource(source.clone()))?;
-        let guard = self.inner.leases.gate_guard(source).await;
+        // The holders' restart locks (held until their attached jobs are relaunched),
+        // then the gate.
+        let (_restarts, guard) = self.inner.restarts_then_gate(source).await;
         let narrow = want.is_none();
         let want = match want {
             Some(w) => w,
@@ -302,6 +307,65 @@ impl Node {
 }
 
 impl Inner {
+    /// Wait for job `id`'s restart lock (see [`Inner::restarts`]) and hold it until the
+    /// guard drops; `None` (nothing held) for a job the node has no record of. Never
+    /// called while holding a source's gate.
+    pub(super) async fn restart_guard(&self, id: &JobId) -> Option<OwnedMutexGuard<()>> {
+        let lock = {
+            let jobs = self.jobs.lock().unwrap();
+            if !jobs.contains_key(id) {
+                return None;
+            }
+            self.restarts
+                .lock()
+                .unwrap()
+                .entry(id.clone())
+                .or_default()
+                .clone()
+        };
+        Some(lock.lock_owned().await)
+    }
+
+    /// The restart locks of every job holding `source` (in id order), then its gate,
+    /// for a capture move, which learns the holders it restarts only under the gate. A
+    /// holder that took its lease while the locks were taken (it holds none of them)
+    /// lets everything go and the round is taken again, so no lock is ever waited for
+    /// under the gate.
+    pub(super) async fn restarts_then_gate(
+        &self,
+        source: &SourceId,
+    ) -> (Vec<OwnedMutexGuard<()>>, OwnedMutexGuard<()>) {
+        loop {
+            let mut ids: Vec<JobId> = self
+                .leases
+                .holders(source)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            ids.sort();
+            ids.dedup();
+            let mut locked = Vec::new();
+            let mut guards = Vec::new();
+            for id in ids {
+                if let Some(g) = self.restart_guard(&id).await {
+                    guards.push(g);
+                    locked.push(id);
+                }
+            }
+            let gate = self.leases.gate_guard(source).await;
+            let covered = {
+                let jobs = self.jobs.lock().unwrap();
+                self.leases
+                    .holders(source)
+                    .iter()
+                    .all(|(id, _)| locked.contains(id) || !jobs.contains_key(id))
+            };
+            if covered {
+                return (guards, gate);
+            }
+        }
+    }
+
     /// Replace the live run of the job `rec.id` by a launch of `rec` under the same
     /// id, the record staying `Running` and the lease held throughout: the old run's
     /// supervisor, seeing `relaunch` (see [`super::JobEntry::relaunch`]), releases

@@ -502,6 +502,72 @@ async fn an_attached_job_the_operator_stopped_stays_stopped_through_a_retune() {
     assert_eq!(attached_to(&node, &input), vec![att]);
 }
 
+/// A `job_retune` and a `graph_put` of one input at once take turns (the input's restart
+/// lock): its attached job is never seen `stopped` or `failed` between them, both land,
+/// and it ends `Running` on the input's last tuning.
+#[tokio::test]
+async fn a_retune_and_a_graph_put_of_one_input_at_once_keep_its_attached_job_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let node = Node::open(cfg(dir.path()), registry_with_dsp(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let input = start_fm(&node).await;
+    let att = attach_ok(&node, &input).await;
+    assert!(event(&node, &att, "transcript", 3000).await.is_some());
+    let graph = record(&node, &input).graph;
+    let retune = Op::JobRetune {
+        job: input.clone(),
+        center_hz: Hz(100_002_000),
+        bandwidth_hz: Hz(10_000),
+        bin_hz: None,
+        replace: vec![],
+    };
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let landed = || done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut seen = Vec::new();
+    let watch = async {
+        while done.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            let state = record(&node, &att).state;
+            if state != JobState::Running {
+                seen.push(state);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let (a, b, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(
+            async {
+                let r = node.apply(retune).await;
+                landed();
+                r
+            },
+            async {
+                let r = node.job_graph_put(&input, graph).await;
+                landed();
+                r
+            },
+            watch,
+        )
+    })
+    .await
+    .expect("no deadlock");
+    assert!(seen.is_empty(), "attached job seen {seen:?}");
+    assert_eq!(a, Ok(OpResult::Job(input.clone())));
+    assert!(b.is_ok(), "graph_put: {b:?}");
+    let retuned = Tuning {
+        center_hz: Hz(100_002_000),
+        bandwidth_hz: Hz(10_000),
+    };
+    assert_eq!(record(&node, &input).tuning, retuned);
+    assert_eq!(record(&node, &input).state, JobState::Running);
+    assert_running_for(&node, &att, 500).await;
+    assert_eq!(record(&node, &att).tuning, retuned);
+    assert!(event(&node, &att, "transcript", 3000).await.is_some());
+    assert_eq!(attached_to(&node, &input), vec![att]);
+}
+
 #[tokio::test]
 async fn attach_refuses_non_running_or_audio_less_input() {
     let dir = tempfile::tempdir().unwrap();

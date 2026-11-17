@@ -65,10 +65,6 @@ Caveat, network use: an utterance is 16 kHz mono 16-bit PCM, 32 kB per second of
 
 Report the pilot's level (event or `job_context`), so "no pilot" (no station, or too weak to lock) is visible. Keep mono as the fallback below a pilot threshold, as receivers do: stereo needs about 20 dB more signal for the same audio SNR.
 
-## Jobs: serialise restarts of one input
-
-A per-input restart lock, so a `job_retune` or `graph_put` racing another restart of the same input cannot leave its attached job visibly `stopped`/`failed` for a few tens of ms. From plan 18's review, 2026-11-01.
-
 ## Jobs: a conflict on a controller's child offers a retry that is refused
 
 Cleanup round 0 refuses `job_retune`, `graph_put`, `replace` and (while its owner runs) `job_stop` of a job a controller started, naming the owner. Left:

@@ -493,6 +493,14 @@ struct Inner {
     /// not yet recovered (see [`recover::Episode`]). Locked after `jobs` when both are
     /// held, never the other way round.
     episodes: Mutex<HashMap<SourceId, recover::Episode>>,
+    /// Each job's restart lock, by job id, made at its first restart and dropped with its
+    /// record (see [`Inner::restart_guard`]): held across a restart of the job as an
+    /// input (its stop and relaunch) and the relaunch of the jobs attached to it, by
+    /// `job_retune`, `graph_put` and a capture move, so two restarts of one input take
+    /// turns. Lock order: taken before the source's gate, never while holding it (a
+    /// capture move takes its holders' locks first, see [`Inner::restarts_then_gate`]);
+    /// locked after `jobs` when both are held.
+    restarts: Mutex<HashMap<JobId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Inner {
@@ -658,6 +666,9 @@ impl Inner {
         capture_rate_hz: Option<Option<u64>>,
         running: bool,
     ) -> Result<(), NodeError> {
+        // The restart and its attached jobs' relaunch under the job's restart lock,
+        // taken before any gate: another restart of it waits its turn.
+        let _restart = self.restart_guard(id).await;
         // Before the stop: the jobs attached to it follow the restart (see
         // `Inner::relaunch_attached`), relaunched once it runs again or failed to.
         let held = match running {
@@ -796,7 +807,6 @@ impl Inner {
     /// source's open fault episode) is never forgotten while the episode lasts:
     /// it still counts toward the cap, and older ones go in its place.
     fn prune_history(&self, jobs: &mut HashMap<JobId, JobEntry>) {
-        let jobs_dir = &self.jobs_dir;
         let is_terminal =
             |e: &JobEntry| matches!(e.record.state, JobState::Stopped | JobState::Failed { .. });
         // An owned record (a watch's identify runs and their children) goes as soon as
@@ -810,8 +820,7 @@ impl Inner {
             .map(|e| e.record.id.clone())
             .collect();
         for id in owned {
-            jobs.remove(&id);
-            let _ = std::fs::remove_file(jobs_dir.join(format!("{}.json", id.0)));
+            self.forget(jobs, &id);
         }
         let terminal: Vec<&JobEntry> = jobs
             .values()
@@ -828,9 +837,15 @@ impl Inner {
             .collect();
         candidates.sort_by(|a, b| a.0.0.cmp(&b.0.0).then_with(|| a.1.0.cmp(&b.1.0)));
         for (_, id) in candidates.iter().take(over) {
-            jobs.remove(id);
-            let _ = std::fs::remove_file(jobs_dir.join(format!("{}.json", id.0)));
+            self.forget(jobs, id);
         }
+    }
+
+    /// Forget the record `id`: its entry, its restart lock and (best effort) its file.
+    fn forget(&self, jobs: &mut HashMap<JobId, JobEntry>, id: &JobId) {
+        jobs.remove(id);
+        self.restarts.lock().unwrap().remove(id);
+        let _ = std::fs::remove_file(self.jobs_dir.join(format!("{}.json", id.0)));
     }
 
     /// Remove the session records none of whose captures is left in the burst store
@@ -1223,6 +1238,7 @@ impl Node {
                 verdicts: Mutex::new(HashMap::new()),
                 captured: Mutex::new(HashMap::new()),
                 episodes: Mutex::new(HashMap::new()),
+                restarts: Mutex::new(HashMap::new()),
             }),
             load_errors,
             job_load_errors,
