@@ -81,7 +81,7 @@ pub enum Op {
     /// (`what` `measuring`, `detail`, `step` of `of`, `eta_ms`: the most time left),
     /// `null` otherwise;
     /// `null` for a source that runs in the node), and `ring`, the IQ history (`seconds`
-    /// sized to, `held_s` held now, `gaps` in it, `null` before the first block; a
+    /// sized to, `held_s` held now, `run_s` of it in the newest run, `gaps` in it, `null` before the first block; a
     /// `classify` or `iq_read` span older than it fails `too_old`, one across a gap in
     /// the capture `gap`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
     /// source reported it, `configured` from `--source-position`) where the source knows
@@ -2854,10 +2854,14 @@ pub struct BusySource {
 pub struct RingInfo {
     /// The history length the ring was sized to, in seconds.
     pub seconds: f64,
-    /// Seconds from the oldest retained sample to the newest, gaps included:
-    /// how far back a read can reach (a read across a gap fails `gap`). At most
-    /// `seconds`; less while the ring fills and after a restart.
+    /// Seconds of samples the ring holds: at most `seconds`, less while it fills
+    /// and after a restart. Gaps inside it make the span from its oldest sample to
+    /// its newest longer than this.
     pub held_s: f64,
+    /// Seconds of samples in the newest contiguous run (after the last gap): the
+    /// longest "last N seconds" an `iq_read` can serve, since a read across a gap
+    /// fails `gap`. Equals `held_s` when `gaps` is 0.
+    pub run_s: f64,
     /// The timestamp gaps inside the retained history; each splits it in two.
     pub gaps: u32,
 }
@@ -4493,6 +4497,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                         RingInfo {
                             seconds: r.capacity_seconds(),
                             held_s: r.held_s(),
+                            run_s: r.run_s(),
                             gaps: u32::try_from(r.gaps()).unwrap_or(u32::MAX),
                         }
                     }),

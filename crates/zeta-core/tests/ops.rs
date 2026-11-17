@@ -3801,7 +3801,7 @@ async fn too_old_carries_the_rings_earliest_ns() {
     );
 }
 
-/// `source_list` carries `ring: {seconds, held_s, gaps}` once the source's ring exists (the
+/// `source_list` carries `ring: {seconds, held_s, run_s, gaps}` once the source's ring exists (the
 /// seconds it was sized to, the seconds it holds, the gaps in them) and `null` before; required and nullable in the schema.
 #[tokio::test]
 async fn source_list_reports_the_ring_depth() {
@@ -3828,7 +3828,9 @@ async fn source_list_reports_the_ring_depth() {
     assert_eq!(r["gaps"], 0);
     let held = r["held_s"].as_f64().unwrap();
     assert!((0.0..=1.0).contains(&held), "{r}");
-    assert_eq!(r.as_object().unwrap().len(), 3, "{r}");
+    // No gap: the newest run is all it holds.
+    assert_eq!(r["run_s"], r["held_s"]);
+    assert_eq!(r.as_object().unwrap().len(), 4, "{r}");
     let si = &schema()["result"]["$defs"]["SourceInfo"];
     assert!(
         si["required"].as_array().unwrap().contains(&"ring".into()),

@@ -10,6 +10,8 @@ use crate::port::IqBlock;
 use crate::types::{Hz, Span, Timestamp};
 
 const NS: u128 = 1_000_000_000;
+/// The most segments the ring keeps. A 10 s history sees far fewer breaks than
+/// this from overflows, and the linear search for a segment stays cheap.
 const MAX_SEGMENTS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize, JsonSchema)]
@@ -149,9 +151,17 @@ impl IqRing {
             Some(last) => {
                 let expected = self.time_of(last, next);
                 let tolerance = NS.div_ceil(self.sample_rate_hz.max(1) as u128) as u64;
-                block.t0.0.abs_diff(expected) > tolerance
+                if block.t0.0 + tolerance < expected {
+                    // Time went backwards: segments stay ordered in time, so
+                    // the history before it cannot stay.
+                    self.clear();
+                    true
+                } else {
+                    block.t0.0 > expected + tolerance
+                }
             }
         };
+        let next = self.dropped + self.buf.len() as u64;
         if new_segment {
             self.segments.push_back(Segment {
                 origin_ns: block.t0.0,
@@ -241,13 +251,20 @@ impl IqRing {
         self.segments.len().saturating_sub(1)
     }
 
-    /// Seconds from the oldest retained sample to the newest, gaps included:
-    /// how far back a read can reach (a read across a gap is refused).
+    /// Seconds of samples the ring holds (samples held over the rate): never
+    /// more than the ring's size, whatever gaps lie inside it.
     pub fn held_s(&self) -> f64 {
-        match (self.earliest(), self.latest()) {
-            (Some(e), Some(l)) => l.0.saturating_sub(e.0) as f64 / NS as f64,
-            _ => 0.0,
-        }
+        self.buf.len() as f64 / self.sample_rate_hz.max(1) as f64
+    }
+
+    /// Seconds of samples in the newest contiguous run: the longest "last N
+    /// seconds" a read can serve, since a read across a gap is refused.
+    pub fn run_s(&self) -> f64 {
+        let Some(i) = self.segments.len().checked_sub(1) else {
+            return 0.0;
+        };
+        let (first, end) = self.bounds(i);
+        (end - first) as f64 / self.sample_rate_hz.max(1) as f64
     }
 
     /// The first `samples` samples at `center` starting at `after` (at the
@@ -259,8 +276,7 @@ impl IqRing {
     /// (or `after` lies inside the gap), the answer is the first `samples` of
     /// the next segment that holds them, so the caller sees `t0` jump, as a
     /// scan's FFT steps need whole blocks. Within one segment a block ending
-    /// at `t` is followed by the one asked for `after: t`. Its one caller is
-    /// the scan's dwell (`node/scan.rs`, through `Inner::ring_run_after`).
+    /// at `t` is followed by the one asked for `after: t`.
     pub fn run_after(
         &self,
         center: Hz,
@@ -679,7 +695,7 @@ mod tests {
         assert_eq!(got[0], Complex::new(1500.0, 0.0));
         let got = ring.read(span_ns(5_500 * MS, 5_600 * MS)).unwrap();
         assert_eq!(got[0], Complex::new(5500.0, 0.0));
-        assert!((ring.held_s() - 6.999).abs() < 1e-9);
+        assert_eq!(ring.held_s(), 4.0);
     }
 
     #[test]
@@ -815,5 +831,41 @@ mod tests {
             ring.run_after(c, Some(Timestamp(6_500 * MS)), 1000)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn held_s_counts_samples_and_run_s_the_newest_run() {
+        // 10 s ring: 4 s, a 5 s pause, 4 s. Earliest to latest is about 13 s.
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        for i in 0..4 {
+            ring.push(&block(i));
+        }
+        for i in 9..13 {
+            ring.push(&block(i));
+        }
+        let span_s = (ring.latest().unwrap().0 - ring.earliest().unwrap().0) as f64 / 1e9;
+        assert!(span_s > ring.capacity_seconds(), "{span_s}");
+        assert_eq!(ring.gaps(), 1);
+        assert_eq!(ring.held_s(), 8.0);
+        assert!(ring.held_s() <= ring.capacity_seconds());
+        assert_eq!(ring.run_s(), 4.0);
+        assert_eq!(IqRing::new(10.0, Hz(RATE)).run_s(), 0.0);
+        assert_eq!(IqRing::new(10.0, Hz(RATE)).held_s(), 0.0);
+    }
+
+    #[test]
+    fn a_block_earlier_than_expected_restarts_the_ring() {
+        let mut ring = IqRing::new(10.0, Hz(RATE));
+        ring.push(&block(5));
+        ring.push(&block(6));
+        // Time went backwards: segments must stay ordered in time, so restart.
+        ring.push(&block(2));
+        assert_eq!(ring.gaps(), 0);
+        assert_eq!(ring.earliest(), Some(Timestamp(2_000 * MS)));
+        assert_eq!(ring.latest(), Some(Timestamp(2_999 * MS)));
+        assert!(matches!(
+            ring.read(span(5, 6)),
+            Err(RingError::Future { .. })
+        ));
     }
 }
