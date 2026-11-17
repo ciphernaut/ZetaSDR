@@ -946,3 +946,135 @@ async fn a_heal_does_not_wait_for_a_self_sweep() {
     assert_eq!(node.lease_sweepers(&s()), vec![scan]);
     stop_all(&node).await;
 }
+
+/// A [`FaultablePort`] that heals during `open`: at the first gain `open` restores
+/// (before it resumes the jobs) it bumps its healed counter and yields, so a heal watcher
+/// already running would recover the source then. It counts the node's
+/// [`Port::heal_settled`] calls, which a recovery makes.
+struct HealsDuringOpen {
+    inner: Arc<FaultablePort>,
+    healed_once: std::sync::atomic::AtomicBool,
+    settled: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait]
+impl Port for HealsDuringOpen {
+    fn id(&self) -> &SourceId {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> &zeta_core::types::Capabilities {
+        self.inner.capabilities()
+    }
+    async fn tune(&self, t: Tuning) -> Result<Tuning, zeta_core::port::PortError> {
+        self.inner.tune(t).await
+    }
+    fn current(&self) -> Option<Tuning> {
+        self.inner.current()
+    }
+    fn subscribe(&self) -> zeta_core::port::IqReceiver {
+        self.inner.subscribe()
+    }
+    fn fault(&self) -> Option<String> {
+        self.inner.fault()
+    }
+    async fn idle(&self) {
+        self.inner.idle().await
+    }
+    fn gain(&self) -> Option<zeta_core::port::GainInfo> {
+        self.inner.gain()
+    }
+    async fn set_gain(
+        &self,
+        db: Option<f64>,
+    ) -> Result<zeta_core::port::GainInfo, zeta_core::port::PortError> {
+        let r = self.inner.set_gain(db).await;
+        if !self
+            .healed_once
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.inner.heal();
+            tokio::task::yield_now().await;
+        }
+        r
+    }
+    fn healed(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.inner.healed()
+    }
+    fn heal_settled(&self) {
+        self.settled
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.heal_settled();
+    }
+}
+
+/// A heal reported while `open` runs is recovered once `open` has resumed the jobs, not
+/// during it: the heal watcher starts after the resume. (One thread, so nothing runs
+/// beside `open` but what its awaits let in.)
+#[tokio::test]
+async fn a_heal_during_open_is_recovered_after_the_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    // A first node leaves a gain to restore and a job to resume.
+    let (node, _port, srcs) = node_on(dir.path(), true, &[]).await;
+    let op = Op::SourceSetGain {
+        source: s(),
+        gain_db: Some(20.0),
+    };
+    assert!(node.apply(op).await.is_ok());
+    let job = start_passthrough(&node, "s").await;
+    drop(node);
+    drop(srcs);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let src = tone(dir.path(), "s");
+    let probe = Arc::new(HealsDuringOpen {
+        inner: FaultablePort::new(src.clone()),
+        healed_once: false.into(),
+        settled: 0.into(),
+    });
+    let port: Arc<dyn Port> = probe.clone();
+    let node = Node::open(cfg(dir.path(), true), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    // Open resumed the job and has not recovered the source yet.
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    assert_eq!(
+        probe.settled.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "recovered during open"
+    );
+    assert_eq!(probe.inner.gain_calls(), vec![Some(20.0)]);
+    // The watcher, started after the resume, recovers it now: the gain again.
+    until("the heal is recovered", Duration::from_secs(5), || {
+        probe.settled.load(std::sync::atomic::Ordering::SeqCst) == 1
+    })
+    .await;
+    until("the gain is set again", Duration::from_secs(5), || {
+        probe.inner.gain_calls() == vec![Some(20.0), Some(20.0)]
+    })
+    .await;
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    stop_all(&node).await;
+}
+
+/// A port added to a running node (after `open`) is watched from its `add_port`: its
+/// heal relaunches the job that failed of its fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_port_added_after_open_has_its_heals_recovered() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(cfg(dir.path(), true), registry(), vec![])
+        .await
+        .unwrap();
+    let src = tone(dir.path(), "s");
+    let port = FaultablePort::new(src.clone());
+    node.add_port(port.clone()).unwrap();
+    src.start();
+    let job = start_passthrough(&node, "s").await;
+    fault(&node, &port, &[&job]).await;
+    port.heal();
+    until("the job runs again", Duration::from_secs(5), || {
+        state(&node, &job) == Some(JobState::Running)
+    })
+    .await;
+    stop_all(&node).await;
+}

@@ -456,10 +456,6 @@ Found in plan 20's reviews. With `decode_on: free` the watch puts a decoder on a
 
 Found in the review of 7e5bfc8. `heal_settled` clears whatever fault is held, so a further crash and hello inside the gap between `wait_ended` and the call is cleared without its jobs having been seen. A generation on the held fault would close it. It needs a sub-second respawn, so it is not reachable on real hardware today.
 
-## Node: `watch_healed` starts before `open` has resumed the jobs
-
-Found in plan 20's final review. `watch_healed` is spawned in `add_port`, before `open` runs its own resume, so a heal during `open` runs its recovery concurrently with that resume. The source's gate serialises the two, so it is harmless today; start the watcher after the resume (or have recovery skip what the resume relaunched) so the order does not depend on the gate.
-
 ## Agent: `graph_put` and `job_retune` change an operator's job without the allowance
 
 Found in the plan 21 final review, 2026-11-01. `graph_put` and `job_retune` can change an operator's job, or in effect end it (a graph that fails, a retune off the signal it served), without the allowance: the spec gates only `job_stop` and `replace`. Recorded as a slot: a gate for changes to jobs the run did not start, if the agent is ever seen doing this.

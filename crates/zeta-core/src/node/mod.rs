@@ -501,7 +501,15 @@ struct Inner {
     /// capture move takes its holders' locks first, see [`Inner::restarts_then_gate`]);
     /// locked after `jobs` when both are held.
     restarts: Mutex<HashMap<JobId, Arc<tokio::sync::Mutex<()>>>>,
+    /// While `open` runs (`Some`), the heal counters of the ports it attached, each
+    /// watched ([`recover::watch_healed`]) only once `open` has resumed the jobs, so a
+    /// heal during `open` is recovered after its resume; `None` after, when
+    /// [`Node::add_port`] starts a port's watcher at once.
+    unwatched_heals: Mutex<Option<Vec<HealCounter>>>,
 }
+
+/// A port's heal counter ([`Port::healed`]) with its source, for `recover::watch_healed`.
+type HealCounter = (SourceId, tokio::sync::watch::Receiver<u64>);
 
 impl Inner {
     /// A receiver that changes each time `feed_ring` has pushed a block of `source`
@@ -1239,6 +1247,7 @@ impl Node {
                 captured: Mutex::new(HashMap::new()),
                 episodes: Mutex::new(HashMap::new()),
                 restarts: Mutex::new(HashMap::new()),
+                unwatched_heals: Mutex::new(Some(Vec::new())),
             }),
             load_errors,
             job_load_errors,
@@ -1276,6 +1285,13 @@ impl Node {
         {
             let mut jobs = node.inner.jobs.lock().unwrap();
             node.inner.prune_history(&mut jobs);
+        }
+        // The resume is done: the heal watchers start now, so a heal reported during
+        // `open` (its counter changed meanwhile) is recovered after the resume, not
+        // beside it. A port added later is watched from its `add_port`.
+        let unwatched = node.inner.unwatched_heals.lock().unwrap().take();
+        for (source, rx) in unwatched.unwrap_or_default() {
+            tokio::spawn(recover::watch_healed(node.inner.clone(), source, rx));
         }
         Ok(node)
     }
@@ -1359,8 +1375,9 @@ impl Node {
     /// channel bank (made now for the port's current band, if it has one, and
     /// remade whenever its blocks show a new band). A second port with an
     /// attached source's id is `DuplicateSource`. Does not resume jobs. A port that
-    /// reports heals ([`Port::healed`], a supervised worker) is watched from now on:
-    /// each heal recovers the source (see [`Inner::recover_source`]); one that reports
+    /// reports heals ([`Port::healed`], a supervised worker) is watched from now on (a
+    /// port `open` attaches, once `open` has resumed the jobs; a heal meanwhile is
+    /// recovered then): each heal recovers the source (see [`Inner::recover_source`]); one that reports
     /// its worker's start ([`Port::starting_changed`]) has it said on its feed (see
     /// `recover::watch_starting`).
     pub fn add_port(&self, port: Arc<dyn Port>) -> Result<(), NodeError> {
@@ -1385,7 +1402,15 @@ impl Node {
             tokio::spawn(recover::watch_starting(inner.clone(), source.clone(), rx));
         }
         if let Some(rx) = port.healed() {
-            tokio::spawn(recover::watch_healed(inner.clone(), source, rx));
+            // Taken now, so a heal from here on is seen; during `open`, watched only
+            // once it has resumed the jobs (see `Inner::unwatched_heals`).
+            let mut unwatched = inner.unwatched_heals.lock().unwrap();
+            match unwatched.as_mut() {
+                Some(v) => v.push((source, rx)),
+                None => {
+                    tokio::spawn(recover::watch_healed(inner.clone(), source, rx));
+                }
+            }
         }
         Ok(())
     }
