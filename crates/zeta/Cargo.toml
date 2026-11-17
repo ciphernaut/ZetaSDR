@@ -22,7 +22,7 @@ zeta-ws = { path = "../zeta-ws" }
 zeta-speech = { path = "../zeta-speech" }
 tokio-util = "0.7.20"
 zeta-dsp = { path = "../zeta-dsp" }
-zeta-source-file = { version = "0.1.0", path = "../zeta-source-file" }
+zeta-source-file = { version = "0.2.0", path = "../zeta-source-file" }
 zeta-agent = { path = "../zeta-agent" }
 zeta-source-kiwi = { path = "../zeta-source-kiwi" }
 zeta-source-node = { path = "../zeta-source-node" }

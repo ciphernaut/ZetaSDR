@@ -20,7 +20,7 @@ The figure shows what plugs into a node and which pieces may run on another host
 
 ## Status
 
-Version 0.1.0, for Linux. It is pre-1.0: operations and their fields may still change between
+Version 0.2.0, for Linux. It is pre-1.0: operations and their fields may still change between
 releases, and both ends of a federated link should run the same version. The decoders are tested
 against synthesised signals; the few real recordings they were also checked on are not published.
 Feedback is very welcome; at this stage contributions come as gists, not pull requests (see

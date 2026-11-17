@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.2.0 - 2026-11-17
+
+- More decoders as rows: AIS in-process; FLEX over multimon-ng; M17 with its speech through
+  `c2dec`; the VDL2 and HFDL aircraft data links as program rows, with fields mapped from a row's
+  `output`; DVB-T signalling through `dvbt-rx`, a separate GPL wrapper (not yet published) around
+  SDRangel's `modemdvb`.
+- Digital voice: P25 phase 1 and DMR (both time slots, with an audio policy) report each call's
+  talkgroup, radios and encryption. Their speech needs `zeta-mbe`, a small wrapper around
+  mbelib-neo in [its own repository](https://github.com/ciphernaut/zeta-mbe), which
+  `tools/install-vocoders.sh` builds on the operator's machine. No codec is shipped, and
+  encrypted calls are never decoded.
+- Layer 4: `frame_decode`, thin serial-protocol rows, and signatures the operator accepts written
+  back.
+- Positions: ACARS positions read from a message's text, ground stations as origins, a position
+  per source (a KiwiSDR's own, and a remote node's through a node source), and a Map tab with the
+  register's origins and tiles from five providers.
+- Span decoding: a watch with `modes` decodes every channel of a band, and named sets (`pagers_au`,
+  `airband`, `airband_vhf`, `airband_vhf_and_sos`) start across radios in one operation.
+- The register's answer for a band: expected levels from EIRP, and network sites.
+- The agent's radio follows the page's focus, under a selection policy the user sets.
+- Sources: a shared-memory ring between the SoapySDR worker and the node, a probed rate ladder
+  and the narrowest lossless sample depth; a fast stepped sweep on any IQ source, and sweeps a
+  source runs itself (a KiwiSDR's own waterfall, live on its tab).
+- Analog video: `video_decode` (wide FM, line lock), watched live on the page.
+- A per-source event feed.
+- Jobs: a job a running controller started can't be retuned, replaced or stopped from outside,
+  and the refusal names its owner; `job_start` on an unheld radio tunes it once; channel plans
+  carry their FM deviation (UHF CB at 2500 Hz).
+
 ## 0.1.0 - 2026-11-05
 
 The first public release.
