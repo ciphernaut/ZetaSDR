@@ -499,9 +499,11 @@ struct Inner {
     /// record (see [`Inner::restart_guard`]): held across a restart of the job as an
     /// input (its stop and relaunch) and the relaunch of the jobs attached to it, by
     /// `job_retune`, `graph_put` and a capture move, so two restarts of one input take
-    /// turns. Lock order: taken before the source's gate, never while holding it (a
-    /// capture move takes its holders' locks first, see [`Inner::restarts_then_gate`]);
-    /// locked after `jobs` when both are held.
+    /// turns. Lock order: `set_gate`, then restart locks, then `relaunching` (which
+    /// [`Inner::relaunch_elastic`] and `stop_elastic` hold while they take the gate),
+    /// then the source's gate. A restart lock is never taken while holding `relaunching`
+    /// or a gate (a capture move takes its holders' locks first, see
+    /// [`Inner::restarts_then_gate`]); the map is locked after `jobs` when both are held.
     restarts: Mutex<HashMap<JobId, Arc<tokio::sync::Mutex<()>>>>,
     /// While `open` runs (`Some`), the heal counters of the ports it attached, each
     /// watched ([`recover::watch_healed`]) only once `open` has resumed the jobs, so a
