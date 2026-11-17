@@ -9,9 +9,11 @@ on your own machine, with one script.
 
 - AMBE and IMBE are patented. This project ships no implementation of them and builds none.
 - [`tools/install-vocoders.sh`](../tools/install-vocoders.sh) downloads
-  [mbelib-neo](https://github.com/arancormonk/mbelib-neo) from its authors, under their licence
-  (GPL-2.0-or-later), and builds it on your machine at your request. The program it produces,
-  `zeta-mbe`, is yours and is not to be redistributed with this project.
+  [zeta-mbe](https://github.com/ciphernaut/zeta-mbe), a small stdin/stdout wrapper around
+  [mbelib-neo](https://github.com/arancormonk/mbelib-neo), and runs its install script. That
+  downloads mbelib-neo from its authors, under their licence (GPL-2.0-or-later), and builds both
+  on your machine at your request. The program it produces, `zeta-mbe`, is yours and is not to be
+  redistributed with this project.
 - Whether you may build or use it where you live is your responsibility.
 - Encrypted calls are never decoded.
 - Without the vocoder everything except the speech still works.
@@ -28,21 +30,25 @@ It needs `git`, `cmake` and a C compiler (on Debian or Ubuntu: `sudo apt install
 build-essential`), and names the package of any that is missing. Then it:
 
 1. prints the notice above and waits for `yes`;
-2. clones mbelib-neo at the one commit the script pins, and refuses any other;
-3. builds the library as a static library with `cmake` (its build also fetches the FFT code it
-   compiles in, PFFFT, from the same authors, checked against a pinned checksum), then compiles
-   [`tools/vocoder/zeta-mbe.c`](../tools/vocoder/zeta-mbe.c) against it;
+2. clones zeta-mbe at the one tag and commit the script pins (`v1.0.0`), and refuses any other;
+3. runs zeta-mbe's `install.sh`, which clones mbelib-neo at the one commit it pins, builds it as
+   a static library with `cmake` (its build also fetches the FFT code it compiles in, PFFFT,
+   from the same authors, checked against a pinned checksum) and compiles `zeta-mbe.c` against
+   it;
 4. tests it: 50 frames of silence in for each codec, 160 samples out for each frame (a program
    that fails is not installed);
 5. installs `zeta-mbe` under the prefix, `~/.local/bin/zeta-mbe` by default;
-6. prints what it built, from which commit, and where it put it.
+6. prints what it built, from which commits, and where it put it.
 
-The build happens in a temporary directory, which the script removes when it ends.
+The build happens in temporary directories, which the scripts remove when they end. zeta-mbe's
+[README](https://github.com/ciphernaut/zeta-mbe#readme) describes its own script, which also
+works without this one.
 
 | Option | Meaning |
 |---|---|
 | `--yes` | Accept the notice without the prompt. |
-| `--src DIR` | Build from an mbelib-neo source tree you already have, and download nothing. The tree needs its bundled PFFFT archive (`third_party/pffft-*.tar.gz`), as mbelib-neo's release source archives have it. |
+| `--src DIR` | Build from an mbelib-neo source tree you already have, and download no mbelib-neo. The tree needs its bundled PFFFT archive (`third_party/pffft-*.tar.gz`), as mbelib-neo's release source archives have it. |
+| `--zeta-mbe DIR` | Build from a zeta-mbe checkout you already have, and clone nothing. With `--src` as well, nothing is downloaded. |
 | `--prefix DIR` | Install `DIR/bin/zeta-mbe`. The default is `$HOME/.local`. |
 | `--help` | Print the options and exit. |
 

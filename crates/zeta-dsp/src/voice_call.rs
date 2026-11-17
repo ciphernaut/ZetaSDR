@@ -14,7 +14,8 @@ use zeta_core::stage::StageContext;
 use zeta_core::stream::{Frame, Payload};
 use zeta_core::types::{Provenance, Span, StreamId, Timestamp};
 
-/// The vocoder program the voice rows name as their handler 0 (`tools/vocoder/zeta-mbe.c`).
+/// The vocoder program the voice rows name as their handler 0
+/// (<https://github.com/ciphernaut/zeta-mbe>).
 pub const ZETA_MBE: &str = "zeta-mbe";
 /// Speech samples the vocoder gives per frame (20 ms at [`MBE_RATE_HZ`]).
 pub const MBE_FRAME_SAMPLES: usize = 160;
@@ -23,7 +24,7 @@ pub const MBE_RATE_HZ: u64 = 8000;
 /// The script that builds and installs [`ZETA_MBE`], and the library it links, for a
 /// stage run without a row to say so.
 const INSTALL_SCRIPT: &str = "tools/install-vocoders.sh";
-const INSTALL_URL: &str = "https://github.com/arancormonk/mbelib-neo";
+const INSTALL_URL: &str = "https://github.com/ciphernaut/zeta-mbe";
 
 /// The job-context note for calls heard without their vocoder: the program and how to
 /// get it, from the row's handler 0 when the stage runs one.

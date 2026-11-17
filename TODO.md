@@ -312,7 +312,7 @@ Plan 23 delivered the ADS-B request: a row names its subject (`key`, columns, `w
 
 ## Build: an install script for the AMBE/IMBE vocoder libraries
 
-Done in plan 38: `tools/install-vocoders.sh` builds `zeta-mbe` against `mbelib-neo` at a pinned commit, on the operator's machine at the operator's request; `docs/vocoders.md` has the steps and the legal position. The `blip25-vocoder` paragraph moved to "Digital voice: the next rows".
+Done in plan 38: `tools/install-vocoders.sh` builds `zeta-mbe` against `mbelib-neo` at a pinned commit, on the operator's machine at the operator's request; `docs/vocoders.md` has the steps and the legal position. Since 2026-11-17 the wrapper lives in its own repository, [zeta-mbe](https://github.com/ciphernaut/zeta-mbe) (GPL-2.0-or-later, as mbelib-neo), and the script clones it at a pinned tag and commit and runs its `install.sh`. The `blip25-vocoder` paragraph moved to "Digital voice: the next rows".
 
 ## Digital voice: the next rows
 

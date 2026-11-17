@@ -36,7 +36,7 @@
       {
         "programs": ["zeta-mbe"],
         "optional": true,
-        "install": { "script": "tools/install-vocoders.sh", "url": "https://github.com/arancormonk/mbelib-neo" }
+        "install": { "script": "tools/install-vocoders.sh", "url": "https://github.com/ciphernaut/zeta-mbe" }
       }
     ]
   },

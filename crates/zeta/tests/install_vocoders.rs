@@ -1,6 +1,7 @@
 //! `tools/install-vocoders.sh`: its options, the notice it stops at, that it parses, and its
-//! steps after a yes run against fake `git`, `cmake` and `cc`. Nothing here builds a vocoder
-//! or downloads anything.
+//! steps after a yes run against a fake `git` whose clone is a stub zeta-mbe checkout, so what
+//! the script hands zeta-mbe's `install.sh` is checked without it. Nothing here builds a
+//! vocoder or downloads anything.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -45,31 +46,32 @@ fn run_script(cwd: &Path, bin: &Path, args: &[&str]) -> (Output, String) {
     (out, text)
 }
 
-/// The commit the script pins, read from the script.
+/// The zeta-mbe commit the script pins, read from the script.
 fn pin_commit() -> String {
     let text = std::fs::read_to_string(script()).unwrap();
     text.lines()
-        .find_map(|l| l.strip_prefix("PIN_COMMIT="))
-        .expect("PIN_COMMIT in the script")
+        .find_map(|l| l.strip_prefix("ZETA_MBE_COMMIT="))
+        .expect("ZETA_MBE_COMMIT in the script")
         .to_string()
 }
 
-/// A `zeta-mbe` stand-in that answers each frame of silence with 160 samples.
-const FAKE_PROGRAM_OK: &str = r#"#!/bin/sh
-case "$1" in
-  --version) echo "zeta-mbe fake" ;;
-  imbe7200x4400) n=$(wc -c); head -c $((n / 184 * 320)) /dev/zero ;;
-  ambe3600x2450) n=$(wc -c); head -c $((n / 96 * 320)) /dev/zero ;;
-  *) exit 2 ;;
-esac
-"#;
+/// A stub zeta-mbe checkout in `dir`: its `install.sh` writes its arguments, one per line, to
+/// `record` and exits with `status`.
+fn stub_zeta_mbe(dir: &Path, record: &Path, status: i32) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("zeta-mbe.c"), "").unwrap();
+    write_executable(
+        &dir.join("install.sh"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit {status}\n",
+            record.display()
+        ),
+    );
+}
 
-/// A `zeta-mbe` stand-in that fails.
-const FAKE_PROGRAM_FAILS: &str = "#!/bin/sh\ncat >/dev/null\nexit 1\n";
-
-/// Fake `git` (a clone is an empty tree at the pinned commit), `cmake` (a build leaves an
-/// empty `libmbe-neo.a`) and `cc` (writes `program` where `-o` says) in `bin`.
-fn fake_build_tools(bin: &Path, program: &str) {
+/// Fake `git` (a clone is the stub checkout in `stub`, at `commit`, and leaves `clone_marker`),
+/// `cmake` and `cc` (present, never needed) in `bin`.
+fn fake_tools(bin: &Path, stub: &Path, commit: &str, clone_marker: &Path) {
     std::fs::create_dir_all(bin).unwrap();
     write_executable(
         &bin.join("git"),
@@ -78,34 +80,37 @@ fn fake_build_tools(bin: &Path, program: &str) {
 last=
 for a in "$@"; do last=$a; done
 case " $* " in
-  *" clone "*) mkdir -p "$last/include/mbelib-neo" ;;
-  *" rev-parse "*) echo {} ;;
+  *" clone "*) touch '{marker}'; mkdir -p "$last"; cp -R '{stub}'/. "$last"/ ;;
+  *" rev-parse "*) echo {commit} ;;
 esac
 "#,
-            pin_commit()
+            marker = clone_marker.display(),
+            stub = stub.display(),
         ),
     );
-    write_executable(
-        &bin.join("cmake"),
-        "#!/bin/sh\nif [ \"$1\" = --build ]; then mkdir -p \"$2\"; touch \"$2/libmbe-neo.a\"; fi\n",
+    write_executable(&bin.join("cmake"), "#!/bin/sh\n");
+    write_executable(&bin.join("cc"), "#!/bin/sh\n");
+}
+
+/// The arguments the stub's `install.sh` was run with, or `None` if it never ran.
+fn recorded(record: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(record).ok()?;
+    Some(text.lines().map(str::to_string).collect())
+}
+
+/// A scratch directory with the stub checkout and fake tools, the stub exiting with `status`
+/// and `git rev-parse` answering `commit`: (dir, bin, record file, clone marker).
+fn setup(status: i32, commit: &str) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let (bin, stub, record, cloned) = (
+        dir.path().join("bin"),
+        dir.path().join("stub"),
+        dir.path().join("record"),
+        dir.path().join("cloned"),
     );
-    let program_file = bin.parent().unwrap().join("fake-zeta-mbe");
-    std::fs::write(&program_file, program).unwrap();
-    write_executable(
-        &bin.join("cc"),
-        &format!(
-            r#"#!/bin/sh
-out=
-while [ $# -gt 0 ]; do
-  if [ "$1" = -o ]; then out=$2; shift; fi
-  shift
-done
-cp '{}' "$out"
-chmod 755 "$out"
-"#,
-            program_file.display()
-        ),
-    );
+    stub_zeta_mbe(&stub, &record, status);
+    fake_tools(&bin, &stub, commit, &cloned);
+    (dir, bin, record, cloned)
 }
 
 #[test]
@@ -118,7 +123,7 @@ fn help_exits_zero_and_names_the_options() {
         .unwrap();
     assert!(out.status.success(), "--help failed: {out:?}");
     let text = String::from_utf8_lossy(&out.stdout);
-    for option in ["--yes", "--src", "--prefix"] {
+    for option in ["--yes", "--src", "--zeta-mbe", "--prefix"] {
         assert!(
             text.contains(option),
             "--help does not name {option}: {text}"
@@ -207,44 +212,61 @@ fn the_script_passes_bash_n() {
 }
 
 #[test]
-fn a_relative_prefix_prints_an_absolute_handler_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let bin = dir.path().join("bin");
-    fake_build_tools(&bin, FAKE_PROGRAM_OK);
-    let (out, text) = run_script(dir.path(), &bin, &["--yes", "--prefix", "rel/prefix"]);
-    assert!(out.status.success(), "the script failed: {text}");
-    assert!(
-        dir.path().join("rel/prefix/bin/zeta-mbe").is_file(),
-        "not installed under the relative prefix: {text}"
-    );
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("ZETA_HANDLER_ZETA_MBE="))
-        .unwrap_or_else(|| panic!("no ZETA_HANDLER_ZETA_MBE line: {text}"));
-    let path = Path::new(line.trim_start_matches("ZETA_HANDLER_ZETA_MBE="));
-    assert!(path.is_absolute(), "a relative handler path: {line}");
-    assert!(path.ends_with("rel/prefix/bin/zeta-mbe"), "{line}");
-}
-
-#[test]
-fn a_program_that_fails_its_self_test_is_not_installed() {
-    let dir = tempfile::tempdir().unwrap();
-    let bin = dir.path().join("bin");
-    fake_build_tools(&bin, FAKE_PROGRAM_FAILS);
-    let prefix = dir.path().join("prefix");
+fn after_a_yes_it_clones_the_pinned_tag_and_runs_its_install_script() {
+    let (dir, bin, record, cloned) = setup(0, &pin_commit());
+    let mbelib = dir.path().join("mbelib-neo");
+    std::fs::create_dir(&mbelib).unwrap();
     let (out, text) = run_script(
         dir.path(),
         &bin,
-        &["--yes", "--prefix", prefix.to_str().unwrap()],
+        &["--yes", "--prefix", "rel/prefix", "--src", "mbelib-neo"],
     );
-    assert!(!out.status.success(), "a failing self-test passed: {text}");
+    assert!(out.status.success(), "the script failed: {text}");
+    assert!(cloned.exists(), "nothing was cloned: {text}");
+    let mbelib = std::fs::canonicalize(&mbelib).unwrap();
+    let want = ["--yes", "--prefix", "rel/prefix", "--src"]
+        .map(String::from)
+        .into_iter()
+        .chain([mbelib.display().to_string()])
+        .collect::<Vec<_>>();
+    assert_eq!(recorded(&record), Some(want), "{text}");
+}
+
+#[test]
+fn a_tag_at_another_commit_is_refused() {
+    let (dir, bin, record, _) = setup(0, &"0".repeat(40));
+    let (out, text) = run_script(dir.path(), &bin, &["--yes", "--prefix", "p"]);
+    assert!(!out.status.success(), "another commit was built: {text}");
+    assert!(text.contains("refusing to build it"), "{text}");
+    assert_eq!(recorded(&record), None, "zeta-mbe's script ran: {text}");
+}
+
+#[test]
+fn with_a_checkout_and_a_source_tree_nothing_is_cloned() {
+    let (dir, bin, record, cloned) = setup(0, &pin_commit());
+    std::fs::create_dir(dir.path().join("mbelib-neo")).unwrap();
+    let args = [
+        "--yes",
+        "--prefix",
+        "p",
+        "--src",
+        "mbelib-neo",
+        "--zeta-mbe",
+        "stub",
+    ];
+    let (out, text) = run_script(dir.path(), &bin, &args);
+    assert!(out.status.success(), "the script failed: {text}");
+    assert!(!cloned.exists(), "it cloned with a checkout given: {text}");
     assert!(
-        text.contains("self-test imbe7200x4400") && text.contains("nothing installed"),
-        "no self-test message: {text}"
+        recorded(&record).is_some(),
+        "zeta-mbe's script never ran: {text}"
     );
-    assert!(
-        !prefix.join("bin/zeta-mbe").exists(),
-        "the failing program was installed: {text}"
-    );
+}
+
+#[test]
+fn a_failing_zeta_mbe_install_fails_the_script() {
+    let (dir, bin, _, _) = setup(1, &pin_commit());
+    let (out, text) = run_script(dir.path(), &bin, &["--yes", "--prefix", "p"]);
+    assert!(!out.status.success(), "a failed install passed: {text}");
+    assert!(text.contains("zeta-mbe's install.sh failed"), "{text}");
 }
