@@ -12,7 +12,7 @@ use zeta_ws::{Limits, ServerConfig, bind};
 
 use std::path::{Path, PathBuf};
 
-use zeta_speech::{NodeBackend, SocketBackend, SpeechBackend};
+use zeta_speech::{NodeBackend, SocketBackend, SpeechBackend, UrlBackend};
 
 use crate::cli::{Cli, Command, ModesCmd, SPEECH_EXCLUSIVE, ServeArgs, SpeechArgs, StreamCmd};
 use crate::{agents_md, ask, node_setup};
@@ -21,6 +21,8 @@ const MIN_SECRET_LEN: usize = 12;
 
 /// Where `--stt-node`'s secret comes from; never a flag, so it stays out of `ps`.
 const STT_NODE_SECRET_ENV: &str = "ZETA_STT_NODE_SECRET";
+/// Where `--stt-url`'s bearer comes from; never a flag, so it stays out of `ps`.
+const STT_URL_KEY_ENV: &str = "ZETA_STT_URL_KEY";
 
 /// Handle the commands that involve a network transport, returning the exit code;
 /// give `cli` back untouched for everything else.
@@ -315,15 +317,29 @@ pub async fn serve(
 }
 
 /// The speech backend the flags name: the node at `--stt-node` (its secret from
-/// `ZETA_STT_NODE_SECRET`), else the daemon at `--stt-socket` or the default socket, staging
-/// its WAVs in `<state_dir>/stt`; `None` when neither is given and no default socket exists.
+/// `ZETA_STT_NODE_SECRET`), the server at `--stt-url` (its bearer, if any, from
+/// `ZETA_STT_URL_KEY`), else the daemon at `--stt-socket` or the default socket, staging
+/// its WAVs in `<state_dir>/stt`; `None` when none is given and no default socket exists.
 pub async fn speech_backend(
     args: &SpeechArgs,
     state_dir: &Path,
 ) -> Result<Option<Arc<dyn SpeechBackend>>, String> {
-    match (&args.stt_socket, &args.stt_node) {
-        (Some(_), Some(_)) => Err(SPEECH_EXCLUSIVE.to_string()),
-        (None, Some(url)) => {
+    match (&args.stt_socket, &args.stt_node, &args.stt_url) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+            Err(SPEECH_EXCLUSIVE.to_string())
+        }
+        (None, None, Some(url)) => {
+            let key = std::env::var(STT_URL_KEY_ENV).ok();
+            let backend = UrlBackend::new(
+                url,
+                key,
+                args.stt_url_model.clone(),
+                args.stt_url_languages.clone(),
+            )
+            .map_err(|e| format!("--stt-url: {e}"))?;
+            Ok(Some(Arc::new(backend)))
+        }
+        (None, Some(url), None) => {
             let secret = std::env::var(STT_NODE_SECRET_ENV)
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -333,7 +349,7 @@ pub async fn speech_backend(
                 .map_err(|e| format!("--stt-node: {e}"))?;
             Ok(Some(Arc::new(backend)))
         }
-        (socket, None) => {
+        (socket, None, None) => {
             let Some(path) = socket.clone().or_else(default_stt_socket) else {
                 return Ok(None);
             };

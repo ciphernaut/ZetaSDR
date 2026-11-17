@@ -122,7 +122,7 @@ async fn stt_without_daemon_is_503() {
     let v: Value = resp.json().await.unwrap();
     assert_eq!(
         v["message"],
-        "serve has no speech backend (--stt-socket or --stt-node)"
+        "serve has no speech backend (--stt-socket, --stt-node or --stt-url)"
     );
     ts.stop().await;
 }

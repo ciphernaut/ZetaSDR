@@ -33,7 +33,7 @@ places where a weakness would matter:
   process group is killed when its stage ends. The SoapySDR worker inherits the node's environment
   minus every `ZETA_*` variable whose name holds `SECRET`, `PASSWORD` or `KEY`.
 - **Secrets in output.** KiwiSDR passwords and the secrets of other nodes (`ZETA_NODE_SECRET_<ID>`,
-  `ZETA_STT_NODE_SECRET`) are never printed.
+  `ZETA_STT_NODE_SECRET`, `ZETA_STT_URL_KEY`) are never printed.
 
 Out of scope: an attacker who already holds the node secret can do anything an operator can
 (start and stop jobs, retune radios, run the agent if the node has one, read and delete captures).

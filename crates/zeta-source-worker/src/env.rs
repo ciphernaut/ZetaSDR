@@ -10,9 +10,14 @@
 
 use std::ffi::{OsStr, OsString};
 
-/// Variables removed by exact name: the node's secret, the speech node's, and
+/// Variables removed by exact name: the node's secret, the speech node's and speech server's, and
 /// the agent's LLM key.
-const SECRET_NAMES: &[&str] = &["ZETA_SECRET", "ZETA_STT_NODE_SECRET", "ZETA_LLM_KEY"];
+const SECRET_NAMES: &[&str] = &[
+    "ZETA_SECRET",
+    "ZETA_STT_NODE_SECRET",
+    "ZETA_STT_URL_KEY",
+    "ZETA_LLM_KEY",
+];
 /// Variables removed by prefix: one per `--source-node` and per
 /// `--source-kiwi`.
 const SECRET_PREFIXES: &[&str] = &["ZETA_NODE_SECRET_", "ZETA_KIWI_PASSWORD_"];
@@ -50,6 +55,7 @@ mod tests {
         let vars = [
             "ZETA_SECRET",
             "ZETA_STT_NODE_SECRET",
+            "ZETA_STT_URL_KEY",
             "ZETA_NODE_SECRET_B210",
             "ZETA_KIWI_PASSWORD_K",
             "ZETA_LLM_KEY",

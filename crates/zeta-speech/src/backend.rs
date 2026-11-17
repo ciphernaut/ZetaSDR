@@ -1,8 +1,10 @@
 //! The backend trait, its transcript and its errors.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// The language a request names when it names none.
 pub const DEFAULT_LANGUAGE: &str = "en";
@@ -87,4 +89,35 @@ pub(crate) fn parse_languages(list: &str) -> Vec<String> {
 
 pub(crate) fn default_languages() -> Vec<String> {
     vec![DEFAULT_LANGUAGE.to_string()]
+}
+
+/// The calls a backend takes at once, and how long one waits for a turn before it is given
+/// up as busy.
+pub(crate) struct Slots {
+    slots: Arc<Semaphore>,
+    wait: Duration,
+}
+
+impl Slots {
+    pub(crate) fn new(concurrency: usize, wait: Duration) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(concurrency.max(1))),
+            wait,
+        }
+    }
+
+    pub(crate) fn wait(&self) -> Duration {
+        self.wait
+    }
+
+    /// A slot, held until the permit drops, and the milliseconds the wait for it took;
+    /// `Busy` when none came free within the wait.
+    pub(crate) async fn acquire(&self) -> Result<(OwnedSemaphorePermit, u64), SpeechError> {
+        let asked = Instant::now();
+        let permit = tokio::time::timeout(self.wait, self.slots.clone().acquire_owned())
+            .await
+            .map_err(|_| SpeechError::Busy(self.wait))?
+            .map_err(|_| SpeechError::Daemon("the speech queue closed".into()))?;
+        Ok((permit, asked.elapsed().as_millis() as u64))
+    }
 }

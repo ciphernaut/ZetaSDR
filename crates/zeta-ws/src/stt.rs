@@ -14,7 +14,7 @@ use zeta_speech::{DEFAULT_LANGUAGE, SpeechError};
 
 use crate::http::{Shared, error_response, other};
 
-const NO_BACKEND: &str = "serve has no speech backend (--stt-socket or --stt-node)";
+const NO_BACKEND: &str = "serve has no speech backend (--stt-socket, --stt-node or --stt-url)";
 
 fn is_wav_type(headers: &HeaderMap) -> bool {
     headers

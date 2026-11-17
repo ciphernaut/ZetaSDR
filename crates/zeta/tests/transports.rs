@@ -246,7 +246,9 @@ fn stt_socket_and_stt_node_are_exclusive() {
         .args(["--stt-node", "http://127.0.0.1:9"])
         .assert()
         .code(1)
-        .stderr(contains("--stt-socket and --stt-node are exclusive"));
+        .stderr(contains(
+            "--stt-socket, --stt-node and --stt-url are exclusive",
+        ));
 }
 
 #[test]
@@ -262,7 +264,9 @@ fn stt_socket_and_stt_node_are_exclusive_for_every_command() {
         .assert()
         .code(1)
         .stdout("")
-        .stderr(contains("--stt-socket and --stt-node are exclusive"));
+        .stderr(contains(
+            "--stt-socket, --stt-node and --stt-url are exclusive",
+        ));
     plain()
         .env_remove("ZETA_STT_SOCKET")
         .env_remove("ZETA_STT_NODE")
@@ -271,7 +275,9 @@ fn stt_socket_and_stt_node_are_exclusive_for_every_command() {
         .args(["--stt-node", "http://127.0.0.1:9", "source", "list"])
         .assert()
         .code(1)
-        .stderr(contains("--stt-socket and --stt-node are exclusive"));
+        .stderr(contains(
+            "--stt-socket, --stt-node and --stt-url are exclusive",
+        ));
 }
 
 #[test]

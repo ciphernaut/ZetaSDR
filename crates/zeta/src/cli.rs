@@ -221,7 +221,7 @@ impl Cli {
         use clap::CommandFactory;
         use clap::error::ErrorKind;
         let err = |kind, msg: String| Err(Self::command().error(kind, msg));
-        if self.speech.stt_socket.is_some() && self.speech.stt_node.is_some() {
+        if self.speech.backends_named() > 1 {
             return err(ErrorKind::ArgumentConflict, SPEECH_EXCLUSIVE.to_string());
         }
         if let Some(raw) = self.knowledge_acma_raw.take() {
@@ -1020,10 +1020,10 @@ pub struct AskArgs {
     pub radio_prefer: Vec<String>,
 }
 
-/// The usage error for `--stt-socket` with `--stt-node`.
-pub const SPEECH_EXCLUSIVE: &str = "--stt-socket and --stt-node are exclusive";
+/// The usage error for any two of `--stt-socket`, `--stt-node` and `--stt-url`.
+pub const SPEECH_EXCLUSIVE: &str = "--stt-socket, --stt-node and --stt-url are exclusive";
 
-/// The speech backend: a local daemon or another node.
+/// The speech backend: a local daemon, another node or a Whisper server.
 #[derive(Debug, Clone, Default, Args)]
 pub struct SpeechArgs {
     /// Unix socket of the speech daemon (`local-voice`, or any daemon speaking its
@@ -1033,9 +1033,37 @@ pub struct SpeechArgs {
     pub stt_socket: Option<PathBuf>,
     /// Transcribe with the speech backend of the ZetaSDR node at URL (http://HOST:PORT)
     /// instead of a local daemon. Its secret comes from ZETA_STT_NODE_SECRET and is never
-    /// printed. Excludes --stt-socket
+    /// printed. Excludes --stt-socket and --stt-url
     #[arg(long, global = true, env = "ZETA_STT_NODE", value_name = "URL")]
     pub stt_node: Option<String>,
+    /// Transcribe with a Whisper server over HTTP: the full endpoint URL, used as given
+    /// (an OpenAI-compatible /v1/audio/transcriptions, or whisper.cpp's /inference). Its
+    /// bearer, if it wants one, comes from ZETA_STT_URL_KEY and is never printed. The
+    /// audio of what is heard leaves this host. Excludes --stt-socket and --stt-node
+    #[arg(long, global = true, env = "ZETA_STT_URL", value_name = "URL")]
+    pub stt_url: Option<String>,
+    /// The `model` field sent to --stt-url, for a server that wants one
+    #[arg(long, global = true, env = "ZETA_STT_URL_MODEL", value_name = "NAME")]
+    pub stt_url_model: Option<String>,
+    /// The language codes `GET /stt/languages` answers for --stt-url (the server's own list
+    /// is not asked) [default: en]
+    #[arg(
+        long,
+        global = true,
+        env = "ZETA_STT_URL_LANGUAGES",
+        value_name = "CODES",
+        value_delimiter = ','
+    )]
+    pub stt_url_languages: Vec<String>,
+}
+
+impl SpeechArgs {
+    /// How many of `--stt-socket`, `--stt-node` and `--stt-url` are given.
+    fn backends_named(&self) -> usize {
+        usize::from(self.stt_socket.is_some())
+            + usize::from(self.stt_node.is_some())
+            + usize::from(self.stt_url.is_some())
+    }
 }
 
 #[derive(Debug, Clone, Default, Args)]

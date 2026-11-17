@@ -9,8 +9,10 @@ backend** the operator chose with a global flag:
   file exists): a speech daemon on a Unix socket.
 - `--stt-node URL` (env `ZETA_STT_NODE`; the secret in `ZETA_STT_NODE_SECRET`): another node's
   `POST /stt`.
+- `--stt-url URL` (env `ZETA_STT_URL`; the bearer, if any, in `ZETA_STT_URL_KEY`): a Whisper
+  server over HTTP, see the guide's speech section.
 
-The two flags are exclusive (exit 1). Without either, a `transcribe` job fails with a reason
+The three flags are exclusive (exit 1). Without any, a `transcribe` job fails with a reason
 naming the missing backend. This page has three separable sections: installing the
 `local-voice` daemon on a node's host, writing your own daemon, and sharing one daemon between
 several nodes. The recipe for using it is in `docs/agents/field-craft.md` ("Transcribing a
@@ -118,8 +120,8 @@ zeta serve --listen 127.0.0.1:7979 --secret "$SECRET" --stt-socket "$XDG_RUNTIME
 ```
 
 A backend that lives inside the node's process instead implements the
-`zeta_speech::SpeechBackend` trait (`crates/zeta-speech/src/backend.rs`); `SocketBackend` and
-`NodeBackend` are its two implementations.
+`zeta_speech::SpeechBackend` trait (`crates/zeta-speech/src/backend.rs`); `SocketBackend`,
+`NodeBackend` and `UrlBackend` are its implementations.
 
 ## 3. One daemon for several nodes
 
@@ -141,7 +143,7 @@ ZETA_STT_NODE_SECRET=SECRET zeta serve --listen 0.0.0.0:7979 --secret "$LOCAL_SE
 - `GET /stt/languages` answers `{"backend": NAME, "languages": [CODES]}` (503 without a
   backend); a node using `--stt-node` takes its languages from that answer, or `en` when the
   node is unreachable at start.
-- `--stt-socket` and `--stt-node` are exclusive.
+- `--stt-socket`, `--stt-node` and `--stt-url` are exclusive.
 
 ## Separation
 

@@ -6,16 +6,15 @@
 //! speaks it; so can any other daemon.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::Semaphore;
 
 use crate::backend::{
-    SpeechBackend, SpeechError, Transcript, check_language, default_languages, parse_languages,
+    Slots, SpeechBackend, SpeechError, Transcript, check_language, default_languages,
+    parse_languages,
 };
 
 /// Longest daemon answer line accepted.
@@ -39,8 +38,7 @@ pub struct SocketBackend {
     staging_dir: PathBuf,
     timeout: Duration,
     languages: Vec<String>,
-    slots: Arc<Semaphore>,
-    queue_wait: Duration,
+    slots: Slots,
 }
 
 /// Removes the staged WAV file when dropped, on every path out of `transcribe`.
@@ -93,8 +91,7 @@ impl SocketBackend {
             staging_dir,
             timeout,
             languages,
-            slots: Arc::new(Semaphore::new(concurrency.max(1))),
-            queue_wait,
+            slots: Slots::new(concurrency, queue_wait),
         }
     }
 }
@@ -110,17 +107,12 @@ impl SpeechBackend for SocketBackend {
     }
 
     fn queue_wait(&self) -> Duration {
-        self.queue_wait
+        self.slots.wait()
     }
 
     async fn transcribe(&self, wav: &[u8], language: &str) -> Result<Transcript, SpeechError> {
         let language = check_language(&self.languages, language)?;
-        let asked = Instant::now();
-        let _slot = tokio::time::timeout(self.queue_wait, self.slots.acquire())
-            .await
-            .map_err(|_| SpeechError::Busy(self.queue_wait))?
-            .map_err(|_| SpeechError::Daemon("the speech queue closed".into()))?;
-        let queued_ms = asked.elapsed().as_millis() as u64;
+        let (_slot, queued_ms) = self.slots.acquire().await?;
         let dir = &self.staging_dir;
         tokio::fs::create_dir_all(dir)
             .await

@@ -329,13 +329,35 @@ $Z --node http://field-host:7979 stream list    # the attached job's two event s
 
 `zeta job attach --kind transcribe --job ID [--language CODE]` creates the attached job; the
 node needs a speech backend, chosen with the global flags `--stt-socket PATH` (default
-`$XDG_RUNTIME_DIR/voiced.sock` when it exists) or `--stt-node URL` (secret in
-`ZETA_STT_NODE_SECRET`), which are exclusive. `denoise` is RNNoise through `nnnoiseless`
+`$XDG_RUNTIME_DIR/voiced.sock` when it exists), `--stt-node URL` (secret in
+`ZETA_STT_NODE_SECRET`) or `--stt-url URL`, which are exclusive. `denoise` is RNNoise through `nnnoiseless`
 (BSD-3-Clause, weights embedded). Source separation, for music under speech, is a slot filled
 by an external audio plugin, for instance a Demucs wrapper on a GPU host:
 `examples/python/separate_stub.py` shows the contract and [docs/speech.md](speech.md#separation) how to
 swap it into the chain. [docs/speech.md](speech.md) also covers installing `local-voice` on
 a node's host, writing your own daemon and sharing one daemon between nodes.
+
+`--stt-url URL` (env `ZETA_STT_URL`) sends each utterance to a Whisper server on another host.
+`URL` is the full endpoint, used as given. The node `POST`s a `multipart/form-data` form: the
+utterance's WAV as `file`, `response_format=json`, `language`, and `model` when
+`--stt-url-model NAME` is given. The server answers JSON with a `text`. The server's bearer, if
+it wants one, is read from `ZETA_STT_URL_KEY` and never printed. `GET /stt/languages` answers
+from `--stt-url-languages en,de` (default `en`); the server's own model list is not asked. Two
+servers answer this way:
+
+```bash
+# an OpenAI-compatible server (faster-whisper-server, speaches, vLLM)
+ZETA_STT_URL_KEY=KEY zeta serve --listen 7979 --secret "$S" \
+    --stt-url http://gpu-host:8000/v1/audio/transcriptions --stt-url-model Systran/faster-whisper-small
+# whisper.cpp's server
+zeta serve --listen 7979 --secret "$S" --stt-url http://gpu-host:8080/inference
+```
+
+Network caveat: an utterance is up to about 480 kB (16 kHz 16-bit mono, at most 15 s), sent as
+one burst after it ends, not streamed. One channel is nothing on a LAN, but many channels on a
+slow uplink (a Pi at the antenna on WiFi) see the upload time count against the 30 s busy
+window, so calls drop as `busy` before the GPU is the limit. The audio of third-party
+transmissions leaves the host with this flag: that is the operator's choice.
 
 ## Sources
 

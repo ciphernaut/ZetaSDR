@@ -308,7 +308,7 @@ async fn no_backend_fails_at_start() {
         .unwrap();
     assert_eq!(
         failure(res),
-        "transcribe: this node has no speech backend (--stt-socket or --stt-node)"
+        "transcribe: this node has no speech backend (--stt-socket, --stt-node or --stt-url)"
     );
     drop(rig.tx);
 }

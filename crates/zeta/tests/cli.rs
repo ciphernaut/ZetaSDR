@@ -4259,3 +4259,32 @@ fn job_start_takes_method_and_bin_hz() {
     assert_eq!(v["error"], "out_of_range", "{v}");
     assert_eq!(v["field"], "bin_hz", "{v}");
 }
+
+/// Any two of `--stt-socket`, `--stt-node` and `--stt-url` is a usage error, for every
+/// command.
+#[test]
+fn any_two_speech_backend_flags_are_a_usage_error() {
+    let flags = [
+        ("--stt-socket", "/nonexistent/voiced.sock"),
+        ("--stt-node", "http://127.0.0.1:9"),
+        ("--stt-url", "http://127.0.0.1:9/v1/audio/transcriptions"),
+    ];
+    for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+        let dir = tempfile::tempdir().unwrap();
+        zeta_bin()
+            .env_remove("ZETA_STT_SOCKET")
+            .env_remove("ZETA_STT_NODE")
+            .env_remove("ZETA_STT_URL")
+            .env("ZETA_STT_NODE_SECRET", "s3cret")
+            .arg("--state-dir")
+            .arg(dir.path().join("state"))
+            .args([flags[a].0, flags[a].1, flags[b].0, flags[b].1])
+            .args(["source", "list"])
+            .assert()
+            .code(1)
+            .stdout("")
+            .stderr(contains(
+                "--stt-socket, --stt-node and --stt-url are exclusive",
+            ));
+    }
+}

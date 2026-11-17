@@ -21,11 +21,12 @@ use crate::socket::STT_CONCURRENCY;
 use crate::wav::wav_s16_mono;
 
 /// Why transcription is not ready on a node started without a speech backend.
-pub const NO_BACKEND_REASON: &str = "this node has no speech backend (--stt-socket or --stt-node)";
+pub const NO_BACKEND_REASON: &str =
+    "this node has no speech backend (--stt-socket, --stt-node or --stt-url)";
 
 /// Why a transcribe job fails on a node started without a speech backend.
 pub const NO_BACKEND: &str =
-    "transcribe: this node has no speech backend (--stt-socket or --stt-node)";
+    "transcribe: this node has no speech backend (--stt-socket, --stt-node or --stt-url)";
 
 /// The rate every backend is handed.
 const RATE_16K: u64 = 16_000;

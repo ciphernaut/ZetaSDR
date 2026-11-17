@@ -152,7 +152,7 @@ text(1104, 376, "HTTPS PUT", size=10, anchor="end")
 line([(CL_X, 510), (10, 510), (10, 112), (RX + RW / 2, 112), (RX + RW / 2, 128)], dash=True)
 text(700, 108, "zeta ask: its own HTTP chat + tools to the LLM (--llm-url), wherever it runs", size=10, anchor="middle", italic=True)
 
-box(RX, 420, RW, 80, "Speech on another node", "HTTP POST /stt to that node: --stt-node URL (secret ZETA_STT_NODE_SECRET); exclusive with --stt-socket.", "REMOTE")
+box(RX, 420, RW, 80, "Speech on another host", "--stt-node URL (a node's POST /stt) or --stt-url URL (a Whisper server, multipart POST; key ZETA_STT_URL_KEY).", "REMOTE")
 line([(NX1, 286), (RX, 460)])
 text(RX, 520, "REMOTE RADIOS (IQ in, tune out)", size=10.5, bold=True, op=0.7)
 radios = [

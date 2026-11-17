@@ -449,11 +449,12 @@
 <text x="1064" y="1361.0" font-size="12.5" font-weight="700">zeta-speech</text>
 <text x="1064" y="1376.0" font-size="10.5">
 <tspan x="1064" dy="0">transcribe stage; backends SocketBackend</tspan>
-<tspan x="1064" dy="13.0">(local-voice protocol on a Unix socket)</tspan>
-<tspan x="1064" dy="13.0">and NodeBackend (another node's POST</tspan>
-<tspan x="1064" dy="13.0">/stt); 16 kHz WAV; 4 slots, 30 s busy</tspan>
-<tspan x="1064" dy="13.0">drop; attached chain stream_in → denoise</tspan>
-<tspan x="1064" dy="13.0">→ vad → transcribe.</tspan>
+<tspan x="1064" dy="13.0">(local-voice protocol on a Unix socket),</tspan>
+<tspan x="1064" dy="13.0">NodeBackend (another node's POST /stt)</tspan>
+<tspan x="1064" dy="13.0">and UrlBackend (a Whisper server over</tspan>
+<tspan x="1064" dy="13.0">HTTP, multipart); 16 kHz WAV; 4 slots,</tspan>
+<tspan x="1064" dy="13.0">30 s busy drop; attached chain stream_in</tspan>
+<tspan x="1064" dy="13.0">→ denoise → vad → transcribe.</tspan>
 </text>
 <circle cx="1056" cy="1345.0" r="9" fill="currentColor" fill-opacity="0.9"/>
 <text x="1056" y="1348.6" font-size="10.5" font-weight="700" text-anchor="middle" fill="#ffffff" stroke="none">6</text>
