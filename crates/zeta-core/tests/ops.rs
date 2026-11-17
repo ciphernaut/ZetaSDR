@@ -3801,8 +3801,8 @@ async fn too_old_carries_the_rings_earliest_ns() {
     );
 }
 
-/// `source_list` carries `ring: {seconds}` once the source's ring exists (the
-/// seconds it was sized to) and `null` before; required and nullable in the schema.
+/// `source_list` carries `ring: {seconds, held_s, gaps}` once the source's ring exists (the
+/// seconds it was sized to, the seconds it holds, the gaps in them) and `null` before; required and nullable in the schema.
 #[tokio::test]
 async fn source_list_reports_the_ring_depth() {
     let dir = tempfile::tempdir().unwrap();
@@ -3821,7 +3821,14 @@ async fn source_list_reports_the_ring_depth() {
     let Ok(OpResult::Sources(v)) = node.apply(Op::SourceList {}).await else {
         panic!("expected sources");
     };
-    assert_eq!(ring(&v), serde_json::json!({"seconds": 1.0}));
+    // `held_s` is what the ring holds now (a slice of the sized second) and `gaps`
+    // the timestamp gaps inside it; a file source streams without one.
+    let r = ring(&v);
+    assert_eq!(r["seconds"], 1.0);
+    assert_eq!(r["gaps"], 0);
+    let held = r["held_s"].as_f64().unwrap();
+    assert!((0.0..=1.0).contains(&held), "{r}");
+    assert_eq!(r.as_object().unwrap().len(), 3, "{r}");
     let si = &schema()["result"]["$defs"]["SourceInfo"];
     assert!(
         si["required"].as_array().unwrap().contains(&"ring".into()),

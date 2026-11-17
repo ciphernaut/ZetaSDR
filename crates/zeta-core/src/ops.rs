@@ -80,9 +80,10 @@ pub enum Op {
     /// `source_measure`); and `starting`, what a worker not yet live is doing
     /// (`what` `measuring`, `detail`, `step` of `of`, `eta_ms`: the most time left),
     /// `null` otherwise;
-    /// `null` for a source that runs in the node), and `ring`, the IQ history (`seconds`, `null`
-    /// before the first block; a `classify` or `iq_read` span older than it fails
-    /// `too_old`, one across a gap in the capture `gap`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
+    /// `null` for a source that runs in the node), and `ring`, the IQ history (`seconds`
+    /// sized to, `held_s` held now, `gaps` in it, `null` before the first block; a
+    /// `classify` or `iq_read` span older than it fails `too_old`, one across a gap in
+    /// the capture `gap`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
     /// source reported it, `configured` from `--source-position`) where the source knows
     /// where it is, `null` otherwise, and `sweeps`, the scans the source is sweeping for
     /// by its own means, which hold no band and are never among `holders` (`sweeps` is
@@ -2853,6 +2854,12 @@ pub struct BusySource {
 pub struct RingInfo {
     /// The history length the ring was sized to, in seconds.
     pub seconds: f64,
+    /// Seconds from the oldest retained sample to the newest, gaps included:
+    /// how far back a read can reach (a read across a gap fails `gap`). At most
+    /// `seconds`; less while the ring fills and after a restart.
+    pub held_s: f64,
+    /// The timestamp gaps inside the retained history; each splits it in two.
+    pub gaps: u32,
 }
 
 /// A source's channel bank: its bin spacing and live subscribers.
@@ -4481,8 +4488,13 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                     sweeps: node.lease_sweepers(&id),
                     scans_waiting: node.lease_waiting(&id),
                     capture_policy: node.capture_policy(&id),
-                    ring: node.ring(&id).map(|r| RingInfo {
-                        seconds: r.read().unwrap().capacity_seconds(),
+                    ring: node.ring(&id).map(|r| {
+                        let r = r.read().unwrap();
+                        RingInfo {
+                            seconds: r.capacity_seconds(),
+                            held_s: r.held_s(),
+                            gaps: u32::try_from(r.gaps()).unwrap_or(u32::MAX),
+                        }
                     }),
                     id,
                     capabilities,

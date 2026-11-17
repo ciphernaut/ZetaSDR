@@ -586,10 +586,6 @@ From the operator, 2026-11-06, raised while scoping plan 28 (analog video): a vi
 
 From the operator, 2026-11-06, while scoping plan 28. The 5.8 GHz FPV channels are letter-named (A1-A8 descending, B on 19 MHz steps, E irregular, F, R on 37 MHz steps) and the plan registry numbers channels on uniform steps and matches a job within 1 kHz, so plan 28 ships no video plan. Later: lift the channel tables from the open VTX firmware (OpenVTx's and Betaflight's VTX tables, which carry every band and power level the transmitters themselves use), as `fpv_58` and `fpv_13` rows with letter names, and give a plan a match tolerance wide enough for a job centred on a measured carrier (plan 28's rule) to take its channel's name. `plan_start` on a video plan is not wanted.
 
-## Sources: `source_list` reports the ring's size, not what it holds
-
-From plan 30's live acceptance, 2026-11-07: pinned at 10.24 MHz the B210's ring held about 3.5 s while `source_list` reported `ring.seconds: 10.0`, and `iq read` of 9 s answered `too_old`. Checked in cleanup round 0: the ring's seconds already follow the rate (`ring_seconds_for`), and at 10.24 MHz the default budget does hold 10 s, so the figure was right as a size. What it held was cut short by the ring restarting on a timestamp gap ("Source: the IQ history restarts on every timestamp gap"). Fix that first; a `held_s` beside `seconds` would then say how much history a read can reach.
-
 ## Capture: the burst gate does not suit VDL2 on the B210
 
 From plan 30's live acceptance, 2026-11-07. A `capture` job on 136.975 MHz, 25 kHz fired on spikes of about 1 ms, wrote 32 windows in about 20 s, then stopped at its burst cap; none decoded. The VDL2 fixture was recorded off the ring instead (an `iq read` of the last 3 s on each `vdl2_decode` event, channelised offline). Spec 4.6 assumed the gate would serve VDL2. Look at a minimum burst length for the gate and at "record on decode" as a capture mode.
