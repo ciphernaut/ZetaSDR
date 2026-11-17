@@ -219,6 +219,9 @@
 //                          demodulator node (nbfm_demod, am_demod, ssb_demod: DENOISE_KINDS;
 //                          hidden for the others), the entry reading the state it would
 //                          switch to; the note `<kind>: denoise on|off`
+//   stereo Stereo on|off   the same for `stereo` on a wfm_demod job's wfm_demod node (two
+//                          channels, L and R once the pilot locks; hidden for the other
+//                          kinds); the note `wfm_demod: stereo on|off`
 //   mute   Mute in mix     graph_put of the covering mix's own graph with this channel added to
 //                          its `muted` (mix.js mixCovering, muteOp; the entry reads `Unmute in
 //                          mix` for a muted one, hidden when no running mix covers the job's
@@ -287,6 +290,7 @@ const OUTLINE_ENTRIES = [
   ["w12500", "12.5 kHz"],
   ["w25000", "25 kHz"],
   ["denoise", "Denoise on"],
+  ["stereo", "Stereo on"],
   ["mute", "Mute in mix"],
   ["stop", "Stop"],
 ];
@@ -305,6 +309,12 @@ function denoiseNode(job) {
   const kind = DENOISE_KINDS.get(job.kind);
   if (!kind) return null;
   return ((job.graph && job.graph.nodes) || []).find((n) => n.kind === kind) || null;
+}
+
+// The wfm_demod node of a wfm_demod `job`, the one that takes `stereo`, or null.
+function stereoNode(job) {
+  if (job.kind !== "wfm_demod") return null;
+  return ((job.graph && job.graph.nodes) || []).find((n) => n.kind === "wfm_demod") || null;
 }
 
 const ENTRIES = [
@@ -741,10 +751,11 @@ class Menu {
     this.setFitting(null);
     this.outlineJob = job;
     const t = job.tuning;
-    // Fit and the width presets only for the demodulators, Denoise for the voice ones
-    // (reading the state it would switch to); Stop always.
+    // Fit and the width presets only for the demodulators, Denoise for the voice ones and
+    // Stereo for FM broadcast (each reading the state it would switch to); Stop always.
     const fits = FIT_KINDS.has(job.kind);
     const dn = denoiseNode(job);
+    const st = stereoNode(job);
     for (const item of this.outlineEl.querySelectorAll(".ctx-item")) {
       const action = item.dataset.action;
       if (action === "mute") {
@@ -754,6 +765,9 @@ class Menu {
       } else if (action === "denoise") {
         item.hidden = dn === null;
         item.textContent = dn && dn.params && dn.params.denoise ? "Denoise off" : "Denoise on";
+      } else if (action === "stereo") {
+        item.hidden = st === null;
+        item.textContent = st && st.params && st.params.stereo ? "Stereo off" : "Stereo on";
       } else {
         item.hidden = action !== "stop" && !fits;
       }
@@ -856,6 +870,17 @@ class Menu {
       }
       const r = await this.applyOp({ op: "graph_put", job: job.id, graph });
       if (r) this.t.note(`${job.kind}: denoise ${on ? "on" : "off"}`);
+    } else if (action === "stereo") {
+      // As Denoise: `stereo` is carried too, and the relaunch gives the job two channels.
+      const st = stereoNode(job);
+      if (!st) return;
+      const on = !(st.params && st.params.stereo);
+      const graph = JSON.parse(JSON.stringify(job.graph));
+      for (const n of graph.nodes) {
+        if (n.kind === "wfm_demod") n.params = { ...(n.params || {}), stereo: on };
+      }
+      const r = await this.applyOp({ op: "graph_put", job: job.id, graph });
+      if (r) this.t.note(`${job.kind}: stereo ${on ? "on" : "off"}`);
     } else if (/^w\d+$/.test(action)) {
       await this.applyOp({
         op: "job_retune",

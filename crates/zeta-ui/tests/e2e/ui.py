@@ -5358,6 +5358,58 @@ def scenario_wfm_decode_plays_audio(page, url, secret):
             stop_job(url, secret, j["id"])
 
 
+def scenario_wfm_stereo_toggle_plays_two_channels(page, url, secret):
+    # The outline menu's Stereo entry (wfm_demod only) is a graph_put of the job's own graph
+    # with `stereo: true` on its wfm_demod node; the relaunched job's audio has two channels
+    # and plays as two, and its context carries the pilot reading.
+    select_source(page, url, secret, "wfm")
+    job = start_job(url, secret, "wfm_demod", "wfm", 104_900_000, 200_000)
+    try:
+        ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
+        page.evaluate("window.zetaTest.poll()")
+        expect(ol).to_have_count(1)
+        ol.click(button="right")
+        menu = page.locator("#ctx-outline")
+        expect(menu).to_be_visible()
+        expect(menu.locator('.ctx-item[data-action="denoise"]')).to_be_hidden()
+        item = menu.locator('.ctx-item[data-action="stereo"]')
+        expect(item).to_have_text("Stereo on")
+        with page.expect_request(is_op("graph_put")) as req:
+            item.click()
+        body = json.loads(req.value.post_data)
+        demod = [n for n in body["graph"]["nodes"] if n["kind"] == "wfm_demod"]
+        assert body["job"] == job and len(demod) == 1 and demod[0]["params"]["stereo"] is True, \
+            f"stereo put {body}"
+        expect(menu).to_be_hidden()
+        expect(page.locator("#transcript .line.note", has_text="wfm_demod: stereo on")) \
+            .to_have_count(1)
+
+        def stereo_running():
+            r = job_record(url, secret, job)
+            return (r["state"]["status"] == "running"
+                    and [n for n in r["graph"]["nodes"]
+                         if n["kind"] == "wfm_demod"][0]["params"]["stereo"] is True)
+        wait_until(stereo_running, 5.0, "stereo applied")
+        # The fixture carries a pilot: the job's context reads it.
+        wait_until(lambda: "pilot_db" in job_record(url, secret, job)["context"].get("wfm", {}),
+                   15.0, "job_context.wfm")
+        row = job_row(page, job)
+        row.locator("button.play").click()
+        # The first frames of a demod on this 240 kHz source take 4-7 s in a debug build.
+        page.wait_for_function(
+            "() => window.zetaAudio && window.zetaAudio.framesPlayed > 0", timeout=15_000)
+        assert page.evaluate("window.zetaAudio.lastChannels") == 2, "audio header channels"
+        assert page.evaluate("window.zetaAudio.lastRate") == 48_000
+        page.evaluate("window.zetaTest.poll()")
+        row.locator("button.play").click()
+        expect(row.locator("button.play")).to_have_text("▶")
+        ol.click(button="right")
+        expect(menu.locator('.ctx-item[data-action="stereo"]')).to_have_text("Stereo off")
+        page.keyboard.press("Escape")
+    finally:
+        stop_job(url, secret, job)
+
+
 def scenario_what_is_this_names_fm_broadcast(page, url, secret):
     menu = open_menu_on_wfm(page, url, secret)
     page.click('#ctx .ctx-item[data-action="classify"]')

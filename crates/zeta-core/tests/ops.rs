@@ -2686,7 +2686,8 @@ fn wfm_expansion_is_channel_then_wfm_demod() {
         assert_eq!(g.nodes[1].kind, "wfm_demod");
         assert_eq!(
             g.nodes[1].params,
-            serde_json::json!({"deviation_hz": want, "audio_rate_hz": 48_000, "deemphasis_us": 50})
+            serde_json::json!({"deviation_hz": want, "audio_rate_hz": 48_000, "deemphasis_us": 50,
+                "stereo": false})
         );
         assert_eq!(g.edges.len(), 1);
         assert_eq!(g.edges[0].from, g.nodes[0].id);
@@ -3765,6 +3766,41 @@ fn demod_graphs_carry_denoise_and_the_voice_shaping() {
         .expand(&src, tuning, Hz(480_000), None, None, None, &modes())
         .unwrap();
     assert!(g.nodes.iter().all(|n| n.params.get("denoise").is_none()));
+}
+
+#[test]
+fn a_wfm_graph_carries_stereo_through_a_reexpansion_and_a_retune() {
+    let tuning = Tuning {
+        center_hz: Hz(104_900_000),
+        bandwidth_hz: Hz(200_000),
+    };
+    let src = SourceId("b210".into());
+    let kind = JobKind::WfmDemod;
+    let g = kind
+        .expand(&src, tuning, Hz(1_000_000), None, None, None, &modes())
+        .unwrap();
+    let mut stored = g.clone();
+    for n in stored.nodes.iter_mut().filter(|n| n.kind == "wfm_demod") {
+        n.params["stereo"] = true.into();
+    }
+    for carried in [None, Some(&zeta_core::ops::RETUNE_CARRIED_PARAMS[..])] {
+        let again = match carried {
+            None => kind.reexpand(&src, tuning, Hz(2_000_000), None, &stored, None, &modes()),
+            Some(c) => kind.reexpand_carrying(
+                &src,
+                tuning,
+                Hz(2_000_000),
+                None,
+                &stored,
+                None,
+                &modes(),
+                c,
+            ),
+        }
+        .unwrap();
+        let n = again.nodes.iter().find(|n| n.kind == "wfm_demod").unwrap();
+        assert_eq!(n.params["stereo"], true, "{carried:?}");
+    }
 }
 
 #[test]

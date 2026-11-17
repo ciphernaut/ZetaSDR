@@ -115,9 +115,10 @@ pub fn block_offset(block: u32) -> Option<Offset> {
     Offset::ALL.into_iter().find(|o| o.word() == syn)
 }
 
-/// Transposed direct-form II biquad (RBJ cookbook designs), run in f64.
+/// Transposed direct-form II biquad (RBJ cookbook designs), run in f64. `wfm_demod`'s
+/// stereo pilot lock uses its band-pass too.
 #[derive(Clone, Debug)]
-struct Biquad {
+pub(crate) struct Biquad {
     b: [f64; 3],
     a: [f64; 2],
     z: [f64; 2],
@@ -133,7 +134,7 @@ impl Biquad {
     }
 
     /// Band-pass, 0 dB and zero phase at `f0`, quality `q`.
-    fn bandpass(f0: f64, q: f64, rate: f64) -> Self {
+    pub(crate) fn bandpass(f0: f64, q: f64, rate: f64) -> Self {
         let w = 2.0 * PI * f0 / rate;
         let alpha = w.sin() / (2.0 * q);
         Self::from_rbj(
@@ -154,7 +155,7 @@ impl Biquad {
         )
     }
 
-    fn run(&mut self, x: f64) -> f64 {
+    pub(crate) fn run(&mut self, x: f64) -> f64 {
         let y = self.b[0] * x + self.z[0];
         self.z[0] = self.b[1] * x - self.a[0] * y + self.z[1];
         self.z[1] = self.b[2] * x - self.a[1] * y;

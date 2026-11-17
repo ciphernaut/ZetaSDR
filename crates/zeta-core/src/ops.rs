@@ -2029,6 +2029,7 @@ impl JobKind {
                                 "deviation_hz": deviation_hz.map_or(WFM_DEVIATION_DEFAULT_HZ, |d| d.0),
                                 "audio_rate_hz": AUDIO_RATE_HZ,
                                 "deemphasis_us": WFM_DEEMPHASIS_US,
+                                "stereo": false,
                             }),
                         },
                     ],
@@ -2560,7 +2561,7 @@ pub const WATCH_MODES_EMPTY: &str = "modes: empty list (null lets identify decid
 
 /// The params [`JobKind::reexpand`] carries from a stored graph to the node of the same
 /// stage kind: what an operator may set with `graph_put` and still have the node's graph.
-const CARRIED_PARAMS: [&str; 9] = [
+const CARRIED_PARAMS: [&str; 10] = [
     "squelch_db",
     "squelch",
     "guard_hz",
@@ -2570,19 +2571,22 @@ const CARRIED_PARAMS: [&str; 9] = [
     "denoise",
     "audio_lowpass_hz",
     "deemphasis_us",
+    "stereo",
 ];
 
 /// The params a retune ([`JobKind::reexpand_carrying`]) carries from the stored graph:
-/// the squelch. The adjacent-channel guard (`guard_hz`, `guard_db`, `channel_hz`, and the
+/// the squelch and the demodulator's audio (`denoise`, the voice shaping, `wfm_demod`'s
+/// `stereo`). The adjacent-channel guard (`guard_hz`, `guard_db`, `channel_hz`, and the
 /// channel node's `wide_hz`) is derived again from the channel plan at the new band, so a
 /// width preset changes the filter and a move to a neighbouring channel takes that
 /// channel's geometry.
-pub const RETUNE_CARRIED_PARAMS: [&str; 5] = [
+pub const RETUNE_CARRIED_PARAMS: [&str; 6] = [
     "squelch_db",
     "squelch",
     "denoise",
     "audio_lowpass_hz",
     "deemphasis_us",
+    "stereo",
 ];
 
 /// `fm_demod`'s audio low-pass cutoff, Hz: voice to 3.4 kHz, the FM hiss above it out.

@@ -68,6 +68,50 @@ pub fn wfm_modulate(
     nbfm_modulate(&mixed, audio_rate_hz, iq_rate_hz, deviation_hz, offset_hz)
 }
 
+/// Pilot level of a standard stereo broadcast, as a fraction of full deviation (9 %).
+pub const STEREO_PILOT_LEVEL: f32 = 0.09;
+
+/// The broadcast FM stereo multiplex of `left` and `right` (equal lengths, nominally
+/// within ±1, already at `rate_hz`, which must exceed 106 kHz): `0.9 · ((L+R)/2 +
+/// (L-R)/2 · sin(2ω n))` plus the 19 kHz pilot `pilot · sin(ω n)`, `ω = 2π 19 kHz /
+/// rate_hz`, so the suppressed 38 kHz carrier is in phase with the pilot's second
+/// harmonic, as transmitters send it. `pilot` is [`STEREO_PILOT_LEVEL`] for a stereo
+/// station, 0 for a mono one; at those levels the peak stays within ±1.
+pub fn stereo_mpx(left: &[f32], right: &[f32], rate_hz: u32, pilot: f32) -> Vec<f32> {
+    assert_eq!(
+        left.len(),
+        right.len(),
+        "stereo_mpx: L and R lengths differ"
+    );
+    let step = 19_000.0 / rate_hz as f64;
+    left.iter()
+        .zip(right)
+        .enumerate()
+        .map(|(n, (&l, &r))| {
+            let ph = 2.0 * PI * (n as f64 * step).fract();
+            let sum = 0.45 * (l + r) as f64;
+            let diff = 0.45 * (l - r) as f64 * (2.0 * ph).sin();
+            (sum + diff + pilot as f64 * ph.sin()) as f32
+        })
+        .collect()
+}
+
+/// Stereo broadcast FM: [`stereo_mpx`] of `left` and `right` at `rate_hz` with a pilot
+/// of `pilot`, frequency-modulated at `deviation_hz` ([`wfm_modulate_composite`]).
+pub fn wfm_stereo_modulate(
+    left: &[f32],
+    right: &[f32],
+    rate_hz: u32,
+    deviation_hz: f64,
+    pilot: f32,
+) -> Vec<Complex<f32>> {
+    wfm_modulate_composite(
+        &stereo_mpx(left, right, rate_hz, pilot),
+        rate_hz,
+        deviation_hz,
+    )
+}
+
 /// FM of a ready-made broadcast `composite` (nominally within ±1) already at
 /// the IQ rate: [`nbfm_modulate`] at equal rates and no offset, so no
 /// resampling and no further filtering. Used by [`rds_station_iq`]; [`wfm_modulate`] does not use it.

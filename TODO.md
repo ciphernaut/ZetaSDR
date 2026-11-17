@@ -53,15 +53,9 @@ The voice low-pass and de-emphasis shipped 2026-11-01 (`fm_demod` carries `audio
 
 `--stt-url` is built (a multipart POST of the utterance to a Whisper server). Left: an utterance is 16 kHz mono 16-bit PCM, up to about 480 kB sent as one burst, and on a slow uplink the upload time counts against the 30 s busy window. Measure it (UAT.md, "Speech over the network"); consider FLAC or 8 kHz for narrowband voice (CB audio is 3.4 kHz wide) to cut it by half or more, only if a Whisper server accepts it without a quality loss.
 
-## Feature: stereo for `wfm_demod`
+## `wfm_demod` stereo: a weak station stays stereo
 
-`wfm_demod` is mono only. Operators expect stereo for broadcast FM. A working offline reference is in `scratch/fm_stereo.py` (local, not committed):
-- discriminator to MPX;
-- 19 kHz pilot band-pass, squared and band-passed at 38 kHz, normalised, as the L-R carrier;
-- L-R recovered by mixing and a 15 kHz low-pass;
-- L/R matrix, 50 us de-emphasis per channel.
-
-Report the pilot's level (event or `job_context`), so "no pilot" (no station, or too weak to lock) is visible. Keep mono as the fallback below a pilot threshold, as receivers do: stereo needs about 20 dB more signal for the same audio SNR.
+`stereo: true` is built (cleanup round 2). Left: its fallback reads the pilot against the multiplex, which falls only as the signal is all but lost (a synthesised station still decodes stereo at 3 dB SNR, its stereo some 15 dB noisier than its mono at any SNR), so a weak station that keeps its pilot stays stereo; a noise reading or blend would drop or soften it.
 
 ## Jobs: a conflict on a controller's child offers a retry that is refused
 
@@ -361,7 +355,7 @@ Plan 29 shipped AIS, FLEX, M17, M20 synthesis and APRS positions (see "Decoder w
 
 - ~~**DMR voice**~~ (done in plan 38: `dmr_decode`, with P25 phase 1 beside it).
 - ~~**Whole-span POCSAG and APRS**~~ (done in plan 31: a `watch` with `modes`, and the `pagers_au` set).
-- **Stereo** for `wfm_demod` (see the stereo gist above) now that audio rows exist to consume it.
+- ~~**Stereo**~~ for `wfm_demod` (done in cleanup round 2: `stereo: true` on its node).
 - **DFM serial.** `dfm_decode` keeps `test: null` (it prints `skipped: no test`, and `--strict` fails it). Plan 29 task 9 built `crates/zeta-dsp/src/dfm_frame.rs` and the `dfm` family, and `dfm09mod --json --ecc` decodes their position, climb, time and satellites through the row's own chain, but the id stays `DFM-xxxxxxxx`: the serial's place in the sensor (configuration) field is not settled (channels 4-15, half layouts `half << 8 | index` and others, sequential or fixed-plus-alternating sensor sequences and runs up to 1200 frames all left the placeholder). The operator's ruling at the fallback was to leave `test: null` rather than a position-only test. Next: a public description of the DFM-09 configuration channels (the TH Koeln thesis's appendix A "From a Frame to a Data Packet" was not in the published excerpt), then set the row's `test` (`expect {id, lat}`, `within_ms` about 15000).
 
 ## Decoder wave 2: leftovers from plan 29
