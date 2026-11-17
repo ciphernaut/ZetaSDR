@@ -232,6 +232,35 @@ async fn a_stop_sends_what_was_collected() {
     assert_eq!(a[0]["frame"], 10);
 }
 
+/// A listener that takes connections and never answers; its URL.
+async fn silent_api() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/sondes/telemetry", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            held.push(s);
+        }
+    });
+    url
+}
+
+/// The last batch of a stop that the API does not answer in time is counted `failed`,
+/// its `last_error` saying so.
+#[tokio::test]
+async fn a_last_batch_that_times_out_counts_as_failed() {
+    let url = silent_api().await;
+    let r = start(&url, 60_000);
+    r.send(rs41("R1234567", 10));
+    let context = r.context.clone();
+    stop(r).await;
+    let c = context.lock().unwrap()["sondehub"].clone();
+    assert_eq!(c["failed"], 1, "{c}");
+    assert_eq!(c["sent"], 0, "{c}");
+    let e = c["last_error"].as_str().unwrap_or_default();
+    assert!(e.contains("timed out"), "{c}");
+}
+
 #[tokio::test]
 async fn events_without_a_position_are_skipped() {
     let (url, seen) = api(200).await;

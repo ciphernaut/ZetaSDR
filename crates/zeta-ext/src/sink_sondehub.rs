@@ -5,7 +5,7 @@
 //! `batch_ms` sends what it collected as one `PUT` of a JSON array to `url`, each
 //! element in SondeHub's v2 telemetry shape with the station's callsign and position;
 //! a stop (a restart of the job, a retune) sends what it collected first, waiting at most
-//! 2 s for it. It has no outputs. After every batch the job's context holds
+//! 2 s for it (a batch not answered by then counts `failed`, as any other). It has no outputs. After every batch the job's context holds
 //! `sondehub = {sent, failed, last_error}`: a non-2xx answer or a transport error counts
 //! `failed` once (the batch is dropped, never retried) and sets `last_error`; the next
 //! batch still goes. Events of any other protocol, or without a position, a `datetime`, a
@@ -300,7 +300,15 @@ impl Stage for SondehubStage {
                     }
                     let never = CancellationToken::new();
                     let last = flush(&client, &p.url, &mut batch, &mut tally, &ctx, &never);
-                    let _ = tokio::time::timeout(LAST_BATCH_TIMEOUT, last).await;
+                    if tokio::time::timeout(LAST_BATCH_TIMEOUT, last).await.is_err() {
+                        // Counted as any failed batch: dropped, not retried.
+                        tally.failed += 1;
+                        tally.last_error = Some(format!(
+                            "last batch timed out after {} ms at the stop",
+                            LAST_BATCH_TIMEOUT.as_millis()
+                        ));
+                        tally.note(&ctx);
+                    }
                     return Err(StageError::Cancelled);
                 }
                 f = rx.recv() => match f {
