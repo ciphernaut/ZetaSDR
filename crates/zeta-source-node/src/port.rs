@@ -13,7 +13,7 @@ use zeta_client::{ClientError, NodeClient, Received, Subscription};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::types::{
-    Capabilities, Claim, Hz, JobId, SampleFormat, SourceId, StreamKind, Timestamp,
+    Capabilities, Claim, Hz, JobId, SampleFormat, SourceId, SourcePosition, StreamKind, Timestamp,
 };
 use zeta_vrt::IqMeta;
 
@@ -94,6 +94,8 @@ struct Live {
 pub struct NodePort {
     id: SourceId,
     caps: Capabilities,
+    /// The remote source's own position, as its `source_list` said at open.
+    position: Option<SourcePosition>,
     remote: Arc<Remote>,
 }
 
@@ -163,6 +165,7 @@ impl NodePort {
         Ok(NodePort {
             id: cfg.id.clone(),
             caps,
+            position: remote.position,
             remote: Arc::new(Remote {
                 id: cfg.id.0.clone(),
                 url,
@@ -387,6 +390,14 @@ impl Port for NodePort {
         *r.shared.fault.lock().unwrap() = None;
         *r.shared.current.lock().unwrap() = Some(band);
         Ok(band)
+    }
+
+    fn position(&self) -> Option<SourcePosition> {
+        self.position
+    }
+
+    fn position_is_relayed(&self) -> bool {
+        true
     }
 
     fn current(&self) -> Option<Tuning> {

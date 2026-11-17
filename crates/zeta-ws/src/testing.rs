@@ -10,7 +10,7 @@ use zeta_agent::LlmConfig;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::SourceId;
+use zeta_core::types::{SourceId, SourcePosition};
 use zeta_source_file::fixtures::write_tone;
 use zeta_source_file::{FileOpts, FileSource};
 use zeta_speech::SpeechBackend;
@@ -28,6 +28,8 @@ pub struct TestOpts {
     pub llm: Option<LlmConfig>,
     /// The speech backend behind `POST /stt`; `None` (the default) answers 503.
     pub speech: Option<Arc<dyn SpeechBackend>>,
+    /// Where the node says its sources are (`--source-position`).
+    pub source_positions: std::collections::BTreeMap<SourceId, SourcePosition>,
 }
 
 impl Default for TestOpts {
@@ -39,6 +41,7 @@ impl Default for TestOpts {
             agents_md: "# test guide\n".to_string(),
             llm: None,
             speech: None,
+            source_positions: Default::default(),
         }
     }
 }
@@ -84,7 +87,7 @@ pub async fn spawn_with(dir: &Path, opts: TestOpts) -> TestServer {
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
     let cfg = NodeConfig {
-        source_positions: Default::default(),
+        source_positions: opts.source_positions.clone(),
         sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.join("state"),

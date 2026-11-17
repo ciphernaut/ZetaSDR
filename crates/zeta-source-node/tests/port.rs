@@ -10,7 +10,7 @@ use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpResult};
 use zeta_core::port::{Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
-use zeta_core::types::{Hz, SampleFormat, SourceId};
+use zeta_core::types::{Hz, PositionFrom, SampleFormat, SourceId, SourcePosition};
 use zeta_source_node::{NodePort, NodeSourceConfig, open, proxy_capabilities};
 use zeta_ws::testing::{TestServer, spawn};
 
@@ -84,6 +84,75 @@ async fn open_copies_capabilities_as_remote_push() {
     assert_eq!(port.current(), None);
     assert_eq!(port.fault(), None);
     drop(port);
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn a_node_source_reports_the_remotes_position() {
+    let dir = tempfile::tempdir().unwrap();
+    let pos = SourcePosition {
+        lat: -27.0,
+        lon: 153.0,
+        alt_m: Some(10.0),
+        from: PositionFrom::Configured,
+    };
+    let srv = zeta_ws::testing::spawn_with(
+        dir.path(),
+        zeta_ws::testing::TestOpts {
+            source_positions: [(SourceId("tone".to_string()), pos)].into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let port = open_tone(&srv).await;
+    assert_eq!(port.position(), Some(pos));
+    drop(port);
+    srv.stop().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn(dir.path()).await;
+    let port = open_tone(&srv).await;
+    assert_eq!(port.position(), None);
+    drop(port);
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn the_operators_source_position_wins_over_the_remotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = SourcePosition {
+        lat: -27.0,
+        lon: 153.0,
+        alt_m: None,
+        from: PositionFrom::Configured,
+    };
+    let srv = zeta_ws::testing::spawn_with(
+        dir.path(),
+        zeta_ws::testing::TestOpts {
+            source_positions: [(SourceId("tone".to_string()), remote)].into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let port = Arc::new(open_tone(&srv).await);
+    let mine = SourcePosition {
+        lat: -33.0,
+        lon: 151.0,
+        alt_m: Some(5.0),
+        from: PositionFrom::Configured,
+    };
+    let local = tempfile::tempdir().unwrap();
+    let node = local_node_at(
+        local.path(),
+        port.clone(),
+        [(SourceId("far".to_string()), mine)].into(),
+    )
+    .await;
+    assert_eq!(node.source_position(&SourceId("far".into())), Some(mine));
+    // Without a flag the remote's position is what the source reports.
+    let node2 = local_node(local.path(), port.clone()).await;
+    assert_eq!(node2.source_position(&SourceId("far".into())), Some(remote));
+    drop((node, node2, port));
     srv.stop().await;
 }
 
@@ -399,10 +468,18 @@ async fn identical_tune_is_idempotent() {
 
 /// A local node whose only source is `port`, with the passthrough stage.
 async fn local_node(dir: &std::path::Path, port: Arc<dyn Port>) -> Node {
+    local_node_at(dir, port, Default::default()).await
+}
+
+async fn local_node_at(
+    dir: &std::path::Path,
+    port: Arc<dyn Port>,
+    source_positions: std::collections::BTreeMap<SourceId, SourcePosition>,
+) -> Node {
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
     let cfg = NodeConfig {
-        source_positions: Default::default(),
+        source_positions,
         sets_dir: None,
         burst_policy: Default::default(),
         state_dir: dir.join("local"),

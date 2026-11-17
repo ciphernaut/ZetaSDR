@@ -597,6 +597,12 @@ pub trait Port: Send + Sync {
     fn position(&self) -> Option<crate::types::SourcePosition> {
         None
     }
+    /// Whether [`Port::position`] is only relayed from another node's record (a
+    /// `--source-node` source) and not measured by the port's own receiver (a KiwiSDR's
+    /// GPS). The operator's `--source-position` entry wins over a relayed position.
+    fn position_is_relayed(&self) -> bool {
+        false
+    }
     /// The sample depth in force on the source's link, one of
     /// [`Capabilities::depths`], with its rate cap; `None` for a source with
     /// one depth. A port bounds `tune`'s bandwidth by its cap, which may differ

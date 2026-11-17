@@ -517,16 +517,23 @@ impl Inner {
         self.modes.get().unwrap_or_default()
     }
 
-    /// Where source `id` is: what its port reports itself (`from: status`), else the
+    /// Where source `id` is: what its port reports itself (`from: status`; a position a
+    /// port only relays from another node yields to the entry), else the
     /// operator's `--source-position` entry (`from: configured`), else `None`. The one
     /// definition behind [`Node::source_position`] and the origin query's vantage.
     pub(crate) fn source_position(&self, id: &SourceId) -> Option<SourcePosition> {
-        self.port(id).and_then(|p| p.position()).or_else(|| {
-            self.source_positions.get(id).map(|p| SourcePosition {
-                from: PositionFrom::Configured,
-                ..*p
-            })
-        })
+        let port = self.port(id);
+        let configured = self.source_positions.get(id).map(|p| SourcePosition {
+            from: PositionFrom::Configured,
+            ..*p
+        });
+        // A position the port measured itself overrides the flag; one it only relays
+        // from another node does not.
+        match port {
+            Some(p) if p.position_is_relayed() => configured.or_else(|| p.position()),
+            Some(p) => p.position().or(configured),
+            None => configured,
+        }
     }
 
     /// The kind a job recorded as `kind` was expanded from, when the node expands its
