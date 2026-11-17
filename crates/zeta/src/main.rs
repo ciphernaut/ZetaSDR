@@ -332,17 +332,16 @@ fn verdict_job(rec: &zeta_core::job::JobRecord) -> Option<Option<zeta_core::type
 
 /// `--then-tail`: wait up to `STREAM_WAIT` for the job's audio output (a
 /// demodulator's; its `squelch` events are not what a tail is for), else its
-/// decoder's event output: the last of its event outputs (an edge between its
-/// stages never), then apply `StreamTail` to it. The outputs are in graph order and a
-/// row's decoder comes after its demod, so the last is the decoder's events, never a
-/// demod's `squelch` events (which a demod that keeps its squelch on publishes first). A job whose graph has a `slicer` is tailed on the stream
+/// decoder's event output ([`zeta_core::node::Node::job_decoder_events`]: the
+/// downstream-most node's, never a demod's `squelch` events, whatever order the row
+/// lists its nodes in; an edge between its stages never), then apply `StreamTail` to
+/// it. A job whose graph has a `slicer` is tailed on the stream
 /// `job_context.slicer.stream` names, waited for the same way.
 async fn tail_job(
     node: &zeta_core::node::Node,
     job: &zeta_core::types::JobId,
     t: cli::ThenTail,
 ) -> Result<zeta_core::ops::OpResult, OpError> {
-    use zeta_core::types::StreamKind;
     let deadline = tokio::time::Instant::now() + STREAM_WAIT;
     // A chain with a slicer (`bits_start`) is tailed on its `bits` events, which the
     // slicer names in the job's context once it has sliced.
@@ -362,14 +361,9 @@ async fn tail_job(
                 .and_then(|c| c["slicer"]["stream"].as_str().map(String::from))
                 .map(zeta_core::types::StreamId)
         } else {
-            node.job_audio_stream(job).ok().or_else(|| {
-                // An output, never an edge between two of its stages (a watch's
-                // spectrum rows); the last, the decoder's.
-                node.job_outputs(job)
-                    .into_iter()
-                    .rfind(|(k, _)| *k == StreamKind::Event)
-                    .map(|(_, s)| s)
-            })
+            node.job_audio_stream(job)
+                .ok()
+                .or_else(|| node.job_decoder_events(job))
         };
         if let Some(s) = found {
             break s;

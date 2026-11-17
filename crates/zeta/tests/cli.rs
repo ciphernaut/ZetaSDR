@@ -934,6 +934,39 @@ fn then_tail_on_a_squelched_audio_row_tails_the_decoder() {
     assert_eq!(frames[0]["payload"]["src"], "VK3ABC", "{v:#}");
 }
 
+/// The same squelched APRS row with its nodes listed decoder first, demod last: the
+/// tail still picks the decoder's events by the graph's shape, not the list's order.
+#[test]
+fn then_tail_on_a_squelched_row_listing_its_demod_last_tails_the_decoder() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let mut aprs: Value =
+        serde_json::from_str(include_str!("../../../modes/aprs_decode.json")).unwrap();
+    let nodes = aprs["decoder"]["nodes"].as_array_mut().unwrap();
+    let at = nodes
+        .iter()
+        .position(|n| n["kind"] == "nbfm_demod")
+        .unwrap();
+    let mut demod = nodes.remove(at);
+    demod["params"]["squelch"] = true.into();
+    demod["params"]["squelch_db"] = (-120).into();
+    nodes.push(demod);
+    std::fs::write(modes.join("aprs_decode.json"), aprs.to_string()).unwrap();
+    let modes_dir = modes.display().to_string();
+    let out = aprs_start(dir.path(), "1,5000", &[])
+        .args(["--modes-dir", &modes_dir])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 1, "{v:#}");
+    assert_eq!(frames[0]["payload"]["src"], "VK3ABC", "{v:#}");
+}
+
 #[test]
 fn job_start_pocsag_decode_prints_pocsag_event() {
     let dir = tempfile::tempdir().unwrap();

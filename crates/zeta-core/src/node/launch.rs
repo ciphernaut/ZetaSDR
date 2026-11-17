@@ -385,6 +385,7 @@ impl Inner {
                             id: sid.clone(),
                             role: *role,
                             voice: *voice,
+                            node: Some(n.id.clone()),
                         });
                     }
                 }
@@ -406,6 +407,7 @@ impl Inner {
                     id: sid.clone(),
                     role,
                     voice: role.is_some_and(|r| voices.contains(&r)),
+                    node: Some(n.id.clone()),
                 });
                 sid
             });

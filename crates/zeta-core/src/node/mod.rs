@@ -377,6 +377,8 @@ pub(crate) struct JobOutput {
     pub id: StreamId,
     pub role: Option<&'static str>,
     pub voice: bool,
+    /// The graph node that produces it; `None` for a controller's own output.
+    pub node: Option<graph::NodeId>,
 }
 
 impl JobOutput {
@@ -386,6 +388,7 @@ impl JobOutput {
             id,
             role: None,
             voice: false,
+            node: None,
         }
     }
 }
@@ -2397,6 +2400,66 @@ impl Node {
             .filter(|e| e.cancel.is_some())
             .map(|e| e.outputs.iter().map(|o| (o.kind, o.id.clone())).collect())
             .unwrap_or_default()
+    }
+
+    /// The event output of `job`'s current run that carries its decoder's events: one
+    /// of the downstream-most node that is not a squelch demod ([`crate::ops::SQUELCH_STAGES`],
+    /// whose event output is its `squelch` stream). Nodes whose outputs no other node
+    /// consumes (a sink does not count) come first, then the deepest from the graph's
+    /// roots, then the last in the graph's order. A controller's own output (no node)
+    /// is its decoder's. With only squelch outputs, the last of them; `None` for a job
+    /// with no event output or that does not run here.
+    pub fn job_decoder_events(&self, job: &JobId) -> Option<StreamId> {
+        let jobs = self.inner.jobs.lock().unwrap();
+        let e = jobs.get(job).filter(|e| e.cancel.is_some())?;
+        let g = &e.record.graph;
+        let events: Vec<&JobOutput> = e
+            .outputs
+            .iter()
+            .filter(|o| o.kind == StreamKind::Event)
+            .collect();
+        if let Some(o) = events.iter().find(|o| o.node.is_none()) {
+            return Some(o.id.clone());
+        }
+        let node = |id: &graph::NodeId| g.nodes.iter().position(|n| &n.id == id);
+        let squelch = |o: &&&JobOutput| {
+            o.node
+                .as_ref()
+                .and_then(&node)
+                .is_some_and(|i| crate::ops::SQUELCH_STAGES.contains(&g.nodes[i].kind.as_str()))
+        };
+        let sink = |id: &graph::NodeId| {
+            node(id).is_some_and(|i| {
+                self.inner
+                    .registry
+                    .spec(&g.nodes[i].kind)
+                    .is_some_and(|s| s.outputs.is_empty())
+            })
+        };
+        // Whether no node but a sink consumes `id`'s outputs.
+        let terminal = |id: &graph::NodeId| !g.edges.iter().any(|e| &e.from == id && !sink(&e.to));
+        // The longest path from a root to `id` (the graph is acyclic: validated).
+        fn depth(g: &Graph, id: &graph::NodeId, seen: usize) -> usize {
+            if seen > g.nodes.len() {
+                return seen;
+            }
+            g.edges
+                .iter()
+                .filter(|e| &e.to == id)
+                .map(|e| 1 + depth(g, &e.from, seen + 1))
+                .max()
+                .unwrap_or(0)
+        }
+        let rank = |o: &&&JobOutput| {
+            let id = o.node.as_ref().expect("a node's output");
+            (terminal(id), depth(g, id, 0), node(id))
+        };
+        events
+            .iter()
+            .filter(|o| !squelch(o))
+            .max_by_key(rank)
+            .or_else(|| events.last())
+            .map(|o| o.id.clone())
     }
 
     /// Persist the job as `Stopped`, then cancel its stages and wait for its
