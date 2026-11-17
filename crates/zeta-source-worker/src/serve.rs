@@ -17,22 +17,27 @@
 //! nothing of the old driver behind.
 //!
 //! Every frame goes through one writer thread that owns the buffered stdout
-//! and flushes per frame, so control messages and blocks keep one order and a
-//! parent that reads slowly never blocks the status task's fault check (blocks
-//! beyond [`MAX_QUEUED_BLOCKS`] are dropped and counted as lost instead). Both
-//! kinds of drop, and blocks the pump lost to a lagging broadcast, add up in
-//! the status's `transport_dropped`.
+//! and flushes per frame, so a parent that reads slowly never blocks the status
+//! task's fault check (blocks beyond [`MAX_QUEUED_BLOCKS`] are dropped and
+//! counted as lost instead). It keeps two queues: control frames (the hello,
+//! replies, statuses) and data frames (blocks, ring descriptors), each in the
+//! order queued, and takes the next control frame before the next data frame,
+//! so a reply or a status waits behind at most the one frame being written,
+//! not a queue of blocks (at 20 Msps on the pipe, tens of milliseconds and
+//! megabytes). Both kinds of drop, and blocks the pump lost to a lagging
+//! broadcast, add up in the status's `transport_dropped`.
 //!
 //! [`requests_until_signal`] is the stdin a worker hands `serve`: SIGTERM and
 //! SIGINT become a `shutdown` request, and a watchdog ends the process if the
 //! request is never read.
 
+use std::collections::VecDeque;
 use std::io::{self, BufWriter, Write};
 use std::os::fd::RawFd;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, DuplexStream};
@@ -80,21 +85,75 @@ pub const SIGNAL_EXIT_WATCHDOG: Duration = Duration::from_secs(5);
 /// short lines, so this only has to absorb a burst while `serve` is busy.
 const REQUEST_PIPE: usize = 64 * 1024;
 
-/// What the writer thread is handed. Nearly every message is a frame (`End`
-/// comes once), so the frame's size, a hello's capability record included,
-/// is what each one costs either way.
-#[allow(clippy::large_enum_variant)]
-enum Out {
-    Frame(Frame),
-    /// Flush, then stop.
-    End,
+/// What the writer thread has yet to write.
+#[derive(Default)]
+struct Queued {
+    /// The hello, replies and statuses: taken before any data frame.
+    control: VecDeque<Control>,
+    /// Blocks and ring descriptors.
+    data: VecDeque<Frame>,
+    /// Set by [`Writer::end`]: write what is queued, then stop.
+    end: bool,
+    /// Set once the thread has stopped: later frames are dropped.
+    closed: bool,
+}
+
+/// The writer thread's queues, and the signal that one has something.
+#[derive(Default)]
+struct Queues {
+    queued: Mutex<Queued>,
+    ready: Condvar,
+}
+
+impl Queues {
+    fn lock(&self) -> MutexGuard<'_, Queued> {
+        // Plain queues: a panic while the lock was held leaves them usable.
+        self.queued.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queue a frame with `push`; false once the thread has stopped.
+    fn push(&self, push: impl FnOnce(&mut Queued)) -> bool {
+        let mut q = self.lock();
+        if q.closed {
+            return false;
+        }
+        push(&mut q);
+        drop(q);
+        self.ready.notify_one();
+        true
+    }
+
+    /// The next frame to write, control first; `None` once ended and empty.
+    fn next(&self) -> Option<Frame> {
+        let mut q = self.lock();
+        loop {
+            if let Some(c) = q.control.pop_front() {
+                return Some(Frame::Control(c));
+            }
+            if let Some(f) = q.data.pop_front() {
+                return Some(f);
+            }
+            if q.end {
+                return None;
+            }
+            q = self.ready.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// The thread has stopped: drop what is left and refuse the rest.
+    fn close(&self) {
+        let mut q = self.lock();
+        q.closed = true;
+        q.control.clear();
+        q.data.clear();
+    }
 }
 
 /// The sending side of the writer thread, shared by the request loop and the
 /// tasks.
 #[derive(Clone)]
 struct Writer {
-    tx: std_mpsc::Sender<Out>,
+    queues: Arc<Queues>,
     queued_blocks: Arc<AtomicUsize>,
 }
 
@@ -102,15 +161,16 @@ impl Writer {
     /// Start the writer thread over `stdout`; the receiver answers once it has
     /// flushed its last frame and stopped.
     fn start(stdout: impl Write + Send + 'static) -> io::Result<(Self, std_mpsc::Receiver<()>)> {
-        let (tx, rx) = std_mpsc::channel::<Out>();
+        let queues = Arc::new(Queues::default());
         let (done_tx, done_rx) = std_mpsc::channel();
         let queued_blocks = Arc::new(AtomicUsize::new(0));
         let queued = queued_blocks.clone();
+        let q = queues.clone();
         std::thread::Builder::new()
             .name("worker-stdout".into())
             .spawn(move || {
                 let mut out = BufWriter::new(stdout);
-                while let Ok(Out::Frame(f)) = rx.recv() {
+                while let Some(f) = q.next() {
                     let block = matches!(f, Frame::Block(_));
                     let written = write_frame(&mut out, &f).and_then(|()| out.flush());
                     if block {
@@ -124,33 +184,47 @@ impl Writer {
                     }
                 }
                 let _ = out.flush();
+                q.close();
                 let _ = done_tx.send(());
             })?;
-        Ok((Writer { tx, queued_blocks }, done_rx))
+        Ok((
+            Writer {
+                queues,
+                queued_blocks,
+            },
+            done_rx,
+        ))
     }
 
+    /// Queue a control frame, ahead of every data frame still queued.
     fn control(&self, c: Control) {
-        let _ = self.tx.send(Out::Frame(Frame::Control(c)));
+        self.queues.push(|q| q.control.push_back(c));
     }
 
-    /// Queue a block for the pipe unless the writer is too far behind; false
-    /// when dropped.
+    /// Queue a block for the pipe unless the writer is too far behind (or has
+    /// stopped); false when dropped.
     fn block(&self, b: IqBlock) -> bool {
         if self.queued_blocks.load(Ordering::Relaxed) >= MAX_QUEUED_BLOCKS {
             return false;
         }
         self.queued_blocks.fetch_add(1, Ordering::Relaxed);
-        if self.tx.send(Out::Frame(Frame::Block(b))).is_err() {
+        if !self.queues.push(|q| q.data.push_back(Frame::Block(b))) {
             self.queued_blocks.fetch_sub(1, Ordering::Relaxed);
             return false;
         }
         true
     }
 
-    /// Queue the descriptor of a block written into the ring. Not bounded like
-    /// blocks: the ring's slots already bound how many can be outstanding.
+    /// Have the writer thread flush what is queued, then stop.
+    fn end(&self) {
+        self.queues.push(|q| q.end = true);
+    }
+
+    /// Queue the descriptor of a block written into the ring, in order with
+    /// the blocks. Not bounded like blocks: the ring's slots already bound how
+    /// many can be outstanding.
     fn descriptor(&self, d: Descriptor) {
-        let _ = self.tx.send(Out::Frame(Frame::Descriptor(d)));
+        self.queues.push(|q| q.data.push_back(Frame::Descriptor(d)));
     }
 }
 
@@ -292,7 +366,7 @@ pub async fn serve(
     status.abort();
     let _ = pump.await;
     let _ = status.await;
-    let _ = writer.tx.send(Out::End);
+    writer.end();
     drop(writer);
     // Waited for off the runtime: a parent that stopped reading must not
     // stall a worker thread, and must not keep the worker alive either.
@@ -518,4 +592,96 @@ pub fn redirect_stdout_to_stderr() -> io::Result<RawFd> {
         return Err(e);
     }
     Ok(frames)
+}
+
+#[cfg(test)]
+mod tests {
+    use num_complex::Complex;
+
+    use super::*;
+    use crate::wire::read_frame;
+
+    /// A sink whose first write says it began on `began`, then waits for
+    /// `gate`, as a parent that has stopped reading holds the writer.
+    struct Held {
+        began: Option<std_mpsc::Sender<()>>,
+        gate: Option<std_mpsc::Receiver<()>>,
+        out: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for Held {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(b) = self.began.take() {
+                let _ = b.send(());
+            }
+            if let Some(g) = self.gate.take() {
+                let _ = g.recv();
+            }
+            self.out.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn block(n: u64) -> IqBlock {
+        IqBlock {
+            t0: Timestamp(n),
+            sample_rate_hz: Hz(2_000_000),
+            center_hz: Hz(100_000_000),
+            samples: vec![Complex::new(0.0, 0.0); 4096].into(),
+        }
+    }
+
+    fn status() -> Control {
+        Control::Status(Status {
+            fault: Some("marker".into()),
+            current: None,
+            gain: None,
+            stats: None,
+            transport_dropped: 0,
+            depth: None,
+        })
+    }
+
+    #[test]
+    fn a_control_frame_is_written_before_the_blocks_queued_ahead_of_it() {
+        let (began_tx, began) = std_mpsc::channel();
+        let (open, gate) = std_mpsc::channel();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let sink = Held {
+            began: Some(began_tx),
+            gate: Some(gate),
+            out: out.clone(),
+        };
+        let (writer, done) = Writer::start(sink).unwrap();
+        // Block 0 is taken and its write held; the queue then fills behind it.
+        assert!(writer.block(block(0)));
+        began.recv_timeout(Duration::from_secs(5)).unwrap();
+        for n in 1..MAX_QUEUED_BLOCKS as u64 {
+            assert!(writer.block(block(n)), "block {n}");
+        }
+        // Full: a block is dropped, as before.
+        assert!(!writer.block(block(999)));
+        writer.control(status());
+        open.send(()).unwrap();
+        writer.end();
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let bytes = out.lock().unwrap().clone();
+        let mut r = bytes.as_slice();
+        let mut order = Vec::new();
+        while let Some(f) = read_frame(&mut r).unwrap() {
+            order.push(match f {
+                Frame::Block(b) => format!("block {}", b.t0.0),
+                Frame::Control(Control::Status(_)) => "status".to_string(),
+                other => panic!("unexpected frame {other:?}"),
+            });
+        }
+        let mut want = vec!["block 0".to_string(), "status".to_string()];
+        want.extend((1..MAX_QUEUED_BLOCKS as u64).map(|n| format!("block {n}")));
+        assert_eq!(order, want);
+    }
 }
