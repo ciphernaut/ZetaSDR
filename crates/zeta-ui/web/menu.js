@@ -19,9 +19,10 @@
 //   FIT_KINDS, FIT_MIN_HZ, FIT_MIN_HZ_DEFAULT, FIT_FACTOR, FIT_TIMEOUT_MS, FIT_NOISE_SNR_DB,
 //   MEASURE_DC_MASK_HZ
 //       the fit of a demodulator entry (see Fitting below)
-//   fitBand(api, source, centerHz, bandwidthHz)
-//       -> Promise<{centerHz, bandwidthHz, label, snrDb, dialHz} | null>
-//       Starts a `measure` job on the band (api.op, so an OpError propagates), tails its
+//   fitBand(api, source, centerHz, bandwidthHz, applyOp = null, replace = [])
+//       -> Promise<{centerHz, bandwidthHz, label, snrDb, dialHz} | null | false>
+//       Starts a `measure` job on the band (api.op, so an OpError propagates; with `applyOp` the
+//       start goes through it and a start it could not apply gives false), tails its
 //       `event` stream (stream_tail, up to 3 frames within FIT_TIMEOUT_MS) and stops it
 //       (always). The frame used is the first whose payload has `partial: false`,
 //       else the last; null when no frame came, when its label is `noise`, or when it is
@@ -169,6 +170,7 @@
 // ssb_demod; their Decode and Transcribe entries alike) measure the box before starting. The
 // menu stays open, the box drawn and #ctx-footer reading `measuring…`, while fitBand runs on
 // the selection's centre and bandwidth; then the menu closes and:
+//   - false (the measure would not start; applyOp noted it, a conflict with its retry): nothing starts;
 //   - fitBand threw: the note `<kind>: <message>` (an error line) and nothing starts;
 //   - null (noise, a weak unknown, no event): the job starts with the tuning above
 //     (jobTuning) and, once it started, the note reads `no signal found in <lo>-<hi> MHz;
@@ -400,9 +402,11 @@ export function jobTuning(action, s) {
   return { centerHz: s.centerHz, bandwidthHz: s.bandwidthHz };
 }
 
-// Measures a band with a short `measure` job; the fit, or null when there is no signal.
-export async function fitBand(api, source, centerHz, bandwidthHz) {
-  const r = await api.op({
+// Measures a band with a short `measure` job; the fit, or null when there is no signal. With
+// `applyOp` the start goes through it (a conflict gets its stop-and-retry line there) and a
+// start it could not apply returns false, already reported; without it a failed start throws.
+export async function fitBand(api, source, centerHz, bandwidthHz, applyOp = null, replace = []) {
+  const start = {
     op: "job_start",
     kind: "measure",
     source,
@@ -411,8 +415,10 @@ export async function fitBand(api, source, centerHz, bandwidthHz) {
     deviation_hz: null,
     sideband: null,
     elastic: false,
-    replace: [],
-  });
+    replace,
+  };
+  const r = applyOp ? await applyOp(start) : await api.op(start);
+  if (!r) return false;
   const id = r.value;
   let frames = [];
   try {
@@ -772,15 +778,24 @@ class Menu {
   async chooseOutline(action) {
     const job = this.outlineJob;
     if (!job || this.fitting !== null) return;
+    if (action === "fit") return this.fitOutline(job);
+    await this.chooseOutlineAction(action, job);
+  }
+
+  // Fit to signal on a running job's band. A conflict on the measure start gets the usual
+  // stop-and-retry line, whose retry runs this whole fit again with the holders `replace`d.
+  async fitOutline(job, replace = []) {
     const t = job.tuning;
-    if (action === "fit") {
+    {
       const token = ++this.fitGen;
       this.setFitting(token);
       const kind = job.kind;
       let fit;
       let error = null;
+      const start = (op) =>
+        this.applyOp(op, { retry: (holders) => this.fitOutline(job, holders) });
       try {
-        fit = await fitBand(this.ov.api, job.source, t.center_hz, t.bandwidth_hz);
+        fit = await fitBand(this.ov.api, job.source, t.center_hz, t.bandwidth_hz, start, replace);
       } catch (e) {
         error = e;
       }
@@ -791,6 +806,8 @@ class Menu {
       this.closeOutline();
       if (error) {
         this.t.note(`${kind}: ${error.message}`, true);
+      } else if (fit === false) {
+        // The measure would not start: applyOp already noted why (a conflict offers its retry).
       } else if (fit === null) {
         const lo = t.center_hz - t.bandwidth_hz / 2;
         const hi = t.center_hz + t.bandwidth_hz / 2;
@@ -814,6 +831,10 @@ class Menu {
       }
       return;
     }
+  }
+
+  async chooseOutlineAction(action, job) {
+    const t = job.tuning;
     this.closeOutline();
     if (action === "stop") {
       await this.applyOp({ op: "job_stop", job: job.id });
@@ -1045,7 +1066,7 @@ class Menu {
 
   // A demodulator entry (Decode or Transcribe): fit, then start (see Fitting); a Transcribe
   // entry attaches to the job after, as choose does.
-  async fitAndStart(action, s, job) {
+  async fitAndStart(action, s, job, replace = []) {
     this.footer.textContent = "measuring…";
     // While it runs, an SSB entry's hover no longer rewrites the footer and choose ignores
     // further choices; a close() meanwhile (Escape, a press outside, a new box) bumps fitGen.
@@ -1055,7 +1076,10 @@ class Menu {
     let fit;
     let error = null;
     try {
-      fit = await fitBand(this.ov.api, s.sourceId, s.centerHz, s.bandwidthHz);
+      // A conflict's retry runs this whole fit-and-start again with the holders `replace`d.
+      const start = (op) =>
+        this.applyOp(op, { retry: (holders) => this.fitAndStart(action, s, job, holders) });
+      fit = await fitBand(this.ov.api, s.sourceId, s.centerHz, s.bandwidthHz, start, replace);
     } catch (e) {
       error = e;
     }
@@ -1069,6 +1093,7 @@ class Menu {
       this.t.note(`${kind}: ${error.message}`, true);
       return;
     }
+    if (fit === false) return; // applyOp already noted why the measure would not start
     let r;
     if (fit === null) {
       const lo = s.centerHz - s.bandwidthHz / 2;

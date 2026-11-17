@@ -770,6 +770,68 @@ def scenario_fit_first_lands_on_the_tone(page, url, secret):
             stop_job(url, secret, j["id"])
 
 
+def scenario_fit_start_conflict_offers_replace(page, url, secret):
+    # The fit's measure start goes through applyOp: a conflict gets the usual stop-and-retry
+    # line (the node's answer is stubbed: a measure job shares what it can), and nothing
+    # starts. The retry runs the whole fit again with the holder `replace`d (the stub lets that
+    # second start through with no holder, as the node has none to stop): the measure job is
+    # stopped again and the demodulator starts.
+    holder = "j-fitconflict"
+    sent = []
+    starts = []
+
+    def route(r):
+        body = r.request.post_data or ""
+        if '"job_start"' in body:
+            op = json.loads(body)
+            if op.get("kind") == "measure":
+                sent.append(op)
+                if len(sent) == 1:
+                    return r.fulfill(status=422, content_type="application/json",
+                                     body=json.dumps({
+                        "error": "conflict", "source": "tone", "holders": [holder],
+                        "current": {"center_hz": 100_000_000, "bandwidth_hz": 48_000},
+                        "options": []}))
+                return r.continue_(post_data=json.dumps(dict(op, replace=[])))
+            if op.get("kind") != "spectrum":  # the page's own spectrum jobs
+                starts.append(op)
+        return r.continue_()
+
+    page.route("**/op", route)
+    try:
+        menu = open_menu_on_tone(page, url, secret)
+        page.click('#ctx .ctx-item[data-action="fm_demod"]')
+        expect(menu).to_be_hidden(timeout=10_000)
+        line = page.locator("#transcript .line.error",
+                            has_text=re.compile(rf"conflict: source tone held by .*{holder}"))
+        expect(line).to_have_count(1, timeout=10_000)
+        retry = line.locator("button", has_text=re.compile(r"and retry$"))
+        expect(retry).to_have_count(1)
+        assert len(sent) == 1 and sent[0]["replace"] == [], sent
+        assert not running_jobs(url, secret, "fm_demod", "tone")
+        assert not starts, starts
+        retry.click()
+        # Poll through the page (not time.sleep): the route stub only runs while Playwright does.
+        for _ in range(75):
+            if running_jobs(url, secret, "fm_demod", "tone"):
+                break
+            page.wait_for_timeout(200)
+        else:
+            raise AssertionError(f"the retry did not start the demodulator: {sent} {starts}")
+        assert len(sent) == 2 and sent[1]["replace"] == [holder], sent
+        assert len(starts) == 1 and starts[0]["kind"] == "fm_demod", starts
+        for _ in range(25):
+            if not running_jobs(url, secret, "measure", "tone"):
+                break
+            page.wait_for_timeout(200)
+        else:
+            raise AssertionError("a measure job is left after the retry")
+    finally:
+        page.unroute("**/op", route)
+        for j in running_jobs(url, secret, "fm_demod", "tone"):
+            stop_job(url, secret, j["id"])
+
+
 def scenario_fit_first_without_a_signal_starts_at_the_box(page, url, secret):
     # Noise only: the fit finds no signal and the job starts at the box as drawn.
     select_source(page, url, secret, "quiet")

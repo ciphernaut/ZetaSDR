@@ -742,7 +742,7 @@ function noteRefusals(v) {
 // JSON, or null when it failed; with `{errors: true}` an error the node applied (not a
 // transport or validation failure) comes back as its JSON (`error`, ...) so the caller can
 // act on it (classify's `too_old` retry).
-async function applyOp(op, { errors = false } = {}) {
+async function applyOp(op, { errors = false, retry = null } = {}) {
   const t = state.transcript;
   if (!state.api) return null;
   let result = null;
@@ -758,7 +758,7 @@ async function applyOp(op, { errors = false } = {}) {
     if (op.op === "plan_start" || op.op === "set_start") noteRefusals(result && result.value);
   } catch (e) {
     if (notApplied(e)) t.note(`${op.op}: ${e.message}`, true);
-    else if (e.json && e.json.error === "conflict") await offerReplace(op, e.json);
+    else if (e.json && e.json.error === "conflict") await offerReplace(op, e.json, retry);
     if (errors && !notApplied(e)) result = e.json;
   }
   state.jobs?.refresh();
@@ -836,10 +836,11 @@ export function conflictActions(err, retry) {
 
 // The conflict line for `op` (refused with `err`), with its retry buttons when the op
 // takes `replace`. The job list is refreshed first so the holders' kinds are known.
-async function offerReplace(op, err) {
+// `retry(replace)` is what a retry button runs when the caller has more to redo than `op` alone.
+async function offerReplace(op, err, retry = null) {
   if (state.jobs) await state.jobs.refresh();
   const actions = REPLACEABLE.has(op.op)
-    ? conflictActions(err, (replace) => applyOp({ ...op, replace }))
+    ? conflictActions(err, retry ?? ((replace) => applyOp({ ...op, replace })))
     : [];
   state.transcript?.note(conflictText(err), true, actions);
 }
