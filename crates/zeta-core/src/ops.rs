@@ -2851,20 +2851,40 @@ pub struct BusySource {
 /// A source's IQ history, as `source_list` reports it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_ring_fields)]
 pub struct RingInfo {
     /// The history length the ring was sized to, in seconds.
     pub seconds: f64,
     /// Seconds of samples the ring holds: at most `seconds`, less while it fills
     /// and after a restart. Gaps inside it make the span from its oldest sample to
     /// its newest longer than this.
+    #[serde(default)]
     pub held_s: f64,
     /// Seconds of samples in the newest contiguous run (after the last gap): the
     /// longest "last N seconds" an `iq_read` can serve, since a read across a gap
     /// fails `gap`. Equals `held_s` when `gaps` is 0.
+    #[serde(default)]
     pub run_s: f64,
     /// The timestamp gaps inside the retained history; each splits it in two.
+    #[serde(default)]
     pub gaps: u32,
+}
+
+/// `held_s`, `run_s` and `gaps` default when parsed (a ring listed by an older node), but
+/// every node of this version writes them, so the published schema requires them.
+fn require_ring_fields(schema: &mut schemars::Schema) {
+    if let Some(req) = schema
+        .ensure_object()
+        .entry("required")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+    {
+        for field in ["held_s", "run_s", "gaps"] {
+            if !req.iter().any(|r| r == field) {
+                req.push(field.into());
+            }
+        }
+    }
 }
 
 /// A source's channel bank: its bin spacing and live subscribers.

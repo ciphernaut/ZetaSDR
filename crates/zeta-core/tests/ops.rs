@@ -2324,6 +2324,26 @@ async fn a_source_record_without_sweeps_still_parses() {
     assert_eq!(back, v[0]);
 }
 
+/// A ring from a node older than `held_s`, `run_s` and `gaps` still parses (a federated
+/// source listed by an older node); the schema still requires all three.
+#[test]
+fn a_ring_without_held_run_and_gaps_still_parses() {
+    let mut json = serde_json::json!({"seconds": 30.0, "held_s": 12.5, "run_s": 4.0, "gaps": 2});
+    for k in ["held_s", "run_s", "gaps"] {
+        json.as_object_mut().unwrap().remove(k).unwrap();
+    }
+    let back: zeta_core::ops::RingInfo = serde_json::from_value(json).unwrap();
+    assert_eq!(back.seconds, 30.0);
+    assert_eq!((back.held_s, back.run_s, back.gaps), (0.0, 0.0, 0));
+    let ri = &schema()["result"]["$defs"]["SourceInfo"]["properties"]["ring"];
+    for k in ["held_s", "run_s", "gaps"] {
+        assert!(
+            ri["required"].as_array().unwrap().contains(&k.into()),
+            "{ri}"
+        );
+    }
+}
+
 /// Every node of this version writes `sweeps`, so the result schema requires it.
 #[test]
 fn the_source_list_schema_requires_sweeps() {
