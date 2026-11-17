@@ -23,15 +23,24 @@ const CANDIDATES: &str = "candidates";
 
 /// How one query's run ended.
 enum Outcome {
-    Ok { rows: usize, ms: u128 },
+    Ok {
+        rows: usize,
+        ms: u128,
+    },
     Fail(String),
+    /// Not run, and nothing wrong: the band has no candidate to take a register id from.
+    Quiet(String),
+    /// Not run, and the check cannot say the query works: a defect to fix.
     Skipped(String),
 }
 
 /// Check the register's queries (only `only`'s, when given) at `signal` and print
 /// `<provider>/<id>: ok <rows> rows <ms> ms`, `... fail: <reason>` or
 /// `... skipped: <reason>` for each, then `<provider>: answer <ms> ms of <deadline> ms`
-/// for one whole answer from the station (from nowhere without one). A register that does
+/// for one whole answer from the station (from nowhere without one), and, after the
+/// queries, `<provider>: skipped <n> of <total> queries` when any was skipped (a skip
+/// is no failure only when the band is quiet: no candidate to take a register id from; any
+/// other skip, a query the check cannot run, fails). A register that does
 /// not answer its health read is `<provider>: unreachable: <reason>` alone. Exit 0 iff
 /// nothing failed; with no register configured, print `no register configured` and fail.
 pub async fn run(
@@ -80,10 +89,12 @@ pub async fn run(
     let mut rows = queries.for_provider(ACMA_PROVIDER);
     rows.sort_by_key(|q| q.id != CANDIDATES);
     let mut failed = false;
+    let (mut skipped, mut quiet, mut total) = (0usize, 0usize, 0usize);
     let mut candidates: Option<Result<Vec<Row>, String>> = None;
     for q in rows {
         let outcome = match values_for(q, &sample, candidates.as_ref()) {
-            Err(why) => Outcome::Skipped(why),
+            Err(Skip::Quiet(why)) => Outcome::Quiet(why),
+            Err(Skip::Defect(why)) => Outcome::Skipped(why),
             Ok(values) => {
                 let t = Instant::now();
                 let result = provider.run_query(&q.id, &values).await;
@@ -99,14 +110,29 @@ pub async fn run(
             }
         };
         let name = format!("{ACMA_PROVIDER}/{}", q.id);
+        total += 1;
         match outcome {
             Outcome::Ok { rows, ms } => println!("{name}: ok {rows} rows {ms} ms"),
             Outcome::Fail(why) => {
                 failed = true;
                 println!("{name}: fail: {why}");
             }
-            Outcome::Skipped(why) => println!("{name}: skipped: {why}"),
+            Outcome::Quiet(why) => {
+                quiet += 1;
+                println!("{name}: skipped: {why}");
+            }
+            Outcome::Skipped(why) => {
+                skipped += 1;
+                failed = true;
+                println!("{name}: skipped: {why}");
+            }
         }
+    }
+    if skipped + quiet > 0 {
+        println!(
+            "{ACMA_PROVIDER}: skipped {} of {total} queries ({quiet} quiet band, {skipped} not runnable)",
+            skipped + quiet
+        );
     }
 
     let t = Instant::now();
@@ -137,6 +163,15 @@ pub async fn run(
     }
 }
 
+/// Why a query is skipped.
+enum Skip {
+    /// The band has no candidate row to take a register id from: no failure.
+    Quiet(String),
+    /// The check cannot run the query (a candidates row without the column, a
+    /// parameter with no sample value, no candidates query, a failed one): a failure.
+    Defect(String),
+}
+
 /// The values `q` runs with: the sample signal's, and for a query that takes a register
 /// id, every parameter the first candidates row holding all its ids names (its
 /// `licence_no`, `site_id` and `center_hz`). `Err` says why the query is skipped.
@@ -144,7 +179,7 @@ fn values_for<'a>(
     q: &'a RegisterQuery,
     sample: &BTreeMap<&'static str, ParamValue>,
     candidates: Option<&Result<Vec<Row>, String>>,
-) -> Result<BTreeMap<&'a str, ParamValue>, String> {
+) -> Result<BTreeMap<&'a str, ParamValue>, Skip> {
     let mut values: BTreeMap<&str, ParamValue> =
         sample.iter().map(|(k, v)| (*k, v.clone())).collect();
     let ids: Vec<&str> = q
@@ -156,17 +191,27 @@ fn values_for<'a>(
     if !ids.is_empty() {
         let wanted = ids.join(", ");
         let rows = match candidates {
-            None => return Err(format!("no {CANDIDATES} run to take {wanted} from")),
-            Some(Err(_)) => return Err(format!("the {CANDIDATES} query failed: no {wanted}")),
+            None => {
+                return Err(Skip::Defect(format!(
+                    "no {CANDIDATES} run to take {wanted} from"
+                )));
+            }
+            Some(Err(_)) => {
+                return Err(Skip::Defect(format!(
+                    "the {CANDIDATES} query failed: no {wanted}"
+                )));
+            }
             Some(Ok(rows)) if rows.is_empty() => {
-                return Err(format!("the {CANDIDATES} query returned no {wanted}"));
+                return Err(Skip::Quiet(format!(
+                    "the {CANDIDATES} query returned no {wanted}"
+                )));
             }
             Some(Ok(rows)) => rows,
         };
         let row = rows
             .iter()
             .find(|r| ids.iter().all(|id| id_of(r, id).is_some()))
-            .ok_or_else(|| format!("no {CANDIDATES} row holds {wanted}"))?;
+            .ok_or_else(|| Skip::Defect(format!("no {CANDIDATES} row holds {wanted}")))?;
         for p in &q.params {
             let v = match p.kind {
                 ParamKind::Id => id_of(row, &p.name).map(ParamValue::Id),
@@ -182,7 +227,7 @@ fn values_for<'a>(
         .iter()
         .find(|p| !values.contains_key(p.name.as_str()))
     {
-        Some(p) => Err(format!("no sample value for `{}`", p.name)),
+        Some(p) => Err(Skip::Defect(format!("no sample value for `{}`", p.name))),
         None => Ok(values),
     }
 }

@@ -114,6 +114,7 @@ fn every_builtin_query_passes_on_the_stub() {
     let (ms, deadline) = rest.split_once(" ms of ").expect(answer);
     ms.parse::<u64>().expect(answer);
     assert_eq!(deadline, "5000 ms", "{answer}");
+    assert!(!out.contains("skipped"), "{out}");
     assert_eq!(code, 0, "{out}");
 
     // Named, the provider checks the same; another name is not configured.
@@ -163,12 +164,76 @@ fn a_query_the_register_rejects_fails_by_name_and_exits_nonzero() {
         let l = line(&out, &format!("acma/{id}"));
         assert!(l.contains(": skipped: "), "{out}");
     }
+    assert!(
+        out.lines()
+            .any(|l| l == "acma: skipped 3 of 6 queries (0 quiet band, 3 not runnable)"),
+        "{out}"
+    );
     // The rest still answer.
     for id in ["area_devices", "plan_span"] {
         let q = format!("acma/{id}");
         assert!(ok_rows(line(&out, &q), &q).is_some(), "{out}");
     }
-    assert!(line(&out, "acma").starts_with("acma: answer "), "{out}");
+    assert!(out.lines().any(|l| l.starts_with("acma: answer ")), "{out}");
+    assert_ne!(code, 0, "{out}");
+}
+
+#[test]
+fn a_quiet_band_skips_the_id_queries_and_still_exits_zero() {
+    let url = acma_stub::serve_on_thread(rows(), Mode::Normal);
+    let dir = tempfile::tempdir().unwrap();
+    let (out, code) = run(zeta(dir.path()).args([
+        "--knowledge-acma",
+        &url,
+        "registers",
+        "check",
+        "--center-hz",
+        "900000000",
+    ]));
+    for id in ["licence_related", "site_channels", "link_far_end"] {
+        let l = line(&out, &format!("acma/{id}"));
+        assert!(l.contains(": skipped: "), "{out}");
+    }
+    assert!(
+        out.lines()
+            .any(|l| l == "acma: skipped 3 of 6 queries (3 quiet band, 0 not runnable)"),
+        "{out}"
+    );
+    assert_eq!(code, 0, "{out}");
+}
+
+#[test]
+fn a_candidates_row_without_the_ids_fails_the_check() {
+    let url = acma_stub::serve_on_thread(rows(), Mode::Normal);
+    let dir = tempfile::tempdir().unwrap();
+    let registers = dir.path().join("registers");
+    std::fs::create_dir_all(registers.join("acma")).unwrap();
+    let mine = json!({
+        "id": "candidates",
+        "provider": "acma",
+        "name": "A candidates query whose rows carry no register ids",
+        "call": "execute_sql",
+        "sql": "SELECT d.FREQUENCY AS center_hz FROM device_details d WHERE d.FREQUENCY BETWEEN {lo_hz} AND {hi_hz}",
+        "params": [
+            {"name": "lo_hz", "kind": "number"},
+            {"name": "hi_hz", "kind": "number"}
+        ],
+        "limit": 10,
+        "columns": ["center_hz"]
+    });
+    std::fs::write(
+        registers.join("acma/candidates.json"),
+        serde_json::to_string_pretty(&mine).unwrap(),
+    )
+    .unwrap();
+    let (out, code) = run(zeta(dir.path())
+        .arg("--registers-dir")
+        .arg(&registers)
+        .args(["--knowledge-acma", &url, "registers", "check"]));
+    assert!(
+        line(&out, "acma/licence_related").contains("no candidates row holds"),
+        "{out}"
+    );
     assert_ne!(code, 0, "{out}");
 }
 
