@@ -786,8 +786,13 @@ async fn a_rerun_of_a_stopped_job_replaces_its_predecessor() {
     let first = start_job(&node).await;
     node.job_stop(&first).await.unwrap();
     let again = start_job(&node).await;
-    // Running, the re-run takes no slot: its predecessor is still kept.
+    // Running, the re-run takes no slot: its predecessor is still kept, through a
+    // `graph_put` restart of the re-run too (briefly `stopped` inside it).
     assert_eq!(node.job_list().len(), 2);
+    node.job_graph_put(&again, graph("passthrough"))
+        .await
+        .unwrap();
+    assert_eq!(node.job_list().len(), 2, "{:?}", node.job_list());
     node.job_stop(&again).await.unwrap();
     let list = node.job_list();
     let ids: Vec<_> = list.iter().map(|r| r.id.clone()).collect();

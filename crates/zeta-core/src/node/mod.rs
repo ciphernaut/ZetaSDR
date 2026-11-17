@@ -848,7 +848,9 @@ impl Inner {
         // record of the same kind on the same source and band started after it ended
         // (two that ran side by side are no re-run of each other). Never one another
         // record names as its input or owner, one the heal of its source would relaunch,
-        // or one whose run has not released yet (as for an owned record above).
+        // or one whose run has not released yet (as for an owned record above). A record
+        // mid-restart (a `graph_put`'s, briefly `stopped`) takes no part: it runs again.
+        let in_play = |e: &JobEntry| is_terminal(e) && e.record.owner.is_none() && !e.restarting;
         let named: std::collections::HashSet<&JobId> = jobs
             .values()
             .flat_map(|e| e.record.input.iter().chain(e.record.owner.iter()))
@@ -864,10 +866,7 @@ impl Inner {
         }
         // Per band, the terminal record that started last.
         let mut last: HashMap<_, (Timestamp, &JobId)> = HashMap::new();
-        for e in jobs
-            .values()
-            .filter(|e| is_terminal(e) && e.record.owner.is_none())
-        {
+        for e in jobs.values().filter(|e| in_play(e)) {
             let this = (e.record.created_ns, &e.record.id);
             let kept = last.entry(key(e)).or_insert(this);
             if (this.0.0, this.1) > (kept.0.0, kept.1) {
@@ -880,8 +879,7 @@ impl Inner {
         };
         let replaced: Vec<JobId> = jobs
             .values()
-            .filter(|e| is_terminal(e) && e.record.owner.is_none())
-            .filter(|e| rerun(e))
+            .filter(|e| in_play(e) && rerun(e))
             .filter(|e| !named.contains(&e.record.id) && !self.keep_from_prune(jobs, e))
             .filter(|e| e.cancel.is_none() && (e.released || e.run == 0))
             .map(|e| e.record.id.clone())
