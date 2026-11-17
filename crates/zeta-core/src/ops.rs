@@ -80,11 +80,12 @@ pub enum Op {
     /// `source_measure`); and `starting`, what a worker not yet live is doing
     /// (`what` `measuring`, `detail`, `step` of `of`, `eta_ms`: the most time left),
     /// `null` otherwise;
-    /// `null` for a source that runs in the node), and `ring`, the IQ history (`seconds`
-    /// sized to, `held_s` held now, `run_s` of it in the newest run, `gaps` in it, `null` before the first block; a
-    /// `classify` or `iq_read` span older than it fails `too_old`, one across a gap in
-    /// the capture `gap`), and `position` `{lat, lon, alt_m, from}` (`from` `status` when the
-    /// source reported it, `configured` from `--source-position`) where the source knows
+    /// `null` for a source that runs in the node), and `ring`, the IQ history
+    /// (`seconds` sized to, `held_s` held now, `run_s` of it in the newest run, `gaps` in
+    /// it; `null` before the first block; a `classify` or `iq_read` span older than it
+    /// fails `too_old`, one across a gap in the capture `gap`), and `position`
+    /// `{lat, lon, alt_m, from}` (`from` `status` when the source reported it,
+    /// `configured` from `--source-position`) where the source knows
     /// where it is, `null` otherwise, and `sweeps`, the scans the source is sweeping for
     /// by its own means, which hold no band and are never among `holders` (`sweeps` is
     /// always an array, empty when none). A source can sweep when `capabilities.sweep`

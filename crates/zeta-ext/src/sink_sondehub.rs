@@ -5,12 +5,13 @@
 //! `batch_ms` sends what it collected as one `PUT` of a JSON array to `url`, each
 //! element in SondeHub's v2 telemetry shape with the station's callsign and position;
 //! a stop (a restart of the job, a retune) sends what it collected first, waiting at most
-//! 2 s for it (a batch not answered by then counts `failed`, as any other). It has no outputs. After every batch the job's context holds
-//! `sondehub = {sent, failed, last_error}`: a non-2xx answer or a transport error counts
-//! `failed` once (the batch is dropped, never retried) and sets `last_error`; the next
-//! batch still goes. Events of any other protocol, or without a position, a `datetime`, a
-//! `frame` or a numeric altitude (SondeHub rejects those), are skipped, so `failed` counts
-//! transport trouble only.
+//! 2 s for it (a batch not answered by then counts `failed`, as any other). It has no
+//! outputs. After every batch the job's context holds `sondehub = {sent, failed,
+//! last_error}`: a non-2xx answer or a transport error counts `failed` once
+//! (the batch is dropped, never retried) and sets `last_error`; the next batch still
+//! goes. Events of any other protocol, or without a position, a `datetime`, a `frame` or a
+//! numeric altitude (SondeHub rejects those), are skipped, so `failed` counts transport
+//! trouble only.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

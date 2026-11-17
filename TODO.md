@@ -123,7 +123,7 @@ From the B210 CB run, 2026-11-01 (plan series "Plan 18 status"). A ch9 transmiss
 
 ## UI: the classify retry knows only `too_old`
 
-The page's classify retry (`menu.js` `reclassify`, about lines 984-1028) handles `too_old` alone: a `gap` from the ring (a span that crosses a break in the capture) shows as a plain error, and the retry from `earliest_ns` can itself cross a gap. It could start from the newest run instead, and the footer's `ring N s` could show `ring.run_s`.
+The page's classify retry (`menu.js`, the `reclassify` function) handles `too_old` alone: a `gap` from the ring (a span that crosses a break in the capture) shows as a plain error, and the retry from `earliest_ns` can itself cross a gap. It could start from the newest run instead, and the footer's `ring N s` could show `ring.run_s`.
 
 ## UI: repeated Fit to signal walks the width down to the floor
 
