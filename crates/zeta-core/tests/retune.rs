@@ -723,6 +723,127 @@ async fn a_retune_to_the_same_band_restarts_the_job_and_keeps_its_tuning() {
     assert_eq!(node.debug_stage_count(), n);
 }
 
+/// A job a controller started (its record's `owner`, as a watch's identify run and its
+/// trial child carry) is neither retuned nor stopped by the caller while the owner runs:
+/// both are refused naming the owner, the job left running. Once the owner has stopped,
+/// a record it left behind can still be stopped. The owner is written into the record
+/// on disk between two opens, as no op sets it.
+#[tokio::test]
+async fn a_job_a_controller_owns_is_neither_retuned_nor_stopped_while_its_owner_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let band = t(100_000_000, 12_500);
+    let (owner, child) = {
+        let (node, _radio) = open(dir.path()).await;
+        let owner = start(&node, JobKind::Spectrum, t(100_000_000, 1_000_000)).await;
+        let child = start(&node, JobKind::FmDemod, band).await;
+        (owner, child)
+    };
+    // The first node's supervisors see its shutdown and leave the records `running`.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let path = dir.path().join(format!("state/jobs/{}.json", child.0));
+    let mut rec: JobRecord = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    rec.owner = Some(owner.clone());
+    std::fs::write(&path, serde_json::to_vec(&rec).unwrap()).unwrap();
+
+    let (node, _radio) = open(dir.path()).await;
+    assert_eq!(record(&node, &child).state, JobState::Running);
+    assert_eq!(
+        retune(&node, &child, 100_050_000, 12_500, &[]).await,
+        Err(other(format!(
+            "job {} is run by spectrum {}: stop that job, or start a new one",
+            child.0, owner.0
+        )))
+    );
+    assert_eq!(record(&node, &child).tuning, band);
+    assert_eq!(
+        node.apply(Op::JobStop { job: child.clone() }).await,
+        Err(other(format!(
+            "job {} is run by spectrum {}: stop that job",
+            child.0, owner.0
+        )))
+    );
+    assert_eq!(record(&node, &child).state, JobState::Running);
+    stop(&node, &owner).await;
+    stop(&node, &child).await;
+    assert!(
+        node.job_list()
+            .iter()
+            .all(|r| r.id != child || r.state != JobState::Running)
+    );
+}
+
+/// Rewrite `id`'s record on disk under `dir` with `owner` and `state`, between opens.
+fn own_on_disk(dir: &Path, id: &JobId, owner: &JobId, state: JobState) {
+    let path = dir.join(format!("state/jobs/{}.json", id.0));
+    let mut rec: JobRecord = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    rec.owner = Some(owner.clone());
+    rec.state = state;
+    std::fs::write(&path, serde_json::to_vec(&rec).unwrap()).unwrap();
+}
+
+/// A job a controller started cannot be stopped through another request's `replace`,
+/// nor its graph replaced by `graph_put`, while its owner runs: both are refused naming
+/// the owner, the job left as it was. Once the owner has ended a retune is refused
+/// without pointing at the owner.
+#[tokio::test]
+async fn replace_and_graph_put_of_a_job_a_controller_owns_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let band = t(100_000_000, 12_500);
+    let (owner, child) = {
+        let (node, _radio) = open(dir.path()).await;
+        let owner = start(&node, JobKind::Spectrum, t(100_000_000, 1_000_000)).await;
+        let child = start(&node, JobKind::FmDemod, band).await;
+        (owner, child)
+    };
+    // The first node's supervisors see its shutdown and leave the records `running`.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    own_on_disk(dir.path(), &child, &owner, JobState::Running);
+
+    let (node, _radio) = open(dir.path()).await;
+    let by = format!("job {} is run by spectrum {}", child.0, owner.0);
+    let op = Op::JobStart {
+        kind: JobKind::FmDemod,
+        source: SourceId(RADIO.into()),
+        center_hz: Hz(100_300_000),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz: None,
+        sideband: None,
+        dwell_ms: None,
+        average: None,
+        bits: None,
+        method: None,
+        bin_hz: None,
+        audio_policy: None,
+        elastic: false,
+        replace: vec![child.clone()],
+    };
+    assert_eq!(
+        node.apply(op).await,
+        Err(other(format!("{by}: stop that job")))
+    );
+    assert_eq!(record(&node, &child).state, JobState::Running);
+    let graph = record(&node, &child).graph;
+    // Its own graph again: a restart under its id, were it anyone's job.
+    assert_eq!(
+        node.apply(Op::GraphPut {
+            job: child.clone(),
+            graph: graph.clone(),
+        })
+        .await,
+        Err(other(format!("{by}: stop that job, or start a new one")))
+    );
+    assert_eq!(record(&node, &child).graph, graph);
+    stop(&node, &owner).await;
+    assert_eq!(
+        retune(&node, &child, 100_050_000, 12_500, &[]).await,
+        Err(other(format!(
+            "job {} was started by spectrum {}, which is not running: stop it, or start a new job",
+            child.0, owner.0
+        )))
+    );
+    stop(&node, &child).await;
+}
+
 /// The next frame on the `ops` stream, with its event payload.
 async fn next(rx: &mut broadcast::Receiver<Frame>) -> (Frame, serde_json::Value) {
     let f = tokio::time::timeout(Duration::from_secs(5), rx.recv())

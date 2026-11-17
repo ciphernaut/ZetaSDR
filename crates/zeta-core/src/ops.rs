@@ -353,8 +353,14 @@ pub enum Op {
     /// (elastic or rigid), `mix` (it has no band), a `graph_start` job (it runs on no
     /// radio) and `transcribe` (attached: retune its
     /// input), and for a job whose graph an operator `graph_put` replaced (it launches as stored: put a new
-    /// graph or start a new job). A job that is not running is `job <id> is <state>`; an
-    /// unknown id is `unknown`. The result is the job's id, as `job_start` answers.
+    /// graph or start a new job). A job a controller started (its `owner`: a watch's
+    /// identify run or its trial) is refused naming the owner, `job <id> is run by <kind>
+    /// <owner>: stop that job, or start a new one` (once the owner has ended, `job <id>
+    /// was started by <kind> <owner>, which is not running: stop it, or start a new
+    /// job`); a `replace` naming one while its owner runs is refused as `job <id> is run
+    /// by <kind> <owner>: stop that job`. A job that is not running is `job
+    /// <id> is <state>`; an unknown id is `unknown`. The result is the job's id, as
+    /// `job_start` answers.
     ///
     /// A `scan` its source sweeps for itself (`job_context.scan.method` `source`) is
     /// re-aimed instead: under the source's gate the source's running sweep moves to the
@@ -639,7 +645,8 @@ pub enum Op {
         job: JobId,
     },
     /// Replace a job's graph; restarts a running job under the same id with
-    /// the new graph.
+    /// the new graph. A job a controller started (its `owner`) is refused naming the
+    /// owner, as on `job_retune`.
     GraphPut {
         job: JobId,
         graph: Graph,
@@ -3893,6 +3900,40 @@ fn unknown_job(node: &Node, job: &JobId) -> OpError {
     }
 }
 
+/// The refusal of a `job_retune` or `graph_put` (`stop` false) or a `job_stop` (`stop`
+/// true) of `job` when a controller started it (its record's `owner`: a watch's identify
+/// run or that run's trial child): the controller's dwell is not the caller's to spoil,
+/// so the caller is pointed at the owner. A stop is refused only while both run, so a
+/// stop of one that ended is the usual no-op and a record its owner left behind can
+/// still be stopped; a retune of such a record is refused without naming the owner as
+/// the job to stop.
+fn owned_refusal(node: &Node, job: &JobId, stop: bool) -> Option<OpError> {
+    let jobs = node.job_list();
+    let rec = jobs.iter().find(|r| &r.id == job)?;
+    let owner = rec.owner.as_ref()?;
+    let owner_rec = jobs.iter().find(|r| &r.id == owner);
+    let by = match owner_rec {
+        Some(r) => format!("{} {}", r.kind, owner.0),
+        None => format!("job {}", owner.0),
+    };
+    let owner_runs = owner_rec.is_some_and(|r| r.state == JobState::Running);
+    match (stop, owner_runs) {
+        (true, true) if rec.state == JobState::Running => Some(other(format!(
+            "job {} is run by {by}: stop that job",
+            job.0
+        ))),
+        (true, _) => None,
+        (false, true) => Some(other(format!(
+            "job {} is run by {by}: stop that job, or start a new one",
+            job.0
+        ))),
+        (false, false) => Some(other(format!(
+            "job {} was started by {by}, which is not running: stop it, or start a new job",
+            job.0
+        ))),
+    }
+}
+
 fn port_error(e: PortError) -> OpError {
     match e {
         PortError::OutOfRange {
@@ -4942,11 +4983,14 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             .map(OpResult::Job)
             .map_err(|e| node_error(node, e)),
         Op::JobList {} => Ok(OpResult::Jobs(node.job_list())),
-        Op::JobStop { job } => node
-            .job_stop(&job)
-            .await
-            .map(|()| OpResult::Ok)
-            .map_err(|e| node_error(node, e)),
+        Op::JobStop { job } => match owned_refusal(node, &job, true) {
+            Some(e) => Err(e),
+            None => node
+                .job_stop(&job)
+                .await
+                .map(|()| OpResult::Ok)
+                .map_err(|e| node_error(node, e)),
+        },
         Op::JobsStop { source, kind, plan } => jobs_stop(node, source, kind, plan).await,
         Op::JobContext { job } => node
             .job_context(&job)
@@ -4969,11 +5013,14 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             .find(|r| r.id == job)
             .map(|r| OpResult::Graph(r.graph))
             .ok_or_else(|| unknown_job(node, &job)),
-        Op::GraphPut { job, graph } => node
-            .job_graph_put(&job, graph)
-            .await
-            .map(|()| OpResult::Ok)
-            .map_err(|e| node_error(node, e)),
+        Op::GraphPut { job, graph } => match owned_refusal(node, &job, false) {
+            Some(e) => Err(e),
+            None => node
+                .job_graph_put(&job, graph)
+                .await
+                .map(|()| OpResult::Ok)
+                .map_err(|e| node_error(node, e)),
+        },
         Op::GraphStart { graph } => node
             .graph_start(graph)
             .await
@@ -6778,6 +6825,9 @@ async fn job_retune(
     let Some(rec) = node.job_list().into_iter().find(|r| r.id == job) else {
         return Err(unknown_job(node, &job));
     };
+    if let Some(e) = owned_refusal(node, &job, false) {
+        return Err(e);
+    }
     if rec.kind == JobKind::Scan.name() {
         return scan_retune(node, rec, center_hz, bandwidth_hz, bin_hz, replace).await;
     }

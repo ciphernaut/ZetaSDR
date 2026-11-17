@@ -3014,8 +3014,23 @@ impl Inner {
     ) -> Result<(), NodeError> {
         self.leases.assert_gate(source, guard);
         for id in replace {
-            if !self.jobs.lock().unwrap().contains_key(id) {
-                return Err(NodeError::UnknownJob(id.clone()));
+            {
+                let jobs = self.jobs.lock().unwrap();
+                let Some(e) = jobs.get(id) else {
+                    return Err(NodeError::UnknownJob(id.clone()));
+                };
+                // A job a running controller started is the controller's to stop: the
+                // operator's choice is the owner (as `job_stop` refuses it).
+                if let Some(owner) = &e.record.owner
+                    && let Some(o) = jobs
+                        .get(owner)
+                        .filter(|o| o.record.state == JobState::Running)
+                {
+                    return Err(NodeError::Other(format!(
+                        "job {} is run by {} {}: stop that job",
+                        id.0, o.record.kind, owner.0
+                    )));
+                }
             }
             if !self.leases.holders(source).iter().any(|(j, _)| j == id) {
                 return Err(NodeError::Other(format!(
