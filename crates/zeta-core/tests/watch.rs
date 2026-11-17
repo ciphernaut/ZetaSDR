@@ -1274,14 +1274,19 @@ async fn owned_jobs_never_take_a_history_slot() {
     let dir = tempfile::tempdir().unwrap();
     let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
     let node = Arc::new(node);
-    // A full history of the operator's own stopped jobs.
+    // A full history of the operator's own stopped jobs, each on a band of its own (so
+    // none replaces another as its re-run).
     let mut mine = Vec::new();
-    for _ in 0..zeta_core::node::JOB_HISTORY_MAX {
+    for i in 0..zeta_core::node::JOB_HISTORY_MAX {
+        let band = Tuning {
+            bandwidth_hz: Hz(capture().bandwidth_hz.0 - i as u64),
+            ..capture()
+        };
         let g = JobKind::Passthrough
-            .expand(&rx(), capture(), Hz(0), None, None, None, &node.modes())
+            .expand(&rx(), band, Hz(0), None, None, None, &node.modes())
             .unwrap();
         let id = node
-            .job_start("passthrough", rx(), capture(), g, None, false)
+            .job_start("passthrough", rx(), band, g, None, false)
             .await
             .unwrap();
         node.job_stop(&id).await.unwrap();

@@ -611,8 +611,19 @@ async fn elastic_start_while_a_scan_stops_the_others_is_stopped_too() {
         Ok(OpResult::Job(id)) => id,
         other => panic!("expected the scan to start, got {other:?}"),
     };
+    assert_eq!(record(&node, &second).state, JobState::Stopped);
+    // The first is stopped too, or gone from the history: the second, started on the same
+    // capture once the first's record had ended, is its re-run and takes its slot.
+    let first_state = node
+        .job_list()
+        .into_iter()
+        .find(|r| r.id == first)
+        .map(|r| r.state);
+    assert!(
+        matches!(first_state, None | Some(JobState::Stopped)),
+        "{first_state:?}"
+    );
     for id in [&first, &second] {
-        assert_eq!(record(&node, id).state, JobState::Stopped, "{id:?}");
         assert!(streams(&node, id).is_empty(), "{id:?}");
     }
     let s = source(&node).await;

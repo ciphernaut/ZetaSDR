@@ -777,6 +777,14 @@ async fn identify_resumed_after_a_restart_stops_its_stale_child() {
         .expect("identify's event stream")
         .id;
     let mut events = node.bus().subscribe(&stream).expect("subscribed");
+    // The stale child's state, `None` once its record is gone: a later trial child on its
+    // band is its re-run and takes its history slot.
+    let child_state = || {
+        node.job_list()
+            .into_iter()
+            .find(|r| r.id == child)
+            .map(|r| r.state)
+    };
     // No samples yet: the stale child ends all the same, and its lease with it. Its state
     // turns before its lease is released, so wait for both (a leaked lease never gets there).
     let holders = || -> Vec<JobId> {
@@ -788,7 +796,7 @@ async fn identify_resumed_after_a_restart_stops_its_stale_child() {
     until(
         "the stale child ends and only identify holds the radio",
         Duration::from_secs(3),
-        || state(&node, &child) != JobState::Running && holders() == [id.clone()],
+        || child_state() != Some(JobState::Running) && holders() == [id.clone()],
     )
     .await;
     assert_eq!(state(&node, &id), JobState::Running);
@@ -813,7 +821,7 @@ async fn identify_resumed_after_a_restart_stops_its_stale_child() {
     .await
     .expect("a candidate from the resumed identify");
     assert_eq!(first["protocol"], "candidate", "{first}");
-    assert_ne!(state(&node, &child), JobState::Running);
+    assert_ne!(child_state(), Some(JobState::Running));
     stop_all(&node).await;
 }
 

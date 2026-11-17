@@ -172,8 +172,10 @@ pub enum NodeError {
 
 /// How many stopped or failed job records the node keeps: when a job ends
 /// and more than this many are terminal, the oldest beyond the cap are
-/// forgotten and their files removed. Running jobs are never counted.
-pub const JOB_HISTORY_MAX: usize = 20;
+/// forgotten and their files removed. Running jobs are never counted. A re-run
+/// (the same kind on the same source and band) takes its predecessor's slot
+/// rather than a new one.
+pub const JOB_HISTORY_MAX: usize = 50;
 
 /// How long [`Node::replace_holders`] waits, holding the source's gate, for a
 /// stopped job's lease to go.
@@ -807,7 +809,8 @@ impl Inner {
         Ok(())
     }
 
-    /// Forget the terminal records that ended earliest beyond
+    /// Forget the terminal records that a later re-run replaced (the same kind on the
+    /// same source and band, started after it ended), then those that ended earliest beyond
     /// [`JOB_HISTORY_MAX`], removing their files (best effort: a file that
     /// will not go is retried at the next prune). Called with `jobs` locked
     /// after a record turns terminal; that record ended last, so it survives.
@@ -828,6 +831,51 @@ impl Inner {
             .map(|e| e.record.id.clone())
             .collect();
         for id in owned {
+            self.forget(jobs, &id);
+        }
+        // A re-run takes its predecessor's slot: a terminal record goes once a terminal
+        // record of the same kind on the same source and band started after it ended
+        // (two that ran side by side are no re-run of each other). Never one another
+        // record names as its input or owner, one the heal of its source would relaunch,
+        // or one whose run has not released yet (as for an owned record above).
+        let named: std::collections::HashSet<&JobId> = jobs
+            .values()
+            .flat_map(|e| e.record.input.iter().chain(e.record.owner.iter()))
+            .collect();
+        fn key(e: &JobEntry) -> (&str, &SourceId, u64, u64) {
+            let r = &e.record;
+            (
+                &r.kind,
+                &r.source,
+                r.tuning.center_hz.0,
+                r.tuning.bandwidth_hz.0,
+            )
+        }
+        // Per band, the terminal record that started last.
+        let mut last: HashMap<_, (Timestamp, &JobId)> = HashMap::new();
+        for e in jobs
+            .values()
+            .filter(|e| is_terminal(e) && e.record.owner.is_none())
+        {
+            let this = (e.record.created_ns, &e.record.id);
+            let kept = last.entry(key(e)).or_insert(this);
+            if (this.0.0, this.1) > (kept.0.0, kept.1) {
+                *kept = this;
+            }
+        }
+        let rerun = |e: &JobEntry| {
+            last.get(&key(e))
+                .is_some_and(|(started, id)| *id != &e.record.id && started.0 >= e.ended_ns.0)
+        };
+        let replaced: Vec<JobId> = jobs
+            .values()
+            .filter(|e| is_terminal(e) && e.record.owner.is_none())
+            .filter(|e| rerun(e))
+            .filter(|e| !named.contains(&e.record.id) && !self.keep_from_prune(jobs, e))
+            .filter(|e| e.cancel.is_none() && (e.released || e.run == 0))
+            .map(|e| e.record.id.clone())
+            .collect();
+        for id in replaced {
             self.forget(jobs, &id);
         }
         let terminal: Vec<&JobEntry> = jobs

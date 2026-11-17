@@ -344,6 +344,30 @@ async fn attached_job_stops_when_input_stops() {
     assert!(streams_of(&node, &id).is_empty(), "streams unregistered");
 }
 
+/// A stopped input an attached record names is kept when a re-run of it (the same kind
+/// on the same source and band) stops: the re-run takes a slot of its own.
+#[tokio::test]
+async fn a_rerun_never_replaces_an_input_an_attached_record_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let input = start_audio(&node).await;
+    let id = attach_ok(&node, &input).await;
+    node.job_stop(&input).await.unwrap();
+    assert_eq!(wait_not_running(&node, &id, 1000).await, JobState::Stopped);
+    let rerun = start_audio(&node).await;
+    node.job_stop(&rerun).await.unwrap();
+    let mut ids: Vec<_> = node.job_list().into_iter().map(|r| r.id).collect();
+    ids.sort();
+    let mut want = vec![input.clone(), id.clone(), rerun];
+    want.sort();
+    assert_eq!(ids, want);
+    assert_eq!(record(&node, &id).input, Some(input));
+}
+
 /// The attached job follows a `graph_put` restart of its input: relaunched under its
 /// own id on the input's new stream, never `Stopped`.
 #[tokio::test]

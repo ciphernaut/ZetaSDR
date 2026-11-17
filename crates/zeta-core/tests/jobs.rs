@@ -82,16 +82,30 @@ fn on_disk(dir: &Path, id: &JobId) -> JobRecord {
 }
 
 async fn start_job(node: &Node) -> JobId {
+    start_job_at(node, tuning()).await
+}
+
+/// A `monitor` job on `band` (inside the capture: [`tuning`] or narrower).
+async fn start_job_at(node: &Node, band: Tuning) -> JobId {
     node.job_start(
         "monitor",
         SourceId("file0".into()),
-        tuning(),
+        band,
         graph("passthrough"),
         None,
         false,
     )
     .await
     .unwrap()
+}
+
+/// The `i`th of a run of distinct bands inside the capture: [`tuning`] `i` Hz narrower,
+/// so no two of them are one job re-run.
+fn nth_band(i: usize) -> Tuning {
+    Tuning {
+        bandwidth_hz: Hz(tuning().bandwidth_hz.0 - i as u64),
+        ..tuning()
+    }
 }
 
 #[tokio::test]
@@ -666,7 +680,8 @@ async fn idle_fires_only_when_the_last_holder_stops() {
 }
 
 /// Stopped jobs are history: only the newest `JOB_HISTORY_MAX` terminal
-/// records survive, in memory and on disk; a running job is never pruned.
+/// records survive, in memory and on disk; a running job is never pruned. (Each on a
+/// band of its own, so none replaces another as its re-run.)
 #[tokio::test]
 async fn stopped_jobs_beyond_the_history_cap_are_forgotten() {
     use zeta_core::node::JOB_HISTORY_MAX;
@@ -678,8 +693,8 @@ async fn stopped_jobs_beyond_the_history_cap_are_forgotten() {
     src.start();
     let keep = start_job(&node).await;
     let mut stopped = Vec::new();
-    for _ in 0..JOB_HISTORY_MAX + 3 {
-        let id = start_job(&node).await;
+    for i in 0..JOB_HISTORY_MAX + 3 {
+        let id = start_job_at(&node, nth_band(i + 1)).await;
         node.job_stop(&id).await.unwrap();
         stopped.push(id);
     }
@@ -725,6 +740,7 @@ async fn stopped_jobs_beyond_the_history_cap_are_forgotten() {
             id: id.clone(),
             state: JobState::Stopped,
             created_ns: Timestamp(i as u64 + 1),
+            tuning: nth_band(i + 1),
             ..on_disk(dir.path(), &stopped[4])
         };
         std::fs::write(
@@ -749,4 +765,81 @@ async fn stopped_jobs_beyond_the_history_cap_are_forgotten() {
     }
     assert!(jobs_dir.join(format!("{}.json", stopped[3].0)).exists());
     assert!(list.iter().any(|r| r.id == stopped[3]));
+}
+
+/// The node keeps the 50 newest terminal records.
+#[test]
+fn the_history_cap_is_50() {
+    assert_eq!(zeta_core::node::JOB_HISTORY_MAX, 50);
+}
+
+/// A stopped job's re-run (the same kind on the same source and band) takes its
+/// predecessor's history slot once it stops: the older record and its file go.
+#[tokio::test]
+async fn a_rerun_of_a_stopped_job_replaces_its_predecessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let first = start_job(&node).await;
+    node.job_stop(&first).await.unwrap();
+    let again = start_job(&node).await;
+    // Running, the re-run takes no slot: its predecessor is still kept.
+    assert_eq!(node.job_list().len(), 2);
+    node.job_stop(&again).await.unwrap();
+    let list = node.job_list();
+    let ids: Vec<_> = list.iter().map(|r| r.id.clone()).collect();
+    assert_eq!(ids, vec![again.clone()], "{list:?}");
+    let jobs_dir = dir.path().join("state").join("jobs");
+    assert!(!jobs_dir.join(format!("{}.json", first.0)).exists());
+    assert!(jobs_dir.join(format!("{}.json", again.0)).exists());
+    // Another kind, or another band, is no re-run.
+    let narrower = start_job_at(&node, nth_band(1)).await;
+    node.job_stop(&narrower).await.unwrap();
+    let other = node
+        .job_start(
+            "other",
+            SourceId("file0".into()),
+            tuning(),
+            graph("passthrough"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    node.job_stop(&other).await.unwrap();
+    let mut ids: Vec<_> = node.job_list().into_iter().map(|r| r.id).collect();
+    ids.sort();
+    let mut want = vec![again, narrower, other];
+    want.sort();
+    assert_eq!(ids, want);
+}
+
+/// A stranger's older stopped record survives any number of re-runs of another job:
+/// each re-run replaces its own predecessor, never the oldest record.
+#[tokio::test]
+async fn a_strangers_record_survives_reruns_of_another_job() {
+    use zeta_core::node::JOB_HISTORY_MAX;
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let stranger = start_job_at(&node, nth_band(1)).await;
+    node.job_stop(&stranger).await.unwrap();
+    // A test's job, run and stopped more times than the history holds.
+    let mut last = None;
+    for _ in 0..JOB_HISTORY_MAX + 5 {
+        let id = start_job(&node).await;
+        node.job_stop(&id).await.unwrap();
+        last = Some(id);
+    }
+    let mut ids: Vec<_> = node.job_list().into_iter().map(|r| r.id).collect();
+    ids.sort();
+    let mut want = vec![stranger, last.unwrap()];
+    want.sort();
+    assert_eq!(ids, want, "the stranger and the last re-run");
 }

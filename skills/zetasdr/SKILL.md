@@ -413,7 +413,7 @@ JSON: `{"op":"job_list"}`
 
 CLI: `zeta job list`
 
-Stopped and failed jobs are kept as history, newest 20 only (older ones are forgotten with their files); a running job is never dropped. Through `ask` (the agent transport) each record is returned without its `graph`; `graph_get` fetches one.
+Stopped and failed jobs are kept as history, newest 50 only (older ones are forgotten with their files); a re-run (the same kind on the same source and band) takes its predecessor's place rather than a slot of its own; a running job is never dropped. Through `ask` (the agent transport) each record is returned without its `graph`; `graph_get` fetches one.
 
 ### job_stop
 

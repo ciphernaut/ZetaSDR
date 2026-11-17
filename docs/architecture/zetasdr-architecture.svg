@@ -207,7 +207,7 @@
 <tspan x="439.5" dy="13.0">a job is a graph on a source band; persisted,</tspan>
 <tspan x="439.5" dy="13.0">resumed by serve (scan first, then widest</tspan>
 <tspan x="439.5" dy="13.0">first), run generation so a stopped run cannot</tspan>
-<tspan x="439.5" dy="13.0">outlive its job, history of 20. job_retune</tspan>
+<tspan x="439.5" dy="13.0">outlive its job, history of 50. job_retune</tspan>
 <tspan x="439.5" dy="13.0">relaunches a running job under its id on a new</tspan>
 <tspan x="439.5" dy="13.0">band, squelch, deviation and sideband carried.</tspan>
 <tspan x="439.5" dy="13.0">Attached jobs (transcribe) read another job's</tspan>

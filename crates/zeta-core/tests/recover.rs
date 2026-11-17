@@ -392,7 +392,8 @@ async fn a_record_failed_in_an_earlier_episode_is_not_recovered() {
         kind: "passthrough".into(),
         graph: one_node("passthrough", serde_json::json!({"kind": "iq"})),
         source: s(),
-        tuning: band(TONE_RATE_HZ),
+        // A band of its own: `b` below is no re-run of it.
+        tuning: band(TONE_RATE_HZ - 1),
         state: JobState::Failed {
             reason: format!("source s: {UNPLUGGED}"),
         },
@@ -435,9 +436,20 @@ async fn history_pruning_keeps_recoverable_records() {
     let a = start_passthrough(&node, "s").await;
     let b = start_passthrough(&node, "s").await;
     fault(&node, &port, &[&a, &b]).await;
-    // 23 more terminal records, each ending after the two recoverable ones.
-    for _ in 0..23 {
-        let id = start_passthrough(&node, "t").await;
+    // More terminal records than the cap holds, each ending after the two recoverable
+    // ones, each on a band of its own (none a re-run of another).
+    for i in 0..zeta_core::node::JOB_HISTORY_MAX + 1 {
+        let id = node
+            .job_start(
+                "passthrough",
+                SourceId("t".into()),
+                band(TONE_RATE_HZ - 1 - i as u64),
+                one_node("passthrough", serde_json::json!({"kind": "iq"})),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
         node.job_stop(&id).await.unwrap();
     }
     let list = node.job_list();
@@ -602,8 +614,9 @@ async fn a_port_that_cannot_heal_opens_no_episode_and_its_records_are_pruned() {
         .await
         .unwrap();
     src.start();
+    // More than the cap holds, all running at once (none a re-run of another).
     let mut jobs = Vec::new();
-    for _ in 0..25 {
+    for _ in 0..zeta_core::node::JOB_HISTORY_MAX + 5 {
         jobs.push(start_passthrough(&node, "n").await);
     }
     faultable.set_fault(Some(UNPLUGGED.into()));
