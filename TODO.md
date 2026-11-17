@@ -45,13 +45,9 @@ From the same run. At the 1 Msps UHF CB pin `stats.timeouts` climbs about 8 per 
 
 From plan 15's non-goals, 2026-10-31. A demodulator's or decoder's own capture centre sits on its channel, so the receiver's DC spike lands in the channel (the same problem the scan grid had; a one-off demod read it as a 59 dB carrier on 2026-10-23). Keeping the centre off the channel needs the lease manager to know the capture's minimum width before it tunes, which the capability record does not carry, and the offset depends on the notch width plan 15 measures (`SCAN_NOTCH_HZ`: its live acceptance's figure is this gist's input). Its own small plan after plan 15. Seen live 2026-11-01 on the B210: after `replace` moved the last fm_demod to 477.466 MHz the capture centred on it, putting the DC spike on the channel.
 
-## Bug: a refused `graph_put` persists its graph
-
-A `graph_put` that loses a race with another put on the same job returns an error, but its graph is already in the record (`graph_get` and a restart use it). Found in plan 14 review, pre-existing. Fix: under the jobs lock, refuse before persisting when the entry is `Running` again after this put's stop.
-
 ## Audio: the default `deviation_hz` on a 12.5 kHz channel
 
-The voice low-pass and de-emphasis shipped 2026-11-01 (`fm_demod` carries `audio_lowpass_hz` 3400 and `deemphasis_us` 530; the voice demodulators take `denoise: true`). Left, from the operator listening to a fitted ch9 demod on the B210: on a 12.5 kHz channel the default `deviation_hz` 5000 halves the audio level of a 2.5 kHz-deviation CB signal; the fit (or the channel plan) could set 2500 there.
+The voice low-pass and de-emphasis shipped 2026-11-01 (`fm_demod` carries `audio_lowpass_hz` 3400 and `deemphasis_us` 530; the voice demodulators take `denoise: true`). A channel plan now carries its channels' deviation (`uhf_cb_au` 2500, cleanup round 0), which `plan_start` and a set's plan members use when none is asked. Left: a demod started directly (the page's box menu, a fit, `job_start`) on a CB channel still takes the kind's 5000; it could take the deviation of a plan channel it lands on.
 
 ## Speech: a Whisper server over the network
 
@@ -73,17 +69,12 @@ Report the pilot's level (event or `job_context`), so "no pilot" (no station, or
 
 A per-input restart lock, so a `job_retune` or `graph_put` racing another restart of the same input cannot leave its attached job visibly `stopped`/`failed` for a few tens of ms. From plan 18's review, 2026-11-01.
 
-## Lease: job_start on an unheld radio tunes twice
+## Jobs: a conflict on a controller's child offers a retry that is refused
 
-`tune_if_unheld` and then `ensure_as`'s empty-held path each tune the radio. Harmless, but one tune too many. From plan 18's review, 2026-11-01.
-
-## Jobs: refuse job_retune on controller-owned jobs
-
-An `identify` run's trial children (and a watch's identify runs) are ordinary records with an `owner`, so the CLI or the agent can `job_retune` one mid-trial and spoil the controller's dwell. Refuse `rec.owner.is_some()` naming the owner, as `job_stop` should for the same reason. From plan 18's review, 2026-11-01.
-
-## UI: route the fit's measure start through applyOp
-
-`fitBand` starts its `measure` job with `api.op` directly, so a conflict on it gets a bare `<kind>: <message>` note and no "stop … and retry" button. Route it through `applyOp` (or reuse its conflict rendering) so the retry is offered as for every other start. From plan 18's review, 2026-11-01.
+Cleanup round 0 refuses `job_retune`, `graph_put`, `replace` and (while its owner runs) `job_stop` of a job a controller started, naming the owner. Left:
+- A conflict whose holder is such a child (a watch's identify trial or capture) still offers `retry with replace: [<child>]`, and the page draws it as a button; the retry is then refused naming the watch. The conflict should name the owner instead, but the lease manager does not know a holder's owner: it needs the owner registered with the lease at launch (`record_running`) and cleared on release, and the conflicts `ops.rs` builds itself (channelised, a set's busy and decide conflicts) covered too. A watch's trial may sit on a source the watch does not hold, so `replace: [<watch>]` there is refused as not holding the source: decide what the retry offers then.
+- A standalone `identify`'s trial children carry no `owner`, so they are not covered.
+- While a watch restarts for its own `graph_put` it is briefly stopped, and a `job_stop` of its child passes in that window; the next run then finds the child stopped rather than re-adopting it.
 
 ## Node: stream sockets are a fixed pool
 
@@ -116,7 +107,6 @@ Done in plan 30 (`docs/superpowers/specs/2026-11-06-aircraft-links-design.md`, `
 
 ## Aircraft links: deferred minors from plan 30
 
-- `adsb_decode` has no `subject.merge` yet (one line adds `["icao"]`).
 - ADS-C over the X.25/ATN half is not mapped.
 - The VDL2 fixture is unrecorded until UAT, and so is the HFDL one (Task 8 was skipped: no Kiwi reachable from the build shell).
 - The ADS-C tag wrapper is confirmed only on the fixture: the slot index varies (the map lists slots 0 and 1) and the altitude unit (feet) is from the ADS-C spec.
@@ -127,13 +117,13 @@ Done in plan 30 (`docs/superpowers/specs/2026-11-06-aircraft-links-design.md`, `
 - The `$center_khz` first-frame wait has no direct test.
 - A string that trims to "" is kept as "".
 - An older federated node refuses a plan-30 node's `source_list`: `--source-node` from an older binary rejects the unknown `position` field (as `ring` and `worker` did before it). Either both ends upgrade together, or `zeta-source-node` parses `SourceInfo` leniently.
-- `NodePort` (`crates/zeta-source-node`) does not forward a remote source's `position`: a one-line `Port::position` copying `remote.position`.
+- `NodePort` reads the remote source's `position` once, at open: a far Kiwi's GPS fix or a position set on the far node later is not seen until the source is reopened. A local `--source-position` wins over the relayed one.
 - The fake-program checks assert no `summary`, and HFDL's only the uplink.
 - No scenario covers a merged group's member dropped by `subject_drop_s` (Review Focus 4).
 
-## Jobs: an attached job's record keeps its input's old tuning after a retune
+## Jobs: an attached job whose relaunch fails keeps its input's old tuning
 
-After its input's `job_retune` the `transcribe` row still read ch20 / 476.900 MHz while the demod sat at 476.925 MHz. `job_retune` (and `graph_put`) should update the attached records' `tuning` copy when they are relaunched. From the B210 live run of plans 15/18, 2026-11-01.
+Cleanup round 0 makes an attached job relaunched after its input's `job_retune`, `graph_put` or capture move record the input's new tuning. Left: when that relaunch fails, the `Failed` record keeps the old tuning.
 
 ## Fit: a weak voice channel fits to the width floor
 
@@ -328,7 +318,6 @@ Plan 38 left these. Each new protocol is a framing module and a row on plan 38's
 - **Trunking.** Following a P25 or DMR Tier III control channel to its voice channels (see "Architecture: a mode registry...", Trunking). P25 trunking blocks are counted, not parsed.
 - **Calls heard but never reported.** Three kinds of call give no event: a P25 call whose link control is itself encrypted (it names no radio); a P25 call whose LDU2 sync never counts within `ES_TRUSTED_SYMBOLS`, which on a weak signal shows as frames arriving and nothing reported; a DMR call whose embedded link control never completes. Reporting the first needs `src` and `dst` nullable in the shared call schema (`voice_call.rs`). A cheap first step for the others: announce a call that has its link control after one superframe held, which needs a `silent` value for "not yet known".
 - **DMR.** A handheld call and a slot-1 call at the same time both map to voice index 0 on the main stream. The zero-correction EMB rule costs a weak repeater join about 2 of up to 5 bursts before the first sync, at 3 % bit errors. `GRID_OVERRIDE_SYNCS` (3) is not pinned by a test against 2. One learnt colour code per repeater, cleared on a grid rebuild.
-- **M17's LICH Golay table** has the XOR defect P25's had: two-bit errors are detected, not corrected (`m17::golay_table`). A one-character fix, frozen by plan 38, which kept M17's behaviour.
 - **A shared codes module.** Three Golay(24,12) implementations and two mask generators exist (`m17.rs`, `p25.rs`, `dmr.rs`).
 - **Front-end limits** (documented in `fsk4.rs`):
   - the weak, off-deviation corner: acquisition over longer stretches, or soft decisions, would help;
@@ -470,10 +459,6 @@ The node-level station (`station set/get/clear`) shipped in plan 19.1. What is l
 ## Bug: a decoder the watch placed on another free source keeps running if the watch never recovers
 
 Found in plan 20's reviews. With `decode_on: free` the watch puts a decoder on a second source; when the watch's own source faults and the watch fails, its decoders are left to fail on their own (plan 20 spec 4.7), but a decoder on a healthy other source keeps running with nothing to stop it, and recovery re-adopts it only if the watch heals. Decide whether a watch that stays failed (the fault outlasting some bound) stops the decoders it placed elsewhere.
-
-## Bug: `source_ensure` and `source_pin` refusals from a faulted source lack the `source <id>: ` prefix
-
-Found in plan 20's reviews. `job_start` and a job's failure read `source <id>: <fault>`, but `source_ensure` and `source_pin` still answer bare `io: <fault>`. Route them through the same helper `job_start` uses.
 
 ## Worker: a parent-side status-silence watchdog
 
@@ -629,9 +614,9 @@ From the operator, 2026-11-06, raised while scoping plan 28 (analog video): a vi
 
 From the operator, 2026-11-06, while scoping plan 28. The 5.8 GHz FPV channels are letter-named (A1-A8 descending, B on 19 MHz steps, E irregular, F, R on 37 MHz steps) and the plan registry numbers channels on uniform steps and matches a job within 1 kHz, so plan 28 ships no video plan. Later: lift the channel tables from the open VTX firmware (OpenVTx's and Betaflight's VTX tables, which carry every band and power level the transmitters themselves use), as `fpv_58` and `fpv_13` rows with letter names, and give a plan a match tolerance wide enough for a job centred on a measured carrier (plan 28's rule) to take its channel's name. `plan_start` on a video plan is not wanted.
 
-## Bug: `source_list` reports the startup ring length after a retune
+## Sources: `source_list` reports the ring's size, not what it holds
 
-From plan 30's live acceptance, 2026-11-07. The B210's ring was sized for 10 s at the startup capture of 3.84 MHz. Pinned at 10.24 MHz it held about 3.5 s, yet `source_list` still reported `ring.seconds: 10.0`, and `iq read` of 9 s answered `too_old`. Either resize the ring on a retune (it is a byte budget, so seconds shrink as the rate grows) or report the seconds the current rate actually holds.
+From plan 30's live acceptance, 2026-11-07: pinned at 10.24 MHz the B210's ring held about 3.5 s while `source_list` reported `ring.seconds: 10.0`, and `iq read` of 9 s answered `too_old`. Checked in cleanup round 0: the ring's seconds already follow the rate (`ring_seconds_for`), and at 10.24 MHz the default budget does hold 10 s, so the figure was right as a size. What it held was cut short by the ring restarting on a timestamp gap ("Source: the IQ history restarts on every timestamp gap"). Fix that first; a `held_s` beside `seconds` would then say how much history a read can reach.
 
 ## Capture: the burst gate does not suit VDL2 on the B210
 
@@ -809,15 +794,11 @@ Seen 2026-11-14 in full workspace runs with the host's load average between 20 a
 
 Each waits a fixed time on a real-time source or an external program. Reproduce under load (`taskset -c 0,1` plus a busy loop on each CPU) before widening a margin.
 
-Seen again during plan 38 (2026-11-14 to 2026-11-16), each passing when re-run alone: `acars::tests::acarsdec_decodes_our_fixture`, `mix::both_tones_are_heard_and_a_continuous_tone_has_no_gaps_at_100_ms_blocks`, the composite video test `a_gap_in_the_input_time_keeps_the_lock_costs_a_field_and_counts` (`zeta-dsp/tests/composite.rs`), and the page scenario `job_row_two_lines`. That scenario measures with a one-shot `bounding_box()` right after `start_job`: wait for the row before measuring.
+Seen again during plan 38 (2026-11-14 to 2026-11-16), each passing when re-run alone: `acars::tests::acarsdec_decodes_our_fixture`, `mix::both_tones_are_heard_and_a_continuous_tone_has_no_gaps_at_100_ms_blocks`, the composite video test `a_gap_in_the_input_time_keeps_the_lock_costs_a_field_and_counts` (`zeta-dsp/tests/composite.rs`), and the page scenario `job_row_two_lines` (it now waits for the row to be laid out before measuring, cleanup round 0).
 
-## Test: the UI suite's heavier shard is near its deadline
+## Test: the UI suite's shards against their deadline
 
-After plan 38's stream-picker scenario the heavier of the two shards has about 67 s left of its 450 s `DEADLINE` (382.7 s of it used) (`crates/zeta/tests/ui.rs`). The next scenarios should rebalance `SHARD_STARTS` or add a shard before the deadline is raised.
-
-## Test: `modes_check::a_bad_synth_block_fails_its_row_and_the_rest_still_run` flaked once on a leftover scratch dir
-
-Seen 2026-11-09 in a full workspace run (the suite in parallel), six single reruns passed. The checker's `remove_dir_all` of `check-<pid>-pocsag_decode` has its result ignored (`modes_check.rs`, after `run_test`), so a node still writing its state dir as it shuts down leaves the directory for the test to find. Wait for the node to finish, or retry the removal, before reporting the row.
+Rebalanced in cleanup round 0 (the second shard starts at `ssb_entry_tunes_the_dial`): 213 scenarios, 368.9 s and 373.7 s of scenario time, 377.5 s wall against the 450 s `DEADLINE` (`crates/zeta/tests/ui.rs`), so about 70 s left. When new scenarios eat that, move the cut again from a `ZETA_UI_PROFILE` run, or add a shard, before raising the deadline.
 
 ## Page: pointer movement over the page is costly
 
@@ -983,7 +964,6 @@ From the operator, 2026-11-12, while settling plan 37 (`docs/superpowers/specs/2
 - **Area-wide devices are ordered by frequency**, not by nearness to the signal.
 - **Selected and matched site styling hides the confirmed ring.**
 - **The off-site partner frequency of a signal's licence is not marked on the waterfall.**
-- **`zeta registers check` exits 0 when it skipped a query**, and prints no skipped count.
 - **The station antenna's azimuth weighs the origin score but not the candidate rank** that Identify and the page's top three use.
 - **The identify verdict event and the job context carry the whole register answer**: cap what the event carries.
 - **A ground-wave candidate gets a free-space level.**

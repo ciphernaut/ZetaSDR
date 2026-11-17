@@ -4,9 +4,19 @@ A sweep of `TODO.md` by size, so the small debts are paid in rounds rather than 
 
 Sizes are estimates: **XS** a few lines and a test, **S** a focused session, **M** a plan of its own (spec first), **L** several plans.
 
-## Round 0: the XS sweep (this run)
+## Budgets, from Round 0's actuals
+
+Round 0 was estimated at about 150k tokens and its subagents used about 940k: implementers 136k to 302k a batch (25k to 50k an item, the most on lease and job-supervision code), reviewers 67k to 162k a batch (the most for an Opus review of locking), a fix round about 30k a batch. Lines changed say little; the cost is reading the code around a fix, building and testing it, the review, and the fix round each review has found a reason for. Every batch review found something real, so the review stays.
+
+The test rule that applies from Round 1 on: per fix, only its new test and the tests beside it; a touched crate's whole suite once per batch; the workspace and page suites once on the merged branch; a repeat loop only where the brief asks for one (a race fix).
+
+Budget per round from these figures: an XS item about 50k with its review; an S item about 150k to 250k. Round 1 about 0.8M to 1M, Round 2 about 1.5M, Round 3 about 1M, Round 4 about 100k to 200k per section.
+
+## Round 0: the XS sweep (done 2026-11-17)
 
 Built subagent-driven on `worktree-cleanup-xs`, one implementer per batch and a reviewer after each, then the full gate. Every fix carries a test that fails without it.
+
+Outcome: thirteen items landed; A6 needed no change (the ring's seconds already follow the rate; what cut the history short is "Source: the IQ history restarts on every timestamp gap"). Reviews changed four items: C1's retry now reruns the whole fit and start; B3 fails on any skip but a quiet band; B4 keeps a repeat `plan_start` from doubling a demodulator; A2 also guards `replace` and `graph_put`. Left over, in `TODO.md`: a conflict on a controller's child still offers a retry that is refused ("Jobs: a conflict on a controller's child offers a retry that is refused").
 
 **Batch A, node and lease (Opus):**
 - A1. "Bug: a refused `graph_put` persists its graph": refuse before persisting when the entry is `Running` again after this put's stop.
