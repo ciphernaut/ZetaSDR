@@ -828,13 +828,23 @@ impl Inner {
         Ok(stages)
     }
 
+    /// `graph`, a fresh expansion of a record whose sinks are `sinks`, with them
+    /// appended again (see [`JobRecord::sinks`]); a graph the sinks would not validate on
+    /// is the error.
+    pub(super) fn sinked(&self, graph: Graph, sinks: &[graph::Node]) -> Result<Graph, NodeError> {
+        let mut graph = graph;
+        graph::append_sinks(&mut graph, sinks, &self.registry)?;
+        Ok(graph)
+    }
+
     /// Re-expand `rec`'s graph for the capture `band` when it is of a built-in kind
     /// and was expanded for another rate (`capture_rate_hz`), recording the new rate
     /// and reselecting `stages`. A record without a rate that the node expanded
     /// (written before the field existed) is re-expanded too, and so is one expanded
     /// for this rate that no expansion at it reproduces (an older expansion: a plan
     /// channel recorded before the adjacent-channel guard); an operator's graph
-    /// (`operator_graph`, from `graph_put`) is left as stored.
+    /// (`operator_graph`, from `graph_put`) is left as stored. The record's `sinks` are
+    /// appended to each expansion (a watch's decoder keeps its feed).
     fn fit_capture(
         &self,
         rec: &mut JobRecord,
@@ -875,14 +885,16 @@ impl Inner {
                 )
             };
             let current = |g: &Result<Graph, _>| {
-                g.as_ref()
-                    .is_ok_and(|g| graph::same_pipeline(g, &rec.graph))
+                g.as_ref().is_ok_and(|g| {
+                    self.sinked(g.clone(), &rec.sinks)
+                        .is_ok_and(|g| graph::same_pipeline(&g, &rec.graph))
+                })
             };
             if graph.is_err() || current(&graph) || current(&unbanked()) {
                 return Ok(());
             }
         }
-        let graph = graph.map_err(NodeError::Expand)?;
+        let graph = self.sinked(graph.map_err(NodeError::Expand)?, &rec.sinks)?;
         *stages = self.stages(&graph)?;
         rec.graph = graph;
         rec.capture_rate_hz = Some(rate.0);
@@ -921,6 +933,7 @@ impl Inner {
                 &self.modes(),
             )
             .map_err(NodeError::Expand)?;
+        let graph = self.sinked(graph, &rec.sinks)?;
         *stages = self.stages(&graph)?;
         rec.graph = graph;
         rec.capture_rate_hz = Some(band.bandwidth_hz.0);

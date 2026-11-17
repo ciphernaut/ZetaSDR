@@ -228,6 +228,66 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
     Ok(())
 }
 
+/// Append `sinks` (nodes of stages with an `event` input and no outputs) to `graph`, each
+/// fed by the event output of its decoder: its last node with an event output that no
+/// event edge leaves. `Ok(false)`, the graph untouched, when `sinks` is empty or the graph
+/// has no such node; the validation error, the graph untouched, when the graph with them
+/// would not validate.
+pub fn append_sinks(
+    graph: &mut Graph,
+    sinks: &[Node],
+    registry: &StageRegistry,
+) -> Result<bool, GraphError> {
+    if sinks.is_empty() {
+        return Ok(false);
+    }
+    let from = graph.nodes.iter().rev().find(|n| {
+        registry
+            .spec(&n.kind)
+            .is_some_and(|s| s.outputs.contains(&StreamKind::Event))
+            && !graph
+                .edges
+                .iter()
+                .any(|e| e.from == n.id && e.kind == StreamKind::Event)
+    });
+    let Some(from) = from.map(|n| n.id.clone()) else {
+        return Ok(false);
+    };
+    let mut with = graph.clone();
+    for s in sinks {
+        with.nodes.push(s.clone());
+        with.edges.push(Edge {
+            from: from.clone(),
+            to: s.id.clone(),
+            kind: StreamKind::Event,
+        });
+    }
+    validate(&with, registry)?;
+    *graph = with;
+    Ok(true)
+}
+
+/// `graph` without the nodes `sinks` names (by id) and the edges into them: what
+/// [`append_sinks`] appended taken off again.
+pub fn strip_sinks(graph: &Graph, sinks: &[Node]) -> Graph {
+    let gone = |id: &NodeId| sinks.iter().any(|s| &s.id == id);
+    Graph {
+        id: graph.id.clone(),
+        nodes: graph
+            .nodes
+            .iter()
+            .filter(|n| !gone(&n.id))
+            .cloned()
+            .collect(),
+        edges: graph
+            .edges
+            .iter()
+            .filter(|e| !gone(&e.to) && !gone(&e.from))
+            .cloned()
+            .collect(),
+    }
+}
+
 /// Whether `a` and `b` are the same pipeline whatever their graph and node ids: the same
 /// node kinds and params in the same order, and the same edges (by node position and
 /// stream kind, in any order).

@@ -277,6 +277,7 @@ fn running_record(
         owner: None,
         audio_policy: None,
         stream: None,
+        sinks: Vec::new(),
     }
 }
 
@@ -699,7 +700,7 @@ impl Inner {
             false => Vec::new(),
         };
         let rec = match self
-            .store_graph(id, graph, capture_rate_hz, running.then_some(false))
+            .store_graph(id, graph, capture_rate_hz, running.then_some(false), None)
             .await
         {
             Ok(rec) => rec,
@@ -731,13 +732,17 @@ impl Inner {
     /// The first half of [`Inner::swap_graph`]: stop the job when `stop` is `Some`
     /// (`Some(true)`: gated, see [`Inner::stop_gated`]; a controller's run tells this
     /// restart from a `job_stop` by a flag), persist `graph` as its own and
-    /// return the record, for the caller to launch.
+    /// return the record, for the caller to launch. `capture_rate_hz` as in
+    /// [`Node::job_graph_set`] (`None`: an operator's graph); `sinks` the record's
+    /// [`JobRecord::sinks`] from now on (`None` keeps them; an operator's graph has
+    /// none).
     pub(crate) async fn store_graph(
         self: &Arc<Self>,
         id: &JobId,
         graph: Graph,
         capture_rate_hz: Option<Option<u64>>,
         stop: Option<bool>,
+        sinks: Option<Vec<graph::Node>>,
     ) -> Result<JobRecord, NodeError> {
         let mut own = None;
         if let Some(gated) = stop {
@@ -767,10 +772,16 @@ impl Inner {
                 id.0
             )));
         }
+        let sinks = match (capture_rate_hz, sinks) {
+            (None, _) => Vec::new(),
+            (Some(_), Some(s)) => s,
+            (Some(_), None) => entry.record.sinks.clone(),
+        };
         let rec = JobRecord {
             graph,
             capture_rate_hz: capture_rate_hz.flatten(),
             operator_graph: capture_rate_hz.is_none(),
+            sinks,
             ..entry.record.clone()
         };
         persist(&self.jobs_dir, &rec)?;
@@ -2089,6 +2100,7 @@ impl Node {
             owner: None,
             audio_policy: None,
             stream: voice.map(String::from),
+            sinks: Vec::new(),
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2142,6 +2154,7 @@ impl Node {
             owner: None,
             audio_policy: None,
             stream: None,
+            sinks: Vec::new(),
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2251,6 +2264,7 @@ impl Node {
             owner: None,
             audio_policy: None,
             stream: None,
+            sinks: Vec::new(),
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2345,6 +2359,7 @@ impl Node {
             owner: None,
             audio_policy: None,
             stream: None,
+            sinks: Vec::new(),
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2679,7 +2694,11 @@ impl Node {
                 rec.audio_policy,
                 &self.inner.modes(),
             )
-            .is_ok_and(|g| graph::same_pipeline(&g, graph))
+            .is_ok_and(|g| {
+                self.inner
+                    .sinked(g, &rec.sinks)
+                    .is_ok_and(|g| graph::same_pipeline(&g, graph))
+            })
         })
     }
 
@@ -3272,6 +3291,7 @@ mod tests {
             owner,
             audio_policy: None,
             stream: None,
+            sinks: Vec::new(),
         }
     }
 

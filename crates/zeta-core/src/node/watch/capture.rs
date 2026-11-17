@@ -136,6 +136,7 @@ async fn start(
         owner: Some(r.id.clone()),
         audio_policy: None,
         stream: None,
+        sinks: Vec::new(),
     };
     let id = rec.id.clone();
     w.capturing.push((id.clone(), signal.clone()));

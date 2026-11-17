@@ -1759,6 +1759,11 @@ async fn a_watch_with_sondehub_appends_the_sink() {
     let from = graph.nodes.iter().find(|n| n.id == edge.from).unwrap();
     assert_eq!(from.kind, "pocsag_decode", "{graph:#?}");
     assert_eq!(state(&node, &job), Some(JobState::Running));
+    // The row's expansion at the capture rate, the sink stored beside it.
+    let rec = record(&node, &job).unwrap();
+    assert!(!rec.operator_graph, "{rec:?}");
+    assert_eq!(rec.capture_rate_hz, Some(RATE_HZ as u64), "{rec:?}");
+    assert_eq!(rec.sinks, vec![sink.clone()], "{rec:?}");
     // The sink adds no stream: the decoder's own event output is still the job's.
     assert!(
         node.job_outputs(&job)
@@ -1848,6 +1853,136 @@ async fn a_stage_with_no_outputs_launches_and_stops_cleanly() {
     })
     .await;
     assert_eq!(state(&node, &job), Some(JobState::Stopped));
+    stop_all(&node).await;
+}
+
+/// A decoder whose record carries a sink, resumed where the capture is another rate
+/// than the one its graph was expanded for: re-expanded for the new rate (as any row's
+/// decoder is) with its sink appended again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sinked_decoder_resumed_at_another_capture_rate_keeps_its_sink() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let tuning = Tuning {
+        center_hz: Hz(POCSAG_HZ),
+        bandwidth_hz: Hz(12_500),
+    };
+    let kind = JobKind::from_name("pocsag_decode").unwrap();
+    let sink = GraphNode {
+        id: NodeId("sondehub".into()),
+        kind: "sink_sondehub".into(),
+        params: serde_json::json!({"callsign": "T"}),
+    };
+    let expand = |node: &Node, rate: u64| {
+        let mut g = kind
+            .expand(&rx(), tuning, Hz(rate), None, None, None, &node.modes())
+            .unwrap();
+        assert!(
+            zeta_core::graph::append_sinks(&mut g, std::slice::from_ref(&sink), &registry())
+                .unwrap()
+        );
+        g
+    };
+    let old_rate = 2 * RATE_HZ as u64;
+    let id = {
+        let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+        let rec = zeta_core::job::JobRecord {
+            format: zeta_core::job::JOB_RECORD_FORMAT,
+            id: JobId::new(),
+            kind: "pocsag_decode".into(),
+            graph: expand(&node, old_rate),
+            source: rx(),
+            tuning,
+            state: JobState::Running,
+            context: serde_json::json!({}),
+            created_ns: Timestamp(0),
+            input: None,
+            capture_rate_hz: Some(old_rate),
+            elastic: false,
+            operator_graph: false,
+            owner: None,
+            audio_policy: None,
+            stream: None,
+            sinks: vec![sink.clone()],
+        };
+        let path = dir
+            .path()
+            .join("state/jobs")
+            .join(format!("{}.json", rec.id.0));
+        std::fs::write(path, serde_json::to_vec(&rec).unwrap()).unwrap();
+        rec.id
+    };
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    until("the decoder resumes", Duration::from_secs(10), || {
+        state(&node, &id) == Some(JobState::Running)
+    })
+    .await;
+    let rec = record(&node, &id).unwrap();
+    assert_eq!(rec.capture_rate_hz, Some(RATE_HZ as u64), "{rec:?}");
+    assert!(!rec.operator_graph, "{rec:?}");
+    assert_eq!(rec.sinks, vec![sink.clone()], "{rec:?}");
+    let want = expand(&node, RATE_HZ as u64);
+    assert!(
+        zeta_core::graph::same_pipeline(&rec.graph, &want),
+        "{:#?}\nwanted {want:#?}",
+        rec.graph
+    );
+    stop_all(&node).await;
+}
+
+/// A `graph_put` of the watch that changes its sink's params: the decoder its next run
+/// re-adopts is restarted with the new params (still its row's expansion at the capture
+/// rate).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_re_adopted_decoder_takes_the_watchs_new_sink() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub_params() })).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let mut graph = record(&node, &watch).unwrap().graph;
+    let mut changed = sondehub_params();
+    changed["callsign"] = "OTHER".into();
+    let detect = graph.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+    detect.params["sondehub"] = changed.clone();
+    node.apply(Op::GraphPut {
+        job: watch.clone(),
+        graph,
+    })
+    .await
+    .unwrap();
+    let sink_params = || {
+        record(&node, &job).and_then(|r| {
+            r.graph
+                .nodes
+                .iter()
+                .find(|n| n.kind == "sink_sondehub")
+                .map(|n| n.params.clone())
+        })
+    };
+    until(
+        "the decoder runs with the new sink",
+        Duration::from_secs(30),
+        || {
+            sink_params().as_ref() == Some(&changed)
+                && state(&node, &job) == Some(JobState::Running)
+        },
+    )
+    .await;
+    let rec = record(&node, &job).unwrap();
+    assert_eq!(rec.sinks.len(), 1, "{rec:?}");
+    assert_eq!(rec.sinks[0].params, changed);
+    assert_eq!(rec.capture_rate_hz, Some(RATE_HZ as u64), "{rec:?}");
+    assert!(!rec.operator_graph, "{rec:?}");
+    until("the watch still keeps it", Duration::from_secs(10), || {
+        decoding(&node, &watch)
+            .iter()
+            .any(|d| d["job"] == job.0.as_str() && d["sink_error"].is_null())
+    })
+    .await;
     stop_all(&node).await;
 }
 
@@ -1968,6 +2103,10 @@ async fn a_failed_sink_restart_keeps_the_decoder_without_the_sink() {
     assert_eq!(state(&node, &job), Some(JobState::Running));
     let rec = record(&node, &job).unwrap();
     assert!(rec.graph.nodes.iter().all(|n| n.kind != "sink_sondehub"));
+    // The fallback is the row's expansion at its capture rate, re-expandable as before.
+    assert_eq!(rec.capture_rate_hz, Some(RATE_HZ as u64), "{rec:?}");
+    assert!(!rec.operator_graph, "{rec:?}");
+    assert!(rec.sinks.is_empty(), "{rec:?}");
     let listed = decoding(&node, &watch);
     assert!(listed[0]["sink_error"].is_string(), "{listed:?}");
     assert!(events.watch("lost").is_empty(), "{:#?}", events.all());

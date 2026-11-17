@@ -217,6 +217,21 @@ async fn a_batch_is_posted_with_the_station_fields() {
     stop(r).await;
 }
 
+/// A stop before the batch is due (a decoder's restart, a retune): what was collected
+/// is still sent, frames already published included.
+#[tokio::test]
+async fn a_stop_sends_what_was_collected() {
+    let (url, seen) = api(200).await;
+    let r = start(&url, 60_000);
+    r.send(rs41("R1234567", 10));
+    stop(r).await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let a = seen[0].body.as_array().expect("a JSON array");
+    assert_eq!(a.len(), 1, "{a:?}");
+    assert_eq!(a[0]["frame"], 10);
+}
+
 #[tokio::test]
 async fn events_without_a_position_are_skipped() {
     let (url, seen) = api(200).await;

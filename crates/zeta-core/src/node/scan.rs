@@ -1554,6 +1554,7 @@ mod tests {
             owner: None,
             audio_policy: None,
             stream: None,
+            sinks: Vec::new(),
         };
         inner.jobs.lock().unwrap().insert(
             id.clone(),

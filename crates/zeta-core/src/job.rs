@@ -85,12 +85,19 @@ pub struct JobRecord {
     #[serde(default)]
     #[schemars(schema_with = "crate::types::nullable::<String>")]
     pub stream: Option<String>,
+    /// The sinks the node appends to `graph` at every expansion of it (the feed a `watch`
+    /// gives the decoders it keeps): nodes of stages with an `event` input and no
+    /// outputs, each fed by the graph's decoder events ([`crate::graph::append_sinks`]).
+    /// `graph` already carries them; a re-expansion at another capture rate appends them
+    /// again. Empty for every other job (and in a record written before the field).
+    #[serde(default)]
+    pub sinks: Vec<crate::graph::Node>,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
 /// cannot override that for deserialisation); a record is always written with
 /// `format`, `input`, `capture_rate_hz`, `elastic`, `operator_graph`, `owner`,
-/// `audio_policy` and `stream`, so the published schema requires them.
+/// `audio_policy`, `stream` and `sinks`, so the published schema requires them.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -107,6 +114,7 @@ fn require_format(schema: &mut schemars::Schema) {
             "owner",
             "audio_policy",
             "stream",
+            "sinks",
         ] {
             if !req.iter().any(|r| r == f) {
                 req.push(f.into());

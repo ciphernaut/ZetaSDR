@@ -75,16 +75,21 @@ impl Node {
             }
         };
         let bin_rate = self.inner.bank_bin_rate(&rec.source, capture);
-        let graph = match kind.reexpand_carrying(
-            &rec.source,
-            want,
-            capture.bandwidth_hz,
-            bin_rate,
-            &rec.graph,
-            rec.audio_policy,
-            &self.inner.modes(),
-            &RETUNE_CARRIED_PARAMS,
-        ) {
+        let graph = kind
+            .reexpand_carrying(
+                &rec.source,
+                want,
+                capture.bandwidth_hz,
+                bin_rate,
+                &rec.graph,
+                rec.audio_policy,
+                &self.inner.modes(),
+                &RETUNE_CARRIED_PARAMS,
+            )
+            .map_err(NodeError::Expand)
+            // A watch's decoder keeps its feed (`JobRecord::sinks`).
+            .and_then(|g| self.inner.sinked(g, &rec.sinks));
+        let graph = match graph {
             Ok(g) => g,
             Err(e) => {
                 // Best effort: the old band back, the job still running on it.
@@ -97,7 +102,7 @@ impl Node {
                 if tuned || back.is_ok_and(|(_, t)| t) {
                     let _ = self.inner.relaunch_elastic(&rec.source, Some(id)).await;
                 }
-                return Err(NodeError::Expand(e));
+                return Err(e);
             }
         };
         let source = rec.source.clone();

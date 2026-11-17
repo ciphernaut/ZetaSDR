@@ -3576,6 +3576,7 @@ mod tests {
             owner: None,
             audio_policy: None,
             stream: None,
+            sinks: Vec::new(),
         }
     }
 

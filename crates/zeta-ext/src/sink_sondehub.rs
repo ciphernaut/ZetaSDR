@@ -3,8 +3,9 @@
 //! The stage reads the events of a sonde decoder (`protocol` `rs41`, `dfm` or `m20`),
 //! keeps those that carry a `position` and an `id` (the sonde's serial), and every
 //! `batch_ms` sends what it collected as one `PUT` of a JSON array to `url`, each
-//! element in SondeHub's v2 telemetry shape with the station's callsign and position.
-//! It has no outputs. After every batch the job's context holds
+//! element in SondeHub's v2 telemetry shape with the station's callsign and position;
+//! a stop (a restart of the job, a retune) sends what it collected first, waiting at most
+//! 2 s for it. It has no outputs. After every batch the job's context holds
 //! `sondehub = {sent, failed, last_error}`: a non-2xx answer or a transport error counts
 //! `failed` once (the batch is dropped, never retried) and sets `last_error`; the next
 //! batch still goes. Events of any other protocol, or without a position, a `datetime`, a
@@ -34,6 +35,8 @@ pub const SONDEHUB_URL: &str = "https://api.v2.sondehub.org/sondes/telemetry";
 const BATCH_MS_MIN: u64 = 100;
 /// How long one upload may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a stop waits for the last batch to go: it holds up a restart of the job.
+const LAST_BATCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The failure when a position is needed and neither the params nor a station give one.
 const NO_STATION: &str = "sink.params.lat: no station set (station set --lat --lon --alt-m)";
@@ -281,7 +284,25 @@ impl Stage for SondehubStage {
         while open {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                _ = cancel.cancelled() => {
+                    // A stop (a restart of the decoder, a retune): what was collected and
+                    // what was already published still goes, within a bound.
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Frame { payload: Payload::Event(ev), .. }) => {
+                                if let Some(t) = telemetry(&p, pos, &ev, &iso8601(now_ns())) {
+                                    batch.push(t);
+                                }
+                            }
+                            Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let never = CancellationToken::new();
+                    let last = flush(&client, &p.url, &mut batch, &mut tally, &ctx, &never);
+                    let _ = tokio::time::timeout(LAST_BATCH_TIMEOUT, last).await;
+                    return Err(StageError::Cancelled);
+                }
                 f = rx.recv() => match f {
                     Ok(Frame { payload: Payload::Event(ev), .. }) => {
                         if let Some(t) = telemetry(&p, pos, &ev, &iso8601(now_ns())) {

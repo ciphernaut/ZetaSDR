@@ -379,6 +379,7 @@ impl Inner {
             owner: r.owner.clone(),
             audio_policy: None,
             stream: None,
+            sinks: Vec::new(),
         };
         let child = rec.id.clone();
         // Recorded first, so a run resumed after a restart can stop it (see `stale`).
