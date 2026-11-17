@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Starting, TransportPath, Tuning};
 use zeta_core::types::{Capabilities, Claim, Depth, Hz, SampleFormat, SourceId};
 use zeta_source_worker::port::{
-    Attach, HELLO_TIMEOUT, Timings, WorkerConfig, WorkerPort, worker_args,
+    Attach, HELLO_TIMEOUT, STATUS_SILENCE, Timings, WorkerConfig, WorkerPort, worker_args,
 };
 use zeta_source_worker::ring::{DEFAULT_RING_BYTES, Ring};
 
@@ -29,6 +29,7 @@ fn timings() -> Timings {
         backoff_max: Duration::from_millis(300),
         alive_reset: Duration::from_secs(2),
         shutdown_grace: Duration::from_millis(500),
+        status_silence: STATUS_SILENCE,
     }
 }
 
@@ -994,6 +995,51 @@ async fn a_descriptor_outside_the_ring_is_a_bad_frame() {
     port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
     assert!(mock_samples(&next_block(&mut rx).await));
     assert_eq!(port.fault(), None);
+}
+
+#[tokio::test]
+async fn a_worker_whose_status_goes_silent_is_faulted_killed_and_respawned() {
+    let dir = tempdir();
+    // Only the first spawn's statuses stop; its stdout stays open and its
+    // blocks keep coming, as from a worker whose status task is wedged.
+    let (mut cfg, _rec) = cfg_wrapped(
+        dir.path(),
+        "[ \"$N\" = 0 ] && export ZETA_FAKE_MUTE_STATUS=1\nexec \"$FAKE\" --script stream \"$@\"",
+    );
+    // Three ticks of a healthy worker's status.
+    cfg.timings.status_silence = Duration::from_secs(3);
+    let (port, attach) = open(cfg, None).await;
+    assert!(matches!(attach, Attach::Hello), "{attach:?}");
+    let healed = port.healed().unwrap();
+    let first = port.worker().unwrap().pid.unwrap();
+    let mut rx = port.subscribe();
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    // Blocks arrive meanwhile: they are not a status.
+    assert!(mock_samples(&next_block(&mut rx).await));
+    assert_eq!(port.fault(), None);
+    let silent = "soapy worker for f: no status for 3 s";
+    until("the silence fault", Duration::from_secs(8), || {
+        port.fault().as_deref() == Some(silent)
+    })
+    .await;
+    until("the silent worker killed", Duration::from_secs(3), || {
+        !alive(first)
+    })
+    .await;
+    // The respawn path heals it as after any other end.
+    until("a heal", Duration::from_secs(5), || *healed.borrow() > 0).await;
+    assert_eq!(port.fault().as_deref(), Some(silent));
+    port.heal_settled();
+    assert_eq!(port.fault(), None);
+    let w = port.worker().unwrap();
+    assert_eq!(w.restarts, 1);
+    assert_ne!(w.pid, Some(first));
+    port.tune(tuning(100_000_000, 2_000_000)).await.unwrap();
+    assert!(mock_samples(&next_block(&mut rx).await));
+    // A worker whose statuses come is left alone past the bound.
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert_eq!(port.fault(), None);
+    assert_eq!(port.worker().unwrap().restarts, 1);
 }
 
 #[tokio::test]

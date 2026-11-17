@@ -17,7 +17,7 @@ use zeta_core::ops::{Op, OpResult, SourceInfo};
 use zeta_core::port::{Port, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::types::{Claim, Hz, JobId, SourceId, Timestamp};
-use zeta_source_worker::port::{Attach, Timings, WorkerConfig, WorkerPort};
+use zeta_source_worker::port::{Attach, STATUS_SILENCE, Timings, WorkerConfig, WorkerPort};
 use zeta_source_worker::ring::{DEFAULT_RING_BYTES, MIN_SLOTS, SLOT_SAMPLES};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_zeta-fake-worker");
@@ -43,6 +43,7 @@ fn timings_backoff(backoff: Duration) -> Timings {
         backoff_max: backoff.max(Duration::from_millis(300)),
         alive_reset: Duration::from_secs(2),
         shutdown_grace: Duration::from_millis(500),
+        status_silence: STATUS_SILENCE,
     }
 }
 

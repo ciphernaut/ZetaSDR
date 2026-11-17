@@ -78,7 +78,9 @@
 //! build would. `ZETA_FAKE_BAD_SLOT=1` rewrites the first descriptor to name
 //! slot 9999, which no ring has. `ZETA_FAKE_STALE_SEQ=1` rewrites the third
 //! descriptor to repeat the second (seq 1 in slot 1), a stale descriptor the
-//! ring's own checks would pass. `ZETA_FAKE_READ_SAMPLES=N` scripts the mock's reads `N`
+//! ring's own checks would pass. `ZETA_FAKE_MUTE_STATUS=1` drops every status
+//! frame and passes the rest on (the hello, replies, blocks), as a worker whose
+//! status task is wedged while its stdout stays open. `ZETA_FAKE_READ_SAMPLES=N` scripts the mock's reads `N`
 //! samples long instead of [`READ_SAMPLES`], and raises the mock's rate
 //! ceiling to `100 N` when that is above its own, since the source reads a
 //! hundredth of a second at a time: a tune to that rate then gets blocks of
@@ -601,6 +603,8 @@ struct Bend {
     late_progress: bool,
     /// Name this format in the hello's transport.
     hello_format: Option<String>,
+    /// Drop every status frame.
+    mute_status: bool,
 }
 
 impl Bend {
@@ -610,6 +614,7 @@ impl Bend {
             || self.stale_seq
             || self.late_progress
             || self.hello_format.is_some()
+            || self.mute_status
     }
 }
 
@@ -635,6 +640,9 @@ fn bend_frames(mut frames: File, bend: Bend) -> io::Result<(File, std::sync::mps
             let mut bad_slot = bend.bad_slot;
             let mut descriptors = 0u64;
             while let Ok(Some(mut f)) = read_frame(&mut rd) {
+                if bend.mute_status && matches!(f, Frame::Control(Control::Status(_))) {
+                    continue;
+                }
                 if let Frame::Descriptor(d) = &mut f {
                     if bad_slot {
                         d.slot = 9999;
@@ -888,6 +896,7 @@ fn main() -> ExitCode {
             stale_seq: std::env::var("ZETA_FAKE_STALE_SEQ").is_ok_and(|v| v == "1"),
             late_progress: std::env::var("ZETA_FAKE_LATE_PROGRESS").is_ok_and(|v| v == "1"),
             hello_format: std::env::var("ZETA_FAKE_HELLO_FORMAT").ok(),
+            mute_status: std::env::var("ZETA_FAKE_MUTE_STATUS").is_ok_and(|v| v == "1"),
         };
         if let Some(p) = protocol.filter(|p| *p != 1) {
             return wrong_hello(port.as_ref(), p, frames);

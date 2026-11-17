@@ -15,6 +15,16 @@
 //! `zeta-soapy-worker[<id>]: ` so a driver's own log lines are attributable;
 //! the last line is kept, as an open failure explains itself there.
 //!
+//! A live worker writes its status every second. One that goes
+//! [`Timings::status_silence`](crate::port::Timings::status_silence) without
+//! one ([`STATUS_SILENCE`](crate::port::STATUS_SILENCE), 10 s) is faulted
+//! `soapy worker for <id>: no status for 10 s` and killed, and then respawned
+//! as after any other end: a driver deadlocked under its status task, or a
+//! worker wedged with its stdout open, would otherwise stall the source
+//! silently. Only a status counts as hearing from it (its hello starts the
+//! clock): blocks come from another task of the worker, which may be running
+//! while the status task is stuck.
+//!
 //! Each spawn gets a fresh shared-memory [`Ring`] (unless
 //! [`WorkerConfig::ring_bytes`] is 0 or the kernel has no memfds): the child
 //! inherits it on descriptor 3 and is told `--ring-fd 3`, and the stdout
@@ -379,10 +389,14 @@ struct Worker {
     /// spawn (its `pre_exec` hook names the descriptor) until the reap; the
     /// stdout thread holds a clone while it reads.
     ring: Option<Arc<Ring>>,
-    /// Why the stdout thread stopped reading, when the worker broke the
-    /// protocol (a malformed frame, a descriptor the ring cannot hold): the
+    /// Why the worker was ended for what it sent or did not send: a protocol
+    /// break the stdout thread stopped reading at (a malformed frame, a
+    /// descriptor the ring cannot hold), or its status falling silent. The
     /// fault the reap reports.
-    bad_frame: Arc<Mutex<Option<String>>>,
+    misbehaved: Arc<Mutex<Option<String>>>,
+    /// Marked by the stdout thread at each status; its sender is dropped when
+    /// the thread ends.
+    heard: watch::Receiver<()>,
     /// The hello, and when the spawn's first progress frame came (`None`
     /// without one).
     hello: oneshot::Receiver<(Hello, Option<Instant>)>,
@@ -746,8 +760,19 @@ impl Supervisor {
         remeasure: &mut Remeasures,
     ) -> Option<State> {
         let mut stdout_done = w.stdout_done.take();
+        let silence = self.cfg.timings.status_silence;
         let status = tokio::select! {
             status = w.child.wait() => status.ok(),
+            () = silent(&mut w.heard, silence) => {
+                let why = format!("no status for {} s", silence.as_secs());
+                *w.misbehaved.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+                let _ = w.child.kill().await;
+                w.stdout_done = stdout_done;
+                let mut ended = self.reap(*w, None, Some(since.elapsed())).await;
+                // Our kill, not a crash.
+                ended.crashed = false;
+                return self.ended(ended);
+            }
             // Its stdout closed or went bad while it runs: nothing more can be
             // heard from it, so give it the grace to exit and then end it.
             _ = async { stdout_done.as_mut().unwrap().await }, if stdout_done.is_some() => {
@@ -898,16 +923,25 @@ impl Supervisor {
         let (stdout_done_tx, stdout_done) = oneshot::channel();
         let (stderr_done_tx, stderr_done) = oneshot::channel();
         let last_stderr = Arc::new(Mutex::new(None));
-        let bad_frame = Arc::new(Mutex::new(None));
+        let misbehaved = Arc::new(Mutex::new(None));
+        let (heard_tx, heard) = watch::channel(());
         let id = self.id().to_string();
 
         let (shared, l) = (self.shared.clone(), link.clone());
-        let (r, bad) = (ring.clone(), bad_frame.clone());
+        let (r, bad) = (ring.clone(), misbehaved.clone());
         let as_asked = self.as_asked;
         let reader = std::thread::Builder::new()
             .name(format!("worker-stdout-{id}"))
             .spawn(move || {
-                let why = read_stdout(stdout, &shared, &l, r.as_deref(), hello_tx, as_asked);
+                let why = read_stdout(
+                    stdout,
+                    &shared,
+                    &l,
+                    r.as_deref(),
+                    hello_tx,
+                    heard_tx,
+                    as_asked,
+                );
                 if let Some(why) = why {
                     *bad.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
                 }
@@ -929,7 +963,8 @@ impl Supervisor {
             pid,
             link,
             ring,
-            bad_frame,
+            misbehaved,
+            heard,
             hello,
             stdout_done: Some(stdout_done),
             stderr_done,
@@ -965,10 +1000,14 @@ impl Supervisor {
             if mine { s.worker_fault.take() } else { None }
         };
         let crashed = status.is_some_and(|s| s.signal().is_some());
-        let bad_frame = w.bad_frame.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let (fault, not_found) = match bad_frame {
-            // Ended for breaking the protocol: how it then exited (killed,
-            // most likely) says less than what it sent.
+        let misbehaved = w
+            .misbehaved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let (fault, not_found) = match misbehaved {
+            // Ended for breaking the protocol or falling silent: how it then
+            // exited (killed, most likely) says less than why.
             Some(why) => (format!("soapy worker for {}: {why}", self.id()), None),
             None => exit_fault(self.id(), &self.cfg.args, status, worker_fault, last_stderr),
         };
@@ -1236,6 +1275,19 @@ fn signal_text(sig: i32) -> String {
     }
 }
 
+/// Return once `within` passes with no mark on `heard` (none since the last
+/// wait counts as one now); never once its sender, the stdout thread, is gone,
+/// as the worker's end then says more.
+async fn silent(heard: &mut watch::Receiver<()>, within: Duration) {
+    loop {
+        match tokio::time::timeout(within, heard.changed()).await {
+            Ok(Ok(())) => continue,
+            Ok(Err(_)) => std::future::pending::<()>().await,
+            Err(_) => return,
+        }
+    }
+}
+
 fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1253,13 +1305,14 @@ fn now_ns() -> u64 {
 /// progress frame before the hello is the snapshot's `starting` (its `detail`
 /// prefixed [`AS_ASKED_PREFIX`] on a spawn `as_asked`, the one a remeasure
 /// starts); the first is logged ([`measuring_line`]) and its time handed on
-/// with the hello.
+/// with the hello. Each status marks `heard`, for the silence watchdog.
 fn read_stdout(
     mut stdout: File,
     shared: &Shared,
     link: &Arc<Link>,
     ring: Option<&Ring>,
     hello: oneshot::Sender<(Hello, Option<Instant>)>,
+    heard: watch::Sender<()>,
     as_asked: bool,
 ) -> Option<String> {
     let mut hello = Some(hello);
@@ -1339,6 +1392,7 @@ fn read_stdout(
                 shared.bump_starting();
             }
             Frame::Control(Control::Status(st)) => {
+                heard.send_replace(());
                 let mut s = shared.snapshot();
                 if s.link.as_ref().is_some_and(|l| Arc::ptr_eq(l, link)) {
                     s.worker_fault = st.fault;

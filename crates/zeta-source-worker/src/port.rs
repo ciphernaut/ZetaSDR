@@ -51,6 +51,14 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// the pipe and the worker. Copied rather than imported so this crate does not
 /// depend on the driver crate.
 pub const TUNE_TIMEOUT: Duration = Duration::from_secs(7);
+/// How long a live worker may go without a status before it is faulted
+/// `soapy worker for <id>: no status for 10 s` and killed, to be respawned as
+/// after any other end. The worker writes one every second (its
+/// `STATUS_TICK`), so this is ten missed; a driver deadlocked under the
+/// worker's status task, or a worker wedged with its stdout open, would
+/// otherwise stall the source silently. Its blocks alone do not count: they
+/// come from another task.
+pub const STATUS_SILENCE: Duration = Duration::from_secs(10);
 
 /// What [`WorkerPort::close`] allows beyond the shutdown grace: the kill and
 /// reap of a worker that outlived it, and the reader threads' join.
@@ -75,6 +83,8 @@ pub struct Timings {
     pub alive_reset: Duration,
     /// See [`SHUTDOWN_GRACE`].
     pub shutdown_grace: Duration,
+    /// See [`STATUS_SILENCE`].
+    pub status_silence: Duration,
 }
 
 impl Default for Timings {
@@ -85,6 +95,7 @@ impl Default for Timings {
             backoff_max: BACKOFF_MAX,
             alive_reset: ALIVE_RESET,
             shutdown_grace: SHUTDOWN_GRACE,
+            status_silence: STATUS_SILENCE,
         }
     }
 }

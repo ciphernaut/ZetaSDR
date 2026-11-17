@@ -460,10 +460,6 @@ The node-level station (`station set/get/clear`) shipped in plan 19.1. What is l
 
 Found in plan 20's reviews. With `decode_on: free` the watch puts a decoder on a second source; when the watch's own source faults and the watch fails, its decoders are left to fail on their own (plan 20 spec 4.7), but a decoder on a healthy other source keeps running with nothing to stop it, and recovery re-adopts it only if the watch heals. Decide whether a watch that stays failed (the fault outlasting some bound) stops the decoders it placed elsewhere.
 
-## Worker: a parent-side status-silence watchdog
-
-Found in plan 20's final review. The worker writes its status every second; the node never notices when it stops. A driver deadlocked under the worker's status task (or a worker wedged with its stdout open) stalls silently, as it did in-process. Wanted: the supervisor faults the source with `soapy worker for <id>: no status for 10 s` and kills the worker, which the respawn path then handles like any other end.
-
 ## Worker: `heal_settled` clears a later fault unseen
 
 Found in the review of 7e5bfc8. `heal_settled` clears whatever fault is held, so a further crash and hello inside the gap between `wait_ended` and the call is cleared without its jobs having been seen. A generation on the held fault would close it. It needs a sub-second respawn, so it is not reachable on real hardware today.
