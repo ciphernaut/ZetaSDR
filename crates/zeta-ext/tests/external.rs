@@ -409,6 +409,11 @@ async fn fifo_input_is_fed() {
         fifo.display(),
         run_dir.display()
     );
+    // The run directory and the run's own subdirectory are private to the node's user.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&run_dir), 0o700, "run dir");
+    assert_eq!(mode(fifo.parent().unwrap()), 0o700, "run's subdirectory");
     drop(r.tx);
     assert!(matches!(result_within(r.handle, 10).await, Ok(())));
     assert_eq!(
@@ -810,4 +815,80 @@ async fn a_row_with_fields_publishes_the_mapped_event_and_without_them_the_whole
     assert!(v.get("icao").is_none(), "{v}");
     drop(r.tx);
     assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
+#[cfg(unix)]
+mod run_dir {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn mode(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn prepare_makes_missing_directories_private_and_leaves_an_existing_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("a").join("run");
+        zeta_ext::prepare_run_dir(&run).unwrap();
+        assert_eq!(mode(&run), 0o700);
+        assert_eq!(mode(run.parent().unwrap()), 0o700);
+
+        // A shared directory such as the system temp directory keeps its mode.
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        zeta_ext::prepare_run_dir(&shared).unwrap();
+        assert_eq!(mode(&shared), 0o1777);
+        assert_eq!(
+            std::fs::read_dir(&shared).unwrap().count(),
+            0,
+            "the writability probe left something behind"
+        );
+    }
+
+    #[test]
+    fn prepare_refuses_a_file_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let e = zeta_ext::prepare_run_dir(&file).unwrap_err();
+        assert!(e.contains(file.to_str().unwrap()), "{e}");
+        let below = file.join("run");
+        let e = zeta_ext::prepare_run_dir(&below).unwrap_err();
+        assert!(e.contains(below.to_str().unwrap()), "{e}");
+    }
+
+    #[test]
+    fn prepare_refuses_an_unwritable_directory_naming_it() {
+        if unsafe { geteuid() } == 0 {
+            return; // root writes anywhere
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let e = zeta_ext::prepare_run_dir(&ro).unwrap_err();
+        assert!(e.contains(ro.to_str().unwrap()), "{e}");
+    }
+
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+
+    #[test]
+    fn each_run_gets_a_new_private_subdirectory_and_never_reuses_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // A leftover of someone else's, with a file of its own in it.
+        let taken = dir.path().join("external-taken");
+        std::fs::create_dir(&taken).unwrap();
+        std::fs::write(taken.join("input"), "theirs").unwrap();
+        let a = zeta_ext::external::run_subdir(dir.path()).unwrap();
+        let b = zeta_ext::external::run_subdir(dir.path()).unwrap();
+        assert_ne!(a.path(), b.path());
+        assert_ne!(a.path(), taken);
+        assert_eq!(mode(a.path()), 0o700);
+        assert_eq!(std::fs::read(taken.join("input")).unwrap(), b"theirs");
+    }
 }

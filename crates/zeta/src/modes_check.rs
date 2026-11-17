@@ -98,12 +98,13 @@ enum Outcome {
 pub async fn run(
     state_dir: PathBuf,
     modes_dir: Option<PathBuf>,
+    run_dir: Option<PathBuf>,
     plugins: &[PluginSpec],
     only: Option<String>,
     strict: bool,
 ) -> ExitCode {
     let (registry, handle, modes_dir) =
-        match node_setup::load_modes(&state_dir, plugins, None, modes_dir).await {
+        match node_setup::load_modes(&state_dir, run_dir, plugins, None, modes_dir).await {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("zeta: {e}");

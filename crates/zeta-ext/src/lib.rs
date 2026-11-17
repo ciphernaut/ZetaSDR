@@ -19,6 +19,7 @@ pub use acma::AcmaKnowledge;
 pub use adsb::{ADSB_MODE, ADSB_RATE_HZ, AdsbDecodeStage, AdsbParams, find_dump1090};
 pub use external::{
     EXTERNAL_DECODE_KIND, ExternalDecodeStage, ExternalParams, ModesHandle, apply_fields,
+    prepare_run_dir,
 };
 pub use parsers::sbs;
 pub use proc::HANDLER_VERSION_TIMEOUT;

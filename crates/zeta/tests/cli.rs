@@ -2436,6 +2436,56 @@ fn serve_banner(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
 }
 
 #[test]
+fn run_dir_is_made_with_mode_0700_and_an_unusable_one_stops_serve_naming_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path().join("var").join("run");
+    let seen = serve_banner(dir.path(), &["--run-dir", run.to_str().unwrap()], &[]);
+    assert!(seen.contains("serving; Ctrl-C"), "{seen}");
+    let mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "{}", run.display());
+
+    // A path that is a file, by flag and by variable: serve stops at startup.
+    let file = dir.path().join("not-a-dir");
+    std::fs::write(&file, "x").unwrap();
+    for (args, env) in [
+        (vec!["--run-dir", file.to_str().unwrap()], vec![]),
+        (vec![], vec![("ZETA_RUN_DIR", file.to_str().unwrap())]),
+    ] {
+        let out = zeta_bin()
+            .arg("--state-dir")
+            .arg(dir.path().join("state2"))
+            .args(&args)
+            .envs(env)
+            .arg("serve")
+            .timeout(std::time::Duration::from_secs(20))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(text.contains(file.to_str().unwrap()), "{text}");
+    }
+}
+
+#[test]
+fn run_dir_is_refused_with_node_and_ignored_from_the_environment() {
+    zeta_bin()
+        .args(["--node", "http://127.0.0.1:9", "--secret", "s"])
+        .args(["--run-dir", "/nonexistent", "source", "list"])
+        .assert()
+        .code(1)
+        .stderr(contains("configured on the serving node"));
+    let out = zeta_bin()
+        .env("ZETA_RUN_DIR", "/nonexistent")
+        .args(["--node", "http://127.0.0.1:9", "--secret", "s"])
+        .args(["source", "list"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(!text.contains("configured on the serving node"), "{text}");
+}
+
+#[test]
 fn serve_warns_when_llm_flags_are_given_without_listen() {
     let dir = tempfile::tempdir().unwrap();
     let flags = ["--llm-url", "http://127.0.0.1:1", "--llm-model", "m"];

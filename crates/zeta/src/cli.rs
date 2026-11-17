@@ -95,6 +95,11 @@ pub struct Cli {
     /// built-in ones; a query with a built-in provider and id replaces it
     #[arg(long, global = true, env = "ZETA_REGISTERS_DIR", value_name = "DIR")]
     pub registers_dir: Option<PathBuf>,
+    /// Directory under which each external program run makes its own subdirectory for its
+    /// fifo; made with mode 0700 when missing, and `serve` stops at startup when it cannot
+    /// be used [default: <state dir>/run]
+    #[arg(long, global = true, env = "ZETA_RUN_DIR", value_name = "PATH")]
+    pub run_dir: Option<PathBuf>,
     #[command(flatten)]
     pub speech: SpeechArgs,
     /// Every source flag parsed, file then soapy then kiwi then node then vrt (filled by
@@ -207,6 +212,9 @@ impl Cli {
             if from_env("registers_dir") {
                 cli.registers_dir = None;
             }
+            if from_env("run_dir") {
+                cli.run_dir = None;
+            }
             if from_env("bursts_keep_mb") {
                 cli.bursts_keep_mb = None;
             }
@@ -313,6 +321,7 @@ impl Cli {
             || self.themes_dir.is_some()
             || self.sets_dir.is_some()
             || self.registers_dir.is_some()
+            || self.run_dir.is_some()
             || self.knowledge_acma.is_some()
             || self.bursts_keep_mb.is_some()
             || self.bursts_keep_days.is_some()

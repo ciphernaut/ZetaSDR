@@ -54,7 +54,7 @@ const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The stages the CLI node runs. `external_decode` and its `adsb_decode` alias run the
 /// mode rows of the registry `modes` will hold (set once the rows are loaded against this
-/// registry: see [`open`]), their fifos under `run_dir` (`<state_dir>/run`; `None`, as
+/// registry: see [`open`]), their fifos under `run_dir` (`--run-dir`, else `<state_dir>/run`; `None`, as
 /// for a schema listing, fails a fifo row). `transcribe` runs on `speech`; without one it is still
 /// registered and its jobs fail saying the node has no speech backend.
 pub fn registry(
@@ -438,9 +438,11 @@ pub async fn open(
     modes_dir: Option<PathBuf>,
     themes_dir: Option<PathBuf>,
     sets_dir: Option<PathBuf>,
+    run_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
 ) -> Result<(Node, RemotePorts), String> {
-    let (registry, modes, modes_dir) = load_modes(&state_dir, plugins, speech, modes_dir).await?;
+    let (registry, modes, modes_dir) =
+        load_modes(&state_dir, run_dir, plugins, speech, modes_dir).await?;
     let themes = load_themes(themes_dir);
     let (node, remotes) = open_with(
         state_dir,
@@ -484,12 +486,14 @@ fn load_themes(themes_dir: Option<PathBuf>) -> Arc<zeta_core::themes::ThemeRegis
 /// opens many nodes on one loading.
 pub async fn load_modes(
     state_dir: &Path,
+    run_dir: Option<PathBuf>,
     plugins: &[PluginSpec],
     speech: Option<Arc<dyn SpeechBackend>>,
     modes_dir: Option<PathBuf>,
 ) -> Result<(StageRegistry, ModesHandle, Option<PathBuf>), String> {
     let handle = ModesHandle::default();
-    let registry = with_plugins(plugins, speech, &handle, &state_dir.join("run")).await?;
+    let run_dir = run_dir.unwrap_or_else(|| state_dir.join("run"));
+    let registry = with_plugins(plugins, speech, &handle, &run_dir).await?;
     // The rows validate against every stage (`external_decode` and the plugins
     // included); program rows are probed after the plugins, and the registry is finished
     // before the stages and the node share it.

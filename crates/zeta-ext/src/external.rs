@@ -278,7 +278,7 @@ pub async fn run_row(
             let Some(run_dir) = run_dir else {
                 return Err(fail("fifo input needs a run directory".into()));
             };
-            Some(fifo_dir(run_dir).map_err(|e| {
+            Some(run_subdir(run_dir).map_err(|e| {
                 fail(format!(
                     "no fifo directory under {}: {e}",
                     run_dir.display()
@@ -666,13 +666,48 @@ async fn connect(
     }
 }
 
+/// Make `dir` and any missing parents, each new one with mode 0700 (an existing one keeps
+/// its mode: the system temp directory is shared).
+fn create_private(dir: &Path) -> io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
+}
+
+/// Check at startup that `dir` can hold the runs' subdirectories: make it when missing
+/// (mode 0700), refuse a path that is not a directory or cannot be written, each with a
+/// message naming the path, so a bad `--run-dir` stops `serve` and not the first program job.
+pub fn prepare_run_dir(dir: &Path) -> Result<(), String> {
+    let name = dir.display();
+    create_private(dir).map_err(|e| format!("run directory {name}: {e}"))?;
+    if !dir.is_dir() {
+        return Err(format!("run directory {name}: not a directory"));
+    }
+    run_subdir(dir)
+        .map(drop)
+        .map_err(|e| format!("run directory {name}: cannot be written: {e}"))
+}
+
 /// A directory of this run's own under `run_dir` (made when missing) for its fifo,
-/// removed with the fifo when dropped.
-fn fifo_dir(run_dir: &Path) -> io::Result<tempfile::TempDir> {
-    std::fs::create_dir_all(run_dir)?;
-    tempfile::Builder::new()
-        .prefix("external-")
-        .tempdir_in(run_dir)
+/// removed with the fifo when dropped. Always mode 0700 and made exclusively under a fresh
+/// random name (an existing name is never reused), so on a shared directory no other user
+/// can read the fifo or place it first.
+pub fn run_subdir(run_dir: &Path) -> io::Result<tempfile::TempDir> {
+    create_private(run_dir)?;
+    let mut b = tempfile::Builder::new();
+    b.prefix("external-");
+    // The default follows the umask (0755 typically): ask for 0700 at creation.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        b.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    b.tempdir_in(run_dir)
 }
 
 #[cfg(unix)]

@@ -131,7 +131,7 @@ async fn main() -> ExitCode {
         return print(serde_json::to_string_pretty(&e), 2);
     }
     if let cli::Command::Modes(cli::ModesCmd::Check { id, strict }) = cli.command {
-        return modes_check::run(state_dir, cli.modes_dir, &plugins, id, strict).await;
+        return modes_check::run(state_dir, cli.modes_dir, cli.run_dir, &plugins, id, strict).await;
     }
     let (serve_args, speech_args, secret) = (
         match &cli.command {
@@ -163,6 +163,14 @@ async fn main() -> ExitCode {
         },
         Some(_) => None,
     };
+    // `serve` checks the run directory now, so a bad one stops it here and not at the first
+    // program job; a one-shot leaves the state directory as it found it.
+    if op.is_none() {
+        let dir = cli.run_dir.clone().unwrap_or_else(|| state_dir.join("run"));
+        if let Err(e) = zeta_ext::prepare_run_dir(&dir) {
+            return fail(&e);
+        }
+    }
     // One backend serves `transcribe` jobs (a one-shot can start or attach one) and, with
     // `serve --listen`, `POST /stt`.
     let speech = match transport::speech_backend(&speech_args, &state_dir).await {
@@ -181,6 +189,7 @@ async fn main() -> ExitCode {
         cli.modes_dir.clone(),
         cli.themes_dir.clone(),
         cli.sets_dir.clone(),
+        cli.run_dir.clone(),
         speech.clone(),
     )
     .await

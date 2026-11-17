@@ -36,6 +36,7 @@ pub async fn run(
     modes_dir: Option<PathBuf>,
     themes_dir: Option<PathBuf>,
     sets_dir: Option<PathBuf>,
+    run_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
     knowledge_acma: Option<crate::sources::AcmaFlag>,
     registers_dir: Option<PathBuf>,
@@ -88,6 +89,7 @@ pub async fn run(
                 modes_dir,
                 themes_dir,
                 sets_dir,
+                run_dir,
                 speech,
             );
             let (node, remotes) = match opened.await {
