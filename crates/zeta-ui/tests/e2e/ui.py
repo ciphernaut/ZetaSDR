@@ -10012,7 +10012,7 @@ def scenarios():
 # (<s> s)` times so each block takes about the same time.
 SHARD_STARTS = {
     1: [],
-    2: ["ws_busy_is_noted_once"],
+    2: ["ssb_entry_tunes_the_dial"],
     3: ["fm_demod_does_not_poll_streams", "subjects_distance_and_sort"],
 }
 
