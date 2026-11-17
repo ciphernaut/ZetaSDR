@@ -340,14 +340,6 @@ Plan 38 left these. Each new protocol is a framing module and a row on plan 38's
 
 **Later: `blip25-vocoder` in the vocoder seat.** From the operator, 2026-11-14. A Rust crate (MIT, IMBE and half-rate AMBE+2, soft decisions; SDR-- uses it) that would decode in-process with no install script, as an off-by-default cargo feature that no released build enables. Set aside for now: its own `PATENT_NOTICE.md` and `ATTRIBUTION.md` say the codec core was recovered from a compiled vendor binary, and name an active patent on the half-rate codec to 2028-05-20. Revisit in a later sprint when that position is clearer; plan 38's vocoder seat is where it would go. It does not cover D-STAR's AMBE.
 
-## Packaging: the run directory and install hints for handlers
-
-From the operator, 2026-10-28, on a plan 16 review ruling (the run directory is `--run-dir` since cleanup round 2). Today a missing handler's hint falls through `apt install` → `dnf install` → `brew install` (ruling 15; the built-in row only names the Debian package).
-
-- **Install hints.** Extend the row's install map to `snap` and `flatpak` where the handler ships that way (`snap install <pkg>`, `flatpak install <ref>`), and name an AppImage by URL in `url` (it is a download, not a package manager). The report line keeps one command and one URL; the order of fallbacks follows what the host has (`which apt dnf brew snap flatpak`).
-
-Scope estimate: a row-schema field and two tests.
-
 ## Feature: decoder wave 2 (rows on the sonde frameworks)
 
 Plan 29 shipped AIS, FLEX, M17, M20 synthesis and APRS positions (see "Decoder wave 2: leftovers from plan 29"). What stays:

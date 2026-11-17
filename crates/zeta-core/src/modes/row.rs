@@ -364,6 +364,8 @@ impl Band {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(deny_unknown_fields, rename = "ModeDecoder")]
+// Rows are parsed once and held in the registry: the size of the largest variant costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum Decoder {
     /// Today's `Graph` shape without its id; the channel node's `center_hz`,
     /// `bandwidth_hz` and `out_rate_hz` are written `"$center_hz"`, `"$bandwidth_hz"`,
@@ -744,6 +746,13 @@ pub struct Install {
     pub fedora: Option<String>,
     #[serde(default)]
     pub brew: Option<String>,
+    /// A snap package (`snap install <snap>`).
+    #[serde(default)]
+    pub snap: Option<String>,
+    /// A Flatpak reference (`flatpak install <flatpak>`). An AppImage has no field: it is
+    /// a download, named by `url`.
+    #[serde(default)]
+    pub flatpak: Option<String>,
     /// A script in this repository that builds and installs the program, run from a
     /// source checkout (`tools/install-vocoders.sh`); `null` when absent.
     #[serde(default)]
@@ -752,20 +761,36 @@ pub struct Install {
 }
 
 impl Install {
-    /// How to get the program, ahead of the URL: `bash <script>` when the row names a
-    /// script, else the first of `apt install <debian>`, `dnf install <fedora>`,
-    /// `brew install <brew>`; `None` when the row names neither.
+    /// How to get the program, ahead of the URL, for this host: [`Install::hint_for`] over
+    /// the package managers on its `PATH` (probed once per process).
     pub fn hint(&self) -> Option<String> {
+        self.hint_for(super::handlers::host_package_managers())
+    }
+
+    /// One command to get the program: `bash <script>` when the row names a script, else
+    /// the install command of the first of `apt`, `dnf`, `brew`, `snap`, `flatpak` that is
+    /// in `host` and has an entry in the row; when none of the host's managers has one,
+    /// the first of those the row has an entry for (so the hint still names something).
+    /// `None` when the row names no script and no package.
+    pub fn hint_for(&self, host: &[&str]) -> Option<String> {
         if let Some(s) = &self.script {
             return Some(format!("bash {s}"));
         }
-        [
+        let entries = [
             ("apt", &self.debian),
             ("dnf", &self.fedora),
             ("brew", &self.brew),
-        ]
-        .into_iter()
-        .find_map(|(tool, pkg)| pkg.as_ref().map(|p| format!("{tool} install {p}")))
+            ("snap", &self.snap),
+            ("flatpak", &self.flatpak),
+        ];
+        let command = |(tool, pkg): &(&str, &Option<String>)| {
+            pkg.as_ref().map(|p| format!("{tool} install {p}"))
+        };
+        entries
+            .iter()
+            .filter(|e| host.contains(&e.0))
+            .find_map(command)
+            .or_else(|| entries.iter().find_map(command))
     }
 }
 
@@ -2626,6 +2651,89 @@ mod tests {
             blocks[0].install.hint().as_deref(),
             Some("apt install codec2")
         );
+    }
+
+    fn install(v: serde_json::Value) -> Install {
+        let mut base = serde_json::json!({"url": "https://example.org/x"});
+        base.as_object_mut()
+            .unwrap()
+            .extend(v.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn the_hint_follows_the_package_managers_the_host_has() {
+        let both = install(serde_json::json!({"debian": "pkg", "flatpak": "org.example.Pkg"}));
+        // Only flatpak on the host: its entry, though the row also has a Debian one.
+        assert_eq!(
+            both.hint_for(&["flatpak"]).as_deref(),
+            Some("flatpak install org.example.Pkg")
+        );
+        // The fixed order, whatever order the host's list is in: apt before snap.
+        let all = install(serde_json::json!({"debian": "pkg", "snap": "pkg-snap"}));
+        assert_eq!(
+            all.hint_for(&["snap", "apt"]).as_deref(),
+            Some("apt install pkg")
+        );
+        assert_eq!(
+            all.hint_for(&["snap"]).as_deref(),
+            Some("snap install pkg-snap")
+        );
+        // None of the host's managers has an entry (or the host has none): today's order
+        // over the row's entries.
+        let row = install(serde_json::json!({"fedora": "f", "flatpak": "org.example.Pkg"}));
+        assert_eq!(row.hint_for(&["apt"]).as_deref(), Some("dnf install f"));
+        assert_eq!(row.hint_for(&[]).as_deref(), Some("dnf install f"));
+        let row = install(serde_json::json!({"snap": "s", "flatpak": "org.example.Pkg"}));
+        assert_eq!(row.hint_for(&["apt"]).as_deref(), Some("snap install s"));
+        // No entry at all: no hint.
+        assert_eq!(install(serde_json::json!({})).hint_for(&["apt"]), None);
+    }
+
+    #[test]
+    fn an_install_script_wins_over_every_package_manager() {
+        let row = install(serde_json::json!({
+            "debian": "pkg", "snap": "s", "script": "tools/install.sh"
+        }));
+        assert_eq!(
+            row.hint_for(&["apt", "snap"]).as_deref(),
+            Some("bash tools/install.sh")
+        );
+    }
+
+    #[test]
+    fn snap_and_flatpak_are_install_fields_and_an_unknown_key_is_still_refused() {
+        let row = parse(&edited(M17, |v| {
+            v["decoder"]["handlers"][0]["install"]["snap"] = "codec2".into();
+            v["decoder"]["handlers"][0]["install"]["flatpak"] = "org.example.Codec2".into();
+        }))
+        .unwrap();
+        let i = &row.decoder.handler_blocks()[0].install;
+        assert_eq!(i.snap.as_deref(), Some("codec2"));
+        assert_eq!(i.flatpak.as_deref(), Some("org.example.Codec2"));
+        let e = parse(&edited(M17, |v| {
+            v["decoder"]["handlers"][0]["install"]["appimage"] = "x".into()
+        }))
+        .unwrap_err();
+        assert_eq!(e.field, "appimage", "{e}");
+    }
+
+    #[test]
+    fn the_host_probe_names_managers_in_the_fixed_order_from_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["snap", "apt"] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Not executable: not there.
+        std::fs::write(dir.path().join("dnf"), "").unwrap();
+        assert_eq!(
+            crate::modes::handlers::package_managers_on(Some(dir.path().as_os_str().to_owned())),
+            vec!["apt", "snap"]
+        );
+        assert!(crate::modes::handlers::package_managers_on(None).is_empty());
     }
 
     #[test]

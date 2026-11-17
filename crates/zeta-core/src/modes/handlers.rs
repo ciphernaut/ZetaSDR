@@ -65,6 +65,23 @@ pub fn find_program(
     })
 }
 
+/// The package managers an install hint can name, in the order the hint prefers them.
+pub const PACKAGE_MANAGERS: [&str; 5] = ["apt", "dnf", "brew", "snap", "flatpak"];
+
+/// Which of [`PACKAGE_MANAGERS`] are executables in a `path` directory, in that order.
+pub fn package_managers_on(path: Option<OsString>) -> Vec<&'static str> {
+    PACKAGE_MANAGERS
+        .into_iter()
+        .filter(|tool| find_program(&[(*tool).to_string()], None, path.clone()).is_some())
+        .collect()
+}
+
+/// The package managers this host has on `PATH`, probed once per process.
+pub fn host_package_managers() -> &'static [&'static str] {
+    static HOST: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| package_managers_on(std::env::var_os("PATH")))
+}
+
 /// Whether `p` is a file this process may execute (on Unix, any execute bit set).
 pub fn is_executable(p: &Path) -> bool {
     let Ok(m) = std::fs::metadata(p) else {
