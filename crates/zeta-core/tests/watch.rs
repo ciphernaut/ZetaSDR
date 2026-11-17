@@ -27,6 +27,9 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Capabilities, Hz, JobId, SourceId, StreamKind, Timestamp};
 use zeta_source_file::{FileOpts, FileSource};
 
+mod common;
+use common::until;
+
 const RATE_HZ: u32 = 1_024_000;
 /// A well-known POCSAG centre: the burst sits here, so `pocsag_decode` is tried first.
 const POCSAG_HZ: u64 = 148_637_500;
@@ -531,17 +534,9 @@ async fn node_over(
     modes_dir: Option<&Path>,
 ) -> Node {
     let cfg = NodeConfig {
-        source_positions: Default::default(),
-        sets_dir: None,
-        burst_policy: Default::default(),
-        state_dir: dir.join("state"),
         ring_seconds: 4.0,
-        ring_budget_bytes: u64::MAX,
-        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
-        backends: vec![Backend::Cpu],
-        resume: true,
-        bank_factory: None,
         modes_dir: modes_dir.map(Path::to_path_buf),
+        ..common::cfg(dir, true)
     };
     let srcs: Vec<Arc<FileSource>> = ports.iter().map(|(_, s)| s.clone()).collect();
     let node = Node::open(cfg, registry(), ports.into_iter().map(|(p, _)| p).collect())
@@ -677,15 +672,6 @@ impl Events {
 
     fn all(&self) -> Vec<Value> {
         self.seen.lock().unwrap().clone()
-    }
-}
-
-/// Poll `f` every 20 ms until it holds, panicking with `what` after `within`.
-async fn until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + within;
-    while !f() {
-        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

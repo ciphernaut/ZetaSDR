@@ -613,24 +613,34 @@ impl Inner {
         }
         let source = port.id();
         let (caps, speed) = port.record_to_cache();
+        if let Err(e) = self.update_source_record(source, |rec| {
+            rec.capabilities = Some(caps);
+            rec.measured_at_speed = speed;
+        }) {
+            self.persist_errors
+                .lock()
+                .unwrap()
+                .push(format!("source record {}: {e}", source.0));
+        }
+    }
+
+    /// Change `source`'s record with `change` and write it atomically; on a failed
+    /// write the record in memory is left as it was.
+    pub(crate) fn update_source_record(
+        &self,
+        source: &SourceId,
+        change: impl FnOnce(&mut SourceRecord),
+    ) -> Result<(), NodeError> {
         let mut sources = self.sources.lock().unwrap();
         let mut rec = sources
             .get(source)
             .cloned()
             .unwrap_or_else(SourceRecord::new);
         rec.format = SOURCE_RECORD_FORMAT;
-        rec.capabilities = Some(caps);
-        rec.measured_at_speed = speed;
-        match persist_source(&self.sources_dir, source, &rec) {
-            Ok(()) => {
-                sources.insert(source.clone(), rec);
-            }
-            Err(e) => self
-                .persist_errors
-                .lock()
-                .unwrap()
-                .push(format!("source record {}: {e}", source.0)),
-        }
+        change(&mut rec);
+        persist_source(&self.sources_dir, source, &rec)?;
+        sources.insert(source.clone(), rec);
+        Ok(())
     }
 
     /// See [`Node::job_stop`].
@@ -2949,16 +2959,7 @@ impl Node {
         source: &SourceId,
         change: impl FnOnce(&mut SourceRecord),
     ) -> Result<(), NodeError> {
-        let mut sources = self.inner.sources.lock().unwrap();
-        let mut rec = sources
-            .get(source)
-            .cloned()
-            .unwrap_or_else(SourceRecord::new);
-        rec.format = SOURCE_RECORD_FORMAT;
-        change(&mut rec);
-        persist_source(&self.inner.sources_dir, source, &rec)?;
-        sources.insert(source.clone(), rec);
-        Ok(())
+        self.inner.update_source_record(source, change)
     }
 
     /// Jobs currently holding a rigid lease on `source`, with the band each asked for.

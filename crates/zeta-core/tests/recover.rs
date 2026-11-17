@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::graph::{Graph, GraphId, Node as GraphNode, NodeId};
 use zeta_core::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
-use zeta_core::node::{Node, NodeConfig};
+use zeta_core::node::Node;
 use zeta_core::ops::{JobKind, Op, OpResult, SourceInfo};
 use zeta_core::port::{Port, Tuning};
 use zeta_core::stage::{
@@ -30,74 +30,14 @@ use zeta_core::test_fixtures::FaultablePort;
 use zeta_core::types::{Hz, JobId, SourceId, StreamId, StreamKind, Timestamp};
 use zeta_source_file::{FileOpts, FileSource, fixtures};
 
+mod common;
+use common::{MapStage, audio, cfg, same, until};
+
 /// What a `FaultablePort` reports while the device is away, as a worker port does.
 const UNPLUGGED: &str = "no samples for 1000 ms (device unplugged?)";
 /// The tone recording's centre and rate.
 const TONE_HZ: u64 = 100_000_000;
 const TONE_RATE_HZ: u64 = 48_000;
-
-/// What a stand-in stage emits for one input frame: (output index, payload) pairs.
-type MapFn = fn(&Frame) -> Vec<(usize, Payload)>;
-
-/// A stage that maps every frame of its one input through `f`, keeping its provenance.
-struct MapStage {
-    spec: StageSpec,
-    f: MapFn,
-}
-
-impl MapStage {
-    fn new(kind: &'static str, input: StreamKind, outputs: &[StreamKind], f: MapFn) -> Arc<Self> {
-        Arc::new(Self {
-            spec: StageSpec {
-                kind,
-                inputs: vec![input],
-                outputs: outputs.to_vec(),
-                params_schema: schemars::json_schema!({"type": "object"}),
-            },
-            f,
-        })
-    }
-}
-
-#[async_trait]
-impl Stage for MapStage {
-    fn spec(&self) -> &StageSpec {
-        &self.spec
-    }
-    fn backend(&self) -> Backend {
-        Backend::Cpu
-    }
-    async fn run(
-        &self,
-        _params: Value,
-        mut inputs: Vec<broadcast::Receiver<Frame>>,
-        outputs: Vec<StreamId>,
-        bus: Arc<StreamBus>,
-        cancel: CancellationToken,
-        _ctx: StageContext,
-    ) -> Result<(), StageError> {
-        let Some(rx) = inputs.first_mut() else {
-            return Err(StageError::Failed("expected 1 input".into()));
-        };
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(StageError::Cancelled),
-                r = rx.recv() => match r {
-                    Ok(frame) => {
-                        for (i, payload) in (self.f)(&frame) {
-                            if let Some(out) = outputs.get(i) {
-                                bus.publish(Frame::new(out.clone(), frame.provenance.clone(), payload));
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                },
-            }
-        }
-    }
-}
 
 /// A stage that fails at once for its own reason, not the source's.
 struct FailStage(StageSpec);
@@ -147,18 +87,6 @@ impl Stage for IdleStage {
         cancel.cancelled().await;
         Err(StageError::Cancelled)
     }
-}
-
-fn audio() -> Payload {
-    Payload::Audio {
-        sample_rate_hz: Hz(48_000),
-        channels: 1,
-        samples: Arc::from(vec![0.1f32; 480]),
-    }
-}
-
-fn same(f: &Frame) -> Vec<(usize, Payload)> {
-    vec![(0, f.payload.clone())]
 }
 
 /// The stand-ins (registered first, so they win over the dsp stages of the same kind),
@@ -218,22 +146,6 @@ fn registry() -> StageRegistry {
     })));
     zeta_dsp::register_all(&mut r);
     r
-}
-
-fn cfg(dir: &Path, resume: bool) -> NodeConfig {
-    NodeConfig {
-        source_positions: Default::default(),
-        sets_dir: None,
-        burst_policy: Default::default(),
-        state_dir: dir.join("state"),
-        ring_seconds: 1.0,
-        ring_budget_bytes: u64::MAX,
-        scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
-        backends: vec![Backend::Cpu],
-        resume,
-        bank_factory: None,
-        modes_dir: None,
-    }
 }
 
 /// A looping, real-time tone source `id`, tunable 1 MHz either side of its centre.
@@ -363,15 +275,6 @@ async fn source_of(node: &Node, id: &SourceId) -> SourceInfo {
     match node.apply(Op::SourceList {}).await {
         Ok(OpResult::Sources(v)) => v.into_iter().find(|i| &i.id == id).unwrap(),
         r => panic!("source_list: {r:?}"),
-    }
-}
-
-/// Poll `f` every 20 ms until it holds, panicking with `what` after `within`.
-async fn until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + within;
-    while !f() {
-        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
