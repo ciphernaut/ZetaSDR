@@ -163,7 +163,43 @@ fn registry_lingering(linger: Duration) -> StageRegistry {
         },
         linger,
     )));
+    r.register(Arc::new(Idle(
+        StageSpec {
+            kind: "idle",
+            inputs: vec![],
+            outputs: vec![StreamKind::Event],
+            params_schema: schemars::json_schema!({}),
+        },
+        linger,
+    )));
     r
+}
+
+/// A root stage taking no input (so a `graph_start` job runs it on no radio) that
+/// emits nothing and, `.1` after it is cancelled, ends.
+struct Idle(StageSpec, Duration);
+
+#[async_trait]
+impl Stage for Idle {
+    fn spec(&self) -> &StageSpec {
+        &self.0
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: serde_json::Value,
+        _inputs: Vec<broadcast::Receiver<Frame>>,
+        _outputs: Vec<StreamId>,
+        _bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        cancel.cancelled().await;
+        tokio::time::sleep(self.1).await;
+        Err(StageError::Cancelled)
+    }
 }
 
 fn cfg(dir: &Path) -> NodeConfig {
@@ -353,6 +389,88 @@ async fn concurrent_graph_puts_leave_one_run() {
     );
     assert!(streams(&node, &id).is_empty(), "{:?}", streams(&node, &id));
     assert!(node.lease_holders(&source(&node).await.id).is_empty());
+}
+
+/// A one-node `idle` graph whose node carries `tag`, so a test can tell whose it is.
+fn idle_graph(tag: &str) -> zeta_core::graph::Graph {
+    serde_json::from_value(serde_json::json!({
+        "id": "g",
+        "nodes": [{"id": "n", "kind": "idle", "params": {"tag": tag}}],
+        "edges": [],
+    }))
+    .unwrap()
+}
+
+/// The `tag` param of `g`'s first node.
+fn tag_of(g: &zeta_core::graph::Graph) -> serde_json::Value {
+    g.nodes[0].params["tag"].clone()
+}
+
+/// Two `graph_put`s of one running job at once with different graphs, over and over
+/// (a job on no radio, so neither put's relaunch waits on the source's gate): when one
+/// is refused because the other's launch took the id, the record keeps the winner's
+/// graph, in memory and on disk, so `graph_get` and a restart give what runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_graph_put_keeps_the_winners_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new();
+    let node = Arc::new(
+        Node::open(
+            cfg(dir.path()),
+            registry_lingering(Duration::from_millis(20)),
+            vec![radio.clone()],
+        )
+        .await
+        .unwrap(),
+    );
+    let id = match node
+        .apply(Op::GraphStart {
+            graph: idle_graph("start"),
+        })
+        .await
+        .unwrap()
+    {
+        OpResult::Job(id) => id,
+        r => panic!("graph_start: {r:?}"),
+    };
+    let rt = tokio::runtime::Handle::current();
+    let mut refused = 0;
+    for round in 0..ROUNDS {
+        let ready = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let put = |tag: &'static str| {
+            let (node, id, ready, rt) = (node.clone(), id.clone(), ready.clone(), rt.clone());
+            std::thread::spawn(move || {
+                ready.fetch_add(1, Ordering::SeqCst);
+                while ready.load(Ordering::SeqCst) < 2 {
+                    std::hint::spin_loop();
+                }
+                let graph = idle_graph(tag);
+                rt.block_on(node.apply(Op::GraphPut { job: id, graph }))
+            })
+        };
+        let (a, b) = (put("a"), put("b"));
+        let (a, b) = tokio::task::spawn_blocking(move || (a.join().unwrap(), b.join().unwrap()))
+            .await
+            .unwrap();
+        let winner = match (&a, &b) {
+            (Ok(_), Err(_)) => "a",
+            (Err(_), Ok(_)) => "b",
+            (Ok(_), Ok(_)) => continue,
+            _ => panic!("round {round}: both refused: {a:?} {b:?}"),
+        };
+        refused += 1;
+        let got = match node.apply(Op::GraphGet { job: id.clone() }).await.unwrap() {
+            OpResult::Graph(g) => g,
+            r => panic!("graph_get: {r:?}"),
+        };
+        assert_eq!(tag_of(&got), winner, "round {round}: {a:?} {b:?}");
+        let path = dir.path().join(format!("state/jobs/{}.json", id.0));
+        let on_disk: JobRecord = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(tag_of(&on_disk.graph), winner, "round {round}: on disk");
+        assert_eq!(record(&node, &id).state, JobState::Running, "round {round}");
+    }
+    eprintln!("{refused} of {ROUNDS} rounds had a refused put");
+    node.apply(Op::JobStop { job: id.clone() }).await.unwrap();
 }
 
 /// As `elastic.rs::stop_during_a_relaunch_is_not_undone`, and no stage task of the

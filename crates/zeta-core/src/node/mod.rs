@@ -700,6 +700,15 @@ impl Inner {
         let entry = jobs
             .get_mut(id)
             .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+        // Running again after this restart's stop: another launch of the id (an
+        // overlapping `graph_put`) took it, and this one's launch would be refused.
+        // Refused here, before the write, so the record keeps the graph that runs.
+        if stop.is_some() && entry.record.state == JobState::Running {
+            return Err(NodeError::Other(format!(
+                "job {} is already running a launch",
+                id.0
+            )));
+        }
         let rec = JobRecord {
             graph,
             capture_rate_hz: capture_rate_hz.flatten(),
