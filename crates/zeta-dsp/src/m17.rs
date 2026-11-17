@@ -302,8 +302,9 @@ fn golay_table() -> &'static [u32] {
         for a in 0..n {
             for b in a..n {
                 for c in b..n {
-                    // Repeated positions give the weight 1 and 2 patterns.
-                    let e = (1u32 << a) ^ (1 << b) ^ (1 << c);
+                    // OR, not XOR: a repeated position must stay set, so a = b, b = c
+                    // give the weight 2 patterns and a = b = c the weight 1 ones.
+                    let e = (1u32 << a) | (1 << b) | (1 << c);
                     t[usize::from(golay_syndrome(e))] = e;
                 }
             }
@@ -794,6 +795,24 @@ mod tests {
                         let bad = word ^ (1 << a) ^ (1 << b) ^ (1 << c);
                         assert_eq!(golay24_decode(bad), Some(data), "{data:03x} {a} {b} {c}");
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn golay_corrects_every_one_and_two_bit_error() {
+        for data in [0u16, 0xFFF, 0xABC, 0x123] {
+            let word = golay24_encode(data);
+            for a in 0..24 {
+                assert_eq!(
+                    golay24_decode(word ^ (1 << a)),
+                    Some(data),
+                    "{data:03x} {a}"
+                );
+                for b in a + 1..24 {
+                    let bad = word ^ (1 << a) ^ (1 << b);
+                    assert_eq!(golay24_decode(bad), Some(data), "{data:03x} {a} {b}");
                 }
             }
         }
