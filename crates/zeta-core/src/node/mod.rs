@@ -999,6 +999,18 @@ pub(crate) fn source_fault_reason(source: &SourceId, e: &dyn std::fmt::Display) 
     format!("source {}: {e}", source.0)
 }
 
+impl NodeError {
+    /// A lease request's failure on `source`: a tune the port refused reads as the
+    /// source's failure ([`NodeError::SourcePort`], `source <id>: <error>`), as a job
+    /// that failed on the faulted source does; a conflict stays a conflict.
+    pub(crate) fn of_lease(source: &SourceId, e: LeaseError) -> Self {
+        match e {
+            LeaseError::Port(p) => NodeError::SourcePort(source.clone(), p),
+            e => NodeError::Lease(e),
+        }
+    }
+}
+
 /// A port's refusal of a gain as the node reports it: an `Unsupported` text
 /// verbatim (it names the source and the range), an I/O failure as `Io`.
 fn gain_error(e: PortError) -> NodeError {
@@ -2777,7 +2789,12 @@ impl Node {
                 .leases
                 .pin_locked(port.as_ref(), want, &guard)
                 .await
-                .map_err(NodeError::Lease),
+                .map_err(|e| {
+                    if let LeaseError::Port(_) = &e {
+                        self.inner.note_fault_if_faulted(source);
+                    }
+                    NodeError::of_lease(source, e)
+                }),
             Err(e) => Err(e),
         };
         let (result, tuned) = match leased {

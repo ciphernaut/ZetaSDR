@@ -3637,6 +3637,49 @@ async fn job_start_on_a_faulted_source_is_refused_naming_the_source() {
     }
 }
 
+/// `source_ensure` and `source_pin` on a source whose port cannot tune are refused under
+/// the source's name, as `job_start` is, not as a bare `io: <fault>`.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test]
+async fn source_ensure_and_pin_on_a_faulted_source_are_refused_naming_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = fixtures::write_tone(dir.path());
+    let opts = FileOpts {
+        realtime: false,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: None,
+    };
+    let src = Arc::new(FileSource::open(SourceId("s".into()), &meta, opts).unwrap());
+    let port = zeta_core::test_fixtures::FaultablePort::new(src);
+    let node = Node::open(cfg(dir.path()), registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    port.set_fault(Some("device not found: x".into()));
+    let ensure = Op::SourceEnsure {
+        source: SourceId("s".into()),
+        center_hz: Hz(100_010_000),
+        bandwidth_hz: Hz(48_000),
+        replace: vec![],
+        widen: false,
+    };
+    let pin = Op::SourcePin {
+        source: SourceId("s".into()),
+        center_hz: Hz(100_010_000),
+        bandwidth_hz: Hz(48_000),
+        replace: vec![],
+    };
+    for op in [ensure, pin] {
+        let name = op.name();
+        match node.apply(op).await {
+            Err(OpError::Other { message }) => {
+                assert_eq!(message, "source s: io: device not found: x", "{name}")
+            }
+            other => panic!("{name}: expected Other, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn demod_graphs_carry_denoise_and_the_voice_shaping() {
     let tuning = Tuning {
