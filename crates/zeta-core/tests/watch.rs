@@ -418,8 +418,30 @@ impl Stage for Failing {
 }
 
 /// While set, a [`HoldStop`] stage that was cancelled waits for it to clear before it
-/// ends: its run's teardown (the lease still held) lasts as long as a test needs.
+/// ends: its run's teardown (the lease still held) lasts as long as a test needs. Set
+/// through [`hold_stops`] only.
 static HOLD_STOPS: AtomicBool = AtomicBool::new(false);
+
+/// [`HOLD_STOPS`] set while this lives: cleared when released or dropped, so a test
+/// that panics leaves no later test held.
+struct HoldStops;
+
+impl HoldStops {
+    fn release(&self) {
+        HOLD_STOPS.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for HoldStops {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn hold_stops() -> HoldStops {
+    HOLD_STOPS.store(true, Ordering::SeqCst);
+    HoldStops
+}
 
 /// A real stage (`pocsag_decode` in the tests) whose end after a cancel waits while
 /// [`HOLD_STOPS`] is set.
@@ -2093,6 +2115,89 @@ async fn a_watch_sink_is_checked_against_its_stage() {
     assert!(running(&node).is_empty(), "{:?}", running(&node));
 }
 
+/// A decoder kept with its sink by the build before the sinks were stored beside the
+/// graph (`operator_graph: true`, no `sinks`, the sink node named `sondehub`): after a
+/// node restart it resumes as stored and the watch re-adopts it as it is, with no second
+/// sink beside the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_old_sinked_decoder_is_re_adopted_without_a_second_sink() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let jobs = dir.path().join("state").join("jobs");
+    let file = |id: &JobId| jobs.join(format!("{}.json", id.0));
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub_params() })).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    drop(events);
+    // The decoder's record as the earlier build wrote it.
+    let mut old: Value =
+        serde_json::from_str(&std::fs::read_to_string(file(&job)).unwrap()).unwrap();
+    let sink_id = old["graph"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["kind"] == "sink_sondehub")
+        .expect("the sink")["id"]
+        .clone();
+    for n in old["graph"]["nodes"].as_array_mut().unwrap() {
+        if n["id"] == sink_id {
+            n["id"] = "sondehub".into();
+        }
+    }
+    for e in old["graph"]["edges"].as_array_mut().unwrap() {
+        if e["to"] == sink_id {
+            e["to"] = "sondehub".into();
+        }
+    }
+    old["operator_graph"] = true.into();
+    old["capture_rate_hz"] = Value::Null;
+    old.as_object_mut().unwrap().remove("sinks");
+    let graph: Graph = serde_json::from_value(old["graph"].clone()).unwrap();
+    // A mark the re-adoption clears, so the test sees it happen.
+    let mut w: Value =
+        serde_json::from_str(&std::fs::read_to_string(file(&watch)).unwrap()).unwrap();
+    w["context"]["watch"]["decoding"][0]["sink_error"] = "marked".into();
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    std::fs::write(file(&job), old.to_string()).unwrap();
+    std::fs::write(file(&watch), w.to_string()).unwrap();
+
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let events = Events::of(&node, &watch);
+    until(
+        "the watch re-adopts the decoder",
+        Duration::from_secs(20),
+        || {
+            decoding(&node, &watch)
+                .iter()
+                .any(|d| d["job"] == job.0.as_str() && d["sink_error"].is_null())
+        },
+    )
+    .await;
+    let rec = record(&node, &job).unwrap();
+    assert_eq!(rec.state, JobState::Running);
+    assert!(rec.operator_graph, "{rec:?}");
+    let sinks: Vec<&GraphNode> = rec
+        .graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == "sink_sondehub")
+        .collect();
+    assert_eq!(sinks.len(), 1, "{:#?}", rec.graph);
+    assert_eq!(sinks[0].id, NodeId("sondehub".into()));
+    assert!(
+        zeta_core::graph::same_pipeline(&rec.graph, &graph),
+        "{:#?}",
+        rec.graph
+    );
+    assert!(events.watch("lost").is_empty(), "{:#?}", events.all());
+    stop_all(&node).await;
+}
+
 fn sondehub_params() -> Value {
     serde_json::json!({
         "callsign": "TEST", "lat": -27.5, "lon": 153.0, "alt_m": 10, "batch_ms": 5000,
@@ -2292,7 +2397,7 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
     let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
     let node = Arc::new(node);
     // The sink restart waits once the proof has landed, until the gate is held.
-    zeta_core::node::watch::test_hold_sink_restarts(true);
+    let hold = zeta_core::node::watch::test_hold_sink_restarts();
     let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub_params() })).await;
     until("the sink restart waits", Duration::from_secs(40), || {
         zeta_core::node::watch::test_sink_restarts_held() > 0
@@ -2328,7 +2433,7 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
     // stopped for the restart and its launch waits on the gate.
     let early = tokio::time::timeout(Duration::from_millis(300), &mut replace).await;
     assert!(early.is_err(), "the replace ran under the gate: {early:?}");
-    zeta_core::node::watch::test_hold_sink_restarts(false);
+    hold.release();
     until("the decoder is stopped", Duration::from_secs(30), || {
         state(&node, &child) != Some(JobState::Running)
     })
@@ -2378,7 +2483,7 @@ async fn a_replace_of_the_decoder_during_its_sink_restart_leaves_it_stopped() {
     let port = Muting::new(src.clone(), false);
     let node = node_over_with(dir.path(), vec![(port, src)], None, holding_registry()).await;
     let node = Arc::new(node);
-    HOLD_STOPS.store(true, Ordering::SeqCst);
+    let held = hold_stops();
     let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub_params() })).await;
     let events = Events::of(&node, &watch);
     // The sink restart's gated stop of the decoder, its teardown held: stopped, a gated
@@ -2424,7 +2529,7 @@ async fn a_replace_of_the_decoder_during_its_sink_restart_leaves_it_stopped() {
         || node.debug_gated_stop(&decoder) != Some(restart),
     )
     .await;
-    HOLD_STOPS.store(false, Ordering::SeqCst);
+    held.release();
     let r = tokio::time::timeout(Duration::from_secs(10), replace)
         .await
         .expect("the replace returns")
@@ -2440,6 +2545,49 @@ async fn a_replace_of_the_decoder_during_its_sink_restart_leaves_it_stopped() {
     assert_eq!(events.watch("lost")[0]["job"], decoder.0.as_str());
     assert_eq!(state(&node, &decoder), Some(JobState::Stopped));
     assert!(!holds(&decoder), "{:?}", node.lease_holders(&rx()));
+    stop_all(&node).await;
+}
+
+/// A sink restart that waits on its decoder's restart lock (held here, as a capture move
+/// holds it while it relaunches the watch in place and waits for the watch's run to end)
+/// gives way to the watch's stop: the stop returns while the lock is still held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sink_restart_waiting_on_the_decoders_restart_lock_lets_the_watch_stop() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let hold = zeta_core::node::watch::test_hold_sink_restarts();
+    let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub_params() })).await;
+    until("the sink restart waits", Duration::from_secs(40), || {
+        zeta_core::node::watch::test_sink_restarts_held() > 0
+    })
+    .await;
+    let child = owned(&node, &watch)
+        .into_iter()
+        .find(|r| r.kind == "pocsag_decode")
+        .unwrap()
+        .id;
+    let lock = node
+        .debug_restart_guard(&child)
+        .await
+        .expect("the decoder's record");
+    hold.release();
+    until(
+        "the sink restart goes for the lock",
+        Duration::from_secs(5),
+        || zeta_core::node::watch::test_sink_restarts_held() == 0,
+    )
+    .await;
+    let stop = tokio::time::timeout(Duration::from_secs(10), node.job_stop(&watch)).await;
+    assert!(
+        stop.is_ok(),
+        "the watch's stop waited on the decoder's restart lock"
+    );
+    stop.unwrap().unwrap();
+    assert_eq!(state(&node, &watch), Some(JobState::Stopped));
+    drop(lock);
     stop_all(&node).await;
 }
 

@@ -406,6 +406,10 @@ From plan 33. Not built:
 - `radio_prefer` by driver or role, which needs a driver in `SourceInfo`;
 - a node-stored per-caller policy, replacing the browser's `zeta.radio_prefs` once users exist;
 
+## Bug: an ungated `job_stop` during a restart's teardown is undone
+
+Found in cleanup Round 1 (batch H): `record_running` refuses a launch only after a gated stop (a `replace`) or during a flagged relaunch (an elastic job, a `job_retune`), so a plain `job_stop` that lands while a `graph_put` restart or a watch's sink restart is stopping the job is undone by the relaunch that follows.
+
 ## Station: discipline the B210 to its GPS module
 
 The operator says the B210 has a GPS module attached. The node's unit runs it as `driver=uhd,serial=31B92DD,gain=65,ppm=2.7` with no `clock_source` or `time_source`, UHD has never logged an internal GPSDO for this B210 (no "Detecting internal GPSDO" line in the journal), and no USB GPS is on the host. So how the module is fitted must be found out before the unit changes: an Ettus internal GPSDO board takes `clock_source=gpsdo,time_source=gpsdo`; an external reference into REF/PPS takes `clock_source=external,time_source=external`. Once disciplined, drop `ppm=2.7` and calibrate the HackRF against the B210 on a steady carrier: the 433.88 MHz remote read 2.6-3.2 kHz higher on the HackRF than on the B210, about 6-7 ppm.

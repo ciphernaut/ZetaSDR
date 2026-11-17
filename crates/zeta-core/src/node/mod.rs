@@ -2823,6 +2823,13 @@ impl Node {
         self.inner.jobs.lock().unwrap().get(id)?.gated_stop
     }
 
+    /// Hold job `id`'s restart lock (see `Inner::restart_guard`), for tests of what
+    /// waits on it; `None` for a job the node has no record of.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub async fn debug_restart_guard(&self, id: &JobId) -> Option<OwnedMutexGuard<()>> {
+        self.inner.restart_guard(id).await
+    }
+
     /// Hold `source`'s gate, for tests of what waits on it.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub async fn debug_gate(&self, source: &SourceId) -> OwnedMutexGuard<()> {

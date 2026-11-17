@@ -204,27 +204,43 @@ fn sink_launch_fails() -> bool {
         .is_ok()
 }
 
-/// Tests only: while set, a sink restart waits before it stops the decoder.
+/// Tests only: while set, a sink restart waits as it begins, before it takes the
+/// decoder's restart lock.
 #[cfg(feature = "test-fixtures")]
 static TEST_HOLD_SINK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Tests only: how many sink restarts have reached the hold since it was last set.
+/// Tests only: how many sink restarts wait on the hold now.
 #[cfg(feature = "test-fixtures")]
 static TEST_SINK_HELD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Tests only: hold the sink restarts from now on (`true`, the count of those held
-/// cleared) or let them go (`false`).
+/// Tests only: the sink restarts are held while this lives; dropped (a test that
+/// panicked included) or [`SinkHold::release`]d, they go on.
 #[cfg(feature = "test-fixtures")]
-pub fn test_hold_sink_restarts(on: bool) {
-    use std::sync::atomic::Ordering;
-    if on {
-        TEST_SINK_HELD.store(0, Ordering::SeqCst);
+pub struct SinkHold(());
+
+#[cfg(feature = "test-fixtures")]
+impl SinkHold {
+    /// Let the held sink restarts go on.
+    pub fn release(&self) {
+        TEST_HOLD_SINK.store(false, std::sync::atomic::Ordering::SeqCst);
     }
-    TEST_HOLD_SINK.store(on, Ordering::SeqCst);
 }
 
-/// Tests only: how many sink restarts have reached the hold since
-/// [`test_hold_sink_restarts`] set it.
+#[cfg(feature = "test-fixtures")]
+impl Drop for SinkHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Tests only: hold the sink restarts from now on, until the guard goes.
+#[cfg(feature = "test-fixtures")]
+pub fn test_hold_sink_restarts() -> SinkHold {
+    TEST_HOLD_SINK.store(true, std::sync::atomic::Ordering::SeqCst);
+    SinkHold(())
+}
+
+/// Tests only: how many sink restarts wait on the hold now.
 #[cfg(feature = "test-fixtures")]
 pub fn test_sink_restarts_held() -> u32 {
     TEST_SINK_HELD.load(std::sync::atomic::Ordering::SeqCst)
@@ -238,13 +254,18 @@ async fn sink_hold(cancel: &CancellationToken) -> bool {
         return true;
     }
     TEST_SINK_HELD.fetch_add(1, Ordering::SeqCst);
+    let mut passed = true;
     while TEST_HOLD_SINK.load(Ordering::SeqCst) {
         tokio::select! {
-            _ = cancel.cancelled() => return false,
+            _ = cancel.cancelled() => {
+                passed = false;
+                break;
+            }
             _ = tokio::time::sleep(Duration::from_millis(5)) => {}
         }
     }
-    true
+    TEST_SINK_HELD.fetch_sub(1, Ordering::SeqCst);
+    passed
 }
 
 #[cfg(feature = "test-fixtures")]
@@ -1583,10 +1604,19 @@ impl Inner {
     /// decoder is [`SinkOutcome::Lost`]. An operator's graph (and a decoder kept with a
     /// sink before the sinks were stored beside its graph) runs as stored: `Off`.
     async fn sink_into(self: &Arc<Self>, r: &Run, job: &JobId, sinks: &[GraphNode]) -> SinkOutcome {
+        #[cfg(feature = "test-fixtures")]
+        if !sink_hold(&r.cancel).await {
+            return SinkOutcome::Cancelled;
+        }
         // The decoder's restart lock before its record is read, held through both
         // relaunches (the order: restart lock, then the source's gate, which the stop
         // and the launch take inside): an operator's `graph_put` of it waits its turn.
-        let _restart = self.restart_guard(job).await;
+        // Given up when the watch is stopped: a capture move holds the lock while it
+        // relaunches the watch in place, and waits for this run to end.
+        let _restart = tokio::select! {
+            g = self.restart_guard(job) => g,
+            _ = r.cancel.cancelled() => return SinkOutcome::Cancelled,
+        };
         let Some(rec) = self.jobs.lock().unwrap().get(job).map(|e| e.record.clone()) else {
             return SinkOutcome::Off;
         };
@@ -1608,10 +1638,6 @@ impl Inner {
         };
         if wanted == rec.sinks {
             return outcome(refused);
-        }
-        #[cfg(feature = "test-fixtures")]
-        if !sink_hold(&r.cancel).await {
-            return SinkOutcome::Cancelled;
         }
         // Stopping an owned job forgets its record: it is the watch's ordinary decoder
         // from here on (the caller disowns it too).
