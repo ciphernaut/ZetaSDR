@@ -406,10 +406,6 @@ From plan 33. Not built:
 - `radio_prefer` by driver or role, which needs a driver in `SourceInfo`;
 - a node-stored per-caller policy, replacing the browser's `zeta.radio_prefs` once users exist;
 
-## Bug: `--then-tail` on a program row with a squelched demod tails the squelch events first
-
-Found in plan 17 task 7. `--then-tail` now tails the first event output of the job; for an audio-input program row whose `nbfm_demod` keeps its squelch on, that is the demod's `squelch` event stream, which publishes before the decoder's events, so the tail shows `squelch` frames and the decode may land after `max_frames`. The sonde rows run the squelch off, so they are unaffected; an operator audio row that keeps it on is not. Tail the last event output (the decoder's) or the one whose frames carry `protocol`, and test it with a squelched audio row.
-
 ## Bug: a sink-bearing decoder is frozen as an operator graph
 
 Found in plan 17 task 10. A decoder with a `sink_sondehub` node (added by the watch's `sondehub` param) is stored `operator_graph: true`, so it is not re-expanded at a different capture rate, and the sink-less fallback after a failed sink relaunch is stored the same way with no capture rate. Keep the row's expansion and re-append the sink on re-expansion (store the sink config beside the graph), so a retune does not leave the decoder at the old rate. Same area: decoders the watch re-adopts after a `graph put` keep their old sink config, and a batch buffered at a restart is lost.

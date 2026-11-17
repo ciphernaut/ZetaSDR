@@ -1250,8 +1250,8 @@ pub enum JobCmd {
         elastic: bool,
         #[command(flatten)]
         replace: ReplaceArg,
-        /// After starting, tail the job's audio output (else its first event) stream, stop
-        /// the job and print `[job_result, frames_result, {"stopped": true}]`;
+        /// After starting, tail the job's audio output (else its decoder's event) stream,
+        /// stop the job and print `[job_result, frames_result, {"stopped": true}]`;
         /// a job that is not running prints `[job_result, job_record]` and
         /// exits 2 (one-shot only)
         #[arg(long, value_name = "MAX_FRAMES,TIMEOUT_MS", value_parser = parse_then_tail)]

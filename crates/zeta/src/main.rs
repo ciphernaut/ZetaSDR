@@ -332,8 +332,10 @@ fn verdict_job(rec: &zeta_core::job::JobRecord) -> Option<Option<zeta_core::type
 
 /// `--then-tail`: wait up to `STREAM_WAIT` for the job's audio output (a
 /// demodulator's; its `squelch` events are not what a tail is for), else its
-/// first event output stream (an edge between its stages never), then apply
-/// `StreamTail` to it. A job whose graph has a `slicer` is tailed on the stream
+/// decoder's event output: the last of its event outputs (an edge between its
+/// stages never), then apply `StreamTail` to it. The outputs are in graph order and a
+/// row's decoder comes after its demod, so the last is the decoder's events, never a
+/// demod's `squelch` events (which a demod that keeps its squelch on publishes first). A job whose graph has a `slicer` is tailed on the stream
 /// `job_context.slicer.stream` names, waited for the same way.
 async fn tail_job(
     node: &zeta_core::node::Node,
@@ -362,10 +364,10 @@ async fn tail_job(
         } else {
             node.job_audio_stream(job).ok().or_else(|| {
                 // An output, never an edge between two of its stages (a watch's
-                // spectrum rows).
+                // spectrum rows); the last, the decoder's.
                 node.job_outputs(job)
                     .into_iter()
-                    .find(|(k, _)| *k == StreamKind::Event)
+                    .rfind(|(k, _)| *k == StreamKind::Event)
                     .map(|(_, s)| s)
             })
         };

@@ -900,6 +900,40 @@ fn job_start_then_tail_prints_aprs_event() {
     assert_eq!(frames[0]["payload"]["src"], "VK3ABC");
 }
 
+/// An operator's APRS row whose demod keeps its squelch on (an absolute threshold under
+/// the noise, so it is always open): the demod publishes `squelch` events on the job's
+/// event stream before the decoder's first packet. `--then-tail` tails the decoder's
+/// events, so the one frame it prints is the packet.
+#[test]
+fn then_tail_on_a_squelched_audio_row_tails_the_decoder() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let mut aprs: Value =
+        serde_json::from_str(include_str!("../../../modes/aprs_decode.json")).unwrap();
+    let demod = aprs["decoder"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|n| n["kind"] == "nbfm_demod")
+        .expect("the row's demod");
+    demod["params"]["squelch"] = true.into();
+    demod["params"]["squelch_db"] = (-120).into();
+    std::fs::write(modes.join("aprs_decode.json"), aprs.to_string()).unwrap();
+    let modes_dir = modes.display().to_string();
+    let out = aprs_start(dir.path(), "1,5000", &[])
+        .args(["--modes-dir", &modes_dir])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let frames = v[1]["value"]["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 1, "{v:#}");
+    assert_eq!(frames[0]["payload"]["src"], "VK3ABC", "{v:#}");
+}
+
 #[test]
 fn job_start_pocsag_decode_prints_pocsag_event() {
     let dir = tempfile::tempdir().unwrap();
