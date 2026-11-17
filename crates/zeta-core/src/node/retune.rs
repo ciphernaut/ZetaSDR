@@ -424,7 +424,13 @@ impl Inner {
                     e.relaunch = false;
                     continue;
                 }
-                e.record.clone()
+                let mut rec = e.record.clone();
+                // The record's copy of its input's band follows a retune of the input
+                // (the launch persists it).
+                if let Some(input) = rec.input.as_ref().and_then(|i| jobs.get(i)) {
+                    rec.tuning = input.record.tuning;
+                }
+                rec
             };
             if let Err(e) = self.launch(rec).await {
                 // A launch refused because another relaunch took the id leaves that

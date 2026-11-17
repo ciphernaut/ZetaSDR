@@ -558,6 +558,12 @@ async fn an_attached_transcribe_survives_its_inputs_retune_under_its_id() {
     );
     assert_running_for(&node, &att, 2000).await;
     assert_eq!(record(&node, &att).input, Some(input.clone()));
+    // Its record's copy of the input's tuning follows the retune, on disk too.
+    let retuned = record(&node, &input).tuning;
+    assert_eq!(record(&node, &att).tuning, retuned);
+    let path = dir.path().join(format!("state/jobs/{}.json", att.0));
+    let on_disk: JobRecord = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(on_disk.tuning, retuned);
     assert!(event(&node, &att, "transcript", 3000).await.is_some());
     assert_eq!(attached_to(&node, &input), vec![att]);
 }
