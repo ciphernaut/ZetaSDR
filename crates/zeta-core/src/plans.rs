@@ -26,6 +26,10 @@ pub struct ChannelPlan {
     /// Channels that carry data, never voice: `plan_start` attaches no `transcribe`
     /// to them and a mix does not read a job centred on one.
     pub no_voice: &'static [u32],
+    /// The FM peak deviation the plan's channels use, Hz; `plan_start` gives an
+    /// `fm_demod` it when the caller's `deviation_hz` is `null` (`None`: the kind's
+    /// default).
+    pub deviation_hz: Option<u64>,
 }
 
 /// A frequency within this many Hz of a channel centre is on the channel.
@@ -66,6 +70,7 @@ pub const UHF_CB_AU: ChannelPlan = ChannelPlan {
         (40, "road (convention)"),
     ],
     no_voice: &[22, 23],
+    deviation_hz: Some(2_500),
 };
 
 /// VHF ACARS: the seven channels aircraft use around 131 MHz, numbered by
@@ -129,6 +134,7 @@ pub const ACARS_VHF: ChannelPlan = ChannelPlan {
         (7, "Europe"),
     ],
     no_voice: &[1, 2, 3, 4, 5, 6, 7],
+    deviation_hz: None,
 };
 
 /// AIS: the two maritime VHF channels, 87B and 88B, in one capture. Data only.
@@ -153,6 +159,7 @@ pub const AIS_VHF: ChannelPlan = ChannelPlan {
     ],
     notes: &[(1, "channel A, 87B"), (2, "channel B, 88B")],
     no_voice: &[1, 2],
+    deviation_hz: None,
 };
 
 /// Every plan the node knows; a frequency on two plans takes the first. The page's

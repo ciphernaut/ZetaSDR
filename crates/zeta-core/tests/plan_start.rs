@@ -284,6 +284,60 @@ async fn plan_start_starts_every_channel_under_one_tune() {
     }
 }
 
+/// The `deviation_hz` param of the first node of `graph` that has one.
+fn graph_deviation(graph: &zeta_core::graph::Graph) -> Option<u64> {
+    fn find(v: &serde_json::Value) -> Option<u64> {
+        match v {
+            serde_json::Value::Object(m) => m
+                .get("deviation_hz")
+                .and_then(|d| d.as_f64())
+                .map(|d| d as u64)
+                .or_else(|| m.values().find_map(find)),
+            serde_json::Value::Array(a) => a.iter().find_map(find),
+            _ => None,
+        }
+    }
+    find(&serde_json::to_value(graph).unwrap())
+}
+
+#[tokio::test]
+async fn a_cb_plan_channel_demodulates_at_the_plans_deviation_unless_one_is_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open(dir.path(), &radio).await;
+    // The plan's own deviation (UHF CB uses 2500 Hz), shown by `channel_plans` too.
+    let Ok(OpResult::ChannelPlans { plans }) = node.apply(Op::ChannelPlans {}).await else {
+        panic!("expected channel_plans");
+    };
+    let dev = |id: &str| plans.iter().find(|p| p.id == id).unwrap().deviation_hz;
+    assert_eq!(dev(PLAN), Some(Hz(2_500)));
+    assert_eq!(dev("ais_vhf"), None);
+    let a = planned(&node, fm_plan(Some(vec![9]), &[])).await;
+    let job = node.job_list().into_iter().find(|r| r.id == a.started[0].2);
+    assert_eq!(graph_deviation(&job.unwrap().graph), Some(2_500));
+    // The operator's own value wins.
+    let mut op = fm_plan(Some(vec![9]), &[&a.started[0].2]);
+    if let Op::PlanStart { deviation_hz, .. } = &mut op {
+        *deviation_hz = Some(3_000);
+    }
+    let b = planned(&node, op).await;
+    let job = node.job_list().into_iter().find(|r| r.id == b.started[0].2);
+    assert_eq!(graph_deviation(&job.unwrap().graph), Some(3_000));
+}
+
+#[tokio::test]
+async fn a_job_at_the_default_deviation_is_the_channels_existing_job_when_the_plan_supplies_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open(dir.path(), &radio).await;
+    // ch9, started by hand at the kind's 5000 Hz default (as before the plan carried one).
+    let job = started(&node, start(JobKind::FmDemod, band(476_625_000, 12_500))).await;
+    let a = planned(&node, fm_plan(Some(vec![9]), &[])).await;
+    assert!(a.started.is_empty(), "{:?}", a.started);
+    assert_eq!(a.existing, vec![(9, job)]);
+    assert_eq!(node.job_list().len(), 1);
+}
+
 #[tokio::test]
 async fn plan_start_ais_vhf_runs_ais_decode_on_both_channels() {
     let dir = tempfile::tempdir().unwrap();

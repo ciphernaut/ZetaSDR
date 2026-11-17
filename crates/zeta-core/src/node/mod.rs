@@ -2270,8 +2270,23 @@ impl Node {
         deviation_hz: Option<u64>,
         sideband: Option<Sideband>,
     ) -> Option<JobId> {
+        self.duplicate_of_as(source, kind, tuning, (deviation_hz, sideband), true)
+    }
+
+    /// [`Node::duplicate_of`], comparing the deviation only when `match_deviation`
+    /// (a plan's own deviation was not asked for, so a job at any deviation counts).
+    pub(crate) fn duplicate_of_as(
+        &self,
+        source: &SourceId,
+        kind: &str,
+        tuning: Tuning,
+        (deviation_hz, sideband): (Option<u64>, Option<Sideband>),
+        match_deviation: bool,
+    ) -> Option<JobId> {
         let k = self.expandable_kind(kind)?;
         let norm = |(d, s): (Option<u64>, Option<Sideband>)| match k {
+            JobKind::FmDemod if !match_deviation => (None, None),
+            JobKind::WfmDemod if !match_deviation => (None, None),
             JobKind::FmDemod => (Some(d.unwrap_or(FM_DEVIATION_DEFAULT_HZ)), None),
             JobKind::WfmDemod => (Some(d.unwrap_or(WFM_DEVIATION_DEFAULT_HZ)), None),
             JobKind::SsbDemod => (None, Some(s.unwrap_or(Sideband::Usb))),

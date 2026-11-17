@@ -888,7 +888,7 @@ fn nullable_hz_u64(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         "type": ["integer", "null"],
         "format": "uint64",
         "minimum": 0,
-        "description": "FM peak deviation in Hz (100..=75000) for `fm_demod` and `wfm_demod`; `null` is the kind's default (5000 for `fm_demod`, 75000 for `wfm_demod`). Any other kind must pass `null`."
+        "description": "FM peak deviation in Hz (100..=75000) for `fm_demod` and `wfm_demod`; `null` is the kind's default (5000 for `fm_demod`, 75000 for `wfm_demod`), or, on a `plan_start` of `fm_demod`, the deviation the channel plan carries (`channel_plans`). Any other kind must pass `null`."
     })
 }
 
@@ -2929,7 +2929,7 @@ impl FrameSummary {
 /// One channel plan as `channel_plans` reports it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::modes::require_all)]
 pub struct PlanInfo {
     pub id: String,
     pub name: String,
@@ -2938,6 +2938,12 @@ pub struct PlanInfo {
     pub bandwidth_hz: Hz,
     /// The smallest spacing between two channel centres.
     pub adjacent_hz: Hz,
+    /// The FM peak deviation the plan's channels use; `plan_start` gives an `fm_demod`
+    /// the demodulator's `deviation_hz` when its own is `null`. `null` for none: the
+    /// kind's default.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<Hz>")]
+    pub deviation_hz: Option<Hz>,
     /// Sorted by frequency.
     pub channels: Vec<PlanChannel>,
 }
@@ -2977,6 +2983,7 @@ impl From<&crate::plans::ChannelPlan> for PlanInfo {
             region: p.region.into(),
             bandwidth_hz: Hz(p.bandwidth_hz),
             adjacent_hz: Hz(crate::plans::adjacent_hz(p)),
+            deviation_hz: p.deviation_hz.map(Hz),
             channels: crate::plans::channels(p)
                 .into_iter()
                 .map(|(number, hz)| PlanChannel {
@@ -5195,6 +5202,9 @@ pub(crate) struct PlanChannels {
     pub numbers: Vec<u32>,
     pub kind: JobKind,
     pub deviation: Option<Hz>,
+    /// `deviation` is the plan's own, the caller having given none: a running job of
+    /// the kind on a channel is that channel's, whatever its deviation.
+    pub deviation_from_plan: bool,
     pub sideband: Option<Sideband>,
 }
 
@@ -5266,11 +5276,22 @@ fn plan_check_as(
     )
     .map_err(|e| e.error)?;
     kind.mode_row(&node.modes())?;
+    // The plan's own deviation when the caller gave none: data on the plan, not a
+    // guess from the channel width.
+    let deviation_from_plan =
+        deviation.is_none() && kind == JobKind::FmDemod && plan.deviation_hz.is_some();
+    let deviation = deviation.or_else(|| {
+        (kind == JobKind::FmDemod)
+            .then_some(plan.deviation_hz)
+            .flatten()
+            .map(Hz)
+    });
     let pc = PlanChannels {
         plan,
         numbers,
         kind,
         deviation,
+        deviation_from_plan,
         sideband,
     };
     Ok((pc, language))
@@ -5323,12 +5344,12 @@ pub(crate) fn plan_existing(
     for &n in &pc.numbers {
         let band = pc.channel_band(n);
         let dup = node
-            .duplicate_of(
+            .duplicate_of_as(
                 source,
                 pc.kind.name(),
                 band,
-                pc.deviation.map(|d| d.0),
-                pc.sideband,
+                (pc.deviation.map(|d| d.0), pc.sideband),
+                !pc.deviation_from_plan,
             )
             .filter(|j| !replace.contains(j));
         match dup {
