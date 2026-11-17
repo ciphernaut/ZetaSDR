@@ -601,6 +601,54 @@ async fn a_retune_keeps_the_policy() {
     assert_eq!(heard(&node, &t).await, "slot1");
 }
 
+/// An attached job whose relaunch after its input's retune fails (the row, reloaded
+/// meanwhile, no longer has its voice) ends `failed` at the input's new tuning, the one
+/// it was asked to run at, on disk too.
+#[tokio::test]
+async fn an_attached_job_whose_relaunch_fails_after_a_retune_records_the_new_tuning() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let job = start_two_voice(&node, 100_000_000, None).await;
+    let t = attach(&node, &job, Some("slot1")).await.unwrap();
+    assert_eq!(heard(&node, &t).await, "slot1");
+    // The row's decoder is now a one-voice demodulator.
+    let mut one_voice = row();
+    one_voice["decoder"]["nodes"][1] =
+        json!({"id": "decode", "kind": "am_demod", "params": {"audio_rate_hz": 16000}});
+    std::fs::write(
+        dir.path().join(format!("modes/{ROW}.json")),
+        one_voice.to_string(),
+    )
+    .unwrap();
+    node.reload_modes().unwrap();
+    let r = node
+        .apply(Op::JobRetune {
+            job: job.clone(),
+            center_hz: Hz(100_005_000),
+            bandwidth_hz: Hz(12_500),
+            bin_hz: None,
+            replace: vec![],
+        })
+        .await;
+    assert_eq!(r, Ok(OpResult::Job(job.clone())));
+    let retuned = record(&node, &job).tuning;
+    assert_eq!(retuned.center_hz, Hz(100_005_000));
+    assert_eq!(record(&node, &job).state, JobState::Running);
+    until("the attached relaunch failed", || {
+        matches!(record(&node, &t).state, JobState::Failed { .. })
+    })
+    .await;
+    let JobState::Failed { reason } = record(&node, &t).state else {
+        unreachable!()
+    };
+    assert_eq!(reason, format!("stream: {} has one voice", job.0));
+    assert_eq!(record(&node, &t).tuning, retuned);
+    let path = dir.path().join(format!("state/jobs/{}.json", t.0));
+    let on_disk: JobRecord = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(on_disk.tuning, retuned);
+    assert!(matches!(on_disk.state, JobState::Failed { .. }));
+}
+
 /// The refusal's text for a start on `center_hz` that repeats `job`, running `policy`.
 fn duplicate_message(center_hz: u64, job: &JobId, policy: &str) -> String {
     format!(

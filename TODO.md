@@ -117,10 +117,6 @@ Done in plan 30 (`docs/superpowers/specs/2026-11-06-aircraft-links-design.md`, `
 - The fake-program checks assert no `summary`, and HFDL's only the uplink.
 - No scenario covers a merged group's member dropped by `subject_drop_s` (Review Focus 4).
 
-## Jobs: an attached job whose relaunch fails keeps its input's old tuning
-
-Cleanup round 0 makes an attached job relaunched after its input's `job_retune`, `graph_put` or capture move record the input's new tuning. Left: when that relaunch fails, the `Failed` record keeps the old tuning.
-
 ## Fit: a weak voice channel fits to the width floor
 
 From the B210 CB run, 2026-11-01 (plan series "Plan 18 status"). A ch9 transmission at 9-12 dB measured `bandwidth_hz` 600-800 (`fsk`: "two rf tones 500 Hz apart", or `noise` between words) because `measure`'s occupied band is the bins 6 dB over the floor, and at that SNR only the carrier line clears it, never the ±3 kHz voice sidebands; 1.25 x 800 Hz floors at 5 kHz, so the demod was fitted 5 kHz wide on a 12.5 kHz voice channel (intelligible, transcribed, but clipped). The width rule should not trust an occupied width under a voice channel's minimum: when the layer-1 label is `fm`, `fsk` or `unknown` and the measured width is under the kind's floor, take the channel plan's width at that centre (12.5 kHz on UHF CB) or a measured width at a lower threshold (bins within 20 dB of the peak, or the width that holds 99 % of the band's excess power), and say which in the `fitted` line. The same 1 s window also mislabels an FM voice carrier as `fsk` (the carrier plus one modulation line); a burst-aware layer 1 (below) helps here too.

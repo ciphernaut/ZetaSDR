@@ -496,6 +496,7 @@ impl Inner {
                 }
                 rec
             };
+            let tuning = rec.tuning;
             if let Err(e) = self.launch(rec).await {
                 // A launch refused because another relaunch took the id leaves that
                 // run's entry alone (`finish` ends only run `run`).
@@ -507,6 +508,11 @@ impl Inner {
                     .filter(|e| e.run == run)
                 {
                     entry.relaunch = false;
+                    // The `Failed` record keeps the tuning it was asked to run at, its
+                    // input's new one (`finish` persists it).
+                    if entry.record.state == JobState::Running {
+                        entry.record.tuning = tuning;
+                    }
                 }
                 self.finish(
                     &id,
