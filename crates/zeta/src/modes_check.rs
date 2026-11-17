@@ -216,8 +216,26 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
         Ok(()) => run_test(m, test, &scratch, ctx).await,
         Err(e) => Outcome::Fail(format!("{}: {e}", scratch.display())),
     };
-    let _ = std::fs::remove_dir_all(&scratch);
+    remove_scratch(&scratch).await;
     outcome
+}
+
+/// Remove a check's scratch directory. The node that ran in it may still be writing its state
+/// as it shuts down, which makes a removal fail or leave files behind: try again for a while
+/// (the directory is only scratch, so a last failure is reported and left for the state dir's
+/// owner).
+async fn remove_scratch(scratch: &Path) {
+    const ATTEMPTS: u32 = 40;
+    for attempt in 1..=ATTEMPTS {
+        match std::fs::remove_dir_all(scratch) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if attempt == ATTEMPTS => {
+                eprintln!("modes check: could not remove {}: {e}", scratch.display());
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
 }
 
 /// Run `test` of row `m` on a node over its capture, with `scratch` as the node's state
@@ -463,6 +481,26 @@ mod tests {
 
     fn fail(s: &str) -> Outcome {
         Outcome::Fail(s.into())
+    }
+
+    /// A removal that fails at first (here the parent is read-only for a moment, as a node
+    /// still writing its state directory makes it fail) is retried until it goes.
+    #[tokio::test]
+    async fn the_scratch_dir_goes_once_what_blocked_its_removal_is_done() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("check-1-row");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let parent = dir.path().to_path_buf();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let p = parent.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        });
+        remove_scratch(&scratch).await;
+        release.join().unwrap();
+        assert!(!scratch.exists(), "left behind");
     }
 
     #[test]
