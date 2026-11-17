@@ -1,5 +1,9 @@
 # TODO
 
+## Cleanup: the rounds of small debts
+
+`docs/superpowers/plans/2026-11-17-cleanup-spike.md` sorts the sections below by size into rounds: Round 0 (the XS sweep), node and worker fixes, small features, the page, and the deferred review minors. A section stays here until its item lands.
+
 ## UI: themes as folders (plan 26)
 
 Merged to `main` 576002a and deployed on test_host 2026-11-04: spec `docs/superpowers/specs/2026-11-03-themes-design.md`, plan `docs/superpowers/plans/2026-11-03-themes.md`. Themes are folders (`theme.json` + `style.css`) under repo-root `themes/` (console, plain, cyberpunk, terminal, psytrance, vibecoder), the operator's own in `--themes-dir`, listed by `themes_list` / `zeta themes list`, served at `/ui/themes/<id>/`; the author's guide is `docs/themes.md`, the UAT section is "Plan 26: themes". Mobile and other per-device layouts are later (see the footprints entry below).
