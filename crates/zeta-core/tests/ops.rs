@@ -367,11 +367,12 @@ async fn source_ensure_during_job_start_does_not_retune() {
         replace: vec![],
         widen: false,
     };
-    // `job_start` tunes twice: once (unheld) to learn the source rate, then
-    // under its lease. Send `ensure` once the second, slow tune has begun, so
-    // it lands inside the job's lease-and-tune.
+    // `job_start` holds the source's gate across its one tune of the unheld source
+    // (to learn its rate) and the job's lease, which takes that tune. Send `ensure`
+    // once the slow tune has begun: it waits on the gate and lands only after the
+    // lease, so it finds the job holding the source.
     let ensured = async {
-        while port.tunes.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+        while port.tunes.load(std::sync::atomic::Ordering::SeqCst) < 1 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         node.apply(ensure).await
@@ -382,11 +383,17 @@ async fn source_ensure_during_job_start_does_not_retune() {
         other => panic!("expected Job, got {other:?}"),
     };
     match ensured {
-        Err(OpError::Conflict { holders, .. }) => assert_eq!(holders, vec![job]),
+        Err(OpError::Conflict { holders, .. }) => assert_eq!(holders, vec![job.clone()]),
         Ok(OpResult::Tuning(t)) => assert_eq!(t, job_tuning),
         other => panic!("expected Conflict or the job's tuning, got {other:?}"),
     }
     assert_eq!(port.current(), Some(job_tuning));
+    let holders: Vec<JobId> = node
+        .lease_holders(&SourceId("hackrf0".into()))
+        .into_iter()
+        .map(|(j, _)| j)
+        .collect();
+    assert_eq!(holders, vec![job]);
 }
 
 /// A stage that runs until cancelled, registered under another stage's kind

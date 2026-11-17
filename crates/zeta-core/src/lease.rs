@@ -130,6 +130,11 @@ pub struct LeaseManager {
     waiting: Mutex<HashMap<SourceId, Vec<JobId>>>,
     /// Bumped on every yield and every release on a source ([`LeaseManager::changes`]).
     changes: Mutex<HashMap<SourceId, tokio::sync::watch::Sender<u64>>>,
+    /// Per source, the band an unheld port was last tuned to by `tune_if_unheld`
+    /// (asked, granted), until the next lease request, tune or idle there: a rigid
+    /// lease that would tune the port to the same band with nothing held (a
+    /// `job_start`, whose tune came first) takes it as tuned instead of tuning twice.
+    primed: Mutex<HashMap<SourceId, (Tuning, Tuning)>>,
     /// The sources whose capture policy is [`CapturePolicy::Widest`]
     /// ([`LeaseManager::set_capture_policy`]).
     widest: Mutex<HashSet<SourceId>>,
@@ -319,6 +324,7 @@ impl LeaseManager {
         let leased = self.leases.lock().unwrap().contains_key(port.id());
         let waited = self.waiting.lock().unwrap().contains_key(port.id());
         if !leased && !waited && !self.sweeps.lock().unwrap().contains_key(port.id()) {
+            self.primed.lock().unwrap().remove(port.id());
             port.idle().await;
         }
     }
@@ -329,6 +335,8 @@ impl LeaseManager {
     /// scan's time-shared lease is granted beside it. A second claim by the same
     /// holder is the same claim; [`LeaseManager::release`] drops it.
     pub fn claim_sweep(&self, source: &SourceId, holder: JobId) {
+        // The source's own sweep may move the device: a later lease tunes afresh.
+        self.primed.lock().unwrap().remove(source);
         let mut sweeps = self.sweeps.lock().unwrap();
         let v = sweeps.entry(source.clone()).or_default();
         if !v.contains(&holder) {
@@ -613,10 +621,13 @@ impl LeaseManager {
         };
         let source = port.id().clone();
         self.assert_gate(&source, guard);
+        let primed = self.primed.lock().unwrap().remove(&source);
+        let unheld;
         {
             let mut leases = self.leases.lock().unwrap();
             // A time-shared lease that gives way is decided as if it were not there.
             let held = leases.get(&source).map(|v| standing(v)).unwrap_or_default();
+            unheld = held.is_empty();
             // An elastic request on a held port joins its capture untuned (a
             // held port lacking a current tuning is at its first holder's band),
             // unless a time-shared lease holds it.
@@ -673,14 +684,27 @@ impl LeaseManager {
             true => want,
             false => self.capture_for(port, want),
         };
-        let got = port.tune(ask).await?;
+        // The unheld port's last tune (a `job_start`'s, under this gate or just before
+        // it) asked the same band and the port is still there, unfaulted: no second tune.
+        let (got, tuned) = match primed {
+            Some((asked, got))
+                if unheld
+                    && !pin
+                    && asked == ask
+                    && port.current() == Some(got)
+                    && port.fault().is_none() =>
+            {
+                (got, false)
+            }
+            _ => (port.tune(ask).await?, true),
+        };
         let mut leases = self.leases.lock().unwrap();
         let v = leases.entry(source).or_default();
         v.retain(|l| l.job != holder);
         // A rigid lease's band is the one asked for (the capture may be wider, and
         // may later move around it: `widen_locked`); an elastic one's is the capture.
         v.push(lease(if elastic { got } else { want }));
-        Ok((got, true))
+        Ok((got, tuned))
     }
 
     /// Pin `port` at `want` (see [`pin_holder`]) under the source's gate the
@@ -917,6 +941,7 @@ impl LeaseManager {
         if !held {
             return Ok(None);
         }
+        self.primed.lock().unwrap().remove(port.id());
         port.tune(step).await.map(Some)
     }
 
@@ -1032,6 +1057,7 @@ impl LeaseManager {
                 .map(|(t, tuned)| (t, tuned, Vec::new()));
         };
         self.yield_shared(&mut self.leases.lock().unwrap(), &source);
+        self.primed.lock().unwrap().remove(&source);
         let got = port.tune(want).await?;
         if got == cur {
             return Ok((got, false, Vec::new()));
@@ -1110,7 +1136,12 @@ impl LeaseManager {
             {
                 return Ok((cur, false));
             }
-            return Ok((port.tune(want).await?, true));
+            let got = port.tune(want).await?;
+            self.primed
+                .lock()
+                .unwrap()
+                .insert(source.clone(), (want, got));
+            return Ok((got, true));
         };
         let cur = port.current().unwrap_or(first.band);
         let shared = held.iter().any(|l| l.time_shared);
@@ -1341,6 +1372,48 @@ mod tests {
         assert_eq!(p.current(), Some(want));
     }
 
+    /// `job_start` on an unheld radio: `tune_if_unheld` tunes the capture, then the
+    /// job's lease (with nothing held) takes it as tuned, with no second tune. A port
+    /// idled, retuned or faulted in between is tuned again.
+    #[tokio::test]
+    async fn a_lease_after_a_tune_of_the_unheld_port_does_not_tune_again() {
+        let tunes = |p: &FakePort| p.tunes.load(std::sync::atomic::Ordering::SeqCst);
+        let (p, m, j) = (FakePort::new(), LeaseManager::new(), JobId::new());
+        let want = t(100_000_000, 1_000_000);
+        assert_eq!(
+            m.tune_if_unheld_tuned(&p, want).await.unwrap(),
+            (want, true)
+        );
+        assert_eq!(
+            m.ensure_tuned(&p, j.clone(), want, false).await.unwrap(),
+            (want, false)
+        );
+        assert_eq!(tunes(&p), 1);
+        assert_eq!(m.holders(p.id()), vec![(j.clone(), want)]);
+        // Released and idled: the next lease tunes, as from scratch.
+        m.release(&j);
+        m.tune_if_unheld_tuned(&p, want).await.unwrap();
+        m.idle_if_unheld(&p).await;
+        m.ensure_tuned(&p, j.clone(), want, false).await.unwrap();
+        assert_eq!(tunes(&p), 3);
+        // A tune to another band in between: the lease tunes its own.
+        m.release(&j);
+        m.tune_if_unheld_tuned(&p, want).await.unwrap();
+        let far = t(433_000_000, 1_000_000);
+        m.tune_if_unheld_tuned(&p, far).await.unwrap();
+        m.ensure_tuned(&p, j.clone(), want, false).await.unwrap();
+        assert_eq!(tunes(&p), 6);
+        // A faulted port is asked again, so its refusal is seen.
+        m.release(&j);
+        let p = FakePort {
+            fault: Some("gone".into()),
+            ..FakePort::new()
+        };
+        m.tune_if_unheld_tuned(&p, want).await.unwrap();
+        m.ensure_tuned(&p, j, want, false).await.unwrap();
+        assert_eq!(tunes(&p), 2);
+    }
+
     #[tokio::test]
     async fn fitting_request_shares_without_retune() {
         let (p, m, j1, j2) = (
@@ -1535,14 +1608,15 @@ mod tests {
                 .await
                 .is_err()
         );
-        // ...while the holder of the guard leases the band (an unheld port is
-        // tuned again, as by `ensure`).
+        // ...while the holder of the guard leases the band (on the port its tune
+        // left unheld there, with no second tune).
         assert_eq!(
             m.ensure_locked(&p, j1.clone(), first, false, &guard)
                 .await
                 .unwrap(),
-            (first, true)
+            (first, false)
         );
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 1);
         drop(guard);
         match other.await {
             Err(LeaseError::Conflict { holders, .. }) => assert_eq!(holders, vec![j1]),
