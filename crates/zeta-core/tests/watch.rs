@@ -1878,6 +1878,70 @@ async fn a_stage_with_no_outputs_launches_and_stops_cleanly() {
     stop_all(&node).await;
 }
 
+/// A row listing its squelched demod after its decoder: the sink is fed by the decoder's
+/// events, never the demod's `squelch` events (the pick `--then-tail` makes too).
+#[tokio::test]
+async fn a_sink_is_fed_by_the_decoder_not_a_squelch_demod_listed_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let tuning = Tuning {
+        center_hz: Hz(POCSAG_HZ),
+        bandwidth_hz: Hz(12_500),
+    };
+    let kind = JobKind::from_name("pocsag_decode").unwrap();
+    let mut g = kind
+        .expand(
+            &rx(),
+            tuning,
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    let decoder = g
+        .nodes
+        .iter()
+        .find(|n| n.kind == "pocsag_decode")
+        .unwrap()
+        .id
+        .clone();
+    let chan = g
+        .edges
+        .iter()
+        .find(|e| e.to == decoder)
+        .unwrap()
+        .from
+        .clone();
+    let demod = NodeId("late_demod".into());
+    g.nodes.push(GraphNode {
+        id: demod.clone(),
+        kind: "nbfm_demod".into(),
+        params: serde_json::json!({"deviation_hz": 5000, "audio_rate_hz": 16000}),
+    });
+    g.edges.push(Edge {
+        from: chan,
+        to: demod.clone(),
+        kind: StreamKind::Iq,
+    });
+    let sink = GraphNode {
+        id: NodeId("sondehub".into()),
+        kind: "sink_sondehub".into(),
+        params: serde_json::json!({"callsign": "T"}),
+    };
+    assert!(
+        zeta_core::graph::append_sinks(&mut g, std::slice::from_ref(&sink), &registry()).unwrap()
+    );
+    let fed = g.edges.iter().find(|e| e.to == sink.id).unwrap();
+    assert_eq!(fed.from, decoder, "{g:?}");
+    assert_eq!(
+        zeta_core::graph::decoder_event_node(&g, &registry()),
+        Some(&decoder)
+    );
+    stop_all(&node).await;
+}
+
 /// A decoder whose record carries a sink, resumed where the capture is another rate
 /// than the one its graph was expanded for: re-expanded for the new rate (as any row's
 /// decoder is) with its sink appended again.

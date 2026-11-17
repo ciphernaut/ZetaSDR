@@ -298,9 +298,52 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
     Ok(())
 }
 
+/// The node of `graph` whose event output carries its decoder's events: of the nodes with
+/// an event output that are not a squelch demod ([`crate::ops::SQUELCH_STAGES`], whose
+/// event output is its `squelch` stream), the one no other node but a sink consumes
+/// first, then the deepest from the graph's roots, then the last in the graph's order.
+/// With only squelch demods, the last of them; `None` for a graph with no event output.
+pub fn decoder_event_node<'g>(graph: &'g Graph, registry: &StageRegistry) -> Option<&'g NodeId> {
+    let pos = |id: &NodeId| graph.nodes.iter().position(|n| &n.id == id);
+    let sink = |id: &NodeId| {
+        pos(id).is_some_and(|i| {
+            registry
+                .spec(&graph.nodes[i].kind)
+                .is_some_and(|s| s.outputs.is_empty())
+        })
+    };
+    let terminal = |id: &NodeId| !graph.edges.iter().any(|e| &e.from == id && !sink(&e.to));
+    // The longest path from a root to `id` (the graph is acyclic when validated).
+    fn depth(g: &Graph, id: &NodeId, seen: usize) -> usize {
+        if seen > g.nodes.len() {
+            return seen;
+        }
+        g.edges
+            .iter()
+            .filter(|e| &e.to == id)
+            .map(|e| 1 + depth(g, &e.from, seen + 1))
+            .max()
+            .unwrap_or(0)
+    }
+    let events: Vec<&Node> = graph
+        .nodes
+        .iter()
+        .filter(|n| {
+            registry
+                .spec(&n.kind)
+                .is_some_and(|s| s.outputs.contains(&StreamKind::Event))
+        })
+        .collect();
+    events
+        .iter()
+        .filter(|n| !crate::ops::SQUELCH_STAGES.contains(&n.kind.as_str()))
+        .max_by_key(|n| (terminal(&n.id), depth(graph, &n.id, 0), pos(&n.id)))
+        .or(events.last())
+        .map(|n| &n.id)
+}
+
 /// Append `sinks` (nodes of stages with an `event` input and no outputs) to `graph`, each
-/// fed by the event output of its decoder: its last node with an event output that no
-/// event edge leaves. `Ok(false)`, the graph untouched, when `sinks` is empty or the graph
+/// fed by the event output of its decoder ([`decoder_event_node`]). `Ok(false)`, the graph untouched, when `sinks` is empty or the graph
 /// has no such node; the validation error, the graph untouched, when the graph with them
 /// would not validate.
 pub fn append_sinks(
@@ -311,16 +354,8 @@ pub fn append_sinks(
     if sinks.is_empty() {
         return Ok(false);
     }
-    let from = graph.nodes.iter().rev().find(|n| {
-        registry
-            .spec(&n.kind)
-            .is_some_and(|s| s.outputs.contains(&StreamKind::Event))
-            && !graph
-                .edges
-                .iter()
-                .any(|e| e.from == n.id && e.kind == StreamKind::Event)
-    });
-    let Some(from) = from.map(|n| n.id.clone()) else {
+    let from = decoder_event_node(graph, registry);
+    let Some(from) = from.cloned() else {
         return Ok(false);
     };
     let mut with = graph.clone();
