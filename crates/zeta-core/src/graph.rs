@@ -86,11 +86,83 @@ pub enum GraphError {
     Cycle,
 }
 
-/// The `sondehub` params of a watch's `detect` node, checked as the `sink_sondehub` stage
-/// would check its own: `sondehub.<field>: <error>` (or `sondehub: <error>` when no field
-/// is named), `sondehub: sink_sondehub stage not registered` without the stage.
-fn check_sondehub(params: &serde_json::Value, registry: &StageRegistry) -> Result<(), String> {
-    check_block("sondehub", crate::ops::SONDEHUB_STAGE, params, registry)
+/// The sinks a watch's `detect` node params `p` give every decoder it keeps, as the
+/// nodes appended to it (each id its kind, `<kind>_<n>` for the n-th later one of that
+/// kind), each with the name its errors carry: `sink` for one `{kind, params}`,
+/// `sink[<i>]` in a list. `sondehub` is shorthand for
+/// `sink: {kind: sink_sondehub, params: <it>}`; both at once is refused.
+pub fn watch_sinks(p: &serde_json::Value) -> Result<Vec<(String, Node)>, String> {
+    let given = |k: &str| p.get(k).filter(|v| !v.is_null());
+    let entry = |name: String, e: &serde_json::Value| match e["kind"].as_str() {
+        Some(kind) => Ok((
+            name,
+            kind.to_string(),
+            e.get("params")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+        )),
+        None => Err(format!("{name}.kind: a stage kind is required")),
+    };
+    let entries = match (given("sink"), given("sondehub")) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "sink and sondehub: give one (sondehub is shorthand for sink: \
+                 {{kind: {}, params: ...}})",
+                crate::ops::SONDEHUB_STAGE
+            ));
+        }
+        (None, Some(params)) => vec![(
+            "sink".to_string(),
+            crate::ops::SONDEHUB_STAGE.to_string(),
+            params.clone(),
+        )],
+        (Some(serde_json::Value::Array(a)), None) => a
+            .iter()
+            .enumerate()
+            .map(|(i, e)| entry(format!("sink[{i}]"), e))
+            .collect::<Result<_, _>>()?,
+        (Some(e), None) => vec![entry("sink".to_string(), e)?],
+        (None, None) => Vec::new(),
+    };
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    Ok(entries
+        .into_iter()
+        .map(|(name, kind, params)| {
+            let n = seen.entry(kind.clone()).or_default();
+            let id = match *n {
+                0 => kind.clone(),
+                n => format!("{kind}_{n}"),
+            };
+            *n += 1;
+            (
+                name,
+                Node {
+                    id: NodeId(id),
+                    kind,
+                    params,
+                },
+            )
+        })
+        .collect())
+}
+
+/// A watch's sinks ([`watch_sinks`]), each checked: its `kind` a registered stage with
+/// one `event` input and no outputs (`<name>.kind: ...`), its params as that stage checks
+/// its own (`<name>.params.<field>: ...`).
+fn check_sinks(p: &serde_json::Value, registry: &StageRegistry) -> Result<(), String> {
+    for (name, n) in watch_sinks(p)? {
+        let Some(spec) = registry.spec(&n.kind) else {
+            return Err(format!("{name}.kind: {} stage not registered", n.kind));
+        };
+        if spec.inputs != [StreamKind::Event] || !spec.outputs.is_empty() {
+            return Err(format!(
+                "{name}.kind: {} is not a sink (a sink has one event input and no outputs)",
+                n.kind
+            ));
+        }
+        check_block(&format!("{name}.params"), &n.kind, &n.params, registry)?;
+    }
+    Ok(())
 }
 
 /// The `capture` params of a watch's `detect` node (the `on_unknown: capture` child's),
@@ -164,10 +236,8 @@ pub fn validate(graph: &Graph, registry: &StageRegistry) -> Result<(), GraphErro
             return Err(bad(e.to_string()));
         }
         registry.check_params(&n.kind, &n.params).map_err(bad)?;
-        if n.kind == crate::ops::DETECT_STAGE
-            && let Some(p) = n.params.get("sondehub").filter(|p| !p.is_null())
-        {
-            check_sondehub(p, registry).map_err(bad)?;
+        if n.kind == crate::ops::DETECT_STAGE {
+            check_sinks(&n.params, registry).map_err(bad)?;
         }
         if n.kind == crate::ops::DETECT_STAGE
             && let Some(p) = n.params.get("capture").filter(|p| !p.is_null())

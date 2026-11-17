@@ -1986,6 +1986,113 @@ async fn a_re_adopted_decoder_takes_the_watchs_new_sink() {
     stop_all(&node).await;
 }
 
+/// `sink` names the stage: one `{kind, params}` or a list, each appended to every kept
+/// decoder under its own node, fed by the decoder's events and stored beside its graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_with_a_list_of_sinks_appends_each() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let node = Arc::new(node);
+    let mut other = sondehub_params();
+    other["callsign"] = "OTHER".into();
+    let sink = serde_json::json!([
+        {"kind": "sink_sondehub", "params": sondehub_params()},
+        {"kind": "sink_sondehub", "params": other},
+    ]);
+    let watch = start_watch(&node, serde_json::json!({ "sink": sink })).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let rec = record(&node, &job).unwrap();
+    let sinks: Vec<&GraphNode> = rec
+        .graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == "sink_sondehub")
+        .collect();
+    assert_eq!(sinks.len(), 2, "{:#?}", rec.graph);
+    assert_ne!(sinks[0].id, sinks[1].id);
+    assert_eq!(sinks[0].params, sondehub_params());
+    assert_eq!(sinks[1].params, other);
+    let decoder = rec
+        .graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "pocsag_decode")
+        .unwrap();
+    for s in &sinks {
+        assert!(
+            rec.graph
+                .edges
+                .iter()
+                .any(|e| e.from == decoder.id && e.to == s.id && e.kind == StreamKind::Event),
+            "{:#?}",
+            rec.graph
+        );
+    }
+    assert_eq!(rec.sinks.iter().collect::<Vec<_>>(), sinks, "{rec:?}");
+    assert!(!rec.operator_graph, "{rec:?}");
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    stop_all(&node).await;
+}
+
+/// `sink` is checked at `graph::validate`: a kind with outputs, an unknown kind, both
+/// `sink` and `sondehub`, and bad params (named `sink.params.<field>`, or
+/// `sink[<i>].params.<field>` in a list) are refused; `sondehub` alone is the shorthand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_sink_is_checked_against_its_stage() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
+    let check =
+        |params: Value| zeta_core::graph::validate(&watch_graph(&node, params), &registry());
+    let refused = |params: Value| check(params).unwrap_err().to_string();
+    let e =
+        refused(serde_json::json!({"sink": {"kind": "passthrough", "params": {"kind": "event"}}}));
+    assert!(e.contains("sink.kind: passthrough is not a sink"), "{e}");
+    let e = refused(serde_json::json!({"sink": {"kind": "no_such_stage"}}));
+    assert!(
+        e.contains("sink.kind: no_such_stage stage not registered"),
+        "{e}"
+    );
+    let e =
+        refused(serde_json::json!({"sink": {"kind": "sink_sondehub", "params": {"callsign": 5}}}));
+    assert!(e.contains("sink.params.callsign"), "{e}");
+    let e = refused(serde_json::json!({"sink": [
+        {"kind": "sink_sondehub", "params": sondehub_params()},
+        {"kind": "sink_sondehub", "params": {"callsign": 5}},
+    ]}));
+    assert!(e.contains("sink[1].params.callsign"), "{e}");
+    let e = refused(serde_json::json!({
+        "sink": {"kind": "sink_sondehub", "params": sondehub_params()},
+        "sondehub": sondehub_params(),
+    }));
+    assert!(e.contains("sink and sondehub"), "{e}");
+    let e = refused(serde_json::json!({"sondehub": {"callsign": 5}}));
+    assert!(e.contains("sink.params.callsign"), "{e}");
+    assert!(
+        check(serde_json::json!({"sink": {"kind": "sink_sondehub", "params": sondehub_params()}}))
+            .is_ok()
+    );
+    assert!(check(serde_json::json!({"sondehub": sondehub_params()})).is_ok());
+    // Refused at `job_start` too, before anything starts.
+    let g = watch_graph(
+        &node,
+        serde_json::json!({"sink": {"kind": "passthrough", "params": {"kind": "event"}}}),
+    );
+    let e = node
+        .job_start("watch", rx(), capture(), g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("sink.kind: passthrough is not a sink"),
+        "{e}"
+    );
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+}
+
 fn sondehub_params() -> Value {
     serde_json::json!({
         "callsign": "TEST", "lat": -27.5, "lon": 153.0, "alt_m": 10, "batch_ms": 5000,
@@ -2047,7 +2154,7 @@ async fn a_watch_with_a_bad_sondehub_is_refused() {
         .job_start("watch", rx(), capture(), g, Some(Hz(RATE_HZ as u64)), false)
         .await
         .unwrap_err();
-    assert!(e.to_string().contains("sondehub.callsign"), "{e}");
+    assert!(e.to_string().contains("sink.params.callsign"), "{e}");
     assert!(running(&node).is_empty(), "{:?}", running(&node));
     // At a put: refused before anything restarts.
     let watch = start_watch(&node, serde_json::json!({})).await;
@@ -2062,7 +2169,7 @@ async fn a_watch_with_a_bad_sondehub_is_refused() {
         })
         .await
         .unwrap_err();
-    assert!(e.to_string().contains("sondehub"), "{e}");
+    assert!(e.to_string().contains("sink.params"), "{e}");
     assert_eq!(node.job_outputs(&watch), stream, "nothing restarted");
     assert_eq!(state(&node, &watch), Some(JobState::Running));
     stop_all(&node).await;
@@ -2079,7 +2186,7 @@ async fn a_watch_with_a_bad_sondehub_is_refused() {
     let e = zeta_core::graph::validate(&g, &stages).unwrap_err();
     assert!(
         e.to_string()
-            .contains("sondehub: sink_sondehub stage not registered"),
+            .contains("sink.kind: sink_sondehub stage not registered"),
         "{e}"
     );
     assert!(zeta_core::graph::validate(&g, &registry()).is_ok());
@@ -2098,7 +2205,7 @@ async fn a_failed_sink_restart_keeps_the_decoder_without_the_sink() {
     let job = decoded(&node, &events, &watch).await;
     let d = &events.watch("decoding")[0];
     let summary = d["summary"].as_str().unwrap();
-    assert!(summary.contains("sondehub sink refused"), "{summary}");
+    assert!(summary.contains("sink refused"), "{summary}");
     assert!(summary.contains("sink restart failed"), "{summary}");
     assert_eq!(state(&node, &job), Some(JobState::Running));
     let rec = record(&node, &job).unwrap();
@@ -2129,7 +2236,7 @@ async fn a_sondehub_sink_without_a_station_keeps_the_decoder() {
     let job = decoded(&node, &events, &watch).await;
     let d = &events.watch("decoding")[0];
     let summary = d["summary"].as_str().unwrap();
-    assert!(summary.contains("sondehub sink refused"), "{summary}");
+    assert!(summary.contains("sink refused"), "{summary}");
     assert!(summary.contains("no station set"), "{summary}");
     assert_eq!(state(&node, &job), Some(JobState::Running));
     let rec = record(&node, &job).unwrap();

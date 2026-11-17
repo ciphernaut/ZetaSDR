@@ -63,7 +63,13 @@ pub struct DetectParams {
     /// Watch policy, ignored by the stage: the source ids a `watch` with
     /// `decode_on: free` tries first, in order.
     pub prefer: Vec<SourceId>,
-    /// Watch policy, ignored by the stage: the feed sink's settings, kept as given.
+    /// Watch policy, ignored by the stage: the sinks a `watch` appends to every decoder
+    /// it keeps, fed by the decoder's events: one `{kind, params}` or a list of them,
+    /// `kind` a stage with one `event` input and no outputs, `params` its params (checked
+    /// by the graph as that stage's).
+    pub sink: Option<WatchSinks>,
+    /// Watch policy, ignored by the stage: shorthand for
+    /// `sink: {kind: "sink_sondehub", params: <this>}` (not beside `sink`).
     pub sondehub: Option<serde_json::Value>,
     /// Watch policy, ignored by the stage: what a `watch` does with a signal whose first
     /// identify run ends unknown, `report` it or also `capture` its bursts.
@@ -121,6 +127,31 @@ impl DetectParams {
     }
 }
 
+/// One sink of a `watch`'s `sink` (see [`DetectParams::sink`]).
+#[derive(Clone, Debug, PartialEq, JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct WatchSink {
+    /// The sink's stage kind.
+    pub kind: String,
+    /// Its params (`{}` when left out).
+    #[serde(default = "empty_params")]
+    #[schemars(default = "empty_params")]
+    pub params: serde_json::Value,
+}
+
+/// A `watch`'s `sink`: one sink or a list of them.
+#[derive(Clone, Debug, PartialEq, JsonSchema, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WatchSinks {
+    One(WatchSink),
+    Many(Vec<WatchSink>),
+}
+
+fn empty_params() -> serde_json::Value {
+    serde_json::json!({})
+}
+
 /// Where a `watch` keeps a decoder it proved (see [`DetectParams::decode_on`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +189,7 @@ impl Default for DetectParams {
             gone_ms: zeta_core::ops::DETECT_GONE_MS_DEFAULT,
             decode_on: DecodeOn::Capture,
             prefer: Vec::new(),
+            sink: None,
             sondehub: None,
             on_unknown: OnUnknown::Report,
             capture: None,

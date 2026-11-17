@@ -406,12 +406,6 @@ From plan 33. Not built:
 - `radio_prefer` by driver or role, which needs a driver in `SourceInfo`;
 - a node-stored per-caller policy, replacing the browser's `zeta.radio_prefs` once users exist;
 
-## Architecture: a generic `sink` param on the watch
-
-Found in plan 17's final review. The watch's feed out is wired for one sink: `DetectParams` carries a `sondehub` field (zeta-dsp `detect.rs`), `graph.rs` checks it against the `SONDEHUB_STAGE` stage's schema, and `watch.rs` appends a node of that kind to every decoder it keeps under the same name. A second feed (AIS NMEA or APRS-IS for the wave-2 rows, SBS for aircraft) would copy all three places and add another field the detect stage only passes through.
-
-Replace it with `sink: {kind, params}` (or a list of them) on the detect node: `graph::validate` checks `params` against the named stage's `params_schema` and requires an `event` input and no outputs, the watch appends `kind` with `params` fed by the decoder's events, and `sondehub: {...}` stays accepted as shorthand for `sink: {kind: "sink_sondehub", params: {...}}` so existing watches resume. The `sondehub.<field>` error naming becomes `sink.params.<field>`, and the sink-restart path (`place_decoder`, the sink-less fallback) works on any kind.
-
 ## Station: discipline the B210 to its GPS module
 
 The operator says the B210 has a GPS module attached. The node's unit runs it as `driver=uhd,serial=31B92DD,gain=65,ppm=2.7` with no `clock_source` or `time_source`, UHD has never logged an internal GPSDO for this B210 (no "Detecting internal GPSDO" line in the journal), and no USB GPS is on the host. So how the module is fitted must be found out before the unit changes: an Ettus internal GPSDO board takes `clock_source=gpsdo,time_source=gpsdo`; an external reference into REF/PPS takes `clock_source=external,time_source=external`. Once disciplined, drop `ppm=2.7` and calibrate the HackRF against the B210 on a steady carrier: the 433.88 MHz remote read 2.6-3.2 kHz higher on the HackRF than on the B210, about 6-7 ppm.

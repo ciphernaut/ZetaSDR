@@ -65,7 +65,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::persist::now;
 use super::{Inner, source_fault_reason};
-use crate::graph::{self, Graph, Node as GraphNode, NodeId};
+use crate::graph::{self, Graph, Node as GraphNode};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::{Allocation, DEFAULT_REGION, band_assignments};
 use crate::modes::ModeRegistry;
@@ -318,9 +318,9 @@ pub(super) struct Policy {
     free: bool,
     prefer: Vec<SourceId>,
     gone_ms: u64,
-    /// The sinks every decoder the watch keeps gets, fed by its events: a
-    /// `sink_sondehub` node with the `sondehub` params of the `detect` node (none
-    /// appends nothing). Stored beside the decoder's graph ([`JobRecord::sinks`]).
+    /// The sinks every decoder the watch keeps gets, fed by its events: the `detect`
+    /// node's `sink` (or its `sondehub` shorthand; none appends nothing). Stored beside
+    /// the decoder's graph ([`JobRecord::sinks`]).
     sinks: Vec<GraphNode>,
     /// With `on_unknown: capture`, the `burst_capture` params (the `capture` block, `{}`
     /// for the defaults) of the capture an unknown signal gets; `None` with `report`.
@@ -341,22 +341,17 @@ pub(super) struct Policy {
     seed_known: bool,
 }
 
-/// The sinks the policy `p` (a `detect` node's params) gives every kept decoder: a
-/// `sink_sondehub` node with its `sondehub` params, if any.
+/// The sinks the policy `p` (a `detect` node's params) gives every kept decoder
+/// ([`graph::watch_sinks`]; the start and put of the watch refuse a bad one first).
 fn sinks_of(p: &serde_json::Value) -> Vec<GraphNode> {
-    match &p["sondehub"] {
-        serde_json::Value::Null => Vec::new(),
-        params => vec![GraphNode {
-            id: NodeId("sondehub".into()),
-            kind: SONDEHUB_STAGE.into(),
-            params: params.clone(),
-        }],
-    }
+    graph::watch_sinks(p)
+        .map(|v| v.into_iter().map(|(_, n)| n).collect())
+        .unwrap_or_default()
 }
 
 impl Policy {
     /// The policy in `graph`'s `detect` node: `decode_on` (`capture`, default, or
-    /// `free`), `prefer` (source ids), the detector's `gone_ms`, `sondehub`,
+    /// `free`), `prefer` (source ids), the detector's `gone_ms`, `sink` (or `sondehub`),
     /// `on_unknown`/`capture`, `modes`, `max_decoders`, `hold_ms` (left out: the
     /// silence constant, or a test's override of it), `cooldown_ms`, `confirm_ms` and
     /// `seed_known`.
@@ -623,7 +618,8 @@ struct Tracked {
     waiting: bool,
 }
 
-/// What came of giving a kept decoder the `sondehub` sink.
+/// What came of giving a kept decoder the watch's sinks (as one set: they restart and
+/// fall back together).
 enum SinkOutcome {
     /// Not asked for, or nothing to attach it to.
     Off,
@@ -659,7 +655,7 @@ struct Decoding {
     /// How it was started (a decoder persisted before the field: `identify`).
     #[serde(default = "Via::identify")]
     via: Via,
-    /// Why the decoder runs without the `sondehub` sink it was asked to have.
+    /// Why the decoder runs without the sinks it was asked to have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sink_error: Option<String>,
     /// The last event of the decoder this run saw (else `since_ns`).
@@ -1443,7 +1439,7 @@ impl Inner {
             summary.push_str(&format!(": {why}"));
         }
         if let Some(why) = sink_error {
-            summary.push_str(&format!("; sondehub sink refused: {why}"));
+            summary.push_str(&format!("; sink refused: {why}"));
         }
         let e = Event {
             signal: Some(&signal),
@@ -2231,7 +2227,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             summary.push_str(&format!(": {why}"));
         }
         if let Some(why) = sink_error {
-            summary.push_str(&format!("; sondehub sink refused: {why}"));
+            summary.push_str(&format!("; sink refused: {why}"));
         }
         let e = Event {
             signal: Some(&signal),

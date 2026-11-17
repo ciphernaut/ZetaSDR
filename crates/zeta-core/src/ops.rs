@@ -2506,13 +2506,14 @@ pub fn fill_squelch_params(graph: &mut Graph) -> bool {
 }
 
 /// The stage kind of a `watch`'s detector (registered by `zeta-dsp`); its params carry
-/// the watch's policy too (`decode_on`, `prefer`, `sondehub`, `on_unknown`, `capture`,
+/// the watch's policy too (`decode_on`, `prefer`, `sink`, `sondehub`, `on_unknown`, `capture`,
 /// `modes`, `max_decoders`, `hold_ms`, `cooldown_ms`, `confirm_ms`, `seed_known`), see
 /// `node::watch`.
 pub const DETECT_STAGE: &str = "detect";
 
 /// The stage kind of the sonde feed a watch appends to its decoders when its `detect`
-/// params carry `sondehub` (registered by `zeta-ext`).
+/// params carry `sondehub` (shorthand for a `sink` of this kind; registered by
+/// `zeta-ext`).
 pub const SONDEHUB_STAGE: &str = "sink_sondehub";
 
 /// The stage kind a `capture` job cuts its bursts with (registered by `zeta-dsp`): it
