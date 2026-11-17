@@ -78,7 +78,7 @@ Cleanup round 0 refuses `job_retune`, `graph_put`, `replace` and (while its owne
 
 ## Node: stream sockets are a fixed pool
 
-One open page held 12-16 of the node's 16 stream slots (`max_ws`); a second page got `stream refused: too many stream connections` on every stream and could not paint (the B210 live run of plans 15/18, 2026-11-01; the operator's page hit it again while agent `stream tail`s ran). The default was raised 16 → 64 the same day. Still to do: a `--max-streams N` flag on `serve` (env `ZETA_MAX_STREAMS`), per-client fairness so one page cannot take the whole pool. The page now holds one feed socket per shown source (plan 27).
+One open page held 12-16 of the node's 16 stream slots (`max_ws`); a second page got `stream refused: too many stream connections` on every stream and could not paint (the B210 live run of plans 15/18, 2026-11-01; the operator's page hit it again while agent `stream tail`s ran). The default was raised 16 → 64 the same day, and `zeta serve --max-streams N` (env `ZETA_MAX_STREAMS`) sets it. Still to do: per-client fairness so one page cannot take the whole pool. The page now holds one feed socket per shown source (plan 27).
 
 ## Page: positioned jobs on other sources onto their feeds
 

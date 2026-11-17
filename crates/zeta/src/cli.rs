@@ -1044,8 +1044,36 @@ pub struct ServeArgs {
     /// 127.0.0.1); requires --secret or ZETA_SECRET
     #[arg(long, value_name = "[ADDR:]PORT")]
     pub listen: Option<String>,
+    /// Most stream websockets open at once (default 64); a page holds one per shown stream
+    #[arg(
+        long,
+        env = "ZETA_MAX_STREAMS",
+        value_name = "N",
+        value_parser = parse_max_streams
+    )]
+    pub max_streams: Option<usize>,
     #[command(flatten)]
     pub llm: LlmArgs,
+}
+
+impl ServeArgs {
+    /// The server's limits: the defaults, with `--max-streams` as the stream pool.
+    pub fn limits(&self) -> zeta_ws::Limits {
+        let mut limits = zeta_ws::Limits::default();
+        if let Some(n) = self.max_streams {
+            limits.max_ws = n;
+        }
+        limits
+    }
+}
+
+/// `--max-streams N`: a whole number, at least 1 (a pool of none refuses every stream).
+fn parse_max_streams(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("--max-streams must be at least 1".into()),
+        Ok(n) => Ok(n),
+        Err(_) => Err("--max-streams must be a whole number, at least 1".into()),
+    }
 }
 
 /// `source capture --policy`.
@@ -2372,5 +2400,39 @@ mod soapy_worker_tests {
     fn soapy_worker_progress_is_off_unless_passed() {
         assert!(!progress(&[]));
         assert!(progress(&["--progress"]));
+    }
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use super::*;
+
+    fn serve(extra: &[&str]) -> Result<ServeArgs, clap::Error> {
+        let base = ["zeta", "serve"];
+        match Cli::try_parse_from(base.iter().chain(extra))?.command {
+            Command::Serve(a) => Ok(a),
+            c => panic!("serve: {c:?}"),
+        }
+    }
+
+    #[test]
+    fn max_streams_defaults_to_the_stream_pool_of_the_limits() {
+        let limits = serve(&[]).unwrap().limits();
+        assert_eq!(limits.max_ws, zeta_ws::Limits::default().max_ws);
+        assert_eq!(limits.max_ws, 64);
+    }
+
+    #[test]
+    fn max_streams_sets_the_stream_pool() {
+        let args = serve(&["--max-streams", "3"]).unwrap();
+        assert_eq!(args.limits().max_ws, 3);
+    }
+
+    #[test]
+    fn max_streams_zero_is_refused_plainly() {
+        let e = serve(&["--max-streams", "0"]).unwrap_err().to_string();
+        assert!(e.contains("--max-streams must be at least 1"), "{e}");
+        let e = serve(&["--max-streams", "many"]).unwrap_err().to_string();
+        assert!(e.contains("--max-streams must be a whole number"), "{e}");
     }
 }

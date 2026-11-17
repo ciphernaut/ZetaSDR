@@ -282,7 +282,7 @@ pub async fn serve(
         listen,
         secret,
         agents_md: agents_md::rendering(),
-        limits: Limits::default(),
+        limits: args.limits(),
         llm,
         speech,
     };

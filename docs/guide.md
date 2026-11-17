@@ -545,6 +545,10 @@ an authenticated HTTP and websocket API. It needs a bearer secret, from `--secre
 draw a warning). Every request, `/health` included, must carry `Authorization: Bearer <secret>`,
 else it gets 401.
 
+`--max-streams N` (or `ZETA_MAX_STREAMS`, default 64) bounds the stream websockets the node holds
+open at once; a page holds one per shown stream, and past the bound a stream is refused with
+`too many stream connections`.
+
 | Route | |
 |---|---|
 | `GET /health` | status, version, `build` (the build the node runs: `ZETA_BUILD_ID` if set, else version plus the executable's modification time; the web page reloads itself when it changes or the uptime goes backwards), uptime, websocket connections, `stages_running`, and the websocket counters since start: `ws_dropped_slow` (sockets closed for a slow reader), `ws_credit_skipped` (binary frames skipped for want of credit), `video_frames_sent` and `video_frames_skipped` (video frames not sent: a newer one first, lag or unencodable; the sum of the sockets' `lagged.missed`) |
