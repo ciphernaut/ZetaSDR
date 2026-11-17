@@ -414,10 +414,6 @@ Found in plan 17 task 7. `--then-tail` now tails the first event output of the j
 
 Found in plan 17 task 10. A decoder with a `sink_sondehub` node (added by the watch's `sondehub` param) is stored `operator_graph: true`, so it is not re-expanded at a different capture rate, and the sink-less fallback after a failed sink relaunch is stored the same way with no capture rate. Keep the row's expansion and re-append the sink on re-expansion (store the sink config beside the graph), so a retune does not leave the decoder at the old rate. Same area: decoders the watch re-adopts after a `graph put` keep their old sink config, and a batch buffered at a restart is lost.
 
-## Bug: `gated_stop` is cleared unconditionally by a sink restart
-
-Found in plan 17 task 10. `store_graph` clears `gated_stop` before relaunching the same id so the relaunch is not suppressed; a `replace` that names only the decoder during the sink restart's teardown can therefore let it relaunch after being stopped. Clear only the entry the restart itself set (a token compare), and make `replace_during_a_sink_restart` deterministic (it can flake when the proof lands before the gate is taken).
-
 ## Architecture: a generic `sink` param on the watch
 
 Found in plan 17's final review. The watch's feed out is wired for one sink: `DetectParams` carries a `sondehub` field (zeta-dsp `detect.rs`), `graph.rs` checks it against the `SONDEHUB_STAGE` stage's schema, and `watch.rs` appends a node of that kind to every decoder it keeps under the same name. A second feed (AIS NMEA or APRS-IS for the wave-2 rows, SBS for aircraft) would copy all three places and add another field the detect stage only passes through.

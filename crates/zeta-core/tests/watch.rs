@@ -417,8 +417,71 @@ impl Stage for Failing {
     }
 }
 
-fn registry() -> StageRegistry {
+/// While set, a [`HoldStop`] stage that was cancelled waits for it to clear before it
+/// ends: its run's teardown (the lease still held) lasts as long as a test needs.
+static HOLD_STOPS: AtomicBool = AtomicBool::new(false);
+
+/// A real stage (`pocsag_decode` in the tests) whose end after a cancel waits while
+/// [`HOLD_STOPS`] is set.
+struct HoldStop(Arc<dyn Stage>);
+
+#[async_trait]
+impl Stage for HoldStop {
+    fn spec(&self) -> &StageSpec {
+        self.0.spec()
+    }
+    fn backend(&self) -> Backend {
+        self.0.backend()
+    }
+    fn outputs_for(&self, params: &Value) -> Vec<StreamKind> {
+        self.0.outputs_for(params)
+    }
+    fn check_params(&self, params: &Value) -> Result<(), String> {
+        self.0.check_params(params)
+    }
+    async fn run(
+        &self,
+        params: Value,
+        inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<zeta_core::types::StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: tokio_util::sync::CancellationToken,
+        ctx: StageContext,
+    ) -> Result<(), StageError> {
+        let own = tokio_util::sync::CancellationToken::new();
+        let run = self.0.run(params, inputs, outputs, bus, own.clone(), ctx);
+        tokio::pin!(run);
+        tokio::select! {
+            r = &mut run => r,
+            _ = cancel.cancelled() => {
+                while HOLD_STOPS.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                own.cancel();
+                run.await
+            }
+        }
+    }
+}
+
+/// [`registry`] with `pocsag_decode` wrapped in [`HoldStop`].
+fn holding_registry() -> StageRegistry {
+    let mut dsp = StageRegistry::new();
+    zeta_dsp::register_all(&mut dsp);
+    let pocsag = dsp
+        .select("pocsag_decode", &[Backend::Cpu])
+        .expect("pocsag_decode");
     let mut r = StageRegistry::new();
+    r.register(Arc::new(HoldStop(pocsag)));
+    registry_into(r)
+}
+
+fn registry() -> StageRegistry {
+    registry_into(StageRegistry::new())
+}
+
+/// `r` (whose stages come first) with the tests' stages and the DSP stages.
+fn registry_into(mut r: StageRegistry) -> StageRegistry {
     r.register(Arc::new(PassthroughStage::new()));
     r.register(Arc::new(Failing(StageSpec {
         kind: FAIL_STAGE,
@@ -533,13 +596,23 @@ async fn node_over(
     ports: Vec<(Arc<dyn Port>, Arc<FileSource>)>,
     modes_dir: Option<&Path>,
 ) -> Node {
+    node_over_with(dir, ports, modes_dir, registry()).await
+}
+
+/// [`node_over`] with the stages `stages`.
+async fn node_over_with(
+    dir: &Path,
+    ports: Vec<(Arc<dyn Port>, Arc<FileSource>)>,
+    modes_dir: Option<&Path>,
+    stages: StageRegistry,
+) -> Node {
     let cfg = NodeConfig {
         ring_seconds: 4.0,
         modes_dir: modes_dir.map(Path::to_path_buf),
         ..common::cfg(dir, true)
     };
     let srcs: Vec<Arc<FileSource>> = ports.iter().map(|(_, s)| s.clone()).collect();
-    let node = Node::open(cfg, registry(), ports.into_iter().map(|(p, _)| p).collect())
+    let node = Node::open(cfg, stages, ports.into_iter().map(|(p, _)| p).collect())
         .await
         .unwrap();
     for c in zeta_dsp::classifiers(node.modes_handle()) {
@@ -1972,11 +2045,11 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
     let dir = tempfile::tempdir().unwrap();
     let (node, _port) = node_on(dir.path(), &fixtures().pocsag, false).await;
     let node = Arc::new(node);
+    // The sink restart waits once the proof has landed, until the gate is held.
+    zeta_core::node::watch::test_hold_sink_restarts(true);
     let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub_params() })).await;
-    until("the identify child runs", Duration::from_secs(40), || {
-        owned(&node, &watch)
-            .iter()
-            .any(|r| r.kind == "pocsag_decode" && r.state == JobState::Running)
+    until("the sink restart waits", Duration::from_secs(40), || {
+        zeta_core::node::watch::test_sink_restarts_held() > 0
     })
     .await;
     let child = owned(&node, &watch)
@@ -1984,7 +2057,8 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
         .find(|r| r.kind == "pocsag_decode")
         .unwrap()
         .id;
-    // Held from before the proof: the decoder's relaunch with the sink queues on it.
+    assert_eq!(state(&node, &child), Some(JobState::Running));
+    // Held from before the restart: the decoder's relaunch with the sink queues on it.
     let gate = node.debug_gate(&rx()).await;
     let op = Op::JobStart {
         kind: JobKind::Measure,
@@ -2008,6 +2082,7 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
     // stopped for the restart and its launch waits on the gate.
     let early = tokio::time::timeout(Duration::from_millis(300), &mut replace).await;
     assert!(early.is_err(), "the replace ran under the gate: {early:?}");
+    zeta_core::node::watch::test_hold_sink_restarts(false);
     until("the decoder is stopped", Duration::from_secs(30), || {
         state(&node, &child) != Some(JobState::Running)
     })
@@ -2042,6 +2117,83 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
         || running(&node) == only_measure && holders() == [measure.clone()],
     )
     .await;
+    stop_all(&node).await;
+}
+
+/// A `replace` naming the proved decoder while its sink restart's stop is still tearing
+/// it down (its lease still held): the restart's launch does not undo that stop, so the
+/// decoder stays stopped and the watch reports it `lost`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replace_of_the_decoder_during_its_sink_restart_leaves_it_stopped() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let src = file_source("rx", &fixtures().pocsag);
+    let port = Muting::new(src.clone(), false);
+    let node = node_over_with(dir.path(), vec![(port, src)], None, holding_registry()).await;
+    let node = Arc::new(node);
+    HOLD_STOPS.store(true, Ordering::SeqCst);
+    let watch = start_watch(&node, serde_json::json!({ "sondehub": sondehub_params() })).await;
+    let events = Events::of(&node, &watch);
+    // The sink restart's gated stop of the decoder, its teardown held: stopped, a gated
+    // stop's token set, the lease still the decoder's.
+    let holds = |id: &JobId| node.lease_holders(&rx()).iter().any(|(j, _)| j == id);
+    let tearing_down = || {
+        node.job_list().into_iter().find(|r| {
+            r.kind == "pocsag_decode"
+                && r.state == JobState::Stopped
+                && node.debug_gated_stop(&r.id).is_some()
+                && holds(&r.id)
+        })
+    };
+    until(
+        "the sink restart stops the decoder",
+        Duration::from_secs(40),
+        || tearing_down().is_some(),
+    )
+    .await;
+    let decoder = tearing_down().unwrap().id;
+    let restart = node.debug_gated_stop(&decoder).unwrap();
+    let op = Op::JobStart {
+        kind: JobKind::Measure,
+        source: rx(),
+        center_hz: Hz(POCSAG_HZ),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz: None,
+        sideband: None,
+        dwell_ms: None,
+        average: None,
+        bits: None,
+        method: None,
+        bin_hz: None,
+        audio_policy: None,
+        elastic: false,
+        replace: vec![decoder.clone()],
+    };
+    let n = node.clone();
+    let replace = tokio::spawn(async move { n.apply(op).await });
+    until(
+        "the replace stops the decoder",
+        Duration::from_secs(10),
+        || node.debug_gated_stop(&decoder) != Some(restart),
+    )
+    .await;
+    HOLD_STOPS.store(false, Ordering::SeqCst);
+    let r = tokio::time::timeout(Duration::from_secs(10), replace)
+        .await
+        .expect("the replace returns")
+        .unwrap();
+    assert!(matches!(r, Ok(OpResult::Job(_))), "{r:?}");
+    until(
+        "the watch gives up the decoder",
+        Duration::from_secs(20),
+        || !events.watch("lost").is_empty() || !events.watch("decoding").is_empty(),
+    )
+    .await;
+    assert!(events.watch("decoding").is_empty(), "{:#?}", events.all());
+    assert_eq!(events.watch("lost")[0]["job"], decoder.0.as_str());
+    assert_eq!(state(&node, &decoder), Some(JobState::Stopped));
+    assert!(!holds(&decoder), "{:?}", node.lease_holders(&rx()));
     stop_all(&node).await;
 }
 

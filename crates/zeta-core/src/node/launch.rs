@@ -958,10 +958,9 @@ impl Inner {
         // An elastic job being relaunched, or any job a `replace` stopped, that was
         // stopped (or ended) meanwhile stays so: its stop already returned, so this
         // launch must not undo it.
-        if jobs
-            .get(&rec.id)
-            .is_some_and(|e| (e.relaunch || e.gated_stop) && e.record.state != JobState::Running)
-        {
+        if jobs.get(&rec.id).is_some_and(|e| {
+            (e.relaunch || e.gated_stop.is_some()) && e.record.state != JobState::Running
+        }) {
             self.leases.release(&rec.id);
             return Err(NodeError::Stopped(rec.id));
         }
@@ -997,7 +996,7 @@ impl Inner {
                 outputs: Vec::new(),
                 blind: false,
                 relaunch: false,
-                gated_stop: false,
+                gated_stop: None,
                 released: false,
                 restarting: false,
                 reaim: None,
@@ -1251,7 +1250,7 @@ pub(super) async fn supervise(
             Some(e) if e.run == run => {
                 // A relaunch keeps the lease; nothing was released.
                 e.released = !relaunch;
-                let gated = e.gated_stop;
+                let gated = e.gated_stop.is_some();
                 // An owned record that ended goes now (see `Inner::prune_history`).
                 if e.record.owner.is_some() {
                     inner.prune_history(&mut jobs);

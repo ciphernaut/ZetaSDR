@@ -246,7 +246,7 @@ impl Inner {
             .lock()
             .unwrap()
             .get(id)
-            .is_some_and(|e| e.gated_stop)
+            .is_some_and(|e| e.gated_stop.is_some())
     }
 
     /// The last [`IDENTIFY_MEASURE_MS`] of the source's ring at the capture `capture`,

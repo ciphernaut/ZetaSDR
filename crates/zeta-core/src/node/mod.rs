@@ -218,11 +218,14 @@ struct JobEntry {
     /// retuned or restarted by `graph_put`): its supervisor then leaves the record
     /// `Running` and the lease held for the relaunch.
     relaunch: bool,
-    /// Set by a stop under the source's gate ([`Inner::stop_gated`], a `replace`):
-    /// the supervisor then does not idle the port, which would take that gate, and
-    /// a launch of the job already past its lease (a `graph_put` restart) is
-    /// refused, so the replaced job stays stopped (see [`Inner::record_running`]).
-    gated_stop: bool,
+    /// Set by a stop under the source's gate ([`Inner::stop_gated`], a `replace`), to
+    /// that stop's token (each gated stop takes a fresh one, [`next_stop_token`]): the
+    /// supervisor then does not idle the port, which would take that gate, and a
+    /// launch of the job already past its lease (a `graph_put` restart) is refused, so
+    /// the replaced job stays stopped (see [`Inner::record_running`]). A restart that
+    /// stopped the job gated itself clears only its own token (see
+    /// [`Inner::store_graph`]), never a `replace`'s that came during its teardown.
+    gated_stop: Option<u64>,
     /// Set by the supervisor once the lease is released and the streams are
     /// unregistered, when all that is left is the port's idle.
     released: bool,
@@ -237,6 +240,14 @@ struct JobEntry {
     /// Set at launch for a scan its source sweeps for itself: where `job_retune` hands
     /// its re-aims ([`self_sweep::Reaim`]) to the run's task.
     reaim: Option<tokio::sync::mpsc::Sender<self_sweep::Reaim>>,
+}
+
+/// The tokens of gated stops ([`JobEntry::gated_stop`]): each takes the next.
+static STOP_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A fresh token for a gated stop.
+fn next_stop_token() -> u64 {
+    STOP_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A new `Running` record of an operator's job of `kind` on the radio: a fresh id, an
@@ -284,7 +295,7 @@ impl JobEntry {
             outputs: Vec::new(),
             blind: false,
             relaunch: false,
-            gated_stop: false,
+            gated_stop: None,
             released: false,
             restarting: false,
             reaim: None,
@@ -666,7 +677,7 @@ impl Inner {
 
     /// See [`Node::job_stop`].
     async fn stop(&self, id: &JobId) -> Result<(), NodeError> {
-        self.stop_with(id, false).await
+        self.stop_with(id, false).await.map(|_| ())
     }
 
     /// Store `graph` as job `id`'s (`capture_rate_hz` as in [`Node::job_graph_set`]) and,
@@ -728,15 +739,19 @@ impl Inner {
         capture_rate_hz: Option<Option<u64>>,
         stop: Option<bool>,
     ) -> Result<JobRecord, NodeError> {
+        let mut own = None;
         if let Some(gated) = stop {
             if let Some(e) = self.jobs.lock().unwrap().get_mut(id) {
                 e.restarting = true;
             }
-            if let Err(e) = self.stop_with(id, gated).await {
-                if let Some(e) = self.jobs.lock().unwrap().get_mut(id) {
-                    e.restarting = false;
+            match self.stop_with(id, gated).await {
+                Ok(token) => own = token,
+                Err(e) => {
+                    if let Some(e) = self.jobs.lock().unwrap().get_mut(id) {
+                        e.restarting = false;
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
         }
         let mut jobs = self.jobs.lock().unwrap();
@@ -760,10 +775,12 @@ impl Inner {
         };
         persist(&self.jobs_dir, &rec)?;
         entry.record = rec.clone();
-        // The gated stop was this restart's own, not a `replace`'s: the launch that
-        // follows must not be refused as undoing it (see `record_running`).
-        if stop == Some(true) {
-            entry.gated_stop = false;
+        // The gated stop was this restart's own: the launch that follows must not be
+        // refused as undoing it (see `record_running`). Only while the token is still
+        // its own: a `replace` that stopped the job during the teardown set its own, and
+        // the launch is refused, so the job stays stopped.
+        if own.is_some() && entry.gated_stop == own {
+            entry.gated_stop = None;
         }
         Ok(rec)
     }
@@ -775,19 +792,24 @@ impl Inner {
     /// released and its streams unregistered when this returns, unless another
     /// stop took the supervisor first (see [`Node::replace_holders`]).
     async fn stop_gated(&self, id: &JobId) -> Result<(), NodeError> {
-        self.stop_with(id, true).await
+        self.stop_with(id, true).await.map(|_| ())
     }
 
-    async fn stop_with(&self, id: &JobId, gated: bool) -> Result<(), NodeError> {
-        let done = {
+    /// Stop `id`, gated or not (see [`Inner::stop_gated`]). A gated stop sets a fresh
+    /// token in [`JobEntry::gated_stop`] (over any earlier one) and returns it when it
+    /// was this stop that ended the record (else `None`: the record was already
+    /// stopped or failed); an ungated stop returns `None`.
+    async fn stop_with(&self, id: &JobId, gated: bool) -> Result<Option<u64>, NodeError> {
+        let (done, token) = {
             let mut jobs = self.jobs.lock().unwrap();
             let entry = jobs
                 .get_mut(id)
                 .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
-            if !matches!(
+            let live = !matches!(
                 entry.record.state,
                 JobState::Failed { .. } | JobState::Stopped
-            ) {
+            );
+            if live {
                 let rec = JobRecord {
                     state: JobState::Stopped,
                     ..entry.record.clone()
@@ -797,7 +819,12 @@ impl Inner {
                 entry.ended_ns = now();
             }
             // Set before the cancel, under the jobs lock the supervisor reads it under.
-            entry.gated_stop |= gated;
+            let mut token = None;
+            if gated {
+                let t = next_stop_token();
+                entry.gated_stop = Some(t);
+                token = live.then_some(t);
+            }
             if let Some(c) = entry.cancel.take() {
                 c.cancel();
             }
@@ -806,7 +833,7 @@ impl Inner {
             let done = done.filter(|_| !(gated && entry.released));
             let ended = entry.ended.clone();
             self.prune_history(&mut jobs);
-            (done, ended)
+            ((done, ended), token)
         };
         if let Some(h) = done.0 {
             let _ = h.await;
@@ -817,7 +844,7 @@ impl Inner {
         if let Some(mut ended) = done.1 {
             let _ = ended.changed().await;
         }
-        Ok(())
+        Ok(token)
     }
 
     /// Forget the terminal records that a later re-run replaced (the same kind on the
@@ -2768,6 +2795,13 @@ impl Node {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn debug_set_sweep_start_timeout(&self, d: std::time::Duration) {
         *self.inner.sweep_start_timeout.lock().unwrap() = d;
+    }
+
+    /// The token of the last gated stop of `id` (see `JobEntry::gated_stop`), for tests
+    /// of a `replace` that lands during a restart.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn debug_gated_stop(&self, id: &JobId) -> Option<u64> {
+        self.inner.jobs.lock().unwrap().get(id)?.gated_stop
     }
 
     /// Hold `source`'s gate, for tests of what waits on it.
