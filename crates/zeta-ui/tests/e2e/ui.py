@@ -4034,8 +4034,16 @@ def scenario_job_row_two_lines(page, url, secret):
     cur = current_capture(url, secret, "tone")["center_hz"]
     job = start_job(url, secret, "fm_demod", "tone", cur, 12_500, deviation_hz=5000)
     try:
-        row = job_row(page, job)
-        kind, band, ident = (row.locator(s).bounding_box() for s in (".kind", ".band", ".id"))
+        page.evaluate("window.zetaTest.poll()")
+        row = page.locator(f'#jobs .job[data-id="{job}"]')
+        # A loaded host paints the row late: wait for it, filled in, before measuring it.
+        expect(row.locator(".band")).to_have_text(f"{cur / 1e6:.4f} MHz, 12.5 kHz", timeout=15_000)
+
+        def boxes():
+            got = [row.locator(s).bounding_box() for s in (".kind", ".band", ".id")]
+            return got if all(got) else None
+
+        kind, band, ident = wait_until(boxes, 15.0, "the job row laid out")
         assert band["y"] > kind["y"] + kind["height"] / 2, (kind, band)
         assert ident["y"] > kind["y"] + kind["height"] / 2, (kind, ident)
         sw, cw = page.evaluate("el => [el.scrollWidth, el.clientWidth]", row.element_handle())
