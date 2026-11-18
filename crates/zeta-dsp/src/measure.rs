@@ -37,6 +37,11 @@ use crate::{Input, frame_span, run_map};
 const SIZE: usize = 1024;
 /// Occupied band: bins at or above the noise floor plus this many dB.
 const OCCUPIED_DB: f32 = 6.0;
+/// [`power_width_hz`] counts only bins at least this many dB over the noise floor: the
+/// averaged noise bins stay under it, so the share is the signal's, not the box's noise.
+const POWER_GATE_DB: f32 = 3.0;
+/// The share of the excess power [`power_width_hz`] holds.
+const POWER_SHARE: f64 = 0.99;
 /// Below-threshold gaps of at most this width inside the occupied band are
 /// bridged, so the discrete sidebands of an FM tone count as one band.
 const GAP_HZ: f64 = 1_500.0;
@@ -171,6 +176,54 @@ fn occupied(db: &[f32], peak: usize, threshold: f32, gap: usize) -> (usize, usiz
         }
     };
     (extend(peak, -1), extend(peak, 1))
+}
+
+/// The width (Hz) that holds [`POWER_SHARE`] of the excess power over the noise floor `floor` (dB)
+/// of the band around `peak` in `db` (`bin_hz` per bin): the run of bins around the peak at
+/// least [`POWER_GATE_DB`] over the floor (gaps of up to `gap` bins bridged, so a separate
+/// neighbour is not counted), trimmed of the first and last half of the remaining share of
+/// its power. At a low SNR the occupied band (6 dB over the floor) can be only a carrier line;
+/// the sidebands under that threshold still hold most of the power. `None` when no bin
+/// clears the gate.
+fn power_width_hz(db: &[f32], peak: usize, floor: f32, gap: usize, bin_hz: f64) -> Option<u64> {
+    let gate = floor + POWER_GATE_DB;
+    if db.get(peak).is_none_or(|&v| v < gate) {
+        return None;
+    }
+    let (a, b) = occupied(db, peak, gate, gap);
+    let noise = 10f64.powf(floor as f64 / 10.0);
+    let excess: Vec<f64> = db[a..=b]
+        .iter()
+        .map(|&v| {
+            if v >= gate {
+                (10f64.powf(v as f64 / 10.0) - noise).max(0.0)
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let total: f64 = excess.iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let tail = total * (1.0 - POWER_SHARE) / 2.0;
+    let mut acc = 0.0;
+    let lo = excess
+        .iter()
+        .position(|&e| {
+            acc += e;
+            acc > tail
+        })
+        .unwrap_or(0);
+    let mut acc = 0.0;
+    let hi = excess
+        .iter()
+        .rposition(|&e| {
+            acc += e;
+            acc > tail
+        })
+        .unwrap_or(excess.len() - 1);
+    Some(((hi - lo + 1) as f64 * bin_hz).round().max(bin_hz.round()) as u64)
 }
 
 /// Coefficient of variation (std / mean) of the envelope `|x|`; 0 for an
@@ -422,7 +475,10 @@ pub(crate) fn measure_band_noted(
             tone_spacing_hz: None,
             symbol_rate_line: None,
         };
-        let note = RateNote { cv: 0.0 };
+        let note = RateNote {
+            cv: 0.0,
+            power99_hz: None,
+        };
         return (record, note);
     }
     let v = gated_view(iq, rate_hz, bandwidth_hz);
@@ -522,7 +578,10 @@ pub(crate) fn measure_band_noted(
         tone_spacing_hz: fsk.map(|(_, s)| s),
         symbol_rate_line: rate.map(|(_, line)| line),
     };
-    let note = RateNote { cv: v.cv };
+    let note = RateNote {
+        cv: v.cv,
+        power99_hz: power_width_hz(db, peak, floor, gap, bin_hz),
+    };
     (record, note)
 }
 
@@ -602,6 +661,9 @@ fn rate_of(
 pub(crate) struct RateNote {
     /// Envelope CV of the samples the rate was searched over.
     pub cv: f32,
+    /// The width holding [`POWER_SHARE`] of the excess power (over the noise floor) of the
+    /// band around the peak: see [`power_width_hz`]. `None` for an empty block.
+    pub power99_hz: Option<u64>,
 }
 
 /// Frequencies of the two tones when `db[lo..=hi]` holds two tone peaks: local
@@ -1165,6 +1227,7 @@ fn window_event(
     ev["label"] =
         serde_json::to_value(&label).map_err(|e| StageError::Failed(format!("measure: {e}")))?;
     ev["partial"] = partial.into();
+    ev["power99_hz"] = note.power99_hz.into();
     prov.span = frame_span(t0, buf.len(), rate);
     Ok(Frame::new(out.clone(), prov, Payload::Event(ev)))
 }
@@ -1696,6 +1759,88 @@ mod tests {
         assert_eq!(l.name, "fm");
     }
 
+    /// A weak FM voice signal as the receiver sees it at about 10 dB: a carrier line `carrier`
+    /// times the noise's own amplitude, voice sidebands 300-3000 Hz either side of it
+    /// `sideband_db` over the noise's level, and white noise. The occupied band (6 dB over the
+    /// floor) is the carrier line alone, the sidebands hold most of the power.
+    fn weak_fm_voice(carrier: f32, sideband_db: f32) -> Vec<Complex<f32>> {
+        use rustfft::FftPlanner;
+        let n = RATE as usize;
+        let mut state = 99u64;
+        let mut gauss = move || {
+            let mut uniform = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 11) + 1) as f64 / (1u64 << 53) as f64
+            };
+            let (u, v) = (uniform(), uniform());
+            let r = (-2.0 * u.ln()).sqrt() / std::f64::consts::SQRT_2;
+            Complex::new(
+                (r * (std::f64::consts::TAU * v).cos()) as f32,
+                (r * (std::f64::consts::TAU * v).sin()) as f32,
+            )
+        };
+        let noise: Vec<Complex<f32>> = (0..n).map(|_| gauss()).collect();
+        let mut side: Vec<Complex<f32>> = (0..n).map(|_| gauss()).collect();
+        let mut planner = FftPlanner::<f32>::new();
+        planner.plan_fft_forward(n).process(&mut side);
+        for (k, b) in side.iter_mut().enumerate() {
+            let hz = if k <= n / 2 { k } else { n - k };
+            if !(300..=3_000).contains(&hz) {
+                *b = Complex::new(0.0, 0.0);
+            }
+        }
+        planner.plan_fft_inverse(n).process(&mut side);
+        let k = 10f32.powf(sideband_db / 20.0) / n as f32;
+        noise
+            .iter()
+            .zip(&side)
+            .map(|(w, s)| w + s * k + Complex::new(carrier, 0.0))
+            .collect()
+    }
+
+    #[test]
+    fn a_weak_voice_signals_power_width_is_its_sidebands_not_its_carrier_line() {
+        let iq = weak_fm_voice(0.1, 1.0);
+        let (f, note) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
+        assert!(f.bandwidth_hz.0 < 1_000, "occupied {}", f.bandwidth_hz.0);
+        let w = note.power99_hz.expect("a power width");
+        assert!((4_000..=14_000).contains(&w), "power99_hz {w}");
+    }
+
+    #[tokio::test]
+    async fn the_measure_event_carries_the_power_width() {
+        let blocks = tone_blocks(10);
+        let (events, _) = run_stage(32, None, |tx, prov| {
+            Box::pin(async move {
+                for (i, b) in blocks.iter().enumerate() {
+                    tx.send(iq_frame(&prov, 1_000_000_000 + i as u64 * 100_000_000, b))
+                        .unwrap();
+                }
+            })
+        })
+        .await;
+        let Payload::Event(ev) = &events.last().expect("an event").payload else {
+            panic!("event")
+        };
+        let w = ev["power99_hz"].as_u64().expect("power99_hz in the event");
+        assert!(w <= ev["bandwidth_hz"].as_u64().unwrap().max(1_000), "{ev}");
+    }
+
+    #[test]
+    fn a_clean_narrow_tone_has_a_narrow_power_width() {
+        let mut iq: Vec<Complex<f32>> = (0..48_000)
+            .map(|i| {
+                Complex::from_polar(1.0, std::f32::consts::TAU * 1_000.0 * i as f32 / 48_000.0)
+            })
+            .collect();
+        awgn(&mut iq, 30.0, 3);
+        let (_, note) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
+        let w = note.power99_hz.expect("a power width");
+        assert!(w <= 600, "power99_hz {w}");
+    }
+
     #[test]
     fn measure_afsk_packet_reports_fsk_and_1200_baud() {
         let silence = RATE as usize / 2;
@@ -1805,6 +1950,8 @@ mod tests {
         ev.as_object_mut().unwrap().remove("label");
         assert_eq!(ev["partial"], false);
         ev.as_object_mut().unwrap().remove("partial");
+        assert!(ev["power99_hz"].is_number() || ev["power99_hz"].is_null());
+        ev.as_object_mut().unwrap().remove("power99_hz");
         assert_eq!(ev["symbol_rate_baud"], serde_json::Value::Null);
         let rec: FeatureRecord = serde_json::from_value(ev).unwrap();
         eprintln!(
