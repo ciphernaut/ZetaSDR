@@ -12,7 +12,7 @@ The test rule that applies from Round 1 on: per fix, only its new test and the t
 
 Budget per round from these figures: an XS item about 50k with its review; an S item about 150k to 250k. Round 1 was budgeted at 0.8M to 1M and used about 2.3M for twelve S entries (about 190k each, everything included). So from Round 2 on, budget about 200k per S item, and about 0.4M per round for the whole-branch review, its fix wave and their re-reviews. That puts Round 2 (eight items) near 2M, Round 3 (six page items, with UI runs) near 1.6M, and Round 4 about 100k to 200k per section.
 
-Round 2 then used about 3.4M for nine items: a small feature costs about twice a small fix. Its section below has the figures, and they put Round 3 near 2.8M.
+Round 2 then used about 3.4M for nine items: a small feature costs about twice a small fix. Its section below has the figures, and they put Round 3 near 2.8M. Round 3, with a seventh item added, was estimated at 3.1M and used about 2.8M.
 
 ## Round 0: the XS sweep (done 2026-11-17)
 
@@ -148,7 +148,53 @@ The full gate ran twice, about 32 minutes each.
 - "Packaging: the run directory and install hints for handlers".
 - "Digital voice: the next rows": an audio policy in a set, and `c2dec` optional for M17.
 
-## Round 3: the page (S each)
+## Round 3: the page (S each, done 2026-11-19)
+
+Built subagent-driven on `worktree-cleanup-r3` in five batches, one after another, each with one implementer, one review and one fix round with a scoped re-review; then a whole-branch review, one fix wave with a scoped re-review, and the full gate.
+
+Outcome, by batch:
+- N, cost and audio (Sonnet): a drag on the waterfall or on a job's outline does its work once per animation frame and ends on the release position. The player counts the times the page ran dry (`page gaps N` in the mix's row) and grows its lead from 100 ms towards 500 ms on a gap, halving the excess after each quiet minute.
+- O, the view (Sonnet): the `view set` policies are kept for the browser and shared across tabs, except the seven that say what one tab is looking at; `view set dir` mirrors the frame; `view set time_flow` flips the waterfall's time axis; a ribbon is raised a clear strip in from the newest edge.
+- P, the fit (Sonnet): `measure` reports `power99_hz`. Fit to signal on a running job measures a box twice the job's width, uses it only when the signal lies inside the job's band, and never widens a job on a measured width. A width under the kind's floor is replaced by the plan channel's width, else the 99 % power width, else kept, and the `fitted` line says which.
+- Q, feeds: nothing to build. One feed per other source had already replaced the per-job sockets and their cap (ff8d4fa4); the section was stale.
+- R, the menus (Opus): one entry table (`actions.js`) feeds the box menu, a job's outline menu and the job row's `⋯` control. The box menu's first level is seven lines (What is this?, Listen, Decode, Measure, Plans, Capture, Send to agent) and a job's is six; a group opens a panel at its side by hover, click, key or tap.
+
+The reviews changed these:
+- The profile for the first item found that pointer movement outside a drag does no work on the page at all. The lag the operator reported is not in the pointer handlers; what is left is a check of the canvas path on a desktop GPU, in `TODO.md`.
+- Batch P took three passes. The first build could widen a job across a neighbouring channel; the controller's first correction brought the walk-down back for a signal wider than its job; the fix wave settled it: where the measured signal reaches past the job's band the fit keeps the width and says so.
+- Batch R's first build hid a decoder row outside its ranges, as the brief asked. A row's ranges say where `identify` tries it, not where it may be started, so such rows now sit under an `elsewhere` divider in Decode and nothing the node would accept is hidden. It also gained a dwell before another group replaces an open panel, and placement that no theme's CSS can shift.
+- The whole-branch review found a fit started from the row's control on a source that is not shown measuring a box that source's capture could not hold, and the plan rule capped by the measured box.
+- The page suite was 27 s from its per-shard deadline. It now runs in three shards (about 290 s each here; about 420 s pinned to two CPUs, against 450 s).
+
+Decided along the way, and worth the operator's eye:
+- Ribbons: the operator chose "anchored at the oldest side"; what was built keeps a ribbon tied to its moment (it still drifts with its columns) and keeps the newest 15 % of the width clear instead. A fixed anchor at the oldest edge is one change in `overlays.js` if the page shows it is wanted.
+- Shared policies: `follow`, `scanner`, `plan`, `main`, `map`, `pane` and `subjects` stay per tab; everything else, `zoom_out` and `auto_scan_stop` included, is now shared, so a change in one tab applies in the others at once.
+- A fit never widens a job except to a plan channel's width; a signal wider than its job is widened with a width preset.
+- The sticky lit selection of a job and the classifier's suggested first line were left out, as agreed.
+
+**Rollback and older clients:** the node-side change is one key (`power99_hz`) in the `measure` event, which no strict reader parses, so an older page or client reads this node's answers and this page reads an older node's. A page older than this round finds its radio policy moved out of the key it reads; `TODO.md` ("Left from cleanup round 3", Rollback) says what to set again.
+
+Left over: "Left from cleanup round 3" in `TODO.md`.
+
+Actuals, subagents only (about 2.8M against an estimate of 3.1M):
+
+| stage | per batch | total |
+|---|---|---|
+| implementer | Sonnet 57-229k; Opus 387k | 1.03M |
+| review | Sonnet 69-111k; Opus 121-179k | 0.48M |
+| fix round and its re-review, every batch but Q | 11-67k and 57-104k | 0.45M |
+| whole-branch review, fix wave and its re-review | 287k, 404k, 155k | 0.85M |
+
+Per item, everything included: about 400k for seven items, or about 470k for the six that needed building. What the figures say:
+- A page item costs what a node feature does. The diff is smaller but every behaviour needs a browser scenario, and a scoped re-review costs 60k to 100k however small the fix.
+- Every batch that built something needed a fix round, and two of the four reviews (the fit, the menus) found the defect in the brief's own ruling, not in the code. A ruling on a rule with several paths (the fit) is worth a second reader before it is briefed.
+- The fix wave was again the single largest stage (26 items, six Important).
+- A stale `TODO.md` section cost 57k to find out it was done. Check that a section's named code still exists before briefing it.
+
+The full gate ran once, 30 minutes.
+
+For Round 4 (deferred minors): the earlier figure of 100k to 200k per section stands for sections of node nits; a section of page nits needs a scenario per nit, so budget 250k.
+
 
 - "Page: pointer movement over the page is costly" (profile first).
 - "Mix: the page's audio stutters under channel load while every node counter reads 0" (the page counter first, then the adaptive lead).

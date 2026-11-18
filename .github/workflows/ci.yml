@@ -78,7 +78,7 @@ jobs:
 
   ui:
     runs-on: ubuntu-24.04
-    # A normal run takes about 11 minutes (the suite alone about 5, in two shards, each
+    # A normal run takes about 11 minutes (the suite alone about 7, in three shards, each
     # killed after ui.rs's DEADLINE of 7.5). Chromium's system packages come from the
     # runner's Ubuntu mirror, which once took 10 minutes for 20 MB: the margin absorbs that
     # and still stops a hung suite long before GitHub's 6 hours.
