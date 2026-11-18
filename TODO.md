@@ -138,6 +138,25 @@ The page's classify retry (`menu.js`, the `reclassify` function) handles `too_ol
 Each fit measures the already-narrowed channel's occupied width and takes 1.25 times it, so repeating it converges on the kind's minimum (100.5 MHz `wfm_demod`: 163.3 → 150.6 → 150 kHz). Fit from a band at least as wide as the current one plus a margin, or measure a fixed wider box around the job's centre. From the B210 live run of plans 15/18, 2026-11-01.
 
 
+## UI: the popup menus are cluttered
+
+From the operator, 2026-11-18, after cleanup round 2 was deployed: both popup menus, the box menu (a drag on the waterfall) and a job's outline menu, "still look cluttered like before". Round 2 added to them: a "Start plan" entry per channel group in the box menu, and Stereo on a `wfm_demod` job's outline menu. Every feature so far has appended its entries to one flat list.
+
+Wanted, for both menus:
+- entries grouped by purpose (listen, decode, measure, plans, capture), a group opening as a submenu or a hover box, so the first level is short;
+- only what applies offered: by the selection's width and band for the box menu (a row's ranges and widths already say where it fits), by the job's kind for the outline menu;
+- one entry table shared by the two menus and the job's row, as "UI: more actions on an existing job" below asks, so a new feature adds a row to the table and not a line to each menu.
+
+Where this is heading (next entry): the menu's first line is what the classifier says the signal is, and the rest is the long tail.
+
+## Classify: layers 1 and 2 choose the job, with no agent or model
+
+From the operator, 2026-11-18: "eventually we want to be able to use the L1/L2 classifier to set the right job type without needing an agent or llm". Today picking the job for a signal is the operator reading a menu, or the agent reasoning over `classify` and `identify`. The classifier already holds what the choice needs: layer 1 gives a signal's width, modulation family, symbol rate and a label; layer 2 adds a decoder row's proof, a learned signature's match and the catalogue's names; and the mode rows say what each decoder and demodulator takes (ranges, widths, proofs).
+
+Wanted: a deterministic mapping from that answer to a job, as data and not code: for a selection or a detected signal, the node answers the job it would start (kind, centre, width, parameters) with the evidence for it, and the runner-up when the answer is ambiguous. A layer-2 proof names its decoder row outright; a layer-1 label with no proof maps to a demodulator (an FM voice channel to `fm_demod` at its measured width). The box menu offers that answer as its first entry ("Start `fm_demod` here: 12.5 kHz FM voice"), a watch can start it on a new signal ("Watch: start a voice demodulator and a transcriber on each new signal" is the voice case of this), and the agent calls the same operation instead of working it out. Where neither layer can tell, the answer says so and the menu falls back to its groups.
+
+Spec first: it is a feature, not cleanup. The menu grouping above is the part that can land now and leaves the first line free for it.
+
 ## UI: more actions on an existing job, and a selected job lit on the waterfall
 
 From the operator, 2026-11-01 (after the B210 day). A running job's row and its tag/outline menu should offer the next steps directly: listen (the audio player on a demodulator), attach `transcribe`, decode or investigate its band (`identify`, `classify` on the job's band and span, `measure`, a `watch` on it), stop. Today the row has graph/stop and the outline menu has Fit, the width presets and Stop (plan 18), and the box menu is the only way into identify/classify. Selecting a job (a click on its row, tag or outline) should also light it on the waterfall as a sticky selection, not only on hover (`hot` from plan 18 is hover-only), so the operator can see which job the next action applies to. One entry table shared by the row, the tag and the outline menu.
