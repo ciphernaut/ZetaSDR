@@ -220,7 +220,7 @@ input:focus { border-color: var(--text); }
 /* ---- the side column: boxes drawn with a single line, the title set into the top edge ---- */
 #side {
   background: var(--bg);
-  border-left: 1px solid var(--border);
+  border-inline-start: 1px solid var(--border);
   padding: 4px 6px 6px;
   gap: 6px;
 }

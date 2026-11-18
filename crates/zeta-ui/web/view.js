@@ -57,6 +57,13 @@
 //                          none): the agent's preference order among the free radios; the ids
 //                          are not checked against source_list (a radio absent today may be
 //                          attached tomorrow)
+//         dir              auto | ltr | rtl (default auto): the document's text direction
+//                          (app.js applyDir sets <html dir>; auto leaves the attribute off, so
+//                          the browser's own applies). It mirrors the frame: the side column,
+//                          the rail and axis, the tab strips, text alignment and the menus.
+//                          Frequency is vertical on the waterfall (highest at the top), so
+//                          `dir` never turns it round; which side time runs from is
+//                          `time_flow`'s alone, independent of `dir`
 //         video            smooth | sharp (default smooth): the full video view's picture
 //                          (video.js): every field at 360 wide, or full width 5 a second
 //       Where a policy lives. A policy that is about what this tab is looking at (a
@@ -335,6 +342,12 @@ export const POLICIES = [
     },
     default_: "none",
     describe: "none, a comma-separated list of source ids",
+  },
+  {
+    key: "dir",
+    values: ["auto", "ltr", "rtl"],
+    default_: "auto",
+    describe: "auto (the browser's own), ltr, rtl",
   },
   {
     key: "video",

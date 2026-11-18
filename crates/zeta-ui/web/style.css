@@ -162,7 +162,7 @@ input:focus { border-color: var(--accent); }
   height: var(--default-mark-size);
   border-radius: 50%;
   background: var(--default-mark);
-  margin-right: -4px;
+  margin-inline-end: -4px;
 }
 .src-tab.fault .name { color: var(--error); }
 /* The Map tab (app.js mapTab): after the source tabs; the shown source's tab keeps its colour
@@ -176,7 +176,7 @@ input:focus { border-color: var(--accent); }
   border: 1px solid var(--accent);
   border-radius: 3px;
   padding: 0 3px;
-  margin-left: 4px;
+  margin-inline-start: 4px;
   color: var(--accent);
   font-size: 10px;
 }
@@ -270,12 +270,12 @@ html[data-dock="right"][data-strip] #waterfall, html[data-dock="right"][data-str
 #subjects { display: flex; flex-direction: column; }
 #subjects[hidden] { display: none; }
 #subjects .subject-job, #subjects .subject-merged, #subjects .subject-site { flex: 0 1 auto; min-height: 0; margin: 4px 8px; overflow: auto; }
-#subjects h3 { position: sticky; left: 0; margin: 4px 0; font-size: 12px; font-weight: normal; color: var(--accent); }
-#subjects .not-watched { position: sticky; left: 0; color: var(--error); font-size: 11px; }
+#subjects h3 { position: sticky; inset-inline-start: 0; margin: 4px 0; font-size: 12px; font-weight: normal; color: var(--accent); }
+#subjects .not-watched { position: sticky; inset-inline-start: 0; color: var(--error); font-size: 11px; }
 #subjects table { min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
-#subjects thead th { position: sticky; top: 0; z-index: 2; background: var(--bg); text-align: left; font-weight: normal; color: var(--dim); cursor: pointer; white-space: nowrap; padding: 1px 8px 1px 0; }
-#subjects td { max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 8px 1px 0; }
-#subjects th:first-child, #subjects td:first-child { position: sticky; left: 0; padding-left: 4px; background: var(--bg); }
+#subjects thead th { position: sticky; top: 0; z-index: 2; background: var(--bg); text-align: start; font-weight: normal; color: var(--dim); cursor: pointer; white-space: nowrap; padding-block: 1px; padding-inline: 0 8px; }
+#subjects td { max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-block: 1px; padding-inline: 0 8px; }
+#subjects th:first-child, #subjects td:first-child { position: sticky; inset-inline-start: 0; padding-inline-start: 4px; background: var(--bg); }
 #subjects thead th:first-child { z-index: 3; }
 #subjects tr.subject { cursor: pointer; }
 #subjects tr.subject.dim { color: var(--dim); }
@@ -304,7 +304,7 @@ html[data-dock="right"][data-strip] #waterfall, html[data-dock="right"][data-str
   border-inline-end: 1px solid var(--border); color: var(--dim);
 }
 #waterfall .wf-axis .tick {
-  position: absolute; right: 6px; transform: translateY(-50%); font-size: 11px;
+  position: absolute; inset-inline-end: 6px; transform: translateY(-50%); font-size: 11px;
 }
 #waterfall .wf-axis .tick[data-edge="top"] { transform: none; }
 #waterfall .wf-axis .tick[data-edge="bottom"] { transform: translateY(-100%); }
@@ -442,7 +442,7 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
   flex-direction: column;
   min-height: 0;
   background: var(--bar);
-  border-left: 1px solid var(--border);
+  border-inline-start: 1px solid var(--border);
 }
 .pane { display: flex; flex-direction: column; min-height: 0; }
 .pane.transcript { flex: 1; }
@@ -643,7 +643,7 @@ details.turn > pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 2px
 .job-group[data-kind="set"] > .job,
 .job-group[data-kind="set"] > .job-group { margin-inline-start: 12px; }
 /* Buttons offered after a transcript line (a conflict's "stop … and retry"). */
-.line button.action { margin-left: 6px; padding: 0 6px; font-style: normal; }
+.line button.action { margin-inline-start: 6px; padding: 0 6px; font-style: normal; }
 
 #bar {
   grid-area: bar;
@@ -686,7 +686,7 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   position: fixed;
   top: var(--bar-h-top);
   bottom: var(--bar-h-bottom);
-  right: 0;
+  inset-inline-end: 0;
   width: min(var(--side-w), 92vw);
   z-index: 10;
   box-shadow: -8px 0 24px var(--shadow);
@@ -707,7 +707,7 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   box-shadow: 0 6px 18px var(--shadow);
 }
 #ctx .ctx-item, #ctx-outline .ctx-item {
-  text-align: left;
+  text-align: start;
   border: 1px solid transparent;
   background: transparent;
   padding: 4px 8px;
@@ -749,7 +749,7 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 }
 #src-menu[hidden] { display: none; }
 #src-menu .link-diag, #src-menu .fit-capture {
-  text-align: left;
+  text-align: start;
   border: 1px solid transparent;
   background: transparent;
   color: var(--text);
@@ -869,7 +869,7 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 #bits .bits-row .byte { padding: 0 2px; }
 #bits .bits-row .byte:hover { outline: 1px solid var(--text); }
 #bits .bits-row .byte.sync { background: var(--ok); color: #000; }
-#bits .bits-side { width: 22em; display: flex; flex-direction: column; gap: 4px; padding: 2px 4px; overflow: auto; border-left: 1px solid var(--border); }
+#bits .bits-side { width: 22em; display: flex; flex-direction: column; gap: 4px; padding: 2px 4px; overflow: auto; border-inline-start: 1px solid var(--border); }
 #bits-eye { width: 192px; height: 128px; border: 1px solid var(--border); }
 #bits-hyps { margin: 0; padding-left: 1.2em; }
 #bits-hyps li { margin: 1px 0; }

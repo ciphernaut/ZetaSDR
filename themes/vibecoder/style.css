@@ -355,8 +355,8 @@ input::placeholder { color: #64748b; }
 /* ---- the side column: panes float as cards with gaps between them ---- */
 #side {
   background: transparent;
-  border-left: 0;
-  padding: 10px 8px 10px 2px;
+  border-inline-start: 0;
+  padding-block: 10px; padding-inline: 2px 8px;
   gap: 10px;
 }
 section.pane {

@@ -285,7 +285,7 @@ input:focus, #cmd:focus {
       transparent 1.5px 16px),
     radial-gradient(ellipse at 50% 120%, rgba(255, 79, 200, 0.08), transparent 60%),
     var(--bg);
-  border-left: 0;
+  border-inline-start: 0;
   box-shadow: inset 1px 0 0 color-mix(in srgb, var(--c-channel-5) 40%, transparent);
   padding: 6px 6px 6px 8px;
   gap: 8px;

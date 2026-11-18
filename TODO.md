@@ -293,7 +293,7 @@ Found in plan 16 task 7 (pre-existing): the debug-build bank path at 2.048 MHz d
 
 ## UI: `view set dir ltr|rtl|auto`
 
-Plan 24 draws the frame, rail and ribbons with logical properties (`inset-inline-start` and friends), so a right-to-left page is mostly the `dir` attribute. Add the view policy (`auto` follows the browser) and check the canvas-drawn parts (axis ticks, ribbons' tilt) for left/right assumptions. Spec 4.9 of the console theme.
+`view set dir` is built (the frame, rail, axis tick side, tab strips, menus' text alignment and the Subjects table's sticky column mirror; the waterfall's time side is `time_flow`'s). Left: the map (Leaflet's own controls, the map notes and tile note are placed with physical `left`/`right` and are not mirrored), the plan-24 themes' decorative inset shadows and clip corners (physical), the narrow drawer's shadow, and `dir` is not among the agent's `view_set` keys (`VIEW_KEYS` in `zeta-agent`); add it there if the agent should be able to flip it.
 
 ## UI: `view set time_flow left|right`
 

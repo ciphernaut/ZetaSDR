@@ -4009,6 +4009,51 @@ def scenario_rigid_bands_are_outlined(page, url, secret):
             stop_job(url, secret, hi)
 
 
+def scenario_view_dir_mirrors_the_frame_not_the_frequencies(page, url, secret):
+    """`view set dir rtl` puts the side column on the other side and the rail and axis at the
+    other edge; frequency is vertical, so a drag and a job's outline keep their frequencies."""
+    cur, hzpp = show_retune(page, url, secret)
+    job = start_job(url, secret, "passthrough", "retune", cur + 8_000, 4_000)
+    html = page.locator("html")
+    drag = lambda: (page.mouse.move(box["x"] + 300, box["y"] + 100), page.mouse.down(),
+                    page.mouse.move(box["x"] + 340, box["y"] + 160, steps=4), page.mouse.up())
+    try:
+        expect(outlines(page).first).to_be_visible()
+        expect(page.locator(f'#waterfall .outline[data-key="{job}"]')).to_have_count(1)
+        assert html.get_attribute("dir") is None, "auto forces no dir"
+        canvas = page.locator("#waterfall canvas.wf-canvas")
+        box = canvas.bounding_box()
+        drag()
+        ltr_sel = page.evaluate("window.zetaLastSelection")
+        ltr_out = outline_box(page, job)
+        ltr_side = page.locator("#side").bounding_box()
+        ltr_axis = page.locator("#waterfall .wf-axis").bounding_box()
+        assert ltr_side["x"] > box["x"] and ltr_axis["x"] < box["x"], (ltr_side, ltr_axis, box)
+        run_cmd(page, "view set dir rtl")
+        expect(html).to_have_attribute("dir", "rtl")
+        side = page.locator("#side").bounding_box()
+        assert side["x"] < page.locator("#main").bounding_box()["x"], f"side column at {side}"
+        box = canvas.bounding_box()
+        axis = page.locator("#waterfall .wf-axis").bounding_box()
+        assert axis["x"] > box["x"], f"the axis is at the other edge: {axis} vs {box}"
+        # A drag at the same height selects the same frequencies; the outline lies over them.
+        drag()
+        sel = page.evaluate("window.zetaLastSelection")
+        assert abs(sel["centerHz"] - ltr_sel["centerHz"]) <= 3 * hzpp, (sel, ltr_sel)
+        out = outline_box(page, job)
+        assert abs(out["y"] - ltr_out["y"]) <= 1 and abs(out["height"] - ltr_out["height"]) <= 1, \
+            (out, ltr_out)
+        assert page.evaluate("window.zetaLastSelection")["bandwidthHz"] > 0
+        run_cmd(page, "view set dir ltr")
+        expect(html).to_have_attribute("dir", "ltr")
+        run_cmd(page, "view set dir auto")
+        page.wait_for_function("() => !document.documentElement.hasAttribute('dir')")
+        assert page.locator("#side").bounding_box()["x"] > box["x"]
+    finally:
+        run_cmd(page, "view reset")
+        stop_job(url, secret, job)
+
+
 def scenario_tags_show_kind_id_and_link_rows(page, url, secret):
     select_source(page, url, secret, "retune")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)

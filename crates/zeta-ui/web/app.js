@@ -1441,6 +1441,7 @@ function start(api) {
   loadStationHome(api);
   loadThemes(api);
   applyTheme();
+  applyDir();
   applySide();
   mountSideHeads();
   applyRail();
@@ -1451,6 +1452,7 @@ function start(api) {
   state.view.onChange((key) => {
     if (key === "plan") redrawPlan();
     if (key === "theme") applyTheme();
+    if (key === "dir") applyDir();
     if (key === "side") applySide();
     if (key === "main") applyMain();
     if (key === "pane") applyPanes();
@@ -1717,6 +1719,13 @@ const SIDE_PANES = ["transcript", "jobs"];
 function sideOpen(value) {
   if (value === "both") return SIDE_PANES;
   return SIDE_PANES.includes(value) ? [value] : [];
+}
+
+// The `dir` policy as <html dir>: auto leaves the attribute off (the browser's own direction).
+function applyDir() {
+  const dir = state.view ? state.view.get("dir") : "auto";
+  if (dir === "auto") document.documentElement.removeAttribute("dir");
+  else document.documentElement.setAttribute("dir", dir);
 }
 
 // Narrow, the drawer shows both panes whatever `side` says, so the header bars are inert:

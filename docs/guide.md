@@ -747,6 +747,7 @@ View policies shape this, set from the command line and kept for the browser (it
 | `subject_drop_s` | seconds of silence before a subject goes from the table and the map, `300` |
 | `origin_fade_s` | seconds over which a lit site's brightness falls to nothing after its signal was last active, `300` |
 | `map_tiles` | `auto` (the theme's `layout.map_tiles`, else `osm-dark` under a dark theme and `osm` under a light one), `osm`, `osm-dark`, `opentopo`, `esri-street`, `esri-imagery` |
+| `dir` | `auto` (the browser's own direction), `ltr`, `rtl`: the text direction of the page (`<html dir>`). It mirrors the frame (the side column, the rail and axis, the tab strips, menus' alignment); frequency stays vertical on the waterfall, and the side time runs from is `time_flow`'s |
 | `radio_policy` | `focus` (the agent uses the focused radio only; when it cannot take the band it says why, names the free radios and asks), `focus-fallback` (the first free radio in preference order, says which and why), `free-first`, `ask`; the agent cannot set it |
 | `radio_prefer` | `none`, or radio ids in order, `b210,hackrf`; the fallback's preference order |
 
