@@ -1140,8 +1140,9 @@ def scenario_scan_entry_on_a_held_source_starts_a_scan_that_waits(page, url, sec
         scan = scans[0]["id"]
         waiting = job_row(page, scan).locator(".waiting")
         expect(waiting).to_have_text(f"waiting: source tone is held by measure {job}", timeout=10_000)
-        colour = waiting.evaluate("e => getComputedStyle(e).fontStyle")
-        assert colour == "italic", f"the waiting text is no note: {colour}"
+        # Polled: the row is redrawn on every job poll, and a style read once from a node that
+        # was just replaced comes back empty.
+        expect(waiting).to_have_css("font-style", "italic", timeout=10_000)
         assert page.locator("#transcript .line", has_text="conflict: source tone").count() == 0, \
             "a conflict line for a scan that waits"
         page.wait_for_function("() => window.zetaTest.waterfallMode === 'spectrum'", timeout=10_000)
