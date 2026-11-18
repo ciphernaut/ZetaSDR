@@ -1479,7 +1479,14 @@ function start(api) {
     onOrigins: (key, answer) => state.map?.origin(key, answer),
     // A job's menu offers the row's ▶ and Transcribe as its Listen and Transcribe.
     isAudio: (job) => isAudioJob(job, (kind) => state.subjects?.rowOf(kind) ?? null),
-    play: (job, opts) => toggleAudio(job, opts),
+    // Listen reads `Stop listening` while the job plays any of its streams, and then stops it.
+    play: (job, opts) => {
+      if (state.audio && state.audio.jobId === job.id) {
+        stopAudio();
+        state.jobs?.redraw();
+        syncListen();
+      } else toggleAudio(job, opts);
+    },
     transcribe: (job, { role = null } = {}) => applyOp(attachOp(job.id, role)),
     playing: (id) => !!state.audio && state.audio.jobId === id,
     command: (text) => {

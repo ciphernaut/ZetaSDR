@@ -786,10 +786,14 @@ keys and Enter; Escape closes one level):
 - **Capture**: Capture bursts, Save selection as SigMF (`iq_read`; the transcript shows the path).
 - **Send to agent**: `POST /ask` with "Look at C Hz, BW Hz wide, from START to END: what is it?".
 
-Only what applies is offered, read from `modes_list`: a decoder where the band it would start
-(the box, or the width the entry widens it to) is at least its row's narrowest width and the box
-meets one of the row's ranges, a demodulator where it is at least the kind's minimum width. A
-group with nothing to offer is left out, and a group with one entry shows that entry itself.
+Nothing the node would start is hidden, but the menu reads `modes_list` to order it: in Decode,
+the rows that fit the box (the band the entry would start, the box or the width the entry widens
+it to, is at least the row's narrowest width, and the box meets one of the row's ranges, or the
+row has none) come first, and the others follow under an *elsewhere* heading, as usable as the
+rest (a row's ranges say where `identify` tries it, not where it may run). A group with nothing to
+offer is left out, and a group whose one entry fits, with nothing elsewhere, shows that entry
+itself. While a submenu is open, another group opens only once the pointer rests on it, so a
+pointer crossing other entries on its way into the open submenu leaves it be.
 
 A running demodulator's outline has a handle at each edge (resize) and a body (move). The
 dragged band is shown with a ghost and a readout and sent as `job_retune` on release, keeping

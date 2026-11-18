@@ -451,8 +451,8 @@ section.pane {
 .job button.mute[aria-pressed="true"] { background: #f1f5f9; color: var(--dim); }
 .job-group > summary { color: var(--dim); padding: 2px 8px; border-radius: 8px; }
 
-/* ---- menus: frosted cards ---- */
-#ctx, #ctx-outline {
+/* ---- menus: frosted cards (a submenu is one too) ---- */
+#ctx, #ctx-outline, #ctx .ctx-sub, #ctx-outline .ctx-sub {
   padding: 6px;
   background: rgba(255, 255, 255, 0.8);
   -webkit-backdrop-filter: blur(18px) saturate(1.6);

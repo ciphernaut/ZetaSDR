@@ -138,19 +138,25 @@
 //
 // Groups: both menus are drawn per group of actions.js GROUPS[surface], in order (box: What is
 // this?, Listen, Decode, Measure, Plans, Capture, Send to agent; job: Fit to signal, Width, the
-// toggles, Mute in mix, Stop), each group's offered entries in table order. A `direct` group's
-// entries, and a group whose entries take one line (an entry with `items` takes one more per
-// item), stand in the first level; any other group is one opener, `.ctx-item[data-group=<id>]`
-// reading the group's label with an arrow towards the inline end (aria-haspopup), whose entries
-// stand in its submenu, `.ctx-sub[data-group=<id>]` (role menu). An entry with a `sub` (Decode
-// across this band…) opens its own, `.ctx-sub[data-for=<id>]`, the same way: one mechanism,
-// every panel a direct child of the menu. A submenu opens when the pointer reaches its opener,
+// toggles, Mute in mix, Next, Stop), each group's offered entries in table order, those an
+// entry's `elsewhere` marks after the others under an `elsewhere` (ELSEWHERE) heading. A
+// `direct` group's entries, and a group whose entries take one line (an entry with `items`
+// takes one more per item) and that has no `elsewhere` entry, stand in the first level; any
+// other group is one opener, `.ctx-item[data-group=<id>]` reading the group's label with an
+// arrow towards the inline end (aria-haspopup), whose entries stand in its submenu,
+// `.ctx-sub[data-group=<id>]` (role menu). An entry with a `sub` (Decode across this band…)
+// opens its own, `.ctx-sub[data-for=<id>]`, the same way: one mechanism, every panel a direct
+// child of the menu (`position: absolute` in it). A submenu opens when the pointer reaches its opener,
 // on a click or tap (which also focuses its first entry), and by keyboard on the opener (the
 // arrow towards the inline end, or Enter); the pointer on another entry of the opener's level
 // closes it, as do Escape (one level, the focus back on the opener; the whole menu while a fit
 // runs) and the arrow towards the inline start. placeSub puts it at the opener's side towards
 // the inline end (`dir`), on the other side when there is no room there, and shifts it up to
-// stay inside the viewport. A Transcribe twin's `section` starts a `.ctx-sep` heading.
+// stay inside the viewport, at most the viewport's height (it scrolls; a focused entry is
+// scrolled into view). While a submenu is open, another opener (or entry) of its level takes
+// over only after the pointer rests on it HOVER_DWELL_MS. An entry's section (sectionOf)
+// starts a `.ctx-sep` heading. A menu drawn again when modes_list answers keeps its open
+// submenus and focus (repaint).
 //
 // The job's menu (#ctx-outline, role menu): overlays.js opens it by right-click on a retunable
 // outline, or a long press on its label in the narrow footprint; the job row's ⋯ opens it too
@@ -160,7 +166,7 @@
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
 // as for #ctx.
 
-import { GROUPS, action as entryOf, groupOf, offered } from "./actions.js";
+import { GROUPS, action as entryOf, groupOf, offered, sectionOf } from "./actions.js";
 import { channelHolding, planGroups, planNoVoice } from "./plans.js";
 import { bandText, mhzText, registerLines, registerText } from "./units.js";
 import { capHz } from "./waterfall.js";
@@ -447,13 +453,17 @@ export function dcClause(rec, lo, hi, what) {
   return ` (the capture centre ${mhzText(dc)} MHz is in the ${what}: the ${khz} kHz around it are not measured)`;
 }
 
-// Places submenu `panel` (position: fixed) beside `opener`, an item of `parent` (the menu or a
-// panel): towards the inline end (the right, or the left under `rtl`), on the other side when it
-// would leave the viewport there; its top at the opener's, shifted up to stay inside it.
+// Places submenu `panel` beside `opener`, an item of `parent` (the menu or a panel): towards the
+// inline end (the right, or the left under `rtl`), on the other side when it would leave the
+// viewport there; its top at the opener's, shifted up to stay inside it. The panel is
+// `position: absolute` in its menu (`root`): the place is worked out in the viewport and written
+// as offsets from the menu's padding box, so a theme that makes the menu a containing block
+// (filter, backdrop-filter, transform, contain) cannot move it.
 const SUB_INSET_PX = 5;
-export function placeSub(panel, opener, parent, rtl) {
+export function placeSub(panel, opener, parent, rtl, root) {
   const p = parent.getBoundingClientRect();
   const o = opener.getBoundingClientRect();
+  const m = root.getBoundingClientRect();
   const w = panel.offsetWidth;
   const h = panel.offsetHeight;
   const end = rtl ? p.left - w : p.right;
@@ -462,9 +472,14 @@ export function placeSub(panel, opener, parent, rtl) {
   const left = Math.max(0, Math.min(fitsEnd ? end : other, window.innerWidth - w));
   // The panel's first entry level with the opener (its padding and border above it).
   const top = Math.max(0, Math.min(o.top - SUB_INSET_PX, window.innerHeight - h));
-  panel.style.left = `${left}px`;
-  panel.style.top = `${top}px`;
+  panel.style.left = `${left - m.left - root.clientLeft}px`;
+  panel.style.top = `${top - m.top - root.clientTop}px`;
 }
+
+// How long the pointer rests on another entry before the open submenu gives way (hover intent).
+export const HOVER_DWELL_MS = 250;
+// The heading of a group's entries whose data says the selection is not where they fit.
+export const ELSEWHERE = "elsewhere";
 
 export function mountMenu(wf, opts) {
   return new Menu(wf, opts);
@@ -597,6 +612,7 @@ class Menu {
       const outline = !this.outlineEl.hidden;
       const menu = outline ? this.outlineEl : this.el;
       if (menu.hidden) return;
+      this.cancelDwell();
       const active = menu.contains(document.activeElement) ? document.activeElement : null;
       const level = (active && active.closest(".ctx-sub")) || menu;
       const rtl = getComputedStyle(menu).direction === "rtl";
@@ -713,10 +729,12 @@ class Menu {
     const nodes = [];
     const panels = [];
     for (const g of GROUPS[ctx.surface]) {
-      const es = offer.filter((e) => groupOf(e, ctx.surface) === g.id);
-      if (es.length === 0) continue;
+      const all = offer.filter((e) => groupOf(e, ctx.surface) === g.id);
+      if (all.length === 0) continue;
+      const far = all.filter((e) => e.elsewhere && e.elsewhere(ctx));
+      const es = all.filter((e) => !far.includes(e));
       const lines = es.reduce((n, e) => n + 1 + (e.items ? e.items(ctx).length : 0), 0);
-      if (g.direct || lines === 1) {
+      if (g.direct || (lines === 1 && far.length === 0)) {
         const promoted = this.entryNodes(es, ctx, root, panels);
         const item = promoted.find((n) => n.classList.contains("ctx-item"));
         if (!g.direct && g.prefix && !item.textContent.startsWith(g.label)) {
@@ -731,6 +749,9 @@ class Menu {
       panel.dataset.group = g.id;
       panel.setAttribute("aria-label", g.label);
       panel.append(...this.entryNodes(es, ctx, panel, panels));
+      if (far.length > 0) {
+        panel.append(this.sep(ELSEWHERE), ...this.entryNodes(far, ctx, panel, panels));
+      }
       nodes.push(opener);
       panels.push(panel);
     }
@@ -744,14 +765,9 @@ class Menu {
     const nodes = [];
     let section;
     for (const entry of es) {
-      if (entry.section && entry.section !== section) {
-        const sep = document.createElement("div");
-        sep.className = "ctx-sep";
-        sep.setAttribute("role", "separator");
-        sep.textContent = entry.section;
-        nodes.push(sep);
-      }
-      section = entry.section;
+      const now = sectionOf(entry, ctx.surface);
+      if (now && now !== section) nodes.push(this.sep(now));
+      section = now;
       const item = this.item(entry, ctx);
       this.leaves(item, container);
       nodes.push(item);
@@ -787,14 +803,24 @@ class Menu {
     return nodes;
   }
 
+  // A `.ctx-sep` heading reading `text`.
+  sep(text) {
+    const sep = document.createElement("div");
+    sep.className = "ctx-sep";
+    sep.setAttribute("role", "separator");
+    sep.textContent = text;
+    return sep;
+  }
+
   // The menu (#ctx or #ctx-outline) `node` belongs to.
   rootOf(node) {
     return node.closest("#ctx, #ctx-outline") || node;
   }
 
   // A submenu panel (`.ctx-sub`, hidden) that `opener`, an item in `parent` (the menu or a
-  // panel), opens at its side: on the pointer reaching it, on a click or a tap (which also
-  // focuses its first entry); never toggled shut by them.
+  // panel), opens at its side: on the pointer reaching it (after HOVER_DWELL_MS while another
+  // panel of its level is open: see dwell), on a click or a tap (which also focuses its first
+  // entry); never toggled shut by them.
   panel(root, opener, parent) {
     const panel = document.createElement("div");
     panel.className = "ctx-sub";
@@ -805,27 +831,51 @@ class Menu {
     opener.ctxPanel = panel;
     opener.setAttribute("aria-haspopup", "menu");
     opener.setAttribute("aria-expanded", "false");
-    opener.addEventListener("pointerenter", () => {
-      if (this.fitting === null) this.openSub(panel);
-    });
+    this.dwell(opener, parent, () => this.openSub(panel));
     opener.addEventListener("click", () => {
       if (this.fitting !== null) return;
+      this.cancelDwell();
       this.openSub(panel);
       this.levelItems(panel)[0]?.focus({ preventScroll: true });
     });
     return panel;
   }
 
-  // An item that opens nothing closes, as the pointer reaches it, the submenus open from its
-  // level (`container`).
+  // An item that opens nothing closes, as the pointer reaches it (see dwell), the submenus
+  // open from its level (`container`).
   leaves(item, container) {
     if (item.ctxPanel) return;
-    item.addEventListener("pointerenter", () => {
-      if (this.fitting !== null) return;
+    this.dwell(item, container, () => {
       for (const p of this.openSubs(this.rootOf(container))) {
         if (p.ctxParent === container) this.closeSub(p);
       }
     });
+  }
+
+  // Hover intent: the pointer reaching `item` (of level `container`) runs `act` at once when no
+  // submenu of that level is open, else only once it has rested there HOVER_DWELL_MS, so a
+  // pointer crossing other entries on its way into an open panel leaves the panel alone.
+  // Leaving the item cancels it, as do a click and a key (cancelDwell).
+  dwell(item, container, act) {
+    item.addEventListener("pointerenter", () => {
+      if (this.fitting !== null) return;
+      this.cancelDwell();
+      const open = this.openSubs(this.rootOf(container)).some((p) => p.ctxParent === container);
+      if (!open) {
+        act();
+        return;
+      }
+      this.dwellTimer = setTimeout(() => {
+        this.dwellTimer = null;
+        if (this.fitting === null && item.isConnected) act();
+      }, HOVER_DWELL_MS);
+    });
+    item.addEventListener("pointerleave", () => this.cancelDwell());
+  }
+
+  cancelDwell() {
+    if (this.dwellTimer) clearTimeout(this.dwellTimer);
+    this.dwellTimer = null;
   }
 
   // The open submenu panels of menu `root`.
@@ -841,7 +891,7 @@ class Menu {
     }
     panel.hidden = false;
     panel.ctxOpener.setAttribute("aria-expanded", "true");
-    placeSub(panel, panel.ctxOpener, panel.ctxParent, getComputedStyle(root).direction === "rtl");
+    placeSub(panel, panel.ctxOpener, panel.ctxParent, getComputedStyle(root).direction === "rtl", root);
   }
 
   // Closes `panel` and the submenus open from it.
@@ -929,9 +979,7 @@ class Menu {
     if (this.rows === null) {
       const at = this.sel;
       this.modeRows().then(() => {
-        if (this.sel === at && !this.el.hidden && this.fitting === null) {
-          this.paint(this.el, this.footer, this.boxCtx());
-        }
+        if (this.sel === at && !this.el.hidden && this.fitting === null) this.repaint();
       });
     }
     this.el.hidden = false;
@@ -943,7 +991,42 @@ class Menu {
     this.el.querySelector(".ctx-item")?.focus({ preventScroll: true });
   }
 
+  // Draws the open box menu again (the rows came after it opened), keeping its open submenus
+  // and the focused entry, and keeping it inside the viewport.
+  repaint() {
+    const key = (n) =>
+      n && (n.dataset.group ? `g:${n.dataset.group}` : n.dataset.for ? `f:${n.dataset.for}`
+        : n.dataset.action ? `a:${n.dataset.action}` : n.dataset.planGroup ? `p:${n.dataset.planGroup}`
+          : n.dataset.mode ? `m:${n.dataset.mode}` : null);
+    const opened = this.openSubs(this.el).map((p) => key(p));
+    const active = this.el.contains(document.activeElement) ? document.activeElement : null;
+    const focusKey = active ? key(active) : null;
+    const focusIn = active ? key(active.closest(".ctx-sub")) : null;
+    this.paint(this.el, this.footer, this.boxCtx());
+    const panelOf = (k) =>
+      [...this.el.querySelectorAll(":scope > .ctx-sub")].find((p) => key(p) === k);
+    for (const k of opened) {
+      const p = panelOf(k);
+      if (p) this.openSub(p);
+    }
+    this.clamp(this.el);
+    if (focusKey) {
+      const level = focusIn ? panelOf(focusIn) : this.el;
+      const again = level && this.levelItems(level).find((i) => key(i) === focusKey);
+      (again || this.levelItems(this.el)[0])?.focus({ preventScroll: true });
+    }
+  }
+
+  // Keeps menu `el` inside the viewport where it stands.
+  clamp(el) {
+    const x = parseFloat(el.style.left) || 0;
+    const y = parseFloat(el.style.top) || 0;
+    el.style.left = `${Math.max(0, Math.min(x, window.innerWidth - el.offsetWidth))}px`;
+    el.style.top = `${Math.max(0, Math.min(y, window.innerHeight - el.offsetHeight))}px`;
+  }
+
   close() {
+    this.cancelDwell();
     this.el.hidden = true;
     this.wf.clearSelection();
     // A fit in progress is cancelled: its result no longer belongs to an open menu.
@@ -971,6 +1054,7 @@ class Menu {
   }
 
   closeOutline() {
+    this.cancelDwell();
     this.outlineEl.hidden = true;
     this.outlineJob = null;
     this.fitGen += 1;

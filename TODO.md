@@ -131,12 +131,13 @@ The page's classify retry (`menu.js`, the `reclassify` function) handles `too_ol
 
 ## UI: the popup menus, after the grouping
 
-Built (cleanup round 3): both menus and the job row draw from one entry table (`actions.js`), the box menu's first level is What is this?, Listen, Decode, Measure, Plans, Capture and Send to agent, a job's is Fit, Width, its toggles, Mute in mix, Next and Stop, and only what applies is offered (`modes_list` widths and ranges). Left:
+Built (cleanup round 3): both menus and the job row draw from one entry table (`actions.js`), the box menu's first level is What is this?, Listen, Decode, Measure, Plans, Capture and Send to agent, a job's is Fit, Width, its toggles, Mute in mix, Next and Stop; the decoder rows that fit the box by their `modes_list` widths and ranges come first in Decode and the others follow under `elsewhere`, and a job's menu offers only what its kind takes. Left:
 - the first line is free for the classifier's answer: "Classify: layers 1 and 2 choose the job" below;
-- the rows say where a decoder applies only as far as their data goes: `rds_decode` has no `range_hz`, so RDS (and FM broadcast, a demodulator with no row) is offered on any box; a row `range_hz` or a demodulator row would narrow it;
-- the demodulators' minimum widths are the fit's page constants (`FIT_MIN_HZ`), not row data;
+- the rows say where a decoder fits only as far as their data goes: `rds_decode` has no `range_hz`, so RDS stands with the fitting rows on any box, and the demodulators have no rows at all, so Listen is not ordered;
 - a job's What is this? reads the newest 2 s of its band only on the shown source (the page has no time base for another source's ring), and its menu from the row plays the row's picked voice but its outline's the main stream;
-- POCSAG and ACARS are offered on a box narrower than their row because the entries widen it: whether a tight box should offer them stays the operator's call.
+- POCSAG and ACARS fit a box narrower than their row because the entries widen it: whether a tight box should put them under `elsewhere` stays the operator's call;
+- the row's Stop and Mute in mix buttons are still their own code, not the table's `stop` and `mute` entries;
+- `actions.js` and `menu.js` import each other (safe: neither reads the other at load), which a move of the kind constants out of menu.js would end.
 
 ## Classify: layers 1 and 2 choose the job, with no agent or model
 

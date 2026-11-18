@@ -738,9 +738,14 @@ def menu_item(page, action, menu="#ctx", force=False):
     root = page.locator(menu)
     expect(root).to_be_visible()
     item = root.locator(f'.ctx-item[data-action="{action}"]')
-    expect(item).to_have_count(1)
-    for sel in item.evaluate(MENU_PATH_JS):
-        root.locator(sel).click(force=force)
+    # The menu is drawn again once modes_list answers: open the path, then resolve the entry,
+    # and open it again if a repaint closed it meanwhile.
+    for _ in range(3):
+        expect(item).to_have_count(1)
+        for sel in item.evaluate(MENU_PATH_JS):
+            root.locator(sel).click(force=force)
+        if item.is_visible():
+            break
     return item
 
 
@@ -2079,7 +2084,7 @@ THEME_HOOKS = [
     "#top", ".brand", ".src-tab", '.src-tab[aria-selected="true"]', "#rail", ".wf-axis",
     "#waterfall", ".wf-canvas", "#side", "section.pane", ".pane-head",
     "section.pane[data-collapsed]", "#panes", "#bar", "#cmd", "#mic", "#map", "#graph",
-    '[role="menu"]', ".ctx-item", ".job", ".job .kind", ".job .band", '.job[data-state="running"]',
+    '[role="menu"]', ".ctx-item", ".ctx-sub", ".ctx-sep", ".job", ".job .kind", ".job .band", '.job[data-state="running"]',
     ".job-tag", ".job-tag .kind", ".job-tag .channel", ".job-tag .centre", ".ov-ribbon",
     ".outline", ".graph-node.selected", ".job-tag.hot", ".job-tag.speaking",
     ".job-tag .dot.closed", "html[data-theme]", "html[data-rail]", "html[data-footprint]",
@@ -2122,6 +2127,8 @@ def scenario_theme_hooks(page, url, secret):
         # graph view, so dispatched).
         row.locator("button.more").dispatch_event("click")
         expect(page.locator("#ctx-outline")).to_be_visible()
+        page.locator('#ctx-outline .ctx-item[data-group="next"]').dispatch_event("click")
+        expect(page.locator('#ctx-outline .ctx-sub[data-group="next"] .ctx-sep')).to_be_visible()
         for hook in THEME_HOOKS:
             expect(page.locator(hook).first, hook).to_be_attached()
         page.keyboard.press("Escape")
@@ -5749,14 +5756,31 @@ def drag_hz(page, hz, view_hz):
     return drag_menu(page, 0.5 - f / 2, 0.5 + f / 2)
 
 
+# Where `action` stands in the open box menu: "first" (the first level), "near" (in its group's
+# submenu before the `elsewhere` heading), "elsewhere" (after it), or null (absent).
+MENU_SIDE_JS = """(a) => {
+  const root = document.getElementById('ctx');
+  const item = root.querySelector(`.ctx-item[data-action="${a}"]`);
+  if (!item) return null;
+  const panel = item.closest('.ctx-sub');
+  if (!panel) return 'first';
+  const sep = [...panel.querySelectorAll('.ctx-sep')].find((x) => x.textContent === 'elsewhere');
+  return sep && (sep.compareDocumentPosition(item) & Node.DOCUMENT_POSITION_FOLLOWING)
+    ? 'elsewhere' : 'near';
+}"""
+
+
+def menu_side(page, action):
+    return page.evaluate(MENU_SIDE_JS, action)
+
+
 def scenario_box_menu_offers_only_what_fits(page, url, secret):
-    # A decoder entry is offered where the selection can hold its modes_list row: the width it
-    # asks for (APRS: the box as drawn) at least the row's narrowest, and the box meeting one
-    # of the row's ranges; a filtered entry is absent, not greyed. The widths and bands come
-    # from the row and the sources.
+    # Every decoder is offered; one whose modes_list row says the box is not where it fits
+    # (the width it asks for under the row's narrowest, or the box outside the row's ranges)
+    # stands after the Decode submenu's `elsewhere` heading, fully usable. The widths and bands
+    # come from the row and the sources.
     row = mode_rows(url, secret)["aprs_decode"]
     need = row["band"].get("min_hz") or row["band"]["bandwidth_hz"]
-    item = page.locator('#ctx .ctx-item[data-action="aprs_decode"]')
     select_source(page, url, secret, "aprs")
     wait_span(page, MENU_SPAN_S)
     drag_menu(page, 0.0, 1.0)
@@ -5765,14 +5789,15 @@ def scenario_box_menu_offers_only_what_fits(page, url, secret):
     drag_hz(page, need * 0.6, view_hz)
     c, bw = box_of(page)
     assert bw < need and in_ranges(row, c - bw / 2, c + bw / 2), f"narrow box {c} {bw}"
-    expect(item).to_have_count(0)
+    wait_until(lambda: menu_side(page, "aprs_decode") == "elsewhere", 5.0, "APRS elsewhere")
     close_menu(page)
     drag_hz(page, need * 1.5, view_hz)
     c, bw = box_of(page)
     assert bw >= need and in_ranges(row, c - bw / 2, c + bw / 2), f"wide box {c} {bw}"
+    wait_until(lambda: menu_side(page, "aprs_decode") == "near", 5.0, "APRS above the heading")
     expect(menu_item(page, "aprs_decode")).to_have_count(1)
     close_menu(page)
-    # The same width on the tone, outside the row's ranges.
+    # The same width on the tone, outside the row's ranges: under the heading, and it starts.
     page.click('.src-tab[data-id="tone"]')
     expect(page.locator('.src-tab[data-id="tone"]')).to_have_attribute("aria-selected", "true")
     wait_span(page, MENU_SPAN_S)
@@ -5782,7 +5807,127 @@ def scenario_box_menu_offers_only_what_fits(page, url, secret):
     drag_hz(page, need * 1.5, view_hz)
     c, bw = box_of(page)
     assert bw >= need and not in_ranges(row, c - bw / 2, c + bw / 2), f"tone box {c} {bw}"
-    expect(item).to_have_count(0)
+    wait_until(lambda: menu_side(page, "aprs_decode") == "elsewhere", 5.0, "APRS elsewhere")
+    started = []
+    try:
+        with page.expect_request(is_op("job_start")) as req:
+            menu_click(page, "aprs_decode")
+        body = json.loads(req.value.post_data)
+        assert (body["kind"], body["source"]) == ("aprs_decode", "tone"), f"start {body}"
+        wait_until(lambda: running_jobs(url, secret, "aprs_decode", "tone"), 5.0, "APRS on tone")
+        started = running_jobs(url, secret, "aprs_decode", "tone")
+    finally:
+        for j in started or running_jobs(url, secret, "aprs_decode", "tone"):
+            stop_job(url, secret, j["id"])
+
+
+def scenario_decode_menu_lists_new_kinds(page, url, secret):
+    # The Decode submenu lists every decoder: on the pocsag source a box in POCSAG's range has
+    # POCSAG above the `elsewhere` heading, ACARS (outside its range here) under it.
+    rows = mode_rows(url, secret)
+    select_source(page, url, secret, "pocsag")
+    wait_span(page, MENU_SPAN_S)
+    drag_menu(page, 0.25, 0.75)
+    c, bw = box_of(page)
+    assert in_ranges(rows["pocsag_decode"], c - bw / 2, c + bw / 2), f"box {c} {bw}"
+    assert not in_ranges(rows["acars_decode"], c - bw / 2, c + bw / 2), f"box {c} {bw}"
+    wait_until(lambda: menu_side(page, "pocsag_decode") == "near", 5.0, "POCSAG near")
+    assert menu_side(page, "acars_decode") == "elsewhere", menu_side(page, "acars_decode")
+    expect(menu_item(page, "pocsag_decode")).to_have_text("POCSAG")
+    expect(menu_item(page, "acars_decode")).to_have_text("ACARS")
+    close_menu(page)
+
+
+def scenario_submenus_wait_for_the_pointer_to_rest(page, url, secret):
+    # Hover intent: with Listen's submenu open, a pointer crossing Measure and Plans on its
+    # way into Listen's panel leaves the panel open; resting on Measure past the dwell switches.
+    menu = open_menu_on_tone(page, url, secret)
+    page.evaluate("() => { const m = document.getElementById('ctx'); m.style.left = '100px';"
+                  " m.style.top = '120px'; }")
+    listen = menu.locator('.ctx-sub[data-group="listen"]')
+    measure = menu.locator('.ctx-sub[data-group="measure"]')
+
+    def centre(loc):
+        b = loc.bounding_box()
+        return b["x"] + b["width"] / 2, b["y"] + b["height"] / 2
+
+    page.mouse.move(*centre(menu.locator('.ctx-item[data-group="listen"]')))
+    expect(listen).to_be_visible()
+    last = listen.locator(".ctx-item").last
+    lx, ly = centre(last)
+    page.mouse.move(*centre(menu.locator('.ctx-item[data-group="measure"]')))
+    page.mouse.move(*centre(menu.locator('.ctx-item[data-group="plans"]')))
+    page.mouse.move(lx, ly)
+    page.wait_for_timeout(400)
+    expect(listen).to_be_visible()
+    expect(measure).to_be_hidden()
+    expect(last).to_be_visible()
+    last.hover()
+    page.mouse.move(*centre(menu.locator('.ctx-item[data-group="measure"]')))
+    expect(measure).to_be_visible()
+    expect(listen).to_be_hidden()
+    close_menu(page)
+
+
+def scenario_submenus_beside_their_opener_in_every_theme(page, url, secret):
+    # Under every built-in theme (one makes the menu a containing block): a submenu stands at
+    # its opener's side with its top at the opener's, and at the right and bottom edges it
+    # opens on the other side and stays inside the viewport. A short viewport scrolls it.
+    themes = sorted(os.listdir(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))), "themes")))
+    show_tone_waterfall(page, url, secret)
+    wait_span(page, MENU_SPAN_S)
+    menu = page.locator("#ctx")
+    listen = menu.locator('.ctx-sub[data-group="listen"]')
+    opener = menu.locator('.ctx-item[data-group="listen"]')
+    vw, vh = page.evaluate("[innerWidth, innerHeight]")
+
+    def place(left=None, right=None, bottom=False):
+        page.evaluate("""([l, r, b]) => { const m = document.getElementById('ctx');
+            if (l !== null) m.style.left = l + 'px';
+            if (r !== null) m.style.left = (innerWidth - m.offsetWidth - r) + 'px';
+            m.style.top = b ? (innerHeight - m.offsetHeight - 2) + 'px' : '120px'; }""",
+                      [left, right, bottom])
+
+    for theme in themes:
+        run_cmd(page, f"view set theme {theme}")
+        page.wait_for_function("""(t) => { const l = document.getElementById('theme-css');
+            return document.documentElement.dataset.theme === t
+              && (!l || ((l.getAttribute('href') || '').includes('/' + t + '/') && !!l.sheet)); }""",
+                               arg=theme)
+        drag_menu(page)
+        place(left=40)
+        opener.click()
+        expect(listen).to_be_visible()
+        m, o, sb = menu.bounding_box(), opener.bounding_box(), listen.bounding_box()
+        assert abs(sb["x"] - (m["x"] + m["width"])) <= 3, f"{theme}: {sb} beside {m}"
+        assert abs(sb["y"] - o["y"]) <= 12, f"{theme}: {sb} level with {o}"
+        close_menu(page)
+        drag_menu(page)
+        place(right=2, bottom=True)
+        opener.click()
+        expect(listen).to_be_visible()
+        m, sb = menu.bounding_box(), listen.bounding_box()
+        assert sb["x"] >= 0 and sb["y"] >= 0 and sb["x"] + sb["width"] <= vw + 0.5 \
+            and sb["y"] + sb["height"] <= vh + 0.5, f"{theme}: {sb} leaves the viewport"
+        assert sb["x"] + sb["width"] <= m["x"] + 3, f"{theme}: {sb} not left of {m}"
+        close_menu(page)
+    # A viewport shorter than the panel: it scrolls, and the keys bring the focus into view.
+    drag_menu(page)
+    place(left=100)
+    page.set_viewport_size({"width": WIDE["width"], "height": 240})
+    opener.click()
+    expect(listen).to_be_visible()
+    sb = listen.bounding_box()
+    assert sb["height"] <= 240, f"panel {sb} taller than the viewport"
+    assert listen.evaluate("p => p.scrollHeight > p.clientHeight"), "the panel does not scroll"
+    page.keyboard.press("ArrowUp")  # from the first entry to the last
+    last = listen.locator(".ctx-item").last
+    expect(last).to_be_focused()
+    lb, sb = last.bounding_box(), listen.bounding_box()
+    assert lb["y"] >= sb["y"] - 1 and lb["y"] + lb["height"] <= sb["y"] + sb["height"] + 1, \
+        f"focused {lb} outside the panel {sb}"
+    page.set_viewport_size(WIDE)
     close_menu(page)
 
 
@@ -6128,21 +6273,10 @@ def scenario_set_menu_starts_a_set_and_groups_its_jobs(page, url, secret):
 
 def scenario_adsb_entry_asks_for_2400_khz(page, url, secret):
     # ADS-B always asks for 2.4 MHz, whatever was selected; the 48 kHz tone cannot serve it,
-    # so the node refuses with out_of_range naming bandwidth_hz and the transcript says so. No
-    # source of the test node is in the row's range (the entry is offered only there): the
-    # page is told the row has none.
-    def route(r):
-        if '"modes_list"' not in (r.request.post_data or ""):
-            return r.continue_()
-        resp = r.fetch()
-        data = resp.json()
-        for m in (data.get("value") or {}).get("modes") or []:
-            if m["id"] == "adsb_decode":
-                m["band"]["range_hz"] = None
-        return r.fulfill(response=resp, body=json.dumps(data))
-
-    page.route("**/op", route)
+    # so the node refuses with out_of_range naming bandwidth_hz and the transcript says so.
+    # The tone is outside the row's range: the entry stands under Decode's `elsewhere`.
     open_menu_on_tone(page, url, secret)
+    wait_until(lambda: menu_side(page, "adsb_decode") == "elsewhere", 5.0, "ADS-B elsewhere")
     def is_adsb_start(r):
         if r.method != "POST" or not r.url.endswith("/op"):
             return False
@@ -10882,8 +11016,9 @@ def scenario_video_feed_stopping_falls_back_to_the_next(page, url, secret):
 
 
 def scenario_decode_video_greys_when_the_box_is_too_wide(page, url, secret):
-    # Video is offered on a box at least its row's narrowest wide (modes_list `min_hz`; it
-    # starts on the box as drawn), and greyed, its title the lease's words, when the radio's cap
+    # Video stands with the fitting decoders on a box at least its row's narrowest wide
+    # (modes_list `min_hz`; it starts on the box as drawn), under `elsewhere` on a narrower
+    # one, and is greyed, its title the lease's words, when the radio's cap
     # is under the box. The waterfall shows at most the capture's own width, so a real box is
     # never wider than the file's cap (asserted: its rate): the page is told a cap between the
     # middle box and the widest one.
@@ -10921,7 +11056,7 @@ def scenario_decode_video_greys_when_the_box_is_too_wide(page, url, secret):
         close_menu(page)
         drag_menu(page, 0.40, 0.60)
         assert box_of(page)[1] < need, f"narrow box {box_of(page)} need {need}"
-        expect(page.locator('#ctx .ctx-item[data-action="video"]')).to_have_count(0)
+        wait_until(lambda: menu_side(page, "video") == "elsewhere", 5.0, "Video elsewhere")
         close_menu(page)
     finally:
         page.unroute("**/op", route)

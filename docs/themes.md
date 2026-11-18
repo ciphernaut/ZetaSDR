@@ -204,8 +204,10 @@ selectors (`#bar .prompt`, `html[data-side]`, `.thin`, `.expanded`, `#wf-badge`,
 fixed along with the page when it changes; a theme of your own should keep to the hooks below. The
 core's menu rules are written with ID selectors, so a theme that styles menus must write
 `#ctx, #ctx-outline` (a bare `[role="menu"]` loses to them), and give a menu's submenus,
-`#ctx .ctx-sub, #ctx-outline .ctx-sub`, the same panel looks. A submenu is a `position: fixed`
-child of its menu: a `clip-path`, `mask` or `filter` on the menu clips it too. An end-to-end scenario (`scenario_theme_hooks`) checks that each
+`#ctx .ctx-sub, #ctx-outline .ctx-sub`, the same panel looks. A submenu is a `position: absolute`
+child of its menu, placed from the menu's own box, so a `filter`, `backdrop-filter` or
+`transform` on the menu does not move it; a `clip-path`, `mask` or `overflow` on the menu
+clips it. An end-to-end scenario (`scenario_theme_hooks`) checks that each
 selector below matches on a page with a running demodulator, a ribbon, a collapsed pane, a pane
 docked right, the map, the graph view and a job's menu open, so renaming one fails the suite. A
 menu's entries exist only while it is open.

@@ -19,7 +19,11 @@
 //     disabled(ctx) -> string | null   why it is offered greyed (aria-disabled, the string its
 //               title); absent: never
 //     section   a heading the entry starts in its group (a `.ctx-sep` before the first entry
-//               of a section: the Transcribe twins under the demodulators)
+//               of a section: the Transcribe twins under the demodulators, a job's band steps
+//               under Next); a string, or {box, job} per surface (sectionOf)
+//     elsewhere(ctx) -> bool   true where the entry's data says the selection is not where it
+//               fits: it is drawn after its group's fitting entries, under an `elsewhere`
+//               heading, fully usable (the decoder rows outside their ranges or widths)
 //     keep      true when the menu stays open while it runs (the fitted entries: the fit
 //               closes it); every other entry closes the menu first
 //     items(ctx) -> [{key, label, title, run(ctx)}]   entries drawn after it, one per element (a
@@ -38,17 +42,19 @@
 //            left out
 //   action(id) -> the entry, or undefined
 //   groupOf(entry, surface) -> the entry's group id on that surface
+//   sectionOf(entry, surface) -> the entry's section heading on that surface, or undefined
 //   offered(surface, ctx) -> the entries offered on a surface for ctx, in table order
 //   runAction(id, ctx)  runs an entry that applies to ctx (agent.js's row buttons)
 //   rowRanges(row), rowMeets(row, sel), rowFits(id, row, sel)   what the box's decoder entries
 //            read from modes_list (see Offered)
 //
-// Offered (each entry's `applies`, all from data the page has): a decoder entry where its row
-// fits the selection (rowFits: the width the entry asks for on it, jobTuning, at least the row's
-// `min_hz`, else its `bandwidth_hz`, and the box meeting one of its `range_hz` spans; a row
-// without ranges anywhere; a row the page has not read yet, everywhere); a demodulator entry and
-// its Transcribe twin where the width it asks for is at least the kind's FIT_MIN_HZ; Decode
-// across this band's rows by their width and ranges; the job's own entries by its kind and graph.
+// Offered: nothing the node would accept is hidden. Every decoder and demodulator entry is on
+// the box menu; a decoder whose row does not fit the selection (rowFits: the width the entry
+// asks for on it, jobTuning, at least the row's `min_hz`, else its `bandwidth_hz`, and the box
+// meeting one of its `range_hz` spans; a row without ranges fits anywhere; a row the page has
+// not read yet, everywhere) is drawn under its group's `elsewhere` heading. A row's ranges say
+// where identify tries it, not where it may start. Decode across this band's rows are filtered
+// by their width and ranges; the job's own entries by its kind and graph (`applies`).
 //
 // A ctx is the menu's own (menu.js builds it):
 //   box: {surface: "box", host, sel, plan, sets, rows, src}: `host` the Menu (whose methods the
@@ -209,7 +215,8 @@
 //                          mix` for a muted one, left out when no running mix covers the job's
 //                          source); the note `<kind>: muted in mix` / `unmuted in mix`
 //   listen Listen          (Next) the row's ▶: play(job, {role}) (app.js toggleAudio), reading
-//                          `Stop listening` while it plays; a job with an audio stream, not an
+//                          `Stop listening` while the page plays any of its streams, and then
+//                          stopping it (app.js); a job with an audio stream, not an
 //                          attached one
 //   transcribe Transcribe  (Next) the row's Transcribe: transcribe(job, {role}), job_attach
 //                          kind=transcribe; a running job with audio
@@ -218,7 +225,7 @@
 //                          on the shown source, over its newest JOB_SPAN_NS
 //   stop   Stop            job_stop
 
-import { DENOISE_KINDS, FIT_KINDS, FIT_MIN_HZ, jobTuning, videoRefusal } from "./menu.js";
+import { DENOISE_KINDS, FIT_KINDS, jobTuning, videoRefusal } from "./menu.js";
 
 // The width presets of a running demodulator's menu, in Hz.
 const WIDTHS = [2500, 5000, 6250, 12500, 25000];
@@ -301,22 +308,21 @@ const fitted = (id) => (c) => c.host.fitAndStart(id, c.sel);
 const job = (kind, deviation = null, sideband = null) => ({ kind, deviation, sideband });
 
 // A decoder entry: a job started on the selection as its tuning says (menu.js jobTuning).
-// Offered where the selection can hold it (rowFits on its row).
+// Always offered (the node starts a row anywhere); `elsewhere` where its row says the selection
+// is not where it fits (rowFits).
 const decoder = (id, label, kind = id) => ({
   id, label, group: "decode", on: ["box"], job: job(kind), run: start(id),
-  applies: (c) => rowFits(id, rowOf(c, kind), c.sel),
+  elsewhere: (c) => !rowFits(id, rowOf(c, kind), c.sel),
 });
-// A demodulator entry: fitted to the signal first. Offered where the width it asks for on the
-// selection (jobTuning) is at least the kind's minimum (FIT_MIN_HZ; none for ssb_demod).
-const demodFits = (id, kind) => (c) => !(jobTuning(id, c.sel).bandwidthHz < (FIT_MIN_HZ[kind] ?? 0));
+// A demodulator entry: fitted to the signal first. Always offered: a demodulator has no row to
+// read a width from.
 const demod = (id, label, j) => ({
   id, label, group: "listen", on: ["box"], job: j, keep: true, run: fitted(id),
-  applies: demodFits(id, j.kind),
 });
 // A demodulator's Transcribe twin: the twin's job, then a transcriber attached to it.
-const twin = (id, label, of, kind) => ({
+const twin = (id, label, of) => ({
   id, label, group: "listen", section: "Transcribe", on: ["box"], twin: of, keep: true,
-  run: fitted(id), applies: demodFits(of, kind),
+  run: fitted(id),
 });
 
 export const ACTIONS = [
@@ -324,6 +330,7 @@ export const ACTIONS = [
   // shown source (menu.js jobCtx).
   {
     id: "classify", label: "What is this?", group: { box: "what", job: "next" }, on: ["box", "job"],
+    section: { job: "On its band" },
     applies: (c) => c.surface === "box" || (banded(c) && c.sel.startNs !== null),
     run: (c) => c.host.classify(c.sel),
   },
@@ -332,11 +339,11 @@ export const ACTIONS = [
   demod("am_demod", "AM", job("am_demod")),
   demod("ssb_usb", "SSB (USB)", job("ssb_demod", null, "usb")),
   demod("ssb_lsb", "SSB (LSB)", job("ssb_demod", null, "lsb")),
-  twin("fm_transcribe", "NBFM voice", "fm_demod", "fm_demod"),
-  twin("wfm_transcribe", "FM broadcast", "wfm_demod", "wfm_demod"),
-  twin("am_transcribe", "AM", "am_demod", "am_demod"),
-  twin("ssb_usb_transcribe", "SSB (USB)", "ssb_usb", "ssb_demod"),
-  twin("ssb_lsb_transcribe", "SSB (LSB)", "ssb_lsb", "ssb_demod"),
+  twin("fm_transcribe", "NBFM voice", "fm_demod"),
+  twin("wfm_transcribe", "FM broadcast", "wfm_demod"),
+  twin("am_transcribe", "AM", "am_demod"),
+  twin("ssb_usb_transcribe", "SSB (USB)", "ssb_usb"),
+  twin("ssb_lsb_transcribe", "SSB (LSB)", "ssb_lsb"),
   decoder("aprs_decode", "APRS"),
   decoder("pocsag_decode", "POCSAG"),
   decoder("rds_decode", "RDS (FM station data)"),
@@ -362,15 +369,15 @@ export const ACTIONS = [
   // On a job (its next steps): the same run on the job's band as the selection.
   {
     id: "identify", label: "Identify (thorough)", group: { box: "measure", job: "next" },
-    on: ["box", "job"], job: job("identify"), run: start("identify"), applies: (c) => c.surface === "box" || banded(c),
+    on: ["box", "job"], job: job("identify"), run: start("identify"), section: { job: "On its band" }, applies: (c) => c.surface === "box" || banded(c),
   },
   {
     id: "watch", label: "Watch this band", group: { box: "measure", job: "next" },
-    on: ["box", "job"], job: job("watch"), run: start("watch"), applies: (c) => c.surface === "box" || banded(c),
+    on: ["box", "job"], job: job("watch"), run: start("watch"), section: { job: "On its band" }, applies: (c) => c.surface === "box" || banded(c),
   },
   {
     id: "measure", label: "Measure job", group: { box: "measure", job: "next" },
-    on: ["box", "job"], job: job("measure"), run: start("measure"), applies: (c) => c.surface === "box" || banded(c),
+    on: ["box", "job"], job: job("measure"), run: start("measure"), section: { job: "On its band" }, applies: (c) => c.surface === "box" || banded(c),
   },
   { id: "scan", label: "Scan this span", group: "measure", on: ["box"], run: (c) => c.host.scan(c.sel) },
   {
@@ -451,6 +458,12 @@ export function action(id) {
 
 export function groupOf(entry, surface) {
   return typeof entry.group === "string" ? entry.group : entry.group[surface];
+}
+
+export function sectionOf(entry, surface) {
+  return typeof entry.section === "object" && entry.section !== null
+    ? entry.section[surface]
+    : entry.section;
 }
 
 // Whether `entry` is offered for ctx: on its surface, applying, and with a non-empty submenu.

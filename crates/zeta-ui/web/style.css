@@ -724,9 +724,12 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   outline: none;
 }
 /* A group's submenu (menu.js), and "Decode across this band…"'s rows: a panel of the menu's
-   own looks at its opener's side (placeSub sets left and top). */
+   own looks at its opener's side (placeSub sets left and top, from the menu's padding box), no
+   taller than the viewport (it scrolls). */
 #ctx .ctx-sub, #ctx-outline .ctx-sub {
-  position: fixed;
+  position: absolute;
+  max-height: calc(100vh - 8px);
+  overflow-y: auto;
   z-index: 21;
   display: flex;
   flex-direction: column;
