@@ -9769,7 +9769,10 @@ def scenario_an_accept_is_undone_and_the_signature_deleted(page, url, secret):
         0, timeout=20000)
     assert sig["id"] not in [s["id"] for s in capture_ops(url, secret, "signature_list",
                                                           state=None)]
-    clear_captures(url, secret)
+    # Its own captures only: an earlier scenario's accepts keep theirs pinned, and a pinned
+    # capture's delete is refused. These two were unpinned by the Undo, so they delete.
+    for c in caps:
+        capture_ops(url, secret, "capture_delete", capture=c["id"])
 
 
 def scenario_allow_signatures_switch(page, url, secret):
