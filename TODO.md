@@ -84,10 +84,6 @@ Cleanup round 0 refuses `job_retune`, `graph_put`, `replace` and (while its owne
 
 One open page held 12-16 of the node's 16 stream slots (`max_ws`); a second page got `stream refused: too many stream connections` on every stream and could not paint (the B210 live run of plans 15/18, 2026-11-01; the operator's page hit it again while agent `stream tail`s ran). The default was raised 16 → 64 the same day, and `zeta serve --max-streams N` (env `ZETA_MAX_STREAMS`) sets it. Still to do: per-client fairness so one page cannot take the whole pool. The page now holds one feed socket per shown source (plan 27).
 
-## Page: positioned jobs on other sources onto their feeds
-
-`MAX_POSITIONED` and the per-job sockets remain for the map's jobs on other sources. One feed per such source replaces them.
-
 ## Feed: follow-ups from plan 27's final review
 
 Found in the whole-branch review of plan 27 (2026-11-05); none blocks the feed, each is a known gap.
