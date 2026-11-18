@@ -3740,27 +3740,7 @@ fn cb_source(dir: &Path) -> String {
 #[test]
 fn plan_start_cli_maps_to_the_op_and_parses_channel_ranges() {
     let dir = tempfile::tempdir().unwrap();
-    let run = |channels: &str| {
-        let mut cmd = zeta_bin();
-        cmd.arg("--state-dir")
-            .arg(dir.path().join("state"))
-            .arg("--source-file")
-            .arg(cb_source(dir.path()))
-            .arg("--json")
-            .args([
-                "plan",
-                "start",
-                "--plan",
-                "uhf_cb_au",
-                "--kind",
-                "fm_demod",
-                "--source",
-                "cb",
-                "--channels",
-                channels,
-            ]);
-        cmd
-    };
+    let run = |channels: &str| plan_start_on_cb(dir.path(), &["--channels", channels]);
     let out = run("2,1-2,1")
         .assert()
         .success()
@@ -3780,6 +3760,77 @@ fn plan_start_cli_maps_to_the_op_and_parses_channel_ranges() {
     assert_eq!(op["channels"], serde_json::json!([1, 2]), "{op}");
     // The recording is 48 kHz wide, so two adjacent channels are what it can hold.
     run("8-5").assert().code(1).stderr(contains("channels"));
+}
+
+/// `zeta <args>` over the CB recording (source `cb`).
+fn on_cb(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = zeta_bin();
+    cmd.arg("--state-dir")
+        .arg(dir.join("state"))
+        .arg("--source-file")
+        .arg(cb_source(dir))
+        .arg("--json")
+        .args(args);
+    cmd
+}
+
+/// `zeta plan start` of `fm_demod` on uhf_cb_au over the CB recording, with `extra`.
+fn plan_start_on_cb(dir: &Path, extra: &[&str]) -> Command {
+    let mut args = vec![
+        "plan",
+        "start",
+        "--plan",
+        "uhf_cb_au",
+        "--kind",
+        "fm_demod",
+        "--source",
+        "cb",
+    ];
+    args.extend_from_slice(extra);
+    on_cb(dir, &args)
+}
+
+#[test]
+fn plan_start_and_jobs_stop_cli_take_a_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = plan_start_on_cb(dir.path(), &["--group", "data"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let started: Vec<u64> = v["value"]["started"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["channel"].as_u64().unwrap())
+        .collect();
+    assert_eq!(started, [22, 23], "{v}");
+    let op = last_logged_op(dir.path());
+    assert_eq!(op["group"], "data", "{op}");
+    assert_eq!(op["channels"], Value::Null, "{op}");
+    // A group beside channels, or without a plan to stop on, is a usage error.
+    plan_start_on_cb(dir.path(), &["--group", "data", "--channels", "1"])
+        .assert()
+        .code(1)
+        .stderr(contains("--group").and(contains("--channels")));
+    on_cb(dir.path(), &["jobs", "stop", "--group", "data"])
+        .assert()
+        .code(1)
+        .stderr(contains("--plan"));
+    on_cb(
+        dir.path(),
+        &["jobs", "stop", "--plan", "uhf_cb_au", "--group", "data"],
+    )
+    .assert()
+    .success();
+    let op = last_logged_op(dir.path());
+    assert_eq!(
+        (&op["op"], &op["group"]),
+        (&"jobs_stop".into(), &"data".into()),
+        "{op}"
+    );
 }
 
 #[test]

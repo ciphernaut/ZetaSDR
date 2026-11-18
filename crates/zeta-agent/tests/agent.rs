@@ -724,6 +724,34 @@ async fn a_run_stops_what_plan_start_gave_it() {
 }
 
 #[tokio::test]
+async fn the_plan_start_tool_takes_a_group_in_place_of_channels() {
+    let tools = op_tools(&zeta_core::ops::schema(), "");
+    let tool = tools.iter().find(|t| t.name == "plan_start").unwrap();
+    let group = &tool.input_schema["properties"]["group"];
+    assert_eq!(group["type"], json!(["string", "null"]), "{group}");
+    let planned = json!({"result": "plan_start", "value": {
+        "started": [], "existing": [], "refused": [], "warnings": []}});
+    let plan_args = json!({"plan": "uhf_cb_au", "kind": "fm_demod", "channels": null,
+        "group": "lower40_voice", "deviation_hz": null, "sideband": null,
+        "attach": "transcribe", "language": null, "source": "tone", "replace": []});
+    let fake = fake(vec![
+        tool_call_response(&[("plan_start", plan_args)]),
+        text_response("done", "stop"),
+    ])
+    .await;
+    let exec = RecordingExecutor::new(vec![("plan_start", Ok(planned))]);
+    let agent = Agent::new(llm(&fake), &exec, cfg());
+    let t = agent.run("transcribe the lower 40").await.unwrap();
+    assert!(t.calls[0].ok, "{}", t.calls[0].result);
+    let calls = exec.calls.lock().unwrap();
+    let op = calls.iter().find(|o| o["op"] == "plan_start").unwrap();
+    assert_eq!(
+        (&op["group"], &op["channels"]),
+        (&json!("lower40_voice"), &Value::Null)
+    );
+}
+
+#[tokio::test]
 async fn a_run_stops_the_job_it_attached() {
     let fake = fake(vec![
         tool_call_response(&[(

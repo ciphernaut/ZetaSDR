@@ -156,9 +156,10 @@
 // call (`not_allowed`) adds a note naming what was refused with the action `allow … and ask
 // again`, which re-sends that one request with the refused flags true and leaves the switches
 // as they were; the note's buttons disable once clicked), `stop all` (a `jobs_stop` of every job but the
-// page's spectrum) and `plan start <plan> <kind> [<attach>] [ch N,N-M]` (a `plan_start` op on
-// the shown source through applyOp: conflicts get retry buttons, refused channels and
-// warnings a note each).
+// page's spectrum) and `plan start <plan> <kind> [<attach>] [ch N,N-M | group ID]` (a
+// `plan_start` op on the shown source through applyOp, `group` naming one of the plan's named
+// groups in place of channels: conflicts get retry buttons, refused channels and warnings a
+// note each).
 
 import { OpError, connect, Unauthorized } from "./api.js";
 import { QUIET_OPS, Transcript, errorText, startJobs, startOpsFeed } from "./agent.js";
@@ -982,12 +983,20 @@ export async function runSourceCommand(st, words) {
   }
 }
 
-// `plan start <plan> <kind> [<attach>] [ch N,N-M]`: the `plan_start` op for the shown source,
-// or {error} when the words do not parse. No `ch` means every channel of the plan.
+// `plan start <plan> <kind> [<attach>] [ch N,N-M | group ID]`: the `plan_start` op for the
+// shown source, or {error} when the words do not parse. Neither `ch` nor `group` means every
+// channel of the plan; `group` names one of its groups (channel_plans' `groups`).
 function planOp(src, words) {
   const [verb, plan, kind, ...rest] = words;
-  const usage = "plan start: expected <plan> <kind> [<attach>] [ch N,N-M]";
+  const usage = "plan start: expected <plan> <kind> [<attach>] [ch N,N-M | group ID]";
   if (verb !== "start" || !plan || !kind) return { error: usage };
+  let group = null;
+  const g = rest.indexOf("group");
+  if (g >= 0) {
+    if (rest.length !== g + 2 || rest.includes("ch")) return { error: usage };
+    group = rest[g + 1];
+    rest.length = g;
+  }
   let channels = null;
   const at = rest.indexOf("ch");
   if (at >= 0) {
@@ -1012,6 +1021,7 @@ function planOp(src, words) {
       op: "plan_start",
       plan,
       channels,
+      ...(group === null ? {} : { group }),
       kind,
       source: src.id,
       deviation_hz: null,

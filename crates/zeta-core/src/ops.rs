@@ -565,13 +565,26 @@ pub enum Op {
     /// `error`) and `warnings` (strings to repeat to the operator; empty when there is
     /// nothing to say). The jobs are ordinary jobs; running the same request twice
     /// starts only what is missing.
+    #[schemars(transform = require_group)]
     PlanStart {
         /// A plan id from `channel_plans`.
         plan: String,
-        /// Channel numbers of the plan; `null` for every channel.
+        /// Channel numbers of the plan; `null` for every channel (or for `group`'s).
         #[serde(deserialize_with = "nullable_u32_list")]
         #[schemars(required, schema_with = "nullable_channels_schema")]
         channels: Option<Vec<u32>>,
+        /// A group id of the plan (`channel_plans`' `groups`: `lower40_voice`), in place
+        /// of `channels`: its channels. `null` for none; beside `channels` it is refused
+        /// naming the plan's groups, and an unknown one is `unknown` listing them.
+        // Left out when `null`, so a node or a CLI of this build can still start a plan
+        // on an older node, which refuses a field it does not know.
+        #[serde(
+            default,
+            deserialize_with = "nullable_string_value",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+        group: Option<String>,
         kind: JobKind,
         source: SourceId,
         /// As on `job_start`, passed to every start.
@@ -599,7 +612,8 @@ pub enum Op {
     },
     /// Stop every running job that matches all the filters given, in one operation:
     /// `source`, `kind` and `plan` (`null` for any; all three `null` is every job). A
-    /// job's filter on `plan` is its centre lying on one of that plan's channels; a job on
+    /// job's filter on `plan` is its centre lying on one of that plan's channels (with
+    /// `group`, one of that group's channels); a job on
     /// no radio (`graph_start`, `bits_start`, a mix) never matches a `plan`. Elastic
     /// jobs (the page's spectrum) and jobs another job owns (a `watch`'s or an
     /// `identify`'s trial jobs) are never named: they follow the capture or their owner.
@@ -607,6 +621,7 @@ pub enum Op {
     /// that ended with its input counts as stopped. The result lists `stopped` (ids) and
     /// `failed` (`job`, `error`; the others go on). No match is an empty `stopped`, not
     /// an error.
+    #[schemars(transform = require_group)]
     JobsStop {
         /// An id from `source_list`; `null` for every source.
         #[serde(deserialize_with = "crate::modes::nullable")]
@@ -620,6 +635,17 @@ pub enum Op {
         #[serde(deserialize_with = "nullable_string_value")]
         #[schemars(required, schema_with = "crate::types::nullable::<String>")]
         plan: Option<String>,
+        /// A group id of `plan` (`channel_plans`' `groups`): only its channels' jobs;
+        /// `null` for the whole plan. It needs `plan`; an unknown one is `unknown`
+        /// listing the plan's groups.
+        // Left out when `null`, as `plan_start`'s.
+        #[serde(
+            default,
+            deserialize_with = "nullable_string_value",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+        group: Option<String>,
     },
     /// A job's record: what it is doing now, kept by the job itself (`scan`, `watch`,
     /// `identify`, `squelch`, `channel`, ...). A `scan`'s `scan` key holds `method`
@@ -1193,6 +1219,25 @@ fn require_all_value(schema: &mut schemars::Schema) {
         .and_then(|v| <&mut schemars::Schema>::try_from(v).ok());
     if let Some(value) = value {
         crate::knowledge::require_all(value);
+    }
+}
+
+/// `plan_start` and `jobs_stop` require their `group`, after `channels` (or `plan`, where
+/// there is no `channels`), and show no default for it; it still defaults to `null` when a
+/// request from before it leaves it out.
+fn require_group(schema: &mut schemars::Schema) {
+    if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
+        req.retain(|f| f != "group");
+        let after = |name: &str| req.iter().position(|f| f == name);
+        let at = after("channels")
+            .or_else(|| after("plan"))
+            .map_or(req.len(), |i| i + 1);
+        req.insert(at, "group".into());
+    }
+    if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties")
+        && let Some(serde_json::Value::Object(p)) = props.get_mut("group")
+    {
+        p.remove("default");
     }
 }
 
@@ -3039,6 +3084,22 @@ pub struct PlanInfo {
     pub deviation_hz: Option<Hz>,
     /// Sorted by frequency.
     pub channels: Vec<PlanChannel>,
+    /// Named groups of the plan's channels, each in place of a channel list for
+    /// `plan_start` and `jobs_stop`. Absent from an older node's plans: none.
+    #[serde(default)]
+    pub groups: Vec<PlanGroup>,
+}
+
+/// One named group of a plan's channels.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PlanGroup {
+    /// What `plan_start`'s and `jobs_stop`'s `group` takes (`lower40_voice`).
+    pub id: String,
+    pub name: String,
+    /// Its channel numbers, sorted.
+    pub channels: Vec<u32>,
 }
 
 /// One channel of a plan.
@@ -3083,6 +3144,15 @@ impl From<&crate::plans::ChannelPlan> for PlanInfo {
                     number,
                     center_hz: Hz(hz),
                     note: note(number),
+                })
+                .collect(),
+            groups: p
+                .groups
+                .iter()
+                .map(|g| PlanGroup {
+                    id: g.id.into(),
+                    name: g.name.into(),
+                    channels: g.channels(),
                 })
                 .collect(),
         }
@@ -4429,12 +4499,13 @@ pub(crate) struct PlanFields {
 }
 
 /// `plan_start`'s checks of its own fields, in order, touching nothing: the plan known,
-/// each channel known and listed once (`null` for all), a kind that runs per channel,
+/// a known `group` given in place of `channels` (see [`plan_group`]), each channel
+/// known and listed once (`null` for all), a kind that runs per channel,
 /// `deviation_hz` and `sideband` as `job_start` checks them, an attachable `attach`,
 /// and `language` only with `attach` and a BCP-47 code. Each error names its field.
 pub(crate) fn check_plan_start_fields(
     plan: &str,
-    channels: Option<&[u32]>,
+    (channels, group): (Option<&[u32]>, Option<&str>),
     kind: &JobKind,
     (deviation_hz, sideband): (Option<u64>, Option<Sideband>),
     (attach, language): (Option<&JobKind>, Option<&str>),
@@ -4449,6 +4520,21 @@ pub(crate) fn check_plan_start_fields(
             },
         ));
     };
+    let grouped = match (channels, group) {
+        (Some(_), Some(_)) => {
+            return Err(FieldError::new(
+                "group",
+                other(format!(
+                    "group: give channels or group, not both ({}'s groups: {})",
+                    p.id,
+                    group_ids(p).join(", ")
+                )),
+            ));
+        }
+        (None, Some(g)) => Some(plan_group(p, g).map_err(|e| FieldError::new("group", e))?),
+        (_, None) => None,
+    };
+    let channels = grouped.as_deref().or(channels);
     let all = crate::plans::channels(p);
     let mut known: Vec<u32> = all.iter().map(|&(n, _)| n).collect();
     known.sort_unstable();
@@ -4498,6 +4584,23 @@ pub(crate) fn check_plan_start_fields(
         deviation,
         language,
     })
+}
+
+/// The group ids of `plan`, in its order.
+fn group_ids(plan: &crate::plans::ChannelPlan) -> Vec<String> {
+    plan.groups.iter().map(|g| g.id.to_string()).collect()
+}
+
+/// The channels of `plan`'s group `id`: `unknown` on `group`, listing the plan's groups,
+/// when it has none of that id.
+fn plan_group(plan: &crate::plans::ChannelPlan, id: &str) -> Result<Vec<u32>, OpError> {
+    crate::plans::group(plan, id)
+        .map(crate::plans::Group::channels)
+        .ok_or_else(|| OpError::Unknown {
+            field: "group".into(),
+            value: id.into(),
+            known: group_ids(plan),
+        })
 }
 
 /// `plan_start`'s checks of `attach` and `language`: an attachable `attach`, and
@@ -5000,6 +5103,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
         Op::PlanStart {
             plan,
             channels,
+            group,
             kind,
             source,
             deviation_hz,
@@ -5011,7 +5115,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             plan_start(
                 node,
                 plan,
-                channels,
+                (channels, group),
                 kind,
                 source,
                 (deviation_hz, sideband),
@@ -5106,7 +5210,12 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 .map(|()| OpResult::Ok)
                 .map_err(|e| node_error(node, e)),
         },
-        Op::JobsStop { source, kind, plan } => jobs_stop(node, source, kind, plan).await,
+        Op::JobsStop {
+            source,
+            kind,
+            plan,
+            group,
+        } => jobs_stop(node, source, kind, plan, group).await,
         Op::JobContext { job } => node
             .job_context(&job)
             .map(OpResult::Context)
@@ -5253,11 +5362,15 @@ async fn jobs_stop(
     source: Option<SourceId>,
     kind: Option<JobKind>,
     plan: Option<String>,
+    group: Option<String>,
 ) -> Result<OpResult, OpError> {
     if let Some(s) = &source
         && node.port(s).is_none()
     {
         return Err(unknown_source(node, s));
+    }
+    if group.is_some() && plan.is_none() {
+        return Err(other("group: needs plan"));
     }
     let channels = match &plan {
         None => None,
@@ -5272,7 +5385,12 @@ async fn jobs_stop(
                         .collect(),
                 });
             };
-            Some(crate::plans::channels(p))
+            let mut on = crate::plans::channels(p);
+            if let Some(g) = &group {
+                let numbers = plan_group(p, g)?;
+                on.retain(|(n, _)| numbers.contains(n));
+            }
+            Some(on)
         }
     };
     let on_plan = |hz: u64| {
@@ -5405,7 +5523,7 @@ pub(crate) fn plan_check(
     plan_check_as(
         node,
         plan,
-        channels,
+        (channels, None),
         kind,
         (deviation_hz, sideband),
         (None, None),
@@ -5418,7 +5536,7 @@ pub(crate) fn plan_check(
 fn plan_check_as(
     node: &Node,
     plan: &str,
-    channels: Option<Vec<u32>>,
+    (channels, group): (Option<Vec<u32>>, Option<&str>),
     kind: JobKind,
     (deviation_hz, sideband): (Option<u64>, Option<Sideband>),
     (attach, language): (Option<&JobKind>, Option<&str>),
@@ -5431,7 +5549,7 @@ fn plan_check_as(
         ..
     } = check_plan_start_fields(
         plan,
-        channels.as_deref(),
+        (channels.as_deref(), group),
         &kind,
         (deviation_hz, sideband),
         (attach, language),
@@ -5682,7 +5800,7 @@ pub(crate) async fn plan_attach(
 async fn plan_start(
     node: &Node,
     plan: String,
-    channels: Option<Vec<u32>>,
+    (channels, group): (Option<Vec<u32>>, Option<String>),
     kind: JobKind,
     source: SourceId,
     (deviation_hz, sideband): (Option<u64>, Option<Sideband>),
@@ -5693,7 +5811,7 @@ async fn plan_start(
     let (pc, language) = plan_check_as(
         node,
         &plan,
-        channels,
+        (channels, group.as_deref()),
         kind,
         (deviation_hz, sideband),
         (attach.as_ref(), language.as_deref()),

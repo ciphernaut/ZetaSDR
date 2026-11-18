@@ -430,6 +430,7 @@ fn cb_plan() -> Op {
     Op::PlanStart {
         plan: "uhf_cb_au".into(),
         channels: Some(vec![1, 2]),
+        group: None,
         kind: JobKind::FmDemod,
         source: SourceId("cb".into()),
         deviation_hz: None,

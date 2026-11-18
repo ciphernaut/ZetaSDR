@@ -449,7 +449,7 @@ fn validate_member(
             ..
         } => crate::ops::check_plan_start_fields(
             plan,
-            channels.as_deref(),
+            (channels.as_deref(), None),
             kind,
             (*deviation_hz, *sideband),
             (attach.as_ref(), language.as_deref()),

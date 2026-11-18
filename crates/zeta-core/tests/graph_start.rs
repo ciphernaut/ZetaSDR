@@ -411,6 +411,7 @@ async fn jobs_stop_with_a_plan_skips_a_graph_job_on_a_plan_channel() {
             source: None,
             kind: None,
             plan: Some("uhf_cb_au".into()),
+            group: None,
         })
         .await
         .unwrap();

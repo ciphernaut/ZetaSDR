@@ -476,6 +476,9 @@ pub enum JobsCmd {
         /// Only jobs on a channel of this plan
         #[arg(long, value_name = "ID")]
         plan: Option<String>,
+        /// Only jobs on a channel of this group of the plan (from `zeta plans`)
+        #[arg(long, value_name = "ID", requires = "plan")]
+        group: Option<String>,
     },
 }
 
@@ -709,6 +712,10 @@ pub enum PlanCmd {
         /// Channel numbers, e.g. 1,2,5-8; absent = every channel of the plan
         #[arg(long, value_name = "N[,N|N-M]", value_parser = parse_channels)]
         channels: Option<Channels>,
+        /// A named group of the plan's channels (from `zeta plans`, e.g. lower40_voice)
+        /// in place of --channels
+        #[arg(long, value_name = "ID", conflicts_with = "channels")]
+        group: Option<String>,
         /// Job kind to start on each channel
         #[arg(long, value_parser = parse_job_kind)]
         kind: JobKind,
@@ -1868,14 +1875,21 @@ impl Command {
                 }
                 Op::ChannelPlans {}
             }
-            Command::Jobs(JobsCmd::Stop { source, kind, plan }) => Op::JobsStop {
+            Command::Jobs(JobsCmd::Stop {
+                source,
+                kind,
+                plan,
+                group,
+            }) => Op::JobsStop {
                 source: source.map(SourceId),
                 kind,
                 plan,
+                group,
             },
             Command::Plan(PlanCmd::Start {
                 plan,
                 channels,
+                group,
                 kind,
                 source,
                 deviation_hz,
@@ -1886,6 +1900,7 @@ impl Command {
             }) => Op::PlanStart {
                 plan,
                 channels: channels.map(|c| c.0),
+                group,
                 kind,
                 source: SourceId(source),
                 deviation_hz,

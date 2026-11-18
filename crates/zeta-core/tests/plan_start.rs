@@ -142,6 +142,7 @@ fn plan_op(
     Op::PlanStart {
         plan: plan.into(),
         channels,
+        group: None,
         kind,
         source: SourceId(RADIO.into()),
         deviation_hz: None,
@@ -299,6 +300,152 @@ fn graph_deviation(graph: &zeta_core::graph::Graph) -> Option<u64> {
         }
     }
     find(&serde_json::to_value(graph).unwrap())
+}
+
+/// `fm_demod` on the plan's group `group` (`channels` as given), nothing attached.
+fn fm_group(group: &str, channels: Option<Vec<u32>>) -> Op {
+    let mut op = fm_plan(channels, &[]);
+    if let Op::PlanStart { group: g, .. } = &mut op {
+        *g = Some(group.into());
+    }
+    op
+}
+
+/// The CB plan's group ids, as every refusal naming them lists them.
+const CB_GROUPS: [&str; 5] = [
+    "lower40_voice",
+    "upper40_voice",
+    "voice",
+    "repeater_outputs",
+    "data",
+];
+
+#[tokio::test]
+async fn a_group_starts_exactly_its_channels() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open(dir.path(), &radio).await;
+    let a = planned(&node, fm_group("lower40_voice", None)).await;
+    let numbers: Vec<u32> = a.started.iter().map(|s| s.0).collect();
+    assert_eq!(numbers.len(), 38);
+    assert_eq!(
+        numbers,
+        (1..=40)
+            .filter(|n| *n != 22 && *n != 23)
+            .collect::<Vec<u32>>()
+    );
+    assert_eq!(a.refused, 0);
+    assert_eq!(running(&node).len(), 38);
+    let centres: Vec<u64> = node
+        .job_list()
+        .iter()
+        .map(|r| r.tuning.center_hz.0)
+        .collect();
+    // ch22 and ch23 (476.950 and 476.975 MHz) carry no job.
+    assert!(!centres.contains(&476_950_000) && !centres.contains(&476_975_000));
+}
+
+#[tokio::test]
+async fn a_group_beside_channels_or_unknown_is_refused_naming_the_plans_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open(dir.path(), &radio).await;
+    let both = other_message(node.apply(fm_group("data", Some(vec![1]))).await);
+    assert_eq!(
+        both,
+        format!(
+            "group: give channels or group, not both (uhf_cb_au's groups: {})",
+            CB_GROUPS.join(", ")
+        )
+    );
+    match node.apply(fm_group("lower_40", None)).await {
+        Err(OpError::Unknown {
+            field,
+            value,
+            known,
+        }) => {
+            assert_eq!((field.as_str(), value.as_str()), ("group", "lower_40"));
+            assert_eq!(known, CB_GROUPS);
+        }
+        other => panic!("expected unknown, got {other:?}"),
+    }
+    assert!(node.job_list().is_empty());
+    assert_eq!(radio.tunes(), 0);
+}
+
+#[tokio::test]
+async fn channel_plans_serves_each_plans_groups_with_their_channels() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open(dir.path(), &radio).await;
+    let Ok(OpResult::ChannelPlans { plans }) = node.apply(Op::ChannelPlans {}).await else {
+        panic!("expected channel_plans");
+    };
+    let cb = plans.iter().find(|p| p.id == PLAN).unwrap();
+    let ids: Vec<&str> = cb.groups.iter().map(|g| g.id.as_str()).collect();
+    assert_eq!(ids, CB_GROUPS);
+    let data = &cb.groups[4];
+    assert_eq!(
+        (data.name.as_str(), data.channels.as_slice()),
+        ("Data", &[22, 23][..])
+    );
+    assert_eq!(cb.groups[0].channels.len(), 38);
+    assert_eq!(cb.groups[0].name, "Lower 40, voice");
+    assert!(
+        plans
+            .iter()
+            .find(|p| p.id == "ais_vhf")
+            .unwrap()
+            .groups
+            .is_empty()
+    );
+    // An older node's plan, without `groups`, reads as having none.
+    let mut old = serde_json::to_value(cb).unwrap();
+    old.as_object_mut().unwrap().remove("groups");
+    let read: zeta_core::ops::PlanInfo = serde_json::from_value(old).unwrap();
+    assert!(read.groups.is_empty());
+    assert_eq!(read.channels, cb.channels);
+}
+
+#[tokio::test]
+async fn jobs_stop_with_a_group_stops_only_that_groups_channels() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new(RADIO);
+    let node = open(dir.path(), &radio).await;
+    planned(&node, fm_plan(Some((1..=25).collect()), &[])).await;
+    let stop = |plan: Option<&str>, group: &str| Op::JobsStop {
+        source: None,
+        kind: None,
+        plan: plan.map(Into::into),
+        group: Some(group.into()),
+    };
+    // A group needs its plan, and an unknown one lists the plan's groups.
+    let r = other_message(node.apply(stop(None, "data")).await);
+    assert_eq!(r, "group: needs plan");
+    match node.apply(stop(Some(PLAN), "nope")).await {
+        Err(OpError::Unknown { field, known, .. }) => {
+            assert_eq!(field, "group");
+            assert_eq!(known, CB_GROUPS);
+        }
+        other => panic!("expected unknown, got {other:?}"),
+    }
+    assert_eq!(running(&node).len(), 25);
+    let stopped = match node.apply(stop(Some(PLAN), "data")).await.unwrap() {
+        OpResult::JobsStopped { stopped, failed } => {
+            assert!(failed.is_empty(), "{failed:?}");
+            stopped
+        }
+        r => panic!("jobs_stop: {r:?}"),
+    };
+    assert_eq!(stopped.len(), 2);
+    let left: Vec<u64> = node
+        .job_list()
+        .into_iter()
+        .filter(|r| r.state == JobState::Running)
+        .map(|r| r.tuning.center_hz.0)
+        .collect();
+    assert_eq!(left.len(), 23);
+    assert!(!left.contains(&476_950_000) && !left.contains(&476_975_000));
 }
 
 #[tokio::test]
@@ -855,6 +1002,7 @@ async fn jobs_stop_stops_what_matches_and_keeps_the_elastic_spectrum() {
         source: source.map(|s| zeta_core::types::SourceId(s.into())),
         kind,
         plan: plan.map(Into::into),
+        group: None,
     };
     planned(&node, fm_plan(None, &[])).await;
     let elastic = started(
@@ -923,6 +1071,7 @@ async fn jobs_stop_with_no_filter_stops_a_job_outside_any_plan() {
             source: None,
             kind: None,
             plan: Some(PLAN.into()),
+            group: None,
         })
         .await
         .unwrap();
@@ -933,6 +1082,7 @@ async fn jobs_stop_with_no_filter_stops_a_job_outside_any_plan() {
             source: None,
             kind: None,
             plan: None,
+            group: None,
         })
         .await
         .unwrap();
@@ -967,6 +1117,7 @@ async fn jobs_stop_ends_demodulators_and_their_attached_jobs_without_failures() 
             source: Some(SourceId(RADIO.into())),
             kind: None,
             plan: None,
+            group: None,
         })
         .await
         .unwrap();

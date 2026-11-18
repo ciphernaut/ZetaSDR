@@ -4,6 +4,8 @@
 //   loadPlans(api) -> Promise<void>   `channel_plans` once; an error leaves the list empty
 //   planIds() -> string[]             the loaded plan ids
 //   resolvePlan(policy) -> string | null   the id of the first plan `policy` selects
+//   planGroups(id) -> [{id, name, channels}]   the plan's named groups (none for an older
+//       node's plans, which carry no `groups`, or an unknown plan)
 //   channelLabel(hz, policy) -> {text: "ch20", title: "uhf_cb_au ch20 · <note>", plan: "uhf_cb_au"} | null
 //       The channel centred within CHANNEL_MATCH_HZ of `hz`. `policy` is the view's `plan`:
 //       `auto` any plan, a plan id that plan only, `none` null.
@@ -37,6 +39,11 @@ export function planIds() {
 function selected(policy) {
   if (policy === "none") return [];
   return policy === "auto" || policy === undefined ? plans : plans.filter((p) => p.id === policy);
+}
+
+export function planGroups(id) {
+  const p = plans.find((x) => x.id === id);
+  return p && Array.isArray(p.groups) ? p.groups : [];
 }
 
 // The id of the first plan `policy` selects (null for `none` or when no plan is loaded).

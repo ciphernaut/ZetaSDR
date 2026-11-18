@@ -149,7 +149,9 @@ fn jobs_stop_cli_line_and_rule_are_in_the_guide() {
         .stdout
         .clone();
     let md = String::from_utf8(md).unwrap();
-    assert!(md.contains("CLI: `zeta jobs stop [--source ID] [--kind KIND] [--plan ID]`"));
+    assert!(
+        md.contains("CLI: `zeta jobs stop [--source ID] [--kind KIND] [--plan ID [--group ID]]`")
+    );
     assert!(md.contains("use `jobs_stop`, never one `job_stop` per job"));
 }
 

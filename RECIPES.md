@@ -104,6 +104,15 @@ default set in the script was `[6, 9, 20, 27]`, the channels with speech seen so
 {"op":"plan_start","plan":"uhf_cb_au","channels":null,"kind":"fm_demod","source":"b210","deviation_hz":2500,"sideband":null,"attach":"transcribe","language":null,"replace":[]}
 ```
 
+For part of the plan name one of its groups (`channel_plans` lists them with their channels)
+in place of `channels`, never a typed list: `lower40_voice` is ch1-40 less the data channels 22
+and 23, `upper40_voice` ch41-80 less the reserved 61-63, `voice` both, `repeater_outputs` ch1-8
+and 41-48, `data` ch22 and 23. "Transcribe the lower 40":
+
+```json
+{"op":"plan_start","plan":"uhf_cb_au","channels":null,"group":"lower40_voice","kind":"fm_demod","source":"b210","deviation_hz":2500,"sideband":null,"attach":"transcribe","language":null,"replace":[]}
+```
+
 Read all four lists of the answer: `started` (each with `attached` or an `attach_error`),
 `existing` (left alone), `refused` (that channel's error; the rest went on) and `warnings`
 (repeat them to the operator: the speech daemon has four slots, so 80 transcribers queue). Run it
@@ -120,6 +129,8 @@ on the node reads what was said after the fact.
 ```json
 {"op":"jobs_stop","source":"b210","kind":null,"plan":"uhf_cb_au"}
 ```
+
+`"group":"lower40_voice"` beside `plan` stops only that group's channels.
 
 Then `source_unpin` if the radio is wanted elsewhere; the pin is not a holder and `replace`
 cannot name it.

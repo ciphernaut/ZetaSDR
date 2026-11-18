@@ -4408,6 +4408,7 @@ async fn jobs_stop_of_the_decoders_frees_the_cap() {
         source: Some(rx()),
         kind: JobKind::from_name("pocsag_decode"),
         plan: None,
+        group: None,
     };
     match node.apply(op).await {
         Ok(OpResult::JobsStopped { stopped, failed }) => {

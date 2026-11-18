@@ -578,6 +578,7 @@ async fn job_start_plan_start_and_job_retune_refuse_a_mix() {
     let plan = Op::PlanStart {
         plan: "uhf_cb_au".into(),
         channels: Some(vec![1]),
+        group: None,
         kind: JobKind::Mix,
         source: src("a"),
         deviation_hz: None,
@@ -653,6 +654,7 @@ async fn jobs_stop_stops_it_only_without_a_source_or_plan_filter() {
         source: source.map(src),
         kind,
         plan: plan.map(String::from),
+        group: None,
     };
     match node.apply(stop(Some("a"), None, None)).await {
         Ok(OpResult::JobsStopped { stopped, failed }) => {

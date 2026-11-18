@@ -138,7 +138,11 @@
 //   plan       Start plan…                    shown only when the view's plan policy names a plan
 //                                             (mountMenu's `plan()`); puts `plan start <plan>
 //                                             fm_demod transcribe` in the command line
-//                                             (`command(text)`) and focuses it
+//                                             (`command(text)`) and focuses it. After it, one
+//                                             `.ctx-item[data-group=<id>]` per named group of
+//                                             that plan (plans.js planGroups), `Start plan ›
+//                                             <group name>`: puts `plan start <plan> fm_demod
+//                                             transcribe group <id>` there the same way
 //   set        Start set…                     shown only when `sets()` (mountMenu's: set_list's
 //                                             entries, read with the jobs) has a `ready` set;
 //                                             opens #ctx-set where the menu stood (plan 31
@@ -231,6 +235,7 @@
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
 // as for #ctx.
 
+import { planGroups } from "./plans.js";
 import { bandText, mhzText, registerLines, registerText } from "./units.js";
 import { capHz } from "./waterfall.js";
 
@@ -576,6 +581,13 @@ class Menu {
         item.addEventListener("pointerleave", hide);
       }
       this.el.append(item);
+      if (action === "plan") {
+        // The plan's named groups, filled on open.
+        this.planGroupsEl = document.createElement("div");
+        this.planGroupsEl.className = "ctx-plan-groups";
+        this.planGroupsEl.setAttribute("role", "group");
+        this.el.append(this.planGroupsEl);
+      }
       if (action === "decode_across") {
         item.setAttribute("aria-haspopup", "true");
         item.addEventListener("pointerenter", () => this.showSub(true));
@@ -718,8 +730,10 @@ class Menu {
     this.setFitting(null);
     this.sel = { ...sel, sourceId: this.wf.sourceId };
     this.showFooter(this.current());
-    // `Start plan…` only where the view's plan policy names a plan.
-    this.el.querySelector('[data-action="plan"]').hidden = this.plan() === null;
+    // `Start plan…` only where the view's plan policy names a plan, its groups after it.
+    const plan = this.plan();
+    this.el.querySelector('[data-action="plan"]').hidden = plan === null;
+    this.fillPlanGroups(plan);
     // `Start set…` only when set_list has a ready set.
     this.el.querySelector('[data-action="set"]').hidden = this.readySets().length === 0;
     this.fillSub(this.sel);
@@ -905,6 +919,26 @@ class Menu {
         });
     }
     return this.readyRows;
+  }
+
+  // One `Start plan › <name>` entry per named group of `plan` (none for null).
+  fillPlanGroups(plan) {
+    const groups = plan === null ? [] : planGroups(plan);
+    this.planGroupsEl.replaceChildren(
+      ...groups.map((g) => {
+        const item = document.createElement("button");
+        item.className = "ctx-item";
+        item.dataset.group = g.id;
+        item.setAttribute("role", "menuitem");
+        item.textContent = `Start plan › ${g.name}`;
+        item.title = `${plan} channels ${g.channels.join(", ")}`;
+        item.addEventListener("click", () => {
+          this.close();
+          this.command(`plan start ${plan} fm_demod transcribe group ${g.id}`);
+        });
+        return item;
+      }),
+    );
   }
 
   // The "Decode across" submenu for selection `sel`: the ready rows no wider than it; the

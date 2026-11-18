@@ -144,13 +144,13 @@ fn note(op: &str) -> Option<&'static str> {
             "Stopping a job is the operator's decision: never `job_stop` a job the request did not name, except one you started in this run (`job_start`, `plan_start`, `job_attach`, `graph_start`, `bits_start`, or the `verdict.job` of your own `identify` once you have read it): stop your own `measure` and `identify` leftovers when done. Through `ask` any other stop needs the run to allow stops, else it is refused as `not_allowed`: report that, do not retry. A job a running controller started (its `owner`: a watch's identify run or its trial) is refused naming the owner, `job <id> is run by <kind> <owner>: stop that job`; it ends with its owner.",
         ),
         "jobs_stop" => Some(
-            "One call however many jobs match; the page's elastic spectrum keeps running. Stopping jobs is the operator's decision: use it only when the request asks for all of them, or names the source, kind or plan. Through `ask` the run must allow stops, else the call is refused as `not_allowed`: report that, do not retry. Report how many stopped and any `failed`. A mix stops only with no filter or `kind: mix`.",
+            "One call however many jobs match; the page's elastic spectrum keeps running. `group` (with `plan`) narrows a plan to one of its `channel_plans` groups: \"stop the data channels\" is `plan: uhf_cb_au, group: data`. Stopping jobs is the operator's decision: use it only when the request asks for all of them, or names the source, kind, plan or group. Through `ask` the run must allow stops, else the call is refused as `not_allowed`: report that, do not retry. Report how many stopped and any `failed`. A mix stops only with no filter or `kind: mix`.",
         ),
         "mix_start" => Some(
             "Starts one `mix` job that plays the audio of every job on `sources` (`null`: every source) as one stream, so whatever is talking is heard. It holds no lease, tunes nothing and blocks no job; jobs started or stopped later join and leave by themselves. Its `event` stream publishes `active` (who is talking: `job`, `source`, `center_hz`) when it changes, with a hangover after a channel falls silent. It is idempotent on the same set of sources: a mix of that set already running answers its id (`null` matches only `null`). To mute a channel, `graph get` the mix, edit `muted` on the `mix` node (a list of `{source, center_hz}`), `graph put`, which restarts it under its id.",
         ),
         "plan_start" => Some(
-            "Starts `kind` on the channels of a plan (`channels`, `null` for all of them) at each channel's `center_hz` with the plan's `bandwidth_hz`, under one lease decision for the band that bounds them: inside the current capture nothing retunes, otherwise the source is tuned when only elastic jobs hold it, and a scan or a rigid holder elsewhere is a `conflict` naming the holders with nothing started. Check `source_list` first. `kind` must run on the radio (not `transcribe`, `spectrum`, `scan`, `watch` or `identify`). `deviation_hz` and `sideband` are passed to every start as on `job_start` (`null` is the kind's default; give 2500 for `fm_demod` on 12.5 kHz channels). `attach` is `null` or `transcribe`, attached to every channel started or already running except the data channels (UHF CB ch22 and ch23, every ACARS and AIS channel: their demodulators start, untranscribed, and a warning names them), and needs a ready stage (a speech backend for `transcribe`), else the op is refused with the stage's reason: start without `attach`. `language` must be `null` without `attach`. `replace`: as on `job_start`. The result lists `started` (channel, `center_hz`, `job`, `attached`, `attach_error`), `existing` (channels an identical running job already holds, skipped), `refused` (channels whose own start failed, with the error; the others went on) and `warnings`: repeat the `warnings` to the operator. Run it again to complete a partial set: running channels are `existing`, so nothing doubles.",
+            "Starts `kind` on the channels of a plan (`channels`, `null` for all of them, or a named `group` of them from `channel_plans` in place of `channels`) at each channel's `center_hz` with the plan's `bandwidth_hz`, under one lease decision for the band that bounds them: inside the current capture nothing retunes, otherwise the source is tuned when only elastic jobs hold it, and a scan or a rigid holder elsewhere is a `conflict` naming the holders with nothing started. Check `source_list` first. `kind` must run on the radio (not `transcribe`, `spectrum`, `scan`, `watch` or `identify`). `deviation_hz` and `sideband` are passed to every start as on `job_start` (`null` is the kind's default; give 2500 for `fm_demod` on 12.5 kHz channels). `attach` is `null` or `transcribe`, attached to every channel started or already running except the data channels (UHF CB ch22 and ch23, every ACARS and AIS channel: their demodulators start, untranscribed, and a warning names them), and needs a ready stage (a speech backend for `transcribe`), else the op is refused with the stage's reason: start without `attach`. `language` must be `null` without `attach`. `replace`: as on `job_start`. The result lists `started` (channel, `center_hz`, `job`, `attached`, `attach_error`), `existing` (channels an identical running job already holds, skipped), `refused` (channels whose own start failed, with the error; the others went on) and `warnings`: repeat the `warnings` to the operator. Run it again to complete a partial set: running channels are `existing`, so nothing doubles. Name a group, never a list: \"transcribe the lower 40\" is `group: lower40_voice` with `channels: null` and `attach: transcribe` (UHF CB's groups: `lower40_voice` 1-40 less the data channels 22 and 23, `upper40_voice` 41-80 less the reserved 61-63, `voice` both, `repeater_outputs` 1-8 and 41-48, `data` 22 and 23). `channels` and `group` together are refused naming the plan's groups, and an unknown group is `unknown` listing them.",
         ),
         "set_list" => Some(
             "Read it before naming a set: set ids, their roles (`radios`, each with a `note` saying what radio it needs) and members come from here, and it only reads. A set that does not load is `broken` and names the field: report it, never work round it. `running` says whether a set runs, on which sources, and each of its jobs' state (`ended` for one stopped or failed since).",
@@ -242,7 +242,15 @@ fn hint(op: &str, field: &str) -> Option<&'static str> {
         "radios" => Some("each role of the set (from `set_list`) to an id from `source list`"),
         "members" => Some("member ids of the set (strings), `null` for every member"),
         "sources" => Some("ids from `source list` (strings), `null` for every source"),
-        "channels" => Some("channel numbers of the plan (integers), `null` for all"),
+        "channels" => {
+            Some("channel numbers of the plan (integers), `null` for all (or for `group`'s)")
+        }
+        "group" if op == "jobs_stop" => Some(
+            "a group id of `plan` from `channel_plans`: only its channels' jobs; `null` for the whole plan",
+        ),
+        "group" => Some(
+            "a group id of the plan from `channel_plans` (`lower40_voice`), in place of `channels`; `null` for none",
+        ),
         "job" => Some("an id from `job list`"),
         "stream" => Some("an id from `stream list`"),
         "replace" => Some("ids from `job list` (strings), `[]` for none"),
@@ -585,7 +593,7 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
         return "zeta set start --set airband [--radio wide=<id>,second=<id>] [--members acars,adsb] [--replace ID,ID] (no --radio: every role null, the node picks)".into();
     }
     if op == "jobs_stop" {
-        return "zeta jobs stop [--source ID] [--kind KIND] [--plan ID]".into();
+        return "zeta jobs stop [--source ID] [--kind KIND] [--plan ID [--group ID]]".into();
     }
     if op == "capture_list" {
         return "zeta capture list [--center-hz C --bandwidth-hz B]".into();
@@ -612,7 +620,7 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
         return "zeta register site <provider> <site_id>".into();
     }
     if op == "plan_start" {
-        return "zeta plan start --plan uhf_cb_au --kind fm_demod --source <id> [--channels 1,2,5-8] [--attach transcribe] [--language de] [--replace ID,ID]".into();
+        return "zeta plan start --plan uhf_cb_au --kind fm_demod --source <id> [--channels 1,2,5-8 | --group lower40_voice] [--attach transcribe] [--language de] [--replace ID,ID]".into();
     }
     let mut line = String::from("zeta ");
     line.push_str(&match op.split_once('_') {
