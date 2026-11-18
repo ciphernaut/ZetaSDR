@@ -1920,3 +1920,98 @@ async fn an_unready_attach_starts_the_member_without_it_and_warns() {
     );
     assert_eq!(running_jobs(&node).len(), 3);
 }
+
+// ---- a member's audio policy ----
+
+/// A one-member set `id` on role `r`: `kind` at 300 MHz, 12.5 kHz wide, with
+/// `audio_policy` (a JSON value; absent when `None`).
+fn voice_set(id: &str, kind: &str, audio_policy: Option<&str>) -> String {
+    let policy = audio_policy.map_or(String::new(), |p| format!(r#", "audio_policy": {p}"#));
+    format!(
+        r#"{{"id": "{id}", "name": "{id}", "notes": "", "radios": {{"r": {{"note": "any"}}}},
+            "members": [
+              {{"id": "v", "radio": "r", "op": "job_start", "kind": "{kind}",
+                "center_hz": 300000000, "bandwidth_hz": 12500, "deviation_hz": null,
+                "sideband": null{policy}}}]}}"#
+    )
+}
+
+/// The `audio` param of the job's `dmr_decode` node.
+fn decode_audio(rec: &zeta_core::job::JobRecord) -> serde_json::Value {
+    let decode = rec.graph.nodes.iter().find(|n| n.kind == "dmr_decode");
+    decode.expect("a dmr_decode node").params["audio"].clone()
+}
+
+#[tokio::test]
+async fn a_voice_members_audio_policy_reaches_its_job_and_survives_a_restart() {
+    use zeta_core::ops::AudioPolicy;
+    let dir = tempfile::tempdir().unwrap();
+    let sets = dir.path().join("sets");
+    let voice = voice_set("voice", "dmr_decode", Some(r#""all""#));
+    write_set(&sets, "voice.json", &voice);
+    write_set(&sets, "plain.json", &voice_set("plain", "dmr_decode", None));
+    let (a, b) = (Radio::new("a"), Radio::new("b"));
+    let node = open_two(dir.path(), &a, &b).await;
+    let r = started_set(&node, set_op("voice", &[("r", Some("a"))], None, &[])).await;
+    assert!(r.refused.is_empty(), "{:?}", r.refused);
+    let v = r.job("v");
+    let rec = record(&node, &v);
+    assert_eq!(rec.audio_policy, Some(AudioPolicy::All));
+    assert_eq!(decode_audio(&rec), "all");
+    // A member without one runs the default, and its record says none was given.
+    let p = started_set(&node, set_op("plain", &[("r", Some("b"))], None, &[])).await;
+    assert!(p.refused.is_empty(), "{:?}", p.refused);
+    let rec = record(&node, &p.job("v"));
+    assert_eq!(rec.audio_policy, None);
+    assert_eq!(decode_audio(&rec), "first_active");
+    drop(node);
+
+    let (a, b) = (Radio::new("a"), Radio::new("b"));
+    let node = open_two(dir.path(), &a, &b).await;
+    until("the voice job resumes", || running_jobs(&node).contains(&v)).await;
+    let rec = record(&node, &v);
+    assert_eq!(rec.audio_policy, Some(AudioPolicy::All));
+    assert_eq!(decode_audio(&rec), "all");
+}
+
+#[tokio::test]
+async fn a_policy_on_a_member_with_one_voice_is_refused_as_job_start_refuses_it() {
+    // job_start's own refusal of a policy on the same kind.
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path(), None).await;
+    let mut op = job_start("radio0", JobKind::FmDemod, band(300_000_000, 12_500));
+    if let Op::JobStart { audio_policy, .. } = &mut op {
+        *audio_policy = Some(zeta_core::ops::AudioPolicy::Follow);
+    }
+    let refusal = other_message(node.apply(op).await);
+    assert_eq!(refusal, "audio_policy: fm_demod has one voice");
+
+    let sets = dir.path().join("operator-sets");
+    let one = voice_set("one", "fm_demod", Some(r#""follow""#));
+    write_set(&sets, "one.json", &one);
+    // A decoder row with one voice is refused the same way.
+    let pager = voice_set("pager", "pocsag_decode", Some(r#""all""#));
+    write_set(&sets, "pager.json", &pager);
+    let loaded = load(Some(&sets));
+    assert_eq!(broken(&loaded, "one"), format!("members[0].{refusal}"));
+    assert_eq!(
+        broken(&loaded, "pager"),
+        "members[0].audio_policy: pocsag_decode has one voice"
+    );
+}
+
+#[test]
+fn a_member_without_a_policy_loads_and_writes_none() {
+    use zeta_core::sets::parse;
+    let set = parse(&voice_set("old", "dmr_decode", None)).expect("parses without the field");
+    let written = serde_json::to_value(&set).unwrap();
+    assert!(
+        written["members"][0].get("audio_policy").is_none(),
+        "{written}"
+    );
+    // `null` reads as absent; a policy that does not exist names the member.
+    let null = parse(&voice_set("old", "dmr_decode", Some("null"))).unwrap();
+    assert_eq!(null.members, set.members);
+    let e = parse(&voice_set("bad", "dmr_decode", Some(r#""loud""#))).unwrap_err();
+    assert_eq!(e.field, "members[0]", "{e}");
+}

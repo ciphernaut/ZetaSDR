@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::modes::{ModeRegistry, is_mode_id};
-use crate::ops::{JobKind, Sideband};
+use crate::ops::{AudioPolicy, JobKind, Sideband};
 use crate::stage::StageRegistry;
 use crate::types::Hz;
 
@@ -141,6 +141,10 @@ pub enum Member {
         /// A `watch` member's params for its `detect` node; absent on any other kind.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         params: Option<Value>,
+        /// What the main audio stream of a kind with several voices carries, as
+        /// `job_start` takes it; absent (or `null`): the default, `first_active`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio_policy: Option<AudioPolicy>,
     },
     PlanStart {
         id: String,
@@ -222,13 +226,20 @@ impl Member {
                 kind,
                 center_hz,
                 bandwidth_hz,
+                audio_policy,
                 ..
-            } => format!(
-                "{} at {} MHz, {} kHz wide",
-                kind.name(),
-                mhz(center_hz.0),
-                khz(bandwidth_hz.0)
-            ),
+            } => {
+                let mut s = format!(
+                    "{} at {} MHz, {} kHz wide",
+                    kind.name(),
+                    mhz(center_hz.0),
+                    khz(bandwidth_hz.0)
+                );
+                if let Some(p) = audio_policy {
+                    s.push_str(&format!(", audio_policy {}", p.name()));
+                }
+                s
+            }
             Member::PlanStart {
                 kind,
                 plan,
@@ -397,6 +408,7 @@ fn validate_member(
             deviation_hz,
             sideband,
             params,
+            audio_policy,
             ..
         } => {
             crate::ops::check_startable(kind).map_err(|e| SetError::new("kind", e.to_string()))?;
@@ -408,6 +420,14 @@ fn validate_member(
                 ));
             }
             crate::ops::check_start_fields(kind, *deviation_hz, *sideband).map_err(field)?;
+            // A row this node lacks or cannot run passes: refused when the set starts.
+            if let Ok(row) = kind.mode_row(modes) {
+                crate::ops::check_audio_policy(kind, row, *audio_policy).map_err(|e| {
+                    let e = e.to_string();
+                    let e = e.strip_prefix("audio_policy: ").unwrap_or(&e);
+                    SetError::new("audio_policy", e)
+                })?;
+            }
             if bandwidth_hz.0 == 0 {
                 return Err(SetError::new("bandwidth_hz", "at least 1 Hz"));
             }

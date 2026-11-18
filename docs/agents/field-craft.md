@@ -253,7 +253,7 @@ A result of `not_allowed` means the run may not do that: the agent is not allowe
 6. Run it again to complete a partial set: running members are `existing`.
 7. `set_stop` is the operator's: use it only when the request names the set, or you started the whole set in this run. It stops only the jobs the instance started, those on a radio first; jobs started by hand on the same radios keep running. Report `stopped`, `ended` (already stopped by hand or failed) and `failed`; when a stop failed the instance is kept, so a second `set_stop` can finish it. Through `ask` a set started with `existing` members leaves `set_stop` to the operator: a run may stop only a set it started whole.
 
-A set file never names a source: the operator's own sets (`--sets-dir`) are refused at load when they carry `source`, `replace` or `params.prefer`. A row the host lacks does not break a set at load; that member is refused at start.
+A set file never names a source: the operator's own sets (`--sets-dir`) are refused at load when they carry `source`, `replace` or `params.prefer`. A row the host lacks does not break a set at load; that member is refused at start. A `job_start` member of a row with several voices (`dmr_decode`) may carry `audio_policy` as `job_start` takes it (absent: `first_active`); its job's record keeps it, and on a kind with one voice the set is broken at load (`members[<i>].audio_policy: <kind> has one voice`).
 
 ### Listening to many channels
 

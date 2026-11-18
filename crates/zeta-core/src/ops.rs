@@ -5951,6 +5951,7 @@ enum SetMemberStart {
         sideband: Option<Sideband>,
         /// A `watch` member's params for its `detect` node.
         params: Option<serde_json::Value>,
+        audio_policy: Option<AudioPolicy>,
     },
     Plan {
         pc: PlanChannels,
@@ -6089,26 +6090,26 @@ fn gate_of<'g>(
 }
 
 /// `job_start` of a set's `job_start` member on `source` inside the capture `capture`,
-/// under the source's gate (`guard`): the graph expanded at the capture's rate, a
-/// `watch` member's `params` set on its `detect` node before the start (no restart).
+/// under the source's gate (`guard`): the graph expanded at the capture's rate with the
+/// member's audio policy (kept on the job's record), a `watch` member's `params` set on
+/// its `detect` node before the start (no restart).
 #[allow(clippy::too_many_arguments)]
 async fn start_set_job(
     node: &Node,
     source: &SourceId,
     kind: &JobKind,
     tuning: Tuning,
-    (deviation, sideband): (Option<Hz>, Option<Sideband>),
+    start_params: (Option<Hz>, Option<Sideband>, Option<AudioPolicy>),
     params: Option<&serde_json::Value>,
     capture: Tuning,
     guard: &tokio::sync::OwnedMutexGuard<()>,
 ) -> (Result<JobId, OpError>, AfterGate) {
-    let mut graph = match kind.expand(
+    let mut graph = match kind.expand_voiced(
         source,
         tuning,
         capture.bandwidth_hz,
         node.bank_bin_rate(source, capture),
-        deviation,
-        sideband,
+        start_params,
         &node.modes(),
     ) {
         Ok(g) => g,
@@ -6127,7 +6128,7 @@ async fn start_set_job(
             graph,
             Some(capture.bandwidth_hz),
             false,
-            None,
+            start_params.2,
             serde_json::json!({}),
             Some(guard),
         )
@@ -6241,8 +6242,11 @@ async fn set_start(
                 deviation_hz,
                 sideband,
                 params,
+                audio_policy,
                 ..
             } => match check_start_params(kind, *deviation_hz, *sideband).and_then(|d| {
+                // The member's policy, as `job_start` checks it.
+                check_audio_policy(kind, kind.mode_row(&modes)?, *audio_policy)?;
                 // A watch's `modes`, checked here as `job_start` checks them, so a row
                 // this node lacks is refused before its radio is held or tuned.
                 match set_watch_modes(kind, params.as_ref(), &modes, *bandwidth_hz) {
@@ -6259,6 +6263,7 @@ async fn set_start(
                     deviation,
                     sideband: *sideband,
                     params: params.clone(),
+                    audio_policy: *audio_policy,
                 },
                 Err(error) => {
                     refused.push(refuse(error));
@@ -6451,6 +6456,7 @@ async fn set_start(
                 deviation,
                 sideband,
                 params,
+                ..
             } => {
                 c.existing_job = node
                     .duplicate_of(
@@ -6645,13 +6651,14 @@ async fn set_start(
                     deviation,
                     sideband,
                     params,
+                    audio_policy,
                 } if c.existing_job.is_none() => {
                     let (r, after_start) = start_set_job(
                         node,
                         &c.source,
                         kind,
                         *tuning,
-                        (*deviation, *sideband),
+                        (*deviation, *sideband, *audio_policy),
                         params.as_ref(),
                         capture,
                         guard,
