@@ -180,7 +180,8 @@
 //         refreshed with a ×N count instead of drawn again. `top` is the ribbon's centre line
 //         (style.css's translateY(-50%) centres the box on it, rotated by --ribbon-tilt about
 //         its centre; the inset from the newest edge and `top` stay the untilted box). A
-//         ribbon is in lane `lane` (0: on the band line, yFor(hz)); its top is yFor(hz) + lane * RIBBON_STEP_DIR * (h + RIBBON_GAP_PX).
+//         ribbon is in lane `lane` (0: on the band line, yFor(hz)); its top is
+//         yFor(hz) + lane * RIBBON_STEP_DIR * (h + RIBBON_GAP_PX).
 //         A new one takes lane 0 and every unkeyed ribbon it overlaps (at the newest edge,
 //         and, in turn, every one those overlap) steps one lane on, animated over
 //         RIBBON_STEP_MS; one that would pass MAX_LANES or reach another job band's base lane

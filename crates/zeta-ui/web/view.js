@@ -78,8 +78,11 @@
 //       zoom_out, auto_scan_stop, radio_policy, radio_prefer) is shared by the browser, in
 //       `localStorage` under VIEW_PREFS_KEY, so a new tab starts from what was set and a change
 //       in one tab applies in the others at once (the `storage` event fires onChange for each
-//       key that differs). A value an older page left under RADIO_PREFS_KEY is carried over
-//       once; values an older page kept per tab (VIEW_KEY) for a shared key are not.
+//       key that differs, once the page has mounted: listen). A value an older page left under
+//       RADIO_PREFS_KEY is carried over once. An older page kept every policy per tab: the first
+//       tab of this build to load, finding no shared store, copies the shared-kind values of its
+//       own VIEW_KEY into it (and leaves them there; this build reads VIEW_KEY for the per-tab
+//       policies only); every later tab finds the store and keeps it.
 //   homePoint(value) -> {lat, lon} | null   the `home` policy's value as numbers (null: none)
 //   setStationHome(point|null)  the node's station position ({lat, lon}; app.js reads it once
 //       with `station_get` at page load), the home used while the view's `home` is none
@@ -91,8 +94,9 @@
 //       refuses any other before applying)
 //   VIEW_KEY   the sessionStorage key holding the per-tab values set ({key: value}, defaults
 //       left out)
-//   VIEW_PREFS_KEY   the localStorage key holding the shared values set (the same shape);
-//       with storage unavailable the defaults apply and a value set holds for the page load
+//   VIEW_PREFS_KEY   the localStorage key holding the shared values set (the same shape),
+//       written even with none set (`{}`: this build has run in the browser); with storage
+//       unavailable the defaults apply and a value set holds for the page load
 //   RADIO_PREFS_KEY   where an older page kept radio_policy and radio_prefer (migrated)
 //   mountView() -> View
 //     view.get(key)             the value (the default when not set)
@@ -105,6 +109,10 @@
 //     view.clear()              fires onClear (the jobs list drops its finished rows)
 //     view.onChange(cb)         cb(key, value) after a set or reset
 //     view.onClear(cb)          cb() on clear()
+//     view.listen()             follows the other tabs from now (the `storage` event: before,
+//                               it is ignored), reading the shared store anew first (app.js
+//                               calls it once the page has mounted every listener)
+//     view.destroy()            stops following them and removes the listener (logout)
 //   runViewCommand(view, words) -> {text, error}
 //       The transcript line for `view <words…>`: `set <key> <value>` → `<key> = <value>`,
 //       `show`, `reset` → `view policies reset`, `clear` → `finished rows cleared`;
@@ -406,14 +414,23 @@ function loadShared() {
 }
 
 // True when the write took; false when storage refused it (the values then hold for this
-// page load, in the caller's held copy).
+// page load, in the caller's held copy). The key is written even with no value set (`{}`): its
+// presence says this build has kept the shared policies here (see the carry-over in mountView).
 function saveShared(values) {
   try {
-    if (Object.keys(values).length) localStorage.setItem(VIEW_PREFS_KEY, JSON.stringify(values));
-    else localStorage.removeItem(VIEW_PREFS_KEY);
+    localStorage.setItem(VIEW_PREFS_KEY, JSON.stringify(values));
     return true;
   } catch {
     return false;
+  }
+}
+
+// Whether the shared store exists (null: storage unavailable).
+function sharedExists() {
+  try {
+    return localStorage.getItem(VIEW_PREFS_KEY) !== null;
+  } catch {
+    return null;
   }
 }
 
@@ -437,11 +454,19 @@ function valuesFrom(stored, tab) {
 
 export function mountView() {
   // The per-tab values (policies marked `tab`), and the shared ones (every other policy).
-  const values = valuesFrom(loadStored(), true);
+  const tabStored = loadStored();
+  const values = valuesFrom(tabStored, true);
   let shared = valuesFrom(loadShared() ?? {}, false);
   // Once a write has failed the held copy is the truth for the rest of the page load (a
   // read that still works would give back the value from before).
   let storageFailed = false;
+  // An older page kept every policy per tab: the first tab of this build to load, finding no
+  // shared store, carries its own shared-kind values into one (they stay in the tab's store,
+  // which this build reads for the per-tab ones only); later tabs find the store and keep it.
+  if (sharedExists() === false) {
+    shared = valuesFrom(tabStored, false);
+    if (!saveShared(shared)) storageFailed = true;
+  }
   // The radio preferences an older page left under RADIO_PREFS_KEY are carried over once
   // (a value already shared wins), then the old key goes.
   try {
@@ -494,10 +519,22 @@ export function mountView() {
     }
     fire(key);
   };
-  window.addEventListener("storage", (e) => {
-    if (e.key === null || e.key === VIEW_PREFS_KEY) refresh();
-  });
+  // Another tab's change, once the page has mounted (listen) and until destroy.
+  let listening = false;
+  const onStorage = (e) => {
+    if (listening && (e.key === null || e.key === VIEW_PREFS_KEY)) refresh();
+  };
+  window.addEventListener("storage", onStorage);
   const view = {
+    listen() {
+      if (listening) return;
+      listening = true;
+      refresh();
+    },
+    destroy() {
+      listening = false;
+      window.removeEventListener("storage", onStorage);
+    },
     get(key) {
       const p = byKey.get(key);
       if (!p) return undefined;

@@ -1972,7 +1972,7 @@ def scenario_view_policies_are_shared(page, url, secret):
         # `view reset` in one clears the shared store, and the other follows.
         run_cmd(second, "view reset")
         expect(page.locator("html")).to_have_attribute("data-theme", "console")
-        assert second.evaluate("localStorage.getItem('zeta.view_policies')") is None
+        assert second.evaluate("localStorage.getItem('zeta.view_policies')") == "{}"
         # An older page's radio prefs are read once and moved.
         page.evaluate("""() => {
           localStorage.setItem('zeta.radio_prefs',
@@ -2000,6 +2000,69 @@ def scenario_view_policies_are_shared(page, url, secret):
         assert view_value(fourth, "radio_prefer") == "radio_prefer none"
         only = fourth.evaluate("JSON.parse(localStorage.getItem('zeta.view_policies'))")
         assert only == {"radio_policy": "free-first"}, only
+
+        # An older page kept every policy per tab. The first tab of this build to find no
+        # shared store carries its tab's shared-kind values into one, leaving its tab store as
+        # it was; a later tab, whatever its own old values, takes the store.
+        def tab_with(stored):
+            p = page.context.new_page()
+            others.append(p)
+            p.add_init_script(f"sessionStorage.setItem('zeta.view', {json.dumps(json.dumps(stored))})")
+            p.set_viewport_size(WIDE)
+            login(p, url, secret)
+            return p
+
+        page.evaluate("localStorage.removeItem('zeta.view_policies')")
+        old = {"theme": "terminal", "side": "jobs", "follow": "free"}
+        fifth = tab_with(old)
+        expect(fifth.locator("html")).to_have_attribute("data-theme", "terminal")
+        assert view_value(fifth, "side") == "side jobs"
+        assert view_value(fifth, "follow") == "follow free"
+        seeded = fifth.evaluate("JSON.parse(localStorage.getItem('zeta.view_policies'))")
+        assert seeded == {"theme": "terminal", "side": "jobs"}, seeded
+        assert fifth.evaluate("JSON.parse(sessionStorage.getItem('zeta.view'))") == old
+        sixth = tab_with({"theme": "plain"})
+        expect(sixth.locator("html")).to_have_attribute("data-theme", "terminal")
+        # Once the store exists, a reset stays reset over a reload of an old tab.
+        run_cmd(fifth, "view reset")
+        expect(fifth.locator("html")).to_have_attribute("data-theme", "console")
+        fifth.reload()
+        expect(fifth.locator("#login")).to_be_hidden()
+        expect(fifth.locator('.src-tab[data-id="tone"]')).to_be_visible()
+        expect(fifth.locator("html")).to_have_attribute("data-theme", "console")
+        assert view_value(fifth, "side") == "side both"
+
+        # `dir` or `time_flow` changed in another tab closes this tab's menu and drops a drag
+        # in progress (both were placed for the other direction).
+        page.click('.src-tab[data-id="tone"]')
+        wait_span(page, MENU_SPAN_S)
+        menu = drag_menu(page)
+        run_cmd(second, "view set time_flow left")
+        expect(page.locator("#waterfall")).to_have_attribute("data-newest", "left")
+        expect(menu).to_be_hidden()
+        box = page.locator("#waterfall canvas.wf-canvas").bounding_box()
+        page.mouse.move(box["x"] + 60, box["y"] + box["height"] * 0.4)
+        page.mouse.down()
+        page.mouse.move(box["x"] + box["width"] - 60, box["y"] + box["height"] * 0.6, steps=4)
+        run_cmd(second, "view set dir rtl")
+        expect(page.locator("html")).to_have_attribute("dir", "rtl")
+        page.mouse.up()
+        page.wait_for_timeout(300)
+        expect(menu).to_be_hidden()
+        # A logged-out page no longer answers another tab's change (it threw on the gone
+        # waterfall), and nothing it left listening fails.
+        errors = []
+        second.on("pageerror", lambda e: errors.append(str(e)))
+        second.evaluate("() => { window.zetaTest.setSecret('wrong'); window.zetaTest.poll(); }")
+        expect(second.locator("#login")).to_be_visible()
+        run_cmd(page, "view set time_flow left")  # (a change, whatever came before)
+        expect(page.locator("#waterfall")).to_have_attribute("data-newest", "left")
+        run_cmd(page, "view set time_flow right")
+        expect(page.locator("#waterfall")).to_have_attribute("data-newest", "right")
+        run_cmd(page, "view set dir ltr")
+        expect(page.locator("html")).to_have_attribute("dir", "ltr")
+        second.wait_for_timeout(300)
+        assert not errors, errors
     finally:
         for p in others:
             p.close()
@@ -4130,9 +4193,11 @@ def scenario_view_dir_mirrors_the_frame_not_the_frequencies(page, url, secret):
         stop_job(url, secret, job)
 
 
-RIBBON_EDGE_JS = """() => {
+RIBBON_EDGE_JS = """(text = null) => {
   const layer = document.querySelector("#waterfall .ov-layer");
-  const r = [...document.querySelectorAll('#waterfall .ov-ribbon.flow')].pop();
+  // The newest `flow` ribbon, or the one whose text holds `text`.
+  const all = [...document.querySelectorAll('#waterfall .ov-ribbon.flow')];
+  const r = text === null ? all.pop() : all.find((x) => x.textContent.includes(text));
   // The untilted box (offsetLeft/Width), as a theme leans ribbons about their centre.
   const w = layer.clientWidth;  // the clear strip at the newest edge (overlays.js NEWEST_STRIP_*)
   const strip = Math.min(Math.max(w * 0.15, 120), w * 0.4);
@@ -4242,10 +4307,13 @@ def scenario_ribbons_keep_the_newest_strip_clear(page, url, secret):
                       " return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))); }")
         page.evaluate("window.zetaTest.ribbon(100003000, 'raised unsized ' + 'x'.repeat(400), 'flow')")
         page.evaluate("document.getElementById('waterfall').style.display = ''")
+        # (by its text: a column arriving meanwhile can retire the newer ribbons)
         page.wait_for_function(
-            "() => { const r = [...document.querySelectorAll('#waterfall .ov-ribbon.flow')].pop();"
-            " return r.style.maxWidth !== '' && parseFloat(r.style.maxWidth) > 0; }", timeout=5_000)
-        e = page.evaluate(RIBBON_EDGE_JS)
+            "() => { const r = [...document.querySelectorAll('#waterfall .ov-ribbon.flow')]"
+            ".find((x) => x.textContent.includes('raised unsized'));"
+            " return !!r && r.style.maxWidth !== '' && parseFloat(r.style.maxWidth) > 0; }",
+            timeout=5_000)
+        e = page.evaluate(RIBBON_EDGE_JS, "raised unsized")
         assert e["fromRight"] >= e["strip"] - 1, f"raised unsized: {e}"
     finally:
         run_cmd(page, "view reset")
@@ -7221,7 +7289,8 @@ def scenario_stop_all_is_one_operation_and_keeps_the_spectrum(page, url, secret)
 
 def scenario_view_dir_rtl_keeps_channel_ticks_off_the_frequency_labels(page, url, secret):
     """With a plan's channel ticks on the axis, `dir rtl` keeps them clear of the numeric
-    frequency labels (both sit on the axis's inline sides)."""
+    frequency labels: the channel ticks at the axis's inline start, the labels at its inline
+    end, in ltr and in rtl."""
     select_source(page, url, secret, "cb")
     set_band(page, 476_900_000, 40_000)
     ticks = page.locator("#waterfall .wf-axis .tick.ch")
@@ -7229,17 +7298,27 @@ def scenario_view_dir_rtl_keeps_channel_ticks_off_the_frequency_labels(page, url
     boxes = lambda sel: page.evaluate(
         "(s) => [...document.querySelectorAll(s)].map((e) => { const r = e.getBoundingClientRect();"
         " return {l: r.left, r: r.right, t: r.top, b: r.bottom}; })", sel)
-    overlap = lambda a, b: a["l"] < b["r"] and b["l"] < a["r"] and a["t"] < b["b"] and b["t"] < a["b"]
     try:
         for mode in ("ltr", "rtl"):
             run_cmd(page, f"view set dir {mode}")
             expect(page.locator("html")).to_have_attribute("dir", mode)
             expect(ticks.first).to_be_visible()
+            axis = boxes("#waterfall .wf-axis")[0]
             ch = boxes("#waterfall .wf-axis .tick.ch")
             nums = boxes("#waterfall .wf-axis .tick:not(.ch)")
             assert ch and nums, (ch, nums)
-            bad = [(c, n) for c in ch for n in nums if overlap(c, n)]
-            assert not bad, f"channel ticks overlap frequency labels in {mode}: {bad[:2]}"
+            # The distance from the axis's inline start (the left in ltr, the right in rtl) to a
+            # box's start, and from a box's end to the axis's inline end.
+            if mode == "ltr":
+                start_in = lambda b: b["l"] - axis["l"]
+                end_in = lambda b: axis["r"] - b["r"]
+            else:
+                start_in = lambda b: axis["r"] - b["r"]
+                end_in = lambda b: b["l"] - axis["l"]
+            bad = [c for c in ch if not (0 <= start_in(c) <= 4 and end_in(c) > 4)]
+            assert not bad, f"channel ticks off the inline start in {mode}: {bad[:2]} {axis}"
+            bad = [n for n in nums if not (0 <= end_in(n) <= 8 and start_in(n) > 4)]
+            assert not bad, f"frequency labels off the inline end in {mode}: {bad[:2]} {axis}"
     finally:
         run_cmd(page, "view reset")
 
@@ -7387,6 +7466,13 @@ def scenario_the_players_lead_grows_on_a_starved_queue_and_falls_back(page, url,
           out.silent = {dry: quiet.dry, gaps: st.gaps - gaps};
           const fresh = a.planFrame(a.newState(), {now: 5, startNs: 1, endNs: 2, duration: 0.02});
           out.first = {dry: fresh.dry, gaps: fresh.state.gaps, start: fresh.start};
+          // A context whose clock has not started (0, a context resumed late): the first frame
+          // still takes the lead, so the next one, arriving 30 ms later, finds the queue full.
+          const zero = a.planFrame(a.newState(), {now: 0, startNs: NS, endNs: NS + 0.02 * NS,
+                                                  duration: 0.02});
+          const next = a.planFrame(zero.state, {now: 0.03, startNs: NS + 0.02 * NS,
+                                                endNs: NS + 0.04 * NS, duration: 0.02});
+          out.zero = {start: zero.start, dry: next.dry, gaps: next.state.gaps};
           out.note = [a.audioNote({gaps: 0, leadMs: 100}), a.audioNote({gaps: 3, leadMs: 100}),
                       a.audioNote({gaps: 0, leadMs: 350}), a.audioNote({gaps: 3, leadMs: 350})];
           return out;
@@ -7406,6 +7492,7 @@ def scenario_the_players_lead_grows_on_a_starved_queue_and_falls_back(page, url,
     assert r["silent"] == {"dry": 0, "gaps": 0}, f"silence is not starvation: {r['silent']}"
     assert r["first"]["dry"] == 0 and r["first"]["gaps"] == 0 and r["first"]["start"] == 5.1, \
         f"the first frame is not a gap: {r['first']}"
+    assert r["zero"] == {"start": 0.1, "dry": 0, "gaps": 0}, f"the first frame's lead: {r['zero']}"
     assert r["note"] == ["", "page gaps 3", "lead 350 ms", "page gaps 3, lead 350 ms"], r["note"]
 
 
@@ -7424,12 +7511,13 @@ def scenario_the_mix_row_shows_the_pages_own_starvation_count(page, url, secret)
         # only demodulator gone the mix sends nothing, and the page's counters stand still.
         stop_job(url, secret, demod)
         wait_until(lambda: page.evaluate("window.zetaAudio.playing") == mix, 3.0, "still playing")
-        seen = {"n": -1}
+        # Stopped: three reads 0.6 s apart agree (two equal pairs in a row).
+        seen = {"reads": []}
 
         def quiet():
-            n = page.evaluate("window.zetaAudio.framesPlayed")
-            was, seen["n"] = seen["n"], n
-            return n == was
+            seen["reads"] = (seen["reads"] + [page.evaluate("window.zetaAudio.framesPlayed")])[-3:]
+            r = seen["reads"]
+            return len(r) == 3 and r[0] == r[1] == r[2]
         wait_until(quiet, 10.0, "no more frames", step_s=0.6)
         # What the player records on a dry re-anchor (planFrame is tested apart): the row
         # says so, as the page's count and not the node's.
@@ -7914,7 +8002,7 @@ def scenario_radio_default_mark_and_policy(page, url, secret):
         assert view_value(second, "radio_policy") == "radio_policy focus"
         assert view_value(second, "radio_prefer") == "radio_prefer none"
         stored = second.evaluate(f"localStorage.getItem('{VIEW_PREFS_KEY}')")
-        assert stored is None, f"view reset left {stored!r}"
+        assert stored == "{}", f"view reset left {stored!r}"
         # Storage that throws: the defaults, and a set holds for the page load.
         run_cmd(page, "view set radio_policy free-first")
         expect(view_line(page, "radio_policy = free-first")).to_be_visible()

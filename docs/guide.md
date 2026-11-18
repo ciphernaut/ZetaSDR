@@ -818,7 +818,8 @@ the band's excess power) when it is itself over the minimum, else keeps the job'
 width is held only to what the capture holds about the centre (from a box, to the box), and the
 line adds `, capped by the capture` (or `the box`) when that cut it. Every rigid job carries a tag (kind, short id, squelch dot, channel, last transcript
 snippet) linked by hover with its row in the job list, and rows show the band. In `console` the
-tags move to a rail, a column left of the frequency axis, each at its band's height and showing
+tags move to a rail, a column beside the frequency axis (at its inline start: the left, or the
+right under `dir rtl`), each at its band's height and showing
 the plan channel (or the kind) and the centre in MHz; a tag that overlaps a full one collapses to
 a thin segment, a hot or speaking tag stays full, and the outline, tag, row and ribbons share one
 colour per job. Idle plan channels fold into one `<n> idle <kind> on <plan>` group when more than

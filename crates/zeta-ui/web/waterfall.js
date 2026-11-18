@@ -103,6 +103,8 @@
 //         or another source cancels the running one, which stops where it was
 //     wf.easing     true while an easeTo runs
 //     wf.clearSelection()   erases the drawn selection rectangle (the menu closed)
+//     wf.cancelDrag()   drops a drag in progress and its pending frame, its release selecting
+//         nothing (app.js, when `dir` or `time_flow` changes under it); destroy() does too
 //     wf.centerHz() -> the centre of the band shown (null before the band is known)
 //     wf.xForNs(ns) -> CSS x of a time on the painted columns (the newest edge when newer
 //         than the newest; null when older than the oldest column or none is painted)
@@ -2321,6 +2323,18 @@ class Waterfall {
     this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
   }
 
+  // Drops a drag in progress (its pending frame too: its release then selects nothing) and
+  // erases what it drew.
+  cancelDrag() {
+    if (this.dragFrame !== null) cancelAnimationFrame(this.dragFrame);
+    this.dragFrame = null;
+    this.dragPending = null;
+    this.dragRect = null;
+    if (!this.drag) return;
+    this.drag = null;
+    this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
+  }
+
   // The theme's waterfall ramp (theme.json `ramp`: 2-16 stops [t, [r, g, b]], t from 0 to 1,
   // checked by the node); anything else keeps the default. Every stored column is painted
   // again with it.
@@ -2441,6 +2455,7 @@ class Waterfall {
 
   destroy() {
     this.cancelEase();
+    this.cancelDrag();
     this.gen += 1;
     if (this.sub) this.sub.close();
     this.sub = null;

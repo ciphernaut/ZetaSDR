@@ -102,6 +102,9 @@
 //                           `job_list` record) at client (x, y), kept inside the viewport; the
 //                           first entry is focused; `role` the voice its Listen and Transcribe use
 //     menu.closeOutline()   hides it
+//     menu.closeAll()       hides both menus and the set picker and erases the box (app.js, when
+//                           `dir` or `time_flow` changes under them: they were placed for the
+//                           other direction)
 //     menu.destroy()
 //     The table's runs (actions.js) call the Menu's own methods: classify, iqRead, askAbout,
 //     startJob, fitAndStart, decodeAcross, scan, openSet, command, planGroupsOf (a box's ctx
@@ -1163,6 +1166,14 @@ class Menu {
     this.outlineJob = null;
     this.fitGen += 1;
     this.setFitting(null);
+  }
+
+  // Closes whatever is open (both menus, a fit in either cancelled, and the set picker) and
+  // erases the box.
+  closeAll() {
+    this.close();
+    this.closeOutline();
+    this.closeSet();
   }
 
   // Fit to signal on a running job's band. A conflict on the measure start gets the usual

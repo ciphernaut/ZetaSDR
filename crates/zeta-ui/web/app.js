@@ -1455,7 +1455,12 @@ function start(api) {
     if (key === "plan") redrawPlan();
     if (key === "theme") applyTheme();
     if (key === "dir") applyDir();
-    if (key === "time_flow") state.wf.timeFlowChanged();
+    if (key === "time_flow") state.wf?.timeFlowChanged();
+    if (key === "dir" || key === "time_flow") {
+      // An open menu, a drawn box and a drag were placed for the other direction.
+      state.wf?.cancelDrag();
+      state.menu?.closeAll();
+    }
     if (key === "side") applySide();
     if (key === "main") applyMain();
     if (key === "pane") applyPanes();
@@ -1558,6 +1563,8 @@ function start(api) {
     submitCommand();
   });
   loadSources();
+  // Every listener is in place: the other tabs' policy changes are followed from here.
+  state.view.listen();
 }
 
 // The transcript line of a watched job's verdict, or null: a watch's `unknown`, `decoding`
@@ -2022,6 +2029,8 @@ function logout(api) {
   api.onBusy = null;
   if (state.nodeCheck) state.nodeCheck.close();
   state.nodeCheck = null;
+  // The other tabs' policy changes are no longer this page's (a new login mounts a new view).
+  state.view?.destroy();
   stopAudio();
   if (state.mix) state.mix.close();
   state.mix = null;

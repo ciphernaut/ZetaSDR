@@ -45,7 +45,8 @@
 //       it was late): that counts one gap, adds the time the queue stood empty to gapS and
 //       grows the lead by it, to MAX_LEAD_S. A frame whose span jumps after the last (the
 //       mix sends nothing in silence, and a demodulator nothing while its squelch is shut)
-//       or the first frame after a start is not a gap: it only re-anchors at now + lead. A header
+//       or the first frame after a start is not a gap: it only re-anchors at now + lead (the
+//       first frame always does, even on a context clock still at 0). A header
 //       without `start_ns` / `end_ns` (a non-number compares as a jump) reads as silence and
 //       is never counted.
 //       A lead over LEAD_S falls back by half its excess after each LEAD_QUIET_S with no
@@ -97,7 +98,9 @@ export function planFrame(state, { now, startNs, endNs, duration }) {
   }
   let start = state.nextStart;
   let dry = 0;
-  if (start < now) {
+  // The first frame after a start takes the lead too, whatever the clock reads (a context
+  // whose clock has not started reads 0, not behind the empty queue).
+  if (start < now || state.lastEndNs === null) {
     const continues =
       state.lastEndNs !== null && Math.abs(startNs - state.lastEndNs) <= CONTIGUOUS_NS;
     if (state.nextStart > 0 && continues) {
