@@ -219,6 +219,43 @@ async fn a_proposed_or_rejected_signature_is_not_scored() {
     assert_eq!(after.last_matched_ns, None, "{after:?}");
 }
 
+/// `signature_retract` (`delete` false) or `signature_delete` of `id`: the record.
+async fn take_back(node: &Node, id: &str, delete: bool) -> SignatureRecord {
+    let op = match delete {
+        false => Op::SignatureRetract { id: id.into() },
+        true => Op::SignatureDelete { id: id.into() },
+    };
+    match node.apply_from(op, "cli").await.unwrap() {
+        OpResult::Signature(rec) => *rec,
+        r => panic!("signature: {r:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_retracted_or_deleted_signature_labels_no_later_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let later = write(&node, "01LATER", &fsk_iq(42), RATE_HZ, WIDTH_HZ).await;
+    for delete in [false, true] {
+        let first = write(&node, "01FIRST", &fsk_iq(41), RATE_HZ, WIDTH_HZ).await;
+        let rec = propose(&node, &first.id).await;
+        accept(&node, &rec.id).await;
+        assert_eq!(
+            learned(&node, &later.id).await.len(),
+            1,
+            "labelled once accepted"
+        );
+        let back = take_back(&node, &rec.id, delete).await;
+        assert_eq!(back.id, rec.id);
+        // No restart: the next classify no longer labels with it.
+        let labels = learned(&node, &later.id).await;
+        assert!(labels.is_empty(), "delete {delete}: {labels:?}");
+        let state = node.signatures().get(&rec.id).map(|r| r.state);
+        let want = (!delete).then_some(SignatureState::Retracted);
+        assert_eq!(state, want, "delete {delete}");
+    }
+}
+
 #[tokio::test]
 async fn knowledge_lookup_lists_learned_signatures_with_their_tier() {
     let dir = tempfile::tempdir().unwrap();
@@ -636,6 +673,69 @@ async fn an_existing_learned_row_is_kept_as_is() {
     let m = node.modes().get(&id).cloned().expect("the row loads");
     assert_eq!(m.state, ModeState::Ready, "{m:?}");
     assert_eq!(m.row.name, "edited");
+}
+
+#[tokio::test]
+async fn a_retract_removes_the_learned_row_the_accept_wrote_and_a_restart_keeps_it_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes_dir = dir.path().join("modes");
+    let node = open_in(dir.path(), &modes_dir, None).await;
+    let rec = propose_framed(&node, vec![]);
+    let rec = accept(&node, &rec.id).await;
+    let id = row_id(&rec);
+    let path = modes_dir.join(format!("{id}.json"));
+    assert!(
+        listed(&node, &id).await.is_some(),
+        "the row is listed once accepted"
+    );
+    let back = take_back(&node, &rec.id, false).await;
+    assert_eq!(back.state, SignatureState::Retracted);
+    assert!(
+        listed(&node, &id).await.is_none(),
+        "the row left the registry"
+    );
+    assert!(!path.exists(), "{path:?} removed");
+    assert_eq!(
+        (&back.decoder, &back.decoder_file),
+        (&None, &None),
+        "{back:?}"
+    );
+    let note = format!("row {id} removed: the signature was retracted");
+    assert_eq!(
+        back.decoder_note.as_deref(),
+        Some(note.as_str()),
+        "{back:?}"
+    );
+    // The provenance is kept, and when it was retracted is recorded.
+    assert_eq!(back.provenance.accepted_by.as_deref(), Some("cli"));
+    assert!(back.provenance.retracted_ns >= back.provenance.accepted_ns);
+    assert!(back.provenance.retracted_ns.is_some());
+    drop(node);
+    let node = open_in(dir.path(), &modes_dir, None).await;
+    assert!(
+        node.modes().get(&id).is_none(),
+        "a restart brings no row back"
+    );
+    assert_eq!(node.signatures().get(&rec.id), Some(back));
+}
+
+#[tokio::test]
+async fn a_delete_leaves_a_learned_row_the_accept_found_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes_dir = dir.path().join("modes");
+    let node = open_in(dir.path(), &modes_dir, None).await;
+    let rec = propose_framed(&node, vec![]);
+    let id = row_id(&rec);
+    let path = modes_dir.join(format!("{id}.json"));
+    let row = serde_json::to_value(zeta_core::signatures::learned_row(&rec, &id)).unwrap();
+    std::fs::create_dir_all(&modes_dir).unwrap();
+    std::fs::write(&path, serde_json::to_string_pretty(&row).unwrap()).unwrap();
+    accept(&node, &rec.id).await;
+    take_back(&node, &rec.id, true).await;
+    assert!(node.signatures().get(&rec.id).is_none());
+    // The file was the operator's before the accept: the delete takes nothing of theirs.
+    assert!(path.exists(), "{path:?} kept");
+    assert!(listed(&node, &id).await.is_some());
 }
 
 #[tokio::test]

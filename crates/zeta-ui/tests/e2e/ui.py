@@ -9615,7 +9615,7 @@ def propose(url, secret, capture, framing=None, name=None):
 
 
 def clear_signatures(url, secret):
-    """Reject every proposed signature (an accepted one stays: there is no unaccept)."""
+    """Reject every proposed signature (an accepted one stays)."""
     for s in capture_ops(url, secret, "signature_list", state="proposed"):
         capture_ops(url, secret, "signature_reject", id=s["id"])
 
@@ -9734,6 +9734,40 @@ def scenario_proposal_accepted_from_the_page(page, url, secret):
     rec = capture_ops(url, secret, "signature_show", id=framed["id"])
     assert rec["decoder"] == row_id and rec["name"] == framed["name"], rec
     # The pinned captures stay in the store for the rest of the run (unpin is not an op).
+
+
+def scenario_an_accept_is_undone_and_the_signature_deleted(page, url, secret):
+    # The accept's note carries Undo (signature_retract, no confirm): the record shows
+    # `retracted` and its captures are unpinned; Delete (after a confirm) removes the record.
+    clear_signatures(url, secret)
+    caps = two_captures_of(url, secret, "fsk", 433_920_000, 12_000)
+    sig = propose(url, secret, caps[0]["id"], name="undo test")
+    login(page, url, secret)
+    page.locator('#panes .pane-tab[data-pane="explore"]').click()
+    row = f'#explore tr.signature[data-id="{sig["id"]}"] >> '
+    expect(page.locator(row + "td.state")).to_have_text("proposed", timeout=20000)
+    page.click(row + 'button[data-action="accept"]')
+    note = page.locator("#transcript .line.note",
+                        has_text=f"accepted undo test ({sig['id'][-6:]})")
+    expect(note).to_have_count(1)
+    expect(page.locator(row + 'button[data-action="retract"]')).to_have_count(1)
+    note.locator("button.action", has_text="Undo").click()
+    expect(page.locator(row + "td.state")).to_have_text("retracted", timeout=20000)
+    expect(page.locator("#transcript .line.note",
+                        has_text=f"retracted undo test ({sig['id'][-6:]})")).to_have_count(1)
+    rec = capture_ops(url, secret, "signature_show", id=sig["id"])
+    assert rec["state"] == "retracted" and rec["provenance"]["retracted_ns"], rec
+    pins = {c["id"]: c["pinned"] for c in capture_ops(url, secret, "capture_list", signal=None)}
+    assert not any(pins[c] for c in rec["provenance"]["captures"]), f"unpinned {pins}"
+    expect(page.locator(row + 'button[data-action="retract"]')).to_have_count(0)
+    page.click(row + 'button[data-action="delete"]')
+    expect(page.locator(row + 'button[data-action="delete"]')).to_have_text("sure?")
+    page.click(row + 'button[data-action="delete"]')
+    expect(page.locator(f'#explore tr.signature[data-id="{sig["id"]}"]')).to_have_count(
+        0, timeout=20000)
+    assert sig["id"] not in [s["id"] for s in capture_ops(url, secret, "signature_list",
+                                                          state=None)]
+    clear_captures(url, secret)
 
 
 def scenario_allow_signatures_switch(page, url, secret):

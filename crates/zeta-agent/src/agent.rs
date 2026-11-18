@@ -23,12 +23,19 @@ pub struct Allow {
     pub replace: bool,
     /// `capture_delete` may be applied.
     pub delete_captures: bool,
-    /// `signature_accept` and `signature_reject` may be applied.
+    /// `signature_accept`, `signature_reject`, `signature_retract` and
+    /// `signature_delete` may be applied.
     pub accept_signatures: bool,
 }
 
-/// The operations that answer a signature proposal: the operator's decision.
-pub const GATED_SIGNATURE_OPS: &[&str] = &["signature_accept", "signature_reject"];
+/// The operations that answer a signature proposal or take an answer back: the
+/// operator's decision.
+pub const GATED_SIGNATURE_OPS: &[&str] = &[
+    "signature_accept",
+    "signature_reject",
+    "signature_retract",
+    "signature_delete",
+];
 
 /// The operations whose `replace` stops jobs to make room.
 pub const GATED_REPLACE_OPS: &[&str] = &[
@@ -44,8 +51,8 @@ pub const GATED_REPLACE_OPS: &[&str] = &[
 /// `Some(error)` when `op` would stop jobs and the run is not allowed to:
 /// a `job_stop`, or a gated op with a non-empty `replace`, or a `source_ensure`
 /// with `widen` (it restarts the holders); likewise a
-/// `capture_delete` without `delete_captures`, and a `signature_accept` or
-/// `signature_reject` without `accept_signatures`. The executor is
+/// `capture_delete` without `delete_captures`, and a signature decision
+/// ([`GATED_SIGNATURE_OPS`]) without `accept_signatures`. The executor is
 /// never reached; the error goes back to the model as the call's result.
 pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
     // `op_from_call` always inserts `"op"`, so a value without a name never comes from a call.
@@ -69,7 +76,7 @@ pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
             "error": "not_allowed",
             "field": "op",
             "op": name,
-            "message": "accepting or rejecting a signature is the operator's decision: report the proposal to the operator; they unlock it by allowing signatures for the run",
+            "message": "accepting, rejecting, retracting or deleting a signature is the operator's decision: report the proposal to the operator; they unlock it by allowing signatures for the run",
         }));
     }
     // A widened capture restarts every job holding the source: the operator's call,
@@ -532,10 +539,12 @@ mod tests {
     }
 
     #[test]
-    fn signature_accept_and_reject_are_gated() {
+    fn signature_decisions_are_gated() {
         let accept = json!({"op": "signature_accept", "id": "01SIG", "name": null});
         let reject = json!({"op": "signature_reject", "id": "01SIG"});
-        for op in [&accept, &reject] {
+        let retract = json!({"op": "signature_retract", "id": "01SIG"});
+        let delete = json!({"op": "signature_delete", "id": "01SIG"});
+        for op in [&accept, &reject, &retract, &delete] {
             let refused = gate(op, Allow::default()).expect("refused");
             assert_eq!(
                 refused,
@@ -543,7 +552,7 @@ mod tests {
                     "error": "not_allowed",
                     "field": "op",
                     "op": op["op"],
-                    "message": "accepting or rejecting a signature is the operator's decision: report the proposal to the operator; they unlock it by allowing signatures for the run",
+                    "message": "accepting, rejecting, retracting or deleting a signature is the operator's decision: report the proposal to the operator; they unlock it by allowing signatures for the run",
                 })
             );
             // Allowing stops and deletes does not allow signatures.

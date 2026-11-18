@@ -519,8 +519,12 @@ fsk|psk|ook demod -> clock_recover -> slicer -> bit_view` from the capture's fea
 refuses rather than guesses a rate; `job_context` then holds the clock, the slicer and `bit_view`'s
 hypotheses (line code, frame period, sync-word and CRC candidates). `graph_start` runs any graph
 with no radio at its root (`capture_in`, `stream_in`, `mix`). The page's Explore pane lists the
-captures (What is this, Download, Delete, Work the bits) and the Bits pane shows the bits and the
-hypotheses. The node stops at classification: reading the content of someone else's link is the
+captures (What is this, Download, Delete, Work the bits) and the signatures (Accept and Reject on a
+proposal, Retract on an accepted one, Delete on any after a confirm; the accept's note carries
+Undo), and the Bits pane shows the bits and the hypotheses. `zeta signature retract --id ID` takes
+back a wrong accept with no restart: the record is kept as `retracted`, labels nothing more, its
+`learned_<id>` row leaves the modes and its captures are unpinned unless another accepted record
+holds them; `zeta signature delete --id ID` removes a record in any state the same way. The node stops at classification: reading the content of someone else's link is the
 operator's decision.
 
 ## External stages

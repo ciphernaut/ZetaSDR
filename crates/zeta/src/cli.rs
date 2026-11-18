@@ -610,6 +610,19 @@ pub enum SignatureCmd {
         #[arg(long)]
         id: String,
     },
+    /// Take back an accepted signature: it is kept as retracted, labels nothing more, its
+    /// learned row goes and its captures are unpinned
+    Retract {
+        /// A signature id (from `signature list`)
+        #[arg(long)]
+        id: String,
+    },
+    /// Delete a signature record in any state, undoing what an accept of it did
+    Delete {
+        /// A signature id (from `signature list`)
+        #[arg(long)]
+        id: String,
+    },
 }
 
 /// `--state`: `proposed`, `accepted`, `rejected` or `superseded`.
@@ -1008,8 +1021,8 @@ pub struct AskArgs {
     /// Let the agent delete captures (`capture_delete`)
     #[arg(long)]
     pub allow_delete: bool,
-    /// Let the agent accept or reject learned signatures (`signature_accept`,
-    /// `signature_reject`)
+    /// Let the agent accept, reject, retract or delete learned signatures
+    /// (`signature_accept`, `signature_reject`, `signature_retract`, `signature_delete`)
     #[arg(long)]
     pub allow_signatures: bool,
     /// The radio a request that names none uses (the default radio); the policy then
@@ -1672,6 +1685,8 @@ impl Command {
                     SignatureCmd::Propose { .. }
                         | SignatureCmd::Accept { .. }
                         | SignatureCmd::Reject { .. }
+                        | SignatureCmd::Retract { .. }
+                        | SignatureCmd::Delete { .. }
                 )
                 | Command::Jobs(JobsCmd::Stop { .. })
                 // The job form writes the job's context.
@@ -1968,6 +1983,8 @@ impl Command {
                 Op::SignatureAccept { id, name }
             }
             Command::Signature(SignatureCmd::Reject { id }) => Op::SignatureReject { id },
+            Command::Signature(SignatureCmd::Retract { id }) => Op::SignatureRetract { id },
+            Command::Signature(SignatureCmd::Delete { id }) => Op::SignatureDelete { id },
             Command::Station(StationCmd::Get) => Op::StationGet {},
             Command::Station(StationCmd::Clear) => Op::StationClear {},
             Command::Register(RegisterCmd::Site { provider, site_id }) => {
@@ -2148,6 +2165,19 @@ mod cli_signature_tests {
     }
 
     #[test]
+    fn cli_signature_retract_and_delete_take_the_id() {
+        assert_eq!(
+            op(&["zeta", "signature", "retract", "--id", "X"]),
+            Op::SignatureRetract { id: "X".into() }
+        );
+        assert_eq!(
+            op(&["zeta", "signature", "delete", "--id", "X"]),
+            Op::SignatureDelete { id: "X".into() }
+        );
+        assert!(Cli::try_parse_from(["zeta", "signature", "retract"]).is_err());
+    }
+
+    #[test]
     fn cli_signature_list_takes_an_optional_state() {
         assert_eq!(
             op(&["zeta", "signature", "list"]),
@@ -2205,6 +2235,8 @@ mod cli_signature_tests {
         assert!(mutates(&["zeta", "signature", "propose", "--capture", "C"]));
         assert!(mutates(&["zeta", "signature", "accept", "--id", "X"]));
         assert!(mutates(&["zeta", "signature", "reject", "--id", "X"]));
+        assert!(mutates(&["zeta", "signature", "retract", "--id", "X"]));
+        assert!(mutates(&["zeta", "signature", "delete", "--id", "X"]));
         assert!(!mutates(&["zeta", "signature", "list"]));
         assert!(!mutates(&["zeta", "signature", "show", "--id", "X"]));
     }

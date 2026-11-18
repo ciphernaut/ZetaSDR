@@ -851,6 +851,7 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 #explore tr.signature td.confidence, #explore tr.signature td.evidence { color: var(--dim); }
 #explore tr.signature.proposed td.state { color: var(--user); }
 #explore tr.signature.accepted td.state { color: var(--ok); }
+#explore tr.signature.retracted td.state { color: var(--dim); }
 #explore tr.signature td.state code { font-family: var(--font-mono); }
 #explore tr.signature td.name { max-width: none; }
 #explore tr.signature input.sig-name { width: 16em; font-size: 11px; }

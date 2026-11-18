@@ -497,6 +497,9 @@ struct Inner {
     relaunching: tokio::sync::Mutex<()>,
     /// Held across [`Node::mix_start`], so two starts of one set make one mix.
     mix_gate: tokio::sync::Mutex<()>,
+    /// Held across a signature's accept, retract and delete, so the captures they pin
+    /// or unpin and the `learned_<id>` row they write or remove always match the store.
+    signature_gate: Mutex<()>,
     /// Cancelled when the `Node` is dropped; every job token is a child of it.
     shutdown: CancellationToken,
     /// The verdicts of owned `identify` runs, by identify id, until their owner (a
@@ -1328,6 +1331,7 @@ impl Node {
                 knowledge: RwLock::new(vec![learned_knowledge]),
                 classifiers: RwLock::new(classifiers),
                 persist_errors: Mutex::new(instance_errors),
+                signature_gate: Mutex::new(()),
                 ops_log: jsonlog::JsonLog::new(cfg.state_dir.join("ops.log")),
                 transcripts_log: jsonlog::JsonLog::new(cfg.state_dir.join("transcripts.log")),
                 events_log: jsonlog::JsonLog::with_max_bytes(
@@ -1695,11 +1699,21 @@ impl Node {
     /// The store's refusal as the ops answer it: an unknown id names the store's ids, a
     /// record in the wrong state is `signature <id> is <state>, not proposed`.
     fn signature_error(&self, e: crate::signatures::StoreError) -> OpError {
+        self.signature_error_not(e, crate::signatures::SignatureState::Proposed)
+    }
+
+    /// [`Node::signature_error`] for an op that takes a record in the state `want`:
+    /// `signature <id> is <state>, not <want>`.
+    fn signature_error_not(
+        &self,
+        e: crate::signatures::StoreError,
+        want: crate::signatures::SignatureState,
+    ) -> OpError {
         use crate::signatures::StoreError;
         match e {
             StoreError::Unknown(id) => self.unknown_signature(&id),
             StoreError::State { id, state } => OpError::Other {
-                message: format!("signature {id} is {state}, not proposed"),
+                message: format!("signature {id} is {state}, not {want}"),
             },
             e @ StoreError::Io(_) => OpError::Other {
                 message: e.to_string(),
@@ -1800,6 +1814,7 @@ impl Node {
         by: &str,
     ) -> Result<crate::signatures::SignatureRecord, OpError> {
         use crate::signatures::{SignatureState, StoreError};
+        let _gate = self.inner.signature_gate.lock().unwrap();
         let store = self.signatures();
         let rec = store.get(id).ok_or_else(|| self.unknown_signature(id))?;
         if rec.state != SignatureState::Proposed {
@@ -1907,6 +1922,131 @@ impl Node {
                 rec
             }
         }
+    }
+
+    /// `signature_retract`: the accepted record `id` becomes `retracted` (refused, naming
+    /// its state, unless it is accepted), then what its accept did is undone on the
+    /// running node: the `learned_<id>` row the accept wrote leaves the modes directory
+    /// and the registry, and its captures are unpinned unless a remaining record that
+    /// pins ([`crate::signatures::SignatureState::pins`]) still lists them. The layer-2
+    /// scorer reads only accepted records, so the next classify no longer labels with
+    /// it. Under the signature gate, as an accept is.
+    pub fn signature_retract(
+        &self,
+        id: &str,
+    ) -> Result<crate::signatures::SignatureRecord, OpError> {
+        use crate::signatures::SignatureState;
+        let _gate = self.inner.signature_gate.lock().unwrap();
+        let rec = self
+            .signatures()
+            .retract(id, now().0)
+            .map_err(|e| self.signature_error_not(e, SignatureState::Accepted))?;
+        let rec = self.remove_learned_row(rec);
+        self.unpin_released(&rec)?;
+        Ok(rec)
+    }
+
+    /// `signature_delete`: remove the record `id` in any state (its file goes too), then
+    /// undo what an accept of it did, as [`Node::signature_retract`] does. The record as
+    /// it stood.
+    pub fn signature_delete(
+        &self,
+        id: &str,
+    ) -> Result<crate::signatures::SignatureRecord, OpError> {
+        let _gate = self.inner.signature_gate.lock().unwrap();
+        let rec = self
+            .signatures()
+            .delete(id)
+            .map_err(|e| self.signature_error(e))?;
+        // The record is gone: its row and pins are undone on what it was.
+        let undone = self.remove_learned_row(rec.clone());
+        self.unpin_released(&undone)?;
+        Ok(rec)
+    }
+
+    /// Remove the `learned_<id>` row of `rec` that its accept wrote (its `decoder` set
+    /// with no `decoder_note`: a row file found there before the accept, `kept as is`,
+    /// is the operator's and stays), reload the rows, and note it on the record if the
+    /// store still holds it: `decoder` and `decoder_file` cleared, `decoder_note` `row
+    /// <mode> removed: the signature was retracted`. A file that cannot be removed is a
+    /// note too (`row <mode> not removed: <error>`), the row left in place.
+    fn remove_learned_row(
+        &self,
+        rec: crate::signatures::SignatureRecord,
+    ) -> crate::signatures::SignatureRecord {
+        let (Some(mode), Some(file), None) = (&rec.decoder, &rec.decoder_file, &rec.decoder_note)
+        else {
+            return rec;
+        };
+        let (decoder, file, note) = match std::fs::remove_file(file) {
+            Ok(()) => (
+                None,
+                None,
+                format!("row {mode} removed: the signature was retracted"),
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+                None,
+                None,
+                format!("row {mode} removed: the signature was retracted"),
+            ),
+            Err(e) => (
+                Some(mode.clone()),
+                Some(file.clone()),
+                format!("row {mode} not removed: {e}"),
+            ),
+        };
+        if decoder.is_none()
+            && let Ok(lines) = self.reload_modes()
+        {
+            for line in lines {
+                eprintln!("{line}");
+            }
+        }
+        let store = self.signatures();
+        if store.get(&rec.id).is_none() {
+            return crate::signatures::SignatureRecord {
+                decoder,
+                decoder_file: file,
+                decoder_note: Some(note),
+                ..rec
+            };
+        }
+        match store.set_decoder(&rec.id, decoder, file, Some(note)) {
+            Ok(rec) => rec,
+            Err(e) => {
+                self.inner
+                    .persist_errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("signatures: {}: {e}", rec.id));
+                rec
+            }
+        }
+    }
+
+    /// Unpin each capture of `rec` that no record left in the store pins
+    /// ([`crate::signatures::SignatureState::pins`]); one gone from the burst store is
+    /// skipped.
+    fn unpin_released(&self, rec: &crate::signatures::SignatureRecord) -> Result<(), OpError> {
+        let held: Vec<String> = self
+            .signatures()
+            .list(None)
+            .into_iter()
+            .filter(|r| r.id != rec.id && r.state.pins())
+            .flat_map(|r| r.provenance.captures)
+            .collect();
+        let bursts = self.bursts();
+        for c in rec.provenance.captures.iter().filter(|c| !held.contains(c)) {
+            match bursts.unpin(c) {
+                Ok(()) | Err(crate::bursts::StoreError::Unknown(_)) => {}
+                Err(e) => {
+                    return Err(OpError::Other {
+                        message: format!("capture {c}: {e}"),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `signature_reject`: reject the proposal `id`, by the transport `by`.

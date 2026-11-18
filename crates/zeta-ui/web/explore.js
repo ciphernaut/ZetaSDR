@@ -25,13 +25,16 @@
 //   Each poll also lists `signature_list {state: null}`; under the captures a
 //   `table.signatures` holds the records in EXPLORE_SIGNATURE_STATES, newest first, one
 //   `tr.signature[data-id]` each: `td.name` (an `input.sig-name` prefilled with the name,
-//   `readonly` once accepted; a name typed, and the focus and caret in it, survive the
-//   redraw), `td.confidence` (two decimals), `td.state` (`proposed`, `accepted`, or `accepted · learned` and the row id
+//   `readonly` once no longer proposed; a name typed, and the focus and caret in it, survive the
+//   redraw), `td.confidence` (two decimals), `td.state` (`proposed`, `accepted`, `retracted`, or `accepted · learned` and the row id
 //   when `decoder` is set), `td.evidence` (signatureText) and `td.actions`: Accept
 //   (proposed only: `signature_accept {id, name}`, `name` the input when it was changed,
-//   else null; the transcript notes `accepted <name> (<id tail>)` and the `decoder_note`
-//   when set) and Reject (armed like Delete: `sure?` for DELETE_CONFIRM_MS, then
-//   `signature_reject`, noting `rejected <name> (<id tail>)`).
+//   else null; the transcript notes `accepted <name> (<id tail>)`, with an Undo button that
+//   retracts it, and the `decoder_note` when set), Reject (proposed only, armed like Delete:
+//   `sure?` for DELETE_CONFIRM_MS, then `signature_reject`, noting `rejected <name> (<id
+//   tail>)`), Retract (accepted only, no confirm: `signature_retract`, noting `retracted <name>
+//   (<id tail>)` and the `decoder_note` when set) and Delete (every row, armed the same way,
+//   then `signature_delete`, noting `deleted <name> (<id tail>)`).
 //   Registers the `explore` pane with the strip, eligible while any capture or any listed
 //   signature exists, and selects it when a capture appears that the load's first poll did
 //   not list (once per load): a
@@ -43,7 +46,7 @@ import { bandText, khzText, registerText, registerVerdictLine } from "./units.js
 export const EXPLORE_POLL_MS = 2000;
 export const DELETE_CONFIRM_MS = 3000;
 // The signature states the pane lists (a rejected or superseded record is history).
-export const EXPLORE_SIGNATURE_STATES = ["proposed", "accepted"];
+export const EXPLORE_SIGNATURE_STATES = ["proposed", "accepted", "retracted"];
 // The characters of an id the transcript and the brackets name it by.
 const ID_TAIL = 6;
 // The row fields the operator types in; a redraw keeps the focus and caret in them.
@@ -123,6 +126,7 @@ class ExplorePane {
     this.signatures = []; // the listed records in EXPLORE_SIGNATURE_STATES, newest first
     this.names = new Map(); // signature id -> the name typed in its row
     this.armedReject = new Map(); // signature id -> timer of the pending reject confirmation
+    this.armedDelete = new Map(); // signature id -> timer of the pending delete confirmation
     this.onInput = (ev) => {
       const tr = ev.target.closest("tr.capture");
       if (tr && ev.target.classList.contains("bits-rate")) this.rates.set(tr.dataset.id, ev.target.value);
@@ -329,14 +333,15 @@ class ExplorePane {
       tr.className = `signature ${s.state}`;
       tr.dataset.id = s.id;
       const accepted = s.state === "accepted";
+      const proposed = s.state === "proposed";
       const name = document.createElement("td");
       name.className = "name";
       const input = document.createElement("input");
       input.type = "text";
       input.className = "sig-name";
-      input.value = accepted ? s.name : (this.names.get(s.id) ?? s.name);
-      input.readOnly = accepted;
-      input.title = accepted ? s.name : "the name Accept gives it";
+      input.value = proposed ? (this.names.get(s.id) ?? s.name) : s.name;
+      input.readOnly = !proposed;
+      input.title = proposed ? "the name Accept gives it" : s.name;
       name.append(input);
       const conf = document.createElement("td");
       conf.className = "confidence";
@@ -355,9 +360,12 @@ class ExplorePane {
       evidence.title = evidence.textContent;
       const actions = document.createElement("td");
       actions.className = "actions";
-      const buttons = accepted ? [] : [
-        ["accept", "Accept"],
-        ["reject", this.armedReject.has(s.id) ? "sure?" : "Reject"],
+      const buttons = [
+        ...(proposed
+          ? [["accept", "Accept"], ["reject", this.armedReject.has(s.id) ? "sure?" : "Reject"]]
+          : []),
+        ...(accepted ? [["retract", "Retract"]] : []),
+        ["delete", this.armedDelete.has(s.id) ? "sure?" : "Delete"],
       ];
       for (const [action, label] of buttons) {
         const b = document.createElement("button");
@@ -395,6 +403,8 @@ class ExplorePane {
     const sig = ev.target.closest("tr.signature");
     if (b && sig) {
       if (b.dataset.action === "reject") return this.reject(sig.dataset.id);
+      if (b.dataset.action === "retract") return this.retract(sig.dataset.id);
+      if (b.dataset.action === "delete") return this.deleteSignature(sig.dataset.id);
       if (b.dataset.action === "accept") return this.accept(sig.dataset.id, sig.querySelector("input.sig-name")?.value);
       return;
     }
@@ -514,7 +524,8 @@ class ExplorePane {
       const rec = r && r.result === "signature" ? r.value : null;
       if (rec) {
         this.names.delete(id);
-        this.t.note(`accepted ${rec.name} (${rec.id.slice(-ID_TAIL)})`);
+        const undo = { label: "Undo", run: () => this.retract(id) };
+        this.t.note(`accepted ${rec.name} (${rec.id.slice(-ID_TAIL)})`, false, [undo]);
         if (rec.decoder_note) this.t.note(`${rec.id.slice(-ID_TAIL)}: ${rec.decoder_note}`);
       }
     } catch (e) {
@@ -525,21 +536,61 @@ class ExplorePane {
     await this.poll();
   }
 
-  // Reject (see the header): arm, then a second click within DELETE_CONFIRM_MS rejects.
-  async reject(id) {
-    if (!this.armedReject.has(id)) {
-      this.armedReject.set(
+  // Whether a click on `id`'s button armed in `armed` confirms: the first arms it (the button
+  // reads `sure?` for DELETE_CONFIRM_MS) and answers false, a second within that answers true.
+  confirmed(armed, id) {
+    if (!armed.has(id)) {
+      armed.set(
         id,
         setTimeout(() => {
-          this.armedReject.delete(id);
+          armed.delete(id);
           if (!this.destroyed) this.render();
         }, DELETE_CONFIRM_MS),
       );
       this.render();
-      return;
+      return false;
     }
-    clearTimeout(this.armedReject.get(id));
-    this.armedReject.delete(id);
+    clearTimeout(armed.get(id));
+    armed.delete(id);
+    return true;
+  }
+
+  // Retract (see the header; the accept note's Undo too): no confirm.
+  async retract(id) {
+    const key = `${id}retract`;
+    if (this.busy.has(key)) return;
+    this.busy.add(key);
+    try {
+      const r = await this.api.op({ op: "signature_retract", id });
+      const rec = r && r.result === "signature" ? r.value : null;
+      if (rec) {
+        this.t.note(`retracted ${rec.name} (${rec.id.slice(-ID_TAIL)})`);
+        if (rec.decoder_note) this.t.note(`${rec.id.slice(-ID_TAIL)}: ${rec.decoder_note}`);
+      }
+    } catch (e) {
+      this.t.note(`signature_retract: ${e.message}`, true);
+    } finally {
+      this.busy.delete(key);
+    }
+    await this.poll();
+  }
+
+  // Delete a signature (see the header): arm, then a second click deletes.
+  async deleteSignature(id) {
+    if (!this.confirmed(this.armedDelete, id)) return;
+    try {
+      const r = await this.api.op({ op: "signature_delete", id });
+      const rec = r && r.result === "signature" ? r.value : null;
+      if (rec) this.t.note(`deleted ${rec.name} (${rec.id.slice(-ID_TAIL)})`);
+    } catch (e) {
+      this.t.note(`signature_delete: ${e.message}`, true);
+    }
+    await this.poll();
+  }
+
+  // Reject (see the header): arm, then a second click within DELETE_CONFIRM_MS rejects.
+  async reject(id) {
+    if (!this.confirmed(this.armedReject, id)) return;
     try {
       const r = await this.api.op({ op: "signature_reject", id });
       const rec = r && r.result === "signature" ? r.value : null;
@@ -592,6 +643,7 @@ class ExplorePane {
     clearTimeout(this.armedAll);
     for (const t of this.armed.values()) clearTimeout(t);
     for (const t of this.armedReject.values()) clearTimeout(t);
+    for (const t of this.armedDelete.values()) clearTimeout(t);
     this.el.removeEventListener("click", this.onClick);
     this.el.removeEventListener("input", this.onInput);
     this.panes?.unregister("explore");

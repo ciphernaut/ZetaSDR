@@ -304,6 +304,26 @@ impl BurstStore {
         })
     }
 
+    /// Unpin the capture `id` ([`pin`](Self::pin) undone): expiry and delete may take it
+    /// again.
+    pub fn unpin(&self, id: &str) -> Result<(), StoreError> {
+        let mut index = self.index.lock().unwrap();
+        let rec = index
+            .iter_mut()
+            .find(|r| r.id == id)
+            .ok_or_else(|| StoreError::Unknown(id.into()))?;
+        if !rec.pinned {
+            return Ok(());
+        }
+        rec.pinned = false;
+        self.persist(&index).map_err(|e| {
+            if let Some(r) = index.iter_mut().find(|r| r.id == id) {
+                r.pinned = true;
+            }
+            StoreError::Io(e.to_string())
+        })
+    }
+
     /// Apply the policy: the oldest unpinned captures go until the unpinned rest fit
     /// `keep_bytes` (a pinned capture counts against no budget), then every unpinned capture older than
     /// `keep_days`. Returns the ids removed. A failed index write keeps the records

@@ -540,6 +540,25 @@ pub enum Op {
         /// An id from `signature_list`.
         id: String,
     },
+    /// Take back an accept: the accepted record becomes `retracted` (it stays, with its
+    /// provenance and `retracted_ns`), and on the running node its `learned_<id>` row
+    /// leaves the registry (the file the accept wrote is removed), the next classify no
+    /// longer labels with it, and its captures are unpinned unless another accepted (or
+    /// superseded) record lists them. A record not `accepted` is refused (`signature <id>
+    /// is <state>, not accepted`); a retracted record cannot be accepted again, only
+    /// deleted. Gated as `signature_accept` is: through `ask` the run needs
+    /// `allow.accept_signatures`, else `not_allowed`.
+    SignatureRetract {
+        /// An id from `signature_list`.
+        id: String,
+    },
+    /// Delete a signature record in any state, its file with it; for an accepted (or
+    /// superseded) one, what the accept did is undone as `signature_retract` undoes it.
+    /// The answer is the record as it stood. Gated as `signature_accept` is.
+    SignatureDelete {
+        /// An id from `signature_list`.
+        id: String,
+    },
     /// Start `kind` on every channel of the channel plan `plan` (`channel_plans`), or on
     /// the channels numbered in `channels`, each at its channel's `center_hz` with the
     /// plan's `bandwidth_hz`, and attach `attach` to each started job. Under the source's
@@ -3540,8 +3559,8 @@ pub enum OpResult {
     Station(Option<crate::station::Station>),
     /// `signature_list`: the records, newest first.
     Signatures(Vec<crate::signatures::SignatureRecord>),
-    /// `signature_show`, `signature_propose`, `signature_accept` and `signature_reject`:
-    /// the record.
+    /// `signature_show`, `signature_propose`, `signature_accept`, `signature_reject`,
+    /// `signature_retract` and `signature_delete` (as it stood): the record.
     Signature(Box<crate::signatures::SignatureRecord>),
     /// `origin_lookup`: the lit sites, best first.
     Origins(crate::node::OriginAnswer),
@@ -3579,6 +3598,8 @@ impl Op {
             Op::SignaturePropose { .. } => "signature_propose",
             Op::SignatureAccept { .. } => "signature_accept",
             Op::SignatureReject { .. } => "signature_reject",
+            Op::SignatureRetract { .. } => "signature_retract",
+            Op::SignatureDelete { .. } => "signature_delete",
             Op::PlanStart { .. } => "plan_start",
             Op::JobList {} => "job_list",
             Op::JobStop { .. } => "job_stop",
@@ -5196,6 +5217,8 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             .signature_accept(&id, name, transport)
             .map(signature_result),
         Op::SignatureReject { id } => node.signature_reject(&id, transport).map(signature_result),
+        Op::SignatureRetract { id } => node.signature_retract(&id).map(signature_result),
+        Op::SignatureDelete { id } => node.signature_delete(&id).map(signature_result),
         Op::MixStart { sources } => node
             .mix_start(sources)
             .await

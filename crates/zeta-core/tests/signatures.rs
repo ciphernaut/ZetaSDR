@@ -279,6 +279,152 @@ async fn accept_pins_the_captures_and_reject_ends_a_proposal() {
     assert_eq!(known, ids);
 }
 
+/// `op` from the CLI transport: the record, or the error.
+async fn decided(node: &Node, op: Op) -> Result<SignatureRecord, OpError> {
+    match node.apply_from(op, "cli").await? {
+        OpResult::Signature(rec) => Ok(*rec),
+        r => panic!("signature: {r:?}"),
+    }
+}
+
+/// Whether each capture of `ids` is pinned.
+fn pinned(node: &Node, ids: &[String]) -> Vec<bool> {
+    let bursts = node.bursts();
+    ids.iter()
+        .map(|id| bursts.get(id).unwrap().pinned)
+        .collect()
+}
+
+#[tokio::test]
+async fn retract_and_delete_unpin_the_captures_no_remaining_record_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let set = write_set(&node, "01SET");
+    // Two proposals from one set: both list its two captures.
+    let a = propose(&node, &set[0].id, None).await.unwrap();
+    let b = propose(&node, &set[1].id, None).await.unwrap();
+    let c = propose(&node, &set[1].id, None).await.unwrap();
+    assert_eq!(a.provenance.captures, b.provenance.captures);
+    let caps = a.provenance.captures.clone();
+    let accept = |id: &str| Op::SignatureAccept {
+        id: id.into(),
+        name: None,
+    };
+    let retract = |id: &str| Op::SignatureRetract { id: id.into() };
+    let delete = |id: &str| Op::SignatureDelete { id: id.into() };
+    let accepted = decided(&node, accept(&a.id)).await.unwrap();
+    decided(&node, accept(&b.id)).await.unwrap();
+    assert_eq!(pinned(&node, &caps), [true, true]);
+
+    // Retract: the record stays, retracted, its provenance kept; b still holds the pins.
+    let ra = decided(&node, retract(&a.id)).await.unwrap();
+    assert_eq!(ra.state, SignatureState::Retracted);
+    assert_eq!(ra.provenance.accepted_ns, accepted.provenance.accepted_ns);
+    assert_eq!(ra.provenance.accepted_by.as_deref(), Some("cli"));
+    assert_eq!(ra.provenance.captures, caps);
+    assert!(ra.provenance.retracted_ns.is_some(), "{ra:?}");
+    assert_eq!(pinned(&node, &caps), [true, true], "b still holds them");
+    assert_eq!(
+        list(&node, Some(SignatureState::Retracted)).await,
+        std::slice::from_ref(&ra)
+    );
+
+    // Retract takes only an accepted record, accept only a proposed one: each names it.
+    let refused = |state: &str, id: &str, not: &str| OpError::Other {
+        message: format!("signature {id} is {state}, not {not}"),
+    };
+    let e = decided(&node, retract(&a.id)).await.unwrap_err();
+    assert_eq!(e, refused("retracted", &a.id, "accepted"));
+    let e = decided(&node, retract(&c.id)).await.unwrap_err();
+    assert_eq!(e, refused("proposed", &c.id, "accepted"));
+    let e = decided(&node, accept(&a.id)).await.unwrap_err();
+    assert_eq!(e, refused("retracted", &a.id, "proposed"));
+    for op in [retract("nope"), delete("nope")] {
+        let e = decided(&node, op).await.unwrap_err();
+        assert!(
+            matches!(&e, OpError::Unknown { field, value, .. } if field == "id" && value == "nope"),
+            "{e:?}"
+        );
+    }
+
+    // Delete: the record and its file go; with a retracted, nothing holds the pins now.
+    let file = |id: &str| {
+        dir.path()
+            .join("state")
+            .join(SIGNATURES_DIR)
+            .join(format!("{id}.json"))
+    };
+    assert!(file(&b.id).is_file());
+    let rb = decided(&node, delete(&b.id)).await.unwrap();
+    assert_eq!(
+        (rb.id.as_str(), rb.state),
+        (b.id.as_str(), SignatureState::Accepted)
+    );
+    assert!(!file(&b.id).exists());
+    assert_eq!(pinned(&node, &caps), [false, false]);
+    // A record in any state deletes: the retracted one and the proposal.
+    decided(&node, delete(&a.id)).await.unwrap();
+    decided(&node, delete(&c.id)).await.unwrap();
+    assert!(list(&node, None).await.is_empty());
+    for op in ["signature_retract", "signature_delete"] {
+        assert!(logged(dir.path(), op) >= 1, "{op} in ops.log");
+    }
+
+    // A restart reads the store as the deletes left it.
+    drop(node);
+    let node = open(dir.path()).await;
+    assert!(list(&node, None).await.is_empty());
+    assert!(node.signatures().load_errors().is_empty());
+}
+
+/// The `ops.log` entries naming `op`.
+fn logged(dir: &Path, op: &str) -> usize {
+    std::fs::read_to_string(dir.join("state").join("ops.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|l| l["op"]["op"] == op)
+        .count()
+}
+
+#[tokio::test]
+async fn a_retracted_record_survives_a_restart_and_an_older_record_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (retracted, old) = {
+        let node = open(dir.path()).await;
+        let set = write_set(&node, "01SET");
+        let a = propose(&node, &set[0].id, None).await.unwrap();
+        let b = propose(&node, &set[1].id, None).await.unwrap();
+        node.apply(Op::SignatureAccept {
+            id: a.id.clone(),
+            name: None,
+        })
+        .await
+        .unwrap();
+        let r = decided(&node, Op::SignatureRetract { id: a.id })
+            .await
+            .unwrap();
+        (r, b)
+    };
+    // A record never retracted is written as the build before retract wrote it, with no
+    // `retracted_ns`, and reads back so.
+    let path = dir
+        .path()
+        .join("state")
+        .join(SIGNATURES_DIR)
+        .join(format!("{}.json", old.id));
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(v["provenance"].get("retracted_ns").is_none(), "{v}");
+    let node = open(dir.path()).await;
+    assert!(
+        node.signatures().load_errors().is_empty(),
+        "{:?}",
+        node.signatures().load_errors()
+    );
+    assert_eq!(node.signatures().get(&old.id), Some(old));
+    assert_eq!(node.signatures().get(&retracted.id), Some(retracted));
+}
+
 #[tokio::test]
 async fn the_store_reloads_its_records() {
     let dir = tempfile::tempdir().unwrap();

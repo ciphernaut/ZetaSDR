@@ -194,7 +194,12 @@ export const NARROW_MAX_PX = 700;
 const SECRET_KEY = "zeta.secret";
 const SOURCE_KEY = "zeta.source";
 // The agent calls `allow signatures` unlocks: answering a proposal is the operator's.
-const SIGNATURE_DECISIONS = ["signature_accept", "signature_reject"];
+const SIGNATURE_DECISIONS = [
+  "signature_accept",
+  "signature_reject",
+  "signature_retract",
+  "signature_delete",
+];
 
 export const state = {
   api: null,

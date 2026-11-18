@@ -37,7 +37,8 @@ pub const SUPERSEDE_WIDTH_RANGE: (f64, f64) = (0.5, 2.0);
 pub const LEARNED_ROW_PREFIX: &str = "learned_";
 
 /// Where a signature stands: `proposed` (waiting for the operator), `accepted`,
-/// `rejected`, or `superseded` (a mode row proved its band).
+/// `rejected`, `superseded` (a mode row proved its band), or `retracted` (an accept the
+/// operator took back: it labels nothing and pins nothing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SignatureState {
@@ -45,6 +46,7 @@ pub enum SignatureState {
     Accepted,
     Rejected,
     Superseded,
+    Retracted,
 }
 
 impl SignatureState {
@@ -55,7 +57,14 @@ impl SignatureState {
             SignatureState::Accepted => "accepted",
             SignatureState::Rejected => "rejected",
             SignatureState::Superseded => "superseded",
+            SignatureState::Retracted => "retracted",
         }
+    }
+
+    /// Whether a record in this state keeps its captures pinned: the accept pinned them,
+    /// and a supersede leaves them so.
+    pub fn pins(self) -> bool {
+        matches!(self, SignatureState::Accepted | SignatureState::Superseded)
     }
 }
 
@@ -122,6 +131,13 @@ pub struct SignatureProvenance {
     #[serde(default)]
     #[schemars(schema_with = "crate::types::nullable::<u64>")]
     pub superseded_ns: Option<u64>,
+    /// When the operator retracted the accept; `null` for a record never retracted. The
+    /// store's file leaves it out while it is `null` (see [`SignatureStore`]'s writes), so
+    /// an older build still reads every record but a retracted one; absent reads as
+    /// `null`.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<u64>")]
+    pub retracted_ns: Option<u64>,
 }
 
 /// One learned signature: the waveform, the framing that checked (if any), the decoder
@@ -468,6 +484,7 @@ impl SignatureStore {
                 accepted_by: None,
                 superseded_by: None,
                 superseded_ns: None,
+                retracted_ns: None,
             },
             matches: 0,
             last_matched_ns: None,
@@ -509,6 +526,32 @@ impl SignatureStore {
             r.provenance.accepted_by = Some(by.to_string());
             Ok(())
         })
+    }
+
+    /// Retract the accepted record `id` at `now_ns`: it becomes `retracted`, its
+    /// provenance kept. [`StoreError::State`] unless it is accepted.
+    pub fn retract(&self, id: &str, now_ns: u64) -> Result<SignatureRecord, StoreError> {
+        self.change(id, |r| {
+            expect_state(r, SignatureState::Accepted)?;
+            r.state = SignatureState::Retracted;
+            r.provenance.retracted_ns = Some(now_ns);
+            Ok(())
+        })
+    }
+
+    /// Remove the record `id`, in any state, and its file; the record as it stood.
+    pub fn delete(&self, id: &str) -> Result<SignatureRecord, StoreError> {
+        let mut records = self.records.lock().unwrap();
+        let i = records
+            .iter()
+            .position(|r| r.id == id)
+            .ok_or_else(|| StoreError::Unknown(id.into()))?;
+        match std::fs::remove_file(self.dir.join(format!("{id}.json"))) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::Io(e.to_string())),
+        }
+        Ok(records.remove(i))
     }
 
     /// Mark the accepted record `id` superseded by the mode `mode`:
@@ -571,10 +614,20 @@ impl SignatureStore {
         Ok(next)
     }
 
-    /// Write `<id>.json` atomically: a temp file, then a rename.
+    /// Write `<id>.json` atomically: a temp file, then a rename. A `null` `retracted_ns`
+    /// is left out of the file, so a record never retracted is written as the build
+    /// before retract wrote it, and that build (whose records deny unknown fields) still
+    /// reads it; a retracted record it skips, listed in its `load_errors`.
     fn persist(&self, r: &SignatureRecord) -> Result<(), StoreError> {
         let io = |e: std::io::Error| StoreError::Io(e.to_string());
-        let json = serde_json::to_vec_pretty(r).map_err(|e| StoreError::Io(e.to_string()))?;
+        let encode = |e: serde_json::Error| StoreError::Io(e.to_string());
+        let mut v = serde_json::to_value(r).map_err(encode)?;
+        if let Some(p) = v["provenance"].as_object_mut()
+            && p.get("retracted_ns").is_some_and(Value::is_null)
+        {
+            p.remove("retracted_ns");
+        }
+        let json = serde_json::to_vec_pretty(&v).map_err(encode)?;
         let tmp = self.dir.join(format!("{}.json.tmp", r.id));
         std::fs::write(&tmp, json).map_err(io)?;
         std::fs::rename(&tmp, self.dir.join(format!("{}.json", r.id))).map_err(io)
@@ -717,5 +770,25 @@ mod tests {
             s["properties"]["decoder"]["type"],
             serde_json::json!(["string", "null"])
         );
+    }
+
+    #[test]
+    fn a_record_never_retracted_is_written_as_the_build_before_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = SignatureStore::open(dir.path()).unwrap();
+        let a = s.propose(new(None), 1).unwrap();
+        let written = |id: &str| -> Value {
+            let path = dir.path().join(SIGNATURES_DIR).join(format!("{id}.json"));
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        assert!(written(&a.id)["provenance"].get("retracted_ns").is_none());
+        s.accept(&a.id, None, "ui", 2).unwrap();
+        assert!(written(&a.id)["provenance"].get("retracted_ns").is_none());
+        s.retract(&a.id, 3).unwrap();
+        assert_eq!(written(&a.id)["provenance"]["retracted_ns"], 3);
+        // What the ops answer carries every field, `retracted_ns` included.
+        let fresh = s.propose(new(None), 4).unwrap();
+        let answered = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(answered["provenance"]["retracted_ns"], Value::Null);
     }
 }
