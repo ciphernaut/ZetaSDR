@@ -391,19 +391,18 @@ async fn channel_plans_serves_each_plans_groups_with_their_channels() {
     );
     assert_eq!(cb.groups[0].channels.len(), 38);
     assert_eq!(cb.groups[0].name, "Lower 40, voice");
-    assert!(
-        plans
-            .iter()
-            .find(|p| p.id == "ais_vhf")
-            .unwrap()
-            .groups
-            .is_empty()
-    );
-    // An older node's plan, without `groups`, reads as having none.
+    // The data channels are served too, so the page offers no voice start of a group of them.
+    assert_eq!(cb.no_voice, [22, 23]);
+    let ais = plans.iter().find(|p| p.id == "ais_vhf").unwrap();
+    assert!(ais.groups.is_empty());
+    assert_eq!(ais.no_voice, [1, 2]);
+    // An older node's plan, without `groups` or `no_voice`, reads as having none.
     let mut old = serde_json::to_value(cb).unwrap();
     old.as_object_mut().unwrap().remove("groups");
+    old.as_object_mut().unwrap().remove("no_voice");
     let read: zeta_core::ops::PlanInfo = serde_json::from_value(old).unwrap();
     assert!(read.groups.is_empty());
+    assert!(read.no_voice.is_empty());
     assert_eq!(read.channels, cb.channels);
 }
 

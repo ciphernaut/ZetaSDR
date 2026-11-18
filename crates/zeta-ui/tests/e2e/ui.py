@@ -878,24 +878,26 @@ def scenario_save_sigmf(page, url, secret):
 
 
 def scenario_plan_menu_offers_the_plans_groups(page, url, secret):
-    # A plan's named groups follow "Start plan…" in the box menu, by name; one puts its
-    # `plan start … group <id>` in the command line, and Enter sends plan_start with the group
-    # in place of channels. No source of the test node captures the CB data channels, so the
-    # node's answer is its refusal of the band and nothing starts.
+    # A plan's named groups follow "Start plan…" in the box menu, by name, but for a group
+    # whose channels are all data channels (the plan's `no_voice`: CB's Data), which a voice
+    # demodulator has no business on; one puts its `plan start … group <id>` in the command
+    # line, and Enter sends plan_start with the group in place of channels. No source of the
+    # test node captures the CB channels, so the node's answer is its refusal of the band
+    # and nothing starts.
     menu = open_menu_on_tone(page, url, secret)
     groups = menu.locator(".ctx-plan-groups .ctx-item")
     expect(groups).to_have_text([
         "Start plan › Lower 40, voice", "Start plan › Upper 40, voice", "Start plan › Voice",
-        "Start plan › Repeater outputs", "Start plan › Data"])
-    menu.locator('.ctx-item[data-group="data"]').click()
+        "Start plan › Repeater outputs"])
+    menu.locator('.ctx-item[data-group="voice"]').click()
     expect(menu).to_be_hidden()
     expect(page.locator("#cmd")).to_have_value(
-        "plan start uhf_cb_au fm_demod transcribe group data")
+        "plan start uhf_cb_au fm_demod transcribe group voice")
     with page.expect_request(lambda r: r.method == "POST" and r.url.endswith("/op")
                              and (r.post_data or "").find('"plan_start"') >= 0) as req:
         page.press("#cmd", "Enter")
     body = json.loads(req.value.post_data)
-    want = {"plan": "uhf_cb_au", "channels": None, "group": "data", "kind": "fm_demod",
+    want = {"plan": "uhf_cb_au", "channels": None, "group": "voice", "kind": "fm_demod",
             "source": "tone", "attach": "transcribe"}
     assert {k: body.get(k) for k in want} == want, f"plan_start {body}"
     expect(page.locator("#transcript .line.error", has_text="plan_start")).not_to_have_count(0)

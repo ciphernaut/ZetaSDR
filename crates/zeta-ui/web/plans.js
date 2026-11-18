@@ -46,6 +46,12 @@ export function planGroups(id) {
   return p && Array.isArray(p.groups) ? p.groups : [];
 }
 
+// The numbers of plan `id`'s data channels (`no_voice`; none from an older node).
+export function planNoVoice(id) {
+  const p = plans.find((x) => x.id === id);
+  return p && Array.isArray(p.no_voice) ? p.no_voice : [];
+}
+
 // The id of the first plan `policy` selects (null for `none` or when no plan is loaded).
 export function resolvePlan(policy) {
   const p = selected(policy)[0];

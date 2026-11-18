@@ -734,6 +734,10 @@ From the operator, 2026-11-09: when several licensed sites share one channel, th
 
 Keep live examples out of the repository: no site names, frequencies, distances or bearings from real observations of infrastructure.
 
+## Sets: a `plan_start` member cannot name a channel group
+
+Cleanup round 2 gave plans named channel groups (`channel_plans` `groups`) and `plan_start` a `group` in place of `channels`, but a set's `plan_start` member has no `group` field (`Member::PlanStart` in `sets.rs`, whose check passes `(channels, None)` to `check_plan_start_fields`), so a set file still types a channel list where a group would do. Add `group` to the member, exclusive with `channels`, checked at load and started as `plan_start` takes it.
+
 ## Plans: a `pocsag_au` channel plan
 
 From the operator, 2026-11-09: there is no POCSAG channel plan, only the `pagers_au` set (a span watch that starts decoders on carriers it detects). An always-on plan (one pocsag_decode per register-assigned pager channel in the region, as `acars_vhf` does for ACARS) would decode a quiet channel's first page without waiting for detection. Build it from the register's assignments rather than a hand list, and keep the set as the default.

@@ -3114,6 +3114,12 @@ pub struct PlanInfo {
     /// `plan_start` and `jobs_stop`. Absent from an older node's plans: none.
     #[serde(default)]
     pub groups: Vec<PlanGroup>,
+    /// The numbers of the channels that carry data, never voice, sorted: `plan_start`
+    /// attaches no `transcribe` to them, a mix does not read a job on one, and the page
+    /// offers no voice start of a group made only of them. Absent from an older node's
+    /// plans: none.
+    #[serde(default)]
+    pub no_voice: Vec<u32>,
 }
 
 /// One named group of a plan's channels.
@@ -3181,6 +3187,11 @@ impl From<&crate::plans::ChannelPlan> for PlanInfo {
                     channels: g.channels(),
                 })
                 .collect(),
+            no_voice: {
+                let mut n = p.no_voice.to_vec();
+                n.sort_unstable();
+                n
+            },
         }
     }
 }

@@ -140,7 +140,8 @@
 //                                             fm_demod transcribe` in the command line
 //                                             (`command(text)`) and focuses it. After it, one
 //                                             `.ctx-item[data-group=<id>]` per named group of
-//                                             that plan (plans.js planGroups), `Start plan ›
+//                                             that plan (plans.js planGroups) but one of data
+//                                             channels only (planNoVoice), `Start plan ›
 //                                             <group name>`: puts `plan start <plan> fm_demod
 //                                             transcribe group <id>` there the same way
 //   set        Start set…                     shown only when `sets()` (mountMenu's: set_list's
@@ -235,7 +236,7 @@
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
 // as for #ctx.
 
-import { planGroups } from "./plans.js";
+import { planGroups, planNoVoice } from "./plans.js";
 import { bandText, mhzText, registerLines, registerText } from "./units.js";
 import { capHz } from "./waterfall.js";
 
@@ -921,9 +922,14 @@ class Menu {
     return this.readyRows;
   }
 
-  // One `Start plan › <name>` entry per named group of `plan` (none for null).
+  // One `Start plan › <name>` entry per named group of `plan` (none for null), but for a
+  // group whose channels are all data channels (`no_voice`): the entry starts voice
+  // demodulators and transcribers.
   fillPlanGroups(plan) {
-    const groups = plan === null ? [] : planGroups(plan);
+    const noVoice = plan === null ? [] : planNoVoice(plan);
+    const groups = (plan === null ? [] : planGroups(plan)).filter(
+      (g) => !g.channels.every((n) => noVoice.includes(n)),
+    );
     this.planGroupsEl.replaceChildren(
       ...groups.map((g) => {
         const item = document.createElement("button");
