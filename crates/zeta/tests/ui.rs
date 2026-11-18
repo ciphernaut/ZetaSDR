@@ -353,16 +353,17 @@ fn video_fixture(dir: &Path) -> PathBuf {
 }
 
 /// Wall-clock limit on each shard's ui.py run. One run of every scenario took 575-615 s on
-/// 2026-11-08 (the limit was 690 s); split in two shards (SHARDS) it took about 260 s, and
-/// about 310 s pinned to two CPUs (`taskset -c 0,1`, as on CI's runners). 450 s is about
-/// 1.45 times the pinned run, room for a few more scenarios before SHARD_STARTS or SHARDS
-/// needs a look.
+/// 2026-11-08 (the limit was 690 s); split in two shards it took about 260 s, and about 310 s
+/// pinned to two CPUs (`taskset -c 0,1`, as on CI's runners). On 2026-11-19, 233 scenarios
+/// took 405 s and 420 s in two shards, and in three (SHARDS) 294 s, 247 s and 291 s, or 420 s
+/// at most pinned to two CPUs. Each shard prints its own time: move SHARD_STARTS from a
+/// `ZETA_UI_PROFILE` run, or add a shard, before raising this.
 const DEADLINE: Duration = Duration::from_secs(450);
 
 /// The shards run at once by default (ui.py's `SHARD_STARTS` says where each begins), each
 /// with its own nodes and Chromium: the scenarios mostly wait on fixtures played in real time,
-/// so two runs share a 2-CPU runner.
-const SHARDS: usize = 2;
+/// so three runs share a 2-CPU runner.
+const SHARDS: usize = 3;
 
 /// Waits for `child` until `deadline`, killing it then; its exit status (None when killed)
 /// and everything it wrote. Its pipes are drained on threads so it never blocks on them.
@@ -1263,13 +1264,20 @@ fn ui_scenarios_pass_in_headless_chromium() {
         .map(|(i, n)| {
             let shard = (shards > 1).then(|| format!("{i}/{shards}"));
             let child = n.run_ui(shard.as_deref(), only.as_deref());
-            std::thread::spawn(move || wait_with_deadline(child, DEADLINE))
+            std::thread::spawn(move || {
+                let at = Instant::now();
+                (wait_with_deadline(child, DEADLINE), at.elapsed())
+            })
         })
         .collect();
     let mut failed = Vec::new();
     for (i, run) in runs.into_iter().enumerate() {
-        let (status, stdout, stderr) = run.join().expect("ui.py waiter");
-        println!("--- shard {i}/{shards}\n{stdout}");
+        let ((status, stdout, stderr), took) = run.join().expect("ui.py waiter");
+        // Each shard's own wall time, against DEADLINE (SHARD_STARTS is cut from these).
+        println!(
+            "--- shard {i}/{shards} ({:.1} s)\n{stdout}",
+            took.as_secs_f64()
+        );
         match status {
             None => failed.push(format!(
                 "shard {i}/{shards}: ui.py still running after {} s; killed\n--- stderr\n{stderr}",

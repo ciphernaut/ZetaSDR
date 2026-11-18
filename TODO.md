@@ -11,7 +11,6 @@ One line each, from the round's reviews:
 - **Speech:** the `--stt-url` "no host" error can still print credentials from a URL that cannot be a base (`mailto:user:pw@host`): print the scheme only. An answer over 64 KiB is always "answer too long", so a proxy's large error page loses its status slice.
 - **Signatures:** a row file the node never wrote, kept on a retract or delete, logs an "outlives its record" warning; quieter would be to warn only for a row the accept generated. The page's note on a delete has no page test.
 - **Plans:** the page scenario for groups shows the menu and the request, not a group starting (the page test node has no source that captures the UHF CB channels). The UHF CB groups are also spelled out in four docs, where pointing at `channel_plans` would not drift. The box menu drops a group with no channels.
-- **Page tests:** three scenarios were added without rebalancing `SHARD_STARTS`; profile with `ZETA_UI_PROFILE` and move the cut.
 - **Modes:** `m17_takes_no_classify_slot_from_pocsag` asserts an exact tried set that any row's range change breaks; a test with crowd rows would hold. P25 looks its vocoder up on each call, M17 once at start.
 - **FM broadcast:** the mono and RDS checksum pins compare exact float bits, so they follow the C library's `sin` and `atan2`.
 - **Docs:** three design documents under `docs/superpowers` still name a network operator beside a pager frequency; field craft no longer does.
@@ -735,7 +734,7 @@ Seen again during plan 38 (2026-11-14 to 2026-11-16), each passing when re-run a
 
 ## Test: the UI suite's shards against their deadline
 
-Rebalanced in cleanup round 0 (the second shard starts at `ssb_entry_tunes_the_dial`): 213 scenarios, 368.9 s and 373.7 s of scenario time, 377.5 s wall against the 450 s `DEADLINE` (`crates/zeta/tests/ui.rs`), so about 70 s left. When new scenarios eat that, move the cut again from a `ZETA_UI_PROFILE` run, or add a shard, before raising the deadline.
+Split into three shards in cleanup round 3 (2026-11-19; `SHARDS` in `crates/zeta/tests/ui.rs`, the second and third starting at `kiwi_zoom_is_anchored_on_the_pointer` and `mute_in_mix_from_row_and_outline`). With 233 scenarios two shards took 404.9 s and 420.4 s wall against the 450 s `DEADLINE` (30 s left, already within 16 s of each other; the best two-shard cut, `menu_entry_table_is_whole`, gains about 8 s); three take 293.5 s, 246.5 s and 290.5 s (about 156 s left) on the 12-CPU host, and 419.5 s, 394.5 s and 419.9 s pinned to two CPUs (`taskset -c 0,1`, as on CI's runners: about 30 s left there). The harness now prints each shard's own wall time. The two zoom-anchoring scenarios take 82 s of it between them, most of it the settles that check a view does not move by itself. When new scenarios eat the pinned margin, move the cuts from a `ZETA_UI_PROFILE` run, or add a shard, before raising the deadline.
 
 ## Page: pointer movement over the page is costly
 
