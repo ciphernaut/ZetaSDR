@@ -67,7 +67,8 @@
 //       state, id, an `.events` cell (filled by overlays.js: a count of the job's events seen on its source's feed), on rows of an AUDIO_KINDS kind a
 //       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job, {role}) and, while
 //       running, a `button.transcribe` (Transcribe) calling onTranscribe(job, {role}) (ruling
-//       R14), a `button.graph` calling onGraph(job), and a Stop button applying `job_stop`.
+//       R14), both through actions.js's `listen` and `transcribe` entries (runAction), a
+//       `button.graph` calling onGraph(job), and a Stop button applying `job_stop`.
 //       `role` is null (the job's main stream) unless the job's mode row (audioKind) lists
 //       `voices`: such a row has a stream picker, a `select.voice` after ▶ with the options
 //       `main` (value "") and each voice, and `role` is the voice picked (remembered per job
@@ -149,6 +150,7 @@
 //       else the set whose running instance lists it in `running.members[].job` (`sets`:
 //       set_list's entries; `key` the set id, `title` its name)
 //   SET_STOP_CONFIRM_MS         how long a set group's Stop stays armed (3000)
+import { runAction } from "./actions.js";
 import { channelColour } from "./overlays.js";
 import { mixCovering } from "./mix.js";
 import { channelLabel } from "./plans.js";
@@ -779,6 +781,16 @@ function jobRow(
   const voices = audio ? (audioKind?.(job.kind)?.voices ?? []) : [];
   const picked = voices.length > 0 && voiceOf ? voiceOf(job.id) : null;
   const role = voices.includes(picked) ? picked : null;
+  // The row's ▶ and Transcribe are the job menu's Listen and Transcribe (actions.js).
+  const rowCtx = {
+    surface: "job",
+    job,
+    audio,
+    running: status === "running",
+    role,
+    play: onPlay,
+    transcribe: onTranscribe,
+  };
   if (audio && onPlay) {
     const on = playing ? playing(job.id) : false;
     const play = document.createElement("button");
@@ -786,7 +798,7 @@ function jobRow(
     play.textContent = on ? "■" : "▶";
     play.title = `${on ? "stop" : "play"} the audio${role ? ` (${role})` : ""}`;
     play.setAttribute("aria-pressed", String(on));
-    play.onclick = () => onPlay(job, { role });
+    play.onclick = () => runAction("listen", rowCtx);
     actions.append(play);
   }
   if (voices.length > 0 && onVoice) actions.append(voiceSelect(job, voices, role, onVoice));
@@ -795,7 +807,7 @@ function jobRow(
     tr.className = "transcribe";
     tr.textContent = "Transcribe";
     tr.title = `job_attach kind=transcribe job=${job.id}${role ? ` stream=${role}` : ""}`;
-    tr.onclick = () => onTranscribe(job, { role });
+    tr.onclick = () => runAction("transcribe", rowCtx);
     actions.append(tr);
   }
   const m = mute && status === "running" ? mute(job) : null;

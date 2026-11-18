@@ -43,6 +43,11 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
         include_bytes!("../web/menu.js"),
     ),
     (
+        "actions.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/actions.js"),
+    ),
+    (
         "audio.js",
         "text/javascript; charset=utf-8",
         include_bytes!("../web/audio.js"),
@@ -173,6 +178,7 @@ mod tests {
             ("waterfall.js", "text/javascript; charset=utf-8"),
             ("overlays.js", "text/javascript; charset=utf-8"),
             ("menu.js", "text/javascript; charset=utf-8"),
+            ("actions.js", "text/javascript; charset=utf-8"),
             ("audio.js", "text/javascript; charset=utf-8"),
             ("graph.js", "text/javascript; charset=utf-8"),
             ("voice.js", "text/javascript; charset=utf-8"),

@@ -84,8 +84,13 @@
 //                           client (x, y), kept inside the viewport; the first entry is focused
 //     menu.closeOutline()   hides it
 //     menu.destroy()
+//     The table's runs (actions.js) call the Menu's own methods: classify, iqRead, askAbout,
+//     startJob, fitAndStart, decodeAcross, scan, openSet, command, planGroupsOf (a box's ctx
+//     `sel`), and fitOutline, retuneWidth, toggle, mute, stopJob (a job).
+//   DENOISE_KINDS   the job kinds whose demodulator node takes `denoise`, by its stage kind
 //
-// Entries (`.ctx-item[data-action]`):
+// Entries (`.ctx-item[data-action]`), drawn from actions.js's table (ACTIONS: which entries a
+// surface offers, their labels, groups and when they apply); what each does:
 //   classify   What is this?                  notes "classify: running…", then classify
 //                                             {selection}; the layer-1 labels are drawn with
 //                                             ov.label at the selection's centre (stacked
@@ -239,7 +244,7 @@
 //
 // The outline menu (#ctx-outline, role menu; overlays.js opens it by right-click on a retunable
 // outline, or a long press on its label in the narrow footprint). Entries
-// (`.ctx-item[data-action]`, OUTLINE_ENTRIES), on the job's own source and tuning; Fit and the
+// (`.ctx-item[data-action]`, actions.js's `job` entries), on the job's own source and tuning; Fit and the
 // width presets only for a job whose kind is in FIT_KINDS (the others are hidden: the node
 // would refuse a decoder's or a passthrough's narrowing as often as not), Stop always:
 //   fit    Fit to signal   fitJob on the job (a wide box or its own band: see fitJob), then
@@ -274,6 +279,7 @@
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
 // as for #ctx.
 
+import { action as entryOf, offered } from "./actions.js";
 import { channelHolding, planGroups, planNoVoice } from "./plans.js";
 import { bandText, mhzText, registerLines, registerText } from "./units.js";
 import { capHz } from "./waterfall.js";
@@ -326,19 +332,6 @@ export const MEASURE_DC_MASK_HZ = 25000;
 export const DECODE_ACROSS_PERSIST_MS = 500;
 export const DECODE_ACROSS_WIDTH_FIT = [0.5, 2];
 
-const OUTLINE_ENTRIES = [
-  ["fit", "Fit to signal"],
-  ["w2500", "2.5 kHz"],
-  ["w5000", "5 kHz"],
-  ["w6250", "6.25 kHz"],
-  ["w12500", "12.5 kHz"],
-  ["w25000", "25 kHz"],
-  ["denoise", "Denoise on"],
-  ["stereo", "Stereo on"],
-  ["mute", "Mute in mix"],
-  ["stop", "Stop"],
-];
-
 // The job kinds whose demodulator node takes `denoise` (RNNoise on its audio), by the node's
 // stage kind: the voice demodulators; wfm_demod (music) has none.
 export const DENOISE_KINDS = new Map([
@@ -347,77 +340,13 @@ export const DENOISE_KINDS = new Map([
   ["ssb_demod", "ssb_demod"],
 ]);
 
-// The demodulator node of `job` (a job_list record with its graph) that takes `denoise`,
-// or null.
-function denoiseNode(job) {
-  const kind = DENOISE_KINDS.get(job.kind);
-  if (!kind) return null;
-  return ((job.graph && job.graph.nodes) || []).find((n) => n.kind === kind) || null;
+// The job an entry of the table starts ({kind, deviation, sideband}; a Transcribe entry's
+// twin's), or undefined.
+function jobOf(id) {
+  const e = entryOf(id);
+  if (!e) return undefined;
+  return e.twin ? entryOf(e.twin).job : e.job;
 }
-
-// The wfm_demod node of a wfm_demod `job`, the one that takes `stereo`, or null.
-function stereoNode(job) {
-  if (job.kind !== "wfm_demod") return null;
-  return ((job.graph && job.graph.nodes) || []).find((n) => n.kind === "wfm_demod") || null;
-}
-
-const ENTRIES = [
-  ["classify", "What is this?"],
-  ["capture", "Capture bursts"],
-  ["identify", "Identify (thorough)"],
-  ["watch", "Watch this band"],
-  ["decode_across", "Decode across this band…"],
-  ["aprs_decode", "Decode › APRS"],
-  ["pocsag_decode", "Decode › POCSAG"],
-  ["rds_decode", "Decode › RDS (FM station data)"],
-  ["adsb_decode", "Decode › ADS-B (dump1090)"],
-  ["acars_decode", "Decode › ACARS"],
-  ["video", "Decode video"],
-  ["fm_demod", "Decode › NBFM audio"],
-  ["wfm_demod", "Decode › FM broadcast audio"],
-  ["am_demod", "Decode › AM"],
-  ["ssb_usb", "Decode › SSB (USB)"],
-  ["ssb_lsb", "Decode › SSB (LSB)"],
-  ["wfm_transcribe", "Transcribe › FM broadcast"],
-  ["fm_transcribe", "Transcribe › NBFM voice"],
-  ["am_transcribe", "Transcribe › AM"],
-  ["ssb_usb_transcribe", "Transcribe › SSB (USB)"],
-  ["ssb_lsb_transcribe", "Transcribe › SSB (LSB)"],
-  ["measure", "Start background job › measure"],
-  ["plan", "Start plan…"],
-  ["set", "Start set…"],
-  ["scan", "Scan this span"],
-  ["iq_read", "Save selection as SigMF"],
-  ["ask", "Send to agent"],
-];
-// The job each decode entry starts: kind, deviation_hz and sideband.
-const JOBS = {
-  capture: { kind: "capture", deviation: null, sideband: null },
-  identify: { kind: "identify", deviation: null, sideband: null },
-  watch: { kind: "watch", deviation: null, sideband: null },
-  aprs_decode: { kind: "aprs_decode", deviation: null, sideband: null },
-  pocsag_decode: { kind: "pocsag_decode", deviation: null, sideband: null },
-  rds_decode: { kind: "rds_decode", deviation: null, sideband: null },
-  adsb_decode: { kind: "adsb_decode", deviation: null, sideband: null },
-  acars_decode: { kind: "acars_decode", deviation: null, sideband: null },
-  video: { kind: "video_decode", deviation: null, sideband: null },
-  fm_demod: { kind: "fm_demod", deviation: 5000, sideband: null },
-  wfm_demod: { kind: "wfm_demod", deviation: 75000, sideband: null },
-  am_demod: { kind: "am_demod", deviation: null, sideband: null },
-  ssb_usb: { kind: "ssb_demod", deviation: null, sideband: "usb" },
-  ssb_lsb: { kind: "ssb_demod", deviation: null, sideband: "lsb" },
-  measure: { kind: "measure", deviation: null, sideband: null },
-};
-// Each Transcribe entry's Decode twin: the job it starts before attaching to it.
-const TRANSCRIBE = {
-  wfm_transcribe: "wfm_demod",
-  fm_transcribe: "fm_demod",
-  am_transcribe: "am_demod",
-  ssb_usb_transcribe: "ssb_usb",
-  ssb_lsb_transcribe: "ssb_lsb",
-};
-// The JOBS entry an action starts (a Transcribe entry's twin's), or undefined.
-const jobOf = (action) => JOBS[TRANSCRIBE[action] ?? action];
 
 // Why "Decode video" cannot start on `src` (a source_list record) for a box `bandwidthHz`
 // wide: the lease's refusal, `insufficient bandwidth: <id> delivers at most <cap> Hz`, with
@@ -436,8 +365,8 @@ export function videoRefusal(src, bandwidthHz) {
 // ADSB_BANDWIDTH_HZ; everything else uses the selection as is. A Transcribe entry tunes as
 // its Decode twin.
 export function jobTuning(action, s) {
-  action = TRANSCRIBE[action] ?? action;
-  const sb = JOBS[action] ? JOBS[action].sideband : null;
+  action = (action && entryOf(action)?.twin) ?? action;
+  const sb = jobOf(action)?.sideband ?? null;
   if (sb === "usb") return { centerHz: s.centerHz - SSB_DIAL_OFFSET_HZ, bandwidthHz: SSB_BANDWIDTH_HZ };
   if (sb === "lsb") return { centerHz: s.centerHz + SSB_DIAL_OFFSET_HZ, bandwidthHz: SSB_BANDWIDTH_HZ };
   if (action === "adsb_decode") return { centerHz: s.centerHz, bandwidthHz: ADSB_BANDWIDTH_HZ };
@@ -681,52 +610,17 @@ class Menu {
     this.sel = null;
     // The fit in progress (its generation token) or null; close() bumps fitGen.
     this.fitting = null;
-    this.videoRefused = null; // why "Decode video" cannot start on the open box (videoRefusal)
     this.fitGen = 0;
     this.labelKeys = [];
     this.pointer = { x: 0, y: 0 };
+    // modes_list's rows (a promise), read once per page; `rows` once it answered.
+    this.modesRead = null;
+    this.rows = null;
 
     this.el = document.createElement("div");
     this.el.id = "ctx";
     this.el.setAttribute("role", "menu");
     this.el.hidden = true;
-    for (const [action, text] of ENTRIES) {
-      const item = document.createElement("button");
-      item.className = "ctx-item";
-      item.dataset.action = action;
-      item.setAttribute("role", "menuitem");
-      item.textContent = text;
-      item.addEventListener("click", () => this.choose(action));
-      if (jobOf(action) && jobOf(action).sideband) {
-        const idle = () => this.sel && this.fitting === null;
-        const show = () => idle() && this.showFooter(this.current(), action);
-        const hide = () => idle() && this.showFooter(this.current());
-        item.addEventListener("focus", show);
-        item.addEventListener("pointerenter", show);
-        item.addEventListener("blur", hide);
-        item.addEventListener("pointerleave", hide);
-      }
-      this.el.append(item);
-      if (action === "plan") {
-        // The plan's named groups, filled on open.
-        this.planGroupsEl = document.createElement("div");
-        this.planGroupsEl.className = "ctx-plan-groups";
-        this.planGroupsEl.setAttribute("role", "group");
-        this.el.append(this.planGroupsEl);
-      }
-      if (action === "decode_across") {
-        item.setAttribute("aria-haspopup", "true");
-        item.addEventListener("pointerenter", () => this.showSub(true));
-        this.sub = document.createElement("div");
-        this.sub.className = "ctx-sub";
-        this.sub.dataset.for = action;
-        this.sub.setAttribute("role", "group");
-        this.sub.hidden = true;
-        this.el.append(this.sub);
-      }
-    }
-    // The ready mode rows (a promise of modes_list's entries), read once per page.
-    this.readyRows = null;
     this.footer = document.createElement("div");
     this.footer.id = "ctx-footer";
     this.el.append(this.footer);
@@ -738,15 +632,6 @@ class Menu {
     this.outlineEl.id = "ctx-outline";
     this.outlineEl.setAttribute("role", "menu");
     this.outlineEl.hidden = true;
-    for (const [action, text] of OUTLINE_ENTRIES) {
-      const item = document.createElement("button");
-      item.className = "ctx-item";
-      item.dataset.action = action;
-      item.setAttribute("role", "menuitem");
-      item.textContent = text;
-      item.addEventListener("click", () => this.chooseOutline(action));
-      this.outlineEl.append(item);
-    }
     this.outlineFooter = document.createElement("div");
     this.outlineFooter.id = "ctx-outline-footer";
     this.outlineEl.append(this.outlineFooter);
@@ -823,12 +708,42 @@ class Menu {
     document.addEventListener("pointerdown", this.onPointerDown, true);
     document.addEventListener("keydown", this.onKey);
     wf.onSelect((sel) => this.open(sel, this.pointer.x, this.pointer.y));
+    // Read the rows before the first box, so its menu opens with them.
+    this.modeRows();
   }
 
   // The selection with its span clamped, as the footer shows it.
   current() {
     const s = this.sel;
     return { ...s, ...clampSpan(s.startNs, s.endNs, newestNs(this.wf)) };
+  }
+
+  // The box menu's ctx (actions.js) for the open selection, its span clamped now.
+  boxCtx() {
+    return {
+      surface: "box",
+      host: this,
+      sel: this.current(),
+      plan: this.plan(),
+      sets: this.readySets(),
+      rows: this.rows,
+      src: (this.sources() || []).find((x) => x.id === this.sel.sourceId),
+    };
+  }
+
+  // The outline menu's ctx (actions.js) for `job`.
+  jobCtx(job) {
+    return {
+      surface: "job",
+      host: this,
+      job,
+      mute: this.muteFor(job),
+      audio: false,
+      running: job.state?.status === "running",
+      role: null,
+      play: () => {},
+      transcribe: () => {},
+    };
   }
 
   // The selection, or with an SSB `action` the dial that entry tunes.
@@ -849,35 +764,140 @@ class Menu {
     return typeof d === "number" ? ` ring ${d.toFixed(1)} s` : "";
   }
 
+  // Draws `root`'s entries from the table for `ctx` (offered on its surface, in table order),
+  // `footer` last.
+  paint(root, footer, ctx) {
+    const nodes = [];
+    for (const entry of offered(ctx.surface, ctx)) {
+      const item = this.item(entry, ctx);
+      nodes.push(item);
+      if (entry.items) {
+        const group = document.createElement("div");
+        group.className = "ctx-plan-groups";
+        group.setAttribute("role", "group");
+        group.append(
+          ...entry.items(ctx).map((x) => {
+            const el = this.button(entry.id, x.label, () => this.choose(entry, x.run));
+            el.dataset.group = x.key;
+            el.removeAttribute("data-action");
+            if (x.title) el.title = x.title;
+            return el;
+          }),
+        );
+        nodes.push(group);
+      }
+      if (entry.sub) {
+        const sub = document.createElement("div");
+        sub.className = "ctx-sub";
+        sub.dataset.for = entry.id;
+        sub.setAttribute("role", "group");
+        sub.hidden = true;
+        sub.append(
+          ...entry.sub(ctx).map((x) => {
+            const el = this.button(entry.id, x.label, () => this.choose(entry, x.run));
+            el.removeAttribute("data-action");
+            el.dataset.mode = x.key;
+            return el;
+          }),
+        );
+        item.setAttribute("aria-haspopup", "true");
+        item.setAttribute("aria-expanded", "false");
+        const show = () => {
+          sub.hidden = false;
+          item.setAttribute("aria-expanded", "true");
+        };
+        item.addEventListener("pointerenter", show);
+        // Shown, never toggled: the pointer reaching the entry already showed it.
+        item.addEventListener("click", () => {
+          if (this.fitting !== null) return;
+          show();
+          sub.querySelector(".ctx-item")?.focus({ preventScroll: true });
+        });
+        nodes.push(sub);
+      }
+    }
+    root.replaceChildren(...nodes, footer);
+  }
+
+  // A `.ctx-item` for `entry` (`id` its data-action) reading `label`, calling `onClick`.
+  button(id, label, onClick) {
+    const item = document.createElement("button");
+    item.className = "ctx-item";
+    item.dataset.action = id;
+    item.setAttribute("role", "menuitem");
+    item.textContent = label;
+    if (onClick) item.addEventListener("click", onClick);
+    return item;
+  }
+
+  // The `.ctx-item` of a table entry: its label for ctx, greyed when `disabled` says why, an
+  // SSB entry's dial in the footer while it is hovered or focused.
+  item(entry, ctx) {
+    const label = typeof entry.label === "function" ? entry.label(ctx) : entry.label;
+    const item = this.button(entry.id, label, entry.sub ? null : () => this.choose(entry));
+    const refused = entry.disabled ? entry.disabled(ctx) : null;
+    if (refused) {
+      item.setAttribute("aria-disabled", "true");
+      item.dataset.refused = "true";
+      item.title = refused;
+    }
+    if (ctx.surface === "box" && jobOf(entry.id)?.sideband) {
+      const idle = () => this.sel && this.fitting === null;
+      const show = () => idle() && this.showFooter(this.current(), entry.id);
+      const hide = () => idle() && this.showFooter(this.current());
+      item.addEventListener("focus", show);
+      item.addEventListener("pointerenter", show);
+      item.addEventListener("blur", hide);
+      item.addEventListener("pointerleave", hide);
+    }
+    return item;
+  }
+
+  // Chooses `entry` (or one of its items or submenu rows, `run`) on the open menu: nothing
+  // while a fit runs or while it is greyed; the menu closes first unless the entry keeps it
+  // open; the box's ctx is taken now (its span clamped again).
+  async choose(entry, run = (c) => entry.run(c)) {
+    if (this.fitting !== null) return;
+    const box = !this.el.hidden;
+    if (box ? !this.sel : !this.outlineJob) return;
+    const ctx = box ? this.boxCtx() : this.jobCtx(this.outlineJob);
+    if (entry.disabled && entry.disabled(ctx)) return;
+    if (box) this.showFooter(ctx.sel, entry.id);
+    if (!entry.keep) {
+      if (box) this.close();
+      else this.closeOutline();
+    }
+    return run(ctx);
+  }
+
   open(sel, x, y) {
     if (!this.wf.sourceId) return;
     // A new box cancels a fit still running for the previous one.
     this.fitGen += 1;
     this.setFitting(null);
     this.sel = { ...sel, sourceId: this.wf.sourceId };
+    this.paint(this.el, this.footer, this.boxCtx());
     this.showFooter(this.current());
-    // `Start plan…` only where the view's plan policy names a plan, its groups after it.
-    const plan = this.plan();
-    this.el.querySelector('[data-action="plan"]').hidden = plan === null;
-    this.fillPlanGroups(plan);
-    // `Start set…` only when set_list has a ready set.
-    this.el.querySelector('[data-action="set"]').hidden = this.readySets().length === 0;
-    this.fillSub(this.sel);
-    const src = (this.sources() || []).find((x) => x.id === this.sel.sourceId);
-    this.videoRefused = videoRefusal(src, this.sel.bandwidthHz);
-    this.paintVideoEntry();
+    // The rows' first answer draws the menu again (Decode across's rows).
+    if (this.rows === null) {
+      const at = this.sel;
+      this.modeRows().then(() => {
+        if (this.sel === at && !this.el.hidden && this.fitting === null) {
+          this.paint(this.el, this.footer, this.boxCtx());
+        }
+      });
+    }
     this.el.hidden = false;
     // Keep it inside the viewport.
     const w = this.el.offsetWidth;
     const h = this.el.offsetHeight;
     this.el.style.left = `${Math.max(0, Math.min(x, window.innerWidth - w))}px`;
     this.el.style.top = `${Math.max(0, Math.min(y, window.innerHeight - h))}px`;
-    this.el.querySelector(".ctx-item").focus({ preventScroll: true });
+    this.el.querySelector(".ctx-item")?.focus({ preventScroll: true });
   }
 
   close() {
     this.el.hidden = true;
-    this.showSub(false);
     this.wf.clearSelection();
     // A fit in progress is cancelled: its result no longer belongs to an open menu.
     this.fitGen += 1;
@@ -891,27 +911,7 @@ class Menu {
     this.setFitting(null);
     this.outlineJob = job;
     const t = job.tuning;
-    // Fit and the width presets only for the demodulators, Denoise for the voice ones and
-    // Stereo for FM broadcast (each reading the state it would switch to); Stop always.
-    const fits = FIT_KINDS.has(job.kind);
-    const dn = denoiseNode(job);
-    const st = stereoNode(job);
-    for (const item of this.outlineEl.querySelectorAll(".ctx-item")) {
-      const action = item.dataset.action;
-      if (action === "mute") {
-        const m = this.muteFor(job);
-        item.hidden = m === null;
-        item.textContent = m && m.muted ? "Unmute in mix" : "Mute in mix";
-      } else if (action === "denoise") {
-        item.hidden = dn === null;
-        item.textContent = dn && dn.params && dn.params.denoise ? "Denoise off" : "Denoise on";
-      } else if (action === "stereo") {
-        item.hidden = st === null;
-        item.textContent = st && st.params && st.params.stereo ? "Stereo off" : "Stereo on";
-      } else {
-        item.hidden = action !== "stop" && !fits;
-      }
-    }
+    this.paint(this.outlineEl, this.outlineFooter, this.jobCtx(job));
     this.outlineFooter.textContent =
       `job=${job.id} center_hz=${t.center_hz} bandwidth_hz=${t.bandwidth_hz}`;
     this.outlineEl.hidden = false;
@@ -919,7 +919,7 @@ class Menu {
     const h = this.outlineEl.offsetHeight;
     this.outlineEl.style.left = `${Math.max(0, Math.min(x, window.innerWidth - w))}px`;
     this.outlineEl.style.top = `${Math.max(0, Math.min(y, window.innerHeight - h))}px`;
-    this.outlineEl.querySelector(".ctx-item:not([hidden])").focus({ preventScroll: true });
+    this.outlineEl.querySelector(".ctx-item")?.focus({ preventScroll: true });
   }
 
   closeOutline() {
@@ -927,13 +927,6 @@ class Menu {
     this.outlineJob = null;
     this.fitGen += 1;
     this.setFitting(null);
-  }
-
-  async chooseOutline(action) {
-    const job = this.outlineJob;
-    if (!job || this.fitting !== null) return;
-    if (action === "fit") return this.fitOutline(job);
-    await this.chooseOutlineAction(action, job);
   }
 
   // Fit to signal on a running job's band. A conflict on the measure start gets the usual
@@ -1013,130 +1006,74 @@ class Menu {
     }
   }
 
-  async chooseOutlineAction(action, job) {
-    const t = job.tuning;
-    this.closeOutline();
-    if (action === "stop") {
-      await this.applyOp({ op: "job_stop", job: job.id });
-    } else if (action === "mute") {
-      // The mix's own graph, read now, with this channel added to (or taken off) `muted`.
-      const m = this.muteFor(job);
-      if (!m) return;
-      const r = await m.run();
-      if (r) this.t.note(`${job.kind}: ${r.muted ? "muted" : "unmuted"} in mix`);
-    } else if (action === "denoise") {
-      // The job's own graph with the flag flipped: a carried param, so the node keeps the
-      // job re-expandable and relaunches it under its id (an attached transcribe follows).
-      const dn = denoiseNode(job);
-      if (!dn) return;
-      const on = !(dn.params && dn.params.denoise);
-      const graph = JSON.parse(JSON.stringify(job.graph));
-      for (const n of graph.nodes) {
-        if (n.kind === dn.kind) n.params = { ...(n.params || {}), denoise: on };
-      }
-      const r = await this.applyOp({ op: "graph_put", job: job.id, graph });
-      if (r) this.t.note(`${job.kind}: denoise ${on ? "on" : "off"}`);
-    } else if (action === "stereo") {
-      // As Denoise: `stereo` is carried too, and the relaunch gives the job two channels.
-      const st = stereoNode(job);
-      if (!st) return;
-      const on = !(st.params && st.params.stereo);
-      const graph = JSON.parse(JSON.stringify(job.graph));
-      for (const n of graph.nodes) {
-        if (n.kind === "wfm_demod") n.params = { ...(n.params || {}), stereo: on };
-      }
-      const r = await this.applyOp({ op: "graph_put", job: job.id, graph });
-      if (r) this.t.note(`${job.kind}: stereo ${on ? "on" : "off"}`);
-    } else if (/^w\d+$/.test(action)) {
-      await this.applyOp({
-        op: "job_retune",
-        job: job.id,
-        center_hz: t.center_hz,
-        bandwidth_hz: Number(action.slice(1)),
-        replace: [],
-      });
-    }
+  // A width preset: job_retune to `hz` about the job's centre.
+  retuneWidth(job, hz) {
+    return this.applyOp({
+      op: "job_retune",
+      job: job.id,
+      center_hz: job.tuning.center_hz,
+      bandwidth_hz: hz,
+      replace: [],
+    });
   }
 
-  // The ready rows of `modes_list`, read on first use and cached (a failure is tried again
-  // at the next opening).
+  // Denoise or Stereo: the job's own graph with `param` flipped on `node`'s kind. A carried
+  // param, so the node keeps the job re-expandable and relaunches it under its id (an attached
+  // transcribe follows); stereo gives the relaunched job two channels.
+  async toggle(job, node, param) {
+    if (!node) return;
+    const on = !(node.params && node.params[param]);
+    const graph = JSON.parse(JSON.stringify(job.graph));
+    for (const n of graph.nodes) {
+      if (n.kind === node.kind) n.params = { ...(n.params || {}), [param]: on };
+    }
+    const r = await this.applyOp({ op: "graph_put", job: job.id, graph });
+    if (r) this.t.note(`${job.kind}: ${param} ${on ? "on" : "off"}`);
+  }
+
+  // Mute in mix: the covering mix's own graph, read now, with this channel added to (or taken
+  // off) `muted`.
+  async mute(job) {
+    const m = this.muteFor(job);
+    if (!m) return;
+    const r = await m.run();
+    if (r) this.t.note(`${job.kind}: ${r.muted ? "muted" : "unmuted"} in mix`);
+  }
+
+  stopJob(job) {
+    return this.applyOp({ op: "job_stop", job: job.id });
+  }
+
+  // modes_list's rows, read on first use and kept (a failure is tried again at the next
+  // opening); `this.rows` once they came.
   modeRows() {
-    if (!this.readyRows) {
-      this.readyRows = this.ov.api
-        .op({ op: "modes_list", family: null, state: "ready" })
-        .then((r) => ((r && r.value && r.value.modes) || []).filter((m) => m.state === "ready"))
+    if (!this.modesRead) {
+      this.modesRead = this.ov.api
+        .op({ op: "modes_list", family: null, state: null })
+        .then((r) => {
+          this.rows = (r && r.value && r.value.modes) || [];
+          return this.rows;
+        })
         .catch(() => {
-          this.readyRows = null;
+          this.modesRead = null;
           return [];
         });
     }
-    return this.readyRows;
+    return this.modesRead;
   }
 
-  // One `Start plan › <name>` entry per named group of `plan` (none for null), but for a
-  // group whose channels are all data channels (`no_voice`): the entry starts voice
-  // demodulators and transcribers.
-  fillPlanGroups(plan) {
-    const noVoice = plan === null ? [] : planNoVoice(plan);
-    const groups = (plan === null ? [] : planGroups(plan)).filter(
-      (g) => !g.channels.every((n) => noVoice.includes(n)),
-    );
-    this.planGroupsEl.replaceChildren(
-      ...groups.map((g) => {
-        const item = document.createElement("button");
-        item.className = "ctx-item";
-        item.dataset.group = g.id;
-        item.setAttribute("role", "menuitem");
-        item.textContent = `Start plan › ${g.name}`;
-        item.title = `${plan} channels ${g.channels.join(", ")}`;
-        item.addEventListener("click", () => {
-          this.close();
-          this.command(`plan start ${plan} fm_demod transcribe group ${g.id}`);
-        });
-        return item;
-      }),
-    );
-  }
-
-  // The "Decode across" submenu for selection `sel`: the ready rows no wider than it; the
-  // entry hidden when none fits. Hidden until asked for.
-  async fillSub(sel) {
-    this.showSub(false);
-    const rows = await this.modeRows();
-    if (this.sel !== sel) return;
-    const fit = rows.filter(
-      (r) => typeof r.band?.bandwidth_hz === "number" && r.band.bandwidth_hz <= sel.bandwidthHz,
-    );
-    this.sub.replaceChildren(
-      ...fit.map((row) => {
-        const item = document.createElement("button");
-        item.className = "ctx-item";
-        item.dataset.mode = row.id;
-        item.setAttribute("role", "menuitem");
-        item.textContent = `Decode ${row.name} across this band`;
-        item.addEventListener("click", () => this.decodeAcross(row));
-        return item;
-      }),
-    );
-    this.el.querySelector('[data-action="decode_across"]').hidden = fit.length === 0;
-  }
-
-  // Shows (`on`) or hides the "Decode across" submenu; an empty one stays hidden.
-  showSub(on) {
-    if (!this.sub) return;
-    this.sub.hidden = !on || this.sub.childElementCount === 0;
-    this.el
-      .querySelector('[data-action="decode_across"]')
-      .setAttribute("aria-expanded", String(!this.sub.hidden));
+  // The named groups of `plan` that a voice entry may start (none for null): every one but a
+  // group whose channels are all data channels (`no_voice`).
+  planGroupsOf(plan) {
+    if (plan === null) return [];
+    const noVoice = planNoVoice(plan);
+    return planGroups(plan).filter((g) => !g.channels.every((n) => noVoice.includes(n)));
   }
 
   // A watch on the selection that decodes `row` directly (plan 31 spec 4.7, call 5.1: the
   // page keeps the two-op form): job_start, then its `detect` node's modes, persist_ms and
   // width_hz by graph_put.
-  async decodeAcross(row) {
-    if (!this.sel || this.fitting !== null) return;
-    const s = this.current();
-    this.close();
+  async decodeAcross(row, s) {
     const r = await this.startJob("watch", s);
     if (!r || r.result !== "job" || !r.value) return;
     const id = r.value;
@@ -1170,7 +1107,8 @@ class Menu {
     return rec && rec.id === id ? rec : null;
   }
 
-  // Marks fit `token` in progress (null: none), the entries aria-disabled meanwhile.
+  // Marks fit `token` in progress (null: none), the entries aria-disabled meanwhile (a greyed
+  // entry, `data-refused`, stays so).
   setFitting(token) {
     this.fitting = token;
     const items = [
@@ -1178,22 +1116,8 @@ class Menu {
       ...this.outlineEl.querySelectorAll(".ctx-item"),
     ];
     for (const item of items) {
-      if (token === null) item.removeAttribute("aria-disabled");
+      if (token === null && !item.dataset.refused) item.removeAttribute("aria-disabled");
       else item.setAttribute("aria-disabled", "true");
-    }
-    if (token === null) this.paintVideoEntry();
-  }
-
-  // "Decode video" greyed, its title the lease's words, while this.videoRefused (open()) says
-  // the shown radio cannot carry the box; choose() refuses it on the same value.
-  paintVideoEntry() {
-    const item = this.el.querySelector('[data-action="video"]');
-    if (this.videoRefused) {
-      item.setAttribute("aria-disabled", "true");
-      item.title = this.videoRefused;
-    } else {
-      if (this.fitting === null) item.removeAttribute("aria-disabled");
-      item.removeAttribute("title");
     }
   }
 
@@ -1213,76 +1137,57 @@ class Menu {
     });
   }
 
-  async choose(action) {
-    // A fit in progress ignores further choices (a double click starts one job).
-    if (!this.sel || this.fitting !== null) return;
-    if (action === "video" && this.videoRefused) return;
-    if (action === "decode_across") {
-      // Shown, never toggled: the pointer reaching the entry already showed it.
-      this.showSub(true);
-      this.sub.querySelector(".ctx-item")?.focus({ preventScroll: true });
-      return;
-    }
-    const s = this.current();
-    this.showFooter(s, action);
-    const job = jobOf(action);
-    // "Capture bursts" is fitted first like a demodulator, but a running capture has no retune.
-    if (job && (FIT_KINDS.has(job.kind) || job.kind === "capture")) {
-      await this.fitAndStart(action, s, job);
-      return;
-    }
-    this.close();
-    const selection = {
+  // The node's `selection` for `s` (a selection with its span).
+  selection(s) {
+    return {
       source: s.sourceId,
       span: { start_ns: s.startNs, end_ns: s.endNs },
       center_hz: s.centerHz,
       bandwidth_hz: s.bandwidthHz,
     };
-    if (action === "classify") {
-      this.t.note("classify: running…");
-      let r = await this.applyOp({ op: "classify", selection }, { errors: true });
-      if (r && r.error === "ring" && r.detail?.cause === "too_old") r = await this.reclassify(selection, r.detail);
-      if (r && r.result === "classification" && r.value) {
-        this.showLabels(s, r.value.labels || []);
-        for (const t of r.value.tried || []) {
-          this.t.note(`tried ${t.mode} ${Number(t.score).toFixed(2)} ${t.outcome}`);
-        }
-        // An older node sends no `register`: its allocations' one line.
-        const reg = r.value.register
-          ? registerLines(r.value.register)
-          : [registerText(r.value.allocations)].filter(Boolean);
-        for (const line of reg) this.t.note(line);
-        const o = r.value.origins;
-        if (o) this.onOrigins(`classify:${o.t_ns}`, o);
+  }
+
+  // What is this?: classify on `s` (see the header).
+  async classify(s) {
+    const selection = this.selection(s);
+    this.t.note("classify: running…");
+    let r = await this.applyOp({ op: "classify", selection }, { errors: true });
+    if (r && r.error === "ring" && r.detail?.cause === "too_old") r = await this.reclassify(selection, r.detail);
+    if (r && r.result === "classification" && r.value) {
+      this.showLabels(s, r.value.labels || []);
+      for (const t of r.value.tried || []) {
+        this.t.note(`tried ${t.mode} ${Number(t.score).toFixed(2)} ${t.outcome}`);
       }
-    } else if (action === "iq_read") {
-      const r = await this.applyOp({ op: "iq_read", selection });
-      if (r && r.result === "iq" && r.value) {
-        this.t.note(`saved ${r.value.samples} samples to ${r.value.path}`);
-      }
-    } else if (action === "ask") {
-      await this.ask(
-        `Look at ${s.centerHz} Hz, ${s.bandwidthHz} Hz wide, on ${s.sourceId}, ` +
-          `from ${s.startNs} to ${s.endNs}: what is it?`,
-      );
-    } else if (action === "plan") {
-      const plan = this.plan();
-      if (plan !== null) this.command(`plan start ${plan} fm_demod transcribe`);
-    } else if (action === "set") {
-      this.openSet(s.sourceId);
-    } else if (action === "scan") {
-      await this.scan(s);
-    } else if (jobOf(action)) {
-      const r = await this.startJob(action, s);
-      if (action in TRANSCRIBE && r && r.result === "job" && r.value) {
-        await this.applyOp(this.attachOp(r.value));
-      }
+      // An older node sends no `register`: its allocations' one line.
+      const reg = r.value.register
+        ? registerLines(r.value.register)
+        : [registerText(r.value.allocations)].filter(Boolean);
+      for (const line of reg) this.t.note(line);
+      const o = r.value.origins;
+      if (o) this.onOrigins(`classify:${o.t_ns}`, o);
     }
   }
 
-  // A demodulator entry (Decode or Transcribe): fit, then start (see Fitting); a Transcribe
-  // entry attaches to the job after, as choose does.
-  async fitAndStart(action, s, job, replace = []) {
+  // Save selection as SigMF: iq_read on `s`.
+  async iqRead(s) {
+    const r = await this.applyOp({ op: "iq_read", selection: this.selection(s) });
+    if (r && r.result === "iq" && r.value) {
+      this.t.note(`saved ${r.value.samples} samples to ${r.value.path}`);
+    }
+  }
+
+  // Send to agent: asks about `s`, naming its radio.
+  askAbout(s) {
+    return this.ask(
+      `Look at ${s.centerHz} Hz, ${s.bandwidthHz} Hz wide, on ${s.sourceId}, ` +
+        `from ${s.startNs} to ${s.endNs}: what is it?`,
+    );
+  }
+
+  // A demodulator entry (Decode or Transcribe) or Capture bursts: fit, then start (see
+  // Fitting); a Transcribe entry attaches to the job after.
+  async fitAndStart(action, s, replace = []) {
+    const job = jobOf(action);
     this.footer.textContent = "measuring…";
     // While it runs, an SSB entry's hover no longer rewrites the footer and choose ignores
     // further choices; a close() meanwhile (Escape, a press outside, a new box) bumps fitGen.
@@ -1294,7 +1199,7 @@ class Menu {
     try {
       // A conflict's retry runs this whole fit-and-start again with the holders `replace`d.
       const start = (op) =>
-        this.applyOp(op, { retry: (holders) => this.fitAndStart(action, s, job, holders) });
+        this.applyOp(op, { retry: (holders) => this.fitAndStart(action, s, holders) });
       fit = await fitBand(this.ov.api, s.sourceId, s.centerHz, s.bandwidthHz, start, replace);
     } catch (e) {
       error = e;
@@ -1329,7 +1234,7 @@ class Menu {
         this.t.note(fittedNote(kind, t, fit));
       }
     }
-    if (action in TRANSCRIBE && r && r.result === "job" && r.value) {
+    if (entryOf(action)?.twin && r && r.result === "job" && r.value) {
       await this.applyOp(this.attachOp(r.value));
     }
   }

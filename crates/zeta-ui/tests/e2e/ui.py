@@ -5565,6 +5565,40 @@ NEW_DECODE_ENTRIES = [
 ]
 
 
+# Every `data-action` the two menus had before they were drawn from one table (actions.js).
+MENU_ACTION_IDS = [
+    "classify", "capture", "identify", "watch", "decode_across", "aprs_decode", "pocsag_decode",
+    "rds_decode", "adsb_decode", "acars_decode", "video", "fm_demod", "wfm_demod", "am_demod",
+    "ssb_usb", "ssb_lsb", "wfm_transcribe", "fm_transcribe", "am_transcribe",
+    "ssb_usb_transcribe", "ssb_lsb_transcribe", "measure", "plan", "set", "scan", "iq_read",
+    "ask", "fit", "w2500", "w5000", "w6250", "w12500", "w25000", "denoise", "stereo", "mute",
+    "stop",
+]
+
+
+def scenario_menu_entry_table_is_whole(page, url, secret):
+    # actions.js, imported on the page: every entry has a group on each surface it is offered
+    # on and at least one surface, the ids are unique, and every old id is still there.
+    login(page, url, secret)
+    got = page.evaluate(
+        """async () => {
+          const a = await import('./actions.js');
+          return a.ACTIONS.map((e) => ({
+            id: e.id,
+            on: e.on,
+            groups: e.on.map((s) => a.groupOf(e, s)),
+            known: e.on.map((s) => (a.GROUPS[s] || []).some((g) => g.id === a.groupOf(e, s))),
+          }));
+        }""")
+    ids = [e["id"] for e in got]
+    assert len(ids) == len(set(ids)), f"duplicate ids {ids}"
+    missing = [i for i in MENU_ACTION_IDS if i not in ids]
+    assert not missing, f"ids gone from the table: {missing}"
+    for e in got:
+        assert e["on"] and set(e["on"]) <= {"box", "job"}, f"surfaces {e}"
+        assert all(isinstance(g, str) and g for g in e["groups"]), f"groups {e}"
+
+
 def scenario_decode_menu_lists_new_kinds(page, url, secret):
     menu = open_menu_on_tone(page, url, secret)
     items = menu.locator(".ctx-item").evaluate_all(
