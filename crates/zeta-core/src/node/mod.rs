@@ -87,6 +87,12 @@ pub fn ring_seconds_for(budget_bytes: u64, rate_hz: u64, max_seconds: f64) -> f6
     s.max(1.0).min(max_seconds)
 }
 
+/// The note an accept leaves when a `learned_<id>` row file (`mode`) was already there: the
+/// operator's, kept as is. A retract or delete never removes a file whose record says so.
+fn kept_note(mode: &str) -> String {
+    format!("row {mode} already present: kept as is")
+}
+
 pub struct NodeConfig {
     pub state_dir: PathBuf,
     /// Longest ring history in seconds; a fast source gets less, see [`ring_seconds_for`].
@@ -1877,7 +1883,7 @@ impl Node {
             Some(dir) => {
                 let path = dir.join(format!("{mode}.json"));
                 let file = path.display().to_string();
-                let kept = format!("row {mode} already present: kept as is");
+                let kept = kept_note(&mode);
                 let written = serde_json::to_vec_pretty(&learned_row(&rec, &mode))
                     .map_err(std::io::Error::other)
                     .and_then(|json| {
@@ -1927,10 +1933,12 @@ impl Node {
     /// `signature_retract`: the accepted record `id` becomes `retracted` (refused, naming
     /// its state, unless it is accepted), then what its accept did is undone on the
     /// running node: the `learned_<id>` row the accept wrote leaves the modes directory
-    /// and the registry, and its captures are unpinned unless a remaining record that
-    /// pins ([`crate::signatures::SignatureState::pins`]) still lists them. The layer-2
-    /// scorer reads only accepted records, so the next classify no longer labels with
-    /// it. Under the signature gate, as an accept is.
+    /// and the registry ([`Node::remove_learned_row`]), and its captures are unpinned
+    /// unless a remaining record that pins ([`crate::signatures::SignatureState::pins`])
+    /// still lists them. The layer-2 scorer reads only accepted records, so the next
+    /// classify no longer labels with it. Under the signature gate, as an accept is. Once
+    /// the record is retracted nothing fails the op: a row file kept or a capture left
+    /// pinned is a warning, in the answer's `decoder_note` and in `persist_errors`.
     pub fn signature_retract(
         &self,
         id: &str,
@@ -1942,13 +1950,13 @@ impl Node {
             .retract(id, now().0)
             .map_err(|e| self.signature_error_not(e, SignatureState::Accepted))?;
         let rec = self.remove_learned_row(rec);
-        self.unpin_released(&rec)?;
-        Ok(rec)
+        Ok(self.unpin_released(rec))
     }
 
     /// `signature_delete`: remove the record `id` in any state (its file goes too), then
-    /// undo what an accept of it did, as [`Node::signature_retract`] does. The record as
-    /// it stood.
+    /// undo what an accept of it did, as [`Node::signature_retract`] does, trying again
+    /// what a retract of it could not undo. The answer is the record as it stood, its
+    /// `decoder_note` saying what became of the row and carrying any warning.
     pub fn signature_delete(
         &self,
         id: &str,
@@ -1959,41 +1967,56 @@ impl Node {
             .delete(id)
             .map_err(|e| self.signature_error(e))?;
         // The record is gone: its row and pins are undone on what it was.
-        let undone = self.remove_learned_row(rec.clone());
-        self.unpin_released(&undone)?;
-        Ok(rec)
+        let rec = self.remove_learned_row(rec);
+        Ok(self.unpin_released(rec))
     }
 
-    /// Remove the `learned_<id>` row of `rec` that its accept wrote (its `decoder` set
-    /// with no `decoder_note`: a row file found there before the accept, `kept as is`,
-    /// is the operator's and stays), reload the rows, and note it on the record if the
-    /// store still holds it: `decoder` and `decoder_file` cleared, `decoder_note` `row
-    /// <mode> removed: the signature was retracted`. A file that cannot be removed is a
-    /// note too (`row <mode> not removed: <error>`), the row left in place.
+    /// Remove the `learned_<id>` row of `rec`, reload the rows, and note it on the record
+    /// if the store still holds it: `decoder` and `decoder_file` cleared, `decoder_note`
+    /// `row <mode> removed: the signature was retracted`. Only a file the accept wrote
+    /// and nobody changed goes: `decoder` and `decoder_file` set, the note not the
+    /// accept's [`kept_note`] (a file there before the accept is the operator's), and its
+    /// row equal, parsed, to the [`crate::signatures::learned_row`] the accept wrote
+    /// (parsed, so a row another build wrote or reformatted still compares equal). A
+    /// note left by an earlier removal that failed does not stop this one. A file kept
+    /// (the operator's, edited, unreadable) or that cannot be removed stays in place,
+    /// `decoder` and `decoder_file` with it, and is a warning ([`Node::warn_signature`])
+    /// ending `it now outlives its record`.
     fn remove_learned_row(
         &self,
         rec: crate::signatures::SignatureRecord,
     ) -> crate::signatures::SignatureRecord {
-        let (Some(mode), Some(file), None) = (&rec.decoder, &rec.decoder_file, &rec.decoder_note)
-        else {
+        const OUTLIVES: &str = "it now outlives its record";
+        let (Some(mode), Some(file)) = (rec.decoder.clone(), rec.decoder_file.clone()) else {
             return rec;
         };
-        let (decoder, file, note) = match std::fs::remove_file(file) {
-            Ok(()) => (
-                None,
-                None,
-                format!("row {mode} removed: the signature was retracted"),
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
-                None,
-                None,
-                format!("row {mode} removed: the signature was retracted"),
-            ),
-            Err(e) => (
-                Some(mode.clone()),
-                Some(file.clone()),
-                format!("row {mode} not removed: {e}"),
-            ),
+        let kept = kept_note(&mode);
+        let removed = format!("row {mode} removed: the signature was retracted");
+        let (decoder, file, note, warn) = if rec
+            .decoder_note
+            .as_deref()
+            .is_some_and(|n| n.starts_with(&kept))
+        {
+            let note = format!("{kept}; {OUTLIVES}");
+            (Some(mode), Some(file), note, true)
+        } else {
+            match self.learned_row_unchanged(&rec, &mode, &file) {
+                Err(why) => {
+                    let note = format!("row {mode} not removed: {why}; {OUTLIVES}");
+                    (Some(mode), Some(file), note, true)
+                }
+                Ok(false) => (None, None, removed, false),
+                Ok(true) => match std::fs::remove_file(&file) {
+                    Ok(()) => (None, None, removed, false),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        (None, None, removed, false)
+                    }
+                    Err(e) => {
+                        let note = format!("row {mode} not removed: {e}; {OUTLIVES}");
+                        (Some(mode), Some(file), note, true)
+                    }
+                },
+            }
         };
         if decoder.is_none()
             && let Ok(lines) = self.reload_modes()
@@ -2001,6 +2024,9 @@ impl Node {
             for line in lines {
                 eprintln!("{line}");
             }
+        }
+        if warn {
+            self.warn_signature(&rec.id, &note);
         }
         let store = self.signatures();
         if store.get(&rec.id).is_none() {
@@ -2014,20 +2040,55 @@ impl Node {
         match store.set_decoder(&rec.id, decoder, file, Some(note)) {
             Ok(rec) => rec,
             Err(e) => {
-                self.inner
-                    .persist_errors
-                    .lock()
-                    .unwrap()
-                    .push(format!("signatures: {}: {e}", rec.id));
+                self.warn_signature(&rec.id, &e.to_string());
                 rec
             }
         }
     }
 
+    /// Whether the row file `file` of `rec` still holds the row its accept wrote
+    /// (`Ok(true)`), is gone (`Ok(false)`), or is to be kept (`Err`, why: it differs, or
+    /// cannot be read).
+    fn learned_row_unchanged(
+        &self,
+        rec: &crate::signatures::SignatureRecord,
+        mode: &str,
+        file: &str,
+    ) -> Result<bool, String> {
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.to_string()),
+        };
+        let written = serde_json::to_string(&crate::signatures::learned_row(rec, mode))
+            .map_err(|e| e.to_string())
+            .and_then(|json| crate::modes::parse(&json).map_err(|e| e.to_string()))?;
+        match crate::modes::parse(&text) {
+            Ok(row) if row == written => Ok(true),
+            _ => Err("it differs from the row the accept wrote".into()),
+        }
+    }
+
+    /// Record `warning` about the signature `id` in `persist_errors`, as
+    /// `signatures: <id>: <warning>`.
+    fn warn_signature(&self, id: &str, warning: &str) {
+        self.inner
+            .persist_errors
+            .lock()
+            .unwrap()
+            .push(format!("signatures: {id}: {warning}"));
+    }
+
     /// Unpin each capture of `rec` that no record left in the store pins
     /// ([`crate::signatures::SignatureState::pins`]); one gone from the burst store is
-    /// skipped.
-    fn unpin_released(&self, rec: &crate::signatures::SignatureRecord) -> Result<(), OpError> {
+    /// skipped. A capture that cannot be unpinned is a warning, never an error (the
+    /// record has already changed): `capture <id> not unpinned: <error>`, added to the
+    /// returned record's `decoder_note` (`; ` between) and to `persist_errors`. A later
+    /// delete tries again.
+    fn unpin_released(
+        &self,
+        rec: crate::signatures::SignatureRecord,
+    ) -> crate::signatures::SignatureRecord {
         let held: Vec<String> = self
             .signatures()
             .list(None)
@@ -2036,17 +2097,26 @@ impl Node {
             .flat_map(|r| r.provenance.captures)
             .collect();
         let bursts = self.bursts();
+        let mut failed = Vec::new();
         for c in rec.provenance.captures.iter().filter(|c| !held.contains(c)) {
             match bursts.unpin(c) {
                 Ok(()) | Err(crate::bursts::StoreError::Unknown(_)) => {}
-                Err(e) => {
-                    return Err(OpError::Other {
-                        message: format!("capture {c}: {e}"),
-                    });
-                }
+                Err(e) => failed.push(format!("capture {c} not unpinned: {e}")),
             }
         }
-        Ok(())
+        if failed.is_empty() {
+            return rec;
+        }
+        let warning = failed.join("; ");
+        self.warn_signature(&rec.id, &warning);
+        let decoder_note = Some(match rec.decoder_note {
+            Some(n) => format!("{n}; {warning}"),
+            None => warning,
+        });
+        crate::signatures::SignatureRecord {
+            decoder_note,
+            ..rec
+        }
     }
 
     /// `signature_reject`: reject the proposal `id`, by the transport `by`.

@@ -573,7 +573,7 @@ pub enum CaptureCmd {
 pub enum SignatureCmd {
     /// List the learned signatures, newest first; with --state only those in that state
     List {
-        /// Only this state: proposed, accepted, rejected or superseded
+        /// Only this state: proposed, accepted, rejected, superseded or retracted
         #[arg(long, value_name = "S", value_parser = parse_signature_state)]
         state: Option<SignatureState>,
     },
@@ -625,7 +625,7 @@ pub enum SignatureCmd {
     },
 }
 
-/// `--state`: `proposed`, `accepted`, `rejected` or `superseded`.
+/// `--state`: `proposed`, `accepted`, `rejected`, `superseded` or `retracted`.
 fn parse_signature_state(s: &str) -> Result<SignatureState, String> {
     serde_json::from_value(s.into()).map_err(|e| e.to_string())
 }

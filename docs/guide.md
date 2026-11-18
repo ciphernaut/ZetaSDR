@@ -524,9 +524,10 @@ captures (What is this, Download, Delete, Work the bits) and the signatures (Acc
 proposal, Retract on an accepted one, Delete on any after a confirm; the accept's note carries
 Undo), and the Bits pane shows the bits and the hypotheses. `zeta signature retract --id ID` takes
 back a wrong accept with no restart: the record is kept as `retracted`, labels nothing more, its
-`learned_<id>` row leaves the modes and its captures are unpinned unless another accepted record
-holds them; `zeta signature delete --id ID` removes a record in any state the same way. The node stops at classification: reading the content of someone else's link is the
-operator's decision.
+`learned_<id>` row leaves the modes (a row file there before the accept or edited since stays,
+with a warning) and its captures are unpinned unless another accepted or superseded record holds
+them; `zeta signature delete --id ID` removes a record in any state the same way. The node stops
+at classification: reading the content of someone else's link is the operator's decision.
 
 ## External stages
 

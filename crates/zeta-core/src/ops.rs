@@ -542,19 +542,25 @@ pub enum Op {
     },
     /// Take back an accept: the accepted record becomes `retracted` (it stays, with its
     /// provenance and `retracted_ns`), and on the running node its `learned_<id>` row
-    /// leaves the registry (the file the accept wrote is removed), the next classify no
-    /// longer labels with it, and its captures are unpinned unless another accepted (or
-    /// superseded) record lists them. A record not `accepted` is refused (`signature <id>
-    /// is <state>, not accepted`); a retracted record cannot be accepted again, only
-    /// deleted. Gated as `signature_accept` is: through `ask` the run needs
-    /// `allow.accept_signatures`, else `not_allowed`.
+    /// leaves the registry (the file the accept wrote is removed, unless it was there
+    /// before the accept or has been edited since), the next classify no longer labels
+    /// with it, and its captures are unpinned unless another accepted (or superseded)
+    /// record lists them. Once the record is retracted nothing fails the op: a row file
+    /// kept or that cannot be removed, or a capture that cannot be unpinned, is a warning
+    /// in the answer's `decoder_note` (a kept row file `... it now outlives its record`).
+    /// A record not `accepted` is refused (`signature <id> is <state>, not accepted`); a
+    /// retracted record cannot be accepted again, only deleted. Gated as
+    /// `signature_accept` is: through `ask` the run needs `allow.accept_signatures`, else
+    /// `not_allowed`.
     SignatureRetract {
         /// An id from `signature_list`.
         id: String,
     },
     /// Delete a signature record in any state, its file with it; for an accepted (or
-    /// superseded) one, what the accept did is undone as `signature_retract` undoes it.
-    /// The answer is the record as it stood. Gated as `signature_accept` is.
+    /// superseded) one, what the accept did is undone as `signature_retract` undoes it,
+    /// and what a retract of it could not undo is tried again. The answer is the record as
+    /// it stood, but for its `decoder_note`, which says what became of its row and
+    /// carries any warning, as `signature_retract`'s does. Gated as `signature_accept` is.
     SignatureDelete {
         /// An id from `signature_list`.
         id: String,

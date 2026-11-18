@@ -738,6 +738,188 @@ async fn a_delete_leaves_a_learned_row_the_accept_found_there() {
     assert!(listed(&node, &id).await.is_some());
 }
 
+/// Set `dir`'s mode to `mode` (unix permissions).
+fn chmod(dir: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Whether this process ignores directory permissions (root): a read-only directory
+/// then refuses nothing, and the test `test` says it is skipped.
+fn ignores_permissions(test: &str) -> bool {
+    let root = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0");
+    if root {
+        eprintln!("{test}: skipped: running as root, a read-only directory refuses nothing");
+    }
+    root
+}
+
+/// The warnings `persist_errors` holds for the signature `id`.
+fn warnings(node: &Node, id: &str) -> Vec<String> {
+    let prefix = format!("signatures: {id}: ");
+    node.persist_errors()
+        .into_iter()
+        .filter_map(|e| e.strip_prefix(&prefix).map(str::to_string))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_delete_that_cannot_remove_the_row_says_the_row_outlives_its_record() {
+    if ignores_permissions("a_delete_that_cannot_remove_the_row") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let modes_dir = dir.path().join("modes");
+    let node = open_in(dir.path(), &modes_dir, None).await;
+    let rec = propose_framed(&node, vec![]);
+    let rec = accept(&node, &rec.id).await;
+    let id = row_id(&rec);
+    let path = modes_dir.join(format!("{id}.json"));
+    chmod(&modes_dir, 0o555);
+    let back = take_back(&node, &rec.id, true).await;
+    chmod(&modes_dir, 0o755);
+    assert!(
+        node.signatures().get(&rec.id).is_none(),
+        "the record is gone"
+    );
+    assert!(path.exists(), "{path:?} could not be removed");
+    let note = back.decoder_note.clone().unwrap_or_default();
+    assert!(
+        note.starts_with(&format!("row {id} not removed: ")),
+        "{back:?}"
+    );
+    assert!(note.ends_with("; it now outlives its record"), "{back:?}");
+    assert_eq!(warnings(&node, &rec.id), vec![note], "the warning is kept");
+}
+
+#[tokio::test]
+async fn a_delete_removes_the_row_a_retract_could_not() {
+    if ignores_permissions("a_delete_removes_the_row_a_retract_could_not") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let modes_dir = dir.path().join("modes");
+    let node = open_in(dir.path(), &modes_dir, None).await;
+    let rec = propose_framed(&node, vec![]);
+    let rec = accept(&node, &rec.id).await;
+    let id = row_id(&rec);
+    let path = modes_dir.join(format!("{id}.json"));
+    chmod(&modes_dir, 0o555);
+    let back = take_back(&node, &rec.id, false).await;
+    chmod(&modes_dir, 0o755);
+    assert_eq!(back.state, SignatureState::Retracted);
+    assert!(path.exists(), "{path:?} could not be removed");
+    assert_eq!(back.decoder.as_deref(), Some(id.as_str()), "{back:?}");
+    let note = back.decoder_note.clone().unwrap_or_default();
+    assert!(note.ends_with("; it now outlives its record"), "{back:?}");
+    assert_eq!(warnings(&node, &rec.id), vec![note]);
+    assert_eq!(node.signatures().get(&rec.id), Some(back));
+    // The delete tries again, and this time the file goes.
+    let gone = take_back(&node, &rec.id, true).await;
+    assert!(!path.exists(), "{path:?} removed by the delete");
+    assert!(
+        listed(&node, &id).await.is_none(),
+        "the row left the registry"
+    );
+    let note = format!("row {id} removed: the signature was retracted");
+    assert_eq!(
+        gone.decoder_note.as_deref(),
+        Some(note.as_str()),
+        "{gone:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_learned_row_edited_since_the_accept_outlives_its_retract() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes_dir = dir.path().join("modes");
+    let node = open_in(dir.path(), &modes_dir, None).await;
+    let rec = propose_framed(&node, vec![]);
+    let rec = accept(&node, &rec.id).await;
+    let id = row_id(&rec);
+    let path = modes_dir.join(format!("{id}.json"));
+    let mut row: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    row["name"] = "edited".into();
+    std::fs::write(&path, serde_json::to_string_pretty(&row).unwrap()).unwrap();
+    let back = take_back(&node, &rec.id, false).await;
+    assert_eq!(back.state, SignatureState::Retracted);
+    assert!(path.exists(), "the operator's edit is kept");
+    let note = format!(
+        "row {id} not removed: it differs from the row the accept wrote; it now outlives its \
+         record"
+    );
+    assert_eq!(
+        back.decoder_note.as_deref(),
+        Some(note.as_str()),
+        "{back:?}"
+    );
+    assert_eq!(warnings(&node, &rec.id), vec![note]);
+    // A delete keeps it too, and says so again.
+    let gone = take_back(&node, &rec.id, true).await;
+    assert!(path.exists(), "still kept");
+    assert_eq!(gone.decoder_note, back.decoder_note);
+}
+
+#[tokio::test]
+async fn a_learned_row_rewritten_but_not_edited_is_still_removed() {
+    // Compared parsed, not byte for byte: compact JSON with its keys sorted is the same row.
+    let dir = tempfile::tempdir().unwrap();
+    let modes_dir = dir.path().join("modes");
+    let node = open_in(dir.path(), &modes_dir, None).await;
+    let rec = propose_framed(&node, vec![]);
+    let rec = accept(&node, &rec.id).await;
+    let id = row_id(&rec);
+    let path = modes_dir.join(format!("{id}.json"));
+    let row: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_string(&row).unwrap()).unwrap();
+    let back = take_back(&node, &rec.id, false).await;
+    assert!(!path.exists(), "{path:?} removed");
+    let note = format!("row {id} removed: the signature was retracted");
+    assert_eq!(
+        back.decoder_note.as_deref(),
+        Some(note.as_str()),
+        "{back:?}"
+    );
+    assert!(warnings(&node, &rec.id).is_empty());
+}
+
+#[tokio::test]
+async fn an_unpin_that_fails_after_a_retract_is_a_warning_and_a_delete_retries_it() {
+    if ignores_permissions("an_unpin_that_fails_after_a_retract") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    let cap = write(&node, "01SET", &fsk_iq(41), RATE_HZ, WIDTH_HZ).await;
+    let rec = propose(&node, &cap.id).await;
+    accept(&node, &rec.id).await;
+    assert!(node.bursts().get(&cap.id).unwrap().pinned);
+    let bursts = dir.path().join("state").join("bursts");
+    chmod(&bursts, 0o555);
+    let back = take_back(&node, &rec.id, false).await;
+    chmod(&bursts, 0o755);
+    assert_eq!(back.state, SignatureState::Retracted, "the retract stands");
+    assert!(
+        node.bursts().get(&cap.id).unwrap().pinned,
+        "the unpin failed"
+    );
+    let note = back.decoder_note.clone().unwrap_or_default();
+    assert!(
+        note.starts_with(&format!("capture {} not unpinned: ", cap.id)),
+        "{back:?}"
+    );
+    assert_eq!(warnings(&node, &rec.id), vec![note]);
+    // The delete unpins it.
+    take_back(&node, &rec.id, true).await;
+    assert!(
+        !node.bursts().get(&cap.id).unwrap().pinned,
+        "unpinned by the delete"
+    );
+}
+
 #[tokio::test]
 async fn accept_without_a_writable_modes_directory_accepts_and_says_so() {
     let dir = tempfile::tempdir().unwrap();

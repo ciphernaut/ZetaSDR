@@ -581,7 +581,10 @@ class ExplorePane {
     try {
       const r = await this.api.op({ op: "signature_delete", id });
       const rec = r && r.result === "signature" ? r.value : null;
-      if (rec) this.t.note(`deleted ${rec.name} (${rec.id.slice(-ID_TAIL)})`);
+      if (rec) {
+        this.t.note(`deleted ${rec.name} (${rec.id.slice(-ID_TAIL)})`);
+        if (rec.decoder_note) this.t.note(`${rec.id.slice(-ID_TAIL)}: ${rec.decoder_note}`);
+      }
     } catch (e) {
       this.t.note(`signature_delete: ${e.message}`, true);
     }
