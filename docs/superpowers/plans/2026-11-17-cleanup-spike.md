@@ -12,6 +12,8 @@ The test rule that applies from Round 1 on: per fix, only its new test and the t
 
 Budget per round from these figures: an XS item about 50k with its review; an S item about 150k to 250k. Round 1 was budgeted at 0.8M to 1M and used about 2.3M for twelve S entries (about 190k each, everything included). So from Round 2 on, budget about 200k per S item, and about 0.4M per round for the whole-branch review, its fix wave and their re-reviews. That puts Round 2 (eight items) near 2M, Round 3 (six page items, with UI runs) near 1.6M, and Round 4 about 100k to 200k per section.
 
+Round 2 then used about 3.4M for nine items: a small feature costs about twice a small fix. Its section below has the figures, and they put Round 3 near 2.8M.
+
 ## Round 0: the XS sweep (done 2026-11-17)
 
 Built subagent-driven on `worktree-cleanup-xs`, one implementer per batch and a reviewer after each, then the full gate. Every fix carries a test that fails without it.
@@ -90,7 +92,52 @@ The full gate ran once, about 30 minutes of wall clock.
 - "Bug: `--then-tail` on a program row with a squelched demod tails the squelch events first".
 - "Bug: a sink-bearing decoder is frozen as an operator graph", then "Architecture: a generic `sink` param on the watch".
 
-## Round 2: small features (S each)
+## Round 2: small features (S each, done 2026-11-18)
+
+Built subagent-driven on `worktree-cleanup-r2` in five batches, one after another, each with one implementer and one review; then a whole-branch review, one fix wave with a scoped re-review, and the full gate.
+
+Outcome: all nine items landed (the "Digital voice" entry is two).
+- I, speech (Sonnet): `--stt-url` posts each utterance to an OpenAI-compatible or whisper.cpp server, with `--stt-url-model`, `--stt-url-languages` and a bearer from `ZETA_STT_URL_KEY`.
+- J, FM broadcast (Opus): `wfm_demod` takes `stereo`, always two channels when on, mono in both while the pilot is absent or weak.
+- L, packaging (Sonnet): `--run-dir` (`ZETA_RUN_DIR`); a handler's install hint follows the package managers the host has, and a row may name `snap` and `flatpak`.
+- K, modes and identify (Opus): `band.range_hz` is one range or a list, and the rows that lacked ranges have them; an identify takes `dwell_scale`, which a watch raises to 3 then 6 on its retries; `c2dec` is optional for M17.
+- M, operations (Opus): a set member may carry an audio policy; a plan carries named channel groups that `plan_start` and `jobs_stop` take; `signature_retract` and `signature_delete`, with Undo, Retract and Delete in the Explore pane.
+
+The reviews changed these:
+- Batch J: a weak station now plays mono. The first build read the pilot against the multiplex, which only detects a pilot; the fix reads the pilot's SNR on the PLL's quadrature arm (stereo over 35 dB, mono under 30). The pilot PLL is shared with RDS, and a mono run clears `job_context.wfm`.
+- Batch K: an M17 job without `c2dec` says so in `job_context.m17.vocoder`, as P25 and DMR do.
+- Batch M: a retract or delete removes only a learned row that is unchanged since the accept, and reports a row it kept or could not remove instead of answering as if it had.
+- Batch I: the reply is read up to a cap, the key is blanked before an error's body is cut, and no error prints a URL's credentials.
+- The first gate run: the page scenario for Undo and Delete depended on the scenario before it.
+
+Decided along the way, and worth the operator's eye:
+- K changed a scoring rule: a range gives centre credit only to a row that lists no centres. Without it POCSAG's VHF range tied APRS on its own frequency. A row with both centres and a range scores lower between its centres than before.
+- `plan_start` with neither `channels` nor `group` still means every channel; only both together are refused.
+- The speech upload format (FLAC, 8 kHz) was not built. By the operator's word it is to be a probed capability of the server, not a flag; the `TODO.md` section says so.
+- A watch's third try dwells six times as long, and the watch identifies one signal at a time, so on a band with slow rows it holds other new signals back for minutes. `TODO.md` has the figures.
+
+**Rollback and older clients:** this build reads everything the previous build wrote. The previous binary skips a `retracted` signature record, marks a row file that names `snap` or `flatpak` as broken, refuses a set file whose member carries an audio policy, and refuses a stored `wfm_demod` graph with `stereo: true`. A client of the previous build refuses this node's `channel_plans` answer, its `signature_*` answers and a modes answer with a several-range row. Nothing is deleted by rolling back.
+
+Left over: "Left from cleanup round 2" in `TODO.md`.
+
+Actuals, subagents only (about 3.4M against an estimate of 2.1M; the operator's budget was 2M):
+
+| stage | per batch | total |
+|---|---|---|
+| implementer | Sonnet 145-165k; Opus 316-503k | 1.62M |
+| review | Sonnet 79k; Opus 126-216k | 0.81M |
+| fix round (J only) and its re-review | 128k and 96k | 0.22M |
+| whole-branch review, fix wave and its re-review | 257k, 326k, 155k | 0.74M |
+
+Per item, everything included: about 375k, twice Round 1's 190k. Why:
+- These were features, not fixes. Each added an op field, a flag or a row field, and so touched `ops.rs`, the CLI, the agent prose, the guide and the generated agent docs; three had page work. One field added to the job-start parameters meant a line in forty test files.
+- A review's cost follows the diff's size, and a feature's diff with its tests and docs ran 270 to 580 kB; reviews ran 126k to 216k on Opus.
+- J cost 734k for one item: the brief prescribed a measure that could not do what the section asked, and the fix round built the right one.
+- The fix wave carried 40 items (two Important, the rest parked minors) and cost as much as a batch.
+
+For Round 3 (six page items): budget about 350k per item and about 0.7M for the whole-branch review and fix wave, so near 2.8M, not 1.6M. Two things that held the cost down and are worth keeping: reviewers were given the diff without the generated agent docs, and the two late Important findings went into the fix wave rather than each into a resumed implementer and a re-review of its own.
+
+The full gate ran twice, about 32 minutes each.
 
 - "Speech: a Whisper server over the network".
 - "Feature: stereo for `wfm_demod`".

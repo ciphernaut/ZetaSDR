@@ -4,6 +4,19 @@
 
 `docs/superpowers/plans/2026-11-17-cleanup-spike.md` sorts the sections below by size into rounds: Round 0 (the XS sweep), node and worker fixes, small features, the page, and the deferred review minors. A section stays here until its item lands.
 
+## Left from cleanup round 2 (2026-11-18)
+
+One line each, from the round's reviews:
+- **Test: `then_tail_on_a_proving_identify_with_keep_leaves_the_child_running` fails now and then under load.** The one-shot `--keep` process can exit before the identify records its verdict, so the record it leaves says `running` and no later `job list` changes it; polling cannot help. Either the test asserts only that the child decoder is running, or `--keep` on a controller job waits for the verdict (a behaviour change).
+- **Speech:** the `--stt-url` "no host" error can still print credentials from a URL that cannot be a base (`mailto:user:pw@host`): print the scheme only. An answer over 64 KiB is always "answer too long", so a proxy's large error page loses its status slice.
+- **Signatures:** a row file the node never wrote, kept on a retract or delete, logs an "outlives its record" warning; quieter would be to warn only for a row the accept generated. The page's note on a delete has no page test.
+- **Plans:** the page scenario for groups shows the menu and the request, not a group starting (the page test node has no source that captures the UHF CB channels). The UHF CB groups are also spelled out in four docs, where pointing at `channel_plans` would not drift. The box menu drops a group with no channels.
+- **Page tests:** three scenarios were added without rebalancing `SHARD_STARTS`; profile with `ZETA_UI_PROFILE` and move the cut.
+- **Modes:** `m17_takes_no_classify_slot_from_pocsag` asserts an exact tried set that any row's range change breaks; a test with crowd rows would hold. P25 looks its vocoder up on each call, M17 once at start.
+- **FM broadcast:** the mono and RDS checksum pins compare exact float bits, so they follow the C library's `sin` and `atan2`.
+- **Docs:** three design documents under `docs/superpowers` still name a network operator beside a pager frequency; field craft no longer does.
+- **Clients:** a client built before this round refuses this node's `channel_plans` answer, its `signature_*` answers and a modes answer holding a several-range row (new fields on strict types). Say so in the next release notes.
+
 ## UI: themes as folders (plan 26)
 
 Merged to `main` 576002a and deployed on test_host 2026-11-04: spec `docs/superpowers/specs/2026-11-03-themes-design.md`, plan `docs/superpowers/plans/2026-11-03-themes.md`. Themes are folders (`theme.json` + `style.css`) under repo-root `themes/` (console, plain, cyberpunk, terminal, psytrance, vibecoder), the operator's own in `--themes-dir`, listed by `themes_list` / `zeta themes list`, served at `/ui/themes/<id>/`; the author's guide is `docs/themes.md`, the UAT section is "Plan 26: themes". Mobile and other per-device layouts are later (see the footprints entry below).
