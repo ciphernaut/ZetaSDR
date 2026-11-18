@@ -477,19 +477,11 @@ Both are the operator's tools, run on their word (an `allow`-class gate for TX).
 
 ## Watch: the identify dwell misses a marginal sonde the detector now sees
 
-Seen on the B210 2026-11-03 14:10 AEST during UAT 19.1.D: the watch's detector raised RS41 `X1342539` at
-401.5001 MHz (5 kHz, 4800 Bd, 15 dB, 130 km away at 15.8 km up) as `new`, so plan 17's miss is fixed, but
-its identify ended `unknown` and, with `on_unknown: capture`, spent the run's 32 captures on a signal a
-decoder row proves. An `rs41_decode` started by hand on the measured centre got 3 frames in the first 10 s and
-none in the next 20: at that strength a frame comes only now and then, so the row's 5 s `identify.dwell_ms`
-sees none. Also, the hand decoder took the signal out of the watch's list (a job on its band), so the watch
-never re-tried it. Options, to spec: (1) a dwell that grows with the retry (`tries`): 5 s, then 15, then 30;
-(2) when layer 1 reads a sonde-shaped signal (4800 Bd, 4-6 kHz, in 400.05-406 MHz) run the sonde rows for a
-longer dwell before the capture, since the capture is what an `unknown` costs; (3) classify the captured
-windows with the program rows too (they are `skipped_span` today at 46 ms, but a sonde's 640 ms windows
-hold frames). Beside it, `capture classify` on a 46 ms window of the 404.025 MHz telemetry link ranks three
-catalogue radiosonde names at 0.7 above the layer-1 `unknown` 0.5 on the frequency range alone: cap a
-range-only catalogue match under the layer-1 label, or say "range only" in its evidence.
+Seen on the B210 2026-11-03 during UAT 19.1.D: the watch raised a weak RS41 (5 kHz, 4800 Bd, 15 dB, far off and high up) as `new`, but its identify ended `unknown` and, with `on_unknown: capture`, spent the run's 32 captures on a signal a decoder row proves: at that strength a frame comes only now and then (3 in 10 s, then none in 20 s), so one 5 s dwell sees none. The dwell now grows with the watch's retry (`dwell_scale` 1, 3, then 6 times each row's `identify.dwell_ms`, capped at 60 s). Its cost: the watch runs one identify at a time and starts nothing else meanwhile, and the scale applies to every row an identify tries, so a third try holds back every other new signal for six times the dwells of all the rows it tries: about 2.5 minutes on the sonde band (three sonde rows, M17, P25 and DMR, 24 s of dwell at 1x). Still open, to spec:
+- When layer 1 reads a sonde-shaped signal (4800 Bd, 4-6 kHz, in 400.05-406 MHz), run the sonde rows for a longer dwell before the capture, since the capture is what an `unknown` costs.
+- Classify the captured windows with the program rows too (they are `skipped_span` today at 46 ms, but a sonde's 640 ms windows hold frames).
+- A decoder started by hand on the signal takes it out of the watch's list (a job on its band), so the watch never re-tries it.
+- `capture classify` on a 46 ms window of a sonde's telemetry link ranks three catalogue radiosonde names at 0.7 above the layer-1 `unknown` 0.5 on the frequency range alone: cap a range-only catalogue match under the layer-1 label, or say "range only" in its evidence.
 
 ## Channel bank: a capture under 2 Msps gets none, so 80 CB channels run direct at 5 cores
 

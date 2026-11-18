@@ -417,6 +417,96 @@ impl Stage for Failing {
     }
 }
 
+/// The row of the dwell-scale tests, at [`POCSAG_HZ`]: tried first there (priority 1), its
+/// own dwell [`LATE_DWELL_MS`], its decoder [`LATE_STAGE`].
+const LATE_ROW: &str = "late_test";
+/// The decoder stage of [`LATE_ROW`]: its first event comes [`LATE_AFTER`] after it starts.
+const LATE_STAGE: &str = "late_decode";
+/// [`LATE_ROW`]'s own `identify.dwell_ms`: shorter than [`LATE_AFTER`], so a dwell of 1x
+/// misses the proof and one of 3x catches it.
+const LATE_DWELL_MS: u64 = 1_000;
+const LATE_AFTER: Duration = Duration::from_millis(2_000);
+
+/// A decoder that, like a weak sonde's, gives its first frame only [`LATE_AFTER`] after it
+/// starts, then one per input frame.
+struct Late(StageSpec);
+
+#[async_trait]
+impl Stage for Late {
+    fn spec(&self) -> &StageSpec {
+        &self.0
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        mut inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<zeta_core::types::StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: tokio_util::sync::CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        let start = tokio::time::Instant::now();
+        let mut rx = inputs.remove(0);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                r = rx.recv() => match r {
+                    Ok(f) if start.elapsed() >= LATE_AFTER => {
+                        let ev = serde_json::json!({"protocol": "late"});
+                        bus.publish(Frame::new(outputs[0].clone(), f.provenance, Payload::Event(ev)));
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
+            }
+        }
+    }
+}
+
+/// A modes directory under `dir`: [`Fixtures::quick_modes`]' rows at a 300 ms dwell (so a
+/// run that tries them stays short, scaled or not), with [`LATE_ROW`] when `late`.
+fn short_modes(dir: &Path, late: bool) -> PathBuf {
+    let modes = dir.join("short_modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    for entry in std::fs::read_dir(&fixtures().quick_modes).unwrap() {
+        let p = entry.unwrap().path();
+        let mut row: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        row["identify"]["dwell_ms"] = 300.into();
+        std::fs::write(modes.join(p.file_name().unwrap()), row.to_string()).unwrap();
+    }
+    if !late {
+        return modes;
+    }
+    let late = serde_json::json!({
+        "id": LATE_ROW,
+        "name": "Late proof",
+        "family": "general",
+        "band": {"bandwidth_hz": 12_500, "centers_hz": [POCSAG_HZ]},
+        "modulation": ["fsk", "fm"],
+        "label": "Late",
+        "protocol": "late",
+        "decoder": {
+            "kind": "graph",
+            "nodes": [
+                {"id": "channel", "kind": "channel", "params": {"center_hz": "$center_hz",
+                    "bandwidth_hz": "$bandwidth_hz", "out_rate_hz": "$out_rate_hz"}},
+                {"id": "decode", "kind": LATE_STAGE, "params": {}}
+            ],
+            "edges": [{"from": "channel", "to": "decode", "kind": "iq"}]
+        },
+        "event": {"schema": {"type": "object", "properties": {"protocol": {"type": "string"}}},
+            "summary": "late frame"},
+        "identify": {"proof": "event", "min_events": 1, "dwell_ms": LATE_DWELL_MS,
+            "min_span_ms": 1000, "quick": null, "priority": 1},
+        "catalogue": []
+    });
+    std::fs::write(modes.join(format!("{LATE_ROW}.json")), late.to_string()).unwrap();
+    modes
+}
+
 /// While set, a [`HoldStop`] stage that was cancelled waits for it to clear before it
 /// ends: its run's teardown (the lease still held) lasts as long as a test needs. Set
 /// through [`hold_stops`] only.
@@ -507,6 +597,12 @@ fn registry_into(mut r: StageRegistry) -> StageRegistry {
     r.register(Arc::new(PassthroughStage::new()));
     r.register(Arc::new(Failing(StageSpec {
         kind: FAIL_STAGE,
+        inputs: vec![StreamKind::Iq],
+        outputs: vec![StreamKind::Event],
+        params_schema: schemars::json_schema!({"type": "object"}),
+    })));
+    r.register(Arc::new(Late(StageSpec {
+        kind: LATE_STAGE,
         inputs: vec![StreamKind::Iq],
         outputs: vec![StreamKind::Event],
         params_schema: schemars::json_schema!({"type": "object"}),
@@ -895,6 +991,7 @@ async fn a_signal_inside_another_jobs_band_is_ignored() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };
@@ -1038,10 +1135,13 @@ async fn an_unknown_signal_is_retried_at_most_three_times() {
     zeta_core::node::watch::test_timing(1_000, 0);
     let dir = tempfile::tempdir().unwrap();
     let src = file_source("rx", &fixtures().fsk);
+    // Each retry dwells longer (1, 3, 6 and 6 times each row's dwell): short rows keep
+    // the four tries quick.
+    let modes = short_modes(dir.path(), false);
     let node = node_over(
         dir.path(),
         vec![(src.clone() as Arc<dyn Port>, src)],
-        Some(&fixtures().quick_modes),
+        Some(&modes),
     )
     .await;
     let node = Arc::new(node);
@@ -1078,6 +1178,90 @@ async fn an_unknown_signal_is_retried_at_most_three_times() {
     assert_eq!(running(&node), [(watch.0.clone(), "watch".to_string())]);
     stop_all(&node).await;
     zeta_core::node::watch::test_timing(0, 0);
+}
+
+/// A row whose proof comes only after more than its own dwell (a weak sonde's rare frame)
+/// is missed by the watch's first identify of the signal and proved by its retry, whose
+/// dwell is three times the row's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_later_than_the_dwell_is_missed_first_and_proved_on_the_retry() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(1_000, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let modes = short_modes(dir.path(), true);
+    let src = file_source("rx", &fixtures().fsk);
+    let node = node_over(
+        dir.path(),
+        vec![(src.clone() as Arc<dyn Port>, src)],
+        Some(&modes),
+    )
+    .await;
+    let node = Arc::new(node);
+    let watch = start_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    decoded(&node, &events, &watch).await;
+    let all = events.all();
+    assert_eq!(events.watch("unknown").len(), 1, "{all:#?}");
+    assert_eq!(events.watch("identifying").len(), 2, "{all:#?}");
+    assert_eq!(events.watch("decoding")[0]["mode"], LATE_ROW, "{all:#?}");
+    stop_all(&node).await;
+    zeta_core::node::watch::test_timing(0, 0);
+}
+
+/// An identify started by hand with `dwell_scale` 3 waits three times each row's own
+/// dwell, so the late row proves; without it each row's own dwell, so it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dwell_scale_by_hand_lengthens_each_rows_dwell() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let modes = short_modes(dir.path(), true);
+    let src = file_source("rx", &fixtures().fsk);
+    let node = node_over(
+        dir.path(),
+        vec![(src.clone() as Arc<dyn Port>, src)],
+        Some(&modes),
+    )
+    .await;
+    let node = Arc::new(node);
+    for (scale, outcome, evidence) in [
+        (None, "no_frame", "no late event in 1000 ms"),
+        (Some(3), "proved", "decode late_test: "),
+    ] {
+        let op = Op::JobStart {
+            kind: JobKind::Identify,
+            source: rx(),
+            center_hz: Hz(POCSAG_HZ),
+            bandwidth_hz: Hz(12_500),
+            deviation_hz: None,
+            sideband: None,
+            dwell_ms: None,
+            average: None,
+            bits: None,
+            method: None,
+            bin_hz: None,
+            audio_policy: None,
+            dwell_scale: scale,
+            elastic: false,
+            replace: vec![],
+        };
+        let Ok(OpResult::Job(id)) = node.apply(op).await else {
+            panic!("identify did not start");
+        };
+        let events = Events::of(&node, &id);
+        until("identify ends", Duration::from_secs(30), || {
+            state(&node, &id) != Some(JobState::Running)
+        })
+        .await;
+        let all = events.all();
+        let late = all
+            .iter()
+            .find(|e| e["protocol"] == "candidate" && e["mode"] == LATE_ROW)
+            .unwrap_or_else(|| panic!("{scale:?}: no {LATE_ROW} candidate: {all:#?}"));
+        assert_eq!(late["outcome"], outcome, "{scale:?}: {late}");
+        let got = late["evidence"].as_str().unwrap_or_default();
+        assert!(got.starts_with(evidence), "{scale:?}: {late}");
+        stop_all(&node).await;
+    }
 }
 
 /// A licence register's answer, after `delay`: `rows` when given, else one transmitter
@@ -1614,6 +1798,7 @@ async fn watch_is_neither_elastic_nor_attachable() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: true,
         replace: vec![],
     };
@@ -2488,6 +2673,7 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![watch.clone()],
     };
@@ -2582,6 +2768,7 @@ async fn a_replace_of_the_decoder_during_its_sink_restart_leaves_it_stopped() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![decoder.clone()],
     };
@@ -3539,6 +3726,7 @@ async fn a_hand_started_decoder_inside_the_band_is_left_alone() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };
@@ -3621,6 +3809,7 @@ async fn a_replace_of_a_span_watch_stops_its_decoders() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![watch.clone()],
     };

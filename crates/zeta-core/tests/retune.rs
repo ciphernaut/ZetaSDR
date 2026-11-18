@@ -187,6 +187,7 @@ async fn start_as(node: &Node, kind: JobKind, band: Tuning, elastic: bool) -> Jo
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic,
         replace: vec![],
     };
@@ -814,6 +815,7 @@ async fn replace_and_graph_put_of_a_job_a_controller_owns_are_refused() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![child.clone()],
     };

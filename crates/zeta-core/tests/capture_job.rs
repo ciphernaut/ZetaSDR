@@ -117,6 +117,7 @@ async fn a_capture_job_ends_stopped_with_its_records_in_the_store() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };

@@ -294,6 +294,7 @@ async fn identify(node: &Node, center_hz: u64) -> (JobId, tokio::task::JoinHandl
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };
@@ -598,6 +599,7 @@ async fn identify_is_neither_elastic_nor_attachable() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: true,
         replace: vec![],
     };
@@ -661,6 +663,7 @@ async fn a_replace_of_identify_completes_while_a_child_is_stopped() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![id.clone()],
     };
@@ -1233,6 +1236,7 @@ async fn trials_stay_on_the_band_when_the_capture_is_no_wider() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };

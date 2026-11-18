@@ -116,6 +116,7 @@ fn measure(center: u64, bw: u64) -> Op {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     }
@@ -1274,6 +1275,7 @@ async fn a_scan_on_a_fake_kiwi_sweeps_for_itself_beside_a_demodulator() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };
@@ -1584,6 +1586,7 @@ async fn job_retune_re_aims_a_kiwi_scan_on_its_open_socket() {
         method: None,
         bin_hz: Some(30_000),
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };

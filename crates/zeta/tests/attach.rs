@@ -83,6 +83,7 @@ async fn start(node: &Node, kind: JobKind, bandwidth_hz: u64) -> JobId {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };
@@ -284,6 +285,7 @@ async fn job_start_with_transcribe_is_refused() {
             method: None,
             bin_hz: None,
             audio_policy: None,
+            dwell_scale: None,
             elastic: false,
             replace: vec![],
         })

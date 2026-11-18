@@ -136,6 +136,7 @@ async fn start_measure(node: &Node, center_hz: u64, bandwidth_hz: u64) -> JobId 
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };

@@ -279,6 +279,7 @@ async fn job_start_refuses_the_graph_and_bits_kinds() {
                 method: None,
                 bin_hz: None,
                 audio_policy: None,
+                dwell_scale: None,
                 elastic: false,
                 replace: vec![],
             })

@@ -6,7 +6,8 @@
 //! ends it the same way with `mode: null` and the layer-1 label and features, or the
 //! learned signature the measurement matches (`learned`). A run a watch starts with
 //! `context.identify.candidates` (its fitting `modes`) tries only those rows and
-//! publishes no `candidate` event for the rest.
+//! publishes no `candidate` event for the rest. `context.identify.dwell_scale`
+//! (`job_start`'s `dwell_scale`, or the watch's retry) multiplies each row's dwell.
 //!
 //! A stop of the job, or any other end of its loop (a fault fails it with the source's
 //! fault, as any job on a faulted source), stops the child it is trying (never a proved
@@ -33,7 +34,7 @@ use crate::learned::{LEARNED_VERDICT_MIN, label_score, learned_match};
 use crate::modes::Proof;
 use crate::modes::score::{allocation_match, allocation_term, score_rows};
 use crate::modes::{Identify, LoadedMode, ModeState};
-use crate::ops::{IDENTIFY_MEASURE_MS, JobKind};
+use crate::ops::{IDENTIFY_DWELL_SCALE_MAX, IDENTIFY_MEASURE_MS, JobKind, identify_dwell_ms};
 use crate::port::{Port, Tuning};
 use crate::stage::StageError;
 use crate::stream::{Frame, Payload};
@@ -61,6 +62,10 @@ struct Run {
     /// The rows the run may try, when its owner restricted it (a watch's fitting
     /// `modes`, from `context.identify.candidates`); `None` tries every row.
     candidates: Option<Vec<String>>,
+    /// What each row's `identify.dwell_ms` is multiplied by ([`identify_dwell_ms`]),
+    /// from `context.identify.dwell_scale` (`job_start`'s `dwell_scale`, or a watch's
+    /// retry); 1 when absent.
+    dwell_scale: u32,
 }
 
 /// `q` as the register is asked about a signal a decoder proved: the row's `modulation`
@@ -126,6 +131,11 @@ impl Inner {
                 .filter_map(|c| c.as_str().map(str::to_string))
                 .collect::<Vec<_>>()
         });
+        let dwell_scale = rec.context["identify"]["dwell_scale"]
+            .as_u64()
+            .and_then(|s| u32::try_from(s).ok())
+            .filter(|s| (1..=IDENTIFY_DWELL_SCALE_MAX).contains(s))
+            .unwrap_or(1);
         let (id, tuning, owner) = (rec.id.clone(), rec.tuning, rec.owner.clone());
         let token = self.shutdown.child_token();
         let (prov, run, ended) = self.record_running(rec, &token)?;
@@ -140,6 +150,7 @@ impl Inner {
             stale,
             owner,
             candidates,
+            dwell_scale,
         };
         let mut set = JoinSet::new();
         let (running, body) = (
@@ -409,9 +420,10 @@ impl Inner {
         }
     }
 
-    /// Wait up to the row's `dwell_ms` for its proof on `child`'s event streams: events
-    /// of the row's `protocol` (with `proof: field`, those whose `field` is true), at
-    /// least `min_events` of them.
+    /// Wait up to the row's `dwell_ms`, scaled by the run's `dwell_scale`
+    /// ([`identify_dwell_ms`]), for its proof on `child`'s event streams: events of the
+    /// row's `protocol` (with `proof: field`, those whose `field` is true), at least
+    /// `min_events` of them.
     async fn await_proof(&self, r: &Run, mode: &LoadedMode, child: &JobId) -> Attempt {
         let row = &mode.row;
         let rule = &row.identify;
@@ -427,7 +439,8 @@ impl Inner {
                 .collect()
         };
         let had_streams = !rxs.is_empty();
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(rule.dwell_ms);
+        let dwell_ms = identify_dwell_ms(rule.dwell_ms, r.dwell_scale);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(dwell_ms);
         let need = rule.min_events.max(1);
         let mut seen = 0;
         loop {
@@ -486,10 +499,7 @@ impl Inner {
                 });
             }
             if tokio::time::Instant::now() >= deadline {
-                return Attempt::NoFrame(format!(
-                    "no {} event in {} ms",
-                    row.protocol, rule.dwell_ms
-                ));
+                return Attempt::NoFrame(format!("no {} event in {dwell_ms} ms", row.protocol));
             }
             tokio::select! {
                 _ = r.cancel.cancelled() => return Attempt::Cancelled,
@@ -508,7 +518,7 @@ impl Inner {
 /// register's [`allocation_term`]; no catalogue term, which lives with the
 /// classifiers) and publish `skipped_band` for those wider than the band and
 /// `unavailable` for those not ready; (3) try the rest in score order, each as a child
-/// job for its `identify.dwell_ms`, centred on the measured centre when that lies in
+/// job for its `identify.dwell_ms` (times the run's `dwell_scale`), centred on the measured centre when that lies in
 /// the band (else on the band's): `no_frame` stops it before the next, `proved` leaves
 /// it running and ends the job with the verdict; (4) an exhausted list ends the job
 /// with `mode: null`, the layer-1 label and features, `recentred`, `allocations` and

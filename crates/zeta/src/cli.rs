@@ -1281,6 +1281,11 @@ pub enum JobCmd {
         /// call, mixed); absent = first_active
         #[arg(long, value_enum)]
         audio_policy: Option<AudioPolicyArg>,
+        /// identify only: multiply each tried row's identify dwell by N (1..=6), for a
+        /// signal whose frames come only now and then; no row then waits over 60 s
+        /// unless its own dwell is longer; absent = 1
+        #[arg(long, value_name = "N")]
+        dwell_scale: Option<u32>,
         /// spectrum only: follow the source's capture instead of holding it
         /// (never conflicts; relaunched under the same id on every retune)
         #[arg(long)]
@@ -1761,6 +1766,7 @@ impl Command {
                 method,
                 bin_hz,
                 audio_policy,
+                dwell_scale,
                 elastic,
                 replace,
                 ..
@@ -1777,6 +1783,7 @@ impl Command {
                 method: method.map(Into::into),
                 bin_hz,
                 audio_policy: audio_policy.map(Into::into),
+                dwell_scale,
                 elastic,
                 replace: replace.into_ids(),
             },

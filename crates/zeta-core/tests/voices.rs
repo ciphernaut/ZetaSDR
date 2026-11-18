@@ -276,6 +276,7 @@ fn start_op(kind: JobKind, center_hz: u64, audio_policy: Option<AudioPolicy>) ->
         method: None,
         bin_hz: None,
         audio_policy,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     }
@@ -753,6 +754,7 @@ fn requests_without_the_new_fields_still_parse() {
             op,
             Op::JobStart {
                 audio_policy: None,
+                dwell_scale: None,
                 ..
             }
         ),
@@ -775,6 +777,7 @@ fn requests_without_the_new_fields_still_parse() {
             op,
             Op::JobStart {
                 audio_policy: Some(AudioPolicy::Follow),
+                dwell_scale: None,
                 ..
             }
         ),

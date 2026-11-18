@@ -217,6 +217,7 @@ async fn job_start_passthrough_then_list_then_stop() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };
@@ -357,6 +358,7 @@ async fn source_ensure_during_job_start_does_not_retune() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };
@@ -466,6 +468,7 @@ async fn job_start_holds_the_gate_through_its_tune_and_lease() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };
@@ -1176,6 +1179,7 @@ async fn conflict_reports_current_tuning_and_real_options() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };
@@ -1285,6 +1289,7 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };
@@ -2021,6 +2026,7 @@ fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     }
@@ -3399,6 +3405,78 @@ async fn job_start_runs_a_row_outside_its_ranges() {
     node.job_stop(&id).await.unwrap();
 }
 
+/// `dwell_scale` is `identify`'s alone and takes 1 to 6: anything else is refused before
+/// anything is tuned or started.
+#[tokio::test]
+async fn job_start_refuses_a_dwell_scale_out_of_range_or_on_another_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = Arc::new(WidePort::new("rtl0"));
+    let node = Node::open(
+        cfg(dir.path()),
+        registry(),
+        vec![port.clone() as Arc<dyn Port>],
+    )
+    .await
+    .unwrap();
+    let start = |kind: &str, scale: u64| -> Op {
+        serde_json::from_value(serde_json::json!({
+            "op": "job_start", "kind": kind, "source": "rtl0",
+            "center_hz": 100_000_000u64, "bandwidth_hz": 12_500, "deviation_hz": null,
+            "sideband": null, "dwell_scale": scale, "elastic": false, "replace": [],
+        }))
+        .unwrap()
+    };
+    for scale in [0, 7] {
+        match node.apply(start("identify", scale)).await {
+            Err(OpError::OutOfRange {
+                field, min, max, ..
+            }) => assert_eq!((field.as_str(), min, max), ("dwell_scale", 1, 6)),
+            other => panic!("dwell_scale {scale}: expected out_of_range, got {other:?}"),
+        }
+    }
+    match node.apply(start("passthrough", 2)).await {
+        Err(OpError::Other { message }) => assert_eq!(
+            message,
+            "dwell_scale applies only to kind identify; pass null (kind is passthrough)"
+        ),
+        other => panic!("expected other, got {other:?}"),
+    }
+    assert!(node.job_list().is_empty());
+    assert_eq!(port.current(), None);
+}
+
+/// A `job_start` without a `dwell_scale` is written without the field, so an older node
+/// (which refuses a field it does not know) still takes it; one with a scale names it.
+#[test]
+fn a_job_start_without_a_dwell_scale_is_written_without_it() {
+    let start = |dwell_scale| Op::JobStart {
+        kind: JobKind::Identify,
+        source: SourceId("rtl0".into()),
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz: None,
+        sideband: None,
+        dwell_ms: None,
+        average: None,
+        bits: None,
+        method: None,
+        bin_hz: None,
+        audio_policy: None,
+        dwell_scale,
+        elastic: false,
+        replace: vec![],
+    };
+    let plain = serde_json::to_value(start(None)).unwrap();
+    assert!(plain.get("dwell_scale").is_none(), "{plain}");
+    assert_eq!(serde_json::from_value::<Op>(plain).unwrap(), start(None));
+    let scaled = serde_json::to_value(start(Some(3))).unwrap();
+    assert_eq!(scaled["dwell_scale"], 3, "{scaled}");
+    assert_eq!(
+        serde_json::from_value::<Op>(scaled).unwrap(),
+        start(Some(3))
+    );
+}
+
 /// Built-in kinds keep their wire names; any other lowercase id is a mode; anything
 /// else does not deserialise.
 #[test]
@@ -3474,6 +3552,7 @@ async fn start_on(node: &Node, source: &str, kind: JobKind, elastic: bool) -> Jo
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic,
         replace: vec![],
     };
@@ -3683,6 +3762,7 @@ async fn job_start_on_a_faulted_source_is_refused_naming_the_source() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };
@@ -3998,6 +4078,7 @@ fn start_look(kind: JobKind, dwell_ms: Option<u64>, average: Option<u32>) -> Op 
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     }

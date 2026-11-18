@@ -2598,7 +2598,8 @@ impl Node {
     /// without letting the gate go. What must wait for the gate to be released
     /// (relaunching the elastic jobs a tune moved, stopping those a scan
     /// displaces) is returned, for [`Node::after_gate`] once the guard is dropped. The
-    /// record keeps `audio_policy`, the one `graph` was expanded with.
+    /// record keeps `audio_policy`, the one `graph` was expanded with, and starts with
+    /// `context` (an identify's `dwell_scale`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn job_start_gated(
         &self,
@@ -2609,10 +2610,12 @@ impl Node {
         capture_rate_hz: Option<Hz>,
         elastic: bool,
         audio_policy: Option<AudioPolicy>,
+        context: serde_json::Value,
         guard: Option<&OwnedMutexGuard<()>>,
     ) -> (Result<JobId, NodeError>, AfterGate) {
         let rec = JobRecord {
             audio_policy,
+            context,
             ..running_record(kind, source, tuning, graph, capture_rate_hz, elastic)
         };
         self.start_record_gated(rec, guard, &[]).await

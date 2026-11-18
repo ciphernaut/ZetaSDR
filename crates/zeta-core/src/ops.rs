@@ -300,6 +300,21 @@ pub enum Op {
         #[serde(default, deserialize_with = "nullable_audio_policy")]
         #[schemars(required, schema_with = "nullable_audio_policy_schema")]
         audio_policy: Option<AudioPolicy>,
+        /// `identify` only: what each tried row's `identify.dwell_ms` is multiplied by
+        /// (1..=6), for a signal whose frames come only now and then; no row then waits
+        /// over 60000 ms unless its own `dwell_ms` is already longer (it then gets its
+        /// own, unscaled). `null` is 1, each row's own dwell. A watch passes 1, 3 and 6 on
+        /// its first, second and later tries of one signal. Any other kind must pass
+        /// `null`.
+        // Left out when `null`, so a node or a CLI of this build can still start a job
+        // on an older node, which refuses a field it does not know.
+        #[serde(
+            default,
+            deserialize_with = "nullable_u32",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(required, schema_with = "nullable_dwell_scale")]
+        dwell_scale: Option<u32>,
         /// `spectrum` only (`false` for any other kind): the job follows the
         /// source's capture instead of holding it. It never conflicts, never
         /// retunes a held source (its `tuning` is the capture it joins), is
@@ -980,6 +995,16 @@ fn nullable_average(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     })
 }
 
+/// Schema of `job_start`'s `dwell_scale`: `["integer","null"]` (1..=6).
+fn nullable_dwell_scale(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "format": "uint32",
+        "minimum": 0,
+        "description": "`identify` only: what each tried row's `identify.dwell_ms` is multiplied by (1..=6), no row's dwell then over 60000 ms unless its own is longer; `null` is 1. Any other kind must pass `null`."
+    })
+}
+
 /// Deserialize a required `Option<Sideband>` (see [`nullable_u64`]).
 fn nullable_sideband<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Sideband>, D::Error> {
     <Option<Sideband> as Deserialize>::deserialize(d)
@@ -1209,17 +1234,18 @@ fn require_attach_stream(schema: &mut schemars::Schema) {
 }
 
 /// `job_start` requires its look, `dwell_ms`, `average`, `bits`, `method` and
-/// `bin_hz`, then `audio_policy`, after `sideband` (the field order agents read), and
-/// like `deviation_hz` shows no default for them; they still default to `null` when a
-/// request from before them leaves them out.
+/// `bin_hz`, then `audio_policy` and `dwell_scale`, after `sideband` (the field order
+/// agents read), and like `deviation_hz` shows no default for them; they still default
+/// to `null` when a request from before them leaves them out.
 fn require_the_look(schema: &mut schemars::Schema) {
-    const LOOK: [&str; 6] = [
+    const LOOK: [&str; 7] = [
         "dwell_ms",
         "average",
         "bits",
         "method",
         "bin_hz",
         "audio_policy",
+        "dwell_scale",
     ];
     if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
         req.retain(|f| !LOOK.iter().any(|l| f == l));
@@ -2276,6 +2302,28 @@ pub fn scan_average_in_force(
 /// How much of the ring, in ms, an `identify` job measures (layer 1) before it scores
 /// the mode rows.
 pub const IDENTIFY_MEASURE_MS: u64 = 1_000;
+
+/// The factors a watch's identify runs on one signal multiply each tried row's
+/// `identify.dwell_ms` by, its `dwell_scale`: the first try, the second, the third and
+/// later. A frame that comes only now and then (a weak sonde) is missed by one short
+/// dwell and caught by a longer one; 5, 15 then 30 s for a 5 s row.
+pub const IDENTIFY_DWELL_SCALES: [u32; 3] = [1, 3, 6];
+/// The largest `dwell_scale` an identify takes: [`IDENTIFY_DWELL_SCALES`]' last.
+pub const IDENTIFY_DWELL_SCALE_MAX: u32 = IDENTIFY_DWELL_SCALES[IDENTIFY_DWELL_SCALES.len() - 1];
+/// No scaled dwell is longer than this, ms, unless the row's own `dwell_ms` already is.
+pub const IDENTIFY_DWELL_CAP_MS: u64 = 60_000;
+
+/// How long an identify run waits on a row whose `identify.dwell_ms` is `row_dwell_ms`
+/// under `dwell_scale`: the two multiplied, at most [`IDENTIFY_DWELL_CAP_MS`]; a row whose
+/// own dwell is longer than the cap gets its own, unscaled.
+pub fn identify_dwell_ms(row_dwell_ms: u64, dwell_scale: u32) -> u64 {
+    match row_dwell_ms > IDENTIFY_DWELL_CAP_MS {
+        true => row_dwell_ms,
+        false => row_dwell_ms
+            .saturating_mul(u64::from(dwell_scale))
+            .min(IDENTIFY_DWELL_CAP_MS),
+    }
+}
 
 /// Full width of the DC notch a scan masks on local hardware, in Hz: bins within
 /// half of this of each capture's centre are masked (the `fft` stage's
@@ -4195,6 +4243,26 @@ pub(crate) fn check_audio_policy(
     Ok(())
 }
 
+/// `job_start`'s `dwell_scale`: `identify` only (else `other`), in
+/// 1..=[`IDENTIFY_DWELL_SCALE_MAX`] (else `out_of_range`).
+fn check_dwell_scale(kind: &JobKind, dwell_scale: Option<u32>) -> Result<(), OpError> {
+    let Some(s) = dwell_scale else {
+        return Ok(());
+    };
+    if *kind != JobKind::Identify {
+        return Err(other(format!(
+            "dwell_scale applies only to kind identify; pass null (kind is {})",
+            kind.name()
+        )));
+    }
+    range(
+        "dwell_scale",
+        u64::from(s),
+        1,
+        u64::from(IDENTIFY_DWELL_SCALE_MAX),
+    )
+}
+
 /// `job_start`'s checks of a scan's look: `dwell_ms` (1..=`SCAN_DWELL_MAX_MS`),
 /// `average` (1..=`SCAN_AVERAGE_MAX`), `bits` (which the source's depths decide,
 /// [`scan_bits_refusal`]), `method` and `bin_hz` (1..=`SCAN_BIN_MAX_HZ`) are for
@@ -4665,6 +4733,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             method,
             bin_hz,
             audio_policy,
+            dwell_scale,
             elastic,
             replace,
         } => {
@@ -4676,6 +4745,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             }
             let deviation = check_start_params(&kind, deviation_hz, sideband)?;
             check_look(&kind, dwell_ms, average, bits, method, bin_hz)?;
+            check_dwell_scale(&kind, dwell_scale)?;
             // A scan the source sweeps takes no lease: there is no room to make.
             if method == Some(ScanMethod::Source) && !replace.is_empty() {
                 return Err(other(SCAN_REPLACE_STEPPED));
@@ -4867,6 +4937,10 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                             Some(granted.bandwidth_hz),
                             elastic,
                             audio_policy,
+                            match dwell_scale {
+                                Some(s) => serde_json::json!({"identify": {"dwell_scale": s}}),
+                                None => serde_json::json!({}),
+                            },
                             guard.as_ref(),
                         )
                         .await;
@@ -5504,6 +5578,7 @@ pub(crate) async fn plan_start_channels(
                         Some(granted.bandwidth_hz),
                         false,
                         None,
+                        serde_json::json!({}),
                         Some(guard),
                     )
                     .await;
@@ -6053,6 +6128,7 @@ async fn start_set_job(
             Some(capture.bandwidth_hz),
             false,
             None,
+            serde_json::json!({}),
             Some(guard),
         )
         .await;
@@ -7244,6 +7320,25 @@ fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scaled dwell is the row's times the scale, capped at 60 s, unless the row's
+    /// own dwell is longer: then it is the row's, unscaled.
+    #[test]
+    fn the_scaled_identify_dwell_is_capped() {
+        assert_eq!(IDENTIFY_DWELL_SCALES, [1, 3, 6]);
+        assert_eq!(IDENTIFY_DWELL_SCALE_MAX, 6);
+        let five: Vec<u64> = IDENTIFY_DWELL_SCALES
+            .iter()
+            .map(|&s| identify_dwell_ms(5_000, s))
+            .collect();
+        assert_eq!(five, [5_000, 15_000, 30_000]);
+        assert_eq!(identify_dwell_ms(15_000, 6), IDENTIFY_DWELL_CAP_MS);
+        assert_eq!(identify_dwell_ms(15_000, 3), 45_000);
+        assert_eq!(identify_dwell_ms(60_000, 6), 60_000);
+        assert_eq!(identify_dwell_ms(90_000, 6), 90_000);
+        assert_eq!(identify_dwell_ms(90_000, 1), 90_000);
+        assert_eq!(identify_dwell_ms(u64::MAX, 6), u64::MAX);
+    }
 
     #[test]
     fn suggest_scales_by_powers_of_ten() {

@@ -446,6 +446,7 @@ async fn job_start_records_the_capture_rate() {
         method: None,
         bin_hz: None,
         audio_policy: None,
+        dwell_scale: None,
         elastic: false,
         replace: vec![],
     };

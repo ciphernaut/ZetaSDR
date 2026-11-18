@@ -11,7 +11,10 @@
 //! not reappear within the detector's `gone_ms` are stopped. Only events in the decoder
 //! row's own `protocol` count against its silence (a frame row's `timing` and forwarded
 //! `bits` flow on noise). An unknown signal is tried again after [`RETRY_MS`] while it
-//! persists, at most [`RETRY_MAX`] times; with `on_unknown: capture` its bursts are
+//! persists, at most [`RETRY_MAX`] times, each identify run's rows dwelling longer
+//! ([`IDENTIFY_DWELL_SCALES`]: 1, 3, then 6 times their own `identify.dwell_ms`). The
+//! watch runs one identify at a time, so while a long one dwells no other signal is
+//! identified or started. With `on_unknown: capture` its bursts are
 //! captured once per run by an owned `capture` child (see [`capture`]), unless identify
 //! named a learned signature for it (summary `learned <name> at <MHz>: ...`).
 //!
@@ -72,8 +75,8 @@ use crate::modes::ModeRegistry;
 use crate::modes::ModeState;
 use crate::modes::score::score_rows;
 use crate::ops::{
-    DETECT_GONE_MS_DEFAULT, DETECT_STAGE, DETECT_WIDTH_HZ_DEFAULT, JobKind, SONDEHUB_STAGE,
-    WATCH_CONFIRM_MS_DEFAULT, WATCH_COOLDOWN_MS_DEFAULT, WATCH_HOLD_MS_DEFAULT,
+    DETECT_GONE_MS_DEFAULT, DETECT_STAGE, DETECT_WIDTH_HZ_DEFAULT, IDENTIFY_DWELL_SCALES, JobKind,
+    SONDEHUB_STAGE, WATCH_CONFIRM_MS_DEFAULT, WATCH_COOLDOWN_MS_DEFAULT, WATCH_HOLD_MS_DEFAULT,
     WATCH_MAX_DECODERS_DEFAULT, WATCH_MODES_EMPTY,
 };
 use crate::port::{Port, Tuning};
@@ -142,6 +145,13 @@ fn identify_band(modes: &ModeRegistry, watch_hz: u64, s: &Signal) -> (u64, f32) 
         .map_or((s.bandwidth_hz, 0.0), |x| {
             (x.mode.row.band.bandwidth_hz, x.score)
         })
+}
+
+/// The `dwell_scale` of a signal's identify run after `tries` tries that found nothing:
+/// [`IDENTIFY_DWELL_SCALES`]' entry for the try, its last for every try after.
+fn dwell_scale(tries: u32) -> u32 {
+    let last = IDENTIFY_DWELL_SCALES.len() - 1;
+    IDENTIFY_DWELL_SCALES[(tries as usize).min(last)]
 }
 
 /// Whether a signal `signal_hz` wide fits a row `row_hz` wide by [`WIDTH_FIT`].
@@ -1170,7 +1180,8 @@ impl Inner {
 
     /// Start an owned `identify` run on `t`'s centre and band inside the watch's
     /// capture, recorded as `current` first, restricted to `candidates` when given (in
-    /// its `context.identify.candidates`). The launch runs in its own task, so a stop
+    /// its `context.identify.candidates`), its rows' dwells scaled by the signal's try
+    /// ([`dwell_scale`], in `context.identify.dwell_scale`). The launch runs in its own task, so a stop
     /// of the watch never drops it half way (as identify's own children). `Ok(None)`:
     /// cancelled.
     async fn start_identify(
@@ -1203,9 +1214,12 @@ impl Inner {
             source: r.prov.source.clone(),
             tuning,
             state: JobState::Running,
-            context: match candidates {
-                Some(c) => serde_json::json!({"identify": {"candidates": c}}),
-                None => serde_json::json!({}),
+            context: {
+                let mut identify = serde_json::json!({"dwell_scale": dwell_scale(t.tries)});
+                if let Some(c) = candidates {
+                    identify["candidates"] = c.into();
+                }
+                serde_json::json!({ "identify": identify })
             },
             created_ns: now(),
             input: None,
