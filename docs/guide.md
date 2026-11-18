@@ -769,23 +769,37 @@ id's tail; no sideways scroll), with a live event counter, ■ to stop it, ▶ o
 `fm_demod` row to play its audio in the browser (one job at a time) and `graph` to open the
 job's graph view.
 
-Drag across the waterfall to select a band and a time span; a context menu opens with:
+Drag across the waterfall to select a band and a time span; a context menu opens. Its first
+level is short, and each group opens beside it (on the pointer, a click or tap, or the arrow
+keys and Enter; Escape closes one level):
 
-| Entry | Operation |
-|---|---|
-| What is this? | `classify` on the selection; the labels are drawn at the selection and listed in the transcript |
-| Decode › APRS | `job_start` `aprs_decode` on the selection's centre and bandwidth |
-| Decode › NBFM audio | `job_start` `fm_demod` (deviation 5000 Hz) on the box's measured centre and 1.25× its occupied width, floored at 5 kHz; a box with only noise starts as drawn |
-| Start background job › measure | `job_start` `measure` |
-| Save selection as SigMF | `iq_read` on the selection; the transcript shows the capture path |
-| Send to agent | `POST /ask` with "Look at C Hz, BW Hz wide, from START to END: what is it?" |
+- **What is this?**: `classify` on the selection; the labels are drawn at the selection and listed
+  in the transcript.
+- **Listen**: the demodulators (NBFM, FM broadcast, AM, SSB USB and LSB), each fitted to the
+  signal first (`fm_demod` on the box's measured centre and 1.25× its occupied width, floored at
+  5 kHz; a box with only noise starts as drawn), and under *Transcribe* the same with a
+  `transcribe` attached.
+- **Decode**: the decoder rows (APRS, POCSAG, RDS, ADS-B, ACARS, video), then *Decode across this
+  band…*, a watch that decodes one row wherever it appears in the box.
+- **Measure**: Identify (thorough), Watch this band, a `measure` job, Scan this span.
+- **Plans**: Start plan… and the plan's groups, Start set….
+- **Capture**: Capture bursts, Save selection as SigMF (`iq_read`; the transcript shows the path).
+- **Send to agent**: `POST /ask` with "Look at C Hz, BW Hz wide, from START to END: what is it?".
+
+Only what applies is offered, read from `modes_list`: a decoder where the band it would start
+(the box, or the width the entry widens it to) is at least its row's narrowest width and the box
+meets one of the row's ranges, a demodulator where it is at least the kind's minimum width. A
+group with nothing to offer is left out, and a group with one entry shows that entry itself.
 
 A running demodulator's outline has a handle at each edge (resize) and a body (move). The
 dragged band is shown with a ghost and a readout and sent as `job_retune` on release, keeping
 the job id, the attached `transcribe` and the ribbons; a conflict snaps it back with the usual
-retry buttons. Right-click (long press on a phone) opens Fit to signal, the width presets and
-Stop (a decoder's or a passthrough's menu holds Stop only; an SSB fit moves the dial and keeps
-the band). A fit on a running job measures a box about its centre of twice its width, so a narrow
+retry buttons. Right-click (long press on a phone), or the job row's ⋯, opens the job's menu: Fit to
+signal, Width (the presets), Denoise or Stereo where the kind takes them, Mute in mix when a mix
+covers the job, Next (Listen and Transcribe on a job with audio, and on its band and source What
+is this?, for a job on the shown source, Identify, a `measure` job and Watch) and Stop. A
+decoder's or a passthrough's menu holds Next and Stop only; an SSB fit moves the dial and keeps
+the band. A fit on a running job measures a box about its centre of twice its width, so a narrow
 signal fits the same on a second fit as on the first; a signal that runs past the job's band (a
 wider signal or a neighbour) is measured again in the band itself, a signal that fills the band is
 left as it is, and a fit never widens a job except to a plan channel's width. A weak voice signal

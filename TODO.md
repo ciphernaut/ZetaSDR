@@ -129,16 +129,14 @@ A weak FM voice carrier (9-12 dB) is also mislabelled `fsk` by the same 1 s wind
 
 The page's classify retry (`menu.js`, the `reclassify` function) handles `too_old` alone: a `gap` from the ring (a span that crosses a break in the capture) shows as a plain error, and the retry from `earliest_ns` can itself cross a gap. It could start from the newest run instead, and the footer's `ring N s` could show `ring.run_s`.
 
-## UI: the popup menus are cluttered
+## UI: the popup menus, after the grouping
 
-From the operator, 2026-11-18, after cleanup round 2 was deployed: both popup menus, the box menu (a drag on the waterfall) and a job's outline menu, "still look cluttered like before". Round 2 added to them: a "Start plan" entry per channel group in the box menu, and Stereo on a `wfm_demod` job's outline menu. Every feature so far has appended its entries to one flat list.
-
-Wanted, for both menus:
-- entries grouped by purpose (listen, decode, measure, plans, capture), a group opening as a submenu or a hover box, so the first level is short;
-- only what applies offered: by the selection's width and band for the box menu (a row's ranges and widths already say where it fits), by the job's kind for the outline menu;
-- one entry table shared by the two menus and the job's row, as "UI: more actions on an existing job" below asks, so a new feature adds a row to the table and not a line to each menu.
-
-Where this is heading (next entry): the menu's first line is what the classifier says the signal is, and the rest is the long tail.
+Built (cleanup round 3): both menus and the job row draw from one entry table (`actions.js`), the box menu's first level is What is this?, Listen, Decode, Measure, Plans, Capture and Send to agent, a job's is Fit, Width, its toggles, Mute in mix, Next and Stop, and only what applies is offered (`modes_list` widths and ranges). Left:
+- the first line is free for the classifier's answer: "Classify: layers 1 and 2 choose the job" below;
+- the rows say where a decoder applies only as far as their data goes: `rds_decode` has no `range_hz`, so RDS (and FM broadcast, a demodulator with no row) is offered on any box; a row `range_hz` or a demodulator row would narrow it;
+- the demodulators' minimum widths are the fit's page constants (`FIT_MIN_HZ`), not row data;
+- a job's What is this? reads the newest 2 s of its band only on the shown source (the page has no time base for another source's ring), and its menu from the row plays the row's picked voice but its outline's the main stream;
+- POCSAG and ACARS are offered on a box narrower than their row because the entries widen it: whether a tight box should offer them stays the operator's call.
 
 ## Classify: layers 1 and 2 choose the job, with no agent or model
 
@@ -148,9 +146,9 @@ Wanted: a deterministic mapping from that answer to a job, as data and not code:
 
 Spec first: it is a feature, not cleanup. The menu grouping above is the part that can land now and leaves the first line free for it.
 
-## UI: more actions on an existing job, and a selected job lit on the waterfall
+## UI: a selected job lit on the waterfall
 
-From the operator, 2026-11-01 (after the B210 day). A running job's row and its tag/outline menu should offer the next steps directly: listen (the audio player on a demodulator), attach `transcribe`, decode or investigate its band (`identify`, `classify` on the job's band and span, `measure`, a `watch` on it), stop. Today the row has graph/stop and the outline menu has Fit, the width presets and Stop (plan 18), and the box menu is the only way into identify/classify. Selecting a job (a click on its row, tag or outline) should also light it on the waterfall as a sticky selection, not only on hover (`hot` from plan 18 is hover-only), so the operator can see which job the next action applies to. One entry table shared by the row, the tag and the outline menu.
+From the operator, 2026-11-01 (after the B210 day). Built in cleanup round 3: a running job's next steps (listen, transcribe, What is this?, identify, measure, watch on its band) in its outline menu's Next and behind its row's ⋯, from the one entry table. Left: selecting a job (a click on its row, tag or outline) should light it on the waterfall as a sticky selection, not only on hover (`hot` from plan 18 is hover-only), so the operator can see which job the next action applies to; and the wide footprint's tag has no menu of its own (the narrow one's long press opens the outline menu).
 
 ## UI: on-waterfall messages cover the newest columns
 

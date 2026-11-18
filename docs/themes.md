@@ -207,7 +207,8 @@ core's menu rules are written with ID selectors, so a theme that styles menus mu
 `#ctx .ctx-sub, #ctx-outline .ctx-sub`, the same panel looks. A submenu is a `position: fixed`
 child of its menu: a `clip-path`, `mask` or `filter` on the menu clips it too. An end-to-end scenario (`scenario_theme_hooks`) checks that each
 selector below matches on a page with a running demodulator, a ribbon, a collapsed pane, a pane
-docked right, the map and the graph view open, so renaming one fails the suite.
+docked right, the map, the graph view and a job's menu open, so renaming one fails the suite. A
+menu's entries exist only while it is open.
 
 Regions:
 

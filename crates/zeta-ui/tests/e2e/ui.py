@@ -2073,8 +2073,8 @@ def scenario_theme_switch_live(page, url, secret):
 
 
 # The selectors docs/themes.md promises a theme may target (spec 5). Each must match on a page
-# with a running demodulator, a ribbon, a collapsed pane, a pane docked right, the map and the
-# graph view open, and each must appear verbatim in the docs.
+# with a running demodulator, a ribbon, a collapsed pane, a pane docked right, the map, the
+# graph view and a job's menu open, and each must appear verbatim in the docs.
 THEME_HOOKS = [
     "#top", ".brand", ".src-tab", '.src-tab[aria-selected="true"]', "#rail", ".wf-axis",
     "#waterfall", ".wf-canvas", "#side", "section.pane", ".pane-head",
@@ -2118,6 +2118,10 @@ def scenario_theme_hooks(page, url, secret):
         row.dispatch_event("pointerenter")
         expect(tag).to_have_class(re.compile(r"\bhot\b"))
         tag.evaluate("t => t.classList.add('speaking')")
+        # A menu's entries exist while it is open: the job's menu, from its row's ⋯ (under the
+        # graph view, so dispatched).
+        row.locator("button.more").dispatch_event("click")
+        expect(page.locator("#ctx-outline")).to_be_visible()
         for hook in THEME_HOOKS:
             expect(page.locator(hook).first, hook).to_be_attached()
         page.keyboard.press("Escape")
@@ -4740,14 +4744,14 @@ def scenario_drag_body_moves_the_centre_and_a_short_drag_is_a_click(page, url, s
             body = json.loads(req.value.post_data)
             assert body["job"] == small and body["bandwidth_hz"] == 1000, f"body drag {body}"
             assert body["center_hz"] < cur + 12_000, f"body drag {body}"
-            # A passthrough's outline menu offers Stop only (no fit, no presets).
+            # A passthrough's outline menu offers its next steps and Stop only (no fit, no
+            # presets, no toggles).
             page.evaluate("window.zetaTest.poll()")
             sol.click(button="right")
             menu = page.locator("#ctx-outline")
             expect(menu).to_be_visible()
-            got = menu.locator(".ctx-item:visible").evaluate_all(
-                "els => els.map(e => e.dataset.action)")
-            assert got == ["stop"], f"passthrough outline menu {got}"
+            got = menu.evaluate(FIRST_LEVEL_JS)
+            assert got == ["group:next", "stop"], f"passthrough outline menu {got}"
             page.keyboard.press("Escape")
             expect(menu).to_be_hidden()
         finally:
@@ -4843,7 +4847,8 @@ def scenario_outline_menu_presets_fit_and_stop(page, url, secret):
             "els => els.filter(e => e.offsetParent !== null)"
             ".map(e => [e.dataset.action || 'group:' + e.dataset.group, e.textContent])")
         assert got == [["fit", "Fit to signal"], ["group:width", "Width"],
-                       ["denoise", "Denoise on"], ["stop", "Stop"]], f"entries {got}"
+                       ["denoise", "Denoise on"], ["group:next", "Next"], ["stop", "Stop"]], \
+            f"entries {got}"
         widths = menu.locator('.ctx-sub[data-group="width"] .ctx-item').evaluate_all(
             "els => els.map(e => [e.dataset.action, e.textContent])")
         assert widths == [["w2500", "2.5 kHz"], ["w5000", "5 kHz"], ["w6250", "6.25 kHz"],
@@ -5695,12 +5700,134 @@ def scenario_box_menu_groups_open_by_hover_click_and_keys(page, url, secret):
     expect(measure).to_be_hidden()
     assert focused_key(page) == "group:measure", focused_key(page)
     page.keyboard.press("ArrowUp")
+    up = focused_key(page)
+    assert up == first[first.index("group:measure") - 1], f"ArrowUp to {up} in {first}"
+    menu.locator('.ctx-item[data-group="listen"]').focus()
     page.keyboard.press("Enter")
-    opened = focused_key(page)
-    assert opened not in (None, "group:measure") and not opened.startswith("group:"), opened
+    expect(listen).to_be_visible()
+    assert focused_key(page) == "fm_demod", focused_key(page)
     page.keyboard.press("Escape")
     page.keyboard.press("Escape")
     expect(menu).to_be_hidden()
+
+
+def mode_rows(url, secret):
+    """modes_list's rows, by id."""
+    r = http_json(url, secret, "/op", {"op": "modes_list", "family": None, "state": None})
+    return {m["id"]: m for m in r["value"]["modes"]}
+
+
+def in_ranges(row, lo, hi):
+    """Whether lo..hi Hz meets one of a modes_list row's ranges (none: anywhere)."""
+    r = row["band"].get("range_hz")
+    if not r:
+        return True
+    spans = [r] if isinstance(r[0], (int, float)) else r
+    return any(lo <= b and hi >= a for a, b in spans)
+
+
+def box_of(page):
+    """(center_hz, bandwidth_hz) of the open box menu's footer."""
+    footer = page.locator("#ctx-footer").text_content()
+    m = re.search(r"center_hz=(\d+) bandwidth_hz=(\d+)", footer)
+    assert m, f"footer {footer!r}"
+    return int(m.group(1)), int(m.group(2))
+
+
+def close_menu(page, menu="#ctx"):
+    """Escape, once per open level, until `menu` is hidden."""
+    for _ in range(4):
+        if not page.locator(menu).is_visible():
+            break
+        page.keyboard.press("Escape")
+    expect(page.locator(menu)).to_be_hidden()
+
+
+def drag_hz(page, hz, view_hz):
+    """drag_menu over about `hz` about the middle of a view `view_hz` wide."""
+    f = min(1.0, hz / view_hz)
+    return drag_menu(page, 0.5 - f / 2, 0.5 + f / 2)
+
+
+def scenario_box_menu_offers_only_what_fits(page, url, secret):
+    # A decoder entry is offered where the selection can hold its modes_list row: the width it
+    # asks for (APRS: the box as drawn) at least the row's narrowest, and the box meeting one
+    # of the row's ranges; a filtered entry is absent, not greyed. The widths and bands come
+    # from the row and the sources.
+    row = mode_rows(url, secret)["aprs_decode"]
+    need = row["band"].get("min_hz") or row["band"]["bandwidth_hz"]
+    item = page.locator('#ctx .ctx-item[data-action="aprs_decode"]')
+    select_source(page, url, secret, "aprs")
+    wait_span(page, MENU_SPAN_S)
+    drag_menu(page, 0.0, 1.0)
+    view_hz = box_of(page)[1]
+    close_menu(page)
+    drag_hz(page, need * 0.6, view_hz)
+    c, bw = box_of(page)
+    assert bw < need and in_ranges(row, c - bw / 2, c + bw / 2), f"narrow box {c} {bw}"
+    expect(item).to_have_count(0)
+    close_menu(page)
+    drag_hz(page, need * 1.5, view_hz)
+    c, bw = box_of(page)
+    assert bw >= need and in_ranges(row, c - bw / 2, c + bw / 2), f"wide box {c} {bw}"
+    expect(menu_item(page, "aprs_decode")).to_have_count(1)
+    close_menu(page)
+    # The same width on the tone, outside the row's ranges.
+    page.click('.src-tab[data-id="tone"]')
+    expect(page.locator('.src-tab[data-id="tone"]')).to_have_attribute("aria-selected", "true")
+    wait_span(page, MENU_SPAN_S)
+    drag_menu(page, 0.0, 1.0)
+    view_hz = box_of(page)[1]
+    close_menu(page)
+    drag_hz(page, need * 1.5, view_hz)
+    c, bw = box_of(page)
+    assert bw >= need and not in_ranges(row, c - bw / 2, c + bw / 2), f"tone box {c} {bw}"
+    expect(item).to_have_count(0)
+    close_menu(page)
+
+
+def scenario_job_menu_offers_next_steps_from_outline_and_row(page, url, secret):
+    # A running demodulator's menu (its outline's right-click, or its row's ⋯) offers its
+    # next steps under Next, from the same table as the box menu: Identify on the job's band
+    # sends job_start with the job's centre and source. An fm_demod offers no Stereo.
+    select_source(page, url, secret, "tone")
+    page.wait_for_function("() => window.zetaTest.wf().painted > 30", timeout=15_000)
+    job = start_job(url, secret, "fm_demod", "tone", 100_001_000, 12_500, deviation_hz=5000)
+    ids = []
+    try:
+        ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
+        page.evaluate("window.zetaTest.poll()")
+        expect(ol).to_have_count(1)
+        ol.click(button="right")
+        menu = page.locator("#ctx-outline")
+        expect(menu).to_be_visible()
+        expect(menu.locator('.ctx-item[data-action="stereo"]')).to_have_count(0)
+        nxt = "els => els.map(e => e.dataset.action)"
+        from_outline = menu.locator('.ctx-sub[data-group="next"] .ctx-item').evaluate_all(nxt)
+        for want in ("listen", "transcribe", "classify", "identify", "measure", "watch"):
+            assert want in from_outline, f"next steps {from_outline}"
+        with page.expect_request(is_op("job_start")) as req:
+            menu_click(page, "identify", "#ctx-outline")
+        body = json.loads(req.value.post_data)
+        assert (body["kind"], body["source"], body["center_hz"]) == \
+            ("identify", "tone", 100_001_000), f"identify {body}"
+        expect(menu).to_be_hidden()
+        wait_until(lambda: running_jobs(url, secret, "identify", "tone"), 5.0, "an identify")
+        ids = [j["id"] for j in running_jobs(url, secret, "identify", "tone")]
+        # The row's ⋯ opens the same menu for the job.
+        page.evaluate("window.zetaTest.poll()")
+        job_row(page, job).locator("button.more").click()
+        expect(menu).to_be_visible()
+        expect(page.locator("#ctx-outline-footer")).to_contain_text(f"job={job} ")
+        assert menu.evaluate(FIRST_LEVEL_JS) == \
+            ["fit", "group:width", "denoise", "group:next", "stop"], menu.evaluate(FIRST_LEVEL_JS)
+        from_row = menu.locator('.ctx-sub[data-group="next"] .ctx-item').evaluate_all(nxt)
+        assert from_row == from_outline, f"row {from_row} outline {from_outline}"
+        close_menu(page, "#ctx-outline")
+    finally:
+        for j in ids:
+            stop_job(url, secret, j)
+        stop_job(url, secret, job)
 
 
 def scenario_submenus_stay_inside_the_viewport(page, url, secret):
@@ -6001,7 +6128,20 @@ def scenario_set_menu_starts_a_set_and_groups_its_jobs(page, url, secret):
 
 def scenario_adsb_entry_asks_for_2400_khz(page, url, secret):
     # ADS-B always asks for 2.4 MHz, whatever was selected; the 48 kHz tone cannot serve it,
-    # so the node refuses with out_of_range naming bandwidth_hz and the transcript says so.
+    # so the node refuses with out_of_range naming bandwidth_hz and the transcript says so. No
+    # source of the test node is in the row's range (the entry is offered only there): the
+    # page is told the row has none.
+    def route(r):
+        if '"modes_list"' not in (r.request.post_data or ""):
+            return r.continue_()
+        resp = r.fetch()
+        data = resp.json()
+        for m in (data.get("value") or {}).get("modes") or []:
+            if m["id"] == "adsb_decode":
+                m["band"]["range_hz"] = None
+        return r.fulfill(response=resp, body=json.dumps(data))
+
+    page.route("**/op", route)
     open_menu_on_tone(page, url, secret)
     def is_adsb_start(r):
         if r.method != "POST" or not r.url.endswith("/op"):
@@ -10742,9 +10882,15 @@ def scenario_video_feed_stopping_falls_back_to_the_next(page, url, secret):
 
 
 def scenario_decode_video_greys_when_the_box_is_too_wide(page, url, secret):
-    # The waterfall shows at most the capture's own width, so a real box is never wider than
-    # the file's cap (asserted: its rate, 8 MHz); the page is told a 4 MHz cap instead.
-    cap = 4_000_000
+    # Video is offered on a box at least its row's narrowest wide (modes_list `min_hz`; it
+    # starts on the box as drawn), and greyed, its title the lease's words, when the radio's cap
+    # is under the box. The waterfall shows at most the capture's own width, so a real box is
+    # never wider than the file's cap (asserted: its rate): the page is told a cap between the
+    # middle box and the widest one.
+    row = mode_rows(url, secret)["video_decode"]
+    need = row["band"].get("min_hz") or row["band"]["bandwidth_hz"]
+    full = current_capture(url, secret, "video")["bandwidth_hz"]
+    cap = int(0.88 * full)
 
     def route(r):
         if '"source_list"' not in (r.request.post_data or ""):
@@ -10755,27 +10901,28 @@ def scenario_decode_video_greys_when_the_box_is_too_wide(page, url, secret):
             src.setdefault("capabilities", {})["max_bandwidth_hz"] = {"asserted": cap}
         return r.fulfill(response=resp, body=json.dumps(data))
 
-    def box_hz():
-        footer = page.locator("#ctx-footer").text_content()
-        return int(re.search(r"bandwidth_hz=(\d+)", footer).group(1))
-
     page.route("**/op", route)
     try:
         select_source(page, url, secret, "video")
         wait_span(page, MENU_SPAN_S)
-        item = page.locator('#ctx .ctx-item[data-action="video"]')
         drag_menu(page, 0.02, 0.98)
-        assert box_hz() > cap, f"wide box {box_hz()} Hz"
+        assert box_of(page)[1] > cap, f"wide box {box_of(page)} cap {cap}"
+        item = menu_item(page, "video")
         expect(item).to_have_attribute("aria-disabled", "true", timeout=10_000)
         title = item.get_attribute("title")
         assert title.startswith("insufficient bandwidth") and "(measured at open)" not in title, \
             title
-        page.keyboard.press("Escape")
-        drag_menu(page, 0.40, 0.60)
-        assert box_hz() < cap, f"narrow box {box_hz()} Hz"
+        close_menu(page)
+        drag_menu(page, 0.10, 0.90)
+        assert need <= box_of(page)[1] < cap, f"middle box {box_of(page)} need {need} cap {cap}"
+        item = menu_item(page, "video")
         expect(item).not_to_have_attribute("aria-disabled", "true")
         assert item.get_attribute("title") is None
-        page.keyboard.press("Escape")
+        close_menu(page)
+        drag_menu(page, 0.40, 0.60)
+        assert box_of(page)[1] < need, f"narrow box {box_of(page)} need {need}"
+        expect(page.locator('#ctx .ctx-item[data-action="video"]')).to_have_count(0)
+        close_menu(page)
     finally:
         page.unroute("**/op", route)
 

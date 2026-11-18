@@ -80,138 +80,32 @@
 //   Menu:
 //     menu.open(sel, x, y)  shows the menu for a waterfall selection at client (x, y)
 //     menu.close()          hides it and erases the selection rectangle
-//     menu.openOutline(job, x, y)  shows #ctx-outline for a running job (a `job_list` record) at
-//                           client (x, y), kept inside the viewport; the first entry is focused
+//     menu.openOutline(job, x, y, role = null)  shows #ctx-outline for a running job (a
+//                           `job_list` record) at client (x, y), kept inside the viewport; the
+//                           first entry is focused; `role` the voice its Listen and Transcribe use
 //     menu.closeOutline()   hides it
 //     menu.destroy()
 //     The table's runs (actions.js) call the Menu's own methods: classify, iqRead, askAbout,
 //     startJob, fitAndStart, decodeAcross, scan, openSet, command, planGroupsOf (a box's ctx
-//     `sel`), and fitOutline, retuneWidth, toggle, mute, stopJob (a job).
+//     `sel`), and fitOutline, retuneWidth, toggle, mute, stopJob (a job). A job's ctx carries
+//     its band as `sel` (jobCtx), so its next steps run the box entries' runs.
+//   JOB_SPAN_NS     the span a job's What is this? reads (the newest painted, on the shown source)
+//   mountMenu's opts also take isAudio(job), play(job, {role}), transcribe(job, {role}) and
+//     playing(id): app.js's, for a job menu's Listen and Transcribe (the row's ▶ and Transcribe)
 //   DENOISE_KINDS   the job kinds whose demodulator node takes `denoise`, by its stage kind
 //
-// Entries (`.ctx-item[data-action]`), drawn from actions.js's table (ACTIONS: which entries a
-// surface offers, their labels, groups and when they apply); what each does:
-//   classify   What is this?                  notes "classify: running…", then classify
-//                                             {selection}; the layer-1 labels are drawn with
-//                                             ov.label at the selection's centre (stacked
-//                                             LABEL_STEP_PX apart, or LABEL_FALLBACK_STEP_HZ
-//                                             while the band is unknown), the top layer-2
-//                                             label one line under the last of them; every
-//                                             label is listed in the transcript as
-//                                             `L<layer> <name> <confidence>`, then each
-//                                             mode decode-to-identify considered as
-//                                             `tried <mode> <score> <outcome>`, then the
-//                                             register's answer as units.js registerLines
-//                                             words it (the verdict with the data's date,
-//                                             the band, the top candidates, what the first
-//                                             belongs to; an older node without `register`:
-//                                             the registerText line), and its `origins`
-//                                             light the map (onOrigins)
-//   identify   Identify (thorough)            job_start kind=identify, bandwidth_hz at least
-//                                             IDENTIFY_MIN_BANDWIDTH_HZ; each `candidate`
-//                                             event shows as a ribbon (its `summary`, class
-//                                             `candidate`), held by the feed until a poll
-//                                             lists the job
-//   watch      Watch this band                job_start kind=watch on the selection as is
-//   decode_across  Decode across this band…   opens its submenu `.ctx-sub[data-for=
-//                                             "decode_across"]` (a click, or the pointer on
-//                                             it): one `.ctx-item[data-mode=<id>]` per `ready`
-//                                             row of `modes_list` (read once per page, then
-//                                             cached) whose band.bandwidth_hz is no wider than
-//                                             the selection, `Decode <row name> across this
-//                                             band`; the entry is hidden when none fits.
-//                                             Choosing a row: job_start kind=watch on the
-//                                             selection as is, then graph_get and graph_put of
-//                                             its `detect` node with modes [<id>], persist_ms
-//                                             DECODE_ACROSS_PERSIST_MS and width_hz
-//                                             DECODE_ACROSS_WIDTH_FIT × the row's width
-//                                             ([0.5, 2]: the node's span fit, so the detector's
-//                                             ceiling admits every signal the watch would
-//                                             decode; plan 31 spec 4.7: two ops, one click)
-//   aprs_decode  Decode › APRS                job_start kind=aprs_decode, deviation_hz null
-//   pocsag_decode  Decode › POCSAG            job_start kind=pocsag_decode, deviation_hz null,
-//                                             bandwidth_hz at least POCSAG_MIN_BANDWIDTH_HZ
-//   rds_decode  Decode › RDS (FM station data)  job_start kind=rds_decode, deviation_hz null,
-//                                             bandwidth_hz at least WFM_MIN_BANDWIDTH_HZ
-//   adsb_decode  Decode › ADS-B (dump1090)    job_start kind=adsb_decode, deviation_hz null,
-//                                             bandwidth_hz always ADSB_BANDWIDTH_HZ (the node
-//                                             refuses under 2 MHz; a narrower source answers
-//                                             out_of_range, shown in the transcript)
-//   acars_decode  Decode › ACARS              job_start kind=acars_decode, deviation_hz null,
-//                                             bandwidth_hz at least ACARS_MIN_BANDWIDTH_HZ
-//   video      Decode video                   job_start kind=video_decode at the box's centre
-//                                             and width as drawn (never fitted, never a grid);
-//                                             greyed (aria-disabled, its title the lease's
-//                                             words, videoRefusal) when the shown source's
-//                                             max_bandwidth_hz is under the box's width
-//   fm_demod   Decode › NBFM audio            job_start kind=fm_demod, deviation_hz 5000
-//                                             (fitted first: see Fitting)
-//   wfm_demod  Decode › FM broadcast audio    job_start kind=wfm_demod, deviation_hz 75000,
-//                                             bandwidth_hz at least WFM_MIN_BANDWIDTH_HZ
-//                                             (fitted first)
-//   am_demod   Decode › AM                    job_start kind=am_demod, deviation_hz null
-//                                             (fitted first)
-//   ssb_usb    Decode › SSB (USB)             job_start kind=ssb_demod, sideband usb, at the
-//                                             dial: center_hz = selection centre − 1500,
-//                                             bandwidth_hz 6000 (ruling R6; fitted first)
-//   ssb_lsb    Decode › SSB (LSB)             likewise, sideband lsb, centre + 1500
-//   wfm_transcribe  Transcribe › FM broadcast  the job_start of its Decode twin (wfm_demod,
-//   fm_transcribe   Transcribe › NBFM voice    fm_demod, am_demod, ssb_usb, ssb_lsb: same
-//   am_transcribe   Transcribe › AM            kind, deviation, sideband and tuning), then on
-//   ssb_usb_transcribe  Transcribe › SSB (USB) success attachOp(<its job>): a transcribe job
-//   ssb_lsb_transcribe  Transcribe › SSB (LSB) attached to that demodulator (the twin is
-//                                             fitted first, as its Decode entry)
-//   measure    Start background job › measure job_start kind=measure, deviation_hz null
-//                                             (every job_start sends sideband: null unless SSB)
-//   scan       Scan this span                 (starts the default look, 20 ms x 1; the job's
-//                                             row offers the others: agent.js SCAN_LOOKS) wf.release() (the
-//                                             waterfall lets go; the node decides: on a source
-//                                             another job holds the scan waits, its row saying
-//                                             so), job_start
-//                                             kind=scan on the selection's centre and
-//                                             bandwidth, then wf.resume() (scan mode when the
-//                                             scan runs, else the spectrum job again); in
-//                                             sweep mode (a KiwiSDR's tab) it re-aims the
-//                                             tab's own scan instead (wf.requestView: a
-//                                             job_retune), starting none
-//   plan       Start plan…                    shown only when the view's plan policy names a plan
-//                                             (mountMenu's `plan()`); puts `plan start <plan>
-//                                             fm_demod transcribe` in the command line
-//                                             (`command(text)`) and focuses it. After it, one
-//                                             `.ctx-item[data-group=<id>]` per named group of
-//                                             that plan (plans.js planGroups) but one of data
-//                                             channels only (planNoVoice), `Start plan ›
-//                                             <group name>`: puts `plan start <plan> fm_demod
-//                                             transcribe group <id>` there the same way
-//   set        Start set…                     shown only when `sets()` (mountMenu's: set_list's
-//                                             entries, read with the jobs) has a `ready` set;
-//                                             opens #ctx-set where the menu stood (plan 31
-//                                             spec 5.5): `select.set-pick` of the ready sets
-//                                             (the first chosen), then per role of the chosen
-//                                             set (in its members' order) a
-//                                             `select[data-role=<role>]` of every source of
-//                                             `sources()` (source_list's records) plus
-//                                             "pick" (value "", sent as null), the first
-//                                             role on the shown source, the rest "pick";
-//                                             Start (`button.start`) sends set_start {set,
-//                                             radios, members: null, replace: []} (its line
-//                                             counts started, existing, refused and warnings;
-//                                             each refusal and warning is noted), Cancel,
-//                                             Escape or a press outside close it
-//   iq_read    Save selection as SigMF        iq_read {selection}; the transcript shows the path
-//   ask        Send to agent                  /ask "Look at <c> Hz, <bw> Hz wide, on <source>,
-//                                             from <start> to <end>: what is it?" (naming
-//                                             the radio makes it the agent's default)
+// Entries: actions.js's table, whose header says what each does and when it is offered;
+// the runs are this module's Menu methods.
 // The jobs use the selection's centre and bandwidth on the source the waterfall shows (the
 // SSB entries their dial frequency and SSB_BANDWIDTH_HZ instead; FM broadcast and RDS widen
 // the bandwidth, ADS-B replaces it, see jobTuning).
 // #ctx-footer shows the selection in the vocabulary: center_hz=… bandwidth_hz=… start_ns=…
-// end_ns=…, with the span already clamped (see below); while an SSB entry (Decode or
-// Transcribe) is focused or hovered it shows that entry's dial instead: center_hz=<dial>
+// end_ns=…, with the span already clamped (see below); while an SSB entry (Listen or its
+// Transcribe twin) is focused or hovered it shows that entry's dial instead: center_hz=<dial>
 // bandwidth_hz=6000 sideband=usb|lsb start_ns=… end_ns=….
 //
 // Fitting: the demodulator entries (a kind in FIT_KINDS: fm_demod, wfm_demod, am_demod,
-// ssb_demod; their Decode and Transcribe entries alike) measure the box before starting. The
+// ssb_demod; their Listen entries and Transcribe twins alike) measure the box before starting. The
 // menu stays open, the box drawn and #ctx-footer reading `measuring…`, while fitBand runs on
 // the selection's centre and bandwidth; then the menu closes and:
 //   - false (the measure would not start; applyOp noted it, a conflict with its retry): nothing starts;
@@ -258,39 +152,10 @@
 // the inline end (`dir`), on the other side when there is no room there, and shifts it up to
 // stay inside the viewport. A Transcribe twin's `section` starts a `.ctx-sep` heading.
 //
-// The outline menu (#ctx-outline, role menu; overlays.js opens it by right-click on a retunable
-// outline, or a long press on its label in the narrow footprint). Entries
-// (`.ctx-item[data-action]`, actions.js's `job` entries), on the job's own source and tuning; Fit and the
-// width presets only for a job whose kind is in FIT_KINDS (the others are hidden: the node
-// would refuse a decoder's or a passthrough's narrowing as often as not), Stop always:
-//   fit    Fit to signal   fitJob on the job (a wide box or its own band: see fitJob), then
-//                          job_retune to fitTuning(...), never wider than the job except by a
-//                          plan's width, its centre kept in the job's band; a signal that fills
-//                          the band changes nothing and the note reads `(<label>, kept: the
-//                          signal fills the band)` (an ssb_demod keeps its width and moves its dial,
-//                          the sideband read from its graph's ssb_demod node), and once the
-//                          retune answered the note `fitted <kind> to <band> (<label>, <rule>)`; no
-//                          signal: the note `no signal found in the band; left as it is` (with
-//                          the capture-centre clause above when the band holds the centre of a
-//                          local radio's capture: `no signal found in the band (the capture
-//                          centre <mhz> MHz is in the band: the 50 kHz around it are not
-//                          measured); left as it is`) and nothing changes. Shares the fit guard
-//                          above (entries aria-disabled meanwhile, closing the menu cancels it:
-//                          `<kind>: fit cancelled`)
-//   w2500 2.5 kHz, w5000 5 kHz, w6250 6.25 kHz, w12500 12.5 kHz, w25000 25 kHz
-//                          job_retune to that bandwidth_hz about the same centre_hz
-//   denoise Denoise on|off graph_put of the job's own graph with `denoise` flipped on its
-//                          demodulator node (nbfm_demod, am_demod, ssb_demod: DENOISE_KINDS;
-//                          hidden for the others), the entry reading the state it would
-//                          switch to; the note `<kind>: denoise on|off`
-//   stereo Stereo on|off   the same for `stereo` on a wfm_demod job's wfm_demod node (two
-//                          channels, L and R once the pilot locks; hidden for the other
-//                          kinds); the note `wfm_demod: stereo on|off`
-//   mute   Mute in mix     graph_put of the covering mix's own graph with this channel added to
-//                          its `muted` (mix.js mixCovering, muteOp; the entry reads `Unmute in
-//                          mix` for a muted one, hidden when no running mix covers the job's
-//                          source); the note `<kind>: muted in mix` / `unmuted in mix`
-//   stop   Stop            job_stop
+// The job's menu (#ctx-outline, role menu): overlays.js opens it by right-click on a retunable
+// outline, or a long press on its label in the narrow footprint; the job row's ⋯ opens it too
+// (openOutline, with the voice the row plays). Its entries are actions.js's `job` ones, on the
+// job's own source and tuning.
 // Every retune is {op: job_retune, job, center_hz, bandwidth_hz, replace: []}. #ctx-outline-footer
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
 // as for #ctx.
@@ -347,6 +212,9 @@ export const MEASURE_DC_MASK_HZ = 25000;
 // widths as fractions of the chosen row's band.bandwidth_hz, the node's span fit (0.5-2x).
 export const DECODE_ACROSS_PERSIST_MS = 500;
 export const DECODE_ACROSS_WIDTH_FIT = [0.5, 2];
+// What is this? on a running job (its menu's Next) reads its band over the newest this many ns
+// the waterfall painted (the box menu reads the span dragged).
+export const JOB_SPAN_NS = 2_000_000_000;
 
 // The job kinds whose demodulator node takes `denoise` (RNNoise on its audio), by the node's
 // stage kind: the voice demodulators; wfm_demod (music) has none.
@@ -625,8 +493,12 @@ export function clampSpan(startNs, endNs, newest) {
 class Menu {
   constructor(
     wf,
-    { applyOp, attachOp, ask, transcript, ov, plan = () => null, planPolicy = () => "none", ringSeconds = () => null, command = () => {}, muteFor = () => null, onOrigins = () => {}, sets = () => [], sources = () => [] },
+    { applyOp, attachOp, ask, transcript, ov, plan = () => null, planPolicy = () => "none", ringSeconds = () => null, command = () => {}, muteFor = () => null, onOrigins = () => {}, sets = () => [], sources = () => [], isAudio = () => false, play = () => {}, transcribe = () => {}, playing = () => false },
   ) {
+    this.isAudio = isAudio;
+    this.play = play;
+    this.transcribe = transcribe;
+    this.playing = playing;
     this.wf = wf;
     this.sets = sets;
     this.sources = sources;
@@ -783,18 +655,36 @@ class Menu {
     };
   }
 
-  // The outline menu's ctx (actions.js) for `job`.
-  jobCtx(job) {
+  // The job menu's ctx (actions.js) for `job`, playing and transcribing voice `role` (null:
+  // the main stream). Its `sel` is the job's band as a selection on its source (null without
+  // a band); its span the newest JOB_SPAN_NS the waterfall painted when the job is on the
+  // shown source, else null (the page has no time base for another source's ring).
+  jobCtx(job, role = null) {
+    const t = job.tuning;
+    let sel = null;
+    if (t && Number.isFinite(t.center_hz) && Number.isFinite(t.bandwidth_hz)) {
+      const end = job.source === this.wf.sourceId ? newestNs(this.wf) : null;
+      sel = {
+        sourceId: job.source,
+        centerHz: t.center_hz,
+        bandwidthHz: t.bandwidth_hz,
+        startNs: end === null ? null : Math.round(end - JOB_SPAN_NS),
+        endNs: end === null ? null : Math.round(end),
+        clamped: false,
+      };
+    }
     return {
       surface: "job",
       host: this,
       job,
+      sel,
       mute: this.muteFor(job),
-      audio: false,
+      audio: !job.input && this.isAudio(job),
       running: job.state?.status === "running",
-      role: null,
-      play: () => {},
-      transcribe: () => {},
+      playing: this.playing(job.id),
+      role,
+      play: this.play,
+      transcribe: this.transcribe,
     };
   }
 
@@ -827,7 +717,12 @@ class Menu {
       if (es.length === 0) continue;
       const lines = es.reduce((n, e) => n + 1 + (e.items ? e.items(ctx).length : 0), 0);
       if (g.direct || lines === 1) {
-        nodes.push(...this.entryNodes(es, ctx, root, panels));
+        const promoted = this.entryNodes(es, ctx, root, panels);
+        const item = promoted.find((n) => n.classList.contains("ctx-item"));
+        if (!g.direct && g.prefix && !item.textContent.startsWith(g.label)) {
+          item.textContent = `${g.label} › ${item.textContent}`;
+        }
+        nodes.push(...promoted);
         continue;
       }
       const opener = this.button(null, g.label);
@@ -1012,7 +907,7 @@ class Menu {
     if (this.fitting !== null) return;
     const box = !this.el.hidden;
     if (box ? !this.sel : !this.outlineJob) return;
-    const ctx = box ? this.boxCtx() : this.jobCtx(this.outlineJob);
+    const ctx = box ? this.boxCtx() : this.jobCtx(this.outlineJob, this.outlineRole);
     if (entry.disabled && entry.disabled(ctx)) return;
     if (box) this.showFooter(ctx.sel, entry.id);
     if (!entry.keep) {
@@ -1056,14 +951,15 @@ class Menu {
     this.setFitting(null);
   }
 
-  openOutline(job, x, y) {
+  openOutline(job, x, y, role = null) {
     // One menu at a time; opening cancels a fit still running for the previous one.
     if (!this.el.hidden) this.close();
     this.fitGen += 1;
     this.setFitting(null);
     this.outlineJob = job;
-    const t = job.tuning;
-    this.paint(this.outlineEl, this.outlineFooter, this.jobCtx(job));
+    this.outlineRole = role;
+    const t = job.tuning || {};
+    this.paint(this.outlineEl, this.outlineFooter, this.jobCtx(job, role));
     this.outlineFooter.textContent =
       `job=${job.id} center_hz=${t.center_hz} bandwidth_hz=${t.bandwidth_hz}`;
     this.outlineEl.hidden = false;

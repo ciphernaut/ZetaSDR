@@ -163,7 +163,7 @@
 // note each).
 
 import { OpError, connect, Unauthorized } from "./api.js";
-import { QUIET_OPS, Transcript, errorText, startJobs, startOpsFeed } from "./agent.js";
+import { QUIET_OPS, Transcript, errorText, isAudioJob, startJobs, startOpsFeed } from "./agent.js";
 import { mountWaterfall } from "./waterfall.js";
 import { mountOverlays } from "./overlays.js";
 import { mountMenu } from "./menu.js";
@@ -1477,6 +1477,11 @@ function start(api) {
     sets: () => state.jobs?.sets() ?? [],
     sources: () => state.sources,
     onOrigins: (key, answer) => state.map?.origin(key, answer),
+    // A job's menu offers the row's ▶ and Transcribe as its Listen and Transcribe.
+    isAudio: (job) => isAudioJob(job, (kind) => state.subjects?.rowOf(kind) ?? null),
+    play: (job, opts) => toggleAudio(job, opts),
+    transcribe: (job, { role = null } = {}) => applyOp(attachOp(job.id, role)),
+    playing: (id) => !!state.audio && state.audio.jobId === id,
     command: (text) => {
       const cmd = $("#cmd");
       cmd.value = text;
@@ -1523,6 +1528,7 @@ function start(api) {
     onPlay: toggleAudio,
     onTranscribe: (job, { role = null } = {}) => applyOp(attachOp(job.id, role)),
     onGraph: (job) => showGraph(api, job.id),
+    onMore: (job, x, y, role) => state.menu?.openOutline(job, x, y, role),
     onOrigins: (job) => askOrigins(job.id),
     playing: (id) => !!state.audio && state.audio.jobId === id,
     onHot: (id, on) => state.ov?.setHot(id, on),

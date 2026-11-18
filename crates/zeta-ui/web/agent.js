@@ -68,7 +68,10 @@
 //       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job, {role}) and, while
 //       running, a `button.transcribe` (Transcribe) calling onTranscribe(job, {role}) (ruling
 //       R14), both through actions.js's `listen` and `transcribe` entries (runAction), a
-//       `button.graph` calling onGraph(job), and a Stop button applying `job_stop`.
+//       `button.graph` calling onGraph(job), on a running job with a band (not a mix) a compact
+//       `button.more` (⋯) calling onMore(job, x, y, role) (app.js: the job's menu, menu.js
+//       openOutline, under the control: the same entries as its outline's), and a Stop button
+//       applying `job_stop`.
 //       `role` is null (the job's main stream) unless the job's mode row (audioKind) lists
 //       `voices`: such a row has a stream picker, a `select.voice` after ▶ with the options
 //       `main` (value "") and each voice, and `role` is the voice picked (remembered per job
@@ -654,7 +657,7 @@ function voiceSelect(job, voices, role, onVoice) {
 function jobRow(
   job,
   onStop,
-  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits, onOrigins, audioKind, scanInfo, onLook, voiceOf, onVoice },
+  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits, onOrigins, onMore, audioKind, scanInfo, onLook, voiceOf, onVoice },
 ) {
   const row = document.createElement("div");
   const attached = !!job.input;
@@ -838,6 +841,22 @@ function jobRow(
   }
   if (scan && scan.params && onLook) actions.append(lookSelect(job, scan, scan.depths, onLook));
   if (onGraph) actions.append(graphButton(job, onGraph));
+  // The job's menu (its outline's: Fit, Width, the toggles, Next, Stop) on a running job with a
+  // band, opened under the control.
+  const t2 = job.tuning;
+  if (onMore && status === "running" && job.kind !== "mix" && t2
+      && Number.isFinite(t2.center_hz) && Number.isFinite(t2.bandwidth_hz) && t2.bandwidth_hz > 0) {
+    const more = document.createElement("button");
+    more.className = "more";
+    more.textContent = "⋯";
+    more.title = "more: this job's menu";
+    more.setAttribute("aria-haspopup", "menu");
+    more.onclick = () => {
+      const r = more.getBoundingClientRect();
+      onMore(job, r.left, r.bottom, role);
+    };
+    actions.append(more);
+  }
   actions.append(stopButton(job, onStop));
   row.append(actions);
   return row;
@@ -986,6 +1005,7 @@ export function startJobs(
     mute = null,
     onBits = null,
     onOrigins = null,
+    onMore = null,
     audioKind = null,
     countEl = null,
     lastEvent = null,
@@ -1117,6 +1137,7 @@ export function startJobs(
     mute,
     onBits,
     onOrigins,
+    onMore,
     audioKind,
     scanInfo: (job) => {
       const s = scans.get(job.id);
