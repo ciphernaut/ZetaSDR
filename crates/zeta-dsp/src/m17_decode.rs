@@ -20,7 +20,8 @@
 //! 48 kHz and published on the stage's audio output, one frame of audio per stream frame
 //! with that frame's span. An encrypted stream feeds it nothing. Its exit fails nothing but
 //! that stream's audio: the events go on, `job_context.m17.vocoder` says why once, and the
-//! next LSF starts it again.
+//! next LSF starts it again. Without it (the row marks it optional) every stream is
+//! reported with no audio, and `job_context.m17.vocoder` says so once, with how to get it.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -67,6 +68,33 @@ pub use crate::vocoder::AUDIO_RATE_HZ;
 pub const C2DEC: &str = "c2dec";
 /// How long the vocoders of a finished input may take to hand back their speech.
 pub use crate::vocoder::VOCODER_DRAIN;
+/// Where to get [`C2DEC`] for a stage run without a row to say so.
+const C2DEC_URL: &str = "https://github.com/drowe67/codec2";
+
+/// The job-context note for a run whose optional `c2dec` is absent: why there is no audio,
+/// how to get it (the row's handler 0 install hint, for this host's package managers) and
+/// when the node looks again (the stage looks it up once, at start).
+fn no_c2dec_note(ctx: &StageContext) -> String {
+    let install = ctx.mode.as_ref().and_then(|row| {
+        row.decoder
+            .handler_blocks()
+            .first()
+            .map(|b| b.install.clone())
+    });
+    let (hint, url) = match &install {
+        Some(i) => (i.hint(), i.url.as_str()),
+        None => (None, C2DEC_URL),
+    };
+    let how = match hint {
+        Some(h) => format!("install it with {h} ({url})"),
+        None => format!("install it from {url}"),
+    };
+    let var = zeta_core::modes::handlers::handler_vars(&[C2DEC.to_string()]).remove(0);
+    format!(
+        "{C2DEC} not found: streams are reported with no audio; {how}; the node finds it on \
+         PATH or by {var} when the job next starts"
+    )
+}
 /// One frame (192 symbols at 4800 baud), ns.
 const FRAME_NS: u64 = FRAME_SYMBOLS as u64 * 1_000_000_000 / M17_BAUD as u64;
 /// Codec 2 speech samples per stream frame (40 ms at 8 kHz).
@@ -710,6 +738,10 @@ impl Stage for M17DecodeStage {
         };
         let events_out = events_out.clone();
         let program = crate::vocoder::program(&ctx, 0, C2DEC, true).map_err(StageError::Failed)?;
+        if program.is_none() {
+            // Looked up once, here: the note says so, and says it once.
+            ctx.note(serde_json::json!({"m17": {"vocoder": no_c2dec_note(&ctx)}}));
+        }
         let env = VocoderEnv {
             bus: bus.clone(),
             out: audio_out.clone(),
@@ -1075,7 +1107,8 @@ mod tests {
     }
 
     /// Without `c2dec` (the row's handler is optional, as the P25 and DMR rows'
-    /// `zeta-mbe`): the stream's two events, and no audio.
+    /// `zeta-mbe`): the stream's two events, no audio, and one note saying why and how to
+    /// get it.
     #[tokio::test]
     async fn without_c2dec_a_stream_gives_its_events_and_no_audio() {
         let _env = VOCODER_ENV.lock().await;
@@ -1088,7 +1121,30 @@ mod tests {
         assert_eq!(run.events[0]["eot"], false, "{:?}", run.events);
         assert_eq!(run.events[1]["eot"], true, "{:?}", run.events);
         assert!(run.audio.is_empty(), "{} audio frames", run.audio.len());
-        assert_eq!(vocoder_note(&run.notes), None, "{:?}", run.notes);
+        let note = vocoder_note(&run.notes).expect("a vocoder note");
+        // The hint follows the host's package managers: the stable parts only.
+        assert!(
+            note.starts_with(
+                "c2dec not found: streams are reported with no audio; install it with "
+            ),
+            "{note}"
+        );
+        assert!(
+            note.contains("(https://github.com/drowe67/codec2)"),
+            "{note}"
+        );
+        assert!(
+            note.ends_with(
+                "; the node finds it on PATH or by ZETA_HANDLER_C2DEC when the job next starts"
+            ),
+            "{note}"
+        );
+        let said = run
+            .notes
+            .iter()
+            .filter(|n| n["m17"]["vocoder"].is_string())
+            .count();
+        assert_eq!(said, 1, "once: {:?}", run.notes);
     }
 
     /// With the real `c2dec`, when the host has it: the zero payload renders as a
