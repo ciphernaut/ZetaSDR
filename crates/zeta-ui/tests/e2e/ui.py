@@ -2096,9 +2096,9 @@ def scenario_view_set_show_reset(page, url, secret):
                  "home none",
                  "subjects auto", "subject_dim_s 60", "subject_drop_s 300",
                  "origin_fade_s 300", "pane none", "theme console", "side both", "dock auto",
-                 "map_tiles auto", "radio_policy focus", "radio_prefer none", "video smooth"):
+                 "map_tiles auto", "radio_policy focus", "radio_prefer none", "video smooth", "dir auto", "time_flow right"):
         assert text in shown, f"{text!r} not in view show: {shown!r}"
-    assert shown.count("\n") == 20, f"view show: {shown!r}"
+    assert shown.count("\n") == 22, f"view show: {shown!r}"
     run_cmd(page, "view set follow sideways")
     expect(view_line(page, "sideways", error=True)).to_contain_text("target, free")
     run_cmd(page, "view set finished_rows_s 5")
@@ -4058,7 +4058,9 @@ RIBBON_EDGE_JS = """() => {
   const layer = document.querySelector("#waterfall .ov-layer");
   const r = [...document.querySelectorAll('#waterfall .ov-ribbon.flow')].pop();
   // The untilted box (offsetLeft/Width), as a theme leans ribbons about their centre.
-  return {fromLeft: r.offsetLeft, fromRight: layer.clientWidth - r.offsetLeft - r.offsetWidth,
+  const w = layer.clientWidth;  // the clear strip at the newest edge (overlays.js NEWEST_STRIP_*)
+  const strip = Math.min(Math.max(w * 0.15, 120), w * 0.4);
+  return {fromLeft: r.offsetLeft, fromRight: w - r.offsetLeft - r.offsetWidth, strip, width: r.offsetWidth,
           style: {left: r.style.left, right: r.style.right}};
 }"""
 
@@ -4075,14 +4077,16 @@ def scenario_view_time_flow_flips_the_newest_side(page, url, secret):
     width = page.evaluate(f"window.zetaTest.xForNs({far})")
     assert width > 100, width
     try:
-        # Newest at the right: a ribbon enters at the right edge and drifts left.
+        # Newest at the right: a ribbon enters at the right, clear of the newest strip, and
+        # drifts left.
         page.evaluate("window.zetaTest.ribbon(100000000, 'flow one', 'flow')")
         edge = page.evaluate(RIBBON_EDGE_JS)
-        assert edge["fromRight"] <= 1 and edge["style"]["left"] == "auto", edge
+        assert abs(edge["fromRight"] - edge["strip"]) <= 1 and edge["style"]["left"] == "auto", edge
         page.wait_for_function(
-            "() => document.querySelector('#waterfall .ov-ribbon.flow').style.right !== '0px'",
-            timeout=5_000)
-        assert page.evaluate(RIBBON_EDGE_JS)["fromRight"] >= 1, page.evaluate(RIBBON_EDGE_JS)
+            "(s) => parseFloat(document.querySelector('#waterfall .ov-ribbon.flow').style.right) > s",
+            arg=edge["strip"], timeout=5_000)
+        drifted = page.evaluate(RIBBON_EDGE_JS)
+        assert drifted["fromRight"] >= drifted["strip"] + 1, drifted
         run_cmd(page, "view set time_flow left")
         expect(view_line(page, "time_flow = left")).to_be_visible()
         expect(page.locator("#waterfall")).to_have_attribute("data-newest", "left")
@@ -4095,11 +4099,11 @@ def scenario_view_time_flow_flips_the_newest_side(page, url, secret):
         # drifts right.
         page.evaluate("window.zetaTest.ribbon(100001000, 'flow two', 'flow')")
         edge = page.evaluate(RIBBON_EDGE_JS)
-        assert edge["fromLeft"] <= 1 and edge["style"]["right"] == "auto", edge
+        assert abs(edge["fromLeft"] - edge["strip"]) <= 1 and edge["style"]["right"] == "auto", edge
         page.wait_for_function(
-            "() => [...document.querySelectorAll('#waterfall .ov-ribbon.flow')].pop().style.left"
-            " !== '0px'", timeout=5_000)
-        assert page.evaluate(RIBBON_EDGE_JS)["fromLeft"] >= 1
+            "(s) => parseFloat([...document.querySelectorAll('#waterfall .ov-ribbon.flow')]"
+            ".pop().style.left) > s", arg=edge["strip"], timeout=5_000)
+        assert page.evaluate(RIBBON_EDGE_JS)["fromLeft"] >= edge["strip"] + 1
         # A drag still reports the span the right way round, and a row's columns keep coming.
         painted = page.evaluate(f"{wf}.painted")
         box = page.locator("#waterfall canvas.wf-canvas").bounding_box()
@@ -4114,7 +4118,40 @@ def scenario_view_time_flow_flips_the_newest_side(page, url, secret):
         expect(page.locator("#waterfall")).to_have_attribute("data-newest", "right")
         assert page.evaluate(f"window.zetaTest.xForNs({far})") == width
         page.evaluate("window.zetaTest.ribbon(100002000, 'flow three', 'flow')")
-        assert page.evaluate(RIBBON_EDGE_JS)["fromRight"] <= 1
+        edge = page.evaluate(RIBBON_EDGE_JS)
+        assert abs(edge["fromRight"] - edge["strip"]) <= 1, edge
+    finally:
+        run_cmd(page, "view reset")
+
+
+def scenario_ribbons_keep_the_newest_strip_clear(page, url, secret):
+    """An event ribbon is laid out from the oldest side towards the newest and never enters
+    the clear strip at the newest edge, a long line cut to fit; `time_flow left` mirrors it."""
+    show_tone_waterfall(page, url, secret)
+    wait_span(page, 1.0)
+    long_text = "a long transcript line " * 30
+    try:
+        for flow in ("right", "left"):
+            if flow == "left":
+                run_cmd(page, "view set time_flow left")
+                expect(page.locator("#waterfall")).to_have_attribute("data-newest", "left")
+            page.evaluate("(t) => window.zetaTest.ribbon(100000000, t, 'flow')", f"{flow} " + long_text)
+            e = page.evaluate(RIBBON_EDGE_JS)
+            layer_w = page.evaluate(
+                "document.querySelector('#waterfall .ov-layer').clientWidth")
+            near, far = ("fromRight", "fromLeft") if flow == "right" else ("fromLeft", "fromRight")
+            assert e["strip"] >= 120, e
+            assert e[near] >= e["strip"] - 1, f"the ribbon covers the newest strip: {flow} {e}"
+            assert e["width"] <= layer_w - e["strip"] + 1, f"a long line is cut to fit: {e}"
+            assert e[far] >= -1, f"the ribbon runs off the oldest edge: {e}"
+            # Cut with an ellipsis: the text is wider than the box.
+            assert page.evaluate(
+                "() => { const r = [...document.querySelectorAll('#waterfall .ov-ribbon.flow')]"
+                ".pop(); return r.scrollWidth > r.clientWidth; }"), e
+            # A short one starts right at the strip's boundary and runs to the oldest side.
+            page.evaluate("(t) => window.zetaTest.ribbon(100001000, t, 'flow')", f"short {flow}")
+            s = page.evaluate(RIBBON_EDGE_JS)
+            assert abs(s[near] - s["strip"]) <= 1, f"{flow} {s}"
     finally:
         run_cmd(page, "view reset")
 
@@ -8552,7 +8589,8 @@ def scenario_summary_line_replaces_ribbons_per_aircraft(page, url, secret):
         for icao in ("7C0001", "7C0003"):
             expect(page.locator("#waterfall .ov-ribbon", has_text=icao)).to_have_count(0)
         expect(page.locator("#waterfall b")).to_have_count(0)
-        assert ribbons.evaluate("e => e.style.right") == "0px"
+        # Newest-edge ribbons sit in from the newest edge by the clear strip (at least 120 px).
+        assert ribbons.evaluate("e => parseFloat(e.style.right)") >= 120
     finally:
         stop_job(url, secret, job)
 

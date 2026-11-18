@@ -163,10 +163,17 @@
 //     ov.ribbon(hz, text, cls) -> element
 //         A text ribbon at wf.yForHz(hz) (the band's middle when hz or the band is unknown;
 //         ribbons and labels are placed again when the waterfall's view changes, wf.onView),
-//         entering at the newest edge (wf.newestSide(): the right unless `time_flow` is
-//         left) and drifting towards the oldest with the waterfall's columns (wf.onColumn;
-//         `off` is its distance in from the newest edge, placeX puts it on the side wf names,
-//         and when the policy changes, wf.onFlow, every ribbon goes to the new side); removed
+//         laid out from the oldest-column side towards the newest and drifting towards the
+//         oldest with the waterfall's columns (wf.onColumn; the newest side is
+//         wf.newestSide(): the right unless `time_flow` is left). A ribbon is born `off` =
+//         stripPx() in from the newest edge: the strip (NEWEST_STRIP_FRACTION of the layer, at
+//         least NEWEST_STRIP_MIN_PX, at most NEWEST_STRIP_MAX_FRACTION) stays clear of every
+//         ribbon's box so the newest columns, and the fresh signal a ribbon announces, stay
+//         visible; a long line is cut with an ellipsis (an `agent` ribbon wraps) before it
+//         reaches the layer's oldest edge. Every ribbon is tied to its frequency (`hz`, its
+//         row) and to the moment it was raised (it keeps its column as time goes on); only
+//         its placement along time follows `time_flow`: placeX puts it on the side wf names,
+//         and when the policy changes (wf.onFlow) every ribbon goes to the new side. Removed
 //         when it leaves the oldest edge or RIBBON_TTL_MS after it was last refreshed. The same text and class still at the newest edge is refreshed with a
 //         ×N count instead of drawn again. `top` is the ribbon's centre line (style.css's
 //         translateY(-50%) centres the box on it, rotated by --ribbon-tilt about its centre;
@@ -275,6 +282,13 @@ const KEYED_RIBBON_MS = 500;
 const RIBBON_GAP_PX = 2;
 const LABEL_GAP_PX = 2;
 const MAX_LANES = 8;
+// The clear strip at the newest edge of the waterfall (the newest columns, so a fresh signal
+// stays visible): no ribbon's box enters it. Its width in px is NEWEST_STRIP_FRACTION of the
+// layer's, at least NEWEST_STRIP_MIN_PX, at most NEWEST_STRIP_MAX_FRACTION of the layer (a
+// narrow footprint keeps most of its width for the ribbons).
+export const NEWEST_STRIP_FRACTION = 0.15;
+export const NEWEST_STRIP_MIN_PX = 120;
+export const NEWEST_STRIP_MAX_FRACTION = 0.4;
 // Ribbon collisions. A new ribbon takes its band's line; the ribbons it overlaps step one lane
 // away in RIBBON_STEP_DIR (-1 up, +1 down) over RIBBON_STEP_MS, at most MAX_LANES lanes and never
 // into another band's base lane (they clip instead), and fall back as the line clears. Keyed
@@ -1110,15 +1124,17 @@ class Overlays {
     r.drawn = performance.now();
     const text = String(typeof r.nextText === "function" ? r.nextText() : r.nextText);
     const countText = r.count > 1 ? ` ×${r.count}` : "";
-    const moved = r.off > 0;
+    const strip = this.stripPx();
+    const moved = r.off > strip;
     if (text === r.text && countText === r.countText && !moved) return;
     r.text = text;
     r.bodyEl.textContent = text;
     r.el.title = text;
     r.countText = countText;
     r.countEl.textContent = countText;
+    this.limitWidth(r);
     r.w = r.el.offsetWidth;
-    r.off = 0;
+    r.off = strip;
     this.placeX(r);
     if (moved) this.place(r);
   }
@@ -1127,7 +1143,7 @@ class Overlays {
     if (this.destroyed) return null;
     text = String(text);
     const same = this.ribbons.find(
-      (r) => !r.key && r.text === text && r.cls === cls && r.hz === hz && r.off < r.w,
+      (r) => !r.key && r.text === text && r.cls === cls && r.hz === hz && r.off - this.stripPx() < r.w,
     );
     if (same) {
       same.count += 1;
@@ -1155,10 +1171,11 @@ class Overlays {
     el.title = text;
     this.layer.append(el);
     const r = {
-      el, bodyEl: body, countEl, text, cls, hz, band: band ? band.key : null, lane: 0, off: 0,
-      born: performance.now(), count: 1, key,
+      el, bodyEl: body, countEl, text, cls, hz, band: band ? band.key : null, lane: 0,
+      off: this.stripPx(), born: performance.now(), count: 1, key,
     };
     this.placeX(r);
+    this.limitWidth(r);
     r.w = el.offsetWidth;
     r.h = el.offsetHeight;
     el.style.zIndex = String(this.ribbons.length);
@@ -2039,6 +2056,21 @@ class Overlays {
       return true;
     });
     this.layout();
+  }
+
+  // The width in px of the clear strip at the newest edge (NEWEST_STRIP_*), 0 while the layer
+  // has no width (the map is shown).
+  stripPx() {
+    const w = this.layer.clientWidth;
+    return Math.min(Math.max(w * NEWEST_STRIP_FRACTION, NEWEST_STRIP_MIN_PX), w * NEWEST_STRIP_MAX_FRACTION);
+  }
+
+  // A ribbon is born in from the newest edge by the strip, so it never covers the newest
+  // columns; its box is at most the layer less the strip (a longer line is cut with an
+  // ellipsis, or wraps for an `agent` ribbon, before it runs off the oldest edge).
+  limitWidth(r) {
+    const w = this.layer.clientWidth;
+    if (w > 0) r.el.style.maxWidth = `${Math.max(0, Math.min(0.8 * w, w - this.stripPx()))}px`;
   }
 
   // Puts ribbon r `r.off` px in from the newest edge, on the side wf.newestSide() names.

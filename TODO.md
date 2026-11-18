@@ -163,7 +163,7 @@ From the operator, 2026-11-01 (after the B210 day). A running job's row and its 
 
 ## UI: on-waterfall messages cover the newest columns
 
-From the operator, 2026-11-01. Event ribbons (`signal new`, `identifying`, `unknown`, transcripts, the watch's lines) are laid out from the right-hand edge, over the newest columns, so they hide the fresh RF activity they announce. Anchor them at the left (the oldest columns) and let them run towards the right, or into a gutter, so the latest spectrum stays visible; the staircase lanes (above) and this share the layout code in `overlays.js`.
+From the operator, 2026-11-01. Built: ribbons are raised in from the newest edge by a clear strip (`NEWEST_STRIP_*` in `overlays.js`: 15% of the layer, at least 120 px, at most 40%) and drift towards the oldest columns, so the newest columns stay visible; a long line is cut with an ellipsis. Left: the strip's box is a ribbon rule only, so the capture bracket, a watch's marks and the band controls over the waterfall still sit at the newest edge; a ribbon is not yet kept off the strip when the layer is narrowed after it was raised; the staircase lanes (below) share the layout code (`place`, `laneTop`, `ribbonsOverlap`) and read `off`, the inset from the newest edge, not a side.
 
 ## Feature: more digital decoding modes
 

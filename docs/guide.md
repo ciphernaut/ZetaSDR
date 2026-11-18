@@ -760,7 +760,7 @@ strongest signal`) is a question for the agent.
 The waterfall is the UI's own `spectrum` job on the selected source (it reuses a running one,
 and stops the one it started when the page closes). Overlays are pinned to their channel and
 scroll with it: a `measure` job's layer-1 label with its confidence, an `aprs_decode` packet as
-a ribbon (`VK3ABC > APRS: >hi` on the fixture), any other event as a short ribbon. Ribbons
+a ribbon (`VK3ABC > APRS: >hi` on the fixture), any other event as a short ribbon. A ribbon is raised just in from the newest edge (the right unless `time_flow` is `left`) and drifts towards the oldest columns; the newest strip (15% of the width, at least 120 px) stays clear, so the fresh signal a ribbon announces stays visible, and a long line is cut with an ellipsis. Ribbons
 ride their band: centred on the band line, tilted by the theme (-15 degrees in `console`, level in
 `plain`; `layout.ribbon_tilt_deg` in a theme's `theme.json`) and in the job's colour; a new chunk takes the line and older ones step up a lane, then
 fall back as it clears (a subject's keyed ribbon never steps). The job list
