@@ -1347,6 +1347,8 @@ function start(api) {
   state.wf.onNotice = (text, actions = []) => state.transcript?.note(text, true, actions);
   state.wf.follow = () => state.view.get("follow");
   state.wf.plan = () => state.view.get("plan");
+  state.wf.timeFlow = () => state.view.get("time_flow");
+  state.wf.el.dataset.newest = state.wf.newestSide();
   state.coarse = mountCoarse(state.wf, api, state.view, {
     transcript: state.transcript,
     sources: () => state.sources,
@@ -1453,6 +1455,7 @@ function start(api) {
     if (key === "plan") redrawPlan();
     if (key === "theme") applyTheme();
     if (key === "dir") applyDir();
+    if (key === "time_flow") state.wf.timeFlowChanged();
     if (key === "side") applySide();
     if (key === "main") applyMain();
     if (key === "pane") applyPanes();
@@ -2348,6 +2351,17 @@ window.zetaTest = {
   },
   // The waterfall: {sourceId, jobId, painted, badge, coarsePainted, coarseMasked, easing, view
   // (the band shown, {lo, hi} or null), band (the capture)}, or null without one.
+  // The waterfall's time layout (waterfall.js): the side the newest column is on, the CSS x
+  // of a time (xForNs) and the oldest column's start.
+  newestSide() {
+    return state.wf ? state.wf.newestSide() : null;
+  },
+  xForNs(ns) {
+    return state.wf ? state.wf.xForNs(ns) : null;
+  },
+  oldestNs() {
+    return state.wf ? state.wf.oldestNs() : null;
+  },
   wf() {
     const wf = state.wf;
     if (!wf) return null;

@@ -55,7 +55,14 @@
 //         pieces of work done for them (at most one per frame) and the overlay redraws they
 //         caused; read by the e2e scenarios.
 //     wf.onColumn(cb)   cb(shiftCssPx) after each painted column: everything painted moved
-//         left by that many CSS px (overlays.js scrolls its ribbons with it).
+//         by that many CSS px towards the oldest side (overlays.js scrolls its ribbons with it).
+//     wf.timeFlow   () -> the `time_flow` view policy, `left` | `right`: the side the newest
+//         column is on (default right); set by app.js. wf.newestSide() -> "left" | "right" is
+//         the one place that decides which way time runs: the canvas shifts, the new column,
+//         xForNs, slotAt and a resize all read it, overlays.js reads it for its ribbons,
+//         spans and marks, and #waterfall carries it as data-newest for the CSS.
+//         wf.timeFlowChanged() (app.js, when the policy changes) paints the stored columns
+//         again mirrored and calls the wf.onFlow(cb) listeners, cb(side).
 //     wf.plan       () -> the `plan` view policy (default auto); the axis marks the channels
 //         of plans.js in view, when at least 14 px apart; wf.drawAxis() redraws it.
 //     wf.onView(cb)     cb({lo, hi, outside}) after the band or the view changed (a zoom, a
@@ -97,8 +104,8 @@
 //     wf.easing     true while an easeTo runs
 //     wf.clearSelection()   erases the drawn selection rectangle (the menu closed)
 //     wf.centerHz() -> the centre of the band shown (null before the band is known)
-//     wf.xForNs(ns) -> CSS x of a time on the painted columns (right edge when newer than
-//         the newest; null when older than the oldest column or none is painted)
+//     wf.xForNs(ns) -> CSS x of a time on the painted columns (the newest edge when newer
+//         than the newest; null when older than the oldest column or none is painted)
 //     wf.oldestNs() -> the start of the oldest column on screen (null when none or untimed)
 //     wf.yForHz(hz) -> CSS px from the canvas top (null before the band is known)
 //     wf.rail       the `div#rail` before the axis, the canvas's height (0 wide and hidden in
@@ -128,9 +135,11 @@
 // the own job is started again only once it ended). The badge hides at the first frame after
 // that, also one that comes while the map is shown, so a relaunch badge is clear on return.
 //
-// Layout: frequency is vertical (highest at the top), time runs right to left: each event
-// becomes one CSS-pixel column (Math.round(devicePixelRatio) backing pixels, at least 1) at
-// the right edge after the canvas is shifted left by that much with drawImage. At most
+// Layout: frequency is vertical (highest at the top), time is horizontal, the newest
+// column on the side `time_flow` names (the right by default, so time runs right to left):
+// each event becomes one CSS-pixel column (Math.round(devicePixelRatio) backing pixels, at
+// least 1) at the newest edge after the canvas is shifted towards the oldest side with
+// drawImage. The frame's `dir` does not touch this: frequency is never mirrored. At most
 // MAX_ROWS_PER_S columns per second are painted; extra events are dropped, and so is every
 // event while the map is shown in the waterfall's place (<html data-main="map">). Rows: spectrum
 // event v2 (`q` of up to 8192 u8 levels with `floor_db` and `step_db`, db = floor_db +
@@ -658,8 +667,11 @@ class Waterfall {
     this.refreshThemeColours();
     this.selectCbs = [];
     this.columnCbs = [];
+    this.flowCbs = [];
     this.viewCbs = [];
     this.plan = () => "auto"; // the view's `plan` policy (app.js sets it)
+    this.timeFlow = () => "right"; // the view's `time_flow` policy (app.js sets it)
+    this.el.dataset.newest = "right";
     this.gen = 0;
     this.sub = null;
     this.src = null; // the source record being shown
@@ -1430,12 +1442,46 @@ class Waterfall {
     return s.hi - (y / this.cssHeight()) * (s.hi - s.lo);
   }
 
+  // The side the newest column is on, "left" or "right": the `time_flow` policy and the one
+  // place the page decides which way time runs (overlays.js and the CSS read it from here:
+  // <html> carries no copy, #waterfall's data-newest does, kept by timeFlowChanged).
+  newestSide() {
+    return this.timeFlow() === "left" ? "left" : "right";
+  }
+
+  // The `time_flow` policy changed: the columns are painted again mirrored (what is stored
+  // in the ring, as after a resize) and the listeners told so that overlays place theirs.
+  timeFlowChanged() {
+    this.el.dataset.newest = this.newestSide();
+    this.scheduleRedraw();
+    for (const cb of this.flowCbs) cb(this.newestSide());
+  }
+
+  onFlow(cb) {
+    this.flowCbs.push(cb);
+  }
+
+  // Backing-pixel x of the column `age` columns older than the newest, `cw` px wide.
+  columnX(age, cw) {
+    return this.newestSide() === "right" ? this.canvas.width - (age + 1) * cw : age * cw;
+  }
+
+  // Moves what is painted one column towards the oldest side; the new column goes at
+  // columnX(0, cw).
+  shiftColumns(cw) {
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    if (w <= cw) return;
+    if (this.newestSide() === "right") this.ctx.drawImage(this.canvas, cw, 0, w - cw, h, 0, 0, w - cw, h);
+    else this.ctx.drawImage(this.canvas, 0, 0, w - cw, h, cw, 0, w - cw, h);
+  }
+
   resize() {
     const dpr = window.devicePixelRatio || 1;
     const w = Math.max(1, Math.round(this.canvas.clientWidth * dpr));
     const h = Math.max(1, Math.round(this.canvas.clientHeight * dpr));
     if (w === this.canvas.width && h === this.canvas.height) return;
-    // Keep what is painted: anchored right, stretched to the new height.
+    // Keep what is painted: anchored at the newest side, stretched to the new height.
     let old = null;
     if (this.columns > 0 && this.canvas.width > 1) {
       old = document.createElement("canvas");
@@ -1449,7 +1495,9 @@ class Waterfall {
     this.overlay.height = h;
     this.ctx.fillStyle = BG_CSS;
     this.ctx.fillRect(0, 0, w, h);
-    if (old) this.ctx.drawImage(old, w - old.width, 0, old.width, h);
+    if (old) {
+      this.ctx.drawImage(old, this.newestSide() === "right" ? w - old.width : 0, 0, old.width, h);
+    }
     this.column = this.ctx.createImageData(Math.max(1, Math.round(dpr)), h);
     this.coarseColumn = this.ctx.createImageData(this.column.width, h);
     this.blankColumn();
@@ -1999,13 +2047,12 @@ class Waterfall {
     this.pushSlot(COARSE_ONLY, msg);
   }
 
-  // Shifts the canvas left by one column and draws the coarse column alone at the right edge.
+  // Shifts the canvas one column towards the oldest side and draws the coarse column alone at
+  // the newest edge.
   paintCoarseColumn() {
-    const w = this.canvas.width;
-    const h = this.canvas.height;
-    const cw = Math.min(this.coarseColumn.width, w);
-    if (w > cw) this.ctx.drawImage(this.canvas, cw, 0, w - cw, h, 0, 0, w - cw, h);
-    this.ctx.putImageData(this.coarseColumn, w - cw, 0);
+    const cw = Math.min(this.coarseColumn.width, this.canvas.width);
+    this.shiftColumns(cw);
+    this.ctx.putImageData(this.coarseColumn, this.columnX(0, cw), 0);
     this.coarsePainted += 1;
   }
 
@@ -2055,14 +2102,13 @@ class Waterfall {
     this.fillColumn(row, false);
   }
 
-  // Shifts the canvas left by one column and draws `row` at the right edge (composeColumn).
+  // Shifts the canvas one column towards the oldest side and draws `row` at the newest edge
+  // (composeColumn).
   paintColumn(row) {
-    const w = this.canvas.width;
-    const h = this.canvas.height;
-    const cw = Math.min(this.column.width, w); // backing pixels per event
+    const cw = Math.min(this.column.width, this.canvas.width); // backing pixels per event
     this.composeColumn(row);
-    if (w > cw) this.ctx.drawImage(this.canvas, cw, 0, w - cw, h, 0, 0, w - cw, h);
-    this.ctx.putImageData(this.column, w - cw, 0);
+    this.shiftColumns(cw);
+    this.ctx.putImageData(this.column, this.columnX(0, cw), 0);
     if (this.mode === "spectrum" && this.coarseRows.length) this.coarsePainted += 1;
   }
 
@@ -2186,12 +2232,12 @@ class Waterfall {
       }
       const row = this.rows[col % RING_COLUMNS];
       if (row === COARSE_ONLY) {
-        this.ctx.putImageData(this.coarseColumn, w - (k + 1) * cw, 0);
+        this.ctx.putImageData(this.coarseColumn, this.columnX(k, cw), 0);
         continue;
       }
       if (!row || row.lo === undefined) continue;
       this.composeColumn(row);
-      this.ctx.putImageData(this.column, w - (k + 1) * cw, 0);
+      this.ctx.putImageData(this.column, this.columnX(k, cw), 0);
     }
     // Coarse rows newer than the newest column: in the coarse column for the next one.
     if (this.mode === "spectrum") {
@@ -2326,7 +2372,8 @@ class Waterfall {
     if (this.columns === 0) return null;
     const dpr = this.canvas.width / (this.canvas.clientWidth || 1);
     const cw = Math.max(1, Math.min(this.column.width, this.canvas.width));
-    const px = Math.max(0, this.canvas.width - 1 - Math.floor(x * dpr));
+    const fromEdge = this.newestSide() === "right" ? this.canvas.width - 1 - x * dpr : x * dpr;
+    const px = Math.max(0, Math.floor(fromEdge));
     const age = Math.floor(px / cw);
     const oldest = Math.min(this.columns, RING_COLUMNS, Math.ceil(this.canvas.width / cw)) - 1;
     return (this.columns - 1 - Math.min(age, oldest)) % RING_COLUMNS;
@@ -2343,7 +2390,8 @@ class Waterfall {
     const cw = Math.max(1, Math.min(this.column.width, this.canvas.width));
     const shown = Math.min(this.columns, RING_COLUMNS, Math.ceil(this.canvas.width / cw));
     const slotOf = (age) => (this.columns - 1 - age) % RING_COLUMNS;
-    if (ns >= this.ringEnd[slotOf(0)]) return this.canvas.width / dpr;
+    const right = this.newestSide() === "right";
+    if (ns >= this.ringEnd[slotOf(0)]) return right ? this.canvas.width / dpr : 0;
     // The column starts fall with age (the ring is monotonic), so the youngest column that
     // starts at or before `ns` (or is untimed, which ends the walk) is a binary search.
     let lo = 0;
@@ -2360,7 +2408,8 @@ class Waterfall {
     if (!start) return null;
     const span = this.ringEnd[slot] - start;
     const frac = span > 0 ? Math.min(1, (ns - start) / span) : 0;
-    return (this.canvas.width - (lo + 1 - frac) * cw) / dpr;
+    const d = (lo + 1 - frac) * cw; // from the newest edge
+    return (right ? this.canvas.width - d : d) / dpr;
   }
 
   // The start (ns since the epoch) of the oldest column on screen; null when none is painted
@@ -2376,15 +2425,17 @@ class Waterfall {
   resolve(d) {
     const fHi = this.hzForY(Math.min(d.y0, d.y1));
     const fLo = this.hzForY(Math.max(d.y0, d.y1));
-    const left = this.slotAt(Math.min(d.x0, d.x1));
-    const right = this.slotAt(Math.max(d.x0, d.x1));
-    if (left === null || right === null) return null;
-    const startNs = Math.round(this.ringStart[left]);
+    const a = this.slotAt(Math.min(d.x0, d.x1));
+    const b = this.slotAt(Math.max(d.x0, d.x1));
+    if (a === null || b === null) return null;
+    // The older slot is the left one with the newest on the right, the right one otherwise.
+    const [older, newer] = this.newestSide() === "right" ? [a, b] : [b, a];
+    const startNs = Math.round(this.ringStart[older]);
     return {
       centerHz: Math.round((fHi + fLo) / 2),
       bandwidthHz: Math.max(1, Math.round(fHi - fLo)),
       startNs,
-      endNs: Math.max(startNs, Math.round(this.ringEnd[right])),
+      endNs: Math.max(startNs, Math.round(this.ringEnd[newer])),
     };
   }
 

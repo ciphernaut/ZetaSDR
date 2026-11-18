@@ -163,14 +163,16 @@
 //     ov.ribbon(hz, text, cls) -> element
 //         A text ribbon at wf.yForHz(hz) (the band's middle when hz or the band is unknown;
 //         ribbons and labels are placed again when the waterfall's view changes, wf.onView),
-//         entering at the right edge and moving left with the waterfall's columns
-//         (wf.onColumn); removed when it leaves the left edge or RIBBON_TTL_MS after it was
-//         last refreshed. The same text and class still at the right edge is refreshed with a
+//         entering at the newest edge (wf.newestSide(): the right unless `time_flow` is
+//         left) and drifting towards the oldest with the waterfall's columns (wf.onColumn;
+//         `off` is its distance in from the newest edge, placeX puts it on the side wf names,
+//         and when the policy changes, wf.onFlow, every ribbon goes to the new side); removed
+//         when it leaves the oldest edge or RIBBON_TTL_MS after it was last refreshed. The same text and class still at the newest edge is refreshed with a
 //         ×N count instead of drawn again. `top` is the ribbon's centre line (style.css's
 //         translateY(-50%) centres the box on it, rotated by --ribbon-tilt about its centre;
-//         `right` and `top` stay the untilted box). A ribbon is in lane `lane` (0: on the band
+//         the inset from the newest edge and `top` stay the untilted box). A ribbon is in lane `lane` (0: on the band
 //         line, yFor(hz)); its top is yFor(hz) + lane * RIBBON_STEP_DIR * (h + RIBBON_GAP_PX).
-//         A new one takes lane 0 and every unkeyed ribbon it overlaps (at the right edge,
+//         A new one takes lane 0 and every unkeyed ribbon it overlaps (at the newest edge,
 //         and, in turn, every one those overlap) steps one lane on, animated over
 //         RIBBON_STEP_MS; one that would pass MAX_LANES or reach another job band's base lane
 //         (its centre line plus or minus half a lane) keeps its lane and gets class `clipped`,
@@ -448,6 +450,7 @@ class Overlays {
     el.append(this.layer);
 
     wf.onColumn((shift) => this.scroll(shift));
+    wf.onFlow(() => this.flowChanged());
     wf.onView(() => this.layout());
     this.timer = setInterval(() => this.expire(), EXPIRE_EVERY_MS);
     this.ro = new ResizeObserver(() => this.layout());
@@ -1099,7 +1102,7 @@ class Overlays {
   }
 
   // A keyed ribbon as last told: the text replaced, `×count` when `count` is over 1, the width
-  // measured again if either changed, the ribbon back at the right edge and placed again if it
+  // measured again if either changed, the ribbon back at the newest edge and placed again if it
   // had moved.
   drawKeyed(r) {
     r.keyedTimer = undefined;
@@ -1107,7 +1110,7 @@ class Overlays {
     r.drawn = performance.now();
     const text = String(typeof r.nextText === "function" ? r.nextText() : r.nextText);
     const countText = r.count > 1 ? ` ×${r.count}` : "";
-    const moved = r.right > 0;
+    const moved = r.off > 0;
     if (text === r.text && countText === r.countText && !moved) return;
     r.text = text;
     r.bodyEl.textContent = text;
@@ -1115,8 +1118,8 @@ class Overlays {
     r.countText = countText;
     r.countEl.textContent = countText;
     r.w = r.el.offsetWidth;
-    r.right = 0;
-    r.el.style.right = "0px";
+    r.off = 0;
+    this.placeX(r);
     if (moved) this.place(r);
   }
 
@@ -1124,7 +1127,7 @@ class Overlays {
     if (this.destroyed) return null;
     text = String(text);
     const same = this.ribbons.find(
-      (r) => !r.key && r.text === text && r.cls === cls && r.hz === hz && r.right < r.w,
+      (r) => !r.key && r.text === text && r.cls === cls && r.hz === hz && r.off < r.w,
     );
     if (same) {
       same.count += 1;
@@ -1150,12 +1153,12 @@ class Overlays {
     countEl.className = "count";
     el.append(body, countEl);
     el.title = text;
-    el.style.right = "0px";
     this.layer.append(el);
     const r = {
-      el, bodyEl: body, countEl, text, cls, hz, band: band ? band.key : null, lane: 0, right: 0,
+      el, bodyEl: body, countEl, text, cls, hz, band: band ? band.key : null, lane: 0, off: 0,
       born: performance.now(), count: 1, key,
     };
+    this.placeX(r);
     r.w = el.offsetWidth;
     r.h = el.offsetHeight;
     el.style.zIndex = String(this.ribbons.length);
@@ -1185,8 +1188,8 @@ class Overlays {
   // Whether ribbons a and b overlap, a's centre line at `top` (a.top when not given).
   ribbonsOverlap(a, b, top = a.top) {
     return (
-      a.right < b.right + b.w &&
-      b.right < a.right + a.w &&
+      a.off < b.off + b.w &&
+      b.off < a.off + a.w &&
       Math.abs(top - b.top) < (a.h + b.h) / 2
     );
   }
@@ -1209,7 +1212,7 @@ class Overlays {
     r.el.style.top = `${r.top}px`;
   }
 
-  // Places a new (or redrawn) ribbon at the right edge. An unkeyed one takes the band line and
+  // Places a new (or redrawn) ribbon at the newest edge. An unkeyed one takes the band line and
   // steps the unkeyed ribbons it overlaps one lane on, and in turn those they then overlap; a
   // ribbon that cannot step (MAX_LANES, another band's base lane) is clipped where it is. A
   // keyed one takes the first lane free of overlap and moves nobody.
@@ -1451,8 +1454,12 @@ class Overlays {
       this.unspan(key);
       return false;
     }
-    const x0 = this.wf.xForNs(sp.startNs);
-    const left = x0 === null ? 0 : x0;
+    // The span's start is its older edge: left of its end with the newest on the right, right
+    // of it otherwise (an older start off the columns runs to the oldest edge).
+    const newestRight = this.wf.newestSide() === "right";
+    const x0 = this.wf.xForNs(sp.startNs) ?? (newestRight ? 0 : this.layer.clientWidth);
+    const left = Math.min(x0, x1);
+    const spanW = Math.abs(x1 - x0);
     const y0 = this.wf.yForHz(sp.hi);
     const y1 = this.wf.yForHz(sp.lo);
     if (y0 === null || y1 === null || !Number.isFinite(y0 + y1)) {
@@ -1462,7 +1469,7 @@ class Overlays {
     sp.el.hidden = false;
     const s = sp.el.style;
     s.left = `${left}px`;
-    s.width = `${Math.max(2, x1 - left)}px`;
+    s.width = `${Math.max(2, spanW)}px`;
     s.top = `${y0}px`;
     s.height = `${Math.max(2, y1 - y0)}px`;
     return true;
@@ -2023,14 +2030,29 @@ class Overlays {
     const width = this.layer.clientWidth;
     this.ribbons = this.ribbons.filter((r) => {
       if (r.held?.()) return true;
-      r.right += shift;
-      if (r.right > width) {
+      r.off += shift;
+      if (r.off > width) {
         r.el.remove();
         return false;
       }
-      r.el.style.right = `${r.right}px`;
+      this.placeX(r);
       return true;
     });
+    this.layout();
+  }
+
+  // Puts ribbon r `r.off` px in from the newest edge, on the side wf.newestSide() names.
+  placeX(r) {
+    const s = r.el.style;
+    const right = this.wf.newestSide() === "right";
+    s.right = right ? `${r.off}px` : "auto";
+    s.left = right ? "auto" : `${r.off}px`;
+  }
+
+  // `time_flow` changed: every ribbon goes to the new newest edge (an unmoved one stays in
+  // from it by the same distance, so it drifts the other way), spans and marks follow.
+  flowChanged() {
+    for (const r of this.ribbons) this.placeX(r);
     this.layout();
   }
 

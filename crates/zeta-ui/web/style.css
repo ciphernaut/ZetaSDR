@@ -409,6 +409,10 @@ html[data-footprint="narrow"] #waterfall .outline.pressable .job-tag { touch-act
 }
 #waterfall .site-channel[data-role="rx"] { border-top-style: dashed; }
 #waterfall .ov-label { left: 6px; color: var(--ok); border-color: var(--ok); }
+/* time_flow left (waterfall.js newestSide, #waterfall[data-newest]): the newest columns are on
+   the left, so the labels sit at the right (the oldest side) and a watch's marks at the left */
+#waterfall[data-newest="left"] .ov-label { left: auto; right: 6px; }
+#waterfall[data-newest="left"] .ov-mark { right: auto; left: 0; }
 #waterfall .ov-label[data-layer="2"] { color: var(--accent); border-color: var(--accent); }
 #waterfall .ov-ribbon {
   max-width: 80%; overflow: hidden; text-overflow: ellipsis; color: var(--text);

@@ -64,6 +64,11 @@
 //                          Frequency is vertical on the waterfall (highest at the top), so
 //                          `dir` never turns it round; which side time runs from is
 //                          `time_flow`'s alone, independent of `dir`
+//         time_flow        right | left (default right): the side the newest column is on.
+//                          `right`: the newest columns at the right edge, the waterfall
+//                          scrolling and ribbons drifting left; `left`: the mirror. Independent
+//                          of `dir`. The waterfall's newestSide() reads it (waterfall.js) and
+//                          every part with a time direction asks that, never this policy
 //         video            smooth | sharp (default smooth): the full video view's picture
 //                          (video.js): every field at 360 wide, or full width 5 a second
 //       Where a policy lives. A policy that is about what this tab is looking at (a
@@ -348,6 +353,12 @@ export const POLICIES = [
     values: ["auto", "ltr", "rtl"],
     default_: "auto",
     describe: "auto (the browser's own), ltr, rtl",
+  },
+  {
+    key: "time_flow",
+    values: ["right", "left"],
+    default_: "right",
+    describe: "right (the newest column on the right, time running left), left",
   },
   {
     key: "video",

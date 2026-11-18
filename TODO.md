@@ -297,7 +297,7 @@ Found in plan 16 task 7 (pre-existing): the debug-build bank path at 2.048 MHz d
 
 ## UI: `view set time_flow left|right`
 
-The waterfall's newest columns are on the right and ribbons drift left with the RF. A policy to flip it (newest on the left, drift right) independent of `dir`; ribbons, the rail's end strip and the squelch scroller read it. Spec 4.9 of the console theme.
+`view set time_flow` is built: the waterfall (frequency vertical, time horizontal, the newest column on the named side), its ribbons, time spans and marks, and the labels' side read `wf.newestSide()`. Left: the rail and the axis are frequency parts, not time ones, so they stay on the frame's start side (the rail's thin-tag strip and the squelch tags have no time direction); `time_flow` is not among the agent's `view_set` keys (`VIEW_KEYS` in `zeta-agent`); add it there with `dir` if the agent should be able to flip it.
 
 ## UI: staircase transcript ribbons on the waterfall
 

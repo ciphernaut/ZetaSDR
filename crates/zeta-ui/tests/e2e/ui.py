@@ -4054,6 +4054,71 @@ def scenario_view_dir_mirrors_the_frame_not_the_frequencies(page, url, secret):
         stop_job(url, secret, job)
 
 
+RIBBON_EDGE_JS = """() => {
+  const layer = document.querySelector("#waterfall .ov-layer");
+  const r = [...document.querySelectorAll('#waterfall .ov-ribbon.flow')].pop();
+  // The untilted box (offsetLeft/Width), as a theme leans ribbons about their centre.
+  return {fromLeft: r.offsetLeft, fromRight: layer.clientWidth - r.offsetLeft - r.offsetWidth,
+          style: {left: r.style.left, right: r.style.right}};
+}"""
+
+
+def scenario_view_time_flow_flips_the_newest_side(page, url, secret):
+    """`view set time_flow left` puts the newest column on the left: the layout helper, a new
+    ribbon's entering edge and the way it drifts, a drag's span; `right` is today's."""
+    show_tone_waterfall(page, url, secret)
+    wait_span(page, 1.0)
+    wf = "window.zetaTest.wf()"
+    far = "Date.now() * 1e6 + 1e12"
+    assert page.evaluate(f"window.zetaTest.newestSide()") == "right", "default newest side"
+    expect(page.locator("#waterfall")).to_have_attribute("data-newest", "right")
+    width = page.evaluate(f"window.zetaTest.xForNs({far})")
+    assert width > 100, width
+    try:
+        # Newest at the right: a ribbon enters at the right edge and drifts left.
+        page.evaluate("window.zetaTest.ribbon(100000000, 'flow one', 'flow')")
+        edge = page.evaluate(RIBBON_EDGE_JS)
+        assert edge["fromRight"] <= 1 and edge["style"]["left"] == "auto", edge
+        page.wait_for_function(
+            "() => document.querySelector('#waterfall .ov-ribbon.flow').style.right !== '0px'",
+            timeout=5_000)
+        assert page.evaluate(RIBBON_EDGE_JS)["fromRight"] >= 1, page.evaluate(RIBBON_EDGE_JS)
+        run_cmd(page, "view set time_flow left")
+        expect(view_line(page, "time_flow = left")).to_be_visible()
+        expect(page.locator("#waterfall")).to_have_attribute("data-newest", "left")
+        assert page.evaluate(f"window.zetaTest.newestSide()") == "left", "left"
+        assert page.evaluate(f"window.zetaTest.xForNs({far})") == 0, page.evaluate("window.zetaTest.xForNs(Date.now() * 1e6 + 1e12)")
+        # Older is further from the newest edge: from the left now.
+        old = page.evaluate(f"window.zetaTest.xForNs(window.zetaTest.oldestNs())")
+        assert 5 < old < width / 2, f"the oldest column is at x={old} of {width}: a few columns in"
+        # The ribbon already drawn moved with the flip; a new one enters at the left edge and
+        # drifts right.
+        page.evaluate("window.zetaTest.ribbon(100001000, 'flow two', 'flow')")
+        edge = page.evaluate(RIBBON_EDGE_JS)
+        assert edge["fromLeft"] <= 1 and edge["style"]["right"] == "auto", edge
+        page.wait_for_function(
+            "() => [...document.querySelectorAll('#waterfall .ov-ribbon.flow')].pop().style.left"
+            " !== '0px'", timeout=5_000)
+        assert page.evaluate(RIBBON_EDGE_JS)["fromLeft"] >= 1
+        # A drag still reports the span the right way round, and a row's columns keep coming.
+        painted = page.evaluate(f"{wf}.painted")
+        box = page.locator("#waterfall canvas.wf-canvas").bounding_box()
+        page.mouse.move(box["x"] + 40, box["y"] + 100)
+        page.mouse.down()
+        page.mouse.move(box["x"] + 200, box["y"] + 160, steps=4)
+        page.mouse.up()
+        sel = page.evaluate("window.zetaLastSelection")
+        assert sel["startNs"] < sel["endNs"], sel
+        page.wait_for_function(f"() => {wf}.painted > {painted}", timeout=5_000)
+        run_cmd(page, "view set time_flow right")
+        expect(page.locator("#waterfall")).to_have_attribute("data-newest", "right")
+        assert page.evaluate(f"window.zetaTest.xForNs({far})") == width
+        page.evaluate("window.zetaTest.ribbon(100002000, 'flow three', 'flow')")
+        assert page.evaluate(RIBBON_EDGE_JS)["fromRight"] <= 1
+    finally:
+        run_cmd(page, "view reset")
+
+
 def scenario_tags_show_kind_id_and_link_rows(page, url, secret):
     select_source(page, url, secret, "retune")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=10_000)
