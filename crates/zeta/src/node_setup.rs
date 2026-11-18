@@ -54,9 +54,10 @@ const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The stages the CLI node runs. `external_decode` and its `adsb_decode` alias run the
 /// mode rows of the registry `modes` will hold (set once the rows are loaded against this
-/// registry: see [`open`]), their fifos under `run_dir` (`--run-dir`, else `<state_dir>/run`; `None`, as
-/// for a schema listing, fails a fifo row). `transcribe` runs on `speech`; without one it is still
-/// registered and its jobs fail saying the node has no speech backend.
+/// registry: see [`open`]), their fifos under `run_dir` (`--run-dir`, else
+/// `<state_dir>/run`; `None`, as for a schema listing, fails a fifo row). `transcribe` runs
+/// on `speech`; without one it is still registered and its jobs fail saying the node has
+/// no speech backend.
 pub fn registry(
     speech: Option<Arc<dyn SpeechBackend>>,
     modes: &ModesHandle,

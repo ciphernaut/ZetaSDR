@@ -863,7 +863,11 @@ mod run_dir {
     #[test]
     fn prepare_refuses_an_unwritable_directory_naming_it() {
         if unsafe { geteuid() } == 0 {
-            return; // root writes anywhere
+            eprintln!(
+                "prepare_refuses_an_unwritable_directory_naming_it: skipped: running as root, \
+                 which writes anywhere"
+            );
+            return;
         }
         let dir = tempfile::tempdir().unwrap();
         let ro = dir.path().join("ro");

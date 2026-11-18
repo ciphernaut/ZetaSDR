@@ -850,3 +850,78 @@ fn video_decode_check_passes_on_the_synth() {
         "{out}"
     );
 }
+
+/// `--run-dir` reaches a program row's run in a one-shot command: `modes check` on a fifo
+/// row, whose program records the fifo it is given before it runs `fake_lines`. The fifo
+/// was in a subdirectory of the run's own under the given directory, removed after.
+#[test]
+fn a_fifo_rows_run_makes_its_subdirectory_under_the_run_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path().join("elsewhere").join("run");
+    let record = dir.path().join("fifo-seen");
+    let lines = dir.path().join("lines");
+    std::fs::write(&lines, r#"{"text": "fifo ok", "n": 1}"#).unwrap();
+    // The argument after `--in` is the fifo; the one after `--record`, where to note it.
+    let program = dir.path().join("record_fifo");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$2\" > \"$4\"\nexec {} \"$@\"\n",
+            fake_lines().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let row = serde_json::json!({
+        "id": "fifo_rec",
+        "name": "fifo_rec test row",
+        "family": "general",
+        "band": {"bandwidth_hz": 12500, "centers_hz": [], "min_hz": null},
+        "modulation": [],
+        "label": "FIFO_REC",
+        "protocol": "fifo_rec",
+        "decoder": {
+            "kind": "program",
+            "programs": [program.display().to_string()],
+            "args": ["--in", "$fifo", "--record", record.display().to_string(),
+                     "--lines-file", lines.display().to_string()],
+            "input": {"stream": "iq", "format": "cs8", "rate_hz": 48000, "via": "fifo"},
+            "output": {"via": "stdout", "port": null, "parser": "json_lines"},
+            "install": {"debian": "fake-dec", "url": "https://example.org/fake-dec"}
+        },
+        "event": {
+            "schema": {"type": "object", "properties": {
+                "text": {"type": "string"}, "n": {"type": "integer"}}},
+            "summary": "{text}"
+        },
+        "identify": {"proof": "event", "min_events": 1, "dwell_ms": 1000, "min_span_ms": 1000,
+                     "quick": null},
+        "catalogue": [],
+        "test": {
+            "kind": "synth", "family": "fsk", "symbol_rate_baud": 1200, "deviation_hz": 4500,
+            "order": 2, "bits": "pattern:aa", "repeat": 1,
+            "expect": {"text": "fifo ok"}, "within_ms": 10000
+        }
+    });
+    write_row_json(dir.path(), &row);
+    let (out, code) = stdout(check(dir.path(), &["fifo_rec"]).arg("--run-dir").arg(&run));
+    assert_eq!(out.trim(), "fifo_rec: ok", "{out}");
+    assert_eq!(code, 0);
+    let fifo = std::path::PathBuf::from(std::fs::read_to_string(&record).unwrap().trim());
+    let sub = fifo.parent().expect("the fifo's directory");
+    assert_eq!(
+        sub.parent(),
+        Some(run.as_path()),
+        "{} under {}",
+        fifo.display(),
+        run.display()
+    );
+    let name = sub.file_name().unwrap().to_string_lossy();
+    assert!(name.starts_with("external-"), "{}", sub.display());
+    assert!(!sub.exists(), "{} removed after the run", sub.display());
+    assert!(
+        !dir.path().join("state").join("run").exists(),
+        "nothing under the default run directory"
+    );
+}
