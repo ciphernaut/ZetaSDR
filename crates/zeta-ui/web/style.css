@@ -324,7 +324,8 @@ html[data-dock="right"][data-strip] #waterfall, html[data-dock="right"][data-str
 #band input { width: 8ch; padding: 1px 3px; font-size: 12px; }
 #band input[name="center"] { width: 11ch; }
 #band button { padding: 1px 6px; font-size: 12px; }
-/* overlays.js: labels at the left edge, ribbons entering at the right and scrolling left */
+/* overlays.js: labels at the oldest side, ribbons raised in from the newest edge (right unless
+   time_flow is left; #waterfall[data-newest]) and drifting towards the oldest */
 #waterfall .ov-layer {
   position: absolute; inset-inline-start: calc(var(--rail-w) + var(--axis-w)); top: 0;
   width: calc(100% - var(--rail-w) - var(--axis-w)); height: 100%;

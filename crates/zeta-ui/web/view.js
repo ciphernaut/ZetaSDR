@@ -447,10 +447,9 @@ export function mountView() {
   try {
     const old = JSON.parse(localStorage.getItem(RADIO_PREFS_KEY) || "null");
     if (old && typeof old === "object" && !Array.isArray(old)) {
-      const moved = valuesFrom(
-        { radio_policy: old.radio_policy, radio_prefer: old.radio_prefer },
-        false,
-      );
+      const present = {};
+      for (const k of ["radio_policy", "radio_prefer"]) if (k in old) present[k] = old[k];
+      const moved = valuesFrom(present, false);
       shared = { ...moved, ...shared };
       if (!saveShared(shared)) storageFailed = true;
     }

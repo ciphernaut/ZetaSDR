@@ -174,11 +174,13 @@
 //         row) and to the moment it was raised (it keeps its column as time goes on); only
 //         its placement along time follows `time_flow`: placeX puts it on the side wf names,
 //         and when the policy changes (wf.onFlow) every ribbon goes to the new side. Removed
-//         when it leaves the oldest edge or RIBBON_TTL_MS after it was last refreshed. The same text and class still at the newest edge is refreshed with a
-//         ×N count instead of drawn again. `top` is the ribbon's centre line (style.css's
-//         translateY(-50%) centres the box on it, rotated by --ribbon-tilt about its centre;
-//         the inset from the newest edge and `top` stay the untilted box). A ribbon is in lane `lane` (0: on the band
-//         line, yFor(hz)); its top is yFor(hz) + lane * RIBBON_STEP_DIR * (h + RIBBON_GAP_PX).
+//         when it leaves the oldest edge or RIBBON_TTL_MS after it was last refreshed.
+//         When the layer gets or changes its size every ribbon's width limit is set again
+//         (relimitRibbons). The same text and class still at the newest edge is
+//         refreshed with a ×N count instead of drawn again. `top` is the ribbon's centre line
+//         (style.css's translateY(-50%) centres the box on it, rotated by --ribbon-tilt about
+//         its centre; the inset from the newest edge and `top` stay the untilted box). A
+//         ribbon is in lane `lane` (0: on the band line, yFor(hz)); its top is yFor(hz) + lane * RIBBON_STEP_DIR * (h + RIBBON_GAP_PX).
 //         A new one takes lane 0 and every unkeyed ribbon it overlaps (at the newest edge,
 //         and, in turn, every one those overlap) steps one lane on, animated over
 //         RIBBON_STEP_MS; one that would pass MAX_LANES or reach another job band's base lane
@@ -467,7 +469,10 @@ class Overlays {
     wf.onFlow(() => this.flowChanged());
     wf.onView(() => this.layout());
     this.timer = setInterval(() => this.expire(), EXPIRE_EVERY_MS);
-    this.ro = new ResizeObserver(() => this.layout());
+    this.ro = new ResizeObserver(() => {
+      this.relimitRibbons();
+      this.layout();
+    });
     this.ro.observe(this.layer);
   }
 
@@ -2071,6 +2076,18 @@ class Overlays {
   limitWidth(r) {
     const w = this.layer.clientWidth;
     if (w > 0) r.el.style.maxWidth = `${Math.max(0, Math.min(0.8 * w, w - this.stripPx()))}px`;
+  }
+
+  // The layer got a size or changed it: every ribbon's width limit is set again, and one that
+  // was raised while the layer had none (born at the edge) is moved in by the strip.
+  relimitRibbons() {
+    const strip = this.stripPx();
+    for (const r of this.ribbons) {
+      this.limitWidth(r);
+      r.w = r.el.offsetWidth;
+      if (r.off < strip) r.off = strip;
+      this.placeX(r);
+    }
   }
 
   // Puts ribbon r `r.off` px in from the newest edge, on the side wf.newestSide() names.

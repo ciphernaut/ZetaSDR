@@ -1548,8 +1548,8 @@ class Waterfall {
         t.className = "tick ch";
         t.textContent = String(c.number);
         t.style.top = `${((s.hi - c.center_hz) / span) * h}px`;
-        t.style.right = "auto";
-        t.style.left = "2px";
+        t.style.insetInlineEnd = "auto";
+        t.style.insetInlineStart = "2px";
         ticks.push(t);
       }
     }

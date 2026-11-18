@@ -1922,6 +1922,10 @@ def scenario_view_policies_are_shared(page, url, secret):
         expect(view_line(second, "follow = free")).to_be_visible()
         run_cmd(second, "view set follow target")
         expect(view_line(second, "follow = target")).to_be_visible()
+        # A shared key set after it reaches the first tab; only then is `follow` known to have
+        # had its chance to arrive too.
+        run_cmd(second, "view set theme plain")
+        expect(page.locator("html")).to_have_attribute("data-theme", "plain")
         assert view_value(page, "follow") == "follow free", "a per-tab policy is the tab's own"
         # `view reset` in one clears the shared store, and the other follows.
         run_cmd(second, "view reset")
@@ -1941,6 +1945,19 @@ def scenario_view_policies_are_shared(page, url, secret):
         assert third.evaluate("localStorage.getItem('zeta.radio_prefs')") is None
         moved = third.evaluate("JSON.parse(localStorage.getItem('zeta.view_policies'))")
         assert moved == {"radio_policy": "ask", "radio_prefer": "tone,cb"}, moved
+        # Only one of the two keys set: the other stays at its default, not "undefined".
+        page.evaluate("""() => {
+          localStorage.removeItem('zeta.view_policies');
+          localStorage.setItem('zeta.radio_prefs', JSON.stringify({radio_policy: 'free-first'}));
+        }""")
+        fourth = page.context.new_page()
+        others.append(fourth)
+        fourth.set_viewport_size(WIDE)
+        login(fourth, url, secret)
+        assert view_value(fourth, "radio_policy") == "radio_policy free-first"
+        assert view_value(fourth, "radio_prefer") == "radio_prefer none"
+        only = fourth.evaluate("JSON.parse(localStorage.getItem('zeta.view_policies'))")
+        assert only == {"radio_policy": "free-first"}, only
     finally:
         for p in others:
             p.close()
@@ -4031,8 +4048,17 @@ def scenario_view_dir_mirrors_the_frame_not_the_frequencies(page, url, secret):
         ltr_side = page.locator("#side").bounding_box()
         ltr_axis = page.locator("#waterfall .wf-axis").bounding_box()
         assert ltr_side["x"] > box["x"] and ltr_axis["x"] < box["x"], (ltr_side, ltr_axis, box)
+        page.evaluate("window.zetaTest.ribbon(100000000, 'dir one', 'flow')")
+        ltr_ribbon = page.evaluate(RIBBON_EDGE_JS)
         run_cmd(page, "view set dir rtl")
         expect(html).to_have_attribute("dir", "rtl")
+        # Time is not mirrored by `dir`: a ribbon still enters from the right, clear of the strip.
+        page.evaluate("window.zetaTest.ribbon(100001000, 'dir two', 'flow')")
+        rtl_ribbon = page.evaluate(RIBBON_EDGE_JS)
+        assert rtl_ribbon["style"]["left"] == "auto" == ltr_ribbon["style"]["left"], \
+            (ltr_ribbon, rtl_ribbon)
+        assert rtl_ribbon["strip"] - 1 <= rtl_ribbon["fromRight"] <= rtl_ribbon["strip"] + 60, \
+            rtl_ribbon
         side = page.locator("#side").bounding_box()
         assert side["x"] < page.locator("#main").bounding_box()["x"], f"side column at {side}"
         box = canvas.bounding_box()
@@ -4083,7 +4109,8 @@ def scenario_view_time_flow_flips_the_newest_side(page, url, secret):
         # drifts left.
         page.evaluate("window.zetaTest.ribbon(100000000, 'flow one', 'flow')")
         edge = page.evaluate(RIBBON_EDGE_JS)
-        assert abs(edge["fromRight"] - edge["strip"]) <= 1 and edge["style"]["left"] == "auto", edge
+        assert edge["strip"] - 1 <= edge["fromRight"] <= edge["strip"] + 60 \
+            and edge["style"]["left"] == "auto", edge
         page.wait_for_function(
             "(s) => parseFloat(document.querySelector('#waterfall .ov-ribbon.flow').style.right) > s",
             arg=edge["strip"], timeout=5_000)
@@ -4097,11 +4124,16 @@ def scenario_view_time_flow_flips_the_newest_side(page, url, secret):
         # Older is further from the newest edge: from the left now.
         old = page.evaluate(f"window.zetaTest.xForNs(window.zetaTest.oldestNs())")
         assert 5 < old < width / 2, f"the oldest column is at x={old} of {width}: a few columns in"
-        # The ribbon already drawn moved with the flip; a new one enters at the left edge and
-        # drifts right.
+        # The ribbon already drawn moved with the flip (now placed from the left), and a new
+        # one enters at the left edge and drifts right.
+        first = page.evaluate(
+            "() => { const r = document.querySelector('#waterfall .ov-ribbon.flow');"
+            " return {left: r.style.left, right: r.style.right}; }")
+        assert first["right"] == "auto" and first["left"] != "auto", first
         page.evaluate("window.zetaTest.ribbon(100001000, 'flow two', 'flow')")
         edge = page.evaluate(RIBBON_EDGE_JS)
-        assert abs(edge["fromLeft"] - edge["strip"]) <= 1 and edge["style"]["right"] == "auto", edge
+        assert edge["strip"] - 1 <= edge["fromLeft"] <= edge["strip"] + 60 \
+            and edge["style"]["right"] == "auto", edge
         page.wait_for_function(
             "(s) => parseFloat([...document.querySelectorAll('#waterfall .ov-ribbon.flow')]"
             ".pop().style.left) > s", arg=edge["strip"], timeout=5_000)
@@ -4121,7 +4153,7 @@ def scenario_view_time_flow_flips_the_newest_side(page, url, secret):
         assert page.evaluate(f"window.zetaTest.xForNs({far})") == width
         page.evaluate("window.zetaTest.ribbon(100002000, 'flow three', 'flow')")
         edge = page.evaluate(RIBBON_EDGE_JS)
-        assert abs(edge["fromRight"] - edge["strip"]) <= 1, edge
+        assert edge["strip"] - 1 <= edge["fromRight"] <= edge["strip"] + 60, edge
     finally:
         run_cmd(page, "view reset")
 
@@ -4153,7 +4185,20 @@ def scenario_ribbons_keep_the_newest_strip_clear(page, url, secret):
             # A short one starts right at the strip's boundary and runs to the oldest side.
             page.evaluate("(t) => window.zetaTest.ribbon(100001000, t, 'flow')", f"short {flow}")
             s = page.evaluate(RIBBON_EDGE_JS)
-            assert abs(s[near] - s["strip"]) <= 1, f"{flow} {s}"
+            # (it drifts a pixel a column, so read within a few columns of the strip)
+            assert s["strip"] - 1 <= s[near] <= s["strip"] + 60, f"{flow} {s}"
+        # A ribbon raised while the layer has no size is moved in by the strip and given its
+        # width limit once the layer is sized again.
+        run_cmd(page, "view set time_flow right")
+        page.evaluate("() => { document.getElementById('waterfall').style.display = 'none';"
+                      " return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))); }")
+        page.evaluate("window.zetaTest.ribbon(100003000, 'raised unsized ' + 'x'.repeat(400), 'flow')")
+        page.evaluate("document.getElementById('waterfall').style.display = ''")
+        page.wait_for_function(
+            "() => { const r = [...document.querySelectorAll('#waterfall .ov-ribbon.flow')].pop();"
+            " return r.style.maxWidth !== '' && parseFloat(r.style.maxWidth) > 0; }", timeout=5_000)
+        e = page.evaluate(RIBBON_EDGE_JS)
+        assert e["fromRight"] >= e["strip"] - 1, f"raised unsized: {e}"
     finally:
         run_cmd(page, "view reset")
 
@@ -6477,6 +6522,31 @@ def scenario_stop_all_is_one_operation_and_keeps_the_spectrum(page, url, secret)
 
 # ---- channel plans (plan 13 Task 4) ---------------------------------------------------------
 # `cb` is the tone recording labelled at 476.9 MHz, channel 20 of uhf_cb_au.
+
+def scenario_view_dir_rtl_keeps_channel_ticks_off_the_frequency_labels(page, url, secret):
+    """With a plan's channel ticks on the axis, `dir rtl` keeps them clear of the numeric
+    frequency labels (both sit on the axis's inline sides)."""
+    select_source(page, url, secret, "cb")
+    set_band(page, 476_900_000, 40_000)
+    ticks = page.locator("#waterfall .wf-axis .tick.ch")
+    expect(ticks.first).to_be_visible()
+    boxes = lambda sel: page.evaluate(
+        "(s) => [...document.querySelectorAll(s)].map((e) => { const r = e.getBoundingClientRect();"
+        " return {l: r.left, r: r.right, t: r.top, b: r.bottom}; })", sel)
+    overlap = lambda a, b: a["l"] < b["r"] and b["l"] < a["r"] and a["t"] < b["b"] and b["t"] < a["b"]
+    try:
+        for mode in ("ltr", "rtl"):
+            run_cmd(page, f"view set dir {mode}")
+            expect(page.locator("html")).to_have_attribute("dir", mode)
+            expect(ticks.first).to_be_visible()
+            ch = boxes("#waterfall .wf-axis .tick.ch")
+            nums = boxes("#waterfall .wf-axis .tick:not(.ch)")
+            assert ch and nums, (ch, nums)
+            bad = [(c, n) for c in ch for n in nums if overlap(c, n)]
+            assert not bad, f"channel ticks overlap frequency labels in {mode}: {bad[:2]}"
+    finally:
+        run_cmd(page, "view reset")
+
 
 def scenario_channel_plan_labels(page, url, secret):
     select_source(page, url, secret, "cb")
