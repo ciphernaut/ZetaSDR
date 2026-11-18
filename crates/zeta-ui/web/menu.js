@@ -107,6 +107,7 @@
 //     startJob, fitAndStart, decodeAcross, scan, openSet, command, planGroupsOf (a box's ctx
 //     `sel`), and fitOutline, retuneWidth, toggle, mute, stopJob (a job). A job's ctx carries
 //     its band as `sel` (jobCtx), so its next steps run the box entries' runs.
+//   HOVER_DWELL_MS  the hover intent's dwell (see Groups); ELSEWHERE  the `elsewhere` heading
 //   JOB_SPAN_NS     the span a job's What is this? reads (the newest painted, on the shown source)
 //   mountMenu's opts also take isAudio(job), play(job, {role}), transcribe(job, {role}) and
 //     playing(id): app.js's, for a job menu's Listen and Transcribe (the row's ▶ and Transcribe)
@@ -159,13 +160,15 @@
 // this?, Listen, Decode, Measure, Plans, Capture, Send to agent; job: Fit to signal, Width, the
 // toggles, Mute in mix, Next, Stop), each group's offered entries in table order, those an
 // entry's `elsewhere` marks after the others under an `elsewhere` (ELSEWHERE) heading. A
-// `direct` group's entries, and a group whose entries take one line (an entry with `items`
-// takes one more per item) and that has no `elsewhere` entry, stand in the first level; any
+// `direct` group's entries (its `elsewhere` ones under the heading there too), and a group
+// whose entries take one line (an entry with `items` takes one more per item) and that has no
+// `elsewhere` entry, stand in the first level; any
 // other group is one opener, `.ctx-item[data-group=<id>]` reading the group's label with an
 // arrow towards the inline end (aria-haspopup), whose entries stand in its submenu,
 // `.ctx-sub[data-group=<id>]` (role menu). An entry with a `sub` (Decode across this band…)
 // opens its own, `.ctx-sub[data-for=<id>]`, the same way: one mechanism, every panel a direct
-// child of the menu (`position: absolute` in it). A submenu opens when the pointer reaches its opener,
+// child of the menu (`position: absolute` in it, as wide as its widest entry). A submenu opens
+// when the pointer reaches its opener,
 // on a click or tap (which also focuses its first entry), and by keyboard on the opener (the
 // arrow towards the inline end, or Enter); the pointer on another entry of the opener's level
 // closes it, as do Escape (one level, the focus back on the opener; the whole menu while a fit
@@ -174,8 +177,10 @@
 // stay inside the viewport, at most the viewport's height (it scrolls; a focused entry is
 // scrolled into view). While a submenu is open, another opener (or entry) of its level takes
 // over only after the pointer rests on it HOVER_DWELL_MS. An entry's section (sectionOf)
-// starts a `.ctx-sep` heading. A menu drawn again when modes_list answers keeps its open
-// submenus and focus (repaint).
+// starts a `.ctx-sep` heading, unless nothing precedes it in its level (a heading that does
+// stand first, `elsewhere` over no fitting entry, has no rule above it). A menu drawn again when
+// modes_list answers is kept inside the viewport first and then keeps its open submenus, placed
+// again beside their openers, and its focus (repaint).
 //
 // The job's menu (#ctx-outline, role menu): overlays.js opens it by right-click on a retunable
 // outline, or a long press on its label in the narrow footprint; the job row's ⋯ opens it too
@@ -551,6 +556,10 @@ export function placeSub(panel, opener, parent, rtl, root) {
   const p = parent.getBoundingClientRect();
   const o = opener.getBoundingClientRect();
   const m = root.getBoundingClientRect();
+  // Measured at the menu's corner and as wide as its entries, whatever the last place was.
+  panel.style.left = "0px";
+  panel.style.top = "0px";
+  panel.style.width = "max-content";
   const w = panel.offsetWidth;
   const h = panel.offsetHeight;
   const end = rtl ? p.left - w : p.right;
@@ -822,12 +831,16 @@ class Menu {
       const es = all.filter((e) => !far.includes(e));
       const lines = es.reduce((n, e) => n + 1 + (e.items ? e.items(ctx).length : 0), 0);
       if (g.direct || (lines === 1 && far.length === 0)) {
-        const promoted = this.entryNodes(es, ctx, root, panels);
+        const promoted = this.entryNodes(es, ctx, root, panels, nodes.length > 0);
         const item = promoted.find((n) => n.classList.contains("ctx-item"));
-        if (!g.direct && g.prefix && !item.textContent.startsWith(g.label)) {
+        if (!g.direct && g.prefix && item && !item.textContent.startsWith(g.label)) {
           item.textContent = `${g.label} › ${item.textContent}`;
         }
         nodes.push(...promoted);
+        // A direct group's entries that do not fit stand under the heading in the first level.
+        if (far.length > 0) {
+          nodes.push(this.sep(ELSEWHERE), ...this.entryNodes(far, ctx, root, panels, true));
+        }
         continue;
       }
       const opener = this.button(null, g.label);
@@ -837,7 +850,8 @@ class Menu {
       panel.setAttribute("aria-label", g.label);
       panel.append(...this.entryNodes(es, ctx, panel, panels));
       if (far.length > 0) {
-        panel.append(this.sep(ELSEWHERE), ...this.entryNodes(far, ctx, panel, panels));
+        // The heading's rule only under fitting entries (style.css: a first `.ctx-sep` has none).
+        panel.append(this.sep(ELSEWHERE), ...this.entryNodes(far, ctx, panel, panels, true));
       }
       nodes.push(opener);
       panels.push(panel);
@@ -846,14 +860,16 @@ class Menu {
   }
 
   // The nodes of entries `es` in `container` (the menu or a submenu panel): each entry's item,
-  // a `.ctx-sep` heading where a section starts, the items an entry draws after it, and for an
-  // entry with a submenu its opener (its panel added to `panels`).
-  entryNodes(es, ctx, container, panels) {
+  // a `.ctx-sep` heading where a section starts after something (`after`: nodes precede these
+  // in the container; a section that starts the container takes no heading), the items an
+  // entry draws after it, and for an entry with a submenu its opener (its panel added to
+  // `panels`).
+  entryNodes(es, ctx, container, panels, after = false) {
     const nodes = [];
     let section;
     for (const entry of es) {
       const now = sectionOf(entry, ctx.surface);
-      if (now && now !== section) nodes.push(this.sep(now));
+      if (now && now !== section && (after || nodes.length > 0)) nodes.push(this.sep(now));
       section = now;
       const item = this.item(entry, ctx);
       this.leaves(item, container);
@@ -1092,11 +1108,12 @@ class Menu {
     this.paint(this.el, this.footer, this.boxCtx());
     const panelOf = (k) =>
       [...this.el.querySelectorAll(":scope > .ctx-sub")].find((p) => key(p) === k);
+    // The menu first, so the panels are placed beside where their openers end up.
+    this.clamp(this.el);
     for (const k of opened) {
       const p = panelOf(k);
       if (p) this.openSub(p);
     }
-    this.clamp(this.el);
     if (focusKey) {
       const level = focusIn ? panelOf(focusIn) : this.el;
       const again = level && this.levelItems(level).find((i) => key(i) === focusKey);

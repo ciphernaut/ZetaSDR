@@ -5205,6 +5205,9 @@ def scenario_narrow_long_press_opens_the_outline_menu(page, url, secret):
         page.wait_for_timeout(700)
         page.mouse.up()
         expect(page.locator("#ctx-outline")).to_be_visible()
+        # A passthrough has no audio: its Next holds the band steps only, with no heading.
+        seq = page.locator('#ctx-outline .ctx-sub[data-group="next"]').evaluate(NEXT_SEQ_JS)
+        assert seq and not any(s.startswith("sep:") for s in seq), f"Next {seq}"
         page.keyboard.press("Escape")
         expect(page.locator("#ctx-outline")).to_be_hidden()
         # A tapped segment reads as the console tag does: the channel or the kind, the squelch
@@ -5878,6 +5881,36 @@ def scenario_box_menu_offers_only_what_fits(page, url, secret):
     assert bw < need and in_ranges(row, c - bw / 2, c + bw / 2), f"narrow box {c} {bw}"
     wait_until(lambda: menu_side(page, "aprs_decode") == "elsewhere", 5.0, "APRS elsewhere")
     close_menu(page)
+    # Two made-up entries the data puts elsewhere, added to the page's own table: one in a
+    # group of its own (its heading stands first: the word, no rule), one in a direct group
+    # (drawn in the first level under the heading, not dropped).
+    page.evaluate("""async () => { const a = await import('./actions.js');
+        a.GROUPS.box.splice(a.GROUPS.box.findIndex((g) => g.id === 'agent'), 0,
+                            {id: 'probe', label: 'Probe'});
+        const far = (id, group) => ({id, label: id, group, on: ['box'], elsewhere: () => true,
+                                     run: () => {}});
+        a.ACTIONS.push(far('probe_far', 'probe'), far('probe_direct', 'agent')); }""")
+    drag_hz(page, need * 0.6, view_hz)
+    first = page.evaluate("""() => [...document.getElementById('ctx').children]
+        .filter((e) => !e.classList.contains('ctx-sub') && e.id !== 'ctx-footer')
+        .map((e) => e.classList.contains('ctx-sep') ? 'sep:' + e.textContent
+                                                     : e.dataset.action || 'group:' + e.dataset.group)""")
+    assert first[-3:] == ["ask", "sep:elsewhere", "probe_direct"], f"first level {first}"
+    probe = page.locator('#ctx .ctx-sub[data-group="probe"]').evaluate(
+        """(p) => { const s = p.firstElementChild;
+          return [s.className, s.textContent, getComputedStyle(s).borderTopStyle,
+                  p.children.length]; }""")
+    assert probe == ["ctx-sep", "elsewhere", "none", 2], f"probe panel {probe}"
+    decode = page.locator('#ctx .ctx-sub[data-group="decode"]').evaluate(
+        """(p) => [...p.children].filter((e) => e.classList.contains('ctx-sep'))
+          .map((s) => [s.previousElementSibling !== null, getComputedStyle(s).borderTopStyle])""")
+    assert all((style != "none") == preceded for preceded, style in decode), f"decode {decode}"
+    page.evaluate("""async () => { const a = await import('./actions.js');
+        a.GROUPS.box.splice(a.GROUPS.box.findIndex((g) => g.id === 'probe'), 1);
+        for (const id of ['probe_far', 'probe_direct']) {
+          a.ACTIONS.splice(a.ACTIONS.findIndex((e) => e.id === id), 1);
+        } }""")
+    close_menu(page)
     drag_hz(page, need * 1.5, view_hz)
     c, bw = box_of(page)
     assert bw >= need and in_ranges(row, c - bw / 2, c + bw / 2), f"wide box {c} {bw}"
@@ -5928,6 +5961,9 @@ def scenario_decode_menu_lists_new_kinds(page, url, secret):
 def scenario_submenus_wait_for_the_pointer_to_rest(page, url, secret):
     # Hover intent: with Listen's submenu open, a pointer crossing Measure and Plans on its
     # way into Listen's panel leaves the panel open; resting on Measure past the dwell switches.
+    # The crossing (the pointer entering and leaving Measure and Plans, then entering Listen's
+    # last entry) is dispatched in one page task, so no dwell can fire between its steps however
+    # slow the runner; one left pending would fire within the wait after it.
     menu = open_menu_on_tone(page, url, secret)
     page.evaluate("() => { const m = document.getElementById('ctx'); m.style.left = '100px';"
                   " m.style.top = '120px'; }")
@@ -5938,19 +5974,29 @@ def scenario_submenus_wait_for_the_pointer_to_rest(page, url, secret):
         b = loc.bounding_box()
         return b["x"] + b["width"] / 2, b["y"] + b["height"] / 2
 
-    page.mouse.move(*centre(menu.locator('.ctx-item[data-group="listen"]')))
+    at_measure = centre(menu.locator('.ctx-item[data-group="measure"]'))
+    menu.locator('.ctx-item[data-group="listen"]').hover()
     expect(listen).to_be_visible()
     last = listen.locator(".ctx-item").last
-    lx, ly = centre(last)
-    page.mouse.move(*centre(menu.locator('.ctx-item[data-group="measure"]')))
-    page.mouse.move(*centre(menu.locator('.ctx-item[data-group="plans"]')))
-    page.mouse.move(lx, ly)
+    page.evaluate("""() => {
+      const m = document.getElementById('ctx');
+      const at = (s) => m.querySelector(s);
+      const fire = (el, type) => el.dispatchEvent(new PointerEvent(type, {pointerType: 'mouse'}));
+      fire(at('.ctx-item[data-group="listen"]'), 'pointerleave');
+      for (const g of ['measure', 'plans']) {
+        fire(at(`.ctx-item[data-group="${g}"]`), 'pointerenter');
+        fire(at(`.ctx-item[data-group="${g}"]`), 'pointerleave');
+      }
+      const items = m.querySelectorAll('.ctx-sub[data-group="listen"] .ctx-item');
+      fire(items[items.length - 1], 'pointerenter');
+    }""")
     page.wait_for_timeout(400)
     expect(listen).to_be_visible()
     expect(measure).to_be_hidden()
     expect(last).to_be_visible()
+    # Resting on Measure past the dwell switches.
     last.hover()
-    page.mouse.move(*centre(menu.locator('.ctx-item[data-group="measure"]')))
+    page.mouse.move(*at_measure)
     expect(measure).to_be_visible()
     expect(listen).to_be_hidden()
     close_menu(page)
@@ -6018,6 +6064,11 @@ def scenario_submenus_beside_their_opener_in_every_theme(page, url, secret):
     close_menu(page)
 
 
+# A submenu panel's children in order: an entry's data-action, or `sep:<heading>`.
+NEXT_SEQ_JS = """(p) => [...p.children].map((e) =>
+  e.classList.contains('ctx-sep') ? 'sep:' + e.textContent : e.dataset.action)"""
+
+
 def scenario_job_menu_offers_next_steps_from_outline_and_row(page, url, secret):
     # A running demodulator's menu (its outline's right-click, or its row's ⋯) offers its
     # next steps under Next, from the same table as the box menu: Identify on the job's band
@@ -6038,6 +6089,10 @@ def scenario_job_menu_offers_next_steps_from_outline_and_row(page, url, secret):
         from_outline = menu.locator('.ctx-sub[data-group="next"] .ctx-item').evaluate_all(nxt)
         for want in ("listen", "transcribe", "classify", "identify", "measure", "watch"):
             assert want in from_outline, f"next steps {from_outline}"
+        # Listen and Transcribe first, then the band steps under their heading.
+        seq = menu.locator('.ctx-sub[data-group="next"]').evaluate(NEXT_SEQ_JS)
+        assert seq[:3] == ["listen", "transcribe", "sep:On its band"] \
+            and "sep:On its band" not in seq[3:], f"Next {seq}"
         with page.expect_request(is_op("job_start")) as req:
             menu_click(page, "identify", "#ctx-outline")
         body = json.loads(req.value.post_data)
@@ -6078,9 +6133,71 @@ def scenario_submenus_stay_inside_the_viewport(page, url, secret):
         return b["x"] >= 0 and b["y"] >= 0 and b["x"] + b["width"] <= vw + 0.5 \
             and b["y"] + b["height"] <= vh + 0.5
 
-    menu = open_menu_on_tone(page, url, secret)
-    listen = menu.locator('.ctx-sub[data-group="listen"]')
-    opener = menu.locator('.ctx-item[data-group="listen"]')
+    # modes_list is held until a submenu is open in a menu standing past the bottom edge: the
+    # repaint its answer brings keeps the menu inside the viewport and then places the open
+    # submenu beside its opener (not where the menu stood before).
+    held = []
+
+    def hold(r):
+        if '"modes_list"' in (r.request.post_data or ""):
+            held.append(r)
+        else:
+            r.continue_()
+
+    page.route("**/op", hold)
+    try:
+        menu = open_menu_on_tone(page, url, secret)
+        listen = menu.locator('.ctx-sub[data-group="listen"]')
+        opener = menu.locator('.ctx-item[data-group="listen"]')
+        assert held, "modes_list was not asked"
+        place_menu(left=40)
+        opener.click()
+        expect(listen).to_be_visible()
+        page.evaluate("""() => { document.getElementById('ctx').style.top = (innerHeight - 30) + 'px';
+            document.querySelector('#ctx .ctx-sub[data-group="listen"]').dataset.stale = '1'; }""")
+        for r in held:
+            r.continue_()
+        held.clear()
+        page.wait_for_function("""() => { const p = document.querySelector(
+            '#ctx .ctx-sub[data-group="listen"]'); return !!p && !p.dataset.stale && !p.hidden; }""")
+    finally:
+        page.unroute("**/op", hold)
+        for r in held:
+            r.continue_()
+    vw, vh = page.evaluate("[innerWidth, innerHeight]")
+    m, o, sb = menu.bounding_box(), opener.bounding_box(), listen.bounding_box()
+    assert m["y"] + m["height"] <= vh + 0.5, f"menu {m} past the bottom {vh}"
+    want = max(0, min(o["y"] - 5, vh - sb["height"]))
+    assert abs(sb["y"] - want) <= 2 and inside(sb), f"submenu {sb} for opener {o} ({want})"
+    # A panel is as wide as its widest entry's one line, with a long label, on the first open
+    # and on opening it again after another group's.
+    place_menu(left=40)
+    listen.locator(".ctx-item").last.evaluate(
+        "e => { e.textContent = 'Transcribe ' + 'a rather long entry label '.repeat(3); }")
+    fit_js = """(p) => {
+      const items = [...p.querySelectorAll('.ctx-item')];
+      const one = items.map((i) => {
+        const c = i.cloneNode(true);
+        Object.assign(c.style, {width: 'max-content', position: 'absolute', visibility: 'hidden'});
+        p.append(c);
+        const r = c.getBoundingClientRect();
+        c.remove();
+        return {w: r.width, h: r.height, got: i.getBoundingClientRect().height};
+      });
+      const s = getComputedStyle(p);
+      const inner = p.clientWidth - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight);
+      return {inner, natural: Math.max(...one.map((x) => x.w)),
+              wrapped: one.filter((x) => x.got > x.h + 1).length};
+    }"""
+    for n in range(2):
+        opener.click()
+        expect(listen).to_be_visible()
+        got = listen.evaluate(fit_js)
+        assert got["wrapped"] == 0 and abs(got["inner"] - got["natural"]) <= 1, (n, got)
+        menu.locator('.ctx-item[data-group="measure"]').click()
+        expect(menu.locator('.ctx-sub[data-group="measure"]')).to_be_visible()
+        expect(listen).to_be_hidden()
+    page.keyboard.press("Escape")
     place_menu(right=2, bottom=True)
     opener.hover()
     expect(listen).to_be_visible()

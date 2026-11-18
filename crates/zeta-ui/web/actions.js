@@ -223,7 +223,9 @@
 //                          attached one
 //   transcribe Transcribe  (Next) the row's Transcribe: transcribe(job, {role}), job_attach
 //                          kind=transcribe; a running job with audio
-//   classify, identify, measure, watch  (Next) the box entries' runs on the job's band (`sel`,
+//   classify, identify, measure, watch  (Next, after Listen and Transcribe under the heading
+//                          `On its band`, with no heading when those two are not offered) the
+//                          box entries' runs on the job's band (`sel`,
 //                          menu.js jobCtx), for a job with a band (not a mix); What is this? only
 //                          on the shown source, over its newest JOB_SPAN_NS
 //   stop   Stop            job_stop
@@ -329,6 +331,18 @@ const twin = (id, label, of) => ({
 });
 
 export const ACTIONS = [
+  // A job's first next steps (the row's ▶ and Transcribe), before its band steps' heading.
+  {
+    id: "listen", group: "next", on: ["job"],
+    label: (c) => (c.playing ? "Stop listening" : "Listen"),
+    applies: (c) => c.audio,
+    run: (c) => c.play(c.job, { role: c.role }),
+  },
+  {
+    id: "transcribe", label: "Transcribe", group: "next", on: ["job"],
+    applies: (c) => c.audio && c.running,
+    run: (c) => c.transcribe(c.job, { role: c.role }),
+  },
   // On a job: its band over the newest span of its source, which the page has only for the
   // shown source (menu.js jobCtx).
   {
@@ -437,18 +451,6 @@ export const ACTIONS = [
     label: (c) => (c.mute && c.mute.muted ? "Unmute in mix" : "Mute in mix"),
     applies: (c) => c.mute !== null,
     run: (c) => c.host.mute(c.job),
-  },
-  // The job's next steps (the row's ▶ and Transcribe).
-  {
-    id: "listen", group: "next", on: ["job"],
-    label: (c) => (c.playing ? "Stop listening" : "Listen"),
-    applies: (c) => c.audio,
-    run: (c) => c.play(c.job, { role: c.role }),
-  },
-  {
-    id: "transcribe", label: "Transcribe", group: "next", on: ["job"],
-    applies: (c) => c.audio && c.running,
-    run: (c) => c.transcribe(c.job, { role: c.role }),
   },
   { id: "stop", label: "Stop", group: "stop", on: ["job"], run: (c) => c.host.stopJob(c.job) },
 ];

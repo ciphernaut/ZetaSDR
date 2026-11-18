@@ -725,9 +725,11 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 }
 /* A group's submenu (menu.js), and "Decode across this band…"'s rows: a panel of the menu's
    own looks at its opener's side (placeSub sets left and top, from the menu's padding box), no
-   taller than the viewport (it scrolls). */
+   taller than the viewport (it scrolls). As wide as its widest entry: an absolute box would
+   otherwise shrink to the room its menu leaves right of its offset. */
 #ctx .ctx-sub, #ctx-outline .ctx-sub {
   position: absolute;
+  width: max-content;
   max-height: calc(100vh - 8px);
   overflow-y: auto;
   z-index: 21;
@@ -756,6 +758,11 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   border-top: 1px solid var(--border);
   color: var(--dim);
   font-size: 11px;
+}
+/* A heading with nothing above it in its panel (`elsewhere` over no fitting entry): no rule. */
+.ctx-sub > .ctx-sep:first-child {
+  margin-top: 0;
+  border-top: none;
 }
 #ctx-footer, #ctx-outline-footer {
   margin-top: 4px;

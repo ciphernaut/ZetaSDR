@@ -283,7 +283,7 @@ section.pane {
 #ctx .ctx-item, #ctx-outline .ctx-item { clip-path: none; background: transparent; border: 1px solid transparent; color: var(--text); }
 #ctx .ctx-item:hover, #ctx .ctx-item:focus-visible,
 #ctx-outline .ctx-item:hover, #ctx-outline .ctx-item:focus-visible { border-color: var(--ok); color: var(--ok); box-shadow: none; }
-/* A clip-path clips a fixed child too: while a submenu stands beside the menu, the menu drops
+/* A clip-path on the menu clips its submenu panels: while one stands beside the menu, it drops
    its chamfer (each submenu keeps its own). */
 #ctx:has(> .ctx-sub:not([hidden])), #ctx-outline:has(> .ctx-sub:not([hidden])) { clip-path: none; }
 #graph .graph-panel { --line: var(--ok); --ground: var(--bar); --cut: 14px; }
