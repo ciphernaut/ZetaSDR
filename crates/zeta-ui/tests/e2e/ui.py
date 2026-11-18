@@ -4903,15 +4903,18 @@ def scenario_outline_menu_presets_fit_and_stop(page, url, secret):
         assert abs(body["center_hz"] - (cur + 1000)) <= 100, f"fit centre {body}"
         # Measured on the retune fixture's tone through an fm_demod band of 12.5 kHz: a fresh
         # measure's occupied width x 1.25 gave 7090 Hz (labelled `fm`), not the 5000 Hz floor,
-        # so the width is asserted as a range (floor 5000, cap the measured box: twice the
-        # job's 12500) and the note must report the sent width.
-        assert 5000 <= body["bandwidth_hz"] <= 25000, f"fit width {body}"
+        # so the width is asserted as a range (floor 5000, at most the job's 12500: only a plan
+        # channel's width may widen a running job) and the note must report the sent width.
         kHz = f"{body['bandwidth_hz'] / 1000:.1f}"
         mhz = f"{body['center_hz'] / 1e6:.4f}"
-        expect(page.locator("#transcript .line.note", has_text=re.compile(
+        note = page.locator("#transcript .line.note", has_text=re.compile(
             rf"^fitted fm_demod to {re.escape(mhz)} MHz, {re.escape(kHz)} kHz "
-            rf"\((carrier|fm), (occupied|99 % power|kept|plan [a-z0-9_]+ ch \d+)\)$"
-        ))).to_have_count(1)
+            rf"\((carrier|fm), (occupied|99 % power|kept|plan [a-z0-9_]+ ch \d+"
+            rf"(, capped by the capture)?)\)$"))
+        expect(note).to_have_count(1)
+        widened_by_plan = ", plan " in note.text_content()
+        assert 5000 <= body["bandwidth_hz"] and (body["bandwidth_hz"] <= 12500 or widened_by_plan), \
+            f"fit width {body}: {note.text_content()}"
         wait_until(lambda: job_record(url, secret, job)["tuning"]["bandwidth_hz"]
                    == body["bandwidth_hz"], 5.0, "fit applied")
         page.evaluate("window.zetaTest.poll()")
@@ -4929,9 +4932,12 @@ def scenario_fit_width_rule_and_box_are_pure_functions(page, url, secret):
     # plan channel's width with the measured centre, else a 99 % power width over the floor,
     # else kept; a trusted label under the floor is still occupied; always within floor and
     # cap. fitJob: a run inside the job's band comes from the wide box; a run past it (a wider
-    # signal, a bridged neighbour) is measured again in the job's own band, which never
-    # widens the job or moves its centre out of it; a run filling the band keeps; the wide
-    # box is not used where it would take in the DC mask, and a null from it falls back.
+    # signal, a bridged neighbour) keeps the job's width and centre, on every fit, with no
+    # second measure; the wide box is not used where it holds a local capture's centre off
+    # its own (the DC mask) or where the job's source is not known, and a null from it falls
+    # back to the band, where a run filling the band keeps. The plan rule is capped by the
+    # capture of the job's source on every path, never by the measured box, and the line says
+    # when a cap cut it.
     login(page, url, secret)
     got = page.evaluate(
         """async () => {
@@ -4965,32 +4971,80 @@ def scenario_fit_width_rule_and_box_are_pure_functions(page, url, secret):
           const noise = {partial: false, center_hz: 0, bandwidth_hz: 0, snr_db: 0,
                          label: {name: 'noise', evidence: ''}};
           const mine = {kind: 'fm_demod', source: 's', centerHz: 100_000_000, bandwidthHz: 8000};
-          const run = async (events, j = mine, rec = null) => {
+          // A remote capture (no DC mask) wide enough for every box below.
+          const far2 = {id: 's', capabilities: {remote: true, push: false},
+                        current: {center_hz: 100_000_000, bandwidth_hz: 2_000_000}};
+          // One fit as the outline menu runs it: fitJob, then fitTuning with fitJob's box.
+          const step = async (events, j, rec, planAt = none) => {
             const a = api(events);
             const r = await m.fitJob(a, j, rec);
-            return {calls: a.calls, capHz: r && r.capHz, planCapHz: r && r.planCapHz,
-                    fills: r && r.fillsBand, centre: r && r.fit.centerHz, null: r === null};
+            if (!r) return {calls: a.calls, r};
+            const t = m.fitTuning(j, r.fit, r.box, planAt);
+            return {calls: a.calls, centerHz: t.centerHz, bandwidthHz: t.bandwidthHz,
+                    rule: t.rule, keep: r.box.keep ?? null};
+          };
+          // Fits twice: the second on the job the first left.
+          const twice = async (events, j, rec, planAt = none) => {
+            const one = await step(events, j, rec, planAt);
+            const two = await step(events, {...j, centerHz: one.centerHz,
+                                            bandwidthHz: one.bandwidthHz}, rec, planAt);
+            return [one, two];
           };
           // The same narrow signal, whatever the job's width: a narrow signal inside the job.
-          const inside = await run(() => ev(100_000_500, 6000));
+          const inside = await step(() => ev(100_000_500, 6000), mine, far2);
           // Two adjacent strong channels: the wide run bridges them (one 19.5 kHz run, centre
-          // inside the job's band); the own band shows the job's signal alone.
-          const bridged = await run((bw) => (bw > 8000 ? ev(100_000_800, 19500)
-                                                       : ev(100_000_500, 7000)));
-          const fills = await run((bw) => (bw > 8000 ? ev(100_000_000, 15000)
-                                                     : ev(100_000_000, 8000)));
+          // inside the job's band): the job keeps its width and centre.
+          const bridged = await step((bw) => (bw > 8000 ? ev(100_000_800, 19500)
+                                                        : ev(100_000_500, 7000)), mine, far2);
+          // An 11 kHz signal under the 8 kHz job: a box narrower than the signal under-reads it
+          // (the node's floor sits on the signal), so measuring the band would walk it down.
+          const wider = (bw) => (bw > 11000 ? ev(100_000_000, 11000)
+                                            : ev(100_000_000, Math.round(0.7 * bw)));
+          const reach = await twice(wider, mine, far2);
+          const reachPlan = await twice(wider, mine, far2, plan);
+          // A local capture centred 150 kHz off a 200 kHz job: the wide box holds its centre.
           const rec = {id: 's', capabilities: {remote: false, push: false},
                        current: {center_hz: 100_150_000, bandwidth_hz: 2_000_000}};
-          const dc = await run(() => ev(100_000_000, 150_000),
-                               {kind: 'wfm_demod', source: 's', centerHz: 100_000_000,
-                                bandwidthHz: 200_000}, rec);
-          const fallback = await run((bw) => (bw > 8000 ? noise : ev(100_000_500, 6000)));
+          const wfm = {kind: 'wfm_demod', source: 's', centerHz: 100_000_000, bandwidthHz: 200_000};
+          const dc = await step(() => ev(100_000_000, 150_000), wfm, rec);
+          // The capture centre 6 kHz off an 8 kHz job (inside the band too, the boxes under
+          // 50 kHz): the wide box holds it off its centre, so the band only.
+          const local = (c) => ({id: 's', capabilities: {remote: false, push: false},
+                                 current: {center_hz: c, bandwidth_hz: 2_000_000}});
+          const dcNear = await step(() => ev(100_000_500, 6000), mine, local(100_006_000));
+          // The capture centred on the job: the radio was tuned for it, measured whole.
+          const dcOn = await step(() => ev(100_000_500, 6000), mine, local(100_000_000));
+          const fallback = await step((bw) => (bw > 8000 ? noise : ev(100_000_500, 6000)), mine, far2);
+          const fills = await step((bw) => (bw > 8000 ? noise : ev(100_000_000, 8000)), mine, far2);
+          // A 5 kHz job on a 12.5 kHz plan channel, only the carrier line measured: the plan's
+          // width on the first fit, on the wide path and on the DC-mask path alike.
+          const five = {kind: 'fm_demod', source: 's', centerHz: 100_000_000, bandwidthHz: 5000};
+          const line = () => ev(100_000_200, 600);
+          const planWide = await step(line, five, far2, plan);
+          const planDc = await step(line, five, local(100_004_000), plan);
+          // A channel at the capture's edge (4 kHz inside it): capped, and the line says so.
+          const edgeRec = {id: 's', capabilities: {remote: true, push: false},
+                           current: {center_hz: 99_504_000, bandwidth_hz: 1_000_000}};
+          const planEdge = await step(() => ev(100_000_000, 600), five, edgeRec, plan);
+          // The job's source not known: the band only, and the plan cannot widen past it.
+          const unknown = await step(line, five, null, plan);
+          // A job on a second source, not the one shown: its record is found by id, so the box
+          // is held to that source's capture (16 kHz here) and not twice the job.
+          const shownRec = {...far2, id: 'a'};
+          const kiwi = {id: 'b', capabilities: {remote: true, push: false},
+                        current: {center_hz: 7_100_000, bandwidth_hz: 16_000}};
+          const onB = {kind: 'am_demod', source: 'b', centerHz: 7_100_000, bandwidthHz: 10_000};
+          const recB = m.sourceRecord('b', [shownRec, kiwi], shownRec);
+          const recShown = m.sourceRecord('a', [], shownRec);
+          const recNone = m.sourceRecord('c', [shownRec, kiwi], shownRec);
+          const second = await step(() => ev(7_100_000, 4000), onB, recB);
           return {
             occupied: t(fit({bandwidthHz: 8000}), {bandwidthHz: 25000}, plan),
             carrier: t(fit({bandwidthHz: 600, label: 'carrier'}), {bandwidthHz: 25000}, plan),
             plan: t(fit({}), {bandwidthHz: 25000}, plan),
             planCapped: t(fit({}), {bandwidthHz: 8000, planCapHz: 16000}, plan),
             planUncapped: t(fit({}), {bandwidthHz: 8000, planCapHz: 10000}, plan),
+            planBox: t(fit({}), {bandwidthHz: 8000}, plan),
             power: t(fit({}), {bandwidthHz: 25000}, none),
             capped: t(fit({power99Hz: 40000}), {bandwidthHz: 20000}, none),
             floored: t(fit({power99Hz: 1000}), {bandwidthHz: 20000, keptHz: 9000}, none),
@@ -5010,7 +5064,9 @@ def scenario_fit_width_rule_and_box_are_pure_functions(page, url, secret):
                     m.fitBox({kind: 'ssb_demod', centerHz: 1e8, bandwidthHz: 6000}, null)],
             held: held && {number: held.number, bw: held.bandwidthHz, ok: !!held.plan},
             heldNone, heldId: heldId && heldId.number, far, hasChan: !!chan,
-            inside, bridged, fills, dc, fallback,
+            inside, bridged, reach, reachPlan, dc, dcNear, dcOn, fallback, fills,
+            planWide, planDc, planEdge, unknown, second,
+            recs: [recB && recB.id, recShown && recShown.id, recNone],
           };
         }"""
     )
@@ -5021,7 +5077,12 @@ def scenario_fit_width_rule_and_box_are_pure_functions(page, url, secret):
     assert (p["bandwidthHz"], p["rule"], p["centerHz"]) == (12500, "plan p1 ch 9", 477000700), p
     # A plan's width (data) may pass the job's width, up to its cap; an occupied one may not.
     assert got["planCapped"]["bandwidthHz"] == 12500, got["planCapped"]
-    assert got["planUncapped"]["bandwidthHz"] == 10000, got["planUncapped"]
+    assert got["planCapped"]["rule"] == "plan p1 ch 9", got["planCapped"]
+    # A cap that cuts the plan's width is named (the box menu: the box drawn).
+    pu = got["planUncapped"]
+    assert (pu["bandwidthHz"], pu["rule"]) == (10000, "plan p1 ch 9, capped by the box"), pu
+    pb = got["planBox"]
+    assert (pb["bandwidthHz"], pb["rule"]) == (8000, "plan p1 ch 9, capped by the box"), pb
     pw = got["power"]
     assert (pw["bandwidthHz"], pw["rule"]) == (9000, "99 % power"), pw
     assert got["capped"]["bandwidthHz"] == 20000, got["capped"]
@@ -5041,20 +5102,46 @@ def scenario_fit_width_rule_and_box_are_pure_functions(page, url, secret):
     assert got["hasChan"] and got["held"]["ok"] and got["held"]["bw"] > 0, got
     assert got["heldNone"] is None and got["heldId"] == got["held"]["number"], got
     assert got["far"] is None, got["far"]
-    # A narrow signal inside the job: the wide box, the job's width caps it, the plan's may pass.
-    i = got["inside"]
-    assert i["calls"] == [16000] and (i["capHz"], i["planCapHz"], i["fills"]) == (8000, 16000, False), i
-    # A run past the job's band (a bridged neighbour): measured again in the band.
-    b = got["bridged"]
-    assert b["calls"] == [16000, 8000] and (b["capHz"], b["planCapHz"]) == (8000, 8000), b
-    assert b["centre"] == 100_000_500 and b["fills"] is False, b
-    # A signal filling the band: kept.
-    assert got["fills"]["calls"] == [16000, 8000] and got["fills"]["fills"] is True, got["fills"]
-    # The wide box would take in the DC mask where the band does not: the band only.
+    def tuned(r):
+        return (r["calls"], r["centerHz"], r["bandwidthHz"], r["rule"])
+
+    # A narrow signal inside the job: the wide box, the job's width caps it.
+    assert tuned(got["inside"]) == ([16000], 100_000_500, 7500, "occupied"), got["inside"]
+    # A run past the job's band (a bridged neighbour, a wider signal): kept, width and centre,
+    # with no second measure, on the first fit and on the second.
+    reach = "kept: the signal reaches past the job's band"
+    assert tuned(got["bridged"]) == ([16000], 100_000_000, 8000, reach), got["bridged"]
+    for n, r in enumerate(got["reach"]):
+        assert tuned(r) == ([16000], 100_000_000, 8000, reach), (n, r)
+    # ... and the plan rule still applies there (the second fit finds the run inside the
+    # band the plan gave).
+    one, two = got["reachPlan"]
+    assert tuned(one) == ([16000], 100_000_000, 12500, "plan p1 ch 9"), one
+    assert (two["centerHz"], two["bandwidthHz"]) == (100_000_000, 12500), two
+    # The wide box would take in the DC mask where the band does not: the band only; the same
+    # for a capture centre inside the job's band too, off its centre, under 50 kHz; a capture
+    # centred on the job is measured whole, so the wide box.
     assert got["dc"]["calls"] == [200_000], got["dc"]
-    # The wide box found nothing: the band is measured before giving up.
-    fb = got["fallback"]
-    assert fb["calls"] == [16000, 8000] and fb["centre"] == 100_000_500, fb
+    assert got["dcNear"]["calls"] == [8000], got["dcNear"]
+    assert got["dcOn"]["calls"] == [16000], got["dcOn"]
+    # The wide box found nothing: the band is measured before giving up ...
+    assert tuned(got["fallback"]) == ([16000, 8000], 100_000_500, 7500, "occupied"), got["fallback"]
+    # ... and a run filling the band keeps it.
+    assert tuned(got["fills"]) == ([16000, 8000], 100_000_000, 8000,
+                                   "kept: the signal fills the band"), got["fills"]
+    # The plan rule's cap is the capture, not the measured box: a 5 kHz job on a 12.5 kHz
+    # channel takes the channel's width on the first fit, on the wide path and on the DC-mask
+    # path; at the capture's edge it is cut to what the capture holds about the centre, and
+    # the line says so; with the source not known the band only, and no widening.
+    assert tuned(got["planWide"]) == ([10000], 100_000_200, 12500, "plan p1 ch 9"), got["planWide"]
+    assert tuned(got["planDc"]) == ([5000], 100_000_200, 12500, "plan p1 ch 9"), got["planDc"]
+    assert tuned(got["planEdge"]) == ([8000], 100_000_000, 8000,
+                                      "plan p1 ch 9, capped by the capture"), got["planEdge"]
+    assert tuned(got["unknown"]) == ([5000], 100_000_200, 5000,
+                                     "plan p1 ch 9, capped by the job's band"), got["unknown"]
+    # A job on another source than the one shown: its own record, its own capture's box.
+    assert got["recs"] == ["b", "a", None], got["recs"]
+    assert got["second"]["calls"] == [16000], got["second"]
 
 
 def scenario_fit_twice_measures_the_same_wide_box(page, url, secret):

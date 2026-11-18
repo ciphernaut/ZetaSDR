@@ -803,15 +803,20 @@ signal, Width (the presets), Denoise or Stereo where the kind takes them, Mute i
 covers the job, Next (Listen and Transcribe on a job with audio, and on its band and source What
 is this?, for a job on the shown source, Identify, a `measure` job and Watch) and Stop. A
 decoder's or a passthrough's menu holds Next and Stop only; an SSB fit moves the dial and keeps
-the band. A fit on a running job measures a box about its centre of twice its width, so a narrow
-signal fits the same on a second fit as on the first; a signal that runs past the job's band (a
-wider signal or a neighbour) is measured again in the band itself, a signal that fills the band is
-left as it is, and a fit never widens a job except to a plan channel's width. A weak voice signal
+the band. A fit on a running job measures a box about its centre of twice its width (within the
+capture of the job's source), so a narrow signal fits the same on a second fit as on the first; a
+signal that runs past the job's band (a wider signal or a neighbour) or fills it leaves the job's
+width and centre as they are (`kept: the signal reaches past the job's band`), and a fit never
+widens a job except to a plan channel's width. On a local radio the box is the job's own band when
+the wider one would hold the capture centre off its own centre (the DC mask), as it is when the
+wider box finds nothing. A weak voice signal
 measures as only its carrier line: when the occupied width of an `fm`, `fsk` or `unknown` signal
 is under the kind's minimum, the fit takes the width of the plan channel (of the plan in view)
 that holds the centre, else the `power99_hz` of the `measure` event (the width that holds 99 % of
 the band's excess power) when it is itself over the minimum, else keeps the job's width, and the
-`fitted` line says which (`occupied`, `plan <id> ch <n>`, `99 % power`, `kept`). Every rigid job carries a tag (kind, short id, squelch dot, channel, last transcript
+`fitted` line says which (`occupied`, `plan <id> ch <n>`, `99 % power`, `kept`). A plan channel's
+width is held only to what the capture holds about the centre (from a box, to the box), and the
+line adds `, capped by the capture` (or `the box`) when that cut it. Every rigid job carries a tag (kind, short id, squelch dot, channel, last transcript
 snippet) linked by hover with its row in the job list, and rows show the band. In `console` the
 tags move to a rail, a column left of the frequency axis, each at its band's height and showing
 the plan channel (or the kind) and the centre in MHz; a tag that overlaps a full one collapses to

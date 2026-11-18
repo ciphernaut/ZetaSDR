@@ -187,11 +187,14 @@
 // A job's (menu.js #ctx-outline, the job's menu), on the job's own source and tuning; Fit and the
 // width presets only for a job whose kind is in FIT_KINDS (the node would refuse a decoder's or
 // a passthrough's narrowing as often as not), Stop always:
-//   fit    Fit to signal   fitJob on the job (a wide box or its own band: see fitJob), then
-//                          job_retune to fitTuning(...), never wider than the job except by a
-//                          plan's width, its centre kept in the job's band; a signal that fills
-//                          the band changes nothing and the note reads `(<label>, kept: the
-//                          signal fills the band)` (an ssb_demod keeps its width and moves its dial,
+//   fit    Fit to signal   fitJob on the job's source's record (sourceRecord; a wide box or its
+//                          own band: see fitJob), then job_retune to fitTuning(...), never wider
+//                          than the job except by a plan's width (capped by the capture), its
+//                          centre kept in the job's band; a signal that reaches past the job's
+//                          band or fills it keeps the job as it is (no retune unless a plan
+//                          channel widens it) and the note reads `(<label>, kept: the signal
+//                          reaches past the job's band)` or `(<label>, kept: the signal fills the
+//                          band)` (an ssb_demod keeps its width and moves its dial,
 //                          the sideband read from its graph's ssb_demod node), and once the
 //                          retune answered the note `fitted <kind> to <band> (<label>, <rule>)`; no
 //                          signal: the note `no signal found in the band; left as it is` (with
