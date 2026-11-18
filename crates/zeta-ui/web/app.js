@@ -1473,6 +1473,7 @@ function start(api) {
     ov: state.ov,
     ringSeconds: (id) => state.sources.find((x) => x.id === id)?.ring?.seconds ?? null,
     plan: () => resolvePlan(state.view.get("plan")),
+    planPolicy: () => state.view.get("plan"),
     sets: () => state.jobs?.sets() ?? [],
     sources: () => state.sources,
     onOrigins: (key, answer) => state.map?.origin(key, answer),

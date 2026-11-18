@@ -785,13 +785,15 @@ dragged band is shown with a ghost and a readout and sent as `job_retune` on rel
 the job id, the attached `transcribe` and the ribbons; a conflict snaps it back with the usual
 retry buttons. Right-click (long press on a phone) opens Fit to signal, the width presets and
 Stop (a decoder's or a passthrough's menu holds Stop only; an SSB fit moves the dial and keeps
-the band). A fit on a running job measures a box about its centre of at least twice its width, so
-fitting again gives the same width and not a narrower one. A weak voice signal measures as only
-its carrier line: when the occupied width of an `fm`, `fsk` or `unknown` signal is under the
-kind's minimum, the fit takes the width of the channel plan's channel that holds the centre, else
-the `power99_hz` of the `measure` event (the width that holds 99 % of the band's excess power),
-else keeps the job's width, and the `fitted` line says which (`occupied`, `plan <id> ch <n>`,
-`99 % power`, `kept`). Every rigid job carries a tag (kind, short id, squelch dot, channel, last transcript
+the band). A fit on a running job measures a box about its centre of twice its width, so a narrow
+signal fits the same on a second fit as on the first; a signal that runs past the job's band (a
+wider signal or a neighbour) is measured again in the band itself, a signal that fills the band is
+left as it is, and a fit never widens a job except to a plan channel's width. A weak voice signal
+measures as only its carrier line: when the occupied width of an `fm`, `fsk` or `unknown` signal
+is under the kind's minimum, the fit takes the width of the plan channel (of the plan in view)
+that holds the centre, else the `power99_hz` of the `measure` event (the width that holds 99 % of
+the band's excess power) when it is itself over the minimum, else keeps the job's width, and the
+`fitted` line says which (`occupied`, `plan <id> ch <n>`, `99 % power`, `kept`). Every rigid job carries a tag (kind, short id, squelch dot, channel, last transcript
 snippet) linked by hover with its row in the job list, and rows show the band. In `console` the
 tags move to a rail, a column left of the frequency axis, each at its band's height and showing
 the plan channel (or the kind) and the centre in MHz; a tag that overlaps a full one collapses to

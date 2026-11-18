@@ -9,10 +9,11 @@
 //   channelLabel(hz, policy) -> {text: "ch20", title: "uhf_cb_au ch20 · <note>", plan: "uhf_cb_au"} | null
 //       The channel centred within CHANNEL_MATCH_HZ of `hz`. `policy` is the view's `plan`:
 //       `auto` any plan, a plan id that plan only, `none` null.
-//   channelHolding(hz) -> {plan, number, bandwidthHz} | null
-//       The channel (of any loaded plan) whose band `centre ± plan.bandwidth_hz / 2` holds `hz`;
-//       the nearest centre when several do. The fit's width rule reads it: a plan covers a spot
-//       only where its channels are, so no plan is chosen by view policy.
+//   channelHolding(hz, policy) -> {plan, number, bandwidthHz} | null
+//       The channel (of the plans `policy` selects, as channelLabel) whose band `centre ±
+//       plan.bandwidth_hz / 2` holds `hz`; the nearest centre within a plan. Null for `none`, and
+//       when channels of two plans hold `hz` (which is on air is not known). The fit's width
+//       rule reads it with the view's plan policy.
 //   channelsIn(lo, hi, policy) -> [{number, center_hz}]   the channels centred in lo..hi
 
 const CHANNEL_MATCH_HZ = 1_000;
@@ -89,17 +90,22 @@ export function channelsIn(lo, hi, policy) {
   return out;
 }
 
-export function channelHolding(hz) {
+export function channelHolding(hz, policy) {
   if (typeof hz !== "number") return null;
   let best = null;
-  for (const p of plans) {
+  const held = new Set();
+  for (const p of selected(policy)) {
     const half = typeof p.bandwidth_hz === "number" ? p.bandwidth_hz / 2 : 0;
     for (const c of p.channels) {
       const off = Math.abs(c.center_hz - hz);
-      if (off <= half && (best === null || off < best.off)) {
+      if (off > half) continue;
+      held.add(p.id);
+      if (best === null || off < best.off) {
         best = { off, plan: p.id, number: c.number, bandwidthHz: p.bandwidth_hz };
       }
     }
   }
-  return best && { plan: best.plan, number: best.number, bandwidthHz: best.bandwidthHz };
+  // Two plans holding the spot say nothing about which one is on air: none.
+  if (best === null || held.size > 1) return null;
+  return { plan: best.plan, number: best.number, bandwidthHz: best.bandwidthHz };
 }

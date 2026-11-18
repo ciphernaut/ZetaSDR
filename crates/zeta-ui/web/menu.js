@@ -3,8 +3,8 @@
 // or asks the agent.
 //
 // Exports:
-//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, command, muteFor, onOrigins,
-//                  sets, sources})
+//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, planPolicy, command, muteFor,
+//                  onOrigins, sets, sources})
 //       -> Menu   (`onOrigins(key, answer)`: What is this's classification `origins`, keyed
 //       `classify:<t_ns>`, for the map to light; the box menu has no Origins entry of its
 //       own: What is this? answers it, and the job rows' and the Bits pane's Origins buttons
@@ -15,14 +15,11 @@
 //       transcribes a job (as the job rows' Transcribe button applies it); `ask(text)` is
 //       its /ask path. `muteFor(job) -> {muted, title, run} | null` is app.js's (null: no
 //       running mix covers the job; `run()` applies the mute or unmute op and answers its
-//       result).
+//       result). `planPolicy()` is the view's `plan` policy (`auto`, a plan id or `none`), which
+//       the fit's plan rule reads.
 //   FIT_KINDS, FIT_MIN_HZ, FIT_MIN_HZ_DEFAULT, FIT_FACTOR, FIT_TIMEOUT_MS, FIT_NOISE_SNR_DB,
 //   MEASURE_DC_MASK_HZ
 //       the fit of a demodulator entry (see Fitting below)
-//   FIT_START_HZ
-//       the width a kind starts with when nothing says otherwise ({fm_demod, am_demod: 12500,
-//       wfm_demod: WFM_MIN_BANDWIDTH_HZ}): the least the outline fit measures, and what a fit
-//       that trusts no measurement keeps
 //   fitBand(api, source, centerHz, bandwidthHz, applyOp = null, replace = [])
 //       -> Promise<{centerHz, bandwidthHz, power99Hz, label, snrDb, dialHz} | null | false>
 //       Starts a `measure` job on the band (api.op, so an OpError propagates; with `applyOp` the
@@ -38,28 +35,38 @@
 //   fitBox(job, capture) -> hz
 //       The width of the box a running job is measured in (`job` {kind, centerHz, bandwidthHz},
 //       `capture` the source's `current` {center_hz, bandwidth_hz} or null): about the job's
-//       centre, at least twice its width and at least FIT_START_HZ[kind], so the result does
-//       not depend on how far an earlier fit narrowed the job; but no wider than the capture
-//       holds about that centre, and never under the job's own width. An ssb_demod keeps its
-//       own width (its fit moves the dial only).
-//   fitJob(api, job, capture, applyOp = null, replace = [])
-//       -> Promise<{fit, boxHz} | null | false>
-//       fitBand on fitBox(...) about the job's centre (false and null as fitBand; `job` also
-//       has `source`). The fit takes the strongest signal of the box, which may be a neighbour:
-//       when its centre lies outside the job's own band, the job's own band is measured instead
-//       (boxHz is then the job's width) so a neighbour never moves the job.
-//   fitTuning(job, fit, box, planAt = channelHolding) -> {centerHz, bandwidthHz, rule}
+//       centre, twice its width, no wider than the capture holds about that centre and never
+//       under the job's own width. An ssb_demod keeps its own width (its fit moves the dial only).
+//   fitJob(api, job, rec, applyOp = null, replace = [])
+//       -> Promise<{fit, capHz, planCapHz, fillsBand} | null | false>
+//       Measures a running job (`job` {kind, source, centerHz, bandwidthHz}, `rec` its source's
+//       `source_list` record or null). The wide box (fitBox) is for a signal narrower than the
+//       job, whose width a narrow measurement under-reads: its result is used only when its
+//       occupied run lies inside the job's own band (a margin of 1/128 of the box). A run that
+//       reaches outside it is a wider signal or a neighbour, which the page cannot tell apart:
+//       the job's own band is measured instead, and when that run touches both its edges
+//       `fillsBand` is true (at least this wide: the job is neither narrowed nor moved). The own
+//       band alone is measured when the wide box would take in the receiver's DC mask (dcClause)
+//       and the band does not, and when the wide measurement finds no signal. `capHz` caps the
+//       occupied, 99 % power and kept widths: the job's own width, an occupied width never
+//       widens a job. `planCapHz` caps the plan width: the wide box, or the job's width after an
+//       own-band measure. false and null as fitBand.
+//   fitTuning(job, fit, box, planAt = null) -> {centerHz, bandwidthHz, rule}
 //       The tuning a fitted demodulator starts with (`job` a JOBS entry or {kind, sideband};
-//       `box` {bandwidthHz, keptHz?}: the width measured in, which caps the result, and the
-//       width kept when no measure is trusted, by default min(bandwidthHz, FIT_START_HZ[kind]);
-//       `planAt(hz)` the channel plan lookup of plans.js channelHolding). The width rule, for a
-//       kind but ssb_demod: `occupied` (the label is not fm, fsk or unknown, or the occupied
-//       width fit.bandwidthHz is at least FIT_MIN_HZ[kind]): the occupied width × FIT_FACTOR.
-//       Otherwise that width is only a carrier line, not trusted: `plan <id> ch <n>`, the width
-//       of the plan channel whose band holds the fitted centre (the centre stays the measured
-//       one); else `99 % power`, fit.power99Hz; else `kept`, box.keptHz. Whichever, at least
-//       FIT_MIN_HZ[kind] (FIT_MIN_HZ_DEFAULT for a kind without one) and at most
-//       box.bandwidthHz. `rule` is those words, null for ssb_demod. An ssb_demod moves its dial only: the centre is
+//       `box` {bandwidthHz, planCapHz?, keptHz?, band?}: `bandwidthHz` the cap of the result,
+//       `planCapHz` the cap of a plan's width (default `bandwidthHz`), `keptHz` the width kept
+//       when no measure is trusted (default `bandwidthHz`: the selection's own width), `band`
+//       {centerHz, bandwidthHz} a running job's own band, which the centre never leaves;
+//       `planAt(hz)` the plan lookup, plans.js channelHolding with the view's policy, null for
+//       none). The width rule, for a kind but ssb_demod: `occupied` (the label is not fm, fsk or
+//       unknown, or the occupied width fit.bandwidthHz is at least FIT_MIN_HZ[kind]): the
+//       occupied width × FIT_FACTOR. Otherwise that width is only a carrier line, not trusted:
+//       `plan <id> ch <n>`, the width of the plan channel whose band holds the fitted centre
+//       (the centre stays the measured one); else `99 % power`, fit.power99Hz when it is at least
+//       FIT_MIN_HZ[kind] (under it the sidebands were below the stage's gate and it is only the
+//       carrier too); else `kept`, box.keptHz. Whichever, at least FIT_MIN_HZ[kind]
+//       (FIT_MIN_HZ_DEFAULT for a kind without one) and at most the cap. `rule` is those words,
+//       null for ssb_demod. An ssb_demod moves its dial only: the centre is
 //       fit.dialHz when known, else fit.centerHz ∓ SSB_DIAL_OFFSET_HZ (lsb +, otherwise −),
 //       and the width stays box.bandwidthHz (the entry's SSB_BANDWIDTH_HZ, or the running
 //       job's own width): the channel low-passes at half the band about the dial, and USB
@@ -235,8 +242,11 @@
 // (`.ctx-item[data-action]`, OUTLINE_ENTRIES), on the job's own source and tuning; Fit and the
 // width presets only for a job whose kind is in FIT_KINDS (the others are hidden: the node
 // would refuse a decoder's or a passthrough's narrowing as often as not), Stop always:
-//   fit    Fit to signal   fitJob on the job (a box wider than the job: see fitBox), then
-//                          job_retune to fitTuning(...) capped at that box (an ssb_demod keeps its width and moves its dial,
+//   fit    Fit to signal   fitJob on the job (a wide box or its own band: see fitJob), then
+//                          job_retune to fitTuning(...), never wider than the job except by a
+//                          plan's width, its centre kept in the job's band; a signal that fills
+//                          the band changes nothing and the note reads `(<label>, kept: the
+//                          signal fills the band)` (an ssb_demod keeps its width and moves its dial,
 //                          the sideband read from its graph's ssb_demod node), and once the
 //                          retune answered the note `fitted <kind> to <band> (<label>, <rule>)`; no
 //                          signal: the note `no signal found in the band; left as it is` (with
@@ -301,8 +311,6 @@ export const FIT_KINDS = new Set(["fm_demod", "wfm_demod", "am_demod", "ssb_demo
 export const FIT_MIN_HZ = { fm_demod: 5000, am_demod: 5000, wfm_demod: 150000 };
 // ... and for a kind without an entry.
 export const FIT_MIN_HZ_DEFAULT = 5000;
-// The width a kind starts with when nothing says otherwise ...
-export const FIT_START_HZ = { fm_demod: 12500, am_demod: 12500, wfm_demod: WFM_MIN_BANDWIDTH_HZ };
 // The fitted band is the measured occupied width times this.
 export const FIT_FACTOR = 1.25;
 // How long the fit waits for a measure event.
@@ -512,7 +520,7 @@ const FIT_DOUBTED_LABELS = new Set(["fm", "fsk", "unknown"]);
 export function fitBox(job, capture) {
   const own = job.bandwidthHz;
   if (job.kind === "ssb_demod") return own;
-  let box = Math.max(2 * own, FIT_START_HZ[job.kind] ?? FIT_MIN_HZ_DEFAULT);
+  let box = 2 * own;
   if (capture && typeof capture.center_hz === "number" && typeof capture.bandwidth_hz === "number") {
     const room = Math.min(
       job.centerHz - (capture.center_hz - capture.bandwidth_hz / 2),
@@ -523,20 +531,42 @@ export function fitBox(job, capture) {
   return Math.round(Math.max(box, own));
 }
 
+// A measurement is about this many bins wide: a run within 1/FIT_EDGE_SLACK of the band's width
+// of an edge is at that edge.
+const FIT_EDGE_SLACK = 128;
+
 // Measures a running job (see the header).
-export async function fitJob(api, job, capture, applyOp = null, replace = []) {
-  const boxHz = fitBox(job, capture);
-  const fit = await fitBand(api, job.source, job.centerHz, boxHz, applyOp, replace);
-  if (!fit) return fit;
-  if (boxHz <= job.bandwidthHz) return { fit, boxHz };
-  if (Math.abs(fit.centerHz - job.centerHz) <= job.bandwidthHz / 2) return { fit, boxHz };
-  // The strongest signal of the wider box is not the job's: measure the job's own band.
-  const own = await fitBand(api, job.source, job.centerHz, job.bandwidthHz, applyOp, []);
-  return own ? { fit: own, boxHz: job.bandwidthHz } : own;
+export async function fitJob(api, job, rec, applyOp = null, replace = []) {
+  const own = job.bandwidthHz;
+  const wide = fitBox(job, (rec && rec.current) || null);
+  const masked = (w) =>
+    dcClause(rec, job.centerHz - w / 2, job.centerHz + w / 2, "box") !== "";
+  const measureOwn = async (rep) => {
+    const fit = await fitBand(api, job.source, job.centerHz, own, applyOp, rep);
+    if (!fit) return fit;
+    const slack = own / FIT_EDGE_SLACK;
+    const fills =
+      fit.centerHz - fit.bandwidthHz / 2 <= job.centerHz - own / 2 + slack &&
+      fit.centerHz + fit.bandwidthHz / 2 >= job.centerHz + own / 2 - slack;
+    return { fit, capHz: own, planCapHz: own, fillsBand: fills };
+  };
+  // A wide box that takes in the receiver's DC mask where the job's band does not would hide
+  // the job's own signal: measure the band only.
+  if (wide <= own || (masked(wide) && !masked(own))) return measureOwn(replace);
+  const fit = await fitBand(api, job.source, job.centerHz, wide, applyOp, replace);
+  if (fit === false) return false;
+  if (fit === null) return measureOwn([]);
+  const slack = wide / FIT_EDGE_SLACK;
+  const inside =
+    fit.centerHz - fit.bandwidthHz / 2 >= job.centerHz - own / 2 - slack &&
+    fit.centerHz + fit.bandwidthHz / 2 <= job.centerHz + own / 2 + slack;
+  if (inside) return { fit, capHz: own, planCapHz: wide, fillsBand: false };
+  // The run reaches past the job's band: a wider signal or a neighbour. Measure the band itself.
+  return measureOwn([]);
 }
 
 // The tuning a fitted demodulator starts with (see the header).
-export function fitTuning(job, fit, box, planAt = channelHolding) {
+export function fitTuning(job, fit, box, planAt = null) {
   if (job.kind === "ssb_demod") {
     // The dial moves; the band stays what the entry (or the running job) has.
     let dial = fit.dialHz;
@@ -549,6 +579,7 @@ export function fitTuning(job, fit, box, planAt = channelHolding) {
     return { centerHz: Math.round(dial), bandwidthHz: Math.round(box.bandwidthHz), rule: null };
   }
   const floor = FIT_MIN_HZ[job.kind] ?? FIT_MIN_HZ_DEFAULT;
+  let cap = box.bandwidthHz;
   let width;
   let rule;
   if (!FIT_DOUBTED_LABELS.has(fit.label) || fit.bandwidthHz >= floor) {
@@ -559,17 +590,26 @@ export function fitTuning(job, fit, box, planAt = channelHolding) {
     const plan = planAt ? planAt(fit.centerHz) : null;
     if (plan) {
       width = plan.bandwidthHz;
+      cap = box.planCapHz ?? box.bandwidthHz;
       rule = `plan ${plan.plan} ch ${plan.number}`;
-    } else if (typeof fit.power99Hz === "number") {
+    } else if (typeof fit.power99Hz === "number" && fit.power99Hz >= floor) {
       width = fit.power99Hz;
       rule = "99 % power";
     } else {
-      width = box.keptHz ?? Math.min(box.bandwidthHz, FIT_START_HZ[job.kind] ?? box.bandwidthHz);
+      width = box.keptHz ?? box.bandwidthHz;
       rule = "kept";
     }
   }
-  const bandwidthHz = Math.min(box.bandwidthHz, Math.max(floor, Math.round(width)));
-  return { centerHz: Math.round(fit.centerHz), bandwidthHz: Math.round(bandwidthHz), rule };
+  const bandwidthHz = Math.min(cap, Math.max(floor, Math.round(width)));
+  let centerHz = fit.centerHz;
+  if (box.band) {
+    // A fit never moves a running job's centre out of its own band.
+    centerHz = Math.min(
+      box.band.centerHz + box.band.bandwidthHz / 2,
+      Math.max(box.band.centerHz - box.band.bandwidthHz / 2, centerHz),
+    );
+  }
+  return { centerHz: Math.round(centerHz), bandwidthHz: Math.round(bandwidthHz), rule };
 }
 
 // The transcript line of a fit that was applied (see the header).
@@ -621,7 +661,7 @@ export function clampSpan(startNs, endNs, newest) {
 class Menu {
   constructor(
     wf,
-    { applyOp, attachOp, ask, transcript, ov, plan = () => null, ringSeconds = () => null, command = () => {}, muteFor = () => null, onOrigins = () => {}, sets = () => [], sources = () => [] },
+    { applyOp, attachOp, ask, transcript, ov, plan = () => null, planPolicy = () => "none", ringSeconds = () => null, command = () => {}, muteFor = () => null, onOrigins = () => {}, sets = () => [], sources = () => [] },
   ) {
     this.wf = wf;
     this.sets = sets;
@@ -633,6 +673,8 @@ class Menu {
     this.attachOp = attachOp;
     this.ask = ask;
     this.plan = plan;
+    // The fit's plan rule: the channel of the view's plan policy that holds a frequency.
+    this.planAt = (hz) => channelHolding(hz, planPolicy());
     this.command = command;
     this.t = transcript;
     this.ov = ov;
@@ -903,16 +945,17 @@ class Menu {
       this.setFitting(token);
       const kind = job.kind;
       let fit;
-      let boxHz = t.bandwidth_hz;
+      let measured = null;
       let error = null;
       const start = (op) =>
         this.applyOp(op, { retry: (holders) => this.fitOutline(job, holders) });
       try {
         const own = { kind, source: job.source, centerHz: t.center_hz, bandwidthHz: t.bandwidth_hz };
-        const capture = (this.sourceRec(job.source) || {}).current || null;
-        const r = await fitJob(this.ov.api, own, capture, start, replace);
-        if (r) ({ fit, boxHz } = r);
-        else fit = r;
+        const r = await fitJob(this.ov.api, own, this.sourceRec(job.source), start, replace);
+        if (r) {
+          fit = r.fit;
+          measured = r;
+        } else fit = r;
       } catch (e) {
         error = e;
       }
@@ -934,12 +977,26 @@ class Menu {
         // The sideband from the job's ssb_demod node (a record carries none); USB without one.
         const ssb = ((job.graph && job.graph.nodes) || []).find((n) => n.kind === "ssb_demod");
         const sideband = (ssb && ssb.params && ssb.params.sideband) || null;
+        if (measured.fillsBand && kind !== "ssb_demod") {
+          // The signal fills the band: at least this wide, so not narrowed and not moved.
+          this.t.note(
+            `fitted ${kind} to ${bandText(t.center_hz, t.bandwidth_hz)} ` +
+              `(${fit.label}, kept: the signal fills the band)`,
+          );
+          return;
+        }
         const f = fitTuning(
           { kind, sideband },
           fit,
           kind === "ssb_demod"
             ? { bandwidthHz: t.bandwidth_hz }
-            : { bandwidthHz: boxHz, keptHz: t.bandwidth_hz },
+            : {
+                bandwidthHz: measured.capHz,
+                planCapHz: measured.planCapHz,
+                keptHz: t.bandwidth_hz,
+                band: { centerHz: t.center_hz, bandwidthHz: t.bandwidth_hz },
+              },
+          this.planAt,
         );
         const r = await this.applyOp({
           op: "job_retune",
@@ -1266,7 +1323,7 @@ class Menu {
         );
       }
     } else {
-      const t = fitTuning(job, fit, jobTuning(action, s));
+      const t = fitTuning(job, fit, jobTuning(action, s), this.planAt);
       r = await this.startJob(action, s, t);
       if (r) {
         this.t.note(fittedNote(kind, t, fit));
