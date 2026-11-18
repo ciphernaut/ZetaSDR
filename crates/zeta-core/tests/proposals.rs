@@ -26,7 +26,8 @@ use zeta_core::types::{Hz, JobId, SourceId, StreamKind, Timestamp};
 use zeta_source_file::{FileOpts, FileSource};
 
 const RATE_HZ: u32 = 48_000;
-const CENTER_HZ: u64 = 433_920_000;
+/// A POCSAG centre (in `pocsag_decode`'s 450-470 MHz range, where classify tries it).
+const CENTER_HZ: u64 = 466_075_000;
 const BANDWIDTH_HZ: u64 = 12_500;
 const BAUD: u32 = 4_800;
 const ROW_ID: &str = "fsk_test_frames";

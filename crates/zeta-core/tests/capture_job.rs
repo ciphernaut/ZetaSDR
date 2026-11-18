@@ -16,7 +16,8 @@ use zeta_core::types::{Hz, JobId, SourceId, Timestamp};
 use zeta_source_file::{FileOpts, FileSource};
 
 const RATE_HZ: u32 = 48_000;
-const CENTER_HZ: u64 = 433_920_000;
+/// A POCSAG centre (in `pocsag_decode`'s 450-470 MHz range, where classify tries it).
+const CENTER_HZ: u64 = 466_075_000;
 /// The kind's default `bursts`.
 const BURSTS: usize = 32;
 
