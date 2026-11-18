@@ -77,6 +77,7 @@ fn modes_check_passes_the_in_crate_rows() {
         "aprs_decode",
         // Their vocoder is optional and pinned missing here: the calls are decoded silent.
         "dmr_decode",
+        "m17_decode",
         "p25_decode",
         "pocsag_decode",
         "rds_decode",
@@ -92,12 +93,6 @@ fn modes_check_passes_the_in_crate_rows() {
     assert!(
         out.lines()
             .any(|l| l == "flex_decode: skipped: multimon-ng missing"),
-        "{out}"
-    );
-    // M17's vocoder is pinned missing here.
-    assert!(
-        out.lines()
-            .any(|l| l == "m17_decode: skipped: c2dec missing"),
         "{out}"
     );
     // DFM has no test yet; the RS41 and M20 decoders are pinned missing here.
@@ -128,6 +123,16 @@ fn modes_check_strict_fails_on_a_missing_handler() {
     let (out, code) = stdout(&mut check(dir.path(), &["--strict", "adsb_decode"]));
     assert_eq!(out.trim(), "adsb_decode: fail: dump1090 missing", "{out}");
     assert_eq!(code, 1);
+    // An optional handler missing passes without `--strict` and fails with it, as P25's.
+    for (id, program) in [("m17_decode", "c2dec"), ("p25_decode", "zeta-mbe")] {
+        let (out, code) = stdout(&mut check(dir.path(), &["--strict", id]));
+        assert_eq!(
+            out.trim(),
+            format!("{id}: fail: {program} missing"),
+            "{out}"
+        );
+        assert_eq!(code, 1);
+    }
 }
 
 #[test]

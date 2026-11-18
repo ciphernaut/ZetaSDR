@@ -1122,7 +1122,9 @@ fn every_embedded_row_emits_events_today() {
     }
 }
 
-/// The M17 row runs its stage in-process and Codec 2 through its one handler, `c2dec`.
+/// The M17 row runs its stage in-process and Codec 2 through its one handler, `c2dec`,
+/// optional as the P25 and DMR rows' `zeta-mbe` is: without it the streams are reported
+/// with no audio.
 #[test]
 fn the_m17_row_names_c2dec() {
     let reg = ModeRegistry::load(&stages(), None);
@@ -1131,6 +1133,9 @@ fn the_m17_row_names_c2dec() {
     let blocks = m.row.decoder.handler_blocks();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].programs, ["c2dec".to_string()]);
+    assert!(blocks[0].optional);
+    let p25 = reg.get("p25_decode").unwrap().row.decoder.handler_blocks();
+    assert!(p25[0].optional);
     let v = serde_json::to_value(&m.row).unwrap();
     assert_eq!(v["family"], "amateur_voice");
     assert_eq!(v["band"]["bandwidth_hz"], 12500);

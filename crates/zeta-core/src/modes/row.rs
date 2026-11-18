@@ -2714,15 +2714,19 @@ mod tests {
             Decoder::Graph { handlers, .. } => handlers.clone(),
             _ => panic!("graph row"),
         };
+        // The built-in M17 row's `c2dec` is optional; left out, a handler is required.
         let row = parse(M17).unwrap();
-        assert!(!handlers(&row)[0].optional);
-        assert!(!row.decoder.handler_blocks()[0].optional);
-        let row = parse(&edited(M17, |v| {
-            v["decoder"]["handlers"][0]["optional"] = true.into()
-        }))
-        .unwrap();
         assert!(handlers(&row)[0].optional);
         assert!(row.decoder.handler_blocks()[0].optional);
+        let row = parse(&edited(M17, |v| {
+            v["decoder"]["handlers"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("optional");
+        }))
+        .unwrap();
+        assert!(!handlers(&row)[0].optional);
+        assert!(!row.decoder.handler_blocks()[0].optional);
         let e = parse(&edited(M17, |v| {
             v["decoder"]["handlers"][0]["optional"] = 1.into()
         }))

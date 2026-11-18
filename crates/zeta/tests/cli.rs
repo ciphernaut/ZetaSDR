@@ -20,7 +20,7 @@ fn zeta_bin() -> Command {
         .env_remove("ZETA_SECRET")
         .env("XDG_CONFIG_HOME", common::no_xdg_config())
         // multimon-ng and c2dec are pinned missing, whatever the host has: a test that
-        // wants the FLEX or the M17 row ready sets them again.
+        // wants the FLEX row ready, or M17 with its speech, sets them again.
         .env(
             "ZETA_HANDLER_MULTIMON_NG",
             "/nonexistent/zeta-test/multimon-ng",
@@ -1229,24 +1229,25 @@ fn scan_kind_is_accepted_and_lists_as_running() {
     assert_eq!(listed(dir.path())["state"]["status"], "stopped");
 }
 
-/// The dwell of the POCSAG copy the identify tail test runs, well inside the tail's cap.
-const POCSAG_TAIL_DWELL_MS: u64 = 2_000;
+/// The dwell of the M17 copy the identify tail test runs, well inside the tail's cap.
+const M17_TAIL_DWELL_MS: u64 = 2_000;
 
-/// `identify` on the tone: `m17_decode` is `unavailable` (c2dec pinned missing), the rows
-/// out of their range (`rs41_decode`, `ais_decode`, `flex_decode`) are `skipped_band` at
-/// once, then the first row tried (`pocsag_decode`) is `no_frame` after its dwell; the
-/// job is still trying the next when the tail ends, so it is stopped (and its child with
-/// it).
+/// `identify` on the tone at 100 MHz: the rows found anywhere are tried first, `m17_decode`
+/// (ready without c2dec, its vocoder optional), then `dmr_decode` and `p25_decode`, each
+/// `no_frame` after its dwell; the wide rows and those out of their range (POCSAG and
+/// APRS among them) are `skipped_band` at their turn. The job is still trying a
+/// row or listing them when the tail ends, so it is stopped (and its child with it).
 #[test]
 fn job_start_identify_then_tail_prints_candidates() {
     let dir = tempfile::tempdir().unwrap();
-    // POCSAG dwells 5 s; an operator copy dwells 2 s, well inside the tail's 10 s.
+    // M17 dwells 5 s; an operator copy dwells 2 s, so the three trials (2 s each) end
+    // inside the tail's 10 s.
     let modes = dir.path().join("modes");
     std::fs::create_dir_all(&modes).unwrap();
-    let mut pocsag: Value =
-        serde_json::from_str(include_str!("../../../modes/pocsag_decode.json")).unwrap();
-    pocsag["identify"]["dwell_ms"] = POCSAG_TAIL_DWELL_MS.into();
-    std::fs::write(modes.join("pocsag_decode.json"), pocsag.to_string()).unwrap();
+    let mut m17: Value =
+        serde_json::from_str(include_str!("../../../modes/m17_decode.json")).unwrap();
+    m17["identify"]["dwell_ms"] = M17_TAIL_DWELL_MS.into();
+    std::fs::write(modes.join("m17_decode.json"), m17.to_string()).unwrap();
     let modes_dir = modes.display().to_string();
     let out = zeta(
         dir.path(),
@@ -1263,9 +1264,8 @@ fn job_start_identify_then_tail_prints_candidates() {
             "100000000",
             "--bandwidth-hz",
             "12500",
-            // `stream_tail` waits at most 10 000 ms: one second's measure and the POCSAG
-            // copy's 2 s dwell, the first row tried (AIS and APRS live elsewhere: skipped).
-            // Seven frames: the origin and six candidates.
+            // `stream_tail` waits at most 10 000 ms: one second's measure and three 2 s
+            // dwells. Seven frames: the origin and six candidates.
             "--then-tail",
             "7,10000",
         ],
@@ -1282,8 +1282,8 @@ fn job_start_identify_then_tail_prints_candidates() {
         .iter()
         .partition(|f| f["payload"]["protocol"] == "origin");
     assert_eq!(origin.len(), 1, "{v}");
-    // M17 (unavailable: c2dec is pinned missing), the rows out of range (a sonde row,
-    // AIS, FLEX, analog video's 6 MHz minimum band) and the tried one (POCSAG).
+    // The three tried (M17, DMR, P25) and three skipped at their turn (a wide row's
+    // minimum band, or a row out of its ranges).
     assert_eq!(frames.len(), 6, "{v}");
     for f in &frames {
         let p = &f["payload"];
@@ -3261,6 +3261,32 @@ fn handler_report_lists_missing_programs_with_suggestions() {
     let adsb = rows.iter().find(|m| m["id"] == "adsb_decode").unwrap();
     assert_eq!(adsb["state"], "ready", "{v}");
     assert_eq!(adsb["program"], fake.display().to_string(), "{v}");
+}
+
+/// Without `c2dec` the M17 row is ready, as the P25 and DMR rows are without `zeta-mbe`:
+/// the vocoder is optional, listed in its `missing` and reported as voice silent. (An
+/// empty `PATH` holds no package manager, so the hint is the row's first entry.)
+#[test]
+fn without_c2dec_the_m17_row_is_ready_and_lists_it_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let line =
+        "c2dec: missing (apt install codec2; https://github.com/drowe67/codec2) — voice silent";
+    let out = zeta(dir.path(), &["modes", "list"])
+        .env("PATH", &empty)
+        .assert()
+        .success()
+        .stderr(contains(format!("zeta: handlers: {line}: m17_decode")))
+        .get_output()
+        .stdout
+        .clone();
+    let v = json(&out);
+    let rows = v["value"]["modes"].as_array().expect("modes array");
+    let m17 = rows.iter().find(|m| m["id"] == "m17_decode").unwrap();
+    assert_eq!(m17["state"], "ready", "{m17}");
+    assert_eq!(m17["reason"], Value::Null, "{m17}");
+    assert_eq!(m17["missing"], serde_json::json!([line]), "{m17}");
 }
 
 /// The sonde rows' programs get a report line each, with the package and URL of the

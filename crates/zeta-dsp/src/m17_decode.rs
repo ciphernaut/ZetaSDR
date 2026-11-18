@@ -944,9 +944,18 @@ mod tests {
         f()
     }
 
-    /// Run the stage over `iq` (4 800-sample blocks), then collect what it published,
-    /// waiting until `done` holds over the run.
+    /// Run the stage of the built-in row over `iq` (4 800-sample blocks), then collect
+    /// what it published, waiting until `done` holds over the run.
     async fn run_stage(iq: &[Complex<f32>], done: impl Fn(&Run) -> bool) -> Run {
+        run_row(mode(), iq, done).await
+    }
+
+    /// [`run_stage`] with the row `row`.
+    async fn run_row(
+        row: Arc<zeta_core::modes::ModeRow>,
+        iq: &[Complex<f32>],
+        done: impl Fn(&Run) -> bool,
+    ) -> Run {
         let bus = Arc::new(StreamBus::new(1024));
         let ev = bus.register(StreamKind::Event, prov());
         let au = bus.register(StreamKind::Audio, prov());
@@ -956,7 +965,7 @@ mod tests {
         let notes = Arc::new(Mutex::new(Vec::new()));
         let n = notes.clone();
         let ctx = StageContext::new(SourceId("s".into()))
-            .with_mode(mode())
+            .with_mode(row)
             .with_note(Arc::new(move |v| n.lock().unwrap().push(v)));
         let h = tokio::spawn(async move {
             M17DecodeStage::new()
@@ -1062,6 +1071,23 @@ mod tests {
             "{ns} ns of audio in {} frames",
             run.audio.len()
         );
+        assert_eq!(vocoder_note(&run.notes), None, "{:?}", run.notes);
+    }
+
+    /// Without `c2dec` (the row's handler is optional, as the P25 and DMR rows'
+    /// `zeta-mbe`): the stream's two events, and no audio.
+    #[tokio::test]
+    async fn without_c2dec_a_stream_gives_its_events_and_no_audio() {
+        let _env = VOCODER_ENV.lock().await;
+        set_vocoder("/nonexistent/zeta-test/c2dec");
+        let iq = m17_capture(25);
+        let run = run_stage(&iq, |r| r.events.len() >= 2).await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        assert_eq!(run.events.len(), 2, "{:?}", run.events);
+        assert_eq!(run.events[0]["src"], "VK4ZET", "{:?}", run.events);
+        assert_eq!(run.events[0]["eot"], false, "{:?}", run.events);
+        assert_eq!(run.events[1]["eot"], true, "{:?}", run.events);
+        assert!(run.audio.is_empty(), "{} audio frames", run.audio.len());
         assert_eq!(vocoder_note(&run.notes), None, "{:?}", run.notes);
     }
 
@@ -1233,11 +1259,18 @@ mod tests {
         assert_eq!(said, 2, "one per stream: {:?}", run.notes);
     }
 
+    /// An operator's row that makes the vocoder required: without it the stage fails
+    /// naming it.
     #[tokio::test]
-    async fn a_missing_vocoder_fails_the_stage_naming_it() {
+    async fn a_missing_required_vocoder_fails_the_stage_naming_it() {
         let _env = VOCODER_ENV.lock().await;
         set_vocoder("/nonexistent/zeta-test/c2dec");
-        let run = run_stage(&[], |_| true).await;
+        let mut row = (*mode()).clone();
+        let zeta_core::modes::Decoder::Graph { handlers, .. } = &mut row.decoder else {
+            panic!("a graph row")
+        };
+        handlers[0].optional = false;
+        let run = run_row(Arc::new(row), &[], |_| true).await;
         match run.result {
             Err(StageError::Failed(m)) => {
                 assert!(m.contains("handler c2dec not found"), "{m}")

@@ -35,6 +35,7 @@
     "handlers": [
       {
         "programs": ["c2dec"],
+        "optional": true,
         "install": { "debian": "codec2", "url": "https://github.com/drowe67/codec2" }
       }
     ]
@@ -83,7 +84,7 @@
     "track_points": 100,
     "track_min_m": 50
   },
-  "notes": "M17 (4FSK, 4800 baud, Codec 2) on any 2 m or 70 cm simplex or repeater channel, 12500 Hz band; start it on the measured centre. Its audio is ordinary job audio: listen to it or attach transcribe. Encrypted streams are reported, not decoded. It needs c2dec (package codec2) on the node's host.",
+  "notes": "M17 (4FSK, 4800 baud, Codec 2) on any 2 m or 70 cm simplex or repeater channel, 12500 Hz band; start it on the measured centre. Its audio is ordinary job audio: listen to it or attach transcribe. Encrypted streams are reported, not decoded. Its speech needs c2dec (package codec2) on the node's host; without it the row still runs and every stream is reported, with no audio.",
   "test": {
     "kind": "synth",
     "family": "m17",
