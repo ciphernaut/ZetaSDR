@@ -1181,9 +1181,9 @@ impl Inner {
     /// Start an owned `identify` run on `t`'s centre and band inside the watch's
     /// capture, recorded as `current` first, restricted to `candidates` when given (in
     /// its `context.identify.candidates`), its rows' dwells scaled by the signal's try
-    /// ([`dwell_scale`], in `context.identify.dwell_scale`). The launch runs in its own task, so a stop
-    /// of the watch never drops it half way (as identify's own children). `Ok(None)`:
-    /// cancelled.
+    /// ([`dwell_scale`], in `context.identify.dwell_scale`). The launch runs in its own
+    /// task, so a stop of the watch never drops it half way (as identify's own children).
+    /// `Ok(None)`: cancelled.
     async fn start_identify(
         self: &Arc<Self>,
         r: &Run,

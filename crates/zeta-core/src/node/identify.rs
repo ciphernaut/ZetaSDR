@@ -518,8 +518,9 @@ impl Inner {
 /// register's [`allocation_term`]; no catalogue term, which lives with the
 /// classifiers) and publish `skipped_band` for those wider than the band and
 /// `unavailable` for those not ready; (3) try the rest in score order, each as a child
-/// job for its `identify.dwell_ms` (times the run's `dwell_scale`), centred on the measured centre when that lies in
-/// the band (else on the band's): `no_frame` stops it before the next, `proved` leaves
+/// job for its `identify.dwell_ms` (times the run's `dwell_scale`), centred on the
+/// measured centre when that lies in the band (else on the band's): `no_frame` stops
+/// it before the next, `proved` leaves
 /// it running and ends the job with the verdict; (4) an exhausted list ends the job
 /// with `mode: null`, the layer-1 label and features, `recentred`, `allocations` and
 /// `learned`: the accepted signature the measurement matches (`{id, name, confidence}`,

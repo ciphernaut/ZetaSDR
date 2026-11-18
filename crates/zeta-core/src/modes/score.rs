@@ -124,8 +124,9 @@ pub struct Scored<'a> {
 /// for a row that lists no centres, inside one of `band.range_hz`'s spans (or the row has
 /// neither, "anywhere"; a row whose `range_hz` and listed centres both exclude
 /// `center_hz` scores 0 for it, is not `in_range` and never `fits_band`; a row with
-/// centres is `in_range` anywhere in its spans, scored there without the term); 0.3 when `bandwidth_hz`
-/// lies within 0.5-1.5 times `band.bandwidth_hz`; 0.3 when `layer1` is in `modulation`
+/// centres is `in_range` anywhere in its spans, scored there without the term); 0.3
+/// when `bandwidth_hz` lies within 0.5-1.5 times `band.bandwidth_hz`; 0.3 when `layer1`
+/// is in `modulation`
 /// (never for an empty list); plus the best `catalogue(id)` among the row's `catalogue`
 /// ids, so a catalogue match can lift a row above 1; plus `allocation(row)` (the
 /// register's term, [`allocation_term`]). Highest score first; equal scores

@@ -1229,8 +1229,9 @@ fn scan_kind_is_accepted_and_lists_as_running() {
     assert_eq!(listed(dir.path())["state"]["status"], "stopped");
 }
 
-/// The dwell of the M17 copy the identify tail test runs, well inside the tail's cap.
-const M17_TAIL_DWELL_MS: u64 = 2_000;
+/// The dwell of the M17, DMR and P25 copies the identify tail test runs, so the three
+/// trials and the measure (4 s) end well inside the tail's 10 s cap.
+const TAIL_DWELL_MS: u64 = 1_000;
 
 /// `identify` on the tone at 100 MHz: the rows found anywhere are tried first, `m17_decode`
 /// (ready without c2dec, its vocoder optional), then `dmr_decode` and `p25_decode`, each
@@ -1240,14 +1241,19 @@ const M17_TAIL_DWELL_MS: u64 = 2_000;
 #[test]
 fn job_start_identify_then_tail_prints_candidates() {
     let dir = tempfile::tempdir().unwrap();
-    // M17 dwells 5 s; an operator copy dwells 2 s, so the three trials (2 s each) end
-    // inside the tail's 10 s.
+    // M17 dwells 5 s, DMR and P25 2 s each; operator copies dwell 1 s, so the three
+    // trials end well inside the tail's 10 s.
     let modes = dir.path().join("modes");
     std::fs::create_dir_all(&modes).unwrap();
-    let mut m17: Value =
-        serde_json::from_str(include_str!("../../../modes/m17_decode.json")).unwrap();
-    m17["identify"]["dwell_ms"] = M17_TAIL_DWELL_MS.into();
-    std::fs::write(modes.join("m17_decode.json"), m17.to_string()).unwrap();
+    for (id, text) in [
+        ("m17_decode", include_str!("../../../modes/m17_decode.json")),
+        ("dmr_decode", include_str!("../../../modes/dmr_decode.json")),
+        ("p25_decode", include_str!("../../../modes/p25_decode.json")),
+    ] {
+        let mut row: Value = serde_json::from_str(text).unwrap();
+        row["identify"]["dwell_ms"] = TAIL_DWELL_MS.into();
+        std::fs::write(modes.join(format!("{id}.json")), row.to_string()).unwrap();
+    }
     let modes_dir = modes.display().to_string();
     let out = zeta(
         dir.path(),
@@ -1264,7 +1270,7 @@ fn job_start_identify_then_tail_prints_candidates() {
             "100000000",
             "--bandwidth-hz",
             "12500",
-            // `stream_tail` waits at most 10 000 ms: one second's measure and three 2 s
+            // `stream_tail` waits at most 10 000 ms: one second's measure and three 1 s
             // dwells. Seven frames: the origin and six candidates.
             "--then-tail",
             "7,10000",

@@ -1051,7 +1051,8 @@ fn nullable_dwell_scale(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": ["integer", "null"],
         "format": "uint32",
-        "minimum": 0,
+        "minimum": 1,
+        "maximum": 6,
         "description": "`identify` only: what each tried row's `identify.dwell_ms` is multiplied by (1..=6), no row's dwell then over 60000 ms unless its own is longer; `null` is 1. Any other kind must pass `null`."
     })
 }

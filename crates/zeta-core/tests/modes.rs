@@ -560,9 +560,9 @@ fn flex_ais_and_aprs_are_tried_only_where_they_live() {
 }
 
 /// Identify tries a row of several ranges (the catalogue's) in any of them and nowhere
-/// between: POCSAG on VHF, UHF and 927.3-936.7 MHz, FLEX on VHF and 927.3-936.6 MHz, APRS on 2 m and
-/// 70 cm; the aviation rows only on their international bands (the VHF aeronautical
-/// band, 1090 MHz).
+/// between: POCSAG on VHF, UHF and 927.3-936.7 MHz, FLEX on VHF and 927.3-936.6 MHz,
+/// APRS on 2 m and 70 cm; the aviation rows only on their international bands (the VHF
+/// aeronautical band, 1090 MHz).
 #[test]
 fn rows_with_several_ranges_are_tried_in_each_and_not_between() {
     let mut reg = ModeRegistry::load(&stages(), None);
