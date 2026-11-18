@@ -227,7 +227,7 @@ impl PilotLock {
         self.present && self.strong
     }
 
-    /// The pilot's SNR in its band-pass, dB, within ±[`PILOT_DB_FLOOR`].
+    /// The pilot's SNR in its band-pass, dB, clamped to ±120 dB ([`ratio_db`]).
     fn pilot_snr_db(&self) -> f64 {
         ratio_db(self.pilot_pow(), self.quad_pow)
     }
@@ -238,14 +238,14 @@ impl PilotLock {
         self.coherent.powi(2) / 2.0
     }
 
-    /// The pilot against the MPX, dB, within ±[`PILOT_DB_FLOOR`].
+    /// The pilot against the MPX, dB, clamped to ±120 dB ([`ratio_db`]).
     fn pilot_db(&self) -> f64 {
         ratio_db(self.pilot_pow(), self.mpx_pow)
     }
 }
 
-/// `10 log10(a / b)` within ±[`PILOT_DB_FLOOR`] (`a` of zero the floor, `b` of zero
-/// the ceiling).
+/// `10 log10(a / b)` clamped to ±120 dB: from [`PILOT_DB_FLOOR`] up to its negation (`a`
+/// of zero the floor, `b` of zero the ceiling).
 fn ratio_db(a: f64, b: f64) -> f64 {
     let limit = -PILOT_DB_FLOOR;
     if a <= 0.0 {
