@@ -299,10 +299,6 @@ Plan 24 draws the frame, rail and ribbons with logical properties (`inset-inline
 
 The waterfall's newest columns are on the right and ribbons drift left with the RF. A policy to flip it (newest on the left, drift right) independent of `dir`; ribbons, the rail's end strip and the squelch scroller read it. Spec 4.9 of the console theme.
 
-## UI: view policies in localStorage
-
-The theme and the side-column fold are held per tab, so a new tab starts from the defaults. Move the `view set` policies to localStorage (one choice shared across tabs), keeping the page's refill-from-live-traffic behaviour for everything else.
-
 ## UI: staircase transcript ribbons on the waterfall
 
 From the operator, 2026-10-27. Plan 24 shipped the step-up rule (`crates/zeta-ui/web/overlays.js` `place`/`fallBack`, behind `RIBBON_STEP_DIR` and `RIBBON_STEP_MS`): a new chunk takes its band's line, the unkeyed ribbons it overlaps step one lane up over 160 ms, a ribbon that would pass `MAX_LANES` (8) or reach another job band's base lane clips under the newer one, and lanes fall back as the line clears. `RIBBON_STEP_DIR = 1` with `RIBBON_STEP_MS = 0` restores the old push-down.
@@ -897,7 +893,7 @@ From the first live run of plan 36 and the live-view fixes after it. Each is sma
 
 From the operator, 2026-11-12. While the map is shown in the waterfall's place the page drops every spectrum row (`waterfall.js` `behindMap`), so the waterfall's history has a gap for as long as the map was up. Job events are not affected: they come over the source's event feed. Make it a policy the operator sets and can make their default, for example `view set behind_map pause|paint`: `pause` is today's behaviour, `paint` keeps drawing into the hidden canvas at the browser's cost.
 
-Not built on its own, because more such choices are coming and they want one home: the page's `view set` policies, the agent's radio policy and its allow gates (stops, replace, widen, capture deletes, signatures), and the per-source capture policy (`source_set_capture`) are each kept in a different place today. Design them together, possibly as part of a permissions and authorisations framework: who may set a policy, where its default lives (a page, a node, a source, an operator), and how a caller without the right is refused. Related: "UI: view policies in localStorage".
+Not built on its own, because more such choices are coming and they want one home: the page's `view set` policies, the agent's radio policy and its allow gates (stops, replace, widen, capture deletes, signatures), and the per-source capture policy (`source_set_capture`) are each kept in a different place today. Design them together, possibly as part of a permissions and authorisations framework: who may set a policy, where its default lives (a page, a node, a source, an operator), and how a caller without the right is refused. The `view set` policies are now kept for the browser (shared across tabs, navigation states per tab).
 
 ## Register answer: later stages (plan 37)
 

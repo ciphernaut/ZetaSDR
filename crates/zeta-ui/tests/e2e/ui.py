@@ -1507,7 +1507,7 @@ def scenario_theme_switch(page, url, secret):
     run_cmd(page, "view set theme plain")
     expect(view_line(page, "theme = plain")).to_be_visible()
     expect(page.locator("html")).to_have_attribute("data-theme", "plain")
-    stored = page.evaluate("sessionStorage.getItem('zeta.view')")
+    stored = page.evaluate("localStorage.getItem('zeta.view_policies')")
     assert '"theme":"plain"' in stored, stored
     run_cmd(page, "view set theme neon")
     neon = view_line(page, "neon", error=True)
@@ -1890,11 +1890,66 @@ def scenario_operator_theme(page, url, secret):
         run_cmd(page, "view reset")
 
 
+def scenario_view_policies_are_shared(page, url, secret):
+    """Shared view policies live in localStorage (every tab of the browser), per-tab ones
+    (navigation states) in sessionStorage; an older page's radio prefs are carried over."""
+    page.set_viewport_size(WIDE)
+    login(page, url, secret)
+    expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
+    others = []
+    try:
+        run_cmd(page, "view set theme plain")
+        expect(page.locator("html")).to_have_attribute("data-theme", "plain")
+        run_cmd(page, "view set follow free")
+        expect(view_line(page, "follow = free")).to_be_visible()
+        stored = page.evaluate("JSON.parse(localStorage.getItem('zeta.view_policies'))")
+        assert stored == {"theme": "plain"}, stored
+        tab = page.evaluate("JSON.parse(sessionStorage.getItem('zeta.view'))")
+        assert tab == {"follow": "free"}, tab
+        # A new tab of the same browser starts from the shared choice, not the per-tab one.
+        second = page.context.new_page()
+        others.append(second)
+        second.set_viewport_size(WIDE)
+        login(second, url, secret)
+        expect(second.locator("html")).to_have_attribute("data-theme", "plain")
+        assert view_value(second, "follow") == "follow target"
+        # A shared change in the second applies in the first without a reload, per-tab not.
+        run_cmd(second, "view set theme terminal")
+        expect(page.locator("html")).to_have_attribute("data-theme", "terminal")
+        run_cmd(second, "view set follow free")
+        expect(view_line(second, "follow = free")).to_be_visible()
+        run_cmd(second, "view set follow target")
+        expect(view_line(second, "follow = target")).to_be_visible()
+        assert view_value(page, "follow") == "follow free", "a per-tab policy is the tab's own"
+        # `view reset` in one clears the shared store, and the other follows.
+        run_cmd(second, "view reset")
+        expect(page.locator("html")).to_have_attribute("data-theme", "console")
+        assert second.evaluate("localStorage.getItem('zeta.view_policies')") is None
+        # An older page's radio prefs are read once and moved.
+        page.evaluate("""() => {
+          localStorage.setItem('zeta.radio_prefs',
+            JSON.stringify({radio_policy: 'ask', radio_prefer: 'tone,cb'}));
+        }""")
+        third = page.context.new_page()
+        others.append(third)
+        third.set_viewport_size(WIDE)
+        login(third, url, secret)
+        assert view_value(third, "radio_policy") == "radio_policy ask"
+        assert view_value(third, "radio_prefer") == "radio_prefer tone,cb"
+        assert third.evaluate("localStorage.getItem('zeta.radio_prefs')") is None
+        moved = third.evaluate("JSON.parse(localStorage.getItem('zeta.view_policies'))")
+        assert moved == {"radio_policy": "ask", "radio_prefer": "tone,cb"}, moved
+    finally:
+        for p in others:
+            p.close()
+        run_cmd(page, "view reset")
+
+
 def scenario_theme_gone_falls_back(page, url, secret):
     """A stored theme that is no longer there falls back to console, saying so once."""
     page.set_viewport_size(WIDE)
     login(page, url, secret)
-    page.evaluate("sessionStorage.setItem('zeta.view', JSON.stringify({theme: 'gone'}))")
+    page.evaluate("localStorage.setItem('zeta.view_policies', JSON.stringify({theme: 'gone'}))")
     page.reload()
     expect(page.locator("#login")).to_be_hidden()
     expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
@@ -1904,7 +1959,7 @@ def scenario_theme_gone_falls_back(page, url, secret):
     expect(html).to_have_attribute("data-theme", "console")
     expect(html).to_have_attribute("data-rail", "on")
     page.wait_for_function(
-        "() => !(sessionStorage.getItem('zeta.view') || '').includes('gone')")
+        "() => !(localStorage.getItem('zeta.view_policies') || '').includes('gone')")
     # The themes list has answered too (fixture_theme is offered), and said nothing more.
     page.wait_for_function("() => window.zetaTest.themeIds().includes('fixture_theme')")
     expect(line).to_have_count(1)
@@ -6597,10 +6652,11 @@ def scenario_audio_comes_back_from_a_suspended_context(page, url, secret):
 
 # ---- the radio policy (plan 33 Task 4) ------------------------------------------------------
 # Against ZETA_UI_URL_LLM (`tone` and `cb`): "radio fallback probe" job_starts a measure on
-# `tone` while `cb` is shown. `radio_policy` and `radio_prefer` persist in `localStorage`
-# (RADIO_PREFS_KEY) across the tabs of one browser; the shown radio stays per tab.
+# `tone` while `cb` is shown. The shared view policies, `radio_policy` and `radio_prefer`
+# among them, persist in `localStorage` (VIEW_PREFS_KEY) across the tabs of one browser; the
+# shown radio stays per tab.
 
-RADIO_PREFS_KEY = "zeta.radio_prefs"
+VIEW_PREFS_KEY = "zeta.view_policies"  # the shared view policies, in localStorage
 
 # Every Storage throws (the page's init script): the page boots with the defaults.
 THROWING_STORAGE_JS = """
@@ -6613,7 +6669,7 @@ Storage.prototype.setItem = function () { throw new Error('storage unavailable')
 THROWING_SET_JS = """
 const realSet = Storage.prototype.setItem;
 Storage.prototype.setItem = function (k, v) {
-  if (k === 'zeta.radio_prefs') throw new Error('storage full');
+  if (k === 'zeta.view_policies') throw new Error('storage full');
   return realSet.call(this, k, v);
 };
 """
@@ -6760,7 +6816,7 @@ def scenario_radio_default_mark_and_policy(page, url, secret):
         expect(view_line(second, "view policies reset")).to_be_visible()
         assert view_value(second, "radio_policy") == "radio_policy focus"
         assert view_value(second, "radio_prefer") == "radio_prefer none"
-        stored = second.evaluate(f"localStorage.getItem('{RADIO_PREFS_KEY}')")
+        stored = second.evaluate(f"localStorage.getItem('{VIEW_PREFS_KEY}')")
         assert stored is None, f"view reset left {stored!r}"
         # Storage that throws: the defaults, and a set holds for the page load.
         run_cmd(page, "view set radio_policy free-first")
@@ -6789,7 +6845,7 @@ def scenario_radio_default_mark_and_policy(page, url, secret):
         for p in others:
             p.close()
         run_cmd(page, "view reset")
-        page.evaluate(f"localStorage.removeItem('{RADIO_PREFS_KEY}')")
+        page.evaluate(f"localStorage.removeItem('{VIEW_PREFS_KEY}')")
         for j in tone_measures():
             stop_job(url, secret, j)
     assert not tone_measures(), "the measure on tone stopped"

@@ -2,7 +2,7 @@
 //
 // Exports:
 //   POLICIES   the registry, one entry per policy: {key, values | parse, default_, describe,
-//       local?} (`local`: kept in localStorage under RADIO_PREFS_KEY, see below).
+//       tab?} (`tab: true`: per tab; every other policy is shared by the browser, see below).
 //       `values` lists the allowed words; `parse(text)` instead returns the value or
 //       undefined when `text` is not one; `describe` names what is allowed (error texts and
 //       `view show`). A new behaviour is a new entry: the commands and `view show` are
@@ -59,9 +59,15 @@
 //                          attached tomorrow)
 //         video            smooth | sharp (default smooth): the full video view's picture
 //                          (video.js): every field at 360 wide, or full width 5 a second
-//       radio_policy and radio_prefer persist for the browser: they live in `localStorage`
-//       under RADIO_PREFS_KEY (`local: true` in the table), read on every `get` so another
-//       tab's change shows at the next ask; every other key stays per tab in VIEW_KEY.
+//       Where a policy lives. A policy that is about what this tab is looking at (a
+//       navigation state) is per tab (`tab: true`, in sessionStorage under VIEW_KEY): follow,
+//       scanner, plan, main, map, pane, subjects. Every other policy (a look-and-feel, layout
+//       or behaviour preference: theme, side, dock, map_tiles, video, the seconds, home,
+//       zoom_out, auto_scan_stop, radio_policy, radio_prefer) is shared by the browser, in
+//       `localStorage` under VIEW_PREFS_KEY, so a new tab starts from what was set and a change
+//       in one tab applies in the others at once (the `storage` event fires onChange for each
+//       key that differs). A value an older page left under RADIO_PREFS_KEY is carried over
+//       once; values an older page kept per tab (VIEW_KEY) for a shared key are not.
 //   homePoint(value) -> {lat, lon} | null   the `home` policy's value as numbers (null: none)
 //   setStationHome(point|null)  the node's station position ({lat, lon}; app.js reads it once
 //       with `station_get` at page load), the home used while the view's `home` is none
@@ -71,10 +77,11 @@
 //       setThemeIds(ids) gives the ready ids `themes_list` answered (app.js loadThemes)
 //   AGENT_VIEW_KEYS   the keys an agent's `view_set` may set (presentation only; app.js
 //       refuses any other before applying)
-//   VIEW_KEY   the sessionStorage key holding the values set ({key: value}, defaults left out)
-//   RADIO_PREFS_KEY   the localStorage key holding radio_policy and radio_prefer when set
-//       (a JSON object of the keys set); with storage unavailable the defaults apply and a
-//       value set holds for the page load
+//   VIEW_KEY   the sessionStorage key holding the per-tab values set ({key: value}, defaults
+//       left out)
+//   VIEW_PREFS_KEY   the localStorage key holding the shared values set (the same shape);
+//       with storage unavailable the defaults apply and a value set holds for the page load
+//   RADIO_PREFS_KEY   where an older page kept radio_policy and radio_prefer (migrated)
 //   mountView() -> View
 //     view.get(key)             the value (the default when not set)
 //     view.set(key, text) -> {ok: true, value} | {ok: false, error}
@@ -82,7 +89,7 @@
 //         `view set <key>: "<text>" is not allowed (allowed: <describe>)`
 //     view.show() -> string     one line per key: `<key> <value> (allowed <describe>)`
 //     view.reset()              every policy back to its default (fires onChange per key),
-//                               radio_policy and radio_prefer cleared from localStorage too
+//                               the shared store (localStorage) cleared too, so every tab follows
 //     view.clear()              fires onClear (the jobs list drops its finished rows)
 //     view.onChange(cb)         cb(key, value) after a set or reset
 //     view.onClear(cb)          cb() on clear()
@@ -95,6 +102,9 @@ import { planIds } from "./plans.js";
 import { paneIds } from "./panes.js";
 
 export const VIEW_KEY = "zeta.view";
+// The localStorage key of the shared policies; RADIO_PREFS_KEY is where an older page kept
+// radio_policy and radio_prefer (read once and moved).
+export const VIEW_PREFS_KEY = "zeta.view_policies";
 export const RADIO_PREFS_KEY = "zeta.radio_prefs";
 // The `origin_fade_s` default: a lit site fades over the subjects' drop time.
 export const ORIGIN_FADE_S_DEFAULT = 300;
@@ -167,7 +177,13 @@ const positiveSeconds = (t) =>
   /^[1-9]\d*$/.test(t) && Number.isSafeInteger(Number(t)) ? Number(t) : undefined;
 
 export const POLICIES = [
-  { key: "follow", values: ["target", "free"], default_: "target", describe: "target, free" },
+  {
+    key: "follow",
+    tab: true,
+    values: ["target", "free"],
+    default_: "target",
+    describe: "target, free",
+  },
   { key: "zoom_out", values: ["scan", "none"], default_: "scan", describe: "scan, none" },
   {
     key: "auto_scan_stop",
@@ -183,12 +199,14 @@ export const POLICIES = [
   },
   {
     key: "scanner",
+    tab: true,
     parse: (t) => (SOURCE_ID.test(t) ? t : undefined),
     default_: "auto",
     describe: "auto (the shown source), a source id",
   },
   {
     key: "plan",
+    tab: true,
     parse: (t) => (t === "auto" || t === "none" || planIds().includes(t) ? t : undefined),
     default_: "auto",
     get describe() {
@@ -197,6 +215,7 @@ export const POLICIES = [
   },
   {
     key: "main",
+    tab: true,
     values: ["rf", "map"],
     default_: "rf",
     describe: "rf, map",
@@ -207,6 +226,7 @@ export const POLICIES = [
   },
   {
     key: "map",
+    tab: true,
     values: ["auto", "on", "off"],
     default_: "auto",
     describe: "auto, on, off",
@@ -228,6 +248,7 @@ export const POLICIES = [
   },
   {
     key: "subjects",
+    tab: true,
     values: ["auto", "on", "off"],
     default_: "auto",
     describe: "auto, on, off",
@@ -257,6 +278,7 @@ export const POLICIES = [
   },
   {
     key: "pane",
+    tab: true,
     parse: (t) => (t === "none" || paneIds().includes(t) ? t : undefined),
     restore: (t) => (t === "none" || PANE_ID.test(t) ? t : undefined),
     default_: "none",
@@ -302,7 +324,6 @@ export const POLICIES = [
     values: ["focus", "focus-fallback", "free-first", "ask"],
     default_: "focus",
     describe: "focus, focus-fallback, free-first, ask",
-    local: true,
   },
   {
     key: "radio_prefer",
@@ -314,7 +335,6 @@ export const POLICIES = [
     },
     default_: "none",
     describe: "none, a comma-separated list of source ids",
-    local: true,
   },
   {
     key: "video",
@@ -331,6 +351,7 @@ function parseValue(p, text) {
   return p.parse(text);
 }
 
+// The per-tab values (sessionStorage[VIEW_KEY]): an object of the keys set.
 function loadStored() {
   try {
     const v = JSON.parse(sessionStorage.getItem(VIEW_KEY) || "{}");
@@ -349,10 +370,11 @@ function saveStored(values) {
   }
 }
 
-// The radio preferences in localStorage, or null when storage is unavailable.
-function loadPrefs() {
+// The shared policies in localStorage (a JSON object of the keys set), or null when
+// storage is unavailable.
+function loadShared() {
   try {
-    const v = JSON.parse(localStorage.getItem(RADIO_PREFS_KEY) || "{}");
+    const v = JSON.parse(localStorage.getItem(VIEW_PREFS_KEY) || "{}");
     return v && typeof v === "object" && !Array.isArray(v) ? v : {};
   } catch {
     return null;
@@ -361,30 +383,56 @@ function loadPrefs() {
 
 // True when the write took; false when storage refused it (the values then hold for this
 // page load, in the caller's held copy).
-function savePrefs(prefs) {
+function saveShared(values) {
   try {
-    if (Object.keys(prefs).length) localStorage.setItem(RADIO_PREFS_KEY, JSON.stringify(prefs));
-    else localStorage.removeItem(RADIO_PREFS_KEY);
+    if (Object.keys(values).length) localStorage.setItem(VIEW_PREFS_KEY, JSON.stringify(values));
+    else localStorage.removeItem(VIEW_PREFS_KEY);
     return true;
   } catch {
     return false;
   }
 }
 
+// The value a stored `text` of policy `p` stands for, or undefined when it no longer parses
+// (a stored value from an older page may not).
+function restoreValue(p, text) {
+  return p.restore ? p.restore(text) : parseValue(p, text);
+}
+
+// The valid values of a stored object, for the policies that are `tab` or not.
+function valuesFrom(stored, tab) {
+  const out = {};
+  for (const [k, v] of Object.entries(stored)) {
+    const p = byKey.get(k);
+    if (!p || !!p.tab !== tab) continue;
+    const kept = restoreValue(p, String(v));
+    if (kept !== undefined) out[k] = kept;
+  }
+  return out;
+}
+
 export function mountView() {
-  // Only values that still parse are kept (a stored value from an older page may not).
-  const values = {};
-  // The `local` keys as last set on this page, used while localStorage is unavailable.
-  let heldPrefs = {};
+  // The per-tab values (policies marked `tab`), and the shared ones (every other policy).
+  const values = valuesFrom(loadStored(), true);
+  let shared = valuesFrom(loadShared() ?? {}, false);
   // Once a write has failed the held copy is the truth for the rest of the page load (a
   // read that still works would give back the value from before).
   let storageFailed = false;
-  const prefs = () => (storageFailed ? heldPrefs : (loadPrefs() ?? heldPrefs));
-  for (const [k, v] of Object.entries(loadStored())) {
-    const p = byKey.get(k);
-    if (!p || p.local) continue;
-    const kept = p.restore ? p.restore(String(v)) : parseValue(p, String(v));
-    if (kept !== undefined) values[k] = kept;
+  // The radio preferences an older page left under RADIO_PREFS_KEY are carried over once
+  // (a value already shared wins), then the old key goes.
+  try {
+    const old = JSON.parse(localStorage.getItem(RADIO_PREFS_KEY) || "null");
+    if (old && typeof old === "object" && !Array.isArray(old)) {
+      const moved = valuesFrom(
+        { radio_policy: old.radio_policy, radio_prefer: old.radio_prefer },
+        false,
+      );
+      shared = { ...moved, ...shared };
+      if (!saveShared(shared)) storageFailed = true;
+    }
+    if (!storageFailed) localStorage.removeItem(RADIO_PREFS_KEY);
+  } catch {
+    /* storage unavailable, or the old value unreadable */
   }
   // A stored `map on` from a page before `main` (spec 4.4) still shows the map (`off` is
   // `main rf`, the default).
@@ -394,38 +442,44 @@ export function mountView() {
   const fire = (key) => {
     for (const cb of changeCbs) cb(key, view.get(key));
   };
+  // Another tab changed the shared policies: read them anew and announce what differs.
+  const refresh = () => {
+    if (storageFailed) return;
+    const stored = loadShared();
+    if (!stored) return;
+    const next = valuesFrom(stored, false);
+    const before = shared;
+    shared = next;
+    for (const p of POLICIES) {
+      if (!p.tab && before[p.key] !== next[p.key]) fire(p.key);
+    }
+  };
   // A value already checked, stored and announced (an alias's `then` sets another key so).
   const put = (key, v) => {
-    if (byKey.get(key).local) {
-      const next = { ...prefs() };
-      if (v === byKey.get(key).default_) delete next[key];
-      else next[key] = v;
-      heldPrefs = next;
-      if (!savePrefs(next)) storageFailed = true;
-    } else {
-      if (v === byKey.get(key).default_) delete values[key];
+    const p = byKey.get(key);
+    if (p.tab) {
+      if (v === p.default_) delete values[key];
       else values[key] = v;
       saveStored(values);
+    } else {
+      refresh();
+      const next = { ...shared };
+      if (v === p.default_) delete next[key];
+      else next[key] = v;
+      shared = next;
+      if (!saveShared(next)) storageFailed = true;
     }
     fire(key);
   };
-  // Another tab of this browser changed the radio preferences: the local keys read anew, so
-  // tell the page (a null key is storage cleared).
   window.addEventListener("storage", (e) => {
-    if (e.key !== null && e.key !== RADIO_PREFS_KEY) return;
-    for (const p of POLICIES) if (p.local) fire(p.key);
+    if (e.key === null || e.key === VIEW_PREFS_KEY) refresh();
   });
   const view = {
     get(key) {
       const p = byKey.get(key);
       if (!p) return undefined;
-      if (p.local) {
-        // Read each time: another tab of this browser may have set it.
-        const stored = prefs()[key];
-        const v = stored === undefined ? undefined : parseValue(p, String(stored));
-        return v === undefined ? p.default_ : v;
-      }
-      return key in values ? values[key] : p.default_;
+      const src = p.tab ? values : shared;
+      return key in src ? src[key] : p.default_;
     },
     set(key, text) {
       const p = byKey.get(key);
@@ -449,8 +503,8 @@ export function mountView() {
     reset() {
       for (const k of Object.keys(values)) delete values[k];
       saveStored(values);
-      heldPrefs = {};
-      if (!savePrefs(heldPrefs)) storageFailed = true;
+      shared = {};
+      if (!saveShared(shared)) storageFailed = true;
       for (const p of POLICIES) fire(p.key);
     },
     clear() {

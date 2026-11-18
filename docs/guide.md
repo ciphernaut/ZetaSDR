@@ -728,7 +728,7 @@ line takes `source pin --center-hz N --bandwidth-hz N [--replace ID]`, `source u
 gain DB|auto` for the selected source. A `fm_demod`/`am_demod` row whose channel is idle shows a
 `squelch` tag.
 
-View policies shape this, set from the command line and kept in the tab's `sessionStorage` (except `radio_policy` and `radio_prefer`, which live in the browser's `localStorage` under `zeta.radio_prefs` and so follow every tab and restart):
+View policies shape this, set from the command line and kept for the browser (its `localStorage`, under `zeta.view_policies`): a new tab starts from what was set, and a change in one tab applies in the other open tabs at once. The ones about what a tab is looking at stay per tab, in its `sessionStorage`: `follow`, `scanner`, `plan`, `main`, `map`, `pane` and `subjects`.
 
 | Key | Values (default first) |
 |---|---|
@@ -747,8 +747,8 @@ View policies shape this, set from the command line and kept in the tab's `sessi
 | `subject_drop_s` | seconds of silence before a subject goes from the table and the map, `300` |
 | `origin_fade_s` | seconds over which a lit site's brightness falls to nothing after its signal was last active, `300` |
 | `map_tiles` | `auto` (the theme's `layout.map_tiles`, else `osm-dark` under a dark theme and `osm` under a light one), `osm`, `osm-dark`, `opentopo`, `esri-street`, `esri-imagery` |
-| `radio_policy` | `focus` (the agent uses the focused radio only; when it cannot take the band it says why, names the free radios and asks), `focus-fallback` (the first free radio in preference order, says which and why), `free-first`, `ask`; saved in the browser; `view reset` clears it; the agent cannot set it |
-| `radio_prefer` | `none`, or radio ids in order, `b210,hackrf`; the fallback's preference order; saved in the browser |
+| `radio_policy` | `focus` (the agent uses the focused radio only; when it cannot take the band it says why, names the free radios and asks), `focus-fallback` (the first free radio in preference order, says which and why), `free-first`, `ask`; the agent cannot set it |
+| `radio_prefer` | `none`, or radio ids in order, `b210,hackrf`; the fallback's preference order |
 
 `view set <key> <value>`, `view show`, `view reset` (every policy back to its default) and
 `view clear` (drops the finished job rows from the list) are typed at the command line; an
