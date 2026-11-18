@@ -7,9 +7,11 @@
 //! band-passed, locks a PLL whose doubled phase is the suppressed 38 kHz carrier; L-R is
 //! the MPX mixed with that carrier and low-passed at 15 kHz, L+R the MPX through the
 //! same low-pass (so the two are delay-matched); L = sum + diff, R = sum - diff, each
-//! de-emphasised and resampled on its own. While the pilot reads under the threshold
-//! (no pilot, or too weak to trust) both channels carry L+R. The reading is noted to the
-//! job as `job_context.wfm` (`pilot_db`, `stereo`).
+//! de-emphasised and resampled on its own. L and R are decoded only while the pilot is
+//! present (its power against the MPX's, `pilot_db`) and strong (its power against the
+//! noise in its own band, `pilot_snr_db`); otherwise (no pilot, or a station too weak
+//! for clean stereo) both channels carry L+R. The reading is noted to the job as
+//! `job_context.wfm` (`pilot_db`, `pilot_snr_db`, `stereo`).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,17 +44,18 @@ pub const WFM_AUDIO_TAPS: usize = 127;
 /// whole MPX band (to 57 kHz RDS) and divides 48 kHz audio exactly.
 pub const WFM_AUDIO_STAGE_RATE_HZ: u64 = 240_000;
 
-/// The pilot reading over which a mono decode turns stereo, dB (the locked pilot's power
-/// against the MPX's). A pilot sent at the standard 8-10 % of deviation reads -24 dB or
-/// more on a clean signal whatever the programme: the multiplex is peak-limited at 100 %
-/// deviation, so its power is at most full scale. Noise lowers the reading only as the
-/// signal is lost (a synthesised station reads -18 dB at 3 dB SNR over a 240 kHz
-/// capture, under -28 dB only at -5 dB), and with no pilot the loop reads the noise in
-/// its few-hertz band: about -46 dB on noise alone, -34 dB at its highest. So -30 dB
-/// keeps every clean station's pilot with 6 dB to spare and does not take noise for one. It does not drop a merely weak station
-/// to mono: that needs a reading of the noise, or blend, neither built.
+/// The pilot presence (`pilot_db`, the locked pilot's power against the MPX's) over
+/// which the pilot counts as present, dB. A pilot sent at the standard 8-10 % of
+/// deviation reads -24 dB or more on a clean signal whatever the programme: the
+/// multiplex is peak-limited at 100 % deviation, so its power is at most full scale (a
+/// full-deviation sine programme under an 8 % pilot reads -21 dB). With no pilot the
+/// loop reads the noise in its few-hertz band: about -46 dB on noise alone, -34 dB at
+/// its highest, 4 dB under this threshold. So -30 dB keeps every clean station's pilot
+/// with 6 dB to spare and does not take noise for one. Noise barely moves the reading
+/// while the pilot lasts (-10 dB at 40 dB SNR, -18 dB at 3 dB), so a weak station is
+/// judged by [`PILOT_SNR_ON_DB`] instead.
 pub const STEREO_ON_DB: f64 = -30.0;
-/// The pilot reading under which a stereo decode falls back to mono, dB: 6 dB under
+/// The pilot presence under which the pilot counts as gone, dB: 6 dB under
 /// [`STEREO_ON_DB`]. The reading moves with the programme's loudness (the MPX's power,
 /// averaged over [`PILOT_AVERAGE_S`]), by 4-5 dB from one phrase to the next, so a
 /// marginal pilot switches once each way rather than with every phrase.
@@ -64,7 +67,36 @@ pub const PILOT_AVERAGE_S: f64 = 0.1;
 /// must sit under the 0.45 of the rate a resampler passes. Below it both channels carry
 /// L+R and the reading is `null`.
 pub const STEREO_MIN_RATE_HZ: u64 = 120_000;
-/// Floor of the reading, dB (no pilot over a silent MPX).
+/// The pilot SNR (`pilot_snr_db`: the locked pilot's power against the noise in its
+/// ±100 Hz band-pass, read on the loop's quadrature arm) over which a present pilot
+/// turns stereo on, dB. The broadcast multiplex carries nothing but the pilot near
+/// 19 kHz, so that noise is the discriminator's, which grows as the station weakens,
+/// and the figure falls dB for dB with the station's SNR. Stereo is noisier than mono
+/// at any signal: L-R rides at 23-53 kHz, where FM noise is strongest. On a
+/// synthesised station (a 9 % pilot, a 1 kHz tone in L at half deviation, noise over a
+/// 240 kHz capture), with the SINAD of L decoded in stereo and in mono:
+///
+/// | station SNR | pilot_snr_db | stereo SINAD | mono SINAD |
+/// |---|---|---|---|
+/// | 30 dB | 40-49 | 40 dB | 55 dB |
+/// | 20 dB | 36-39 | 30 dB | 45 dB |
+/// | 15 dB | 32-34 | 25 dB | 40 dB |
+/// | 12 dB | 29-31 | 22 dB | 37 dB |
+/// | 10 dB | 26-29 | 20 dB | 35 dB |
+/// | 5 dB | 19-22 | 13 dB | 20 dB |
+///
+/// Over 35 dB the stereo SINAD is about 28 dB or better, clean to the ear; under
+/// [`PILOT_SNR_OFF_DB`] it falls from 22 dB toward 20 (audible hiss) while mono still gives
+/// 35-40 dB, so a receiver is better off in mono there.
+pub const PILOT_SNR_ON_DB: f64 = 35.0;
+/// The pilot SNR under which a stereo decode falls back to mono, dB: 5 dB under
+/// [`PILOT_SNR_ON_DB`], more than the 2-3 dB the reading wanders on a steady station.
+pub const PILOT_SNR_OFF_DB: f64 = 30.0;
+/// Cutoff of the two one-pole low-passes on the quadrature arm, Hz: well above the
+/// pilot band-pass's ±100 Hz, so its noise passes whole, and 38 times under the 38 kHz
+/// product of the arm's mixing, which they take some 63 dB down.
+const PILOT_QUAD_LP_HZ: f64 = 1_000.0;
+/// Floor of the readings, dB (no pilot over a silent MPX), and, negated, their ceiling.
 const PILOT_DB_FLOOR: f64 = -120.0;
 /// Time constant of the band-passed pilot's power that normalises the [`PilotPll`]'s
 /// phase detector, s (`rds_decode`'s, at its 240 kHz).
@@ -95,8 +127,8 @@ pub struct WfmParams {
     /// De-emphasis time constant, µs: 50 (Australia, Europe) or 75 (Americas).
     pub deemphasis_us: u64,
     /// Decode stereo: the output is two channels (L, R interleaved) for the whole run,
-    /// both L+R while the 19 kHz pilot reads under the threshold (`job_context.wfm`:
-    /// `pilot_db`, `stereo`). `false` (the default): one channel, mono.
+    /// both L+R unless the 19 kHz pilot is present and strong (`job_context.wfm`:
+    /// `pilot_db`, `pilot_snr_db`, `stereo`). `false` (the default): one channel, mono.
     #[serde(default)]
     pub stereo: bool,
 }
@@ -107,6 +139,9 @@ pub struct Pilot {
     /// The locked pilot's power against the MPX's, dB, to 0.1 dB; `None` before the
     /// first block and under [`STEREO_MIN_RATE_HZ`].
     pub pilot_db: Option<f64>,
+    /// The pilot's power against the noise in its own band, dB, to 0.1 dB (`None` as
+    /// `pilot_db`): it falls as the station weakens, where `pilot_db` stays put.
+    pub pilot_snr_db: Option<f64>,
     /// Whether L and R are decoded (else both channels carry L+R).
     pub stereo: bool,
 }
@@ -120,24 +155,43 @@ struct PilotLock {
     /// Smoothed power of the MPX.
     mpx_pow: f64,
     alpha: f64,
-    /// [`STEREO_ON_DB`] and [`STEREO_OFF_DB`] as power ratios.
+    /// The quadrature arm `2 p cos(phase)` through two one-pole low-passes at
+    /// [`PILOT_QUAD_LP_HZ`] (the 38 kHz product out), its factor a sample, and its
+    /// smoothed power: the noise in the pilot band-pass.
+    quad: [f64; 2],
+    quad_alpha: f64,
+    quad_pow: f64,
+    /// [`STEREO_ON_DB`] and [`STEREO_OFF_DB`] as power ratios, and
+    /// [`PILOT_SNR_ON_DB`] and [`PILOT_SNR_OFF_DB`].
     on: f64,
     off: f64,
-    stereo: bool,
+    snr_on: f64,
+    snr_off: f64,
+    /// The pilot is present (pilot against MPX), and strong enough (its SNR); stereo
+    /// is decoded while both hold, each with its own hysteresis.
+    present: bool,
+    strong: bool,
 }
 
 impl PilotLock {
     fn new(rate_hz: u64) -> Self {
         let fs = rate_hz as f64;
         let alpha = |tau_s: f64| 1.0 - (-1.0 / (tau_s * fs)).exp();
+        let ratio = |db: f64| 10f64.powf(db / 10.0);
         Self {
             pll: PilotPll::new(fs, alpha(PLL_LEVEL_S)),
             coherent: 0.0,
             mpx_pow: 0.0,
             alpha: alpha(PILOT_AVERAGE_S),
-            on: 10f64.powf(STEREO_ON_DB / 10.0),
-            off: 10f64.powf(STEREO_OFF_DB / 10.0),
-            stereo: false,
+            quad: [0.0; 2],
+            quad_alpha: alpha(1.0 / (2.0 * std::f64::consts::PI * PILOT_QUAD_LP_HZ)),
+            quad_pow: 0.0,
+            on: ratio(STEREO_ON_DB),
+            off: ratio(STEREO_OFF_DB),
+            snr_on: ratio(PILOT_SNR_ON_DB),
+            snr_off: ratio(PILOT_SNR_OFF_DB),
+            present: false,
+            strong: false,
         }
     }
 
@@ -148,12 +202,34 @@ impl PilotLock {
         let (sn, cs) = phase.sin_cos();
         self.coherent += self.alpha * (2.0 * p * sn - self.coherent);
         self.mpx_pow += self.alpha * (x * x - self.mpx_pow);
+        let mut q = 2.0 * p * cs;
+        for stage in &mut self.quad {
+            *stage += self.quad_alpha * (q - *stage);
+            q = *stage;
+        }
+        self.quad_pow += self.alpha * (q * q - self.quad_pow);
         // Compared without the log: the pilot's power A²/2 against the threshold's
-        // share of the MPX's.
+        // share of the MPX's, and against the noise beside it.
         let pilot_pow = self.pilot_pow();
-        let share = if self.stereo { self.off } else { self.on };
-        self.stereo = pilot_pow > share * self.mpx_pow;
+        let share = if self.present { self.off } else { self.on };
+        self.present = pilot_pow > share * self.mpx_pow;
+        let share = if self.strong {
+            self.snr_off
+        } else {
+            self.snr_on
+        };
+        self.strong = pilot_pow > share * self.quad_pow;
         2.0 * sn * cs
+    }
+
+    /// Whether L and R are decoded: the pilot is present and its SNR high enough.
+    fn stereo(&self) -> bool {
+        self.present && self.strong
+    }
+
+    /// The pilot's SNR in its band-pass, dB, within ±[`PILOT_DB_FLOOR`].
+    fn pilot_snr_db(&self) -> f64 {
+        ratio_db(self.pilot_pow(), self.quad_pow)
     }
 
     /// The pilot's power, `A²/2` of its smoothed in-phase amplitude. Unlocked, that
@@ -162,14 +238,23 @@ impl PilotLock {
         self.coherent.powi(2) / 2.0
     }
 
-    /// The reading in dB, floored at [`PILOT_DB_FLOOR`].
+    /// The pilot against the MPX, dB, within ±[`PILOT_DB_FLOOR`].
     fn pilot_db(&self) -> f64 {
-        let pilot_pow = self.pilot_pow();
-        if self.mpx_pow <= 0.0 || pilot_pow <= 0.0 {
-            return PILOT_DB_FLOOR;
-        }
-        (10.0 * (pilot_pow / self.mpx_pow).log10()).max(PILOT_DB_FLOOR)
+        ratio_db(self.pilot_pow(), self.mpx_pow)
     }
+}
+
+/// `10 log10(a / b)` within ±[`PILOT_DB_FLOOR`] (`a` of zero the floor, `b` of zero
+/// the ceiling).
+fn ratio_db(a: f64, b: f64) -> f64 {
+    let limit = -PILOT_DB_FLOOR;
+    if a <= 0.0 {
+        return -limit;
+    }
+    if b <= 0.0 {
+        return limit;
+    }
+    (10.0 * (a / b).log10()).clamp(-limit, limit)
 }
 
 /// The stereo decode at one stage rate: the pilot lock (none under
@@ -210,7 +295,7 @@ impl StereoDecoder {
                 for &s in x {
                     let carrier = lock.step(s as f64);
                     mixed.push((2.0 * s as f64 * carrier) as f32);
-                    on.push(lock.stereo);
+                    on.push(lock.stereo());
                 }
                 let diff = self.diff.process(&mixed);
                 let mut l = Vec::with_capacity(x.len());
@@ -341,17 +426,19 @@ impl WfmDemod {
             return None;
         }
         let lock = self.stereo.as_ref().and_then(|s| s.lock.as_ref());
+        let tenth = |db: f64| (db * 10.0).round() / 10.0;
         Some(Pilot {
-            pilot_db: lock.map(|l| (l.pilot_db() * 10.0).round() / 10.0),
-            stereo: lock.is_some_and(|l| l.stereo),
+            pilot_db: lock.map(|l| tenth(l.pilot_db())),
+            pilot_snr_db: lock.map(|l| tenth(l.pilot_snr_db())),
+            stereo: lock.is_some_and(PilotLock::stereo),
         })
     }
 }
 
 /// Demodulates a wideband FM IQ stream to de-emphasised audio at `audio_rate_hz`:
 /// mono, or with `stereo` two channels and the pilot's reading noted to the job as
-/// `job_context.wfm` (`pilot_db`, `stereo`) when it turns stereo or mono, and every
-/// five seconds otherwise.
+/// `job_context.wfm` (`pilot_db`, `pilot_snr_db`, `stereo`) when it turns stereo or
+/// mono, and every five seconds otherwise; a mono run clears it (`{"wfm": null}`).
 pub struct WfmDemodStage {
     spec: StageSpec,
 }
@@ -401,6 +488,10 @@ impl Stage for WfmDemodStage {
             return Err(StageError::Failed("expected 1 output".into()));
         };
         let channels = demod.channels();
+        if !p.stereo {
+            // No reading this run: clear one an earlier run (before a `graph_put`) noted.
+            ctx.note(serde_json::json!({ "wfm": null }));
+        }
         // The stereo state last noted, and when.
         let mut noted: Option<(bool, Instant)> = None;
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
@@ -535,11 +626,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_stereo_stage_sends_two_channel_frames_and_notes_the_pilot() {
-        // 1 s of a station whose pilot comes on halfway.
+        // 2 s of a station whose pilot comes on at 0.5 s.
         use crate::synth::{STEREO_PILOT_LEVEL, stereo_mpx, tone, wfm_modulate_composite};
-        let left = tone(240_000, 240_000, 1_000.0, 0.4);
-        let right = tone(240_000, 240_000, 3_000.0, 0.4);
-        let pilot = tone(240_000, 240_000, crate::rds::PILOT_HZ, STEREO_PILOT_LEVEL);
+        let left = tone(240_000, 480_000, 1_000.0, 0.4);
+        let right = tone(240_000, 480_000, 3_000.0, 0.4);
+        let pilot = tone(240_000, 480_000, crate::rds::PILOT_HZ, STEREO_PILOT_LEVEL);
         let mut mpx = stereo_mpx(&left, &right, 240_000, 0.0);
         for (m, p) in mpx.iter_mut().zip(&pilot).skip(120_000) {
             *m += p;
@@ -548,7 +639,7 @@ mod tests {
         let p = serde_json::json!({"deviation_hz": 75_000, "audio_rate_hz": 48_000,
             "deemphasis_us": 50, "stereo": true});
         let (frames, notes) = run_stage(p, &iq).await;
-        assert_eq!(frames.len(), 50);
+        assert_eq!(frames.len(), 100);
         let mut per_channel = 0;
         for (i, f) in frames.iter().enumerate() {
             let Payload::Audio {
@@ -567,7 +658,7 @@ mod tests {
             assert_eq!(f.provenance.span.start_ns.0, start);
             assert_eq!(f.provenance.span.end_ns.0, start + 20_000_000);
         }
-        assert!(per_channel.abs_diff(48_000) <= 2, "{per_channel} a channel");
+        assert!(per_channel.abs_diff(96_000) <= 2, "{per_channel} a channel");
         // Mono at the first block, stereo once the pilot came; nothing more within 5 s.
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes[0]["wfm"]["pilot_db"].as_f64().unwrap() < STEREO_OFF_DB);
@@ -575,10 +666,12 @@ mod tests {
         assert_eq!(notes[1]["wfm"]["stereo"], true);
         let db = notes[1]["wfm"]["pilot_db"].as_f64().unwrap();
         assert!(db > STEREO_ON_DB, "{notes:?}");
+        let snr = notes[1]["wfm"]["pilot_snr_db"].as_f64().unwrap();
+        assert!(snr > PILOT_SNR_ON_DB, "{notes:?}");
     }
 
     #[tokio::test]
-    async fn a_mono_stage_sends_one_channel_and_notes_nothing() {
+    async fn a_mono_stage_sends_one_channel_and_clears_the_reading() {
         let audio = crate::synth::tone(48_000, 9_600, 1_000.0, 0.4);
         let iq = crate::synth::wfm_modulate(&audio, 48_000, 240_000, 75_000.0, 0.0, true);
         let p = serde_json::json!({"deviation_hz": 75_000, "audio_rate_hz": 48_000,
@@ -588,6 +681,7 @@ mod tests {
         for f in &frames {
             assert!(matches!(f.payload, Payload::Audio { channels: 1, .. }));
         }
-        assert!(notes.is_empty(), "{notes:?}");
+        // One note, at the start: a reading an earlier stereo run left is cleared.
+        assert_eq!(notes, [serde_json::json!({ "wfm": null })]);
     }
 }

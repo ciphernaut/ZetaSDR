@@ -5404,8 +5404,18 @@ def scenario_wfm_stereo_toggle_plays_two_channels(page, url, secret):
         row.locator("button.play").click()
         expect(row.locator("button.play")).to_have_text("▶")
         ol.click(button="right")
-        expect(menu.locator('.ctx-item[data-action="stereo"]')).to_have_text("Stereo off")
-        page.keyboard.press("Escape")
+        item = menu.locator('.ctx-item[data-action="stereo"]')
+        expect(item).to_have_text("Stereo off")
+        # Stereo off: the mono run clears the pilot reading the stereo run left.
+        with page.expect_request(is_op("graph_put")) as req:
+            item.click()
+        body = json.loads(req.value.post_data)
+        assert [n for n in body["graph"]["nodes"]
+                if n["kind"] == "wfm_demod"][0]["params"]["stereo"] is False, f"put {body}"
+        expect(page.locator("#transcript .line.note", has_text="wfm_demod: stereo off")) \
+            .to_have_count(1)
+        wait_until(lambda: "wfm" not in job_record(url, secret, job)["context"], 10.0,
+                   "job_context.wfm cleared")
     finally:
         stop_job(url, secret, job)
 

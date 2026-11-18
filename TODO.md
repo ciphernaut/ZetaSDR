@@ -53,9 +53,12 @@ The voice low-pass and de-emphasis shipped 2026-11-01 (`fm_demod` carries `audio
 
 `--stt-url` is built (a multipart POST of the utterance to a Whisper server). Left: an utterance is 16 kHz mono 16-bit PCM, up to about 480 kB sent as one burst, and on a slow uplink the upload time counts against the 30 s busy window. Measure it (UAT.md, "Speech over the network"); consider FLAC or 8 kHz for narrowband voice (CB audio is 3.4 kHz wide) to cut it by half or more, only if a Whisper server accepts it without a quality loss.
 
-## `wfm_demod` stereo: a weak station stays stereo
+## `wfm_demod` stereo: blend, the switch, the mix
 
-`stereo: true` is built (cleanup round 2). Left: its fallback reads the pilot against the multiplex, which falls only as the signal is all but lost (a synthesised station still decodes stereo at 3 dB SNR, its stereo some 15 dB noisier than its mono at any SNR), so a weak station that keeps its pilot stays stereo; a noise reading or blend would drop or soften it.
+`stereo: true` is built (cleanup round 2), with a hard switch to mono under a pilot SNR threshold. Left:
+- **Blend:** scale L-R down with the pilot SNR between the two thresholds instead of switching, as receivers do, so a fading station narrows rather than snaps to mono.
+- **The switch is a hard step:** L-R turns on or off at one sample, with no crossfade; a short ramp (tens of ms) would hide it.
+- **A mix skips a stereo input** (`job_context.mix.skipped`) rather than downmixing it, so turning Stereo on for a station in a running mix drops it from the mix; the mix could average the two channels, as `denoise` and `transcribe` do.
 
 ## Jobs: a conflict on a controller's child offers a retry that is refused
 

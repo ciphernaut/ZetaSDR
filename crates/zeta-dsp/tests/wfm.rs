@@ -10,7 +10,9 @@ use zeta_dsp::fixtures::{
     STEREO_PILOT_LEVEL, awgn, stereo_mpx, tone, wfm_modulate, wfm_modulate_composite,
     wfm_stereo_modulate,
 };
-use zeta_dsp::wfm::{STEREO_OFF_DB, WFM_AUDIO_TAPS, WfmDemod, WfmParams, deemphasis};
+use zeta_dsp::wfm::{
+    PILOT_SNR_OFF_DB, STEREO_OFF_DB, STEREO_ON_DB, WFM_AUDIO_TAPS, WfmDemod, WfmParams, deemphasis,
+};
 
 fn params(deviation_hz: u64) -> WfmParams {
     WfmParams {
@@ -261,51 +263,154 @@ fn wfm_demod_at_2_msps_bounds_its_filter() {
     assert!(rejection >= 40.0, "pilot only {rejection} dB down");
 }
 
-/// The settled part of a 1 s, 48 kHz channel: 0.25 s in (the pilot locked, the reading
-/// settled), 0.7 s long, whole cycles of 1, 2.5 and 3 kHz.
+/// The settled part of a 48 kHz channel: the 0.7 s ending 50 ms before its end (whole
+/// cycles of 1, 2.5, 3 and 10 kHz). In a 2 s stereo run that is past the lock and the
+/// pilot SNR's settling, which take up to a second.
 fn settled(x: &[f32]) -> &[f32] {
-    &x[12_000..12_000 + 33_600]
+    let end = x.len() - 2_400;
+    &x[end - 33_600..end]
 }
 
 #[test]
 fn stereo_keeps_a_left_only_tone_out_of_the_right_and_the_mirror() {
-    let one = tone(240_000, 240_000, 1_000.0, 0.5);
-    let silent = vec![0.0; 240_000];
-    for (left, right, name) in [(&one, &silent, "left"), (&silent, &one, "right")] {
-        let iq = wfm_stereo_modulate(left, right, 240_000, 75_000.0, STEREO_PILOT_LEVEL);
-        let (out, d, _) = demod_stereo(&iq, 240_000, 2_400);
-        assert!(d.pilot().unwrap().stereo, "{name}: {:?}", d.pilot());
-        let (l, r) = split(&out);
-        assert!(l.len().abs_diff(48_000) <= 2, "len {}", l.len());
-        let (l, r) = (settled(&l), settled(&r));
-        let (on, off) = if name == "left" { (l, r) } else { (r, l) };
-        let a_on = amplitude(on, 48_000.0, 1_000.0);
-        let a_off = amplitude(off, 48_000.0, 1_000.0);
-        let separation = db(a_on, a_off);
-        eprintln!("stereo {name}-only 1 kHz: {separation:.1} dB separation, tone {a_on:.4}");
-        assert!(
-            separation >= 30.0,
-            "{name}: separation only {separation:.1} dB"
-        );
-        // The multiplex carries 0.9 of each channel (L+R and L-R at 0.45 each), so the
-        // channel is 0.9 of the 0.5 tone, after 50 us de-emphasis at 1 kHz.
-        let want = 0.45 / (1.0 + (2.0 * PI * 1_000.0 * 50e-6).powi(2)).sqrt();
-        assert!(
-            (a_on - want).abs() <= 0.1 * want,
-            "{name}: tone {a_on} vs {want}"
-        );
-        let pilot = db(a_on, amplitude(on, 48_000.0, 19_000.0));
-        assert!(
-            pilot >= 20.0,
-            "{name}: pilot only {pilot:.1} dB below the tone"
-        );
+    // At the stage rate and at the 200 kHz the built-in expansion feeds the stage.
+    for rate in [240_000u32, 200_000] {
+        let one = tone(rate, 2 * rate as usize, 1_000.0, 0.5);
+        let silent = vec![0.0; 2 * rate as usize];
+        for (left, right, name) in [(&one, &silent, "left"), (&silent, &one, "right")] {
+            let iq = wfm_stereo_modulate(left, right, rate, 75_000.0, STEREO_PILOT_LEVEL);
+            let (out, d, _) = demod_stereo(&iq, rate as u64, rate as usize / 100);
+            assert!(d.pilot().unwrap().stereo, "{rate} {name}: {:?}", d.pilot());
+            let (l, r) = split(&out);
+            assert!(l.len().abs_diff(96_000) <= 2, "len {}", l.len());
+            let (l, r) = (settled(&l), settled(&r));
+            let (on, off) = if name == "left" { (l, r) } else { (r, l) };
+            let a_on = amplitude(on, 48_000.0, 1_000.0);
+            let a_off = amplitude(off, 48_000.0, 1_000.0);
+            let separation = db(a_on, a_off);
+            eprintln!(
+                "stereo at {rate} Hz, {name}-only 1 kHz: {separation:.1} dB separation, \
+                 tone {a_on:.4}"
+            );
+            assert!(
+                separation >= 30.0,
+                "{rate} {name}: separation only {separation:.1} dB"
+            );
+            // The multiplex carries 0.9 of each channel (L+R and L-R at 0.45 each), so
+            // the channel is 0.9 of the 0.5 tone, after 50 us de-emphasis at 1 kHz.
+            let want = 0.45 / (1.0 + (2.0 * PI * 1_000.0 * 50e-6).powi(2)).sqrt();
+            assert!(
+                (a_on - want).abs() <= 0.1 * want,
+                "{rate} {name}: tone {a_on} vs {want}"
+            );
+            let pilot = db(a_on, amplitude(on, 48_000.0, 19_000.0));
+            assert!(
+                pilot >= 20.0,
+                "{rate} {name}: pilot only {pilot:.1} dB below the tone"
+            );
+        }
     }
 }
 
 #[test]
+fn stereo_de_emphasises_each_channel() {
+    // A 10 kHz tone in L and silence in R: 50 us takes 10 kHz down by 10.4 dB (0.303),
+    // where an un-de-emphasised channel would keep the whole 0.9 of the 0.5 tone.
+    let ten = tone(240_000, 480_000, 10_000.0, 0.5);
+    let silent = vec![0.0; 480_000];
+    let iq = wfm_stereo_modulate(&ten, &silent, 240_000, 75_000.0, STEREO_PILOT_LEVEL);
+    let (out, _, _) = demod_stereo(&iq, 240_000, 2_400);
+    let (l, r) = split(&out);
+    let (l, r) = (settled(&l), settled(&r));
+    let want = 0.45 / (1.0 + (2.0 * PI * 10_000.0 * 50e-6).powi(2)).sqrt();
+    let a_l = amplitude(l, 48_000.0, 10_000.0);
+    eprintln!("stereo 10 kHz in L: {a_l:.4}, want {want:.4}");
+    assert!((a_l - want).abs() <= 0.1 * want, "L {a_l} vs {want}");
+    let separation = db(a_l, amplitude(r, 48_000.0, 10_000.0));
+    assert!(separation >= 30.0, "10 kHz separation {separation:.1} dB");
+}
+
+/// `iq` with noise added for a station SNR of `snr_db(t)` dB at `t` seconds (the noise
+/// over the whole `rate_hz` capture, as `awgn` gives it).
+fn with_noise(iq: &mut [Complex<f32>], rate_hz: u32, seed: u64, snr_db: impl Fn(f64) -> f64) {
+    let mut noise = vec![Complex::new(0.0f32, 0.0); iq.len()];
+    // On zeros `awgn` takes unit power, the FM signal's: this is 0 dB SNR.
+    awgn(&mut noise, 0.0, seed);
+    for (n, (s, w)) in iq.iter_mut().zip(&noise).enumerate() {
+        let gain = 10f64.powf(-snr_db(n as f64 / rate_hz as f64) / 20.0) as f32;
+        *s += w * gain;
+    }
+}
+
+#[test]
+fn a_weak_station_plays_mono_with_its_pilot_present_and_its_snr_low() {
+    // 10 dB SNR over the capture: the pilot is there (pilot_db about -12) but the
+    // stereo would be some 15 dB noisier than the mono.
+    let left = tone(240_000, 240_000, 1_000.0, 0.5);
+    let right = tone(240_000, 240_000, 3_000.0, 0.5);
+    let mut iq = wfm_stereo_modulate(&left, &right, 240_000, 75_000.0, STEREO_PILOT_LEVEL);
+    with_noise(&mut iq, 240_000, 9, |_| 10.0);
+    let (out, d, states) = demod_stereo(&iq, 240_000, 2_400);
+    let reading = d.pilot().unwrap();
+    eprintln!("weak station: {reading:?}");
+    assert!(states.iter().all(|s| !s), "{reading:?}");
+    assert!(reading.pilot_db.unwrap() > STEREO_ON_DB, "{reading:?}");
+    assert!(
+        reading.pilot_snr_db.unwrap() < PILOT_SNR_OFF_DB,
+        "{reading:?}"
+    );
+    let (l, r) = split(&out);
+    assert_eq!(l, r);
+}
+
+#[test]
+fn a_station_fading_and_returning_switches_once_each_way() {
+    // 10 s: 30 dB SNR for 1 s, down to 5 dB over 4 s, back to 30 dB over 4 s, held
+    // for 1 s. After the first lock, stereo turns off once on the way down and on once
+    // on the way up.
+    let fs = 240_000;
+    let len = 10 * fs as usize;
+    let left = tone(fs, len, 1_000.0, 0.4);
+    let right = tone(fs, len, 2_500.0, 0.3);
+    let mut iq = wfm_stereo_modulate(&left, &right, fs, 75_000.0, STEREO_PILOT_LEVEL);
+    with_noise(&mut iq, fs, 13, |t| {
+        let down = ((t - 1.0) / 4.0).min((9.0 - t) / 4.0).clamp(0.0, 1.0);
+        30.0 - 25.0 * down
+    });
+    let (_, _, states) = demod_stereo(&iq, fs as u64, 2_400);
+    let changes: Vec<(usize, bool)> = states
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| w[0] != w[1])
+        .map(|(i, w)| (i + 1, w[1]))
+        .collect();
+    eprintln!("fade: stereo changes at 10 ms blocks {changes:?}");
+    let to: Vec<bool> = changes.iter().map(|c| c.1).collect();
+    assert_eq!(to, [true, false, true], "{changes:?}");
+    assert!(
+        changes[0].0 < 100,
+        "stereo within the first second: {changes:?}"
+    );
+}
+
+#[test]
+fn a_loud_clean_station_still_decodes_stereo() {
+    // The loudest a sine programme can be (L+R at full deviation, peak 0.98 with the
+    // pilot) under a pilot at 8 %, the low end of the standard: the pilot reads about
+    // -21 dB against the MPX, its SNR stays high.
+    let full = tone(240_000, 240_000, 1_000.0, 1.0);
+    let iq = wfm_stereo_modulate(&full, &full, 240_000, 75_000.0, 0.08);
+    let (_, d, _) = demod_stereo(&iq, 240_000, 2_400);
+    let reading = d.pilot().unwrap();
+    eprintln!("loud station: {reading:?}");
+    assert!(reading.stereo, "{reading:?}");
+    assert!(reading.pilot_db.unwrap() < -20.0, "{reading:?}");
+}
+
+#[test]
 fn stereo_puts_different_tones_in_their_own_channels() {
-    let left = tone(240_000, 240_000, 1_000.0, 0.4);
-    let right = tone(240_000, 240_000, 3_000.0, 0.4);
+    let left = tone(240_000, 480_000, 1_000.0, 0.4);
+    let right = tone(240_000, 480_000, 3_000.0, 0.4);
     let iq = wfm_stereo_modulate(&left, &right, 240_000, 75_000.0, STEREO_PILOT_LEVEL);
     let (out, _, _) = demod_stereo(&iq, 240_000, 2_400);
     let (l, r) = split(&out);
@@ -364,7 +469,9 @@ fn stereo_switches_once_each_way_as_a_pilot_comes_and_goes() {
     // to it over 4 s (7.5 dB/s), held for 1 s, back down over 4 s; gone for the last
     // 0.5 s. The programme's loudness steps by 4.4 dB every 0.2 s, as speech and music
     // do, so the reading (pilot against MPX) wanders that much as it crosses each
-    // threshold: a single threshold would switch back and forth there.
+    // threshold: a single threshold would switch back and forth there. The signal is
+    // strong (45 dB SNR), so the pilot's SNR is over its own threshold wherever the
+    // presence crosses its thresholds, and it is the presence's hysteresis on test.
     let fs = 240_000;
     let len = 10 * fs as usize;
     let loudness = |n: usize| {
@@ -397,7 +504,7 @@ fn stereo_switches_once_each_way_as_a_pilot_comes_and_goes() {
         *m += level(n as f64 / fs as f64) as f32 * p;
     }
     let mut iq = wfm_modulate_composite(&mpx, fs, 75_000.0);
-    awgn(&mut iq, 20.0, 7);
+    awgn(&mut iq, 45.0, 7);
     let (_, _, states) = demod_stereo(&iq, fs as u64, 2_400);
     let changes: Vec<(usize, bool)> = states
         .windows(2)
@@ -445,7 +552,12 @@ fn stereo_false_is_one_channel_with_no_reading() {
 fn stereo_output_is_two_channels_at_the_audio_rate() {
     // Each block gives two samples for every one mono gives, at the stage rate and
     // through the resampler.
-    for (rate, block) in [(240_000u32, 2_400usize), (480_000, 9_600), (250_000, 2_500)] {
+    for (rate, block) in [
+        (240_000u32, 2_400usize),
+        (480_000, 9_600),
+        (250_000, 2_500),
+        (200_000, 2_000),
+    ] {
         let left = tone(rate, rate as usize, 1_000.0, 0.4);
         let iq = wfm_stereo_modulate(&left, &left, rate, 75_000.0, STEREO_PILOT_LEVEL);
         let mut d = WfmDemod::new(&stereo()).unwrap();
