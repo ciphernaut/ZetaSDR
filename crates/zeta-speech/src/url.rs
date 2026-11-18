@@ -10,7 +10,7 @@ use reqwest::Url;
 use crate::backend::{
     Slots, SpeechBackend, SpeechError, Transcript, check_language, default_languages, normalise,
 };
-use crate::socket::{STT_CONCURRENCY, STT_QUEUE_WAIT};
+use crate::socket::{MAX_REPLY_BYTES, STT_CONCURRENCY, STT_QUEUE_WAIT};
 
 /// Longest part of a server's error body carried in the error.
 const BODY_SLICE: usize = 200;
@@ -60,12 +60,13 @@ impl UrlBackend {
         concurrency: usize,
         queue_wait: Duration,
     ) -> Result<Self, String> {
-        let url = Url::parse(url).map_err(|e| format!("{url:?}: {e}"))?;
+        // The text is never repeated: it may carry credentials, malformed or not.
+        let url = Url::parse(url).map_err(|e| format!("not a URL: {e}"))?;
         let Some(host) = url.host_str() else {
-            return Err(format!("{url:?}: no host"));
+            return Err(format!("{}: no host", shown(&url)));
         };
         if !matches!(url.scheme(), "http" | "https") {
-            return Err(format!("{url:?}: not an http or https URL"));
+            return Err(format!("{}: not an http or https URL", shown(&url)));
         }
         // The host only: a URL may carry credentials or a token in its query.
         let name = match url.port() {
@@ -117,15 +118,27 @@ impl UrlBackend {
         if let Some(key) = &self.key {
             req = req.bearer_auth(key);
         }
-        let resp = req.send().await.map_err(|e| self.transport(e))?;
+        let mut resp = req.send().await.map_err(|e| self.transport(e))?;
         let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| self.transport(e))?;
-        let text = String::from_utf8_lossy(&bytes);
+        // Read by chunk, at most MAX_REPLY_BYTES, as the socket backend caps its reply.
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| self.transport(e))? {
+            if (bytes.len() + chunk.len()) as u64 > MAX_REPLY_BYTES {
+                return Err(SpeechError::Daemon(format!(
+                    "{} answered {status}: answer too long (over {MAX_REPLY_BYTES} bytes)",
+                    self.name
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        // The key is blanked before the cut, so a key echoed across it cannot leave its head.
+        let text = self.redact(&String::from_utf8_lossy(&bytes));
         let slice: String = text.chars().take(BODY_SLICE).collect();
         if !status.is_success() {
-            return Err(SpeechError::Daemon(
-                self.redact(&format!("{} answered {status}: {slice}", self.name)),
-            ));
+            return Err(SpeechError::Daemon(format!(
+                "{} answered {status}: {slice}",
+                self.name
+            )));
         }
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         match v["text"].as_str() {
@@ -134,10 +147,10 @@ impl UrlBackend {
                 language: language.to_string(),
                 queued_ms: 0,
             }),
-            None => Err(SpeechError::Daemon(self.redact(&format!(
+            None => Err(SpeechError::Daemon(format!(
                 "{} answered {status} with no \"text\": {slice}",
                 self.name
-            )))),
+            ))),
         }
     }
 
@@ -153,6 +166,15 @@ impl UrlBackend {
             )))
         }
     }
+}
+
+/// `url` for an error: without its user, password and query, which may carry credentials.
+fn shown(url: &Url) -> String {
+    let mut url = url.clone();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.to_string()
 }
 
 /// The form: the WAV as `file`, `response_format=json`, and `model` and `language` when given.

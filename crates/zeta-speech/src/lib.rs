@@ -1,6 +1,6 @@
 //! Speech-to-text backends for a ZetaSDR node: one [`SpeechBackend`] trait, a local daemon on
-//! a Unix socket ([`SocketBackend`]) another node's `POST /stt` ([`NodeBackend`]), a Whisper server
-//! over HTTP ([`UrlBackend`]), and the `transcribe` stage on them ([`TranscribeStage`]).
+//! a Unix socket ([`SocketBackend`]), another node's `POST /stt` ([`NodeBackend`]), a Whisper
+//! server over HTTP ([`UrlBackend`]), and the `transcribe` stage on them ([`TranscribeStage`]).
 
 mod backend;
 mod node;

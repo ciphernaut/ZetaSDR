@@ -18,7 +18,7 @@ use crate::backend::{
 };
 
 /// Longest daemon answer line accepted.
-const MAX_REPLY_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_REPLY_BYTES: u64 = 64 * 1024;
 
 /// Longest the construction-time `languages` probe waits (or the call timeout, when that is
 /// shorter): every local command builds the backend, so a hung daemon must not stall it

@@ -337,12 +337,13 @@ $Z --node http://field-host:7979 stream list    # the attached job's two event s
 `zeta job attach --kind transcribe --job ID [--language CODE]` creates the attached job; the
 node needs a speech backend, chosen with the global flags `--stt-socket PATH` (default
 `$XDG_RUNTIME_DIR/voiced.sock` when it exists), `--stt-node URL` (secret in
-`ZETA_STT_NODE_SECRET`) or `--stt-url URL`, which are exclusive. `denoise` is RNNoise through `nnnoiseless`
-(BSD-3-Clause, weights embedded). Source separation, for music under speech, is a slot filled
-by an external audio plugin, for instance a Demucs wrapper on a GPU host:
-`examples/python/separate_stub.py` shows the contract and [docs/speech.md](speech.md#separation) how to
-swap it into the chain. [docs/speech.md](speech.md) also covers installing `local-voice` on
-a node's host, writing your own daemon and sharing one daemon between nodes.
+`ZETA_STT_NODE_SECRET`) or `--stt-url URL`, which are exclusive. `denoise` is RNNoise
+through `nnnoiseless` (BSD-3-Clause, weights embedded). Source separation, for music under
+speech, is a slot filled by an external audio plugin, for instance a Demucs wrapper on a GPU
+host: `examples/python/separate_stub.py` shows the contract and
+[docs/speech.md](speech.md#separation) how to swap it into the chain.
+[docs/speech.md](speech.md) also covers installing `local-voice` on a node's host, writing
+your own daemon and sharing one daemon between nodes.
 
 `--stt-url URL` (env `ZETA_STT_URL`) sends each utterance to a Whisper server on another host.
 `URL` is the full endpoint, used as given. The node `POST`s a `multipart/form-data` form: the

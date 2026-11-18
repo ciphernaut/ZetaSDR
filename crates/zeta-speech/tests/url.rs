@@ -91,6 +91,9 @@ async fn serve(answer: Option<(u16, &'static str)>) -> (String, Arc<Mutex<Vec<Se
                 let mut chunk = [0u8; 8192];
                 let (head_end, len) = loop {
                     let n = conn.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
                     buf.extend_from_slice(&chunk[..n]);
                     if let Some(at) = find(&buf, b"\r\n\r\n") {
                         let head = String::from_utf8_lossy(&buf[..at]).to_string();
@@ -107,6 +110,9 @@ async fn serve(answer: Option<(u16, &'static str)>) -> (String, Arc<Mutex<Vec<Se
                 };
                 while buf.len() < head_end + len {
                     let n = conn.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
                     buf.extend_from_slice(&chunk[..n]);
                 }
                 log.lock().unwrap().push(Seen {
@@ -220,13 +226,44 @@ async fn a_server_that_never_answers_frees_its_slot_at_the_timeout() {
     )
     .unwrap();
     let wav = wav_s16_mono(&[0]);
-    for _ in 0..2 {
-        // The second call only gets its turn because the first gave its slot back.
-        let started = Instant::now();
-        let err = b.transcribe(&wav, "en").await.unwrap_err();
+    // Two calls at once on one slot: the second waits for the slot (its queue wait, 5 s, is
+    // far over the timeout) and only gets its turn because the first gave it back at its
+    // timeout, so both time out, one after the other, well inside the queue wait.
+    let started = Instant::now();
+    let (one, two) = tokio::join!(b.transcribe(&wav, "en"), b.transcribe(&wav, "en"));
+    for err in [one.unwrap_err(), two.unwrap_err()] {
         assert!(matches!(err, SpeechError::Timeout(_)), "{err:?}");
-        assert!(started.elapsed() < Duration::from_secs(3));
     }
+    let took = started.elapsed();
+    assert!(took >= Duration::from_millis(600), "one slot: {took:?}");
+    assert!(took < Duration::from_secs(3), "{took:?}");
+}
+
+#[tokio::test]
+async fn an_answer_over_the_cap_is_an_error_not_read_whole() {
+    let body = format!(r#"{{"text": "{}"}}"#, "a".repeat(100 * 1024));
+    let (url, _) = serve(Some((200, Box::leak(body.into_boxed_str())))).await;
+    let err = backend(&url, None, None)
+        .transcribe(&wav_s16_mono(&[0]), "en")
+        .await
+        .unwrap_err();
+    let SpeechError::Daemon(msg) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(msg.contains("too long"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_key_echoed_across_the_cut_of_the_error_body_is_redacted_whole() {
+    // The key starts 10 characters before the 200-character cut of the body.
+    let body = format!("{}{KEY}", "x".repeat(190));
+    let (url, _) = serve(Some((500, Box::leak(body.into_boxed_str())))).await;
+    let err = backend(&url, Some(KEY), None)
+        .transcribe(&wav_s16_mono(&[0]), "en")
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(!msg.contains(&KEY[..10]), "{msg}");
 }
 
 #[tokio::test]
@@ -269,6 +306,18 @@ async fn a_busy_server_drops_the_call_after_the_queue_wait() {
 fn a_url_that_is_not_http_is_refused() {
     for bad in ["not a url", "ftp://host/x", "file:///x"] {
         assert!(UrlBackend::new(bad, None, None, vec![]).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn a_refused_url_is_named_without_its_credentials() {
+    for bad in [
+        "ftp://user:s3cret@host/x",
+        "http://user:s3cret@host:99999/x",
+        "http://user:s3cret@[::1/x",
+    ] {
+        let err = UrlBackend::new(bad, None, None, vec![]).err().unwrap();
+        assert!(!err.contains("s3cret"), "{bad}: {err}");
     }
 }
 

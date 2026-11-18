@@ -51,7 +51,7 @@ The voice low-pass and de-emphasis shipped 2026-11-01 (`fm_demod` carries `audio
 
 ## Speech: a Whisper server over the network
 
-`--stt-url` is built (a multipart POST of the utterance to a Whisper server). Left: an utterance is 16 kHz mono 16-bit PCM, up to about 480 kB sent as one burst, and on a slow uplink the upload time counts against the 30 s busy window. Measure it (UAT.md, "Speech over the network"); consider FLAC or 8 kHz for narrowband voice (CB audio is 3.4 kHz wide) to cut it by half or more, only if a Whisper server accepts it without a quality loss.
+`--stt-url` is built (a multipart POST of the utterance to a Whisper server). Left: an utterance is 16 kHz mono 16-bit PCM, up to about 480 kB sent as one burst, and on a slow uplink the upload time counts against the 30 s busy window. Measure it (UAT.md, "Speech over the network"). The upload format (FLAC, 8 kHz for narrowband voice: CB audio is 3.4 kHz wide) is revisited later, and then as a **probed capability of the speech server**, not a hard-wired flag: the node finds out what the server accepts (its formats and rates, and its languages and models, which `--stt-url-model` and `--stt-url-languages` hard-wire today) and picks the cheapest format it accepts without a quality loss. Not built yet.
 
 ## `wfm_demod` stereo: blend, the switch, the mix
 

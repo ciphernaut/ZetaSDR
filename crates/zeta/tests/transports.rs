@@ -283,10 +283,19 @@ fn stt_socket_and_stt_node_are_exclusive_for_every_command() {
 #[test]
 fn node_flag_ignores_speech_flags() {
     // Nothing listens on the node, so the request itself fails: the flags were let through.
-    for flag in ["--stt-socket", "--stt-node"] {
+    for flag in [
+        "--stt-socket",
+        "--stt-node",
+        "--stt-url",
+        "--stt-url-model",
+        "--stt-url-languages",
+    ] {
         plain()
             .env_remove("ZETA_STT_SOCKET")
             .env_remove("ZETA_STT_NODE")
+            .env_remove("ZETA_STT_URL")
+            .env_remove("ZETA_STT_URL_MODEL")
+            .env_remove("ZETA_STT_URL_LANGUAGES")
             .args(["--node", "http://127.0.0.1:9", "--secret", SECRET])
             .args([flag, "x", "source", "list"])
             .assert()
