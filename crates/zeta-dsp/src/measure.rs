@@ -1078,7 +1078,12 @@ pub const MIN_PARTIAL_S: f64 = 0.25;
 /// not measured. With a `dc_hz` in its context (a local hardware receiver) the
 /// bins within [`MEASURE_DC_MASK_HZ`] of it take no part in the floor, the peak
 /// or the occupied band (see [`measure_band_masked`]); `dc_mask_hz` is that
-/// half-width, 0 without one.
+/// half-width, 0 without one. Each event also carries `power99_hz`: the width
+/// holding 99 % of the excess power of the bins around the peak that are at
+/// least [`POWER_GATE_DB`] (3 dB) over the noise floor (see [`power_width_hz`]).
+/// Sidebands that stay under that gate are not counted, so for a signal weaker
+/// than that it is only the carrier line, narrow like the occupied width: a
+/// reader treats a `power99_hz` under the kind's minimum as no better than it.
 pub struct MeasureStage {
     spec: StageSpec,
 }
@@ -1826,6 +1831,23 @@ mod tests {
         };
         let w = ev["power99_hz"].as_u64().expect("power99_hz in the event");
         assert!(w <= ev["bandwidth_hz"].as_u64().unwrap().max(1_000), "{ev}");
+    }
+
+    #[test]
+    fn sidebands_under_the_gate_leave_only_a_narrow_power_width() {
+        // The limit of `power99_hz`, stated honestly: the same signal as the test above with
+        // its sidebands 6 dB under the noise's own level (about 2 dB over the floor at best,
+        // under the 3 dB gate): the margin of that test is thin, a few dB of sideband level
+        // between 6000 Hz and a width as narrow as the occupied band's. Here only the carrier
+        // line is counted, so a reader must treat a width under the kind's minimum as untrusted.
+        let iq = weak_fm_voice(0.1, -6.0);
+        let (f, note) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
+        let w = note.power99_hz.expect("a power width");
+        eprintln!("under the gate: occupied {} power99 {w}", f.bandwidth_hz.0);
+        assert!(f.bandwidth_hz.0 < 1_000, "occupied {}", f.bandwidth_hz.0);
+        // Measured 1500 Hz: noise bins over the gate bridged to the carrier, nowhere near the
+        // 5 kHz the page's `fm_demod` floor asks of a trusted width.
+        assert!(w < 2_500, "power99_hz {w}");
     }
 
     #[test]
