@@ -203,7 +203,9 @@ selectors (`#bar .prompt`, `html[data-side]`, `.thin`, `.expanded`, `#wf-badge`,
 `.job .actions`, `#ctx`, `#ctx-outline`, `.ctx-item`) that are not promised stable and are
 fixed along with the page when it changes; a theme of your own should keep to the hooks below. The
 core's menu rules are written with ID selectors, so a theme that styles menus must write
-`#ctx, #ctx-outline` (a bare `[role="menu"]` loses to them). An end-to-end scenario (`scenario_theme_hooks`) checks that each
+`#ctx, #ctx-outline` (a bare `[role="menu"]` loses to them), and give a menu's submenus,
+`#ctx .ctx-sub, #ctx-outline .ctx-sub`, the same panel looks. A submenu is a `position: fixed`
+child of its menu: a `clip-path`, `mask` or `filter` on the menu clips it too. An end-to-end scenario (`scenario_theme_hooks`) checks that each
 selector below matches on a page with a running demodulator, a ribbon, a collapsed pane, a pane
 docked right, the map and the graph view open, so renaming one fails the suite.
 
@@ -241,7 +243,8 @@ With only the binary and no checkout, fetch the starting files from a running no
 - `#map`: the map, in the waterfall's place while the Map tab is selected. `#graph`: the graph
   view (a modal dialog).
 - `[role="menu"]`: a menu (`#ctx`, the box menu, and `#ctx-outline`, the outline menu); its entries
-  are `.ctx-item`.
+  are `.ctx-item`. A group's entries open in a submenu beside it, `.ctx-sub` (also
+  `[role="menu"]`), with `.ctx-sep` headings inside.
 
 Jobs:
 

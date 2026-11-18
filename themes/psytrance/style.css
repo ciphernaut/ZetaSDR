@@ -43,11 +43,12 @@ button, .src-tab, .pane-tab, #cmd, input, #jobs .job, .job-tag[data-colour],
 /* The menus are named by id (#ctx, #ctx-outline) to outweigh the core's id rules; they are
    position: fixed already, which holds the ring. */
 section.pane, #graph .graph-panel { position: relative; }
-section.pane, #ctx, #ctx-outline, #graph .graph-panel {
+section.pane, #ctx, #ctx-outline, #ctx .ctx-sub, #ctx-outline .ctx-sub, #graph .graph-panel {
   border: 0;
   border-radius: var(--soft);
 }
-section.pane::before, #ctx::before, #ctx-outline::before, #graph .graph-panel::before {
+section.pane::before, #ctx::before, #ctx-outline::before, #ctx .ctx-sub::before,
+#ctx-outline .ctx-sub::before, #graph .graph-panel::before {
   content: "";
   position: absolute;
   inset: 0;
@@ -339,7 +340,7 @@ section.pane > * { position: relative; z-index: 1; }
 .job-group > summary { color: var(--dim); font-size: 11px; }
 
 /* ---- menus and the graph view ---- */
-#ctx, #ctx-outline { background: var(--bar); box-shadow: 0 10px 28px var(--shadow); }
+#ctx, #ctx-outline, #ctx .ctx-sub, #ctx-outline .ctx-sub { background: var(--bar); box-shadow: 0 10px 28px var(--shadow); }
 #ctx .ctx-item, #ctx-outline .ctx-item {
   position: relative;
   z-index: 1;

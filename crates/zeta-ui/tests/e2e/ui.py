@@ -713,6 +713,42 @@ def drag_menu(page, lo=0.40, hi=0.60):
     return menu
 
 
+# The openers, outermost first, of the submenus that hold the element (a `.ctx-sub` panel is a
+# direct child of its menu, its opener a `.ctx-item[data-group]` for a group's panel or the
+# `.ctx-item[data-action]` its `data-for` names).
+MENU_PATH_JS = """(el) => {
+  const root = el.closest('#ctx, #ctx-outline');
+  const path = [];
+  for (let p = el.closest('.ctx-sub'); p; ) {
+    const sel = p.dataset.group ? `.ctx-item[data-group="${p.dataset.group}"]`
+                                : `.ctx-item[data-action="${p.dataset.for}"]`;
+    path.unshift(sel);
+    const opener = root.querySelector(sel);
+    p = opener ? opener.closest('.ctx-sub') : null;
+  }
+  return path;
+}"""
+
+
+def menu_item(page, action, menu="#ctx", force=False):
+    """The `.ctx-item[data-action=<action>]` of the open `menu` (#ctx, the box menu, or
+    #ctx-outline, a job's), with the group and submenus holding it opened by a click on each
+    opener, outermost first (`force`: clicked although aria-disabled, as during a fit). The one
+    way the scenarios reach a menu entry."""
+    root = page.locator(menu)
+    expect(root).to_be_visible()
+    item = root.locator(f'.ctx-item[data-action="{action}"]')
+    expect(item).to_have_count(1)
+    for sel in item.evaluate(MENU_PATH_JS):
+        root.locator(sel).click(force=force)
+    return item
+
+
+def menu_click(page, action, menu="#ctx", force=False):
+    """Opens the group (and submenus) holding `action` in the open `menu` and clicks it."""
+    menu_item(page, action, menu, force).click(force=force)
+
+
 def scenario_what_is_this_classifies(page, url, secret):
     menu = open_menu_on_tone(page, url, secret)
     assert not page.evaluate(OVERLAY_BLANK_JS), "no selection rectangle drawn"
@@ -721,7 +757,7 @@ def scenario_what_is_this_classifies(page, url, secret):
     expect(menu).to_be_hidden()
     assert page.evaluate(OVERLAY_BLANK_JS), "selection rectangle left after the menu closed"
     menu = drag_menu(page)
-    page.click('#ctx .ctx-item[data-action="classify"]')
+    menu_click(page, "classify")
     expect(menu).to_be_hidden()
     expect(page.locator("#transcript .line.note", has_text="classify: running…")).to_be_visible()
     line = page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
@@ -735,7 +771,7 @@ def scenario_decode_starts_job_and_logs_op(page, url, secret):
     menu = open_menu_on_tone(page, url, secret)
     if os.environ.get("ZETA_UI_SHOTS"):
         page.screenshot(path=os.path.join(os.environ["ZETA_UI_SHOTS"], "menu.png"))
-    page.click('#ctx .ctx-item[data-action="fm_demod"]')
+    menu_click(page, "fm_demod")
     expect(menu).to_be_hidden()
     jobs = []
     try:
@@ -765,12 +801,12 @@ def scenario_fit_first_lands_on_the_tone(page, url, secret):
     # is checked as fitted (at least the floor, under the box), not pinned. A second click
     # during the fit is ignored; Escape during a fit cancels its start.
     menu = open_menu_on_tone(page, url, secret)
-    page.click('#ctx .ctx-item[data-action="fm_demod"]')
+    menu_click(page, "fm_demod")
     # The entries are aria-disabled during the fit (Playwright would wait): force the click
     # a browser still delivers.
     expect(page.locator('#ctx .ctx-item[data-action="fm_demod"]')).to_have_attribute(
         "aria-disabled", "true")
-    page.click('#ctx .ctx-item[data-action="fm_demod"]', force=True)
+    menu_click(page, "fm_demod", force=True)
     jobs = []
     fitted = page.locator("#transcript .line.note", has_text=re.compile(r"^fitted fm_demod "))
     try:
@@ -796,7 +832,7 @@ def scenario_fit_first_lands_on_the_tone(page, url, secret):
         page.mouse.move(box["x"] + box["width"] - 20, box["y"] + box["height"] * 0.60, steps=6)
         page.mouse.up()
         expect(menu).to_be_visible()
-        page.click('#ctx .ctx-item[data-action="fm_demod"]')
+        menu_click(page, "fm_demod")
         expect(page.locator("#ctx-footer")).to_have_text("measuring…")
         page.keyboard.press("Escape")
         expect(menu).to_be_hidden()
@@ -845,7 +881,7 @@ def scenario_fit_start_conflict_offers_replace(page, url, secret):
     page.route("**/op", route)
     try:
         menu = open_menu_on_tone(page, url, secret)
-        page.click('#ctx .ctx-item[data-action="fm_demod"]')
+        menu_click(page, "fm_demod")
         expect(menu).to_be_hidden(timeout=10_000)
         line = page.locator("#transcript .line.error",
                             has_text=re.compile(rf"conflict: source tone held by .*{holder}"))
@@ -885,7 +921,7 @@ def scenario_fit_first_without_a_signal_starts_at_the_box(page, url, secret):
     footer = page.locator("#ctx-footer").text_content()
     m = re.search(r"center_hz=(\d+) bandwidth_hz=(\d+)", footer)
     c, bw = int(m.group(1)), int(m.group(2))
-    page.click('#ctx .ctx-item[data-action="fm_demod"]')
+    menu_click(page, "fm_demod")
     jobs = []
     try:
         expect(menu).to_be_hidden(timeout=10_000)
@@ -909,7 +945,7 @@ def scenario_save_sigmf(page, url, secret):
     page.mouse.click(5, 5)
     expect(menu).to_be_hidden()
     menu = drag_menu(page)
-    page.click('#ctx .ctx-item[data-action="iq_read"]')
+    menu_click(page, "iq_read")
     expect(menu).to_be_hidden()
     line = page.locator("#transcript .line", has_text=re.compile(r"\.sigmf-meta$"))
     expect(line.first).to_be_visible(timeout=15_000)
@@ -930,11 +966,12 @@ def scenario_plan_menu_offers_the_plans_groups(page, url, secret):
     # test node captures the CB channels, so the node's answer is its refusal of the band
     # and nothing starts.
     menu = open_menu_on_tone(page, url, secret)
+    menu_item(page, "plan")
     groups = menu.locator(".ctx-plan-groups .ctx-item")
     expect(groups).to_have_text([
         "Start plan › Lower 40, voice", "Start plan › Upper 40, voice", "Start plan › Voice",
         "Start plan › Repeater outputs"])
-    menu.locator('.ctx-item[data-group="voice"]').click()
+    menu.locator('.ctx-item[data-plan-group="voice"]').click()
     expect(menu).to_be_hidden()
     expect(page.locator("#cmd")).to_have_value(
         "plan start uhf_cb_au fm_demod transcribe group voice")
@@ -1135,8 +1172,8 @@ def scenario_scan_entry_starts_a_scan_job(page, url, secret):
     wait_span(page, 1.5)  # drag_menu asserts at least 1 s
     # The whole height: the file source's own band, which a scan covers in one step.
     menu = drag_menu(page, 0.0, 1.05)
-    expect(page.locator('#ctx .ctx-item[data-action="scan"]')).to_have_text("Scan this span")
-    page.click('#ctx .ctx-item[data-action="scan"]')
+    expect(menu_item(page, "scan")).to_have_text("Scan this span")
+    menu_click(page, "scan")
     expect(menu).to_be_hidden()
     scans = []
     try:
@@ -1179,7 +1216,7 @@ def scenario_scan_entry_on_a_held_source_starts_a_scan_that_waits(page, url, sec
     page.route("**/op", route)
     try:
         drag_menu(page, 0.0, 1.05)
-        page.click('#ctx .ctx-item[data-action="scan"]')
+        menu_click(page, "scan")
         scans = wait_until(lambda: running_scan_jobs(url, secret, "tone"), 10.0, "a scan job on tone")
         assert posted, "the page never posted a scan job_start"
         scan = scans[0]["id"]
@@ -1205,7 +1242,7 @@ def scenario_scan_looks_and_sweep_time(page, url, secret):
     show_tone_waterfall(page, url, secret)
     wait_span(page, 1.5)  # drag_menu asserts at least 1 s
     drag_menu(page, 0.0, 1.05)
-    page.click('#ctx .ctx-item[data-action="scan"]')
+    menu_click(page, "scan")
     scans = []
     try:
         scans = wait_until(lambda: running_scan_jobs(url, secret, "tone"), 5.0, "a scan job on tone")
@@ -1284,7 +1321,7 @@ def scenario_scan_look_on_a_source_with_depths(page, url, secret):
     page.route("**/op", route)
     wait_span(page, 1.5)
     drag_menu(page, 0.0, 1.05)
-    page.click('#ctx .ctx-item[data-action="scan"]')
+    menu_click(page, "scan")
     scans = []
     try:
         # Route handlers run only while Playwright waits: poll through the page.
@@ -1330,7 +1367,7 @@ def scenario_scan_of_a_sub_band_scans_just_that_band(page, url, secret):
     drag_menu(page, 0.10, 0.30)
     footer = page.locator("#ctx-footer").text_content()
     bw = int(re.search(r"bandwidth_hz=(\d+)", footer).group(1))
-    page.click('#ctx .ctx-item[data-action="scan"]')
+    menu_click(page, "scan")
     scans = []
     try:
         deadline = time.monotonic() + 5.0
@@ -2877,7 +2914,7 @@ def scenario_kiwi_scan_this_span_re_aims_the_tabs_scan(page, url, secret):
         page.wait_for_timeout(3_000)  # drag_menu asks for a span of at least 1 s
         page.route("**/op", log.route)
         menu = drag_menu(page, 0.40, 0.60)
-        page.click('#ctx .ctx-item[data-action="scan"]')
+        menu_click(page, "scan")
         expect(menu).to_be_hidden()
         # The route handler runs while Playwright waits (not in a time.sleep).
         for _ in range(25):
@@ -4801,16 +4838,20 @@ def scenario_outline_menu_presets_fit_and_stop(page, url, secret):
         ol.click(button="right")
         menu = page.locator("#ctx-outline")
         expect(menu).to_be_visible()
+        # The first level: Fit, the Width group, Denoise, Stop; the presets in Width.
         got = menu.locator(".ctx-item").evaluate_all(
             "els => els.filter(e => e.offsetParent !== null)"
-            ".map(e => [e.dataset.action, e.textContent])")
-        assert got == [["fit", "Fit to signal"], ["w2500", "2.5 kHz"], ["w5000", "5 kHz"],
-                       ["w6250", "6.25 kHz"], ["w12500", "12.5 kHz"], ["w25000", "25 kHz"],
+            ".map(e => [e.dataset.action || 'group:' + e.dataset.group, e.textContent])")
+        assert got == [["fit", "Fit to signal"], ["group:width", "Width"],
                        ["denoise", "Denoise on"], ["stop", "Stop"]], f"entries {got}"
+        widths = menu.locator('.ctx-sub[data-group="width"] .ctx-item').evaluate_all(
+            "els => els.map(e => [e.dataset.action, e.textContent])")
+        assert widths == [["w2500", "2.5 kHz"], ["w5000", "5 kHz"], ["w6250", "6.25 kHz"],
+                          ["w12500", "12.5 kHz"], ["w25000", "25 kHz"]], f"widths {widths}"
         expect(page.locator("#ctx-outline-footer")).to_contain_text(
             f"job={job} center_hz={cur} bandwidth_hz=20000")
         with page.expect_request(is_op("job_retune")) as req:
-            page.click('#ctx-outline .ctx-item[data-action="w12500"]')
+            menu_click(page, "w12500", "#ctx-outline")
         assert json.loads(req.value.post_data) == {
             "op": "job_retune", "job": job, "center_hz": cur, "bandwidth_hz": 12500,
             "replace": []}, f"preset {req.value.post_data}"
@@ -4822,7 +4863,7 @@ def scenario_outline_menu_presets_fit_and_stop(page, url, secret):
         # (the node keeps the job re-expandable), the entry reading "Denoise off" afterwards.
         ol.click(button="right")
         with page.expect_request(is_op("graph_put")) as req:
-            page.click('#ctx-outline .ctx-item[data-action="denoise"]')
+            menu_click(page, "denoise", "#ctx-outline")
         body = json.loads(req.value.post_data)
         demod = [n for n in body["graph"]["nodes"] if n["kind"] == "nbfm_demod"]
         assert body["job"] == job and len(demod) == 1 and demod[0]["params"]["denoise"] is True, \
@@ -4844,7 +4885,7 @@ def scenario_outline_menu_presets_fit_and_stop(page, url, secret):
         # Fit: the tone sits at cur + 1000 Hz.
         ol.click(button="right")
         with page.expect_request(is_op("job_retune")) as req:
-            page.click('#ctx-outline .ctx-item[data-action="fit"]')
+            menu_click(page, "fit", "#ctx-outline")
         body = json.loads(req.value.post_data)
         assert body["job"] == job and body["replace"] == [], f"fit {body}"
         assert abs(body["center_hz"] - (cur + 1000)) <= 100, f"fit centre {body}"
@@ -4863,7 +4904,7 @@ def scenario_outline_menu_presets_fit_and_stop(page, url, secret):
                    == body["bandwidth_hz"], 5.0, "fit applied")
         page.evaluate("window.zetaTest.poll()")
         ol.click(button="right")
-        page.click('#ctx-outline .ctx-item[data-action="stop"]')
+        menu_click(page, "stop", "#ctx-outline")
         wait_until(lambda: job_record(url, secret, job)["state"]["status"] == "stopped",
                    5.0, "stopped from the menu")
     finally:
@@ -5024,7 +5065,7 @@ def scenario_fit_twice_measures_the_same_wide_box(page, url, secret):
         ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
         ol.click(button="right")
         with page.expect_request(is_op("job_retune")) as req:
-            page.click('#ctx-outline .ctx-item[data-action="fit"]')
+            menu_click(page, "fit", "#ctx-outline")
         body = json.loads(req.value.post_data)
         wait_until(lambda: job_record(url, secret, job)["tuning"]["bandwidth_hz"]
                    == body["bandwidth_hz"], 5.0, f"fit {n} applied")
@@ -5524,13 +5565,13 @@ def scenario_ssb_entry_tunes_the_dial(page, url, secret):
     open_menu_on_tone(page, url, secret)
     footer = page.locator("#ctx-footer").text_content()
     centre = int(re.search(r"center_hz=(\d+)", footer).group(1))
-    page.focus('#ctx .ctx-item[data-action="ssb_usb"]')
+    menu_item(page, "ssb_usb").focus()
     expect(page.locator("#ctx-footer")).to_contain_text(
         f"center_hz={centre - 1500} bandwidth_hz=6000 sideband=usb")
-    page.focus('#ctx .ctx-item[data-action="ssb_lsb"]')
+    menu_item(page, "ssb_lsb").focus()
     expect(page.locator("#ctx-footer")).to_contain_text(
         f"center_hz={centre + 1500} bandwidth_hz=6000 sideband=lsb")
-    page.click('#ctx .ctx-item[data-action="ssb_usb"]')
+    menu_click(page, "ssb_usb")
     jobs = []
     try:
         # The fit moves the dial only: the band stays the entry's 6000 Hz (a 3000 Hz band
@@ -5550,20 +5591,12 @@ def scenario_ssb_entry_tunes_the_dial(page, url, secret):
 
 
 TRANSCRIBE_ENTRIES = [
-    ("wfm_transcribe", "Transcribe › FM broadcast"),
-    ("fm_transcribe", "Transcribe › NBFM voice"),
-    ("am_transcribe", "Transcribe › AM"),
-    ("ssb_usb_transcribe", "Transcribe › SSB (USB)"),
-    ("ssb_lsb_transcribe", "Transcribe › SSB (LSB)"),
+    ("fm_transcribe", "NBFM voice"),
+    ("wfm_transcribe", "FM broadcast"),
+    ("am_transcribe", "AM"),
+    ("ssb_usb_transcribe", "SSB (USB)"),
+    ("ssb_lsb_transcribe", "SSB (LSB)"),
 ]
-
-NEW_DECODE_ENTRIES = [
-    ("pocsag_decode", "Decode › POCSAG"),
-    ("rds_decode", "Decode › RDS (FM station data)"),
-    ("adsb_decode", "Decode › ADS-B (dump1090)"),
-    ("acars_decode", "Decode › ACARS"),
-]
-
 
 # Every `data-action` the two menus had before they were drawn from one table (actions.js).
 MENU_ACTION_IDS = [
@@ -5599,17 +5632,122 @@ def scenario_menu_entry_table_is_whole(page, url, secret):
         assert all(isinstance(g, str) and g for g in e["groups"]), f"groups {e}"
 
 
-def scenario_decode_menu_lists_new_kinds(page, url, secret):
+# The first level of an open menu: [action, or "group:<id>" for a group's opener] of each
+# shown `.ctx-item` outside the submenu panels.
+FIRST_LEVEL_JS = """(root) => [...root.querySelectorAll('.ctx-item')]
+  .filter((e) => !e.closest('.ctx-sub') && e.closest('[hidden]') === null)
+  .map((e) => e.dataset.action || 'group:' + e.dataset.group)"""
+
+
+def focused_key(page):
+    """The data-action (or `group:<id>`) of the focused element, or None."""
+    return page.evaluate("""() => { const e = document.activeElement;
+        return e && e.classList.contains('ctx-item')
+          ? (e.dataset.action || 'group:' + e.dataset.group) : null; }""")
+
+
+def scenario_box_menu_groups_open_by_hover_click_and_keys(page, url, secret):
+    # The box menu's first level is short (at most 8 lines on the default box): What is this?,
+    # the groups in their order, Send to agent. A group opens as a submenu at its side on the
+    # pointer reaching it, on a click, and by keyboard (the arrow towards the inline end or
+    # Enter; Escape or the other arrow closes one level); its entries carry no `Decode ›` or
+    # `Transcribe ›` prefix, the Transcribe twins under their own heading.
     menu = open_menu_on_tone(page, url, secret)
-    items = menu.locator(".ctx-item").evaluate_all(
-        "els => els.map(e => [e.dataset.action, e.textContent])")
-    actions = [a for a, _ in items]
-    assert "aprs_decode" in actions, f"menu entries {items}"
-    at = actions.index("aprs_decode")
-    got = [tuple(i) for i in items[at + 1:at + 1 + len(NEW_DECODE_ENTRIES)]]
-    assert got == NEW_DECODE_ENTRIES, f"entries after APRS: {got}; menu {items}"
+    first = menu.evaluate(FIRST_LEVEL_JS)
+    assert len(first) <= 8, f"first level {first}"
+    assert first[0] == "classify" and first[-1] == "ask", f"first level {first}"
+    order = ["group:listen", "group:decode", "group:measure", "group:plans", "group:capture"]
+    groups = [g for g in first if g.startswith("group:")]
+    assert groups == [g for g in order if g in groups] and "group:listen" in groups, first
+    labels = menu.locator(".ctx-sub .ctx-item").all_text_contents()
+    assert labels and not [x for x in labels if "›" in x and not x.startswith("Start plan")], \
+        f"prefixed entries {labels}"
+    listen = menu.locator('.ctx-sub[data-group="listen"]')
+    expect(listen.locator(".ctx-sep")).to_have_text("Transcribe")
+    # Hover: the panel stands at the menu's inline end (the right, ltr); another first-level
+    # entry under the pointer closes it.
+    expect(listen).to_be_hidden()
+    page.evaluate("() => { const m = document.getElementById('ctx'); m.style.left = '100px';"
+                  " m.style.top = '120px'; }")
+    menu.locator('.ctx-item[data-group="listen"]').hover()
+    expect(listen).to_be_visible()
+    m, sb = menu.bounding_box(), listen.bounding_box()
+    assert sb["x"] >= m["x"] + m["width"] - 2, f"submenu {sb} not right of the menu {m}"
+    menu.locator('.ctx-item[data-action="classify"]').hover()
+    expect(listen).to_be_hidden()
+    # Click: opens and focuses the group's first entry.
+    measure = menu.locator('.ctx-sub[data-group="measure"]')
+    menu.locator('.ctx-item[data-group="measure"]').click()
+    expect(measure).to_be_visible()
+    assert focused_key(page) == "identify", focused_key(page)
+    # Keyboard: Escape closes one level (back on the opener), the arrows move and open.
+    page.mouse.move(2, 2)
+    page.keyboard.press("Escape")
+    expect(measure).to_be_hidden()
+    expect(menu).to_be_visible()
+    assert focused_key(page) == "group:measure", focused_key(page)
+    page.keyboard.press("ArrowRight")
+    expect(measure).to_be_visible()
+    assert focused_key(page) == "identify", focused_key(page)
+    page.keyboard.press("ArrowDown")
+    assert focused_key(page) == "watch", focused_key(page)
+    page.keyboard.press("ArrowLeft")
+    expect(measure).to_be_hidden()
+    assert focused_key(page) == "group:measure", focused_key(page)
+    page.keyboard.press("ArrowUp")
+    page.keyboard.press("Enter")
+    opened = focused_key(page)
+    assert opened not in (None, "group:measure") and not opened.startswith("group:"), opened
+    page.keyboard.press("Escape")
     page.keyboard.press("Escape")
     expect(menu).to_be_hidden()
+
+
+def scenario_submenus_stay_inside_the_viewport(page, url, secret):
+    # A submenu opens towards the inline end (right, ltr; left, rtl), on the other side when
+    # there is no room there, shifted up when it would leave the bottom; the same in rtl
+    # mirrored.
+    def place_menu(left=None, right=None, bottom=False):
+        page.evaluate("""([l, r, b]) => { const m = document.getElementById('ctx');
+            if (l !== null) m.style.left = l + 'px';
+            if (r !== null) m.style.left = (innerWidth - m.offsetWidth - r) + 'px';
+            m.style.top = b ? (innerHeight - m.offsetHeight - 2) + 'px' : '120px'; }""",
+                      [left, right, bottom])
+
+    def inside(b):
+        vw, vh = page.evaluate("[innerWidth, innerHeight]")
+        return b["x"] >= 0 and b["y"] >= 0 and b["x"] + b["width"] <= vw + 0.5 \
+            and b["y"] + b["height"] <= vh + 0.5
+
+    menu = open_menu_on_tone(page, url, secret)
+    listen = menu.locator('.ctx-sub[data-group="listen"]')
+    opener = menu.locator('.ctx-item[data-group="listen"]')
+    place_menu(right=2, bottom=True)
+    opener.hover()
+    expect(listen).to_be_visible()
+    m, sb = menu.bounding_box(), listen.bounding_box()
+    assert inside(sb), f"submenu {sb} leaves the viewport"
+    assert sb["x"] + sb["width"] <= m["x"] + 2, f"submenu {sb} not left of the menu {m}"
+    page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
+    expect(menu).to_be_hidden()
+    run_cmd(page, "view set dir rtl")
+    expect(page.locator("html")).to_have_attribute("dir", "rtl")
+    menu = drag_menu(page)
+    place_menu(left=500)
+    opener.hover()
+    expect(listen).to_be_visible()
+    m, sb = menu.bounding_box(), listen.bounding_box()
+    assert sb["x"] + sb["width"] <= m["x"] + 2, f"rtl: submenu {sb} not left of the menu {m}"
+    page.mouse.move(2, 2)
+    page.keyboard.press("Escape")
+    place_menu(left=2)
+    opener.hover()
+    expect(listen).to_be_visible()
+    m, sb = menu.bounding_box(), listen.bounding_box()
+    assert inside(sb) and sb["x"] >= m["x"] + m["width"] - 2, f"rtl at the edge: {sb} {m}"
+    page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
 
 
 def scenario_identify_from_a_box_shows_candidates(page, url, secret):
@@ -5620,7 +5758,7 @@ def scenario_identify_from_a_box_shows_candidates(page, url, secret):
     page.wait_for_function("() => window.zetaTest.wf().painted > 30", timeout=15_000)
     menu = drag_menu(page)
     try:
-        page.click('#ctx .ctx-item[data-action="identify"]')
+        menu_click(page, "identify")
         expect(menu).to_be_hidden()
         ribbon = page.locator("#waterfall .ov-ribbon.candidate", has_text="pocsag_decode: proved")
         expect(ribbon.first).to_be_visible(timeout=10_000)
@@ -5646,10 +5784,10 @@ def running_watch_jobs(url, secret, source):
 
 def scenario_watch_entry_starts_a_watch_and_outlines_its_band(page, url, secret):
     menu = open_menu_on_tone(page, url, secret)
-    expect(page.locator('#ctx .ctx-item[data-action="watch"]')).to_have_text("Watch this band")
+    expect(menu_item(page, "watch")).to_have_text("Watch this band")
     footer = page.locator("#ctx-footer").text_content()
     m = re.search(r"center_hz=(\d+) bandwidth_hz=(\d+)", footer)
-    page.click('#ctx .ctx-item[data-action="watch"]')
+    menu_click(page, "watch")
     expect(menu).to_be_hidden()
     watches = []
     try:
@@ -5717,7 +5855,7 @@ def scenario_decode_across_entry_starts_a_watch_with_modes(page, url, secret):
     select_source(page, url, secret, "pocsag")
     wait_span(page, 1.2)
     menu = drag_menu(page, 0.25, 0.75)
-    entry = page.locator('#ctx .ctx-item[data-action="decode_across"]')
+    entry = menu_item(page, "decode_across")
     expect(entry).to_have_text("Decode across this band…")
     sub = page.locator('#ctx .ctx-sub[data-for="decode_across"]')
     expect(sub).to_be_hidden()
@@ -5792,7 +5930,7 @@ def scenario_set_menu_starts_a_set_and_groups_its_jobs(page, url, secret):
     # the set's jobs fold under one group titled by the set's name, the members on the shown
     # source listed and the others counted; the group's Stop is set_stop after a confirm.
     menu = open_menu_on_tone(page, url, secret)
-    entry = page.locator('#ctx .ctx-item[data-action="set"]')
+    entry = menu_item(page, "set")
     expect(entry).to_have_text("Start set…")
     entry.click()
     expect(menu).to_be_hidden()
@@ -5875,7 +6013,7 @@ def scenario_adsb_entry_asks_for_2400_khz(page, url, secret):
         return body.get("op") == "job_start" and body.get("kind") == "adsb_decode"
     try:
         with page.expect_request(is_adsb_start) as req:
-            page.click('#ctx .ctx-item[data-action="adsb_decode"]')
+            menu_click(page, "adsb_decode")
         body = json.loads(req.value.post_data)
         assert body["bandwidth_hz"] == 2_400_000, f"job_start {body}"
         # The op's own head says bandwidth_hz=2400000: match the error after the arrow.
@@ -5900,7 +6038,7 @@ def open_menu_on_wfm(page, url, secret):
 
 def scenario_wfm_decode_plays_audio(page, url, secret):
     menu = open_menu_on_wfm(page, url, secret)
-    page.click('#ctx .ctx-item[data-action="wfm_demod"]')
+    menu_click(page, "wfm_demod")
     expect(menu).to_be_hidden()
     jobs = []
     try:
@@ -5943,7 +6081,7 @@ def scenario_wfm_stereo_toggle_plays_two_channels(page, url, secret):
         menu = page.locator("#ctx-outline")
         expect(menu).to_be_visible()
         expect(menu.locator('.ctx-item[data-action="denoise"]')).to_be_hidden()
-        item = menu.locator('.ctx-item[data-action="stereo"]')
+        item = menu_item(page, "stereo", "#ctx-outline")
         expect(item).to_have_text("Stereo on")
         with page.expect_request(is_op("graph_put")) as req:
             item.click()
@@ -5975,7 +6113,7 @@ def scenario_wfm_stereo_toggle_plays_two_channels(page, url, secret):
         row.locator("button.play").click()
         expect(row.locator("button.play")).to_have_text("▶")
         ol.click(button="right")
-        item = menu.locator('.ctx-item[data-action="stereo"]')
+        item = menu_item(page, "stereo", "#ctx-outline")
         expect(item).to_have_text("Stereo off")
         # Stereo off: the mono run clears the pilot reading the stereo run left.
         with page.expect_request(is_op("graph_put")) as req:
@@ -5993,7 +6131,7 @@ def scenario_wfm_stereo_toggle_plays_two_channels(page, url, secret):
 
 def scenario_what_is_this_names_fm_broadcast(page, url, secret):
     menu = open_menu_on_wfm(page, url, secret)
-    page.click('#ctx .ctx-item[data-action="classify"]')
+    menu_click(page, "classify")
     expect(menu).to_be_hidden()
     line = page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
     expect(line.first).to_be_visible(timeout=45_000)
@@ -6067,7 +6205,7 @@ def scenario_transcript_ribbon_appears(page, url, secret):
         "els => els.map(e => [e.dataset.action, e.textContent])")
     for entry in TRANSCRIBE_ENTRIES:
         assert list(entry) in items, f"{entry} not in the menu: {items}"
-    page.click('#ctx .ctx-item[data-action="wfm_transcribe"]')
+    menu_click(page, "wfm_transcribe")
     clicked = time.monotonic()
     expect(menu).to_be_hidden()
     demod = None
@@ -7041,7 +7179,7 @@ def scenario_mute_in_mix_from_row_and_outline(page, url, secret):
         # From the outline menu.
         page.evaluate("window.zetaTest.poll()")
         page.locator(f'#waterfall .outline[data-key="{demod}"]').click(button="right")
-        item = page.locator('#ctx-outline .ctx-item[data-action="mute"]')
+        item = menu_item(page, "mute", "#ctx-outline")
         expect(item).to_have_text("Unmute in mix")
         item.click()
         wait_until(lambda: mix_graph_muted(url, secret, mix) == [], 5.0, "unmuted in the graph")
@@ -7247,7 +7385,7 @@ def scenario_radio_default_mark_and_policy(page, url, secret):
                                timeout=5_000)
         wait_span(page, MENU_SPAN_S)
         drag_menu(page)
-        page.click('#ctx .ctx-item[data-action="ask"]')
+        menu_click(page, "ask")
         expect(page.locator("#transcript .line.assistant", has_text="A tone.")
                ).to_have_count(1, timeout=10_000)
         expect(page.locator("#transcript .line.user", has_text="what is it?")
@@ -7795,7 +7933,7 @@ def scenario_origins_from_what_is_this_and_bits(page, url, secret):
         # lighting the classification's own origins, the box's measured label named.
         menu = open_menu_on_tone(page, url, secret)
         expect(menu.locator('.ctx-item[data-action="origins"]')).to_have_count(0)
-        page.click('#ctx .ctx-item[data-action="classify"]')
+        menu_click(page, "classify")
         expect(menu).to_be_hidden()
         expect(page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
                .first).to_be_visible(timeout=15_000)
@@ -7889,7 +8027,7 @@ def scenario_classify_lights_sites(page, url, secret):
     page.route(TILE_HOSTS, lambda r: r.abort())
     try:
         menu = open_menu_on_tone(page, url, secret)
-        page.click('#ctx .ctx-item[data-action="classify"]')
+        menu_click(page, "classify")
         expect(menu).to_be_hidden()
         line = page.locator("#transcript .line.op", has_text=re.compile(r"^classify .*→ ok"))
         expect(line.first).to_be_visible(timeout=15_000)
@@ -7936,7 +8074,7 @@ def scenario_what_is_this_shows_the_register_answer(page, url, secret):
         menu = open_menu_on_tone(page, url, secret)
         # Origins left the box menu: What is this? answers it.
         expect(page.locator('#ctx [data-action="origins"]')).to_have_count(0)
-        page.click('#ctx .ctx-item[data-action="classify"]')
+        menu_click(page, "classify")
         expect(menu).to_be_hidden()
         block = wait_until(lambda: register_block(page), 15, "the register's verdict line")
         verdict, band, rest = block[0], block[1], block[2:]
@@ -8101,7 +8239,7 @@ def scenario_an_unreachable_register_says_so(page, url, secret):
     try:
         set_demo_station(node, secret)
         menu = open_menu_on_tone(page, node, secret)
-        page.click('#ctx .ctx-item[data-action="classify"]')
+        menu_click(page, "classify")
         expect(menu).to_be_hidden()
         block = wait_until(lambda: register_block(page), 20, "the register's verdict line")
         assert block[0].startswith("register unreachable: "), block
@@ -8246,7 +8384,7 @@ def scenario_a_map_site_can_be_selected(page, url, secret):
     marks = page.locator("#waterfall .site-channel")
     try:
         menu = open_menu_on_tone(page, url, secret)
-        page.click('#ctx .ctx-item[data-action="classify"]')
+        menu_click(page, "classify")
         expect(menu).to_be_hidden()
         expect(page.locator("#tabs .map-tab .count")).to_have_text("2", timeout=15_000)
         # A subject with a fix, so a marker click can take the selection.
@@ -10088,7 +10226,7 @@ def two_windows(url, secret, job, window_ms=WINDOW_MS):
 def scenario_capture_bursts_from_the_box_menu_and_explore_lists_it(page, url, secret):
     clear_captures(url, secret)
     menu = open_menu_on_tone(page, url, secret)
-    page.click('#ctx .ctx-item[data-action="capture"]')
+    menu_click(page, "capture")
     expect(page.locator("#transcript .line.note", has_text="fitted capture to").first).to_be_visible(timeout=20000)
     # The menu's job: the running one (job_list keeps earlier scenarios' ended jobs).
     job = next(j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
@@ -10217,7 +10355,7 @@ def scenario_too_old_classify_reissues_on_the_latest_span(page, url, secret):
     span = re.search(r"start_ns=(\d+) end_ns=(\d+)", footer)
     span_s = (int(span.group(2)) - int(span.group(1))) / 1e9
     assert span_s >= float(m.group(1)) + 2.0, f"box of {span_s:.1f} s on a ring of {footer!r}"
-    page.click('#ctx .ctx-item[data-action="classify"]')
+    menu_click(page, "classify")
     expect(page.locator("#transcript .line.note", has_text="buffer moved on; classified the last")
            .first).to_be_visible(timeout=20000)
     expect(page.locator("#transcript .line.note", has_text="tried ").first).to_be_visible(timeout=20000)

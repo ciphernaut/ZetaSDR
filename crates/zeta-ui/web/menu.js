@@ -240,7 +240,23 @@
 // and again when an entry is chosen); the footer says so when it was.
 //
 // Closing: Escape, a pointer press outside the menu, or choosing an entry. Up/Down move the
-// focus between entries; Enter or Space chooses one.
+// focus between the entries of one level; Enter or Space chooses one.
+//
+// Groups: both menus are drawn per group of actions.js GROUPS[surface], in order (box: What is
+// this?, Listen, Decode, Measure, Plans, Capture, Send to agent; job: Fit to signal, Width, the
+// toggles, Mute in mix, Stop), each group's offered entries in table order. A `direct` group's
+// entries, and a group whose entries take one line (an entry with `items` takes one more per
+// item), stand in the first level; any other group is one opener, `.ctx-item[data-group=<id>]`
+// reading the group's label with an arrow towards the inline end (aria-haspopup), whose entries
+// stand in its submenu, `.ctx-sub[data-group=<id>]` (role menu). An entry with a `sub` (Decode
+// across this band…) opens its own, `.ctx-sub[data-for=<id>]`, the same way: one mechanism,
+// every panel a direct child of the menu. A submenu opens when the pointer reaches its opener,
+// on a click or tap (which also focuses its first entry), and by keyboard on the opener (the
+// arrow towards the inline end, or Enter); the pointer on another entry of the opener's level
+// closes it, as do Escape (one level, the focus back on the opener; the whole menu while a fit
+// runs) and the arrow towards the inline start. placeSub puts it at the opener's side towards
+// the inline end (`dir`), on the other side when there is no room there, and shifts it up to
+// stay inside the viewport. A Transcribe twin's `section` starts a `.ctx-sep` heading.
 //
 // The outline menu (#ctx-outline, role menu; overlays.js opens it by right-click on a retunable
 // outline, or a long press on its label in the narrow footprint). Entries
@@ -279,7 +295,7 @@
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
 // as for #ctx.
 
-import { action as entryOf, offered } from "./actions.js";
+import { GROUPS, action as entryOf, groupOf, offered } from "./actions.js";
 import { channelHolding, planGroups, planNoVoice } from "./plans.js";
 import { bandText, mhzText, registerLines, registerText } from "./units.js";
 import { capHz } from "./waterfall.js";
@@ -563,6 +579,25 @@ export function dcClause(rec, lo, hi, what) {
   return ` (the capture centre ${mhzText(dc)} MHz is in the ${what}: the ${khz} kHz around it are not measured)`;
 }
 
+// Places submenu `panel` (position: fixed) beside `opener`, an item of `parent` (the menu or a
+// panel): towards the inline end (the right, or the left under `rtl`), on the other side when it
+// would leave the viewport there; its top at the opener's, shifted up to stay inside it.
+const SUB_INSET_PX = 5;
+export function placeSub(panel, opener, parent, rtl) {
+  const p = parent.getBoundingClientRect();
+  const o = opener.getBoundingClientRect();
+  const w = panel.offsetWidth;
+  const h = panel.offsetHeight;
+  const end = rtl ? p.left - w : p.right;
+  const other = rtl ? p.right : p.left - w;
+  const fitsEnd = rtl ? end >= 0 : end + w <= window.innerWidth;
+  const left = Math.max(0, Math.min(fitsEnd ? end : other, window.innerWidth - w));
+  // The panel's first entry level with the opener (its padding and border above it).
+  const top = Math.max(0, Math.min(o.top - SUB_INSET_PX, window.innerHeight - h));
+  panel.style.left = `${left}px`;
+  panel.style.top = `${top}px`;
+}
+
 export function mountMenu(wf, opts) {
   return new Menu(wf, opts);
 }
@@ -690,18 +725,35 @@ class Menu {
       const outline = !this.outlineEl.hidden;
       const menu = outline ? this.outlineEl : this.el;
       if (menu.hidden) return;
+      const active = menu.contains(document.activeElement) ? document.activeElement : null;
+      const level = (active && active.closest(".ctx-sub")) || menu;
+      const rtl = getComputedStyle(menu).direction === "rtl";
+      const toEnd = rtl ? "ArrowLeft" : "ArrowRight";
+      const toStart = rtl ? "ArrowRight" : "ArrowLeft";
       if (ev.key === "Escape") {
         ev.preventDefault();
-        if (outline) this.closeOutline();
+        // One level: the deepest open submenu, else the menu (a fit in progress: the menu).
+        const deep = this.fitting === null ? this.deepestSub(menu) : null;
+        if (deep) {
+          this.closeSub(deep);
+          deep.ctxOpener.focus({ preventScroll: true });
+        } else if (outline) this.closeOutline();
         else this.close();
       } else if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
         ev.preventDefault();
-        const items = [...menu.querySelectorAll(".ctx-item")].filter(
-          (i) => i.closest("[hidden]") === null,
-        );
-        const at = items.indexOf(document.activeElement);
+        const items = this.levelItems(level);
+        if (items.length === 0) return;
+        const at = items.indexOf(active);
         const step = ev.key === "ArrowDown" ? 1 : -1;
         items[(at + step + items.length) % items.length].focus();
+      } else if (ev.key === toEnd && active && active.ctxPanel && this.fitting === null) {
+        ev.preventDefault();
+        this.openSub(active.ctxPanel);
+        this.levelItems(active.ctxPanel)[0]?.focus({ preventScroll: true });
+      } else if (ev.key === toStart && level !== menu) {
+        ev.preventDefault();
+        this.closeSub(level);
+        level.ctxOpener.focus({ preventScroll: true });
       }
     };
     document.addEventListener("pointerup", this.onPointerUp, true);
@@ -764,12 +816,49 @@ class Menu {
     return typeof d === "number" ? ` ring ${d.toFixed(1)} s` : "";
   }
 
-  // Draws `root`'s entries from the table for `ctx` (offered on its surface, in table order),
-  // `footer` last.
+  // Draws `root` for `ctx` from the table (see Groups in the header), `footer` after the
+  // first level and the submenu panels after it.
   paint(root, footer, ctx) {
+    const offer = offered(ctx.surface, ctx);
     const nodes = [];
-    for (const entry of offered(ctx.surface, ctx)) {
+    const panels = [];
+    for (const g of GROUPS[ctx.surface]) {
+      const es = offer.filter((e) => groupOf(e, ctx.surface) === g.id);
+      if (es.length === 0) continue;
+      const lines = es.reduce((n, e) => n + 1 + (e.items ? e.items(ctx).length : 0), 0);
+      if (g.direct || lines === 1) {
+        nodes.push(...this.entryNodes(es, ctx, root, panels));
+        continue;
+      }
+      const opener = this.button(null, g.label);
+      opener.dataset.group = g.id;
+      const panel = this.panel(root, opener, root);
+      panel.dataset.group = g.id;
+      panel.setAttribute("aria-label", g.label);
+      panel.append(...this.entryNodes(es, ctx, panel, panels));
+      nodes.push(opener);
+      panels.push(panel);
+    }
+    root.replaceChildren(...nodes, footer, ...panels);
+  }
+
+  // The nodes of entries `es` in `container` (the menu or a submenu panel): each entry's item,
+  // a `.ctx-sep` heading where a section starts, the items an entry draws after it, and for an
+  // entry with a submenu its opener (its panel added to `panels`).
+  entryNodes(es, ctx, container, panels) {
+    const nodes = [];
+    let section;
+    for (const entry of es) {
+      if (entry.section && entry.section !== section) {
+        const sep = document.createElement("div");
+        sep.className = "ctx-sep";
+        sep.setAttribute("role", "separator");
+        sep.textContent = entry.section;
+        nodes.push(sep);
+      }
+      section = entry.section;
       const item = this.item(entry, ctx);
+      this.leaves(item, container);
       nodes.push(item);
       if (entry.items) {
         const group = document.createElement("div");
@@ -777,53 +866,116 @@ class Menu {
         group.setAttribute("role", "group");
         group.append(
           ...entry.items(ctx).map((x) => {
-            const el = this.button(entry.id, x.label, () => this.choose(entry, x.run));
-            el.dataset.group = x.key;
-            el.removeAttribute("data-action");
+            const el = this.button(null, x.label, () => this.choose(entry, x.run));
+            el.dataset.planGroup = x.key;
             if (x.title) el.title = x.title;
+            this.leaves(el, container);
             return el;
           }),
         );
         nodes.push(group);
       }
       if (entry.sub) {
-        const sub = document.createElement("div");
-        sub.className = "ctx-sub";
-        sub.dataset.for = entry.id;
-        sub.setAttribute("role", "group");
-        sub.hidden = true;
-        sub.append(
+        const panel = this.panel(this.rootOf(container), item, container);
+        panel.dataset.for = entry.id;
+        panel.append(
           ...entry.sub(ctx).map((x) => {
-            const el = this.button(entry.id, x.label, () => this.choose(entry, x.run));
-            el.removeAttribute("data-action");
+            const el = this.button(null, x.label, () => this.choose(entry, x.run));
             el.dataset.mode = x.key;
+            this.leaves(el, panel);
             return el;
           }),
         );
-        item.setAttribute("aria-haspopup", "true");
-        item.setAttribute("aria-expanded", "false");
-        const show = () => {
-          sub.hidden = false;
-          item.setAttribute("aria-expanded", "true");
-        };
-        item.addEventListener("pointerenter", show);
-        // Shown, never toggled: the pointer reaching the entry already showed it.
-        item.addEventListener("click", () => {
-          if (this.fitting !== null) return;
-          show();
-          sub.querySelector(".ctx-item")?.focus({ preventScroll: true });
-        });
-        nodes.push(sub);
+        panels.push(panel);
       }
     }
-    root.replaceChildren(...nodes, footer);
+    return nodes;
   }
 
-  // A `.ctx-item` for `entry` (`id` its data-action) reading `label`, calling `onClick`.
+  // The menu (#ctx or #ctx-outline) `node` belongs to.
+  rootOf(node) {
+    return node.closest("#ctx, #ctx-outline") || node;
+  }
+
+  // A submenu panel (`.ctx-sub`, hidden) that `opener`, an item in `parent` (the menu or a
+  // panel), opens at its side: on the pointer reaching it, on a click or a tap (which also
+  // focuses its first entry); never toggled shut by them.
+  panel(root, opener, parent) {
+    const panel = document.createElement("div");
+    panel.className = "ctx-sub";
+    panel.setAttribute("role", "menu");
+    panel.hidden = true;
+    panel.ctxOpener = opener;
+    panel.ctxParent = parent;
+    opener.ctxPanel = panel;
+    opener.setAttribute("aria-haspopup", "menu");
+    opener.setAttribute("aria-expanded", "false");
+    opener.addEventListener("pointerenter", () => {
+      if (this.fitting === null) this.openSub(panel);
+    });
+    opener.addEventListener("click", () => {
+      if (this.fitting !== null) return;
+      this.openSub(panel);
+      this.levelItems(panel)[0]?.focus({ preventScroll: true });
+    });
+    return panel;
+  }
+
+  // An item that opens nothing closes, as the pointer reaches it, the submenus open from its
+  // level (`container`).
+  leaves(item, container) {
+    if (item.ctxPanel) return;
+    item.addEventListener("pointerenter", () => {
+      if (this.fitting !== null) return;
+      for (const p of this.openSubs(this.rootOf(container))) {
+        if (p.ctxParent === container) this.closeSub(p);
+      }
+    });
+  }
+
+  // The open submenu panels of menu `root`.
+  openSubs(root) {
+    return [...root.querySelectorAll(":scope > .ctx-sub")].filter((p) => !p.hidden);
+  }
+
+  // Opens `panel` beside its opener, closing the others open from the same level first.
+  openSub(panel) {
+    const root = this.rootOf(panel.ctxParent);
+    for (const p of this.openSubs(root)) {
+      if (p !== panel && p.ctxParent === panel.ctxParent) this.closeSub(p);
+    }
+    panel.hidden = false;
+    panel.ctxOpener.setAttribute("aria-expanded", "true");
+    placeSub(panel, panel.ctxOpener, panel.ctxParent, getComputedStyle(root).direction === "rtl");
+  }
+
+  // Closes `panel` and the submenus open from it.
+  closeSub(panel) {
+    const root = this.rootOf(panel.ctxParent);
+    for (const p of this.openSubs(root)) if (p.ctxParent === panel) this.closeSub(p);
+    panel.hidden = true;
+    panel.ctxOpener.setAttribute("aria-expanded", "false");
+  }
+
+  // The deepest open submenu of `root` (one with none open from it), or null.
+  deepestSub(root) {
+    const open = this.openSubs(root);
+    return open.find((p) => !open.some((q) => q.ctxParent === p)) || null;
+  }
+
+  // The items of one level (`container`: the menu or a panel), shown ones only.
+  levelItems(container) {
+    const root = this.rootOf(container);
+    return [...container.querySelectorAll(".ctx-item")].filter(
+      (i) => (i.closest(".ctx-sub") || root) === container && i.closest("[hidden]") === null,
+    );
+  }
+
+  // A `.ctx-item` reading `label` (`id` its data-action, none for null), calling `onClick`.
   button(id, label, onClick) {
     const item = document.createElement("button");
     item.className = "ctx-item";
-    item.dataset.action = id;
+    if (id !== null) item.dataset.action = id;
     item.setAttribute("role", "menuitem");
     item.textContent = label;
     if (onClick) item.addEventListener("click", onClick);

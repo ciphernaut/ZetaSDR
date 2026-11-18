@@ -19,6 +19,8 @@
 //     applies(ctx) -> bool   whether it is offered (absent: always)
 //     disabled(ctx) -> string | null   why it is offered greyed (aria-disabled, the string its
 //               title); absent: never
+//     section   a heading the entry starts in its group (a `.ctx-sep` before the first entry
+//               of a section: the Transcribe twins under the demodulators)
 //     keep      true when the menu stays open while it runs (the fitted entries: the fit
 //               closes it); every other entry closes the menu first
 //     items(ctx) -> [{key, label, title, run(ctx)}]   entries drawn after it, one per element (a
@@ -27,7 +29,11 @@
 //               [data-for=<id>]`), each `.ctx-item[data-mode=<key>]`; an entry whose sub is
 //               empty is not offered
 //     run(ctx)  what choosing it does
-//   GROUPS   per surface, its groups in menu order: [{id, label}]
+//   GROUPS   per surface, its groups in menu order: [{id, label, direct}]. A group's entries open
+//            as a submenu at its opener's side (`.ctx-item[data-group=<id>]` reading `label`,
+//            its panel `.ctx-sub[data-group=<id>]`); a `direct` group's entries, or a group's
+//            only line, stand in the first level instead, and a group with no entry offered is
+//            left out
 //   action(id) -> the entry, or undefined
 //   groupOf(entry, surface) -> the entry's group id on that surface
 //   offered(surface, ctx) -> the entries offered on a surface for ctx, in table order
@@ -52,21 +58,21 @@ const WIDTHS = [2500, 5000, 6250, 12500, 25000];
 
 export const GROUPS = {
   box: [
-    { id: "what", label: "What is this?" },
+    { id: "what", label: "What is this?", direct: true },
     { id: "listen", label: "Listen" },
     { id: "decode", label: "Decode" },
     { id: "measure", label: "Measure" },
     { id: "plans", label: "Plans" },
     { id: "capture", label: "Capture" },
-    { id: "agent", label: "Send to agent" },
+    { id: "agent", label: "Send to agent", direct: true },
   ],
   job: [
-    { id: "fit", label: "Fit to signal" },
+    { id: "fit", label: "Fit to signal", direct: true },
     { id: "width", label: "Width" },
-    { id: "toggles", label: "Toggles" },
-    { id: "mix", label: "Mix" },
+    { id: "toggles", label: "Toggles", direct: true },
+    { id: "mix", label: "Mix", direct: true },
     { id: "next", label: "Next" },
-    { id: "stop", label: "Stop" },
+    { id: "stop", label: "Stop", direct: true },
   ],
 };
 
@@ -98,17 +104,31 @@ const demod = (id, label, j) => ({
 });
 // A demodulator's Transcribe twin: the twin's job, then a transcriber attached to it.
 const twin = (id, label, of) => ({
-  id, label, group: "listen", on: ["box"], twin: of, keep: true, run: fitted(id),
+  id, label, group: "listen", section: "Transcribe", on: ["box"], twin: of, keep: true,
+  run: fitted(id),
 });
 
 export const ACTIONS = [
   { id: "classify", label: "What is this?", group: "what", on: ["box"], run: (c) => c.host.classify(c.sel) },
+  demod("fm_demod", "NBFM audio", job("fm_demod", 5000)),
+  demod("wfm_demod", "FM broadcast audio", job("wfm_demod", 75000)),
+  demod("am_demod", "AM", job("am_demod")),
+  demod("ssb_usb", "SSB (USB)", job("ssb_demod", null, "usb")),
+  demod("ssb_lsb", "SSB (LSB)", job("ssb_demod", null, "lsb")),
+  twin("fm_transcribe", "NBFM voice", "fm_demod"),
+  twin("wfm_transcribe", "FM broadcast", "wfm_demod"),
+  twin("am_transcribe", "AM", "am_demod"),
+  twin("ssb_usb_transcribe", "SSB (USB)", "ssb_usb"),
+  twin("ssb_lsb_transcribe", "SSB (LSB)", "ssb_lsb"),
+  decoder("aprs_decode", "APRS"),
+  decoder("pocsag_decode", "POCSAG"),
+  decoder("rds_decode", "RDS (FM station data)"),
+  decoder("adsb_decode", "ADS-B (dump1090)"),
+  decoder("acars_decode", "ACARS"),
   {
-    id: "capture", label: "Capture bursts", group: "capture", on: ["box"],
-    job: job("capture"), keep: true, run: fitted("capture"),
+    ...decoder("video", "Video", "video_decode"),
+    disabled: (c) => videoRefusal(c.src, c.sel.bandwidthHz),
   },
-  { id: "identify", label: "Identify (thorough)", group: "measure", on: ["box"], job: job("identify"), run: start("identify") },
-  { id: "watch", label: "Watch this band", group: "measure", on: ["box"], job: job("watch"), run: start("watch") },
   {
     id: "decode_across", label: "Decode across this band…", group: "decode", on: ["box"],
     // The ready rows no wider than the selection.
@@ -122,26 +142,10 @@ export const ACTIONS = [
           run: (k) => k.host.decodeAcross(row, k.sel),
         })),
   },
-  decoder("aprs_decode", "Decode › APRS"),
-  decoder("pocsag_decode", "Decode › POCSAG"),
-  decoder("rds_decode", "Decode › RDS (FM station data)"),
-  decoder("adsb_decode", "Decode › ADS-B (dump1090)"),
-  decoder("acars_decode", "Decode › ACARS"),
-  {
-    ...decoder("video", "Decode video", "video_decode"),
-    disabled: (c) => videoRefusal(c.src, c.sel.bandwidthHz),
-  },
-  demod("fm_demod", "Decode › NBFM audio", job("fm_demod", 5000)),
-  demod("wfm_demod", "Decode › FM broadcast audio", job("wfm_demod", 75000)),
-  demod("am_demod", "Decode › AM", job("am_demod")),
-  demod("ssb_usb", "Decode › SSB (USB)", job("ssb_demod", null, "usb")),
-  demod("ssb_lsb", "Decode › SSB (LSB)", job("ssb_demod", null, "lsb")),
-  twin("wfm_transcribe", "Transcribe › FM broadcast", "wfm_demod"),
-  twin("fm_transcribe", "Transcribe › NBFM voice", "fm_demod"),
-  twin("am_transcribe", "Transcribe › AM", "am_demod"),
-  twin("ssb_usb_transcribe", "Transcribe › SSB (USB)", "ssb_usb"),
-  twin("ssb_lsb_transcribe", "Transcribe › SSB (LSB)", "ssb_lsb"),
-  { id: "measure", label: "Start background job › measure", group: "measure", on: ["box"], job: job("measure"), run: start("measure") },
+  { id: "identify", label: "Identify (thorough)", group: "measure", on: ["box"], job: job("identify"), run: start("identify") },
+  { id: "watch", label: "Watch this band", group: "measure", on: ["box"], job: job("watch"), run: start("watch") },
+  { id: "measure", label: "Measure job", group: "measure", on: ["box"], job: job("measure"), run: start("measure") },
+  { id: "scan", label: "Scan this span", group: "measure", on: ["box"], run: (c) => c.host.scan(c.sel) },
   {
     id: "plan", label: "Start plan…", group: "plans", on: ["box"],
     applies: (c) => c.plan !== null,
@@ -159,7 +163,10 @@ export const ACTIONS = [
     id: "set", label: "Start set…", group: "plans", on: ["box"],
     applies: (c) => c.sets.length > 0, run: (c) => c.host.openSet(c.sel.sourceId),
   },
-  { id: "scan", label: "Scan this span", group: "measure", on: ["box"], run: (c) => c.host.scan(c.sel) },
+  {
+    id: "capture", label: "Capture bursts", group: "capture", on: ["box"],
+    job: job("capture"), keep: true, run: fitted("capture"),
+  },
   { id: "iq_read", label: "Save selection as SigMF", group: "capture", on: ["box"], run: (c) => c.host.iqRead(c.sel) },
   { id: "ask", label: "Send to agent", group: "agent", on: ["box"], run: (c) => c.host.askAbout(c.sel) },
 

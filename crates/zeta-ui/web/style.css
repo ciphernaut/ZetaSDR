@@ -723,13 +723,36 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
   color: var(--accent);
   outline: none;
 }
-/* "Decode across this band…"'s rows (menu.js), indented under the entry. */
-#ctx .ctx-sub {
+/* A group's submenu (menu.js), and "Decode across this band…"'s rows: a panel of the menu's
+   own looks at its opener's side (placeSub sets left and top). */
+#ctx .ctx-sub, #ctx-outline .ctx-sub {
+  position: fixed;
+  z-index: 21;
   display: flex;
   flex-direction: column;
-  margin-inline-start: 8px;
-  padding-inline-start: 4px;
-  border-inline-start: 1px solid var(--border);
+  min-width: 180px;
+  max-width: calc(100vw - 16px);
+  padding: 4px;
+  background: var(--bar);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 6px 18px var(--shadow);
+}
+/* An entry that opens a submenu points towards it (the inline end). */
+#ctx .ctx-item[aria-haspopup], #ctx-outline .ctx-item[aria-haspopup] {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ctx-item[aria-haspopup]::after { content: "▸"; }
+.ctx-item[aria-haspopup]:dir(rtl)::after { content: "◂"; }
+/* A section's heading inside a group (the Transcribe twins under the demodulators). */
+.ctx-sep {
+  margin-top: 4px;
+  padding: 4px 8px 2px;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 11px;
 }
 #ctx-footer, #ctx-outline-footer {
   margin-top: 4px;

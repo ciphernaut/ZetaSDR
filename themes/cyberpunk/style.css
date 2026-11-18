@@ -21,7 +21,7 @@
    --cut is the cut corner's leg; --line the outline's colour. The cut corner is the top end
    one; the gradient layer draws its diagonal 1.5 px inside the clip so the outline is whole. */
 button, #cmd, .src-tab, .pane-tab, .job-tag, #jobs .job, section.pane, #waterfall .ov-ribbon,
-#ctx, #ctx-outline, #graph .graph-panel, #band, #login-form, input {
+#ctx, #ctx-outline, #ctx .ctx-sub, #ctx-outline .ctx-sub, #graph .graph-panel, #band, #login-form, input {
   --cut: 7px;
   --line: var(--border);
   --ground: transparent;
@@ -273,7 +273,7 @@ section.pane {
 .job-group > summary { color: var(--dim); font-size: 10px; }
 
 /* ---- menus and the graph view (the menus named by id, to outweigh the core's id rules) ---- */
-#ctx, #ctx-outline {
+#ctx, #ctx-outline, #ctx .ctx-sub, #ctx-outline .ctx-sub {
   --line: var(--accent);
   --ground: var(--bar);
   --cut: 10px;
@@ -283,6 +283,9 @@ section.pane {
 #ctx .ctx-item, #ctx-outline .ctx-item { clip-path: none; background: transparent; border: 1px solid transparent; color: var(--text); }
 #ctx .ctx-item:hover, #ctx .ctx-item:focus-visible,
 #ctx-outline .ctx-item:hover, #ctx-outline .ctx-item:focus-visible { border-color: var(--ok); color: var(--ok); box-shadow: none; }
+/* A clip-path clips a fixed child too: while a submenu stands beside the menu, the menu drops
+   its chamfer (each submenu keeps its own). */
+#ctx:has(> .ctx-sub:not([hidden])), #ctx-outline:has(> .ctx-sub:not([hidden])) { clip-path: none; }
 #graph .graph-panel { --line: var(--ok); --ground: var(--bar); --cut: 14px; }
 #graph .graph-title { color: var(--ok); text-shadow: 0 0 6px rgba(0, 240, 255, 0.6); }
 #graph .graph-canvas { border-color: var(--border); }

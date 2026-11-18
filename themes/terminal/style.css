@@ -294,7 +294,7 @@ html&[data-side="none"]:not([data-footprint="narrow"]) .pane h2 { margin: 0; ali
 
 /* ---- menus and the graph view: boxes, the entry under the pointer in inverse video (the
    menus named by id, to outweigh the core's id rules) ---- */
-#ctx, #ctx-outline {
+#ctx, #ctx-outline, #ctx .ctx-sub, #ctx-outline .ctx-sub {
   background: var(--bg);
   border: 1px solid var(--text);
   box-shadow: 0 0 0 1px var(--bg), 0 8px 18px var(--shadow);
