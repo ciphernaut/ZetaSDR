@@ -85,8 +85,9 @@
 // (browsers tie autoplay to the gesture), and given to audio.js. Pressed while a mix plays it
 // stops (aria-pressed and its text follow the audio). The mix is a job with no band, so its
 // row has no outline: a MixWatch (mix.js) keeps one event socket on the playing (else the
-// newest) mix, its row's `.mix-now` cell says who is talking or was last, and
-// ov.setSpeaking lights the jobs it hears. A demodulator's row and outline menu offer
+// newest) mix, its row's `.mix-now` cell says who is talking or was last (and, on the
+// playing mix, this page's own starved-queue count and grown lead: audio.js audioNote,
+// `page gaps 3, lead 350 ms`), and ov.setSpeaking lights the jobs it hears. A demodulator's row and outline menu offer
 // `Mute in mix` while a running mix covers its source (muteFor). Other text starting `mix` goes to the agent.
 //
 // The map (map.js) is mounted in #map at login: the overlays hand it every event of the jobs
@@ -166,7 +167,7 @@ import { QUIET_OPS, Transcript, errorText, startJobs, startOpsFeed } from "./age
 import { mountWaterfall } from "./waterfall.js";
 import { mountOverlays } from "./overlays.js";
 import { mountMenu } from "./menu.js";
-import { playJob } from "./audio.js";
+import { audioNote, playJob } from "./audio.js";
 import { closeGraph, redrawOpenGraph, showGraph } from "./graph.js";
 import { mountMic } from "./voice.js";
 import {
@@ -2055,6 +2056,7 @@ function toggleAudio(job, { ctx = null, role = null } = {}) {
       ctx,
       role,
       onError: (message) => state.transcript.note(message, true),
+      onGap: paintMix,
       onEnd: () => {
         if (state.audio === entry) state.audio = null;
         state.jobs?.redraw();
@@ -2157,7 +2159,10 @@ function mixRowText(id) {
     const ch = channelLabel(hz, plan);
     return ch ? ch.text : `${(hz / 1e6).toFixed(3)} MHz`;
   };
-  return state.mix.rowText(id, label, Date.now());
+  const text = state.mix.rowText(id, label, Date.now());
+  // The page's own starvation count, on the mix this page is playing: not the node's.
+  const note = window.zetaAudio.playing === id ? audioNote() : "";
+  return note ? (text ? `${text} · ${note}` : note) : text;
 }
 
 // Rewrites every mix row's `.mix-now` cell in place (no redraw: the events come often).

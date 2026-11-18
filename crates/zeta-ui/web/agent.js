@@ -98,7 +98,9 @@
 //       A running row whose position(id) (map.js rowText: the job's last fix from the view's
 //       `home`, `14.8 km, 47°`) is not null shows it in a `.pos` line under the row.
 //       A running `mix` row (job_start refuses the kind: it comes from mix_start) has a
-//       `.mix-now` cell with mixText(job) (mix.js rowText: `ch9 now`, `last ch9 12 s ago`);
+//       `.mix-now` cell with mixText(job) (mix.js rowText: `ch9 now`, `last ch9 12 s ago`; on
+//       the mix this page plays, app.js adds audio.js audioNote: `ch9 now · page gaps 3, lead
+//       350 ms`, the page's own starved-queue count, not the node's);
 //       app.js rewrites it in place as the mix's events arrive. A running demodulator's row has
 //       a `.mute` button (`Mute in mix` / `Unmute in mix`, aria-pressed) when mute(job) gives
 //       {muted, title, run} (app.js: a running mix covers the job's source); `muted` is the

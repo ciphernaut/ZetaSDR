@@ -6198,6 +6198,102 @@ def scenario_listen_to_all_starts_one_mix_and_plays(page, url, secret):
         stop_mixes(url, secret)
 
 
+def scenario_the_players_lead_grows_on_a_starved_queue_and_falls_back(page, url, secret):
+    login(page, url, secret)
+    r = page.evaluate(
+        """async () => {
+          const a = await import('./audio.js');
+          const NS = 1e9;
+          // Frames of 20 ms, each starting where the last ended (a node that never paused).
+          let st = a.newState();
+          let t = 0;      // the context clock (s)
+          let ns = 1e12;  // the frame's span on the node's clock
+          const feed = (arriveAt, jump = 0) => {
+            ns += jump;
+            const p = a.planFrame(st, {now: arriveAt, startNs: ns, endNs: ns + 0.02 * NS,
+                                       duration: 0.02});
+            ns += 0.02 * NS;
+            st = p.state;
+            return p;
+          };
+          const out = {};
+          // Steady: a frame every 20 ms from the first, nothing dry, the lead stays.
+          for (let i = 0; i < 200; i++) { t = 1 + i * 0.02; feed(t); }
+          out.steady = {gaps: st.gaps, lead: st.lead};
+          // A stall: the next frame arrives 250 ms after the queue ran out.
+          t = st.nextStart + 0.25;
+          const stall = feed(t);
+          out.stall = {dry: stall.dry, gaps: st.gaps, lead: st.lead, gapS: st.gapS,
+                       start: stall.start - t};
+          // Repeated stalls cap the lead at MAX_LEAD_S.
+          for (let k = 0; k < 4; k++) { t += 0.02; feed(t); t += 1.0; feed(t); }
+          out.capped = {lead: st.lead, gaps: st.gaps, max: a.MAX_LEAD_S};
+          // A quiet minute: the lead falls back by half its excess, a minute at a time.
+          const grown = st.lead;
+          t += 61; feed(t, 5 * NS);
+          const one = st.lead;
+          t += 61; feed(t, 5 * NS);
+          out.fall = {grown, one, two: st.lead, base: a.LEAD_S};
+          for (let k = 0; k < 20; k++) { t += 61; feed(t, 5 * NS); }
+          out.floor = st.lead;
+          // Within the minute nothing falls back.
+          st = {...st, lead: 0.3, calmSince: t}; t += 30; feed(t, 5 * NS);
+          out.within = st.lead;
+          // A gap in the span (the mix was silent) is not a starved page, and the first
+          // frame after a start is not one either.
+          const gaps = st.gaps;
+          t += 10; const quiet = feed(t, 5 * NS);
+          out.silent = {dry: quiet.dry, gaps: st.gaps - gaps};
+          const fresh = a.planFrame(a.newState(), {now: 5, startNs: 1, endNs: 2, duration: 0.02});
+          out.first = {dry: fresh.dry, gaps: fresh.state.gaps, start: fresh.start};
+          out.note = [a.audioNote({gaps: 0, leadMs: 100}), a.audioNote({gaps: 3, leadMs: 100}),
+                      a.audioNote({gaps: 0, leadMs: 350}), a.audioNote({gaps: 3, leadMs: 350})];
+          return out;
+        }""")
+    assert r["steady"] == {"gaps": 0, "lead": 0.1}, f"steady frames: {r['steady']}"
+    s = r["stall"]
+    assert abs(s["dry"] - 0.25) < 1e-6 and s["gaps"] == 1, f"a 250 ms stall counts once: {s}"
+    assert abs(s["lead"] - 0.35) < 1e-6 and abs(s["gapS"] - 0.25) < 1e-6, f"lead covers it: {s}"
+    assert abs(s["start"] - 0.35) < 1e-6, f"the frame restarts one lead ahead: {s}"
+    assert r["capped"]["lead"] == r["capped"]["max"] == 0.5 and r["capped"]["gaps"] > 1, \
+        f"the lead stops at its cap: {r['capped']}"
+    f = r["fall"]
+    assert abs(f["one"] - (0.1 + (f["grown"] - 0.1) / 2)) < 1e-9, f"half the excess: {f}"
+    assert 0.1 < f["two"] < f["one"], f"and again a minute later: {f}"
+    assert r["floor"] == 0.1, f"back to the base lead: {r['floor']}"
+    assert r["within"] == 0.3, f"nothing falls back inside a minute: {r['within']}"
+    assert r["silent"] == {"dry": 0, "gaps": 0}, f"silence is not starvation: {r['silent']}"
+    assert r["first"]["dry"] == 0 and r["first"]["gaps"] == 0 and r["first"]["start"] == 5.1, \
+        f"the first frame is not a gap: {r['first']}"
+    assert r["note"] == ["", "page gaps 3", "lead 350 ms", "page gaps 3, lead 350 ms"], r["note"]
+
+
+def scenario_the_mix_row_shows_the_pages_own_starvation_count(page, url, secret):
+    stop_mixes(url, secret)
+    select_source(page, url, secret, "cb")
+    demod = start_job(url, secret, "fm_demod", "cb", 476_900_000, 12_500)
+    try:
+        page.locator("#listen-all").click()
+        page.wait_for_function(
+            "() => window.zetaAudio && window.zetaAudio.framesPlayed > 0", timeout=5_000)
+        mix = mix_jobs(url, secret)[0]["id"]
+        now = page.locator(f'#jobs .job[data-id="{mix}"] .mix-now')
+        expect(now).to_be_visible()
+        # What the player records on a dry re-anchor (planFrame is tested apart): the row
+        # says so, as the page's count and not the node's.
+        page.evaluate("() => { window.zetaAudio.gaps = 7; window.zetaAudio.leadMs = 350; }")
+        page.evaluate("window.zetaTest.poll()")
+        expect(now).to_contain_text("page gaps 7", timeout=5_000)
+        expect(now).to_contain_text("lead 350 ms")
+        page.evaluate("() => { window.zetaAudio.gaps = 0; window.zetaAudio.leadMs = 100; }")
+        page.evaluate("window.zetaTest.poll()")
+        expect(now).not_to_contain_text("page gaps", timeout=5_000)
+        expect(now).not_to_contain_text("lead")
+    finally:
+        stop_job(url, secret, demod)
+        stop_mixes(url, secret)
+
+
 def scenario_mix_lights_the_speaker_and_names_the_last_heard(page, url, secret):
     stop_mixes(url, secret)
     select_source(page, url, secret, "cb")

@@ -529,15 +529,17 @@ badly". The mix's `underruns` and `dropped_ms` stayed 0 throughout and `measured
 node's accounting cannot see it. What the code says: the mix emits a 20 ms frame per tick and nothing in
 silence; the page (`audio.js`) schedules each frame `LEAD_S` (100 ms) ahead and, when its queue runs dry,
 re-anchors at now + 100 ms without counting it, so any delivery hiccup over 100 ms (a tokio stall while 40
-direct channels each filter the full 1 Msps capture, a late WebSocket flush) is a silent gap. Three things,
-to spec: (1) count the dry re-anchors in `window.zetaAudio` and show them in the mix's row, so the operator
-can tell a starved page from a starved mix; (2) an adaptive lead: start at 100 ms and grow by the gap seen,
-to 500 ms, falling back when quiet for a minute; (3) the node side: the bank under 2 Msps (its own gist)
-and a cheaper idle channel. The operator's question: "is there a way to reduce CPU resource contention on
-idle channels". The channel filter at the capture rate is the cost, not the demod: with a bank a closed
-squelch could skip the demod and the resampler and read its gate from the bank bin's power alone; on the
-direct path there is nothing to skip before the filter. Measure the page counter first: if the page never
-runs dry the gap is in the browser's own output and (2) is the fix.
+direct channels each filter the full 1 Msps capture, a late WebSocket flush) is a silent gap. Cleanup round 3
+built the page side: the page counts its dry re-anchors (`page gaps N` in the playing mix's row, `gaps` and
+`gapMs` in `window.zetaAudio`; a frame whose span continues the last one's is starvation, a jump in the span
+is the mix having been silent) and its lead grows by the gap seen, to 500 ms, halving its excess after each
+quiet minute (shown as `lead N ms` while over 100 ms). What is left is the node side: the bank under 2 Msps
+(its own gist) and a cheaper idle channel. The operator's question: "is there a way to reduce CPU resource
+contention on idle channels". The channel filter at the capture rate is the cost, not the demod: with a
+bank a closed squelch could skip the demod and the resampler and read its gate from the bank bin's power
+alone; on the direct path there is nothing to skip before the filter. Read the page counter under channel
+load first: if it stays 0 while the audio stutters the gap is in the browser's own output, and the grown
+lead is the only fix on the page.
 
 ## Agent: the language for the node's own model to work out automations itself
 
