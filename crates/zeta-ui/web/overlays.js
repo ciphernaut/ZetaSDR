@@ -207,7 +207,10 @@
 //         rounded to Hz, replace []) goes through applyOp: null (a refusal or a conflict,
 //         whose line offers "stop <kind> <id> and retry") snaps the outline back to the
 //         ghost's band, a result keeps the dragged band until the next `job_list`; ghost and
-//         readout go either way. `pointercancel` snaps back and sends nothing. While a drag
+//         readout go either way. `pointercancel` snaps back and sends nothing. A drag's moves
+//         are applied once per animation frame (the latest position; the layer's top is read
+//         at pointerdown) and `pointerup` applies its own position first, so the retune is
+//         the pointer's last position (counted in window.zetaPerf, waterfall.js). While a drag
 //         runs (ov.drag) the polls and the view changes leave that outline where the pointer
 //         has it, and a wheel over a draggable outline still zooms the waterfall. In the
 //         narrow footprint no handles are made and the body stays pointer-transparent; pins,
@@ -1780,7 +1783,7 @@ class Overlays {
     const el = o.el;
     el.addEventListener("pointerdown", (ev) => this.dragStart(ev, key));
     el.addEventListener("pointermove", (ev) => this.dragMove(ev, key));
-    el.addEventListener("pointerup", () => this.dragUp(key));
+    el.addEventListener("pointerup", (ev) => this.dragUp(key, ev));
     el.addEventListener("pointercancel", () => this.dragCancel(key));
     el.addEventListener("contextmenu", (ev) => {
       if (this.footprint() !== "wide" || !el.classList.contains("retunable")) return;
@@ -1836,8 +1839,9 @@ class Overlays {
     this.press = null;
   }
 
-  layerY(ev) {
-    return ev.clientY - this.layer.getBoundingClientRect().top;
+  // The layer's y of a client y; `top` is the layer's client top (read once per drag).
+  layerY(clientY, top = this.layer.getBoundingClientRect().top) {
+    return clientY - top;
   }
 
   dragStart(ev, key) {
@@ -1852,11 +1856,15 @@ class Overlays {
       // no capture (a synthetic event): the drag still runs while the pointer is over it
     }
     const { lo, hi } = o;
+    const top = this.layer.getBoundingClientRect().top;
     this.drag = {
       key,
       job: o.job,
       mode,
-      y0: this.layerY(ev),
+      top,
+      pendingY: null, // the latest pointer clientY not yet applied
+      frame: null, // its requestAnimationFrame id
+      y0: this.layerY(ev.clientY, top),
       lo0: lo,
       hi0: hi,
       lo,
@@ -1865,11 +1873,29 @@ class Overlays {
     };
   }
 
+  // A drag's pointer move: keep the latest position, apply it on the next animation frame.
   dragMove(ev, key) {
     const d = this.drag;
+    if (!d || d.key !== key || d.sending) return;
+    window.zetaPerf.pointerEvents++;
+    d.pendingY = ev.clientY;
+    if (d.frame === null) d.frame = requestAnimationFrame(() => this.dragApply(key));
+  }
+
+  // The pending position (or `clientY`, the release's own) applied: a frame's one piece of work.
+  dragApply(key, clientY = null) {
+    const d = this.drag;
+    if (d && d.key === key) {
+      if (d.frame !== null) cancelAnimationFrame(d.frame);
+      d.frame = null;
+    }
     const o = this.outlines.get(key);
     if (!d || d.key !== key || d.sending || !o || this.wf.yForHz(d.lo0) === null) return;
-    const y = this.layerY(ev);
+    const at = clientY ?? d.pendingY;
+    d.pendingY = null;
+    if (at === null) return;
+    window.zetaPerf.pointerWork++;
+    const y = this.layerY(at, d.top);
     if (!d.moved && Math.abs(y - d.y0) < DRAG_CLICK_PX) return;
     const delta = this.wf.hzForY(y) - this.wf.hzForY(d.y0);
     if (!Number.isFinite(delta)) return;
@@ -1900,9 +1926,10 @@ class Overlays {
   }
 
   // The release: a click (under DRAG_CLICK_PX) sends nothing; a drag retunes the job.
-  async dragUp(key) {
+  async dragUp(key, ev) {
     const d = this.drag;
     if (!d || d.key !== key || d.sending) return;
+    this.dragApply(key, ev.clientY); // the release's own position, not the last frame's
     if (!d.moved) {
       this.drag = null;
       return;
@@ -1933,6 +1960,7 @@ class Overlays {
   endDrag(snapBack = false) {
     const d = this.drag;
     this.drag = null;
+    if (d && d.frame !== null) cancelAnimationFrame(d.frame);
     if (this.ghostEl) this.ghostEl.remove();
     if (this.readoutEl) this.readoutEl.remove();
     this.ghostEl = null;

@@ -45,7 +45,15 @@
 //         Uint8Array, floorDb, stepDb} for v2 rows, {db: Float32Array} for older ones,
 //         {coarseOnly: true} for a column of the coarse layer alone (see Layers)
 //     wf.onSelect(cb)   cb({centerHz, bandwidthHz, startNs, endNs}) after a drag; the same
-//         object is kept in window.zetaLastSelection.
+//         object is kept in window.zetaLastSelection. A drag's moves are coalesced to one
+//         piece of work per animation frame (the latest pointer position; the overlay rectangle
+//         is read once, at pointerdown); pointerup/pointercancel applies the final position
+//         at once, so a drag ends where the pointer did. Outside a drag a pointer move costs
+//         nothing (hover work is CSS and enter/leave handlers, none per move).
+//     window.zetaPerf   {pointerEvents, pointerWork, redraws}: pointermove events a drag
+//         received (here and in overlays.js, whose outline drags use the same object), the
+//         pieces of work done for them (at most one per frame) and the overlay redraws they
+//         caused; read by the e2e scenarios.
 //     wf.onColumn(cb)   cb(shiftCssPx) after each painted column: everything painted moved
 //         left by that many CSS px (overlays.js scrolls its ribbons with it).
 //     wf.plan       () -> the `plan` view policy (default auto); the axis marks the channels
@@ -362,6 +370,9 @@ function buildRamp(stops) {
 
 let RAMP = buildRamp(RAMP_STOPS);
 
+// Counters for the e2e scenarios (see the header); overlays.js adds to the same object.
+window.zetaPerf = window.zetaPerf || { pointerEvents: 0, pointerWork: 0, redraws: 0 };
+
 function percentile(values, p) {
   const sorted = Float64Array.from(values).sort();
   return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
@@ -677,6 +688,9 @@ class Waterfall {
     this.lastCoarsePaint = -Infinity;
     this.easing = false;
     this.easeRaf = null;
+    this.dragRect = null; // the overlay's rectangle, read at pointerdown for one drag
+    this.dragPending = null; // the latest drag pointer position not yet drawn
+    this.dragFrame = null; // its requestAnimationFrame id
     this.listed = null; // {id, lo, hi}: the shown source's `current` in the last source_list
     this.staleBand = null; // the band a source_list move left; its late rows do not move back
     this.lastPaint = -Infinity;
@@ -2197,7 +2211,7 @@ class Waterfall {
   }
 
   local(ev) {
-    const r = this.overlay.getBoundingClientRect();
+    const r = this.dragRect || this.overlay.getBoundingClientRect();
     return {
       x: Math.max(0, Math.min(r.width, ev.clientX - r.left)),
       y: Math.max(0, Math.min(r.height, ev.clientY - r.top)),
@@ -2207,13 +2221,27 @@ class Waterfall {
   dragStart(ev) {
     if (ev.button !== 0) return;
     this.overlay.setPointerCapture(ev.pointerId);
+    this.dragRect = this.overlay.getBoundingClientRect();
     const p = this.local(ev);
     this.drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
     this.drawDrag();
   }
 
+  // A drag's pointer move: keep the latest position and draw it on the next animation frame.
   dragMove(ev) {
     if (!this.drag) return;
+    window.zetaPerf.pointerEvents++;
+    this.dragPending = { clientX: ev.clientX, clientY: ev.clientY };
+    if (this.dragFrame === null) this.dragFrame = requestAnimationFrame(() => this.dragApply());
+  }
+
+  // The pending position, drawn: a frame's one piece of work.
+  dragApply() {
+    this.dragFrame = null;
+    const ev = this.dragPending;
+    this.dragPending = null;
+    if (!this.drag || !ev) return;
+    window.zetaPerf.pointerWork++;
     const p = this.local(ev);
     this.drag.x1 = p.x;
     this.drag.y1 = p.y;
@@ -2222,7 +2250,14 @@ class Waterfall {
 
   dragEnd(ev) {
     if (!this.drag) return;
-    this.dragMove(ev);
+    if (this.dragFrame !== null) cancelAnimationFrame(this.dragFrame);
+    this.dragFrame = null;
+    this.dragPending = null;
+    const end = this.local(ev); // the release's own position, not the last frame's
+    this.drag.x1 = end.x;
+    this.drag.y1 = end.y;
+    this.dragRect = null;
+    this.drawDrag();
     const d = this.drag;
     this.drag = null;
     if (Math.abs(d.y1 - d.y0) < 1 || !this.band) {
@@ -2264,6 +2299,7 @@ class Waterfall {
   }
 
   drawDrag() {
+    window.zetaPerf.redraws++;
     const d = this.drag;
     const dpr = this.overlay.width / (this.overlay.clientWidth || 1);
     const o = this.octx;

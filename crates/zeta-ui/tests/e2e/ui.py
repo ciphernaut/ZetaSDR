@@ -443,6 +443,49 @@ def scenario_selection_reports_band(page, url, secret):
     assert sel["startNs"] <= sel["endNs"], f"selection {sel}"
 
 
+POINTER_BURST_JS = """([n, up]) => {
+  const el = document.querySelector('#waterfall .wf-overlay');
+  const b = el.getBoundingClientRect();
+  const z = window.zetaPerf;
+  const before = {...z};
+  const at = (i) => ({clientX: b.left + 300 + i * 2, clientY: b.top + 100 + i * 3, pointerId: 1,
+                      button: 0, bubbles: true});
+  for (let i = 1; i <= n; i++) el.dispatchEvent(new PointerEvent('pointermove', at(i)));
+  const inFrame = {events: z.pointerEvents - before.pointerEvents,
+                   work: z.pointerWork - before.pointerWork};
+  if (up) el.dispatchEvent(new PointerEvent('pointerup', at(n)));
+  return inFrame;
+}"""
+
+
+def scenario_a_drags_pointer_moves_cost_one_piece_of_work_per_frame(page, url, secret):
+    show_tone_waterfall(page, url, secret)
+    box = page.locator("#waterfall canvas.wf-canvas").bounding_box()
+    # 50 moves in one task: all seen, none worked on until the frame, then one piece of work.
+    page.mouse.move(box["x"] + 300, box["y"] + 100)
+    page.mouse.down()
+    sync = page.evaluate(POINTER_BURST_JS, [50, False])
+    assert sync == {"events": 50, "work": 0}, f"work done inside the task: {sync}"
+    page.wait_for_function(
+        "() => window.zetaPerf.pointerWork >= 1", timeout=3_000)
+    page.wait_for_timeout(300)
+    perf = page.evaluate("window.zetaPerf")
+    assert perf["pointerWork"] == 1, f"50 moves in one frame did {perf['pointerWork']} pieces of work"
+    # A drag whose last moves and release share a frame ends on the release's position.
+    page.evaluate(POINTER_BURST_JS, [20, True])
+    sel = page.evaluate("window.zetaLastSelection")
+    page.mouse.up()
+    # The same end point reached by one move and a release is the same selection.
+    page.mouse.move(box["x"] + 300, box["y"] + 100)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 300 + 40, box["y"] + 100 + 60)
+    page.mouse.up()
+    ref = page.evaluate("window.zetaLastSelection")
+    assert sel and ref, f"no selection: {sel!r} {ref!r}"
+    for k in ("centerHz", "bandwidthHz"):
+        assert abs(sel[k] - ref[k]) <= 1, f"{k}: burst {sel} vs single move {ref}"
+
+
 # ---- overlays and transcript (Task 8) ----------------------------------------------------
 # These run after the waterfall scenarios: they start decode jobs that the page watches (more
 # websockets), and each stops its own jobs at the end so later runs start clean.
