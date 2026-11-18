@@ -6,7 +6,7 @@
     "bandwidth_hz": 25000,
     "centers_hz": [136975000, 136725000, 136775000, 136825000, 136875000],
     "min_hz": null,
-    "range_hz": null
+    "range_hz": [117975000, 137000000]
   },
   "modulation": ["psk"],
   "label": "VDL2",

@@ -180,8 +180,26 @@ async fn modes_list_filters_by_family_and_state() {
     assert_eq!(v["family"], "pagers");
     assert_eq!(v["decoder_kind"], "graph");
     assert_eq!(v["file"], "modes/pocsag_decode.json");
-    assert_eq!(v["band"]["range_hz"], serde_json::Value::Null);
+    // A row of several ranges lists them; one of one range keeps the `[lo, hi]` form.
+    assert_eq!(
+        v["band"]["range_hz"],
+        serde_json::json!([
+            [138_000_000, 175_000_000],
+            [450_000_000, 470_000_000],
+            [927_340_000, 936_660_000]
+        ])
+    );
     assert_eq!(v["band"]["min_hz"], serde_json::Value::Null);
+    let back: zeta_core::ops::ModeInfo = serde_json::from_value(v.clone()).unwrap();
+    assert_eq!(back, pagers[1]);
+    let sondes = list(Some(Family::WeatherScience), None).await;
+    let one = serde_json::to_value(&sondes[0]).unwrap();
+    assert_eq!(
+        one["band"]["range_hz"],
+        serde_json::json!([400_050_000, 406_000_000])
+    );
+    let back: zeta_core::ops::ModeInfo = serde_json::from_value(one).unwrap();
+    assert_eq!(back, sondes[0]);
     let adsb = list(Some(Family::Aviation), Some(ModeState::Ready)).await;
     let v = serde_json::to_value(&adsb[1]).unwrap();
     assert_eq!(v["id"], "adsb_decode");
@@ -438,7 +456,10 @@ fn the_rs41_row_is_an_audio_program_row() {
     assert_eq!(block.programs, ["rs41mod"]);
     assert_eq!(m.row.position.as_ref().map(|p| p.lat.as_str()), Some("lat"));
     assert_eq!(m.row.time.as_deref(), Some("datetime"));
-    assert_eq!(m.row.band.range_hz, Some([400_050_000, 406_000_000]));
+    assert_eq!(
+        serde_json::to_value(&m.row.band).unwrap()["range_hz"],
+        serde_json::json!([400_050_000, 406_000_000])
+    );
     assert!(m.row.band.centers_hz.is_empty());
     assert_eq!(m.row.identify.priority, 1);
     for (id, program) in [("dfm_decode", "dfm09mod"), ("m20_decode", "m20mod")] {
@@ -524,8 +545,6 @@ fn flex_ais_and_aprs_are_tried_only_where_they_live() {
     ] {
         assert_eq!(fit(center, id), (true, true), "{id} at {center} Hz");
     }
-    // Out of the US 929-932 MHz band too (the row has one range: the catalogue's VHF one).
-    assert_eq!(fit(931_000_000, "flex_decode"), (false, false));
     assert_eq!(fit(156_800_000, "ais_decode"), (false, false));
     // APRS lives on its centres (144.390, 144.800 and the AU 145.175 MHz), not all of
     // 2 m: an FM or M17 signal elsewhere on the band gets no centre credit from it.
@@ -538,6 +557,86 @@ fn flex_ais_and_aprs_are_tried_only_where_they_live() {
     }
     let aprs = reg.get("aprs_decode").unwrap();
     assert!(aprs.row.band.centers_hz.contains(&145_175_000));
+}
+
+/// Identify tries a row of several ranges (the catalogue's) in any of them and nowhere
+/// between: POCSAG on VHF, UHF and 927.3-936.7 MHz, FLEX on VHF and 927.3-936.6 MHz, APRS on 2 m and
+/// 70 cm; the aviation rows only on their international bands (the VHF aeronautical
+/// band, 1090 MHz).
+#[test]
+fn rows_with_several_ranges_are_tried_in_each_and_not_between() {
+    let mut reg = ModeRegistry::load(&stages(), None);
+    for id in ["flex_decode", "acars_decode", "vdl2_decode", "adsb_decode"] {
+        reg.set_program(id, Some("/stand-in".into()), None);
+    }
+    let fit = |center_hz: u64, bandwidth_hz: u64, id: &str| {
+        let scored = zeta_core::modes::score::score_rows(
+            &reg,
+            center_hz,
+            bandwidth_hz,
+            "fsk",
+            &|_| 0.0,
+            &|_| 0.0,
+        );
+        let s = scored.iter().find(|s| s.mode.row.id.0 == id).unwrap();
+        (s.in_range, s.fits_band)
+    };
+    let cases: [(&str, u64, &[u64], &[u64]); 6] = [
+        (
+            "pocsag_decode",
+            12_500,
+            &[
+                148_637_500,
+                160_000_000,
+                466_075_000,
+                452_000_000,
+                931_000_000,
+            ],
+            &[137_000_000, 300_000_000, 471_000_000, 937_000_000],
+        ),
+        (
+            "flex_decode",
+            25_000,
+            &[152_000_000, 929_612_500, 931_000_000],
+            &[151_000_000, 500_000_000, 937_000_000],
+        ),
+        (
+            "aprs_decode",
+            12_500,
+            &[144_800_000, 432_500_000],
+            &[146_500_000, 300_000_000, 435_000_000],
+        ),
+        (
+            "acars_decode",
+            10_000,
+            &[131_550_000, 119_000_000, 136_500_000],
+            &[117_000_000, 403_025_000],
+        ),
+        (
+            "vdl2_decode",
+            25_000,
+            &[136_975_000, 125_000_000],
+            &[138_000_000, 403_025_000],
+        ),
+        (
+            "adsb_decode",
+            2_400_000,
+            &[1_090_000_000],
+            &[978_000_000, 403_025_000],
+        ),
+    ];
+    for (id, width, inside, outside) in cases {
+        for &center in inside {
+            assert_eq!(fit(center, width, id), (true, true), "{id} at {center} Hz");
+        }
+        for &center in outside {
+            assert_eq!(
+                fit(center, width, id),
+                (false, false),
+                "{id} at {center} Hz"
+            );
+        }
+    }
 }
 
 #[test]

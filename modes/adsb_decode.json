@@ -5,7 +5,8 @@
   "band": {
     "bandwidth_hz": 2400000,
     "centers_hz": [1090000000],
-    "min_hz": 2000000
+    "min_hz": 2000000,
+    "range_hz": [1089500000, 1090500000]
   },
   "modulation": [],
   "label": "ADS-B",

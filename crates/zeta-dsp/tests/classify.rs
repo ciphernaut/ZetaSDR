@@ -174,10 +174,11 @@ async fn a_short_selection_reports_skipped_span_and_a_layer1_label() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn program_rows_are_skipped_quick() {
     let dir = tempfile::tempdir().unwrap();
-    let node = node_over_with(dir.path(), &ais_capture(), AIS_A_HZ, None).await;
-    let c = classify_span(&node, AIS_A_HZ, 25_000, 2_000_000_000).await;
-    // A program row that scores (vdl2_decode's 25 kHz band matches) is tried but has no
-    // quick attempt.
+    // A 25 kHz FSK burst on VDL2's worldwide channel: a program row in range there that
+    // scores (vdl2_decode's 25 kHz band matches) is tried but has no quick attempt.
+    const VDL2_HZ: u64 = 136_975_000;
+    let node = node_over_with(dir.path(), &ais_capture(), VDL2_HZ, None).await;
+    let c = classify_span(&node, VDL2_HZ, 25_000, 2_000_000_000).await;
     assert_eq!(
         outcome(&c, "vdl2_decode"),
         Some(Outcome::SkippedQuick),
@@ -318,7 +319,15 @@ async fn m17_takes_no_classify_slot_from_pocsag() {
     let c = classify_span(&node, CENTER, 12_500, 2_000_000_000).await;
     assert_eq!(outcome(&c, "m17_decode"), None, "{c:?}");
     assert_eq!(outcome(&c, "pocsag_decode"), Some(Outcome::Proved), "{c:?}");
-    assert_eq!(c.tried.len(), zeta_dsp::identify::CLASSIFY_TRIES, "{c:?}");
+    // Only three rows are in range at 144.8 MHz (the aviation rows keep to their bands):
+    // a slot is free, and m17 still takes none.
+    let mut tried: Vec<&str> = c.tried.iter().map(|t| t.mode.as_str()).collect();
+    tried.sort();
+    assert_eq!(
+        tried,
+        ["aprs_decode", "pocsag_decode", "rds_decode"],
+        "{c:?}"
+    );
 }
 
 /// AIS channel A.

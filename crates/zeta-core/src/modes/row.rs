@@ -346,10 +346,11 @@ pub struct Band {
     /// The narrowest `bandwidth_hz` a job may give the mode; `null` for no minimum.
     #[serde(default)]
     pub min_hz: Option<u64>,
-    /// The span `[lo, hi]` the mode is found anywhere in (radiosondes in 400-406 MHz);
-    /// `null` for none.
+    /// Where identify tries the mode: one span `[lo, hi]` (radiosondes in 400-406 MHz) or
+    /// a list of them (`[[lo, hi], ...]`, pagers on VHF and UHF); `null` for anywhere.
     #[serde(default)]
-    pub range_hz: Option<[u64; 2]>,
+    #[schemars(schema_with = "ranges_schema")]
+    pub range_hz: Option<Ranges>,
 }
 
 impl Band {
@@ -358,6 +359,63 @@ impl Band {
     pub fn fits(&self, bandwidth_hz: u64) -> bool {
         self.min_hz.unwrap_or(self.bandwidth_hz) <= bandwidth_hz
     }
+}
+
+/// A row's `band.range_hz`: the spans `[lo, hi]` (inclusive) it is found anywhere in.
+/// Read as one span `[lo, hi]` or a list of them; written as one span when it holds one
+/// (as every row read before lists were), so a client that knows only that form still
+/// reads a one-range row. [`validate`] refuses an empty list and a span with `lo >= hi`;
+/// spans may overlap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ranges(pub Vec<[u64; 2]>);
+
+impl Ranges {
+    /// Whether `hz` lies in any of the spans.
+    pub fn contains(&self, hz: u64) -> bool {
+        self.0.iter().any(|&[lo, hi]| (lo..=hi).contains(&hz))
+    }
+}
+
+impl From<[u64; 2]> for Ranges {
+    fn from(span: [u64; 2]) -> Self {
+        Ranges(vec![span])
+    }
+}
+
+impl Serialize for Ranges {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.0.as_slice() {
+            [one] => one.serialize(s),
+            all => all.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Ranges {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged, expecting = "a range [lo, hi] or a list of them")]
+        enum Form {
+            One([u64; 2]),
+            Many(Vec<[u64; 2]>),
+        }
+        Ok(match Form::deserialize(d)? {
+            Form::One(span) => Ranges(vec![span]),
+            Form::Many(spans) => Ranges(spans),
+        })
+    }
+}
+
+/// Schema of `band.range_hz`: one `[lo, hi]`, a non-empty list of them, or `null`.
+fn ranges_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let span = g.subschema_for::<[u64; 2]>();
+    schemars::json_schema!({
+        "anyOf": [
+            span,
+            {"type": "array", "items": span, "minItems": 1},
+            {"type": "null"},
+        ]
+    })
 }
 
 /// The decoder: a graph template, an external program, or a frame chain.
@@ -1027,13 +1085,19 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             ));
         }
     }
-    if let Some([lo, hi]) = row.band.range_hz
-        && lo >= hi
-    {
-        return Err(RowError::new(
-            "band.range_hz",
-            format!("[{lo}, {hi}] must be [lo, hi] with lo < hi"),
-        ));
+    if let Some(ranges) = &row.band.range_hz {
+        if ranges.0.is_empty() {
+            return Err(RowError::new(
+                "band.range_hz",
+                "must list at least one range",
+            ));
+        }
+        if let Some([lo, hi]) = ranges.0.iter().find(|[lo, hi]| lo >= hi) {
+            return Err(RowError::new(
+                "band.range_hz",
+                format!("[{lo}, {hi}] must be [lo, hi] with lo < hi"),
+            ));
+        }
     }
     // Every event field the row names: the summary's, the position map's, the time's.
     let mut named: Vec<(String, String)> = summary_fields(&row.event.summary)?
@@ -1712,7 +1776,46 @@ mod tests {
         });
         let row = parse(&text).unwrap();
         validate(&row, &no_stages()).unwrap();
-        assert_eq!(row.band.range_hz, Some([400_050_000, 406_000_000]));
+        assert_eq!(
+            serde_json::to_value(&row.band).unwrap()["range_hz"],
+            serde_json::json!([400_050_000, 406_000_000])
+        );
+        // In a list, each range is checked, and the list must not be empty.
+        let reversed = serde_json::json!([[138_000_000, 175_000_000], [470_000_000, 450_000_000]]);
+        let text = edited(ADSB, |v| v["band"]["range_hz"] = reversed);
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(e.field, "band.range_hz", "{e}");
+        assert!(e.error.contains("[470000000, 450000000]"), "{e}");
+        let text = edited(ADSB, |v| v["band"]["range_hz"] = serde_json::json!([]));
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new("band.range_hz", "must list at least one range"),
+            "{e}"
+        );
+    }
+
+    /// `band.range_hz` is one range `[lo, hi]`, as every row before lists was, or a list
+    /// of them (overlapping allowed). A row of one range writes it back as it was read,
+    /// so a client that knows only the one-range form reads it unchanged.
+    #[test]
+    fn range_hz_is_one_range_or_a_list() {
+        let read = |range: serde_json::Value| {
+            let text = edited(ADSB, |v| v["band"]["range_hz"] = range);
+            let row = parse(&text).unwrap();
+            validate(&row, &no_stages()).unwrap();
+            serde_json::to_value(&row.band).unwrap()["range_hz"].clone()
+        };
+        let one = serde_json::json!([400_050_000, 406_000_000]);
+        assert_eq!(read(one.clone()), one);
+        let two = serde_json::json!([[138_000_000, 175_000_000], [450_000_000, 470_000_000]]);
+        assert_eq!(read(two.clone()), two);
+        let overlapping =
+            serde_json::json!([[138_000_000, 175_000_000], [170_000_000, 180_000_000]]);
+        assert_eq!(read(overlapping.clone()), overlapping);
+        // A list of one is one range.
+        assert_eq!(read(serde_json::json!([[400_050_000, 406_000_000]])), one);
+        assert_eq!(read(serde_json::Value::Null), serde_json::Value::Null);
     }
 
     #[test]

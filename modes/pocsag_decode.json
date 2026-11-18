@@ -4,7 +4,8 @@
   "family": "pagers",
   "band": {
     "bandwidth_hz": 12500,
-    "centers_hz": [148637500, 466075000]
+    "centers_hz": [148637500, 466075000],
+    "range_hz": [[138000000, 175000000], [450000000, 470000000], [927340000, 936660000]]
   },
   "modulation": ["fm", "fsk"],
   "label": "POCSAG",

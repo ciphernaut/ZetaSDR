@@ -4,8 +4,8 @@
 use super::{LoadedMode, ModeRegistry, ModeState};
 use crate::knowledge::Allocation;
 
-/// Score for the measured centre lying near one of the row's well-known centres or in
-/// its `range_hz` (granted when it has neither).
+/// Score for the measured centre lying near one of the row's well-known centres or, for
+/// a row without centres, in its `range_hz` (granted when it has neither).
 const CENTER_SCORE: f32 = 0.4;
 /// Score for the measured bandwidth lying within half to 1.5 times the row's.
 const BANDWIDTH_SCORE: f32 = 0.3;
@@ -112,16 +112,19 @@ pub struct Scored<'a> {
     /// Whether the band passed to [`score_rows`] is wide enough for the row
     /// ([`super::Band::fits`]).
     pub fits_band: bool,
-    /// Whether the measured centre lies in the row's `band.range_hz` (true for a row
-    /// without one); a row out of range scores nothing for the centre and never fits.
+    /// Whether the measured centre lies in one of the row's `band.range_hz` spans or
+    /// near one of its centres (true for a row without a range); a row out of range
+    /// scores nothing for the centre and never fits.
     pub in_range: bool,
 }
 
 /// The `ready` and `unavailable` rows of `modes` (a broken row is never tried) scored
 /// against a signal measured at `center_hz`, `bandwidth_hz` wide and labelled `layer1`:
-/// 0.4 when `center_hz` lies within `band.bandwidth_hz` of one of `band.centers_hz` or
-/// inside `band.range_hz` (or the row has neither, "anywhere"; a row whose `range_hz`
-/// and listed centres both exclude `center_hz` scores 0 for it, is not `in_range` and never `fits_band`); 0.3 when `bandwidth_hz`
+/// 0.4 when `center_hz` lies within `band.bandwidth_hz` of one of `band.centers_hz`, or,
+/// for a row that lists no centres, inside one of `band.range_hz`'s spans (or the row has
+/// neither, "anywhere"; a row whose `range_hz` and listed centres both exclude
+/// `center_hz` scores 0 for it, is not `in_range` and never `fits_band`; a row with
+/// centres is `in_range` anywhere in its spans, scored there without the term); 0.3 when `bandwidth_hz`
 /// lies within 0.5-1.5 times `band.bandwidth_hz`; 0.3 when `layer1` is in `modulation`
 /// (never for an empty list); plus the best `catalogue(id)` among the row's `catalogue`
 /// ids, so a catalogue match can lift a row above 1; plus `allocation(row)` (the
@@ -143,15 +146,18 @@ pub fn score_rows<'a>(
             let band = &m.row.band;
             let in_range = band
                 .range_hz
-                .is_some_and(|[lo, hi]| (lo..=hi).contains(&center_hz));
+                .as_ref()
+                .is_some_and(|r| r.contains(center_hz));
             let near = band
                 .centers_hz
                 .iter()
                 .any(|&c| center_hz.abs_diff(c) <= band.bandwidth_hz);
             // A row with a range and no listed centre near excludes a centre outside it.
             let in_range_or_none = band.range_hz.is_none() || in_range || near;
-            let center = in_range_or_none
-                && (in_range || near || (band.centers_hz.is_empty() && band.range_hz.is_none()));
+            // A row's listed centres say where it is: its range then only bounds where it
+            // is tried. A row without centres is credited anywhere in its range.
+            let center =
+                near || (band.centers_hz.is_empty() && (in_range || band.range_hz.is_none()));
             let bw = band.bandwidth_hz as f64;
             let width = (bw * 0.5..=bw * 1.5).contains(&(bandwidth_hz as f64));
             let modulation = m.row.modulation.iter().any(|l| l == layer1);
@@ -307,7 +313,7 @@ mod tests {
         let mut modes = registry();
         add_row(&mut modes, "sonde", |r| {
             r.band.centers_hz = vec![];
-            r.band.range_hz = Some([400_050_000, 406_000_000]);
+            r.band.range_hz = Some([400_050_000, 406_000_000].into());
             r.band.bandwidth_hz = 10_000;
             r.modulation = vec![];
             r.catalogue = vec![];
@@ -328,11 +334,85 @@ mod tests {
         assert_eq!(sonde(410_000_000), 0.0);
         // A centre near a listed one still scores, range or not.
         add_row(&mut modes, "both", |r| {
-            r.band.range_hz = Some([400_050_000, 406_000_000]);
+            r.band.range_hz = Some([400_050_000, 406_000_000].into());
         });
         let both = score_rows(&modes, 1_090_000_000, 1, "noise", &|_| 0.0, &|_| 0.0);
         let both = both.iter().find(|s| s.mode.row.id.0 == "both").unwrap();
         assert!((both.score - CENTER_SCORE).abs() < 1e-6, "{}", both.score);
+    }
+
+    /// A row's `band` as `json` gives it.
+    fn band(json: serde_json::Value) -> super::super::Band {
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// A row of two ranges is in range in either, and out between them.
+    #[test]
+    fn a_two_range_row_is_in_range_in_both_and_out_between() {
+        let mut modes = registry();
+        add_row(&mut modes, "pager", |r| {
+            r.band = band(serde_json::json!({
+                "bandwidth_hz": 12_500, "centers_hz": [],
+                "range_hz": [[138_000_000, 175_000_000], [450_000_000, 470_000_000]],
+            }));
+            r.modulation = vec![];
+            r.catalogue = vec![];
+        });
+        let pager = |center_hz| {
+            let scored = score_rows(&modes, center_hz, 12_500, "noise", &|_| 0.0, &|_| 0.0);
+            let s = scored.iter().find(|s| s.mode.row.id.0 == "pager").unwrap();
+            (s.in_range, s.fits_band, s.score)
+        };
+        let both = CENTER_SCORE + BANDWIDTH_SCORE;
+        for center_hz in [148_000_000, 175_000_000, 450_000_000, 466_000_000] {
+            let (in_range, fits, score) = pager(center_hz);
+            assert!(in_range && fits, "{center_hz}");
+            assert!((score - both).abs() < 1e-6, "{center_hz}: {score}");
+        }
+        for center_hz in [137_000_000, 300_000_000, 470_000_001] {
+            let (in_range, fits, score) = pager(center_hz);
+            assert!(!in_range && !fits, "{center_hz}");
+            assert!(
+                (score - BANDWIDTH_SCORE).abs() < 1e-6,
+                "{center_hz}: {score}"
+            );
+        }
+    }
+
+    /// A row that lists centres scores the centre term near them only: its range bounds
+    /// where it is tried, so a centre elsewhere in the range is a candidate scored
+    /// without it (POCSAG over all of 138-175 MHz does not tie APRS on 144.8 MHz).
+    #[test]
+    fn a_range_bounds_a_row_with_centres_without_crediting_its_centre() {
+        let mut modes = registry();
+        add_row(&mut modes, "pager", |r| {
+            r.band = band(serde_json::json!({
+                "bandwidth_hz": 12_500, "centers_hz": [148_637_500],
+                "range_hz": [[138_000_000, 175_000_000], [450_000_000, 470_000_000]],
+            }));
+            r.modulation = vec![];
+            r.catalogue = vec![];
+        });
+        let pager = |center_hz| {
+            let scored = score_rows(&modes, center_hz, 12_500, "noise", &|_| 0.0, &|_| 0.0);
+            let s = scored.iter().find(|s| s.mode.row.id.0 == "pager").unwrap();
+            (s.in_range, s.score)
+        };
+        let (in_range, score) = pager(148_637_500);
+        assert!(in_range);
+        assert!(
+            (score - CENTER_SCORE - BANDWIDTH_SCORE).abs() < 1e-6,
+            "{score}"
+        );
+        for center_hz in [144_800_000, 460_000_000] {
+            let (in_range, score) = pager(center_hz);
+            assert!(in_range, "{center_hz}");
+            assert!(
+                (score - BANDWIDTH_SCORE).abs() < 1e-6,
+                "{center_hz}: {score}"
+            );
+        }
+        assert!(!pager(300_000_000).0);
     }
 
     #[test]

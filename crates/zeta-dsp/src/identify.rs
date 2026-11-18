@@ -592,12 +592,44 @@ mod tests {
             .collect()
     }
 
+    /// Decode-to-identify over the embedded rows and six operator rows on 300 MHz, more
+    /// than the built-in rows' ranges leave in classify's reach on any one channel: five
+    /// 12.5 kHz AM copies of the POCSAG row and, sorting after them at the same score, a
+    /// 25 kHz one, which a register candidate of its own width lifts into the five.
+    fn d_crowded(dir: &std::path::Path) -> DecodeToIdentify {
+        let pocsag: serde_json::Value = ModeRegistry::embedded()
+            .into_iter()
+            .find(|(f, _)| f.ends_with("pocsag_decode.json"))
+            .map(|(_, t)| serde_json::from_str(t).unwrap())
+            .unwrap();
+        let rows = [
+            ("crowd_a", "am", 12_500),
+            ("crowd_b", "am", 12_500),
+            ("crowd_c", "am", 12_500),
+            ("crowd_d", "am", 12_500),
+            ("crowd_e", "am", 12_500),
+            ("crowd_wide", "am", 25_000),
+        ];
+        for (id, label, bw) in rows {
+            let mut row = pocsag.clone();
+            row["id"] = id.into();
+            row["band"] = serde_json::json!({"bandwidth_hz": bw, "centers_hz": [300_000_000]});
+            row["modulation"] = serde_json::json!([label]);
+            row["catalogue"] = serde_json::json!([]);
+            std::fs::write(dir.join(format!("{id}.json")), row.to_string()).unwrap();
+        }
+        let mut stages = StageRegistry::new();
+        crate::register_all(&mut stages);
+        DecodeToIdentify::new(Arc::new(ModeRegistry::load(&stages, Some(dir))).into())
+    }
+
     /// The register may only reorder what classify tries (design 2, anti-goals): a
     /// register whose candidate fits the sixth row by the measurement does not bring it
     /// into the five tried, and does not push one of them out.
     #[tokio::test]
     async fn the_register_reorders_the_rows_tried_and_never_changes_the_set() {
-        let d = d();
+        let dir = tempfile::tempdir().unwrap();
+        let d = d_crowded(dir.path());
         let modes = d.modes.get().unwrap();
         // A measurement on one of the rows' own channels where a register candidate
         // fitting the sixth row by the measurement alone would lift it into the five.

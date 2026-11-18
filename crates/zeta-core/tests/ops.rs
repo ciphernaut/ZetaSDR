@@ -3361,6 +3361,44 @@ async fn an_unknown_mode_id_names_the_known_ids() {
     assert_eq!(port.current(), None);
 }
 
+/// A row's `band.range_hz` bounds only what identify tries: `job_start` runs the row
+/// wherever it is asked to, here POCSAG between its VHF and UHF ranges.
+#[tokio::test]
+async fn job_start_runs_a_row_outside_its_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stages = registry();
+    zeta_dsp::register_all(&mut stages);
+    let port = Arc::new(WidePort::new("rtl0"));
+    let node = Node::open(cfg(dir.path()), stages, vec![port.clone() as Arc<dyn Port>])
+        .await
+        .unwrap();
+    let pocsag = node.modes();
+    let pocsag = pocsag.get("pocsag_decode").unwrap();
+    let range = serde_json::to_value(&pocsag.row.band).unwrap()["range_hz"].clone();
+    assert_eq!(
+        range,
+        serde_json::json!([
+            [138_000_000, 175_000_000],
+            [450_000_000, 470_000_000],
+            [927_340_000, 936_660_000]
+        ])
+    );
+    let op: Op = serde_json::from_value(serde_json::json!({
+        "op": "job_start", "kind": "pocsag_decode", "source": "rtl0",
+        "center_hz": 300_000_000u64, "bandwidth_hz": 12_500, "deviation_hz": null,
+        "sideband": null, "elastic": false, "replace": [],
+    }))
+    .unwrap();
+    let id = match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        other => panic!("expected a job, got {other:?}"),
+    };
+    let rec = node.job_list().into_iter().find(|r| r.id == id).unwrap();
+    assert_eq!(rec.state, JobState::Running, "{rec:?}");
+    assert_eq!(rec.tuning.center_hz, Hz(300_000_000));
+    node.job_stop(&id).await.unwrap();
+}
+
 /// Built-in kinds keep their wire names; any other lowercase id is a mode; anything
 /// else does not deserialise.
 #[test]

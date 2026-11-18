@@ -127,6 +127,23 @@ fn span_fits(row_hz: u64, signal_hz: u64, floor_hz: u64) -> bool {
     fits_within(fit, row_hz, signal_hz)
 }
 
+/// The band an identify run on `s` takes and its queue score: the best-scoring ready
+/// row of `modes` (`score_rows` at the signal's centre and width) in range for the
+/// signal's centre that fits the signal (its measured width within [`WIDTH_FIT`] of the
+/// row's band) and a watch band `watch_hz` wide, else the signal's own width at score 0.
+fn identify_band(modes: &ModeRegistry, watch_hz: u64, s: &Signal) -> (u64, f32) {
+    score_rows(modes, s.center_hz, s.bandwidth_hz, "", &|_| 0.0, &|_| 0.0)
+        .into_iter()
+        .filter(|x| x.mode.state == ModeState::Ready && x.in_range)
+        .find(|x| {
+            let band = &x.mode.row.band;
+            width_fits(band.bandwidth_hz, s.bandwidth_hz) && band.bandwidth_hz <= watch_hz
+        })
+        .map_or((s.bandwidth_hz, 0.0), |x| {
+            (x.mode.row.band.bandwidth_hz, x.score)
+        })
+}
+
 /// Whether a signal `signal_hz` wide fits a row `row_hz` wide by [`WIDTH_FIT`].
 fn width_fits(row_hz: u64, signal_hz: u64) -> bool {
     fits_within(WIDTH_FIT, row_hz, signal_hz)
@@ -1095,29 +1112,9 @@ impl Inner {
         };
     }
 
-    /// The band an identify run on `s` takes and its queue score: the best-scoring ready
-    /// row (`score_rows` at the signal's centre and width) that fits the signal (its
-    /// measured width within [`WIDTH_FIT`] of the row's band) and the watch's band, else
-    /// the signal's own width at score 0.
+    /// [`identify_band`] of `s` with the node's rows and the watch's band.
     fn identify_band(&self, r: &Run, s: &Signal) -> (u64, f32) {
-        score_rows(
-            &self.modes(),
-            s.center_hz,
-            s.bandwidth_hz,
-            "",
-            &|_| 0.0,
-            &|_| 0.0,
-        )
-        .into_iter()
-        .filter(|x| x.mode.state == ModeState::Ready)
-        .find(|x| {
-            let band = &x.mode.row.band;
-            width_fits(band.bandwidth_hz, s.bandwidth_hz)
-                && band.bandwidth_hz <= r.tuning.bandwidth_hz.0
-        })
-        .map_or((s.bandwidth_hz, 0.0), |x| {
-            (x.mode.row.band.bandwidth_hz, x.score)
-        })
+        identify_band(&self.modes(), r.tuning.bandwidth_hz.0, s)
     }
 
     /// The rows of the policy's `modes` that fit `s`, with their widths: ready, its
@@ -2764,6 +2761,26 @@ mod tests {
             fits: Vec::new(),
             waiting: false,
         }
+    }
+
+    /// The width an identify run takes comes only from rows in range for the signal's
+    /// centre: the 8 MHz `dvbt_decode` (174-862 MHz) sets it at 500 MHz, not at 1.3 GHz.
+    #[test]
+    fn identify_band_ignores_an_out_of_range_wide_row() {
+        let mut modes = ModeRegistry::load(&crate::stage::StageRegistry::new(), None);
+        modes.set_program("dvbt_decode", Some("/stand-in".into()), None);
+        let signal = |center_hz| Signal {
+            center_hz,
+            bandwidth_hz: 7_000_000,
+            ..tracked(0, 0).signal
+        };
+        let (band_hz, score) = identify_band(&modes, 20_000_000, &signal(500_000_000));
+        assert_eq!(band_hz, 8_000_000);
+        assert!(score > 0.0, "{score}");
+        assert_eq!(
+            identify_band(&modes, 20_000_000, &signal(1_300_000_000)),
+            (7_000_000, 0.0)
+        );
     }
 
     #[test]

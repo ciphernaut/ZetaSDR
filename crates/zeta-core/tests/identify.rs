@@ -476,18 +476,22 @@ async fn identify_on_a_tone_ends_unknown_with_a_label() {
     eprintln!("{events:#?}");
     let tried: Vec<&Value> = events.iter().filter(|e| !e["job"].is_null()).collect();
     let modes: Vec<&str> = tried.iter().map(|e| e["mode"].as_str().unwrap()).collect();
-    // AIS (162 MHz only) is not tried at 144.8 MHz.
-    assert_eq!(modes.len(), 6, "{events:#?}");
+    // AIS (162 MHz only) and ACARS (the VHF aeronautical band) are not tried at
+    // 144.8 MHz.
+    assert_eq!(modes.len(), 5, "{events:#?}");
     for m in [
         "dmr_decode",
         "p25_decode",
         "aprs_decode",
         "m17_decode",
         "pocsag_decode",
-        "acars_decode",
     ] {
         assert!(modes.contains(&m), "{m} not tried: {events:#?}");
     }
+    let acars = outcome(&events, "acars_decode").expect("acars_decode's candidate");
+    assert_eq!(acars["outcome"], "skipped_band", "{acars}");
+    let evidence = acars["evidence"].as_str().unwrap_or_default();
+    assert!(evidence.contains("outside the row's range"), "{acars}");
     for e in &tried {
         assert_eq!(e["outcome"], "no_frame", "{e}");
     }
@@ -497,7 +501,7 @@ async fn identify_on_a_tone_ends_unknown_with_a_label() {
     let label = verdict["label"].as_str().unwrap();
     assert!(label == "carrier" || label == "fm", "{ctx}");
     assert!(verdict["features"]["bandwidth_hz"].is_u64(), "{ctx}");
-    assert_eq!(ctx["identify"]["attempts"], 6, "{ctx}");
+    assert_eq!(ctx["identify"]["attempts"], 5, "{ctx}");
     assert!(running(&node).is_empty(), "{:?}", running(&node));
     assert!(node.lease_holders(&rx()).is_empty());
 }
