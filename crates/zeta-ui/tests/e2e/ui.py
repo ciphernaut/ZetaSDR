@@ -472,10 +472,12 @@ def scenario_a_drags_pointer_moves_cost_one_piece_of_work_per_frame(page, url, s
     perf = page.evaluate("window.zetaPerf")
     assert perf["pointerWork"] == 1, f"50 moves in one frame did {perf['pointerWork']} pieces of work"
     # A drag whose last moves and release share a frame ends on the release's position.
+    page.evaluate("window.zetaLastSelection = null")
     page.evaluate(POINTER_BURST_JS, [20, True])
     sel = page.evaluate("window.zetaLastSelection")
     page.mouse.up()
     # The same end point reached by one move and a release is the same selection.
+    page.evaluate("window.zetaLastSelection = null")
     page.mouse.move(box["x"] + 300, box["y"] + 100)
     page.mouse.down()
     page.mouse.move(box["x"] + 300 + 40, box["y"] + 100 + 60)
@@ -4595,6 +4597,46 @@ def scenario_drag_body_moves_the_centre_and_a_short_drag_is_a_click(page, url, s
         page.mouse.up()
         page.wait_for_timeout(200)
         assert seen == [], f"the release after a cancel sent {[r.post_data for r in seen]}"
+        # An outline drag coalesces too: 30 moves in one task do no work until the frame,
+        # one piece then, and a release in the same task as moves wins over them.
+        x, y = centre_of(outline_box(page, job))
+        before = job_record(url, secret, job)["tuning"]["center_hz"]
+        page.mouse.move(x, y)
+        page.mouse.down()
+        burst = page.evaluate(
+            """([x, y, n, id]) => {
+              const el = document.querySelector('#waterfall .outline[data-key="' + id + '"]');
+              const z = window.zetaPerf;
+              const b = {...z};
+              for (let i = 1; i <= n; i++)
+                el.dispatchEvent(new PointerEvent('pointermove', {clientX: x, clientY: y + i * 2,
+                                 pointerId: 1, button: 0, bubbles: true}));
+              return {events: z.pointerEvents - b.pointerEvents, work: z.pointerWork - b.pointerWork};
+            }""", [x, y, 30, job])
+        assert burst == {"events": 30, "work": 0}, f"outline work done inside the task: {burst}"
+        page.wait_for_function(
+            "() => window.zetaPerf.pointerWork >= 1", timeout=3_000)
+        page.wait_for_timeout(300)
+        work = page.evaluate("window.zetaPerf.pointerWork")
+        with page.expect_request(is_op("job_retune")) as req:
+            page.evaluate(
+                """([x, y, id]) => {
+                  const el = document.querySelector('#waterfall .outline[data-key="' + id + '"]');
+                  for (let i = 31; i <= 40; i++)
+                    el.dispatchEvent(new PointerEvent('pointermove', {clientX: x, clientY: y + i * 2,
+                                     pointerId: 1, button: 0, bubbles: true}));
+                  el.dispatchEvent(new PointerEvent('pointerup', {clientX: x, clientY: y + 80,
+                                   pointerId: 1, button: 0, bubbles: true}));
+                }""", [x, y, job])
+        body = json.loads(req.value.post_data)
+        assert page.evaluate("window.zetaPerf.pointerWork") == work + 1, \
+            "the release applies its own position once, the pending frame's work is dropped"
+        assert abs(body["center_hz"] - (before - 80 * hzpp)) <= 1.5 * hzpp, \
+            f"the retune is not the release's position: {body} from {before}"
+        page.mouse.up()
+        wait_until(lambda: job_record(url, secret, job)["tuning"]["center_hz"]
+                   == body["center_hz"], 5.0, "the record follows")
+        page.evaluate("window.zetaTest.poll()")
         # A band a few px tall: the handles sit outside it, so the body still moves it.
         small = start_job(url, secret, "passthrough", "retune", cur + 12_000, 1000)
         try:
@@ -6481,6 +6523,17 @@ def scenario_the_mix_row_shows_the_pages_own_starvation_count(page, url, secret)
         mix = mix_jobs(url, secret)[0]["id"]
         now = page.locator(f'#jobs .job[data-id="{mix}"] .mix-now')
         expect(now).to_be_visible()
+        # The player rewrites its fields on every frame, so stop the frames first: with its
+        # only demodulator gone the mix sends nothing, and the page's counters stand still.
+        stop_job(url, secret, demod)
+        wait_until(lambda: page.evaluate("window.zetaAudio.playing") == mix, 3.0, "still playing")
+        seen = {"n": -1}
+
+        def quiet():
+            n = page.evaluate("window.zetaAudio.framesPlayed")
+            was, seen["n"] = seen["n"], n
+            return n == was
+        wait_until(quiet, 10.0, "no more frames", step_s=0.6)
         # What the player records on a dry re-anchor (planFrame is tested apart): the row
         # says so, as the page's count and not the node's.
         page.evaluate("() => { window.zetaAudio.gaps = 7; window.zetaAudio.leadMs = 350; }")
