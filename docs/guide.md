@@ -728,7 +728,7 @@ line takes `source pin --center-hz N --bandwidth-hz N [--replace ID]`, `source u
 gain DB|auto` for the selected source. A `fm_demod`/`am_demod` row whose channel is idle shows a
 `squelch` tag.
 
-View policies shape this, set from the command line and kept for the browser (its `localStorage`, under `zeta.view_policies`): a new tab starts from what was set, and a change in one tab applies in the other open tabs at once. The ones about what a tab is looking at stay per tab, in its `sessionStorage`: `follow`, `scanner`, `plan`, `main`, `map`, `pane` and `subjects`.
+View policies shape this, set from the command line and kept for the browser (its `localStorage`, under `zeta.view_policies`): a new tab starts from what was set, and a change in one tab applies in the other open tabs at once. The ones about what a tab is looking at stay per tab, in its `sessionStorage`: `follow`, `scanner`, `plan`, `main`, `map`, `pane` and `subjects`. A page from before this split kept every policy per tab: the first tab of the newer page to load brings its own look and layout into the shared store, and every tab after it takes that store.
 
 | Key | Values (default first) |
 |---|---|

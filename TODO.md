@@ -16,6 +16,14 @@ One line each, from the round's reviews:
 - **Docs:** three design documents under `docs/superpowers` still name a network operator beside a pager frequency; field craft no longer does.
 - **Clients:** a client built before this round refuses this node's `channel_plans` answer, its `signature_*` answers and a modes answer holding a several-range row (new fields on strict types). Say so in the next release notes.
 
+## Left from cleanup round 3 (2026-11-19)
+
+One line each, from the round's reviews:
+- **Fit:** the box menu's plan rule is still capped by the box drawn (the line says `capped by the box`), where the outline fit's is capped by the capture only; if a narrow drag over a voice channel should start at the channel's width, cap it by the capture there too. Two overlapping plans give no plan rule rather than a pick. Closing the menu during a fit does not stop its second measure (the own band after a wide box found nothing): it is started and stopped anyway.
+- **Drag:** the overlay's rect is read once per drag, so a scroll or resize mid-drag skews the selection (negligible so far).
+- **Overlays:** under `dir rtl` a ribbon's accent border moves to the other side (cosmetic); the name `overCap` in `overlays.js` now means "no feed".
+- **Rollback:** a page older than this round reads `radio_policy` and `radio_prefer` only from `zeta.radio_prefs`, which this one moves into the shared store and deletes, and every other shared policy only per tab: after a rollback the agent's radio policy starts from `focus` with no preference list, and a policy set since in one tab is not seen.
+
 ## UI: themes as folders (plan 26)
 
 Merged to `main` 576002a and deployed on test_host 2026-11-04: spec `docs/superpowers/specs/2026-11-03-themes-design.md`, plan `docs/superpowers/plans/2026-11-03-themes.md`. Themes are folders (`theme.json` + `style.css`) under repo-root `themes/` (console, plain, cyberpunk, terminal, psytrance, vibecoder), the operator's own in `--themes-dir`, listed by `themes_list` / `zeta themes list`, served at `/ui/themes/<id>/`; the author's guide is `docs/themes.md`, the UAT section is "Plan 26: themes". Mobile and other per-device layouts are later (see the footprints entry below).
