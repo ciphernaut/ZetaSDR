@@ -21,7 +21,7 @@
 //   capture that is not pinned, one `capture_delete` each, and notes
 //   `deleted <n> captures` with `(<m> pinned kept)` or the failures appended).
 //   Packet captures (`packets_list`, polled with the rest) are `tr.packet-capture[data-id]` rows
-//   after the IQ ones: the time, the decoder row's name and the frequency (`APRS packet radio
+//   after the IQ ones: the time, the decoder row's label (its name when it has none) and the frequency (`APRS
 //   144.8000 MHz`), the size, `<n> packets`, `recording` while `writing`, and under `td.actions` an
 //   `a.packets-download` (href `/captures/<id>.pcapng`, `download`; a click fetches it with the
 //   bearer and saves a Blob, the secret never in a URL) and Delete (`packets_delete`, armed like
@@ -120,8 +120,7 @@ class ExplorePane {
     this.panes = panes;
     this.captures = [];
     this.packetCaptures = []; // packets_list's records, newest first
-    this.rowNames = new Map(); // decoder row id -> its name (modes_list, read with the first record)
-    this.modesRead = false;
+    this.rowNames = new Map(); // decoder row id -> its label (modes_show)
     this.baseline = null; // the ids the first poll listed (null before it answers)
     this.selected = false; // the auto-select happened (once per load)
     this.everShown = false; // the pane was shown this load
@@ -207,7 +206,7 @@ class ExplorePane {
     const p = pkts.status === "fulfilled" ? pkts.value : null;
     if (p && p.result === "packet_captures" && Array.isArray(p.value)) {
       this.packetCaptures = p.value;
-      if (p.value.length) await this.readRowNames();
+      await this.readRowNames();
     }
     const s = sigs.status === "fulfilled" ? sigs.value : null;
     if (s && s.result === "signatures" && Array.isArray(s.value)) {
@@ -310,15 +309,18 @@ class ExplorePane {
     this.restoreField(place);
   }
 
-  // The decoder rows' names, read once (a failure is tried again at the next poll).
+  // The labels of the decoder rows the packet captures name (`modes_show` each once; a row
+  // with no label gives its name, one that is no row stays as its id).
   async readRowNames() {
-    if (this.modesRead) return;
-    try {
-      const r = await this.api.op({ op: "modes_list", family: null, state: null });
-      for (const m of r?.value?.modes || []) this.rowNames.set(m.id, m.name);
-      this.modesRead = true;
-    } catch {
-      // The id stands in for the name.
+    for (const id of new Set(this.packetCaptures.map((c) => c.mode).filter(Boolean))) {
+      if (this.rowNames.has(id)) continue;
+      try {
+        const r = await this.api.op({ op: "modes_show", id });
+        const row = r?.value?.mode?.row;
+        this.rowNames.set(id, row ? row.label || row.name || id : id);
+      } catch {
+        // The id stands in for the label until the next poll.
+      }
     }
   }
 

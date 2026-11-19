@@ -250,7 +250,7 @@ def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
     for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2",
-                   "dmr", "packets", "kiwi"):
+                   "dmr", "kiwi"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -10840,18 +10840,18 @@ def scenario_explore_what_is_this_and_delete(page, url, secret):
 def scenario_packet_capture(page, url, secret):
     # An APRS decoder's menu captures its packets: Explore lists the capture as it is
     # written (`recording`, a packet count), its link downloads a pcapng, Stop packet
-    # capture ends the recording and Delete removes the file. Self-seeding on the `packets`
-    # source (two invented stations looping), so it passes alone.
-    for j in running_jobs(url, secret, "packets", "packets"):
+    # capture ends the recording and Delete removes the file. Self-seeding on the `aprs`
+    # source (its packet looping), so it passes alone.
+    for j in running_jobs(url, secret, "packets", "aprs"):
         stop_job(url, secret, j["id"])
     wait_until(lambda: not any(c["writing"] for c in capture_ops(url, secret, "packets_list")),
                10, "old recordings ended")
     for c in capture_ops(url, secret, "packets_list"):
         capture_ops(url, secret, "packets_delete", capture=c["id"])
-    select_source(page, url, secret, "packets")
-    job = start_job(url, secret, "aprs_decode", "packets", 144_800_000, 12_500)
+    select_source(page, url, secret, "aprs")
+    job = start_job(url, secret, "aprs_decode", "aprs", 144_800_000, 12_500)
     # A job that is not a packet decoder offers neither entry.
-    other = start_job(url, secret, "passthrough", "packets", 144_800_000, 12_500)
+    other = start_job(url, secret, "passthrough", "aprs", 144_800_000, 12_500)
     menu = page.locator("#ctx-outline")
     row = '#explore tr.packet-capture'
     try:
@@ -10879,7 +10879,7 @@ def scenario_packet_capture(page, url, secret):
             " return !!r && r.children[4].textContent === 'recording'"
             " && parseInt(r.children[3].textContent, 10) >= 1; }", timeout=20_000)
         expect(page.locator(row)).to_have_count(1)
-        expect(page.locator(row)).to_contain_text("APRS packet radio 144.8000 MHz")
+        expect(page.locator(row)).to_contain_text("APRS 144.8000 MHz")
         # Delete is disabled while it records.
         expect(page.locator(row + ' button[data-action="delete"]')).to_be_disabled()
         link = page.locator(row + " a.packets-download")
@@ -10912,7 +10912,7 @@ def scenario_packet_capture(page, url, secret):
         expect(page.locator(row)).to_have_count(0, timeout=20_000)
         assert capture_ops(url, secret, "packets_list") == []
     finally:
-        for j in running_jobs(url, secret, "packets", "packets"):
+        for j in running_jobs(url, secret, "packets", "aprs"):
             stop_job(url, secret, j["id"])
         stop_job(url, secret, other)
         stop_job(url, secret, job)

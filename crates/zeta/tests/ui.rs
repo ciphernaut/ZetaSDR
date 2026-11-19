@@ -11,8 +11,7 @@
 //! relabelled at 476.9 MHz, channel 20 of the CB plan), `quiet` (1 s of low complex noise at
 //! 20 MHz, which `measure` labels `noise`; see [`quiet_fixture`]), `fsk` (framed 2-FSK at
 //! 433.92 MHz, the Bits pane's; see [`fsk_fixture`]), `dmr` (a DMR repeater with a call on
-//! each slot, at 450 MHz; see [`dmr_fixture`]), `packets` (two invented APRS stations looping,
-//! at 144.8 MHz; [`aprs_fixture`], the packet capture scenario's), and `--modes-dir` holding the
+//! each slot, at 450 MHz; see [`dmr_fixture`]), and `--modes-dir` holding the
 //! `fake_pos` program row (zeta-ext's `fake_lines`, printing two fixes of one sonde 2 s into a
 //! job; see [`fake_pos_row`]) and `--sets-dir` holding [`fake_sets`]' `two_sources`, and
 //! `kiwi`, a KiwiSDR on 127.0.0.1 (zeta-source-kiwi's `FakeKiwi`, see [`start_fake_kiwi`]),
@@ -45,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{ServeProc, aprs_fixture, speech_fixture};
+use common::{ServeProc, speech_fixture};
 use zeta_ext::testing::acma_stub::{self, Mode};
 use zeta_source_kiwi::testing::{FakeCarrier, FakeKiwi, FakeScript, FakeWf};
 use zeta_speech::testing::FakeDaemon;
@@ -1086,10 +1085,6 @@ impl Nodes {
         let fsk = format!("fsk={}", fsk_fixture(dir.path()).display());
         // A DMR repeater with a call on each slot: the job row's stream picker.
         let dmr = format!("dmr={}", dmr_fixture(dir.path()).display());
-        // Two invented APRS stations looping, in a directory of their own: the packet capture
-        // scenario's source (`packets`).
-        let packets_dir = tempfile::tempdir().unwrap();
-        let packets = format!("packets={}", aprs_fixture(packets_dir.path()).display());
         // Two sources carry the same analog video recording (the video scenarios).
         let video_meta = video_fixture(dir.path());
         let video = format!("video={}", video_meta.display());
@@ -1146,8 +1141,6 @@ impl Nodes {
                 "--source-file",
                 &dmr,
                 "--source-file",
-                &packets,
-                "--source-file",
                 &video,
                 "--source-file",
                 &video2,
@@ -1198,7 +1191,7 @@ impl Nodes {
             shortring,
             rebuild_meta,
             _voiced,
-            dirs: vec![dir, sock_dir, nostt_dir, llm_dir, short_dir, packets_dir],
+            dirs: vec![dir, sock_dir, nostt_dir, llm_dir, short_dir],
             _kiwi: kiwi,
             _kiwi_rt: kiwi_rt,
         }
