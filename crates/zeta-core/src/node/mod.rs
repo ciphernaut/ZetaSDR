@@ -459,6 +459,8 @@ struct Inner {
     themes: RwLock<Arc<crate::themes::ThemeRegistry>>,
     /// The `capture` jobs' windows, opened (and expired) at `open`.
     bursts: Arc<crate::bursts::BurstStore>,
+    /// The packet captures `packet_capture` jobs wrote, opened (and expired) at `open`.
+    packets: Arc<crate::packets::PacketStore>,
     /// The learned signatures, opened at `open`.
     signatures: Arc<crate::signatures::SignatureStore>,
     /// The exploration jobs' session records (see [`propose::record_session`]),
@@ -1260,6 +1262,11 @@ impl Node {
         if cfg.burst_policy.expire_at_open {
             bursts.expire();
         }
+        let packets =
+            crate::packets::PacketStore::open(&cfg.state_dir, cfg.burst_policy).map_err(io)?;
+        if cfg.burst_policy.expire_at_open {
+            packets.expire();
+        }
         let signatures = crate::signatures::SignatureStore::open(&cfg.state_dir).map_err(io)?;
         load_errors.extend(signatures.load_errors().iter().cloned());
         // Every node lists and scores its accepted signatures.
@@ -1323,6 +1330,7 @@ impl Node {
                 set_gate: tokio::sync::Mutex::new(()),
                 themes: RwLock::new(Arc::new(crate::themes::ThemeRegistry::load(None))),
                 bursts,
+                packets,
                 signatures,
                 sessions,
                 proposing: Mutex::new(()),
@@ -1666,6 +1674,11 @@ impl Node {
         let lines = modes.startup_lines();
         inner.modes.set(Arc::new(modes));
         Ok(lines)
+    }
+
+    /// The packet store: the pcapng captures `packet_capture` jobs wrote.
+    pub fn packets(&self) -> Arc<crate::packets::PacketStore> {
+        self.inner.packets.clone()
     }
 
     /// The burst store: the windows `capture` jobs wrote.

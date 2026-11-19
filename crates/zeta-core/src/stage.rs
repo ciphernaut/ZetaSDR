@@ -99,6 +99,9 @@ pub struct StageContext {
     /// The node's burst store, `Some` for every job in a node (only a `burst_capture`
     /// stage writes to it).
     pub bursts: Option<Arc<crate::bursts::BurstStore>>,
+    /// The node's packet capture store, `Some` for every job in a node (only a
+    /// `packet_capture` stage writes to it).
+    pub packets: Option<Arc<crate::packets::PacketStore>>,
 }
 
 impl StageContext {
@@ -114,6 +117,7 @@ impl StageContext {
             mix_inputs: None,
             station: None,
             bursts: None,
+            packets: None,
         }
     }
 

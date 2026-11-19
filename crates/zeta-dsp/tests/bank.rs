@@ -121,6 +121,7 @@ fn spawn(
         mix_inputs: None,
         station: None,
         bursts: None,
+        packets: None,
     };
     let (bus2, rx_in, c2) = (bus.clone(), root.subscribe(), cancel.clone());
     let stage = tokio::spawn(async move {

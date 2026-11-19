@@ -15,6 +15,7 @@ pub mod lease;
 pub mod modes;
 pub mod node;
 pub mod ops;
+pub mod packets;
 pub mod pcapng;
 pub mod plans;
 pub mod port;
