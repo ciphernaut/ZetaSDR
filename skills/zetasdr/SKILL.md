@@ -922,6 +922,15 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: iq
 - outputs: event, audio
 
+### packet_capture
+
+- inputs: packet
+- outputs: 
+- params.job: string
+- params.center_hz: integer
+- params.mode: string or null
+- params.access: string or null
+
 ### passthrough
 
 - inputs: iq, audio, video, text, event, sink, packet
@@ -986,7 +995,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 ### stream_in
 
 - inputs: 
-- outputs: audio
+- outputs: audio, packet
 - params.job: string
 - params.kind: string (StreamKind: iq|audio|video|text|event|sink|packet)
 - params.stream: string

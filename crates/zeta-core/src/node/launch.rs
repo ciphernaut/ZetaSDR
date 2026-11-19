@@ -22,6 +22,7 @@ use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
 use crate::modes::{Identity, Station};
 use crate::ops::{JobKind, local_hardware};
+use crate::packet_capture::PACKET_CAPTURE_KIND;
 use crate::port::{IqReceiver, Port, Tuning};
 use crate::ring::IqRing;
 use crate::stage::{Stage, StageContext, StageError, StageSpec};
@@ -78,8 +79,10 @@ impl Inner {
     ///
     /// An attached job (`rec.input`) never touches the radio: no port, lease, tune,
     /// bank or IQ stream. Its `stream_in` nodes are first pointed at the input job's
-    /// current audio stream (`InputNotRunning` / `NoAudioStream` otherwise), so a
-    /// resumed attached job reads the resumed input. A `mix` has no input and no port
+    /// current stream of their kind, and its `packet_capture` nodes given the input's
+    /// id, centre and mode row ([`Inner::point_attached`]; `InputNotRunning`,
+    /// `NoAudioStream` or `NoPacketStream` otherwise), so a resumed attached job reads
+    /// the resumed input. A `mix` has no input and no port
     /// either: its stage finds its audio through [`Inner::mix_inputs`].
     ///
     /// With `gate` (the source's gate, held by the caller) the lease is taken
@@ -131,8 +134,7 @@ impl Inner {
         );
         let port = match rec.input.clone() {
             Some(input) => {
-                let stream = self.audio_stream(&input, rec.stream.as_deref())?;
-                point_stream_in(&mut rec.graph, &input, &stream);
+                self.point_attached(&mut rec, &input)?;
                 None
             }
             None if rec.leaseless() => None,
@@ -1070,13 +1072,81 @@ impl Inner {
     }
 }
 
-/// Point every `stream_in` node of an attached job's graph at `stream` of `input`.
-fn point_stream_in(graph: &mut Graph, input: &JobId, stream: &StreamId) {
-    for n in graph.nodes.iter_mut().filter(|n| n.kind == STREAM_IN_KIND) {
-        if let Some(p) = n.params.as_object_mut() {
-            p.insert("job".into(), input.0.clone().into());
-            p.insert("stream".into(), stream.0.clone().into());
+impl Inner {
+    /// Point the attached record `rec`'s graph at its input job `input` as it runs now:
+    /// each `stream_in` node at the input's stream of the node's own `kind` (`packet`:
+    /// [`Inner::packet_stream`]; else audio, the record's voice `rec.stream` or the
+    /// main stream), and each `packet_capture` node's `job`, `center_hz`, `mode` and
+    /// `access` from the input's record and its kind's mode row, so a relaunch after the
+    /// input's retune captures under its new centre. `InputNotRunning`,
+    /// `NoAudioStream`, `NoVoice` or `NoPacketStream` when a stream is not there.
+    fn point_attached(&self, rec: &mut JobRecord, input: &JobId) -> Result<(), NodeError> {
+        let mut pointed = false;
+        for n in rec
+            .graph
+            .nodes
+            .iter_mut()
+            .filter(|n| n.kind == STREAM_IN_KIND)
+        {
+            let kind = n
+                .params
+                .get("kind")
+                .and_then(|k| serde_json::from_value(k.clone()).ok());
+            let stream = match kind {
+                Some(StreamKind::Packet) => self.packet_stream(input)?,
+                _ => self.audio_stream(input, rec.stream.as_deref())?,
+            };
+            point_stream_in(n, input, &stream);
+            pointed = true;
         }
+        if !pointed {
+            // No `stream_in` (an operator's graph): the input must still run.
+            self.audio_stream(input, rec.stream.as_deref())?;
+        }
+        if !rec
+            .graph
+            .nodes
+            .iter()
+            .any(|n| n.kind == PACKET_CAPTURE_KIND)
+        {
+            return Ok(());
+        }
+        let (kind, center_hz) = {
+            let jobs = self.jobs.lock().unwrap();
+            let e = jobs
+                .get(input)
+                .ok_or_else(|| NodeError::InputNotRunning(input.clone()))?;
+            (e.record.kind.clone(), e.record.tuning.center_hz)
+        };
+        let modes = self.modes();
+        let row = self
+            .expandable_kind(&kind)
+            .and_then(|k| k.mode_row(&modes).ok().flatten());
+        let fill = serde_json::json!({
+            "job": input.0,
+            "center_hz": center_hz.0,
+            "mode": row.map(|r| r.id.0.clone()),
+            "access": row.and_then(|r| r.access),
+        });
+        for n in rec
+            .graph
+            .nodes
+            .iter_mut()
+            .filter(|n| n.kind == PACKET_CAPTURE_KIND)
+        {
+            if let (Some(p), Some(fill)) = (n.params.as_object_mut(), fill.as_object()) {
+                p.extend(fill.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Point the `stream_in` node `n` of an attached job's graph at `stream` of `input`.
+fn point_stream_in(n: &mut graph::Node, input: &JobId, stream: &StreamId) {
+    if let Some(p) = n.params.as_object_mut() {
+        p.insert("job".into(), input.0.clone().into());
+        p.insert("stream".into(), stream.0.clone().into());
     }
 }
 

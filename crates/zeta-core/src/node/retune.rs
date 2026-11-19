@@ -457,7 +457,7 @@ impl Inner {
     }
 
     /// Relaunch the attached jobs [`Inner::hold_attached`] held, each under its own id
-    /// on its input's current audio stream (the launch repoints `stream_in`; it takes
+    /// on its input's current streams (the launch repoints `stream_in`; it takes
     /// no lease and no gate). Each held run is cancelled (if still live) and awaited
     /// through its `ended`, as [`Inner::relaunch_in_place`] does: an attached run has
     /// no port, so its supervisor has nothing left to do once `ended` closes. Only the

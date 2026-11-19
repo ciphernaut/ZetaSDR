@@ -209,6 +209,11 @@ impl PacketStore {
         Ok((id, file, head.len() as u64))
     }
 
+    /// The store's directory, `state_dir/packets`.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Every record, newest first.
     pub fn list(&self) -> Vec<PacketCaptureRecord> {
         let mut v = self.index.lock().unwrap().clone();

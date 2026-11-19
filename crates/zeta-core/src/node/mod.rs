@@ -156,6 +156,9 @@ pub enum NodeError {
     /// An attached job's input job runs but has no audio stream to read.
     #[error("input job {} has no audio stream", .0.0)]
     NoAudioStream(JobId),
+    /// An attached job's input job runs but has no packet stream to read.
+    #[error("job {} has no packet stream: its kind's outputs list no packet (modes_list)", .0.0)]
+    NoPacketStream(JobId),
     /// A `job_attach` (or an attached job's relaunch) names a voice `role` its input job
     /// `job` does not have; `voices` are the ones it has (none: it has one voice).
     #[error("{}", no_voice(.job, .role, .voices))]
@@ -1026,6 +1029,24 @@ impl Inner {
                     .map(String::from)
                     .collect(),
             })
+    }
+
+    /// The packet stream an attached job reads from `job`: its last packet output stream
+    /// in graph order. `InputNotRunning` as [`Inner::audio_stream`], `NoPacketStream`
+    /// when it outputs no packets.
+    fn packet_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
+        let jobs = self.jobs.lock().unwrap();
+        let entry = jobs
+            .get(job)
+            .filter(|e| e.record.state == JobState::Running && e.cancel.is_some())
+            .ok_or_else(|| NodeError::InputNotRunning(job.clone()))?;
+        entry
+            .outputs
+            .iter()
+            .rev()
+            .find(|o| o.kind == StreamKind::Packet)
+            .map(|o| o.id.clone())
+            .ok_or_else(|| NodeError::NoPacketStream(job.clone()))
     }
 
     /// What a `mix` stage of the job `except` may read: the audio output of every job
@@ -2609,6 +2630,13 @@ impl Node {
         voice: Option<&str>,
     ) -> Result<StreamId, NodeError> {
         self.inner.audio_stream(job, voice)
+    }
+
+    /// The packet stream a job attached to `job` would read: the last packet output
+    /// stream in `job`'s graph order. `InputNotRunning` as [`Node::job_audio_stream`],
+    /// `NoPacketStream` when it outputs no packets.
+    pub fn job_packet_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
+        self.inner.packet_stream(job)
     }
 
     /// The output streams (those no edge of its graph consumes) of `job`'s current run,

@@ -1147,3 +1147,193 @@ async fn a_composite_output_is_never_the_jobs_audio() {
         Err(zeta_core::node::NodeError::NoAudioStream(_))
     ));
 }
+
+/// [`registry`] with a stand-in decoder publishing one AX.25 packet per IQ block, and
+/// the real `packet_capture`.
+fn registry_with_packets() -> StageRegistry {
+    let mut r = registry();
+    r.register(MapStage::new(
+        "packet_src",
+        StreamKind::Iq,
+        &[StreamKind::Packet],
+        |_| {
+            vec![(
+                0,
+                Payload::Packet {
+                    link_type: zeta_core::stream::LinkType::Ax25Kiss,
+                    data: Arc::from(vec![0u8, 0x82, 0xa0]),
+                },
+            )]
+        },
+    ));
+    r.register(Arc::new(
+        zeta_core::packet_capture::PacketCaptureStage::new(),
+    ));
+    r
+}
+
+/// A `packets` chain by hand, `stream_in` (packet) into `packet_capture`, every param
+/// the launch fills stale.
+fn packets_graph() -> Graph {
+    let (a, b) = (NodeId("in".into()), NodeId("cap".into()));
+    Graph {
+        id: GraphId::new(),
+        nodes: vec![
+            GraphNode {
+                id: a.clone(),
+                kind: "stream_in".into(),
+                params: serde_json::json!({"job": "stale", "kind": "packet", "stream": "stale"}),
+            },
+            GraphNode {
+                id: b.clone(),
+                kind: "packet_capture".into(),
+                params: serde_json::json!({
+                    "job": "stale", "center_hz": 1, "mode": "stale", "access": "restricted"
+                }),
+            },
+        ],
+        edges: vec![Edge {
+            from: a,
+            to: b,
+            kind: StreamKind::Packet,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn a_packet_capture_names_its_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let node = Node::open(cfg(dir.path()), registry_with_packets(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let input = node
+        .job_start(
+            "pkt",
+            file0(),
+            tuning(),
+            node_graph("packet_src", serde_json::json!({})),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(node.job_packet_stream(&input).is_ok());
+    let att = node
+        .job_attach("packets", &input, None, packets_graph())
+        .await
+        .unwrap();
+    let store = node.packets();
+    common::until("a capture of the input", Duration::from_secs(10), || {
+        store.list().first().is_some_and(|r| r.packets > 0)
+    })
+    .await;
+    let r = store.list().remove(0);
+    assert_eq!(r.job, input);
+    assert_eq!(r.source, file0());
+    assert_eq!(r.center_hz, Hz(100_000_000));
+    // A kind of no mode row: no mode, no access.
+    assert_eq!((r.mode, r.access), (None, None));
+    assert_eq!(
+        capture_params(&node, &att),
+        serde_json::json!({
+            "job": input.0, "center_hz": 100_000_000u64, "mode": null, "access": null
+        })
+    );
+}
+
+/// The params of `job`'s `packet_capture` node as its record holds them.
+fn capture_params(node: &Node, job: &JobId) -> serde_json::Value {
+    record(node, job)
+        .graph
+        .nodes
+        .into_iter()
+        .find(|n| n.kind == "packet_capture")
+        .expect("a packet_capture node")
+        .params
+}
+
+#[tokio::test]
+async fn a_packet_capture_takes_its_inputs_row_and_follows_its_retune() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let mut registry = registry_with_dsp();
+    registry.register(Arc::new(
+        zeta_core::packet_capture::PacketCaptureStage::new(),
+    ));
+    let node = Node::open(cfg(dir.path()), registry, vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let start = |center_hz| Op::JobStart {
+        kind: JobKind::from_name("aprs_decode").unwrap(),
+        source: file0(),
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(12_500),
+        deviation_hz: None,
+        sideband: None,
+        dwell_ms: None,
+        average: None,
+        bits: None,
+        method: None,
+        bin_hz: None,
+        audio_policy: None,
+        dwell_scale: None,
+        elastic: false,
+        replace: vec![],
+    };
+    let Ok(OpResult::Job(input)) = node.apply(start(100_000_000)).await else {
+        panic!("aprs_decode start");
+    };
+    let att = node
+        .job_attach("packets", &input, None, packets_graph())
+        .await
+        .unwrap();
+    assert_eq!(
+        capture_params(&node, &att),
+        serde_json::json!({
+            "job": input.0, "center_hz": 100_000_000u64, "mode": "aprs_decode", "access": null
+        })
+    );
+    let retune = Op::JobRetune {
+        job: input.clone(),
+        center_hz: Hz(100_002_000),
+        bandwidth_hz: Hz(12_500),
+        bin_hz: None,
+        replace: vec![],
+    };
+    assert_eq!(node.apply(retune).await, Ok(OpResult::Job(input.clone())));
+    common::until(
+        "the capture's centre follows the retune",
+        Duration::from_secs(10),
+        || capture_params(&node, &att)["center_hz"] == 100_002_000u64,
+    )
+    .await;
+    assert_running_for(&node, &att, 500).await;
+    assert_eq!(capture_params(&node, &att)["mode"], "aprs_decode");
+}
+
+#[tokio::test]
+async fn attaching_packets_to_a_job_with_none_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = port(dir.path());
+    let node = Node::open(cfg(dir.path()), registry_with_packets(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let audio = start_audio(&node).await;
+    let e = node.job_packet_stream(&audio).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "job {} has no packet stream: its kind's outputs list no packet (modes_list)",
+            audio.0
+        )
+    );
+    assert!(matches!(
+        node.job_attach("packets", &audio, None, packets_graph()).await,
+        Err(zeta_core::node::NodeError::NoPacketStream(j)) if j == audio
+    ));
+    assert_eq!(attached_to(&node, &audio), Vec::<JobId>::new());
+}

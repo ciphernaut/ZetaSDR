@@ -23,7 +23,7 @@ pub const STREAM_IN_KIND: &str = "stream_in";
 pub struct StreamInParams {
     /// The job whose stream is read (the attached job's `input`).
     pub job: JobId,
-    /// The stream's kind; only `audio` can be attached so far.
+    /// The stream's kind: `audio` or `packet`.
     pub kind: StreamKind,
     /// The stream read. Resolved when the job is attached and again whenever the node
     /// launches the attached job (a resume), from the input job's streams then.
@@ -46,8 +46,8 @@ pub struct StreamInParams {
 /// timestamps carry the gap downstream (`transcribe` closes an utterance on it).
 ///
 /// `StageSpec::outputs` is fixed per stage, while this stage's output kind is
-/// `params.kind`; it declares `[audio]`, the only kind attachable so far, and refuses any
-/// other `kind`.
+/// `params.kind`: it declares both kinds it carries, `[audio, packet]`, and its one output
+/// is of `params.kind` ([`Stage::outputs_for`]). Any other `kind` is refused.
 pub struct StreamInStage {
     spec: StageSpec,
 }
@@ -58,7 +58,7 @@ impl StreamInStage {
             spec: StageSpec {
                 kind: STREAM_IN_KIND,
                 inputs: vec![],
-                outputs: vec![StreamKind::Audio],
+                outputs: vec![StreamKind::Audio, StreamKind::Packet],
                 params_schema: schemars::schema_for!(StreamInParams),
             },
         }
@@ -81,6 +81,15 @@ impl Stage for StreamInStage {
         Backend::Cpu
     }
 
+    /// The one output, of `params.kind` (audio when the params do not say).
+    fn outputs_for(&self, params: &serde_json::Value) -> Vec<StreamKind> {
+        let kind = params
+            .get("kind")
+            .and_then(|k| serde_json::from_value(k.clone()).ok())
+            .unwrap_or(StreamKind::Audio);
+        vec![kind]
+    }
+
     async fn run(
         &self,
         params: serde_json::Value,
@@ -92,9 +101,9 @@ impl Stage for StreamInStage {
     ) -> Result<(), StageError> {
         let p: StreamInParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("stream_in params: {e}")))?;
-        if p.kind != StreamKind::Audio {
+        if !matches!(p.kind, StreamKind::Audio | StreamKind::Packet) {
             return Err(StageError::Failed(format!(
-                "stream_in: only audio streams can be attached, not {}",
+                "stream_in: only audio and packet streams can be attached, not {}",
                 serde_json::to_value(p.kind).map_or_else(|_| "?".into(), |v| v.to_string())
             )));
         }
@@ -200,7 +209,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_a_kind_other_than_audio() {
+    async fn forwards_packets_when_its_kind_is_packet() {
+        use crate::stream::LinkType;
+        let bus = Arc::new(StreamBus::new(8));
+        let input = bus.register(StreamKind::Packet, prov("in", 0));
+        let out = bus.register(StreamKind::Packet, prov("me", 0));
+        let mut rx = bus.subscribe(&out).unwrap();
+        let params = serde_json::json!({"job": "in", "kind": "packet", "stream": input.0});
+        let stage = StreamInStage::new();
+        assert_eq!(
+            stage.spec().outputs,
+            [StreamKind::Audio, StreamKind::Packet]
+        );
+        assert_eq!(stage.outputs_for(&params), [StreamKind::Packet]);
+        let (b, o) = (bus.clone(), out.clone());
+        let h = tokio::spawn(async move {
+            stage
+                .run(
+                    params,
+                    vec![],
+                    vec![o],
+                    b,
+                    CancellationToken::new(),
+                    StageContext::new(SourceId("s".into())),
+                )
+                .await
+        });
+        while bus.receiver_count(&input) != Some(1) {
+            tokio::task::yield_now().await;
+        }
+        let sent = prov("in", 1_700_000_000_000_000_000);
+        bus.publish(Frame::new(
+            input.clone(),
+            sent.clone(),
+            Payload::Packet {
+                link_type: LinkType::Ax25Kiss,
+                data: Arc::from(vec![0u8, 1, 2, 3]),
+            },
+        ));
+        let f = rx.recv().await.unwrap();
+        assert_eq!(f.stream, out);
+        assert_eq!(f.provenance.job, Some(JobId("me".into())));
+        assert_eq!(f.provenance.span, sent.span);
+        match &f.payload {
+            Payload::Packet { link_type, data } => {
+                assert_eq!(*link_type, LinkType::Ax25Kiss);
+                assert_eq!(&data[..], &[0, 1, 2, 3]);
+            }
+            p => panic!("not a packet: {p:?}"),
+        }
+        bus.unregister(&input);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_kind_other_than_audio_or_packet() {
         let bus = Arc::new(StreamBus::new(8));
         let out = bus.register(StreamKind::Audio, prov("me", 0));
         let params = serde_json::json!({"job": "in", "kind": "iq", "stream": "x"});
@@ -214,6 +277,9 @@ mod tests {
                 StageContext::new(SourceId("s".into())),
             )
             .await;
-        assert!(matches!(r, Err(StageError::Failed(m)) if m.contains("only audio")));
+        assert!(
+            matches!(&r, Err(StageError::Failed(m)) if m.contains("only audio and packet")),
+            "{r:?}"
+        );
     }
 }

@@ -14,6 +14,7 @@ use zeta_core::classify::StubClassifier;
 use zeta_core::knowledge::StaticKnowledge;
 use zeta_core::modes::{Install, ModeRegistry, ModeState};
 use zeta_core::node::{Node, NodeConfig};
+use zeta_core::packet_capture::PacketCaptureStage;
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
 use zeta_core::stream_in::StreamInStage;
@@ -66,6 +67,7 @@ pub fn registry(
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));
     registry.register(Arc::new(StreamInStage::new()));
+    registry.register(Arc::new(PacketCaptureStage::new()));
     zeta_dsp::register_all(&mut registry);
     registry.register(Arc::new(TranscribeStage::new(speech, TRANSCRIBE_TIMEOUT)));
     let mut external = ExternalDecodeStage::deferred(modes.clone());
