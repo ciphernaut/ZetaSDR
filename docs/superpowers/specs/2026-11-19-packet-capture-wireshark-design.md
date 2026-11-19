@@ -115,11 +115,22 @@ time and, in a comment, the job, the source and the frequency it came off.
 ### Payload and stream kind
 
 Add `Payload::Packet { link_type: LinkType, data: Arc<[u8]> }` to
-`zeta-core/src/stream.rs`, and `StreamKind::Packet`. `Payload::kind()`, the
+`zeta-core/src/stream.rs`, and `StreamKind::Packet`. The packet carries **no
+timestamp** of its own: the enclosing `Frame`'s `provenance.span.start_ns`
+(`types.rs`: ns since the UNIX epoch) supplies the per-packet time, written into the
+pcapng Enhanced Packet Block with `if_tsresol = 9`. `Payload::kind()`, the
 `StreamKind` all-list in `stage.rs` (around lines 364–369), `outputs_for`'s default,
 and every exhaustive match on `Payload`/`StreamKind` in `zeta-ws`, `zeta-mcp`,
 `zeta-ui` and the node are updated. A bus validation (like `VideoFormat::check_body`)
 refuses an empty `data`.
+
+In phase A those new arms treat a Packet stream as **non-rendered**: it appears in
+`stream list` and feeds the attach sink, but the page is not shown it (no Packet tab;
+not a phase-A goal). Where a stream's payload must serialise for a transport (`stream
+tail`, the ws stream push), a Packet serialises as `{ link_type, data }` with `data`
+base64 — the same shape phase B's live GSMTAP/extcap reader consumes, so the arms are
+not reworked when B lands. `zeta-mcp` and `zeta-ui` use that serialisation or skip the
+stream; neither renders it in phase A.
 
 `LinkType` is a small enum wrapping the pcap/pcapng **LINKTYPE** number the egress
 writes into the interface header:
@@ -136,9 +147,21 @@ The `link_type` is set by the stage from the row, not inferred at the egress.
 
 The frame chain (`channel → … → frame_decode`) gains a second output of
 `StreamKind::Packet` on the frame stage, registered only when wired (lazy, like other
-streams), so a frame job with no packet consumer pays nothing. `frame_decode` already
-produces the frame bytes for its event; it wraps the same bytes as a `Packet` with the
-row's `link_type`. APRS's `aprs_decode` does the same from its AX.25 frame.
+streams), so a frame job with no packet consumer pays nothing.
+
+The packet carries the **full deframed frame**, not the event's payload field — the
+event only forwards part of the frame:
+
+- `frame_decode` emits `fr.bytes` (the whole cut frame it already builds for the
+  event's `bytes`) as a `Packet` under `LINKTYPE_USER0`.
+- `aprs_decode` emits the deframer's `raw` AX.25 frame (address / control / PID /
+  info), **not** the event's `info_hex` (which is only the info field). It is written
+  under `LINKTYPE_AX25_KISS` (202), which means each record is prefixed with a KISS
+  command byte `0x00` and carries no FCS. The HDLC deframer already strips the flags;
+  the builder confirms whether `raw` still carries the two FCS bytes and strips them if
+  so (only CRC-good frames reach this point, `fcs_ok: true`). If prefixing/stripping
+  proves fiddly, `LINKTYPE_AX25` (3) takes the bare frame with no KISS byte — either
+  dissects as AX.25/APRS in Wireshark; KISS is the default for its tooling familiarity.
 
 A frame row's `outputs` (derived by `modes/template.rs::outputs`) then lists `packet`
 alongside `event`, so `modes_list` shows which rows can be captured. The `outputs`
@@ -158,9 +181,25 @@ directory and writes:
 
 pcapng is chosen over classic pcap for the per-packet comment and the typed interface
 metadata. The attachment is recorded on the job like a transcribe attachment and ends
-on `job_detach` or when the job stops; the finished file becomes an artefact served by
-id, following the capture-serving pattern (`ops.rs` `GET /captures/<id>…`), at a
-`.pcapng` suffix. It is listed on the page the way captures are.
+on `job_detach` or when the job stops.
+
+**Served while running (my call, resolving builder gap 1a).** The sink flushes each
+block and the file is downloadable *while capturing*, not only after stop — a live
+amateur-packet channel may run for days and the capture must be retrievable without
+ending it. A reader gets a valid pcapng truncated at the last flushed block.
+
+**Its own artefact record, not an IQ burst (my call, resolving builder gap 3).** A
+pcapng is a new, small artefact kind in `persist.rs`/the capture registry with its own
+id, served at `GET /captures/<id>.pcapng`, listed on the page the way captures are. It
+does **not** reuse the IQ-burst (`bursts.rs`) model, whose shape and retention are
+SigMF IQ. Retention follows the node's existing capture retention (deleted with the
+job's other artefacts / under the same disk-pressure sweep).
+
+**A size cap, rolling (my call, resolving builder gap 3).** A single frame job can run
+unbounded, so the sink caps one pcapng at a byte limit (default 256 MiB; a constant,
+tunable later) and rolls to a fresh artefact id when it fills, so each file stays
+openable and disk pressure frees whole files. The cap and roll are the sink's; the row
+and the op do not carry it.
 
 ### Restricted rows
 
@@ -201,4 +240,18 @@ only reserves the payload; the `.ts` egress is DVB-T's to build.
 
 ## Open decisions for the operator
 
-Carried separately in the handover message, not pre-settled here.
+**Restart / resume behaviour (builder gap 1b) — PENDING the operator.** Jobs and
+transcribe attachments persist and resume across a node restart. Does a `packets`
+attachment?
+
+- *My recommendation — do not resume.* On restart the capture stops, the pcapng so far
+  is kept and served, and the attachment is not re-created; the operator re-attaches if
+  they still want it. This keeps phase A a small sink. A node restart is rare and
+  operator-driven, and a capture that silently resumes into a new file after a restart
+  the operator may not have noticed is more surprising than useful.
+- *The alternative — resume* (re-attach on resume, open a fresh pcapng + id, since
+  appending to a pcapng across a gap is awkward) makes this a persistence feature:
+  more code in `persist.rs`, resume tests, and an entry in the resumed-state the node
+  prints. Worth it only if unattended multi-day capture across restarts is a real need.
+
+Folded into the design once answered.
