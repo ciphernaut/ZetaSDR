@@ -51,7 +51,8 @@ pub struct PacketCaptureParams {
 /// noted `{"capture": <id>, "packets": <n>, "bytes": <n>}` (the file being written) at a
 /// file's first packet, at each roll, at most once a second between, and once more at
 /// the end. The input closing ends the stage `Ok(())`, its capture marked no longer
-/// being written. A file that cannot be written ends it `Failed` naming the path and
+/// being written; a cancel (the job stopped, or its `stream_in` ended first) still writes
+/// every packet its input holds before it ends. A file that cannot be written ends it `Failed` naming the path and
 /// the error; nothing upstream is touched. Without a store (no node) it fails at once.
 ///
 /// The files are written on a blocking thread fed by a queue of [`QUEUE`] packets, so a
@@ -121,6 +122,8 @@ impl Stage for PacketCaptureStage {
         let (tx, items) = mpsc::channel::<Item>(QUEUE);
         let note = ctx.note.clone();
         let mut writer = tokio::task::spawn_blocking(move || write_all(&store, base, items, note));
+        // A packet received and not yet queued when the stage was cancelled.
+        let mut held = None;
         let end = loop {
             tokio::select! {
                 biased;
@@ -129,19 +132,18 @@ impl Stage for PacketCaptureStage {
                 r = &mut writer => return joined(r),
                 r = rx.recv() => match r {
                     Ok(frame) => {
-                        let Payload::Packet { link_type, data } = frame.payload else {
+                        let Some(item) = Item::of(frame) else {
                             continue;
-                        };
-                        let item = Item {
-                            t_ns: frame.provenance.span.start_ns.0,
-                            link_type,
-                            data,
                         };
                         tokio::select! {
                             biased;
-                            _ = cancel.cancelled() => break Err(StageError::Cancelled),
-                            sent = tx.send(item) => if sent.is_err() {
-                                return joined(writer.await);
+                            _ = cancel.cancelled() => {
+                                held = Some(item);
+                                break Err(StageError::Cancelled);
+                            }
+                            permit = tx.reserve() => match permit {
+                                Ok(permit) => permit.send(item),
+                                Err(_) => return joined(writer.await),
                             },
                         }
                     }
@@ -152,6 +154,31 @@ impl Stage for PacketCaptureStage {
                 },
             }
         };
+        // Cancelled (the supervisor stops the job once its `stream_in` ends, which may be
+        // before this stage has read the input's last packets): what the input still
+        // holds is queued too, so a stop drops nothing already decoded.
+        if end.is_err() {
+            let mut rest = held.into_iter().chain(std::iter::from_fn(|| {
+                loop {
+                    match rx.try_recv() {
+                        Ok(frame) => {
+                            if let Some(item) = Item::of(frame) {
+                                return Some(item);
+                            }
+                        }
+                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                            eprintln!("zeta: packet_capture lagged, {n} packets skipped");
+                        }
+                        Err(_) => return None,
+                    }
+                }
+            }));
+            for item in &mut rest {
+                if tx.send(item).await.is_err() {
+                    return joined(writer.await);
+                }
+            }
+        }
         // The writer drains what is queued, closes its file and ends.
         drop(tx);
         joined(writer.await).and(end)
@@ -163,6 +190,20 @@ struct Item {
     t_ns: u64,
     link_type: LinkType,
     data: Arc<[u8]>,
+}
+
+impl Item {
+    /// The packet `frame` carries, at its start; `None` for any other payload.
+    fn of(frame: Frame) -> Option<Self> {
+        let Payload::Packet { link_type, data } = frame.payload else {
+            return None;
+        };
+        Some(Self {
+            t_ns: frame.provenance.span.start_ns.0,
+            link_type,
+            data,
+        })
+    }
 }
 
 /// The writer thread's end as the stage's.
@@ -312,11 +353,21 @@ mod tests {
             params: serde_json::Value,
             ctx: StageContext,
         ) -> tokio::task::JoinHandle<Result<(), StageError>> {
+            self.spawn_with(params, ctx, CancellationToken::new())
+        }
+
+        /// [`Rig::spawn`] under `cancel`.
+        fn spawn_with(
+            &self,
+            params: serde_json::Value,
+            ctx: StageContext,
+            cancel: CancellationToken,
+        ) -> tokio::task::JoinHandle<Result<(), StageError>> {
             let rx = self.bus.subscribe(&self.input).unwrap();
             let bus = self.bus.clone();
             tokio::spawn(async move {
                 PacketCaptureStage::new()
-                    .run(params, vec![rx], vec![], bus, CancellationToken::new(), ctx)
+                    .run(params, vec![rx], vec![], bus, cancel, ctx)
                     .await
             })
         }
@@ -385,6 +436,32 @@ mod tests {
         let r = first(&rig.store).unwrap();
         assert!(!r.writing);
         assert_eq!(r.packets, 1);
+    }
+
+    /// The supervisor cancels the stage once its `stream_in` ends, which can be before the
+    /// stage has read its input's last packets: they are written all the same. On the
+    /// test's one-thread runtime the stage first runs after the packets are published,
+    /// the input closed and the cancel fired, so none has been read when it sees the
+    /// cancel.
+    #[tokio::test]
+    async fn a_cancel_writes_the_packets_its_input_still_holds() {
+        const N: usize = 20;
+        let tmp = tempfile::tempdir().unwrap();
+        let rig = Rig::new(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let cancel = CancellationToken::new();
+        let h = rig.spawn_with(params(), rig.ctx(), cancel.clone());
+        for i in 0..N {
+            rig.publish(T0 + i as u64, packet(LinkType::Ax25Kiss, &[i as u8; 8]));
+        }
+        rig.bus.unregister(&rig.input);
+        cancel.cancel();
+        assert!(matches!(h.await.unwrap(), Err(StageError::Cancelled)));
+        let r = first(&rig.store).expect("a capture");
+        assert!(!r.writing);
+        assert_eq!(r.packets, N as u64);
+        let (_, packets) = pcapng::read(&std::fs::read(&r.path).unwrap()).unwrap();
+        assert_eq!(packets.len(), N);
+        assert_eq!(packets[N - 1].t_ns, T0 + N as u64 - 1);
     }
 
     #[tokio::test]
