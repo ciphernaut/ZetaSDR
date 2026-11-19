@@ -9923,7 +9923,7 @@ def scenario_map_tracks_an_aprs_station(page, url, secret):
                          rowOf('m17_decode')?.outputs ?? null,
                          m.isAudioJob({kind: 'm17_decode'}, rowOf)];
                }""")
-        assert live == [["event"], False, ["event", "audio"], True], f"live row outputs {live}"
+        assert live == [["event", "packet"], False, ["event", "audio"], True], f"live row outputs {live}"
         run_cmd(page, "view set main rf")
         assert not errors, f"console errors: {errors}"
     finally:
