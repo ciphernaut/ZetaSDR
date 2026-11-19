@@ -218,18 +218,14 @@ existing row, so it touches the event schema and `agents_md.rs` prose but adds n
 - Whether DecSAT's CLI or `decsat-server` is the handler invoked, and the precise
   socket/argument form for the `via: udp` feed.
 
-## Open decisions for the operator
+## Decisions (operator, 2026-11-19)
 
-Carried in the handover, not pre-settled:
-
-1. **DVB-S needs a new wrapper — appetite and engine.** The builder check showed no
-   candidate is a drop-in, so DVB-S means building `dvbs-rx` (a GPL wrapper, IQ-in →
-   JSON-out), not just adding a row. This is the bulk of the DVB-S effort and the biggest
-   single call. My pick: build it on DecSAT's `decsat-engine`/`decsat-modem` crates (Rust,
-   GPL, blind DVB-S→TS, in hand). Alternatives: wrap gr-dvbs2rx or SatDump. Confirm the
-   appetite for a new wrapper, and the engine. (The node side stays stdin — no node
-   mechanism either way.)
-2. **Landing shape** — DVB-T2 and DVB-S are independent and very different in size: T2 is
-   a small extension of an existing wrapper and row (no hardware); DVB-S is a new wrapper
-   + row + the L-band dish. I propose two plans, **T2 first** (lands and is live-testable
-   on the discone now), DVB-S second (gated on the dish). Confirmable.
+1. **DVB-S wrapper and engine — DECIDED: build it.** DVB-S means building `dvbs-rx`, a
+   GPL wrapper (IQ-in on stdin → `json_lines` out), on DecSAT's `decsat-engine` /
+   `decsat-modem` crates (Rust, GPL, blind DVB-S→TS, in hand). This is the bulk of the
+   DVB-S effort; the node side stays `via: stdin`, no new node mechanism. (Alternatives
+   gr-dvbs2rx / SatDump were offered and not taken.)
+2. **Landing shape — DECIDED: two plans, T2 first.** DVB-T2 (a small extension of
+   `dvbt-rx` and the existing row, no hardware) lands first and is live-testable on the
+   discone now; DVB-S (new wrapper + row + L-band dish) is a second plan, gated on the
+   dish.
