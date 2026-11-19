@@ -164,3 +164,40 @@ pub fn speech_fixture(dir: &Path) -> PathBuf {
     );
     zeta_dsp::fixtures::write_fixture(dir, "speech", &iq, SPEECH_RATE, SPEECH_HZ)
 }
+
+/// The `aprs` fixture's IQ rate and centre, and where its second station sits above
+/// the centre: inside the capture, so a decoder retuned there needs no tune.
+pub const APRS_RATE: u32 = 96_000;
+pub const APRS_HZ: u64 = 144_800_000;
+pub const APRS_OFFSET_HZ: u64 = 25_000;
+/// The `aprs` fixture's two invented stations: the one on the centre, the one
+/// [`APRS_OFFSET_HZ`] above it.
+pub const APRS_CALLS: [&str; 2] = ["N0CALL", "N0CALL-1"];
+/// What each station of the `aprs` fixture sends: a position at the demo station.
+pub const APRS_INFO: &str = "!2723.05S/15307.05E>zeta packet capture test";
+
+/// The `aprs` fixture in `dir`: a small synthetic APRS capture for a looping file source
+/// (`--source-file aprs=<meta>`, `FileOpts { repeat: true, .. }`), so an `aprs_decode`
+/// job on it decodes a frame about every 1.7 s. Two invented stations send the same
+/// [`APRS_INFO`] at once, [`APRS_CALLS`]`[0]` on [`APRS_HZ`] and [`APRS_CALLS`]`[1]`
+/// [`APRS_OFFSET_HZ`] above it, at [`APRS_RATE`] (about 1.3 MB). Packet capture's node
+/// tests (`tests/attach.rs`) play it, and the page suite's packet capture scenario is
+/// meant to build its fixture with it too. Its meta path.
+pub fn aprs_fixture(dir: &Path) -> PathBuf {
+    let [low, high] = APRS_CALLS;
+    let on = zeta_dsp::fixtures::aprs_packet_iq(low, "APRS", APRS_INFO, APRS_RATE, 0.0);
+    let above = zeta_dsp::fixtures::aprs_packet_iq(
+        high,
+        "APRS",
+        APRS_INFO,
+        APRS_RATE,
+        APRS_OFFSET_HZ as f64,
+    );
+    let mut iq = on;
+    let n = iq.len();
+    for (a, b) in iq.iter_mut().zip(&above) {
+        *a += *b;
+    }
+    iq.extend_from_slice(above.get(n..).unwrap_or_default());
+    zeta_dsp::fixtures::write_fixture(dir, "aprs", &iq, APRS_RATE, APRS_HZ)
+}

@@ -11,7 +11,8 @@ use zeta_core::job::JobState;
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{
-    AUDIO_RATE_HZ, JobKind, Op, OpError, OpResult, ScanMethod, Sideband, channel_rate_hz, schema,
+    AUDIO_RATE_HZ, AttachTo, JobKind, Op, OpError, OpResult, ScanMethod, Sideband, channel_rate_hz,
+    schema,
 };
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{Backend, PassthroughStage, StageRegistry};
@@ -523,7 +524,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 51, "one schema per Op variant");
+    assert_eq!(vs.len(), 53, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -1372,7 +1373,7 @@ fn job_attach_schema_has_a_nullable_language() {
 fn transcribe_expands_attached_to_stream_in_denoise_vad_transcribe() {
     let (job, stream) = (JobId("in".into()), StreamId("s".into()));
     let g = JobKind::Transcribe
-        .expand_attached(&job, &stream, None, "de", false)
+        .expand_attached(&AttachTo::new(&job, &stream), "de")
         .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["stream_in", "denoise", "vad", "transcribe"]);
@@ -1390,7 +1391,7 @@ fn transcribe_expands_attached_to_stream_in_denoise_vad_transcribe() {
         assert_eq!(e.to, g.nodes[i + 1].id);
     }
     assert_eq!(
-        JobKind::WfmDemod.expand_attached(&job, &stream, None, "en", false),
+        JobKind::WfmDemod.expand_attached(&AttachTo::new(&job, &stream), "en"),
         Err(OpError::Other {
             message: "wfm_demod is not attachable".into()
         })
@@ -3925,13 +3926,19 @@ fn a_wfm_graph_carries_stereo_through_a_reexpansion_and_a_retune() {
 fn an_attached_transcribe_skips_its_own_denoise_when_the_input_denoises() {
     let (job, stream) = (JobId("in".into()), StreamId("s".into()));
     let g = JobKind::Transcribe
-        .expand_attached(&job, &stream, None, "en", true)
+        .expand_attached(
+            &AttachTo {
+                denoised: true,
+                ..AttachTo::new(&job, &stream)
+            },
+            "en",
+        )
         .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["stream_in", "vad", "transcribe"]);
     assert_eq!(g.edges.len(), 2);
     let g = JobKind::Transcribe
-        .expand_attached(&job, &stream, None, "en", false)
+        .expand_attached(&AttachTo::new(&job, &stream), "en")
         .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(kinds, ["stream_in", "denoise", "vad", "transcribe"]);

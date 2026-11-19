@@ -1135,16 +1135,17 @@ async function askAgent(text, allowOverride = null) {
     }
     const refused = (r.calls || []).filter((c) => c.result && c.result.error === "not_allowed");
     if (refused.length) {
-      // A refused `capture_delete` needs `delete_captures`, a refused `signature_accept`,
-      // `signature_reject`, `signature_retract` or `signature_delete` needs
+      // A refused `capture_delete` or `packets_delete` needs `delete_captures`, a refused
+      // `signature_accept`, `signature_reject`, `signature_retract` or `signature_delete` needs
       // `accept_signatures` (the note names the verbs refused); any other refusal is a stop
       // or a replace. The retry re-sends this one request with the refused flags true on top
       // of the switches; the session stays as it was (`allow stops|deletes|signatures on`
       // are the switches).
       const isSignature = (c) => SIGNATURE_DECISIONS.includes(c.tool);
-      const deletes = refused.some((c) => c.tool === "capture_delete");
+      const isDelete = (c) => c.tool === "capture_delete" || c.tool === "packets_delete";
+      const deletes = refused.some(isDelete);
       const signatures = refused.some(isSignature);
-      const stopsRefused = refused.some((c) => c.tool !== "capture_delete" && !isSignature(c));
+      const stopsRefused = refused.some((c) => !isDelete(c) && !isSignature(c));
       const verbs = SIGNATURE_DECISIONS.filter((tool) => refused.some((c) => c.tool === tool))
         .map((tool) => tool.replace("signature_", ""));
       const verbList =

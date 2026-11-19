@@ -331,17 +331,36 @@ pub enum Op {
         /// stopped and names the rest.
         replace: Vec<JobId>,
     },
-    /// Attach a job of an attachable `kind` (`transcribe`) to the running job `job`, a job
-    /// whose kind emits audio: the voice demodulators and any mode row whose `outputs`
-    /// lists `audio`. It reads that job's audio output stream (the last one in its graph
-    /// order when it has several; audio passed between two of its stages does not count)
-    /// instead of the radio, holds no lease, copies the job's `source` and `tuning`, and
-    /// records it as its `input`. It follows its input through a `job_retune` or a
-    /// `graph_put` restart: it is relaunched under its own id on the input's new stream
-    /// once the input runs again (`failed` with the reason when it cannot be). It ends
-    /// `stopped` when the input job stops or fails for its own reason. On a node restart
-    /// it resumes after its input, or is `failed` with `input job <id> not running` when
-    /// the input does not run.
+    /// Attach a job of an attachable `kind` (`transcribe` or `packets`) to the running job
+    /// `job`. It reads one of that job's output streams instead of the radio, holds no
+    /// lease, copies the job's `source` and `tuning`, and records it as its `input`. It
+    /// follows its input through a `job_retune` or a `graph_put` restart: it is
+    /// relaunched under its own id on the input's new stream once the input runs again
+    /// (`failed` with the reason when it cannot be). It ends `stopped` when the input job
+    /// stops or fails for its own reason.
+    ///
+    /// `transcribe` reads the audio of a job whose kind emits audio: the voice
+    /// demodulators and any mode row whose `outputs` lists `audio` (the last audio output
+    /// in its graph order when it has several; audio passed between two of its stages
+    /// does not count). On a node restart it resumes after its input, or is `failed` with
+    /// `input job <id> not running` when the input does not run.
+    ///
+    /// `packets` captures the frames of a decoder job whose row's `outputs` lists
+    /// `packet` (`aprs_decode`, a frame row) into a pcapng file Wireshark opens: one
+    /// packet per decoded frame (link type `ax25_kiss` for APRS, `user0` for a frame
+    /// row), stamped with the frame's start, its comment `job=<decoder job> source=<id>
+    /// freq_hz=<centre>`. The job's context names the file as `capture` (with `packets`
+    /// and `bytes` so far), and `packets_list` lists it; fetch it, also while it is
+    /// written, at `GET /captures/<id>.pcapng`. A retune of the input closes the file
+    /// and opens a fresh one at the new centre. `language` is ignored and `stream` must
+    /// be `null` (`packets reads the job's packet stream: pass stream null`). Refused,
+    /// nothing started: a job with no packet stream (`job <id> has no packet stream: its
+    /// kind's outputs list no packet (modes_list)`), an attached job (`packets: job <id>
+    /// is an attached job: attach to its input <input>`), a row with `access:
+    /// restricted` (`packets: <row> is restricted: its capture waits on access control`)
+    /// and a job already captured (`job <id> is already captured by <packets job>`). It
+    /// does not resume across a node restart: it is listed `stopped` with the note
+    /// `packet capture does not resume: attach again`, its file kept.
     #[schemars(transform = require_attach_stream)]
     JobAttach {
         kind: JobKind,
@@ -474,6 +493,19 @@ pub enum Op {
     /// operator's decision: through `ask` it needs `allow.delete_captures`.
     CaptureDelete {
         /// An id from `capture_list`.
+        capture: String,
+    },
+    /// The packet captures the node's packet store holds (written by `packets` jobs),
+    /// newest first, each a record (`id`, `job` the decoder job captured, `source`,
+    /// `center_hz`, `link_type`, `mode` its row, `access`, `created_ns`, `bytes`,
+    /// `packets`, `writing` while a job appends to it). Fetch one at `GET
+    /// /captures/<id>.pcapng`.
+    PacketsList {},
+    /// Delete a packet capture and its file. One being written is refused, `capture <id>
+    /// is being written by job <packets job>: stop the packets job first`. Deleting is the
+    /// operator's decision: through `ask` it needs `allow.delete_captures`.
+    PacketsDelete {
+        /// An id from `packets_list`.
         capture: String,
     },
     /// The learned signatures (`state_dir/signatures`), newest first, narrowed to `state`
@@ -1106,7 +1138,7 @@ fn nullable_kind_filter_schema(_: &mut schemars::SchemaGenerator) -> schemars::S
 fn nullable_attach_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     let mut kinds: Vec<serde_json::Value> = BUILTIN_KINDS
         .iter()
-        .filter(|k| k.attachable())
+        .filter(|k| k.plan_attachable())
         .map(|k| k.name().into())
         .collect();
     kinds.push(serde_json::Value::Null);
@@ -1392,8 +1424,9 @@ const FM_DEVIATION_MAX_HZ: u64 = 75_000;
 /// capture (the `fft` sized as `spectrum`'s); the node runs a controller beside it that
 /// identifies each signal `detect` announces and keeps the proved decoder running
 /// (see `node::watch`).
-/// `transcribe` is attachable, not started on the radio: `job_attach` runs it on another
-/// job's audio (see [`JobKind::expand_attached`]); `job_start` refuses it.
+/// `transcribe` and `packets` are attachable, not started on the radio: `job_attach` runs
+/// them on another job's audio or packets (see [`JobKind::expand_attached`]); `job_start`
+/// refuses them.
 /// `capture` channelises its band as `measure` does and expands to `channel →
 /// burst_capture` ([`BURST_CAPTURE_STAGE`]): the stage writes the band's bursts to the
 /// node's burst store and returns, so the job ends `stopped` with `job_context.capture`.
@@ -1423,12 +1456,13 @@ pub enum JobKind {
     Transcribe,
     Mix,
     Capture,
+    Packets,
     /// A mode row's id that is not a built-in kind's name (an operator's row).
     Mode(ModeId),
 }
 
 /// The built-in kinds, in the order `schema` lists them: every kind but [`JobKind::Mode`].
-pub static BUILTIN_KINDS: [JobKind; 18] = [
+pub static BUILTIN_KINDS: [JobKind; 19] = [
     JobKind::Passthrough,
     JobKind::Spectrum,
     JobKind::FmDemod,
@@ -1447,6 +1481,7 @@ pub static BUILTIN_KINDS: [JobKind; 18] = [
     JobKind::Transcribe,
     JobKind::Mix,
     JobKind::Capture,
+    JobKind::Packets,
 ];
 
 impl Serialize for JobKind {
@@ -1477,6 +1512,38 @@ impl JsonSchema for JobKind {
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         let names: Vec<&str> = BUILTIN_KINDS.iter().map(JobKind::name).collect();
         schemars::json_schema!({ "type": "string", "enum": names })
+    }
+}
+
+/// The running job an attached chain reads, as [`JobKind::expand_attached`] needs it.
+#[derive(Clone, Copy, Debug)]
+pub struct AttachTo<'a> {
+    /// The input job.
+    pub job: &'a JobId,
+    /// The stream of it the chain reads (the launch points it at the current one).
+    pub stream: &'a StreamId,
+    /// `transcribe`: the voice read (`None`: the main stream).
+    pub voice: Option<&'a str>,
+    /// `transcribe`: the input's graph denoises its audio itself ([`JobKind::graph_denoises`]).
+    pub denoised: bool,
+    /// `packets`: the input's centre, its mode row's id and that row's `access`.
+    pub center_hz: Hz,
+    pub mode: Option<&'a str>,
+    pub access: Option<Access>,
+}
+
+impl<'a> AttachTo<'a> {
+    /// `stream` of `job`: its main voice, not denoised, centre 0 and no row.
+    pub fn new(job: &'a JobId, stream: &'a StreamId) -> Self {
+        Self {
+            job,
+            stream,
+            voice: None,
+            denoised: false,
+            center_hz: Hz(0),
+            mode: None,
+            access: None,
+        }
     }
 }
 
@@ -1532,6 +1599,7 @@ impl JobKind {
             JobKind::Transcribe => "transcribe",
             JobKind::Mix => "mix",
             JobKind::Capture => "capture",
+            JobKind::Packets => "packets",
             JobKind::Mode(id) => &id.0,
         }
     }
@@ -1589,7 +1657,8 @@ impl JobKind {
     /// Whether `job_retune` may move a running job of the kind to another band: the
     /// kinds whose one band the node expands a graph for. Not a `spectrum` (it shows the
     /// capture), a `scan` (it sweeps), an `identify` or a `watch` (controllers), an
-    /// attached `transcribe` (its input is retuned instead) or a `mix` (it has no band).
+    /// attached `transcribe` or `packets` (its input is retuned instead) or a `mix` (it
+    /// has no band).
     pub fn retunable(&self) -> bool {
         match self {
             JobKind::Passthrough
@@ -1610,7 +1679,8 @@ impl JobKind {
             | JobKind::Watch
             | JobKind::Transcribe
             | JobKind::Mix
-            | JobKind::Capture => false,
+            | JobKind::Capture
+            | JobKind::Packets => false,
         }
     }
 
@@ -1622,6 +1692,13 @@ impl JobKind {
     /// Whether the kind runs on another job's output (`job_attach`) rather than on the
     /// radio (`job_start`).
     pub fn attachable(&self) -> bool {
+        matches!(self, JobKind::Transcribe | JobKind::Packets)
+    }
+
+    /// Whether `plan_start` (and a set's member) may attach the kind to every job it
+    /// starts: `transcribe`, which reads a channel's audio. `packets` captures one decoder
+    /// job, so it is attached with `job_attach`.
+    pub fn plan_attachable(&self) -> bool {
         matches!(self, JobKind::Transcribe)
     }
 
@@ -1650,33 +1727,42 @@ impl JobKind {
         OpError::Other { message }
     }
 
-    /// The graph of an attached job of this kind reading `input_stream` (an audio stream)
-    /// of `input_job`, its voice `voice` (`None`: its main stream): `stream_in` then the
-    /// kind's chain, joined by audio edges. For `transcribe`: `stream_in -> denoise -> vad
-    /// -> transcribe {"language"}` (and `"stream"`, the voice its events then carry, when
-    /// one is named), without the `denoise` when `input_denoised` (the input's
-    /// demodulator runs RNNoise itself: see [`graph_denoises`]). A kind that is not
-    /// [`attachable`](Self::attachable) is `other("<kind> is not attachable")`.
-    pub fn expand_attached(
-        &self,
-        input_job: &JobId,
-        input_stream: &StreamId,
-        voice: Option<&str>,
-        language: &str,
-        input_denoised: bool,
-    ) -> Result<Graph, OpError> {
-        let chain: Vec<(&str, serde_json::Value)> = match self {
+    /// The graph of an attached job of this kind reading `input.stream` of `input.job`:
+    /// `stream_in` then the kind's chain, joined by edges of the stream's kind. For
+    /// `transcribe` (an audio stream, the voice `input.voice`, `None` its main stream):
+    /// `stream_in -> denoise -> vad -> transcribe {"language"}` (and `"stream"`, the voice
+    /// its events then carry, when one is named), without the `denoise` when
+    /// `input.denoised` (the input's demodulator runs RNNoise itself: see
+    /// [`graph_denoises`]). For `packets` (a packet stream; `language` unused): `stream_in
+    /// -> packet_capture {"job", "center_hz", "mode", "access"}`, the input's id, centre,
+    /// mode row and its access, which the launch refreshes from the input on every
+    /// relaunch. A kind that is not [`attachable`](Self::attachable) is `other("<kind> is
+    /// not attachable")`.
+    pub fn expand_attached(&self, input: &AttachTo, language: &str) -> Result<Graph, OpError> {
+        let (stream_kind, chain): (StreamKind, Vec<(&str, serde_json::Value)>) = match self {
             JobKind::Transcribe => {
                 let mut transcribe = serde_json::json!({"language": language});
-                if let Some(v) = voice {
+                if let Some(v) = input.voice {
                     transcribe["stream"] = v.into();
                 }
                 let mut chain = vec![("vad", serde_json::json!({})), ("transcribe", transcribe)];
-                if !input_denoised {
+                if !input.denoised {
                     chain.insert(0, ("denoise", serde_json::json!({})));
                 }
-                chain
+                (StreamKind::Audio, chain)
             }
+            JobKind::Packets => (
+                StreamKind::Packet,
+                vec![(
+                    crate::packet_capture::PACKET_CAPTURE_KIND,
+                    serde_json::json!({
+                        "job": input.job.0,
+                        "center_hz": input.center_hz.0,
+                        "mode": input.mode,
+                        "access": input.access,
+                    }),
+                )],
+            ),
             _ => {
                 return Err(OpError::Other {
                     message: format!("{} is not attachable", self.name()),
@@ -1687,9 +1773,9 @@ impl JobKind {
             id: NodeId::new(),
             kind: crate::stream_in::STREAM_IN_KIND.into(),
             params: serde_json::json!({
-                "job": input_job.0,
-                "kind": "audio",
-                "stream": input_stream.0,
+                "job": input.job.0,
+                "kind": stream_kind,
+                "stream": input.stream.0,
             }),
         }];
         nodes.extend(chain.into_iter().map(|(kind, params)| GraphNode {
@@ -1702,7 +1788,7 @@ impl JobKind {
             .map(|w| Edge {
                 from: w[0].id.clone(),
                 to: w[1].id.clone(),
-                kind: StreamKind::Audio,
+                kind: stream_kind,
             })
             .collect();
         Ok(Graph {
@@ -1928,7 +2014,9 @@ impl JobKind {
             return template::expand(row, tuning, out, audio_policy.unwrap_or_default());
         }
         Ok(match self {
-            JobKind::Transcribe | JobKind::Mix => unreachable!("refused above: not startable"),
+            JobKind::Transcribe | JobKind::Packets | JobKind::Mix => {
+                unreachable!("refused above: not startable")
+            }
             JobKind::AprsDecode
             | JobKind::PocsagDecode
             | JobKind::RdsDecode
@@ -3574,6 +3662,8 @@ pub enum OpResult {
     Ok,
     /// `capture_list`: the records, newest first.
     Captures(Vec<crate::bursts::CaptureRecord>),
+    /// `packets_list`: the records, newest first.
+    PacketCaptures(Vec<crate::packets::PacketCaptureRecord>),
     /// `capture_show`: the record and its `.sigmf-meta` as JSON.
     Capture {
         record: crate::bursts::CaptureRecord,
@@ -3617,6 +3707,8 @@ impl Op {
             Op::CaptureShow { .. } => "capture_show",
             Op::CaptureClassify { .. } => "capture_classify",
             Op::CaptureDelete { .. } => "capture_delete",
+            Op::PacketsList {} => "packets_list",
+            Op::PacketsDelete { .. } => "packets_delete",
             Op::SignatureList { .. } => "signature_list",
             Op::SignatureShow { .. } => "signature_show",
             Op::SignaturePropose { .. } => "signature_propose",
@@ -3674,6 +3766,7 @@ impl Op {
                 | Op::StationGet {}
                 | Op::CaptureList { .. }
                 | Op::CaptureShow { .. }
+                | Op::PacketsList {}
                 | Op::SignatureList { .. }
                 | Op::SignatureShow { .. }
                 // The band form only: the job form writes the job's context.
@@ -3738,6 +3831,7 @@ impl OpResult {
             OpResult::Schema(_) => "schema",
             OpResult::Station(_) => "station",
             OpResult::Captures(_) => "captures",
+            OpResult::PacketCaptures(_) => "packet_captures",
             OpResult::Capture { .. } => "capture",
             OpResult::Signatures(_) => "signatures",
             OpResult::Signature(_) => "signature",
@@ -4662,6 +4756,17 @@ fn check_attach_fields(
             other(format!("{} is not attachable", a.name())),
         ));
     }
+    if let Some(a) = attach
+        && !a.plan_attachable()
+    {
+        return Err(FieldError::new(
+            "attach",
+            other(format!(
+                "{} captures one decoder job: use job_attach",
+                a.name()
+            )),
+        ));
+    }
     if language.is_some() && attach.is_none() {
         return Err(FieldError::new("language", other("language needs attach")));
     }
@@ -5223,6 +5328,8 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             node.sweep_sessions();
             Ok(OpResult::Ok)
         }
+        Op::PacketsList {} => Ok(OpResult::PacketCaptures(node.packets().list())),
+        Op::PacketsDelete { capture } => packets_delete(node, &capture),
         Op::SignatureList { state } => Ok(OpResult::Signatures(node.signatures().list(state))),
         Op::SignatureShow { id } => node
             .signatures()
@@ -5475,7 +5582,7 @@ async fn jobs_stop(
 }
 
 /// `job_attach`: check the kind and language, then attach to `job`'s audio stream (its
-/// voice `stream`, when named).
+/// voice `stream`, when named); `packets` goes to [`packets_attach`].
 async fn job_attach(
     node: &Node,
     kind: JobKind,
@@ -5485,6 +5592,9 @@ async fn job_attach(
 ) -> Result<OpResult, OpError> {
     if !kind.attachable() {
         return Err(other(format!("{} is not attachable", kind.name())));
+    }
+    if kind == JobKind::Packets {
+        return packets_attach(node, job, stream).await.map(OpResult::Job);
     }
     let language = language.unwrap_or_else(|| ATTACH_LANGUAGE_DEFAULT.into());
     if !is_bcp47(&language) {
@@ -7087,16 +7197,93 @@ async fn attach_one(
     let stream = node
         .job_voice_stream(job, voice)
         .map_err(|e| node_error(node, e))?;
-    let graph = kind.expand_attached(
-        job,
-        &stream,
+    let to = AttachTo {
         voice,
-        language,
-        JobKind::graph_denoises(&input.graph),
-    )?;
+        denoised: JobKind::graph_denoises(&input.graph),
+        ..AttachTo::new(job, &stream)
+    };
+    let graph = kind.expand_attached(&to, language)?;
     node.job_attach(kind.name(), job, voice, graph)
         .await
         .map_err(|e| node_error(node, e))
+}
+
+/// `job_attach` of `packets` (its `language` unused): refuse a `stream`, an unknown job,
+/// an attached job (its own `stream_in -> packet_capture` edge is a packet output, and a
+/// capture of it would name the wrong job), a job with no packet stream or not running,
+/// a row with `access: restricted` and a job a running `packets` job already captures;
+/// then attach `stream_in -> packet_capture` to `job`'s packet stream, with its centre
+/// and row. Nothing is started on a refusal.
+async fn packets_attach(node: &Node, job: JobId, stream: Option<String>) -> Result<JobId, OpError> {
+    if stream.is_some() {
+        return Err(other(
+            "packets reads the job's packet stream: pass stream null",
+        ));
+    }
+    let Some(input) = node.job_list().into_iter().find(|r| r.id == job) else {
+        return Err(unknown_job(node, &job));
+    };
+    if let Some(of) = &input.input {
+        return Err(other(format!(
+            "packets: job {} is an attached job: attach to its input {}",
+            job.0, of.0
+        )));
+    }
+    let packets = node
+        .job_packet_stream(&job)
+        .map_err(|e| node_error(node, e))?;
+    let modes = node.modes();
+    let row = node
+        .expandable_kind(&input.kind)
+        .and_then(|k| k.mode_row(&modes).ok().flatten());
+    if let Some(r) = row
+        && r.access == Some(Access::Restricted)
+    {
+        return Err(other(format!(
+            "packets: {} is restricted: its capture waits on access control",
+            r.id.0
+        )));
+    }
+    if let Some(by) = attached_to(node, &job, &JobKind::Packets) {
+        return Err(other(format!(
+            "job {} is already captured by {}",
+            job.0, by.0
+        )));
+    }
+    let to = AttachTo {
+        center_hz: input.tuning.center_hz,
+        mode: row.map(|r| r.id.0.as_str()),
+        access: row.and_then(|r| r.access),
+        ..AttachTo::new(&job, &packets)
+    };
+    let graph = JobKind::Packets.expand_attached(&to, ATTACH_LANGUAGE_DEFAULT)?;
+    node.job_attach(JobKind::Packets.name(), &job, None, graph)
+        .await
+        .map_err(|e| node_error(node, e))
+}
+
+/// `packets_delete`: an unknown id is `unknown` with the store's ids; one being written
+/// is refused naming the `packets` job writing it (else the decoder job it records).
+fn packets_delete(node: &Node, capture: &str) -> Result<OpResult, OpError> {
+    let store = node.packets();
+    match store.delete(capture) {
+        Ok(_) => Ok(OpResult::Ok),
+        Err(crate::packets::PacketStoreError::Unknown(_)) => Err(OpError::Unknown {
+            field: "capture".into(),
+            value: capture.into(),
+            known: store.list().into_iter().map(|r| r.id).collect(),
+        }),
+        Err(crate::packets::PacketStoreError::Writing { id, job }) => {
+            let by = attached_to(node, &job, &JobKind::Packets).unwrap_or(job);
+            Err(other(format!(
+                "capture {id} is being written by job {}: stop the packets job first",
+                by.0
+            )))
+        }
+        Err(e @ crate::packets::PacketStoreError::Io(_)) => {
+            Err(other(format!("capture {capture}: {e}")))
+        }
+    }
 }
 
 /// `job_retune`: refuse what cannot be retuned (an attached job, an operator's graph, a

@@ -700,6 +700,50 @@ fn job_start_and_attach_take_the_new_flags() {
 }
 
 #[test]
+fn job_attach_packets_and_the_packets_commands_build_their_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    let job = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+    // The job is unknown to the one-shot node, so the attach is refused after it is logged.
+    zeta(
+        dir.path(),
+        &["job", "attach", "--kind", "packets", "--job", job],
+    )
+    .assert()
+    .code(2);
+    assert_eq!(
+        last_logged_op(dir.path()),
+        serde_json::json!({
+            "op": "job_attach", "kind": "packets", "job": job, "language": null, "stream": null
+        })
+    );
+    let out = zeta(dir.path(), &["packets", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        json(&out),
+        serde_json::json!({"result": "packet_captures", "value": []})
+    );
+    assert_eq!(
+        last_logged_op(dir.path()),
+        serde_json::json!({"op": "packets_list"})
+    );
+    let out = zeta(dir.path(), &["packets", "delete", "--capture", "01NOPE"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(json(&out)["error"], "unknown", "{}", json(&out));
+    assert_eq!(
+        last_logged_op(dir.path()),
+        serde_json::json!({"op": "packets_delete", "capture": "01NOPE"})
+    );
+}
+
+#[test]
 fn iq_read_one_shot_writes_capture() {
     let dir = tempfile::tempdir().unwrap();
     let out = zeta(

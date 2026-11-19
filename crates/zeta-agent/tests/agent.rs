@@ -938,6 +938,25 @@ fn gate_covers_every_delete_taking_op() {
         )
         .is_none()
     );
+    // A packet capture is deleted under the same switch.
+    let refused = gate(
+        &json!({"op": "packets_delete", "capture": "a"}),
+        Allow::default(),
+    )
+    .expect("refused");
+    assert_eq!(refused["error"], "not_allowed");
+    assert_eq!(refused["op"], "packets_delete");
+    assert!(gate(&json!({"op": "packets_delete", "capture": "a"}), allowed).is_none());
+    assert!(gate(&json!({"op": "packets_delete", "capture": "a"}), stops).is_some());
+    assert!(gate(&json!({"op": "packets_list"}), Allow::default()).is_none());
+}
+
+#[test]
+fn the_packet_capture_ops_are_tools() {
+    let tools = op_tools(&zeta_core::ops::schema(), "");
+    for name in ["packets_list", "packets_delete"] {
+        assert!(tools.iter().any(|t| t.name == name), "{name}");
+    }
 }
 
 /// `cfg()` with the page-only tools on, the page's ready themes `console` and `plain`.

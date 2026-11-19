@@ -1,7 +1,8 @@
 //! Attached jobs as core sees them: `job_attach`, the `stream_in` stage, the no-lease
 //! launch, the end of an attached job with its input, resume order, and the launch
-//! registering every output of a multi-output stage. The real `denoise`, `vad` and
-//! `transcribe` stages live in other crates; inline stand-ins take their kinds here.
+//! registering every output of a multi-output stage, and `job_attach` of `packets` with
+//! its refusals. The real `denoise`, `vad` and `transcribe` stages live in other crates;
+//! inline stand-ins take their kinds here.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -1254,20 +1255,39 @@ fn capture_params(node: &Node, job: &JobId) -> serde_json::Value {
         .params
 }
 
-#[tokio::test]
-async fn a_packet_capture_takes_its_inputs_row_and_follows_its_retune() {
-    let dir = tempfile::tempdir().unwrap();
-    let (src, port) = port(dir.path());
-    let mut registry = registry_with_dsp();
-    registry.register(Arc::new(
-        zeta_core::packet_capture::PacketCaptureStage::new(),
-    ));
-    let node = Node::open(cfg(dir.path()), registry, vec![port])
-        .await
-        .unwrap();
-    src.start();
-    let start = |center_hz| Op::JobStart {
-        kind: JobKind::from_name("aprs_decode").unwrap(),
+/// An op from its wire form.
+fn op(v: serde_json::Value) -> Op {
+    serde_json::from_value(v).expect("an op")
+}
+
+/// `job_attach` of `packets` to `job`, with `language` and `stream` as given.
+async fn attach_packets_as(
+    node: &Node,
+    job: &JobId,
+    language: Option<&str>,
+    stream: Option<&str>,
+) -> Result<OpResult, OpError> {
+    node.apply(op(serde_json::json!({
+        "op": "job_attach", "kind": "packets", "job": job.0, "language": language, "stream": stream
+    })))
+    .await
+}
+
+async fn attach_packets(node: &Node, job: &JobId) -> Result<OpResult, OpError> {
+    attach_packets_as(node, job, None, None).await
+}
+
+async fn attach_packets_ok(node: &Node, job: &JobId) -> JobId {
+    match attach_packets(node, job).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("attach packets: {r:?}"),
+    }
+}
+
+/// A `job_start` of `kind` on the tone at `center_hz`, 12.5 kHz wide.
+fn start_op(kind: &str, center_hz: u64) -> Op {
+    Op::JobStart {
+        kind: JobKind::from_name(kind).unwrap(),
         source: file0(),
         center_hz: Hz(center_hz),
         bandwidth_hz: Hz(12_500),
@@ -1282,14 +1302,70 @@ async fn a_packet_capture_takes_its_inputs_row_and_follows_its_retune() {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
-    };
-    let Ok(OpResult::Job(input)) = node.apply(start(100_000_000)).await else {
-        panic!("aprs_decode start");
-    };
-    let att = node
-        .job_attach("packets", &input, None, packets_graph())
-        .await
+    }
+}
+
+async fn start_kind(node: &Node, kind: &str) -> JobId {
+    match node.apply(start_op(kind, 100_000_000)).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("{kind} start: {r:?}"),
+    }
+}
+
+/// The id of the restricted copy of the `aprs_decode` row [`packets_node`] loads.
+const RESTRICTED_ROW: &str = "aprs_restricted";
+
+/// A node over the tone with the real DSP stages and `packet_capture`, and a modes
+/// directory holding [`RESTRICTED_ROW`]: the `aprs_decode` row as `access: restricted`.
+async fn packets_node(dir: &Path) -> (Arc<FileSource>, Node) {
+    let (src, port) = port(dir);
+    let modes = dir.join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let (_, aprs) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("aprs_decode.json"))
         .unwrap();
+    let mut row: serde_json::Value = serde_json::from_str(aprs).unwrap();
+    row["id"] = RESTRICTED_ROW.into();
+    row["access"] = "restricted".into();
+    std::fs::write(
+        modes.join(format!("{RESTRICTED_ROW}.json")),
+        row.to_string(),
+    )
+    .unwrap();
+    let mut registry = registry_with_dsp();
+    registry.register(Arc::new(
+        zeta_core::packet_capture::PacketCaptureStage::new(),
+    ));
+    let cfg = NodeConfig {
+        modes_dir: Some(modes),
+        ..cfg(dir)
+    };
+    let node = Node::open(cfg, registry, vec![port]).await.unwrap();
+    assert!(
+        node.modes().get(RESTRICTED_ROW).is_some(),
+        "the restricted row loads"
+    );
+    src.start();
+    (src, node)
+}
+
+#[tokio::test]
+async fn a_packets_attachment_takes_its_inputs_row_and_follows_its_retune() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = packets_node(dir.path()).await;
+    let input = start_kind(&node, "aprs_decode").await;
+    let att = attach_packets_ok(&node, &input).await;
+    let rec = record(&node, &att);
+    assert_eq!(rec.kind, "packets");
+    assert_eq!(rec.input, Some(input.clone()));
+    let kinds: Vec<&str> = rec.graph.nodes.iter().map(|n| n.kind.as_str()).collect();
+    assert_eq!(kinds, ["stream_in", "packet_capture"]);
+    assert_eq!(rec.graph.nodes[0].params["kind"], "packet");
+    assert_eq!(
+        rec.graph.edges.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        [StreamKind::Packet]
+    );
     assert_eq!(
         capture_params(&node, &att),
         serde_json::json!({
@@ -1315,6 +1391,58 @@ async fn a_packet_capture_takes_its_inputs_row_and_follows_its_retune() {
 }
 
 #[tokio::test]
+async fn job_attach_of_packets_refuses_what_it_cannot_capture_and_starts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = packets_node(dir.path()).await;
+    let aprs = start_kind(&node, "aprs_decode").await;
+    let fm = start_kind(&node, "fm_demod").await;
+    let restricted = start_kind(&node, RESTRICTED_ROW).await;
+    let jobs = node.job_list().len();
+    let refused = |r: Result<OpResult, OpError>, message: String| {
+        assert_eq!(r, Err(other(&message)));
+    };
+
+    refused(
+        attach_packets_as(&node, &aprs, None, Some("slot1")).await,
+        "packets reads the job's packet stream: pass stream null".into(),
+    );
+    refused(
+        attach_packets(&node, &fm).await,
+        format!(
+            "job {} has no packet stream: its kind's outputs list no packet (modes_list)",
+            fm.0
+        ),
+    );
+    refused(
+        attach_packets(&node, &restricted).await,
+        format!("packets: {RESTRICTED_ROW} is restricted: its capture waits on access control"),
+    );
+    assert_eq!(node.job_list().len(), jobs, "nothing recorded");
+
+    // `language` is not checked for `packets` (ruling R2).
+    let captured = match attach_packets_as(&node, &aprs, Some("not a language"), None).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("attach packets: {r:?}"),
+    };
+    let jobs = node.job_list().len();
+    refused(
+        attach_packets(&node, &aprs).await,
+        format!("job {} is already captured by {}", aprs.0, captured.0),
+    );
+    // A `packets` job's own edge is a packet output: capturing it would name the wrong
+    // job (ruling R7).
+    refused(
+        attach_packets(&node, &captured).await,
+        format!(
+            "packets: job {} is an attached job: attach to its input {}",
+            captured.0, aprs.0
+        ),
+    );
+    assert_eq!(node.job_list().len(), jobs, "nothing recorded");
+    assert_eq!(attached_to(&node, &aprs), vec![captured]);
+}
+
+#[tokio::test]
 async fn attaching_packets_to_a_job_with_none_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (src, port) = port(dir.path());
@@ -1324,16 +1452,11 @@ async fn attaching_packets_to_a_job_with_none_is_refused() {
     src.start();
     let audio = start_audio(&node).await;
     let e = node.job_packet_stream(&audio).unwrap_err();
-    assert_eq!(
-        e.to_string(),
-        format!(
-            "job {} has no packet stream: its kind's outputs list no packet (modes_list)",
-            audio.0
-        )
+    let message = format!(
+        "job {} has no packet stream: its kind's outputs list no packet (modes_list)",
+        audio.0
     );
-    assert!(matches!(
-        node.job_attach("packets", &audio, None, packets_graph()).await,
-        Err(zeta_core::node::NodeError::NoPacketStream(j)) if j == audio
-    ));
+    assert_eq!(e.to_string(), message);
+    assert_eq!(attach_packets(&node, &audio).await, Err(other(&message)));
     assert_eq!(attached_to(&node, &audio), Vec::<JobId>::new());
 }

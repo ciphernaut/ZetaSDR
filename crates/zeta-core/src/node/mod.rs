@@ -1109,6 +1109,30 @@ impl Inner {
     }
 }
 
+/// The note a `packets` record left running by the last node carries once `open` stops it.
+const PACKETS_NO_RESUME_NOTE: &str = "packet capture does not resume: attach again";
+
+/// A `packets` attachment does not resume across a restart: each `packets` record that
+/// was `Running` is set `Stopped` with [`PACKETS_NO_RESUME_NOTE`] as its context's
+/// `note` (its `capture`, `packets` and `bytes` kept) and persisted, so `open` loads it
+/// as it is; its file stays in the packet store, closed.
+fn stop_packet_captures(dir: &Path, records: &mut [JobRecord]) -> Result<(), NodeError> {
+    for rec in records
+        .iter_mut()
+        .filter(|r| r.kind == JobKind::Packets.name() && r.state == JobState::Running)
+    {
+        rec.state = JobState::Stopped;
+        match rec.context.as_object_mut() {
+            Some(m) => {
+                m.insert("note".into(), PACKETS_NO_RESUME_NOTE.into());
+            }
+            None => rec.context = serde_json::json!({"note": PACKETS_NO_RESUME_NOTE}),
+        }
+        persist(dir, rec)?;
+    }
+    Ok(())
+}
+
 /// The capture a source's resumable rigid records shared: the widest one's band
 /// when it contains the others (the capture it tuned), else the band bounding them
 /// all when the port can capture it (no wider than `max_bandwidth_hz`, its centre in
@@ -1230,7 +1254,10 @@ impl Node {
     /// resume after every rigid one and join the capture they left. Attached jobs
     /// resume after every job on the radio, so their input runs first; one
     /// whose input does not run is kept as `Failed` with `input job <id> not
-    /// running`, and one that failed that way resumes once its input runs.
+    /// running`, and one that failed that way resumes once its input runs. A
+    /// `packets` attachment never resumes: one left `Running` is set `Stopped` with
+    /// the note `packet capture does not resume: attach again` (see
+    /// [`stop_packet_captures`]); its input resumes as any job does.
     /// Without `cfg.resume` every record is loaded as persisted, untouched.
     /// Either way, before any of that, each attached source pinned in its record
     /// (`state_dir/sources`) is held at its pin (see [`Node::source_pin`]), so a
@@ -1270,8 +1297,11 @@ impl Node {
     ) -> Result<Self, NodeError> {
         let jobs_dir = cfg.state_dir.join("jobs");
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
-        let (records, mut load_errors) = load(&jobs_dir)?;
+        let (mut records, mut load_errors) = load(&jobs_dir)?;
         let job_load_errors = load_errors.len();
+        if cfg.resume {
+            stop_packet_captures(&jobs_dir, &mut records)?;
+        }
         let (station, station_error) = crate::station::load(&cfg.state_dir);
         load_errors.extend(station_error);
         let sources_dir = cfg.state_dir.join("sources");

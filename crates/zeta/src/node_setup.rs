@@ -762,7 +762,7 @@ mod meminfo_tests {
 mod tests {
     use super::*;
     use zeta_core::graph::validate;
-    use zeta_core::ops::{AUDIO_RATE_HZ, JobKind, OpError, schema};
+    use zeta_core::ops::{AUDIO_RATE_HZ, AttachTo, JobKind, OpError, schema};
     use zeta_core::port::Tuning;
     use zeta_core::types::Hz;
 
@@ -824,7 +824,7 @@ mod tests {
                     zeta_core::types::StreamId::new(),
                 );
                 let g = kind
-                    .expand_attached(&job, &stream, None, "en", false)
+                    .expand_attached(&AttachTo::new(&job, &stream), "en")
                     .unwrap();
                 validate(&g, &registry).unwrap_or_else(|e| panic!("{kind:?} attached: {e}"));
                 continue;

@@ -21,7 +21,7 @@ fn rendering_lists_every_op_variant() {
         .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     let variants = v["value"]["op"]["oneOf"].as_array().unwrap();
-    assert_eq!(variants.len(), 51);
+    assert_eq!(variants.len(), 53);
     let md = zeta()
         .arg("agents-md")
         .assert()
@@ -246,6 +246,29 @@ fn capture_ops_are_in_the_guide() {
         "allow.delete_captures",
         "GET /captures/<id>.sigmf-meta",
         "newest first",
+    ] {
+        assert!(md.contains(needle), "missing {needle}");
+    }
+}
+
+#[test]
+fn packet_capture_ops_are_in_the_guide() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    for needle in [
+        "CLI: `zeta packets list",
+        "CLI: `zeta packets delete --capture",
+        "\"op\":\"packets_delete\"",
+        "GET /captures/<id>.pcapng",
+        "rolls at 256 MiB",
+        "downloadable while it is written",
+        "packet capture does not resume: attach again",
     ] {
         assert!(md.contains(needle), "missing {needle}");
     }

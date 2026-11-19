@@ -21,7 +21,7 @@ pub struct Allow {
     pub stop_jobs: bool,
     /// A non-empty `replace` may be sent (it stops the named jobs).
     pub replace: bool,
-    /// `capture_delete` may be applied.
+    /// `capture_delete` and `packets_delete` may be applied.
     pub delete_captures: bool,
     /// `signature_accept`, `signature_reject`, `signature_retract` and
     /// `signature_delete` may be applied.
@@ -51,13 +51,13 @@ pub const GATED_REPLACE_OPS: &[&str] = &[
 /// `Some(error)` when `op` would stop jobs and the run is not allowed to:
 /// a `job_stop`, or a gated op with a non-empty `replace`, or a `source_ensure`
 /// with `widen` (it restarts the holders); likewise a
-/// `capture_delete` without `delete_captures`, and a signature decision
+/// `capture_delete` or `packets_delete` without `delete_captures`, and a signature decision
 /// ([`GATED_SIGNATURE_OPS`]) without `accept_signatures`. The executor is
 /// never reached; the error goes back to the model as the call's result.
 pub fn gate(op: &Value, allow: Allow) -> Option<Value> {
     // `op_from_call` always inserts `"op"`, so a value without a name never comes from a call.
     let name = op["op"].as_str()?;
-    if name == "capture_delete" {
+    if matches!(name, "capture_delete" | "packets_delete") {
         if allow.delete_captures {
             return None;
         }

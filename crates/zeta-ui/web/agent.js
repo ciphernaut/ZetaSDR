@@ -18,7 +18,7 @@
 //                               folded into it with a ×N count. Ok outcomes of the read-only
 //                               polls and lookups (QUIET_OPS: job_list, stream_list,
 //                               source_list, and modes_list and modes_show, which the overlays
-//                               ask to find positioned jobs, capture_list and signature_list, the Explore pane's polls, station_get, the home read at load, set_list, read with job_list, and job_retune, which the waterfall sends as the view of a source's own sweep moves) whose
+//                               ask to find positioned jobs, capture_list, packets_list and signature_list, the Explore pane's polls, station_get, the home read at load, set_list, read with job_list, and job_retune, which the waterfall sends as the view of a source's own sweep moves) whose
 //                               transport is "ui" (a UI's own calls) are hidden; errors and
 //                               other callers' records always show (ruling R6). Records from
 //                               another caller are prefixed `[agent]`, `[http]`, `[local]`.
@@ -211,6 +211,7 @@ export const QUIET_OPS = new Set([
   "modes_show",
   "themes_list",
   "capture_list",
+  "packets_list",
   "signature_list",
   "station_get",
   "set_list",

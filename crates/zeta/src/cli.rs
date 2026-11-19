@@ -378,6 +378,9 @@ pub enum Command {
     /// The burst captures the node stored
     #[command(subcommand)]
     Capture(CaptureCmd),
+    /// The packet captures `packets` jobs wrote (pcapng, for Wireshark)
+    #[command(subcommand)]
+    Packets(PacketsCmd),
     /// The learned signatures: proposals waiting for the operator, and accepted ones
     #[command(subcommand)]
     Signature(SignatureCmd),
@@ -564,6 +567,18 @@ pub enum CaptureCmd {
     /// Delete a capture and its files (a pinned one is refused)
     Delete {
         /// A capture id (from `capture list`)
+        #[arg(long)]
+        capture: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PacketsCmd {
+    /// List the packet captures, newest first
+    List,
+    /// Delete a packet capture and its file (one being written is refused)
+    Delete {
+        /// A packet capture id (from `packets list`)
         #[arg(long)]
         capture: String,
     },
@@ -1541,12 +1556,14 @@ fn parse_job_kind(s: &str) -> Result<JobKind, String> {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum AttachKind {
     Transcribe,
+    Packets,
 }
 
 impl From<AttachKind> for JobKind {
     fn from(k: AttachKind) -> Self {
         match k {
             AttachKind::Transcribe => JobKind::Transcribe,
+            AttachKind::Packets => JobKind::Packets,
         }
     }
 }
@@ -1681,6 +1698,7 @@ impl Command {
                 | Command::Bits(BitsCmd::Start { .. })
                 | Command::Station(StationCmd::Set { .. } | StationCmd::Clear)
                 | Command::Capture(CaptureCmd::Delete { .. })
+                | Command::Packets(PacketsCmd::Delete { .. })
                 | Command::Signature(
                     SignatureCmd::Propose { .. }
                         | SignatureCmd::Accept { .. }
@@ -1968,6 +1986,8 @@ impl Command {
             Command::Capture(CaptureCmd::Show { capture }) => Op::CaptureShow { capture },
             Command::Capture(CaptureCmd::Classify { capture }) => Op::CaptureClassify { capture },
             Command::Capture(CaptureCmd::Delete { capture }) => Op::CaptureDelete { capture },
+            Command::Packets(PacketsCmd::List) => Op::PacketsList {},
+            Command::Packets(PacketsCmd::Delete { capture }) => Op::PacketsDelete { capture },
             Command::Signature(SignatureCmd::List { state }) => Op::SignatureList { state },
             Command::Signature(SignatureCmd::Show { id }) => Op::SignatureShow { id },
             Command::Signature(SignatureCmd::Propose {

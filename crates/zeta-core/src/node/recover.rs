@@ -162,8 +162,12 @@ impl Inner {
 
     /// Whether `open` relaunches `rec`: it is `Running`, or it `Failed` only
     /// because its source was absent and that source is now attached, or (an
-    /// attached job) only because its input job was not running and it now runs.
+    /// attached job) only because its input job was not running and it now runs. A
+    /// `packets` attachment never resumes (`open` stops one left running).
     pub(super) fn resumable(&self, rec: &JobRecord) -> bool {
+        if rec.kind == JobKind::Packets.name() {
+            return false;
+        }
         match (&rec.state, &rec.input) {
             (JobState::Running, _) => true,
             (JobState::Failed { reason }, Some(input)) => {

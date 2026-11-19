@@ -653,6 +653,19 @@ async fn channels_are_validated_before_anything_happens() {
         other_message(node.apply(attach_fm).await),
         "fm_demod is not attachable"
     );
+    // `packets` captures one decoder job: it is attached by `job_attach` alone.
+    let attach_packets = plan_op(
+        PLAN,
+        None,
+        JobKind::FmDemod,
+        Some(JobKind::Packets),
+        None,
+        &[],
+    );
+    assert_eq!(
+        other_message(node.apply(attach_packets).await),
+        "packets captures one decoder job: use job_attach"
+    );
     let language_alone = plan_op(PLAN, None, JobKind::FmDemod, None, Some("de"), &[]);
     assert_eq!(
         other_message(node.apply(language_alone).await),

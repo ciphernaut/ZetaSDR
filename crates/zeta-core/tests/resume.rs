@@ -27,6 +27,8 @@ use zeta_core::types::{
 };
 use zeta_source_file::{FileOpts, FileSource, fixtures};
 
+mod common;
+
 fn source_with(dir: &Path, repeat: bool) -> (Arc<FileSource>, Arc<dyn Port>) {
     let meta = fixtures::write_tone(dir);
     let opts = FileOpts {
@@ -674,4 +676,124 @@ async fn a_stored_explicit_source_scan_refused_at_resume_waits_then_runs() {
     assert!(radio.tunes().is_empty(), "{:?}", radio.tunes());
     assert!(node.lease_holders(&SourceId("radio0".into())).is_empty());
     node.job_stop(&scan).await.unwrap();
+}
+
+/// A stand-in decoder publishing one AX.25 packet per IQ block, and the real
+/// `stream_in` and `packet_capture` a `packets` attachment runs.
+fn packets_registry() -> StageRegistry {
+    let mut r = registry();
+    r.register(Arc::new(zeta_core::stream_in::StreamInStage::new()));
+    r.register(Arc::new(
+        zeta_core::packet_capture::PacketCaptureStage::new(),
+    ));
+    r.register(common::MapStage::new(
+        "packet_src",
+        StreamKind::Iq,
+        &[StreamKind::Packet],
+        |_| {
+            vec![(
+                0,
+                zeta_core::stream::Payload::Packet {
+                    link_type: zeta_core::stream::LinkType::Ax25Kiss,
+                    data: Arc::from(vec![0u8, 0x82, 0xa0]),
+                },
+            )]
+        },
+    ));
+    r
+}
+
+/// `job_attach` of `packets` to `job`, by its wire form.
+async fn attach_packets(node: &Node, job: &JobId) -> JobId {
+    let op: Op = serde_json::from_value(serde_json::json!({
+        "op": "job_attach", "kind": "packets", "job": job.0, "language": null, "stream": null
+    }))
+    .unwrap();
+    match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("attach packets: {r:?}"),
+    }
+}
+
+/// `packets_list`, by its wire form.
+async fn packets_list(node: &Node) -> Vec<serde_json::Value> {
+    let op: Op = serde_json::from_value(serde_json::json!({"op": "packets_list"})).unwrap();
+    let r = node.apply(op).await.expect("packets_list");
+    let v = serde_json::to_value(r).unwrap();
+    assert_eq!(v["result"], "packet_captures", "{v}");
+    v["value"].as_array().unwrap().clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_packets_attachment_does_not_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = fixtures::write_tone(dir.path());
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: None,
+    };
+    let src = Arc::new(FileSource::open(SourceId("file0".into()), &meta, opts).unwrap());
+    let port: Arc<dyn Port> = src.clone();
+    let node = Node::open(cfg(dir.path()), packets_registry(), vec![port.clone()])
+        .await
+        .unwrap();
+    // The file source plays only while subscribed: keep it playing between nodes.
+    let _hold = port.subscribe();
+    src.start();
+    let input = node
+        .job_start(
+            "pkt",
+            SourceId("file0".into()),
+            band(48_000),
+            Graph {
+                id: GraphId::new(),
+                nodes: vec![GraphNode {
+                    id: NodeId("n".into()),
+                    kind: "packet_src".into(),
+                    params: serde_json::json!({}),
+                }],
+                edges: vec![],
+            },
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let att = attach_packets(&node, &input).await;
+    until("a packet captured", Duration::from_secs(10), || {
+        node.packets().list().first().is_some_and(|r| r.packets > 0)
+    })
+    .await;
+    let capture = node.packets().list()[0].id.clone();
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let node = Node::open(cfg(dir.path()), packets_registry(), vec![port])
+        .await
+        .unwrap();
+    assert_eq!(record(&node, &input).state, JobState::Running);
+    let rec = record(&node, &att);
+    assert_eq!(rec.state, JobState::Stopped);
+    assert_eq!(
+        rec.context["note"], "packet capture does not resume: attach again",
+        "{}",
+        rec.context
+    );
+    assert_eq!(on_disk(dir.path(), &att).state, JobState::Stopped);
+    let listed = packets_list(&node).await;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["id"], capture);
+    assert_eq!(listed[0]["writing"], false);
+    // A fresh attach starts a new capture.
+    let again = attach_packets(&node, &input).await;
+    assert_ne!(again, att);
+    until("a fresh capture", Duration::from_secs(10), || {
+        node.packets()
+            .list()
+            .iter()
+            .any(|r| r.id != capture && r.packets > 0)
+    })
+    .await;
 }
