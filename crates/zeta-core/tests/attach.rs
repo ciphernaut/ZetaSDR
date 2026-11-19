@@ -1509,6 +1509,95 @@ async fn concurrent_packets_attaches_to_one_job_make_one_capture() {
     assert_eq!(packets, won);
 }
 
+/// A row edited to `access: restricted` after its job was captured stops the capture at
+/// the next relaunch (here the input's retune): the `packets` job ends `failed` with the
+/// attach's refusal, and the decoder keeps running.
+#[tokio::test]
+async fn a_row_made_restricted_stops_its_capture_on_relaunch() {
+    const ROW: &str = "aprs_operator";
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = packets_node(dir.path()).await;
+    let file = dir.path().join("modes").join(format!("{ROW}.json"));
+    let (_, aprs) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("aprs_decode.json"))
+        .unwrap();
+    let mut row: serde_json::Value = serde_json::from_str(aprs).unwrap();
+    row["id"] = ROW.into();
+    std::fs::write(&file, row.to_string()).unwrap();
+    node.reload_modes().unwrap();
+    let input = start_kind(&node, ROW).await;
+    let att = attach_packets_ok(&node, &input).await;
+    assert_eq!(capture_params(&node, &att)["mode"], ROW);
+    row["access"] = "restricted".into();
+    std::fs::write(&file, row.to_string()).unwrap();
+    node.reload_modes().unwrap();
+    assert_eq!(record(&node, &att).state, JobState::Running);
+    let retune = Op::JobRetune {
+        job: input.clone(),
+        center_hz: Hz(100_002_000),
+        bandwidth_hz: Hz(12_500),
+        bin_hz: None,
+        replace: vec![],
+    };
+    assert_eq!(node.apply(retune).await, Ok(OpResult::Job(input.clone())));
+    let failed = JobState::Failed {
+        reason: format!("packets: {ROW} is restricted: its capture waits on access control"),
+    };
+    common::until(
+        "the capture fails on its relaunch",
+        Duration::from_secs(10),
+        || record(&node, &att).state == failed,
+    )
+    .await;
+    assert_running_for(&node, &input, 500).await;
+    assert_eq!(record(&node, &input).tuning.center_hz, Hz(100_002_000));
+}
+
+/// A row made unreadable after its job was captured stops the capture on relaunch too.
+#[tokio::test]
+async fn a_row_made_unreadable_stops_its_capture_on_relaunch() {
+    const ROW: &str = "aprs_operator";
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = packets_node(dir.path()).await;
+    let file = dir.path().join("modes").join(format!("{ROW}.json"));
+    let (_, aprs) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("aprs_decode.json"))
+        .unwrap();
+    let mut row: serde_json::Value = serde_json::from_str(aprs).unwrap();
+    row["id"] = ROW.into();
+    std::fs::write(&file, row.to_string()).unwrap();
+    node.reload_modes().unwrap();
+    let input = start_kind(&node, ROW).await;
+    let att = attach_packets_ok(&node, &input).await;
+    std::fs::remove_file(&file).unwrap();
+    node.reload_modes().unwrap();
+    assert!(node.modes().get(ROW).is_none());
+    // A retune checks the row and is refused; a graph put of the input's own graph is a
+    // relaunch that does not.
+    let retune = Op::JobRetune {
+        job: input.clone(),
+        center_hz: Hz(100_002_000),
+        bandwidth_hz: Hz(12_500),
+        bin_hz: None,
+        replace: vec![],
+    };
+    assert!(node.apply(retune).await.is_err());
+    assert_eq!(record(&node, &att).state, JobState::Running);
+    let graph = record(&node, &input).graph;
+    node.job_graph_put(&input, graph).await.unwrap();
+    let failed = JobState::Failed {
+        reason: format!("packets: {ROW} has no readable mode row: its access cannot be checked"),
+    };
+    common::until(
+        "the capture fails on its relaunch",
+        Duration::from_secs(10),
+        || record(&node, &att).state == failed,
+    )
+    .await;
+}
+
 /// A row job whose row can no longer be read (broken, then gone, after a modes reload)
 /// is not captured: its access cannot be checked, so the attach is refused.
 #[tokio::test]

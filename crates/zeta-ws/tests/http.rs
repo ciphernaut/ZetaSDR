@@ -507,3 +507,38 @@ async fn only_a_packet_capture_id_is_served() {
     }
     ts.stop().await;
 }
+
+/// A capture of a restricted row is answered exactly as an unknown id is.
+#[tokio::test]
+async fn a_restricted_capture_is_not_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let mut w = ts
+        .node
+        .packets()
+        .begin(zeta_core::packets::NewPacketCapture {
+            mode: Some("pager_text".into()),
+            access: Some(zeta_core::modes::Access::Restricted),
+            ..new_packet_capture()
+        })
+        .unwrap();
+    let id = w.id().to_string();
+    w.write(1, b"one").unwrap();
+    assert!(ts.node.packets().get(&id).is_some());
+    let unknown = "01NOPE000000000000000000000";
+    let resp = get(&ts, &format!("/captures/{id}.pcapng")).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = resp.json::<Value>().await.unwrap();
+    let resp = get(&ts, &format!("/captures/{unknown}.pcapng")).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let unknown_body = resp.json::<Value>().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap().replace(&id, "<id>"),
+        unknown_body["message"]
+            .as_str()
+            .unwrap()
+            .replace(unknown, "<id>")
+    );
+    assert_eq!(body["error"], unknown_body["error"]);
+    ts.stop().await;
+}

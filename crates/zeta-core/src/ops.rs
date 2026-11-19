@@ -359,7 +359,11 @@ pub enum Op {
     /// is an attached job: attach to its input <input>`), a job whose row cannot be read
     /// now, say after a modes reload (`packets: <kind> has no readable mode row: its
     /// access cannot be checked`), a row with `access: restricted` (`packets: <row> is
-    /// restricted: its capture waits on access control`) and a job already captured (`job <id> is already captured by <packets job>`). It
+    /// restricted: its capture waits on access control`) and a job already captured (`job <id> is already captured by <packets job>`). A
+    /// row edited to restricted or made unreadable after the attach (and a modes reload)
+    /// ends a running capture at its next relaunch (the input's retune, graph put or heal):
+    /// the `packets` job is `failed` with the same reason, and its input runs on. A
+    /// capture of a restricted row is never served (`404`, as an unknown id). It
     /// does not resume across a node restart: it is listed `stopped` with the note
     /// `packet capture does not resume: attach again`, its file kept.
     #[schemars(transform = require_attach_stream)]
@@ -7243,15 +7247,7 @@ async fn packets_attach(node: &Node, job: JobId, stream: Option<String>) -> Resu
         .job_packet_stream(&job)
         .map_err(|e| node_error(node, e))?;
     let modes = node.modes();
-    let row = capture_row(&input.kind, &modes)?;
-    if let Some(r) = row
-        && r.access == Some(Access::Restricted)
-    {
-        return Err(other(format!(
-            "packets: {} is restricted: its capture waits on access control",
-            r.id.0
-        )));
-    }
+    let row = capture_row(&input.kind, &modes).map_err(other)?;
     if let Some(by) = attached_to(node, &job, &JobKind::Packets) {
         return Err(other(format!(
             "job {} is already captured by {}",
@@ -7275,16 +7271,30 @@ async fn packets_attach(node: &Node, job: JobId, stream: Option<String>) -> Resu
 /// `graph_start` job). A kind that names a row which cannot be read now (gone from the
 /// operator's directory, broken or unavailable after a modes reload) is refused, `packets:
 /// <kind> has no readable mode row: its access cannot be checked`: a capture never goes
-/// ahead without knowing whether its row is restricted.
-fn capture_row<'a>(kind: &str, modes: &'a ModeRegistry) -> Result<Option<&'a ModeRow>, OpError> {
+/// ahead without knowing whether its row is restricted. A row with `access: restricted`
+/// is refused, `packets: <row> is restricted: its capture waits on access control`. The
+/// attach checks it, and so does each launch of a `packets` job (a relaunch after its
+/// input's retune, a graph put or a heal: [`crate::node`]'s `point_attached`), so a row
+/// edited to restricted or made unreadable since the attach stops the capture.
+pub(crate) fn capture_row<'a>(
+    kind: &str,
+    modes: &'a ModeRegistry,
+) -> Result<Option<&'a ModeRow>, String> {
     let Some(k) = JobKind::from_name(kind).filter(|k| !k.leaseless_name()) else {
         return Ok(None);
     };
-    k.mode_row(modes).map_err(|_| {
-        other(format!(
-            "packets: {kind} has no readable mode row: its access cannot be checked"
-        ))
-    })
+    let row = k.mode_row(modes).map_err(|_| {
+        format!("packets: {kind} has no readable mode row: its access cannot be checked")
+    })?;
+    if let Some(r) = row
+        && r.access == Some(Access::Restricted)
+    {
+        return Err(format!(
+            "packets: {} is restricted: its capture waits on access control",
+            r.id.0
+        ));
+    }
+    Ok(row)
 }
 
 /// `packets_delete`: an unknown id is `unknown` with the store's ids; one being written

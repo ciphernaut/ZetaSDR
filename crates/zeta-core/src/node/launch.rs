@@ -1079,7 +1079,9 @@ impl Inner {
     /// main stream), and each `packet_capture` node's `job`, `center_hz`, `mode` and
     /// `access` from the input's record and its kind's mode row, so a relaunch after the
     /// input's retune captures under its new centre. `InputNotRunning`,
-    /// `NoAudioStream`, `NoVoice` or `NoPacketStream` when a stream is not there.
+    /// `NoAudioStream`, `NoVoice` or `NoPacketStream` when a stream is not there; for a
+    /// `packet_capture`, `Other` with the attach's refusal when the input's row is now
+    /// restricted or cannot be read ([`crate::ops::capture_row`]).
     fn point_attached(&self, rec: &mut JobRecord, input: &JobId) -> Result<(), NodeError> {
         let mut pointed = false;
         for n in rec
@@ -1118,10 +1120,22 @@ impl Inner {
                 .ok_or_else(|| NodeError::InputNotRunning(input.clone()))?;
             (e.record.kind.clone(), e.record.tuning.center_hz)
         };
+        // The attach's row check again: a row edited to restricted, or made unreadable,
+        // since the attach ends the capture here (the relaunch fails it with the reason).
+        // A kind the registry never had a row for (a `Node::job_start` caller's own name)
+        // whose capture recorded no such row is a kind of no row, as at its attach.
         let modes = self.modes();
-        let row = self
-            .expandable_kind(&kind)
-            .and_then(|k| k.mode_row(&modes).ok().flatten());
+        let recorded = rec
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == PACKET_CAPTURE_KIND)
+            .any(|n| n.params.get("mode").and_then(|m| m.as_str()) == Some(kind.as_str()));
+        let row = match crate::ops::capture_row(&kind, &modes) {
+            Ok(row) => row,
+            Err(_) if !recorded && self.expandable_kind(&kind).is_none() => None,
+            Err(e) => return Err(NodeError::Other(e)),
+        };
         let fill = serde_json::json!({
             "job": input.0,
             "center_hz": center_hz.0,
