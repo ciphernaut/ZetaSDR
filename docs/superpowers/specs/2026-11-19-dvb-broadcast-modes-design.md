@@ -36,8 +36,10 @@ operator-built external program over IQ and reports what the signal says about i
   roll-off, and MER/Es-No as events — and, as a second step, **lists its MPEG-TS
   services** (PAT/SDT), mirroring the DVB-T signalling→service-list progression. Needs
   the L-band dish/LNB.
-- Both reuse the program-row model, identify's `as_asked`/decoded-query path, and the
-  register emission-designator mapping (`ofdm` → D/V/W/X) the DVB-T row established.
+- Both reuse the program-row model and identify's `as_asked`/decoded-query path. The
+  register emission mapping needs no new work: `modes/score.rs::designator_fits` already
+  maps `ofdm` (T2, like DVB-T) and `psk` (DVB-S QPSK → designators G and D). DVB-S's
+  `modulation: ["psk"]` fits as-is.
 
 ## Non-goals
 
@@ -92,22 +94,27 @@ operator-built external program over IQ and reports what the signal says about i
    wrapper, the fixture and the row for a sibling standard the same library already
    receives.
 
-**DVB-S — the external program:**
+**DVB-S — a wrapper, and which engine it drives.** The builder check (2026-11-19)
+corrected a wrong assumption: **none of the candidate programs is a drop-in handler.**
+DVB-S, like DVB-T, needs a small operator-built wrapper — call it `dvbs-rx` — that reads
+IQ on stdin and prints `json_lines` measurements on stdout, because:
 
-1. *DecSAT* (**chosen**). Rust, GPL-3, already does **DVB-S → MPEG-TS (EN 300 421)** with
-   code rate, rotation and inversion found blind (Viterbi + RS), and a blind
-   symbol-rate/roll-off "Identify". We reviewed it 2026-11-19. One wrinkle: its live IQ
-   input is **network IQ** (`udp://`, `tcp://`, `listen://`), not stdin — so the DVB-S row
-   needs a socket feed, not the `via: stdin` the DVB-T row uses (see "the input wrinkle").
-   Best blind DVB-S decode of the candidates and the one already in hand.
-2. *SatDump DVB-S pipeline.* Fits the existing `via: stdin` cf32 feed with no node change,
-   but SatDump is image/product-oriented and its DVB-S→TS path is less its focus; its
-   status comes from an HTTP port, not stdout (the SatDump gist's open problem).
-3. *gr-dvbs2rx / GNU Radio flowgraph.* Reads stdin cf32, flexible, but must be assembled
-   and validated here.
-4. *Extend `dvbt-rx`.* Rejected: DVB-S is **not** `modemdvb` (which is DVB-T/T2); it is a
-   different SDRangel component (the DATV/leandvb path), so this is not a free extension
-   of the existing wrapper.
+- *DecSAT* has no such mode. Its CLI is file-in/file-out (`analyse`, `scan`, `decode`
+  writes `.ts`/`.csv`) and `decsat-server`'s smart mode reports over its own network
+  protocol, not stdout. But its engine crates (`decsat-engine`, `decsat-modem`) do blind
+  **DVB-S → MPEG-TS (EN 300 421)**, Viterbi + RS, blind symbol rate/roll-off — Rust,
+  GPL-3, in hand. A `dvbs-rx` built on those crates is the cleanest engine (**my pick**).
+- *gr-dvbs2rx / GNU Radio* and *SatDump* can take stdin cf32 but still need a wrapper for
+  machine-readable status (SatDump's is an HTTP port, the SatDump gist's open problem);
+  they are the alternatives if the operator prefers not to depend on DecSAT's crates.
+- *modemdvb* (the DVB-T wrapper's library) does **not** do DVB-S, so there is no
+  extending `dvbt-rx` into it.
+
+So the DVB-S decision is which engine `dvbs-rx` wraps, not which program to call. This is
+a materially bigger piece than DVB-T2: a new GPL wrapper to build, test, publish and
+version, on the `dvbt-rx` precedent (unpublished local repo, named by
+`ZETA_HANDLER_DVBS_RX` in the unit). The node side is unchanged — stdin cf32, exactly
+like `dvbt_decode`.
 
 **DVB-S measurement vs service list — one row or two:** one row, two build steps
 (measurement first, then the MPEG-TS service list), mirroring how the DVB-T row went
@@ -130,6 +137,12 @@ replaced**:
   `locked: false` now means neither T1 nor T2 locked at any width.
 - Identify/classify unchanged (`as_asked`, `range_hz` the broadcast TV bands); the
   decoded-query comparison already maps `ofdm` to the OFDM emission letters.
+- **Acquisition within the dwell (builder gap):** the wrapper now runs two receivers, so
+  it must reach a T2 lock inside the row's 8 s identify dwell. A DVB-T2 signal carries a
+  **P1 preamble symbol** identifying it as T2 before full acquisition, so the wrapper
+  should branch on P1 rather than run the whole DVB-T width sweep and only then try T2.
+  If P1 detection will not fit the dwell, the dwell is widened for this row (builder's
+  measurement on a real/synthetic T2 capture).
 
 Fixture: `modemdvb` has a T2 modulator path, so `dvbt-rx` can write a short synthetic T2
 multiplex for the row's `test` the way the DVB-T fixture gist proposes, under the few-MB
@@ -151,11 +164,11 @@ A new `dvbs_decode` row, `family: "tv"`, `decoder.kind: "program"`, modelled on
   "protocol": "dvbs",
   "decoder": {
     "kind": "program",
-    "programs": ["decsat"],            // or satdump / dvbs2rx; see approaches
+    "programs": ["dvbs-rx"],           // operator-built wrapper; engine = DecSAT crates (my pick)
     "args": [ ... symbol-rate hint, blind ... ],
-    "input": { "stream": "iq", "format": "cf32", "rate_hz": <2–4× Rs>, "via": "udp" },  // the wrinkle
+    "input": { "stream": "iq", "format": "cf32", "rate_hz": <2–4× Rs>, "via": "stdin" },
     "output": { "via": "stdout", "port": null, "parser": "json_lines" },
-    "install": { "debian": null, "url": "https://github.com/CasualArclamp/DecSAT" }
+    "install": { "debian": null, "url": "<dvbs-rx repo, unpublished like dvbt-rx>" }
   },
   "event": { "schema": { ... locked, lock, symbol_rate_baud, code_rate, roll_off,
                           mer_db, esno_db, offset_hz, inverted, services?, network_id? ... },
@@ -175,24 +188,19 @@ A new `dvbs_decode` row, `family: "tv"`, `decoder.kind: "program"`, modelled on
   `range_hz` is the IF span, so identify never offers DVB-S in a terrestrial band and
   vice versa. The dish is out of scope (a later source concern, shared with DVB-S2).
 
-#### The input wrinkle (the one node change DVB-S may need)
+#### No new node mechanism
 
-The program-row `input.via` is `stdin` today. DecSAT's live IQ input is a UDP/TCP socket,
-not stdin. Two ways:
-
-- **Add `via: "udp"` (chosen with DecSAT):** the node binds/sends cf32 to a local socket
-  the program reads. A small, reusable addition to the program-row launcher
-  (`zeta-ext`/launch), useful later for the DVB-S2 measure row and any socket-only
-  program. This is the one genuinely new node mechanism in the spec.
-- **Keep `via: stdin` and pick a stdin program** (SatDump or gr-dvbs2rx): no node change,
-  at the cost of DecSAT's blind DVB-S decode. If the operator prefers no new node
-  mechanism, this is the fallback and the program choice flips with it.
+An earlier draft proposed a `via: "udp"` socket feed, because DecSAT-the-application
+only takes network IQ. With `dvbs-rx` built as a purpose wrapper, that dissolves: the
+wrapper reads cf32 on stdin like `dvbt-rx`, so the DVB-S row uses `via: "stdin"` and the
+node's program-row launcher is unchanged. The cost that would have been a node mechanism
+moves into the wrapper, where it belongs.
 
 ### Shared bookkeeping (both parts, from [[zetasdr-dvbt-direction]])
 
 A new embedded row (DVB-S) means updating `EMBEDDED` in `zeta-core/src/modes/mod.rs`, the
 row-name lists in `zeta-core/tests/modes.rs`, `zeta/tests/cli.rs` (plus a
-`ZETA_HANDLER_DECSAT` override), `zeta/tests/modes_check.rs`, and the order test in
+`ZETA_HANDLER_DVBS_RX` override), `zeta/tests/modes_check.rs`, and the order test in
 `modes/score.rs`. A program row with no centres needs a `range_hz` or it takes a classify
 slot everywhere. Schema fields ending `_hz`/`_baud` are integers. DVB-T2 extends an
 existing row, so it touches the event schema and `agents_md.rs` prose but adds no row.
@@ -214,9 +222,14 @@ existing row, so it touches the event schema and `agents_md.rs` prose but adds n
 
 Carried in the handover, not pre-settled:
 
-1. **The DVB-S external program** — DecSAT (best blind DVB-S, needs the new `via: udp`
-   node mechanism) vs a stdin program (SatDump/gr-dvbs2rx, no node change, weaker DVB-S).
-   My pick is DecSAT; it decides whether the spec adds a node mechanism.
-2. **Landing shape** — DVB-T2 and DVB-S are independent (different program, front end and
-   risk); I propose two plans, T2 first (small, no hardware), DVB-S second (needs the
-   dish). Confirmable.
+1. **DVB-S needs a new wrapper — appetite and engine.** The builder check showed no
+   candidate is a drop-in, so DVB-S means building `dvbs-rx` (a GPL wrapper, IQ-in →
+   JSON-out), not just adding a row. This is the bulk of the DVB-S effort and the biggest
+   single call. My pick: build it on DecSAT's `decsat-engine`/`decsat-modem` crates (Rust,
+   GPL, blind DVB-S→TS, in hand). Alternatives: wrap gr-dvbs2rx or SatDump. Confirm the
+   appetite for a new wrapper, and the engine. (The node side stays stdin — no node
+   mechanism either way.)
+2. **Landing shape** — DVB-T2 and DVB-S are independent and very different in size: T2 is
+   a small extension of an existing wrapper and row (no hardware); DVB-S is a new wrapper
+   + row + the L-band dish. I propose two plans, **T2 first** (lands and is live-testable
+   on the discone now), DVB-S second (gated on the dish). Confirmable.
