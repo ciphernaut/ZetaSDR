@@ -109,7 +109,9 @@ impl PacketStore {
                 Err(e) => {
                     let aside = dir.join(format!("{INDEX_FILE}.broken-{}", ulid::Ulid::generate()));
                     eprintln!("zeta: packets: index unreadable ({e}); moved aside");
-                    std::fs::rename(&index_path, aside)?;
+                    if let Err(e) = std::fs::rename(&index_path, aside) {
+                        eprintln!("zeta: packets: index not moved aside ({e})");
+                    }
                     Vec::new()
                 }
             },
@@ -127,7 +129,14 @@ impl PacketStore {
                 changed = true;
             }
             if meta.len() != r.bytes {
-                trim(&mut r)?;
+                if let Err(e) = trim(&mut r) {
+                    eprintln!(
+                        "zeta: packets: capture {} unreadable ({e}); dropped from the index",
+                        r.id
+                    );
+                    changed = true;
+                    continue;
+                }
                 changed = true;
             }
             kept.push(r);
@@ -162,6 +171,7 @@ impl PacketStore {
             packets: 0,
             last_index: Instant::now(),
             scratch: Vec::new(),
+            poisoned: false,
         })
     }
 
@@ -334,6 +344,8 @@ pub struct PacketWriter {
     packets: u64,
     last_index: Instant,
     scratch: Vec<u8>,
+    /// A failed write could not be undone: the file may hold a torn block.
+    poisoned: bool,
 }
 
 impl PacketWriter {
@@ -347,13 +359,18 @@ impl PacketWriter {
     /// `Some(new id)` then. A packet larger than the cap is written whole in a file of
     /// its own.
     pub fn write(&mut self, t_ns: u64, data: &[u8]) -> std::io::Result<Option<String>> {
+        if self.poisoned {
+            return Err(std::io::Error::other(
+                "packet capture file left torn by an earlier failed write",
+            ));
+        }
         self.scratch.clear();
         pcapng::packet(&mut self.scratch, t_ns, data, &self.comment);
         let mut rolled = None;
         if self.packets > 0 && self.bytes + self.scratch.len() as u64 > self.store.max_bytes {
-            self.store
-                .update(&self.id, self.bytes, self.packets, false, false);
             let (id, file, bytes) = self.store.start(&self.new)?;
+            self.store
+                .update(&self.id, self.bytes, self.packets, false, true);
             self.id = id.clone();
             self.file = file;
             self.bytes = bytes;
@@ -361,7 +378,10 @@ impl PacketWriter {
             self.last_index = Instant::now();
             rolled = Some(id);
         }
-        self.file.write_all(&self.scratch)?;
+        if let Err(e) = self.file.write_all(&self.scratch) {
+            self.rewind();
+            return Err(e);
+        }
         self.bytes += self.scratch.len() as u64;
         self.packets += 1;
         let due = self.last_index.elapsed() >= INDEX_EVERY;
@@ -371,6 +391,21 @@ impl PacketWriter {
         self.store
             .update(&self.id, self.bytes, self.packets, true, due);
         Ok(rolled)
+    }
+}
+
+impl PacketWriter {
+    /// Cut the file back to the last whole block after a failed write; when that
+    /// fails too the writer is poisoned.
+    fn rewind(&mut self) {
+        use std::io::{Seek, SeekFrom};
+        let undone = self
+            .file
+            .set_len(self.bytes)
+            .and_then(|()| self.file.seek(SeekFrom::Start(self.bytes)).map(|_| ()));
+        if undone.is_err() {
+            self.poisoned = true;
+        }
     }
 }
 
@@ -578,5 +613,62 @@ mod tests {
         let live: Vec<String> = store.list().into_iter().map(|r| r.id).collect();
         assert!(live.contains(&ids[1]));
         assert!(live.contains(&open_w.id().to_string()));
+    }
+
+    #[test]
+    fn open_survives_a_capture_file_it_cannot_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let mut w = store.begin(new_capture()).unwrap();
+            w.write(1, &[1; 10]).unwrap();
+            ids.push(w.id().to_string());
+        }
+        let bad = store.get(&ids[0]).unwrap().path;
+        std::fs::remove_file(&bad).unwrap();
+        std::fs::create_dir(&bad).unwrap();
+        drop(store);
+        let store = open(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let live: Vec<String> = store.list().into_iter().map(|r| r.id).collect();
+        assert_eq!(live, vec![ids[1].clone()]);
+    }
+
+    #[test]
+    fn a_torn_write_is_cut_back_and_a_failed_cut_poisons_the_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let mut w = store.begin(new_capture()).unwrap();
+        w.write(1, &[1; 10]).unwrap();
+        // A block cut short in the file, as a failed write_all leaves it.
+        w.file.write_all(&[0xAB; 7]).unwrap();
+        w.rewind();
+        w.write(2, &[2; 10]).unwrap();
+        let r = store.get(w.id()).unwrap();
+        assert_eq!(read_file(&r).len(), 2);
+        assert_eq!(r.bytes, std::fs::metadata(&r.path).unwrap().len());
+        // A handle that cannot write nor truncate: the write fails, the cut fails.
+        w.file = std::fs::File::open(&r.path).unwrap();
+        assert!(w.write(3, &[3; 10]).is_err());
+        assert!(w.write(4, &[4; 10]).is_err());
+        assert_eq!(read_file(&store.get(w.id()).unwrap()).len(), 2);
+        assert_eq!(store.get(w.id()).unwrap().packets, 2);
+    }
+
+    #[test]
+    fn a_failed_roll_leaves_the_old_capture_marked_as_being_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open(tmp.path(), 4096);
+        let mut w = store.begin(new_capture()).unwrap();
+        w.write(1, &[1; 3000]).unwrap();
+        let id = w.id().to_string();
+        std::fs::remove_dir_all(tmp.path().join(PACKETS_DIR)).unwrap();
+        assert!(w.write(2, &[2; 3000]).is_err());
+        assert_eq!(w.id(), id);
+        assert!(store.get(&id).unwrap().writing);
+        assert!(matches!(
+            store.delete(&id),
+            Err(PacketStoreError::Writing { .. })
+        ));
     }
 }
