@@ -240,18 +240,11 @@ only reserves the payload; the `.ts` egress is DVB-T's to build.
 
 ## Open decisions for the operator
 
-**Restart / resume behaviour (builder gap 1b) — PENDING the operator.** Jobs and
-transcribe attachments persist and resume across a node restart. Does a `packets`
-attachment?
-
-- *My recommendation — do not resume.* On restart the capture stops, the pcapng so far
-  is kept and served, and the attachment is not re-created; the operator re-attaches if
-  they still want it. This keeps phase A a small sink. A node restart is rare and
-  operator-driven, and a capture that silently resumes into a new file after a restart
-  the operator may not have noticed is more surprising than useful.
-- *The alternative — resume* (re-attach on resume, open a fresh pcapng + id, since
-  appending to a pcapng across a gap is awkward) makes this a persistence feature:
-  more code in `persist.rs`, resume tests, and an entry in the resumed-state the node
-  prints. Worth it only if unattended multi-day capture across restarts is a real need.
-
-Folded into the design once answered.
+**Restart / resume behaviour (builder gap 1b) — DECIDED by the operator 2026-11-19:
+do not resume.** On a node restart the capture stops, the pcapng written so far is kept
+and served by its id, and the `packets` attachment is **not** re-created; the operator
+re-attaches if they still want it. Unlike jobs and transcribe attachments, a `packets`
+attachment is not persisted in resumed state. This keeps phase A a small sink, with no
+persistence or resume code. (If unattended multi-day capture across restarts is ever
+wanted, resume is a later, separable addition: re-attach on resume into a fresh pcapng
+and id.)
