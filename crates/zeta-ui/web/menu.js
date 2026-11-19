@@ -3,7 +3,7 @@
 // or asks the agent.
 //
 // Exports:
-//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, planPolicy, command, muteFor,
+//   mountMenu(wf, {applyOp, attachOp, ask, transcript, ov, plan, planPolicy, command, muteFor, packetsFor,
 //                  onOrigins, sets, sources})
 //       -> Menu   (`onOrigins(key, answer)`: What is this's classification `origins`, keyed
 //       `classify:<t_ns>`, for the map to light; the box menu has no Origins entry of its
@@ -15,7 +15,9 @@
 //       transcribes a job (as the job rows' Transcribe button applies it); `ask(text)` is
 //       its /ask path. `muteFor(job) -> {muted, title, run} | null` is app.js's (null: no
 //       running mix covers the job; `run()` applies the mute or unmute op and answers its
-//       result). `planPolicy()` is the view's `plan` policy (`auto`, a plan id or `none`), which
+//       result). `packetsFor(job)` the running `packets` job taking `job` as its input, or
+//       null (app.js; the job menu's Capture packets reads Stop packet capture while one runs).
+//       `planPolicy()` is the view's `plan` policy (`auto`, a plan id or `none`), which
 //       the fit's plan rule reads.
 //   FIT_KINDS, FIT_MIN_HZ, FIT_MIN_HZ_DEFAULT, FIT_FACTOR, FIT_TIMEOUT_MS, FIT_NOISE_SNR_DB,
 //   MEASURE_DC_MASK_HZ
@@ -607,7 +609,7 @@ export function clampSpan(startNs, endNs, newest) {
 class Menu {
   constructor(
     wf,
-    { applyOp, attachOp, ask, transcript, ov, plan = () => null, planPolicy = () => "none", ringSeconds = () => null, command = () => {}, muteFor = () => null, onOrigins = () => {}, sets = () => [], sources = () => [], isAudio = () => false, play = () => {}, transcribe = () => {}, playing = () => false },
+    { applyOp, attachOp, ask, transcript, ov, plan = () => null, planPolicy = () => "none", ringSeconds = () => null, command = () => {}, muteFor = () => null, packetsFor = () => null, onOrigins = () => {}, sets = () => [], sources = () => [], isAudio = () => false, play = () => {}, transcribe = () => {}, playing = () => false },
   ) {
     this.isAudio = isAudio;
     this.play = play;
@@ -618,6 +620,7 @@ class Menu {
     this.sources = sources;
     this.onOrigins = onOrigins;
     this.muteFor = muteFor;
+    this.packetsFor = packetsFor;
     this.applyOp = applyOp;
     this.ringSeconds = ringSeconds;
     this.attachOp = attachOp;
@@ -794,6 +797,8 @@ class Menu {
       job,
       sel,
       mute: this.muteFor(job),
+      packets: this.packetsFor(job),
+      rows: this.rows,
       audio: !job.input && this.isAudio(job),
       running: job.state?.status === "running",
       playing: this.playing(job.id),
@@ -1274,6 +1279,15 @@ class Menu {
 
   stopJob(job) {
     return this.applyOp({ op: "job_stop", job: job.id });
+  }
+
+  // Capture packets: attach a packets job to `job`, or stop `running` (its packets job).
+  capturePackets(job, running) {
+    return this.applyOp(
+      running
+        ? { op: "job_stop", job: running.id }
+        : { op: "job_attach", kind: "packets", job: job.id, language: null, stream: null },
+    );
   }
 
   // modes_list's rows, read on first use and kept (a failure is tried again at the next

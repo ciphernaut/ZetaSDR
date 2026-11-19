@@ -1474,6 +1474,7 @@ function start(api) {
     applyOp,
     attachOp,
     muteFor,
+    packetsFor,
     ask: askAgent,
     transcript: state.transcript,
     ov: state.ov,
@@ -2147,6 +2148,16 @@ function syncListen() {
   const on = !!(state.audio && state.audio.mix);
   b.setAttribute("aria-pressed", String(on));
   b.textContent = on ? "Stop listening" : "Listen to all";
+}
+
+// The running `packets` job that takes `job` as its input, or null (the job menu's
+// Capture packets reads Stop packet capture while there is one).
+function packetsFor(job) {
+  return (
+    (state.lastJobs || []).find(
+      (j) => j.kind === "packets" && j.input === job.id && j.state?.status === "running",
+    ) || null
+  );
 }
 
 // The mute a demodulator's row or outline offers: the running mix that hears it (mix.js

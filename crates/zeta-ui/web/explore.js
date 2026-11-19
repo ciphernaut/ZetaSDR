@@ -20,6 +20,13 @@
 //   armed like Delete: `sure?` for DELETE_CONFIRM_MS, then a second click deletes every
 //   capture that is not pinned, one `capture_delete` each, and notes
 //   `deleted <n> captures` with `(<m> pinned kept)` or the failures appended).
+//   Packet captures (`packets_list`, polled with the rest) are `tr.packet-capture[data-id]` rows
+//   after the IQ ones: the time, the decoder row's name and the frequency (`APRS packet radio
+//   144.8000 MHz`), the size, `<n> packets`, `recording` while `writing`, and under `td.actions` an
+//   `a.packets-download` (href `/captures/<id>.pcapng`, `download`; a click fetches it with the
+//   bearer and saves a Blob, the secret never in a URL) and Delete (`packets_delete`, armed like
+//   the others, disabled while `writing`). A running `packets` job counts as a capture job
+//   (noteJobs), so the rows' counts refresh.
 //   Draws the cached region (ov.span, tagged with the id's last 6 characters) of each capture
 //   still on the waterfall's columns (one that ended before the oldest column is skipped).
 //   Each poll also lists `signature_list {state: null}`; under the captures a
@@ -41,7 +48,7 @@
 //   reload never takes the pane back from the stored one (spec 5.7, auto-selected the first
 //   time a capture appears, never again).
 
-import { bandText, khzText, registerText, registerVerdictLine } from "./units.js";
+import { bandText, khzText, mhzText, registerText, registerVerdictLine } from "./units.js";
 
 export const EXPLORE_POLL_MS = 2000;
 export const DELETE_CONFIRM_MS = 3000;
@@ -112,6 +119,9 @@ class ExplorePane {
     this.t = transcript;
     this.panes = panes;
     this.captures = [];
+    this.packetCaptures = []; // packets_list's records, newest first
+    this.rowNames = new Map(); // decoder row id -> its name (modes_list, read with the first record)
+    this.modesRead = false;
     this.baseline = null; // the ids the first poll listed (null before it answers)
     this.selected = false; // the auto-select happened (once per load)
     this.everShown = false; // the pane was shown this load
@@ -149,7 +159,7 @@ class ExplorePane {
   }
 
   eligible() {
-    return this.captures.length > 0 || this.signatures.length > 0;
+    return this.captures.length > 0 || this.packetCaptures.length > 0 || this.signatures.length > 0;
   }
 
   shown() {
@@ -165,7 +175,7 @@ class ExplorePane {
   noteJobs(jobs) {
     const was = this.capturing;
     this.capturing = (jobs || []).some(
-      (j) => j && j.kind === "capture" && (j.state?.status ?? j.status) === "running",
+      (j) => j && (j.kind === "capture" || j.kind === "packets") && (j.state?.status ?? j.status) === "running",
     );
     if (this.capturing && !was) this.schedule();
     else if (was && !this.capturing && !this.polling()) this.poll();
@@ -182,9 +192,10 @@ class ExplorePane {
   async poll() {
     if (this.destroyed) return;
     let listed = false;
-    const [caps, sigs] = await Promise.allSettled([
+    const [caps, sigs, pkts] = await Promise.allSettled([
       this.api.op({ op: "capture_list", signal: null }),
       this.api.op({ op: "signature_list", state: null }),
+      this.api.op({ op: "packets_list" }),
     ]);
     if (this.destroyed) return;
     // A failed list keeps the last one; the next poll tries again.
@@ -192,6 +203,11 @@ class ExplorePane {
     if (r && r.result === "captures" && Array.isArray(r.value)) {
       this.captures = r.value;
       listed = true;
+    }
+    const p = pkts.status === "fulfilled" ? pkts.value : null;
+    if (p && p.result === "packet_captures" && Array.isArray(p.value)) {
+      this.packetCaptures = p.value;
+      if (p.value.length) await this.readRowNames();
     }
     const s = sigs.status === "fulfilled" ? sigs.value : null;
     if (s && s.result === "signatures" && Array.isArray(s.value)) {
@@ -201,6 +217,7 @@ class ExplorePane {
       const ids = new Set(this.signatures.map((x) => x.id));
       for (const id of this.names.keys()) if (!ids.has(id)) this.names.delete(id);
     }
+    if (this.destroyed) return;
     this.render();
     this.syncSpans();
     const ids = this.captures.map((c) => c.id);
@@ -274,6 +291,7 @@ class ExplorePane {
       tr.append(td);
       body.append(tr);
     }
+    for (const c of this.packetCaptures) body.append(this.packetRow(c));
     const table = document.createElement("table");
     table.append(body);
     const tools = document.createElement("div");
@@ -290,6 +308,54 @@ class ExplorePane {
     const place = this.focusedField();
     this.el.replaceChildren(...parts);
     this.restoreField(place);
+  }
+
+  // The decoder rows' names, read once (a failure is tried again at the next poll).
+  async readRowNames() {
+    if (this.modesRead) return;
+    try {
+      const r = await this.api.op({ op: "modes_list", family: null, state: null });
+      for (const m of r?.value?.modes || []) this.rowNames.set(m.id, m.name);
+      this.modesRead = true;
+    } catch {
+      // The id stands in for the name.
+    }
+  }
+
+  // A `tr.packet-capture` (see the header).
+  packetRow(c) {
+    const tr = document.createElement("tr");
+    tr.className = "packet-capture";
+    tr.dataset.id = c.id;
+    const cells = [
+      timeText(c.created_ns),
+      `${(c.mode && (this.rowNames.get(c.mode) ?? c.mode)) || "packets"} ${mhzText(c.center_hz)} MHz`,
+      sizeText(c.bytes),
+      `${c.packets} packets`,
+      c.writing ? "recording" : "",
+    ];
+    for (const text of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      td.title = text;
+      tr.append(td);
+    }
+    const td = document.createElement("td");
+    td.className = "actions";
+    const a = document.createElement("a");
+    a.className = "packets-download";
+    a.href = `${this.api.base}/captures/${encodeURIComponent(c.id)}.pcapng`;
+    a.download = `${c.id}.pcapng`;
+    a.textContent = "Download";
+    const b = document.createElement("button");
+    b.type = "button";
+    b.dataset.action = "delete";
+    b.textContent = this.armed.has(c.id) ? "sure?" : "Delete";
+    b.disabled = !!c.writing;
+    b.title = c.writing ? `written by job ${c.job}: stop its packets job first` : "packets_delete";
+    td.append(a, b);
+    tr.append(td);
+    return tr;
   }
 
   // The operator's place in a row's name or rate field (the element, its row and class,
@@ -408,6 +474,13 @@ class ExplorePane {
       if (b.dataset.action === "accept") return this.accept(sig.dataset.id, sig.querySelector("input.sig-name")?.value);
       return;
     }
+    const a = ev.target.closest("a.packets-download");
+    if (a) {
+      ev.preventDefault();
+      return this.downloadPackets(a.closest("tr").dataset.id);
+    }
+    const pk = ev.target.closest("tr.packet-capture");
+    if (b && pk) return this.removePackets(pk.dataset.id);
     const tr = ev.target.closest("tr.capture");
     if (!b || !tr) return;
     const id = tr.dataset.id;
@@ -487,6 +560,36 @@ class ExplorePane {
     } catch (e) {
       this.t.note(`download: ${e.message}`, true);
     }
+  }
+
+  // The pcapng, fetched with the bearer and saved as a Blob.
+  async downloadPackets(id) {
+    try {
+      const resp = await fetch(`${this.api.base}/captures/${encodeURIComponent(id)}.pcapng`, {
+        headers: { Authorization: "Bearer " + this.api.secret },
+      });
+      if (!resp.ok) throw new Error(`${id}.pcapng: HTTP ${resp.status}`);
+      const url = URL.createObjectURL(await resp.blob());
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${id}.pcapng`;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (e) {
+      this.t.note(`download: ${e.message}`, true);
+    }
+  }
+
+  async removePackets(id) {
+    if (!this.confirmed(this.armed, id)) return;
+    try {
+      await this.api.op({ op: "packets_delete", capture: id });
+    } catch (e) {
+      this.t.note(`packets_delete: ${e.message}`, true);
+    }
+    await this.poll();
   }
 
   async remove(id) {

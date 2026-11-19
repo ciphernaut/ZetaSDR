@@ -250,7 +250,7 @@ def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
     for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2",
-                   "dmr", "kiwi"):
+                   "dmr", "packets", "kiwi"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -10835,6 +10835,91 @@ def scenario_explore_what_is_this_and_delete(page, url, secret):
     page.wait_for_timeout(2500)
     assert view_value(page, "pane") == "pane none", view_value(page, "pane")
     clear_captures(url, secret)
+
+
+def scenario_packet_capture(page, url, secret):
+    # An APRS decoder's menu captures its packets: Explore lists the capture as it is
+    # written (`recording`, a packet count), its link downloads a pcapng, Stop packet
+    # capture ends the recording and Delete removes the file. Self-seeding on the `packets`
+    # source (two invented stations looping), so it passes alone.
+    for j in running_jobs(url, secret, "packets", "packets"):
+        stop_job(url, secret, j["id"])
+    wait_until(lambda: not any(c["writing"] for c in capture_ops(url, secret, "packets_list")),
+               10, "old recordings ended")
+    for c in capture_ops(url, secret, "packets_list"):
+        capture_ops(url, secret, "packets_delete", capture=c["id"])
+    select_source(page, url, secret, "packets")
+    job = start_job(url, secret, "aprs_decode", "packets", 144_800_000, 12_500)
+    # A job that is not a packet decoder offers neither entry.
+    other = start_job(url, secret, "passthrough", "packets", 144_800_000, 12_500)
+    menu = page.locator("#ctx-outline")
+    row = '#explore tr.packet-capture'
+    try:
+        job_row(page, other).locator("button.more").click()
+        expect(menu).to_be_visible()
+        expect(menu.locator('.ctx-item[data-action="packets"]')).to_have_count(0)
+        close_menu(page, "#ctx-outline")
+        job_row(page, job).locator("button.more").click()
+        expect(menu).to_be_visible()
+        item = menu_item(page, "packets", "#ctx-outline")
+        expect(item).to_have_text("Capture packets")
+        with page.expect_request(is_op("job_attach")) as req:
+            item.click()
+        body = json.loads(req.value.post_data)
+        assert (body["kind"], body["job"]) == ("packets", job), f"attach {body}"
+        expect(menu).to_be_hidden()
+        tab = page.locator('#panes .pane-tab[data-pane="explore"]')
+        expect(tab).to_be_visible(timeout=20_000)
+        tab.click()
+        # Recording, with at least one packet.
+        wait_until(lambda: [c for c in capture_ops(url, secret, "packets_list")
+                            if c["writing"] and c["packets"] >= 1], 30, "a packet written")
+        page.wait_for_function(
+            "() => { const r = document.querySelector('#explore tr.packet-capture');"
+            " return !!r && r.children[4].textContent === 'recording'"
+            " && parseInt(r.children[3].textContent, 10) >= 1; }", timeout=20_000)
+        expect(page.locator(row)).to_have_count(1)
+        expect(page.locator(row)).to_contain_text("APRS packet radio 144.8000 MHz")
+        # Delete is disabled while it records.
+        expect(page.locator(row + ' button[data-action="delete"]')).to_be_disabled()
+        link = page.locator(row + " a.packets-download")
+        expect(link).to_have_attribute("href", re.compile(r"/captures/[^/]+\.pcapng$"))
+        href = link.get_attribute("href")
+        head = page.evaluate(
+            "async ([href, secret]) => {"
+            " const r = await fetch(href, {headers: {Authorization: 'Bearer ' + secret}});"
+            " if (!r.ok) return 'HTTP ' + r.status;"
+            " return Array.from(new Uint8Array(await r.arrayBuffer()).slice(0, 4));"
+            " }", [href, secret])
+        assert head == [0x0A, 0x0D, 0x0D, 0x0A], f"pcapng header {head}"
+        # The link saves the file (a click is fetched with the bearer).
+        with page.expect_download() as dl:
+            link.click()
+        assert dl.value.suggested_filename.endswith(".pcapng"), dl.value.suggested_filename
+        # The same menu entry now stops the capture.
+        job_row(page, job).locator("button.more").click()
+        item = menu_item(page, "packets", "#ctx-outline")
+        expect(item).to_have_text("Stop packet capture")
+        with page.expect_request(is_op("job_stop")) as req:
+            item.click()
+        assert json.loads(req.value.post_data)["job"] != job
+        expect(page.locator(row)).not_to_contain_text("recording", timeout=20_000)
+        button = page.locator(row + ' button[data-action="delete"]')
+        expect(button).to_be_enabled()
+        button.click()
+        expect(button).to_have_text("sure?")
+        button.click()
+        expect(page.locator(row)).to_have_count(0, timeout=20_000)
+        assert capture_ops(url, secret, "packets_list") == []
+    finally:
+        for j in running_jobs(url, secret, "packets", "packets"):
+            stop_job(url, secret, j["id"])
+        stop_job(url, secret, other)
+        stop_job(url, secret, job)
+        wait_until(lambda: not any(c["writing"] for c in capture_ops(url, secret, "packets_list")),
+                   10, "recording ended")
+        for c in capture_ops(url, secret, "packets_list"):
+            capture_ops(url, secret, "packets_delete", capture=c["id"])
 
 
 def scenario_explore_delete_all_removes_every_capture(page, url, secret):

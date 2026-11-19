@@ -65,7 +65,8 @@
 //   job: {surface: "job", host, job, sel, mute, audio, running, playing, role, play,
 //        transcribe}: `job` a job_list record, `sel` its band as a selection on its source (its
 //        span the newest painted on the shown source, else null; null without a band), `mute`
-//        app.js muteFor(job) ({muted, title, run} or null), `playing` whether the page plays it, `audio`
+//        app.js muteFor(job) ({muted, title, run} or null), `packets` app.js packetsFor(job) (the
+//        running packets job taking it, or null), `rows` as in a box's ctx, `playing` whether the page plays it, `audio`
 //        whether the job has an audio stream to play (not an attached job), `running` whether it
 //        runs, `role` the voice to play and transcribe (null: the main stream), `play(job,
 //        {role})` and `transcribe(job, {role})` the row's ▶ and Transcribe callbacks (app.js)
@@ -223,6 +224,11 @@
 //                          attached one
 //   transcribe Transcribe  (Next) the row's Transcribe: transcribe(job, {role}), job_attach
 //                          kind=transcribe; a running job with audio
+//   packets Capture packets  (Next, after Transcribe) job_attach kind=packets on a running job
+//                          whose modes_list row's `outputs` lists `packet` (aprs_decode and the
+//                          frame rows), so the node writes its packets to a pcapng capture
+//                          (Explore lists it); reads `Stop packet capture` while a `packets`
+//                          job takes its input (job_stop on that job)
 //   classify, identify, measure, watch  (Next, after Listen and Transcribe under the heading
 //                          `On its band`, with no heading when those two are not offered) the
 //                          box entries' runs on the job's band (`sel`,
@@ -350,6 +356,12 @@ export const ACTIONS = [
     section: { job: "On its band" },
     applies: (c) => c.surface === "box" || (banded(c) && c.sel.startNs !== null),
     run: (c) => c.host.classify(c.sel),
+  },
+  {
+    id: "packets", group: "next", on: ["job"],
+    label: (c) => (c.packets ? "Stop packet capture" : "Capture packets"),
+    applies: (c) => c.running && !c.job.input && (rowOf(c, c.job.kind)?.outputs || []).includes("packet"),
+    run: (c) => c.host.capturePackets(c.job, c.packets),
   },
   demod("fm_demod", "NBFM audio", job("fm_demod", 5000)),
   demod("wfm_demod", "FM broadcast audio", job("wfm_demod", 75000)),
