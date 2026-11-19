@@ -181,8 +181,8 @@ pub const APRS_INFO: &str = "!2723.05S/15307.05E>zeta packet capture test";
 /// job on it decodes a frame about every 1.7 s. Two invented stations send the same
 /// [`APRS_INFO`] at once, [`APRS_CALLS`]`[0]` on [`APRS_HZ`] and [`APRS_CALLS`]`[1]`
 /// [`APRS_OFFSET_HZ`] above it, at [`APRS_RATE`] (about 1.3 MB). Packet capture's node
-/// tests (`tests/attach.rs`) play it, and the page suite's packet capture scenario is
-/// meant to build its fixture with it too. Its meta path.
+/// tests (`tests/attach.rs`) play it; the page suite's packet capture scenario uses that
+/// suite's own `aprs` source instead. Its meta path.
 pub fn aprs_fixture(dir: &Path) -> PathBuf {
     let [low, high] = APRS_CALLS;
     let on = zeta_dsp::fixtures::aprs_packet_iq(low, "APRS", APRS_INFO, APRS_RATE, 0.0);

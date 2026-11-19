@@ -148,12 +148,10 @@ async fn main() -> ExitCode {
         Ok(op) => op,
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
     };
-    // Only the state dir's owner expires the burst store at open: `serve`, or a one-shot
-    // given a policy of its own while no serve runs (a read-only one-shot under serve
-    // never expires what serve's policy keeps).
-    // The state dir's owner: `serve`, or a one-shot while no serve holds it. A one-shot
-    // beside a running serve opens the packet store read-only, so it never recovers,
-    // trims or rewrites what serve is writing.
+    // The state dir's owner is `serve`, or a one-shot while no serve holds it. A one-shot
+    // beside a running serve opens the packet store read-only, so it never recovers, trims
+    // or rewrites what serve is writing, and it never expires the burst store at open. An
+    // owning one-shot expires it only when given a policy of its own.
     let owns_state_dir = op.is_none() || serve_lock::owner(&state_dir).is_none();
     burst_policy.expire_at_open = match op {
         None => true,

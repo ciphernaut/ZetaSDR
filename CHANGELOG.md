@@ -8,6 +8,9 @@
   frequency. `packets_list` and `packets_delete` (CLI `zeta packets`), a download at
   `/captures/<id>.pcapng` while the file is written, a Capture packets entry on a capable job's
   menu and a list in Explore. A capture does not resume on a restart.
+- Every APRS or frame-row job now lists a `packet` stream at `/streams`, which an older
+  `zeta-client` cannot decode: upgrade the peers that read this node's streams (another node's
+  `--source-node`, `zeta-mcp`) together with it.
 
 ## 0.2.0 - 2026-11-17
 

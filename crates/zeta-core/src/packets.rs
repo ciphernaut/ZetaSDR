@@ -3,11 +3,10 @@
 //! [`PacketCaptureRecord`] each, kept within a [`BurstPolicy`] of its own
 //! ([`packet_policy`]: [`PACKET_CAPTURE_KEEP_BYTES`] and the node's `keep_days`, apart
 //! from the burst store's budget), each capture aged by its last write. A capture a job
-//! is still writing is never
-//! expired nor deleted; one cut off by a crash is trimmed to whole blocks at open. A
-//! process that does not own the state directory (a one-shot beside `zeta serve`) opens
-//! the store read-only ([`PacketStore::open_read_only`]): it reads the index as serve
-//! last wrote it and changes nothing.
+//! is still writing is never expired nor deleted; one cut off by a crash is trimmed to
+//! whole blocks at open. A process that does not own the state directory (a one-shot
+//! beside `zeta serve`) opens the store read-only ([`PacketStore::open_read_only`]): it
+//! reads the index as serve last wrote it and changes nothing.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
