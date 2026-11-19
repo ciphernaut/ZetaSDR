@@ -421,7 +421,9 @@ fn parse_meminfo(text: &str) -> Option<u64> {
 /// `passthrough` job from each tune; a VRT source binds its UDP address here; a SoapySDR
 /// device is opened here, in a `zeta soapy-worker` child unless `--soapy-in-process`.
 /// `resume` relaunches persisted `Running` jobs (`serve`); without it they are listed as
-/// persisted and left alone (one-shot). `speech` is the backend `transcribe`
+/// persisted and left alone (one-shot). `owns_state_dir` is false for a one-shot beside a
+/// running `serve`, whose packet store it then opens read-only
+/// ([`NodeConfig::owns_state_dir`]). `speech` is the backend `transcribe`
 /// jobs run on. `themes_dir` is the operator's themes (`--themes-dir`; `None` for
 /// [`zeta_core::themes::default_operator_dir`]). `modes_dir` is the operator's mode rows (`--modes-dir`; `None` for
 /// [`zeta_core::modes::default_operator_dir`]) and `sets_dir` the operator's named sets
@@ -436,6 +438,7 @@ pub async fn open(
     source_positions: BTreeMap<SourceId, SourcePosition>,
     plugins: &[PluginSpec],
     resume: bool,
+    owns_state_dir: bool,
     ring_budget_mb: Option<u64>,
     burst_policy: BurstPolicy,
     modes_dir: Option<PathBuf>,
@@ -456,6 +459,7 @@ pub async fn open(
         sources,
         source_positions,
         resume,
+        owns_state_dir,
         ring_budget_mb,
         burst_policy,
     )
@@ -527,6 +531,7 @@ pub async fn open_with(
     sources: &[SourceSpec],
     source_positions: BTreeMap<SourceId, SourcePosition>,
     resume: bool,
+    owns_state_dir: bool,
     ring_budget_mb: Option<u64>,
     burst_policy: BurstPolicy,
 ) -> Result<(Node, RemotePorts), String> {
@@ -540,6 +545,7 @@ pub async fn open_with(
         sources,
         source_positions,
         resume,
+        owns_state_dir,
         ring_budget_mb,
         burst_policy,
         &mut remotes,
@@ -566,6 +572,7 @@ async fn open_into(
     sources: &[SourceSpec],
     source_positions: BTreeMap<SourceId, SourcePosition>,
     resume: bool,
+    owns_state_dir: bool,
     ring_budget_mb: Option<u64>,
     burst_policy: BurstPolicy,
     remotes: &mut RemotePorts,
@@ -652,6 +659,7 @@ async fn open_into(
             .map_or_else(default_ring_budget, |mb| mb.saturating_mul(1 << 20)),
         backends,
         resume,
+        owns_state_dir,
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         bank_factory: Some(Arc::new(zeta_dsp::bank::PfbBankFactory)),
         modes_dir,

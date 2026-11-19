@@ -344,6 +344,7 @@ async fn themes_list_answers_every_theme() {
         scan_dwell_ms: 20,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };

@@ -261,6 +261,8 @@ async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> 
         &[source],
         Default::default(),
         false,
+        // Its own scratch state dir.
+        true,
         None,
         Default::default(),
     )

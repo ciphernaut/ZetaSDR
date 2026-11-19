@@ -7302,9 +7302,10 @@ fn packets_delete(node: &Node, capture: &str) -> Result<OpResult, OpError> {
                 by.0
             )))
         }
-        Err(e @ crate::packets::PacketStoreError::Io(_)) => {
-            Err(other(format!("capture {capture}: {e}")))
-        }
+        Err(
+            e @ (crate::packets::PacketStoreError::Io(_)
+            | crate::packets::PacketStoreError::ReadOnly),
+        ) => Err(other(format!("capture {capture}: {e}"))),
     }
 }
 

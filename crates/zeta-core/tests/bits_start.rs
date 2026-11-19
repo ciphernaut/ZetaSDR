@@ -81,6 +81,7 @@ async fn open_with(dir: &Path, extra: Option<Arc<dyn Stage>>) -> Node {
         scan_dwell_ms: 20,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };

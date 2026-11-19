@@ -19,6 +19,7 @@ async fn open(dir: &Path) -> Node {
         scan_dwell_ms: 20,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };

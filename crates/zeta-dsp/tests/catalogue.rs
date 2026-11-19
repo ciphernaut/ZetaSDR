@@ -186,6 +186,7 @@ async fn knowledge_lookup_returns_catalogue_signatures() {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: false,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };
@@ -260,6 +261,7 @@ async fn lookup(center_hz: u64, bandwidth_hz: u64) -> Vec<zeta_core::knowledge::
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: false,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };

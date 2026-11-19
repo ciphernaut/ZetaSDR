@@ -151,9 +151,13 @@ async fn main() -> ExitCode {
     // Only the state dir's owner expires the burst store at open: `serve`, or a one-shot
     // given a policy of its own while no serve runs (a read-only one-shot under serve
     // never expires what serve's policy keeps).
+    // The state dir's owner: `serve`, or a one-shot while no serve holds it. A one-shot
+    // beside a running serve opens the packet store read-only, so it never recovers,
+    // trims or rewrites what serve is writing.
+    let owns_state_dir = op.is_none() || serve_lock::owner(&state_dir).is_none();
     burst_policy.expire_at_open = match op {
         None => true,
-        Some(_) => burst_policy.expire_at_open && serve_lock::owner(&state_dir).is_none(),
+        Some(_) => burst_policy.expire_at_open && owns_state_dir,
     };
     // `serve` holds the state dir until it exits; the guard removes the lock.
     let _lock = match op {
@@ -184,6 +188,7 @@ async fn main() -> ExitCode {
         source_positions,
         &plugins,
         op.is_none(),
+        owns_state_dir,
         cli.ring_budget_mb,
         burst_policy,
         cli.modes_dir.clone(),

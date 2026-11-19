@@ -797,6 +797,7 @@ fn cfg_dwell(dir: &Path, scan_dwell_ms: u64) -> NodeConfig {
         ring_budget_bytes: 64 << 20,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         scan_dwell_ms,
         bank_factory: None,
         modes_dir: None,

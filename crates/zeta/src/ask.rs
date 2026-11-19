@@ -84,6 +84,8 @@ pub async fn run(
                 source_positions,
                 plugins,
                 false,
+                // No serve holds the state dir (refused above).
+                true,
                 ring_budget_mb,
                 burst_policy,
                 modes_dir,

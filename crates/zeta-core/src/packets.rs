@@ -2,7 +2,10 @@
 //! frames to, under `state_dir/packets/` with an `index.json` of one
 //! [`PacketCaptureRecord`] each, kept within the node's [`BurstPolicy`] (its own byte
 //! budget, apart from the burst store's). A capture a job is still writing is never
-//! expired nor deleted; one cut off by a crash is trimmed to whole blocks at open.
+//! expired nor deleted; one cut off by a crash is trimmed to whole blocks at open. A
+//! process that does not own the state directory (a one-shot beside `zeta serve`) opens
+//! the store read-only ([`PacketStore::open_read_only`]): it reads the index as serve
+//! last wrote it and changes nothing.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -74,7 +77,12 @@ pub enum PacketStoreError {
     Writing { id: String, job: JobId },
     #[error("io: {0}")]
     Io(String),
+    #[error("{READ_ONLY}")]
+    ReadOnly,
 }
+
+/// Why a read-only store refuses a change.
+const READ_ONLY: &str = "the packet store is read-only: another process owns the state directory";
 
 /// The store: the directory and its index, every change written through.
 pub struct PacketStore {
@@ -82,6 +90,8 @@ pub struct PacketStore {
     policy: BurstPolicy,
     max_bytes: u64,
     index: Mutex<Vec<PacketCaptureRecord>>,
+    /// Opened by [`PacketStore::open_read_only`]: nothing is written.
+    read_only: bool,
 }
 
 impl PacketStore {
@@ -146,11 +156,38 @@ impl PacketStore {
             policy,
             max_bytes,
             index: Mutex::new(kept),
+            read_only: false,
         };
         if changed {
             store.persist(&store.index.lock().unwrap())?;
         }
         Ok(Arc::new(store))
+    }
+
+    /// Open `state_dir/packets` read-only, for a process that does not own the state
+    /// directory while another (`zeta serve`) writes it: the index is read as it is, a
+    /// capture being written stays `writing`, and no file, index or directory is made,
+    /// trimmed or rewritten. A missing or unreadable index reads as empty. `begin`,
+    /// `delete` and `expire` change nothing ([`PacketStoreError::ReadOnly`]).
+    pub fn open_read_only(state_dir: &Path, policy: BurstPolicy) -> Arc<Self> {
+        let dir = state_dir.join(PACKETS_DIR);
+        let mut index: Vec<PacketCaptureRecord> = match std::fs::read(dir.join(INDEX_FILE)) {
+            Err(_) => Vec::new(),
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
+                eprintln!("zeta: packets: index unreadable ({e}); listed as empty");
+                Vec::new()
+            }),
+        };
+        for r in &mut index {
+            r.path = dir.join(format!("{}.pcapng", r.id));
+        }
+        Arc::new(Self {
+            dir,
+            policy,
+            max_bytes: PACKET_CAPTURE_MAX_BYTES,
+            index: Mutex::new(index),
+            read_only: true,
+        })
     }
 
     /// Start a capture file for `new`, with its header written, and the writer that
@@ -177,6 +214,9 @@ impl PacketStore {
 
     /// Make a record and its file (header only), add it to the index and expire.
     fn start(&self, new: &NewPacketCapture) -> std::io::Result<(String, std::fs::File, u64)> {
+        if self.read_only {
+            return Err(std::io::Error::other(READ_ONLY));
+        }
         let id = ulid::Ulid::generate().to_string();
         let path = self.dir.join(format!("{id}.pcapng"));
         let mut head = Vec::new();
@@ -233,6 +273,9 @@ impl PacketStore {
 
     /// Remove the capture `id` and its file; one being written is refused.
     pub fn delete(&self, id: &str) -> Result<PacketCaptureRecord, PacketStoreError> {
+        if self.read_only {
+            return Err(PacketStoreError::ReadOnly);
+        }
         let mut index = self.index.lock().unwrap();
         let i = index
             .iter()
@@ -255,8 +298,12 @@ impl PacketStore {
 
     /// Apply the policy: the oldest closed captures go until all the bytes held fit
     /// `keep_bytes`, then every closed capture older than `keep_days`. A capture being
-    /// written stays (and counts against the budget). Returns the ids removed.
+    /// written stays (and counts against the budget). Returns the ids removed; a
+    /// read-only store removes none.
     pub fn expire(&self) -> Vec<String> {
+        if self.read_only {
+            return Vec::new();
+        }
         let mut index = self.index.lock().unwrap();
         index.sort_by(|a, b| (a.created_ns.0, &a.id).cmp(&(b.created_ns.0, &b.id)));
         let mut total: u64 = index.iter().map(|r| r.bytes).sum();
@@ -315,6 +362,9 @@ impl PacketStore {
 
     /// Write `index` to `index.json` atomically (a temp file, then a rename).
     fn persist(&self, index: &[PacketCaptureRecord]) -> std::io::Result<()> {
+        if self.read_only {
+            return Err(std::io::Error::other(READ_ONLY));
+        }
         let json = serde_json::to_vec(index)?;
         let tmp = self.dir.join(format!("{INDEX_FILE}.tmp"));
         std::fs::write(&tmp, json)?;
@@ -545,6 +595,60 @@ mod tests {
         assert_eq!(r.packets, 2);
         assert_eq!(r.bytes, std::fs::metadata(&path).unwrap().len());
         assert_eq!(read_file(&r).len(), 2);
+    }
+
+    /// A one-shot beside a live writer: the store it opens read-only lists the capture as
+    /// being written and touches neither the index nor the file, though the file has grown
+    /// past what the (throttled) index says; it begins, deletes and expires nothing.
+    #[test]
+    fn a_read_only_open_beside_a_live_writer_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let mut w = store.begin(new_capture()).unwrap();
+        // Within the index's throttle: the file grows, the index on disk does not.
+        for i in 0..3u8 {
+            w.write(u64::from(i), &[i; 30]).unwrap();
+        }
+        let id = w.id().to_string();
+        let path = store.get(&id).unwrap().path;
+        let index_path = tmp.path().join(PACKETS_DIR).join(INDEX_FILE);
+        let (index_before, file_before) = (
+            std::fs::read(&index_path).unwrap(),
+            std::fs::read(&path).unwrap(),
+        );
+        let on_disk: Vec<PacketCaptureRecord> = serde_json::from_slice(&index_before).unwrap();
+        assert!(on_disk[0].writing);
+        assert!(
+            on_disk[0].bytes < file_before.len() as u64,
+            "the index lags"
+        );
+
+        let ro = PacketStore::open_read_only(tmp.path(), BurstPolicy::default());
+        let r = ro.get(&id).unwrap();
+        assert!(r.writing);
+        assert_eq!(r.bytes, on_disk[0].bytes);
+        assert_eq!(r.path, path);
+        assert!(ro.begin(new_capture()).is_err());
+        assert_eq!(ro.delete(&id), Err(PacketStoreError::ReadOnly));
+        assert!(ro.expire().is_empty());
+        drop(ro);
+        assert_eq!(std::fs::read(&index_path).unwrap(), index_before);
+        assert_eq!(std::fs::read(&path).unwrap(), file_before);
+        let files = std::fs::read_dir(tmp.path().join(PACKETS_DIR))
+            .unwrap()
+            .count();
+        assert_eq!(files, 2, "the index and the one capture, nothing new");
+        // The writer goes on as before.
+        w.write(9, &[9; 30]).unwrap();
+        assert_eq!(store.get(&id).unwrap().packets, 4);
+    }
+
+    #[test]
+    fn a_read_only_open_of_no_store_makes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ro = PacketStore::open_read_only(tmp.path(), BurstPolicy::default());
+        assert!(ro.list().is_empty());
+        assert!(!tmp.path().join(PACKETS_DIR).exists());
     }
 
     #[test]

@@ -63,6 +63,7 @@ async fn fm_demod_job_produces_audio_with_tone() {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };
@@ -177,6 +178,7 @@ async fn aprs_decode_job_decodes_fixture_packet() {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };
@@ -276,6 +278,7 @@ async fn node_over(
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };

@@ -2919,6 +2919,7 @@ mod tests {
             scan_dwell_ms: crate::ops::SCAN_DWELL_MS,
             backends: vec![crate::stage::Backend::Cpu],
             resume: false,
+            owns_state_dir: true,
             bank_factory: None,
             modes_dir: None,
             sets_dir: None,

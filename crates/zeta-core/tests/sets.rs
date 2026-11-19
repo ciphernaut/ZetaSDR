@@ -114,6 +114,7 @@ fn cfg(dir: &Path, sets_dir: Option<&Path>) -> NodeConfig {
         scan_dwell_ms: 20,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
         sets_dir: sets_dir.map(Path::to_path_buf),

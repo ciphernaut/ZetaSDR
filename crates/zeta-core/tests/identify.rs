@@ -222,6 +222,7 @@ async fn node_unstarted(
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         // No channel bank: an unoptimised PFB at 2.048 MHz drops about a third of the
         // blocks, and no decoder proves on what is left (the bank's own tests cover it).
         bank_factory: None,

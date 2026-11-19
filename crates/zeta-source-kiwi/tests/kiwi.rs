@@ -95,6 +95,7 @@ async fn node_with(src: Arc<KiwiSource>) -> (Node, tempfile::TempDir) {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };

@@ -107,6 +107,7 @@ pub fn cfg(dir: &Path, resume: bool) -> NodeConfig {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     }

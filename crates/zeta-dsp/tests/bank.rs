@@ -489,6 +489,7 @@ async fn a_band_change_fails_a_bank_served_job_with_the_reason() {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };
@@ -618,6 +619,7 @@ async fn measure_emits_partials_when_the_input_gaps_every_400_ms() {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         bank_factory: Some(Arc::new(PfbBankFactory)),
         modes_dir: None,
     };

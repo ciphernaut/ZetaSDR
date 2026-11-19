@@ -76,6 +76,7 @@ async fn tone_node(dir: &std::path::Path) -> Arc<Node> {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: false,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };
@@ -1198,6 +1199,7 @@ async fn two_source_node_ranged(
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: false,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
         sets_dir: None,

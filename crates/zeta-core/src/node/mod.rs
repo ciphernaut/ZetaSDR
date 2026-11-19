@@ -103,6 +103,12 @@ pub struct NodeConfig {
     /// Relaunch `Running` jobs on `open` (a long-lived node). When false, records
     /// are loaded as persisted and nothing is launched, leased or rewritten.
     pub resume: bool,
+    /// This process owns the state directory: `zeta serve`, or a one-shot while no
+    /// serve holds it. When false (a read-only one-shot beside a running serve) the
+    /// packet store is opened read-only: its index is read as it is (a capture serve
+    /// writes stays `writing`), and nothing in `state_dir/packets` is recovered,
+    /// trimmed, rewritten or expired.
+    pub owns_state_dir: bool,
     /// The default dwell of a `scan` step, ms: the time's worth of settled
     /// samples each step takes (not a time waited), unless `job_start` asks for
     /// another; [`crate::ops::SCAN_DWELL_MS`] (20), and the tests' too.
@@ -1316,8 +1322,12 @@ impl Node {
         if cfg.burst_policy.expire_at_open {
             bursts.expire();
         }
-        let packets =
-            crate::packets::PacketStore::open(&cfg.state_dir, cfg.burst_policy).map_err(io)?;
+        // Only the state dir's owner recovers the store; a one-shot beside serve reads it.
+        let packets = if cfg.owns_state_dir {
+            crate::packets::PacketStore::open(&cfg.state_dir, cfg.burst_policy).map_err(io)?
+        } else {
+            crate::packets::PacketStore::open_read_only(&cfg.state_dir, cfg.burst_policy)
+        };
         if cfg.burst_policy.expire_at_open {
             packets.expire();
         }

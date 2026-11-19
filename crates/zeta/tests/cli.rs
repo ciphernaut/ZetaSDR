@@ -849,6 +849,46 @@ fn mutating_one_shot_refused_while_serve_lock_held() {
     zeta(dir.path(), &start).assert().success();
 }
 
+/// A read-only one-shot beside a running serve lists serve's live packet capture as being
+/// written and leaves its index and its file as they were, though the file has grown past
+/// the index's (throttled) size.
+#[test]
+fn a_one_shot_under_serve_leaves_its_packet_captures_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let packets = state.join("packets");
+    std::fs::create_dir_all(&packets).unwrap();
+    std::fs::write(state.join("serve.lock"), std::process::id().to_string()).unwrap();
+    let id = "01JPACKETCAPTURE0000000000";
+    let index = serde_json::json!([{
+        "id": id, "job": "dec", "source": "tone", "center_hz": 144_800_000u64,
+        "link_type": "ax25_kiss", "mode": "aprs_decode", "access": null,
+        "created_ns": 1_700_000_000_000_000_000u64, "bytes": 8, "packets": 0, "writing": true
+    }])
+    .to_string();
+    let index_path = packets.join("index.json");
+    let file = packets.join(format!("{id}.pcapng"));
+    std::fs::write(&index_path, &index).unwrap();
+    // Longer than the index says, cut inside a block: what an owner's open would trim.
+    std::fs::write(&file, [0xAB; 40]).unwrap();
+    for args in [&["packets", "list"][..], &["job", "list"][..]] {
+        let out = zeta(dir.path(), args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        if args[0] == "packets" {
+            let v = json(&out);
+            assert_eq!(v["value"][0]["id"], id, "{v}");
+            assert_eq!(v["value"][0]["writing"], true, "{v}");
+        }
+    }
+    assert_eq!(std::fs::read_to_string(&index_path).unwrap(), index);
+    assert_eq!(std::fs::read(&file).unwrap(), [0xAB; 40]);
+    assert!(!packets.join("index.json.tmp").exists());
+}
+
 #[test]
 fn repeated_source_file_id_is_a_usage_error() {
     let dir = tempfile::tempdir().unwrap();

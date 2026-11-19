@@ -134,6 +134,7 @@ async fn open_over(dir: &Path, modes_dir: &Path, iq: &Path) -> Node {
         scan_dwell_ms: 20,
         backends: vec![Backend::Cpu],
         resume: true,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: Some(modes_dir.to_path_buf()),
         source_positions: Default::default(),

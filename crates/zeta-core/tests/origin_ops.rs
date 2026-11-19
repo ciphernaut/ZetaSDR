@@ -203,6 +203,7 @@ async fn node(dir: &Path, with_register: bool) -> Node {
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         backends: vec![Backend::Cpu],
         resume: false,
+        owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
     };
