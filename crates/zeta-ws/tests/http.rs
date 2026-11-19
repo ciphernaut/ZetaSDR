@@ -422,3 +422,88 @@ async fn captures_are_served_with_the_bearer_and_404_without_a_record() {
     }
     ts.stop().await;
 }
+
+fn new_packet_capture() -> zeta_core::packets::NewPacketCapture {
+    zeta_core::packets::NewPacketCapture {
+        job: zeta_core::types::JobId("pk".into()),
+        source: SourceId("rx".into()),
+        center_hz: zeta_core::types::Hz(144_800_000),
+        link_type: zeta_core::stream::LinkType::Ax25Kiss,
+        mode: None,
+        access: None,
+    }
+}
+
+#[tokio::test]
+async fn a_capture_is_served_while_it_is_being_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let mut w = ts.node.packets().begin(new_packet_capture()).unwrap();
+    let id = w.id().to_string();
+    w.write(1, b"one").unwrap();
+    w.write(2, b"two").unwrap();
+    let resp = get(&ts, &format!("/captures/{id}.pcapng")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["content-type"],
+        "application/vnd.tcpdump.pcap"
+    );
+    assert_eq!(
+        resp.headers()["content-disposition"],
+        format!("attachment; filename=\"{id}.pcapng\"")
+    );
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(zeta_core::pcapng::read(&body).unwrap().1.len(), 2);
+    w.write(3, b"three").unwrap();
+    let body = get(&ts, &format!("/captures/{id}.pcapng"))
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(zeta_core::pcapng::read(&body).unwrap().1.len(), 3);
+    ts.stop().await;
+}
+
+#[tokio::test]
+async fn only_a_packet_capture_id_is_served() {
+    use zeta_core::bursts::NewCapture;
+    use zeta_core::types::{Hz, JobId};
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let iq = vec![num_complex::Complex::new(0.5f32, -0.25); 16];
+    let cap = ts
+        .node
+        .bursts()
+        .write(
+            NewCapture {
+                source: SourceId("rx".into()),
+                set: JobId("set".into()),
+                center_hz: Hz(433_920_000),
+                bandwidth_hz: Hz(10_000),
+                sample_rate_hz: Hz(48_000),
+                start_ns: 1,
+                end_ns: 2,
+                features: json!({}),
+                signal: None,
+                job: JobId("cap".into()),
+                watch: None,
+                allocations: json!([]),
+            },
+            &iq,
+        )
+        .unwrap();
+    let mut w = ts.node.packets().begin(new_packet_capture()).unwrap();
+    w.write(1, b"one").unwrap();
+    for name in [
+        "01NOPE000000000000000000000.pcapng".to_string(),
+        format!("{}.pcapng", cap.id),
+        format!("{}.sigmf-data", w.id()),
+        format!("{}.sigmf-meta", w.id()),
+        "..%2F..%2Fstate.pcapng".to_string(),
+        ".pcapng".to_string(),
+    ] {
+        let resp = get(&ts, &format!("/captures/{name}")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
+    }
+    ts.stop().await;
+}

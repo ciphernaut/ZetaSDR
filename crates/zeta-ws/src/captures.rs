@@ -1,8 +1,8 @@
-//! `GET /captures/{file}`: a stored capture's SigMF pair, for a remote caller.
+//! `GET /captures/{file}`: a stored capture's SigMF pair or a packet capture, for a remote caller.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use zeta_core::ops::OpError;
 
@@ -23,6 +23,9 @@ pub(crate) async fn file(State(st): State<Shared>, Path(file): Path<String>) -> 
     let Some((id, ext)) = file.rsplit_once('.') else {
         return not_found();
     };
+    if ext == "pcapng" {
+        return packet_capture(&st, id, not_found()).await;
+    }
     let Some(rec) = st.node.bursts().get(id) else {
         return not_found();
     };
@@ -35,4 +38,28 @@ pub(crate) async fn file(State(st): State<Shared>, Path(file): Path<String>) -> 
         Ok(bytes) => ([(CONTENT_TYPE, ctype)], bytes).into_response(),
         Err(_) => not_found(),
     }
+}
+
+/// `<id>.pcapng`: a packet capture from the packet store (`application/vnd.tcpdump.pcap`),
+/// cut to its last whole block, so a reader racing the writer never gets half a block.
+/// The cut is a linear scan of block headers, cheap beside the read.
+async fn packet_capture(st: &Shared, id: &str, not_found: Response) -> Response {
+    let Some(rec) = st.node.packets().get(id) else {
+        return not_found;
+    };
+    let Ok(mut bytes) = tokio::fs::read(&rec.path).await else {
+        return not_found;
+    };
+    bytes.truncate(zeta_core::pcapng::whole_blocks(&bytes));
+    (
+        [
+            (CONTENT_TYPE, "application/vnd.tcpdump.pcap".to_string()),
+            (
+                CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}.pcapng\"", rec.id),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
 }
