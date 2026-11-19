@@ -705,7 +705,7 @@ The one defensive case that is legitimate, if it is ever wanted, is narrower and
 
 ## Feature: packet capture output for Wireshark
 
-Spec: `docs/superpowers/specs/2026-11-19-packet-capture-wireshark-design.md`. Plan 41 (`docs/superpowers/plans/2026-11-19-packet-capture-wireshark.md`) builds phase A, the stored capture; phase B, the live feed, gets its own plan.
+Spec: `docs/superpowers/specs/2026-11-19-packet-capture-wireshark-design.md`. Phase A, the stored capture, is built by plan 41 (`docs/superpowers/plans/2026-11-19-packet-capture-wireshark.md`): the APRS row and frame rows write pcapng files served at `/captures/<id>.pcapng`. What remains is phase B, the live feed (GSMTAP over UDP first, then extcap, each with its own plan), the `.ts` egress for a DVB-T multiplex's transport stream, and capture of restricted rows behind access control.
 
 From the operator, 2026-11-19: Wireshark support, for lawful, research and education use. Nothing writes a packet capture today: a decoder's frame leaves the node as a JSON event, and a stream's payload has no kind for a packet's bytes. The idea is one shared output, not one per decoder: any job whose decoder cuts frames can also give them as a pcapng stream, each packet with the frame's own time, the job, the source and the frequency in its comment.
 

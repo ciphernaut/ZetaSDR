@@ -216,6 +216,30 @@ sonde. `measure.snr_db` is a per-bin peak and reads 20 dB where the channel SNR 
 
 **On the page.** The watch is outlined on the waterfall and its decoder's rail tag shows the centre; `view set side jobs` gives the jobs list the whole side column, and if the watch keeps several decoders **Listen to all** lets the idle ones fold.
 
+## Packet capture for Wireshark
+
+Not run live when written: a stored pcapng of the APRS row's frames, opened in Wireshark. Needs a running `aprs_decode` job (144.8 MHz is the row's own centre).
+
+**Check.** `job_list`: the `aprs_decode` job is `running` and has not been captured; `packets_list` does not already hold its file.
+
+**Attach.** One op; the job is the decoder's id from `job_list`.
+
+```json
+{"op":"job_attach","kind":"packets","job":"<aprs job id>","language":null,"stream":null}
+```
+
+**Verify.** The new job's context shows `capture` (the id), and `packets` and `bytes` climb as traffic arrives. Download while it records and open it:
+
+```bash
+curl -O -H "Authorization: Bearer $ZETA_SECRET" http://<node>/captures/<id>.pcapng
+```
+
+Wireshark dissects AX.25 and APRS; each packet's comment names the job, source and frequency.
+
+**Stop.** `job_stop` on the packets job; the file stays listed until `packets_delete`.
+
+**Gotchas.** A node restart leaves the job `stopped` with the note `packet capture does not resume: attach again`; attach again for a fresh capture. A frame row's capture is `USER0`: bind a user dissector under DLT_USER to read it past the raw bytes.
+
 ## Make your own theme
 
 Verified on the plan 26 build; the folder format and every hook are in `docs/themes.md`.

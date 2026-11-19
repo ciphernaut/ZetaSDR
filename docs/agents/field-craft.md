@@ -358,6 +358,24 @@ The job's context reads `channel.filter: none` when the band is most of the capt
 
 `identify` on a multiplex proves this row by its lock, and its verdict then judges the register against what was decoded (`ofdm` at the locked width) and not against the first-layer measurement, which has no label for a multiplex and reads it far narrower than it is. "What is this?" on the page still uses the measurement, so it can say `disagrees ... measured unknown` on a licensed multiplex: run identify before reporting a disagreement there. Identify re-centres its trials on the measured centre, which on an uneven multiplex can be the middle of the stronger half, a megahertz or more from the multiplex's own; this row is marked `identify.as_asked`, so identify tries it on the band as it was asked. Draw or give the band over the whole block, then: about the channel width, roughly centred.
 
+### Open decoded frames in Wireshark
+
+A running APRS job (`aprs_decode`) or a frame row's job can write its frames to a pcapng file that Wireshark opens. Attach the capture to the decoder's job; it is its own job with its own id:
+
+```json
+{"op":"job_attach","kind":"packets","job":"<decoder job id>","language":null,"stream":null}
+```
+
+Read the capture's id from `packets_list` (or the new job's context: `capture`, `packets`, `bytes`). The file is served while it is still written, so download it at any time:
+
+```bash
+curl -O -H "Authorization: Bearer $ZETA_SECRET" http://<node>/captures/<id>.pcapng
+```
+
+APRS packets are written as `LINKTYPE_AX25_KISS` (202), so Wireshark dissects AX.25 and APRS with no setup. A frame row's frames are `LINKTYPE_USER0` (147): the bytes are visible, and Wireshark shows them as data until a user dissector is bound under Edit, Preferences, Protocols, DLT_USER (a `USER0` entry naming the dissector for that row's frames). Each packet carries the frame's own time, and its comment reads `job=<decoder job> source=<source> freq_hz=<centre>`.
+
+The attach is refused for a stream (`stream` must be `null`), a job with no packet output, a restricted row, a row whose frames cannot be read, a job already captured and an attached input. Stop the capture with `job_stop` on the packets job; it also ends when its decoder stops, and it follows a retune into a fresh file. A capture rolls to a fresh id at 256 MiB. A node restart does not resume it: the job is `stopped` with the note `packet capture does not resume: attach again`, and the file is kept. `packets_delete` removes a file once it is no longer written. Phase B (a live feed into Wireshark) is not built: download the file and open it.
+
 ### Exploring an unknown signal
 
 A signal nobody has named goes up a ladder; stop at the first rung that answers, and report what each rung found.

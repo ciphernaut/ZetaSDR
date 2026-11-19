@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Packet capture for Wireshark (phase A): `job_attach` of `packets` writes an APRS job's AX.25
+  frames (`LINKTYPE_AX25_KISS`) or a frame row's frames (`LINKTYPE_USER0`) to a pcapng under the
+  state directory, each packet with the frame's own time and a comment naming the job, source and
+  frequency. `packets_list` and `packets_delete` (CLI `zeta packets`), a download at
+  `/captures/<id>.pcapng` while the file is written, a Capture packets entry on a capable job's
+  menu and a list in Explore. A capture does not resume on a restart.
+
 ## 0.2.0 - 2026-11-17
 
 - More decoders as rows: AIS in-process; FLEX over multimon-ng; M17 with its speech through
