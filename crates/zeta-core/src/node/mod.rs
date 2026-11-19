@@ -508,6 +508,9 @@ struct Inner {
     relaunching: tokio::sync::Mutex<()>,
     /// Held across [`Node::mix_start`], so two starts of one set make one mix.
     mix_gate: tokio::sync::Mutex<()>,
+    /// Held across a `job_attach` of `packets`, from its "already captured" check to
+    /// its launch, so two attaches to one job make one capture.
+    packets_gate: tokio::sync::Mutex<()>,
     /// Held across a signature's accept, retract and delete, so the captures they pin
     /// or unpin and the `learned_<id>` row they write or remove always match the store.
     signature_gate: Mutex<()>,
@@ -1409,6 +1412,7 @@ impl Node {
                 runs: std::sync::atomic::AtomicU64::new(0),
                 relaunching: tokio::sync::Mutex::new(()),
                 mix_gate: tokio::sync::Mutex::new(()),
+                packets_gate: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
                 verdicts: Mutex::new(HashMap::new()),
                 captured: Mutex::new(HashMap::new()),
@@ -1706,6 +1710,12 @@ impl Node {
     /// the rows as they stand at each use, a reload included.
     pub fn modes_handle(&self) -> ModesHandle {
         self.inner.modes.clone()
+    }
+
+    /// The gate a `job_attach` of `packets` holds from its "already captured" check to
+    /// its launch (see `ops::packets_attach`).
+    pub(crate) async fn packets_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.packets_gate.lock().await
     }
 
     /// Read the mode rows again (the embedded ones, then the operator directory

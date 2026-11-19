@@ -356,9 +356,10 @@ pub enum Op {
     /// be `null` (`packets reads the job's packet stream: pass stream null`). Refused,
     /// nothing started: a job with no packet stream (`job <id> has no packet stream: its
     /// kind's outputs list no packet (modes_list)`), an attached job (`packets: job <id>
-    /// is an attached job: attach to its input <input>`), a row with `access:
-    /// restricted` (`packets: <row> is restricted: its capture waits on access control`)
-    /// and a job already captured (`job <id> is already captured by <packets job>`). It
+    /// is an attached job: attach to its input <input>`), a job whose row cannot be read
+    /// now, say after a modes reload (`packets: <kind> has no readable mode row: its
+    /// access cannot be checked`), a row with `access: restricted` (`packets: <row> is
+    /// restricted: its capture waits on access control`) and a job already captured (`job <id> is already captured by <packets job>`). It
     /// does not resume across a node restart: it is listed `stopped` with the note
     /// `packet capture does not resume: attach again`, its file kept.
     #[schemars(transform = require_attach_stream)]
@@ -1526,9 +1527,11 @@ pub struct AttachTo<'a> {
     pub voice: Option<&'a str>,
     /// `transcribe`: the input's graph denoises its audio itself ([`JobKind::graph_denoises`]).
     pub denoised: bool,
-    /// `packets`: the input's centre, its mode row's id and that row's `access`.
+    /// `packets`: the input's centre, which the capture's comment carries.
     pub center_hz: Hz,
+    /// `packets`: the id of the mode row the input expands from (`None`: a kind of no row).
     pub mode: Option<&'a str>,
+    /// `packets`: that row's `access` (`None`: unrestricted, or no row).
     pub access: Option<Access>,
 }
 
@@ -7211,15 +7214,19 @@ async fn attach_one(
 /// `job_attach` of `packets` (its `language` unused): refuse a `stream`, an unknown job,
 /// an attached job (its own `stream_in -> packet_capture` edge is a packet output, and a
 /// capture of it would name the wrong job), a job with no packet stream or not running,
-/// a row with `access: restricted` and a job a running `packets` job already captures;
-/// then attach `stream_in -> packet_capture` to `job`'s packet stream, with its centre
-/// and row. Nothing is started on a refusal.
+/// a job whose row cannot be read (see [`capture_row`]), a row with `access: restricted`
+/// and a job a running `packets` job already captures; then attach `stream_in ->
+/// packet_capture` to `job`'s packet stream, with its centre and row. The node's packets
+/// gate is held from the checks to the launch, so two attaches to one job at once make
+/// one capture and the other is refused as already captured. Nothing is started on a
+/// refusal.
 async fn packets_attach(node: &Node, job: JobId, stream: Option<String>) -> Result<JobId, OpError> {
     if stream.is_some() {
         return Err(other(
             "packets reads the job's packet stream: pass stream null",
         ));
     }
+    let _gate = node.packets_gate().await;
     let Some(input) = node.job_list().into_iter().find(|r| r.id == job) else {
         return Err(unknown_job(node, &job));
     };
@@ -7233,9 +7240,7 @@ async fn packets_attach(node: &Node, job: JobId, stream: Option<String>) -> Resu
         .job_packet_stream(&job)
         .map_err(|e| node_error(node, e))?;
     let modes = node.modes();
-    let row = node
-        .expandable_kind(&input.kind)
-        .and_then(|k| k.mode_row(&modes).ok().flatten());
+    let row = capture_row(&input.kind, &modes)?;
     if let Some(r) = row
         && r.access == Some(Access::Restricted)
     {
@@ -7260,6 +7265,23 @@ async fn packets_attach(node: &Node, job: JobId, stream: Option<String>) -> Resu
     node.job_attach(JobKind::Packets.name(), &job, None, graph)
         .await
         .map_err(|e| node_error(node, e))
+}
+
+/// The mode row a running job of `kind` expands from, whose id and `access` its capture
+/// records: `None` for a kind of no row (the built-in demodulators, `measure`, a
+/// `graph_start` job). A kind that names a row which cannot be read now (gone from the
+/// operator's directory, broken or unavailable after a modes reload) is refused, `packets:
+/// <kind> has no readable mode row: its access cannot be checked`: a capture never goes
+/// ahead without knowing whether its row is restricted.
+fn capture_row<'a>(kind: &str, modes: &'a ModeRegistry) -> Result<Option<&'a ModeRow>, OpError> {
+    let Some(k) = JobKind::from_name(kind).filter(|k| !k.leaseless_name()) else {
+        return Ok(None);
+    };
+    k.mode_row(modes).map_err(|_| {
+        other(format!(
+            "packets: {kind} has no readable mode row: its access cannot be checked"
+        ))
+    })
 }
 
 /// `packets_delete`: an unknown id is `unknown` with the store's ids; one being written

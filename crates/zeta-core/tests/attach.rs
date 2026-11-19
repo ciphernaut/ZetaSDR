@@ -1460,3 +1460,77 @@ async fn attaching_packets_to_a_job_with_none_is_refused() {
     assert_eq!(attach_packets(&node, &audio).await, Err(other(&message)));
     assert_eq!(attached_to(&node, &audio), Vec::<JobId>::new());
 }
+
+/// Attaches of `packets` to one job at once make one capture: every other one is refused
+/// as already captured by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_packets_attaches_to_one_job_make_one_capture() {
+    const N: usize = 8;
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = packets_node(dir.path()).await;
+    let node = Arc::new(node);
+    let aprs = start_kind(&node, "aprs_decode").await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(N));
+    let tasks: Vec<_> = (0..N)
+        .map(|_| {
+            let (node, aprs, barrier) = (node.clone(), aprs.clone(), barrier.clone());
+            tokio::spawn(async move {
+                barrier.wait().await;
+                attach_packets(&node, &aprs).await
+            })
+        })
+        .collect();
+    let mut results = Vec::new();
+    for t in tasks {
+        results.push(t.await.unwrap());
+    }
+    let won: Vec<JobId> = results
+        .iter()
+        .filter_map(|r| match r {
+            Ok(OpResult::Job(id)) => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(won.len(), 1, "one capture: {results:?}");
+    let refusal = Err(other(&format!(
+        "job {} is already captured by {}",
+        aprs.0, won[0].0
+    )));
+    assert!(
+        results.iter().filter(|r| r.is_err()).all(|r| *r == refusal),
+        "{results:?}"
+    );
+    let packets: Vec<JobId> = node
+        .job_list()
+        .into_iter()
+        .filter(|r| r.kind == "packets" && r.input.as_ref() == Some(&aprs))
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(packets, won);
+}
+
+/// A row job whose row can no longer be read (broken, then gone, after a modes reload)
+/// is not captured: its access cannot be checked, so the attach is refused.
+#[tokio::test]
+async fn a_job_whose_row_cannot_be_read_is_not_captured() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = packets_node(dir.path()).await;
+    let job = start_kind(&node, RESTRICTED_ROW).await;
+    let refusal = Err(other(&format!(
+        "packets: {RESTRICTED_ROW} has no readable mode row: its access cannot be checked"
+    )));
+    let file = dir
+        .path()
+        .join("modes")
+        .join(format!("{RESTRICTED_ROW}.json"));
+    let jobs = node.job_list().len();
+    std::fs::write(&file, "{").unwrap();
+    node.reload_modes().unwrap();
+    assert_eq!(record(&node, &job).state, JobState::Running);
+    assert_eq!(attach_packets(&node, &job).await, refusal);
+    std::fs::remove_file(&file).unwrap();
+    node.reload_modes().unwrap();
+    assert!(node.modes().get(RESTRICTED_ROW).is_none());
+    assert_eq!(attach_packets(&node, &job).await, refusal);
+    assert_eq!(node.job_list().len(), jobs, "nothing recorded");
+}

@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use zeta_core::graph::{Graph, GraphId, Node as GraphNode, NodeId};
 use zeta_core::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use zeta_core::node::{Node, NodeConfig};
-use zeta_core::ops::{JobKind, Op, OpResult};
+use zeta_core::ops::{AttachTo, JobKind, Op, OpResult};
 use zeta_core::port::{
     IqBlock, IqReceiver, Port, PortError, SWEEP_ROWS_CAPACITY, SweepPlan, SweepRequest, SweepRow,
     SweepRows, SweepState, Tuning,
@@ -703,16 +703,16 @@ fn packets_registry() -> StageRegistry {
     r
 }
 
-/// `job_attach` of `packets` to `job`, by its wire form.
+/// A `packets` job attached to `job`, on the graph `job_attach` expands (the stand-in
+/// decoder's kind names no row, which the op would refuse as unreadable).
 async fn attach_packets(node: &Node, job: &JobId) -> JobId {
-    let op: Op = serde_json::from_value(serde_json::json!({
-        "op": "job_attach", "kind": "packets", "job": job.0, "language": null, "stream": null
-    }))
-    .unwrap();
-    match node.apply(op).await {
-        Ok(OpResult::Job(id)) => id,
-        r => panic!("attach packets: {r:?}"),
-    }
+    let stream = node.job_packet_stream(job).unwrap();
+    let graph = JobKind::Packets
+        .expand_attached(&AttachTo::new(job, &stream), "en")
+        .unwrap();
+    node.job_attach(JobKind::Packets.name(), job, None, graph)
+        .await
+        .unwrap()
 }
 
 /// `packets_list`, by its wire form.
