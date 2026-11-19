@@ -102,6 +102,36 @@ fn frame_summary_for_video_carries_dimensions() {
     );
 }
 
+#[test]
+fn a_packet_frame_summarises_as_link_type_and_base64() {
+    use zeta_core::ops::FrameSummary;
+    use zeta_core::stream::LinkType;
+    use zeta_core::types::{Provenance, Span, StreamId, Timestamp};
+
+    let frame = Frame::new(
+        StreamId("s1".into()),
+        Provenance {
+            source: SourceId("file0".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(1),
+                end_ns: Timestamp(2),
+            },
+        },
+        Payload::Packet {
+            link_type: LinkType::User0,
+            data: Arc::from(vec![0xde, 0xad, 0xbe, 0xef]),
+        },
+    );
+    let s = FrameSummary::from_frame(&frame);
+    assert_eq!(s.kind, StreamKind::Packet);
+    assert_eq!(
+        s.payload,
+        serde_json::json!({"link_type": "user0", "data": "3q2+7w=="})
+    );
+}
+
 #[tokio::test]
 async fn every_apply_is_logged_with_outcome() {
     let dir = tempfile::tempdir().unwrap();

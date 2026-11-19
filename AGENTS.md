@@ -919,9 +919,9 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 
 ### passthrough
 
-- inputs: iq, audio, video, text, event, sink
-- outputs: iq, audio, video, text, event, sink
-- params.kind: string (StreamKind: iq|audio|video|text|event|sink)
+- inputs: iq, audio, video, text, event, sink, packet
+- outputs: iq, audio, video, text, event, sink, packet
+- params.kind: string (StreamKind: iq|audio|video|text|event|sink|packet)
 
 ### pocsag_decode
 
@@ -983,7 +983,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: 
 - outputs: audio
 - params.job: string
-- params.kind: string (StreamKind: iq|audio|video|text|event|sink)
+- params.kind: string (StreamKind: iq|audio|video|text|event|sink|packet)
 - params.stream: string
 
 ### transcribe

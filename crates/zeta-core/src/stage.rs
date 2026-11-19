@@ -360,13 +360,14 @@ struct PassthroughParams {
     kind: StreamKind,
 }
 
-const ALL_KINDS: [StreamKind; 6] = [
+const ALL_KINDS: [StreamKind; 7] = [
     StreamKind::Iq,
     StreamKind::Audio,
     StreamKind::Video,
     StreamKind::Text,
     StreamKind::Event,
     StreamKind::Sink,
+    StreamKind::Packet,
 ];
 
 /// Copies frames from its one input to its one output, rewriting the stream id.

@@ -36,6 +36,35 @@ pub enum Payload {
     Text(String),
     Event(serde_json::Value),
     Sink(IqBlock),
+    /// One link-layer packet: `data` is the packet as `link_type` frames it. The bus refuses
+    /// an empty one.
+    Packet {
+        link_type: LinkType,
+        data: Arc<[u8]>,
+    },
+}
+
+/// The link-layer framing of a [`Payload::Packet`], by its pcap LINKTYPE number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkType {
+    /// AX.25 with a KISS port byte in front (LINKTYPE_AX25_KISS, 202).
+    Ax25Kiss,
+    /// A private link type (LINKTYPE_USER0, 147).
+    User0,
+    /// A raw IPv4 or IPv6 packet (LINKTYPE_RAW, 101).
+    RawIp,
+}
+
+impl LinkType {
+    /// The registered pcap LINKTYPE number.
+    pub fn number(self) -> u16 {
+        match self {
+            LinkType::Ax25Kiss => 202,
+            LinkType::User0 => 147,
+            LinkType::RawIp => 101,
+        }
+    }
 }
 
 /// How a [`Payload::Video`] frame's bytes are laid out.
@@ -95,6 +124,7 @@ impl Payload {
             Payload::Text(_) => StreamKind::Text,
             Payload::Event(_) => StreamKind::Event,
             Payload::Sink(_) => StreamKind::Sink,
+            Payload::Packet { .. } => StreamKind::Packet,
         }
     }
 }
@@ -236,6 +266,10 @@ impl StreamBus {
                 return;
             }
             if matches!(frame.payload, Payload::Audio { channels: 0, .. }) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if matches!(&frame.payload, Payload::Packet { data, .. } if data.is_empty()) {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -531,6 +565,41 @@ mod tests {
         for _ in 0..3 {
             assert!(rx.recv().await.is_ok());
         }
+    }
+
+    #[test]
+    fn link_types_carry_their_registered_numbers() {
+        assert_eq!(LinkType::Ax25Kiss.number(), 202);
+        assert_eq!(LinkType::User0.number(), 147);
+        assert_eq!(LinkType::RawIp.number(), 101);
+        assert_eq!(
+            serde_json::to_value(LinkType::Ax25Kiss).unwrap(),
+            "ax25_kiss"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bus_refuses_an_empty_packet() {
+        let bus = StreamBus::new(8);
+        let p = prov("s");
+        let id = bus.register(StreamKind::Packet, p.clone());
+        let mut rx = bus.subscribe(&id).unwrap();
+        let packet = |data: Vec<u8>| {
+            Frame::new(
+                id.clone(),
+                p.clone(),
+                Payload::Packet {
+                    link_type: LinkType::User0,
+                    data: Arc::from(data),
+                },
+            )
+        };
+        bus.publish(packet(vec![]));
+        assert_eq!(bus.dropped(), 1);
+        bus.publish(packet(vec![0, 1]));
+        let got = rx.recv().await.unwrap();
+        assert!(matches!(&got.payload, Payload::Packet { data, .. } if data.len() == 2));
+        assert_eq!(bus.dropped(), 1);
     }
 
     #[tokio::test]

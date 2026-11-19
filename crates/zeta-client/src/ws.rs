@@ -307,5 +307,6 @@ pub(crate) fn kind_name(kind: StreamKind) -> &'static str {
         StreamKind::Text => "text",
         StreamKind::Event => "event",
         StreamKind::Sink => "sink",
+        StreamKind::Packet => "packet",
     }
 }

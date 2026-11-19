@@ -70,6 +70,7 @@ pub enum StreamKind {
     Text,
     Event,
     Sink,
+    Packet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

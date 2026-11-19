@@ -6,6 +6,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -3075,6 +3077,10 @@ impl FrameSummary {
                 "height": height,
                 "format": format.name(),
                 "bytes": frame.len(),
+            }),
+            Payload::Packet { link_type, data } => serde_json::json!({
+                "link_type": link_type,
+                "data": STANDARD.encode(data),
             }),
         };
         Self {

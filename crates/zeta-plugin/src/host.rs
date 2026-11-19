@@ -194,7 +194,7 @@ fn check_hello(kind: &str, h: &Hello) -> Result<schemars::Schema, String> {
     }
     for (side, kinds) in [("input", &h.inputs), ("output", &h.outputs)] {
         if let Some(k) = kinds.iter().find(|k| match k {
-            StreamKind::Sink => true,
+            StreamKind::Sink | StreamKind::Packet => true,
             StreamKind::Video => h.protocol < 2,
             _ => false,
         }) {
@@ -776,5 +776,12 @@ mod tests {
         // `sink` stays refused under both.
         let s = hello(2, vec![StreamKind::Iq], vec![StreamKind::Sink]);
         assert!(check_hello("k", &s).unwrap_err().contains("sink output"));
+        // So does `packet`, at every protocol.
+        for p in [1, 2] {
+            let o = hello(p, vec![StreamKind::Iq], vec![StreamKind::Packet]);
+            assert!(check_hello("k", &o).unwrap_err().contains("packet output"));
+            let i = hello(p, vec![StreamKind::Packet], vec![StreamKind::Iq]);
+            assert!(check_hello("k", &i).unwrap_err().contains("packet input"));
+        }
     }
 }

@@ -26,6 +26,7 @@ pub fn envelope(f: &Frame) -> Result<Vec<u8>, String> {
             format.check_body(*width, *height, frame.len())?;
             frame.to_vec()
         }
+        Payload::Packet { .. } => return Err("packet frames are not sent over vrt".to_string()),
         Payload::Event(_) | Payload::Sink(_) => Vec::new(),
     };
     let header = serde_json::to_vec(&FrameSummary::from_frame(f)).map_err(|e| e.to_string())?;

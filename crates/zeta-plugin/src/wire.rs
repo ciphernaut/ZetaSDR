@@ -124,6 +124,7 @@ pub(crate) fn kind_name(k: StreamKind) -> &'static str {
         StreamKind::Text => "text",
         StreamKind::Event => "event",
         StreamKind::Sink => "sink",
+        StreamKind::Packet => "packet",
     }
 }
 
@@ -316,7 +317,7 @@ pub fn encode_frame(f: &Frame, protocol: u32) -> Result<Vec<u8>, WireError> {
                 .map_err(WireError::VideoMismatch)?;
             frame.to_vec()
         }
-        Payload::Sink(_) => return Err(WireError::KindNotCarried(kind)),
+        Payload::Sink(_) | Payload::Packet { .. } => return Err(WireError::KindNotCarried(kind)),
     };
     let mut summary = FrameSummary::from_frame(f);
     summary.kind = kind;
@@ -504,7 +505,9 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, protocol: u32) -> Result<Fr
             let n = p.frame;
             (Shape::Video(p), n, 1)
         }
-        k @ (StreamKind::Video | StreamKind::Sink) => return Err(WireError::KindNotCarried(k)),
+        k @ (StreamKind::Video | StreamKind::Sink | StreamKind::Packet) => {
+            return Err(WireError::KindNotCarried(k));
+        }
     };
 
     let b = read_u32(r, "body length").await?;
@@ -1031,6 +1034,21 @@ mod tests {
         assert_eq!(
             read_all(&raw_frame(&video, 0, &[])).await.unwrap_err(),
             WireError::KindNotCarried(StreamKind::Video)
+        );
+        let packet = frame(Payload::Packet {
+            link_type: zeta_core::stream::LinkType::User0,
+            data: Arc::from(vec![1u8, 2]),
+        });
+        assert_eq!(
+            encode_frame(&packet, 2).unwrap_err(),
+            WireError::KindNotCarried(StreamKind::Packet)
+        );
+        let mut p = iq_header(0);
+        p["kind"] = json!("packet");
+        p["payload"] = json!({});
+        assert_eq!(
+            read_all(&raw_frame(&p, 0, &[])).await.unwrap_err(),
+            WireError::KindNotCarried(StreamKind::Packet)
         );
     }
 
