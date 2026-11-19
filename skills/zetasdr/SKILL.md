@@ -328,7 +328,7 @@ Delete a capture and its files. A pinned capture is refused (`capture <id> is pi
 
 ### packets_list
 
-The packet captures the node's packet store holds (written by `packets` jobs), newest first, each a record (`id`, `job` the decoder job captured, `source`, `center_hz`, `link_type`, `mode` its row, `access`, `created_ns`, `bytes`, `packets`, `writing` while a job appends to it). Fetch one at `GET /captures/<id>.pcapng`.
+The packet captures the node's packet store holds (written by `packets` jobs), newest first, each a record (`id`, `job` the decoder job captured, `source`, `center_hz`, `link_type`, `mode` its row, `access`, `created_ns`, `last_ns` its last packet, `bytes`, `packets`, `writing` while a job appends to it). Fetch one at `GET /captures/<id>.pcapng`. A file rolls to a fresh id at 256 MiB; the store keeps 4 GiB of captures, its own budget apart from `capture_list`'s, and drops the closed ones written longest ago first, then any not written to for the burst store's `keep_days` (7 by default). One being written is never dropped.
 
 JSON: `{"op":"packets_list"}`
 
@@ -1454,7 +1454,7 @@ curl -O -H "Authorization: Bearer $ZETA_SECRET" http://<node>/captures/<id>.pcap
 
 APRS packets are written as `LINKTYPE_AX25_KISS` (202), so Wireshark dissects AX.25 and APRS with no setup. A frame row's frames are `LINKTYPE_USER0` (147): the bytes are visible, and Wireshark shows them as data until a user dissector is bound under Edit, Preferences, Protocols, DLT_USER (a `USER0` entry naming the dissector for that row's frames). Each packet carries the frame's own time, and its comment reads `job=<decoder job> source=<source> freq_hz=<centre>`.
 
-The attach is refused for a stream (`stream` must be `null`), a job with no packet output, a restricted row, a row whose frames cannot be read, a job already captured and an attached input. Stop the capture with `job_stop` on the packets job; it also ends when its decoder stops, and it follows a retune into a fresh file. A capture rolls to a fresh id at 256 MiB. A node restart does not resume it: the job is `stopped` with the note `packet capture does not resume: attach again`, and the file is kept. `packets_delete` removes a file once it is no longer written. Phase B (a live feed into Wireshark) is not built: download the file and open it.
+The attach is refused for a stream (`stream` must be `null`), a job with no packet output, a restricted row, a row whose frames cannot be read, a job already captured and an attached input. Stop the capture with `job_stop` on the packets job; it also ends when its decoder stops, and it follows a retune into a fresh file. A capture rolls to a fresh id at 256 MiB. The packet store keeps 4 GiB of captures, its own budget apart from the IQ captures', dropping the closed captures written longest ago first, then any not written to for the burst store's `keep_days` (7 by default): a capture is aged by its last packet, so one that ran for days is kept from its end. A capture being written is never dropped. A node restart does not resume it: the job is `stopped` with the note `packet capture does not resume: attach again`, and the file is kept. `packets_delete` removes a file once it is no longer written. Phase B (a live feed into Wireshark) is not built: download the file and open it.
 
 ### Exploring an unknown signal
 

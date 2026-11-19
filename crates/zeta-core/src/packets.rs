@@ -1,7 +1,9 @@
 //! The packet capture store: pcapng files a `packet_capture` stage appends decoded
 //! frames to, under `state_dir/packets/` with an `index.json` of one
-//! [`PacketCaptureRecord`] each, kept within the node's [`BurstPolicy`] (its own byte
-//! budget, apart from the burst store's). A capture a job is still writing is never
+//! [`PacketCaptureRecord`] each, kept within a [`BurstPolicy`] of its own
+//! ([`packet_policy`]: [`PACKET_CAPTURE_KEEP_BYTES`] and the node's `keep_days`, apart
+//! from the burst store's budget), each capture aged by its last write. A capture a job
+//! is still writing is never
 //! expired nor deleted; one cut off by a crash is trimmed to whole blocks at open. A
 //! process that does not own the state directory (a one-shot beside `zeta serve`) opens
 //! the store read-only ([`PacketStore::open_read_only`]): it reads the index as serve
@@ -23,6 +25,9 @@ use crate::types::{Hz, JobId, SourceId, Timestamp};
 
 /// The largest one capture file grows to before the writer starts a fresh one.
 pub const PACKET_CAPTURE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// The bytes the store keeps by default before the oldest closed captures go: 16 files
+/// at the roll size, so a rolled file outlives the next capture's start.
+pub const PACKET_CAPTURE_KEEP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// The store's directory under the state directory.
 pub const PACKETS_DIR: &str = "packets";
 const INDEX_FILE: &str = "index.json";
@@ -49,6 +54,11 @@ pub struct PacketCaptureRecord {
     #[schemars(required, schema_with = "crate::modes::nullable_enum::<Access>")]
     pub access: Option<Access>,
     pub created_ns: Timestamp,
+    /// When a packet was last written to it (its start until the first); the index is
+    /// rewritten at most once a second while it is written, so this lags by up to that.
+    /// What `keep_days` ages it by.
+    #[serde(default = "unknown_last")]
+    pub last_ns: Timestamp,
     pub bytes: u64,
     pub packets: u64,
     /// A job in this node is appending to it.
@@ -79,6 +89,33 @@ pub enum PacketStoreError {
     Io(String),
     #[error("{READ_ONLY}")]
     ReadOnly,
+}
+
+/// The packet store's policy beside the burst store's `burst`: its own byte budget,
+/// [`PACKET_CAPTURE_KEEP_BYTES`], with `burst`'s `keep_days` and `expire_at_open`.
+pub fn packet_policy(burst: BurstPolicy) -> BurstPolicy {
+    BurstPolicy {
+        keep_bytes: PACKET_CAPTURE_KEEP_BYTES,
+        ..burst
+    }
+}
+
+/// `last_ns` of a record from an index written before it: filled at open ([`fill_last`]).
+fn unknown_last() -> Timestamp {
+    Timestamp(0)
+}
+
+/// A record read with no `last_ns` takes its file's modification time, else its
+/// `created_ns` (never earlier than that).
+fn fill_last(r: &mut PacketCaptureRecord, meta: Option<&std::fs::Metadata>) {
+    if r.last_ns.0 != 0 {
+        return;
+    }
+    let mtime = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64);
+    r.last_ns = Timestamp(mtime.unwrap_or(0).max(r.created_ns.0));
 }
 
 /// Why a read-only store refuses a change.
@@ -134,6 +171,10 @@ impl PacketStore {
                 changed = true;
                 continue;
             };
+            if r.last_ns.0 == 0 {
+                fill_last(&mut r, Some(&meta));
+                changed = true;
+            }
             if r.writing {
                 r.writing = false;
                 changed = true;
@@ -180,6 +221,8 @@ impl PacketStore {
         };
         for r in &mut index {
             r.path = dir.join(format!("{}.pcapng", r.id));
+            let meta = std::fs::metadata(&r.path).ok();
+            fill_last(r, meta.as_ref());
         }
         Arc::new(Self {
             dir,
@@ -232,6 +275,7 @@ impl PacketStore {
             mode: new.mode.clone(),
             access: new.access,
             created_ns: Timestamp(now_ns()),
+            last_ns: Timestamp(now_ns()),
             bytes: head.len() as u64,
             packets: 0,
             writing: true,
@@ -296,16 +340,17 @@ impl PacketStore {
         Ok(rec)
     }
 
-    /// Apply the policy: the oldest closed captures go until all the bytes held fit
-    /// `keep_bytes`, then every closed capture older than `keep_days`. A capture being
-    /// written stays (and counts against the budget). Returns the ids removed; a
-    /// read-only store removes none.
+    /// Apply the policy: the closed captures written longest ago go until all the bytes
+    /// held fit `keep_bytes`, then every closed capture not written to for `keep_days`
+    /// (aged by `last_ns`, so a capture that ran for days is kept from its last packet,
+    /// not its start). A capture being written stays (and counts against the budget).
+    /// Returns the ids removed; a read-only store removes none.
     pub fn expire(&self) -> Vec<String> {
         if self.read_only {
             return Vec::new();
         }
         let mut index = self.index.lock().unwrap();
-        index.sort_by(|a, b| (a.created_ns.0, &a.id).cmp(&(b.created_ns.0, &b.id)));
+        index.sort_by(|a, b| (a.last_ns.0, &a.id).cmp(&(b.last_ns.0, &b.id)));
         let mut total: u64 = index.iter().map(|r| r.bytes).sum();
         let mut gone = vec![false; index.len()];
         for (i, r) in index.iter().enumerate() {
@@ -320,7 +365,7 @@ impl PacketStore {
         let cutoff =
             now_ns().saturating_sub(u64::from(self.policy.keep_days).saturating_mul(NS_PER_DAY));
         for (i, r) in index.iter().enumerate() {
-            if !r.writing && r.created_ns.0 < cutoff {
+            if !r.writing && r.last_ns.0 < cutoff {
                 gone[i] = true;
             }
         }
@@ -347,13 +392,25 @@ impl PacketStore {
             .collect()
     }
 
-    /// Set the size of the record `id`; the index is rewritten when `persist`.
-    fn update(&self, id: &str, bytes: u64, packets: u64, writing: bool, persist: bool) {
+    /// Set the size of the record `id`, and its last write to now when `wrote` (a packet
+    /// was just appended); the index is rewritten when `persist`.
+    fn update(
+        &self,
+        id: &str,
+        bytes: u64,
+        packets: u64,
+        writing: bool,
+        wrote: bool,
+        persist: bool,
+    ) {
         let mut index = self.index.lock().unwrap();
         if let Some(r) = index.iter_mut().find(|r| r.id == id) {
             r.bytes = bytes;
             r.packets = packets;
             r.writing = writing;
+            if wrote {
+                r.last_ns = Timestamp(now_ns());
+            }
         }
         if persist {
             let _ = self.persist(&index);
@@ -425,7 +482,7 @@ impl PacketWriter {
         if self.packets > 0 && self.bytes + self.scratch.len() as u64 > self.store.max_bytes {
             let (id, file, bytes) = self.store.start(&self.new)?;
             self.store
-                .update(&self.id, self.bytes, self.packets, false, true);
+                .update(&self.id, self.bytes, self.packets, false, false, true);
             self.id = id.clone();
             self.file = file;
             self.bytes = bytes;
@@ -444,7 +501,7 @@ impl PacketWriter {
             self.last_index = Instant::now();
         }
         self.store
-            .update(&self.id, self.bytes, self.packets, true, due);
+            .update(&self.id, self.bytes, self.packets, true, true, due);
         Ok(rolled)
     }
 }
@@ -467,7 +524,7 @@ impl PacketWriter {
 impl Drop for PacketWriter {
     fn drop(&mut self) {
         self.store
-            .update(&self.id, self.bytes, self.packets, false, true);
+            .update(&self.id, self.bytes, self.packets, false, false, true);
     }
 }
 
@@ -722,6 +779,122 @@ mod tests {
         let live: Vec<String> = store.list().into_iter().map(|r| r.id).collect();
         assert!(live.contains(&ids[1]));
         assert!(live.contains(&open_w.id().to_string()));
+    }
+
+    /// Set the record `id`'s start and last write `created_days` and `last_days` ago.
+    fn age(store: &PacketStore, id: &str, created_days: u64, last_days: u64) {
+        let now = now_ns();
+        let mut index = store.index.lock().unwrap();
+        let r = index.iter_mut().find(|r| r.id == id).unwrap();
+        r.created_ns = Timestamp(now - created_days * NS_PER_DAY);
+        r.last_ns = Timestamp(now - last_days * NS_PER_DAY);
+    }
+
+    /// `keep_days` ages a capture by its last write: one closed and not written to for
+    /// longer goes; one begun long ago but written to lately stays; one being written
+    /// stays however old.
+    #[test]
+    fn keep_days_ages_a_capture_by_its_last_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let keep = u64::from(BurstPolicy::default().keep_days);
+        let closed = || {
+            let mut w = store.begin(new_capture()).unwrap();
+            w.write(1, &[1; 10]).unwrap();
+            w.id().to_string()
+        };
+        let (stale, ran_for_days) = (closed(), closed());
+        let mut live = store.begin(new_capture()).unwrap();
+        live.write(1, &[1; 10]).unwrap();
+        let live_id = live.id().to_string();
+        // Aged once all three are begun (each begin expires the store).
+        age(&store, &stale, keep + 30, keep + 1);
+        age(&store, &ran_for_days, keep + 30, 0);
+        age(&store, &live_id, keep + 30, keep + 30);
+        assert_eq!(store.expire(), vec![stale.clone()]);
+        assert!(store.get(&stale).is_none());
+        assert!(
+            !tmp.path()
+                .join(PACKETS_DIR)
+                .join(format!("{stale}.pcapng"))
+                .exists()
+        );
+        assert!(store.get(&ran_for_days).is_some());
+        assert!(store.get(&live_id).is_some());
+    }
+
+    #[test]
+    fn a_write_moves_the_last_write_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let mut w = store.begin(new_capture()).unwrap();
+        let id = w.id().to_string();
+        age(&store, &id, 3, 3);
+        let before = store.get(&id).unwrap().last_ns;
+        w.write(1, &[1; 10]).unwrap();
+        let r = store.get(&id).unwrap();
+        assert!(r.last_ns.0 > before.0);
+        assert!(r.last_ns.0 > r.created_ns.0);
+        // Closing it is no write.
+        drop(w);
+        assert_eq!(store.get(&id).unwrap().last_ns, r.last_ns);
+    }
+
+    /// An index written before `last_ns` loads, each record taking its file's
+    /// modification time.
+    #[test]
+    fn a_record_without_a_last_write_takes_its_files_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let mut w = store.begin(new_capture()).unwrap();
+        w.write(1, &[1; 10]).unwrap();
+        let id = w.id().to_string();
+        drop(w);
+        age(&store, &id, 20, 20);
+        store.persist(&store.index.lock().unwrap()).unwrap();
+        drop(store);
+        let index_path = tmp.path().join(PACKETS_DIR).join(INDEX_FILE);
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+        v[0].as_object_mut().unwrap().remove("last_ns");
+        std::fs::write(&index_path, v.to_string()).unwrap();
+        let ro = PacketStore::open_read_only(tmp.path(), BurstPolicy::default());
+        let store = open(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let day = now_ns() - NS_PER_DAY;
+        for r in [ro.get(&id).unwrap(), store.get(&id).unwrap()] {
+            assert!(r.last_ns.0 > day, "the file was written just now: {r:?}");
+        }
+    }
+
+    /// With the node's defaults ([`packet_policy`] of the default burst policy) a capture
+    /// that rolled once keeps both its files through the next capture's start: the budget
+    /// is many roll sizes, not one. The full file is made sparse rather than written.
+    #[test]
+    fn a_capture_that_rolled_once_keeps_both_files_under_the_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = packet_policy(BurstPolicy::default());
+        assert_eq!(policy.keep_bytes, PACKET_CAPTURE_KEEP_BYTES);
+        assert_eq!(policy.keep_days, BurstPolicy::default().keep_days);
+        let store = PacketStore::open(tmp.path(), policy).unwrap();
+        let mut w = store.begin(new_capture()).unwrap();
+        w.write(1, &[1; 10]).unwrap();
+        let first = w.id().to_string();
+        // The file all but full, as 256 MiB of packets leave it.
+        let full = PACKET_CAPTURE_MAX_BYTES - 8;
+        w.file.set_len(full).unwrap();
+        {
+            use std::io::{Seek, SeekFrom};
+            w.file.seek(SeekFrom::Start(full)).unwrap();
+        }
+        w.bytes = full;
+        let second = w.write(2, &[2; 100]).unwrap().expect("a roll");
+        drop(w);
+        // The next capture's start expires the store.
+        let next = store.begin(new_capture()).unwrap();
+        for id in [&first, &second, &next.id().to_string()] {
+            assert!(store.get(id).is_some_and(|r| r.path.is_file()), "{id} kept");
+        }
+        assert!(store.get(&first).unwrap().bytes >= full);
     }
 
     #[test]

@@ -498,9 +498,12 @@ pub enum Op {
     },
     /// The packet captures the node's packet store holds (written by `packets` jobs),
     /// newest first, each a record (`id`, `job` the decoder job captured, `source`,
-    /// `center_hz`, `link_type`, `mode` its row, `access`, `created_ns`, `bytes`,
-    /// `packets`, `writing` while a job appends to it). Fetch one at `GET
-    /// /captures/<id>.pcapng`.
+    /// `center_hz`, `link_type`, `mode` its row, `access`, `created_ns`, `last_ns` its
+    /// last packet, `bytes`, `packets`, `writing` while a job appends to it). Fetch one at
+    /// `GET /captures/<id>.pcapng`. A file rolls to a fresh id at 256 MiB; the store keeps
+    /// 4 GiB of captures, its own budget apart from `capture_list`'s, and drops the closed
+    /// ones written longest ago first, then any not written to for the burst store's
+    /// `keep_days` (7 by default). One being written is never dropped.
     PacketsList {},
     /// Delete a packet capture and its file. One being written is refused, `capture <id>
     /// is being written by job <packets job>: stop the packets job first`. Deleting is the

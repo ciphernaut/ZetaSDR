@@ -1323,10 +1323,12 @@ impl Node {
             bursts.expire();
         }
         // Only the state dir's owner recovers the store; a one-shot beside serve reads it.
+        // The store keeps its own byte budget, and the burst store's `keep_days`.
+        let packet_policy = crate::packets::packet_policy(cfg.burst_policy);
         let packets = if cfg.owns_state_dir {
-            crate::packets::PacketStore::open(&cfg.state_dir, cfg.burst_policy).map_err(io)?
+            crate::packets::PacketStore::open(&cfg.state_dir, packet_policy).map_err(io)?
         } else {
-            crate::packets::PacketStore::open_read_only(&cfg.state_dir, cfg.burst_policy)
+            crate::packets::PacketStore::open_read_only(&cfg.state_dir, packet_policy)
         };
         if cfg.burst_policy.expire_at_open {
             packets.expire();
