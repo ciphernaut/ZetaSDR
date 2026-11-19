@@ -954,8 +954,8 @@ pub(crate) mod test_streams {
     use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
     use zeta_core::stage::{Stage, StageContext};
-    use zeta_core::stream::{Frame, Payload, StreamBus};
-    use zeta_core::types::{JobId, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
+    use zeta_core::stream::{Frame, LinkType, Payload, StreamBus};
+    use zeta_core::types::{JobId, Provenance, SourceId, Span, StreamId, Timestamp};
 
     use crate::crc::{CRC16_CCITT, CrcDef, CrcSpec, crc};
     use crate::framing::crc_field;
@@ -1087,20 +1087,49 @@ pub(crate) mod test_streams {
         params: Value,
         input: Vec<Frame>,
     ) -> (Vec<Value>, Value) {
+        let (events, _, context) = run_outputs(stage, params, input, false).await;
+        (events, context)
+    }
+
+    /// As [`run_events`], with a capture listening on the stage's packet output: the
+    /// `(link type, data)` of each packet it published, too.
+    pub async fn run_events_packets(
+        stage: &dyn Stage,
+        params: Value,
+        input: Vec<Frame>,
+    ) -> (Vec<Value>, Vec<(LinkType, Vec<u8>)>, Value) {
+        run_outputs(stage, params, input, true).await
+    }
+
+    async fn run_outputs(
+        stage: &dyn Stage,
+        params: Value,
+        input: Vec<Frame>,
+        capture: bool,
+    ) -> (Vec<Value>, Vec<(LinkType, Vec<u8>)>, Value) {
         let bus = Arc::new(StreamBus::new(4096));
-        let ev = bus.register(
-            StreamKind::Event,
-            Provenance {
-                source: SourceId("s".into()),
-                job: None,
-                channel: None,
-                span: Span {
-                    start_ns: Timestamp(0),
-                    end_ns: Timestamp(0),
-                },
+        let prov = Provenance {
+            source: SourceId("s".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(0),
             },
-        );
-        let mut rx_ev = bus.subscribe(&ev).unwrap();
+        };
+        // One output per kind the stage lists; the first is read as the events.
+        let outs: Vec<StreamId> = stage
+            .spec()
+            .outputs
+            .iter()
+            .map(|k| bus.register(*k, prov.clone()))
+            .collect();
+        let mut rx_ev = bus.subscribe(&outs[0]).unwrap();
+        let mut rx_pk = if capture {
+            outs.get(1).map(|o| bus.subscribe(o).unwrap())
+        } else {
+            None
+        };
         let (tx, rx) = broadcast::channel(input.len().max(1));
         let notes = Arc::new(Mutex::new(Vec::new()));
         let sink = notes.clone();
@@ -1114,7 +1143,7 @@ pub(crate) mod test_streams {
             .run(
                 params,
                 vec![rx],
-                vec![ev],
+                outs,
                 bus.clone(),
                 CancellationToken::new(),
                 ctx,
@@ -1127,13 +1156,19 @@ pub(crate) mod test_streams {
                 events.push(v);
             }
         }
+        let mut packets = Vec::new();
+        while let Some(Ok(f)) = rx_pk.as_mut().map(|r| r.try_recv()) {
+            if let Payload::Packet { link_type, data } = f.payload {
+                packets.push((link_type, data.to_vec()));
+            }
+        }
         let mut context = serde_json::Map::new();
         for n in notes.lock().unwrap().iter() {
             for (k, v) in n.as_object().unwrap() {
                 context.insert(k.clone(), v.clone());
             }
         }
-        (events, Value::Object(context))
+        (events, packets, Value::Object(context))
     }
 }
 

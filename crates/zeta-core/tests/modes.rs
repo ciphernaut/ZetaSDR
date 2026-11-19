@@ -1116,9 +1116,35 @@ fn every_embedded_row_emits_events_today() {
             "m17_decode" | "p25_decode" | "dmr_decode" => &[StreamKind::Event, StreamKind::Audio],
             // Video is its own stream kind, the fields and the lock events beside it.
             "video_decode" => &[StreamKind::Video, StreamKind::Event],
+            // The frame stages publish each frame as a packet beside its event.
+            "aprs_decode" => &[StreamKind::Event, StreamKind::Packet],
+            _ if matches!(m.row.decoder, Decoder::Frame(_)) => {
+                &[StreamKind::Event, StreamKind::Packet]
+            }
             _ => &[StreamKind::Event],
         };
         assert_eq!(m.outputs, want, "{}", m.row.id.0);
+    }
+}
+
+#[test]
+fn rows_that_cut_frames_list_packet() {
+    let reg = ModeRegistry::load(&stages(), None);
+    for m in reg.all() {
+        let id = m.row.id.0.as_str();
+        let lists = m.outputs.contains(&StreamKind::Packet);
+        match &m.row.decoder {
+            Decoder::Frame(_) => {
+                assert_eq!(m.outputs, [StreamKind::Event, StreamKind::Packet], "{id}");
+            }
+            _ if id == "aprs_decode" => {
+                assert_eq!(m.outputs, [StreamKind::Event, StreamKind::Packet]);
+            }
+            _ => assert!(!lists, "{id} lists packet"),
+        }
+    }
+    for id in ["pocsag_decode", "rds_decode", "video_decode"] {
+        assert!(!reg.get(id).unwrap().outputs.contains(&StreamKind::Packet));
     }
 }
 
@@ -1163,7 +1189,7 @@ async fn modes_list_reports_outputs() {
     };
     let aprs = modes.iter().find(|m| m.id.0 == "aprs_decode").unwrap();
     let v = serde_json::to_value(aprs).unwrap();
-    assert_eq!(v["outputs"], serde_json::json!(["event"]));
+    assert_eq!(v["outputs"], serde_json::json!(["event", "packet"]));
 }
 
 #[test]

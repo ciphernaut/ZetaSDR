@@ -138,11 +138,14 @@ pub fn expand(
 
 /// The stream kinds a job of `row` emits. A graph row's are those of its terminal nodes
 /// (no edge leaves them), from each stage's `spec().outputs`, in node order, each kind
-/// once. A program row and a frame row emit events only (a frame row's audio stays
-/// inside its chain).
+/// once, and `packet` when any node's stage lists it and no `packet` edge leaves that
+/// node (the stage's packets then reach the job's output). A program row emits events
+/// only; a frame row emits events and packets (its audio stays inside its chain).
 pub fn outputs(row: &ModeRow, stages: &StageRegistry) -> Vec<StreamKind> {
-    let Decoder::Graph { nodes, edges, .. } = &row.decoder else {
-        return vec![StreamKind::Event];
+    let (nodes, edges) = match &row.decoder {
+        Decoder::Graph { nodes, edges, .. } => (nodes, edges),
+        Decoder::Frame(_) => return vec![StreamKind::Event, StreamKind::Packet],
+        Decoder::Program(_) => return vec![StreamKind::Event],
     };
     let mut out: Vec<StreamKind> = Vec::new();
     for n in nodes
@@ -157,6 +160,17 @@ pub fn outputs(row: &ModeRow, stages: &StageRegistry) -> Vec<StreamKind> {
                 out.push(*k);
             }
         }
+    }
+    let packets = nodes.iter().any(|n| {
+        stages
+            .spec(&n.kind)
+            .is_some_and(|s| s.outputs.contains(&StreamKind::Packet))
+            && !edges
+                .iter()
+                .any(|e| e.from == n.id && e.kind == StreamKind::Packet)
+    });
+    if packets && !out.contains(&StreamKind::Packet) {
+        out.push(StreamKind::Packet);
     }
     out
 }

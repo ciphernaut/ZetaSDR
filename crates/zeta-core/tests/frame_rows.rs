@@ -285,6 +285,11 @@ fn a_frame_row_expands_to_the_chain() {
         assert_eq!((&e.from, &e.to), (&w[0].id, &w[1].id));
     }
     stages().spec("frame_decode").expect("registered");
+    // A frame row's job publishes each frame as a packet beside its event.
+    assert_eq!(
+        template::outputs(&row, &stages()),
+        [StreamKind::Event, StreamKind::Packet]
+    );
     zeta_core::graph::validate(&g, &stages()).unwrap();
     // A band under the row's width is refused, as for an IQ program row.
     let narrow = Tuning {

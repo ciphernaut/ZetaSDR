@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
-use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::stream::{Frame, LinkType, Payload, StreamBus};
 use zeta_core::types::{StreamId, StreamKind};
 
 use crate::afsk::Afsk1200Demod;
@@ -36,7 +36,7 @@ impl AprsDecodeStage {
             spec: StageSpec {
                 kind: "aprs_decode",
                 inputs: vec![StreamKind::Audio],
-                outputs: vec![StreamKind::Event],
+                outputs: vec![StreamKind::Event, StreamKind::Packet],
                 params_schema: schemars::schema_for!(AprsParams),
             },
         }
@@ -77,9 +77,9 @@ impl Stage for AprsDecodeStage {
     ) -> Result<(), StageError> {
         let _: AprsParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("aprs_decode params: {e}")))?;
-        let Some(out) = outputs.first().cloned() else {
-            return Err(StageError::Failed("expected 1 output".into()));
-        };
+        let [out, packets] = <[StreamId; 2]>::try_from(outputs)
+            .map_err(|o| StageError::Failed(format!("expected 2 outputs, got {}", o.len())))?;
+        let tap = bus.clone();
         let mut dec: Option<Decoder> = None;
         run_map(self.spec().kind, inputs, bus, cancel, move |input| {
             let frame = match input {
@@ -129,6 +129,8 @@ impl Stage for AprsDecodeStage {
             };
             let bits = d.demod.feed(samples);
             let mut events = Vec::new();
+            // A frame is built as a packet only when a capture is listening.
+            let capturing = matches!(tap.receiver_count(&packets), Some(n) if n > 0);
             for raw in d.deframer.feed(&bits) {
                 // CRC-good frames that are not UI frames are dropped silently.
                 let Some(f) = parse_ax25_ui(&raw) else {
@@ -148,6 +150,20 @@ impl Stage for AprsDecodeStage {
                 });
                 if let Some(m) = fields.as_object_mut() {
                     m.extend(parse_info(&f.dst, &f.info).fields());
+                }
+                if capturing {
+                    // KISS data frame on port 0; the deframer already dropped the FCS.
+                    let mut kiss = Vec::with_capacity(1 + raw.len());
+                    kiss.push(0x00);
+                    kiss.extend_from_slice(&raw);
+                    events.push(Frame::new(
+                        packets.clone(),
+                        frame.provenance.clone(),
+                        Payload::Packet {
+                            link_type: LinkType::Ax25Kiss,
+                            data: kiss.into(),
+                        },
+                    ));
                 }
                 events.push(Frame::new(
                     out.clone(),
@@ -209,27 +225,101 @@ mod tests {
         Arc::new(loaded.row)
     }
 
-    fn spawn(
-        params: serde_json::Value,
-    ) -> (broadcast::Sender<Frame>, broadcast::Receiver<Frame>, Run) {
+    /// The stage's input, event receiver and packet receiver (when `capture`).
+    struct Spawned {
+        tx: broadcast::Sender<Frame>,
+        events: broadcast::Receiver<Frame>,
+        packets: Option<broadcast::Receiver<Frame>>,
+        run: Run,
+        bus: Arc<StreamBus>,
+    }
+
+    fn spawn_with(params: serde_json::Value, capture: bool) -> Spawned {
         let bus = Arc::new(StreamBus::new(8));
         let out = bus.register(StreamKind::Event, prov());
-        let rx_out = bus.subscribe(&out).unwrap();
+        let pkt = bus.register(StreamKind::Packet, prov());
+        let events = bus.subscribe(&out).unwrap();
+        let packets = capture.then(|| bus.subscribe(&pkt).unwrap());
         let (tx, rx_in) = broadcast::channel(64);
-        let h = tokio::spawn(async move {
+        let b = bus.clone();
+        let run = tokio::spawn(async move {
             AprsDecodeStage::new()
                 .run(
                     params,
                     vec![rx_in],
-                    vec![out],
-                    bus,
+                    vec![out, pkt],
+                    b,
                     CancellationToken::new(),
                     zeta_core::stage::StageContext::new(zeta_core::types::SourceId("s".into()))
                         .with_mode(mode()),
                 )
                 .await
         });
-        (tx, rx_out, h)
+        Spawned {
+            tx,
+            events,
+            packets,
+            run,
+            bus,
+        }
+    }
+
+    fn spawn(
+        params: serde_json::Value,
+    ) -> (broadcast::Sender<Frame>, broadcast::Receiver<Frame>, Run) {
+        let s = spawn_with(params, false);
+        (s.tx, s.events, s.run)
+    }
+
+    /// Feed one `>hi` packet from invented callsigns to a stage and wait for it to end.
+    async fn send_hi(tx: broadcast::Sender<Frame>, run: Run) {
+        let frame = ax25_ui_frame("N0CALL", "APRS", &[], b">hi");
+        let mut audio = vec![0.0f32; 4_800];
+        audio.extend(afsk1200_modulate(
+            &nrzi_encode(&hdlc_frame_bits(&frame, 32, 4)),
+            48_000,
+        ));
+        audio.extend(vec![0.0f32; 4_800]);
+        for chunk in audio.chunks(4_800) {
+            tx.send(audio_frame(chunk.to_vec(), 48_000)).unwrap();
+        }
+        drop(tx);
+        assert!(matches!(run.await.unwrap(), Ok(())));
+    }
+
+    #[tokio::test]
+    async fn a_decoded_frame_is_also_a_kiss_packet() {
+        let s = spawn_with(serde_json::json!({}), true);
+        let (mut ev, mut pk) = (s.events, s.packets.unwrap());
+        send_hi(s.tx, s.run).await;
+        let event_frame = ev.recv().await.unwrap();
+        let f = pk.recv().await.unwrap();
+        assert_eq!(f.kind, StreamKind::Packet);
+        let Payload::Packet { link_type, data } = &f.payload else {
+            panic!("expected a packet")
+        };
+        assert_eq!(*link_type, LinkType::Ax25Kiss);
+        assert_eq!(data[0], 0x00);
+        assert_eq!(data.len(), 1 + 7 + 7 + 1 + 1 + 3); // KISS, dst, src, control, PID, ">hi"
+        assert_eq!(&data[data.len() - 3..], b">hi");
+        assert_eq!(
+            f.provenance.span.start_ns,
+            event_frame.provenance.span.start_ns
+        );
+        assert!(pk.try_recv().is_err(), "one packet per frame");
+    }
+
+    #[tokio::test]
+    async fn no_packet_is_built_without_a_subscriber() {
+        let s = spawn_with(serde_json::json!({}), false);
+        let mut ev = s.events;
+        send_hi(s.tx, s.run).await;
+        assert!(matches!(
+            ev.recv().await.unwrap().payload,
+            Payload::Event(_)
+        ));
+        assert!(ev.try_recv().is_err());
+        assert_eq!(s.bus.dropped(), 0);
     }
 
     #[tokio::test]

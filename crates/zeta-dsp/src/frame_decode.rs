@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
-use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::stream::{Frame, LinkType, Payload, StreamBus};
 use zeta_core::types::{Provenance, Span, StreamId, StreamKind, Timestamp};
 
 use crate::correlate::BitsIn;
@@ -317,7 +317,7 @@ impl FrameDecodeStage {
             spec: StageSpec {
                 kind: FRAME_DECODE_KIND,
                 inputs: vec![StreamKind::Event],
-                outputs: vec![StreamKind::Event],
+                outputs: vec![StreamKind::Event, StreamKind::Packet],
                 params_schema: schemars::schema_for!(FrameDecodeParams),
             },
         }
@@ -358,8 +358,9 @@ impl Stage for FrameDecodeStage {
         self.check_params(&params).map_err(StageError::Failed)?;
         let f: FrameDecodeParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("{FRAME_DECODE_KIND} params: {e}")))?;
-        let [events] = <[StreamId; 1]>::try_from(outputs)
-            .map_err(|o| StageError::Failed(format!("expected 1 output, got {}", o.len())))?;
+        let [events, packets] = <[StreamId; 2]>::try_from(outputs)
+            .map_err(|o| StageError::Failed(format!("expected 2 outputs, got {}", o.len())))?;
+        let tap = bus.clone();
         let sync = f.sync.hex.to_ascii_lowercase();
         let mut state = FrameState::new(f);
         state.stream = events.0.clone();
@@ -367,8 +368,20 @@ impl Stage for FrameDecodeStage {
         run_map_ending(FRAME_DECODE_KIND, inputs, bus, cancel, move |input| {
             let mut out = Vec::new();
             let publish = |found: Vec<Found>, out: &mut Vec<Frame>| {
+                // A frame is built as a packet only when a capture is listening.
+                let capturing = matches!(tap.receiver_count(&packets), Some(n) if n > 0);
                 for fd in found {
                     let ev = frame_event(&ctx, &sync, &fd);
+                    if capturing && !fd.frame.bytes.is_empty() {
+                        out.push(Frame::new(
+                            packets.clone(),
+                            fd.prov.clone(),
+                            Payload::Packet {
+                                link_type: LinkType::User0,
+                                data: fd.frame.bytes.as_slice().into(),
+                            },
+                        ));
+                    }
                     out.push(Frame::new(events.clone(), fd.prov, Payload::Event(ev)));
                     ctx.note(fd.note);
                 }
@@ -409,11 +422,13 @@ impl Stage for FrameDecodeStage {
 mod tests {
     use serde_json::{Value, json};
     use zeta_core::stage::Stage;
-    use zeta_core::stream::{Frame, Payload};
+    use zeta_core::stream::{Frame, LinkType, Payload};
     use zeta_core::types::{JobId, Provenance, SourceId, Span, StreamId, Timestamp};
 
     use super::{BUFFER_BITS_MAX, FrameDecodeStage, FrameState};
-    use crate::bit_view::test_streams::{BAUD, T0, bits_frames, bits_frames_at, run_events};
+    use crate::bit_view::test_streams::{
+        BAUD, T0, bits_frames, bits_frames_at, run_events, run_events_packets,
+    };
     use crate::correlate::BitsIn;
     use crate::framing::test_support::{bodies, bodies_of, fx};
     use crate::framing::{Length, LineCode, MAX_FRAME_BITS, decode_frames, encode_frames};
@@ -435,6 +450,28 @@ mod tests {
     /// The time of bit `k` of a segment from `t0`, as `bits_frames` stamps it.
     fn bit_time(t0: u64, k: usize) -> u64 {
         t0 + (k as u128 * SECOND_NS as u128 / BAUD as u128) as u64
+    }
+
+    #[tokio::test]
+    async fn a_cut_frame_is_also_a_user0_packet() {
+        let f = fx("2dd4", 16, Length::Fixed { fixed_bits: 272 });
+        let bs = bodies(8, 32, 11);
+        let bits = encode_frames(&bs, &f);
+        const PERIOD: usize = 16 + 272;
+        let splits = [2 * PERIOD + 8, 5 * PERIOD + 100, 6 * PERIOD + 3];
+        let (events, packets, _) = run_events_packets(
+            &FrameDecodeStage::new(),
+            serde_json::to_value(&f).unwrap(),
+            bits_frames(&bits, &splits),
+        )
+        .await;
+        let frames = frames_of(&events);
+        assert_eq!(frames.len(), 8, "{events:?}");
+        assert_eq!(packets.len(), frames.len(), "one packet per frame event");
+        for (fr, (link_type, data)) in frames.iter().zip(&packets) {
+            assert_eq!(*link_type, LinkType::User0);
+            assert_eq!(hex(data), fr["bytes"].as_str().unwrap());
+        }
     }
 
     #[tokio::test]
