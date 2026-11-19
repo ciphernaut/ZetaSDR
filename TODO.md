@@ -705,6 +705,8 @@ The one defensive case that is legitimate, if it is ever wanted, is narrower and
 
 ## Feature: packet capture output for Wireshark
 
+Spec: `docs/superpowers/specs/2026-11-19-packet-capture-wireshark-design.md`. Plan 41 (`docs/superpowers/plans/2026-11-19-packet-capture-wireshark.md`) builds phase A, the stored capture; phase B, the live feed, gets its own plan.
+
 From the operator, 2026-11-19: Wireshark support, for lawful, research and education use. Nothing writes a packet capture today: a decoder's frame leaves the node as a JSON event, and a stream's payload has no kind for a packet's bytes. The idea is one shared output, not one per decoder: any job whose decoder cuts frames can also give them as a pcapng stream, each packet with the frame's own time, the job, the source and the frequency in its comment.
 
 - **What it carries first.** The frames the node already decodes: AX.25 from the APRS row, the frame rows' cut frames (`bytes` is already in each event), the transport stream of a DVB-T multiplex once `dvbt-rx` delivers one (the service-list step above), and the signalling of the digital voice rows. That is the research and teaching case as it stands: open a live amateur packet channel or a broadcast multiplex's tables in a dissector.
