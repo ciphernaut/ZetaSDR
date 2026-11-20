@@ -55,6 +55,7 @@ fn cfg(dir: &Path, modes_dir: &Path) -> NodeConfig {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: Some(modes_dir.to_path_buf()),
+        handlers_dir: None,
     }
 }
 
@@ -227,6 +228,7 @@ async fn a_node_without_a_modes_dir_lists_only_the_embedded_rows() {
         sets_dir: None,
         burst_policy: Default::default(),
         modes_dir: None,
+        handlers_dir: None,
         ..cfg(dir.path(), dir.path())
     };
     let node = Node::open(cfg, stages(), vec![]).await.unwrap();
@@ -1241,4 +1243,225 @@ fn a_row_test_without_bandwidth_hz_still_parses() {
         .find(|m| m.row.id.0 == "pocsag_decode")
         .unwrap();
     assert_eq!(m.row.test.as_ref().unwrap().bandwidth_hz, None);
+}
+
+/// A handler file `id` serving `adsb_decode` with the row's own `input` and `output`
+/// (a known-good block), `edit` applied to the whole file.
+fn adsb_handler_file(id: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    let (_, text) = ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("adsb_decode.json"))
+        .expect("embedded adsb_decode");
+    let row: serde_json::Value = serde_json::from_str(text).unwrap();
+    let d = &row["decoder"];
+    let mut file = serde_json::json!({
+        "id": id,
+        "name": "Alternative",
+        "programs": ["zeta-alt-decoder"],
+        "install": {"url": "https://example.invalid/alt"},
+        "modes": {
+            "adsb_decode": {
+                "args": ["--rate", "$rate_hz", "--port", "$port"],
+                "input": d["input"],
+                "output": d["output"],
+            }
+        }
+    });
+    edit(&mut file);
+    file.to_string()
+}
+
+/// The registry over the embedded rows with `files` (name, contents) in a handlers
+/// directory.
+fn with_handler_files(files: &[(&str, &str)]) -> ModeRegistry {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.path().join(name), text).unwrap();
+    }
+    ModeRegistry::load_with(&stages(), None, Some(dir.path()))
+}
+
+/// The ids of `mode`'s handlers, the row's own first.
+fn handler_ids(reg: &ModeRegistry, mode: &str) -> Vec<String> {
+    reg.get(mode)
+        .unwrap()
+        .handlers
+        .iter()
+        .map(|h| h.id.clone())
+        .collect()
+}
+
+#[test]
+fn a_handler_file_adds_a_handler_to_each_mode_it_lists() {
+    let reg = with_handler_files(&[("alt.json", &adsb_handler_file("alt", |_| {}))]);
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "alt"]);
+    let own = reg.handler("adsb_decode", "dump1090").unwrap();
+    assert!(!own.in_process);
+    assert_eq!(own.file, "modes/adsb_decode.json");
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert!(!alt.in_process);
+    assert_eq!(alt.name, "Alternative");
+    assert_eq!(alt.outputs, [StreamKind::Event]);
+    assert_eq!(alt.state, ModeState::Ready, "{:?}", alt.reason);
+    assert!(alt.file.ends_with("alt.json"), "{}", alt.file);
+    let block = reg.program_block("adsb_decode", "alt").unwrap();
+    assert_eq!(block.programs, ["zeta-alt-decoder"]);
+    assert_eq!(block.install.url, "https://example.invalid/alt");
+    assert_eq!(block.args, ["--rate", "$rate_hz", "--port", "$port"]);
+    assert_eq!(
+        reg.program_block("adsb_decode", "dump1090")
+            .unwrap()
+            .programs[0],
+        "dump1090"
+    );
+
+    let with_packets = adsb_handler_file("alt", |f| {
+        f["modes"]["adsb_decode"]["packets"] =
+            serde_json::json!({"via": "tcp", "port": "$packet_port", "parser": "pcap"});
+    });
+    let reg = with_handler_files(&[("alt.json", &with_packets)]);
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.outputs, [StreamKind::Event, StreamKind::Packet]);
+    assert!(
+        reg.program_block("adsb_decode", "alt")
+            .unwrap()
+            .packets
+            .is_some()
+    );
+
+    // A mode no file lists has its own handler only; a graph row's is `builtin`.
+    assert_eq!(handler_ids(&reg, "aprs_decode"), ["builtin"]);
+    let builtin = reg.handler("aprs_decode", "builtin").unwrap();
+    assert!(builtin.in_process);
+    assert_eq!(builtin.state, ModeState::Ready);
+    assert_eq!(builtin.outputs, reg.get("aprs_decode").unwrap().outputs);
+    assert_eq!(reg.program_block("aprs_decode", "builtin"), None);
+    // A graph row with helper programs is `builtin` and in process too.
+    assert_eq!(handler_ids(&reg, "dmr_decode"), ["builtin"]);
+    assert!(reg.handler("dmr_decode", "builtin").unwrap().in_process);
+}
+
+#[test]
+fn an_entry_for_an_unknown_mode_breaks_only_that_entry() {
+    let text = adsb_handler_file("alt", |f| {
+        f["modes"]["no_such_mode"] = f["modes"]["adsb_decode"].clone();
+    });
+    let reg = with_handler_files(&[("alt.json", &text)]);
+    let file = &reg.handler_files()[0];
+    assert_eq!(file.state, ModeState::Ready, "{:?}", file.reason);
+    assert_eq!(file.broken_entries(), ["no_such_mode: no mode of that id"]);
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "alt"]);
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.state, ModeState::Ready, "{:?}", alt.reason);
+}
+
+#[test]
+fn an_entry_missing_a_required_event_field_is_broken() {
+    let text = adsb_handler_file("alt", |f| {
+        f["modes"]["adsb_decode"]["output"]["fields"] =
+            serde_json::json!({"callsign": "/callsign"});
+    });
+    let reg = with_handler_files(&[("alt.json", &text)]);
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.state, ModeState::Broken);
+    assert_eq!(
+        alt.reason.as_deref(),
+        Some("output.fields: no mapping for icao (the row's subject key)")
+    );
+    assert_eq!(reg.program_block("adsb_decode", "alt"), None);
+    // `fields: null` (the whole parsed object is the event) passes.
+    let reg = with_handler_files(&[("alt.json", &adsb_handler_file("alt", |_| {}))]);
+    assert_eq!(
+        reg.handler("adsb_decode", "alt").unwrap().state,
+        ModeState::Ready
+    );
+}
+
+#[test]
+fn an_extra_field_may_not_shadow_a_row_field() {
+    let text = adsb_handler_file("alt", |f| {
+        f["modes"]["adsb_decode"]["extra"] = serde_json::json!({"callsign": "/x"});
+    });
+    let reg = with_handler_files(&[("alt.json", &text)]);
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.state, ModeState::Broken);
+    assert_eq!(
+        alt.reason.as_deref(),
+        Some("extra.callsign: the row's event schema already has it")
+    );
+    let text = adsb_handler_file("alt", |f| {
+        f["modes"]["adsb_decode"]["extra"] = serde_json::json!({"df": "/df"});
+    });
+    let reg = with_handler_files(&[("alt.json", &text)]);
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.state, ModeState::Ready, "{:?}", alt.reason);
+}
+
+#[test]
+fn an_id_of_builtin_or_of_the_rows_own_program_is_refused() {
+    let reg = with_handler_files(&[("b.json", &adsb_handler_file("builtin", |_| {}))]);
+    let file = &reg.handler_files()[0];
+    assert_eq!(file.state, ModeState::Broken);
+    assert!(
+        file.reason.as_deref().unwrap().starts_with("id: "),
+        "{file:?}"
+    );
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090"]);
+
+    let reg = with_handler_files(&[("d.json", &adsb_handler_file("dump1090", |_| {}))]);
+    let file = &reg.handler_files()[0];
+    assert_eq!(file.state, ModeState::Ready, "{file:?}");
+    assert_eq!(
+        file.broken_entries(),
+        ["adsb_decode: id dump1090 is the row's own handler"]
+    );
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090"]);
+    // The row's own handler is untouched.
+    assert_eq!(
+        reg.program_block("adsb_decode", "dump1090")
+            .unwrap()
+            .programs[0],
+        "dump1090"
+    );
+}
+
+#[test]
+fn an_operator_file_replaces_the_embedded_one_of_its_id() {
+    let first = adsb_handler_file("alt", |_| {});
+    let second = adsb_handler_file("alt", |f| f["name"] = "Replacement".into());
+    let reg = ModeRegistry::load_handler_texts(
+        &stages(),
+        &[("handlers/alt.json", &first), ("/op/alt.json", &second)],
+    );
+    assert_eq!(reg.handler_files().len(), 1, "{:?}", reg.handler_files());
+    assert_eq!(reg.handler_files()[0].file, "/op/alt.json");
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "alt"]);
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.name, "Replacement");
+    assert_eq!(alt.file, "/op/alt.json");
+    // A broken operator file leaves the one in force.
+    let reg = ModeRegistry::load_handler_texts(
+        &stages(),
+        &[("handlers/alt.json", &first), ("/op/alt.json", "{")],
+    );
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "alt"]);
+    assert_eq!(
+        reg.handler("adsb_decode", "alt").unwrap().name,
+        "Alternative"
+    );
+}
+
+#[test]
+fn a_broken_handler_file_never_fails_the_load() {
+    let reg = with_handler_files(&[("bad.json", "{")]);
+    assert_eq!(reg.ids(), EMBEDDED);
+    assert_eq!(reg.ready().count(), EMBEDDED.len());
+    let file = &reg.handler_files()[0];
+    assert_eq!(file.state, ModeState::Broken);
+    assert!(file.file.ends_with("bad.json"), "{file:?}");
+    assert!(file.reason.as_deref().unwrap().contains("EOF"), "{file:?}");
+    let lines = reg.startup_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("zeta: handler bad ("), "{lines:?}");
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090"]);
 }

@@ -131,7 +131,16 @@ async fn main() -> ExitCode {
         return print(serde_json::to_string_pretty(&e), 2);
     }
     if let cli::Command::Modes(cli::ModesCmd::Check { id, strict }) = cli.command {
-        return modes_check::run(state_dir, cli.modes_dir, cli.run_dir, &plugins, id, strict).await;
+        return modes_check::run(
+            state_dir,
+            cli.modes_dir,
+            cli.handlers_dir,
+            cli.run_dir,
+            &plugins,
+            id,
+            strict,
+        )
+        .await;
     }
     let (serve_args, speech_args, secret) = (
         match &cli.command {
@@ -190,6 +199,7 @@ async fn main() -> ExitCode {
         cli.ring_budget_mb,
         burst_policy,
         cli.modes_dir.clone(),
+        cli.handlers_dir.clone(),
         cli.themes_dir.clone(),
         cli.sets_dir.clone(),
         cli.run_dir.clone(),

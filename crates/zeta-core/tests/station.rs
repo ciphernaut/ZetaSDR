@@ -22,6 +22,7 @@ async fn open(dir: &Path) -> Node {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     Node::open(cfg, StageRegistry::new(), vec![]).await.unwrap()
 }

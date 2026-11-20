@@ -81,6 +81,11 @@ pub struct Cli {
     /// ~/.config/zetasdr/modes]
     #[arg(long, global = true, value_name = "PATH")]
     pub modes_dir: Option<PathBuf>,
+    /// Directory of the operator's handler files (*.json), read after the built-in ones,
+    /// each adding a program to the modes it lists; a file with a built-in id replaces it
+    /// [default: $XDG_CONFIG_HOME/zetasdr/handlers or ~/.config/zetasdr/handlers]
+    #[arg(long, global = true, value_name = "PATH")]
+    pub handlers_dir: Option<PathBuf>,
     /// Directory of the operator's themes (one folder each), read after the built-in ones;
     /// a theme with a built-in id replaces it [default: $XDG_CONFIG_HOME/zetasdr/themes or
     /// ~/.config/zetasdr/themes]
@@ -318,6 +323,7 @@ impl Cli {
             || !self.plugins.is_empty()
             || self.state_dir.is_some()
             || self.modes_dir.is_some()
+            || self.handlers_dir.is_some()
             || self.themes_dir.is_some()
             || self.sets_dir.is_some()
             || self.registers_dir.is_some()

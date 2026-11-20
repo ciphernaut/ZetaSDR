@@ -1339,6 +1339,7 @@ async fn packets_node(dir: &Path) -> (Arc<FileSource>, Node) {
     ));
     let cfg = NodeConfig {
         modes_dir: Some(modes),
+        handlers_dir: None,
         ..cfg(dir)
     };
     let node = Node::open(cfg, registry, vec![port]).await.unwrap();

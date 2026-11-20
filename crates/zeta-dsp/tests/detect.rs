@@ -102,6 +102,7 @@ async fn detect_publishes_new_and_gone_for_a_synthesised_burst() {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
 

@@ -110,6 +110,7 @@ pub fn cfg(dir: &Path, resume: bool) -> NodeConfig {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     }
 }
 

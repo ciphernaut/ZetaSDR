@@ -227,6 +227,7 @@ async fn node_unstarted(
         // blocks, and no decoder proves on what is left (the bank's own tests cover it).
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let opts = FileOpts {
         realtime: true,

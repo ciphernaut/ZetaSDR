@@ -84,6 +84,7 @@ async fn open_with(dir: &Path, extra: Option<Arc<dyn Stage>>) -> Node {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let mut registry = StageRegistry::new();
     registry.register(Arc::new(PassthroughStage::new()));

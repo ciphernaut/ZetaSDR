@@ -55,6 +55,7 @@ async fn node_over_with(
         owns_state_dir: true,
         bank_factory: None,
         modes_dir,
+        handlers_dir: None,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
     for c in zeta_dsp::classifiers(node.modes_handle()) {

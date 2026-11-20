@@ -72,6 +72,7 @@ fn cfg(dir: &Path) -> NodeConfig {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     }
 }
 
@@ -960,6 +961,7 @@ async fn a_frame_row_is_captured_as_user0() {
     let port: Arc<dyn Port> = src.clone();
     let cfg = NodeConfig {
         modes_dir: Some(modes),
+        handlers_dir: None,
         ..cfg(dir.path())
     };
     let node = Node::open(cfg, packets_registry(), vec![port])
@@ -1059,6 +1061,7 @@ async fn a_program_row_has_a_packet_stream_only_with_a_packets_block() {
     )));
     let cfg = NodeConfig {
         modes_dir: Some(modes),
+        handlers_dir: None,
         ..cfg(dir.path())
     };
     let node = Node::open_with_handle(cfg, stages, vec![port], handle)

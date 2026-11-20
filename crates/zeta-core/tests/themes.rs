@@ -347,6 +347,7 @@ async fn themes_list_answers_every_theme() {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let node = Node::open(cfg, StageRegistry::new(), vec![]).await.unwrap();
     node.set_themes(Arc::new(ThemeRegistry::load(Some(&root))));

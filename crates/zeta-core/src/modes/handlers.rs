@@ -1,6 +1,8 @@
-//! Finding a row's handler programs on this host: `PATH`, an absolute path, or the
+//! Finding a row's programs (a program row's own, a graph row's helper programs) and a
+//! handler file's program on this host: `PATH`, an absolute path, or the
 //! `ZETA_HANDLER_<PROGRAM>` override. One lookup, shared by the startup probe, the
-//! external-program stage and any stage of a graph row that runs a handler.
+//! external-program stage and any stage of a graph row that runs a helper program. It
+//! never runs the program.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

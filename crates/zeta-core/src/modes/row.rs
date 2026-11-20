@@ -1555,7 +1555,7 @@ fn fill(v: &mut serde_json::Value, field: &str) -> Result<(), RowError> {
     Ok(())
 }
 
-fn validate_program(p: &ProgramBlock) -> Result<(), RowError> {
+pub(crate) fn validate_program(p: &ProgramBlock) -> Result<(), RowError> {
     if p.programs.is_empty() {
         return Err(RowError::new(
             "decoder.programs",

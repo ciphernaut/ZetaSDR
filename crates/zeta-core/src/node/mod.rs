@@ -123,6 +123,11 @@ pub struct NodeConfig {
     /// resolves the default, [`crate::modes::default_operator_dir`]). A missing
     /// directory reads as empty.
     pub modes_dir: Option<PathBuf>,
+    /// The operator's handler files (`--handlers-dir`), read after the embedded ones (at
+    /// `open` and by [`Node::reload_modes`]); `None` is no operator directory: only the
+    /// embedded files (the CLI resolves the default,
+    /// [`crate::modes::default_handlers_dir`]). A missing directory reads as empty.
+    pub handlers_dir: Option<PathBuf>,
     /// The operator's named sets (`--sets-dir`), read after the embedded ones at `open`
     /// and validated against the mode rows; `None` is no operator directory: only the
     /// embedded sets (the CLI resolves the default, [`crate::sets::default_operator_dir`]).
@@ -451,6 +456,9 @@ struct Inner {
     /// `reload_modes` reads and where an accepted signature's row is written (`None`:
     /// none, so only the embedded rows load and no row is written).
     modes_dir: Option<PathBuf>,
+    /// The operator's handlers directory as configured (`NodeConfig.handlers_dir`): what
+    /// `reload_modes` reads beside `modes_dir`.
+    handlers_dir: Option<PathBuf>,
     /// Held across [`Node::reload_modes`] (no await inside).
     reloading: Mutex<()>,
     /// The named sets, loaded at `open` from `NodeConfig.sets_dir` over the embedded ones.
@@ -1345,9 +1353,10 @@ impl Node {
         let sessions = crate::sessions::SessionStore::open(&cfg.state_dir).map_err(io)?;
         sessions.sweep(&bursts.list().into_iter().map(|r| r.id).collect());
         if modes.get().is_none() {
-            modes.set(Arc::new(ModeRegistry::load(
+            modes.set(Arc::new(ModeRegistry::load_with(
                 &registry,
                 cfg.modes_dir.as_deref(),
+                cfg.handlers_dir.as_deref(),
             )));
         }
         let sets = Arc::new(crate::sets::SetRegistry::load(
@@ -1389,6 +1398,7 @@ impl Node {
                 registry,
                 modes,
                 modes_dir: cfg.modes_dir.clone(),
+                handlers_dir: cfg.handlers_dir.clone(),
                 reloading: Mutex::new(()),
                 sets,
                 instances_dir,
@@ -1731,9 +1741,10 @@ impl Node {
     }
 
     /// Read the mode rows again (the embedded ones, then the operator directory
-    /// `NodeConfig.modes_dir`, none when it is `None`, as at `open`) against the
-    /// node's stages, carry each program row's probed program and state over from the
-    /// rows in force ([`ModeRegistry::carry_programs`]), read the checked times, and put
+    /// `NodeConfig.modes_dir`, none when it is `None`, as at `open`) and the handler
+    /// files (embedded, then `NodeConfig.handlers_dir`) against the node's stages, carry
+    /// each program row's and handler file's probed program and state over from the
+    /// registry in force ([`ModeRegistry::carry_programs`]), read the checked times, and put
     /// the new registry in force. Jobs already running keep the graphs they were
     /// expanded to. The broken rows' startup lines
     /// ([`ModeRegistry::startup_lines`]), for the caller to show.
@@ -1741,7 +1752,11 @@ impl Node {
         let inner = &self.inner;
         // One reload at a time: a later one reads every file an earlier one saw.
         let _one = inner.reloading.lock().unwrap_or_else(|e| e.into_inner());
-        let mut modes = ModeRegistry::load(&inner.registry, inner.modes_dir.as_deref());
+        let mut modes = ModeRegistry::load_with(
+            &inner.registry,
+            inner.modes_dir.as_deref(),
+            inner.handlers_dir.as_deref(),
+        );
         modes.carry_programs(&inner.modes());
         modes.load_checked(&inner.state_dir.join(MODES_CHECKED_FILE));
         let lines = modes.startup_lines();

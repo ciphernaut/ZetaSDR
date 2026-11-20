@@ -3353,6 +3353,46 @@ fn handler_report_lists_missing_programs_with_suggestions() {
     assert_eq!(adsb["program"], fake.display().to_string(), "{v}");
 }
 
+/// A handler file whose program is not on this host is one `zeta: handlers:` line at
+/// `serve`'s startup, worded as a row's missing program is.
+#[test]
+fn a_handler_files_missing_program_is_one_startup_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let handlers = dir.path().join("handlers");
+    std::fs::create_dir_all(&handlers).unwrap();
+    let file = serde_json::json!({
+        "id": "alt",
+        "name": "Alternative",
+        "programs": ["zeta-no-such-handler"],
+        "install": {"url": "https://example.invalid/alt"},
+        "modes": {
+            "adsb_decode": {
+                "args": ["--port", "$port"],
+                "input": {"stream": "iq", "format": "cs16", "rate_hz": 2400000, "via": "stdin"},
+                "output": {"via": "tcp", "port": "$port", "parser": "sbs"}
+            }
+        }
+    });
+    std::fs::write(handlers.join("alt.json"), file.to_string()).unwrap();
+    let seen = serve_banner(
+        dir.path(),
+        &["--handlers-dir", handlers.to_str().unwrap()],
+        &[],
+    );
+    assert!(seen.contains("serving; Ctrl-C"), "{seen}");
+    let lines: Vec<&str> = seen
+        .lines()
+        .filter(|l| l.contains("zeta-no-such-handler: missing"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "zeta: handlers: zeta-no-such-handler: missing (https://example.invalid/alt) — modes: adsb_decode"
+        ],
+        "{seen}"
+    );
+}
+
 /// Without `c2dec` the M17 row is ready, as the P25 and DMR rows are without `zeta-mbe`:
 /// the vocoder is optional, listed in its `missing` and reported as voice silent. (An
 /// empty `PATH` holds no package manager, so the hint is the row's first entry.)

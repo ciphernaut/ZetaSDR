@@ -51,6 +51,7 @@ async fn open(dir: &Path) -> Node {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
         source_positions: Default::default(),
         sets_dir: None,
     };
@@ -421,6 +422,7 @@ async fn open_in(dir: &Path, modes_dir: &Path, file: Option<&Path>) -> Node {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: Some(modes_dir.to_path_buf()),
+        handlers_dir: None,
         source_positions: Default::default(),
         sets_dir: None,
     };

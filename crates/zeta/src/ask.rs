@@ -18,7 +18,8 @@ use crate::sources::{PluginSpec, SourceSpec};
 use crate::{agents_md, node_setup, serve_lock};
 
 /// Run the request against the remote node, or against a local node on `state_dir`
-/// with `sources`, `plugins`, the operator's mode rows in `modes_dir` and the speech
+/// with `sources`, `plugins`, the operator's mode rows in `modes_dir` and handler files in
+/// `handlers_dir`, and the speech
 /// backend `speech`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -34,6 +35,7 @@ pub async fn run(
     ring_budget_mb: Option<u64>,
     burst_policy: zeta_core::bursts::BurstPolicy,
     modes_dir: Option<PathBuf>,
+    handlers_dir: Option<PathBuf>,
     themes_dir: Option<PathBuf>,
     sets_dir: Option<PathBuf>,
     run_dir: Option<PathBuf>,
@@ -89,6 +91,7 @@ pub async fn run(
                 ring_budget_mb,
                 burst_policy,
                 modes_dir,
+                handlers_dir,
                 themes_dir,
                 sets_dir,
                 run_dir,

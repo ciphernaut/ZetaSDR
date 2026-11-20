@@ -79,6 +79,7 @@ struct Ctx {
     registry: zeta_core::stage::StageRegistry,
     modes: ModesHandle,
     modes_dir: Option<PathBuf>,
+    handlers_dir: Option<PathBuf>,
 }
 
 /// How one row's check ended.
@@ -98,19 +99,21 @@ enum Outcome {
 pub async fn run(
     state_dir: PathBuf,
     modes_dir: Option<PathBuf>,
+    handlers_dir: Option<PathBuf>,
     run_dir: Option<PathBuf>,
     plugins: &[PluginSpec],
     only: Option<String>,
     strict: bool,
 ) -> ExitCode {
-    let (registry, handle, modes_dir) =
-        match node_setup::load_modes(&state_dir, run_dir, plugins, None, modes_dir).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("zeta: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let loaded =
+        node_setup::load_modes(&state_dir, run_dir, plugins, None, modes_dir, handlers_dir).await;
+    let (registry, handle, modes_dir, handlers_dir) = match loaded {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("zeta: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let modes = handle.get().unwrap_or_default();
     if let Some(id) = &only
         && modes.get(id).is_none()
@@ -126,6 +129,7 @@ pub async fn run(
         registry,
         modes: handle.clone(),
         modes_dir,
+        handlers_dir,
     };
     let state_dir = &ctx.state_dir;
     let mut failed = false;
@@ -257,6 +261,7 @@ async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> 
         ctx.registry.clone(),
         ctx.modes.clone(),
         ctx.modes_dir.clone(),
+        ctx.handlers_dir.clone(),
         None,
         &[source],
         Default::default(),

@@ -153,6 +153,7 @@ async fn open(dir: &Path, iq: Option<&[Complex<f32>]>, row: bool) -> Node {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir,
+        handlers_dir: None,
         source_positions: Default::default(),
         sets_dir: None,
     };

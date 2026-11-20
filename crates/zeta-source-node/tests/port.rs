@@ -491,6 +491,7 @@ async fn local_node_at(
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     Node::open(cfg, registry, vec![port]).await.expect("node")
 }

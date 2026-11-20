@@ -37,6 +37,7 @@ async fn stream_tail_returns_events_from_running_job() {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
     src.start();

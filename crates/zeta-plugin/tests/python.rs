@@ -172,6 +172,7 @@ async fn python_plugin_runs_in_a_job_via_graph_put() {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
     src.start();

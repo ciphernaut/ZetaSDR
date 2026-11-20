@@ -117,7 +117,8 @@ enum Probed {
 /// <programs[0]>: missing (<hint>; <url>) — modes: <ids>` for the rows that need it and
 /// `zeta: handlers: <programs[0]>: missing (<hint>; <url>) — voice silent: <ids>` for
 /// those that run without it. The hint is [`Install::hint`] (`bash <script>`, else the
-/// first package), left out (with its `; `) when the row names neither.
+/// first package), left out (with its `; `) when the row names neither. Then each
+/// handler file's program, one line per file ([`probe_handler_files`]).
 pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
     let mut groups: Vec<HandlerGroup> = Vec::new();
     // Each row with its lists in order (as indices into `groups`), and whether it runs
@@ -209,6 +210,59 @@ pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
             if let (Probed::Missing { line, .. }, true) = (a, optional) {
                 modes.set_missing(&id, line.clone());
             }
+        }
+    }
+    lines.extend(probe_handler_files(modes));
+    lines
+}
+
+/// Find each ready handler file's program (one lookup per file, never run: no version
+/// is asked) and record it in every mode whose handler it is
+/// ([`ModeRegistry::set_handler_program`]): found, the handlers are ready with its path;
+/// missing, they are unavailable with the report line as their reason. Returns one line
+/// per file with a mode entry that loaded: `zeta: handlers: <programs[0]>: found <path>
+/// (handler <id>)`, or `zeta: handlers: <programs[0]>: missing (<hint>; <url>) — modes:
+/// <ids>` as for a row's program.
+fn probe_handler_files(modes: &mut ModeRegistry) -> Vec<String> {
+    let files: Vec<(String, Vec<String>, Install, Vec<String>)> = modes
+        .handler_files()
+        .iter()
+        .filter_map(|f| {
+            let h = f.handler.as_ref()?;
+            let served: Vec<String> = f
+                .entries
+                .iter()
+                .filter(|(_, r)| r.is_none())
+                .map(|(m, _)| m.clone())
+                .collect();
+            Some((h.id.clone(), h.programs.clone(), h.install.clone(), served))
+        })
+        .filter(|(.., served)| !served.is_empty())
+        .collect();
+    let mut lines = Vec::new();
+    for (id, programs, install, served) in files {
+        let first = programs.first().cloned().unwrap_or_default();
+        let (program, reason) = match zeta_ext::proc::find_handler(&programs) {
+            Some(path) => {
+                lines.push(format!(
+                    "zeta: handlers: {first}: found {} (handler {id})",
+                    path.display()
+                ));
+                (Some(path), None)
+            }
+            None => {
+                let hint = install.hint().map(|h| format!("{h}; ")).unwrap_or_default();
+                let reason = format!(
+                    "{first}: missing ({hint}{}) — modes: {}",
+                    install.url,
+                    served.join(", ")
+                );
+                lines.push(format!("zeta: handlers: {reason}"));
+                (None, Some(reason))
+            }
+        };
+        for mode in &served {
+            modes.set_handler_program(mode, &id, program.clone(), reason.clone());
         }
     }
     lines
@@ -426,9 +480,11 @@ fn parse_meminfo(text: &str) -> Option<u64> {
 /// ([`NodeConfig::owns_state_dir`]). `speech` is the backend `transcribe`
 /// jobs run on. `themes_dir` is the operator's themes (`--themes-dir`; `None` for
 /// [`zeta_core::themes::default_operator_dir`]). `modes_dir` is the operator's mode rows (`--modes-dir`; `None` for
-/// [`zeta_core::modes::default_operator_dir`]) and `sets_dir` the operator's named sets
-/// (`--sets-dir`; `None` for [`zeta_core::sets::default_operator_dir`]); each broken row is reported on stderr, one
-/// line each, then the handler report of the rows with handlers ([`probe_handlers`]); neither
+/// [`zeta_core::modes::default_operator_dir`]), `handlers_dir` the operator's handler files
+/// (`--handlers-dir`; `None` for [`zeta_core::modes::default_handlers_dir`]) and `sets_dir`
+/// the operator's named sets (`--sets-dir`; `None` for
+/// [`zeta_core::sets::default_operator_dir`]); each broken row or handler file is reported
+/// on stderr, one line each, then the handler report ([`probe_handlers`]); neither
 /// fails the node. Errors name the flag, never a Kiwi password or a node secret. The node
 /// comes with its [`RemotePorts`].
 #[allow(clippy::too_many_arguments)]
@@ -442,19 +498,28 @@ pub async fn open(
     ring_budget_mb: Option<u64>,
     burst_policy: BurstPolicy,
     modes_dir: Option<PathBuf>,
+    handlers_dir: Option<PathBuf>,
     themes_dir: Option<PathBuf>,
     sets_dir: Option<PathBuf>,
     run_dir: Option<PathBuf>,
     speech: Option<Arc<dyn SpeechBackend>>,
 ) -> Result<(Node, RemotePorts), String> {
-    let (registry, modes, modes_dir) =
-        load_modes(&state_dir, run_dir, plugins, speech, modes_dir).await?;
+    let (registry, modes, modes_dir, handlers_dir) = load_modes(
+        &state_dir,
+        run_dir,
+        plugins,
+        speech,
+        modes_dir,
+        handlers_dir,
+    )
+    .await?;
     let themes = load_themes(themes_dir);
     let (node, remotes) = open_with(
         state_dir,
         registry,
         modes,
         modes_dir,
+        handlers_dir,
         sets_dir.or_else(zeta_core::sets::default_operator_dir),
         sources,
         source_positions,
@@ -488,16 +553,17 @@ fn load_themes(themes_dir: Option<PathBuf>) -> Arc<zeta_core::themes::ThemeRegis
 /// the mode rows validated against it: `load`, the checked times of `state_dir`, one
 /// stderr line per broken row, the handler report ([`probe_handlers`]), and the registry
 /// handle `external_decode` reads the rows through filled: the one handle the node is
-/// opened on, so its reloads reach the stages too. Also the operator directory used
-/// (`modes_dir`, else the default). Used by [`open`] and by `zeta modes check`, which
-/// opens many nodes on one loading.
+/// opened on, so its reloads reach the stages too. Also the operator directories used
+/// (`modes_dir` and `handlers_dir`, else the defaults). Used by [`open`] and by `zeta
+/// modes check`, which opens many nodes on one loading.
 pub async fn load_modes(
     state_dir: &Path,
     run_dir: Option<PathBuf>,
     plugins: &[PluginSpec],
     speech: Option<Arc<dyn SpeechBackend>>,
     modes_dir: Option<PathBuf>,
-) -> Result<(StageRegistry, ModesHandle, Option<PathBuf>), String> {
+    handlers_dir: Option<PathBuf>,
+) -> Result<(StageRegistry, ModesHandle, Option<PathBuf>, Option<PathBuf>), String> {
     let handle = ModesHandle::default();
     let run_dir = run_dir.unwrap_or_else(|| state_dir.join("run"));
     let registry = with_plugins(plugins, speech, &handle, &run_dir).await?;
@@ -505,7 +571,9 @@ pub async fn load_modes(
     // included); program rows are probed after the plugins, and the registry is finished
     // before the stages and the node share it.
     let modes_dir = modes_dir.or_else(zeta_core::modes::default_operator_dir);
-    let mut modes = ModeRegistry::load(&registry, modes_dir.as_deref());
+    let handlers_dir = handlers_dir.or_else(zeta_core::modes::default_handlers_dir);
+    let mut modes =
+        ModeRegistry::load_with(&registry, modes_dir.as_deref(), handlers_dir.as_deref());
     modes.load_checked(&checked_path(state_dir));
     for line in modes.startup_lines() {
         eprintln!("{line}");
@@ -514,11 +582,11 @@ pub async fn load_modes(
         eprintln!("{line}");
     }
     handle.set(Arc::new(modes));
-    Ok((registry, handle, modes_dir))
+    Ok((registry, handle, modes_dir, handlers_dir))
 }
 
 /// [`open`] on rows already loaded by [`load_modes`] (their registry, the handle holding
-/// them and the operator directory it used), with the operator's sets in `sets_dir`
+/// them and the operator directories it used), with the operator's sets in `sets_dir`
 /// (`None`: the embedded sets only). A node that fails to open closes the ports
 /// it had opened (see [`RemotePorts::close`]) before the error is returned.
 #[allow(clippy::too_many_arguments)]
@@ -527,6 +595,7 @@ pub async fn open_with(
     registry: StageRegistry,
     modes: ModesHandle,
     modes_dir: Option<PathBuf>,
+    handlers_dir: Option<PathBuf>,
     sets_dir: Option<PathBuf>,
     sources: &[SourceSpec],
     source_positions: BTreeMap<SourceId, SourcePosition>,
@@ -541,6 +610,7 @@ pub async fn open_with(
         registry,
         modes,
         modes_dir,
+        handlers_dir,
         sets_dir,
         sources,
         source_positions,
@@ -568,6 +638,7 @@ async fn open_into(
     registry: StageRegistry,
     modes: ModesHandle,
     modes_dir: Option<PathBuf>,
+    handlers_dir: Option<PathBuf>,
     sets_dir: Option<PathBuf>,
     sources: &[SourceSpec],
     source_positions: BTreeMap<SourceId, SourcePosition>,
@@ -663,6 +734,7 @@ async fn open_into(
         scan_dwell_ms: zeta_core::ops::SCAN_DWELL_MS,
         bank_factory: Some(Arc::new(zeta_dsp::bank::PfbBankFactory)),
         modes_dir,
+        handlers_dir,
         sets_dir,
     };
     let node = Node::open_with_handle(cfg, registry, ports, modes)

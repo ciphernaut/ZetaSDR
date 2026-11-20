@@ -79,6 +79,7 @@ async fn tone_node(dir: &std::path::Path) -> Arc<Node> {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let ports = vec![source.clone() as Arc<dyn Port>];
     let node = Arc::new(Node::open(cfg, registry, ports).await.expect("open node"));
@@ -1202,6 +1203,7 @@ async fn two_source_node_ranged(
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
         sets_dir: None,
     };
     let ports = vec![tone.clone() as Arc<dyn Port>, cb.clone() as Arc<dyn Port>];

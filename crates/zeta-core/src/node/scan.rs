@@ -1524,6 +1524,7 @@ mod tests {
             owns_state_dir: true,
             bank_factory: None,
             modes_dir: None,
+            handlers_dir: None,
             sets_dir: None,
         };
         let node = super::super::Node::open(cfg, crate::stage::StageRegistry::new(), vec![])

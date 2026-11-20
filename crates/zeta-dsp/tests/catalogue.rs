@@ -189,6 +189,7 @@ async fn knowledge_lookup_returns_catalogue_signatures() {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let node = Node::open(cfg, stages(), vec![]).await.unwrap();
     node.add_knowledge(Arc::new(CatalogueKnowledge::new(node.modes_handle())));
@@ -264,6 +265,7 @@ async fn lookup(center_hz: u64, bandwidth_hz: u64) -> Vec<zeta_core::knowledge::
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let node = Node::open(cfg, stages(), vec![]).await.unwrap();
     node.add_knowledge(Arc::new(CatalogueKnowledge::new(node.modes_handle())));

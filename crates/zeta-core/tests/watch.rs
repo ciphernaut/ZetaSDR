@@ -727,6 +727,7 @@ async fn node_over_with(
     let cfg = NodeConfig {
         ring_seconds: 4.0,
         modes_dir: modes_dir.map(Path::to_path_buf),
+        handlers_dir: None,
         ..common::cfg(dir, true)
     };
     let srcs: Vec<Arc<FileSource>> = ports.iter().map(|(_, s)| s.clone()).collect();

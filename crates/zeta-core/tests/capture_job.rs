@@ -101,6 +101,7 @@ async fn a_capture_job_ends_stopped_with_its_records_in_the_store() {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
         burst_policy: Default::default(),
     };
     let port: Arc<dyn Port> = source.clone();
@@ -217,6 +218,7 @@ async fn a_hand_capture_classifies_its_first_window_and_a_watch_child_does_not()
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
         burst_policy: Default::default(),
     };
     let port: Arc<dyn Port> = source.clone();

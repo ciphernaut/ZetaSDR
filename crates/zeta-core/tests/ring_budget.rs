@@ -73,6 +73,7 @@ async fn retune_resizes_ring_within_budget() {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let node = Node::open(cfg, StageRegistry::new(), vec![]).await.unwrap();
     let port = Arc::new(Wide {

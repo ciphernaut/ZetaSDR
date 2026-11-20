@@ -66,6 +66,7 @@ async fn fm_demod_job_produces_audio_with_tone() {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
     src.start();
@@ -181,6 +182,7 @@ async fn aprs_decode_job_decodes_fixture_packet() {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
     src.start();
@@ -281,6 +283,7 @@ async fn node_over(
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let node = Node::open(cfg, reg, vec![port]).await.unwrap();
     src.start();

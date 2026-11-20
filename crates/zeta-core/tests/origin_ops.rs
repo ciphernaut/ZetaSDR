@@ -206,6 +206,7 @@ async fn node(dir: &Path, with_register: bool) -> Node {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     };
     let meta = fixtures::write_tone(dir);
     let opts = FileOpts {

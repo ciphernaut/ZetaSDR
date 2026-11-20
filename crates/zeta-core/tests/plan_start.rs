@@ -114,6 +114,7 @@ fn cfg(dir: &Path) -> NodeConfig {
         owns_state_dir: true,
         bank_factory: None,
         modes_dir: None,
+        handlers_dir: None,
     }
 }
 
