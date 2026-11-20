@@ -522,6 +522,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_capture_of_another_link_type_opens_in_its_own_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rig = Rig::new(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let h = rig.spawn(params(), rig.ctx());
+        rig.publish(T0, packet(LinkType::Other(195), &[1, 2]));
+        rig.publish(T0 + 1, packet(LinkType::Other(195), &[3, 4]));
+        rig.publish(T0 + 2, packet(LinkType::ModeS, &[5, 6]));
+        until(|| rig.store.list().iter().map(|r| r.packets).sum::<u64>() == 3).await;
+        rig.bus.unregister(&rig.input);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+        let mut files: Vec<(u16, LinkType, u64)> = rig
+            .store
+            .list()
+            .iter()
+            .map(|r| {
+                let n = pcapng::read(&std::fs::read(&r.path).unwrap()).unwrap().0;
+                (n, r.link_type, r.packets)
+            })
+            .collect();
+        files.sort_by_key(|f| f.0);
+        assert_eq!(
+            files,
+            [(148, LinkType::ModeS, 1), (195, LinkType::Other(195), 2)]
+        );
+    }
+
+    #[tokio::test]
     async fn without_a_store_it_fails_at_once() {
         let tmp = tempfile::tempdir().unwrap();
         let rig = Rig::new(tmp.path(), PACKET_CAPTURE_MAX_BYTES);

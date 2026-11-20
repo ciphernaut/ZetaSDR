@@ -45,8 +45,11 @@ pub enum Payload {
 }
 
 /// The link-layer framing of a [`Payload::Packet`], by its pcap LINKTYPE number.
+///
+/// The common numbers have names; any other registered number is `Other(n)`, and
+/// `Other` never holds a number that has a name (see [`LinkType::from_number`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", try_from = "LinkTypeWire")]
 pub enum LinkType {
     /// AX.25 with a KISS port byte in front (LINKTYPE_AX25_KISS, 202).
     Ax25Kiss,
@@ -54,6 +57,42 @@ pub enum LinkType {
     User0,
     /// A raw IPv4 or IPv6 packet (LINKTYPE_RAW, 101).
     RawIp,
+    /// Bare AX.25, no KISS byte (LINKTYPE_AX25, 3).
+    Ax25,
+    /// A private link type for Mode S frames (LINKTYPE_USER1, 148).
+    ModeS,
+    /// Any other link-layer number, as written.
+    Other(u16),
+}
+
+/// The serde shape [`LinkType`] reads, so `other` can be checked.
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum LinkTypeWire {
+    Ax25Kiss,
+    User0,
+    RawIp,
+    Ax25,
+    ModeS,
+    Other(u16),
+}
+
+impl TryFrom<LinkTypeWire> for LinkType {
+    type Error = String;
+
+    fn try_from(w: LinkTypeWire) -> Result<Self, String> {
+        Ok(match w {
+            LinkTypeWire::Ax25Kiss => LinkType::Ax25Kiss,
+            LinkTypeWire::User0 => LinkType::User0,
+            LinkTypeWire::RawIp => LinkType::RawIp,
+            LinkTypeWire::Ax25 => LinkType::Ax25,
+            LinkTypeWire::ModeS => LinkType::ModeS,
+            LinkTypeWire::Other(n) => match LinkType::from_number(n) {
+                LinkType::Other(_) => LinkType::Other(n),
+                named => return Err(format!("link type {n} has a name: use {named:?}")),
+            },
+        })
+    }
 }
 
 impl LinkType {
@@ -63,6 +102,21 @@ impl LinkType {
             LinkType::Ax25Kiss => 202,
             LinkType::User0 => 147,
             LinkType::RawIp => 101,
+            LinkType::Ax25 => 3,
+            LinkType::ModeS => 148,
+            LinkType::Other(n) => n,
+        }
+    }
+
+    /// The link type for a LINKTYPE number: a named one when `n` is one, else `Other(n)`.
+    pub fn from_number(n: u16) -> LinkType {
+        match n {
+            202 => LinkType::Ax25Kiss,
+            147 => LinkType::User0,
+            101 => LinkType::RawIp,
+            3 => LinkType::Ax25,
+            148 => LinkType::ModeS,
+            n => LinkType::Other(n),
         }
     }
 }
@@ -565,6 +619,25 @@ mod tests {
         for _ in 0..3 {
             assert!(rx.recv().await.is_ok());
         }
+    }
+
+    #[test]
+    fn link_types_round_trip_by_number_and_json() {
+        for (lt, n, json) in [
+            (LinkType::Ax25Kiss, 202, r#""ax25_kiss""#),
+            (LinkType::User0, 147, r#""user0""#),
+            (LinkType::RawIp, 101, r#""raw_ip""#),
+            (LinkType::Ax25, 3, r#""ax25""#),
+            (LinkType::ModeS, 148, r#""mode_s""#),
+            (LinkType::Other(195), 195, r#"{"other":195}"#),
+        ] {
+            assert_eq!(lt.number(), n);
+            assert_eq!(LinkType::from_number(n), lt);
+            assert_eq!(serde_json::to_string(&lt).unwrap(), json);
+            assert_eq!(serde_json::from_str::<LinkType>(json).unwrap(), lt);
+        }
+        // A named number never deserialises into `other`.
+        assert!(serde_json::from_str::<LinkType>(r#"{"other":148}"#).is_err());
     }
 
     #[test]
