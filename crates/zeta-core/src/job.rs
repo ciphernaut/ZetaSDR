@@ -92,12 +92,24 @@ pub struct JobRecord {
     /// again. Empty for every other job (and in a record written before the field).
     #[serde(default)]
     pub sinks: Vec<crate::graph::Node>,
+    /// The handler that runs the job's mode row (`job_start`'s `handler`, or the
+    /// policy's choice): one of the mode's `handlers` (`modes_list`). `null` for a kind
+    /// of no mode row, an attached job, and a record written before handlers (which runs
+    /// the row's own).
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<String>")]
+    pub handler: Option<String>,
+    /// `handler` was named by the start, not chosen by the policy: a relaunch that finds
+    /// it no longer ready fails the job instead of choosing again.
+    #[serde(default)]
+    pub handler_named: bool,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
 /// cannot override that for deserialisation); a record is always written with
 /// `format`, `input`, `capture_rate_hz`, `elastic`, `operator_graph`, `owner`,
-/// `audio_policy`, `stream` and `sinks`, so the published schema requires them.
+/// `audio_policy`, `stream`, `sinks`, `handler` and `handler_named`, so the published
+/// schema requires them.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -115,6 +127,8 @@ fn require_format(schema: &mut schemars::Schema) {
             "audio_policy",
             "stream",
             "sinks",
+            "handler",
+            "handler_named",
         ] {
             if !req.iter().any(|r| r == f) {
                 req.push(f.into());
@@ -177,5 +191,9 @@ mod tests {
         let written = serde_json::to_value(&r).unwrap();
         assert_eq!(written["audio_policy"], serde_json::Value::Null);
         assert_eq!(written["stream"], serde_json::Value::Null);
+        // A record from before handlers: none named, written as `null` and `false`.
+        assert_eq!((r.handler.as_deref(), r.handler_named), (None, false));
+        assert_eq!(written["handler"], serde_json::Value::Null);
+        assert_eq!(written["handler_named"], false);
     }
 }

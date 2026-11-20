@@ -515,6 +515,8 @@ async fn start_fm(node: &Node) -> JobId {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -763,6 +765,8 @@ async fn job_start_with_transcribe_is_refused() {
             dwell_scale: None,
             elastic: false,
             replace: vec![],
+            handler: None,
+            needs: vec![],
         })
         .await;
     assert_eq!(
@@ -1302,6 +1306,8 @@ fn start_op(kind: &str, center_hz: u64) -> Op {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     }
 }
 
@@ -1370,7 +1376,8 @@ async fn a_packets_attachment_takes_its_inputs_row_and_follows_its_retune() {
     assert_eq!(
         capture_params(&node, &att),
         serde_json::json!({
-            "job": input.0, "center_hz": 100_000_000u64, "mode": "aprs_decode", "access": null
+            "job": input.0, "center_hz": 100_000_000u64, "mode": "aprs_decode", "access": null,
+            "handler": "builtin"
         })
     );
     let retune = Op::JobRetune {
@@ -1623,4 +1630,63 @@ async fn a_job_whose_row_cannot_be_read_is_not_captured() {
     assert!(node.modes().get(RESTRICTED_ROW).is_none());
     assert_eq!(attach_packets(&node, &job).await, refusal);
     assert_eq!(node.job_list().len(), jobs, "nothing recorded");
+}
+
+// Plan 42: a capture judges and records the handler its job runs.
+
+use common::handlers::{self as h, ALT, OWN};
+
+/// A node on [`h::Radio`] whose `adsb_decode` has the handler `alt` giving packets (the
+/// row's own gives none), its jobs' packets published by the `external_decode`
+/// stand-in.
+async fn handler_node(dir: &Path) -> Node {
+    let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
+    Node::open(h::cfg(dir, true), h::stages(Some(ALT)), ports)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_capture_of_a_job_whose_handler_gives_no_packets_names_who_would() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path()).await;
+    let own = h::start(&node, None, &[]).await;
+    assert_eq!(record(&node, &own).handler.as_deref(), Some(OWN));
+    let jobs = node.job_list().len();
+    assert_eq!(
+        attach_packets(&node, &own).await,
+        Err(other(&format!(
+            "job {} has no packet stream: handler {OWN} outputs none ({ALT} does)",
+            own.0
+        )))
+    );
+    assert_eq!(node.job_list().len(), jobs, "nothing recorded");
+}
+
+#[tokio::test]
+async fn a_capture_records_its_jobs_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path()).await;
+    let job = h::start(&node, Some(ALT), &[]).await;
+    let att = attach_packets_ok(&node, &job).await;
+    assert_eq!(capture_params(&node, &att)["handler"], ALT);
+    common::until("a packet captured", Duration::from_secs(10), || {
+        node.packets().list().first().is_some_and(|r| r.packets > 0)
+    })
+    .await;
+    let list = match node.apply(Op::PacketsList {}).await {
+        Ok(OpResult::PacketCaptures(list)) => list,
+        r => panic!("packets_list: {r:?}"),
+    };
+    assert_eq!(list[0].handler.as_deref(), Some(ALT));
+    let wire = serde_json::to_value(&list[0]).unwrap();
+    assert_eq!(wire["handler"], ALT);
+    let bytes = std::fs::read(&list[0].path).unwrap();
+    let whole = zeta_core::pcapng::whole_blocks(&bytes);
+    let (_, packets) = zeta_core::pcapng::read(&bytes[..whole]).unwrap();
+    let comment = packets[0].comment.as_deref().unwrap_or_default();
+    assert!(
+        comment.starts_with(&format!("job={} handler={ALT} source=", job.0)),
+        "{comment}"
+    );
 }

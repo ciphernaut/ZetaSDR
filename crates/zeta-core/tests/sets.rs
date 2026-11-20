@@ -771,6 +771,8 @@ fn job_start(source: &str, kind: JobKind, t: Tuning) -> Op {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     }
 }
 
@@ -1259,6 +1261,8 @@ async fn a_set_start_dropped_after_its_starts_leaves_every_job_to_set_stop() {
         dwell_scale: None,
         elastic: true,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     job(&node, spectrum).await;
     let dropped =

@@ -3,6 +3,7 @@
 use std::f64::consts::PI;
 
 use num_complex::Complex;
+use zeta_core::modes::BUILTIN;
 use zeta_core::stage::StageContext;
 use zeta_core::types::Timestamp;
 
@@ -13,7 +14,9 @@ pub fn time_of(t0: Timestamp, samples: i64, rate_hz: u64) -> u64 {
 }
 
 /// A decoder stage's event payload: `fields` in the job's mode-row envelope (`protocol`,
-/// `summary`, `t_ns`) when the context has the row, else `fields` with `protocol` alone.
+/// `handler`, `summary`, `t_ns`) when the context has the row, else `fields` with
+/// `protocol` alone. A stage of this crate runs in process: its row's handler is
+/// `builtin`.
 pub fn event(
     ctx: &StageContext,
     start_ns: u64,
@@ -21,7 +24,7 @@ pub fn event(
     mut fields: serde_json::Value,
 ) -> serde_json::Value {
     match &ctx.mode {
-        Some(row) => zeta_core::modes::summary::envelope(row, start_ns, fields),
+        Some(row) => zeta_core::modes::summary::envelope(row, BUILTIN, start_ns, fields),
         None => {
             fields["protocol"] = protocol.into();
             fields

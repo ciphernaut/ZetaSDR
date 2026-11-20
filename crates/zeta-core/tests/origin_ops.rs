@@ -247,6 +247,8 @@ async fn start(node: &Node, kind: JobKind, source: &str, center: u64) -> JobId {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,

@@ -52,6 +52,11 @@ pub struct PacketCaptureRecord {
     /// The row's access.
     #[schemars(required, schema_with = "crate::modes::nullable_enum::<Access>")]
     pub access: Option<Access>,
+    /// The handler the decoder job ran (`modes_list`'s `handlers`); `null` for a job of
+    /// no row, and in an index written before handlers.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    pub handler: Option<String>,
     pub created_ns: Timestamp,
     /// When a packet was last written to it (its start until the first); the index is
     /// rewritten at most once a second while it is written, so this lags by up to that.
@@ -76,6 +81,8 @@ pub struct NewPacketCapture {
     pub link_type: LinkType,
     pub mode: Option<String>,
     pub access: Option<Access>,
+    /// The handler the decoder job runs; `None` for a job of no row.
+    pub handler: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -233,11 +240,16 @@ impl PacketStore {
     }
 
     /// Start a capture file for `new`, with its header written, and the writer that
-    /// appends to it.
+    /// appends to it. Each packet's comment is `job=<id> handler=<id> source=<id>
+    /// freq_hz=<hz>`, without `handler=` for a job of no handler.
     pub fn begin(self: &Arc<Self>, new: NewPacketCapture) -> std::io::Result<PacketWriter> {
         let (id, file, bytes) = self.start(&new)?;
+        let handler = new
+            .handler
+            .as_deref()
+            .map_or_else(String::new, |h| format!(" handler={h}"));
         let comment = format!(
-            "job={} source={} freq_hz={}",
+            "job={}{handler} source={} freq_hz={}",
             new.job.0, new.source.0, new.center_hz.0
         );
         Ok(PacketWriter {
@@ -273,6 +285,7 @@ impl PacketStore {
             link_type: new.link_type,
             mode: new.mode.clone(),
             access: new.access,
+            handler: new.handler.clone(),
             created_ns: Timestamp(now_ns()),
             last_ns: Timestamp(now_ns()),
             bytes: head.len() as u64,
@@ -545,6 +558,7 @@ mod tests {
             link_type: LinkType::Ax25Kiss,
             mode: Some("aprs".into()),
             access: None,
+            handler: None,
         }
     }
 
@@ -577,6 +591,19 @@ mod tests {
         }
         drop(w);
         assert!(!store.get(&r.id).unwrap().writing);
+        // A job's handler is in its record and after the job in each comment.
+        let with = NewPacketCapture {
+            handler: Some("alt".into()),
+            ..new_capture()
+        };
+        let mut w = store.begin(with).unwrap();
+        w.write(2_000, &[7; 20]).unwrap();
+        let r = store.list().remove(0);
+        assert_eq!(r.handler.as_deref(), Some("alt"));
+        assert_eq!(
+            read_file(&r)[0].comment.as_deref(),
+            Some("job=j1 handler=alt source=s1 freq_hz=144800000")
+        );
     }
 
     #[test]

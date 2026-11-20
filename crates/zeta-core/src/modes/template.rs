@@ -12,27 +12,37 @@
 
 use std::collections::HashMap;
 
-use super::{Decoder, Demod, FrameBlock, InputStream, ModeRow};
+use super::handler_file::own_handler_id;
+use super::{Decoder, Demod, FrameBlock, InputStream, ModeHandler, ModeRow, ProgramBlock};
 use crate::graph::{Edge, Graph, GraphId, Node, NodeId};
 use crate::ops::{AudioPolicy, OpError};
 use crate::port::Tuning;
 use crate::stage::StageRegistry;
 use crate::types::StreamKind;
 
-/// The stage kind that runs a program row's decoder; its params are `{"mode": <id>}`.
+/// The stage kind that runs a program row's decoder, or a handler file's program; its
+/// params are `{"mode": <id>}`, with `"handler": <id>` for a handler not the row's own.
 pub const EXTERNAL_DECODE_KIND: &str = "external_decode";
 
 /// The placeholder a graph row's template names a stage's audio policy param with,
 /// filled with the job's [`AudioPolicy::name`] (a string, where the others are integers).
 pub const AUDIO_POLICY_PLACEHOLDER: &str = "$audio_policy";
 
-/// `row`'s graph for `tuning` with its channel output at `out_rate_hz`, the narrowest
-/// exact divisor of the source rate that `expand` picks, for both kinds of row (the
-/// `channel` stage decimates by an integer only; a program row's adaptor resamples from
-/// it to the program's `input.rate_hz`). A graph row's `"$audio_policy"` is filled with
-/// `audio_policy`'s name.
+/// `row`'s graph for `tuning`, run by `handler`, with its channel output at
+/// `out_rate_hz`, the narrowest exact divisor of the source rate that `expand` picks, for
+/// every kind of row (the `channel` stage decimates by an integer only; a program's
+/// adaptor resamples from it to the program's `input.rate_hz`). A graph row's
+/// `"$audio_policy"` is filled with `audio_policy`'s name.
+///
+/// An in-process handler (a graph or frame row's own) expands the row's decoder. A
+/// program handler expands as a program row does, from `block` (the handler's program
+/// block, [`super::ModeRegistry::program_block`]; a program row's own block when `None`
+/// and the handler is the row's own): its `external_decode` node's params are
+/// `{"mode": <id>}` for the row's own, `{"mode": <id>, "handler": <id>}` for any other.
 pub fn expand(
     row: &ModeRow,
+    handler: &ModeHandler,
+    block: Option<&ProgramBlock>,
     tuning: Tuning,
     out_rate_hz: u64,
     audio_policy: AudioPolicy,
@@ -43,6 +53,20 @@ pub fn expand(
         ("$out_rate_hz", out_rate_hz.into()),
         (AUDIO_POLICY_PLACEHOLDER, audio_policy.name().into()),
     ];
+    let own = handler.id == own_handler_id(row);
+    if !handler.in_process {
+        let block = match (block, &row.decoder) {
+            (Some(b), _) => b,
+            (None, Decoder::Program(b)) if own => b,
+            (None, _) => {
+                return Err(OpError::Other {
+                    message: format!("mode {}: handler {} has no program", row.id.0, handler.id),
+                });
+            }
+        };
+        let named = (!own).then_some(handler.id.as_str());
+        return program_graph(row, block, named, tuning, out_rate_hz);
+    }
     match &row.decoder {
         Decoder::Graph { nodes, edges, .. } => {
             let ids: HashMap<&NodeId, NodeId> =
@@ -83,57 +107,72 @@ pub fn expand(
                 edges,
             })
         }
-        Decoder::Program(block) => {
-            let channel = Node {
-                id: NodeId::new(),
-                kind: "channel".into(),
-                params: serde_json::json!({
-                    "center_hz": tuning.center_hz.0,
-                    "bandwidth_hz": tuning.bandwidth_hz.0,
-                    "out_rate_hz": out_rate_hz,
-                }),
-            };
-            let decode = Node {
-                id: NodeId::new(),
-                kind: EXTERNAL_DECODE_KIND.into(),
-                params: serde_json::json!({ "mode": row.id.0 }),
-            };
-            // An audio program hears the channel through its demodulator.
-            let demod = match (block.input.stream, &block.demod) {
-                (InputStream::Iq, _) => None,
-                (InputStream::Audio, Some(d)) => Some(demod_node(d)),
-                (InputStream::Audio, None) => {
-                    return Err(OpError::Other {
-                        message: format!("mode {}: audio input needs a demod", row.id.0),
-                    });
-                }
-            };
-            let edge = |from: &Node, to: &Node, kind| Edge {
-                from: from.id.clone(),
-                to: to.id.clone(),
-                kind,
-            };
-            let (nodes, edges) = match demod {
-                None => {
-                    let edges = vec![edge(&channel, &decode, StreamKind::Iq)];
-                    (vec![channel, decode], edges)
-                }
-                Some(demod) => {
-                    let edges = vec![
-                        edge(&channel, &demod, StreamKind::Iq),
-                        edge(&demod, &decode, StreamKind::Audio),
-                    ];
-                    (vec![channel, demod, decode], edges)
-                }
-            };
-            Ok(Graph {
-                id: GraphId::new(),
-                nodes,
-                edges,
-            })
-        }
+        Decoder::Program(block) => program_graph(row, block, None, tuning, out_rate_hz),
         Decoder::Frame(block) => Ok(frame_graph(block, tuning, out_rate_hz)),
     }
+}
+
+/// A program's graph: a `channel` at `out_rate_hz` into [`EXTERNAL_DECODE_KIND`] (an
+/// audio program hearing the channel through its `demod` first), the decode node's
+/// params `{"mode": <row id>}`, with `"handler": <id>` for a handler not the row's own.
+fn program_graph(
+    row: &ModeRow,
+    block: &ProgramBlock,
+    handler: Option<&str>,
+    tuning: Tuning,
+    out_rate_hz: u64,
+) -> Result<Graph, OpError> {
+    let channel = Node {
+        id: NodeId::new(),
+        kind: "channel".into(),
+        params: serde_json::json!({
+            "center_hz": tuning.center_hz.0,
+            "bandwidth_hz": tuning.bandwidth_hz.0,
+            "out_rate_hz": out_rate_hz,
+        }),
+    };
+    let mut params = serde_json::json!({ "mode": row.id.0 });
+    if let Some(h) = handler {
+        params["handler"] = h.into();
+    }
+    let decode = Node {
+        id: NodeId::new(),
+        kind: EXTERNAL_DECODE_KIND.into(),
+        params,
+    };
+    // An audio program hears the channel through its demodulator.
+    let demod = match (block.input.stream, &block.demod) {
+        (InputStream::Iq, _) => None,
+        (InputStream::Audio, Some(d)) => Some(demod_node(d)),
+        (InputStream::Audio, None) => {
+            return Err(OpError::Other {
+                message: format!("mode {}: audio input needs a demod", row.id.0),
+            });
+        }
+    };
+    let edge = |from: &Node, to: &Node, kind| Edge {
+        from: from.id.clone(),
+        to: to.id.clone(),
+        kind,
+    };
+    let (nodes, edges) = match demod {
+        None => {
+            let edges = vec![edge(&channel, &decode, StreamKind::Iq)];
+            (vec![channel, decode], edges)
+        }
+        Some(demod) => {
+            let edges = vec![
+                edge(&channel, &demod, StreamKind::Iq),
+                edge(&demod, &decode, StreamKind::Audio),
+            ];
+            (vec![channel, demod, decode], edges)
+        }
+    };
+    Ok(Graph {
+        id: GraphId::new(),
+        nodes,
+        edges,
+    })
 }
 
 /// The stream kinds a job of `row` emits. A graph row's are those of its terminal nodes
@@ -301,15 +340,21 @@ fn demod_node(demod: &Demod) -> Node {
     }
 }
 
-/// Refuse a band narrower than an IQ program row or a frame row needs: `band.min_hz`
-/// (else `band.bandwidth_hz`) is the least, `band.bandwidth_hz` the suggestion, the
-/// source rate `source_rate_hz` the most. A `graph` row takes any band its channel can
-/// cut.
-pub fn check_band(row: &ModeRow, tuning: Tuning, source_rate_hz: u64) -> Result<(), OpError> {
-    let checked = match &row.decoder {
-        Decoder::Program(block) => block.input.stream == InputStream::Iq,
-        Decoder::Frame(_) => true,
-        Decoder::Graph { .. } => false,
+/// Refuse a band narrower than an IQ program or a frame row needs: `band.min_hz` (else
+/// `band.bandwidth_hz`) is the least, `band.bandwidth_hz` the suggestion, the source rate
+/// `source_rate_hz` the most. `block` is the program that runs (a handler's,
+/// [`super::ModeRegistry::program_block`]); `None` reads the row's own decoder. A `graph`
+/// row run in process takes any band its channel can cut.
+pub fn check_band(
+    row: &ModeRow,
+    block: Option<&ProgramBlock>,
+    tuning: Tuning,
+    source_rate_hz: u64,
+) -> Result<(), OpError> {
+    let checked = match (block, &row.decoder) {
+        (Some(b), _) | (None, Decoder::Program(b)) => b.input.stream == InputStream::Iq,
+        (None, Decoder::Frame(_)) => true,
+        (None, Decoder::Graph { .. }) => false,
     };
     if !checked {
         return Ok(());

@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::modes::{Decoder, ModeRow};
+
+use crate::external::Resolved;
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::{StreamId, StreamKind};
@@ -121,10 +123,23 @@ impl AdsbDecodeStage {
         self
     }
 
-    fn resolve(&self) -> Result<(ModeRow, PathBuf), StageError> {
+    fn resolve(&self) -> Result<Resolved, StageError> {
         match &self.runs {
             Runs::Fixed(None) => Err(StageError::Failed(NO_PROGRAM.into())),
-            Runs::Fixed(Some(p)) => Ok((embedded_row(), p.clone())),
+            Runs::Fixed(Some(p)) => {
+                let row = embedded_row();
+                let Decoder::Program(block) = &row.decoder else {
+                    return Err(StageError::Failed(format!(
+                        "{ADSB_MODE}: the embedded row is not a program row"
+                    )));
+                };
+                Ok(Resolved {
+                    block: block.clone(),
+                    program: p.clone(),
+                    handler: zeta_core::modes::handler_file::own_handler_id(&row),
+                    row,
+                })
+            }
             Runs::Registry(handle) => crate::external::resolve(handle, ADSB_MODE, ADSB_MODE),
         }
     }
@@ -149,12 +164,18 @@ impl Stage for AdsbDecodeStage {
         cancel: CancellationToken,
         ctx: StageContext,
     ) -> Result<(), StageError> {
-        let (row, program) = self.resolve()?;
+        let r = self.resolve()?;
         let _: AdsbParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("adsb_decode params: {e}")))?;
         let run_dir = self.run_dir.as_deref();
+        let program = crate::external::Program {
+            row: &r.row,
+            block: &r.block,
+            path: &r.program,
+            handler: &r.handler,
+        };
         crate::external::run_row(
-            &row, &program, &self.env, run_dir, inputs, outputs, bus, cancel, ctx,
+            program, &self.env, run_dir, inputs, outputs, bus, cancel, ctx,
         )
         .await
     }

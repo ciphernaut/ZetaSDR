@@ -141,6 +141,8 @@ async fn start_measure(node: &Node, center_hz: u64, bandwidth_hz: u64) -> JobId 
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,

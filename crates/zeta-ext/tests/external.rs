@@ -166,6 +166,11 @@ fn start(stage: ExternalDecodeStage, mode: &str) -> Running {
 
 /// [`start`], with a packet output after the event output when `packets`.
 fn start_with(stage: ExternalDecodeStage, mode: &str, packets: bool) -> Running {
+    start_params(stage, json!({ "mode": mode }), packets)
+}
+
+/// [`start_with`] on the stage params `params`.
+fn start_params(stage: ExternalDecodeStage, params: Value, packets: bool) -> Running {
     let bus = Arc::new(StreamBus::new(64));
     let out = bus.register(StreamKind::Event, prov());
     let rx_out = bus.subscribe(&out).unwrap();
@@ -181,7 +186,6 @@ fn start_with(stage: ExternalDecodeStage, mode: &str, packets: bool) -> Running 
         }
         n.lock().unwrap().push(v);
     }));
-    let params = json!({ "mode": mode });
     let outputs = std::iter::once(out).chain(packets.clone()).collect();
     let b = bus.clone();
     let handle = tokio::spawn(async move {
@@ -584,6 +588,90 @@ fn params_take_the_mode_only() {
     );
     assert_eq!(s.get("additionalProperties"), Some(&json!(false)), "{s:?}");
     assert_eq!(s.get("required"), Some(&json!(["mode"])), "{s:?}");
+}
+
+/// The registry of `rows` (as [`registry`]) with the handler file `alt`, which serves
+/// `mode` with the fake program reading its lines from `lines` (so its events differ
+/// from the row's own, whose lines come from `FAKE_LINES`).
+fn registry_with_alt(rows: &[Value], mode: &str, lines: &Path) -> ModeRegistry {
+    let (modes, handlers) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    for r in rows {
+        let id = r["id"].as_str().unwrap();
+        std::fs::write(modes.path().join(format!("{id}.json")), r.to_string()).unwrap();
+    }
+    let row = rows
+        .iter()
+        .find(|r| r["id"] == mode)
+        .expect("the mode's row");
+    let d = &row["decoder"];
+    let alt = json!({
+        "id": "alt",
+        "name": "Alternative",
+        "programs": [fake("fake_lines").display().to_string()],
+        "install": {"url": "https://example.invalid/alt"},
+        "modes": {mode: {
+            "args": ["--lines-file", lines.display().to_string()],
+            "input": d["input"],
+            "output": d["output"],
+        }}
+    });
+    std::fs::write(handlers.path().join("alt.json"), alt.to_string()).unwrap();
+    let mut stages = StageRegistry::new();
+    zeta_dsp::register_all(&mut stages);
+    stages.register(Arc::new(ExternalDecodeStage::deferred(
+        ModesHandle::default(),
+    )));
+    let reg = ModeRegistry::load_with(&stages, Some(modes.path()), Some(handlers.path()));
+    let alt = reg.handler(mode, "alt").expect("alt serves the mode");
+    assert_eq!(alt.state, ModeState::Ready, "{:?}", alt.reason);
+    reg
+}
+
+/// A handler file's program runs for the row's mode when the params name it, and every
+/// event says which handler gave it: `alt`, or the row's own (its first program).
+#[tokio::test]
+async fn a_handler_files_program_runs_for_the_rows_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = dir.path().join("alt-lines");
+    std::fs::write(&lines, r#"{"text":"from alt","n":2}"#).unwrap();
+    let rows = [json_row("fake_json", "cs16", "stdin", &[])];
+    let reg = Arc::new(registry_with_alt(&rows, "fake_json", &lines));
+    let env = [("FAKE_LINES", r#"{"text":"from the row","n":1}"#)];
+
+    let stage = ExternalDecodeStage::new(reg.clone()).with_env(env);
+    let params = json!({"mode": "fake_json", "handler": "alt"});
+    assert_eq!(stage.outputs_for(&params), [StreamKind::Event]);
+    let mut r = start_params(stage, params, false);
+    send(&r.tx, 4, 480, 48_000);
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    assert_eq!(v["summary"], "from alt #2", "{v}");
+    assert_eq!(v["protocol"], "fake_json", "{v}");
+    assert_eq!(v["handler"], "alt", "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+
+    let own = fake("fake_lines").display().to_string();
+    let stage = ExternalDecodeStage::new(reg.clone()).with_env(env);
+    let mut r = start(stage, "fake_json");
+    send(&r.tx, 4, 480, 48_000);
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    assert_eq!(v["summary"], "from the row #1", "{v}");
+    assert_eq!(v["handler"], own.as_str(), "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+
+    // A handler the mode does not have fails the run, naming it.
+    let stage = ExternalDecodeStage::new(reg).with_env(env);
+    let r = start_params(
+        stage,
+        json!({"mode": "fake_json", "handler": "nope"}),
+        false,
+    );
+    let e = result_within(r.handle, 10).await.unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "stage failed: external_decode: mode fake_json has no handler nope"
+    );
 }
 
 /// A little-endian pcap stream of link type 147 holding `records`.
@@ -1030,7 +1118,8 @@ fn a_mapped_line_without_the_listed_tag_has_no_position() {
     for k in ["reg", "lat", "lon"] {
         assert!(fields.get(k).is_none(), "{k} in {fields}");
     }
-    let ev = zeta_core::modes::summary::envelope(&reg.get("m_xid").unwrap().row, 1, fields);
+    let ev =
+        zeta_core::modes::summary::envelope(&reg.get("m_xid").unwrap().row, "dumpvdl2", 1, fields);
     assert_eq!(ev["icao"], "7C0000");
     assert!(ev.get("position").is_none(), "{ev}");
 }
@@ -1042,7 +1131,8 @@ fn a_non_numeric_fix_is_no_position() {
     line["vdl2"]["avlc"]["acars"]["arinc622"]["adsc"]["tags"][0]["basic_report"]["lat"] =
         json!("n/a");
     let fields = zeta_ext::apply_fields(&field_map(vdl2_map()), &line);
-    let ev = zeta_core::modes::summary::envelope(&reg.get("m_na").unwrap().row, 1, fields);
+    let ev =
+        zeta_core::modes::summary::envelope(&reg.get("m_na").unwrap().row, "dumpvdl2", 1, fields);
     assert_eq!(ev["icao"], "7C0000");
     assert!(ev.get("position").is_none(), "{ev}");
 }
@@ -1051,7 +1141,7 @@ fn a_non_numeric_fix_is_no_position() {
 fn vdl2_event(id: &str, lines: &str, line: &Value) -> Value {
     let reg = registry(&[mapped_row(id, lines, Some(vdl2_map()))]);
     let fields = zeta_ext::apply_fields(&field_map(vdl2_map()), line);
-    zeta_core::modes::summary::envelope(&reg.get(id).unwrap().row, 1, fields)
+    zeta_core::modes::summary::envelope(&reg.get(id).unwrap().row, "dumpvdl2", 1, fields)
 }
 
 #[test]

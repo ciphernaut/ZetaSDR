@@ -106,13 +106,14 @@ pub fn fill(template: &str, event: &Value) -> String {
 }
 
 /// `fields` with the row's `derive` entries applied first (see [`derive::apply`]), then
-/// `protocol` (the row's), `summary` (its template filled from `fields`) and `t_ns`
-/// set; every field is kept. `t_ns` is the time in the row's `time` field
+/// `protocol` (the row's), `handler` (the id of the handler that decoded it: `builtin`
+/// from an in-process row's stages), `summary` (its template filled from `fields`) and
+/// `t_ns` set; every field is kept. `t_ns` is the time in the row's `time` field
 /// when the event carries a well-formed one, else `start_ns`. With a row `position`
 /// map and its `lat` and `lon` fields both numbers, `position` is
 /// `{lat, lon, alt_m}` (`alt_m` `null` unless its field is a number, converted from feet
 /// when the map's `alt_unit` is `ft`).
-pub fn envelope(row: &ModeRow, start_ns: u64, mut fields: Value) -> Value {
+pub fn envelope(row: &ModeRow, handler: &str, start_ns: u64, mut fields: Value) -> Value {
     if let Value::Object(m) = &mut fields {
         derive::apply(&row.derive, m);
     }
@@ -143,6 +144,7 @@ pub fn envelope(row: &ModeRow, start_ns: u64, mut fields: Value) -> Value {
     });
     if let Value::Object(m) = &mut fields {
         m.insert("protocol".into(), row.protocol.clone().into());
+        m.insert("handler".into(), handler.into());
         m.insert("summary".into(), summary.into());
         m.insert("t_ns".into(), t_ns.into());
         if let Some(p) = position {
@@ -306,6 +308,7 @@ mod tests {
     fn a_restricted_row_marks_its_events() {
         let ev = envelope(
             &row(|v| v["access"] = "restricted".into()),
+            "dump1090",
             7,
             json!({"icao": "7C6B28"}),
         );
@@ -314,8 +317,10 @@ mod tests {
 
     #[test]
     fn a_plain_row_adds_no_marker() {
-        let ev = envelope(&row(|_| {}), 7, json!({"icao": "7C6B28"}));
+        let ev = envelope(&row(|_| {}), "dump1090", 7, json!({"icao": "7C6B28"}));
         assert!(ev.get("access").is_none());
+        // The handler that decoded it, as given.
+        assert_eq!(ev["handler"], "dump1090");
     }
 
     fn positioned() -> ModeRow {
@@ -326,6 +331,7 @@ mod tests {
     fn alt_unit_ft_converts_in_position() {
         let ev = envelope(
             &row(|_| {}),
+            "dump1090",
             7,
             json!({"icao": "7C6B28", "lat": -27.4, "lon": 153.1, "altitude_ft": 21000}),
         );
@@ -340,6 +346,7 @@ mod tests {
     fn a_fix_with_no_altitude_is_a_partial_position() {
         let ev = envelope(
             &row(|_| {}),
+            "dump1090",
             7,
             json!({"icao": "S1", "lat": -27.4, "lon": 153.1, "altitude_ft": null}),
         );
@@ -347,6 +354,7 @@ mod tests {
         assert_eq!(ev["position"]["lat"], -27.4);
         let ev = envelope(
             &row(|_| {}),
+            "dump1090",
             7,
             json!({"icao": "S1", "lat": null, "lon": 153.1, "altitude_ft": 100}),
         );
@@ -357,6 +365,7 @@ mod tests {
     fn position_added_from_the_map() {
         let ev = envelope(
             &positioned(),
+            "dump1090",
             7,
             json!({"icao": "S1", "lat": -27.4, "lon": 153.1, "alt": 12000.5}),
         );
@@ -368,6 +377,7 @@ mod tests {
         // A row without a map adds nothing.
         let ev = envelope(
             &row(|v| v["position"] = Value::Null),
+            "dump1090",
             7,
             json!({"lat": -27.4, "lon": 153.1}),
         );
@@ -380,12 +390,23 @@ mod tests {
             v["time"] = "datetime".into();
             v["event"]["schema"]["properties"]["datetime"] = json!({"type": "string"});
         });
-        let ev = envelope(&timed, 7, json!({"datetime": "2026-10-28T02:15:30.500Z"}));
+        let ev = envelope(
+            &timed,
+            "dump1090",
+            7,
+            json!({"datetime": "2026-10-28T02:15:30.500Z"}),
+        );
         assert_eq!(ev["t_ns"], 1_793_153_730_500_000_000_u64);
-        let ev = envelope(&timed, 7, json!({"datetime": "1970-01-01T00:00:01Z"}));
+        let ev = envelope(
+            &timed,
+            "dump1090",
+            7,
+            json!({"datetime": "1970-01-01T00:00:01Z"}),
+        );
         assert_eq!(ev["t_ns"], 1_000_000_000_u64);
         let ev = envelope(
             &timed,
+            "dump1090",
             7,
             json!({"datetime": "2024-02-29T00:00:00.123456789Z"}),
         );
@@ -401,23 +422,23 @@ mod tests {
             json!(1_793_153_730),
             Value::Null,
         ] {
-            let ev = envelope(&timed, 7, json!({ "datetime": bad }));
+            let ev = envelope(&timed, "dump1090", 7, json!({ "datetime": bad }));
             assert_eq!(ev["t_ns"], 7, "{bad}");
         }
-        let ev = envelope(&timed, 7, json!({}));
+        let ev = envelope(&timed, "dump1090", 7, json!({}));
         assert_eq!(ev["t_ns"], 7);
     }
 
     #[test]
     fn an_event_without_a_fix_gets_no_position() {
         let row = positioned();
-        let ev = envelope(&row, 7, json!({"lon": 153.1, "alt": 100.0}));
+        let ev = envelope(&row, "dump1090", 7, json!({"lon": 153.1, "alt": 100.0}));
         assert!(ev.get("position").is_none(), "{ev}");
-        let ev = envelope(&row, 7, json!({"lat": null, "lon": 153.1}));
+        let ev = envelope(&row, "dump1090", 7, json!({"lat": null, "lon": 153.1}));
         assert!(ev.get("position").is_none(), "{ev}");
-        let ev = envelope(&row, 7, json!({"lat": "x", "lon": 153.1}));
+        let ev = envelope(&row, "dump1090", 7, json!({"lat": "x", "lon": 153.1}));
         assert!(ev.get("position").is_none(), "{ev}");
-        let ev = envelope(&row, 7, json!({"lat": -27.4, "lon": 153.1}));
+        let ev = envelope(&row, "dump1090", 7, json!({"lat": -27.4, "lon": 153.1}));
         assert_eq!(
             ev["position"],
             json!({"lat": -27.4, "lon": 153.1, "alt_m": null})
@@ -450,7 +471,12 @@ mod tests {
 
     #[test]
     fn a_downlink_text_with_a_fix_gets_lat_lon_and_position() {
-        let ev = envelope(&deriving(), 7, json!({"downlink": true, "text": H1}));
+        let ev = envelope(
+            &deriving(),
+            "dump1090",
+            7,
+            json!({"downlink": true, "text": H1}),
+        );
         assert_eq!(ev["lat"], -27.385);
         assert_eq!(ev["lon"], 153.11833);
         assert_eq!(ev["alt_ft"], 16_500);
@@ -465,6 +491,7 @@ mod tests {
     fn a_text_without_a_fix_adds_no_keys() {
         let ev = envelope(
             &deriving(),
+            "dump1090",
             7,
             json!({"downlink": true, "text": "FOB 133.7 POSRPT 0054/09"}),
         );
@@ -480,7 +507,7 @@ mod tests {
             json!({"text": H1}),
             json!({"downlink": null, "text": H1}),
         ] {
-            let ev = envelope(&deriving(), 7, ev);
+            let ev = envelope(&deriving(), "dump1090", 7, ev);
             for key in ["lat", "lon", "alt_ft", "position"] {
                 assert!(ev.get(key).is_none(), "{key} in {ev}");
             }
@@ -491,6 +518,7 @@ mod tests {
     fn a_structured_fix_is_never_overwritten_or_completed() {
         let ev = envelope(
             &deriving(),
+            "dump1090",
             7,
             json!({"downlink": true, "text": H1, "lat": -27.38, "lon": 153.12}),
         );
@@ -501,6 +529,7 @@ mod tests {
         // One axis set: the text never supplies the other, nor the altitude.
         let ev = envelope(
             &deriving(),
+            "dump1090",
             7,
             json!({"downlink": true, "text": H1, "lat": -27.38, "lon": null}),
         );
@@ -511,6 +540,7 @@ mod tests {
         // Null targets are free: the entry runs.
         let ev = envelope(
             &deriving(),
+            "dump1090",
             7,
             json!({"downlink": true, "text": H1, "lat": null, "lon": null, "alt_ft": null}),
         );
@@ -521,7 +551,7 @@ mod tests {
     #[test]
     fn into_leaving_alt_out_never_writes_it() {
         let row = deriving_into(json!({"lat": "lat", "lon": "lon"}));
-        let ev = envelope(&row, 7, json!({"downlink": true, "text": H1}));
+        let ev = envelope(&row, "dump1090", 7, json!({"downlink": true, "text": H1}));
         assert_eq!(ev["lat"], -27.385);
         assert!(ev.get("alt_ft").is_none(), "{ev}");
         assert_eq!(ev["position"]["alt_m"], Value::Null);
@@ -531,7 +561,7 @@ mod tests {
     fn summary_sees_the_derived_field() {
         let mut row = deriving();
         row.event.summary = "{lat?:.3}".into();
-        let ev = envelope(&row, 7, json!({"downlink": true, "text": H1}));
+        let ev = envelope(&row, "dump1090", 7, json!({"downlink": true, "text": H1}));
         assert_eq!(ev["summary"], "-27.385");
     }
 

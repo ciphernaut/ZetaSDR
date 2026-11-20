@@ -296,6 +296,8 @@ fn running(id: &JobId, kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord
         audio_policy: None,
         stream: None,
         sinks: Vec::new(),
+        handler: None,
+        handler_named: false,
     }
 }
 
@@ -453,6 +455,8 @@ async fn job_start_records_the_capture_rate() {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     let id = match node.apply(op).await.unwrap() {
         OpResult::Job(id) => id,
@@ -798,4 +802,88 @@ async fn a_packets_attachment_does_not_resume() {
             .any(|r| r.id != capture && r.packets > 0)
     })
     .await;
+}
+
+// Plan 42: a relaunch keeps the job's handler, or decides it again.
+
+use common::handlers::{self as h, ALT, MODE, OWN};
+
+/// Open a node on `dir` with the `alt` handler file, alt's program missing when
+/// `alt_missing`.
+async fn handler_node(dir: &Path, alt_missing: bool) -> Node {
+    let cfg = h::cfg(dir, false);
+    let modes = h::registry(&h::stages(None), &cfg, alt_missing);
+    let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
+    Node::open_with_modes(cfg, h::stages(None), ports, Some(Arc::new(modes)))
+        .await
+        .unwrap()
+}
+
+/// The params of the job's `external_decode` node.
+fn decode_params(rec: &JobRecord) -> serde_json::Value {
+    rec.graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "external_decode")
+        .expect("an external_decode node")
+        .params
+        .clone()
+}
+
+#[tokio::test]
+async fn a_chosen_handler_gone_at_restart_is_chosen_again_and_noted() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let ranked = node
+        .apply(Op::HandlerPolicySet {
+            mode: Some(zeta_core::modes::ModeId(MODE.into())),
+            order: vec![ALT.into()],
+        })
+        .await;
+    assert!(ranked.is_ok(), "{ranked:?}");
+    let id = h::start(&node, None, &[]).await;
+    let rec = record(&node, &id);
+    assert_eq!(
+        (rec.handler.as_deref(), rec.handler_named),
+        (Some(ALT), false)
+    );
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let node = handler_node(dir.path(), true).await;
+    let rec = record(&node, &id);
+    assert_eq!(rec.state, JobState::Running, "{:?}", rec.state);
+    assert_eq!(
+        (rec.handler.as_deref(), rec.handler_named),
+        (Some(OWN), false)
+    );
+    assert_eq!(
+        rec.context["handler"],
+        serde_json::json!({"was": ALT, "now": OWN, "why": h::ALT_MISSING})
+    );
+    assert_eq!(decode_params(&rec), serde_json::json!({"mode": MODE}));
+    let disk = on_disk(dir.path(), &id);
+    assert_eq!(disk.handler.as_deref(), Some(OWN));
+    assert_eq!(disk.context["handler"]["now"], OWN);
+}
+
+#[tokio::test]
+async fn a_named_handler_gone_at_restart_fails_the_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let id = h::start(&node, Some(ALT), &[]).await;
+    assert!(record(&node, &id).handler_named);
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let node = handler_node(dir.path(), true).await;
+    let rec = record(&node, &id);
+    assert_eq!(
+        rec.state,
+        JobState::Failed {
+            reason: format!("handler {ALT} is unavailable: {}", h::ALT_MISSING),
+        }
+    );
+    assert_eq!(rec.handler.as_deref(), Some(ALT));
+    assert_eq!(on_disk(dir.path(), &id).state, rec.state);
 }

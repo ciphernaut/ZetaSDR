@@ -292,6 +292,8 @@ async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> 
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,

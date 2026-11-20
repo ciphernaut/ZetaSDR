@@ -76,6 +76,48 @@ pub fn pick<'a>(
         })
 }
 
+/// Why [`choose`] found no handler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The named handler is none of the mode's; its handlers' ids.
+    Unknown(Vec<String>),
+    /// The named handler cannot run: [`unready`]'s words.
+    Unready(String),
+    /// The named handler lacks an output the start needs: `handler <id> outputs no <kind>`.
+    Lacks(String),
+    /// No handler is left for the policy: each one and why it was passed over.
+    NoneLeft(Vec<Passed>),
+}
+
+/// The handler a start of `m` runs: `named` when given (refused when the mode has no
+/// handler of that id, it is not ready, or it lacks an output of `needs`; the policy is
+/// not consulted), else [`pick`]'s under `policy`.
+pub fn choose<'a>(
+    m: &'a LoadedMode,
+    named: Option<&str>,
+    needs: &[StreamKind],
+    policy: &HandlerPolicy,
+) -> Result<&'a ModeHandler, Refusal> {
+    let Some(id) = named else {
+        return pick(&m.row.id.0, &m.handlers, needs, policy).map_err(Refusal::NoneLeft);
+    };
+    let Some(h) = m.handlers.iter().find(|h| h.id == id) else {
+        return Err(Refusal::Unknown(
+            m.handlers.iter().map(|h| h.id.clone()).collect(),
+        ));
+    };
+    if let Some(why) = unready(h) {
+        return Err(Refusal::Unready(why));
+    }
+    match needs.iter().find(|k| !h.outputs.contains(k)) {
+        Some(k) => Err(Refusal::Lacks(format!(
+            "handler {id} outputs no {}",
+            kind_name(*k)
+        ))),
+        None => Ok(h),
+    }
+}
+
 /// A mode's own fields as the node reports them (`modes_list`, `modes_show`) once it
 /// may have more than one handler.
 #[derive(Clone, Debug, PartialEq)]
@@ -137,6 +179,18 @@ pub fn reported(m: &LoadedMode, policy: &HandlerPolicy) -> Reported {
         outputs,
         handler: Some(picked.id.clone()),
     }
+}
+
+/// Why `h` cannot run at all: `handler <id> is <state>: <reason>` (`broken` or
+/// `unavailable`, the reason its own or the state's word); `None` when it is ready.
+pub fn unready(h: &ModeHandler) -> Option<String> {
+    let state = match h.state {
+        ModeState::Ready => return None,
+        ModeState::Broken => "broken",
+        ModeState::Unavailable => "unavailable",
+    };
+    let reason = h.reason.as_deref().unwrap_or(state);
+    Some(format!("handler {} is {state}: {reason}", h.id))
 }
 
 /// Why `h` cannot serve a start that needs `needs`; `None` when it can.

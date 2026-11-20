@@ -58,6 +58,8 @@ async fn stream_tail_returns_events_from_running_job() {
             dwell_scale: None,
             elastic: false,
             replace: vec![],
+            handler: None,
+            needs: vec![],
         })
         .await
     {

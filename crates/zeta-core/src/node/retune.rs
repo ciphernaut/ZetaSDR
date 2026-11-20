@@ -40,7 +40,7 @@ impl Node {
         // The restart and its attached jobs' relaunch under the job's restart lock,
         // taken before the gate: another restart of it waits its turn.
         let _restart = self.inner.restart_guard(id).await;
-        let rec = {
+        let mut rec = {
             let jobs = self.inner.jobs.lock().unwrap();
             let e = jobs
                 .get(id)
@@ -57,6 +57,10 @@ impl Node {
             .port(&rec.source)
             .ok_or_else(|| NodeError::UnknownSource(rec.source.clone()))?;
         let guard = self.inner.leases.gate_guard(&rec.source).await;
+        // The handler the relaunch runs, decided as a restart decides it, before anything
+        // is stopped or moved: a named one no longer ready refuses the retune (the job
+        // runs on as it was), a chosen one is chosen again and the graph below is its.
+        self.inner.rehandle(&mut rec)?;
         if !replace.is_empty() {
             self.replace_holders(&rec.source, replace, &guard).await?;
         }
@@ -82,7 +86,7 @@ impl Node {
                 capture.bandwidth_hz,
                 bin_rate,
                 &rec.graph,
-                rec.audio_policy,
+                (rec.audio_policy, rec.handler.as_deref()),
                 &self.inner.modes(),
                 &RETUNE_CARRIED_PARAMS,
             )
@@ -237,6 +241,7 @@ impl Node {
                     None,
                     &rec.graph,
                     rec.audio_policy,
+                    rec.handler.as_deref(),
                     &self.inner.modes(),
                 ) {
                     drop(guard);

@@ -331,6 +331,28 @@ pub enum Op {
         /// the radio in between. A conflict with a holder not named leaves them
         /// stopped and names the rest.
         replace: Vec<JobId>,
+        /// A mode row's kind only: the handler to run, one of the mode's `handlers`
+        /// (`modes_list`); `null` (or left out) takes the handler policy's choice
+        /// (`handler_policy_get`). One that is not `ready` is refused with its reason
+        /// (`<mode>: handler <id> is unavailable: <reason>`), the policy not consulted;
+        /// an id the mode lacks is `unknown`. The job's record keeps the handler that
+        /// runs (`handler`) and whether it was named (`handler_named`); every event
+        /// carries `handler`. On a restart or a retune a named handler that is no
+        /// longer ready fails the job with the reason; a chosen one is chosen again by
+        /// the policy, its context noting `handler: {was, now, why}`. The same mode on
+        /// the same band with another handler is not a repeat. Any other kind is
+        /// refused a handler (`<kind> has no handlers`).
+        // Left out when `null`, so a node or a CLI of this build can still start a job
+        // on an older node, which refuses a field it does not know.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handler: Option<String>,
+        /// A mode row's kind only: the stream kinds the job must output, among `event`,
+        /// `packet` and `audio` (`["packet"]` for a job to capture); the policy passes
+        /// over a handler without them, ahead of its ranking. No handler left is
+        /// `no_handler`, naming each and why it was passed over. `[]` (or left out)
+        /// for none; any other kind is refused one (`<kind> has no handlers`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        needs: Vec<StreamKind>,
     },
     /// Attach a job of an attachable `kind` (`transcribe` or `packets`) to the running job
     /// `job`. It reads one of that job's output streams instead of the radio, holds no
@@ -349,14 +371,17 @@ pub enum Op {
     /// `packets` captures the frames of a decoder job whose row's `outputs` lists
     /// `packet` (`aprs_decode`, a frame row) into a pcapng file Wireshark opens: one
     /// packet per decoded frame (link type `ax25_kiss` for APRS, `user0` for a frame
-    /// row), stamped with the frame's start, its comment `job=<decoder job> source=<id>
-    /// freq_hz=<centre>`. The job's context names the file as `capture` (with `packets`
-    /// and `bytes` so far), and `packets_list` lists it; fetch it, also while it is
-    /// written, at `GET /captures/<id>.pcapng`. A retune of the input closes the file
-    /// and opens a fresh one at the new centre. `language` is ignored and `stream` must
-    /// be `null` (`packets reads the job's packet stream: pass stream null`). Refused,
-    /// nothing started: a job with no packet stream (`job <id> has no packet stream: its
-    /// kind's outputs list no packet (modes_list)`), an attached job (`packets: job <id>
+    /// row), stamped with the frame's start, its comment `job=<decoder job>
+    /// handler=<its handler> source=<id> freq_hz=<centre>` (no `handler=` for a kind of
+    /// no mode row). The job's context names the file as `capture` (with `packets`
+    /// and `bytes` so far), and `packets_list` lists it with its `handler`; fetch it,
+    /// also while it is written, at `GET /captures/<id>.pcapng`. A retune of the input
+    /// closes the file and opens a fresh one at the new centre. `language` is ignored
+    /// and `stream` must be `null` (`packets reads the job's packet stream: pass stream
+    /// null`). Refused, nothing started: a job with no packet stream (`job <id> has no
+    /// packet stream: its kind's outputs list no packet (modes_list)`; `...: handler <id>
+    /// outputs none (<other> does)` when another handler of its mode gives packets: start
+    /// that one with `needs: ["packet"]`), an attached job (`packets: job <id>
     /// is an attached job: attach to its input <input>`), a job whose row cannot be read
     /// now, say after a modes reload (`packets: <kind> has no readable mode row: its
     /// access cannot be checked`), a row with `access: restricted` (`packets: <row> is
@@ -1370,10 +1395,14 @@ fn require_attach_stream(schema: &mut schemars::Schema) {
     }
 }
 
+/// `job_start`'s `handler` and `needs`, required last in its schema.
+const HANDLER_FIELDS: [&str; 2] = ["handler", "needs"];
+
 /// `job_start` requires its look, `dwell_ms`, `average`, `bits`, `method` and
 /// `bin_hz`, then `audio_policy` and `dwell_scale`, after `sideband` (the field order
 /// agents read), and like `deviation_hz` shows no default for them; they still default
-/// to `null` when a request from before them leaves them out.
+/// to `null` when a request from before them leaves them out. So too `handler` and
+/// `needs`, after `replace` (`null` and `[]` when left out).
 fn require_the_look(schema: &mut schemars::Schema) {
     const LOOK: [&str; 7] = [
         "dwell_ms",
@@ -1393,10 +1422,15 @@ fn require_the_look(schema: &mut schemars::Schema) {
         for (k, f) in LOOK.iter().enumerate() {
             req.insert(at + k, (*f).into());
         }
+        // The handler fields last, after `replace`.
+        for f in HANDLER_FIELDS {
+            req.retain(|r| r != f);
+            req.push(f.into());
+        }
     }
     if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties") {
-        for f in LOOK {
-            if let Some(serde_json::Value::Object(p)) = props.get_mut(f) {
+        for f in LOOK.iter().chain(&HANDLER_FIELDS) {
+            if let Some(serde_json::Value::Object(p)) = props.get_mut(*f) {
                 p.remove("default");
             }
         }
@@ -1564,10 +1598,13 @@ pub struct AttachTo<'a> {
     pub mode: Option<&'a str>,
     /// `packets`: that row's `access` (`None`: unrestricted, or no row).
     pub access: Option<Access>,
+    /// `packets`: the handler the input runs (`None`: a kind of no row, or a record from
+    /// before handlers), which the capture records.
+    pub handler: Option<&'a str>,
 }
 
 impl<'a> AttachTo<'a> {
-    /// `stream` of `job`: its main voice, not denoised, centre 0 and no row.
+    /// `stream` of `job`: its main voice, not denoised, centre 0, no row and no handler.
     pub fn new(job: &'a JobId, stream: &'a StreamId) -> Self {
         Self {
             job,
@@ -1577,6 +1614,7 @@ impl<'a> AttachTo<'a> {
             center_hz: Hz(0),
             mode: None,
             access: None,
+            handler: None,
         }
     }
 }
@@ -1652,11 +1690,36 @@ impl JobKind {
         }
     }
 
-    /// The ready row of `modes` the kind expands from (`None` for a kind without one).
-    /// A missing row is `unknown { field: "kind", value: <id>, known }`, `known` the
-    /// startable built-in kinds and every row id (ready or not); a row that is not ready
-    /// is `other("mode <id> is <state>: <reason>")`.
+    /// The row of `modes` the kind expands from (`None` for a kind without one), when a
+    /// start that names no handler can run it ([`LoadedMode::startable`]: one of its
+    /// handlers is ready, the row's own or a handler file's). A missing row is
+    /// `unknown { field: "kind", value: <id>, known }`, `known` the startable built-in
+    /// kinds and every row id (ready or not); a row no handler can run is
+    /// `other("mode <id> is <state>: <reason>")`, the row's own state and reason.
     pub fn mode_row<'a>(&self, modes: &'a ModeRegistry) -> Result<Option<&'a ModeRow>, OpError> {
+        let Some(m) = self.loaded_mode(modes)? else {
+            return Ok(None);
+        };
+        if m.startable() {
+            return Ok(Some(&m.row));
+        }
+        let state = match m.state {
+            ModeState::Broken => "broken",
+            _ => "unavailable",
+        };
+        Err(other(format!(
+            "mode {} is {state}: {}",
+            m.row.id.0,
+            m.reason.as_deref().unwrap_or_default()
+        )))
+    }
+
+    /// The loaded mode of `modes` the kind expands from, whatever its state (`None` for
+    /// a kind without one); a missing row is `unknown`, as [`JobKind::mode_row`] words it.
+    pub fn loaded_mode<'a>(
+        &self,
+        modes: &'a ModeRegistry,
+    ) -> Result<Option<&'a LoadedMode>, OpError> {
         let Some(id) = self.mode_id() else {
             return Ok(None);
         };
@@ -1677,15 +1740,58 @@ impl JobKind {
                 known,
             }
         })?;
-        let state = match m.state {
-            ModeState::Ready => return Ok(Some(&m.row)),
-            ModeState::Broken => "broken",
-            ModeState::Unavailable => "unavailable",
+        Ok(Some(m))
+    }
+
+    /// The handler a start of the kind runs (see [`Op::JobStart`]'s `handler` and
+    /// `needs`): `None` for a kind of no mode row, which takes neither (`<kind> has no
+    /// handlers`); for a mode, `named` when given (`unknown` on `handler` naming the
+    /// mode's handlers when it has none of that id; `<mode>: handler <id> is <state>:
+    /// <reason>` when it cannot run, `<mode>: handler <id> outputs no <kind>` when it
+    /// lacks one of `needs`), else the choice of `policy` among the mode's ready handlers
+    /// giving every kind of `needs`. A mode no handler can serve is refused as
+    /// [`JobKind::mode_row`] refuses it when it has only the row's own handler and
+    /// nothing is needed, else `no_handler` naming each handler and why it was passed
+    /// over.
+    pub fn start_handler(
+        &self,
+        named: Option<&str>,
+        needs: &[StreamKind],
+        modes: &ModeRegistry,
+        policy: &HandlerPolicy,
+    ) -> Result<Option<String>, OpError> {
+        let Some(m) = self.loaded_mode(modes)? else {
+            if named.is_some() || !needs.is_empty() {
+                return Err(other(format!("{} has no handlers", self.name())));
+            }
+            return Ok(None);
         };
-        Err(other(format!(
-            "mode {id} is {state}: {}",
-            m.reason.as_deref().unwrap_or_default()
-        )))
+        use crate::modes::policy::{Refusal, choose};
+        let mode = &m.row.id.0;
+        if m.state == ModeState::Broken {
+            self.mode_row(modes)?;
+        }
+        match choose(m, named, needs, policy) {
+            Ok(h) => Ok(Some(h.id.clone())),
+            Err(Refusal::Unknown(known)) => Err(OpError::Unknown {
+                field: "handler".into(),
+                value: named.unwrap_or_default().to_string(),
+                known,
+            }),
+            Err(Refusal::Unready(why) | Refusal::Lacks(why)) => {
+                Err(other(format!("{mode}: {why}")))
+            }
+            Err(Refusal::NoneLeft(passed)) => {
+                let only_own = needs.is_empty() && m.handlers.len() <= 1;
+                Err(match self.mode_row(modes) {
+                    Err(e) if only_own => e,
+                    _ => OpError::NoHandler {
+                        mode: mode.clone(),
+                        passed,
+                    },
+                })
+            }
+        }
     }
 
     /// Whether `job_retune` may move a running job of the kind to another band: the
@@ -1768,10 +1874,11 @@ impl JobKind {
     /// its events then carry, when one is named), without the `denoise` when
     /// `input.denoised` (the input's demodulator runs RNNoise itself: see
     /// [`graph_denoises`]). For `packets` (a packet stream; `language` unused): `stream_in
-    /// -> packet_capture {"job", "center_hz", "mode", "access"}`, the input's id, centre,
-    /// mode row and its access, which the launch refreshes from the input on every
-    /// relaunch. A kind that is not [`attachable`](Self::attachable) is `other("<kind> is
-    /// not attachable")`.
+    /// -> packet_capture {"job", "center_hz", "mode", "access", "handler"}`, the input's
+    /// id, centre, mode row, its access and the handler the input runs (left out when it
+    /// has none), which the launch refreshes from the input on every relaunch. A kind
+    /// that is not [`attachable`](Self::attachable) is `other("<kind> is not
+    /// attachable")`.
     pub fn expand_attached(&self, input: &AttachTo, language: &str) -> Result<Graph, OpError> {
         let (stream_kind, chain): (StreamKind, Vec<(&str, serde_json::Value)>) = match self {
             JobKind::Transcribe => {
@@ -1785,18 +1892,22 @@ impl JobKind {
                 }
                 (StreamKind::Audio, chain)
             }
-            JobKind::Packets => (
-                StreamKind::Packet,
-                vec![(
-                    crate::packet_capture::PACKET_CAPTURE_KIND,
-                    serde_json::json!({
-                        "job": input.job.0,
-                        "center_hz": input.center_hz.0,
-                        "mode": input.mode,
-                        "access": input.access,
-                    }),
-                )],
-            ),
+            JobKind::Packets => {
+                let mut capture = serde_json::json!({
+                    "job": input.job.0,
+                    "center_hz": input.center_hz.0,
+                    "mode": input.mode,
+                    "access": input.access,
+                });
+                // Named only when there is one: a capture of no row's job is as before.
+                if let Some(h) = input.handler {
+                    capture["handler"] = h.into();
+                }
+                (
+                    StreamKind::Packet,
+                    vec![(crate::packet_capture::PACKET_CAPTURE_KIND, capture)],
+                )
+            }
             _ => {
                 return Err(OpError::Other {
                     message: format!("{} is not attachable", self.name()),
@@ -1858,7 +1969,8 @@ impl JobKind {
     /// carried to the node of the same stage kind when `expand` writes the key (absent
     /// from `stored`: the defaults `expand` writes). A `watch`'s `detect` node keeps its
     /// stored params whole. A row naming `"$audio_policy"` is filled with `audio_policy`,
-    /// the job record's (`null`: `first_active`).
+    /// the job record's (`null`: `first_active`). A mode is run by `handler`, the job
+    /// record's (`None`: the row's own, a record from before handlers).
     #[allow(clippy::too_many_arguments)]
     pub fn reexpand(
         &self,
@@ -1868,6 +1980,7 @@ impl JobKind {
         bank_bin_rate_hz: Option<u64>,
         stored: &Graph,
         audio_policy: Option<AudioPolicy>,
+        handler: Option<&str>,
         modes: &ModeRegistry,
     ) -> Result<Graph, OpError> {
         self.reexpand_carrying(
@@ -1876,7 +1989,7 @@ impl JobKind {
             source_rate_hz,
             bank_bin_rate_hz,
             stored,
-            audio_policy,
+            (audio_policy, handler),
             modes,
             &CARRIED_PARAMS,
         )
@@ -1895,7 +2008,7 @@ impl JobKind {
     /// [`JobKind::reexpand`] carrying only the params named in `carried` (a retune
     /// passes [`RETUNE_CARRIED_PARAMS`]); the rest take the values `expand` derives.
     /// `deviation_hz` and `sideband` are read back from `stored` whatever `carried` says;
-    /// the audio policy is the record's, `audio_policy`.
+    /// the audio policy and the handler are the record's, `audio_policy` and `handler`.
     #[allow(clippy::too_many_arguments)]
     pub fn reexpand_carrying(
         &self,
@@ -1904,7 +2017,7 @@ impl JobKind {
         source_rate_hz: Hz,
         bank_bin_rate_hz: Option<u64>,
         stored: &Graph,
-        audio_policy: Option<AudioPolicy>,
+        (audio_policy, handler): (Option<AudioPolicy>, Option<&str>),
         modes: &ModeRegistry,
         carried: &[&str],
     ) -> Result<Graph, OpError> {
@@ -1916,6 +2029,7 @@ impl JobKind {
             source_rate_hz,
             bank_bin_rate_hz,
             (deviation_hz, sideband, audio_policy),
+            handler,
             modes,
         )?;
         for n in &mut g.nodes {
@@ -2000,6 +2114,7 @@ impl JobKind {
             source_rate_hz,
             bank_bin_rate_hz,
             (deviation_hz, sideband, None),
+            None,
             modes,
         )
     }
@@ -2008,6 +2123,12 @@ impl JobKind {
     /// `audio_policy`: a mode row naming `"$audio_policy"` is filled with the policy's
     /// name (`null`: `first_active`). `job_start` refuses a policy for a kind
     /// whose row does not name it before anything is expanded.
+    ///
+    /// A mode is run by `handler` (`None`: the row's own; [`JobKind::start_handler`]
+    /// gives a start's): an id the mode lacks is `unknown` on `handler`, one that cannot
+    /// run `other("<mode>: handler <id> is <state>: <reason>")`. A program handler's band
+    /// is checked against its own `input` ([`template::check_band`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn expand_voiced(
         &self,
         _source: &SourceId,
@@ -2015,6 +2136,7 @@ impl JobKind {
         source_rate_hz: Hz,
         bank_bin_rate_hz: Option<u64>,
         (deviation_hz, sideband, audio_policy): (Option<Hz>, Option<Sideband>, Option<AudioPolicy>),
+        handler: Option<&str>,
         modes: &ModeRegistry,
     ) -> Result<Graph, OpError> {
         if !self.startable() {
@@ -2044,8 +2166,16 @@ impl JobKind {
             }
         }
         if let Some(row) = row {
-            template::check_band(row, tuning, source_rate_hz.0)?;
-            return template::expand(row, tuning, out, audio_policy.unwrap_or_default());
+            let (h, block) = mode_handler(modes, row, handler)?;
+            template::check_band(row, block.as_ref(), tuning, source_rate_hz.0)?;
+            return template::expand(
+                row,
+                &h,
+                block.as_ref(),
+                tuning,
+                out,
+                audio_policy.unwrap_or_default(),
+            );
         }
         Ok(match self {
             JobKind::Transcribe | JobKind::Packets | JobKind::Mix => {
@@ -4482,7 +4612,7 @@ fn node_error(node: &Node, e: NodeError) -> OpError {
         NodeError::NoAudioStream(j) => OpError::Other {
             message: format!("job {} has no audio stream", j.0),
         },
-        e @ (NodeError::NoVoice { .. } | NodeError::NoPacketStream(_)) => other(e),
+        e @ (NodeError::NoVoice { .. } | NodeError::NoPacketStream(..)) => other(e),
         NodeError::Expand(e) => e,
         NodeError::Other(message) => OpError::Other { message },
         e @ (NodeError::Io(_) | NodeError::DuplicateSource(_) | NodeError::Stopped(_)) => other(e),
@@ -4552,6 +4682,7 @@ fn leased_band(node: &Node, port: &dyn Port, id: &JobId) -> Option<Tuning> {
 /// job under the same id (`job_graph_put`), once; if the rate moves again the
 /// job is stopped and the start is a `Conflict`. Kinds without a `channel`
 /// node do not depend on the rate and are left alone.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_rate(
     node: &Node,
     port: &dyn Port,
@@ -4559,6 +4690,7 @@ async fn reconcile_rate(
     kind: JobKind,
     tuning: Tuning,
     start_params: (Option<Hz>, Option<Sideband>, Option<AudioPolicy>),
+    handler: Option<&str>,
     mut expected: Hz,
 ) -> Result<(), OpError> {
     if !kind.channelised() {
@@ -4593,6 +4725,7 @@ async fn reconcile_rate(
             leased.bandwidth_hz,
             node.bank_bin_rate(port.id(), leased),
             start_params,
+            handler,
             &node.modes(),
         ) {
             Ok(g) => g,
@@ -4648,6 +4781,34 @@ pub(crate) fn check_audio_policy(
             "audio_policy: {} has one voice",
             kind.name()
         )));
+    }
+    Ok(())
+}
+
+/// The stream kinds `job_start`'s `needs` may hold: what a decoder outputs.
+const NEEDS_KINDS: [StreamKind; 3] = [StreamKind::Event, StreamKind::Packet, StreamKind::Audio];
+
+/// `job_start`'s `handler` and `needs`, before anything else is looked at: `needs` holds
+/// [`NEEDS_KINDS`] only (else `unknown` on `needs` naming them), and a kind of no mode
+/// row takes neither (`<kind> has no handlers`). Which handler runs is decided under the
+/// source's gate ([`JobKind::start_handler`]).
+fn check_handler_fields(
+    kind: &JobKind,
+    handler: Option<&str>,
+    needs: &[StreamKind],
+) -> Result<(), OpError> {
+    if let Some(k) = needs.iter().find(|k| !NEEDS_KINDS.contains(k)) {
+        return Err(OpError::Unknown {
+            field: "needs".into(),
+            value: crate::modes::policy::kind_name(*k),
+            known: NEEDS_KINDS
+                .iter()
+                .map(|k| crate::modes::policy::kind_name(*k))
+                .collect(),
+        });
+    }
+    if kind.mode_id().is_none() && (handler.is_some() || !needs.is_empty()) {
+        return Err(other(format!("{} has no handlers", kind.name())));
     }
     Ok(())
 }
@@ -5189,6 +5350,8 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             dwell_scale,
             elastic,
             replace,
+            handler,
+            needs,
         } => {
             check_startable(&kind)?;
             if elastic && !kind.elastic_capable() {
@@ -5199,6 +5362,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             let deviation = check_start_params(&kind, deviation_hz, sideband)?;
             check_look(&kind, dwell_ms, average, bits, method, bin_hz)?;
             check_dwell_scale(&kind, dwell_scale)?;
+            check_handler_fields(&kind, handler.as_deref(), &needs)?;
             // A scan the source sweeps takes no lease: there is no room to make.
             if method == Some(ScanMethod::Source) && !replace.is_empty() {
                 return Err(other(SCAN_REPLACE_STEPPED));
@@ -5296,17 +5460,34 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             // between. The gate is taken always: the duplicate check below must not
             // race a start of the same job.
             let guard = Some(node.gate_guard(&source).await);
+            // The handler that runs, decided under the gate with the registry in force,
+            // which the expansion below uses too; refused before anything is stopped or
+            // tuned.
+            let modes = node.modes();
+            let resolved = match kind.start_handler(
+                handler.as_deref(),
+                &needs,
+                &modes,
+                &node.handler_policy(),
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    drop(guard);
+                    return Err(e);
+                }
+            };
             // An identical rigid job already runs: refuse, naming it, before anything
             // is stopped or tuned, so a `replace` on a refused start stops nothing. A
-            // match that `replace` names is about to stop, so it is no duplicate.
+            // match that `replace` names is about to stop, so it is no duplicate. Another
+            // handler of the mode on the band is another job.
             if !elastic
                 && let Some(job) = node
                     .duplicate_of(
                         &source,
                         kind.name(),
                         tuning,
-                        deviation.map(|d| d.0),
-                        sideband,
+                        (deviation.map(|d| d.0), sideband),
+                        resolved.as_deref(),
                     )
                     .filter(|j| !replace.contains(j))
             {
@@ -5378,7 +5559,8 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 granted.bandwidth_hz,
                 bin_rate,
                 (deviation, sideband, audio_policy),
-                &node.modes(),
+                resolved.as_deref(),
+                &modes,
             ) {
                 Ok(graph) => {
                     let (r, after) = node
@@ -5389,7 +5571,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                             graph,
                             Some(granted.bandwidth_hz),
                             elastic,
-                            audio_policy,
+                            (audio_policy, (resolved.clone(), handler.is_some())),
                             match dwell_scale {
                                 Some(s) => serde_json::json!({"identify": {"dwell_scale": s}}),
                                 None => serde_json::json!({}),
@@ -5432,6 +5614,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 kind,
                 tuning,
                 (deviation, sideband, audio_policy),
+                resolved.as_deref(),
                 granted.bandwidth_hz,
             )
             .await?;
@@ -5889,6 +6072,9 @@ pub(crate) struct PlanChannels {
     /// the kind on a channel is that channel's, whatever its deviation.
     pub deviation_from_plan: bool,
     pub sideband: Option<Sideband>,
+    /// The handler its channels run: the policy's, as a start naming none gets it
+    /// (`None` for a kind of no mode row).
+    pub handler: Option<String>,
 }
 
 impl PlanChannels {
@@ -5958,7 +6144,8 @@ fn plan_check_as(
         (attach, language),
     )
     .map_err(|e| e.error)?;
-    kind.mode_row(&node.modes())?;
+    // A mode some handler can run, and the one its channels get.
+    let handler = node.plain_handler(&kind, &node.modes())?;
     // The plan's own deviation when the caller gave none: data on the plan, not a
     // guess from the channel width.
     let deviation_from_plan =
@@ -5976,6 +6163,7 @@ fn plan_check_as(
         deviation,
         deviation_from_plan,
         sideband,
+        handler,
     };
     Ok((pc, language))
 }
@@ -6032,6 +6220,7 @@ pub(crate) fn plan_existing(
                 pc.kind.name(),
                 band,
                 (pc.deviation.map(|d| d.0), pc.sideband),
+                pc.handler.as_deref(),
                 !pc.deviation_from_plan,
             )
             .filter(|j| !replace.contains(j));
@@ -6080,13 +6269,13 @@ pub(crate) async fn plan_start_channels(
     let mut after = AfterGate::Nothing;
     for &n in to_start {
         let tuning = pc.channel_band(n);
-        let r = match pc.kind.expand(
+        let r = match pc.kind.expand_voiced(
             source,
             tuning,
             granted.bandwidth_hz,
             bin_rate,
-            pc.deviation,
-            pc.sideband,
+            (pc.deviation, pc.sideband, None),
+            pc.handler.as_deref(),
             &modes,
         ) {
             Ok(graph) => {
@@ -6098,7 +6287,7 @@ pub(crate) async fn plan_start_channels(
                         graph,
                         Some(granted.bandwidth_hz),
                         false,
-                        None,
+                        (None, (pc.handler.clone(), false)),
                         serde_json::json!({}),
                         Some(guard),
                     )
@@ -6401,8 +6590,9 @@ fn bounding_of(bands: impl IntoIterator<Item = Tuning>) -> Tuning {
 
 /// Why a set member of `kind` (the set file's `members[index]`) cannot start on this
 /// node, when its kind is a mode row: an unknown row is `unknown` on
-/// `members[<index>].kind` naming the mode ids, a row that is not ready is `other`
-/// (`<state>: <reason>`). `None` for a ready row or a built-in kind without one.
+/// `members[<index>].kind` naming the mode ids, a row no handler can run is `other`
+/// (`<state>: <reason>`, the row's own). `None` for a mode some handler can run
+/// ([`LoadedMode::startable`]) or a built-in kind without one.
 fn member_kind_refusal(kind: &JobKind, index: usize, modes: &ModeRegistry) -> Option<OpError> {
     let id = kind.mode_id()?;
     let Some(m) = modes.get(id) else {
@@ -6412,10 +6602,11 @@ fn member_kind_refusal(kind: &JobKind, index: usize, modes: &ModeRegistry) -> Op
             known: modes.ids(),
         });
     };
+    // A mode some handler can run starts (on the policy's handler).
     let state = match m.state {
-        ModeState::Ready => return None,
+        _ if m.startable() => return None,
         ModeState::Broken => "broken",
-        ModeState::Unavailable => "unavailable",
+        _ => "unavailable",
     };
     Some(other(format!(
         "{state}: {}",
@@ -6613,7 +6804,8 @@ fn gate_of<'g>(
 /// `job_start` of a set's `job_start` member on `source` inside the capture `capture`,
 /// under the source's gate (`guard`): the graph expanded at the capture's rate with the
 /// member's audio policy (kept on the job's record), a `watch` member's `params` set on
-/// its `detect` node before the start (no restart).
+/// its `detect` node before the start (no restart). A mode runs the policy's handler, as
+/// a start naming none gets it.
 #[allow(clippy::too_many_arguments)]
 async fn start_set_job(
     node: &Node,
@@ -6625,14 +6817,20 @@ async fn start_set_job(
     capture: Tuning,
     guard: &tokio::sync::OwnedMutexGuard<()>,
 ) -> (Result<JobId, OpError>, AfterGate) {
-    let mut graph = match kind.expand_voiced(
-        source,
-        tuning,
-        capture.bandwidth_hz,
-        node.bank_bin_rate(source, capture),
-        start_params,
-        &node.modes(),
-    ) {
+    let modes = node.modes();
+    let expanded = node.plain_handler(kind, &modes).and_then(|handler| {
+        let graph = kind.expand_voiced(
+            source,
+            tuning,
+            capture.bandwidth_hz,
+            node.bank_bin_rate(source, capture),
+            start_params,
+            handler.as_deref(),
+            &modes,
+        )?;
+        Ok((graph, handler))
+    });
+    let (mut graph, handler) = match expanded {
         Ok(g) => g,
         Err(e) => return (Err(e), AfterGate::Nothing),
     };
@@ -6649,7 +6847,7 @@ async fn start_set_job(
             graph,
             Some(capture.bandwidth_hz),
             false,
-            start_params.2,
+            (start_params.2, (handler, false)),
             serde_json::json!({}),
             Some(guard),
         )
@@ -6979,13 +7177,15 @@ async fn set_start(
                 params,
                 ..
             } => {
+                // The member's job runs the policy's handler: one on another is not it.
+                let handler = node.plain_handler(kind, &modes).ok().flatten();
                 c.existing_job = node
                     .duplicate_of(
                         &c.source,
                         kind.name(),
                         *tuning,
-                        deviation.map(|d| d.0),
-                        *sideband,
+                        (deviation.map(|d| d.0), *sideband),
+                        handler.as_deref(),
                     )
                     .filter(|j| !replace.contains(j));
                 if *kind == JobKind::Watch
@@ -7494,12 +7694,47 @@ async fn packets_attach(node: &Node, job: JobId, stream: Option<String>) -> Resu
         center_hz: input.tuning.center_hz,
         mode: row.map(|r| r.id.0.as_str()),
         access: row.and_then(|r| r.access),
+        handler: input.handler.as_deref(),
         ..AttachTo::new(&job, &packets)
     };
     let graph = JobKind::Packets.expand_attached(&to, ATTACH_LANGUAGE_DEFAULT)?;
     node.job_attach(JobKind::Packets.name(), &job, None, graph)
         .await
         .map_err(|e| node_error(node, e))
+}
+
+/// The handler of `row`'s mode a graph is expanded for, `handler` (`None`: the row's
+/// own), and its program block (`None` in process): `unknown` on `handler` naming the
+/// mode's handlers when it has none of that id, `other("<mode>: handler <id> is <state>:
+/// <reason>")` when it cannot run.
+pub(crate) fn mode_handler(
+    modes: &ModeRegistry,
+    row: &ModeRow,
+    handler: Option<&str>,
+) -> Result<
+    (
+        crate::modes::ModeHandler,
+        Option<crate::modes::ProgramBlock>,
+    ),
+    OpError,
+> {
+    let mode = &row.id.0;
+    let m = modes
+        .get(mode)
+        .ok_or_else(|| other(format!("unknown mode {mode}")))?;
+    let h = m.handler(handler).ok_or_else(|| OpError::Unknown {
+        field: "handler".into(),
+        value: handler.unwrap_or_default().to_string(),
+        known: m.handlers.iter().map(|h| h.id.clone()).collect(),
+    })?;
+    if let Some(why) = crate::modes::policy::unready(&h) {
+        return Err(other(format!("{mode}: {why}")));
+    }
+    let block = match h.in_process {
+        true => None,
+        false => modes.program_block(mode, &h.id),
+    };
+    Ok((h, block))
 }
 
 /// The mode row a running job of `kind` expands from, whose id and `access` its capture
@@ -7630,10 +7865,16 @@ async fn job_retune(
     };
     let port = checked_port(node, &rec.source, &want)?;
     // The row's own width rule (a program row's `min_hz`), before the gate: the
-    // expansion would refuse it only after the lease moved and the radio tuned.
-    if let Some(row) = kind.mode_row(&node.modes())? {
+    // expansion would refuse it only after the lease moved and the radio tuned. The
+    // program is the job's handler's.
+    let modes = node.modes();
+    if let Some(row) = kind.mode_row(&modes)? {
         let max = port.capabilities().max_bandwidth_hz.value().0;
-        template::check_band(row, want, max)?;
+        let block = rec
+            .handler
+            .as_deref()
+            .and_then(|h| modes.program_block(&row.id.0, h));
+        template::check_band(row, block.as_ref(), want, max)?;
     }
     match node.job_retune(&job, &kind, want, &replace).await {
         Ok(()) => Ok(OpResult::Job(job)),

@@ -244,6 +244,8 @@ fn start(kind: JobKind, t: Tuning, elastic: bool) -> Op {
         dwell_scale: None,
         elastic,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     }
 }
 

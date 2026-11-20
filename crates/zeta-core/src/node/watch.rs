@@ -137,7 +137,7 @@ fn span_fits(row_hz: u64, signal_hz: u64, floor_hz: u64) -> bool {
 fn identify_band(modes: &ModeRegistry, watch_hz: u64, s: &Signal) -> (u64, f32) {
     score_rows(modes, s.center_hz, s.bandwidth_hz, "", &|_| 0.0, &|_| 0.0)
         .into_iter()
-        .filter(|x| x.mode.state == ModeState::Ready && x.in_range)
+        .filter(|x| x.mode.startable() && x.in_range)
         .find(|x| {
             let band = &x.mode.row.band;
             width_fits(band.bandwidth_hz, s.bandwidth_hz) && band.bandwidth_hz <= watch_hz
@@ -535,9 +535,9 @@ pub(crate) fn check_modes_list(
             return Err(format!("modes[{i}]: unknown mode {id}"));
         };
         let state = match m.state {
-            ModeState::Ready => None,
+            _ if m.startable() => None,
             ModeState::Broken => Some("broken"),
-            ModeState::Unavailable => Some("unavailable"),
+            _ => Some("unavailable"),
         };
         if let Some(state) = state {
             let reason = m.reason.as_deref().unwrap_or("no reason given");
@@ -1140,7 +1140,7 @@ impl Inner {
             .filter_map(|id| {
                 let m = modes.get(id)?;
                 let width = m.row.band.bandwidth_hz;
-                (m.state == ModeState::Ready
+                (m.startable()
                     && span_fits(width, s.bandwidth_hz, r.seed.policy.width_floor_hz)
                     && width <= r.tuning.bandwidth_hz.0)
                     .then(|| (id.clone(), width))
@@ -1230,6 +1230,8 @@ impl Inner {
             audio_policy: None,
             stream: None,
             sinks: Vec::new(),
+            handler: None,
+            handler_named: false,
         };
         let id = rec.id.clone();
         w.current = Some((id.clone(), t.signal.center_hz));
@@ -1281,17 +1283,22 @@ impl Inner {
             .await
             .map_err(|e| e.to_string())?;
         let bin_rate = self.bank_bin_rate(source, granted);
-        let graph = kind.expand(
-            source,
-            tuning,
-            granted.bandwidth_hz,
-            bin_rate,
-            None,
-            None,
-            &self.modes(),
-        );
+        // The policy's handler, as a start that names none gets it.
+        let modes = self.modes();
+        let graph = self.plain_handler(&kind, &modes).and_then(|handler| {
+            let graph = kind.expand_voiced(
+                source,
+                tuning,
+                granted.bandwidth_hz,
+                bin_rate,
+                (None, None, None),
+                handler.as_deref(),
+                &modes,
+            )?;
+            Ok((graph, handler))
+        });
         let started = match graph {
-            Ok(mut graph) => {
+            Ok((mut graph, handler)) => {
                 let sink = match self.append_sink(&mut graph, sinks) {
                     Ok(false) => SinkOutcome::Off,
                     Ok(true) => SinkOutcome::On,
@@ -1321,6 +1328,8 @@ impl Inner {
                     audio_policy: None,
                     stream: None,
                     sinks,
+                    handler,
+                    handler_named: false,
                 };
                 let id = rec.id.clone();
                 // In its own task, as identify's children: `launch`'s future runs this.
@@ -1924,7 +1933,7 @@ async fn known_channels(inner: &Arc<Inner>, r: &Run) -> Option<(Vec<Known>, serd
         .filter_map(|id| {
             let m = modes.get(id)?;
             let width = m.row.band.bandwidth_hz;
-            (m.state == ModeState::Ready && width <= band.bandwidth_hz.0)
+            (m.startable() && width <= band.bandwidth_hz.0)
                 .then(|| (id.clone(), width, m.row.band.centers_hz.clone()))
         })
         .collect();

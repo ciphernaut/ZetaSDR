@@ -25,7 +25,7 @@ const QUEUE: usize = 256;
 const NOTE_EVERY: Duration = Duration::from_secs(1);
 
 /// `packet_capture` parameters: what its captures record of the decoder job they hold.
-/// The node fills all four from the input job each time it launches the attached job.
+/// The node fills them from the input job each time it launches the attached job.
 #[derive(JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -42,6 +42,9 @@ pub struct PacketCaptureParams {
     #[serde(deserialize_with = "crate::modes::nullable")]
     #[schemars(required, schema_with = "crate::modes::nullable_enum::<Access>")]
     pub access: Option<Access>,
+    /// The handler the decoder job runs; left out for a job of none.
+    #[serde(default)]
+    pub handler: Option<String>,
 }
 
 /// Writes each packet of its one input to a capture in [`StageContext::packets`],
@@ -118,6 +121,7 @@ impl Stage for PacketCaptureStage {
             link_type: LinkType::User0,
             mode: p.mode,
             access: p.access,
+            handler: p.handler,
         };
         let (tx, items) = mpsc::channel::<Item>(QUEUE);
         let note = ctx.note.clone();

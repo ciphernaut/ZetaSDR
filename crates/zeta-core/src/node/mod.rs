@@ -40,7 +40,7 @@ use crate::graph::{self, Graph, GraphError};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{Decision, LeaseError, LeaseManager};
-use crate::modes::{MODES_CHECKED_FILE, ModeRegistry, ModesHandle};
+use crate::modes::{MODES_CHECKED_FILE, ModeRegistry, ModeState, ModesHandle};
 use crate::ops::{
     AudioPolicy, FM_DEVIATION_DEFAULT_HZ, JobKind, Op, OpError, OpResult, Sideband,
     WFM_DEVIATION_DEFAULT_HZ,
@@ -168,9 +168,15 @@ pub enum NodeError {
     /// An attached job's input job runs but has no audio stream to read.
     #[error("input job {} has no audio stream", .0.0)]
     NoAudioStream(JobId),
-    /// An attached job's input job runs but has no packet stream to read.
-    #[error("job {} has no packet stream: its kind's outputs list no packet (modes_list)", .0.0)]
-    NoPacketStream(JobId),
+    /// An attached job's input job runs but has no packet stream to read; why, when
+    /// another handler of its mode would give one (`handler <id> outputs none (<ids>
+    /// do)`), else its kind's outputs list none.
+    #[error(
+        "job {} has no packet stream: {}",
+        .0.0,
+        .1.as_deref().unwrap_or("its kind's outputs list no packet (modes_list)")
+    )]
+    NoPacketStream(JobId, Option<String>),
     /// A `job_attach` (or an attached job's relaunch) names a voice `role` its input job
     /// `job` does not have; `voices` are the ones it has (none: it has one voice).
     #[error("{}", no_voice(.job, .role, .voices))]
@@ -299,6 +305,8 @@ fn running_record(
         audio_policy: None,
         stream: None,
         sinks: Vec::new(),
+        handler: None,
+        handler_named: false,
     }
 }
 
@@ -586,6 +594,19 @@ impl Inner {
     /// whole of one use so a reload meanwhile never mixes two sets of rows.
     pub(crate) fn modes(&self) -> Arc<ModeRegistry> {
         self.modes.get().unwrap_or_default()
+    }
+
+    /// The handler a start of `kind` that names none and needs nothing gets from
+    /// `modes`: the policy's choice ([`JobKind::start_handler`]), `None` for a kind of
+    /// no mode row. What identify, a watch, a set and a plan start their decoders with,
+    /// so a mode whose own program is missing but a handler file's is ready starts.
+    pub(crate) fn plain_handler(
+        &self,
+        kind: &JobKind,
+        modes: &ModeRegistry,
+    ) -> Result<Option<String>, crate::ops::OpError> {
+        let policy = self.handler_policy.lock().unwrap().clone();
+        kind.start_handler(None, &[], modes, &policy)
     }
 
     /// Where source `id` is: what its port reports itself (`from: status`; a position a
@@ -1054,7 +1075,8 @@ impl Inner {
 
     /// The packet stream an attached job reads from `job`: its last packet output stream
     /// in graph order. `InputNotRunning` as [`Inner::audio_stream`], `NoPacketStream`
-    /// when it outputs no packets.
+    /// when it outputs no packets, naming the handlers of its mode that would give them
+    /// when its own handler does not ([`Inner::who_gives_packets`]).
     fn packet_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
         let jobs = self.jobs.lock().unwrap();
         let entry = jobs
@@ -1067,7 +1089,38 @@ impl Inner {
             .rev()
             .find(|o| o.kind == StreamKind::Packet)
             .map(|o| o.id.clone())
-            .ok_or_else(|| NodeError::NoPacketStream(job.clone()))
+            .ok_or_else(|| {
+                NodeError::NoPacketStream(job.clone(), self.who_gives_packets(&entry.record))
+            })
+    }
+
+    /// Why `rec`'s job gives no packets when another ready handler of its mode would:
+    /// `handler <its handler> outputs none (<the others' ids, comma separated> do[es])`;
+    /// `None` when no other handler gives them (or its kind has no mode row).
+    fn who_gives_packets(&self, rec: &JobRecord) -> Option<String> {
+        let modes = self.modes();
+        let m = self
+            .expandable_kind(&rec.kind)?
+            .loaded_mode(&modes)
+            .ok()
+            .flatten()?;
+        let runs = rec.handler.clone().unwrap_or_else(|| m.own_handler());
+        let others: Vec<&str> = m
+            .handlers
+            .iter()
+            .filter(|h| h.id != runs && h.state == ModeState::Ready)
+            .filter(|h| h.outputs.contains(&StreamKind::Packet))
+            .map(|h| h.id.as_str())
+            .collect();
+        let verb = match others.len() {
+            0 => return None,
+            1 => "does",
+            _ => "do",
+        };
+        Some(format!(
+            "handler {runs} outputs none ({} {verb})",
+            others.join(", ")
+        ))
     }
 
     /// What a `mix` stage of the job `except` may read: the audio output of every job
@@ -2428,6 +2481,8 @@ impl Node {
             audio_policy: None,
             stream: voice.map(String::from),
             sinks: Vec::new(),
+            handler: None,
+            handler_named: false,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2482,6 +2537,8 @@ impl Node {
             audio_policy: None,
             stream: None,
             sinks: Vec::new(),
+            handler: None,
+            handler_named: false,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2592,6 +2649,8 @@ impl Node {
             audio_policy: None,
             stream: None,
             sinks: Vec::new(),
+            handler: None,
+            handler_named: false,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2687,6 +2746,8 @@ impl Node {
             audio_policy: None,
             stream: None,
             sinks: Vec::new(),
+            handler: None,
+            handler_named: false,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2798,23 +2859,41 @@ impl Node {
         source: &SourceId,
         kind: &str,
         tuning: Tuning,
-        deviation_hz: Option<u64>,
-        sideband: Option<Sideband>,
+        (deviation_hz, sideband): (Option<u64>, Option<Sideband>),
+        handler: Option<&str>,
     ) -> Option<JobId> {
-        self.duplicate_of_as(source, kind, tuning, (deviation_hz, sideband), true)
+        self.duplicate_of_as(
+            source,
+            kind,
+            tuning,
+            (deviation_hz, sideband),
+            handler,
+            true,
+        )
     }
 
     /// [`Node::duplicate_of`], comparing the deviation only when `match_deviation`
     /// (a plan's own deviation was not asked for, so a job at any deviation counts).
+    /// A mode's job repeats only on the same `handler` (the start's resolved one; a
+    /// record from before handlers runs the row's own): another handler on the same
+    /// band is another job.
     pub(crate) fn duplicate_of_as(
         &self,
         source: &SourceId,
         kind: &str,
         tuning: Tuning,
         (deviation_hz, sideband): (Option<u64>, Option<Sideband>),
+        handler: Option<&str>,
         match_deviation: bool,
     ) -> Option<JobId> {
         let k = self.expandable_kind(kind)?;
+        let modes = self.inner.modes();
+        let own = k
+            .loaded_mode(&modes)
+            .ok()
+            .flatten()
+            .map(|m| m.own_handler());
+        let runs = |r: &JobRecord| r.handler.clone().or_else(|| own.clone());
         let norm = |(d, s): (Option<u64>, Option<Sideband>)| match k {
             JobKind::FmDemod if !match_deviation => (None, None),
             JobKind::WfmDemod if !match_deviation => (None, None),
@@ -2835,6 +2914,7 @@ impl Node {
                     && r.kind == kind
                     && r.tuning == tuning
                     && norm(k.start_params(&r.graph)) == want
+                    && runs(r).as_deref() == handler.or(own.as_deref())
             })
             .map(|r| r.id)
     }
@@ -2929,8 +3009,9 @@ impl Node {
     /// without letting the gate go. What must wait for the gate to be released
     /// (relaunching the elastic jobs a tune moved, stopping those a scan
     /// displaces) is returned, for [`Node::after_gate`] once the guard is dropped. The
-    /// record keeps `audio_policy`, the one `graph` was expanded with, and starts with
-    /// `context` (an identify's `dwell_scale`).
+    /// record keeps `audio_policy` and `handler` (`(id, named)`: the handler `graph` was
+    /// expanded for, and whether the start named it), and starts with `context` (an
+    /// identify's `dwell_scale`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn job_start_gated(
         &self,
@@ -2940,13 +3021,15 @@ impl Node {
         graph: Graph,
         capture_rate_hz: Option<Hz>,
         elastic: bool,
-        audio_policy: Option<AudioPolicy>,
+        (audio_policy, (handler, handler_named)): (Option<AudioPolicy>, (Option<String>, bool)),
         context: serde_json::Value,
         guard: Option<&OwnedMutexGuard<()>>,
     ) -> (Result<JobId, NodeError>, AfterGate) {
         let rec = JobRecord {
             audio_policy,
             context,
+            handler,
+            handler_named,
             ..running_record(kind, source, tuning, graph, capture_rate_hz, elastic)
         };
         self.start_record_gated(rec, guard, &[]).await
@@ -3054,6 +3137,7 @@ impl Node {
                 bin_rate,
                 graph,
                 rec.audio_policy,
+                rec.handler.as_deref(),
                 &self.inner.modes(),
             )
             .is_ok_and(|g| {
@@ -3298,6 +3382,16 @@ impl Node {
         crate::station::remove(&self.inner.state_dir)?;
         *self.inner.station.lock().unwrap() = None;
         Ok(())
+    }
+
+    /// The handler a start of `kind` that names none gets from `modes` (see
+    /// [`Inner::plain_handler`]): what a set's or a plan's decoders run.
+    pub(crate) fn plain_handler(
+        &self,
+        kind: &JobKind,
+        modes: &ModeRegistry,
+    ) -> Result<Option<String>, OpError> {
+        self.inner.plain_handler(kind, modes)
     }
 
     /// The operator's handler rankings ([`crate::modes::policy::HandlerPolicy`]).
@@ -3691,6 +3785,8 @@ mod tests {
             audio_policy: None,
             stream: None,
             sinks: Vec::new(),
+            handler: None,
+            handler_named: false,
         }
     }
 

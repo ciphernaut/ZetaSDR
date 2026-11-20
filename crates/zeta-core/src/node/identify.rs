@@ -33,7 +33,7 @@ use crate::knowledge::{Allocation, nearest_of};
 use crate::learned::{LEARNED_VERDICT_MIN, label_score, learned_match};
 use crate::modes::Proof;
 use crate::modes::score::{allocation_match, allocation_term, score_rows};
-use crate::modes::{Identify, LoadedMode, ModeState};
+use crate::modes::{Identify, LoadedMode};
 use crate::ops::{IDENTIFY_DWELL_SCALE_MAX, IDENTIFY_MEASURE_MS, JobKind, identify_dwell_ms};
 use crate::port::{Port, Tuning};
 use crate::stage::StageError;
@@ -362,15 +362,20 @@ impl Inner {
             .ok_or_else(|| format!("{} is not a job kind", mode.row.id.0))?;
         let capture = r.port.current().unwrap_or(r.tuning);
         let bin_rate = self.bank_bin_rate(&r.prov.source, capture);
+        // The policy's handler, as a start that names none gets it.
+        let modes = self.modes();
+        let handler = self
+            .plain_handler(&kind, &modes)
+            .map_err(|e| e.to_string())?;
         let graph = kind
-            .expand(
+            .expand_voiced(
                 &r.prov.source,
                 tuning,
                 capture.bandwidth_hz,
                 bin_rate,
-                None,
-                None,
-                &self.modes(),
+                (None, None, None),
+                handler.as_deref(),
+                &modes,
             )
             .map_err(|e| e.to_string())?;
         let rec = JobRecord {
@@ -391,6 +396,8 @@ impl Inner {
             audio_policy: None,
             stream: None,
             sinks: Vec::new(),
+            handler,
+            handler_named: false,
         };
         let child = rec.id.clone();
         // Recorded first, so a run resumed after a restart can stop it (see `stale`).
@@ -633,7 +640,7 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
             inner.candidate(&r, id, score, Outcome::SkippedBand, &evidence, None, fit);
             continue;
         }
-        if mode.state != ModeState::Ready {
+        if !mode.startable() {
             let evidence = mode.reason.clone().unwrap_or_else(|| "not ready".into());
             let id = mode.row.id.0.as_str();
             inner.candidate(&r, id, score, Outcome::Unavailable, &evidence, None, fit);

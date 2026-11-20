@@ -194,6 +194,8 @@ async fn python_plugin_runs_in_a_job_via_graph_put() {
             dwell_scale: None,
             elastic: false,
             replace: vec![],
+            handler: None,
+            needs: vec![],
         })
         .await
         .unwrap()

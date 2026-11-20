@@ -851,3 +851,197 @@ async fn a_strangers_record_survives_reruns_of_another_job() {
     want.sort();
     assert_eq!(ids, want, "the stranger and the last re-run");
 }
+
+// Plan 42: a job runs the handler it names or the one the policy picks.
+
+mod common;
+use common::handlers::{self as h, ALT, MODE, OWN};
+use zeta_core::modes::policy::Passed;
+use zeta_core::ops::{JobKind, OpError, OpResult};
+use zeta_core::types::StreamKind;
+
+/// A node on [`h::Radio`] with the `alt` handler file (packets beside its events when
+/// `packets`) and the `external_decode` stand-in.
+async fn handler_node(dir: &Path, packets: bool) -> Node {
+    let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
+    Node::open(h::cfg(dir, packets), h::stages(None), ports)
+        .await
+        .unwrap()
+}
+
+fn listed(node: &Node, id: &JobId) -> JobRecord {
+    node.job_list()
+        .into_iter()
+        .find(|r| &r.id == id)
+        .expect("job listed")
+}
+
+/// The params of the job's `external_decode` node.
+fn decode_params(rec: &JobRecord) -> serde_json::Value {
+    rec.graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "external_decode")
+        .expect("an external_decode node")
+        .params
+        .clone()
+}
+
+/// A `job_start` of `fm_demod` at 100 MHz with `handler` and `needs`.
+fn fm_op(handler: Option<&str>, needs: &[StreamKind]) -> zeta_core::ops::Op {
+    h::start_kind_op(JobKind::FmDemod, 100_000_000, 12_500, handler, needs)
+}
+
+#[tokio::test]
+async fn job_start_takes_the_policys_handler_and_records_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let chosen = h::start(&node, None, &[]).await;
+    let rec = listed(&node, &chosen);
+    assert_eq!(
+        (rec.handler.as_deref(), rec.handler_named),
+        (Some(OWN), false)
+    );
+    assert_eq!(decode_params(&rec), serde_json::json!({"mode": MODE}));
+    // `job_list` gives it, and the record on disk keeps it.
+    let wire = serde_json::to_value(&rec).unwrap();
+    assert_eq!(wire["handler"], OWN);
+    assert_eq!(wire["handler_named"], false);
+    assert_eq!(on_disk(dir.path(), &chosen).handler.as_deref(), Some(OWN));
+    node.job_stop(&chosen).await.unwrap();
+
+    let named = h::start(&node, Some(ALT), &[]).await;
+    let rec = listed(&node, &named);
+    assert_eq!(
+        (rec.handler.as_deref(), rec.handler_named),
+        (Some(ALT), true)
+    );
+    assert_eq!(
+        decode_params(&rec),
+        serde_json::json!({"mode": MODE, "handler": ALT})
+    );
+    node.job_stop(&named).await.unwrap();
+    // A kind of no mode row records none.
+    let Ok(OpResult::Job(fm)) = node.apply(fm_op(None, &[])).await else {
+        panic!("fm_demod start")
+    };
+    let rec = listed(&node, &fm);
+    assert_eq!((rec.handler, rec.handler_named), (None, false));
+    assert_eq!(
+        serde_json::to_value(listed(&node, &fm)).unwrap()["handler"],
+        serde_json::Value::Null
+    );
+}
+
+#[tokio::test]
+async fn a_named_handler_that_is_unavailable_is_refused_with_its_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    h::alt_goes_missing(&node);
+    let r = h::try_start(&node, Some(ALT), &[]).await;
+    assert_eq!(
+        r,
+        Err(OpError::Other {
+            message: format!("{MODE}: handler {ALT} is unavailable: {}", h::ALT_MISSING),
+        })
+    );
+    assert!(node.job_list().is_empty(), "nothing started");
+    // The policy passes it over.
+    let id = h::start(&node, None, &[]).await;
+    assert_eq!(listed(&node, &id).handler.as_deref(), Some(OWN));
+}
+
+#[tokio::test]
+async fn an_unknown_handler_names_the_known_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let r = h::try_start(&node, Some("nope"), &[]).await;
+    assert_eq!(
+        r,
+        Err(OpError::Unknown {
+            field: "handler".into(),
+            value: "nope".into(),
+            known: vec![OWN.into(), ALT.into()],
+        })
+    );
+    assert!(node.job_list().is_empty(), "nothing started");
+}
+
+#[tokio::test]
+async fn needs_packet_with_no_such_handler_is_no_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let r = h::try_start(&node, None, &[StreamKind::Packet]).await;
+    let passed = |id: &str| Passed {
+        id: id.into(),
+        why: "outputs no packet".into(),
+    };
+    assert_eq!(
+        r,
+        Err(OpError::NoHandler {
+            mode: MODE.into(),
+            passed: vec![passed(OWN), passed(ALT)],
+        })
+    );
+    // `needs` takes the kinds a decoder outputs only.
+    let r = h::try_start(&node, None, &[StreamKind::Iq]).await;
+    assert_eq!(
+        r,
+        Err(OpError::Unknown {
+            field: "needs".into(),
+            value: "iq".into(),
+            known: vec!["event".into(), "packet".into(), "audio".into()],
+        })
+    );
+    assert!(node.job_list().is_empty(), "nothing started");
+
+    // With alt giving packets, `needs` picks it over the row's own.
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), true).await;
+    let id = h::start(&node, None, &[StreamKind::Packet]).await;
+    let rec = listed(&node, &id);
+    assert_eq!(
+        (rec.handler.as_deref(), rec.handler_named),
+        (Some(ALT), false)
+    );
+}
+
+#[tokio::test]
+async fn handler_and_needs_are_refused_on_a_kind_that_is_no_mode_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let refused = Err(OpError::Other {
+        message: "fm_demod has no handlers".into(),
+    });
+    assert_eq!(node.apply(fm_op(Some("x"), &[])).await, refused);
+    assert_eq!(node.apply(fm_op(None, &[StreamKind::Event])).await, refused);
+    assert!(node.job_list().is_empty(), "nothing started");
+    assert!(matches!(
+        node.apply(fm_op(None, &[])).await,
+        Ok(OpResult::Job(_))
+    ));
+}
+
+#[tokio::test]
+async fn the_same_mode_on_the_same_band_with_another_handler_is_not_a_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let own = h::start(&node, None, &[]).await;
+    let alt = h::start(&node, Some(ALT), &[]).await;
+    assert_ne!(own, alt);
+    // The same handler again is the first's repeat, as before handlers.
+    let again = |job: &JobId| {
+        Err(OpError::Duplicate {
+            message: format!(
+                "an identical {MODE} already runs on {} at 1090000000/2400000 Hz as job {}",
+                h::RADIO,
+                job.0
+            ),
+            job: job.clone(),
+        })
+    };
+    assert_eq!(h::try_start(&node, None, &[]).await, again(&own));
+    assert_eq!(h::try_start(&node, Some(OWN), &[]).await, again(&own));
+    assert_eq!(h::try_start(&node, Some(ALT), &[]).await, again(&alt));
+    assert_eq!(node.job_list().len(), 2);
+}

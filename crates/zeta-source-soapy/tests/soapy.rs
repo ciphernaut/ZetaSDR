@@ -682,6 +682,8 @@ fn passthrough() -> Op {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     }
 }
 

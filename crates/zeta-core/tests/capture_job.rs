@@ -123,6 +123,8 @@ async fn a_capture_job_ends_stopped_with_its_records_in_the_store() {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     let job = match node.apply(op).await {
         Ok(OpResult::Job(j)) => j,

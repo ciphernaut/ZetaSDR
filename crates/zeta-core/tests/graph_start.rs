@@ -284,6 +284,8 @@ async fn job_start_refuses_the_graph_and_bits_kinds() {
                 dwell_scale: None,
                 elastic: false,
                 replace: vec![],
+                handler: None,
+                needs: vec![],
             })
             .await
             .unwrap_err();

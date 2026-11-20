@@ -278,3 +278,63 @@ async fn a_second_job_on_the_source_is_logged_by_the_same_tee() {
     assert!(got[..3].iter().all(|l| l["job"] == first.0), "{got:?}");
     assert!(got[3..].iter().all(|l| l["job"] == second.0), "{got:?}");
 }
+
+/// A synthesised APRS packet at 144.8 MHz, 48 kHz, as a SigMF capture in `dir`, played
+/// on a loop; the meta file's path.
+fn write_aprs(dir: &Path) -> PathBuf {
+    const RATE: u32 = 48_000;
+    let iq = zeta_dsp::synth::aprs_packet_iq("N0CALL", "APZETA", ">handler test", RATE, 0.0);
+    let mut bytes = Vec::with_capacity(iq.len() * 8);
+    for s in &iq {
+        bytes.extend_from_slice(&s.re.to_le_bytes());
+        bytes.extend_from_slice(&s.im.to_le_bytes());
+    }
+    std::fs::write(dir.join("aprs.sigmf-data"), bytes).unwrap();
+    let meta = dir.join("aprs.sigmf-meta");
+    let text = serde_json::json!({
+        "global": {"core:datatype": "cf32_le", "core:sample_rate": RATE, "core:version": "1.0.0"},
+        "captures": [{"core:sample_start": 0, "core:frequency": 144_800_000u64}],
+        "annotations": []
+    });
+    std::fs::write(&meta, text.to_string()).unwrap();
+    meta
+}
+
+/// An in-process row's events carry `handler: "builtin"`, as `job` and `source` they
+/// are logged with.
+#[tokio::test]
+async fn an_events_line_carries_its_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: None,
+    };
+    let src = Arc::new(FileSource::open(tone(), &write_aprs(dir.path()), opts).unwrap());
+    let mut stages = StageRegistry::new();
+    zeta_dsp::register_all(&mut stages);
+    let node = Node::open(cfg(dir.path()), stages, vec![src.clone() as Arc<dyn Port>])
+        .await
+        .unwrap();
+    src.start();
+    let op = serde_json::json!({
+        "op": "job_start", "kind": "aprs_decode", "source": "tone",
+        "center_hz": 144_800_000u64, "bandwidth_hz": 12_500, "deviation_hz": null,
+        "sideband": null, "elastic": false, "replace": [],
+    });
+    let job = match node.apply(serde_json::from_value(op).unwrap()).await {
+        Ok(zeta_core::ops::OpResult::Job(id)) => id,
+        r => panic!("aprs_decode start: {r:?}"),
+    };
+    let path = log_path(dir.path());
+    let aprs = |l: &serde_json::Value| l["event"]["protocol"] == "aprs";
+    assert!(
+        until(10_000, || lines(&path).iter().any(aprs)).await,
+        "an aprs line: {:?}",
+        lines(&path)
+    );
+    let line = lines(&path).into_iter().find(aprs).unwrap();
+    assert_eq!(line["job"], job.0, "{line}");
+    assert_eq!(line["event"]["handler"], "builtin", "{line}");
+}

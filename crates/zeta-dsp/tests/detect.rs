@@ -123,6 +123,8 @@ async fn detect_publishes_new_and_gone_for_a_synthesised_burst() {
             dwell_scale: None,
             elastic: false,
             replace: vec![],
+            handler: None,
+            needs: vec![],
         })
         .await
         .unwrap()

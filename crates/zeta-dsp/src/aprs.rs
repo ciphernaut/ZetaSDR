@@ -348,7 +348,7 @@ mod tests {
             serde_json::json!({
                 "protocol": "aprs", "src": "VK3ABC", "dst": "APRS", "path": ["WIDE1-1"],
                 "info": ">hi", "info_hex": "3e6869", "fcs_ok": true,
-                "summary": "VK3ABC > APRS: >hi", "t_ns": 5,
+                "summary": "VK3ABC > APRS: >hi", "t_ns": 5, "handler": "builtin",
                 "lat": null, "lon": null, "alt_m": null, "course_deg": null, "speed_kt": null,
                 "symbol": null, "comment": null, "data_type": "status", "object": null,
             })

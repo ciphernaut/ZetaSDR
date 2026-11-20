@@ -11,7 +11,9 @@ use serde_json::{Value, json};
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::classify::Outcome;
 use zeta_core::job::JobState;
-use zeta_core::modes::{Decoder, DecoderKind, ModeRegistry, parse, template, validate};
+use zeta_core::modes::{
+    Decoder, DecoderKind, ModeHandler, ModeRegistry, parse, template, validate,
+};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::port::{Port, Tuning};
@@ -191,6 +193,8 @@ async fn start(node: &Node, kind: JobKind) -> JobId {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -260,8 +264,16 @@ fn a_frame_row_expands_to_the_chain() {
         center_hz: Hz(CENTER_HZ),
         bandwidth_hz: Hz(BANDWIDTH_HZ),
     };
-    template::check_band(&row, tuning, RATE_HZ as u64).unwrap();
-    let g = template::expand(&row, tuning, RATE_HZ as u64, Default::default()).unwrap();
+    template::check_band(&row, None, tuning, RATE_HZ as u64).unwrap();
+    let g = template::expand(
+        &row,
+        &ModeHandler::of_row(&row),
+        None,
+        tuning,
+        RATE_HZ as u64,
+        Default::default(),
+    )
+    .unwrap();
     let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
     assert_eq!(
         kinds,
@@ -298,7 +310,7 @@ fn a_frame_row_expands_to_the_chain() {
         center_hz: Hz(CENTER_HZ),
         bandwidth_hz: Hz(6_000),
     };
-    assert!(template::check_band(&row, narrow, RATE_HZ as u64).is_err());
+    assert!(template::check_band(&row, None, narrow, RATE_HZ as u64).is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

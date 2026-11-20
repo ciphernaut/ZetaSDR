@@ -242,6 +242,8 @@ impl Remote {
             dwell_scale: None,
             elastic: false,
             replace: vec![],
+            handler: None,
+            needs: vec![],
         };
         let job = match apply(&self.client, &op).await? {
             OpResult::Job(id) => id,

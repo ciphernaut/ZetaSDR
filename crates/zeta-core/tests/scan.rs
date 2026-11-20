@@ -822,6 +822,8 @@ fn start(kind: JobKind, center_hz: u64, bandwidth_hz: u64) -> Op {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     }
 }
 
@@ -2096,6 +2098,8 @@ async fn a_scan_stored_before_the_look_resumes_at_the_defaults() {
         audio_policy: None,
         stream: None,
         sinks: Vec::new(),
+        handler: None,
+        handler_named: false,
     };
     let jobs = dir.path().join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();

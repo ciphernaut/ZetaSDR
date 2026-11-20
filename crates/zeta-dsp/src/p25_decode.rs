@@ -1308,7 +1308,7 @@ mod tests {
         );
         // A channel with no trunking seen, through the row's envelope.
         let row = mbe.row();
-        let e = zeta_core::modes::summary::envelope(&row, 0, channel_fields(NAC, false));
+        let e = zeta_core::modes::summary::envelope(&row, "builtin", 0, channel_fields(NAC, false));
         summaries
             .iter()
             .copied()

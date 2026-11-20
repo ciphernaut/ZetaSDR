@@ -223,6 +223,8 @@ async fn job_start_passthrough_then_list_then_stop() {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     let id = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -364,6 +366,8 @@ async fn source_ensure_during_job_start_does_not_retune() {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     let ensure = Op::SourceEnsure {
         source,
@@ -474,6 +478,8 @@ async fn job_start_holds_the_gate_through_its_tune_and_lease() {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     // B: 2 MHz around A's band, asked while A's slow tune is under way. A holds the
     // source's gate from its tune through its lease, so B waits behind A (it cannot
@@ -1185,6 +1191,8 @@ async fn conflict_reports_current_tuning_and_real_options() {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -1295,6 +1303,8 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -2032,6 +2042,8 @@ fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     }
 }
 
@@ -2135,7 +2147,16 @@ fn demod_graphs_carry_the_squelch_params() {
             m.params["squelch"] = false.into();
         }
         let again = kind
-            .reexpand(&src, tuning, Hz(96_000), None, &stored, None, &modes())
+            .reexpand(
+                &src,
+                tuning,
+                Hz(96_000),
+                None,
+                &stored,
+                None,
+                None,
+                &modes(),
+            )
             .unwrap();
         let n = again.nodes.iter().find(|n| n.kind == demod).expect(demod);
         assert_eq!(n.params["squelch_db"], -70, "{kind:?}");
@@ -2148,7 +2169,7 @@ fn demod_graphs_carry_the_squelch_params() {
             o.remove("squelch");
         }
         let again = kind
-            .reexpand(&src, tuning, Hz(96_000), None, &old, None, &modes())
+            .reexpand(&src, tuning, Hz(96_000), None, &old, None, None, &modes())
             .unwrap();
         let n = again.nodes.iter().find(|n| n.kind == demod).expect(demod);
         assert_eq!(n.params["squelch"], true, "{kind:?}");
@@ -3058,7 +3079,16 @@ fn reexpand_carries_the_guard_params() {
         n.params["guard_db"] = 20.into();
     }
     let again = JobKind::FmDemod
-        .reexpand(&src, tuning, Hz(512_000), None, &stored, None, &modes())
+        .reexpand(
+            &src,
+            tuning,
+            Hz(512_000),
+            None,
+            &stored,
+            None,
+            None,
+            &modes(),
+        )
         .unwrap();
     let demod = &again.nodes[1].params;
     assert!(
@@ -3079,7 +3109,7 @@ fn reexpand_carries_the_guard_params() {
         old.nodes[1].params.as_object_mut().unwrap().remove(k);
     }
     let again = JobKind::FmDemod
-        .reexpand(&src, tuning, Hz(512_000), None, &old, None, &modes())
+        .reexpand(&src, tuning, Hz(512_000), None, &old, None, None, &modes())
         .unwrap();
     assert_eq!(again.nodes[1].params["guard_hz"], 12_500);
     assert_eq!(again.nodes[0].params["wide_hz"], 37_500);
@@ -3103,7 +3133,7 @@ fn retune_expand(tuning: Tuning) -> zeta_core::graph::Graph {
             Hz(1_024_000),
             Some(256_000),
             &operator_stored(),
-            None,
+            (None, None),
             &modes(),
             &zeta_core::ops::RETUNE_CARRIED_PARAMS,
         )
@@ -3468,6 +3498,8 @@ fn a_job_start_without_a_dwell_scale_is_written_without_it() {
         dwell_scale,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     let plain = serde_json::to_value(start(None)).unwrap();
     assert!(plain.get("dwell_scale").is_none(), "{plain}");
@@ -3558,6 +3590,8 @@ async fn start_on(node: &Node, source: &str, kind: JobKind, elastic: bool) -> Jo
         dwell_scale: None,
         elastic,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -3768,6 +3802,8 @@ async fn job_start_on_a_faulted_source_is_refused_naming_the_source() {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     match node.apply(start(100_000_000)).await {
         Err(OpError::Other { message }) => {
@@ -3857,14 +3893,23 @@ fn demod_graphs_carry_denoise_and_the_voice_shaping() {
         }
         for carried in [None, Some(&zeta_core::ops::RETUNE_CARRIED_PARAMS[..])] {
             let again = match carried {
-                None => kind.reexpand(&src, tuning, Hz(96_000), None, &stored, None, &modes()),
-                Some(c) => kind.reexpand_carrying(
+                None => kind.reexpand(
                     &src,
                     tuning,
                     Hz(96_000),
                     None,
                     &stored,
                     None,
+                    None,
+                    &modes(),
+                ),
+                Some(c) => kind.reexpand_carrying(
+                    &src,
+                    tuning,
+                    Hz(96_000),
+                    None,
+                    &stored,
+                    (None, None),
                     &modes(),
                     c,
                 ),
@@ -3906,14 +3951,23 @@ fn a_wfm_graph_carries_stereo_through_a_reexpansion_and_a_retune() {
     }
     for carried in [None, Some(&zeta_core::ops::RETUNE_CARRIED_PARAMS[..])] {
         let again = match carried {
-            None => kind.reexpand(&src, tuning, Hz(2_000_000), None, &stored, None, &modes()),
-            Some(c) => kind.reexpand_carrying(
+            None => kind.reexpand(
                 &src,
                 tuning,
                 Hz(2_000_000),
                 None,
                 &stored,
                 None,
+                None,
+                &modes(),
+            ),
+            Some(c) => kind.reexpand_carrying(
+                &src,
+                tuning,
+                Hz(2_000_000),
+                None,
+                &stored,
+                (None, None),
                 &modes(),
                 c,
             ),
@@ -4090,6 +4144,8 @@ fn start_look(kind: JobKind, dwell_ms: Option<u64>, average: Option<u32>) -> Op 
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     }
 }
 

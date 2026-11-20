@@ -90,6 +90,8 @@ async fn demod(node: &Node, center_hz: u64) -> JobId {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,

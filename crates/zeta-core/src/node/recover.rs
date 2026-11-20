@@ -160,6 +160,86 @@ impl Inner {
         recoverable_entry(&jobs, &self.episodes.lock().unwrap(), e)
     }
 
+    /// The handler a relaunch of `rec` (a restart's resume, a recovery, a retune, any
+    /// relaunch under its id) runs: the record's while it is ready; else a named one is
+    /// `Err("handler <id> is <state>: <reason>")` (the job fails with it, as a missing
+    /// program fails it) and a chosen one is the policy's choice again (`Err` with the
+    /// `no_handler` words when none is left). A record of no handler (the row's own, a
+    /// record from before handlers) is its row's own; one of a mode the registry no
+    /// longer has keeps its handler: its expansion decides.
+    pub(super) fn resolve_for_relaunch(&self, rec: &JobRecord) -> Result<String, String> {
+        let modes = self.modes();
+        let m = self
+            .expandable_kind(&rec.kind)
+            .and_then(|k| k.loaded_mode(&modes).ok().flatten());
+        let was = match (&rec.handler, m) {
+            (Some(h), _) => h.clone(),
+            (None, Some(m)) => m.own_handler(),
+            (None, None) => return Err(format!("{} has no handlers", rec.kind)),
+        };
+        let Some(m) = m else {
+            return Ok(was);
+        };
+        let gone = match m.handlers.iter().find(|h| h.id == was) {
+            Some(h) => match crate::modes::policy::unready(h) {
+                None => return Ok(was),
+                Some(why) => why,
+            },
+            None => format!("handler {was} is gone: {} has no such handler", m.row.id.0),
+        };
+        if rec.handler_named {
+            return Err(gone);
+        }
+        let policy = self.handler_policy.lock().unwrap().clone();
+        match crate::modes::policy::pick(&m.row.id.0, &m.handlers, &[], &policy) {
+            Ok(h) => Ok(h.id.clone()),
+            Err(passed) => Err(crate::ops::OpError::NoHandler {
+                mode: m.row.id.0.clone(),
+                passed,
+            }
+            .to_string()),
+        }
+    }
+
+    /// Settle the handler `rec` relaunches with ([`Inner::resolve_for_relaunch`]),
+    /// before anything is leased: a named handler no longer ready fails the launch with
+    /// its reason; a chosen one chosen again is recorded, with the change noted in the
+    /// context as `handler: {was, now, why}` (`why` the old handler's reason), and the
+    /// graph is expanded again for it at the capture (its `capture_rate_hz` cleared, so
+    /// [`Inner::fit_capture`] makes it whatever the rate). An attached job, an operator's
+    /// graph and a record of no handler (one from before handlers runs as it did) are
+    /// left as they are.
+    pub(super) fn rehandle(&self, rec: &mut JobRecord) -> Result<(), NodeError> {
+        let Some(was) = rec.handler.clone() else {
+            return Ok(());
+        };
+        if rec.input.is_some() || rec.operator_graph {
+            return Ok(());
+        }
+        let now = self.resolve_for_relaunch(rec).map_err(NodeError::Other)?;
+        if now == was {
+            return Ok(());
+        }
+        let modes = self.modes();
+        let mode = self.expandable_kind(&rec.kind);
+        let why = mode
+            .as_ref()
+            .and_then(|k| k.loaded_mode(&modes).ok().flatten())
+            .and_then(|m| m.handlers.iter().find(|h| h.id == was))
+            .and_then(|h| h.reason.clone())
+            .unwrap_or_else(|| format!("handler {was} is gone"));
+        let note = serde_json::json!({"was": was, "now": now, "why": why});
+        match rec.context.as_object_mut() {
+            Some(c) => {
+                c.insert("handler".into(), note);
+            }
+            None => rec.context = serde_json::json!({ "handler": note }),
+        }
+        rec.handler = Some(now);
+        rec.capture_rate_hz = None;
+        Ok(())
+    }
+
     /// Whether `open` relaunches `rec`: it is `Running`, or it `Failed` only
     /// because its source was absent and that source is now attached, or (an
     /// attached job) only because its input job was not running and it now runs. A

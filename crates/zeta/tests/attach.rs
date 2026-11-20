@@ -93,6 +93,8 @@ async fn start(node: &Node, kind: JobKind, bandwidth_hz: u64) -> JobId {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -295,6 +297,8 @@ async fn job_start_with_transcribe_is_refused() {
             dwell_scale: None,
             elastic: false,
             replace: vec![],
+            handler: None,
+            needs: vec![],
         })
         .await;
     assert_eq!(
@@ -540,6 +544,8 @@ fn job_start_op(kind: &str, source: SourceId, center_hz: u64, bandwidth_hz: u64)
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     }
 }
 
@@ -666,7 +672,11 @@ async fn a_packets_attachment_writes_a_capture_wireshark_reads() {
     let (link, packets) = read_capture(r);
     assert_eq!(link, 202);
     assert!(packets.len() >= 2, "{packets:?}");
-    let comment = format!("job={} source=aprs freq_hz={}", job.0, common::APRS_HZ);
+    let comment = format!(
+        "job={} handler=builtin source=aprs freq_hz={}",
+        job.0,
+        common::APRS_HZ
+    );
     until("each packet's event", Duration::from_secs(5), || {
         packets.iter().all(|p| event_at(&events, p.t_ns).is_some())
     })
@@ -807,7 +817,7 @@ async fn a_retuned_input_is_captured_into_a_fresh_file_with_its_new_frequency() 
     let (_, packets) = read_capture(new);
     assert_eq!(
         packets[0].comment.as_deref(),
-        Some(format!("job={} source=aprs freq_hz={up}", job.0).as_str())
+        Some(format!("job={} handler=builtin source=aprs freq_hz={up}", job.0).as_str())
     );
     let frame = zeta_dsp::ax25::parse_ax25_ui(&packets[0].data[1..]).unwrap();
     assert_eq!(frame.src, common::APRS_CALLS[1], "the station above");

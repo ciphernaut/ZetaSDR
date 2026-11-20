@@ -1,8 +1,11 @@
 //! `external_decode`: a mode row's external program run as a stage (spec 5.2).
 //!
-//! The params are `{"mode": "<row id>"}` only: the program block (programs, args,
-//! input, output, parser) is resolved from the loaded [`ModeRegistry`] at launch, never
-//! taken from the graph, so a `graph_put` cannot run an arbitrary program. The stage
+//! The params are `{"mode": "<row id>"}`, with `"handler": "<id>"` for a handler file's
+//! program in place of the row's own: the program block (programs, args, input, output,
+//! parser) is resolved from the loaded [`ModeRegistry`] at launch
+//! ([`ModeRegistry::program_block`]), never taken from the graph, so a `graph_put`
+//! cannot run an arbitrary program. Every event carries the handler's id (`handler`; a
+//! program row's own is its first program). The stage
 //! reaches the registry through a [`ModesHandle`] set once the registry is loaded (the
 //! stage registry the rows validate against is built first) and replaced on a reload,
 //! read at each run; a run with the handle still empty fails `external_decode: no mode
@@ -94,13 +97,17 @@ pub const WAV_STREAM_SIZE: u32 = 0xFFFF_FFFF;
 /// run reads the rows the handle holds when it starts.
 pub use zeta_core::modes::ModesHandle;
 
-/// `external_decode`'s params: the row to run.
+/// `external_decode`'s params: the row to run, and which of its handlers.
 #[derive(JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct ExternalParams {
-    /// A program row's id (`modes_list`).
+    /// A mode's id (`modes_list`).
     pub mode: String,
+    /// The handler whose program runs, one of the mode's `handlers`; absent for the
+    /// row's own (a program row's decoder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler: Option<String>,
 }
 
 /// IQ or audio in (as the row's `input.stream` says), one event per parsed output line
@@ -154,17 +161,41 @@ impl ExternalDecodeStage {
     }
 }
 
-/// The ready program row `id` of the registry `handle` holds and the program it runs:
-/// the registry's probed program, else (a registry nobody probed, as in tests) the row's
-/// `programs` looked up now. Shared by `external_decode` and the `adsb_decode` alias so
-/// both apply the same readiness rules. Failures: `<prefix>: no mode registry`,
-/// `<prefix>: unknown mode <id>`, `<id>: <reason>` for a row that is not ready,
+/// The ready program row `id` of the registry `handle` holds and the program it runs (its
+/// own handler's): the registry's probed program, else (a registry nobody probed, as in
+/// tests) the row's `programs` looked up now. Shared by `external_decode` and the
+/// `adsb_decode` alias so both apply the same readiness rules. Failures: `<prefix>: no
+/// mode registry`, `<prefix>: unknown mode <id>`, `<id>: <reason>` for a row that is not ready,
 /// `<prefix>: mode <id> is not a program row`, `<id>: no program found (tried ...)`.
 pub(crate) fn resolve(
     handle: &ModesHandle,
     id: &str,
     prefix: &str,
-) -> Result<(ModeRow, PathBuf), StageError> {
+) -> Result<Resolved, StageError> {
+    resolve_handler(handle, id, None, prefix)
+}
+
+/// What a run of a mode's program needs: the row (its envelope), the program block that
+/// runs (the row's own, or a handler file's entry), the program found, and the handler's
+/// id every event carries.
+pub(crate) struct Resolved {
+    pub row: ModeRow,
+    pub block: ProgramBlock,
+    pub program: PathBuf,
+    pub handler: String,
+}
+
+/// [`resolve`] of the handler `handler` of mode `id` (`None`: the row's own, as
+/// `resolve`): its block from [`ModeRegistry::program_block`], its probed program, else
+/// its `programs` looked up now. Beyond `resolve`'s failures: `<prefix>: mode <id> has no
+/// handler <h>`, `<id>: <reason>` for a handler that is not ready, `<prefix>: handler
+/// <h> of mode <id> runs no program`.
+pub(crate) fn resolve_handler(
+    handle: &ModesHandle,
+    id: &str,
+    handler: Option<&str>,
+    prefix: &str,
+) -> Result<Resolved, StageError> {
     let failed = |m: String| StageError::Failed(m);
     let reg = handle
         .get()
@@ -172,26 +203,62 @@ pub(crate) fn resolve(
     let m = reg
         .get(id)
         .ok_or_else(|| failed(format!("{prefix}: unknown mode {id}")))?;
-    if m.state != ModeState::Ready {
+    let Some(h) = handler else {
+        if m.state != ModeState::Ready {
+            return Err(failed(format!(
+                "{id}: {}",
+                m.reason.as_deref().unwrap_or("not ready")
+            )));
+        }
+        let Decoder::Program(block) = &m.row.decoder else {
+            return Err(failed(format!("{prefix}: mode {id} is not a program row")));
+        };
+        let program = find_program(m.program.clone(), block, id)?;
+        return Ok(Resolved {
+            row: m.row.clone(),
+            block: block.clone(),
+            program,
+            handler: m.own_handler(),
+        });
+    };
+    let found = m
+        .handler(Some(h))
+        .ok_or_else(|| failed(format!("{prefix}: mode {id} has no handler {h}")))?;
+    if found.state != ModeState::Ready {
         return Err(failed(format!(
             "{id}: {}",
-            m.reason.as_deref().unwrap_or("not ready")
+            found.reason.as_deref().unwrap_or("not ready")
         )));
     }
-    let Decoder::Program(block) = &m.row.decoder else {
-        return Err(failed(format!("{prefix}: mode {id} is not a program row")));
-    };
-    let program = m
-        .program
-        .clone()
+    let block = reg.program_block(id, h).ok_or_else(|| {
+        failed(format!(
+            "{prefix}: handler {h} of mode {id} runs no program"
+        ))
+    })?;
+    let program = find_program(found.program, &block, id)?;
+    Ok(Resolved {
+        row: m.row.clone(),
+        block,
+        program,
+        handler: h.to_string(),
+    })
+}
+
+/// `probed`, else the first of `block`'s programs found now; `<id>: no program found
+/// (tried ...)` when none is.
+fn find_program(
+    probed: Option<PathBuf>,
+    block: &ProgramBlock,
+    id: &str,
+) -> Result<PathBuf, StageError> {
+    probed
         .or_else(|| proc::find_handler(&block.programs))
         .ok_or_else(|| {
-            failed(format!(
+            StageError::Failed(format!(
                 "{id}: no program found (tried {})",
                 block.programs.join(", ")
             ))
-        })?;
-    Ok((m.row.clone(), program))
+        })
 }
 
 #[async_trait]
@@ -204,14 +271,21 @@ impl Stage for ExternalDecodeStage {
         Backend::Cpu
     }
 
-    /// Events, and packets after them when the row the params name has a `packets`
-    /// block; events only for a row the handle does not hold (the run then fails).
+    /// Events, and packets after them when the program block of the handler the params
+    /// name (absent: the row's own) has a `packets` block; events only for a mode or
+    /// handler the handle does not hold (the run then fails).
     fn outputs_for(&self, params: &serde_json::Value) -> Vec<StreamKind> {
         let mode = params.get("mode").and_then(Value::as_str);
+        let handler = params.get("handler").and_then(Value::as_str);
         let packets = mode.zip(self.modes.get()).is_some_and(|(id, reg)| {
-            reg.get(id).is_some_and(
-                |m| matches!(&m.row.decoder, Decoder::Program(b) if b.packets.is_some()),
-            )
+            let block = match handler {
+                Some(h) => reg.program_block(id, h),
+                None => reg.get(id).and_then(|m| match &m.row.decoder {
+                    Decoder::Program(b) => Some(b.clone()),
+                    _ => None,
+                }),
+            };
+            block.is_some_and(|b| b.packets.is_some())
         });
         match packets {
             true => vec![StreamKind::Event, StreamKind::Packet],
@@ -230,21 +304,44 @@ impl Stage for ExternalDecodeStage {
     ) -> Result<(), StageError> {
         let p: ExternalParams = serde_json::from_value(params)
             .map_err(|e| StageError::Failed(format!("external_decode params: {e}")))?;
-        let (row, program) = resolve(&self.modes, &p.mode, EXTERNAL_DECODE_KIND)?;
+        let r = resolve_handler(
+            &self.modes,
+            &p.mode,
+            p.handler.as_deref(),
+            EXTERNAL_DECODE_KIND,
+        )?;
         let run_dir = self.run_dir.as_deref();
+        let program = Program {
+            row: &r.row,
+            block: &r.block,
+            path: &r.program,
+            handler: &r.handler,
+        };
         run_row(
-            &row, &program, &self.env, run_dir, inputs, outputs, bus, cancel, ctx,
+            program, &self.env, run_dir, inputs, outputs, bus, cancel, ctx,
         )
         .await
     }
 }
 
-/// Run `program` as program row `row`'s decoder (see the module docs), a fifo input in
-/// a directory of its own under `run_dir`. `row` must be a program row.
+/// What [`run_row`] runs: a mode's program, as one of its handlers gives it.
+#[derive(Clone, Copy)]
+pub struct Program<'a> {
+    /// The mode's row: its id names the run, its envelope wraps the events.
+    pub row: &'a ModeRow,
+    /// The program block that runs (the row's own decoder, or a handler file's entry).
+    pub block: &'a ProgramBlock,
+    /// The program found for it.
+    pub path: &'a Path,
+    /// The handler's id, which every event carries.
+    pub handler: &'a str,
+}
+
+/// Run `p`'s program as its mode's decoder (see the module docs), a fifo input in a
+/// directory of its own under `run_dir`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_row(
-    row: &ModeRow,
-    program: &Path,
+    p: Program<'_>,
     env: &[(OsString, OsString)],
     run_dir: Option<&Path>,
     mut inputs: Vec<broadcast::Receiver<Frame>>,
@@ -253,11 +350,9 @@ pub async fn run_row(
     cancel: CancellationToken,
     ctx: StageContext,
 ) -> Result<(), StageError> {
+    let (row, block, program) = (p.row, p.block, p.path);
     let id = row.id.0.as_str();
     let fail = |m: String| StageError::Failed(format!("{id}: {m}"));
-    let Decoder::Program(block) = &row.decoder else {
-        return Err(fail("not a program row".into()));
-    };
     let Some(out) = outputs.first().cloned() else {
         return Err(fail("expected 1 output".into()));
     };
@@ -442,6 +537,7 @@ pub async fn run_row(
     };
     let publisher = Publisher {
         row,
+        handler: p.handler,
         parser: block.output.parser,
         fields: block.output.fields.as_ref(),
         out,
@@ -604,6 +700,8 @@ fn parser_name(p: Parser) -> String {
 /// Turns output lines into published events, counting the unreadable ones.
 struct Publisher<'a> {
     row: &'a ModeRow,
+    /// The handler whose program runs, named in every event.
+    handler: &'a str,
     parser: Parser,
     fields: Option<&'a BTreeMap<String, FieldPath>>,
     out: StreamId,
@@ -755,7 +853,12 @@ impl Publisher<'_> {
             fields = apply_fields(map, &fields);
         }
         let prov = provenance(&self.last_prov, self.source);
-        let ev = zeta_core::modes::summary::envelope(self.row, prov.span.start_ns.0, fields);
+        let ev = zeta_core::modes::summary::envelope(
+            self.row,
+            self.handler,
+            prov.span.start_ns.0,
+            fields,
+        );
         self.bus
             .publish(Frame::new(self.out.clone(), prov, Payload::Event(ev)));
     }

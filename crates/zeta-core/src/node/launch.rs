@@ -150,6 +150,9 @@ impl Inner {
                 Some(port)
             }
         };
+        // The handler that runs now: the record's while it is ready, else a chosen one
+        // chosen again (noted, the graph expanded for it below) and a named one failed.
+        self.rehandle(&mut rec)?;
         // A graph stored before the squelch gets its params (persisted with the record).
         crate::ops::fill_squelch_params(&mut rec.graph);
         let mut stages = self.stages(&rec.graph)?;
@@ -873,6 +876,7 @@ impl Inner {
             bin_rate,
             &rec.graph,
             policy,
+            rec.handler.as_deref(),
             modes,
         );
         // At the same rate the stored graph stands while one of today's expansions (on
@@ -886,6 +890,7 @@ impl Inner {
                     None,
                     &rec.graph,
                     policy,
+                    rec.handler.as_deref(),
                     modes,
                 )
             };
@@ -935,6 +940,7 @@ impl Inner {
                 bin_rate,
                 &rec.graph,
                 rec.audio_policy,
+                rec.handler.as_deref(),
                 &self.modes(),
             )
             .map_err(NodeError::Expand)?;
@@ -1076,9 +1082,9 @@ impl Inner {
     /// Point the attached record `rec`'s graph at its input job `input` as it runs now:
     /// each `stream_in` node at the input's stream of the node's own `kind` (`packet`:
     /// [`Inner::packet_stream`]; else audio, the record's voice `rec.stream` or the
-    /// main stream), and each `packet_capture` node's `job`, `center_hz`, `mode` and
-    /// `access` from the input's record and its kind's mode row, so a relaunch after the
-    /// input's retune captures under its new centre. `InputNotRunning`,
+    /// main stream), and each `packet_capture` node's `job`, `center_hz`, `mode`,
+    /// `access` and `handler` from the input's record and its kind's mode row, so a
+    /// relaunch after the input's retune captures under its new centre. `InputNotRunning`,
     /// `NoAudioStream`, `NoVoice` or `NoPacketStream` when a stream is not there; for a
     /// `packet_capture`, `Other` with the attach's refusal when the input's row is now
     /// restricted or cannot be read ([`crate::ops::capture_row`]).
@@ -1113,12 +1119,13 @@ impl Inner {
         {
             return Ok(());
         }
-        let (kind, center_hz) = {
+        let (kind, center_hz, handler) = {
             let jobs = self.jobs.lock().unwrap();
             let e = jobs
                 .get(input)
                 .ok_or_else(|| NodeError::InputNotRunning(input.clone()))?;
-            (e.record.kind.clone(), e.record.tuning.center_hz)
+            let r = &e.record;
+            (r.kind.clone(), r.tuning.center_hz, r.handler.clone())
         };
         // The attach's row check again: a row edited to restricted, or made unreadable,
         // since the attach ends the capture here (the relaunch fails it with the reason).
@@ -1150,6 +1157,12 @@ impl Inner {
         {
             if let (Some(p), Some(fill)) = (n.params.as_object_mut(), fill.as_object()) {
                 p.extend(fill.clone());
+                // The handler the input runs now (one chosen again at its relaunch), named
+                // only when it has one.
+                match &handler {
+                    Some(h) => p.insert("handler".into(), h.clone().into()),
+                    None => p.remove("handler"),
+                };
             }
         }
         Ok(())

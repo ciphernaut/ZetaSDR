@@ -695,6 +695,8 @@ async fn measure_emits_partials_when_the_input_gaps_every_400_ms() {
             dwell_scale: None,
             elastic: false,
             replace: vec![],
+            handler: None,
+            needs: vec![],
         })
         .await
     {

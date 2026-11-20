@@ -191,6 +191,8 @@ async fn start_as(node: &Node, kind: JobKind, band: Tuning, elastic: bool) -> Jo
         dwell_scale: None,
         elastic,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,

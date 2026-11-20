@@ -431,6 +431,7 @@ fn new_packet_capture() -> zeta_core::packets::NewPacketCapture {
         link_type: zeta_core::stream::LinkType::Ax25Kiss,
         mode: None,
         access: None,
+        handler: None,
     }
 }
 

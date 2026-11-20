@@ -284,6 +284,8 @@ fn running() -> JobRecord {
         audio_policy: None,
         stream: None,
         sinks: Vec::new(),
+        handler: None,
+        handler_named: false,
     }
 }
 

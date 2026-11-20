@@ -524,6 +524,8 @@ fn op_name_matches_the_serialised_tag() {
             dwell_scale: None,
             elastic: false,
             replace: vec![],
+            handler: None,
+            needs: vec![],
         },
         Op::JobRetune {
             job: JobId("j".into()),
@@ -620,6 +622,8 @@ async fn read_only_ops_are_logged_without_their_result() {
             dwell_scale: None,
             elastic: false,
             replace: vec![],
+            handler: None,
+            needs: vec![],
         })
         .await
         .unwrap()
@@ -679,6 +683,8 @@ fn job_start(kind: JobKind, bandwidth_hz: u64) -> Op {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     }
 }
 

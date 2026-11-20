@@ -789,6 +789,8 @@ async fn a_scan_with_bits_on_a_node_source_is_refused_at_job_start() {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     match local.apply(op).await {
         Err(zeta_core::ops::OpError::Other { message }) => {

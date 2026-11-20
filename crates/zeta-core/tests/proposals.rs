@@ -276,6 +276,8 @@ async fn capture_job(node: &Node, bursts: u32) -> JobId {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     let job = match node.apply(op).await {
         Ok(OpResult::Job(j)) => j,
@@ -648,6 +650,8 @@ async fn frame_row_job(node: &Node) -> JobId {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,

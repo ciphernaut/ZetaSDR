@@ -1832,6 +1832,8 @@ impl Command {
                 dwell_scale,
                 elastic,
                 replace: replace.into_ids(),
+                handler: None,
+                needs: vec![],
             },
             Command::Job(JobCmd::Attach {
                 kind,

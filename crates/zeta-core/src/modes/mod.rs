@@ -110,6 +110,33 @@ pub struct LoadedMode {
     pub handlers: Vec<ModeHandler>,
 }
 
+impl LoadedMode {
+    /// Whether a start that names no handler can run the mode: one of its handlers is
+    /// ready, the row's own or a handler file's (the state `modes_list` reports). Every
+    /// caller that starts a decoder with `handler: null` (identify, a watch, a set, a
+    /// plan) asks this, never the row's own `state` alone.
+    pub fn startable(&self) -> bool {
+        self.state == ModeState::Ready || self.handlers.iter().any(|h| h.state == ModeState::Ready)
+    }
+
+    /// The id of the row's own handler: `builtin` for a graph or frame row, its first
+    /// program for a program row.
+    pub fn own_handler(&self) -> String {
+        handler_file::own_handler_id(&self.row)
+    }
+
+    /// The mode's handler `id` (`None`: the row's own); `None` when it has none of that
+    /// id. (A mode listed without its handlers still has the row's own.)
+    pub fn handler(&self, id: Option<&str>) -> Option<ModeHandler> {
+        let own = self.own_handler();
+        let id = id.unwrap_or(&own);
+        match self.handlers.iter().find(|h| h.id == id) {
+            Some(h) => Some(h.clone()),
+            None => (id == own).then(|| own_handler(self)),
+        }
+    }
+}
+
 /// One handler of a mode: the row's own decoder, or a handler file's entry for the mode.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModeHandler {
@@ -137,6 +164,30 @@ pub struct ModeHandler {
     pub checked: Option<u64>,
     /// The file it comes from: the row's for the row's own, the handler file's otherwise.
     pub file: String,
+}
+
+impl ModeHandler {
+    /// `row`'s own handler as a ready row has it, before any probe: what a graph of the
+    /// row alone (no registry) is expanded for.
+    pub fn of_row(row: &ModeRow) -> ModeHandler {
+        let id = handler_file::own_handler_id(row);
+        let in_process = !matches!(row.decoder, Decoder::Program(_));
+        ModeHandler {
+            name: match in_process {
+                true => "built-in".into(),
+                false => id.clone(),
+            },
+            id,
+            in_process,
+            outputs: Vec::new(),
+            state: ModeState::Ready,
+            reason: None,
+            program: None,
+            missing: Vec::new(),
+            checked: None,
+            file: String::new(),
+        }
+    }
 }
 
 /// One handler file as the registry holds it.

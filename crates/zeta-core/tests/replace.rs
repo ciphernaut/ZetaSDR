@@ -196,6 +196,8 @@ fn start_on(source: &str, kind: JobKind, t: Tuning, elastic: bool, replace: &[&J
         dwell_scale: None,
         elastic,
         replace: replace.iter().map(|j| (*j).clone()).collect(),
+        handler: None,
+        needs: vec![],
     }
 }
 
@@ -656,6 +658,8 @@ async fn a_different_deviation_is_not_a_duplicate() {
         dwell_scale: None,
         elastic: false,
         replace: vec![],
+        handler: None,
+        needs: vec![],
     };
     let a = started(&node, fm(None)).await;
     let second = started(&node, fm(Some(2500))).await;
