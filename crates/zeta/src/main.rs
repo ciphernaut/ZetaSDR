@@ -130,7 +130,12 @@ async fn main() -> ExitCode {
         };
         return print(serde_json::to_string_pretty(&e), 2);
     }
-    if let cli::Command::Modes(cli::ModesCmd::Check { id, strict }) = cli.command {
+    if let cli::Command::Modes(cli::ModesCmd::Check {
+        id,
+        strict,
+        handler,
+    }) = cli.command
+    {
         return modes_check::run(
             state_dir,
             cli.modes_dir,
@@ -138,7 +143,18 @@ async fn main() -> ExitCode {
             cli.run_dir,
             &plugins,
             id,
+            handler,
             strict,
+        )
+        .await;
+    }
+    if let cli::Command::Handlers(cli::HandlersCmd::List) = cli.command {
+        return handlers_list(
+            &state_dir,
+            cli.modes_dir,
+            cli.handlers_dir,
+            cli.run_dir,
+            &plugins,
         )
         .await;
     }
@@ -443,6 +459,59 @@ fn tail_log(
         println!("{line}");
     }
     ExitCode::SUCCESS
+}
+
+/// `handlers list`: load this machine's mode rows and handler files as a node would (the
+/// programs looked up, never run) and print one line per handler of each mode, the row's own
+/// first: `<mode> <handler id> <state> <outputs>`, the outputs comma-separated (`-` for
+/// none).
+async fn handlers_list(
+    state_dir: &std::path::Path,
+    modes_dir: Option<std::path::PathBuf>,
+    handlers_dir: Option<std::path::PathBuf>,
+    run_dir: Option<std::path::PathBuf>,
+    plugins: &[sources::PluginSpec],
+) -> ExitCode {
+    let loaded =
+        node_setup::load_modes(state_dir, run_dir, plugins, None, modes_dir, handlers_dir).await;
+    let handle = match loaded {
+        Ok((_, handle, _, _)) => handle,
+        Err(e) => return fail(&e),
+    };
+    let modes = handle.get().unwrap_or_default();
+    for m in modes.all() {
+        // A mode listed without its handlers still has the row's own.
+        let handlers = match m.handlers.is_empty() {
+            true => m.handler(None).into_iter().collect(),
+            false => m.handlers.clone(),
+        };
+        for h in handlers {
+            let outputs: Vec<String> = h
+                .outputs
+                .iter()
+                .map(|k| word(serde_json::to_value(k)))
+                .collect();
+            let outputs = match outputs.is_empty() {
+                true => "-".to_string(),
+                false => outputs.join(","),
+            };
+            println!(
+                "{} {} {} {outputs}",
+                m.row.id.0,
+                h.id,
+                word(serde_json::to_value(h.state))
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// A unit enum value as the operation set spells it (`ready`, `packet`), from its
+/// `serde_json::to_value`.
+fn word(v: serde_json::Result<serde_json::Value>) -> String {
+    v.ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default()
 }
 
 /// Print serialised JSON on stdout and return `code`.

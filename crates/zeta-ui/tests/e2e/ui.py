@@ -10922,6 +10922,46 @@ def scenario_packet_capture(page, url, secret):
             capture_ops(url, secret, "packets_delete", capture=c["id"])
 
 
+def scenario_handler_named_on_job_row(page, url, secret):
+    # `aprs_decode` has two handlers on the suite's node: its own (`builtin`) and `alt`, a
+    # handler file running fake_lines with no packet output (ui.rs `fake_handlers`). A job of
+    # each on `aprs`: each row names the handler it runs, and only the built-in job's menu
+    # offers Capture packets, though the mode's `outputs` (the union) list `packet` for both.
+    modes = http_json(url, secret, "/op", {"op": "modes_list", "family": None,
+                                           "state": None})["value"]["modes"]
+    aprs = next(m for m in modes if m["id"] == "aprs_decode")
+    handlers = {h["id"]: h for h in aprs["handlers"]}
+    assert sorted(handlers) == ["alt", "builtin"], aprs["handlers"]
+    assert "packet" in aprs["outputs"], aprs["outputs"]
+    assert "packet" not in handlers["alt"]["outputs"], handlers["alt"]
+    select_source(page, url, secret, "aprs")
+    jobs = {}
+    menu = page.locator("#ctx-outline")
+    try:
+        for h in ("builtin", "alt"):
+            jobs[h] = http_json(url, secret, "/op", {
+                "op": "job_start", "kind": "aprs_decode", "source": "aprs",
+                "center_hz": 144_800_000, "bandwidth_hz": 12_500, "deviation_hz": None,
+                "sideband": None, "elastic": False, "replace": [], "handler": h})["value"]
+        for h, job in jobs.items():
+            tag = job_row(page, job).locator(".kind .tag.handler")
+            expect(tag).to_have_text(handlers[h]["name"], timeout=15_000)
+            expect(job_row(page, job)).to_contain_text(handlers[h]["name"])
+        # The built-in job first: its menu offers the capture once modes_list is read, so
+        # the alt job's menu below is drawn from the same rows.
+        job_row(page, jobs["builtin"]).locator("button.more").click()
+        expect(menu_item(page, "packets", "#ctx-outline")).to_have_text("Capture packets")
+        close_menu(page, "#ctx-outline")
+        job_row(page, jobs["alt"]).locator("button.more").click()
+        expect(menu).to_be_visible()
+        expect(menu.locator('.ctx-item[data-action="stop"]')).to_have_count(1)
+        expect(menu.locator('.ctx-item[data-action="packets"]')).to_have_count(0)
+        close_menu(page, "#ctx-outline")
+    finally:
+        for job in jobs.values():
+            stop_job(url, secret, job)
+
+
 def scenario_explore_delete_all_removes_every_capture(page, url, secret):
     clear_captures(url, secret)
     job = start_job(url, secret, "capture", "tone", 100_001_000, 6_000)

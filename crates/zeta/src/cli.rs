@@ -10,7 +10,9 @@ use zeta_core::ops::{
 };
 use zeta_core::signatures::SignatureState;
 use zeta_core::station::{Antenna, AntennaKind, Station};
-use zeta_core::types::{Baud, Hz, JobId, Selection, SourceId, Span, StreamId, Timestamp};
+use zeta_core::types::{
+    Baud, Hz, JobId, Selection, SourceId, Span, StreamId, StreamKind, Timestamp,
+};
 
 use crate::sources::{self, PluginSpec, SourceSpec};
 
@@ -396,6 +398,9 @@ pub enum Command {
     /// The decoder modes the node knows
     #[command(subcommand)]
     Modes(ModesCmd),
+    /// The handlers of the decoder modes, and the policy that picks one
+    #[command(subcommand)]
+    Handlers(HandlersCmd),
     /// The themes the page can use
     #[command(subcommand)]
     Themes(ThemesCmd),
@@ -913,7 +918,55 @@ pub enum ModesCmd {
         /// A mode without a test, or whose program is missing, fails instead of being skipped
         #[arg(long)]
         strict: bool,
+        /// Check this handler of the mode (`handlers list`) instead of the row's own; without
+        /// a mode id, every mode that has it. A pass is recorded as `<mode>@<handler>`
+        #[arg(long, value_name = "ID")]
+        handler: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HandlersCmd {
+    /// One line per handler of each mode: mode, id, state, outputs (local: this machine's
+    /// mode rows and handler files)
+    List,
+    /// The operator's ranking of handlers, which the policy picking a mode's handler reads
+    #[command(subcommand)]
+    Policy(HandlerPolicyCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HandlerPolicyCmd {
+    /// Print the handler policy
+    Get,
+    /// Rank a mode's handlers, first preferred, or with no --mode every mode's (the
+    /// node-wide ranking); no handlers clears that ranking
+    Set {
+        /// The mode (from `modes list`); absent = the node-wide ranking
+        #[arg(long, value_name = "ID")]
+        mode: Option<String>,
+        /// Handler ids of the mode (`handlers list`), first preferred
+        #[arg(value_name = "HANDLER")]
+        handlers: Vec<String>,
+    },
+}
+
+/// `job start --needs`: a stream kind the job must output.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum NeedArg {
+    Event,
+    Packet,
+    Audio,
+}
+
+impl From<NeedArg> for StreamKind {
+    fn from(n: NeedArg) -> Self {
+        match n {
+            NeedArg::Event => StreamKind::Event,
+            NeedArg::Packet => StreamKind::Packet,
+            NeedArg::Audio => StreamKind::Audio,
+        }
+    }
 }
 
 /// `--family`, spelled as the operation set spells it (`amateur_digital`).
@@ -1327,6 +1380,14 @@ pub enum JobCmd {
         /// unless its own dwell is longer; absent = 1
         #[arg(long, value_name = "N")]
         dwell_scale: Option<u32>,
+        /// A mode only: the handler to run, one of the mode's (`handlers list`); absent =
+        /// the handler policy's choice (`handlers policy get`)
+        #[arg(long, value_name = "ID")]
+        handler: Option<String>,
+        /// A mode only: the stream kinds the job must output (`packet` for a job to
+        /// capture); the policy passes over a handler without them
+        #[arg(long, value_enum, value_name = "KIND", num_args = 1.., value_delimiter = ',')]
+        needs: Vec<NeedArg>,
         /// spectrum only: follow the source's capture instead of holding it
         /// (never conflicts; relaunched under the same id on every retune)
         #[arg(long)]
@@ -1703,6 +1764,7 @@ impl Command {
                 | Command::Mix(MixCmd::Start { .. })
                 | Command::Bits(BitsCmd::Start { .. })
                 | Command::Station(StationCmd::Set { .. } | StationCmd::Clear)
+                | Command::Handlers(HandlersCmd::Policy(HandlerPolicyCmd::Set { .. }))
                 | Command::Capture(CaptureCmd::Delete { .. })
                 | Command::Packets(PacketsCmd::Delete { .. })
                 | Command::Signature(
@@ -1813,6 +1875,8 @@ impl Command {
                 bin_hz,
                 audio_policy,
                 dwell_scale,
+                handler,
+                needs,
                 elastic,
                 replace,
                 ..
@@ -1832,8 +1896,8 @@ impl Command {
                 dwell_scale,
                 elastic,
                 replace: replace.into_ids(),
-                handler: None,
-                needs: vec![],
+                handler,
+                needs: needs.into_iter().map(Into::into).collect(),
             },
             Command::Job(JobCmd::Attach {
                 kind,
@@ -2020,6 +2084,15 @@ impl Command {
             }
             Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
+            Command::Handlers(HandlersCmd::Policy(HandlerPolicyCmd::Get)) => {
+                Op::HandlerPolicyGet {}
+            }
+            Command::Handlers(HandlersCmd::Policy(HandlerPolicyCmd::Set { mode, handlers })) => {
+                Op::HandlerPolicySet {
+                    mode: mode.map(zeta_core::modes::ModeId),
+                    order: handlers,
+                }
+            }
             Command::Themes(ThemesCmd::List) => Op::ThemesList {},
             Command::Sets => Op::SetList {},
             Command::Set(SetCmd::Start {
@@ -2045,6 +2118,7 @@ impl Command {
             | Command::SoapyWorker(_)
             | Command::Ops(_)
             | Command::Modes(ModesCmd::Check { .. })
+            | Command::Handlers(HandlersCmd::List)
             | Command::Registers(_)
             | Command::Transcripts(_)
             | Command::Events(_)

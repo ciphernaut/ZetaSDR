@@ -47,6 +47,11 @@
 //   runAction(id, ctx)  runs an entry that applies to ctx (agent.js's row buttons)
 //   rowRanges(row), rowMeets(row, sel), rowFits(id, row, sel)   what the box's decoder entries
 //            read from modes_list (see Offered)
+//   jobHandler(job, row) -> the entry of `row.handlers` the job runs (its `handler`), or
+//            undefined; jobOutputs(job, row) -> the stream kinds the job emits: that handler's
+//            `outputs`, else the row's own (a job with no `handler`), [] without a row. A mode's
+//            `outputs` are the union over its ready handlers, so a job is judged by its own
+//            handler's (the packets entry here, agent.js's audio rule)
 //
 // Offered: nothing the node would accept is hidden. Every decoder and demodulator entry is on
 // the box menu; a decoder whose row does not fit the selection (rowFits: the width the entry
@@ -225,10 +230,13 @@
 //   transcribe Transcribe  (Next) the row's Transcribe: transcribe(job, {role}), job_attach
 //                          kind=transcribe; a running job with audio
 //   packets Capture packets  (Next, after Transcribe) job_attach kind=packets on a running job
-//                          whose modes_list row's `outputs` lists `packet` (aprs_decode and the
-//                          frame rows), so the node writes its packets to a pcapng capture
-//                          (Explore lists it); reads `Stop packet capture` while a `packets`
-//                          job takes its input (job_stop on that job)
+//                          whose own outputs list `packet` (jobOutputs: the `outputs` of the
+//                          handler it runs, from its modes_list row's `handlers`, never the
+//                          mode's union; the row's `outputs` for a job with no `handler`:
+//                          aprs_decode's built-in and the frame rows), so the node writes its
+//                          packets to a pcapng capture (Explore lists it); reads `Stop packet
+//                          capture` while a `packets` job takes its input (job_stop on that
+//                          job)
 //   classify, identify, measure, watch  (Next, after Listen and Transcribe under the heading
 //                          `On its band`, with no heading when those two are not offered) the
 //                          box entries' runs on the job's band (`sel`,
@@ -308,6 +316,24 @@ export function rowFits(id, row, sel) {
 // The modes_list row of job kind `kind` in ctx (undefined before the rows are read).
 const rowOf = (c, kind) => (c.rows || []).find((r) => r.id === kind);
 
+// The handler job `job` (a job_list record) runs, from its mode row `row` (modes_list's, or
+// modes_show's as subjects.js keeps it, with `handlers`): the entry whose `id` is the job's
+// `handler`; undefined for a job with no `handler`, a row not read yet, or a handler the row
+// does not list.
+export function jobHandler(job, row) {
+  if (!job || job.handler == null || !row) return undefined;
+  return (row.handlers || []).find((h) => h.id === job.handler);
+}
+
+// The stream kinds `job` emits by its mode row `row`: its own handler's `outputs`
+// (jobHandler), not the mode's, which are the union over the mode's ready handlers; the
+// mode's `outputs` only for a job with no `handler` or one the row does not list; [] without a
+// row. The packets entry and agent.js's audio rule read it.
+export function jobOutputs(job, row) {
+  if (!row) return [];
+  return jobHandler(job, row)?.outputs ?? row.outputs ?? [];
+}
+
 // A job's band as usable for its next steps: a tuning with a width (a mix has none).
 const banded = (c) => {
   const t = c.job.tuning;
@@ -360,7 +386,7 @@ export const ACTIONS = [
   {
     id: "packets", group: "next", on: ["job"],
     label: (c) => (c.packets ? "Stop packet capture" : "Capture packets"),
-    applies: (c) => c.running && !c.job.input && (rowOf(c, c.job.kind)?.outputs || []).includes("packet"),
+    applies: (c) => c.running && !c.job.input && jobOutputs(c.job, rowOf(c, c.job.kind)).includes("packet"),
     run: (c) => c.host.capturePackets(c.job, c.packets),
   },
   demod("fm_demod", "NBFM audio", job("fm_demod", 5000)),

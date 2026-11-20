@@ -816,18 +816,25 @@ impl ModeRegistry {
     }
 
     /// Read `path` (`modes-checked.json` in the state directory: an object of UNIX
-    /// seconds by mode id) into each row's `checked`. A missing, unreadable or
-    /// malformed file, and ids no row has, are ignored: `checked` stays `None`.
+    /// seconds by mode id, and by `<mode id>@<handler id>` for a handler file's handler of
+    /// the mode) into each row's `checked` (its own handler's) and each other handler's. A
+    /// missing, unreadable or malformed file, and keys nothing has, are ignored: `checked`
+    /// stays `None`.
     pub fn load_checked(&mut self, path: &Path) {
         let checked = read_checked(path);
         for m in &mut self.modes {
             m.checked = checked.get(&m.row.id.0).copied();
             sync_own(m);
+            let mode = &m.row.id.0;
+            for h in m.handlers.iter_mut().skip(1) {
+                h.checked = checked.get(&format!("{mode}@{}", h.id)).copied();
+            }
         }
     }
 
-    /// Record in `path` (see [`ModeRegistry::load_checked`]) that `id`'s check passed at
-    /// `at` (UNIX seconds), keeping the other entries.
+    /// Record in `path` (see [`ModeRegistry::load_checked`]) that the check of `id` (a mode
+    /// id, or `<mode id>@<handler id>`) passed at `at` (UNIX seconds), keeping the other
+    /// entries.
     pub fn record_checked(path: &Path, id: &str, at: u64) -> std::io::Result<()> {
         let mut checked = read_checked(path);
         checked.insert(id.to_string(), at);

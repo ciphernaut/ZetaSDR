@@ -45,7 +45,10 @@
 //                               (tooltip: its power and floor, the neighbour's `adjacent_db`
 //                               when measured, and whether the guard holds it), removes it
 //                               otherwise (null: none seen)
-//   isAudioJob(job, rowOf)      AUDIO_KINDS, or a mode row whose `outputs` lists `audio` (startJobs' `audioKind`: kind -> row)
+//   isAudioJob(job, rowOf)      AUDIO_KINDS, or a job whose own outputs list `audio` (actions.js
+//                               jobOutputs: the outputs of the handler it runs, from its mode
+//                               row's `handlers`, never the mode's union; the row's `outputs`
+//                               for a job with no `handler`) (startJobs' `audioKind`: kind -> row)
 //   startJobs(api, el, transcript, {onJobs, onPlay, onTranscribe, onGraph, playing, squelch,
 //                                   view, position, onHot, shownSource})
 //                                                       -> {close, refresh, redraw}
@@ -63,7 +66,11 @@
 //       (the id in sessionStorage[AUTO_SCAN_KEY], coarse.js) reads `scan auto`; a scan the
 //       page did not start reads `scan`. A scan its source sweeps for itself (its
 //       `context.scan.method`, or its fft node's `method`, is `source`) carries a `.tag.method`
-//       reading `source`. Each row shows kind, source,
+//       reading `source`. A job whose mode row (audioKind) lists more than one handler
+//       carries a `.tag.handler` in its `.kind` cell reading the `name` of the handler it runs
+//       (actions.js jobHandler: `built-in`, a program, a handler file's `name`; titled
+//       `handler <id> (named)` or `(the policy's choice)`); an attached row has none. Each
+//       row shows kind, source,
 //       state, id, an `.events` cell (filled by overlays.js: a count of the job's events seen on its source's feed), on rows of an AUDIO_KINDS kind a
 //       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job, {role}) and, while
 //       running, a `button.transcribe` (Transcribe) calling onTranscribe(job, {role}) (ruling
@@ -153,7 +160,7 @@
 //       else the set whose running instance lists it in `running.members[].job` (`sets`:
 //       set_list's entries; `key` the set id, `title` its name)
 //   SET_STOP_CONFIRM_MS         how long a set group's Stop stays armed (3000)
-import { runAction } from "./actions.js";
+import { jobHandler, jobOutputs, runAction } from "./actions.js";
 import { channelColour } from "./overlays.js";
 import { mixCovering } from "./mix.js";
 import { channelLabel } from "./plans.js";
@@ -197,10 +204,11 @@ export const SET_STOP_CONFIRM_MS = 3000;
 // The row spans whose full text is their title (line two cuts them with an ellipsis).
 const TITLED = ["band", "source", "events"];
 export const AUDIO_KINDS = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod", "mix"];
-// Whether a job's row gets ▶ and Transcribe: its kind is a voice demodulator, or its mode
-// row's `outputs` (modes_list) lists `audio`. `rowOf(kind)` gives the row, or null/undefined.
+// Whether a job's row gets ▶ and Transcribe: its kind is a voice demodulator, or the job's own
+// outputs (actions.js jobOutputs: its handler's, from its mode row's `handlers`, else the row's
+// `outputs`) list `audio`. `rowOf(kind)` gives the row, or null/undefined.
 export function isAudioJob(job, rowOf) {
-  return AUDIO_KINDS.includes(job.kind) || !!rowOf?.(job.kind)?.outputs?.includes("audio");
+  return AUDIO_KINDS.includes(job.kind) || jobOutputs(job, rowOf?.(job.kind)).includes("audio");
 }
 export const SQUELCH_KINDS = ["fm_demod", "am_demod"];
 export const QUIET_OPS = new Set([
@@ -685,6 +693,9 @@ function jobRow(
     cells.splice(4, 0, ["band", bandText(t.center_hz, t.bandwidth_hz)]);
   }
   if (job.kind === "mix") cells.splice(4, 0, ["mix-now", mixText ? mixText(job) : ""]);
+  // A mode with more than one handler: the one this job runs, named in its kind cell.
+  const modeRow = attached ? null : audioKind?.(job.kind);
+  const handler = (modeRow?.handlers?.length ?? 0) > 1 ? jobHandler(job, modeRow) : undefined;
   for (const [cls, text] of cells) {
     const span = document.createElement("span");
     span.className = cls;
@@ -717,6 +728,14 @@ function jobRow(
       tag.dir = "auto";
       tag.textContent = "source";
       tag.title = "method: source; the source sweeps it for itself, holding no lease";
+      span.append(" ", tag);
+    }
+    if (cls === "kind" && handler) {
+      const tag = document.createElement("span");
+      tag.className = "tag handler";
+      tag.dir = "auto";
+      tag.textContent = handler.name;
+      tag.title = `handler ${handler.id}${job.handler_named ? " (named)" : " (the policy's choice)"}`;
       span.append(" ", tag);
     }
     if (cls === "kind" && job.kind === "scan" && job.id === autoScanId()) {

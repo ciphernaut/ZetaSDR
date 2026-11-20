@@ -487,6 +487,38 @@ fn job_start_replace_flag_round_trips_to_the_op() {
     assert_eq!(last_logged_op(dir.path())["replace"], serde_json::json!([]));
 }
 
+/// `job start --handler ID --needs KIND` reaches the op as `handler` and `needs` (the node
+/// here has no handler `alt` of `aprs_decode`, so it refuses the start; the op is logged).
+#[test]
+fn job_start_handler_and_needs_reach_the_op() {
+    let dir = tempfile::tempdir().unwrap();
+    zeta(
+        dir.path(),
+        &[
+            "job",
+            "start",
+            "--kind",
+            "aprs_decode",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "12500",
+            "--handler",
+            "alt",
+            "--needs",
+            "packet",
+        ],
+    )
+    .assert()
+    .code(2);
+    let op = last_logged_op(dir.path());
+    assert_eq!(op["op"], "job_start", "{op}");
+    assert_eq!(op["handler"], "alt", "{op}");
+    assert_eq!(op["needs"], serde_json::json!(["packet"]), "{op}");
+}
+
 #[test]
 fn source_ensure_replace_flag_round_trips_to_the_op() {
     let dir = tempfile::tempdir().unwrap();
@@ -4095,6 +4127,165 @@ fn station_set_get_clear_round_trip() {
         json(&out),
         serde_json::json!({"result": "station", "value": null})
     );
+}
+
+/// `handlers policy set` is a mutating command, refused beside a running serve as `station
+/// set` is; `handlers policy get` still reads.
+#[test]
+fn handlers_policy_set_is_refused_beside_serve_and_get_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let pid = std::process::id();
+    std::fs::write(state.join("serve.lock"), pid.to_string()).unwrap();
+    let want = format!("zeta serve (pid {pid}) owns this state dir");
+    for args in [
+        &[
+            "station", "set", "--lat", "-27.38", "--lon", "153.12", "--alt-m", "4",
+        ][..],
+        &[
+            "handlers",
+            "policy",
+            "set",
+            "--mode",
+            "adsb_decode",
+            "dump1090",
+        ][..],
+        &["handlers", "policy", "set"][..],
+    ] {
+        let out = zeta(dir.path(), args)
+            .assert()
+            .code(2)
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(json(&out)["message"], want.as_str(), "{args:?}");
+    }
+    let out = zeta(dir.path(), &["handlers", "policy", "get"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(json(&out)["result"], "handler_policy");
+}
+
+/// `handlers policy set` and `get` against a running node: a mode's ranking is set and read
+/// back, no handlers clears it, and no `--mode` is the node-wide ranking.
+#[test]
+fn handlers_policy_set_and_get_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = common::ServeProc::start(dir.path(), NODE_SECRET);
+    let remote = |args: &[&str]| {
+        json(
+            &common::zeta_remote(&node.url, NODE_SECRET, args)
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone(),
+        )
+    };
+    let set = remote(&[
+        "handlers",
+        "policy",
+        "set",
+        "--mode",
+        "adsb_decode",
+        "dump1090",
+    ]);
+    assert_eq!(set["result"], "handler_policy", "{set}");
+    assert_eq!(
+        set["value"],
+        serde_json::json!({"modes": {"adsb_decode": ["dump1090"]}, "all": []}),
+        "{set}"
+    );
+    assert_eq!(remote(&["handlers", "policy", "get"]), set);
+    let cleared = remote(&["handlers", "policy", "set", "--mode", "adsb_decode"]);
+    assert_eq!(
+        cleared["value"],
+        serde_json::json!({"modes": {}, "all": []}),
+        "{cleared}"
+    );
+    remote(&["handlers", "policy", "set"]);
+    let op = last_logged_op(dir.path());
+    assert_eq!(
+        op,
+        serde_json::json!({"op": "handler_policy_set", "mode": null, "order": []}),
+        "{op}"
+    );
+}
+
+/// `handlers list` (local) prints one line per handler of each mode: mode, id, state and
+/// outputs; a handler file's handler of `adsb_decode` follows the row's own.
+#[test]
+fn handlers_list_names_each_modes_handlers() {
+    let dir = tempfile::tempdir().unwrap();
+    let handlers = dir.path().join("handlers");
+    std::fs::create_dir_all(&handlers).unwrap();
+    let file = serde_json::json!({
+        "id": "alt",
+        "name": "Alternative",
+        "programs": ["zeta-no-such-handler"],
+        "install": {"url": "https://example.invalid/alt"},
+        "modes": {
+            "adsb_decode": {
+                "args": ["--port", "$port"],
+                "input": {"stream": "iq", "format": "cs16", "rate_hz": 2400000, "via": "stdin"},
+                "output": {"via": "tcp", "port": "$port", "parser": "sbs"}
+            }
+        }
+    });
+    std::fs::write(handlers.join("alt.json"), file.to_string()).unwrap();
+    let out = zeta(
+        dir.path(),
+        &[
+            "--handlers-dir",
+            handlers.to_str().unwrap(),
+            "handlers",
+            "list",
+        ],
+    )
+    .env("ZETA_HANDLER_DUMP1090", fake_dump1090())
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let out = String::from_utf8(out).unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    let adsb: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with("adsb_decode "))
+        .collect();
+    assert_eq!(
+        adsb,
+        [
+            "adsb_decode dump1090 ready event",
+            "adsb_decode alt unavailable event"
+        ],
+        "{out}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("aprs_decode builtin ready ") && l.contains("packet")),
+        "{out}"
+    );
+    // Local only: the registry is this machine's.
+    zeta_bin()
+        .args([
+            "--node",
+            "http://127.0.0.1:1",
+            "--secret",
+            "x",
+            "handlers",
+            "list",
+        ])
+        .assert()
+        .code(1)
+        .stderr(contains("handlers list"));
 }
 
 /// `capture list` answers an empty store, narrowed or not; `capture show`/`classify`/

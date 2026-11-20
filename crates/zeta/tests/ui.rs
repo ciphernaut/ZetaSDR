@@ -13,7 +13,9 @@
 //! 433.92 MHz, the Bits pane's; see [`fsk_fixture`]), `dmr` (a DMR repeater with a call on
 //! each slot, at 450 MHz; see [`dmr_fixture`]), and `--modes-dir` holding the
 //! `fake_pos` program row (zeta-ext's `fake_lines`, printing two fixes of one sonde 2 s into a
-//! job; see [`fake_pos_row`]) and `--sets-dir` holding [`fake_sets`]' `two_sources`, and
+//! job; see [`fake_pos_row`]), `--handlers-dir` holding `alt`, a second handler of
+//! `aprs_decode` with no packet output (see [`fake_handlers`]), and `--sets-dir` holding
+//! [`fake_sets`]' `two_sources`, and
 //! `kiwi`, a KiwiSDR on 127.0.0.1 (zeta-source-kiwi's `FakeKiwi`, see [`start_fake_kiwi`]),
 //! whose waterfall draws [`KIWI_CARRIERS`] where they sit in the view asked (their
 //! frequencies passed to ui.py in `ZETA_UI_KIWI_CARRIERS`); the node's state directory is passed to ui.py in
@@ -814,6 +816,37 @@ fn fake_modes(dir: &Path) -> PathBuf {
     modes
 }
 
+/// What `alt` prints for an `aprs_decode` job: one station, shaped as the row's events.
+const ALT_APRS_LINES: &str =
+    "{\"src\":\"N0CALL\",\"dst\":\"APRS\",\"path\":[],\"info\":\">alt handler\"}";
+
+/// A handlers directory under `dir` holding `alt`, a second handler of `aprs_decode`:
+/// zeta-ext's `fake_lines` (pinned with `ZETA_HANDLER_FAKE_LINES`) on the channel's IQ,
+/// printing [`ALT_APRS_LINES`] 2 s into a job, with no `packets` output, so the mode's
+/// `outputs` (the union) list `packet` while a job run by `alt` gives none; its path.
+fn fake_handlers(dir: &Path) -> PathBuf {
+    let handlers = dir.join("handlers");
+    std::fs::create_dir_all(&handlers).expect("create handlers dir");
+    let lines = dir.join("alt_aprs.lines");
+    std::fs::write(&lines, ALT_APRS_LINES).expect("write alt_aprs.lines");
+    let file = serde_json::json!({
+        "id": "alt",
+        "name": "Alt lines (UI tests)",
+        "programs": ["fake_lines"],
+        "install": {"url": "https://example.invalid/alt"},
+        "modes": {
+            "aprs_decode": {
+                "args": ["--lines-file", lines.to_str().unwrap()],
+                "input": {"stream": "iq", "format": "cs16", "rate_hz": 48000, "via": "stdin"},
+                "output": {"via": "stdout", "port": null, "parser": "json_lines"}
+            }
+        }
+    });
+    let text = serde_json::to_string_pretty(&file).unwrap();
+    std::fs::write(handlers.join("alt.json"), text).expect("write alt.json");
+    handlers
+}
+
 /// A themes directory under `dir`: `fixture_theme`, an operator theme (accent `#ff00ff`, no
 /// rail, a black-to-magenta ramp, no style.css), `fixture_dock_right` (the same, with
 /// `layout.dock` right), and a broken `console` override (an unknown
@@ -1095,6 +1128,8 @@ impl Nodes {
         let sock = sock.to_str().expect("socket path is UTF-8");
         let modes = fake_modes(dir.path());
         let modes = modes.to_str().expect("modes path is UTF-8");
+        let handlers = fake_handlers(dir.path());
+        let handlers = handlers.to_str().expect("handlers path is UTF-8");
         let themes = fake_themes(dir.path());
         let themes = themes.to_str().expect("themes path is UTF-8");
         let sets = fake_sets(dir.path());
@@ -1116,6 +1151,8 @@ impl Nodes {
                 &register,
                 "--modes-dir",
                 modes,
+                "--handlers-dir",
+                handlers,
                 "--themes-dir",
                 themes,
                 "--sets-dir",

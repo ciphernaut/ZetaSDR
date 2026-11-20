@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 
 use zeta_speech::{NodeBackend, SocketBackend, SpeechBackend, UrlBackend};
 
-use crate::cli::{Cli, Command, ModesCmd, SPEECH_EXCLUSIVE, ServeArgs, SpeechArgs, StreamCmd};
+use crate::cli::{
+    Cli, Command, HandlersCmd, ModesCmd, SPEECH_EXCLUSIVE, ServeArgs, SpeechArgs, StreamCmd,
+};
 use crate::{agents_md, ask, node_setup};
 
 const MIN_SECRET_LEN: usize = 12;
@@ -89,6 +91,11 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     if matches!(cli.command, Command::Modes(ModesCmd::Check { .. })) {
         return usage(
             "modes check runs the rows' tests on its own node: not supported with --node",
+        );
+    }
+    if matches!(cli.command, Command::Handlers(HandlersCmd::List)) {
+        return usage(
+            "handlers list reads this machine's mode rows and handler files: not supported with --node (modes list gives a node's handlers)",
         );
     }
     if matches!(cli.command, Command::Registers(_)) {

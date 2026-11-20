@@ -1,5 +1,6 @@
-//! `zeta modes check [ID] [--strict]`: run each mode row's `test` on a node over a
-//! synthesised (or fixture) capture and print one line per row. Local only: it opens its
+//! `zeta modes check [ID] [--strict] [--handler H]`: run each mode row's `test` on a node
+//! over a synthesised (or fixture) capture and print one line per row (per mode's handler
+//! `H`, with `--handler`). Local only: it opens its
 //! own nodes, one per row, in a scratch directory under the state directory.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -11,7 +12,9 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::job::JobState;
-use zeta_core::modes::{LoadedMode, ModeRegistry, ModeState, ModesHandle, RowTest, TestSpec};
+use zeta_core::modes::{
+    LoadedMode, ModeHandler, ModeRegistry, ModeState, ModesHandle, RowTest, TestSpec,
+};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::stream::Payload;
 use zeta_core::types::{Hz, SourceId, StreamKind, Timestamp};
@@ -96,6 +99,12 @@ enum Outcome {
 /// row missing only optional handlers runs without them, and fails only with `strict`).
 /// A pass of a row with handlers, every one of them found, is recorded in
 /// `modes-checked.json` in `state_dir`.
+///
+/// With `handler`, each mode's handler of that id is checked in place of the row's own
+/// (the row's own when it is that id): every mode that has one, or `only` (which must).
+/// A handler file's handler prints and records as `<id>@<handler>`, and a pass is always
+/// recorded (it ran, so its program was found).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     state_dir: PathBuf,
     modes_dir: Option<PathBuf>,
@@ -103,6 +112,7 @@ pub async fn run(
     run_dir: Option<PathBuf>,
     plugins: &[PluginSpec],
     only: Option<String>,
+    handler: Option<String>,
     strict: bool,
 ) -> ExitCode {
     let loaded =
@@ -115,13 +125,29 @@ pub async fn run(
         }
     };
     let modes = handle.get().unwrap_or_default();
-    if let Some(id) = &only
-        && modes.get(id).is_none()
+    if let Some(id) = &only {
+        let Some(m) = modes.get(id) else {
+            eprintln!(
+                "zeta: unknown mode {id} (known: {})",
+                modes.ids().join(", ")
+            );
+            return ExitCode::FAILURE;
+        };
+        if let Some(h) = &handler
+            && m.handler(Some(h)).is_none()
+        {
+            let ids: Vec<&str> = m.handlers.iter().map(|h| h.id.as_str()).collect();
+            eprintln!(
+                "zeta: mode {id} has no handler {h} (its handlers: {})",
+                ids.join(", ")
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Some(h) = &handler
+        && !modes.all().iter().any(|m| m.handler(Some(h)).is_some())
     {
-        eprintln!(
-            "zeta: unknown mode {id} (known: {})",
-            modes.ids().join(", ")
-        );
+        eprintln!("zeta: no mode has handler {h}");
         return ExitCode::FAILURE;
     }
     let ctx = Ctx {
@@ -138,22 +164,40 @@ pub async fn run(
         if only.as_ref().is_some_and(|o| o != id) {
             continue;
         }
-        let outcome = check_row(m, &ctx, strict).await;
+        // The handler file's handler of the mode to check; `None` for the row's own.
+        let other = match &handler {
+            None => None,
+            Some(h) => match m.handler(Some(h)) {
+                None => continue,
+                Some(_) if *h == m.own_handler() => None,
+                Some(found) => Some(found),
+            },
+        };
+        let key = match &other {
+            None => id.clone(),
+            Some(h) => format!("{id}@{}", h.id),
+        };
+        let outcome = match &other {
+            None => check_row(m, &ctx, strict).await,
+            Some(h) => check_handler(m, h, &modes, &ctx, strict).await,
+        };
         let line = match &outcome {
-            Outcome::Ok => format!("{id}: ok"),
-            Outcome::Fail(why) => format!("{id}: fail: {why}"),
-            Outcome::Skipped(why) => format!("{id}: skipped: {why}"),
+            Outcome::Ok => format!("{key}: ok"),
+            Outcome::Fail(why) => format!("{key}: fail: {why}"),
+            Outcome::Skipped(why) => format!("{key}: skipped: {why}"),
         };
         println!("{line}");
         match outcome {
             Outcome::Ok => {
-                if !m.row.decoder.handler_blocks().is_empty() && m.missing.is_empty() {
+                let found = other.is_some()
+                    || (!m.row.decoder.handler_blocks().is_empty() && m.missing.is_empty());
+                if found {
                     let at = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs());
-                    let recorded = std::fs::create_dir_all(state_dir).and_then(|()| {
-                        ModeRegistry::record_checked(&node_setup::checked_path(state_dir), id, at)
-                    });
+                    let path = node_setup::checked_path(state_dir);
+                    let recorded = std::fs::create_dir_all(state_dir)
+                        .and_then(|()| ModeRegistry::record_checked(&path, &key, at));
                     if let Err(e) = recorded {
                         eprintln!("zeta: modes-checked.json: {e}");
                     }
@@ -170,15 +214,20 @@ pub async fn run(
     }
 }
 
+/// A skip, or with `strict` a failure.
+fn skipped(strict: bool, why: String) -> Outcome {
+    match strict {
+        true => Outcome::Fail(why),
+        false => Outcome::Skipped(why),
+    }
+}
+
 /// One row's outcome: refused or skipped before any node is opened, else run.
 async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
     if m.state == ModeState::Broken {
         return Outcome::Fail(m.reason.clone().unwrap_or_default());
     }
-    let skip = |why: String| match strict {
-        true => Outcome::Fail(why),
-        false => Outcome::Skipped(why),
-    };
+    let skip = |why: String| skipped(strict, why);
     let Some(test) = &m.row.test else {
         return skip("no test".into());
     };
@@ -209,16 +258,58 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
             .map_or("program", String::as_str);
         return Outcome::Fail(format!("{handler} missing"));
     }
+    run_in_scratch(m, test, None, ctx, strict).await
+}
+
+/// The outcome of `m`'s row test run by the handler file's handler `h`: failed when it is
+/// broken, skipped (failed with `strict`) when its program is missing or the row has no
+/// test, else run by a job naming `h`.
+async fn check_handler(
+    m: &LoadedMode,
+    h: &ModeHandler,
+    modes: &ModeRegistry,
+    ctx: &Ctx,
+    strict: bool,
+) -> Outcome {
+    match h.state {
+        ModeState::Broken => return Outcome::Fail(h.reason.clone().unwrap_or_default()),
+        ModeState::Unavailable => {
+            let program = modes
+                .handler_files()
+                .iter()
+                .filter(|f| f.id == h.id)
+                .find_map(|f| f.handler.as_ref()?.programs.first().cloned())
+                .unwrap_or_else(|| "program".into());
+            return skipped(strict, format!("{program} missing"));
+        }
+        ModeState::Ready => {}
+    }
+    let Some(test) = &m.row.test else {
+        return skipped(strict, "no test".into());
+    };
+    run_in_scratch(m, test, Some(&h.id), ctx, strict).await
+}
+
+/// Run `test` of row `m` by `handler` (`None`: the policy's choice) in a scratch directory
+/// of its own under the state directory, removed after; a fixture not found is skipped
+/// (failed with `strict`).
+async fn run_in_scratch(
+    m: &LoadedMode,
+    test: &RowTest,
+    handler: Option<&str>,
+    ctx: &Ctx,
+    strict: bool,
+) -> Outcome {
     if let TestSpec::Fixture { path } = &test.kind
         && let Err(why) = fixture_path(path)
     {
-        return skip(why);
+        return skipped(strict, why);
     }
     let scratch = ctx
         .state_dir
         .join(format!("check-{}-{}", std::process::id(), m.row.id.0));
     let outcome = match std::fs::create_dir_all(&scratch) {
-        Ok(()) => run_test(m, test, &scratch, ctx).await,
+        Ok(()) => run_test(m, test, handler, &scratch, ctx).await,
         Err(e) => Outcome::Fail(format!("{}: {e}", scratch.display())),
     };
     remove_scratch(&scratch).await;
@@ -243,9 +334,15 @@ async fn remove_scratch(scratch: &Path) {
     }
 }
 
-/// Run `test` of row `m` on a node over its capture, with `scratch` as the node's state
-/// directory parent.
-async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> Outcome {
+/// Run `test` of row `m` on a node over its capture, the job run by `handler` (`None`: the
+/// policy's choice), with `scratch` as the node's state directory parent.
+async fn run_test(
+    m: &LoadedMode,
+    test: &RowTest,
+    handler: Option<&str>,
+    scratch: &Path,
+    ctx: &Ctx,
+) -> Outcome {
     let (capture, center_hz) = match capture(m, test, scratch) {
         Ok(c) => c,
         Err(why) => return Outcome::Fail(why),
@@ -292,7 +389,7 @@ async fn run_test(m: &LoadedMode, test: &RowTest, scratch: &Path, ctx: &Ctx) -> 
         dwell_scale: None,
         elastic: false,
         replace: vec![],
-        handler: None,
+        handler: handler.map(String::from),
         needs: vec![],
     };
     let job = match node.apply(start).await {

@@ -760,6 +760,81 @@ fn the_hfdl_row_decodes_an_uplink_through_the_fake_program() {
     assert_eq!(code, 0);
 }
 
+/// `--handler` checks one handler of a mode: `adsb_decode`'s own dump1090 is missing here,
+/// and the handler file `alt` (`fake_lines` printing the identity the row's test expects)
+/// passes. The pass is recorded as `adsb_decode@alt`, apart from the row's own, which stays
+/// unchecked, and `modes list` shows it on that handler only.
+#[test]
+fn modes_check_checks_a_named_handler_and_records_it_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = dir.path().join("alt.lines");
+    std::fs::write(&lines, r#"{"icao": "7C6B28"}"#).unwrap();
+    let handlers = dir.path().join("handlers");
+    std::fs::create_dir_all(&handlers).unwrap();
+    let file = serde_json::json!({
+        "id": "alt",
+        "name": "Alternative",
+        "programs": [fake_lines().display().to_string()],
+        "install": {"url": "https://example.invalid/alt"},
+        "modes": {
+            "adsb_decode": {
+                "args": ["--lines-file", lines.display().to_string()],
+                "input": {"stream": "iq", "format": "cs16", "rate_hz": 2400000, "via": "stdin"},
+                "output": {"via": "stdout", "port": null, "parser": "json_lines"}
+            }
+        }
+    });
+    std::fs::write(handlers.join("alt.json"), file.to_string()).unwrap();
+    let (out, code) = stdout(
+        check(dir.path(), &["adsb_decode", "--handler", "alt"])
+            .arg("--handlers-dir")
+            .arg(&handlers),
+    );
+    assert_eq!(out.trim(), "adsb_decode@alt: ok", "{out}");
+    assert_eq!(code, 0);
+    let text = std::fs::read_to_string(dir.path().join("state/modes-checked.json")).unwrap();
+    let checked: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(checked["adsb_decode@alt"].is_u64(), "{text}");
+    assert!(checked.get("adsb_decode").is_none(), "{text}");
+    // `modes list` reads it back onto the handler, the row's own still unchecked.
+    let out = Command::cargo_bin("zeta")
+        .unwrap()
+        .env_remove("ZETA_NODE")
+        .env("XDG_CONFIG_HOME", common::no_xdg_config())
+        .env("ZETA_HANDLER_DUMP1090", NO_DUMP1090)
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .arg("--handlers-dir")
+        .arg(&handlers)
+        .args(["modes", "list"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let adsb = v["value"]["modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "adsb_decode")
+        .unwrap()
+        .clone();
+    assert!(adsb["checked"].is_null(), "{adsb}");
+    assert!(adsb["handlers"][0]["checked"].is_null(), "{adsb}");
+    assert_eq!(adsb["handlers"][1]["id"], "alt", "{adsb}");
+    assert!(adsb["handlers"][1]["checked"].is_u64(), "{adsb}");
+    // A handler the mode does not have is refused, naming the ones it has.
+    let out = check(dir.path(), &["adsb_decode", "--handler", "nope"])
+        .arg("--handlers-dir")
+        .arg(&handlers)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("mode adsb_decode has no handler nope (its handlers: dump1090, alt)"),
+        "{err}"
+    );
+}
+
 /// The embedded `pocsag_decode` row (its test block included) as an operator row
 /// `pocsag_voc` naming one handler, `program`.
 fn write_pocsag_with_handler(dir: &Path, program: &str) {
