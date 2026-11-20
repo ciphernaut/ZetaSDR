@@ -951,6 +951,40 @@ async fn a_named_handler_that_is_unavailable_is_refused_with_its_reason() {
     assert_eq!(listed(&node, &id).handler.as_deref(), Some(OWN));
 }
 
+/// A node opened directly (no `zeta` crate probe before it) looks up its handler files'
+/// programs itself: the embedded OnAir with no `onair-rx` is unavailable, with the
+/// lookup's reason, and a start naming it is refused with that reason rather than
+/// failing at launch.
+#[tokio::test]
+async fn a_node_opened_without_the_cli_probes_its_handler_files() {
+    if let Some(p) = zeta_core::modes::handlers::find_handler(&["onair-rx".into()]) {
+        eprintln!("skipped: onair-rx is installed here ({})", p.display());
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
+    let node = Node::open(common::cfg(dir.path(), true), h::stages(None), ports)
+        .await
+        .unwrap();
+    let modes = node.modes();
+    let onair = modes.handler(MODE, "onair").expect("the embedded onair");
+    assert_eq!(onair.state, zeta_core::modes::ModeState::Unavailable);
+    assert_eq!(onair.program, None);
+    let reason = onair.reason.clone().unwrap_or_default();
+    assert_eq!(
+        reason,
+        "onair-rx: missing (https://on-air.dev) — modes: adsb_decode"
+    );
+    let r = h::try_start(&node, Some("onair"), &[]).await;
+    assert_eq!(
+        r,
+        Err(OpError::Other {
+            message: format!("{MODE}: handler onair is unavailable: {reason}"),
+        })
+    );
+    assert!(node.job_list().is_empty(), "nothing started");
+}
+
 #[tokio::test]
 async fn an_unknown_handler_names_the_known_ones() {
     let dir = tempfile::tempdir().unwrap();

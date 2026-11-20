@@ -1382,7 +1382,10 @@ impl Node {
 
     /// [`Node::open`] on the registry `modes` holds (the handle the caller's stages
     /// read the rows through, so a [`Node::reload_modes`] reaches them too); an empty
-    /// handle is filled from `cfg.modes_dir` against `registry`, as `open` does.
+    /// handle is filled from `cfg.modes_dir` against `registry`, as `open` does. Either
+    /// way, each handler file whose handlers are not probed yet has its program looked up
+    /// ([`crate::modes::handlers::probe_handler_files`], which runs nothing), so a missing
+    /// one is `unavailable` on every node.
     pub async fn open_with_handle(
         cfg: NodeConfig,
         registry: StageRegistry,
@@ -1437,6 +1440,17 @@ impl Node {
                 cfg.modes_dir.as_deref(),
                 cfg.handlers_dir.as_deref(),
             )));
+        }
+        // Every node looks up its handler files' programs (never running them), so a
+        // handler whose program is missing is `unavailable` rather than picked and failed
+        // at launch. A registry the caller already probed (the `zeta` crate's, whose
+        // report lines it prints) is left as it is; this one's lines (one per file looked
+        // up, none when nothing changed) are not printed.
+        if let Some(reg) = modes.get() {
+            let mut probed = (*reg).clone();
+            if !crate::modes::handlers::probe_handler_files(&mut probed).is_empty() {
+                modes.set(Arc::new(probed));
+            }
         }
         let sets = Arc::new(crate::sets::SetRegistry::load(
             &modes.get().unwrap_or_default(),

@@ -147,7 +147,8 @@ pub mod handlers {
     pub const RADIO: &str = "radio0";
 
     /// Write `<dir>/handlers/alt.json`: an `adsb_decode` entry running
-    /// `zeta-alt-decoder` on the row's input and output, with a pcap `packets` output
+    /// `<dir>/bin/zeta-alt-decoder` (a stub, so the node finds it) on the row's input and
+    /// output, with a pcap `packets` output
     /// when `packets`; the handlers directory.
     pub fn write_alt(dir: &Path, packets: bool) -> PathBuf {
         write_handler(dir, ALT, packets)
@@ -179,10 +180,18 @@ pub mod handlers {
                 "via": "tcp", "port": "$packet_port", "parser": "pcap"
             });
         }
+        // The node looks the program up when it opens (never running it: the stand-in
+        // stage runs instead), so it must exist for the handler to be ready.
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let program = bin.join(format!("zeta-{id}-decoder"));
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let file = serde_json::json!({
             "id": id,
             "name": "Alternative",
-            "programs": [format!("zeta-{id}-decoder")],
+            "programs": [program.display().to_string()],
             "install": {"url": "https://example.invalid/alt"},
             "modes": {MODE: entry},
         });

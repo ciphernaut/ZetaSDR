@@ -1791,7 +1791,8 @@ async fn the_airband_set_starts_what_this_host_has_and_refuses_the_rest() {
         None,
         Some(format!("{missing}: missing — modes: adsb_decode")),
     );
-    // The embedded OnAir handler's program missing too, as on a host without it.
+    // ADS-B missing whatever this host has: the embedded OnAir handler's program too
+    // (the node's own probe would find an installed `onair-rx` and start ADS-B by it).
     let onair = "onair-rx: missing — modes: adsb_decode".to_string();
     modes.set_handler_program("adsb_decode", "onair", None, Some(onair));
     let (a, b) = (Radio::new("a"), Radio::new("b"));

@@ -22,8 +22,8 @@
 - `modes_list` and `modes_show` gain each mode's `handlers` and `handler` (the policy's pick now);
   the mode is `ready` when any handler is, its `program`, `reason` and `missing` describe that
   pick (or the row's own decoder when none is ready) and its `outputs` are the union over the
-  ready handlers, so a mode with one handler reads as before. Job records gain `handler` and `handler_named`, every decoder event gains `handler`,
-  and a packet capture's comment names it.
+  ready handlers, so a mode with one handler reads as before. Job records gain `handler` and
+  `handler_named`, every decoder event gains `handler`, and a packet capture's comment names it.
 - Packets from programs: a program row's or handler entry's `packets` block reads a second
   output, a pcap stream or dump1090's Beast output, into the job's packet stream. The ADS-B row
   reads dump1090's Beast output, so an `adsb_decode` job takes a packet capture: each Mode S frame

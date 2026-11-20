@@ -204,11 +204,14 @@ fn serde_error(e: &serde_json::Error, whole: &str) -> RowError {
     error(named.as_deref().unwrap_or(whole), msg)
 }
 
-/// The keys every event's envelope sets over the decoded fields: the row's
-/// [`super::ENVELOPE_FIELDS`], the `handler` that ran and a restricted row's `access`.
-const ENVELOPE_KEYS: [&str; 6] = [
-    "protocol", "handler", "summary", "t_ns", "position", "access",
-];
+/// The keys the event envelope sets beside the row's [`super::ENVELOPE_FIELDS`]: the
+/// `handler` that ran and a restricted row's `access`.
+const ENVELOPE_EXTRA: [&str; 2] = ["handler", "access"];
+
+/// Whether the event envelope sets `name` over the decoded fields.
+fn is_envelope_key(name: &str) -> bool {
+    super::ENVELOPE_FIELDS.contains(&name) || ENVELOPE_EXTRA.contains(&name)
+}
 
 /// Check `file`'s entry `entry` against the row it serves: the program block as a
 /// program row's is checked, `output.fields` naming only the row's event fields and
@@ -250,7 +253,7 @@ pub fn validate_entry(
     }
     for (name, path) in &entry.extra {
         let at = format!("extra.{name}");
-        if ENVELOPE_KEYS.contains(&name.as_str()) {
+        if is_envelope_key(name) {
             return Err(error(at, "the event envelope sets it"));
         }
         if properties.contains_key(name) {
@@ -396,7 +399,9 @@ mod tests {
     #[test]
     fn an_extra_field_may_not_be_an_envelope_key() {
         let row = super::super::parse(include_str!("../../../../modes/adsb_decode.json")).unwrap();
-        for name in ENVELOPE_KEYS {
+        for name in [
+            "protocol", "handler", "summary", "t_ns", "position", "access",
+        ] {
             let f = parse_handler_file(&file(|v| {
                 v["modes"]["adsb_decode"]["extra"] = serde_json::json!({ name: "/x" });
             }))
@@ -408,11 +413,5 @@ mod tests {
                 format!("extra.{name}: the event envelope sets it")
             );
         }
-        assert_eq!(
-            ENVELOPE_KEYS,
-            [
-                "protocol", "handler", "summary", "t_ns", "position", "access"
-            ]
-        );
     }
 }

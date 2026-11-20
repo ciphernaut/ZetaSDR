@@ -36,10 +36,10 @@ it runs as an external handler. Linking it dynamically instead would bring the L
 (the library replaceable by the user, its source offered, the notice shipped) and needs `deny.toml`
 changed first.
 
-OnAir is GPL-3.0-or-later with an attribution term. The node
-runs it through `onair-rx`, a wrapper the operator builds and installs, which is kept outside this
-repository under OnAir's licence and prints the attribution line with its version. What ships
-here is `handlers/onair.json`, a handler file naming the wrapper's arguments and output fields;
+OnAir is GPL-3.0-or-later with an attribution term. The node runs it through `onair-rx`, a
+wrapper the operator builds and installs, which is kept outside this repository under OnAir's
+licence and prints the attribution line with its version. What ships here is
+`handlers/onair.json`, a handler file naming the wrapper's arguments and output fields;
 OnAir and the wrapper are never linked or shipped, and without them OnAir's handlers are only
 `unavailable`.
 

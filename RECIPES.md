@@ -244,7 +244,7 @@ Wireshark dissects AX.25 and APRS; each packet's comment names the job, source a
 
 Not run live when written: a stored pcapng of the Mode S frames an ADS-B job decodes, by dump1090 or by OnAir, opened in Wireshark with the node's dissector. Needs a radio that holds 2.4 MHz at 1090 MHz.
 
-**Check.** `modes_show adsb_decode`: `handlers` lists `dump1090` and `onair` with their `state`, and the `outputs` of each list `packet` (dump1090's is its Beast output; OnAir's is the pcap stream `onair-rx` serves, installed by the operator). `source_list` and `job_list`: no rigid holder of the radio outside 1089-1091 MHz, and no `adsb_decode` job already there with the handler wanted (a second start is a `duplicate`).
+**Check.** `modes_show adsb_decode`: `handlers` lists `dump1090` and `onair` with their `state`, and the `outputs` of each list `packet` (dump1090's is its Beast output; OnAir's is the pcap stream `onair-rx` serves, installed by the operator). `source_list` and `job_list`: no rigid holder of the radio whose band the 2.4 MHz capture at 1090 MHz cannot share, and no `adsb_decode` job already there with the handler wanted (a second start is a `duplicate`).
 
 **Start** the decoder with `needs: ["packet"]`, so the policy passes over any handler without packets. `handler: null` runs the policy's pick; `"onair"` or `"dump1090"` runs that one (a job of each may run at once on one band).
 

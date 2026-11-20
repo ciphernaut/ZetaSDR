@@ -254,8 +254,6 @@ async fn reload_modes_picks_up_a_new_row_and_keeps_program_state() {
     probed.set_program("adsb_decode", Some("/usr/bin/dump1090".into()), None);
     let missing = "no program found (tried rs41mod)".to_string();
     probed.set_program("rs41_decode", None, Some(missing.clone()));
-    let onair = "onair-rx: missing".to_string();
-    probed.set_handler_program("adsb_decode", "onair", None, Some(onair));
     node.modes_handle().set(std::sync::Arc::new(probed));
     let mut row: serde_json::Value = serde_json::from_str(&renamed_pocsag("Local pagers")).unwrap();
     row["id"] = "local_pagers".into();
@@ -1643,12 +1641,35 @@ fn alt_cfg(dir: &Path) -> NodeConfig {
     std::fs::write(handlers.join("alt.json"), alt).unwrap();
     NodeConfig {
         handlers_dir: Some(handlers),
-        ..cfg(dir, &dir.join("modes"))
+        ..cfg(dir, &events_only_adsb(dir))
     }
 }
 
+/// `<dir>/modes` holding `adsb_decode` as the embedded row without its `packets` block
+/// (dump1090 giving events only), so the row's own outputs differ from alt's.
+fn events_only_adsb(dir: &Path) -> std::path::PathBuf {
+    let (_, text) = ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("adsb_decode.json"))
+        .expect("embedded adsb_decode");
+    let mut row: serde_json::Value = serde_json::from_str(text).unwrap();
+    let d = row["decoder"].as_object_mut().unwrap();
+    d.remove("packets");
+    for a in d["args"].as_array_mut().unwrap() {
+        if a == "$packet_port" {
+            *a = "0".into();
+        }
+    }
+    let modes = dir.join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    std::fs::write(modes.join("adsb_decode.json"), row.to_string()).unwrap();
+    modes
+}
+
 /// Set what probing found for `adsb_decode`: the row's own program (`None`: dump1090
-/// missing) and alt's (`None`: its program missing); the embedded onair's is missing.
+/// missing) and alt's (`None`: its program missing). The embedded onair's is missing:
+/// the node's own probe at open says so on a host without `onair-rx`, and this keeps
+/// the union and the pick below the same on a host that has it.
 fn probe_adsb(node: &Node, own: Option<&str>, alt: Option<&str>) {
     let mut reg = (*node.modes()).clone();
     let (mode, missing) = ("adsb_decode", |p: &str| format!("{p}: missing"));
@@ -1899,8 +1920,8 @@ async fn modes_list_gives_each_modes_handlers_and_the_policys_pick() {
     assert_eq!(m.handler, None);
     assert_eq!(m.program, None);
     assert_eq!(m.reason.as_deref(), Some("dump1090: missing"));
-    // The row's own outputs: dump1090 gives packets too (its Beast output).
-    assert_eq!(m.outputs, both);
+    // The row's own outputs (this test's row gives events only), not alt's.
+    assert_eq!(m.outputs, [StreamKind::Event]);
     assert_eq!(m.handlers[1].state, ModeState::Unavailable);
     assert_eq!(
         m.handlers[1].reason.as_deref(),
@@ -1910,24 +1931,31 @@ async fn modes_list_gives_each_modes_handlers_and_the_policys_pick() {
     assert_eq!(v["handler"], serde_json::Value::Null);
 }
 
-/// With no operator handler files, and the embedded `onair` unavailable (no `onair-rx`),
-/// every mode's own fields read as the row's (the pre-handler listing), and its one
-/// handler is the row's own; `adsb_decode`'s second is `onair`.
+/// With no handler beyond each row's own (the embedded OnAir file replaced by an
+/// operator file of its id serving no mode), every mode's own fields read as the row's
+/// (the pre-handler listing), and its one handler is the row's own.
 #[tokio::test]
-async fn a_node_with_no_handler_files_lists_modes_as_before() {
+async fn a_node_with_no_handlers_beyond_the_rows_lists_modes_as_before() {
     let dir = tempfile::tempdir().unwrap();
     let modes = dir.path().join("modes");
     std::fs::create_dir_all(&modes).unwrap();
     std::fs::write(modes.join("junk.json"), r#"{"id":"junk_mode","bogus":1}"#).unwrap();
-    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
-        .await
-        .unwrap();
+    let handlers = dir.path().join("handlers");
+    std::fs::create_dir_all(&handlers).unwrap();
+    let no_onair = serde_json::json!({
+        "id": "onair", "name": "OnAir", "programs": ["onair-rx"],
+        "install": {"url": "https://example.invalid/onair"}, "modes": {},
+    });
+    std::fs::write(handlers.join("onair.json"), no_onair.to_string()).unwrap();
+    let cfg = NodeConfig {
+        handlers_dir: Some(handlers),
+        ..cfg(dir.path(), &modes)
+    };
+    let node = Node::open(cfg, stages(), vec![]).await.unwrap();
     // Every kind of answer a probe leaves: found, missing, an optional helper missing,
     // and a check time.
     let mut reg = (*node.modes()).clone();
     reg.set_program("adsb_decode", Some("/usr/bin/dump1090".into()), None);
-    let onair = Some("onair-rx: missing".into());
-    reg.set_handler_program("adsb_decode", "onair", None, onair);
     reg.set_program("rs41_decode", None, Some("rs41mod: missing".into()));
     reg.set_program("dmr_decode", Some("/usr/bin/zeta-mbe".into()), None);
     reg.set_missing(
@@ -1972,11 +2000,8 @@ async fn a_node_with_no_handler_files_lists_modes_as_before() {
             s.checked,
         );
         assert_eq!(shown_now, before, "{id}");
-        let ids: Vec<&str> = info.handlers.iter().map(|h| h.id.as_str()).collect();
-        match id.as_str() {
-            "adsb_decode" => assert_eq!(ids, ["dump1090", "onair"]),
-            _ => assert_eq!(ids, [m.handlers[0].id.as_str()], "{id}"),
-        }
+        assert_eq!(info.handlers.len(), 1, "{id}");
+        assert_eq!(info.handlers[0].id, m.handlers[0].id, "{id}");
         let own = (m.state == ModeState::Ready).then(|| m.handlers[0].id.clone());
         assert_eq!(info.handler, own, "{id}");
     }
