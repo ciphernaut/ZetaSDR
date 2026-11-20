@@ -18,6 +18,11 @@ $FAKE_REPEAT_BYTES (default 0: never) writes the lines again each time that many
 more input bytes have arrived after the last write.
 `--lines-file PATH` takes the lines from that file instead of $FAKE_LINES, which is
 node-wide when a node runs this as a mode row: two rows differ by their `args`.
+`--pcap-port PORT --pcap-file PATH` gives a packet output beside the lines: listen
+on 127.0.0.1 at PORT and, once connected, write the file's bytes in 5-byte chunks
+1 ms apart, then keep the socket open. With `--pcap-interval-ms N` the file is a
+little-endian pcap whose 24-byte header goes first, then one record every N ms.
+`--pcap-refuse` never listens.
 """
 
 import json
@@ -25,8 +30,61 @@ import os
 import socket
 import struct
 import sys
+import threading
+import time
 
 WAV_HEADER_LEN = 44
+PCAP_HEADER_LEN = 24
+PCAP_RECORD_HEADER_LEN = 16
+
+
+def write_chunked(conn, data: bytes) -> None:
+    """Write `data` in 5-byte chunks, 1 ms apart."""
+    for i in range(0, len(data), 5):
+        conn.sendall(data[i : i + 5])
+        time.sleep(0.001)
+
+
+def pcap_pieces(data: bytes, interval: bool) -> list:
+    """The file whole, or with an interval its header and then each record."""
+    if not interval:
+        return [data]
+    pieces = [data[:PCAP_HEADER_LEN]]
+    at = PCAP_HEADER_LEN
+    while at + PCAP_RECORD_HEADER_LEN <= len(data):
+        (incl,) = struct.unpack_from("<I", data, at + 8)
+        end = at + PCAP_RECORD_HEADER_LEN + incl
+        pieces.append(data[at:end])
+        at = end
+    return pieces
+
+
+def serve_pcap(srv, data: bytes, interval_ms: int) -> None:
+    """Accept one connection, write the pieces and keep the socket open."""
+    conn, _ = srv.accept()
+    for i, piece in enumerate(pcap_pieces(data, interval_ms > 0)):
+        if i > 1:
+            time.sleep(interval_ms / 1000)
+        write_chunked(conn, piece)
+    while True:
+        time.sleep(3600)
+
+
+def start_pcap(args) -> None:
+    """Start the packet output `--pcap-port` asks for, unless `--pcap-refuse`."""
+    if "--pcap-port" not in args or "--pcap-refuse" in args:
+        return
+    port = int(args[args.index("--pcap-port") + 1])
+    with open(args[args.index("--pcap-file") + 1], "rb") as f:
+        data = f.read()
+    interval = 0
+    if "--pcap-interval-ms" in args:
+        interval = int(args[args.index("--pcap-interval-ms") + 1])
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(1)
+    threading.Thread(target=serve_pcap, args=(srv, data, interval), daemon=True).start()
 
 
 def read_wav_header(src, out) -> bool:
@@ -63,6 +121,7 @@ def main() -> int:
     repeat = int(os.environ.get("FAKE_REPEAT_BYTES", "0"))
     next_at = 0
 
+    start_pcap(args)
     out = sys.stdout.buffer
     if via.startswith("tcp:"):
         port = int(args[args.index(via[4:]) + 1])

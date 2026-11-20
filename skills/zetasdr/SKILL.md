@@ -854,7 +854,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 ### external_decode
 
 - inputs: iq, audio
-- outputs: event
+- outputs: event, packet
 - params.mode: string
 
 ### fft

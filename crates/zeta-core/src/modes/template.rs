@@ -139,12 +139,16 @@ pub fn expand(
 /// The stream kinds a job of `row` emits. A graph row's are those of its terminal nodes
 /// (no edge leaves them), from each stage's `spec().outputs`, in node order, each kind
 /// once, and `packet` when any node's stage lists it and no `packet` edge leaves that
-/// node (the stage's packets then reach the job's output). A program row emits events
-/// only; a frame row emits events and packets (its audio stays inside its chain).
+/// node (the stage's packets then reach the job's output). A program row emits events,
+/// and packets too with a `packets` block; a frame row emits events and packets (its
+/// audio stays inside its chain).
 pub fn outputs(row: &ModeRow, stages: &StageRegistry) -> Vec<StreamKind> {
     let (nodes, edges) = match &row.decoder {
         Decoder::Graph { nodes, edges, .. } => (nodes, edges),
         Decoder::Frame(_) => return vec![StreamKind::Event, StreamKind::Packet],
+        Decoder::Program(p) if p.packets.is_some() => {
+            return vec![StreamKind::Event, StreamKind::Packet];
+        }
         Decoder::Program(_) => return vec![StreamKind::Event],
     };
     let mut out: Vec<StreamKind> = Vec::new();
@@ -337,5 +341,28 @@ fn fill(v: &mut serde_json::Value, values: &[(&str, serde_json::Value)]) {
         Value::Object(m) => m.values_mut().for_each(|x| fill(x, values)),
         Value::Array(a) => a.iter_mut().for_each(|x| fill(x, values)),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ADSB: &str = include_str!("../../../../modes/adsb_decode.json");
+
+    #[test]
+    fn a_program_row_with_packets_outputs_events_and_packets() {
+        let stages = StageRegistry::new();
+        let row = super::super::parse(ADSB).unwrap();
+        assert_eq!(outputs(&row, &stages), [StreamKind::Event]);
+        let mut v: serde_json::Value = serde_json::from_str(ADSB).unwrap();
+        v["decoder"]["packets"] = serde_json::json!({
+            "via": "tcp", "port": "$packet_port", "parser": "beast", "link_types": {}
+        });
+        let row = super::super::parse(&v.to_string()).unwrap();
+        assert_eq!(
+            outputs(&row, &stages),
+            [StreamKind::Event, StreamKind::Packet]
+        );
     }
 }

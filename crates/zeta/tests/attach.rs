@@ -998,3 +998,99 @@ async fn a_frame_row_is_captured_as_user0() {
         .collect();
     assert_eq!(packets[0].data, bytes, "{ev}");
 }
+
+/// A program row run by zeta-ext's `fake_lines` on the `aprs` fixture's centre; with
+/// `packets`, its block reads pcap from `$packet_port` (the fake never opens it).
+fn program_row(id: &str, packets: bool) -> serde_json::Value {
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("../zeta-ext/tests/fake_lines");
+    let mut args = vec![];
+    let mut block = serde_json::Value::Null;
+    if packets {
+        args = vec!["--pcap-port", "$packet_port", "--pcap-refuse"];
+        block = serde_json::json!({"via": "tcp", "port": "$packet_port", "parser": "pcap",
+            "link_types": {}});
+    }
+    serde_json::json!({
+        "id": id,
+        "name": format!("{id} test row"),
+        "family": "general",
+        "band": {"bandwidth_hz": 12_500, "centers_hz": [], "min_hz": null},
+        "modulation": [],
+        "label": id.to_uppercase(),
+        "protocol": id,
+        "decoder": {
+            "kind": "program",
+            "programs": [fake.display().to_string()],
+            "args": args,
+            "input": {"stream": "iq", "format": "cs16", "rate_hz": 48_000, "via": "stdin"},
+            "output": {"via": "stdout", "port": null, "parser": "json_lines"},
+            "install": {"debian": "fake-dec", "url": "https://example.org/fake-dec"},
+            "packets": block
+        },
+        "event": {"schema": {"type": "object", "properties": {}}, "summary": "line"},
+        "identify": {"proof": "event", "min_events": 1, "dwell_ms": 1000, "min_span_ms": 1000,
+            "quick": null},
+        "catalogue": []
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_program_row_has_a_packet_stream_only_with_a_packets_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    for (id, packets) in [("prog_plain", false), ("prog_packets", true)] {
+        let text = program_row(id, packets).to_string();
+        std::fs::write(modes.join(format!("{id}.json")), text).unwrap();
+    }
+    let meta = common::aprs_fixture(dir.path());
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: 4800,
+        repeat: true,
+        tune_range: None,
+    };
+    let src = Arc::new(FileSource::open(aprs(), &meta, opts).unwrap());
+    let port: Arc<dyn Port> = src.clone();
+    let handle = zeta_ext::ModesHandle::default();
+    let mut stages = packets_registry();
+    stages.register(Arc::new(zeta_ext::ExternalDecodeStage::deferred(
+        handle.clone(),
+    )));
+    let cfg = NodeConfig {
+        modes_dir: Some(modes),
+        ..cfg(dir.path())
+    };
+    let node = Node::open_with_handle(cfg, stages, vec![port], handle)
+        .await
+        .unwrap();
+    src.start();
+    let mut jobs = Vec::new();
+    for id in ["prog_plain", "prog_packets"] {
+        match node
+            .apply(job_start_op(id, aprs(), common::APRS_HZ, 12_500))
+            .await
+        {
+            Ok(OpResult::Job(job)) => jobs.push(job),
+            r => panic!("{id} start: {r:?}"),
+        }
+    }
+    let (plain, packets) = (&jobs[0], &jobs[1]);
+    let refused = node
+        .apply(Op::JobAttach {
+            kind: JobKind::Packets,
+            job: plain.clone(),
+            language: None,
+            stream: None,
+        })
+        .await;
+    let message = format!(
+        "job {} has no packet stream: its kind's outputs list no packet (modes_list)",
+        plain.0
+    );
+    assert_eq!(refused, Err(OpError::Other { message }));
+    let kinds: Vec<StreamKind> = streams_of(&node, plain).iter().map(|s| s.kind).collect();
+    assert!(!kinds.contains(&StreamKind::Packet), "{kinds:?}");
+    node.job_packet_stream(packets)
+        .expect("the packets row's job has a packet stream");
+}

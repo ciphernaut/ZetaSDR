@@ -150,31 +150,47 @@ fn audio_frame(n: usize, rate_hz: u64) -> Frame {
 struct Running {
     tx: broadcast::Sender<Frame>,
     rx_out: broadcast::Receiver<Frame>,
+    /// The job's context, each note merged in at the top level (as the node does).
     context: Arc<Mutex<Value>>,
+    /// Every note, in order.
+    notes: Arc<Mutex<Vec<Value>>>,
+    bus: Arc<StreamBus>,
+    /// The packet output, when the stage was given one.
+    packets: Option<StreamId>,
     handle: tokio::task::JoinHandle<Result<(), StageError>>,
 }
 
 fn start(stage: ExternalDecodeStage, mode: &str) -> Running {
+    start_with(stage, mode, false)
+}
+
+/// [`start`], with a packet output after the event output when `packets`.
+fn start_with(stage: ExternalDecodeStage, mode: &str, packets: bool) -> Running {
     let bus = Arc::new(StreamBus::new(64));
     let out = bus.register(StreamKind::Event, prov());
     let rx_out = bus.subscribe(&out).unwrap();
+    let packets = packets.then(|| bus.register(StreamKind::Packet, prov()));
     let (tx, rx_in) = broadcast::channel(64);
     let context = Arc::new(Mutex::new(json!({})));
-    let c = context.clone();
+    let notes = Arc::new(Mutex::new(Vec::new()));
+    let (c, n) = (context.clone(), notes.clone());
     let ctx = StageContext::new(SourceId("s".into())).with_note(Arc::new(move |v: Value| {
         let mut cx = c.lock().unwrap();
         for (k, x) in v.as_object().unwrap() {
             cx[k] = x.clone();
         }
+        n.lock().unwrap().push(v);
     }));
     let params = json!({ "mode": mode });
+    let outputs = std::iter::once(out).chain(packets.clone()).collect();
+    let b = bus.clone();
     let handle = tokio::spawn(async move {
         stage
             .run(
                 params,
                 vec![rx_in],
-                vec![out],
-                bus,
+                outputs,
+                b,
                 CancellationToken::new(),
                 ctx,
             )
@@ -184,6 +200,9 @@ fn start(stage: ExternalDecodeStage, mode: &str) -> Running {
         tx,
         rx_out,
         context,
+        notes,
+        bus,
+        packets,
         handle,
     }
 }
@@ -559,9 +578,234 @@ fn params_take_the_mode_only() {
     let s = &stage.spec().params_schema;
     assert_eq!(stage.spec().kind, "external_decode");
     assert_eq!(stage.spec().inputs, [StreamKind::Iq, StreamKind::Audio]);
-    assert_eq!(stage.spec().outputs, [StreamKind::Event]);
+    assert_eq!(
+        stage.spec().outputs,
+        [StreamKind::Event, StreamKind::Packet]
+    );
     assert_eq!(s.get("additionalProperties"), Some(&json!(false)), "{s:?}");
     assert_eq!(s.get("required"), Some(&json!(["mode"])), "{s:?}");
+}
+
+/// A little-endian pcap stream of link type 147 holding `records`.
+fn pcap(records: &[Vec<u8>]) -> Vec<u8> {
+    let mut s = Vec::new();
+    s.extend(0xa1b2_c3d4u32.to_le_bytes());
+    s.extend(2u16.to_le_bytes());
+    s.extend(4u16.to_le_bytes());
+    s.extend([0u8; 8]);
+    s.extend(262_144u32.to_le_bytes());
+    s.extend(147u32.to_le_bytes());
+    for (i, r) in records.iter().enumerate() {
+        for v in [i as u32, 0, r.len() as u32, r.len() as u32] {
+            s.extend(v.to_le_bytes());
+        }
+        s.extend(r);
+    }
+    s
+}
+
+/// `json_row` with a packets block (pcap on `$packet_port`, 147 read as `mode_s`) fed by
+/// `fake_lines` from `file`, with `extra` args.
+fn packets_row(id: &str, file: &Path, extra: &[&str]) -> Value {
+    let file = file.display().to_string();
+    let mut args = vec!["--pcap-port", "$packet_port", "--pcap-file", &file];
+    args.extend(extra);
+    let mut r = json_row(id, "cs16", "stdin", &args);
+    r["decoder"]["packets"] = json!({
+        "via": "tcp", "port": "$packet_port", "parser": "pcap",
+        "link_types": {"147": "mode_s"}
+    });
+    r
+}
+
+/// The next packet on `rx` within `secs`: its frame.
+async fn next_packet(rx: &mut broadcast::Receiver<Frame>, secs: u64) -> Option<Frame> {
+    match tokio::time::timeout(Duration::from_secs(secs), rx.recv()).await {
+        Ok(Ok(f)) => Some(f),
+        _ => None,
+    }
+}
+
+/// Poll the context until `external.packets` is a string, for at most `within`.
+async fn packets_note(r: &Running, within: Duration) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let cx = r.context.lock().unwrap().clone();
+        if let Some(s) = cx["external"]["packets"].as_str() {
+            return Some(s.to_string());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[test]
+fn a_row_without_packets_has_no_packet_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.pcap");
+    let reg = registry(&[
+        json_row("plain", "cs16", "stdin", &[]),
+        packets_row("with_packets", &file, &[]),
+    ]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg));
+    assert_eq!(
+        stage.outputs_for(&json!({"mode": "plain"})),
+        [StreamKind::Event]
+    );
+    assert_eq!(
+        stage.outputs_for(&json!({"mode": "with_packets"})),
+        [StreamKind::Event, StreamKind::Packet]
+    );
+    assert_eq!(
+        stage.outputs_for(&json!({"mode": "nope"})),
+        [StreamKind::Event]
+    );
+    let empty = ExternalDecodeStage::deferred(ModesHandle::default());
+    assert_eq!(
+        empty.outputs_for(&json!({"mode": "with_packets"})),
+        [StreamKind::Event]
+    );
+}
+
+#[tokio::test]
+async fn a_programs_packets_reach_its_packet_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.pcap");
+    let records: Vec<Vec<u8>> = (0u8..3).map(|i| vec![0x8d, i, 0xa5, i, 0x5a]).collect();
+    std::fs::write(&file, pcap(&records)).unwrap();
+    let reg = registry(&[packets_row("fake_pk", &file, &[])]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg))
+        .with_env([("FAKE_LINES", r#"{"text":"hi","n":1}"#)]);
+    let mut r = start_with(stage, "fake_pk", true);
+    let mut rx = r.bus.subscribe(r.packets.as_ref().unwrap()).unwrap();
+    send(&r.tx, 4, 480, 48_000);
+    for want in &records {
+        let f = next_packet(&mut rx, 10).await.expect("a packet");
+        assert_eq!(f.provenance.span, prov().span);
+        match f.payload {
+            Payload::Packet { link_type, data } => {
+                assert_eq!(link_type, zeta_core::stream::LinkType::ModeS);
+                assert_eq!(&data[..], &want[..]);
+            }
+            other => panic!("expected a packet, got {:?}", other.kind()),
+        }
+    }
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    assert_eq!(v["summary"], "hi #1", "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
+#[tokio::test]
+async fn packets_are_not_built_with_nobody_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.pcap");
+    let records: Vec<Vec<u8>> = (0u8..30).map(|i| vec![i; 4]).collect();
+    std::fs::write(&file, pcap(&records)).unwrap();
+    let reg = registry(&[packets_row(
+        "fake_pk",
+        &file,
+        &["--pcap-interval-ms", "100"],
+    )]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([
+        ("FAKE_LINES", r#"{"text":"up","n":1}"#),
+        ("FAKE_AFTER_BYTES", "0"),
+    ]);
+    let mut r = start_with(stage, "fake_pk", true);
+    // The program is up once its line arrives; nobody reads its packets for 300 ms.
+    next_event(&mut r.rx_out, 10).await.expect("an event");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut rx = r.bus.subscribe(r.packets.as_ref().unwrap()).unwrap();
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let f = next_packet(&mut rx, 10).await.expect("a packet");
+        match f.payload {
+            Payload::Packet { data, .. } => got.push(data[0]),
+            other => panic!("expected a packet, got {:?}", other.kind()),
+        }
+    }
+    // The framing was kept while nobody read: the records follow on, whole.
+    assert!(
+        got[0] > 0,
+        "records written before the subscription arrived: {got:?}"
+    );
+    assert_eq!(got, [got[0], got[0] + 1, got[0] + 2]);
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
+#[tokio::test]
+async fn a_packet_port_that_never_opens_is_noted_and_events_go_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.pcap");
+    std::fs::write(&file, pcap(&[])).unwrap();
+    let reg = registry(&[packets_row("fake_pk", &file, &["--pcap-refuse"])]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([
+        ("FAKE_LINES", r#"{"text":"on","n":1}"#),
+        ("FAKE_AFTER_BYTES", "0"),
+    ]);
+    let mut r = start_with(stage, "fake_pk", true);
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    assert_eq!(v["summary"], "on #1", "{v}");
+    let note = packets_note(&r, Duration::from_secs(6)).await;
+    assert_eq!(
+        note.as_deref(),
+        Some(
+            format!(
+                "{} did not open its packet port",
+                fake("fake_lines").display()
+            )
+            .as_str()
+        )
+    );
+    assert!(!r.handle.is_finished(), "the job goes on");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
+#[tokio::test]
+async fn a_stream_that_is_not_pcap_is_noted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.pcap");
+    std::fs::write(&file, "OFF\n").unwrap();
+    let reg = registry(&[packets_row("fake_pk", &file, &[])]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([
+        ("FAKE_LINES", "this is not json\n{\"text\":\"ok\",\"n\":1}"),
+        ("FAKE_AFTER_BYTES", "0"),
+    ]);
+    let mut r = start_with(stage, "fake_pk", true);
+    let _rx = r.bus.subscribe(r.packets.as_ref().unwrap()).unwrap();
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    assert_eq!(v["summary"], "ok #1", "{v}");
+    let note = packets_note(&r, Duration::from_secs(6))
+        .await
+        .expect("a packets note");
+    assert!(note.starts_with("not a pcap stream"), "{note}");
+    send(&r.tx, 4, 480, 48_000);
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+    // One reason, noted once: a later note carries it only beside a changed unparsed count.
+    let notes = r.notes.lock().unwrap().clone();
+    let carrying: Vec<&Value> = notes
+        .iter()
+        .filter(|n| !n["external"]["packets"].is_null())
+        .collect();
+    assert!(
+        carrying
+            .iter()
+            .all(|n| n["external"]["packets"] == json!(note)),
+        "{notes:?}"
+    );
+    assert!(
+        (1..=2).contains(&carrying.len()),
+        "noted once, then at most beside the unparsed count: {notes:?}"
+    );
+    // The unparsed count and the packets reason sit side by side.
+    let cx = r.context.lock().unwrap().clone();
+    assert_eq!(cx["external"]["unparsed"], 1, "{cx}");
+    assert_eq!(cx["external"]["packets"], json!(note), "{cx}");
 }
 
 // The vectors in tests/data are SYNTHETIC: built by hand to the shape of the upstream

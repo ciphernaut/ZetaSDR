@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::{Edge, Graph, GraphId, Node};
 use crate::stage::StageRegistry;
+use crate::stream::LinkType;
 
 /// A mode id: lowercase snake case, the string `job_start --kind` takes.
 #[derive(
@@ -608,9 +609,9 @@ pub enum Proof {
 pub struct ProgramBlock {
     /// Names tried on `PATH` in order (or an absolute path), the first found used.
     pub programs: Vec<String>,
-    /// Arguments, with `$port`, `$rate_hz`, `$center_hz`, `$center_khz` (the centre in kHz,
-    /// an integer when it divides) and `$fifo` (the named pipe of `input.via: fifo`)
-    /// substituted.
+    /// Arguments, with `$port`, `$packet_port` (a second port zeta picks, for `packets`),
+    /// `$rate_hz`, `$center_hz`, `$center_khz` (the centre in kHz, an integer when it
+    /// divides) and `$fifo` (the named pipe of `input.via: fifo`) substituted.
     pub args: Vec<String>,
     pub input: ProgramInput,
     pub output: ProgramOutput,
@@ -619,6 +620,46 @@ pub struct ProgramBlock {
     /// required for audio input, `null` for iq.
     #[serde(default)]
     pub demod: Option<Demod>,
+    /// The program's binary packet output beside its events, read into the job's packet
+    /// stream; `null` when it gives none.
+    #[serde(default)]
+    pub packets: Option<ProgramPackets>,
+}
+
+/// A program's second, binary output: whole packets, cut by `parser`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
+pub struct ProgramPackets {
+    /// `tcp`, or `stdout` when the events come over `tcp`.
+    pub via: OutputVia,
+    /// With `via: tcp`, `"$packet_port"` (the second port zeta picks); `null` otherwise.
+    #[serde(default)]
+    pub port: Option<String>,
+    pub parser: PacketParserKind,
+    /// The link type the node gives a link-type number the stream carries (a pcap
+    /// header's), keyed by the number in decimal; a number not listed is read as itself.
+    #[serde(default)]
+    pub link_types: BTreeMap<String, LinkType>,
+}
+
+impl ProgramPackets {
+    /// `link_types` keyed by number; a key that is not a decimal `u16` is left out (a
+    /// validated row has none).
+    pub fn link_type_numbers(&self) -> BTreeMap<u16, LinkType> {
+        self.link_types
+            .iter()
+            .filter_map(|(k, v)| Some((link_type_number(k)?, *v)))
+            .collect()
+    }
+}
+
+/// A `link_types` key's number: decimal digits only, at most 65535.
+fn link_type_number(key: &str) -> Option<u16> {
+    match key.bytes().all(|b| b.is_ascii_digit()) {
+        true => key.parse().ok(),
+        false => None,
+    }
 }
 
 /// The demodulator an audio program row's channel runs through.
@@ -936,7 +977,14 @@ const GRAPH_PLACEHOLDERS: [(&str, u64); 3] = [
     ("$out_rate_hz", 48_000),
 ];
 /// The placeholders a program's `args` may use.
-const PROGRAM_PLACEHOLDERS: [&str; 5] = ["$port", "$rate_hz", "$center_hz", "$center_khz", "$fifo"];
+const PROGRAM_PLACEHOLDERS: [&str; 6] = [
+    "$port",
+    "$packet_port",
+    "$rate_hz",
+    "$center_hz",
+    "$center_khz",
+    "$fifo",
+];
 /// The event fields the node adds after a program's `decoder.output.fields` map, exempt
 /// from the rule that the map names every schema property.
 pub const ENVELOPE_FIELDS: [&str; 4] = ["protocol", "summary", "t_ns", "position"];
@@ -1573,6 +1621,35 @@ fn validate_program(p: &ProgramBlock) -> Result<(), RowError> {
         return Err(RowError::new(
             "decoder.args",
             "with input.via: fifo, an argument must name \"$fifo\" (the pipe zeta makes)",
+        ));
+    }
+    match &p.packets {
+        Some(packets) => validate_packets(packets, p.output.via),
+        None => Ok(()),
+    }
+}
+
+/// A program's `packets` block beside events read `via`.
+fn validate_packets(p: &ProgramPackets, events_via: OutputVia) -> Result<(), RowError> {
+    match p.via {
+        OutputVia::Stdout if events_via == OutputVia::Stdout => {
+            return Err(RowError::new(
+                "decoder.packets.via",
+                "stdout already carries the events",
+            ));
+        }
+        OutputVia::Tcp if p.port.as_deref() != Some("$packet_port") => {
+            return Err(RowError::new(
+                "decoder.packets.port",
+                "\"$packet_port\" with via: tcp (the second port zeta picks)",
+            ));
+        }
+        _ => {}
+    }
+    if let Some(key) = p.link_types.keys().find(|k| link_type_number(k).is_none()) {
+        return Err(RowError::new(
+            format!("decoder.packets.link_types.{key}"),
+            "not a link-type number (decimal, 0 to 65535)",
         ));
     }
     Ok(())
@@ -2849,6 +2926,95 @@ mod tests {
             vec!["apt", "snap"]
         );
         assert!(crate::modes::handlers::package_managers_on(None).is_empty());
+    }
+
+    /// `ADSB` (events on tcp) with a `decoder.packets` block: pcap on `$packet_port`, 147
+    /// read as `mode_s`, then `edit` applied to the block.
+    fn with_packets(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        edited(ADSB, |v| {
+            let mut p = serde_json::json!({
+                "via": "tcp", "port": "$packet_port", "parser": "pcap",
+                "link_types": {"147": "mode_s"}
+            });
+            edit(&mut p);
+            v["decoder"]["packets"] = p;
+            v["decoder"]["args"]
+                .as_array_mut()
+                .unwrap()
+                .extend(["--pcap-port".into(), "$packet_port".into()]);
+        })
+    }
+
+    #[test]
+    fn a_packets_block_round_trips_and_defaults_to_none() {
+        let row = parse(ADSB).unwrap();
+        assert_eq!(program(&row).packets, None);
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["decoder"]["packets"], serde_json::Value::Null);
+        let row = parse(&with_packets(|_| {})).unwrap();
+        validate(&row, &no_stages()).unwrap();
+        let p = program(&row).packets.as_ref().expect("a packets block");
+        assert_eq!(p.via, OutputVia::Tcp);
+        assert_eq!(p.port.as_deref(), Some("$packet_port"));
+        assert_eq!(p.parser, PacketParserKind::Pcap);
+        assert_eq!(
+            p.link_types,
+            BTreeMap::from([("147".to_string(), crate::stream::LinkType::ModeS)])
+        );
+        let again = parse(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(again, row);
+        // `link_types` may be left out.
+        let row = parse(&with_packets(|p| {
+            p.as_object_mut().unwrap().remove("link_types");
+        }))
+        .unwrap();
+        assert!(
+            program(&row)
+                .packets
+                .as_ref()
+                .unwrap()
+                .link_types
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn packets_on_stdout_beside_events_on_stdout_is_refused() {
+        let text = edited(&with_packets(|p| p["via"] = "stdout".into()), |v| {
+            v["decoder"]["output"]["via"] = "stdout".into();
+            v["decoder"]["output"]["port"] = serde_json::Value::Null;
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new("decoder.packets.via", "stdout already carries the events")
+        );
+        // Beside events on tcp, stdout is the packets' own.
+        let text = with_packets(|p| {
+            p["via"] = "stdout".into();
+            p["port"] = serde_json::Value::Null;
+        });
+        validate(&parse(&text).unwrap(), &no_stages()).unwrap();
+    }
+
+    #[test]
+    fn packets_via_tcp_needs_the_packet_port() {
+        for port in [serde_json::Value::Null, "$port".into(), "30005".into()] {
+            let text = with_packets(|p| p["port"] = port.clone());
+            let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+            assert_eq!(e.field, "decoder.packets.port", "{port}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_link_types_key_that_is_not_a_number_is_refused() {
+        for key in ["usb", "-1", "65536", ""] {
+            let text = with_packets(|p| p["link_types"] = serde_json::json!({key: "mode_s"}));
+            let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+            assert_eq!(e.field, format!("decoder.packets.link_types.{key}"), "{e}");
+        }
+        let text = with_packets(|p| p["link_types"] = serde_json::json!({"195": {"other": 195}}));
+        validate(&parse(&text).unwrap(), &no_stages()).unwrap();
     }
 
     #[test]

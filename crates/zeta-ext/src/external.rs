@@ -24,6 +24,16 @@
 //! frame's start). A line the parser cannot read is counted in the job's context as
 //! `external.unparsed`, never fatal; a program that prints nothing is not an error.
 //!
+//! **Packets.** A row with a `packets` block gets a second output, its packet stream
+//! ([`ExternalDecodeStage`]'s `outputs_for`), and `$packet_port` a second free loopback
+//! port. Once the events' output is connected, a task reads the packet output (stdout, or
+//! the port, connected with the same retries for [`CONNECT_TIMEOUT`]), cuts it with the
+//! row's packet parser ([`crate::packet_parsers`]) and publishes each packet with the
+//! provenance the events carry, only while the packet stream has a reader (the framing
+//! is kept all the same). A port that never opens, a stream the parser refuses or a
+//! read error stops that task alone, noted once as `external.packets` beside
+//! `external.unparsed` in the job's context; the job and its events go on.
+//!
 //! **Ending.** Cancel kills and reaps the child and returns `Cancelled`. When the input
 //! closes, the child's input is closed and it gets [`EXIT_GRACE`] to finish; a clean exit
 //! then is `Ok(())` (lines still unread are published first). Any other exit is
@@ -42,7 +52,7 @@ use num_complex::Complex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::broadcast;
@@ -54,9 +64,10 @@ use zeta_core::modes::{
 };
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
-use zeta_core::types::{Provenance, Span, StreamId, StreamKind, Timestamp};
+use zeta_core::types::{Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 use zeta_dsp::resample::Resampler;
 
+use crate::packet_parsers::{PacketParser, Parsed};
 use crate::proc::{self, AbortOnDrop, EXIT_GRACE, LINE_MAX, Pipes, Proc, lock};
 
 /// The stage kind.
@@ -70,6 +81,8 @@ const DRAIN: Duration = Duration::from_secs(1);
 const NOTE_EVERY: Duration = Duration::from_secs(1);
 /// How often opening the fifo is retried while the child has not opened it to read.
 const FIFO_RETRY: Duration = Duration::from_millis(20);
+/// The most bytes of the packet output read at once.
+const PACKET_READ: usize = 64 * 1024;
 
 /// The length of the header [`wav_header`] writes.
 pub const WAV_HEADER_LEN: usize = 44;
@@ -111,7 +124,7 @@ impl ExternalDecodeStage {
             spec: StageSpec {
                 kind: EXTERNAL_DECODE_KIND,
                 inputs: vec![StreamKind::Iq, StreamKind::Audio],
-                outputs: vec![StreamKind::Event],
+                outputs: vec![StreamKind::Event, StreamKind::Packet],
                 params_schema: schemars::schema_for!(ExternalParams),
             },
             modes: handle,
@@ -188,6 +201,21 @@ impl Stage for ExternalDecodeStage {
 
     fn backend(&self) -> Backend {
         Backend::Cpu
+    }
+
+    /// Events, and packets after them when the row the params name has a `packets`
+    /// block; events only for a row the handle does not hold (the run then fails).
+    fn outputs_for(&self, params: &serde_json::Value) -> Vec<StreamKind> {
+        let mode = params.get("mode").and_then(Value::as_str);
+        let packets = mode.zip(self.modes.get()).is_some_and(|(id, reg)| {
+            reg.get(id).is_some_and(
+                |m| matches!(&m.row.decoder, Decoder::Program(b) if b.packets.is_some()),
+            )
+        });
+        match packets {
+            true => vec![StreamKind::Event, StreamKind::Packet],
+            false => vec![StreamKind::Event],
+        }
     }
 
     async fn run(
@@ -269,7 +297,14 @@ pub async fn run_row(
     let uses_port =
         block.output.via == OutputVia::Tcp || block.args.iter().any(|a| a.contains("$port"));
     let port = match uses_port {
-        true => free_port().map_err(|e| fail(format!("no free loopback port: {e}")))?,
+        true => free_port(0).map_err(|e| fail(format!("no free loopback port: {e}")))?,
+        false => 0,
+    };
+    let packets_via = block.packets.as_ref().map(|p| p.via);
+    let uses_packet_port = packets_via == Some(OutputVia::Tcp)
+        || block.args.iter().any(|a| a.contains("$packet_port"));
+    let packet_port = match uses_packet_port {
+        true => free_port(port).map_err(|e| fail(format!("no free loopback port: {e}")))?,
         false => 0,
     };
     // The fifo's directory lives as long as the run.
@@ -291,14 +326,14 @@ pub async fn run_row(
     if let Some(f) = &fifo {
         make_fifo(f).map_err(|e| fail(format!("cannot make fifo {}: {e}", f.display())))?;
     }
-    let args = substitute(block, port, center_hz, fifo.as_deref());
+    let args = substitute(block, (port, packet_port), center_hz, fifo.as_deref());
     let mut child = proc::spawn(
         program,
         &args,
         env,
         Pipes {
             stdin: block.input.via == InputVia::Stdin,
-            stdout: block.output.via == OutputVia::Stdout,
+            stdout: block.output.via == OutputVia::Stdout || packets_via == Some(OutputVia::Stdout),
         },
     )
     .map_err(|e| fail(format!("cannot run {name}: {e}")))?;
@@ -368,6 +403,37 @@ pub async fn run_row(
             }
         },
     };
+    let notes = Arc::new(Notes {
+        ctx: ctx.clone(),
+        external: Mutex::new(serde_json::Map::new()),
+    });
+    // The packet output is read once the events' output is connected; the task ends
+    // with the run.
+    let packet_task = match &block.packets {
+        None => None,
+        Some(p) => {
+            let source = match p.via {
+                OutputVia::Tcp => PacketSource::Tcp(packet_port),
+                OutputVia::Stdout => match child.child.stdout.take() {
+                    Some(s) => PacketSource::Stdout(Box::new(s)),
+                    None => {
+                        proc::reap(&mut child, id).await;
+                        return Err(fail("stdio pipes missing".into()));
+                    }
+                },
+            };
+            let reader = PacketReader {
+                name: name.clone(),
+                parser: crate::packet_parsers::parser(p.parser, &p.link_type_numbers()),
+                out: outputs.get(1).cloned(),
+                bus: bus.clone(),
+                source: ctx.source.clone(),
+                last_prov: last_prov.clone(),
+                notes: notes.clone(),
+            };
+            Some(AbortOnDrop(tokio::spawn(reader.run(source))))
+        }
+    };
     let mut writer = match (early, feed) {
         (Some(w), _) => w,
         (None, Some(f)) => AbortOnDrop(tokio::spawn(f.run())),
@@ -379,8 +445,9 @@ pub async fn run_row(
         fields: block.output.fields.as_ref(),
         out,
         bus: &bus,
-        ctx: &ctx,
+        source: &ctx.source,
         last_prov,
+        notes,
         unparsed: Mutex::new(Unparsed::default()),
     };
     let ends = Ends {
@@ -393,6 +460,7 @@ pub async fn run_row(
     let result = pump(reader, &mut writer, &mut child, &publisher, ends).await;
     publisher.note_unparsed(true);
     writer.0.abort();
+    drop(packet_task);
     proc::reap(&mut child, id).await;
     drop(fifo_dir);
     result
@@ -480,15 +548,21 @@ async fn pump(
     }
 }
 
-/// The row's args with `$port`, `$rate_hz`, `$center_hz`, `$center_khz` and `$fifo`
-/// substituted.
-fn substitute(block: &ProgramBlock, port: u16, center_hz: u64, fifo: Option<&Path>) -> Vec<String> {
+/// The row's args with `$port` and `$packet_port` (`ports`), `$rate_hz`, `$center_hz`,
+/// `$center_khz` and `$fifo` substituted.
+fn substitute(
+    block: &ProgramBlock,
+    (port, packet_port): (u16, u16),
+    center_hz: u64,
+    fifo: Option<&Path>,
+) -> Vec<String> {
     let fifo = fifo.map(|f| f.display().to_string()).unwrap_or_default();
     block
         .args
         .iter()
         .map(|a| {
-            a.replace("$port", &port.to_string())
+            a.replace("$packet_port", &packet_port.to_string())
+                .replace("$port", &port.to_string())
                 .replace("$rate_hz", &block.input.rate_hz.to_string())
                 .replace("$center_hz", &center_hz.to_string())
                 .replace("$center_khz", &zeta_core::modes::center_khz_text(center_hz))
@@ -533,9 +607,115 @@ struct Publisher<'a> {
     fields: Option<&'a BTreeMap<String, FieldPath>>,
     out: StreamId,
     bus: &'a StreamBus,
-    ctx: &'a StageContext,
+    source: &'a SourceId,
     last_prov: Arc<Mutex<Option<Provenance>>>,
+    notes: Arc<Notes>,
     unparsed: Mutex<Unparsed>,
+}
+
+/// The job's `external` context, kept whole: each note carries every key so far
+/// (`unparsed`, `packets`), since the node merges a note's top-level keys only.
+struct Notes {
+    ctx: StageContext,
+    external: Mutex<serde_json::Map<String, Value>>,
+}
+
+impl Notes {
+    /// Set `external.<key>` and note the whole `external` object.
+    fn set(&self, key: &str, value: impl Into<Value>) {
+        let mut m = lock(&self.external);
+        m.insert(key.into(), value.into());
+        // Noted under the lock, so the notes land in the order they were set.
+        self.ctx
+            .note(serde_json::json!({ "external": Value::Object(m.clone()) }));
+    }
+}
+
+/// The provenance of what a program writes now: the latest input frame's, else the
+/// wall clock's (before the first frame).
+fn provenance(last_prov: &Mutex<Option<Provenance>>, source: &SourceId) -> Provenance {
+    lock(last_prov).clone().unwrap_or_else(|| {
+        let t = now();
+        Provenance {
+            source: source.clone(),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: t,
+                end_ns: t,
+            },
+        }
+    })
+}
+
+/// Where a program's packets come from.
+enum PacketSource {
+    Stdout(Box<dyn AsyncRead + Unpin + Send>),
+    /// The `$packet_port`, connected with [`connect_until`]'s retries.
+    Tcp(u16),
+}
+
+/// Reads a program's packet output into packet frames (see the module docs).
+struct PacketReader {
+    /// The program, as the run's messages name it.
+    name: String,
+    parser: Box<dyn PacketParser>,
+    /// The job's packet stream (none when the job was given only the event output).
+    out: Option<StreamId>,
+    bus: Arc<StreamBus>,
+    source: SourceId,
+    last_prov: Arc<Mutex<Option<Provenance>>>,
+    notes: Arc<Notes>,
+}
+
+impl PacketReader {
+    /// Read until the output closes; a port that never opens, a read error or a stream
+    /// the parser refuses is noted as `external.packets` and ends the reading.
+    async fn run(mut self, source: PacketSource) {
+        let mut r: Box<dyn AsyncRead + Unpin + Send> = match source {
+            PacketSource::Stdout(s) => s,
+            PacketSource::Tcp(port) => match connect_until(port, std::future::pending()).await {
+                Ok(s) => Box::new(s),
+                Err(_) => {
+                    let why = format!("{} did not open its packet port", self.name);
+                    return self.notes.set("packets", why);
+                }
+            },
+        };
+        let mut buf = vec![0u8; PACKET_READ];
+        loop {
+            let n = match r.read(&mut buf).await {
+                Ok(0) => return,
+                Ok(n) => n,
+                Err(e) => {
+                    let why = format!("reading {}'s packet output: {e}", self.name);
+                    return self.notes.set("packets", why);
+                }
+            };
+            match self.parser.push(&buf[..n]) {
+                Ok(packets) => self.publish(packets),
+                Err(e) => return self.notes.set("packets", e.0),
+            }
+        }
+    }
+
+    /// Publish `packets` with the events' provenance, only while the packet stream has
+    /// a reader.
+    fn publish(&self, packets: Vec<Parsed>) {
+        let Some(out) = &self.out else { return };
+        if packets.is_empty() || self.bus.receiver_count(out).unwrap_or(0) == 0 {
+            return;
+        }
+        let prov = provenance(&self.last_prov, &self.source);
+        for p in packets {
+            let payload = Payload::Packet {
+                link_type: p.link_type,
+                data: Arc::from(p.data),
+            };
+            self.bus
+                .publish(Frame::new(out.clone(), prov.clone(), payload));
+        }
+    }
 }
 
 /// Unreadable lines so far, and when the count was last noted.
@@ -562,18 +742,7 @@ impl Publisher<'_> {
         if let Some(map) = self.fields {
             fields = apply_fields(map, &fields);
         }
-        let prov = lock(&self.last_prov).clone().unwrap_or_else(|| {
-            let t = now();
-            Provenance {
-                source: self.ctx.source.clone(),
-                job: None,
-                channel: None,
-                span: Span {
-                    start_ns: t,
-                    end_ns: t,
-                },
-            }
-        });
+        let prov = provenance(&self.last_prov, self.source);
         let ev = zeta_core::modes::summary::envelope(self.row, prov.span.start_ns.0, fields);
         self.bus
             .publish(Frame::new(self.out.clone(), prov, Payload::Event(ev)));
@@ -591,8 +760,7 @@ impl Publisher<'_> {
         u.at = Some(Instant::now());
         let n = u.count;
         drop(u);
-        self.ctx
-            .note(serde_json::json!({ "external": { "unparsed": n } }));
+        self.notes.set("unparsed", n);
     }
 }
 
@@ -628,10 +796,19 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
-/// A loopback port free at the time of asking.
-fn free_port() -> io::Result<u16> {
-    let l = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(l.local_addr()?.port())
+/// A loopback port free at the time of asking, other than `besides` (a port already
+/// picked for the run; 0 for none).
+fn free_port(besides: u16) -> io::Result<u16> {
+    // Each listener is held until the answer, so the OS hands out a fresh port each try.
+    let mut held = Vec::new();
+    loop {
+        let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = l.local_addr()?.port();
+        if port != besides {
+            return Ok(port);
+        }
+        held.push(l);
+    }
 }
 
 /// Connect to the child's output port, retrying every [`CONNECT_RETRY`] for
@@ -642,12 +819,29 @@ async fn connect(
     child: &mut Child,
     cancel: &CancellationToken,
 ) -> Result<TcpStream, bool> {
+    let ended = async {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => true,
+            _ = child.wait() => false,
+        }
+    };
+    connect_until(port, ended).await
+}
+
+/// Connect to loopback `port`, retrying every [`CONNECT_RETRY`] for [`CONNECT_TIMEOUT`]
+/// or until `ended` answers. `Err` of what `ended` answered, `Err(false)` when the time
+/// ran out.
+async fn connect_until(
+    port: u16,
+    ended: impl std::future::Future<Output = bool>,
+) -> Result<TcpStream, bool> {
+    tokio::pin!(ended);
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(true),
-            _ = child.wait() => return Err(false),
+            e = &mut ended => return Err(e),
             r = tokio::time::timeout(CONNECT_RETRY, TcpStream::connect(("127.0.0.1", port))) => {
                 if let Ok(Ok(s)) = r {
                     return Ok(s);
@@ -659,8 +853,7 @@ async fn connect(
         }
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(true),
-            _ = child.wait() => return Err(false),
+            e = &mut ended => return Err(e),
             _ = tokio::time::sleep(CONNECT_RETRY) => {}
         }
     }
@@ -1079,13 +1272,20 @@ mod tests {
         let Decoder::Program(mut block) = row.decoder else {
             panic!("a program row")
         };
-        block.args = ["--port=$port", "-r", "$rate_hz", "-f$center_hz", "$fifo"]
-            .map(String::from)
-            .to_vec();
+        block.args = [
+            "--port=$port",
+            "-r",
+            "$rate_hz",
+            "-f$center_hz",
+            "$fifo",
+            "--pcap=$packet_port",
+        ]
+        .map(String::from)
+        .to_vec();
         assert_eq!(
             substitute(
                 &block,
-                30_005,
+                (30_005, 30_006),
                 1_090_000_000,
                 Some(Path::new("/run/x/input"))
             ),
@@ -1094,7 +1294,8 @@ mod tests {
                 "-r",
                 "2400000",
                 "-f1090000000",
-                "/run/x/input"
+                "/run/x/input",
+                "--pcap=30006"
             ]
         );
         assert_eq!(parser_name(Parser::Sbs), "SBS");
@@ -1108,7 +1309,7 @@ mod tests {
         };
         block.args = ["$center_khz", "$center_hz"].map(String::from).to_vec();
         assert_eq!(
-            substitute(&block, 0, 8_942_500, None),
+            substitute(&block, (0, 0), 8_942_500, None),
             ["8942.5", "8942500"]
         );
     }
