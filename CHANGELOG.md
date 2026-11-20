@@ -22,8 +22,9 @@
 - `modes_list` and `modes_show` gain each mode's `handlers` and `handler` (the policy's pick now);
   the mode is `ready` when any handler is, its `program`, `reason` and `missing` describe that
   pick (or the row's own decoder when none is ready) and its `outputs` are the union over the
-  ready handlers, so a mode with one handler reads as before. Job records gain `handler` and
-  `handler_named`, every decoder event gains `handler`, and a packet capture's comment names it.
+  ready handlers, so a mode with one handler reads as before. Job records gain `handler`,
+  `handler_named` and `needs`, every decoder event gains `handler`, and a packet capture's comment
+  names it.
 - Packets from programs: a program row's or handler entry's `packets` block reads a second
   output, a pcap stream or dump1090's Beast output, into the job's packet stream. The ADS-B row
   reads dump1090's Beast output, so an `adsb_decode` job takes a packet capture: each Mode S frame
@@ -36,6 +37,18 @@
 - Peers older than this refuse the link types they do not know (`mode_s`, a number without a
   name) in a stream's frames and the new fields of `modes_list`'s answer: upgrade them together
   with the node.
+- Every `adsb_decode` job now opens a second local port to dump1090 (`--net-bo-port`) for its
+  Beast output, which matters to an operator whose own ADS-B row passes dump1090 its ports. An
+  older CLI or peer does not know the `no_handler` error or the `handler_policy` result; this
+  build's CLI still reads an older node's `modes list` and `modes show` (as no handlers).
+- Rolling back past this build loses state. Once this build has run, the previous build resumes
+  no jobs: every job record this build writes carries `handler`, `handler_named` and `needs`
+  (every launch, resumes included, rewrites the record), and the previous build skips a record
+  with fields it does not know, naming its file. One packet capture whose link type the previous
+  build has no name for (`mode_s`, so any ADS-B capture, `ax25` or any other number) makes it
+  move the whole packet index aside (`index.json.broken-<id>`, with one `index unreadable` line):
+  every capture stops being listed, though the files stay on disk. `handler-policy.json` and the
+  `<mode>@<handler>` keys of `modes-checked.json` are harmless: the previous build ignores them.
 
 ## 0.2.0 - 2026-11-17
 

@@ -35,7 +35,7 @@
 4. A same-kind, same-band start with a different handler is not a duplicate (`duplicate_of` compares the resolved handler). Grouping is plan 43's.
 5. `modes check` checks the row's own handler by default and `--handler <id>` another; `checked` is kept per `mode` and per `mode@handler`.
 6. The page changes only where it would otherwise mislead: the capture entry reads the job's own handler's outputs, and a job row names its handler when its mode has more than one.
-7. `onair-rx` emits one JSON line per decoded Mode S frame carrying the aircraft's current state.
+7. `onair-rx` emits one JSON line per decoded Mode S frame carrying the aircraft's current state. Superseded during the build: a line carries only what its own frame established (the meaning dump1090's SBS output gives), so two handlers' events compare and a stale fix never reads as new.
 
 ## Review Focus
 
