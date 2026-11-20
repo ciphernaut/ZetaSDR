@@ -779,6 +779,14 @@ pub enum OutputVia {
     Tcp,
 }
 
+/// How a program's binary packet output is cut into packets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketParserKind {
+    Pcap,
+    Beast,
+}
+
 /// How a program's output lines become events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
