@@ -1744,10 +1744,13 @@ impl Node {
     /// `NodeConfig.modes_dir`, none when it is `None`, as at `open`) and the handler
     /// files (embedded, then `NodeConfig.handlers_dir`) against the node's stages, carry
     /// each program row's and handler file's probed program and state over from the
-    /// registry in force ([`ModeRegistry::carry_programs`]), read the checked times, and put
-    /// the new registry in force. Jobs already running keep the graphs they were
-    /// expanded to. The broken rows' startup lines
-    /// ([`ModeRegistry::startup_lines`]), for the caller to show.
+    /// registry in force ([`ModeRegistry::carry_programs`]), look up the program of each
+    /// handler file not carried (new or edited:
+    /// [`crate::modes::handlers::probe_handler_files`], which runs nothing), read the
+    /// checked times, and put the new registry in force. Jobs already running keep the
+    /// graphs they were expanded to. The broken rows' and handler files' startup lines
+    /// ([`ModeRegistry::startup_lines`]), then that lookup's report lines, for the caller
+    /// to show.
     pub fn reload_modes(&self) -> Result<Vec<String>, NodeError> {
         let inner = &self.inner;
         // One reload at a time: a later one reads every file an earlier one saw.
@@ -1758,8 +1761,11 @@ impl Node {
             inner.handlers_dir.as_deref(),
         );
         modes.carry_programs(&inner.modes());
+        // A handler file new or edited since the last probe: looked up, never run.
+        let probed = crate::modes::handlers::probe_handler_files(&mut modes);
         modes.load_checked(&inner.state_dir.join(MODES_CHECKED_FILE));
-        let lines = modes.startup_lines();
+        let mut lines = modes.startup_lines();
+        lines.extend(probed);
         inner.modes.set(Arc::new(modes));
         Ok(lines)
     }

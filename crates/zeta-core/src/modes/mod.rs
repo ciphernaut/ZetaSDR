@@ -473,11 +473,12 @@ impl ModeRegistry {
         });
     }
 
-    /// Parse one handler file: a valid one replaces the valid file of its id, a broken
-    /// one is listed beside it (and leaves that one in force).
+    /// Parse one handler file: a valid one replaces the valid file of its id, its
+    /// entries that did not parse recorded in its `entries`; a broken one is listed
+    /// beside it (and leaves that one in force).
     fn add_handler_file(&mut self, file: String, text: &str) {
-        let h = match handler_file::parse_handler_file(text) {
-            Ok(h) => h,
+        let (h, unparsed) = match handler_file::parse_handler_file(text) {
+            Ok(parsed) => parsed,
             Err(e) => {
                 let id = serde_json::from_str::<serde_json::Value>(text)
                     .ok()
@@ -492,7 +493,10 @@ impl ModeRegistry {
             state: ModeState::Ready,
             reason: None,
             handler: Some(h),
-            entries: BTreeMap::new(),
+            entries: unparsed
+                .into_iter()
+                .map(|(mode, e)| (mode, Some(e.to_string())))
+                .collect(),
         };
         let same = |f: &&mut LoadedHandlerFile| f.id == loaded.id && f.state == ModeState::Ready;
         match self.handler_files.iter_mut().find(same) {
@@ -515,16 +519,17 @@ impl ModeRegistry {
     /// Give every mode its handlers: the row's own, then each ready handler file's entry
     /// for it (by file id), recording in each file why an entry did not load. An entry
     /// that fails validation is listed `broken` among the mode's handlers; one naming no
-    /// mode, a broken row, or the row's own handler's id is not listed.
+    /// mode, a broken row, or the row's own handler's id is not listed. The entries that
+    /// did not parse keep the reasons [`ModeRegistry::add_handler_file`] recorded.
     fn attach_handlers(&mut self) {
         for m in &mut self.modes {
             m.handlers = vec![own_handler(m)];
         }
         for f in &mut self.handler_files {
-            f.entries.clear();
             let Some(h) = &f.handler else {
                 continue;
             };
+            f.entries.retain(|mode, _| !h.modes.contains_key(mode));
             for (mode, entry) in &h.modes {
                 let reason = match self.modes.iter_mut().find(|m| m.row.id.0 == *mode) {
                     None => Some("no mode of that id".to_string()),

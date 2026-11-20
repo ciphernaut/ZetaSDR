@@ -7,7 +7,64 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use super::ModeRow;
+use super::{ModeRegistry, ModeRow, ModeState};
+
+/// Look up the program of each ready handler file whose handlers are not probed yet
+/// (`ready` with no program: as loaded, and not carried over a reload by
+/// [`ModeRegistry::carry_programs`]), one [`find_handler`] per file, never running it,
+/// and record it in every such handler ([`ModeRegistry::set_handler_program`]): found,
+/// they are ready with its path; missing, unavailable with the report line as their
+/// reason. Returns one line per file looked up: `zeta: handlers: <programs[0]>: found
+/// <path> (handler <id>)`, or `zeta: handlers: <programs[0]>: missing (<hint>; <url>) —
+/// modes: <ids>` as for a row's program (the hint left out, with its `; `, when the file
+/// names no script or package).
+pub fn probe_handler_files(modes: &mut ModeRegistry) -> Vec<String> {
+    let files: Vec<_> = modes
+        .handler_files()
+        .iter()
+        .filter_map(|f| f.handler.as_ref())
+        .map(|h| (h.id.clone(), h.programs.clone(), h.install.clone()))
+        .collect();
+    let mut lines = Vec::new();
+    for (id, programs, install) in files {
+        let unprobed = |h: &super::ModeHandler| {
+            h.id == id && h.state == ModeState::Ready && h.program.is_none()
+        };
+        let served: Vec<String> = modes
+            .all()
+            .iter()
+            .filter(|m| m.handlers.iter().skip(1).any(unprobed))
+            .map(|m| m.row.id.0.clone())
+            .collect();
+        if served.is_empty() {
+            continue;
+        }
+        let first = programs.first().cloned().unwrap_or_default();
+        let (program, reason) = match find_handler(&programs) {
+            Some(path) => {
+                lines.push(format!(
+                    "zeta: handlers: {first}: found {} (handler {id})",
+                    path.display()
+                ));
+                (Some(path), None)
+            }
+            None => {
+                let hint = install.hint().map(|h| format!("{h}; ")).unwrap_or_default();
+                let reason = format!(
+                    "{first}: missing ({hint}{}) — modes: {}",
+                    install.url,
+                    served.join(", ")
+                );
+                lines.push(format!("zeta: handlers: {reason}"));
+                (None, Some(reason))
+            }
+        };
+        for mode in &served {
+            modes.set_handler_program(mode, &id, program.clone(), reason.clone());
+        }
+    }
+    lines
+}
 
 /// The variables that name a row's program instead of a `PATH` search:
 /// `ZETA_HANDLER_<PROGRAM>` for `programs[0]` (upper-cased, every other character

@@ -118,7 +118,8 @@ enum Probed {
 /// `zeta: handlers: <programs[0]>: missing (<hint>; <url>) — voice silent: <ids>` for
 /// those that run without it. The hint is [`Install::hint`] (`bash <script>`, else the
 /// first package), left out (with its `; `) when the row names neither. Then each
-/// handler file's program, one line per file ([`probe_handler_files`]).
+/// handler file's program, one line per file
+/// ([`zeta_core::modes::handlers::probe_handler_files`]: looked up, never run).
 pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
     let mut groups: Vec<HandlerGroup> = Vec::new();
     // Each row with its lists in order (as indices into `groups`), and whether it runs
@@ -212,59 +213,7 @@ pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
             }
         }
     }
-    lines.extend(probe_handler_files(modes));
-    lines
-}
-
-/// Find each ready handler file's program (one lookup per file, never run: no version
-/// is asked) and record it in every mode whose handler it is
-/// ([`ModeRegistry::set_handler_program`]): found, the handlers are ready with its path;
-/// missing, they are unavailable with the report line as their reason. Returns one line
-/// per file with a mode entry that loaded: `zeta: handlers: <programs[0]>: found <path>
-/// (handler <id>)`, or `zeta: handlers: <programs[0]>: missing (<hint>; <url>) — modes:
-/// <ids>` as for a row's program.
-fn probe_handler_files(modes: &mut ModeRegistry) -> Vec<String> {
-    let files: Vec<(String, Vec<String>, Install, Vec<String>)> = modes
-        .handler_files()
-        .iter()
-        .filter_map(|f| {
-            let h = f.handler.as_ref()?;
-            let served: Vec<String> = f
-                .entries
-                .iter()
-                .filter(|(_, r)| r.is_none())
-                .map(|(m, _)| m.clone())
-                .collect();
-            Some((h.id.clone(), h.programs.clone(), h.install.clone(), served))
-        })
-        .filter(|(.., served)| !served.is_empty())
-        .collect();
-    let mut lines = Vec::new();
-    for (id, programs, install, served) in files {
-        let first = programs.first().cloned().unwrap_or_default();
-        let (program, reason) = match zeta_ext::proc::find_handler(&programs) {
-            Some(path) => {
-                lines.push(format!(
-                    "zeta: handlers: {first}: found {} (handler {id})",
-                    path.display()
-                ));
-                (Some(path), None)
-            }
-            None => {
-                let hint = install.hint().map(|h| format!("{h}; ")).unwrap_or_default();
-                let reason = format!(
-                    "{first}: missing ({hint}{}) — modes: {}",
-                    install.url,
-                    served.join(", ")
-                );
-                lines.push(format!("zeta: handlers: {reason}"));
-                (None, Some(reason))
-            }
-        };
-        for mode in &served {
-            modes.set_handler_program(mode, &id, program.clone(), reason.clone());
-        }
-    }
+    lines.extend(zeta_core::modes::handlers::probe_handler_files(modes));
     lines
 }
 

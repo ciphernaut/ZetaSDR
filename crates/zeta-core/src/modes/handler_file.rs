@@ -5,8 +5,8 @@
 //! Files are embedded (`handlers/*.json` in the repo) and read from the operator's
 //! handlers directory (`--handlers-dir`); the registry ([`super::ModeRegistry`]) adds a
 //! handler to each mode a file lists. A file that does not parse, or whose `id` is not a
-//! handler id, is broken whole; a mode entry that names no mode or fails validation
-//! breaks that entry only.
+//! handler id, is broken whole; a mode entry that does not parse, names no mode or fails
+//! validation breaks that entry only.
 
 use std::collections::BTreeMap;
 
@@ -134,19 +134,46 @@ pub fn own_handler_id(row: &ModeRow) -> String {
     }
 }
 
-/// Parse one handler file and check what concerns the whole file: its `id` and
-/// `programs`. A serde failure names the unknown or missing field when serde says which
-/// (`handler file` otherwise).
-pub fn parse_handler_file(text: &str) -> Result<HandlerFile, RowError> {
-    let file: HandlerFile = serde_json::from_str(text).map_err(|e| {
-        let msg = e.to_string();
-        let named = ["unknown field `", "missing field `"]
-            .iter()
-            .find_map(|p| msg.split_once(p))
-            .and_then(|(_, rest)| rest.split_once('`'))
-            .map(|(name, _)| name.to_string());
-        error(named.as_deref().unwrap_or("handler file"), msg)
-    })?;
+/// A handler file as read before its mode entries: each entry is read on its own, so a
+/// malformed one breaks only itself.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFile {
+    id: String,
+    name: String,
+    programs: Vec<String>,
+    install: Install,
+    modes: BTreeMap<String, serde_json::Value>,
+}
+
+/// Parse one handler file and check what concerns the whole file: its keys, its `id`
+/// and `programs`; a failure there is the file's error. Each mode entry is read on its
+/// own: the file comes with the entries that parsed, and beside it, by mode id, why
+/// each other one did not. A serde failure names the unknown or missing field when serde
+/// says which (`handler file`, or `entry` for an entry, otherwise).
+pub fn parse_handler_file(
+    text: &str,
+) -> Result<(HandlerFile, BTreeMap<String, RowError>), RowError> {
+    let raw: RawFile = serde_json::from_str(text).map_err(|e| serde_error(&e, "handler file"))?;
+    let mut modes = BTreeMap::new();
+    let mut broken = BTreeMap::new();
+    for (mode, value) in raw.modes {
+        match serde_json::from_value::<HandlerEntry>(value) {
+            Ok(entry) => {
+                modes.insert(mode, entry);
+            }
+            Err(e) => {
+                broken.insert(mode, serde_error(&e, "entry"));
+            }
+        }
+    }
+    let file = HandlerFile {
+        id: raw.id,
+        name: raw.name,
+        programs: raw.programs,
+        install: raw.install,
+        modes,
+    };
     if file.id == BUILTIN {
         return Err(error("id", "builtin is a row's own decoder's id"));
     }
@@ -162,7 +189,19 @@ pub fn parse_handler_file(text: &str) -> Result<HandlerFile, RowError> {
             "names no program (give at least one name or absolute path)",
         ));
     }
-    Ok(file)
+    Ok((file, broken))
+}
+
+/// A serde failure as a [`RowError`] on the unknown or missing field it names, else on
+/// `whole`.
+fn serde_error(e: &serde_json::Error, whole: &str) -> RowError {
+    let msg = e.to_string();
+    let named = ["unknown field `", "missing field `"]
+        .iter()
+        .find_map(|p| msg.split_once(p))
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(name, _)| name.to_string());
+    error(named.as_deref().unwrap_or(whole), msg)
 }
 
 /// Check `file`'s entry `entry` against the row it serves: the program block as a
@@ -249,7 +288,7 @@ mod tests {
 
     #[test]
     fn an_entry_builds_the_program_block_with_the_files_programs() {
-        let f = parse_handler_file(&file(|_| {})).unwrap();
+        let f = parse_handler_file(&file(|_| {})).unwrap().0;
         let e = &f.modes["adsb_decode"];
         assert_eq!(e.extra.len(), 1);
         let b = e.program_block(&f);
@@ -260,11 +299,20 @@ mod tests {
         assert_eq!(b.demod, None);
     }
 
+    /// An entry's unknown key breaks that entry only, named under its mode; the file's
+    /// own unknown key, or a missing one, breaks the file.
     #[test]
     fn an_unknown_field_in_an_entry_or_the_file_is_named() {
-        let e = parse_handler_file(&file(|v| v["modes"]["adsb_decode"]["bogus"] = 1.into()))
-            .unwrap_err();
+        let (f, broken) = parse_handler_file(&file(|v| {
+            v["modes"]["ais_decode"] = v["modes"]["adsb_decode"].clone();
+            v["modes"]["adsb_decode"]["bogus"] = 1.into();
+        }))
+        .unwrap();
+        assert_eq!(f.modes.keys().collect::<Vec<_>>(), ["ais_decode"]);
+        assert_eq!(broken.keys().collect::<Vec<_>>(), ["adsb_decode"]);
+        let e = &broken["adsb_decode"];
         assert_eq!(e.field, "bogus", "{e}");
+        assert!(e.error.contains("unknown field"), "{e}");
         let e = parse_handler_file(&file(|v| v["bogus"] = 1.into())).unwrap_err();
         assert_eq!(e.field, "bogus", "{e}");
         let e = parse_handler_file(&file(|v| {
@@ -312,22 +360,25 @@ mod tests {
         let f = parse_handler_file(&file(|v| {
             v["modes"]["adsb_decode"]["args"] = serde_json::json!(["$nope"]);
         }))
-        .unwrap();
+        .unwrap()
+        .0;
         let e = validate_entry(&f, &f.modes["adsb_decode"], &row).unwrap_err();
         assert_eq!(e.field, "args[0]", "{e}");
         let f = parse_handler_file(&file(|v| {
             v["modes"]["adsb_decode"]["output"]["fields"]["nope"] = "/n".into();
         }))
-        .unwrap();
+        .unwrap()
+        .0;
         let e = validate_entry(&f, &f.modes["adsb_decode"], &row).unwrap_err();
         assert_eq!(e.field, "output.fields.nope", "{e}");
         let f = parse_handler_file(&file(|v| {
             v["modes"]["adsb_decode"]["extra"]["df"] = "df".into();
         }))
-        .unwrap();
+        .unwrap()
+        .0;
         let e = validate_entry(&f, &f.modes["adsb_decode"], &row).unwrap_err();
         assert_eq!(e.field, "extra.df", "{e}");
-        let f = parse_handler_file(&file(|_| {})).unwrap();
+        let f = parse_handler_file(&file(|_| {})).unwrap().0;
         validate_entry(&f, &f.modes["adsb_decode"], &row).unwrap();
     }
 }

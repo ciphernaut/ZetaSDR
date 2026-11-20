@@ -1465,3 +1465,78 @@ fn a_broken_handler_file_never_fails_the_load() {
     assert!(lines[0].starts_with("zeta: handler bad ("), "{lines:?}");
     assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090"]);
 }
+
+#[test]
+fn a_malformed_entry_breaks_only_itself() {
+    let text = adsb_handler_file("alt", |f| {
+        let mut bad = f["modes"]["adsb_decode"].clone();
+        bad.as_object_mut().unwrap().remove("input");
+        f["modes"]["ais_decode"] = bad;
+    });
+    let reg = with_handler_files(&[("alt.json", &text)]);
+    let file = &reg.handler_files()[0];
+    assert_eq!(file.state, ModeState::Ready, "{file:?}");
+    let broken = file.broken_entries();
+    assert_eq!(broken.len(), 1, "{broken:?}");
+    assert!(
+        broken[0].starts_with("ais_decode: input: missing field `input`"),
+        "{broken:?}"
+    );
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "alt"]);
+    assert_eq!(
+        reg.handler("adsb_decode", "alt").unwrap().state,
+        ModeState::Ready
+    );
+    assert_eq!(handler_ids(&reg, "ais_decode")[..1], ["builtin"]);
+    assert_eq!(handler_ids(&reg, "ais_decode").len(), 1);
+    let lines = reg.startup_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("zeta: handler alt (") && lines[0].contains("): ais_decode: input: "),
+        "{lines:?}"
+    );
+}
+
+/// A handler file written after the node opened is looked up on the reload that reads
+/// it: a program no host has makes the handler unavailable, one that exists ready with
+/// its path.
+#[tokio::test]
+async fn a_handler_file_added_before_a_reload_is_probed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (modes, handlers) = (dir.path().join("modes"), dir.path().join("handlers"));
+    std::fs::create_dir_all(&handlers).unwrap();
+    let cfg = NodeConfig {
+        handlers_dir: Some(handlers.clone()),
+        ..cfg(dir.path(), &modes)
+    };
+    let node = Node::open(cfg, stages(), vec![]).await.unwrap();
+    assert_eq!(handler_ids(&node.modes(), "adsb_decode"), ["dump1090"]);
+
+    let missing = adsb_handler_file("alt", |f| {
+        f["programs"] = serde_json::json!(["zeta-no-such-handler"]);
+    });
+    std::fs::write(handlers.join("alt.json"), missing).unwrap();
+    node.reload_modes().unwrap();
+    let reg = node.modes();
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.state, ModeState::Unavailable, "{alt:?}");
+    assert_eq!(
+        alt.reason.as_deref(),
+        Some("zeta-no-such-handler: missing (https://example.invalid/alt) — modes: adsb_decode")
+    );
+    assert_eq!(alt.program, None);
+
+    let program = dir.path().join("alt-rx");
+    std::fs::write(&program, "#!/bin/sh\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let found = adsb_handler_file("alt", |f| {
+        f["programs"] = serde_json::json!([program.display().to_string()]);
+    });
+    std::fs::write(handlers.join("alt.json"), found).unwrap();
+    node.reload_modes().unwrap();
+    let reg = node.modes();
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.state, ModeState::Ready, "{alt:?}");
+    assert_eq!(alt.program.as_deref(), Some(program.as_path()));
+}
