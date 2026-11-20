@@ -18,10 +18,11 @@
       "--ifile", "-", "--iformat", "SC16", "--net",
       "--net-bind-address", "127.0.0.1", "--net-sbs-port", "$port",
       "--net-ri-port", "0", "--net-ro-port", "0",
-      "--net-bi-port", "0", "--net-bo-port", "0", "--quiet"
+      "--net-bi-port", "0", "--net-bo-port", "$packet_port", "--quiet"
     ],
     "input": { "stream": "iq", "format": "cs16", "rate_hz": 2400000, "via": "stdin" },
     "output": { "via": "tcp", "port": "$port", "parser": "sbs" },
+    "packets": { "via": "tcp", "port": "$packet_port", "parser": "beast", "link_types": {} },
     "install": { "debian": "dump1090-fa", "url": "https://github.com/flightaware/dump1090" }
   },
   "event": {

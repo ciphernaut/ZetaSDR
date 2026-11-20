@@ -115,7 +115,8 @@ pub fn cfg(dir: &Path, resume: bool) -> NodeConfig {
 }
 
 /// Plan 42's handler fixtures: `adsb_decode` with a handler file `alt` beside the row's
-/// own `dump1090`, a radio wide enough for it, and a stand-in for zeta-ext's
+/// own `dump1090` (events only here) and no OnAir, a radio wide enough for it, and a
+/// stand-in for zeta-ext's
 /// `external_decode` stage (core cannot depend on it).
 pub mod handlers {
     use std::path::{Path, PathBuf};
@@ -188,13 +189,43 @@ pub mod handlers {
         let handlers = dir.join("handlers");
         std::fs::create_dir_all(&handlers).unwrap();
         std::fs::write(handlers.join(format!("{id}.json")), file.to_string()).unwrap();
+        // The embedded OnAir replaced by a file serving no mode: these fixtures' mode has
+        // the row's own handler and the files written here, nothing else.
+        let no_onair = serde_json::json!({
+            "id": "onair", "name": "OnAir", "programs": ["onair-rx"],
+            "install": {"url": "https://example.invalid/onair"}, "modes": {},
+        });
+        std::fs::write(handlers.join("onair.json"), no_onair.to_string()).unwrap();
         handlers
     }
 
-    /// [`super::cfg`] (resuming) reading the handlers directory [`write_alt`] writes.
+    /// `<dir>/modes` holding `adsb_decode` as the embedded row without its `packets`
+    /// block (dump1090 giving events only), so the row's own handler outputs no packets.
+    pub fn write_events_only_row(dir: &Path) -> PathBuf {
+        let (_, text) = ModeRegistry::embedded()
+            .into_iter()
+            .find(|(f, _)| f.ends_with("adsb_decode.json"))
+            .expect("embedded adsb_decode");
+        let mut row: serde_json::Value = serde_json::from_str(text).unwrap();
+        let d = row["decoder"].as_object_mut().unwrap();
+        d.remove("packets");
+        for a in d["args"].as_array_mut().unwrap() {
+            if a == "$packet_port" {
+                *a = "0".into();
+            }
+        }
+        let modes = dir.join("modes");
+        std::fs::create_dir_all(&modes).unwrap();
+        std::fs::write(modes.join(format!("{MODE}.json")), row.to_string()).unwrap();
+        modes
+    }
+
+    /// [`super::cfg`] (resuming) reading the handlers directory [`write_alt`] writes and
+    /// the row [`write_events_only_row`] writes.
     pub fn cfg(dir: &Path, packets: bool) -> NodeConfig {
         NodeConfig {
             handlers_dir: Some(write_alt(dir, packets)),
+            modes_dir: Some(write_events_only_row(dir)),
             ..super::cfg(dir, true)
         }
     }

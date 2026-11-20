@@ -160,7 +160,9 @@ pub struct ModeHandler {
     pub program: Option<PathBuf>,
     /// The optional helper programs not found (the row's own handler only).
     pub missing: Vec<String>,
-    /// When `zeta modes check` last passed it (the row's own handler only).
+    /// When `zeta modes check` last passed it: for the row's own handler `modes check
+    /// <mode>`, for a handler file's `modes check <mode> --handler <id>` (recorded as
+    /// `<mode>@<id>`, see [`ModeRegistry::load_checked`]).
     pub checked: Option<u64>,
     /// The file it comes from: the row's for the row's own, the handler file's otherwise.
     pub file: String,
@@ -311,7 +313,10 @@ const EMBEDDED: [(&str, &str); 17] = [
 ];
 
 /// The embedded handler files, one each under `handlers/` in the repo.
-const EMBEDDED_HANDLERS: [(&str, &str); 0] = [];
+const EMBEDDED_HANDLERS: [(&str, &str); 1] = [(
+    "handlers/onair.json",
+    include_str!("../../../../handlers/onair.json"),
+)];
 
 /// The file in the state directory recording when `zeta modes check` last passed each
 /// program row (see [`ModeRegistry::load_checked`]).

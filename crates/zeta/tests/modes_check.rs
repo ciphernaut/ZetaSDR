@@ -830,7 +830,7 @@ fn modes_check_checks_a_named_handler_and_records_it_apart() {
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("mode adsb_decode has no handler nope (its handlers: dump1090, alt)"),
+        err.contains("mode adsb_decode has no handler nope (its handlers: dump1090, alt, onair)"),
         "{err}"
     );
 }

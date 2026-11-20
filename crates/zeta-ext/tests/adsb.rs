@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use zeta_core::port::IqBlock;
 use zeta_core::stage::{Stage, StageContext, StageError};
-use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::stream::{Frame, LinkType, Payload, StreamBus};
 use zeta_core::types::{Hz, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 use zeta_ext::sbs::parse_line;
 use zeta_ext::{ADSB_RATE_HZ, AdsbDecodeStage, find_dump1090};
@@ -101,14 +101,24 @@ fn iq_frame(iq: &[Complex<f32>], rate_hz: u64) -> Frame {
 struct Running {
     tx: broadcast::Sender<Frame>,
     rx_out: broadcast::Receiver<Frame>,
+    /// The packet output's receiver, when the stage was given one.
+    rx_packets: Option<broadcast::Receiver<Frame>>,
     cancel: CancellationToken,
     handle: tokio::task::JoinHandle<Result<(), StageError>>,
 }
 
 fn start(stage: AdsbDecodeStage) -> Running {
+    start_with(stage, false)
+}
+
+/// [`start`], with a packet output after the event output (subscribed) when `packets`.
+fn start_with(stage: AdsbDecodeStage, packets: bool) -> Running {
     let bus = Arc::new(StreamBus::new(64));
     let out = bus.register(StreamKind::Event, prov());
     let rx_out = bus.subscribe(&out).unwrap();
+    let packets = packets.then(|| bus.register(StreamKind::Packet, prov()));
+    let rx_packets = packets.as_ref().map(|p| bus.subscribe(p).unwrap());
+    let outputs: Vec<StreamId> = std::iter::once(out).chain(packets).collect();
     let (tx, rx_in) = broadcast::channel(64);
     let cancel = CancellationToken::new();
     let c = cancel.clone();
@@ -117,7 +127,7 @@ fn start(stage: AdsbDecodeStage) -> Running {
             .run(
                 serde_json::json!({}),
                 vec![rx_in],
-                vec![out],
+                outputs,
                 bus,
                 c,
                 StageContext::new(SourceId("s".into())),
@@ -127,6 +137,7 @@ fn start(stage: AdsbDecodeStage) -> Running {
     Running {
         tx,
         rx_out,
+        rx_packets,
         cancel,
         handle,
     }
@@ -186,6 +197,59 @@ async fn fake_program_round_trip() {
 #[tokio::test]
 async fn odd_input_rate_is_resampled() {
     round_trip(2_560_000, 4_800).await;
+}
+
+/// The row's Beast output (`--net-bo-port`) is the stage's packet stream: each Mode S
+/// frame dump1090 writes is a `mode_s` packet, with the events' provenance. The packets
+/// are also written to `adsb-beast.pcapng` in the target's test directory, for a look
+/// with Wireshark and `docs/wireshark/zetasdr.lua`.
+#[tokio::test]
+async fn dump1090s_beast_frames_are_mode_s_packets() {
+    let stage = AdsbDecodeStage::new(Some(fake()))
+        .with_env([("FAKE_SBS_LINE", FAKE_IDENT), ("FAKE_REPEAT_MS", "20")]);
+    assert_eq!(
+        stage.outputs_for(&serde_json::json!({})),
+        [StreamKind::Event, StreamKind::Packet]
+    );
+    let mut r = start_with(stage, true);
+    let mut rx = r.rx_packets.take().unwrap();
+    let frame = noise(4_800);
+    let mut capture = Vec::new();
+    zeta_core::pcapng::header(&mut capture, LinkType::ModeS);
+    let mut got = 0u64;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while got < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{got} packets in 10 s"
+        );
+        tokio::select! {
+            f = rx.recv() => {
+                let f = f.expect("packet stream open");
+                assert_eq!(f.provenance.span, prov().span);
+                let Payload::Packet { link_type, data } = f.payload else {
+                    panic!("expected a packet, got {:?}", f.payload.kind())
+                };
+                assert_eq!(link_type, LinkType::ModeS);
+                assert_eq!(data.len(), 14, "{data:02x?}");
+                assert_eq!(data[0] >> 3, 17, "DF17: {data:02x?}");
+                assert_eq!(data[1..4], [0xAB, 0xCD, 0xEF], "{data:02x?}");
+                let t_ns = 1_700_000_000_000_000_000 + got * 1_000_000;
+                zeta_core::pcapng::packet(&mut capture, t_ns, &data, "");
+                got += 1;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                let _ = r.tx.send(iq_frame(&frame, 2_400_000));
+            }
+        }
+    }
+    let file = Path::new(env!("CARGO_TARGET_TMPDIR")).join("adsb-beast.pcapng");
+    std::fs::write(&file, &capture).unwrap();
+    // The events arrive beside the packets.
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    assert_eq!(v["icao"], "ABCDEF", "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
 }
 
 #[tokio::test]

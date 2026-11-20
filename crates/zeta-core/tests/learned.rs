@@ -957,9 +957,16 @@ async fn a_node_without_a_modes_dir_writes_no_learned_row() {
     let note = rec.decoder_note.as_deref();
     assert_eq!(note, Some("no modes directory: row not written"), "{rec:?}");
     assert!(listed(&node, &row_id(&rec)).await.is_none());
-    // A reload reads the embedded rows only, as `open` does.
+    // A reload reads the embedded rows only, as `open` does; its only lines are the
+    // lookup of the embedded OnAir handler's program, which `open` never probed.
     let before = node.modes().ids();
-    assert!(node.reload_modes().unwrap().is_empty());
+    let lines = node.reload_modes().unwrap();
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.starts_with("zeta: handlers: onair-rx: ")),
+        "{lines:?}"
+    );
     assert_eq!(node.modes().ids(), before);
 }
 

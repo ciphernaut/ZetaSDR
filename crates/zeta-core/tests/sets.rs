@@ -1791,6 +1791,9 @@ async fn the_airband_set_starts_what_this_host_has_and_refuses_the_rest() {
         None,
         Some(format!("{missing}: missing — modes: adsb_decode")),
     );
+    // The embedded OnAir handler's program missing too, as on a host without it.
+    let onair = "onair-rx: missing — modes: adsb_decode".to_string();
+    modes.set_handler_program("adsb_decode", "onair", None, Some(onair));
     let (a, b) = (Radio::new("a"), Radio::new("b"));
     let ports: Vec<Arc<dyn Port>> = vec![a.clone(), b.clone()];
     let node = Node::open_with_modes(cfg(dir.path(), None), stages, ports, Some(Arc::new(modes)))

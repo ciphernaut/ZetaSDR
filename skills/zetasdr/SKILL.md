@@ -756,7 +756,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 ### adsb_decode
 
 - inputs: iq
-- outputs: event
+- outputs: event, packet
 
 ### ais_decode
 

@@ -398,16 +398,15 @@ mod tests {
     #[test]
     fn a_program_row_with_packets_outputs_events_and_packets() {
         let stages = StageRegistry::new();
+        // The ADS-B row reads dump1090's Beast output as its packets.
         let row = super::super::parse(ADSB).unwrap();
-        assert_eq!(outputs(&row, &stages), [StreamKind::Event]);
-        let mut v: serde_json::Value = serde_json::from_str(ADSB).unwrap();
-        v["decoder"]["packets"] = serde_json::json!({
-            "via": "tcp", "port": "$packet_port", "parser": "beast", "link_types": {}
-        });
-        let row = super::super::parse(&v.to_string()).unwrap();
         assert_eq!(
             outputs(&row, &stages),
             [StreamKind::Event, StreamKind::Packet]
         );
+        let mut v: serde_json::Value = serde_json::from_str(ADSB).unwrap();
+        v["decoder"]["packets"] = serde_json::Value::Null;
+        let row = super::super::parse(&v.to_string()).unwrap();
+        assert_eq!(outputs(&row, &stages), [StreamKind::Event]);
     }
 }

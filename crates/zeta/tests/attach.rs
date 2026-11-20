@@ -706,7 +706,7 @@ async fn a_packets_attachment_writes_a_capture_wireshark_reads() {
     match std::process::Command::new("tshark")
         .arg("-r")
         .arg(&r.path)
-        .args(["-T", "fields", "-e", "ax25.src"])
+        .args(["-T", "fields", "-e", "frame.protocols", "-e", "ax25.src"])
         .output()
     {
         Err(_) => eprintln!("tshark check skipped: tshark not on PATH"),
@@ -715,11 +715,33 @@ async fn a_packets_attachment_writes_a_capture_wireshark_reads() {
             let text = String::from_utf8_lossy(&out.stdout);
             let lines: Vec<&str> = text.lines().collect();
             assert!(lines.len() >= packets.len(), "{text}");
-            assert!(
-                lines.iter().all(|l| l.trim() == common::APRS_CALLS[0]),
-                "{text}"
-            );
+            for line in &lines {
+                let (protocols, src) = line.split_once('\t').unwrap_or((line, ""));
+                assert!(protocols.split(':').any(|p| p == "ax25"), "{text}");
+                assert_eq!(ax25_call(src.trim()), common::APRS_CALLS[0], "{text}");
+            }
         }
+    }
+}
+
+/// An `ax25.src` field as tshark prints it: the callsign itself, or (as some versions
+/// print it) the 7 address bytes in hex, each character shifted left one bit and the
+/// SSID in bits 1 to 4 of the last; read back as `CALL` or `CALL-SSID`.
+fn ax25_call(field: &str) -> String {
+    let bytes: Option<Vec<u8>> = field
+        .split(':')
+        .map(|b| u8::from_str_radix(b, 16).ok())
+        .collect();
+    match bytes {
+        Some(b) if b.len() == 7 => {
+            let call: String = b[..6].iter().map(|&c| char::from(c >> 1)).collect();
+            let call = call.trim_end().to_string();
+            match (b[6] >> 1) & 0x0f {
+                0 => call,
+                ssid => format!("{call}-{ssid}"),
+            }
+        }
+        _ => field.to_string(),
     }
 }
 

@@ -204,9 +204,16 @@ fn serde_error(e: &serde_json::Error, whole: &str) -> RowError {
     error(named.as_deref().unwrap_or(whole), msg)
 }
 
+/// The keys every event's envelope sets over the decoded fields: the row's
+/// [`super::ENVELOPE_FIELDS`], the `handler` that ran and a restricted row's `access`.
+const ENVELOPE_KEYS: [&str; 6] = [
+    "protocol", "handler", "summary", "t_ns", "position", "access",
+];
+
 /// Check `file`'s entry `entry` against the row it serves: the program block as a
 /// program row's is checked, `output.fields` naming only the row's event fields and
-/// mapping its subject key, and `extra` naming only fields the row's event schema lacks.
+/// mapping its subject key, and `extra` naming no envelope key and only fields the row's
+/// event schema lacks.
 /// The field is named from the entry (`output.fields`, `extra.<name>`, `args[0]`).
 pub fn validate_entry(
     file: &HandlerFile,
@@ -243,6 +250,9 @@ pub fn validate_entry(
     }
     for (name, path) in &entry.extra {
         let at = format!("extra.{name}");
+        if ENVELOPE_KEYS.contains(&name.as_str()) {
+            return Err(error(at, "the event envelope sets it"));
+        }
         if properties.contains_key(name) {
             return Err(error(at, "the row's event schema already has it"));
         }
@@ -380,5 +390,29 @@ mod tests {
         assert_eq!(e.field, "extra.df", "{e}");
         let f = parse_handler_file(&file(|_| {})).unwrap().0;
         validate_entry(&f, &f.modes["adsb_decode"], &row).unwrap();
+    }
+
+    /// An `extra` field may not be one the event's envelope sets over it.
+    #[test]
+    fn an_extra_field_may_not_be_an_envelope_key() {
+        let row = super::super::parse(include_str!("../../../../modes/adsb_decode.json")).unwrap();
+        for name in ENVELOPE_KEYS {
+            let f = parse_handler_file(&file(|v| {
+                v["modes"]["adsb_decode"]["extra"] = serde_json::json!({ name: "/x" });
+            }))
+            .unwrap()
+            .0;
+            let e = validate_entry(&f, &f.modes["adsb_decode"], &row).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!("extra.{name}: the event envelope sets it")
+            );
+        }
+        assert_eq!(
+            ENVELOPE_KEYS,
+            [
+                "protocol", "handler", "summary", "t_ns", "position", "access"
+            ]
+        );
     }
 }

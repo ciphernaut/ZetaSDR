@@ -11,6 +11,31 @@
 - Every APRS or frame-row job now lists a `packet` stream at `/streams`, which an older
   `zeta-client` cannot decode: upgrade the peers that read this node's streams (another node's
   `--source-node`, `zeta-mcp`) together with it.
+- Handlers: a mode may be decoded by more than its row's own decoder. A handler file
+  (`handlers/*.json`, and the operator's from `--handlers-dir`) adds a program to each mode it
+  lists, its output mapped onto the row's events plus fields of its own (`extra`); a broken file
+  or entry is reported at startup and never stops the node. A handler policy picks one
+  (`handler_policy_get`/`handler_policy_set`, CLI `zeta handlers policy`, kept across restarts),
+  and `job_start` takes `handler` to name one and `needs` (`["packet"]`) to pass over handlers
+  without that output. `zeta handlers list` prints each mode's handlers, and `zeta modes check
+  --handler <id>` checks one.
+- `modes_list` and `modes_show` gain each mode's `handlers` and `handler` (the policy's pick now);
+  the mode is `ready` when any handler is, its `program`, `reason` and `missing` describe that
+  pick (or the row's own decoder when none is ready) and its `outputs` are the union over the
+  ready handlers, so a mode with one handler reads as before. Job records gain `handler` and `handler_named`, every decoder event gains `handler`,
+  and a packet capture's comment names it.
+- Packets from programs: a program row's or handler entry's `packets` block reads a second
+  output, a pcap stream or dump1090's Beast output, into the job's packet stream. The ADS-B row
+  reads dump1090's Beast output, so an `adsb_decode` job takes a packet capture: each Mode S frame
+  is a packet under the private link type `mode_s` (`DLT_USER1`, 148), which
+  `docs/wireshark/zetasdr.lua`, a small Lua dissector, reads in Wireshark. A link type is now any
+  link-layer number, the ones the node knows by name.
+- OnAir for ADS-B: `handlers/onair.json` ships with the node and runs `onair-rx`, a wrapper the
+  operator installs (GPL-3.0-or-later, kept outside this repository), for events and packets
+  beside dump1090.
+- Peers older than this refuse the link types they do not know (`mode_s`, a number without a
+  name) in a stream's frames and the new fields of `modes_list`'s answer: upgrade them together
+  with the node.
 
 ## 0.2.0 - 2026-11-17
 

@@ -240,6 +240,39 @@ Wireshark dissects AX.25 and APRS; each packet's comment names the job, source a
 
 **Gotchas.** A node restart leaves the job `stopped` with the note `packet capture does not resume: attach again`; attach again for a fresh capture. A frame row's capture is `USER0`: bind a user dissector under DLT_USER to read it past the raw bytes.
 
+## Aircraft frames for Wireshark
+
+Not run live when written: a stored pcapng of the Mode S frames an ADS-B job decodes, by dump1090 or by OnAir, opened in Wireshark with the node's dissector. Needs a radio that holds 2.4 MHz at 1090 MHz.
+
+**Check.** `modes_show adsb_decode`: `handlers` lists `dump1090` and `onair` with their `state`, and the `outputs` of each list `packet` (dump1090's is its Beast output; OnAir's is the pcap stream `onair-rx` serves, installed by the operator). `source_list` and `job_list`: no rigid holder of the radio outside 1089-1091 MHz, and no `adsb_decode` job already there with the handler wanted (a second start is a `duplicate`).
+
+**Start** the decoder with `needs: ["packet"]`, so the policy passes over any handler without packets. `handler: null` runs the policy's pick; `"onair"` or `"dump1090"` runs that one (a job of each may run at once on one band).
+
+```json
+{"op":"job_start","kind":"adsb_decode","source":"<source>","center_hz":1090000000,"bandwidth_hz":2400000,"deviation_hz":null,"sideband":null,"dwell_ms":null,"average":null,"bits":null,"method":null,"bin_hz":null,"audio_policy":null,"dwell_scale":null,"elastic":false,"replace":[],"handler":null,"needs":["packet"]}
+```
+
+On the CLI: `zeta job start --kind adsb_decode --source <source> --center-hz 1090000000 --bandwidth-hz 2400000 --needs packet [--handler onair]`.
+
+**Attach.** One op on the decoder's id; the record's `handler` says which handler runs.
+
+```json
+{"op":"job_attach","kind":"packets","job":"<adsb job id>","language":null,"stream":null}
+```
+
+**Verify.** `packets_list`: the capture's `link_type` is `mode_s` and `packets` climbs as aircraft are heard. Install the dissector once on the machine that runs Wireshark, then download and open:
+
+```bash
+mkdir -p ~/.local/lib/wireshark/plugins && cp docs/wireshark/zetasdr.lua ~/.local/lib/wireshark/plugins/
+curl -O -H "Authorization: Bearer $ZETA_SECRET" http://<node>/captures/<id>.pcapng
+```
+
+Each packet is one Mode S frame under `DLT_USER 148` (USER1), dissected as ZetaSDR Mode S: downlink format, capability, address, ME and type code, parity; the info column reads `DF17 <address>`. `tshark -X lua_script:docs/wireshark/zetasdr.lua -r <id>.pcapng -T fields -e zetasdr_modes.df -e zetasdr_modes.aa` lists them without installing it. The comment names the job and its handler.
+
+**Stop.** `job_stop` on the packets job, then on the decoder if it is done.
+
+**Gotchas.** A packet takes the time the handler's events take, the start of the latest block of samples fed to it, so frames heard within one block share a time. dump1090's Mode A/C replies are read and dropped; only Mode S frames are captured. OnAir writes Mode S as `USER0`, and its handler file names that `mode_s`: both handlers' captures read alike. Without `needs`, a policy that ranks a handler with no packets first runs it, and the attach is refused naming the handler that has them.
+
 ## Make your own theme
 
 Verified on the plan 26 build; the folder format and every hook are in `docs/themes.md`.

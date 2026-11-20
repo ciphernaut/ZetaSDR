@@ -254,6 +254,8 @@ async fn reload_modes_picks_up_a_new_row_and_keeps_program_state() {
     probed.set_program("adsb_decode", Some("/usr/bin/dump1090".into()), None);
     let missing = "no program found (tried rs41mod)".to_string();
     probed.set_program("rs41_decode", None, Some(missing.clone()));
+    let onair = "onair-rx: missing".to_string();
+    probed.set_handler_program("adsb_decode", "onair", None, Some(onair));
     node.modes_handle().set(std::sync::Arc::new(probed));
     let mut row: serde_json::Value = serde_json::from_str(&renamed_pocsag("Local pagers")).unwrap();
     row["id"] = "local_pagers".into();
@@ -1131,6 +1133,8 @@ fn every_embedded_row_emits_events_today() {
             "video_decode" => &[StreamKind::Video, StreamKind::Event],
             // The frame stages publish each frame as a packet beside its event.
             "aprs_decode" => &[StreamKind::Event, StreamKind::Packet],
+            // dump1090's Beast output is the ADS-B row's packets.
+            "adsb_decode" => &[StreamKind::Event, StreamKind::Packet],
             _ if matches!(m.row.decoder, Decoder::Frame(_)) => {
                 &[StreamKind::Event, StreamKind::Packet]
             }
@@ -1150,8 +1154,9 @@ fn rows_that_cut_frames_list_packet() {
             Decoder::Frame(_) => {
                 assert_eq!(m.outputs, [StreamKind::Event, StreamKind::Packet], "{id}");
             }
-            _ if id == "aprs_decode" => {
-                assert_eq!(m.outputs, [StreamKind::Event, StreamKind::Packet]);
+            // APRS cuts frames in process; ADS-B's program writes them (Beast).
+            _ if id == "aprs_decode" || id == "adsb_decode" => {
+                assert_eq!(m.outputs, [StreamKind::Event, StreamKind::Packet], "{id}");
             }
             _ => assert!(!lists, "{id} lists packet"),
         }
@@ -1291,6 +1296,15 @@ fn with_handler_files(files: &[(&str, &str)]) -> ModeRegistry {
     ModeRegistry::load_with(&stages(), None, Some(dir.path()))
 }
 
+/// The first handler file of `reg` read from the handlers directory (not embedded, as
+/// `handlers/onair.json` is).
+fn operator_file(reg: &ModeRegistry) -> &zeta_core::modes::LoadedHandlerFile {
+    reg.handler_files()
+        .iter()
+        .find(|f| !f.file.starts_with("handlers/"))
+        .expect("an operator handler file")
+}
+
 /// The ids of `mode`'s handlers, the row's own first.
 fn handler_ids(reg: &ModeRegistry, mode: &str) -> Vec<String> {
     reg.get(mode)
@@ -1304,7 +1318,11 @@ fn handler_ids(reg: &ModeRegistry, mode: &str) -> Vec<String> {
 #[test]
 fn a_handler_file_adds_a_handler_to_each_mode_it_lists() {
     let reg = with_handler_files(&[("alt.json", &adsb_handler_file("alt", |_| {}))]);
-    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "alt"]);
+    // The row's own first, then the files' by id: alt beside the embedded onair.
+    assert_eq!(
+        handler_ids(&reg, "adsb_decode"),
+        ["dump1090", "alt", "onair"]
+    );
     let own = reg.handler("adsb_decode", "dump1090").unwrap();
     assert!(!own.in_process);
     assert_eq!(own.file, "modes/adsb_decode.json");
@@ -1351,16 +1369,71 @@ fn a_handler_file_adds_a_handler_to_each_mode_it_lists() {
     assert!(reg.handler("dmr_decode", "builtin").unwrap().in_process);
 }
 
+/// `handlers/onair.json` ships in the node: OnAir is `adsb_decode`'s second handler,
+/// giving events and packets, ready when `onair-rx` is found and otherwise unavailable
+/// with the probe's line; never broken. The row's own handler gives packets too.
+#[test]
+fn the_embedded_onair_handler_serves_adsb() {
+    let mut reg = ModeRegistry::load(&stages(), None);
+    let file = reg
+        .handler_files()
+        .iter()
+        .find(|f| f.id == "onair")
+        .expect("the embedded onair file");
+    assert_eq!(file.file, "handlers/onair.json");
+    assert_eq!(file.state, ModeState::Ready, "{:?}", file.reason);
+    assert_eq!(file.broken_entries(), Vec::<String>::new());
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "onair"]);
+    let both = [StreamKind::Event, StreamKind::Packet];
+    assert_eq!(
+        reg.handler("adsb_decode", "dump1090").unwrap().outputs,
+        both
+    );
+    zeta_core::modes::handlers::probe_handler_files(&mut reg);
+    let onair = reg.handler("adsb_decode", "onair").unwrap();
+    assert_eq!(onair.name, "OnAir");
+    assert!(!onair.in_process);
+    assert_eq!(onair.outputs, both);
+    let installed = zeta_core::modes::handlers::find_handler(&["onair-rx".into()]);
+    match installed {
+        Some(path) => {
+            assert_eq!(onair.state, ModeState::Ready, "{:?}", onair.reason);
+            assert_eq!(onair.program.as_ref(), Some(&path));
+        }
+        None => {
+            assert_eq!(onair.state, ModeState::Unavailable);
+            let reason = onair.reason.as_deref().unwrap_or_default();
+            assert!(reason.starts_with("onair-rx: missing"), "{reason}");
+        }
+    }
+    let block = reg.program_block("adsb_decode", "onair").unwrap();
+    assert_eq!(block.programs, ["onair-rx"]);
+    assert_eq!(block.input.rate_hz, 2_400_000);
+    let packets = block.packets.as_ref().expect("onair's packets");
+    assert_eq!(
+        packets.link_type_numbers().into_iter().collect::<Vec<_>>(),
+        [(147, zeta_core::stream::LinkType::ModeS)]
+    );
+    let extra: Vec<String> = reg
+        .handler_extra("adsb_decode", "onair")
+        .into_keys()
+        .collect();
+    assert_eq!(extra, ["df", "level_dbfs", "tc"]);
+}
+
 #[test]
 fn an_entry_for_an_unknown_mode_breaks_only_that_entry() {
     let text = adsb_handler_file("alt", |f| {
         f["modes"]["no_such_mode"] = f["modes"]["adsb_decode"].clone();
     });
     let reg = with_handler_files(&[("alt.json", &text)]);
-    let file = &reg.handler_files()[0];
+    let file = operator_file(&reg);
     assert_eq!(file.state, ModeState::Ready, "{:?}", file.reason);
     assert_eq!(file.broken_entries(), ["no_such_mode: no mode of that id"]);
-    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "alt"]);
+    assert_eq!(
+        handler_ids(&reg, "adsb_decode"),
+        ["dump1090", "alt", "onair"]
+    );
     let alt = reg.handler("adsb_decode", "alt").unwrap();
     assert_eq!(alt.state, ModeState::Ready, "{:?}", alt.reason);
 }
@@ -1410,22 +1483,22 @@ fn an_extra_field_may_not_shadow_a_row_field() {
 #[test]
 fn an_id_of_builtin_or_of_the_rows_own_program_is_refused() {
     let reg = with_handler_files(&[("b.json", &adsb_handler_file("builtin", |_| {}))]);
-    let file = &reg.handler_files()[0];
+    let file = operator_file(&reg);
     assert_eq!(file.state, ModeState::Broken);
     assert!(
         file.reason.as_deref().unwrap().starts_with("id: "),
         "{file:?}"
     );
-    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090"]);
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "onair"]);
 
     let reg = with_handler_files(&[("d.json", &adsb_handler_file("dump1090", |_| {}))]);
-    let file = &reg.handler_files()[0];
+    let file = operator_file(&reg);
     assert_eq!(file.state, ModeState::Ready, "{file:?}");
     assert_eq!(
         file.broken_entries(),
         ["adsb_decode: id dump1090 is the row's own handler"]
     );
-    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090"]);
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "onair"]);
     // The row's own handler is untouched.
     assert_eq!(
         reg.program_block("adsb_decode", "dump1090")
@@ -1466,14 +1539,14 @@ fn a_broken_handler_file_never_fails_the_load() {
     let reg = with_handler_files(&[("bad.json", "{")]);
     assert_eq!(reg.ids(), EMBEDDED);
     assert_eq!(reg.ready().count(), EMBEDDED.len());
-    let file = &reg.handler_files()[0];
+    let file = operator_file(&reg);
     assert_eq!(file.state, ModeState::Broken);
     assert!(file.file.ends_with("bad.json"), "{file:?}");
     assert!(file.reason.as_deref().unwrap().contains("EOF"), "{file:?}");
     let lines = reg.startup_lines();
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].starts_with("zeta: handler bad ("), "{lines:?}");
-    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090"]);
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "onair"]);
 }
 
 #[test]
@@ -1484,7 +1557,7 @@ fn a_malformed_entry_breaks_only_itself() {
         f["modes"]["ais_decode"] = bad;
     });
     let reg = with_handler_files(&[("alt.json", &text)]);
-    let file = &reg.handler_files()[0];
+    let file = operator_file(&reg);
     assert_eq!(file.state, ModeState::Ready, "{file:?}");
     let broken = file.broken_entries();
     assert_eq!(broken.len(), 1, "{broken:?}");
@@ -1492,7 +1565,10 @@ fn a_malformed_entry_breaks_only_itself() {
         broken[0].starts_with("ais_decode: input: missing field `input`"),
         "{broken:?}"
     );
-    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "alt"]);
+    assert_eq!(
+        handler_ids(&reg, "adsb_decode"),
+        ["dump1090", "alt", "onair"]
+    );
     assert_eq!(
         reg.handler("adsb_decode", "alt").unwrap().state,
         ModeState::Ready
@@ -1520,7 +1596,10 @@ async fn a_handler_file_added_before_a_reload_is_probed() {
         ..cfg(dir.path(), &modes)
     };
     let node = Node::open(cfg, stages(), vec![]).await.unwrap();
-    assert_eq!(handler_ids(&node.modes(), "adsb_decode"), ["dump1090"]);
+    assert_eq!(
+        handler_ids(&node.modes(), "adsb_decode"),
+        ["dump1090", "onair"]
+    );
 
     let missing = adsb_handler_file("alt", |f| {
         f["programs"] = serde_json::json!(["zeta-no-such-handler"]);
@@ -1569,10 +1648,11 @@ fn alt_cfg(dir: &Path) -> NodeConfig {
 }
 
 /// Set what probing found for `adsb_decode`: the row's own program (`None`: dump1090
-/// missing) and alt's (`None`: its program missing).
+/// missing) and alt's (`None`: its program missing); the embedded onair's is missing.
 fn probe_adsb(node: &Node, own: Option<&str>, alt: Option<&str>) {
     let mut reg = (*node.modes()).clone();
     let (mode, missing) = ("adsb_decode", |p: &str| format!("{p}: missing"));
+    reg.set_handler_program(mode, "onair", None, Some(missing("onair-rx")));
     match own {
         Some(p) => reg.set_program(mode, Some(p.into()), None),
         None => reg.set_program(mode, None, Some(missing("dump1090"))),
@@ -1708,7 +1788,10 @@ async fn handler_policy_set_refuses_an_id_no_mode_has() {
     let ids = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     // A named mode: its own handlers' ids.
     let r = policy_set(&node, Some("adsb_decode"), &["alt", "nope"]).await;
-    assert_eq!(r, unknown("order", "nope", ids(&["dump1090", "alt"])));
+    assert_eq!(
+        r,
+        unknown("order", "nope", ids(&["dump1090", "alt", "onair"]))
+    );
     // Another mode's handler is not this one's.
     let r = policy_set(&node, Some("aprs_decode"), &["alt"]).await;
     assert_eq!(r, unknown("order", "alt", ids(&["builtin"])));
@@ -1751,7 +1834,7 @@ async fn modes_list_gives_each_modes_handlers_and_the_policys_pick() {
     assert_eq!(m.reason, None);
     assert_eq!(m.outputs, both);
     let ids: Vec<&str> = m.handlers.iter().map(|h| h.id.as_str()).collect();
-    assert_eq!(ids, ["dump1090", "alt"]);
+    assert_eq!(ids, ["dump1090", "alt", "onair"]);
     let own = &m.handlers[0];
     assert_eq!(own.state, ModeState::Unavailable);
     assert_eq!(own.reason.as_deref(), Some("dump1090: missing"));
@@ -1816,7 +1899,8 @@ async fn modes_list_gives_each_modes_handlers_and_the_policys_pick() {
     assert_eq!(m.handler, None);
     assert_eq!(m.program, None);
     assert_eq!(m.reason.as_deref(), Some("dump1090: missing"));
-    assert_eq!(m.outputs, [StreamKind::Event]);
+    // The row's own outputs: dump1090 gives packets too (its Beast output).
+    assert_eq!(m.outputs, both);
     assert_eq!(m.handlers[1].state, ModeState::Unavailable);
     assert_eq!(
         m.handlers[1].reason.as_deref(),
@@ -1826,8 +1910,9 @@ async fn modes_list_gives_each_modes_handlers_and_the_policys_pick() {
     assert_eq!(v["handler"], serde_json::Value::Null);
 }
 
-/// With no handler files every mode's own fields read as the row's (the pre-handler
-/// listing), and its one handler is the row's own.
+/// With no operator handler files, and the embedded `onair` unavailable (no `onair-rx`),
+/// every mode's own fields read as the row's (the pre-handler listing), and its one
+/// handler is the row's own; `adsb_decode`'s second is `onair`.
 #[tokio::test]
 async fn a_node_with_no_handler_files_lists_modes_as_before() {
     let dir = tempfile::tempdir().unwrap();
@@ -1841,6 +1926,8 @@ async fn a_node_with_no_handler_files_lists_modes_as_before() {
     // and a check time.
     let mut reg = (*node.modes()).clone();
     reg.set_program("adsb_decode", Some("/usr/bin/dump1090".into()), None);
+    let onair = Some("onair-rx: missing".into());
+    reg.set_handler_program("adsb_decode", "onair", None, onair);
     reg.set_program("rs41_decode", None, Some("rs41mod: missing".into()));
     reg.set_program("dmr_decode", Some("/usr/bin/zeta-mbe".into()), None);
     reg.set_missing(
@@ -1885,8 +1972,11 @@ async fn a_node_with_no_handler_files_lists_modes_as_before() {
             s.checked,
         );
         assert_eq!(shown_now, before, "{id}");
-        assert_eq!(info.handlers.len(), 1, "{id}");
-        assert_eq!(info.handlers[0].id, m.handlers[0].id, "{id}");
+        let ids: Vec<&str> = info.handlers.iter().map(|h| h.id.as_str()).collect();
+        match id.as_str() {
+            "adsb_decode" => assert_eq!(ids, ["dump1090", "onair"]),
+            _ => assert_eq!(ids, [m.handlers[0].id.as_str()], "{id}"),
+        }
         let own = (m.state == ModeState::Ready).then(|| m.handlers[0].id.clone());
         assert_eq!(info.handler, own, "{id}");
     }

@@ -1,0 +1,39 @@
+{
+  "id": "onair",
+  "name": "OnAir",
+  "programs": ["onair-rx"],
+  "install": { "url": "https://on-air.dev" },
+  "modes": {
+    "adsb_decode": {
+      "args": [
+        "--mode", "adsb", "--rate", "$rate_hz", "--format", "cs16",
+        "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 2400000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "icao": "/icao",
+          "msg": "/msg",
+          "callsign": "/callsign",
+          "altitude_ft": "/altitude_ft",
+          "ground_speed_kt": "/ground_speed_kt",
+          "track_deg": "/track_deg",
+          "lat": "/lat",
+          "lon": "/lon",
+          "vertical_rate_fpm": "/vertical_rate_fpm",
+          "squawk": "/squawk",
+          "on_ground": "/on_ground"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap",
+        "link_types": { "147": "mode_s" }
+      },
+      "extra": { "df": "/df", "tc": "/tc", "level_dbfs": "/level_dbfs" }
+    }
+  }
+}

@@ -2947,7 +2947,12 @@ mod tests {
 
     #[test]
     fn a_packets_block_round_trips_and_defaults_to_none() {
-        let row = parse(ADSB).unwrap();
+        // The row's own Beast block left out (and its port with it).
+        let row = parse(&edited(ADSB, |v| {
+            v["decoder"].as_object_mut().unwrap().remove("packets");
+            v["decoder"]["args"] = serde_json::json!(["--net-sbs-port", "$port"]);
+        }))
+        .unwrap();
         assert_eq!(program(&row).packets, None);
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["decoder"]["packets"], serde_json::Value::Null);

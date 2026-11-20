@@ -5,7 +5,8 @@
 //!
 //! The row (`modes/adsb_decode.json`) runs dump1090 with its input as SC16 on stdin at
 //! [`ADSB_RATE_HZ`] and reads its SBS output from a loopback port
-//! ([`crate::parsers::sbs`]).
+//! ([`crate::parsers::sbs`]); its Beast output, from a second port, is the stage's packet
+//! stream ([`crate::packet_parsers::beast`]), so a job on the alias takes a capture too.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -49,6 +50,11 @@ fn embedded_row() -> ModeRow {
         .expect("the embedded adsb_decode row parses")
 }
 
+/// Whether `row` is a program row whose block has a `packets` output.
+fn has_packets(row: &ModeRow) -> bool {
+    matches!(&row.decoder, Decoder::Program(b) if b.packets.is_some())
+}
+
 /// `adsb_decode` takes no parameters.
 #[derive(JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,7 +83,7 @@ impl AdsbDecodeStage {
             spec: StageSpec {
                 kind: ADSB_MODE,
                 inputs: vec![StreamKind::Iq],
-                outputs: vec![StreamKind::Event],
+                outputs: vec![StreamKind::Event, StreamKind::Packet],
                 params_schema: schemars::schema_for!(AdsbParams),
             },
             runs,
@@ -154,6 +160,23 @@ impl Stage for AdsbDecodeStage {
 
     fn backend(&self) -> Backend {
         Backend::Cpu
+    }
+
+    /// Events, and packets after them when the row the stage runs (the embedded one, or
+    /// the registry's) has a `packets` block, as the row's own handler under
+    /// `external_decode` gives them.
+    fn outputs_for(&self, _params: &serde_json::Value) -> Vec<StreamKind> {
+        let packets = match &self.runs {
+            Runs::Fixed(_) => has_packets(&embedded_row()),
+            Runs::Registry(handle) => handle
+                .get()
+                .and_then(|reg| reg.get(ADSB_MODE).map(|m| has_packets(&m.row)))
+                .unwrap_or(false),
+        };
+        match packets {
+            true => vec![StreamKind::Event, StreamKind::Packet],
+            false => vec![StreamKind::Event],
+        }
     }
 
     async fn run(

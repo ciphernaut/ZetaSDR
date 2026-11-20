@@ -3576,8 +3576,9 @@ pub struct ModeHandlerInfo {
     /// mode's `missing`.
     #[serde(default)]
     pub missing: Vec<String>,
-    /// When `zeta modes check` last passed it (UNIX seconds; the row's own handler
-    /// only); `null` if never.
+    /// When `zeta modes check` last passed it (UNIX seconds): `modes check <mode>` for
+    /// the row's own handler, `modes check <mode> --handler <id>` for a handler file's;
+    /// `null` if never.
     #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub checked: Option<u64>,

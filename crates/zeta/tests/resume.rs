@@ -809,6 +809,70 @@ fn an_old_adsb_graph_resumes_through_the_alias() {
     }
 }
 
+/// Both ways an ADS-B job runs take a capture of dump1090's Beast frames: a job started
+/// as `adsb_decode` (today's `channel -> external_decode`) and an operator graph on the
+/// `adsb_decode` alias stage. Each gets a `packets` attachment whose capture fills with
+/// `mode_s` packets.
+#[test]
+fn both_adsb_routes_take_a_packets_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let alias = write_old_adsb(dir.path(), true);
+    let serve = adsb_serve(dir.path());
+    assert_eq!(adsb_status(&serve, &alias)["status"], "running");
+    let center = ADSB_HZ.to_string();
+    // Narrower than the alias job's band, so not its duplicate.
+    let width = 2_000_000.to_string();
+    let started = adsb_remote(
+        &serve,
+        &[
+            "job",
+            "start",
+            "--kind",
+            "adsb_decode",
+            "--source",
+            "adsb",
+            "--center-hz",
+            &center,
+            "--bandwidth-hz",
+            &width,
+        ],
+    );
+    let started = JobId(
+        started["value"]
+            .as_str()
+            .unwrap_or_else(|| panic!("job start: {started}"))
+            .to_string(),
+    );
+    assert_eq!(adsb_kinds(&serve, &started), ["channel", "external_decode"]);
+    assert_eq!(adsb_kinds(&serve, &alias), ["channel", "adsb_decode"]);
+    for id in [&started, &alias] {
+        let att = adsb_remote(
+            &serve,
+            &["job", "attach", "--kind", "packets", "--job", &id.0],
+        );
+        assert!(att.get("error").is_none(), "{}: {att}", id.0);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let list = adsb_remote(&serve, &["packets", "list"]);
+        let filled = |id: &JobId| {
+            list["value"].as_array().unwrap().iter().any(|r| {
+                r["job"] == id.0.as_str()
+                    && r["link_type"] == "mode_s"
+                    && r["packets"].as_u64() > Some(0)
+            })
+        };
+        if filled(&started) && filled(&alias) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no mode_s capture of both: {list}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// A `graph_put` naming the `adsb_decode` alias loads: today's graph with its decoder
 /// node put back as `adsb_decode {}` restarts the job on the alias, and it decodes.
 #[test]

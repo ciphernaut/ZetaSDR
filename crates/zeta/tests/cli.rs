@@ -4259,12 +4259,19 @@ fn handlers_list_names_each_modes_handlers() {
         .copied()
         .filter(|l| l.starts_with("adsb_decode "))
         .collect();
+    // dump1090's Beast output is its packets; the embedded onair follows alt (by id),
+    // ready or not as this host has `onair-rx`.
     assert_eq!(
-        adsb,
+        adsb[..2],
         [
-            "adsb_decode dump1090 ready event",
+            "adsb_decode dump1090 ready event,packet",
             "adsb_decode alt unavailable event"
         ],
+        "{out}"
+    );
+    assert_eq!(adsb.len(), 3, "{out}");
+    assert!(
+        adsb[2].starts_with("adsb_decode onair ") && adsb[2].ends_with(" event,packet"),
         "{out}"
     );
     assert!(
