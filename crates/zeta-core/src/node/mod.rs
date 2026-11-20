@@ -60,7 +60,8 @@ pub(crate) use launch::AfterGate;
 use launch::{feed_bank, feed_ring};
 pub(crate) use persist::now;
 use persist::{
-    SET_INSTANCES_DIR, io, load, load_instances, persist, persist_instance, remove_instance,
+    SET_INSTANCES_DIR, io, load, load_handler_policy, load_instances, persist,
+    persist_handler_policy, persist_instance, remove_instance,
 };
 pub use sources::{GainSetting, SOURCE_RECORD_FORMAT, SourceRecord, load_source};
 use sources::{load_sources, persist_source};
@@ -433,6 +434,9 @@ struct Inner {
     state_dir: PathBuf,
     /// The node's station, loaded at `open` and written through on every change.
     station: Mutex<Option<crate::station::Station>>,
+    /// The operator's handler rankings, loaded at `open` and written through on every
+    /// change (`handler-policy.json`).
+    handler_policy: Mutex<crate::modes::policy::HandlerPolicy>,
     jobs_dir: PathBuf,
     /// `state_dir/sources`, one [`SourceRecord`] per source.
     sources_dir: PathBuf,
@@ -1321,6 +1325,8 @@ impl Node {
         }
         let (station, station_error) = crate::station::load(&cfg.state_dir);
         load_errors.extend(station_error);
+        let (handler_policy, policy_error) = load_handler_policy(&cfg.state_dir);
+        load_errors.extend(policy_error);
         let sources_dir = cfg.state_dir.join("sources");
         let (source_records, source_errors) = load_sources(&sources_dir);
         load_errors.extend(source_errors);
@@ -1384,6 +1390,7 @@ impl Node {
             inner: Arc::new(Inner {
                 state_dir: cfg.state_dir.clone(),
                 station: Mutex::new(station),
+                handler_policy: Mutex::new(handler_policy),
                 jobs_dir,
                 sources_dir,
                 sources: Mutex::new(source_records),
@@ -3291,6 +3298,36 @@ impl Node {
         crate::station::remove(&self.inner.state_dir)?;
         *self.inner.station.lock().unwrap() = None;
         Ok(())
+    }
+
+    /// The operator's handler rankings ([`crate::modes::policy::HandlerPolicy`]).
+    pub fn handler_policy(&self) -> crate::modes::policy::HandlerPolicy {
+        self.inner.handler_policy.lock().unwrap().clone()
+    }
+
+    /// Set `mode`'s handler ranking (`None`: the node-wide one) to `order`, an empty
+    /// `order` clearing it: written to `handler-policy.json` first, then kept in memory;
+    /// a failed write leaves the old policy. The ids are not checked here. The result is
+    /// the whole policy.
+    pub fn set_handler_policy(
+        &self,
+        mode: Option<&str>,
+        order: Vec<String>,
+    ) -> Result<crate::modes::policy::HandlerPolicy, NodeError> {
+        let mut held = self.inner.handler_policy.lock().unwrap();
+        let mut next = held.clone();
+        match (mode, order.is_empty()) {
+            (Some(m), true) => {
+                next.modes.remove(m);
+            }
+            (Some(m), false) => {
+                next.modes.insert(m.to_string(), order);
+            }
+            (None, _) => next.all = order,
+        }
+        persist_handler_policy(&self.inner.state_dir, &next)?;
+        *held = next.clone();
+        Ok(next)
     }
 
     /// Hold `source` at `want` without a job: a rigid lease under

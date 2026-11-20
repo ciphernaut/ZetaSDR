@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::NodeError;
 use crate::job::{JOB_RECORD_FORMAT, JobRecord};
+use crate::modes::policy::HandlerPolicy;
 use crate::types::Timestamp;
 
 pub(crate) fn now() -> Timestamp {
@@ -26,6 +27,37 @@ pub(super) fn persist(dir: &Path, rec: &JobRecord) -> Result<(), NodeError> {
     let tmp = dir.join(format!("{}.json.tmp", rec.id.0));
     std::fs::write(&tmp, json).map_err(io)?;
     std::fs::rename(&tmp, &path).map_err(io)
+}
+
+/// The handler policy's file in the state directory.
+pub(super) const HANDLER_POLICY_FILE: &str = "handler-policy.json";
+
+/// Read the handler policy in `state_dir`: a missing file is the empty policy, as is one
+/// that cannot be read or parsed, which also gives one line saying why.
+pub(super) fn load_handler_policy(state_dir: &Path) -> (HandlerPolicy, Option<String>) {
+    match std::fs::read(state_dir.join(HANDLER_POLICY_FILE)) {
+        Ok(b) => match serde_json::from_slice(&b) {
+            Ok(p) => (p, None),
+            Err(e) => (
+                HandlerPolicy::default(),
+                Some(format!("unreadable {HANDLER_POLICY_FILE}: {e}")),
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (HandlerPolicy::default(), None),
+        Err(e) => (
+            HandlerPolicy::default(),
+            Some(format!("{HANDLER_POLICY_FILE}: {e}")),
+        ),
+    }
+}
+
+/// Write the handler policy into `state_dir` atomically: temp file, then rename.
+pub(super) fn persist_handler_policy(state_dir: &Path, p: &HandlerPolicy) -> Result<(), NodeError> {
+    std::fs::create_dir_all(state_dir).map_err(io)?;
+    let json = serde_json::to_vec_pretty(p).map_err(io)?;
+    let tmp = state_dir.join(format!("{HANDLER_POLICY_FILE}.tmp"));
+    std::fs::write(&tmp, json).map_err(io)?;
+    std::fs::rename(&tmp, state_dir.join(HANDLER_POLICY_FILE)).map_err(io)
 }
 
 /// The state directory's subdirectory of the running sets' instances: apart from

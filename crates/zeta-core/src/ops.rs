@@ -19,6 +19,7 @@ use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::{JobRecord, JobState};
 use crate::knowledge::{Allocation, Signature, nearest_of};
 use crate::lease::{Decision, LeaseError};
+use crate::modes::policy::{HandlerPolicy, Passed};
 use crate::modes::{
     Access, Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow,
     ModeState, Subject, is_mode_id, template,
@@ -979,6 +980,29 @@ pub enum Op {
     ModesShow {
         id: String,
     },
+    /// Rank the handlers of mode `mode`, or with `mode: null` of every mode (the
+    /// node-wide ranking), for the policy that picks a mode's handler (`modes_list`'s
+    /// `handler`): among the mode's ready handlers, one lacking an output the start needs
+    /// is passed over; then the mode's ranking leads, then the node-wide one, then an
+    /// in-process handler goes before a program, then the row's own before the handler
+    /// files' (by id). `order` lists handler ids (`modes_list`'s `handlers[].id`), first
+    /// preferred; an id it leaves out goes after those it names, and an empty `order`
+    /// clears that ranking. A ranked handler that is not ready is passed over, never an
+    /// error. Checked before anything is written: `mode` naming no mode is `unknown` on
+    /// `mode`, and an id the mode (with `mode: null`, every mode) has no handler of is
+    /// `unknown` on `order`, listing the ids it has. Kept in `handler-policy.json` in the
+    /// state directory across restarts. The result is the whole policy as stored.
+    HandlerPolicySet {
+        /// A mode id from `modes_list`; `null` for the node-wide ranking.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<ModeId>")]
+        mode: Option<ModeId>,
+        /// Handler ids, first preferred; `[]` clears the ranking.
+        order: Vec<String>,
+    },
+    /// The handler policy: `modes`, each mode's ranking by mode id (`{}` for none), and
+    /// `all`, the node-wide ranking (`[]` for none).
+    HandlerPolicyGet {},
     /// Run every registered classifier over the selection's band and span of
     /// the source ring (no upstream features).
     Classify {
@@ -3301,7 +3325,10 @@ impl From<&crate::plans::ChannelPlan> for PlanInfo {
 }
 
 /// One mode as `modes_list` reports it. (`missing` may be left out of what is read, but
-/// is always written: the schema requires every property.)
+/// is always written: the schema requires every property.) Where the mode has more than
+/// one handler, `state` is `ready` when any handler is; `reason`, `program` and `missing`
+/// describe `handler` (the row's own when none is ready); `outputs` is the union of the
+/// ready handlers'; `checked` stays the row's own handler's.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields, transform = crate::modes::require_all)]
@@ -3353,27 +3380,169 @@ pub struct ModeInfo {
     /// the rows `job_start`'s `audio_policy` applies to. Empty for a row with one voice.
     #[serde(default)]
     pub voices: Vec<String>,
+    /// Every handler of the mode: the row's own first, then each handler file's, by id.
+    pub handlers: Vec<ModeHandlerInfo>,
+    /// The handler the policy picks now (`handler_policy_set`); `null` when none is
+    /// ready.
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub handler: Option<String>,
 }
 
-impl From<&LoadedMode> for ModeInfo {
-    fn from(m: &LoadedMode) -> Self {
+impl ModeInfo {
+    /// `m` as `modes_list` reports it under `policy`: its own fields by the union rule
+    /// ([`crate::modes::policy::reported`]), its handlers from `modes` (`m`'s registry).
+    pub fn new(m: &LoadedMode, modes: &ModeRegistry, policy: &HandlerPolicy) -> Self {
+        let r = crate::modes::policy::reported(m, policy);
         ModeInfo {
             id: m.row.id.clone(),
             name: m.row.name.clone(),
             family: m.row.family,
             band: m.row.band.clone(),
             modulation: m.row.modulation.clone(),
-            state: m.state,
-            reason: m.reason.clone(),
+            state: r.state,
+            reason: r.reason,
             decoder_kind: m.row.decoder.kind(),
             file: m.file.clone(),
-            program: m.program.as_ref().map(|p| p.display().to_string()),
+            program: r.program.as_ref().map(|p| p.display().to_string()),
             checked: m.checked,
-            missing: m.missing.clone(),
+            missing: r.missing,
             subject: m.row.subject.clone(),
             access: m.row.access,
-            outputs: m.outputs.clone(),
+            outputs: r.outputs,
             voices: m.voices.clone(),
+            handlers: ModeHandlerInfo::of(m, modes),
+            handler: r.handler,
+        }
+    }
+}
+
+/// One handler of a mode as `modes_list` and `modes_show` report it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::modes::require_all)]
+pub struct ModeHandlerInfo {
+    /// `builtin` for a graph or frame row's own decoder, a program row's first program
+    /// for its own (`dump1090`), the handler file's `id` otherwise: what
+    /// `handler_policy_set` ranks.
+    pub id: String,
+    /// For people: `built-in`, the program's name, or the handler file's `name`.
+    pub name: String,
+    /// Whether it runs inside the node rather than as an external program.
+    pub in_process: bool,
+    /// The stream kinds a job run by it emits; empty for a broken one.
+    pub outputs: Vec<StreamKind>,
+    pub state: ModeState,
+    /// Why it is not ready (`<field>: <error>` for a broken handler file entry, the
+    /// missing program's line for an unavailable one); `null` when ready.
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub reason: Option<String>,
+    /// The program found for it; `null` in process, and until probed.
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub program: Option<String>,
+    /// The optional helper programs not found (the row's own handler only), as the
+    /// mode's `missing`.
+    #[serde(default)]
+    pub missing: Vec<String>,
+    /// When `zeta modes check` last passed it (UNIX seconds; the row's own handler
+    /// only); `null` if never.
+    #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub checked: Option<u64>,
+    /// The file it comes from: the row's for the row's own, the handler file's otherwise
+    /// (the file to fix when it is broken).
+    pub file: String,
+    /// The event fields a handler file's entry adds beside the row's (its `extra`), by
+    /// name; `[]` for the row's own handler and an entry with none.
+    #[serde(default)]
+    pub extra: Vec<String>,
+}
+
+impl ModeHandlerInfo {
+    /// `m`'s handlers, as reported, from `modes` (`m`'s registry, which holds the handler
+    /// files their `extra` comes from).
+    pub fn of(m: &LoadedMode, modes: &ModeRegistry) -> Vec<Self> {
+        let mode = &m.row.id.0;
+        m.handlers
+            .iter()
+            .enumerate()
+            .map(|(i, h)| ModeHandlerInfo {
+                id: h.id.clone(),
+                name: h.name.clone(),
+                in_process: h.in_process,
+                outputs: h.outputs.clone(),
+                state: h.state,
+                reason: h.reason.clone(),
+                program: h.program.as_ref().map(|p| p.display().to_string()),
+                missing: h.missing.clone(),
+                checked: h.checked,
+                file: h.file.clone(),
+                extra: match i {
+                    0 => vec![],
+                    _ => modes
+                        .handler_files()
+                        .iter()
+                        .filter(|f| f.id == h.id && f.state == ModeState::Ready)
+                        .find_map(|f| f.handler.as_ref()?.modes.get(mode))
+                        .map(|e| e.extra.keys().cloned().collect())
+                        .unwrap_or_default(),
+                },
+            })
+            .collect()
+    }
+}
+
+/// One mode as `modes_show` reports it: the row as loaded, its own fields by the union
+/// rule as in `modes_list`, and its handlers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::modes::require_all)]
+pub struct ModeDetail {
+    /// The row. A broken file's row is what parsed, or a placeholder carrying only its
+    /// id when nothing did; a broken file that meant to replace a row is listed under
+    /// `<id>@<file name>`, the row it meant to replace staying in force.
+    pub row: ModeRow,
+    /// As `modes_list`'s.
+    pub state: ModeState,
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub reason: Option<String>,
+    pub file: String,
+    #[schemars(required, schema_with = "crate::types::nullable::<PathBuf>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub program: Option<PathBuf>,
+    #[schemars(required, schema_with = "crate::types::nullable::<u64>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub checked: Option<u64>,
+    #[serde(default)]
+    pub missing: Vec<String>,
+    pub outputs: Vec<StreamKind>,
+    #[serde(default)]
+    pub voices: Vec<String>,
+    pub handlers: Vec<ModeHandlerInfo>,
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub handler: Option<String>,
+}
+
+impl ModeDetail {
+    /// `m` as `modes_show` reports it under `policy` (see [`ModeInfo::new`]).
+    pub fn new(m: &LoadedMode, modes: &ModeRegistry, policy: &HandlerPolicy) -> Self {
+        let r = crate::modes::policy::reported(m, policy);
+        ModeDetail {
+            row: m.row.clone(),
+            state: r.state,
+            reason: r.reason,
+            file: m.file.clone(),
+            program: r.program,
+            checked: m.checked,
+            missing: r.missing,
+            outputs: r.outputs,
+            voices: m.voices.clone(),
+            handlers: ModeHandlerInfo::of(m, modes),
+            handler: r.handler,
         }
     }
 }
@@ -3600,10 +3769,12 @@ pub enum OpResult {
     },
     /// `set_list`: one entry per set, sorted by id.
     Sets(Vec<SetInfo>),
-    /// `modes_show`: the row as loaded.
+    /// `modes_show`: the row as loaded, with its handlers.
     Mode {
-        mode: Box<LoadedMode>,
+        mode: Box<ModeDetail>,
     },
+    /// `handler_policy_set`, `handler_policy_get`: the policy as stored.
+    HandlerPolicy(HandlerPolicy),
     /// `classify`: every classifier's labels, the modes decode-to-identify
     /// considered with their score and outcome, and the allocations the knowledge
     /// providers hold for the selection's band from its source's vantage (the first
@@ -3748,6 +3919,8 @@ impl Op {
             Op::SetStart { .. } => "set_start",
             Op::SetStop { .. } => "set_stop",
             Op::ModesShow { .. } => "modes_show",
+            Op::HandlerPolicySet { .. } => "handler_policy_set",
+            Op::HandlerPolicyGet {} => "handler_policy_get",
             Op::Classify { .. } => "classify",
             Op::Schema {} => "schema",
         }
@@ -3773,6 +3946,7 @@ impl Op {
                 | Op::ThemesList {}
                 | Op::SetList {}
                 | Op::ModesShow { .. }
+                | Op::HandlerPolicyGet {}
                 | Op::StationGet {}
                 | Op::CaptureList { .. }
                 | Op::CaptureShow { .. }
@@ -3831,6 +4005,7 @@ impl OpResult {
             OpResult::Themes { .. } => "themes",
             OpResult::Sets(_) => "sets",
             OpResult::Mode { .. } => "mode",
+            OpResult::HandlerPolicy(_) => "handler_policy",
             OpResult::Classification { .. } => "classification",
             OpResult::Gain(_) => "gain",
             OpResult::PlanStart { .. } => "plan_start",
@@ -3995,6 +4170,12 @@ pub enum OpError {
         job: JobId,
         message: String,
     },
+    /// No handler of `mode` can serve the start: each of its handlers, and why the
+    /// policy passed it over.
+    NoHandler {
+        mode: String,
+        passed: Vec<Passed>,
+    },
 }
 
 impl OpError {
@@ -4008,6 +4189,7 @@ impl OpError {
             OpError::Graph { .. } => "graph",
             OpError::Other { .. } => "other",
             OpError::Duplicate { .. } => "duplicate",
+            OpError::NoHandler { .. } => "no_handler",
         }
     }
 
@@ -4067,6 +4249,14 @@ impl std::fmt::Display for OpError {
             OpError::Ring { detail } => write!(f, "{detail}"),
             OpError::Graph { detail } => write!(f, "{detail}"),
             OpError::Other { message } | OpError::Duplicate { message, .. } => f.write_str(message),
+            OpError::NoHandler { mode, passed } => {
+                write!(f, "no handler of {mode} can serve this start")?;
+                for (i, p) in passed.iter().enumerate() {
+                    let sep = if i == 0 { ": " } else { "; " };
+                    write!(f, "{sep}{}: {}", p.id, p.why)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -5479,16 +5669,18 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
         Op::ChannelPlans {} => Ok(OpResult::ChannelPlans {
             plans: crate::plans::PLANS.iter().map(PlanInfo::from).collect(),
         }),
-        Op::ModesList { family, state } => Ok(OpResult::Modes {
-            modes: node
-                .modes()
-                .all()
-                .iter()
-                .filter(|m| family.is_none_or(|f| m.row.family == f))
-                .filter(|m| state.is_none_or(|s| m.state == s))
-                .map(ModeInfo::from)
-                .collect(),
-        }),
+        Op::ModesList { family, state } => {
+            let (modes, policy) = (node.modes(), node.handler_policy());
+            Ok(OpResult::Modes {
+                modes: modes
+                    .all()
+                    .iter()
+                    .filter(|m| family.is_none_or(|f| m.row.family == f))
+                    .map(|m| ModeInfo::new(m, &modes, &policy))
+                    .filter(|m| state.is_none_or(|s| m.state == s))
+                    .collect(),
+            })
+        }
         Op::ThemesList {} => Ok(OpResult::Themes {
             themes: node.themes().all().iter().map(ThemeInfo::from).collect(),
         }),
@@ -5504,7 +5696,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             let modes = node.modes();
             match modes.get(&id) {
                 Some(m) => Ok(OpResult::Mode {
-                    mode: Box::new(m.clone()),
+                    mode: Box::new(ModeDetail::new(m, &modes, &node.handler_policy())),
                 }),
                 None => Err(OpError::Unknown {
                     field: "id".into(),
@@ -5513,9 +5705,53 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 }),
             }
         }
+        Op::HandlerPolicySet { mode, order } => handler_policy_set(node, mode, order),
+        Op::HandlerPolicyGet {} => Ok(OpResult::HandlerPolicy(node.handler_policy())),
         Op::Classify { selection } => classify(node, selection).await,
         Op::Schema {} => Ok(OpResult::Schema(node.schema())),
     }
+}
+
+/// `handler_policy_set`: check `mode` and every id of `order` against the registry in
+/// force (`order`'s against `mode`'s handlers, or with no `mode` every mode's), then
+/// store the ranking.
+fn handler_policy_set(
+    node: &Node,
+    mode: Option<ModeId>,
+    order: Vec<String>,
+) -> Result<OpResult, OpError> {
+    let modes = node.modes();
+    let mut known: Vec<String> = match &mode {
+        Some(id) => match modes.get(&id.0) {
+            Some(m) => m.handlers.iter().map(|h| h.id.clone()).collect(),
+            None => {
+                return Err(OpError::Unknown {
+                    field: "mode".into(),
+                    value: id.0.clone(),
+                    known: modes.ids(),
+                });
+            }
+        },
+        None => modes
+            .all()
+            .iter()
+            .flat_map(|m| m.handlers.iter().map(|h| h.id.clone()))
+            .collect(),
+    };
+    if mode.is_none() {
+        known.sort();
+        known.dedup();
+    }
+    if let Some(id) = order.iter().find(|id| !known.contains(id)) {
+        return Err(OpError::Unknown {
+            field: "order".into(),
+            value: id.clone(),
+            known,
+        });
+    }
+    node.set_handler_policy(mode.as_ref().map(|m| m.0.as_str()), order)
+        .map(OpResult::HandlerPolicy)
+        .map_err(|e| node_error(node, e))
 }
 
 /// `jobs_stop`: stop the running jobs the filters match, those on a radio first (an

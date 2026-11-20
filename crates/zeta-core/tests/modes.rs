@@ -5,11 +5,11 @@ use std::path::Path;
 
 use zeta_core::graph::NodeId;
 use zeta_core::modes::{
-    Access, Container, Decoder, Family, Identity, InputStream, ModeRegistry, ModeState,
-    SubjectWaterfall, parse, template, validate,
+    Access, Container, Decoder, Family, Identity, InputStream, ModeId, ModeRegistry, ModeState,
+    SubjectWaterfall, parse, policy::HandlerPolicy, template, validate,
 };
 use zeta_core::node::{Node, NodeConfig};
-use zeta_core::ops::{Op, OpError, OpResult};
+use zeta_core::ops::{ModeDetail, ModeInfo, Op, OpError, OpResult};
 use zeta_core::port::Tuning;
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::types::{Hz, StreamKind};
@@ -1539,4 +1539,349 @@ async fn a_handler_file_added_before_a_reload_is_probed() {
     let alt = reg.handler("adsb_decode", "alt").unwrap();
     assert_eq!(alt.state, ModeState::Ready, "{alt:?}");
     assert_eq!(alt.program.as_deref(), Some(program.as_path()));
+}
+
+/// A node config on `dir` whose handlers directory holds `alt.json`: an `adsb_decode`
+/// handler giving packets beside its events and adding the event field `df`.
+fn alt_cfg(dir: &Path) -> NodeConfig {
+    let handlers = dir.join("handlers");
+    std::fs::create_dir_all(&handlers).unwrap();
+    let alt = adsb_handler_file("alt", |f| {
+        let e = &mut f["modes"]["adsb_decode"];
+        e["packets"] = serde_json::json!({"via": "tcp", "port": "$packet_port", "parser": "pcap"});
+        e["extra"] = serde_json::json!({"df": "/df"});
+    });
+    std::fs::write(handlers.join("alt.json"), alt).unwrap();
+    NodeConfig {
+        handlers_dir: Some(handlers),
+        ..cfg(dir, &dir.join("modes"))
+    }
+}
+
+/// Set what probing found for `adsb_decode`: the row's own program (`None`: dump1090
+/// missing) and alt's (`None`: its program missing).
+fn probe_adsb(node: &Node, own: Option<&str>, alt: Option<&str>) {
+    let mut reg = (*node.modes()).clone();
+    let (mode, missing) = ("adsb_decode", |p: &str| format!("{p}: missing"));
+    match own {
+        Some(p) => reg.set_program(mode, Some(p.into()), None),
+        None => reg.set_program(mode, None, Some(missing("dump1090"))),
+    }
+    match alt {
+        Some(p) => reg.set_handler_program(mode, "alt", Some(p.into()), None),
+        None => reg.set_handler_program(mode, "alt", None, Some(missing("zeta-alt-decoder"))),
+    }
+    node.modes_handle().set(std::sync::Arc::new(reg));
+}
+
+async fn policy_set(node: &Node, mode: Option<&str>, order: &[&str]) -> Result<OpResult, OpError> {
+    node.apply(Op::HandlerPolicySet {
+        mode: mode.map(|m| ModeId(m.into())),
+        order: order.iter().map(|s| s.to_string()).collect(),
+    })
+    .await
+}
+
+async fn policy_get(node: &Node) -> HandlerPolicy {
+    match node.apply(Op::HandlerPolicyGet {}).await {
+        Ok(OpResult::HandlerPolicy(p)) => p,
+        other => panic!("expected the policy, got {other:?}"),
+    }
+}
+
+/// Every mode as `modes_list` reports it.
+async fn listed(node: &Node) -> Vec<ModeInfo> {
+    match node
+        .apply(Op::ModesList {
+            family: None,
+            state: None,
+        })
+        .await
+    {
+        Ok(OpResult::Modes { modes }) => modes,
+        other => panic!("expected modes, got {other:?}"),
+    }
+}
+
+async fn listed_one(node: &Node, id: &str) -> ModeInfo {
+    let all = listed(node).await;
+    all.into_iter().find(|m| m.id.0 == id).expect("listed")
+}
+
+async fn shown(node: &Node, id: &str) -> ModeDetail {
+    match node.apply(Op::ModesShow { id: id.into() }).await {
+        Ok(OpResult::Mode { mode }) => *mode,
+        other => panic!("expected the mode, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn handler_policy_set_persists_and_get_returns_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(alt_cfg(dir.path()), stages(), vec![])
+        .await
+        .unwrap();
+    assert_eq!(policy_get(&node).await, HandlerPolicy::default());
+    let mode_only = HandlerPolicy {
+        modes: [("adsb_decode".to_string(), vec!["alt".to_string()])].into(),
+        all: vec![],
+    };
+    let r = policy_set(&node, Some("adsb_decode"), &["alt"]).await;
+    assert_eq!(r, Ok(OpResult::HandlerPolicy(mode_only.clone())));
+    // The file is written as decided: `{"modes": {...}, "all": [...]}`.
+    let file = dir.path().join("state/handler-policy.json");
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(
+        on_disk,
+        serde_json::json!({"modes": {"adsb_decode": ["alt"]}, "all": []})
+    );
+    drop(node);
+    let node = Node::open(alt_cfg(dir.path()), stages(), vec![])
+        .await
+        .unwrap();
+    assert_eq!(policy_get(&node).await, mode_only);
+
+    // The node-wide ranking sits beside the mode's; an empty order clears each.
+    let both = HandlerPolicy {
+        all: vec!["alt".into(), "dump1090".into()],
+        ..mode_only.clone()
+    };
+    let r = policy_set(&node, None, &["alt", "dump1090"]).await;
+    assert_eq!(r, Ok(OpResult::HandlerPolicy(both.clone())));
+    let r = policy_set(&node, Some("adsb_decode"), &[]).await;
+    let all_only = HandlerPolicy {
+        modes: Default::default(),
+        all: both.all.clone(),
+    };
+    assert_eq!(r, Ok(OpResult::HandlerPolicy(all_only.clone())));
+    drop(node);
+    let node = Node::open(alt_cfg(dir.path()), stages(), vec![])
+        .await
+        .unwrap();
+    assert_eq!(policy_get(&node).await, all_only);
+    let r = policy_set(&node, None, &[]).await;
+    assert_eq!(r, Ok(OpResult::HandlerPolicy(HandlerPolicy::default())));
+    drop(node);
+
+    // A malformed file reads as the empty policy, with one line saying so.
+    std::fs::write(&file, "garbage").unwrap();
+    let node = Node::open(alt_cfg(dir.path()), stages(), vec![])
+        .await
+        .unwrap();
+    assert_eq!(policy_get(&node).await, HandlerPolicy::default());
+    let lines: Vec<_> = node
+        .load_errors()
+        .iter()
+        .filter(|l| l.contains("handler-policy.json"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{:?}", node.load_errors());
+    assert!(
+        lines[0].starts_with("unreadable handler-policy.json: "),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn handler_policy_set_refuses_an_id_no_mode_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(alt_cfg(dir.path()), stages(), vec![])
+        .await
+        .unwrap();
+    let unknown = |field: &str, value: &str, known: Vec<String>| {
+        Err(OpError::Unknown {
+            field: field.into(),
+            value: value.into(),
+            known,
+        })
+    };
+    let ids = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // A named mode: its own handlers' ids.
+    let r = policy_set(&node, Some("adsb_decode"), &["alt", "nope"]).await;
+    assert_eq!(r, unknown("order", "nope", ids(&["dump1090", "alt"])));
+    // Another mode's handler is not this one's.
+    let r = policy_set(&node, Some("aprs_decode"), &["alt"]).await;
+    assert_eq!(r, unknown("order", "alt", ids(&["builtin"])));
+    // The node-wide ranking: every handler id of every mode, once each, sorted.
+    let mut every: Vec<String> = node
+        .modes()
+        .all()
+        .iter()
+        .flat_map(|m| m.handlers.iter().map(|h| h.id.clone()))
+        .collect();
+    every.sort();
+    every.dedup();
+    for id in ["alt", "builtin", "dump1090"] {
+        assert!(every.iter().any(|e| e == id), "{every:?}");
+    }
+    let r = policy_set(&node, None, &["nope"]).await;
+    assert_eq!(r, unknown("order", "nope", every));
+    // A mode the node lacks is unknown on `mode`.
+    let r = policy_set(&node, Some("nope_decode"), &["alt"]).await;
+    assert_eq!(r, unknown("mode", "nope_decode", node.modes().ids()));
+    // Nothing was written.
+    assert_eq!(policy_get(&node).await, HandlerPolicy::default());
+    assert!(!dir.path().join("state/handler-policy.json").exists());
+}
+
+#[tokio::test]
+async fn modes_list_gives_each_modes_handlers_and_the_policys_pick() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(alt_cfg(dir.path()), stages(), vec![])
+        .await
+        .unwrap();
+    let both = [StreamKind::Event, StreamKind::Packet];
+
+    // The row's program missing, alt found: the mode is ready through alt.
+    probe_adsb(&node, None, Some("/opt/alt-rx"));
+    let m = listed_one(&node, "adsb_decode").await;
+    assert_eq!(m.state, ModeState::Ready);
+    assert_eq!(m.handler.as_deref(), Some("alt"));
+    assert_eq!(m.program.as_deref(), Some("/opt/alt-rx"));
+    assert_eq!(m.reason, None);
+    assert_eq!(m.outputs, both);
+    let ids: Vec<&str> = m.handlers.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, ["dump1090", "alt"]);
+    let own = &m.handlers[0];
+    assert_eq!(own.state, ModeState::Unavailable);
+    assert_eq!(own.reason.as_deref(), Some("dump1090: missing"));
+    assert_eq!(own.program, None);
+    assert!(!own.in_process);
+    assert_eq!(own.extra, Vec::<String>::new());
+    let alt = &m.handlers[1];
+    assert_eq!(alt.name, "Alternative");
+    assert_eq!(alt.state, ModeState::Ready);
+    assert_eq!(alt.program.as_deref(), Some("/opt/alt-rx"));
+    assert_eq!(alt.outputs, both);
+    assert_eq!(alt.extra, ["df"]);
+    assert!(alt.file.ends_with("alt.json"), "{}", alt.file);
+    // The `state` filter reads the reported state.
+    let ready = node
+        .apply(Op::ModesList {
+            family: Some(Family::Aviation),
+            state: Some(ModeState::Ready),
+        })
+        .await;
+    let Ok(OpResult::Modes { modes: ready }) = ready else {
+        panic!("{ready:?}")
+    };
+    assert!(ready.iter().any(|r| r.id.0 == "adsb_decode"), "{ready:?}");
+    // `modes_show` says the same.
+    let s = shown(&node, "adsb_decode").await;
+    assert_eq!(
+        (&s.state, &s.handler, &s.reason, &s.outputs, &s.handlers),
+        (&m.state, &m.handler, &m.reason, &m.outputs, &m.handlers)
+    );
+    assert_eq!(s.program, Some("/opt/alt-rx".into()));
+    // The wire form: `handler` and each handler's nullable fields.
+    let v = serde_json::to_value(&m).unwrap();
+    assert_eq!(v["handler"], "alt");
+    assert_eq!(v["handlers"][0]["program"], serde_json::Value::Null);
+    assert_eq!(v["handlers"][1]["extra"], serde_json::json!(["df"]));
+    let back: ModeInfo = serde_json::from_value(v).unwrap();
+    assert_eq!(back, m);
+
+    // Both found: the row's own leads with no ranking, alt when ranked first; the
+    // outputs are both handlers'.
+    probe_adsb(&node, Some("/usr/bin/dump1090"), Some("/opt/alt-rx"));
+    let m = listed_one(&node, "adsb_decode").await;
+    assert_eq!(m.handler.as_deref(), Some("dump1090"));
+    assert_eq!(m.program.as_deref(), Some("/usr/bin/dump1090"));
+    assert_eq!(m.outputs, both);
+    policy_set(&node, Some("adsb_decode"), &["alt"])
+        .await
+        .unwrap();
+    let m = listed_one(&node, "adsb_decode").await;
+    assert_eq!(m.handler.as_deref(), Some("alt"));
+    assert_eq!(m.program.as_deref(), Some("/opt/alt-rx"));
+    assert_eq!(
+        shown(&node, "adsb_decode").await.handler.as_deref(),
+        Some("alt")
+    );
+
+    // None found: the row's own fields.
+    probe_adsb(&node, None, None);
+    let m = listed_one(&node, "adsb_decode").await;
+    assert_eq!(m.state, ModeState::Unavailable);
+    assert_eq!(m.handler, None);
+    assert_eq!(m.program, None);
+    assert_eq!(m.reason.as_deref(), Some("dump1090: missing"));
+    assert_eq!(m.outputs, [StreamKind::Event]);
+    assert_eq!(m.handlers[1].state, ModeState::Unavailable);
+    assert_eq!(
+        m.handlers[1].reason.as_deref(),
+        Some("zeta-alt-decoder: missing")
+    );
+    let v = serde_json::to_value(&m).unwrap();
+    assert_eq!(v["handler"], serde_json::Value::Null);
+}
+
+/// With no handler files every mode's own fields read as the row's (the pre-handler
+/// listing), and its one handler is the row's own.
+#[tokio::test]
+async fn a_node_with_no_handler_files_lists_modes_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    std::fs::write(modes.join("junk.json"), r#"{"id":"junk_mode","bogus":1}"#).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    // Every kind of answer a probe leaves: found, missing, an optional helper missing,
+    // and a check time.
+    let mut reg = (*node.modes()).clone();
+    reg.set_program("adsb_decode", Some("/usr/bin/dump1090".into()), None);
+    reg.set_program("rs41_decode", None, Some("rs41mod: missing".into()));
+    reg.set_program("dmr_decode", Some("/usr/bin/zeta-mbe".into()), None);
+    reg.set_missing(
+        "dmr_decode",
+        "zeta-mbe: missing (x; y) — voice silent".into(),
+    );
+    let checked = dir.path().join("checked.json");
+    ModeRegistry::record_checked(&checked, "adsb_decode", 100).unwrap();
+    reg.load_checked(&checked);
+    node.modes_handle().set(std::sync::Arc::new(reg));
+
+    let reg = node.modes();
+    let list = listed(&node).await;
+    assert_eq!(list.len(), reg.all().len());
+    for info in &list {
+        let m = reg.get(&info.id.0).unwrap();
+        let id = &info.id.0;
+        let before = (
+            m.state,
+            m.reason.clone(),
+            m.program.as_ref().map(|p| p.display().to_string()),
+            m.missing.clone(),
+            m.outputs.clone(),
+            m.checked,
+        );
+        let now = (
+            info.state,
+            info.reason.clone(),
+            info.program.clone(),
+            info.missing.clone(),
+            info.outputs.clone(),
+            info.checked,
+        );
+        assert_eq!(now, before, "{id}");
+        let s = shown(&node, id).await;
+        let shown_now = (
+            s.state,
+            s.reason.clone(),
+            s.program.as_ref().map(|p| p.display().to_string()),
+            s.missing.clone(),
+            s.outputs.clone(),
+            s.checked,
+        );
+        assert_eq!(shown_now, before, "{id}");
+        assert_eq!(info.handlers.len(), 1, "{id}");
+        assert_eq!(info.handlers[0].id, m.handlers[0].id, "{id}");
+        let own = (m.state == ModeState::Ready).then(|| m.handlers[0].id.clone());
+        assert_eq!(info.handler, own, "{id}");
+    }
+    // The probes above are among them.
+    let state = |id: &str| list.iter().find(|m| m.id.0 == id).unwrap().state;
+    assert_eq!(state("rs41_decode"), ModeState::Unavailable);
+    assert_eq!(state("junk_mode"), ModeState::Broken);
 }

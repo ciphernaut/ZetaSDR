@@ -20,6 +20,7 @@
 pub mod derive;
 pub mod handler_file;
 pub mod handlers;
+pub mod policy;
 mod row;
 pub mod score;
 pub mod summary;

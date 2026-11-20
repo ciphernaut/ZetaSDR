@@ -223,7 +223,7 @@ fn a_frame_row_parses_validates_and_lists_its_kind() {
     let reg = ModeRegistry::load(&stages(), Some(dir.path()));
     let m = reg.get(ROW_ID).expect("listed");
     assert_eq!(m.reason, None);
-    let info = zeta_core::ops::ModeInfo::from(m);
+    let info = zeta_core::ops::ModeInfo::new(m, &reg, &Default::default());
     let v = serde_json::to_value(&info).unwrap();
     assert_eq!(v["decoder_kind"], "frame", "{v}");
     assert_eq!(v["state"], "ready", "{v}");

@@ -701,6 +701,25 @@ CLI: `zeta modes show <id>`
 
 One mode's full row as loaded (`row`: band, decoder graph or program block (an audio program row adds its `demod` and `input.container`), event schema and `summary` template (`{field:.N}` and `{field:+.N}` format numbers), `identify` rule, catalogue ids, `decoder.args` placeholders (`$port`, `$rate_hz`, `$center_hz`, `$center_khz` the centre in kHz, an integer when it divides, else up to three decimals, `$fifo`), `decoder.output.fields` (each event field <- the JSON pointer(s) into the program's JSON line it is read from; unmapped rows emit the line as is) and `subject.merge` (the event fields whose equal values mean the same subject across rows sharing `subject.name`, so the page draws one table: `[]` for none) and `subject.merge_skip` (field = value pairs naming the subjects that keep a row of their own, a VDL2 ground station: `{}` for none) and `subject.station` (`{when, key, addressed}`: an event matching every `when` pair is a data link's fixed station's own frame, named by its `key` field (`null`: the anonymous `*`); any other event's `addressed` field names the station it is sent to, so it should be a station identity, never a per-aircraft field, since every distinct value becomes a key of the tally; `null` for no stations; `origin_lookup` reads it), `position` (the event fields of a fix, added to each event as `position: {lat, lon, alt_m}`; `alt_unit` `ft` converts a feet field), `derive` (a list of `{when, from, extract, into}`: the event fields `into` filled from the text of field `from` by the named extractor, only on events matching every `when` pair, and skipped whole when any `into` field already holds a value, so a decoder's structured fix always wins; `acars_position` is the one extractor, giving `lat`, `lon`, `alt_ft`; `[]` for none), `subject` (`key`, `name`, `waterfall` `summary` or `fold`, `columns` of `field`, `label` and `unit`, `heading`, `label`, `identity`: how a subject matches the licence register, `{field, register, strip}`, the event `field` whose value, after `strip` (`ssid` removes an AX.25 `-N`; `null` for nothing), confirms a kept origin whose `register` field (only `callsign`) equals it; `null` for none) and `time` (the event field whose ISO 8601 UTC time becomes `t_ns`), each `null` for none) with its `state`, `reason`, `file`, `program`, `checked`, `missing` (the optional programs a ready row runs without; `[]` for none) and `voices`, each as in `modes_list`. An unknown id is an `unknown` error (`field: "id"`) listing the known ids in `known`; take ids from `modes list`, never invent them.
 
+### handler_policy_set
+
+Rank the handlers of mode `mode`, or with `mode: null` of every mode (the node-wide ranking), for the policy that picks a mode's handler (`modes_list`'s `handler`): among the mode's ready handlers, one lacking an output the start needs is passed over; then the mode's ranking leads, then the node-wide one, then an in-process handler goes before a program, then the row's own before the handler files' (by id). `order` lists handler ids (`modes_list`'s `handlers[].id`), first preferred; an id it leaves out goes after those it names, and an empty `order` clears that ranking. A ranked handler that is not ready is passed over, never an error. Checked before anything is written: `mode` naming no mode is `unknown` on `mode`, and an id the mode (with `mode: null`, every mode) has no handler of is `unknown` on `order`, listing the ids it has. Kept in `handler-policy.json` in the state directory across restarts. The result is the whole policy as stored.
+
+- mode: string or null
+- order: array
+
+JSON: `{"op":"handler_policy_set","mode":null,"order":[]}`
+
+CLI: `zeta handler policy_set`
+
+### handler_policy_get
+
+The handler policy: `modes`, each mode's ranking by mode id (`{}` for none), and `all`, the node-wide ranking (`[]` for none).
+
+JSON: `{"op":"handler_policy_get"}`
+
+CLI: `zeta handler policy_get`
+
 ### classify
 
 Run every registered classifier over the selection's band and span of the source ring (no upstream features).
