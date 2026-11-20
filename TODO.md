@@ -1,5 +1,14 @@
 # TODO
 
+## Alternative handlers for a mode (plans 42 to 45)
+
+From the operator, 2026-11-20 and 2026-11-21. Spec: `docs/superpowers/specs/2026-11-21-alternative-handlers-design.md`. A mode may be decoded by several handlers (its row's own decoder, or a program a handler file describes, OnAir first), a policy picks one, and Send to runs another beside a running job with their subjects merged and marked.
+
+- **Plan 42** (`docs/superpowers/plans/2026-11-21-alternative-handlers.md`): handler files, the policy, packets from programs (dump1090's Beast output, a pcap stream), OnAir for ADS-B. Not started.
+- **Plan 43:** Send to (`job_start.beside`, sibling groups), the merged subject with per-handler marks from the theme. Not planned.
+- **Plan 44:** `capture_decode`: a stored IQ capture replayed into a mode's handler. Not planned.
+- **Plan 45:** OnAir's other modes, rows with no decoder of their own (with the `policy` placeholder), and the two patches to offer upstream. Not planned.
+
 ## Cleanup: the rounds of small debts
 
 `docs/superpowers/plans/2026-11-17-cleanup-spike.md` sorts the sections below by size into rounds: Round 0 (the XS sweep), node and worker fixes, small features, the page, and the deferred review minors. A section stays here until its item lands.
