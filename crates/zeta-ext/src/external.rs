@@ -31,8 +31,9 @@
 //! row's packet parser ([`crate::packet_parsers`]) and publishes each packet with the
 //! provenance the events carry, only while the packet stream has a reader (the framing
 //! is kept all the same). A port that never opens, a stream the parser refuses or a
-//! read error stops that task alone, noted once as `external.packets` beside
-//! `external.unparsed` in the job's context; the job and its events go on.
+//! read error ends the packets alone, noted once as `external.packets` beside
+//! `external.unparsed` in the job's context (a refused stream is still read to its end
+//! and thrown away, so the program is never cut off); the job and its events go on.
 //!
 //! **Ending.** Cancel kills and reaps the child and returns `Cancelled`. When the input
 //! closes, the child's input is closed and it gets [`EXIT_GRACE`] to finish; a clean exit
@@ -670,7 +671,9 @@ struct PacketReader {
 
 impl PacketReader {
     /// Read until the output closes; a port that never opens, a read error or a stream
-    /// the parser refuses is noted as `external.packets` and ends the reading.
+    /// the parser refuses is noted as `external.packets`. After a refused stream the
+    /// output is still read to its end and thrown away: closing it would cut off a
+    /// program still writing (a closed pipe kills one with SIGPIPE), and the job with it.
     async fn run(mut self, source: PacketSource) {
         let mut r: Box<dyn AsyncRead + Unpin + Send> = match source {
             PacketSource::Stdout(s) => s,
@@ -683,18 +686,27 @@ impl PacketReader {
             },
         };
         let mut buf = vec![0u8; PACKET_READ];
+        // False once the parser refused the stream: the rest is drained.
+        let mut parsing = true;
         loop {
             let n = match r.read(&mut buf).await {
                 Ok(0) => return,
                 Ok(n) => n,
-                Err(e) => {
+                Err(e) if parsing => {
                     let why = format!("reading {}'s packet output: {e}", self.name);
                     return self.notes.set("packets", why);
                 }
+                Err(_) => return,
             };
+            if !parsing {
+                continue;
+            }
             match self.parser.push(&buf[..n]) {
                 Ok(packets) => self.publish(packets),
-                Err(e) => return self.notes.set("packets", e.0),
+                Err(e) => {
+                    self.notes.set("packets", e.0);
+                    parsing = false;
+                }
             }
         }
     }

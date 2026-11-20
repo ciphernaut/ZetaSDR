@@ -808,6 +808,101 @@ async fn a_stream_that_is_not_pcap_is_noted_once() {
     assert_eq!(cx["external"]["packets"], json!(note), "{cx}");
 }
 
+/// A row with its events on tcp (`$port`) and its packets on stdout, `fake_lines`
+/// writing `file` there (SIGPIPE at its default), with `extra` args.
+fn stdout_packets_row(id: &str, file: &Path, extra: &[&str]) -> Value {
+    let file = file.display().to_string();
+    let mut args = vec!["--port", "$port", "--pcap-stdout", "--pcap-file", &file];
+    args.extend(extra);
+    let mut r = row(
+        id,
+        &fake("fake_lines"),
+        &args,
+        "cs16",
+        48_000,
+        "stdin",
+        "tcp",
+        "json_lines",
+        "{text} #{n}",
+        json!({"text": {"type": "string"}, "n": {"type": "integer"}}),
+    );
+    r["decoder"]["packets"] = json!({
+        "via": "stdout", "port": null, "parser": "pcap",
+        "link_types": {"147": "mode_s"}
+    });
+    r
+}
+
+#[tokio::test]
+async fn packets_on_stdout_reach_the_packet_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.pcap");
+    let records: Vec<Vec<u8>> = (0u8..3).map(|i| vec![0x8d, i, 0x5a]).collect();
+    std::fs::write(&file, pcap(&records)).unwrap();
+    let reg = registry(&[stdout_packets_row("fake_pk", &file, &[])]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([
+        ("FAKE_VIA", "tcp:--port"),
+        ("FAKE_LINES", r#"{"text":"hi","n":1}"#),
+    ]);
+    let mut r = start_with(stage, "fake_pk", true);
+    let mut rx = r.bus.subscribe(r.packets.as_ref().unwrap()).unwrap();
+    send(&r.tx, 4, 480, 48_000);
+    for want in &records {
+        let f = next_packet(&mut rx, 10).await.expect("a packet");
+        match f.payload {
+            Payload::Packet { link_type, data } => {
+                assert_eq!(link_type, zeta_core::stream::LinkType::ModeS);
+                assert_eq!(&data[..], &want[..]);
+            }
+            other => panic!("expected a packet, got {:?}", other.kind()),
+        }
+    }
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    assert_eq!(v["summary"], "hi #1", "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
+/// A stream the parser refuses is noted, then read to its end and thrown away: a program
+/// still writing to it is never cut off (a closed pipe would kill it with SIGPIPE).
+#[tokio::test]
+async fn a_bad_packet_stream_on_stdout_is_drained_and_the_job_goes_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.pcap");
+    std::fs::write(&file, "OFF\n").unwrap();
+    let reg = registry(&[stdout_packets_row(
+        "fake_pk",
+        &file,
+        &["--pcap-again-ms", "1500"],
+    )]);
+    // A line at once, then one per input frame (480 cs16 samples are 1 920 bytes).
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([
+        ("FAKE_VIA", "tcp:--port"),
+        ("FAKE_LINES", r#"{"text":"on","n":1}"#),
+        ("FAKE_AFTER_BYTES", "0"),
+        ("FAKE_REPEAT_BYTES", "1920"),
+    ]);
+    let mut r = start_with(stage, "fake_pk", true);
+    next_event(&mut r.rx_out, 10).await.expect("an event");
+    let note = packets_note(&r, Duration::from_secs(6))
+        .await
+        .expect("a packets note");
+    assert!(note.starts_with("not a pcap stream"), "{note}");
+    // The fake goes on writing to stdout for 1.5 s.
+    tokio::time::sleep(Duration::from_millis(1_800)).await;
+    if r.handle.is_finished() {
+        panic!("the job ended: {:?}", r.handle.await.unwrap());
+    }
+    while r.rx_out.try_recv().is_ok() {}
+    send(&r.tx, 2, 480, 48_000);
+    let v = next_event(&mut r.rx_out, 10)
+        .await
+        .expect("an event after the note");
+    assert_eq!(v["summary"], "on #1", "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
 // The vectors in tests/data are SYNTHETIC: built by hand to the shape of the upstream
 // formatters (dumpvdl2, dumphfdl, libacars), with invented values, until off-air
 // fixtures replace them.

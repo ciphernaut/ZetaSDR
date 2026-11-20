@@ -22,11 +22,15 @@ node-wide when a node runs this as a mode row: two rows differ by their `args`.
 on 127.0.0.1 at PORT and, once connected, write the file's bytes in 5-byte chunks
 1 ms apart, then keep the socket open. With `--pcap-interval-ms N` the file is a
 little-endian pcap whose 24-byte header goes first, then one record every N ms.
-`--pcap-refuse` never listens.
+`--pcap-refuse` never listens. `--pcap-stdout` writes the packet output to stdout
+instead of a port (the lines then go by $FAKE_VIA=tcp:...), with SIGPIPE at its
+default as a C program has it, so a write to a pipe nobody reads kills it; with
+`--pcap-again-ms N` the file's bytes are written again every 100 ms for N ms after.
 """
 
 import json
 import os
+import signal
 import socket
 import struct
 import sys
@@ -43,6 +47,26 @@ def write_chunked(conn, data: bytes) -> None:
     for i in range(0, len(data), 5):
         conn.sendall(data[i : i + 5])
         time.sleep(0.001)
+
+
+class StdoutConn:
+    """Stdout with a socket's `sendall`, flushed each write."""
+
+    def sendall(self, data: bytes) -> None:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+
+
+def write_stdout_pcap(data: bytes, again_ms: int) -> None:
+    """Write the file to stdout, then again every 100 ms for `again_ms`; stay open."""
+    conn = StdoutConn()
+    write_chunked(conn, data)
+    end = time.monotonic() + again_ms / 1000
+    while time.monotonic() < end:
+        time.sleep(0.1)
+        write_chunked(conn, data)
+    while True:
+        time.sleep(3600)
 
 
 def pcap_pieces(data: bytes, interval: bool) -> list:
@@ -71,7 +95,17 @@ def serve_pcap(srv, data: bytes, interval_ms: int) -> None:
 
 
 def start_pcap(args) -> None:
-    """Start the packet output `--pcap-port` asks for, unless `--pcap-refuse`."""
+    """Start the packet output `--pcap-port` or `--pcap-stdout` asks for, unless
+    `--pcap-refuse`."""
+    if "--pcap-stdout" in args:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        with open(args[args.index("--pcap-file") + 1], "rb") as f:
+            data = f.read()
+        again = 0
+        if "--pcap-again-ms" in args:
+            again = int(args[args.index("--pcap-again-ms") + 1])
+        threading.Thread(target=write_stdout_pcap, args=(data, again), daemon=True).start()
+        return
     if "--pcap-port" not in args or "--pcap-refuse" in args:
         return
     port = int(args[args.index("--pcap-port") + 1])
