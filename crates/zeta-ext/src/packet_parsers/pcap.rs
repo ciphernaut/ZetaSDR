@@ -9,14 +9,20 @@ use zeta_core::stream::LinkType;
 const FILE_HEADER: usize = 24;
 const RECORD_HEADER: usize = 16;
 
+/// The longest record read, whatever the stream's header says.
+const MAX_RECORD: u32 = 262_144;
+
+/// A pcap parser. A bad header or record is a sticky error: the push that meets a
+/// bad record after good ones returns those packets, and every later push is the error.
 pub struct PcapParser {
+    failed: Option<StreamError>,
     link_types: BTreeMap<u16, LinkType>,
     buf: Vec<u8>,
     /// Set once the file header is read: (big-endian, snap length, link type).
     header: Option<(bool, u32, LinkType)>,
 }
 
-/// Whether `magic` (as four stream bytes) is big-endian, or `None` when it is not pcap.
+/// Whether `magic` (as four stream bytes) is big-endian, or an error when it is not pcap.
 fn byte_order(magic: [u8; 4]) -> Result<bool, StreamError> {
     match u32::from_le_bytes(magic) {
         0xa1b2_c3d4 | 0xa1b2_3c4d => Ok(false),
@@ -40,6 +46,7 @@ fn read_u32(b: &[u8], big: bool) -> u32 {
 impl PcapParser {
     pub fn new(link_types: BTreeMap<u16, LinkType>) -> Self {
         Self {
+            failed: None,
             link_types,
             buf: Vec::new(),
             header: None,
@@ -57,7 +64,8 @@ impl PcapParser {
             return Ok(());
         }
         let snap = read_u32(&self.buf[16..], big);
-        let network = read_u32(&self.buf[20..], big);
+        // The top four bits of the field carry FCS flags, not the link type.
+        let network = read_u32(&self.buf[20..], big) & 0x0fff_ffff;
         let n = u16::try_from(network)
             .map_err(|_| StreamError(format!("pcap link type {network} is out of range")))?;
         let link = self
@@ -73,12 +81,23 @@ impl PcapParser {
 
 impl PacketParser for PcapParser {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<Parsed>, StreamError> {
+        if let Some(e) = &self.failed {
+            return Err(e.clone());
+        }
         self.buf.extend_from_slice(bytes);
-        if self.header.is_none() {
-            self.read_header()?;
+        if self.header.is_none()
+            && let Err(e) = self.read_header()
+        {
+            self.failed = Some(e.clone());
+            return Err(e);
         }
         let Some((big, snap, link)) = self.header else {
             return Ok(Vec::new());
+        };
+        let limit = if snap == 0 {
+            MAX_RECORD
+        } else {
+            snap.min(MAX_RECORD)
         };
         let mut out = Vec::new();
         let mut at = 0;
@@ -88,10 +107,15 @@ impl PacketParser for PcapParser {
                 break;
             }
             let incl = read_u32(&rest[8..], big);
-            if incl > snap {
-                return Err(StreamError(format!(
-                    "pcap record of {incl} bytes exceeds the snap length {snap}"
-                )));
+            if incl > limit {
+                let e = StreamError(format!(
+                    "pcap record of {incl} bytes exceeds the limit {limit}"
+                ));
+                self.failed = Some(e.clone());
+                if out.is_empty() {
+                    return Err(e);
+                }
+                break;
             }
             let end = RECORD_HEADER + incl as usize;
             if rest.len() < end {
@@ -199,6 +223,40 @@ mod tests {
         let mut p = PcapParser::new(BTreeMap::new());
         let e = p.push(b"OFF\n").unwrap_err();
         assert_eq!(e.0, "not a pcap stream (magic 4f46460a)");
+    }
+
+    #[test]
+    fn a_header_with_a_zero_snap_length_still_reads_records() {
+        let mut s = header(0xa1b2_c3d4, false, 0, 147);
+        s.extend(record(false, &[7u8; 14]));
+        let got = PcapParser::new(BTreeMap::new()).push(&s).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].data, [7u8; 14]);
+    }
+
+    #[test]
+    fn a_record_over_the_fixed_cap_is_an_error_whatever_the_header_says() {
+        let mut s = header(0xa1b2_c3d4, false, 0xffff_ffff, 147);
+        let mut r = record(false, &[]);
+        r[8..12].copy_from_slice(&300_000u32.to_le_bytes());
+        s.extend(r);
+        assert!(PcapParser::new(BTreeMap::new()).push(&s).is_err());
+    }
+
+    #[test]
+    fn packets_before_a_bad_record_are_returned_and_the_next_push_is_the_error() {
+        let mut s = header(0xa1b2_c3d4, false, 262144, 147);
+        s.extend(record(false, &[1u8; 14]));
+        let mut r = record(false, &[]);
+        r[8..12].copy_from_slice(&300_000u32.to_le_bytes());
+        s.extend(r);
+        let mut p = PcapParser::new(BTreeMap::new());
+        let got = p.push(&s).unwrap();
+        assert_eq!(got.len(), 1);
+        let e1 = p.push(&[0]).unwrap_err();
+        let e2 = p.push(&[1, 2, 3]).unwrap_err();
+        assert_eq!(e1, e2);
+        assert!(e1.0.contains("300000"));
     }
 
     #[test]
