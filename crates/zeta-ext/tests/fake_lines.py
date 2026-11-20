@@ -22,6 +22,8 @@ node-wide when a node runs this as a mode row: two rows differ by their `args`.
 on 127.0.0.1 at PORT and, once connected, write the file's bytes in 5-byte chunks
 1 ms apart, then keep the socket open. With `--pcap-interval-ms N` the file is a
 little-endian pcap whose 24-byte header goes first, then one record every N ms.
+`--pcap-close-after N` closes the connection after the header and N records (the
+program goes on), first writing `--pcap-cut-bytes K` (default 0) bytes of the next.
 `--pcap-refuse` never listens. `--pcap-stdout` writes the packet output to stdout
 instead of a port (the lines then go by $FAKE_VIA=tcp:...), with SIGPIPE at its
 default as a C program has it, so a write to a pipe nobody reads kills it; with
@@ -83,13 +85,22 @@ def pcap_pieces(data: bytes, interval: bool) -> list:
     return pieces
 
 
-def serve_pcap(srv, data: bytes, interval_ms: int) -> None:
-    """Accept one connection, write the pieces and keep the socket open."""
+def serve_pcap(srv, data: bytes, interval_ms: int, close_after, cut: int) -> None:
+    """Accept one connection, write the pieces and keep the socket open, or with
+    `close_after` close it after that many records and `cut` bytes of the next."""
     conn, _ = srv.accept()
-    for i, piece in enumerate(pcap_pieces(data, interval_ms > 0)):
+    pieces = pcap_pieces(data, interval_ms > 0 or close_after is not None)
+    for i, piece in enumerate(pieces):
+        if close_after is not None and i == close_after + 1:
+            write_chunked(conn, piece[:cut])
+            break
         if i > 1:
             time.sleep(interval_ms / 1000)
         write_chunked(conn, piece)
+    if close_after is not None:
+        conn.shutdown(socket.SHUT_RDWR)
+        conn.close()
+        return
     while True:
         time.sleep(3600)
 
@@ -114,11 +125,17 @@ def start_pcap(args) -> None:
     interval = 0
     if "--pcap-interval-ms" in args:
         interval = int(args[args.index("--pcap-interval-ms") + 1])
+    close_after = None
+    if "--pcap-close-after" in args:
+        close_after = int(args[args.index("--pcap-close-after") + 1])
+    cut = 0
+    if "--pcap-cut-bytes" in args:
+        cut = int(args[args.index("--pcap-cut-bytes") + 1])
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
     srv.listen(1)
-    threading.Thread(target=serve_pcap, args=(srv, data, interval), daemon=True).start()
+    threading.Thread(target=serve_pcap, args=(srv, data, interval, close_after, cut), daemon=True).start()
 
 
 def read_wav_header(src, out) -> bool:

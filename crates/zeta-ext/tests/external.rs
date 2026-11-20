@@ -661,13 +661,14 @@ async fn a_handler_files_program_runs_for_the_rows_mode() {
     drop(r.tx);
     assert!(matches!(result_within(r.handle, 10).await, Ok(())));
 
-    let own = fake("fake_lines").display().to_string();
+    // The row names its program by path: its own handler is the program's file name.
+    let own = "fake_lines";
     let stage = ExternalDecodeStage::new(reg.clone()).with_env(env);
     let mut r = start(stage, "fake_json");
     send(&r.tx, 4, 480, 48_000);
     let v = next_event(&mut r.rx_out, 10).await.expect("an event");
     assert_eq!(v["summary"], "from the row #1", "{v}");
-    assert_eq!(v["handler"], own.as_str(), "{v}");
+    assert_eq!(v["handler"], own, "{v}");
     drop(r.tx);
     assert!(matches!(result_within(r.handle, 10).await, Ok(())));
 
@@ -924,6 +925,102 @@ async fn a_packet_port_that_never_opens_is_noted_and_events_go_on() {
     assert!(!r.handle.is_finished(), "the job goes on");
     drop(r.tx);
     assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
+/// A job on `packets_row` whose fake closes its packet connection after `close_after`
+/// records, writing `cut` bytes of the next first; a line at once and one per input frame
+/// (480 cs16 samples are 1 920 bytes). Answers the run, its packet receiver, and the
+/// records it was given.
+fn closing_packets_job(dir: &Path, close_after: &str, cut: &str) -> (Running, Vec<Vec<u8>>) {
+    let file = dir.join("p.pcap");
+    let records: Vec<Vec<u8>> = (0u8..3).map(|i| vec![0x8d, i, 0xa5, i, 0x5a]).collect();
+    std::fs::write(&file, pcap(&records)).unwrap();
+    let reg = registry(&[packets_row(
+        "fake_pk",
+        &file,
+        &["--pcap-close-after", close_after, "--pcap-cut-bytes", cut],
+    )]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([
+        ("FAKE_LINES", r#"{"text":"on","n":1}"#),
+        ("FAKE_AFTER_BYTES", "0"),
+        ("FAKE_REPEAT_BYTES", "1920"),
+    ]);
+    (start_with(stage, "fake_pk", true), records)
+}
+
+#[tokio::test]
+async fn a_packet_port_closed_mid_job_is_noted_and_events_go_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut r, records) = closing_packets_job(dir.path(), "2", "0");
+    let mut rx = r.bus.subscribe(r.packets.as_ref().unwrap()).unwrap();
+    next_event(&mut r.rx_out, 10).await.expect("an event");
+    for want in &records[..2] {
+        let f = next_packet(&mut rx, 10).await.expect("a packet");
+        match f.payload {
+            Payload::Packet { data, .. } => assert_eq!(&data[..], &want[..]),
+            other => panic!("expected a packet, got {:?}", other.kind()),
+        }
+    }
+    let note = packets_note(&r, Duration::from_secs(6)).await;
+    assert_eq!(
+        note.as_deref(),
+        Some(format!("{} closed its packet output", fake("fake_lines").display()).as_str())
+    );
+    assert!(!r.handle.is_finished(), "the job goes on");
+    while r.rx_out.try_recv().is_ok() {}
+    send(&r.tx, 2, 480, 48_000);
+    let v = next_event(&mut r.rx_out, 10)
+        .await
+        .expect("an event after the note");
+    assert_eq!(v["summary"], "on #1", "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
+#[tokio::test]
+async fn a_stream_cut_mid_record_names_the_partial_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut r, _) = closing_packets_job(dir.path(), "1", "10");
+    let _rx = r.bus.subscribe(r.packets.as_ref().unwrap()).unwrap();
+    next_event(&mut r.rx_out, 10).await.expect("an event");
+    let note = packets_note(&r, Duration::from_secs(6)).await;
+    assert_eq!(
+        note.as_deref(),
+        Some(
+            format!(
+                "{} closed its packet output (10 bytes of a partial record)",
+                fake("fake_lines").display()
+            )
+            .as_str()
+        )
+    );
+    assert!(!r.handle.is_finished(), "the job goes on");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
+/// A program that ends with its input closes its packet output too: no note.
+#[tokio::test]
+async fn a_packet_output_closed_by_the_programs_own_end_is_not_noted() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.pcap");
+    std::fs::write(&file, pcap(&[vec![1, 2, 3]])).unwrap();
+    let reg = registry(&[packets_row("fake_pk", &file, &[])]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([
+        ("FAKE_LINES", r#"{"text":"on","n":1}"#),
+        ("FAKE_AFTER_BYTES", "0"),
+    ]);
+    let mut r = start_with(stage, "fake_pk", true);
+    let mut rx = r.bus.subscribe(r.packets.as_ref().unwrap()).unwrap();
+    next_event(&mut r.rx_out, 10).await.expect("an event");
+    next_packet(&mut rx, 10).await.expect("a packet");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+    let notes = r.notes.lock().unwrap().clone();
+    assert!(
+        notes.iter().all(|n| n["external"]["packets"].is_null()),
+        "{notes:?}"
+    );
 }
 
 #[tokio::test]

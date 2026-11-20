@@ -1284,6 +1284,16 @@ fn adsb_handler_file(id: &str, edit: impl FnOnce(&mut serde_json::Value)) -> Str
     file.to_string()
 }
 
+/// `entry` (a handler file's mode entry) giving pcap on `$packet_port`, which its args
+/// name.
+fn with_pcap_port(entry: &mut serde_json::Value) {
+    entry["args"]
+        .as_array_mut()
+        .unwrap()
+        .extend(["--pcap-port".into(), "$packet_port".into()]);
+    entry["packets"] = serde_json::json!({"via": "tcp", "port": "$packet_port", "parser": "pcap"});
+}
+
 /// The registry over the embedded rows with `files` (name, contents) in a handlers
 /// directory.
 fn with_handler_files(files: &[(&str, &str)]) -> ModeRegistry {
@@ -1341,10 +1351,7 @@ fn a_handler_file_adds_a_handler_to_each_mode_it_lists() {
         "dump1090"
     );
 
-    let with_packets = adsb_handler_file("alt", |f| {
-        f["modes"]["adsb_decode"]["packets"] =
-            serde_json::json!({"via": "tcp", "port": "$packet_port", "parser": "pcap"});
-    });
+    let with_packets = adsb_handler_file("alt", |f| with_pcap_port(&mut f["modes"]["adsb_decode"]));
     let reg = with_handler_files(&[("alt.json", &with_packets)]);
     let alt = reg.handler("adsb_decode", "alt").unwrap();
     assert_eq!(alt.outputs, [StreamKind::Event, StreamKind::Packet]);
@@ -1635,7 +1642,7 @@ fn alt_cfg(dir: &Path) -> NodeConfig {
     std::fs::create_dir_all(&handlers).unwrap();
     let alt = adsb_handler_file("alt", |f| {
         let e = &mut f["modes"]["adsb_decode"];
-        e["packets"] = serde_json::json!({"via": "tcp", "port": "$packet_port", "parser": "pcap"});
+        with_pcap_port(e);
         e["extra"] = serde_json::json!({"df": "/df"});
     });
     std::fs::write(handlers.join("alt.json"), alt).unwrap();
@@ -1724,6 +1731,26 @@ async fn shown(node: &Node, id: &str) -> ModeDetail {
         Ok(OpResult::Mode { mode }) => *mode,
         other => panic!("expected the mode, got {other:?}"),
     }
+}
+
+/// An older node's `modes_list` and `modes_show` answers have no `handlers` or `handler`:
+/// they read as no handlers and none picked.
+#[tokio::test]
+async fn an_older_nodes_mode_answers_without_handlers_still_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(alt_cfg(dir.path()), stages(), vec![])
+        .await
+        .unwrap();
+    let mut info = serde_json::to_value(listed_one(&node, "aprs_decode").await).unwrap();
+    let mut detail = serde_json::to_value(shown(&node, "aprs_decode").await).unwrap();
+    for v in [&mut info, &mut detail] {
+        let o = v.as_object_mut().unwrap();
+        assert!(o.remove("handlers").is_some() && o.remove("handler").is_some());
+    }
+    let info: ModeInfo = serde_json::from_value(info).unwrap();
+    assert_eq!((info.handlers.len(), info.handler), (0, None));
+    let detail: ModeDetail = serde_json::from_value(detail).unwrap();
+    assert_eq!((detail.handlers.len(), detail.handler), (0, None));
 }
 
 #[tokio::test]

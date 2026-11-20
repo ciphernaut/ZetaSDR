@@ -258,7 +258,9 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
             .map_or("program", String::as_str);
         return Outcome::Fail(format!("{handler} missing"));
     }
-    run_in_scratch(m, test, None, ctx, strict).await
+    // Named, so neither a ranking nor another handler can change what the row's own
+    // check runs.
+    run_in_scratch(m, test, &m.own_handler(), ctx, strict).await
 }
 
 /// The outcome of `m`'s row test run by the handler file's handler `h`: failed when it is
@@ -287,16 +289,16 @@ async fn check_handler(
     let Some(test) = &m.row.test else {
         return skipped(strict, "no test".into());
     };
-    run_in_scratch(m, test, Some(&h.id), ctx, strict).await
+    run_in_scratch(m, test, &h.id, ctx, strict).await
 }
 
-/// Run `test` of row `m` by `handler` (`None`: the policy's choice) in a scratch directory
-/// of its own under the state directory, removed after; a fixture not found is skipped
-/// (failed with `strict`).
+/// Run `test` of row `m` by `handler` (named, never the policy's choice) in a scratch
+/// directory of its own under the state directory, removed after; a fixture not found is
+/// skipped (failed with `strict`).
 async fn run_in_scratch(
     m: &LoadedMode,
     test: &RowTest,
-    handler: Option<&str>,
+    handler: &str,
     ctx: &Ctx,
     strict: bool,
 ) -> Outcome {
@@ -334,12 +336,12 @@ async fn remove_scratch(scratch: &Path) {
     }
 }
 
-/// Run `test` of row `m` on a node over its capture, the job run by `handler` (`None`: the
-/// policy's choice), with `scratch` as the node's state directory parent.
+/// Run `test` of row `m` on a node over its capture, the job naming `handler`, with
+/// `scratch` as the node's state directory parent.
 async fn run_test(
     m: &LoadedMode,
     test: &RowTest,
-    handler: Option<&str>,
+    handler: &str,
     scratch: &Path,
     ctx: &Ctx,
 ) -> Outcome {
@@ -389,7 +391,7 @@ async fn run_test(
         dwell_scale: None,
         elastic: false,
         replace: vec![],
-        handler: handler.map(String::from),
+        handler: Some(handler.into()),
         needs: vec![],
     };
     let job = match node.apply(start).await {

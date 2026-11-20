@@ -633,12 +633,14 @@ pub struct ProgramBlock {
 pub struct ProgramPackets {
     /// `tcp`, or `stdout` when the events come over `tcp`.
     pub via: OutputVia,
-    /// With `via: tcp`, `"$packet_port"` (the second port zeta picks); `null` otherwise.
+    /// With `via: tcp`, `"$packet_port"` (the second port zeta picks, which an argument
+    /// must name); `null` with `via: stdout`.
     #[serde(default)]
     pub port: Option<String>,
     pub parser: PacketParserKind,
     /// The link type the node gives a link-type number the stream carries (a pcap
-    /// header's), keyed by the number in decimal; a number not listed is read as itself.
+    /// header's), keyed by the number in decimal as written plainly (`147`, never `0147`);
+    /// a number not listed is read as itself.
     #[serde(default)]
     pub link_types: BTreeMap<String, LinkType>,
 }
@@ -1624,18 +1626,28 @@ pub(crate) fn validate_program(p: &ProgramBlock) -> Result<(), RowError> {
         ));
     }
     match &p.packets {
-        Some(packets) => validate_packets(packets, p.output.via),
+        Some(packets) => validate_packets(packets, p.output.via, &p.args),
         None => Ok(()),
     }
 }
 
-/// A program's `packets` block beside events read `via`.
-fn validate_packets(p: &ProgramPackets, events_via: OutputVia) -> Result<(), RowError> {
+/// A program's `packets` block beside events read `via`, run with `args`.
+fn validate_packets(
+    p: &ProgramPackets,
+    events_via: OutputVia,
+    args: &[String],
+) -> Result<(), RowError> {
     match p.via {
         OutputVia::Stdout if events_via == OutputVia::Stdout => {
             return Err(RowError::new(
                 "decoder.packets.via",
                 "stdout already carries the events",
+            ));
+        }
+        OutputVia::Stdout if p.port.is_some() => {
+            return Err(RowError::new(
+                "decoder.packets.port",
+                "stdout takes no port",
             ));
         }
         OutputVia::Tcp if p.port.as_deref() != Some("$packet_port") => {
@@ -1644,13 +1656,40 @@ fn validate_packets(p: &ProgramPackets, events_via: OutputVia) -> Result<(), Row
                 "\"$packet_port\" with via: tcp (the second port zeta picks)",
             ));
         }
+        OutputVia::Tcp
+            if !args
+                .iter()
+                .any(|a| placeholders(a).contains(&"$packet_port")) =>
+        {
+            return Err(RowError::new(
+                "decoder.packets.port",
+                "no argument names $packet_port",
+            ));
+        }
         _ => {}
     }
-    if let Some(key) = p.link_types.keys().find(|k| link_type_number(k).is_none()) {
-        return Err(RowError::new(
-            format!("decoder.packets.link_types.{key}"),
-            "not a link-type number (decimal, 0 to 65535)",
-        ));
+    for key in p.link_types.keys() {
+        let field = format!("decoder.packets.link_types.{key}");
+        let Some(n) = link_type_number(key) else {
+            return Err(RowError::new(
+                field,
+                "not a link-type number (decimal, 0 to 65535)",
+            ));
+        };
+        // One spelling per number, so two keys never name one link type.
+        if *key != n.to_string() {
+            let twin = p
+                .link_types
+                .keys()
+                .find(|k| *k != key && link_type_number(k) == Some(n));
+            return Err(RowError::new(
+                field,
+                match twin {
+                    Some(other) => format!("duplicates {other}"),
+                    None => format!("write it {n}"),
+                },
+            ));
+        }
     }
     Ok(())
 }
@@ -3020,6 +3059,49 @@ mod tests {
         }
         let text = with_packets(|p| p["link_types"] = serde_json::json!({"195": {"other": 195}}));
         validate(&parse(&text).unwrap(), &no_stages()).unwrap();
+    }
+
+    #[test]
+    fn packets_via_tcp_need_an_argument_naming_the_packet_port() {
+        let text = edited(&with_packets(|_| {}), |v| {
+            v["decoder"]["args"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|a| !a.as_str().unwrap().contains("$packet_port"));
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new("decoder.packets.port", "no argument names $packet_port")
+        );
+    }
+
+    #[test]
+    fn packets_via_stdout_take_no_port() {
+        let text = with_packets(|p| p["via"] = "stdout".into());
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new("decoder.packets.port", "stdout takes no port")
+        );
+    }
+
+    #[test]
+    fn a_link_types_key_not_spelled_as_its_number_is_refused() {
+        let text = with_packets(|p| {
+            p["link_types"] = serde_json::json!({"0147": "mode_s", "147": "user0"})
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new("decoder.packets.link_types.0147", "duplicates 147")
+        );
+        let text = with_packets(|p| p["link_types"] = serde_json::json!({"0147": "mode_s"}));
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(
+            e,
+            RowError::new("decoder.packets.link_types.0147", "write it 147")
+        );
     }
 
     #[test]

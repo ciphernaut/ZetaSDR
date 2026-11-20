@@ -125,11 +125,20 @@ pub fn is_handler_id(id: &str) -> bool {
     b.next().is_some_and(ok) && b.all(|c| ok(c) || c == b'_' || c == b'-')
 }
 
-/// The id of `row`'s own handler: `builtin` for a graph or frame row, its first program
-/// for a program row.
+/// The id of `row`'s own handler: `builtin` for a graph or frame row, its first program's
+/// file name for a program row (`dump1090` for `/opt/x/dump1090`; the program is still
+/// looked up by the whole entry).
 pub fn own_handler_id(row: &ModeRow) -> String {
     match &row.decoder {
-        super::Decoder::Program(p) => p.programs.first().cloned().unwrap_or_default(),
+        super::Decoder::Program(p) => p
+            .programs
+            .first()
+            .map(|first| {
+                std::path::Path::new(first)
+                    .file_name()
+                    .map_or_else(|| first.clone(), |n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default(),
         _ => BUILTIN.into(),
     }
 }
@@ -297,6 +306,18 @@ mod tests {
         });
         edit(&mut v);
         v.to_string()
+    }
+
+    #[test]
+    fn a_program_rows_own_handler_is_named_by_its_programs_file_name() {
+        let text = include_str!("../../../../modes/adsb_decode.json");
+        let mut row = super::super::row::parse(text).unwrap();
+        assert_eq!(own_handler_id(&row), "dump1090");
+        let super::super::Decoder::Program(p) = &mut row.decoder else {
+            panic!("a program row")
+        };
+        p.programs = vec!["/opt/x/dump1090".into(), "readsb".into()];
+        assert_eq!(own_handler_id(&row), "dump1090");
     }
 
     #[test]

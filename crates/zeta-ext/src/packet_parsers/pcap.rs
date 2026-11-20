@@ -130,6 +130,10 @@ impl PacketParser for PcapParser {
         self.buf.drain(..at);
         Ok(out)
     }
+
+    fn buffered(&self) -> usize {
+        self.buf.len()
+    }
 }
 
 #[cfg(test)]

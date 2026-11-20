@@ -93,11 +93,6 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
             "modes check runs the rows' tests on its own node: not supported with --node",
         );
     }
-    if matches!(cli.command, Command::Handlers(HandlersCmd::List)) {
-        return usage(
-            "handlers list reads this machine's mode rows and handler files: not supported with --node (modes list gives a node's handlers)",
-        );
-    }
     if matches!(cli.command, Command::Registers(_)) {
         return usage(
             "registers check asks the register from this machine: not supported with --node",
@@ -145,6 +140,9 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
         )
         .await;
     }
+    if matches!(cli.command, Command::Handlers(HandlersCmd::List)) {
+        return handlers_list(&client).await;
+    }
     if let Command::Stream(StreamCmd::Save {
         stream,
         path,
@@ -171,6 +169,30 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
             crate::cli::narrow_plans(&mut r, plan.as_deref());
             print(serde_json::to_string_pretty(&r), 0)
         }
+        Ok(Err(e)) => print(serde_json::to_string_pretty(&e), 2),
+        Err(e) => usage(&e.to_string()),
+    }
+}
+
+/// `handlers list --node`: the serving node's handlers, read from its `modes_list`, in the
+/// lines the local list prints (its programs and checks, not this machine's).
+async fn handlers_list(client: &NodeClient) -> ExitCode {
+    use zeta_core::ops::{Op, OpResult};
+    let list = Op::ModesList {
+        family: None,
+        state: None,
+    };
+    match client.apply(&list).await {
+        Ok(Ok(OpResult::Modes { modes })) => {
+            for m in &modes {
+                for h in &m.handlers {
+                    let line = crate::handler_line(&m.id.0, &h.id, h.state, &h.outputs, h.checked);
+                    println!("{line}");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Ok(other)) => print(serde_json::to_string_pretty(&other), 2),
         Ok(Err(e)) => print(serde_json::to_string_pretty(&e), 2),
         Err(e) => usage(&e.to_string()),
     }

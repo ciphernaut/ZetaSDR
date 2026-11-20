@@ -73,6 +73,10 @@ impl PacketParser for BeastParser {
         self.buf.drain(..at);
         Ok(out)
     }
+
+    fn buffered(&self) -> usize {
+        self.buf.len()
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +117,30 @@ mod tests {
         let got = BeastParser::default().push(&frame(0x32, &data)).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].data, data);
+    }
+
+    #[test]
+    fn an_escape_split_across_pushes_and_a_lone_1a_are_handled() {
+        // A `1a` in the data, written `1a 1a`, split between its two bytes.
+        let mut data: Vec<u8> = (0x60..0x67).collect();
+        data[2] = ESC;
+        let f = frame(0x32, &data);
+        let split = 2 + 7 + 2 + 1;
+        assert_eq!(f[split - 1], ESC);
+        assert_eq!(f[split], ESC);
+        let mut p = BeastParser::default();
+        assert!(p.push(&f[..split]).unwrap().is_empty());
+        let got = p.push(&f[split..]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].data, data);
+        // A stray `1a` followed by a byte that is no type, then a whole frame.
+        let whole: Vec<u8> = (0x70..0x7e).collect();
+        let mut s = vec![ESC, 0x05];
+        s.extend(frame(0x33, &whole));
+        let got = p.push(&s).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].data, whole);
+        assert_eq!(p.buffered(), 0);
     }
 
     #[test]

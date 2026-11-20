@@ -927,8 +927,8 @@ pub enum ModesCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum HandlersCmd {
-    /// One line per handler of each mode: mode, id, state, outputs (local: this machine's
-    /// mode rows and handler files)
+    /// One line per handler of each mode: mode, id, state, outputs (this machine's mode
+    /// rows and handler files; with --node the serving node's)
     List,
     /// The operator's ranking of handlers, which the policy picking a mode's handler reads
     #[command(subcommand)]

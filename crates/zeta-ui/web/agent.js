@@ -66,8 +66,10 @@
 //       (the id in sessionStorage[AUTO_SCAN_KEY], coarse.js) reads `scan auto`; a scan the
 //       page did not start reads `scan`. A scan its source sweeps for itself (its
 //       `context.scan.method`, or its fft node's `method`, is `source`) carries a `.tag.method`
-//       reading `source`. A job whose mode row (audioKind) lists more than one handler
-//       carries a `.tag.handler` in its `.kind` cell reading the `name` of the handler it runs
+//       reading `source`. A job whose mode row (audioKind) lists more than one `ready`
+//       handler (an unavailable one, such as a handler file whose program this host lacks,
+//       is not counted) carries a `.tag.handler` in its `.kind` cell reading the `name` of the
+//       handler it runs
 //       (actions.js jobHandler: `built-in`, a program, a handler file's `name`; titled
 //       `handler <id> (named)` or `(the policy's choice)`); an attached row has none. Each
 //       row shows kind, source,
@@ -693,9 +695,10 @@ function jobRow(
     cells.splice(4, 0, ["band", bandText(t.center_hz, t.bandwidth_hz)]);
   }
   if (job.kind === "mix") cells.splice(4, 0, ["mix-now", mixText ? mixText(job) : ""]);
-  // A mode with more than one handler: the one this job runs, named in its kind cell.
+  // A mode with more than one ready handler: the one this job runs, named in its kind cell.
   const modeRow = attached ? null : audioKind?.(job.kind);
-  const handler = (modeRow?.handlers?.length ?? 0) > 1 ? jobHandler(job, modeRow) : undefined;
+  const ready = (modeRow?.handlers ?? []).filter((h) => h.state === "ready").length;
+  const handler = ready > 1 ? jobHandler(job, modeRow) : undefined;
   for (const [cls, text] of cells) {
     const span = document.createElement("span");
     span.className = cls;

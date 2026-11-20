@@ -34,10 +34,13 @@
 //! the port, connected with the same retries for [`CONNECT_TIMEOUT`]), cuts it with the
 //! row's packet parser ([`crate::packet_parsers`]) and publishes each packet with the
 //! provenance the events carry, only while the packet stream has a reader (the framing
-//! is kept all the same). A port that never opens, a stream the parser refuses or a
-//! read error ends the packets alone, noted once as `external.packets` beside
-//! `external.unparsed` in the job's context (a refused stream is still read to its end
-//! and thrown away, so the program is never cut off); the job and its events go on.
+//! is kept all the same). A port that never opens, a stream the parser refuses, a read
+//! error or the program closing its packet output while it runs on (with the bytes of a
+//! partial packet it left) ends the packets alone, noted once as `external.packets`
+//! beside `external.unparsed` in the job's context (a refused stream is still read to its
+//! end and thrown away, so the program is never cut off); the job and its events go on.
+//! The output closing as the run ends (the input done, or the program exiting within
+//! [`PACKET_LOST_GRACE`]) is no loss and is not noted.
 //!
 //! **Ending.** Cancel kills and reaps the child and returns `Cancelled`. When the input
 //! closes, the child's input is closed and it gets [`EXIT_GRACE`] to finish; a clean exit
@@ -80,6 +83,9 @@ pub const EXTERNAL_DECODE_KIND: &str = "external_decode";
 /// How long the child has to open its output port, and how often it is tried.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_RETRY: Duration = Duration::from_millis(100);
+/// How long a closed or failed packet output waits before it is noted: a program exiting
+/// closes it first, and the run ending meanwhile ends the packet reader without a note.
+pub const PACKET_LOST_GRACE: Duration = Duration::from_secs(1);
 /// How long output lines still unread are published after the child exits.
 const DRAIN: Duration = Duration::from_secs(1);
 /// How often the job's `external.unparsed` count is noted at most.
@@ -536,6 +542,7 @@ pub async fn run_row(
                 source: ctx.source.clone(),
                 last_prov: last_prov.clone(),
                 notes: notes.clone(),
+                input_done: input_done.clone(),
             };
             Some(AbortOnDrop(tokio::spawn(reader.run(source))))
         }
@@ -778,13 +785,16 @@ struct PacketReader {
     source: SourceId,
     last_prov: Arc<Mutex<Option<Provenance>>>,
     notes: Arc<Notes>,
+    /// Set once the program's input is closed: its outputs closing then is its end.
+    input_done: Arc<AtomicBool>,
 }
 
 impl PacketReader {
-    /// Read until the output closes; a port that never opens, a read error or a stream
-    /// the parser refuses is noted as `external.packets`. After a refused stream the
-    /// output is still read to its end and thrown away: closing it would cut off a
-    /// program still writing (a closed pipe kills one with SIGPIPE), and the job with it.
+    /// Read until the output closes; a port that never opens, a read error, a stream the
+    /// parser refuses or the output closing while the run goes on is noted as
+    /// `external.packets`. After a refused stream the output is still read to its end
+    /// and thrown away: closing it would cut off a program still writing (a closed pipe
+    /// kills one with SIGPIPE), and the job with it.
     async fn run(mut self, source: PacketSource) {
         let mut r: Box<dyn AsyncRead + Unpin + Send> = match source {
             PacketSource::Stdout(s) => s,
@@ -801,13 +811,20 @@ impl PacketReader {
         let mut parsing = true;
         loop {
             let n = match r.read(&mut buf).await {
-                Ok(0) => return,
-                Ok(n) => n,
-                Err(e) if parsing => {
-                    let why = format!("reading {}'s packet output: {e}", self.name);
-                    return self.notes.set("packets", why);
+                Ok(0) if parsing => {
+                    let partial = match self.parser.buffered() {
+                        0 => String::new(),
+                        n => format!(" ({n} bytes of a partial record)"),
+                    };
+                    let why = format!("{} closed its packet output{partial}", self.name);
+                    return self.lost(why).await;
                 }
-                Err(_) => return,
+                Ok(n) if n > 0 => n,
+                Err(e) if parsing => {
+                    let why = format!("{}: packet output: {e}", self.name);
+                    return self.lost(why).await;
+                }
+                _ => return,
             };
             if !parsing {
                 continue;
@@ -819,6 +836,18 @@ impl PacketReader {
                     parsing = false;
                 }
             }
+        }
+    }
+
+    /// Note the packet output lost (`why`), unless the run is ending: its input done, or
+    /// within [`PACKET_LOST_GRACE`] (the run ending aborts this task).
+    async fn lost(self, why: String) {
+        if self.input_done.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(PACKET_LOST_GRACE).await;
+        if !self.input_done.load(Ordering::SeqCst) {
+            self.notes.set("packets", why);
         }
     }
 

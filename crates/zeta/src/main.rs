@@ -463,8 +463,8 @@ fn tail_log(
 
 /// `handlers list`: load this machine's mode rows and handler files as a node would (the
 /// programs looked up, never run) and print one line per handler of each mode, the row's own
-/// first: `<mode> <handler id> <state> <outputs>`, the outputs comma-separated (`-` for
-/// none).
+/// first ([`handler_line`]). With `--node` the serving node's are listed instead
+/// (`transport`).
 async fn handlers_list(
     state_dir: &std::path::Path,
     modes_dir: Option<std::path::PathBuf>,
@@ -486,24 +486,36 @@ async fn handlers_list(
             false => m.handlers.clone(),
         };
         for h in handlers {
-            let outputs: Vec<String> = h
-                .outputs
-                .iter()
-                .map(|k| word(serde_json::to_value(k)))
-                .collect();
-            let outputs = match outputs.is_empty() {
-                true => "-".to_string(),
-                false => outputs.join(","),
-            };
-            println!(
-                "{} {} {} {outputs}",
-                m.row.id.0,
-                h.id,
-                word(serde_json::to_value(h.state))
-            );
+            let line = handler_line(&m.row.id.0, &h.id, h.state, &h.outputs, h.checked);
+            println!("{line}");
         }
     }
     ExitCode::SUCCESS
+}
+
+/// One line of `handlers list`: `<mode> <handler id> <state> <outputs>`, the outputs
+/// comma-separated (`-` for none), then `checked=<UNIX seconds>` when `zeta modes check`
+/// passed it.
+fn handler_line(
+    mode: &str,
+    id: &str,
+    state: zeta_core::modes::ModeState,
+    outputs: &[zeta_core::types::StreamKind],
+    checked: Option<u64>,
+) -> String {
+    let outputs: Vec<String> = outputs
+        .iter()
+        .map(|k| word(serde_json::to_value(k)))
+        .collect();
+    let outputs = match outputs.is_empty() {
+        true => "-".to_string(),
+        false => outputs.join(","),
+    };
+    let state = word(serde_json::to_value(state));
+    match checked {
+        Some(at) => format!("{mode} {id} {state} {outputs} checked={at}"),
+        None => format!("{mode} {id} {state} {outputs}"),
+    }
 }
 
 /// A unit enum value as the operation set spells it (`ready`, `packet`), from its

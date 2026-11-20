@@ -29,6 +29,8 @@ impl std::fmt::Display for StreamError {
 /// An incremental parser: feed bytes as they arrive, take whole packets out.
 pub trait PacketParser: Send {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<Parsed>, StreamError>;
+    /// How many pushed bytes are held, waiting for the rest of a packet.
+    fn buffered(&self) -> usize;
 }
 
 /// The parser for `kind`. `link_types` maps the link-type numbers a pcap header

@@ -4280,19 +4280,51 @@ fn handlers_list_names_each_modes_handlers() {
             .any(|l| l.starts_with("aprs_decode builtin ready ") && l.contains("packet")),
         "{out}"
     );
-    // Local only: the registry is this machine's.
-    zeta_bin()
-        .args([
-            "--node",
-            "http://127.0.0.1:1",
-            "--secret",
-            "x",
-            "handlers",
-            "list",
-        ])
+}
+
+/// `handlers list --node` lists the serving node's handlers (its programs, its state
+/// directory's checks), not this machine's: the same lines, `checked=<secs>` added where a
+/// check passed.
+#[test]
+fn handlers_list_with_node_lists_the_nodes_handlers() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("state")).unwrap();
+    std::fs::write(
+        dir.path().join("state/modes-checked.json"),
+        r#"{"adsb_decode": 1700000000}"#,
+    )
+    .unwrap();
+    let dump1090 = fake_dump1090();
+    let node = common::ServeProc::start_env(
+        dir.path(),
+        NODE_SECRET,
+        &[],
+        &[("ZETA_HANDLER_DUMP1090", dump1090.to_str().unwrap())],
+    );
+    // This machine has no dump1090: what is listed is the node's.
+    let out = common::zeta_remote(&node.url, NODE_SECRET, &["handlers", "list"])
+        .env("ZETA_HANDLER_DUMP1090", "/nonexistent/dump1090")
         .assert()
-        .code(1)
-        .stderr(contains("handlers list"));
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines.contains(&"adsb_decode dump1090 ready event,packet checked=1700000000"),
+        "{out}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("adsb_decode onair ")),
+        "{out}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("aprs_decode builtin ready ") && !l.contains("checked")),
+        "{out}"
+    );
 }
 
 /// `capture list` answers an empty store, narrowed or not; `capture show`/`classify`/

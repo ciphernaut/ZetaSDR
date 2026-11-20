@@ -3511,11 +3511,13 @@ pub struct ModeInfo {
     #[serde(default)]
     pub voices: Vec<String>,
     /// Every handler of the mode: the row's own first, then each handler file's, by id.
+    /// Read as `[]` from a node older than handlers.
+    #[serde(default)]
     pub handlers: Vec<ModeHandlerInfo>,
     /// The handler the policy picks now (`handler_policy_set`); `null` when none is
-    /// ready.
+    /// ready, and read as `null` from a node older than handlers.
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
-    #[serde(deserialize_with = "crate::modes::nullable")]
+    #[serde(default, deserialize_with = "crate::modes::nullable")]
     pub handler: Option<String>,
 }
 
@@ -3552,8 +3554,8 @@ impl ModeInfo {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields, transform = crate::modes::require_all)]
 pub struct ModeHandlerInfo {
-    /// `builtin` for a graph or frame row's own decoder, a program row's first program
-    /// for its own (`dump1090`), the handler file's `id` otherwise: what
+    /// `builtin` for a graph or frame row's own decoder, a program row's first program's
+    /// file name for its own (`dump1090`), the handler file's `id` otherwise: what
     /// `handler_policy_set` ranks.
     pub id: String,
     /// For people: `built-in`, the program's name, or the handler file's `name`.
@@ -3652,9 +3654,11 @@ pub struct ModeDetail {
     pub outputs: Vec<StreamKind>,
     #[serde(default)]
     pub voices: Vec<String>,
+    /// As `modes_list`'s (read as `[]` and `null` from a node older than handlers).
+    #[serde(default)]
     pub handlers: Vec<ModeHandlerInfo>,
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
-    #[serde(deserialize_with = "crate::modes::nullable")]
+    #[serde(default, deserialize_with = "crate::modes::nullable")]
     pub handler: Option<String>,
 }
 

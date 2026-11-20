@@ -15,11 +15,14 @@ use crate::types::StreamKind;
 /// goes before every id it does not name, in the ranking's order.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = super::require_all)]
 pub struct HandlerPolicy {
-    /// Each mode's ranking, by mode id; a mode with none is left out.
+    /// Each mode's ranking, by mode id; a mode with none is left out. Read as `{}` when
+    /// absent (a hand-written file); always written (the schema requires it).
+    #[serde(default)]
     pub modes: BTreeMap<String, Vec<String>>,
-    /// The node-wide ranking, read after the mode's own; `[]` for none.
+    /// The node-wide ranking, read after the mode's own; `[]` for none, and when absent.
+    #[serde(default)]
     pub all: Vec<String>,
 }
 
@@ -330,5 +333,16 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_policy_file_with_only_mode_rankings_loads_them() {
+        let p: HandlerPolicy =
+            serde_json::from_str(r#"{"modes": {"adsb_decode": ["onair"]}}"#).unwrap();
+        assert_eq!(p, ranked(&["onair"], &[]));
+        let p: HandlerPolicy = serde_json::from_str(r#"{"all": ["onair"]}"#).unwrap();
+        assert_eq!(p, ranked(&[], &["onair"]));
+        // Unknown keys are still refused.
+        assert!(serde_json::from_str::<HandlerPolicy>(r#"{"mode": {}}"#).is_err());
     }
 }
