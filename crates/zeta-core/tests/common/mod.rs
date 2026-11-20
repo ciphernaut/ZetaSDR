@@ -149,6 +149,11 @@ pub mod handlers {
     /// `zeta-alt-decoder` on the row's input and output, with a pcap `packets` output
     /// when `packets`; the handlers directory.
     pub fn write_alt(dir: &Path, packets: bool) -> PathBuf {
+        write_handler(dir, ALT, packets)
+    }
+
+    /// [`write_alt`] for a handler file of id `id` (its program `zeta-<id>-decoder`).
+    pub fn write_handler(dir: &Path, id: &str, packets: bool) -> PathBuf {
         let (_, text) = ModeRegistry::embedded()
             .into_iter()
             .find(|(f, _)| f.ends_with("adsb_decode.json"))
@@ -174,15 +179,15 @@ pub mod handlers {
             });
         }
         let file = serde_json::json!({
-            "id": ALT,
+            "id": id,
             "name": "Alternative",
-            "programs": ["zeta-alt-decoder"],
+            "programs": [format!("zeta-{id}-decoder")],
             "install": {"url": "https://example.invalid/alt"},
             "modes": {MODE: entry},
         });
         let handlers = dir.join("handlers");
         std::fs::create_dir_all(&handlers).unwrap();
-        std::fs::write(handlers.join("alt.json"), file.to_string()).unwrap();
+        std::fs::write(handlers.join(format!("{id}.json")), file.to_string()).unwrap();
         handlers
     }
 

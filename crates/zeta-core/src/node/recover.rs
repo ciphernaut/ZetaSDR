@@ -56,6 +56,14 @@ pub(super) struct Scope<'a> {
     pub(super) gate: &'a OwnedMutexGuard<()>,
 }
 
+/// The handler a relaunch chose again ([`Inner::resolve_for_relaunch`]), and why the
+/// record's was passed over (its reason, as `modes_list` gives it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Rechosen {
+    pub(super) now: String,
+    pub(super) why: String,
+}
+
 /// What [`Inner::resume_records`] leaves to its caller.
 pub(super) struct Resumed {
     /// The capture holds [`Inner::resume_captures`] took: release each, then idle its
@@ -160,41 +168,51 @@ impl Inner {
         recoverable_entry(&jobs, &self.episodes.lock().unwrap(), e)
     }
 
-    /// The handler a relaunch of `rec` (a restart's resume, a recovery, a retune, any
-    /// relaunch under its id) runs: the record's while it is ready; else a named one is
-    /// `Err("handler <id> is <state>: <reason>")` (the job fails with it, as a missing
-    /// program fails it) and a chosen one is the policy's choice again (`Err` with the
-    /// `no_handler` words when none is left). A record of no handler (the row's own, a
-    /// record from before handlers) is its row's own; one of a mode the registry no
-    /// longer has keeps its handler: its expansion decides.
-    pub(super) fn resolve_for_relaunch(&self, rec: &JobRecord) -> Result<String, String> {
+    /// What a relaunch of `rec` (a restart's resume, a recovery, a retune, any relaunch
+    /// under its id) does with its handler: `Ok(None)` keeps it (it is ready; or the
+    /// record names none, one from before handlers, which runs its row's own as it did;
+    /// or its mode is gone from the registry, so its expansion decides). One no longer
+    /// ready is, when the start named it, `Err("handler <id> is <state>: <reason>")` (the
+    /// job fails with it, as a missing program fails it); when the policy chose it,
+    /// `Ok(Some(_))` with the policy's choice again among the handlers giving what the
+    /// start needed (`rec.needs`) and why the old one was passed over, or `Err` with the
+    /// `no_handler` words when none is left.
+    pub(super) fn resolve_for_relaunch(&self, rec: &JobRecord) -> Result<Option<Rechosen>, String> {
+        let Some(was) = rec.handler.as_deref() else {
+            return Ok(None);
+        };
         let modes = self.modes();
-        let m = self
+        let Some(m) = self
             .expandable_kind(&rec.kind)
-            .and_then(|k| k.loaded_mode(&modes).ok().flatten());
-        let was = match (&rec.handler, m) {
-            (Some(h), _) => h.clone(),
-            (None, Some(m)) => m.own_handler(),
-            (None, None) => return Err(format!("{} has no handlers", rec.kind)),
+            .and_then(|k| k.loaded_mode(&modes).ok().flatten())
+        else {
+            return Ok(None);
         };
-        let Some(m) = m else {
-            return Ok(was);
-        };
-        let gone = match m.handlers.iter().find(|h| h.id == was) {
+        let mode = &m.row.id.0;
+        let (named_refusal, why) = match m.handlers.iter().find(|h| h.id == was) {
             Some(h) => match crate::modes::policy::unready(h) {
-                None => return Ok(was),
-                Some(why) => why,
+                None => return Ok(None),
+                Some(refusal) => {
+                    let why = h.reason.clone().unwrap_or_else(|| refusal.clone());
+                    (refusal, why)
+                }
             },
-            None => format!("handler {was} is gone: {} has no such handler", m.row.id.0),
+            None => (
+                format!("handler {was} is gone: {mode} has no such handler"),
+                format!("{mode} has no handler {was} now"),
+            ),
         };
         if rec.handler_named {
-            return Err(gone);
+            return Err(named_refusal);
         }
         let policy = self.handler_policy.lock().unwrap().clone();
-        match crate::modes::policy::pick(&m.row.id.0, &m.handlers, &[], &policy) {
-            Ok(h) => Ok(h.id.clone()),
+        match crate::modes::policy::pick(mode, &m.handlers, &rec.needs, &policy) {
+            Ok(h) => Ok(Some(Rechosen {
+                now: h.id.clone(),
+                why,
+            })),
             Err(passed) => Err(crate::ops::OpError::NoHandler {
-                mode: m.row.id.0.clone(),
+                mode: mode.clone(),
                 passed,
             }
             .to_string()),
@@ -202,33 +220,22 @@ impl Inner {
     }
 
     /// Settle the handler `rec` relaunches with ([`Inner::resolve_for_relaunch`]),
-    /// before anything is leased: a named handler no longer ready fails the launch with
-    /// its reason; a chosen one chosen again is recorded, with the change noted in the
-    /// context as `handler: {was, now, why}` (`why` the old handler's reason), and the
-    /// graph is expanded again for it at the capture (its `capture_rate_hz` cleared, so
-    /// [`Inner::fit_capture`] makes it whatever the rate). An attached job, an operator's
-    /// graph and a record of no handler (one from before handlers runs as it did) are
-    /// left as they are.
+    /// before anything is leased: a handler no longer ready that the start named, or one
+    /// with nothing left to choose, fails the launch with the reason; one chosen again is
+    /// recorded, with the change noted in the context as `handler: {was, now, why}`, and
+    /// the graph is expanded again for it at the capture (its `capture_rate_hz` cleared,
+    /// so [`Inner::fit_capture`] makes it whatever the rate). An attached job and an
+    /// operator's graph are left as they are.
     pub(super) fn rehandle(&self, rec: &mut JobRecord) -> Result<(), NodeError> {
-        let Some(was) = rec.handler.clone() else {
-            return Ok(());
-        };
         if rec.input.is_some() || rec.operator_graph {
             return Ok(());
         }
-        let now = self.resolve_for_relaunch(rec).map_err(NodeError::Other)?;
-        if now == was {
+        let Some(Rechosen { now, why }) =
+            self.resolve_for_relaunch(rec).map_err(NodeError::Other)?
+        else {
             return Ok(());
-        }
-        let modes = self.modes();
-        let mode = self.expandable_kind(&rec.kind);
-        let why = mode
-            .as_ref()
-            .and_then(|k| k.loaded_mode(&modes).ok().flatten())
-            .and_then(|m| m.handlers.iter().find(|h| h.id == was))
-            .and_then(|h| h.reason.clone())
-            .unwrap_or_else(|| format!("handler {was} is gone"));
-        let note = serde_json::json!({"was": was, "now": now, "why": why});
+        };
+        let note = serde_json::json!({"was": rec.handler, "now": now, "why": why});
         match rec.context.as_object_mut() {
             Some(c) => {
                 c.insert("handler".into(), note);

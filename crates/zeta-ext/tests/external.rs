@@ -594,6 +594,16 @@ fn params_take_the_mode_only() {
 /// `mode` with the fake program reading its lines from `lines` (so its events differ
 /// from the row's own, whose lines come from `FAKE_LINES`).
 fn registry_with_alt(rows: &[Value], mode: &str, lines: &Path) -> ModeRegistry {
+    registry_with_alt_as(rows, mode, lines, |_| {})
+}
+
+/// [`registry_with_alt`] with `edit` applied to alt's entry for `mode`.
+fn registry_with_alt_as(
+    rows: &[Value],
+    mode: &str,
+    lines: &Path,
+    edit: impl FnOnce(&mut Value),
+) -> ModeRegistry {
     let (modes, handlers) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     for r in rows {
         let id = r["id"].as_str().unwrap();
@@ -604,7 +614,7 @@ fn registry_with_alt(rows: &[Value], mode: &str, lines: &Path) -> ModeRegistry {
         .find(|r| r["id"] == mode)
         .expect("the mode's row");
     let d = &row["decoder"];
-    let alt = json!({
+    let mut alt = json!({
         "id": "alt",
         "name": "Alternative",
         "programs": [fake("fake_lines").display().to_string()],
@@ -615,6 +625,7 @@ fn registry_with_alt(rows: &[Value], mode: &str, lines: &Path) -> ModeRegistry {
             "output": d["output"],
         }}
     });
+    edit(&mut alt["modes"][mode]);
     std::fs::write(handlers.path().join("alt.json"), alt.to_string()).unwrap();
     let mut stages = StageRegistry::new();
     zeta_dsp::register_all(&mut stages);
@@ -671,6 +682,68 @@ async fn a_handler_files_program_runs_for_the_rows_mode() {
     assert_eq!(
         e.to_string(),
         "stage failed: external_decode: mode fake_json has no handler nope"
+    );
+}
+
+/// A handler file entry's `extra` fields are read from the line by their pointers and
+/// added beside the row's; the row's own handler adds none.
+#[tokio::test]
+async fn a_handler_files_extra_fields_reach_its_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = dir.path().join("alt-lines");
+    std::fs::write(&lines, r#"{"text":"from alt","n":2,"lvl":-31.5}"#).unwrap();
+    let mut row = json_row("fake_json", "cs16", "stdin", &[]);
+    row["decoder"]["output"]["fields"] = json!({"text": "/text", "n": "/n"});
+    let rows = [row];
+    let reg = Arc::new(registry_with_alt_as(&rows, "fake_json", &lines, |e| {
+        e["extra"] = json!({"level": "/lvl", "absent": "/nope"});
+    }));
+    let env = [("FAKE_LINES", r#"{"text":"from the row","n":1,"lvl":-40}"#)];
+
+    let stage = ExternalDecodeStage::new(reg.clone()).with_env(env);
+    let mut r = start_params(stage, json!({"mode": "fake_json", "handler": "alt"}), false);
+    send(&r.tx, 4, 480, 48_000);
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    assert_eq!(
+        (&v["text"], &v["n"]),
+        (&json!("from alt"), &json!(2)),
+        "{v}"
+    );
+    assert_eq!(v["level"], -31.5, "{v}");
+    assert!(v.get("absent").is_none(), "{v}");
+    assert!(v.get("lvl").is_none(), "the map names only its fields: {v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+
+    let stage = ExternalDecodeStage::new(reg).with_env(env);
+    let mut r = start(stage, "fake_json");
+    send(&r.tx, 4, 480, 48_000);
+    let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+    assert_eq!(v["text"], "from the row", "{v}");
+    assert!(v.get("level").is_none(), "{v}");
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+}
+
+/// The packet output follows the handler the params name: `alt`'s entry gives packets,
+/// the row's own does not.
+#[test]
+fn the_packet_output_follows_the_handlers_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = dir.path().join("alt-lines");
+    let rows = [json_row("fake_json", "cs16", "stdin", &[])];
+    let reg = registry_with_alt_as(&rows, "fake_json", &lines, |e| {
+        e["args"] = json!(["--pcap-port", "$packet_port"]);
+        e["packets"] = json!({"via": "tcp", "port": "$packet_port", "parser": "pcap"});
+    });
+    let stage = ExternalDecodeStage::new(Arc::new(reg));
+    assert_eq!(
+        stage.outputs_for(&json!({"mode": "fake_json", "handler": "alt"})),
+        [StreamKind::Event, StreamKind::Packet]
+    );
+    assert_eq!(
+        stage.outputs_for(&json!({"mode": "fake_json"})),
+        [StreamKind::Event]
     );
 }
 

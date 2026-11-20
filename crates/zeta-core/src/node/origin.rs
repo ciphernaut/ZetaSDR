@@ -3581,6 +3581,7 @@ mod tests {
             sinks: Vec::new(),
             handler: None,
             handler_named: false,
+            needs: Vec::new(),
         }
     }
 

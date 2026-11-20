@@ -277,6 +277,25 @@ fn next_stop_token() -> u64 {
     STOP_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The handler a start runs, as its record keeps it: the id (`None` for a kind of no
+/// mode row), whether the start named it, and the stream kinds the start needed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StartHandler {
+    pub handler: Option<String>,
+    pub named: bool,
+    pub needs: Vec<StreamKind>,
+}
+
+impl StartHandler {
+    /// The policy's choice `handler` for a start that named none and needed nothing.
+    pub(crate) fn chosen(handler: Option<String>) -> Self {
+        Self {
+            handler,
+            ..Self::default()
+        }
+    }
+}
+
 /// A new `Running` record of an operator's job of `kind` on the radio: a fresh id, an
 /// empty context, no input, owner or audio policy.
 fn running_record(
@@ -307,6 +326,7 @@ fn running_record(
         sinks: Vec::new(),
         handler: None,
         handler_named: false,
+        needs: Vec::new(),
     }
 }
 
@@ -2483,6 +2503,7 @@ impl Node {
             sinks: Vec::new(),
             handler: None,
             handler_named: false,
+            needs: Vec::new(),
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2539,6 +2560,7 @@ impl Node {
             sinks: Vec::new(),
             handler: None,
             handler_named: false,
+            needs: Vec::new(),
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2651,6 +2673,7 @@ impl Node {
             sinks: Vec::new(),
             handler: None,
             handler_named: false,
+            needs: Vec::new(),
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2748,6 +2771,7 @@ impl Node {
             sinks: Vec::new(),
             handler: None,
             handler_named: false,
+            needs: Vec::new(),
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -3009,8 +3033,8 @@ impl Node {
     /// without letting the gate go. What must wait for the gate to be released
     /// (relaunching the elastic jobs a tune moved, stopping those a scan
     /// displaces) is returned, for [`Node::after_gate`] once the guard is dropped. The
-    /// record keeps `audio_policy` and `handler` (`(id, named)`: the handler `graph` was
-    /// expanded for, and whether the start named it), and starts with `context` (an
+    /// record keeps `audio_policy` and `handler` (the handler `graph` was expanded for,
+    /// whether the start named it and what it needed), and starts with `context` (an
     /// identify's `dwell_scale`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn job_start_gated(
@@ -3021,15 +3045,16 @@ impl Node {
         graph: Graph,
         capture_rate_hz: Option<Hz>,
         elastic: bool,
-        (audio_policy, (handler, handler_named)): (Option<AudioPolicy>, (Option<String>, bool)),
+        (audio_policy, handler): (Option<AudioPolicy>, StartHandler),
         context: serde_json::Value,
         guard: Option<&OwnedMutexGuard<()>>,
     ) -> (Result<JobId, NodeError>, AfterGate) {
         let rec = JobRecord {
             audio_policy,
             context,
-            handler,
-            handler_named,
+            handler: handler.handler,
+            handler_named: handler.named,
+            needs: handler.needs,
             ..running_record(kind, source, tuning, graph, capture_rate_hz, elastic)
         };
         self.start_record_gated(rec, guard, &[]).await
@@ -3787,6 +3812,7 @@ mod tests {
             sinks: Vec::new(),
             handler: None,
             handler_named: false,
+            needs: Vec::new(),
         }
     }
 

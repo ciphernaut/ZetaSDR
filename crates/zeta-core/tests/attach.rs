@@ -1690,3 +1690,25 @@ async fn a_capture_records_its_jobs_handler() {
         "{comment}"
     );
 }
+
+/// A decoder whose record names no handler (one from before handlers) runs its row's
+/// own, and its capture says so, as its events do.
+#[tokio::test]
+async fn a_capture_of_an_old_record_names_the_rows_own_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = packets_node(dir.path()).await;
+    let band = Tuning {
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(12_500),
+    };
+    let graph = JobKind::AprsDecode
+        .expand(&file0(), band, Hz(48_000), None, None, None, &node.modes())
+        .unwrap();
+    let input = node
+        .job_start("aprs_decode", file0(), band, graph, Some(Hz(48_000)), false)
+        .await
+        .unwrap();
+    assert_eq!(record(&node, &input).handler, None);
+    let att = attach_packets_ok(&node, &input).await;
+    assert_eq!(capture_params(&node, &att)["handler"], "builtin");
+}

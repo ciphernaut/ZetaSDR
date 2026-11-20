@@ -659,6 +659,21 @@ impl ModeRegistry {
         Some(h.modes.get(mode)?.program_block(h))
     }
 
+    /// The event fields `handler` adds for `mode` beside the row's: a handler file entry's
+    /// `extra`, each read from a program's line as `output.fields` reads; empty for the
+    /// row's own handler, a broken one, and one the mode does not have.
+    pub fn handler_extra(&self, mode: &str, handler: &str) -> BTreeMap<String, FieldPath> {
+        let files = self.handler_files.iter().filter(|f| f.id == handler);
+        let own = self.get(mode).is_some_and(|m| m.own_handler() == handler);
+        let entry = files
+            .filter(|f| f.state == ModeState::Ready && !own)
+            .find_map(|f| f.handler.as_ref()?.modes.get(mode));
+        match (entry, self.handler(mode, handler)) {
+            (Some(e), Some(h)) if h.state != ModeState::Broken => e.extra.clone(),
+            _ => BTreeMap::new(),
+        }
+    }
+
     /// Record what probing found for `mode`'s handler `handler`: its program, and when
     /// it is missing `reason`, which makes the handler unavailable (else it is ready).
     /// The row's own handler is [`ModeRegistry::set_program`]'s. A broken handler stays

@@ -298,6 +298,7 @@ fn running(id: &JobId, kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord
         sinks: Vec::new(),
         handler: None,
         handler_named: false,
+        needs: Vec::new(),
     }
 }
 
@@ -886,4 +887,52 @@ async fn a_named_handler_gone_at_restart_fails_the_job() {
     );
     assert_eq!(rec.handler.as_deref(), Some(ALT));
     assert_eq!(on_disk(dir.path(), &id).state, rec.state);
+}
+
+/// A chosen handler gone at restart is chosen again for what the start needed: with
+/// `needs: ["packet"]` and no other handler giving packets, the job fails naming why
+/// each was passed over, rather than running without them.
+#[tokio::test]
+async fn a_rechosen_handler_still_satisfies_the_starts_needs() {
+    let dir = tempfile::tempdir().unwrap();
+    // `alt` gives packets, `alt2` does not; the row's own gives none.
+    let cfg = || NodeConfig {
+        handlers_dir: Some(h::write_handler(dir.path(), "alt2", false)),
+        ..h::cfg(dir.path(), true)
+    };
+    let open = |alt_missing: bool| {
+        let cfg = cfg();
+        let modes = h::registry(&h::stages(None), &cfg, alt_missing);
+        let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
+        Node::open_with_modes(cfg, h::stages(None), ports, Some(Arc::new(modes)))
+    };
+    let node = open(false).await.unwrap();
+    let ranked = node
+        .apply(Op::HandlerPolicySet {
+            mode: Some(zeta_core::modes::ModeId(MODE.into())),
+            order: vec![ALT.into(), "alt2".into()],
+        })
+        .await;
+    assert!(ranked.is_ok(), "{ranked:?}");
+    let id = h::start(&node, None, &[StreamKind::Packet]).await;
+    let rec = record(&node, &id);
+    assert_eq!(
+        (rec.handler.as_deref(), rec.handler_named),
+        (Some(ALT), false)
+    );
+    assert_eq!(rec.needs, [StreamKind::Packet]);
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let node = open(true).await.unwrap();
+    let rec = record(&node, &id);
+    let JobState::Failed { reason } = &rec.state else {
+        panic!("expected failed, got {:?}", rec.state)
+    };
+    assert!(reason.contains("alt2: outputs no packet"), "{reason}");
+    assert!(
+        reason.contains(&format!("{OWN}: outputs no packet")),
+        "{reason}"
+    );
+    assert!(reason.contains(h::ALT_MISSING), "{reason}");
 }

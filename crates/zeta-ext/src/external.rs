@@ -5,7 +5,8 @@
 //! parser) is resolved from the loaded [`ModeRegistry`] at launch
 //! ([`ModeRegistry::program_block`]), never taken from the graph, so a `graph_put`
 //! cannot run an arbitrary program. Every event carries the handler's id (`handler`; a
-//! program row's own is its first program). The stage
+//! program row's own is its first program), and a handler file's fields its entry's `extra`
+//! names beside the row's. The stage
 //! reaches the registry through a [`ModesHandle`] set once the registry is loaded (the
 //! stage registry the rows validate against is built first) and replaced on a reload,
 //! read at each run; a run with the handle still empty fails `external_decode: no mode
@@ -183,6 +184,9 @@ pub(crate) struct Resolved {
     pub block: ProgramBlock,
     pub program: PathBuf,
     pub handler: String,
+    /// The event fields the handler adds beside the row's (a handler file entry's
+    /// `extra`; none for the row's own).
+    pub extra: BTreeMap<String, FieldPath>,
 }
 
 /// [`resolve`] of the handler `handler` of mode `id` (`None`: the row's own, as
@@ -219,6 +223,7 @@ pub(crate) fn resolve_handler(
             block: block.clone(),
             program,
             handler: m.own_handler(),
+            extra: BTreeMap::new(),
         });
     };
     let found = m
@@ -239,6 +244,7 @@ pub(crate) fn resolve_handler(
     Ok(Resolved {
         row: m.row.clone(),
         block,
+        extra: reg.handler_extra(id, h),
         program,
         handler: h.to_string(),
     })
@@ -316,6 +322,7 @@ impl Stage for ExternalDecodeStage {
             block: &r.block,
             path: &r.program,
             handler: &r.handler,
+            extra: &r.extra,
         };
         run_row(
             program, &self.env, run_dir, inputs, outputs, bus, cancel, ctx,
@@ -335,6 +342,9 @@ pub struct Program<'a> {
     pub path: &'a Path,
     /// The handler's id, which every event carries.
     pub handler: &'a str,
+    /// The fields it adds to each event beside the row's, read from the line by their
+    /// pointers as `output.fields` reads (a pointer that finds nothing adds no key).
+    pub extra: &'a BTreeMap<String, FieldPath>,
 }
 
 /// Run `p`'s program as its mode's decoder (see the module docs), a fifo input in a
@@ -540,6 +550,7 @@ pub async fn run_row(
         handler: p.handler,
         parser: block.output.parser,
         fields: block.output.fields.as_ref(),
+        extra: p.extra,
         out,
         bus: &bus,
         source: &ctx.source,
@@ -704,6 +715,8 @@ struct Publisher<'a> {
     handler: &'a str,
     parser: Parser,
     fields: Option<&'a BTreeMap<String, FieldPath>>,
+    /// The handler's `extra` fields, added beside the mapped ones.
+    extra: &'a BTreeMap<String, FieldPath>,
     out: StreamId,
     bus: &'a StreamBus,
     source: &'a SourceId,
@@ -849,8 +862,13 @@ impl Publisher<'_> {
             self.note_unparsed(false);
             return;
         };
+        // The handler's own fields, read from the line before the map keeps only the row's.
+        let extra = (!self.extra.is_empty()).then(|| apply_fields(self.extra, &fields));
         if let Some(map) = self.fields {
             fields = apply_fields(map, &fields);
+        }
+        if let (Value::Object(m), Some(Value::Object(extra))) = (&mut fields, extra) {
+            m.extend(extra);
         }
         let prov = provenance(&self.last_prov, self.source);
         let ev = zeta_core::modes::summary::envelope(

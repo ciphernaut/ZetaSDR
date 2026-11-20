@@ -1559,6 +1559,7 @@ mod tests {
             sinks: Vec::new(),
             handler: None,
             handler_named: false,
+            needs: Vec::new(),
         };
         inner.jobs.lock().unwrap().insert(
             id.clone(),

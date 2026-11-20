@@ -24,7 +24,7 @@ use crate::modes::{
     Access, Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow,
     ModeState, Subject, is_mode_id, template,
 };
-use crate::node::{AfterGate, Node, NodeError};
+use crate::node::{AfterGate, Node, NodeError, StartHandler};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
 use crate::ring::RingError;
 use crate::stage::Readiness;
@@ -5571,7 +5571,14 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                             graph,
                             Some(granted.bandwidth_hz),
                             elastic,
-                            (audio_policy, (resolved.clone(), handler.is_some())),
+                            (
+                                audio_policy,
+                                StartHandler {
+                                    handler: resolved.clone(),
+                                    named: handler.is_some(),
+                                    needs: needs.clone(),
+                                },
+                            ),
                             match dwell_scale {
                                 Some(s) => serde_json::json!({"identify": {"dwell_scale": s}}),
                                 None => serde_json::json!({}),
@@ -6287,7 +6294,7 @@ pub(crate) async fn plan_start_channels(
                         graph,
                         Some(granted.bandwidth_hz),
                         false,
-                        (None, (pc.handler.clone(), false)),
+                        (None, StartHandler::chosen(pc.handler.clone())),
                         serde_json::json!({}),
                         Some(guard),
                     )
@@ -6847,7 +6854,7 @@ async fn start_set_job(
             graph,
             Some(capture.bandwidth_hz),
             false,
-            (start_params.2, (handler, false)),
+            (start_params.2, StartHandler::chosen(handler)),
             serde_json::json!({}),
             Some(guard),
         )
@@ -7690,11 +7697,12 @@ async fn packets_attach(node: &Node, job: JobId, stream: Option<String>) -> Resu
             job.0, by.0
         )));
     }
+    let handler = capture_handler(input.handler.as_deref(), row);
     let to = AttachTo {
         center_hz: input.tuning.center_hz,
         mode: row.map(|r| r.id.0.as_str()),
         access: row.and_then(|r| r.access),
-        handler: input.handler.as_deref(),
+        handler: handler.as_deref(),
         ..AttachTo::new(&job, &packets)
     };
     let graph = JobKind::Packets.expand_attached(&to, ATTACH_LANGUAGE_DEFAULT)?;
@@ -7735,6 +7743,15 @@ pub(crate) fn mode_handler(
         false => modes.program_block(mode, &h.id),
     };
     Ok((h, block))
+}
+
+/// The handler a capture of a job records: its record's, else (a record from before
+/// handlers, which runs the row's own) the own handler of `row`, the job's row; `None` for
+/// a job of no row.
+pub(crate) fn capture_handler(handler: Option<&str>, row: Option<&ModeRow>) -> Option<String> {
+    handler
+        .map(String::from)
+        .or_else(|| row.map(crate::modes::handler_file::own_handler_id))
 }
 
 /// The mode row a running job of `kind` expands from, whose id and `access` its capture

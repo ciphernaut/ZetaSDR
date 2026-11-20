@@ -103,13 +103,17 @@ pub struct JobRecord {
     /// it no longer ready fails the job instead of choosing again.
     #[serde(default)]
     pub handler_named: bool,
+    /// The stream kinds the start needed (`job_start`'s `needs`): a relaunch that chooses
+    /// the handler again chooses among those giving them. Empty for none.
+    #[serde(default)]
+    pub needs: Vec<crate::types::StreamKind>,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
 /// cannot override that for deserialisation); a record is always written with
 /// `format`, `input`, `capture_rate_hz`, `elastic`, `operator_graph`, `owner`,
-/// `audio_policy`, `stream`, `sinks`, `handler` and `handler_named`, so the published
-/// schema requires them.
+/// `audio_policy`, `stream`, `sinks`, `handler`, `handler_named` and `needs`, so the
+/// published schema requires them.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -129,6 +133,7 @@ fn require_format(schema: &mut schemars::Schema) {
             "sinks",
             "handler",
             "handler_named",
+            "needs",
         ] {
             if !req.iter().any(|r| r == f) {
                 req.push(f.into());
@@ -195,5 +200,7 @@ mod tests {
         assert_eq!((r.handler.as_deref(), r.handler_named), (None, false));
         assert_eq!(written["handler"], serde_json::Value::Null);
         assert_eq!(written["handler_named"], false);
+        assert!(r.needs.is_empty());
+        assert_eq!(written["needs"], serde_json::json!([]));
     }
 }

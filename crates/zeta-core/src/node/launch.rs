@@ -1149,6 +1149,7 @@ impl Inner {
             "mode": row.map(|r| r.id.0.clone()),
             "access": row.and_then(|r| r.access),
         });
+        let handler = crate::ops::capture_handler(handler.as_deref(), row);
         for n in rec
             .graph
             .nodes
@@ -1158,7 +1159,7 @@ impl Inner {
             if let (Some(p), Some(fill)) = (n.params.as_object_mut(), fill.as_object()) {
                 p.extend(fill.clone());
                 // The handler the input runs now (one chosen again at its relaunch), named
-                // only when it has one.
+                // only for a job of a row.
                 match &handler {
                     Some(h) => p.insert("handler".into(), h.clone().into()),
                     None => p.remove("handler"),

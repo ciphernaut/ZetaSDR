@@ -398,6 +398,7 @@ impl Inner {
             sinks: Vec::new(),
             handler,
             handler_named: false,
+            needs: Vec::new(),
         };
         let child = rec.id.clone();
         // Recorded first, so a run resumed after a restart can stop it (see `stale`).
