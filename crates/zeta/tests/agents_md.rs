@@ -21,7 +21,7 @@ fn rendering_lists_every_op_variant() {
         .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     let variants = v["value"]["op"]["oneOf"].as_array().unwrap();
-    assert_eq!(variants.len(), 55);
+    assert_eq!(variants.len(), 56);
     let md = zeta()
         .arg("agents-md")
         .assert()
@@ -243,6 +243,8 @@ fn capture_ops_are_in_the_guide() {
         "CLI: `zeta capture classify --capture",
         "CLI: `zeta capture delete --capture",
         "\"op\":\"capture_delete\"",
+        "CLI: `zeta capture decode --capture <id> --kind aprs_decode [--handler ID] [--packets]`",
+        "\"op\":\"capture_decode\"",
         "allow.delete_captures",
         "GET /captures/<id>.sigmf-meta",
         "newest first",
