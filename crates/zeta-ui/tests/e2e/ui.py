@@ -11470,6 +11470,77 @@ def scenario_a_sibling_ribbon_names_its_handler(page, url, secret):
         stop_job(url, secret, lone)
 
 
+def scenario_the_event_rate_ring_stays_inside_its_window(page, url, secret):
+    # An ungrouped job's event times are pruned as they come, not only when its rate is read.
+    select_source(page, url, secret, "tone")
+    r = page.evaluate(
+        """() => {
+          const ov = window.zetaTest.overlays;
+          const job = {id: "ringtest", kind: "x", source: ov.sourceId, state: {status: "running"},
+                       tuning: {center_hz: 100000000, bandwidth_hz: 12500}};
+          const real = performance.now.bind(performance);
+          let t = real();
+          performance.now = () => t;
+          try {
+            const t0 = t;
+            for (let i = 0; i < 3000; i++) {
+              t = t0 + i * 100; // 300 s of events, ten a second
+              ov.render(job, {protocol: "x", summary: "e" + i});
+            }
+            const held = ov.eventTimes.get("ringtest").length;
+            const rate = ov.rateOf("ringtest");
+            t += 120000; // silent for two minutes: counts down to nothing
+            return {held, rate, later: ov.rateOf("ringtest")};
+          } finally {
+            performance.now = real;
+            ov.forget("ringtest");
+          }
+        }""")
+    assert r["held"] <= 601 and r["rate"] == r["held"] and r["later"] == 0, r
+
+
+def scenario_a_sibling_fold_nests_inside_a_watch_fold(page, url, secret):
+    # In-page (a live watch is costly): a watch keeps decoder D, a sibling S was sent from it
+    # (node semantics: D.group = S.group = D). The pair folds as siblings inside the watch's.
+    login(page, url, secret)
+    r = page.evaluate(
+        """async () => {
+          const { startJobs } = await import('./agent.js');
+          const run = {status: "running"};
+          const W = "W0123456", D = "D0123456", S = "S0123456";
+          const tune = {center_hz: 148637500, bandwidth_hz: 12500};
+          const jobs = [
+            {id: W, kind: "watch", source: "tone", state: run, created_ns: 1,
+             context: {watch: {decoding: [{job: D, mode: "m"}]}}},
+            {id: D, kind: "m", source: "tone", state: run, group: D, created_ns: 2, tuning: tune},
+            {id: S, kind: "m", source: "tone", state: run, group: D, created_ns: 3, tuning: tune},
+          ];
+          const api = {op: async (o) => o.op === "job_list" ? {value: jobs}
+                                       : o.op === "set_list" ? {value: []} : {value: null}};
+          const el = document.createElement("div");
+          document.body.append(el);
+          const h = startJobs(api, el, {note() {}, op() {}}, {});
+          await h.refresh();
+          const w = el.querySelector('details[data-kind="watch"]');
+          const sib = w && w.querySelector(':scope > details[data-kind="siblings"]');
+          const out = {
+            top: [...el.children].map((c) => c.tagName + (c.dataset.kind || "")),
+            sib: !!sib, plan: sib && sib.dataset.plan,
+            summary: sib && [...sib.querySelectorAll(':scope > summary .job')].map((j) => j.dataset.id),
+            under: sib && [...sib.querySelectorAll(':scope > .job')].map((j) => j.dataset.id),
+            watchRow: w && !!w.querySelector(':scope > summary > .job[data-id="' + W + '"]'),
+            count: ["W0123456", D, S].map((id) => el.querySelectorAll('.job[data-id="' + id + '"]').length),
+          };
+          h.close();
+          el.remove();
+          return out;
+        }""")
+    assert r["sib"] and r["plan"] == "D0123456", r
+    assert r["summary"] == ["D0123456"] and r["under"] == ["S0123456"], r
+    assert r["watchRow"] and r["count"] == [1, 1, 1], r
+    assert r["top"] == ["DETAILSwatch"], r
+
+
 def scenario_sibling_fields_are_marked_in_the_table(page, url, secret):
     errors = page_errors(page)
     select_source(page, url, secret, "tone")

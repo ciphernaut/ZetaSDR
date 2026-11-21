@@ -958,7 +958,12 @@ class Overlays {
     const at = performance.now();
     this.lastEvents.set(job.id, at);
     if (!this.eventTimes.has(job.id)) this.eventTimes.set(job.id, []);
-    this.eventTimes.get(job.id).push(at);
+    const times = this.eventTimes.get(job.id);
+    times.push(at);
+    // Pruned as it fills: a chatty job nobody reads the rate of must not grow the ring.
+    let old = 0;
+    while (old < times.length && times[old] < at - RATE_WINDOW_MS) old++;
+    if (old > 0) times.splice(0, old);
     if (this.isStationFrame(job, p)) this.stationEvents.set(job.id, performance.now());
     this.jobRow(job, n);
     if (obj) {

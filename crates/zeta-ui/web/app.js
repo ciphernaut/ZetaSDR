@@ -2252,6 +2252,10 @@ function answerRibbon(text) {
 // at a frequency.
 let pollPaused = false;
 window.zetaTest = {
+  // The overlays (overlays.js), or null: a test drives render() with its own clock.
+  get overlays() {
+    return state.ov;
+  },
   get lastRowFormat() {
     return state.wf ? state.wf.lastRowFormat : null;
   },
