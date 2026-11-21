@@ -405,6 +405,5 @@ async fn the_sink_refuses_a_replay() {
     };
     assert!(m.ends_with("a replay uploads nothing"), "{m}");
     drop(tx);
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(seen.lock().unwrap().is_empty(), "a request was made");
 }

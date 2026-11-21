@@ -715,17 +715,82 @@ async fn a_replay_supersedes_no_signature() {
     assert_eq!(after[0].id, sig.id);
 }
 
+const FRAME_ROW: &str = "fsk_frames";
+const FRAME_CENTER_HZ: u64 = 433_920_000;
+const FRAME_RATE_HZ: u32 = 48_000;
+
+/// The framing of the frame row below: a 16-bit sync, a fixed 272-bit frame, a CRC-16.
+fn framing() -> Value {
+    json!({"sync": {"hex": "2dd4", "bits": 16}, "length": {"fixed_bits": 272}, "crc": "crc16-ccitt"})
+}
+
+/// A frame row (`decoder.kind: frame`, so it keeps a session) whose subject counts every
+/// CRC-clean frame as an anonymous station, written to `dir`'s modes directory for [`open`].
+fn write_frame_row(dir: &Path) {
+    let row = json!({
+        "id": FRAME_ROW, "name": "FSK test frames", "family": "general",
+        "band": {"bandwidth_hz": APRS_BAND_HZ, "centers_hz": [FRAME_CENTER_HZ]},
+        "modulation": ["fsk", "fm"], "label": "FSK frames", "protocol": "frame",
+        "decoder": {
+            "kind": "frame",
+            "demod": {"modulation": "fsk", "symbol_rate_baud": 4_800, "order": 2, "tone_spacing_hz": null},
+            "framing": framing(),
+            "parser": "opaque"
+        },
+        "event": {
+            "schema": {"type": "object", "properties": {
+                "protocol": {"type": "string"}, "sync": {"type": "string"},
+                "length_bytes": {"type": "integer"},
+                "crc_ok": {"type": "boolean"}
+            }},
+            "summary": "frame {length_bytes} B"
+        },
+        "subject": {
+            "station": {"when": {"crc_ok": true}, "key": null, "addressed": null},
+            "key": "sync", "name": "frame", "waterfall": "summary",
+            "columns": [{"field": "length_bytes", "label": "Bytes", "unit": null}]
+        },
+        "identify": {"proof": "field", "field": "crc_ok", "min_events": 1, "dwell_ms": 10000,
+            "min_span_ms": 1000, "quick": "frame"},
+        "catalogue": []
+    });
+    let modes = dir.join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    std::fs::write(modes.join(format!("{FRAME_ROW}.json")), row.to_string()).unwrap();
+}
+
 #[tokio::test]
 async fn a_replay_keeps_no_session_and_tallies_no_station() {
     let dir = tempfile::tempdir().unwrap();
+    write_frame_row(dir.path());
     let (node, _radio) = open(dir.path()).await;
-    let ids = write_aprs(&node, 2);
+    // Eight frames of the row's framing, as `tests/frame_rows.rs` synthesises them.
+    let params = json!({"family": "framing", "modulation": "fsk", "symbol_rate_baud": 4_800,
+        "deviation_hz": 2400.0, "frames": 8, "body_bytes": 32, "seed": 7,
+        "framing": framing(), "repeat": 1, "snr_db": 20.0});
+    let (spec, imp) = zeta_dsp::synth::parse_params(params.as_object().unwrap().clone()).unwrap();
+    let iq = zeta_dsp::synth::synthesise(&spec, &imp, FRAME_RATE_HZ, FRAME_CENTER_HZ);
+    let cap = write_capture(
+        &node,
+        "frames",
+        (FRAME_CENTER_HZ, APRS_BAND_HZ, FRAME_RATE_HZ),
+        T0_NS,
+        &iq,
+    );
     let before = node.sessions().len();
-    let id = started(decode(&node, &ids[0], APRS, None, false).await);
-    until_stopped(&node, &id, Duration::from_secs(20)).await;
-    assert_eq!(node.sessions().len(), before);
+    let mut feed = replay_feed(&node);
+    let id = started(decode(&node, &cap, FRAME_ROW, None, false).await);
+    // The replay decodes: a frame the row counts as a station's and proves.
+    let f = envelope(&mut feed, Duration::from_secs(20)).await;
+    assert_eq!(event_of(&f).unwrap()["crc_ok"], true);
+    until_stopped(&node, &id, Duration::from_secs(30)).await;
+    assert_eq!(node.sessions().len(), before, "a replay keeps a session");
     let rec = record(&node, &id);
-    assert!(rec.context.get("stations").is_none(), "{}", rec.context);
+    assert!(
+        rec.context.get("stations").is_none(),
+        "a replay tallies a station: {}",
+        rec.context
+    );
 }
 
 #[tokio::test]
