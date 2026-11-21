@@ -12889,7 +12889,10 @@ def scenarios():
 SHARD_STARTS = {
     1: [],
     2: ["menu_entry_table_is_whole"],
-    3: ["kiwi_zoom_is_anchored_on_the_pointer", "mute_in_mix_from_row_and_outline"],
+    3: ["coarse_layer_paints_outside_the_capture",
+        "subjects_follow_every_job_on_another_source"],
+    4: ["wide_view_zoom_is_anchored_on_the_pointer", "wfm_stereo_toggle_plays_two_channels",
+        "a_chosen_sort_survives_its_section_going"],
 }
 
 
