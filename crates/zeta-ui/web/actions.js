@@ -61,7 +61,8 @@
 //            with `replay`) is never one of those
 //   packetVia(job, row, jobs) -> how the packets entry captures when the job's own handler
 //            gives none: {member} (a running group member whose handler gives packets),
-//            {handler, name} (the handler to start beside the job), or null
+//            {handler, name} (the handler to start beside the job), or null (always for a
+//            replay, which nothing is started beside)
 //   subOf(entry, ctx) -> the entry's submenu elements, or null
 //
 // Offered: nothing the node would accept is hidden. Every decoder and demodulator entry is on
@@ -251,12 +252,14 @@
 //                          <name>` (packetVia): it follows a group member that gives packets
 //                          (attach to it, or `Stop packet capture via <name>` while one runs
 //                          there), else sends host.sendTo(job, handler, ["packet"]) and attaches
-//                          to the job that starts
+//                          to the job that starts; on a replay (a record with `replay`, plan 44)
+//                          only its own handler's packets are offered: nothing starts beside it
 //   send_to  Send to ›      (its own group, between Next and Stop) opens one element per handler
 //                          of the mode that the job's group does not run (groupHandlers): a
 //                          ready one starts a sibling (job_start beside=<job>), another is
 //                          drawn disabled with its reason as the title; not offered for an
-//                          attached or owned job, a mode with one handler, or nothing to list
+//                          attached or owned job, a replay (no one's sibling: the node refuses
+//                          it), a mode with one handler, or nothing to list
 //   Decode ›  a decoder entry whose mode has two or more ready handlers opens `<policy's pick>
 //                          (policy)` (no handler sent) then each ready handler by name
 //                          (startJob's `handler`)
@@ -396,7 +399,7 @@ export function groupHandlers(job, jobs, row) {
 // beside it: the mode's pick when that gives packets and is free, else the first that does), or
 // null.
 export function packetVia(job, row, jobs) {
-  if (!row || jobOutputs(job, row).includes("packet")) return null;
+  if (!row || job.replay || jobOutputs(job, row).includes("packet")) return null;
   const g = job.group ?? job.id;
   const member = (jobs || []).find(
     (j) => j.id !== job.id && sibling(j, job) && (j.id === g || j.group === g)
@@ -528,7 +531,7 @@ export const ACTIONS = [
   },
   {
     id: "send_to", label: "Send to", group: "sendto", on: ["job"],
-    applies: (c) => c.running && !c.job.input && c.job.owner == null
+    applies: (c) => c.running && !c.job.input && c.job.owner == null && !c.job.replay
       && (rowOf(c, c.job.kind)?.handlers?.length ?? 0) > 1,
     sub: sendToSub,
   },

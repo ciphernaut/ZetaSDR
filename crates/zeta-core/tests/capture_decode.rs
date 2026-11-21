@@ -461,6 +461,32 @@ async fn a_second_replay_of_the_same_capture_mode_and_handler_is_a_duplicate() {
 }
 
 #[tokio::test]
+async fn a_replay_cannot_be_sent_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let ids = write_adsb(&node, 3);
+    let id = started(decode(&node, &ids[0], MODE, Some(OWN), false).await);
+    let rec = record(&node, &id);
+    assert_eq!(rec.state, JobState::Running);
+    // Asked as Send to asks: the replay's own kind, source and band.
+    let op = json!({
+        "op": "job_start", "kind": MODE, "source": rec.source.0,
+        "center_hz": rec.tuning.center_hz.0, "bandwidth_hz": rec.tuning.bandwidth_hz.0,
+        "deviation_hz": null, "sideband": null, "elastic": false, "replace": [],
+        "handler": ALT, "needs": [], "beside": id.0,
+    });
+    assert_eq!(
+        node.apply(serde_json::from_value(op).unwrap()).await,
+        Err(OpError::Other {
+            message: format!("job {} cannot be sent from: it is a replay", id.0),
+        })
+    );
+    assert_eq!(node.job_list().len(), 1, "nothing started");
+    assert_eq!(record(&node, &id).group, None, "no group written");
+    node.job_stop(&id).await.unwrap();
+}
+
+#[tokio::test]
 async fn a_finished_replay_notes_what_it_decoded() {
     let dir = tempfile::tempdir().unwrap();
     let (node, _radio) = open(dir.path()).await;

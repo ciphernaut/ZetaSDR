@@ -11843,7 +11843,17 @@ def scenario_two_handlers_replaying_one_capture_merge_and_mark(page, url, secret
     capture = replay_set(url, secret, "tone")[0]["id"]
     own = decode_capture(url, secret, capture, "fake_pair", "fake_lines")
     alt = decode_capture(url, secret, capture, "fake_pair", "alt")
+    menu = page.locator("#ctx-outline")
     try:
+        # A replay is no one's sibling (ruling R9): its running row's menu has no Send to,
+        # though fake_pair has three ready handlers.
+        job_row(page, own).locator("button.more").click()
+        expect(menu).to_be_visible()
+        wait_until(lambda: "stop" in first_level(page), 10, "the replay's job menu")
+        assert job_status(url, secret, own) == "running", "the replay ended before its menu"
+        assert "send_to" not in first_level(page), first_level(page)
+        expect(menu.locator('.ctx-item[data-action="send_to"]')).to_have_count(0)
+        close_menu(page, "#ctx-outline")
         sec = open_replay(page, capture)
         expect(page.locator("#subjects section.subject-replay")).to_have_count(1)
         expect(sec.locator("tr.subject")).to_have_count(1, timeout=10_000)
@@ -11856,8 +11866,49 @@ def scenario_two_handlers_replaying_one_capture_merge_and_mark(page, url, secret
         for h in ("fake_lines", "alt"):
             expect(legend.filter(has_text=names[h])).to_have_count(1)
     finally:
+        close_menu(page, "#ctx-outline")
         stop_job(url, secret, alt)
         stop_job(url, secret, own)
+
+
+def scenario_two_modes_replaying_one_capture_draw_a_table_each(page, url, secret):
+    # fake_pair (four columns, PAIR1) and fake_fold (one column, S1 and S2) replayed from one
+    # capture (ruling R12): one section, a table per mode under its own header. fake_fold has
+    # one ready handler, and its replay's row still names it (ruling R11).
+    clear_captures(url, secret)
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    modes = http_json(url, secret, "/op", {"op": "modes_list", "family": None,
+                                           "state": None})["value"]["modes"]
+    fold = next(m for m in modes if m["id"] == "fake_fold")
+    ready = [h for h in fold["handlers"] if h["state"] == "ready"]
+    assert len(ready) == 1, fold["handlers"]
+    capture = replay_set(url, secret, "tone")[0]["id"]
+    pair = decode_capture(url, secret, capture, "fake_pair")
+    folded = decode_capture(url, secret, capture, "fake_fold")
+    try:
+        expect(job_row(page, folded).locator(".kind .tag.handler")).to_have_text(ready[0]["name"])
+        sec = open_replay(page, capture)
+        expect(page.locator("#subjects section.subject-replay")).to_have_count(1)
+        tables = sec.locator("table[data-mode]")
+        expect(tables).to_have_count(2, timeout=20_000)
+        pt = sec.locator('table[data-mode="fake_pair"]')
+        ft = sec.locator('table[data-mode="fake_fold"]')
+        expect(pt.locator('tr.subject[data-key="PAIR1"]')).to_have_count(1, timeout=10_000)
+        expect(ft.locator('tr.subject[data-key="S1"]')).to_have_count(1, timeout=10_000)
+        expect(ft.locator('tr.subject[data-key="S2"]')).to_have_count(1)
+        expect(ft.locator("tr.subject")).to_have_count(2)
+        heads = lambda t: t.locator("thead th").evaluate_all("els => els.map((e) => e.dataset.col)")
+        assert "own_only" in heads(pt) and "alt" not in heads(pt), heads(pt)
+        assert "alt" in heads(ft) and "own_only" not in heads(ft), heads(ft)
+        expect(pt.locator("caption")).to_have_text(re.compile(r"^fake_pair, 1 pairs"))
+        expect(ft.locator("caption")).to_have_text(re.compile(r"^fake_fold, 2 sondes"))
+        expect(ft.locator('tr.subject[data-key="S2"] td[data-col="alt"]')).not_to_have_text("")
+        page.wait_for_timeout(1_500)  # a tick or two of the pane's redraw
+        assert not errors, errors
+    finally:
+        stop_job(url, secret, folded)
+        stop_job(url, secret, pair)
 
 
 def scenario_a_finished_replay_row_shows_its_note(page, url, secret):
@@ -11866,9 +11917,12 @@ def scenario_a_finished_replay_row_shows_its_note(page, url, secret):
     capture, job = replay_capture(url, secret, "aprs", "aprs_decode")
     try:
         expect(job_row(page, job).locator(".source")).to_have_text("replay")
+        # Its handler, always named (ruling R11).
+        expect(job_row(page, job).locator(".kind .tag.handler")).to_have_text("built-in")
         wait_until(lambda: job_status(url, secret, job) != "running", 30, "the replay ended")
         expect(job_row(page, job).locator(".state")).to_have_text(
             re.compile(r"^replayed "), timeout=10_000)
+        expect(job_row(page, job).locator(".kind .tag.handler")).to_have_text("built-in")
     finally:
         stop_job(url, secret, job)
 

@@ -364,8 +364,9 @@ pub enum Op {
         /// runs is a `duplicate` naming that member (`handler <h> already runs beside job
         /// <id> as job <member>`), as is one a job outside the group runs on the band.
         /// An unknown job is `unknown`; one that is not running is `job <id> is <state>`;
-        /// an attached job, one a watch or an identify runs, an elastic one and one of no
-        /// mode row are `job <id> cannot be sent from: <why>`. The start tunes nothing.
+        /// an attached job, one a watch or an identify runs, an elastic one, a replay and
+        /// one of no mode row are `job <id> cannot be sent from: <why>`. The start tunes
+        /// nothing.
         /// The two share a group, the record field `group`: the named job's when it has
         /// one, else its own id, which is then written on the named job once the sibling
         /// runs (a start that fails writes nothing). `job_stop` stops one member.
@@ -4965,10 +4966,11 @@ impl Beside {
 
 /// `job_start`'s `beside` (see [`Op::JobStart`]), under the source's gate once the
 /// handler is resolved (before, when none is named, so the policy is not consulted): the
-/// job is known (`unknown`), `running`, of a mode row, on the radio, not owned and not
-/// elastic; `replace` is empty; the band is the job's record's (`tuning`), the first
-/// field that differs named; a `handler` is named (else the ready ones the group does not
-/// run are listed). A handler the group runs is refused by [`Beside::repeat`], before
+/// job is known (`unknown`), `running`, of a mode row, on the radio, not owned, not
+/// elastic and no replay (a recording's decode is no one's sibling; refused before the
+/// source is looked up, as a replay's is `node`); `replace` is empty; the band is the
+/// job's record's (`tuning`), the first field that differs named; a `handler` is named
+/// (else the ready ones the group does not run are listed). A handler the group runs is refused by [`Beside::repeat`], before
 /// the ordinary duplicate check.
 fn check_beside(
     node: &Node,
@@ -5000,6 +5002,9 @@ fn check_beside(
     }
     if rec.elastic {
         return Err(cannot("it is elastic".into()));
+    }
+    if rec.replay.is_some() {
+        return Err(cannot("it is a replay".into()));
     }
     let Some(mode) = node
         .expandable_kind(&rec.kind)
@@ -5654,6 +5659,16 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 replace: &replace,
                 handler: handler.as_deref(),
             };
+            // A replay's record is on source `node`, which no port serves: refused before
+            // the source is looked up, in the beside check's own words.
+            if let Some(b) = &beside
+                && node
+                    .job_list()
+                    .iter()
+                    .any(|r| &r.id == b && r.replay.is_some())
+            {
+                check_beside(node, b, &ask, &node.modes())?;
+            }
             if let Some(b) = &beside
                 && kind == JobKind::Scan
             {

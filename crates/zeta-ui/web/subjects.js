@@ -133,8 +133,10 @@
 //     a selection (from here or the map) scrolls its row into view.
 //     A replay group (store.replayGroups) draws, after every live section, one
 //     `section.subject-replay[data-capture=<capture id>]` (plan 44 call 19), its subjects merged
-//     and marked across handlers as a sibling group's are, its columns its last-heard subject's
-//     row's, `Last seen` the recording's `HH:MM:SS` (local time), headed `replay of <HH:MM:SS>
+//     and marked across handlers as a sibling group's are, one `table[data-mode]` per mode its
+//     subjects were first heard from (in the order first heard; captioned `<mode>, <n> <subject
+//     name>`, its columns that mode's row's, sorted apart), `Last seen` the recording's
+//     `HH:MM:SS` (local time), headed `replay of <HH:MM:SS>
 //     <centre> MHz` (the capture's `start_ns` and `center_hz` from one `capture_list` per new
 //     capture, mhzText; `replay of <capture id>` while unknown or once the list no longer holds
 //     it) in a `span.title` beside a `button.close` (`×`) that closes the group. A replay is
@@ -198,6 +200,11 @@ const isReplayGroup = (id) => typeof id === "string" && id.startsWith(REPLAY_GRO
 // The group of a replay record (its `replay`, the capture id it names), else null.
 function replayGroupOf(job) {
   return typeof job?.replay === "string" && job.replay !== "" ? REPLAY_GROUP + job.replay : null;
+}
+
+// The mode a subject was first heard from (its first source's), the key of its replay table.
+function subjectMode(s) {
+  return s.by?.values().next().value?.mode ?? "?";
 }
 
 // `HH:MM:SS` of `ms` (ms since the epoch) on this page's clock (local time).
@@ -1165,17 +1172,22 @@ class SubjectsPane {
     if (!th) return;
     const el = th.closest(`section.subject-job, section.${MERGE_SECTION_CLASS}, section.${REPLAY_SECTION_CLASS}`);
     if (!el) return;
-    const id = el.classList.contains(MERGE_SECTION_CLASS)
+    const replay = el.classList.contains(REPLAY_SECTION_CLASS);
+    const mode = replay ? th.closest("table")?.dataset.mode : null;
+    const secId = el.classList.contains(MERGE_SECTION_CLASS)
       ? mergedId(el.dataset.name)
-      : el.classList.contains(REPLAY_SECTION_CLASS)
+      : replay
         ? REPLAY_GROUP + el.dataset.capture
         : el.dataset.job;
+    // A replay section's tables sort apart, each by `<group id>\0<mode>`.
+    const id = replay ? `${secId}\u0000${mode}` : secId;
     const col = th.dataset.col;
     const cur = this.sorts.get(id);
     this.sorts.set(id, { col, dir: cur && cur.col === col ? -cur.dir : 1 });
     // Asked for under the pointer: sorted once, then held as any other order.
-    const sec = this.sections.get(id);
-    if (sec) sec.order = null;
+    const sec = this.sections.get(secId);
+    const t = replay ? sec?.tables?.get(mode) : sec;
+    if (t) t.order = null;
     this.render();
   }
 
@@ -1405,23 +1417,39 @@ class SubjectsPane {
     const note = document.createElement("div");
     note.className = "not-watched";
     note.textContent = "not watched (its source has no event feed)";
+    if (capture !== null) {
+      // A replay's subjects may be of several modes: a table per mode (drawReplaySection).
+      const tablesEl = document.createElement("div");
+      tablesEl.className = "replay-tables";
+      el.append(h3, tablesEl);
+      sec = { el, h3, title, note, tablesEl, tables: new Map() };
+    } else {
+      const t = this.makeTable();
+      el.append(h3, t.table);
+      sec = { el, h3, title, note, ...t };
+      // The table's hover is the section's own (its fields are the section's).
+      t.table.addEventListener("pointerenter", () => {
+        sec.hover = true;
+      });
+      t.table.addEventListener("pointerleave", () => {
+        sec.hover = false;
+        this.render();
+      });
+    }
+    this.sections.set(id, sec);
+    return sec;
+  }
+
+  // A subjects table with no rows: {table, head, body, sig, rows, hover, order}, the shape
+  // drawTable and held take; whoever makes it wires its hover.
+  makeTable() {
     const table = document.createElement("table");
     const thead = document.createElement("thead");
     const head = document.createElement("tr");
     thead.append(head);
     const body = document.createElement("tbody");
     table.append(thead, body);
-    el.append(h3, table);
-    sec = { el, h3, title, note, table, head, body, sig: "", rows: new Map(), hover: false, order: null };
-    table.addEventListener("pointerenter", () => {
-      sec.hover = true;
-    });
-    table.addEventListener("pointerleave", () => {
-      sec.hover = false;
-      this.render();
-    });
-    this.sections.set(id, sec);
-    return sec;
+    return { table, head, body, sig: "", rows: new Map(), hover: false, order: null };
   }
 
   // The legend under the heading: a chip per source in its mark, then `differs`; only with two
@@ -1456,19 +1484,29 @@ class SubjectsPane {
     if (sec.legend.previousElementSibling !== sec.h3) sec.h3.after(sec.legend);
   }
 
-  drawSection(sec, heading, subjects, cols, watched, sources = []) {
+  // The section's heading, its not-watched note and its legend.
+  drawHead(sec, heading, watched, sources) {
     setText(sec.title ?? sec.h3, heading);
     if (watched) sec.note.remove();
     else if (!sec.note.isConnected) sec.h3.after(sec.note);
     this.drawLegend(sec, sources);
+  }
+
+  drawSection(sec, heading, subjects, cols, watched, sources = []) {
+    this.drawHead(sec, heading, watched, sources);
+    this.drawTable(sec, subjects, cols, sources);
+  }
+
+  // The rows of table `t` (makeTable's shape): `subjects` under `cols`, marked by `sources`.
+  drawTable(t, subjects, cols, sources) {
     const slots = slotMap(sources);
-    sec.table.hidden = subjects.length === 0;
+    t.table.hidden = subjects.length === 0;
     // A table hidden under the pointer sends no leave.
-    if (sec.table.hidden) sec.hover = false;
+    if (t.table.hidden) t.hover = false;
     const sig = JSON.stringify(cols.map((c) => c.col));
-    if (sig !== sec.sig) {
-      sec.sig = sig;
-      sec.head.replaceChildren(
+    if (sig !== t.sig) {
+      t.sig = sig;
+      t.head.replaceChildren(
         ...cols.map((c) => {
           const th = document.createElement("th");
           th.dataset.col = c.col;
@@ -1476,18 +1514,18 @@ class SubjectsPane {
           return th;
         }),
       );
-      sec.body.replaceChildren();
-      sec.rows.clear();
+      t.body.replaceChildren();
+      t.rows.clear();
     }
     const keep = new Set(subjects.map(idOf));
-    for (const [id, tr] of [...sec.rows]) {
+    for (const [id, tr] of [...t.rows]) {
       if (keep.has(id)) continue;
       tr.remove();
-      sec.rows.delete(id);
+      t.rows.delete(id);
     }
     const sel = this.store.selected();
     subjects.forEach((s, i) => {
-      let tr = sec.rows.get(idOf(s));
+      let tr = t.rows.get(idOf(s));
       if (!tr) {
         tr = document.createElement("tr");
         tr.className = "subject";
@@ -1496,7 +1534,7 @@ class SubjectsPane {
           td.dataset.col = c.col;
           tr.append(td);
         }
-        sec.rows.set(idOf(s), tr);
+        t.rows.set(idOf(s), tr);
       }
       // A group's newest member can change under the same row.
       if (tr.dataset.job !== s.job) tr.dataset.job = s.job;
@@ -1514,7 +1552,7 @@ class SubjectsPane {
         setText(tr.children[n], text, why ? `${text} (${why})` : text);
         setMark(tr.children[n], mark);
       });
-      if (sec.body.children[i] !== tr) sec.body.insertBefore(tr, sec.body.children[i] || null);
+      if (t.body.children[i] !== tr) t.body.insertBefore(tr, t.body.children[i] || null);
     });
   }
 
@@ -1536,17 +1574,53 @@ class SubjectsPane {
 
   // A replay group's section (plan 44 call 19): every replay of one capture, merged and
   // marked as siblings are, titled from the capture's record; drawn while it holds subjects.
+  // A table per mode (ruling R12), in the order the modes were first heard, each its own
+  // row's columns under a caption `<mode>, <n> <subject name>`, sorted apart
+  // (`<group id>\0<mode>`).
   drawReplaySection(sec, { id, capture }) {
-    const list = this.store.list(id);
-    const row = list[list.length - 1].row;
-    const cols = this.columns(row, { recorded: true });
-    const subjects = this.held(sec, this.sorted(id, list.reverse(), cols));
     const rec = this.captureOf(capture);
     const heading =
       rec && Number.isFinite(rec.start_ns) && Number.isFinite(rec.center_hz)
         ? `replay of ${clockText(rec.start_ns / 1e6)} ${mhzText(rec.center_hz)} MHz`
         : `replay of ${capture}`;
-    this.drawSection(sec, heading, subjects, cols, true, legendSources(this.store.sources(id), (x) => x.name));
+    const sources = legendSources(this.store.sources(id), (x) => x.name);
+    this.drawHead(sec, heading, true, sources);
+    const byMode = new Map(); // mode -> its subjects, least recently heard first
+    for (const s of this.store.list(id)) {
+      const mode = subjectMode(s);
+      if (!byMode.has(mode)) byMode.set(mode, []);
+      byMode.get(mode).push(s);
+    }
+    for (const [mode, t] of [...sec.tables]) {
+      if (byMode.has(mode)) continue;
+      t.table.remove();
+      sec.tables.delete(mode);
+    }
+    [...byMode].forEach(([mode, list], i) => {
+      let t = sec.tables.get(mode);
+      if (!t) {
+        t = this.makeTable();
+        t.table.dataset.mode = mode;
+        t.caption = document.createElement("caption");
+        t.table.prepend(t.caption);
+        t.table.addEventListener("pointerenter", () => {
+          t.hover = true;
+        });
+        t.table.addEventListener("pointerleave", () => {
+          t.hover = false;
+          this.render();
+        });
+        sec.tables.set(mode, t);
+      }
+      const row = list[list.length - 1].row;
+      const cols = this.columns(row, { recorded: true });
+      const subjects = this.held(t, this.sorted(`${id}\u0000${mode}`, list.reverse(), cols));
+      setText(t.caption, `${mode}, ${subjects.length} ${row.subject.name}`);
+      this.drawTable(t, subjects, cols, sources);
+      if (sec.tablesEl.children[i] !== t.table) {
+        sec.tablesEl.insertBefore(t.table, sec.tablesEl.children[i] || null);
+      }
+    });
   }
 
   // The capture's `capture_list` record: null when the list no longer holds it, undefined
@@ -1735,7 +1809,8 @@ class SubjectsPane {
     }
     const listed = new Set([...(this.jobs() || []).map((j) => j.id), ...ids]);
     for (const id of [...this.sorts.keys()]) {
-      if (!listed.has(id)) this.sorts.delete(id);
+      // A replay table's sort is `<group id>\0<mode>`: kept while its section is listed.
+      if (!listed.has(id.split("\u0000")[0])) this.sorts.delete(id);
     }
     parts.forEach((part, i) => {
       const sec = this.section(part.id, part.name ?? null, part.capture ?? null);

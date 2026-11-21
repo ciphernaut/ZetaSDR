@@ -62,7 +62,8 @@
 //       them finished (0: never; without `view`, 60 s); view.onClear drops the finished rows
 //       at once. A finished row shows `.reason` (the state's reason, or `stopped`) and no
 //       Stop, ▶ or Transcribe button. A replay's row (a record with `replay`, plan 44) is
-//       `.job.replay`, its `.source` reading `replay`; once stopped its `.state` reads the
+//       `.job.replay`, its `.source` reading `replay`, its `.tag.handler` always there (the
+//       handler's name, its id while the row is unknown); once stopped its `.state` reads the
 //       record's `context.note` (what it decoded) in place of `stopped`, with no `.reason`
 //       unless the state gives one. A row of an elastic job (the page's own spectrum job)
 //       reads `<kind> elastic` and has only Stop. The row of the page's own automatic scan
@@ -726,7 +727,12 @@ function jobRow(
   // A mode with more than one ready handler: the one this job runs, named in its kind cell.
   const modeRow = attached ? null : audioKind?.(job.kind);
   const ready = (modeRow?.handlers ?? []).filter((h) => h.state === "ready").length;
-  const handler = ready > 1 || job.group ? jobHandler(job, modeRow) : undefined;
+  // A replay always names its handler (plan 44 call 21), its id while the row is unknown.
+  const handler =
+    ready > 1 || job.group || replay
+      ? (jobHandler(job, modeRow) ??
+        (replay && typeof job.handler === "string" ? { id: job.handler, name: job.handler } : undefined))
+      : undefined;
   // A member of a Send to group: its events a minute and the subjects it has heard.
   if (job.group && !attached && status === "running") {
     const n = rate ? rate(job) : null;
