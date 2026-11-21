@@ -122,20 +122,6 @@ Each token is a custom property the core stylesheet declares in `:root`.
 - `--handler-style-3`: slot 3's `font-style` (`normal`).
 - `--handler-style-4`: slot 4's `font-style` (`italic`).
 - `--c-differs`: the colour of a field two handlers hold different values for.
-
-#### Handler marks
-
-When several handlers hear one subject, the Subjects pane merges them into one row and draws each
-value in the mark of the handler that supplied it: `.mark-1` to `.mark-4`, set from
-`--c-handler-N` and `--handler-style-N`. The styles alternate, so slots 1 and 2 tell apart without
-colour; keep a mark readable without its colour, and at least 3:1 against `--bg`. A field two
-handlers disagree on takes `.mark-differs`, `--c-differs` with a dotted underline. A handler takes
-the next slot in the order it first supplied a field; `theme.json`'s optional `handlers` key pins
-handler ids to slots instead, `1` to `4`:
-
-```json
-"handlers": { "onair": 2 }
-```
 - `--wf-bg`: the waterfall canvas ground; any opaque CSS colour (`#hex`, `rgb()`, `hsl()`, a name, `color-mix()`); one the browser cannot parse falls back to `#000030`.
 - `--wf-select`: the drag rectangle's colour; any opaque CSS colour, `#ffffff` when it does not parse.
 - `--wf-select-alpha`: the drag rectangle's fill opacity.
@@ -166,6 +152,20 @@ handler ids to slots instead, `1` to `4`:
 - `--bar-h-top`: the top bar's height.
 - `--bar-h-bottom`: the command bar's height.
 - `--bar-h`: the current bar height (defaults to `--bar-h-top`).
+
+#### Handler marks
+
+When several handlers hear one subject, the Subjects pane merges them into one row and draws each
+value in the mark of the handler that supplied it: `.mark-1` to `.mark-4`, set from
+`--c-handler-N` and `--handler-style-N`. The styles alternate, so slots 1 and 2 tell apart without
+colour; keep a mark readable without its colour, and at least 3:1 against `--bg`. A field two
+handlers disagree on takes `.mark-differs`, `--c-differs` with a dotted underline. A handler takes
+the next slot in the order it first supplied a field; `theme.json`'s optional `handlers` key pins
+handler ids to slots instead, `1` to `4`:
+
+```json
+"handlers": { "onair": 2 }
+```
 
 ## `style.css`
 
