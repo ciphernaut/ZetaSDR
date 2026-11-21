@@ -9420,8 +9420,31 @@ def scenario_subject_store_keeps_each_sources_fields(page, url, secret):
           out.afterGroup = store.list("J3").map((x) => [x.key, x.job, x.by.size, x.count]);
           out.afterGroupViaSibling = store.list("J4").length;
           out.subjectsInStore = [...store.jobs.values()].reduce((n, m) => n + m.size, 0);
-          out.lateDrops = drops;
+          out.lateDrops = [...drops];
           out.lateMarks = Object.fromEntries(marksOf(store.list("J3")[0], slotsOf("J3")));
+          // A sibling sent from a watch's kept decoder (ruling R5): the group stays the
+          // watch's while the watch runs, the decoder dropped or not.
+          const watchOn = (decoding, status = "running") => ({
+            id: "W", kind: "watch", state: {status},
+            context: {watch: {decoding: decoding.map((j) => ({job: j, mode: "m"}))}}});
+          const d = {id: "D", kind: "m", source: "tone", group: "D", handler: "builtin",
+                     state: run};
+          const js = {id: "JS", kind: "m", source: "tone", group: "D", handler: "alt",
+                      state: run};
+          const all = () => [...store.jobs.values()].flatMap((m) => [...m.keys()]);
+          store.sync([watchOn(["D"]), d, js]);
+          store.event(d, {id: "P", name: "Papa", own_only: "x", handler: "builtin"});
+          store.event(js, {id: "P", name: "Papa", alt_only: "y", handler: "alt"});
+          out.keptBoth = [store.groupId("D"), store.groupId("JS"), all()];
+          store.sync([watchOn([]), {...d, state: stopped}, js]);
+          out.keptDropped = [store.groupId("JS"), all(),
+                             store.list("W").map((x) => [x.key, x.by.size])];
+          const again = store.event(js, {id: "P", level: 3, handler: "alt"});
+          out.keptAgain = [again === store.list("W")[0], all(), again.count];
+          store.sync([watchOn([], "stopped"), {...d, state: stopped}, js]);
+          out.watchGone = [store.groupId("JS"), all()];
+          store.event(js, {id: "P", level: 4, handler: "alt"});
+          out.watchGoneHeard = [store.list("D").length, all()];
           store.destroy();
           return out;
         }""")
@@ -9460,6 +9483,13 @@ def scenario_subject_store_keeps_each_sources_fields(page, url, secret):
     assert r["lateDrops"] == [["J4", "L"]], r
     assert r["lateMarks"]["alt_only"] == {"mark": 2, "title": "only Alt"}, r["lateMarks"]
     assert r["lateMarks"]["name"] == {"mark": None, "title": None}, r["lateMarks"]
+    # A kept decoder's sibling: under the watch while it runs, the decoder dropped or not,
+    # one subject throughout; after the watch, the bare key D, once.
+    assert r["keptBoth"] == ["W", "W", ["P"]], r["keptBoth"]
+    assert r["keptDropped"] == ["W", ["P"], [["P", 2]]], r["keptDropped"]
+    assert r["keptAgain"] == [True, ["P"], 3], r["keptAgain"]
+    assert r["watchGone"] == ["D", []], r["watchGone"]
+    assert r["watchGoneHeard"] == [1, ["P"]], r["watchGoneHeard"]
 
 
 def scenario_subjects_table_merges_three_aircraft(page, url, secret):

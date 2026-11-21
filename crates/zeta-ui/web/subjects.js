@@ -35,7 +35,8 @@
 //     to its group).
 //     store.groupOf(job, jobs = the last sync's) -> {key, kind, title} | null   agent.js groupOf
 //     store.groupId(jobId) -> the group id of a job id (the watch's for a kept decoder, else
-//         the record's `group`, else itself; a group sent from a kept decoder is the watch's),
+//         the record's `group`, else itself; a group sent from a kept decoder is the watch's
+//         for as long as the watch runs, the decoder dropped or not),
 //         as of the last `sync`. An event of a job no sync has seen yet goes by its record's
 //         `group`.
 //     store.sync(jobs)   regroups (a decoder heard before its watch named it moves its subjects
@@ -365,6 +366,9 @@ class SubjectStore {
     this.jobs = new Map();
     this.groups = new Map(); // a kept decoder's id -> its watch's id, as of the last sync
     this.siblings = new Map(); // a job's id -> its record's `group`, as of the last sync
+    // A sibling group's key that was a watch's kept decoder -> that watch, kept while the
+    // watch runs (the decoder dropped or not), so the group stays the watch's
+    this.keptGroups = new Map();
     // group id -> source key -> {key, mode, handler}, in the order the sources first
     // supplied a field to one of the group's subjects
     this.sourceOrder = new Map();
@@ -451,10 +455,10 @@ class SubjectStore {
 
   // The watch's group, else the record's `group` (a bare key: it may name a stopped job,
   // never resolved to a record), else the job itself; a group sent from a watch's kept
-  // decoder is the watch's.
+  // decoder is the watch's while the watch runs.
   groupId(jobId) {
     const g = this.groups.get(jobId) ?? this.siblings.get(jobId) ?? jobId;
-    return this.groups.get(g) ?? g;
+    return this.groups.get(g) ?? this.keptGroups.get(g) ?? g;
   }
 
   // `groupId` for a job record, its own `group` standing in until a sync has seen it (a
@@ -462,7 +466,7 @@ class SubjectStore {
   groupFor(job) {
     if (this.groups.has(job.id) || this.siblings.has(job.id)) return this.groupId(job.id);
     const g = typeof job.group === "string" && job.group !== "" ? job.group : job.id;
-    return this.groups.get(g) ?? g;
+    return this.groups.get(g) ?? this.keptGroups.get(g) ?? g;
   }
 
   subjectOf(job, p) {
@@ -601,6 +605,15 @@ class SubjectStore {
     this.siblings = new Map();
     for (const j of this.lastJobs) {
       if (typeof j.group === "string" && j.group !== "") this.siblings.set(j.id, j.group);
+    }
+    // A sibling group's key kept by a watch now, remembered; one whose watch stopped, forgotten.
+    // Only group keys: a lone decoder the watch drops is its own group again, as before.
+    const groupKeys = new Set(this.siblings.values());
+    for (const [decoder, watch] of this.groups) {
+      if (groupKeys.has(decoder)) this.keptGroups.set(decoder, watch);
+    }
+    for (const [key, watch] of [...this.keptGroups]) {
+      if (!running.has(watch)) this.keptGroups.delete(key);
     }
     const known = new Set(this.lastJobs.map((j) => j.id));
     for (const id of [...this.jobSources.keys()]) if (!known.has(id)) this.jobSources.delete(id);
@@ -775,6 +788,7 @@ class SubjectStore {
     this.jobs.clear();
     this.groups.clear();
     this.siblings.clear();
+    this.keptGroups.clear();
     this.sourceOrder.clear();
     this.jobSources.clear();
     this.changeCbs = [];
