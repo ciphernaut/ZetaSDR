@@ -14,6 +14,20 @@ From the operator, 2026-11-20 and 2026-11-21. Spec: `docs/superpowers/specs/2026
   - Replaying a capture held by another node other than through `--node`.
   - The packet capture's lead is a timing assumption, not a handshake: the capture is started before the first sample by timing, and the replay does not wait for the capture to confirm it is recording.
   - Explore's Send to sorts by the row's name, not its short label.
+  - The refusal of a mode whose graph has no `channel` stage to replay into is neither in the op doc nor tested.
+  - A stopped replay's count can miss events the decoder flushes while it is cancelled; the tally's doc does not say so.
+  - A hung program with `packets` takes about 7 s of the 8 s drain bound, leaving the packet drain little room.
+  - A `packets` job attached late to a running replay drops what was already decoded without a word: a context note would show it.
+  - Explore's title lookup fetches the whole `capture_list` for each new capture; a lookup by id would do.
+  - The page's replay feed handler ignores `lagged`, so frames lost to a lag go unnoted.
+  - On a node with no replay feed, the page asks for `/streams` every 2 s for as long as it is open, as the source feed does.
+  - Send to's widths read in kHz (`needs 2000.0 kHz`), where MHz reads better for wide rows, and its success note names the mode's id, not its label.
+  - Explore's Send to popup paints after an await: a job menu opened meanwhile is painted over (a sequence token and a dwell cancel fix it); its viewport clamp is duplicated from the outline menu's.
+  - The Send to button does not toggle its popup and has no `aria-haspopup`; the popup is empty when `modes_list` fails.
+  - A job attached to a replay: a `graph_put` of it is refused with the replay's own wording (`a replay's graph is its mode's`), and its record has no `context.replay.captures`, so keyed subjects from it (none today) would group under the named capture, not the set's first.
+  - A local `zeta capture decode` whose wait runs out prints the record still `running` and exits 2; the record is stopped with the no-resume note at the next `serve`. Not documented.
+  - Wording: the op doc's replay sentence ("its events carry the recording's own times", where "its" means the job) and one 146-character doc line in `ops.rs`.
+  - Test hygiene: the `events.log` check can pass on an empty log; the 8 s drain test and the two-handler page scenario have thin margins on a 2-CPU runner; the no-lead test passes without the fix; the attach-failure stop path is untested; ui.py sorts by code point where the page uses `localeCompare`; no scenario closes the popup by an outside press or Escape, or chooses across a poll.
 - **Plan 45:** OnAir's other modes, rows with no decoder of their own (with the `policy` placeholder), and the two patches to offer upstream. Not planned. Gist: one handler-file entry per mode, each with a `modes check` against the row's synthesised capture; AIS and APRS with packets first; rows with `decoder: null` for modes only OnAir decodes; the patches (a file source that reads a pipe, sample time to its Wireshark hub) proven in `onair-rx` first.
 - **Plan 42 follow-ups**, from the branch's last review. One line each:
   - **The agent's allow gates do not cover `handler_policy_set`:** only the prose says to change the ranking on the operator's word.

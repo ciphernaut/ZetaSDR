@@ -112,7 +112,7 @@ comparison plan 43 made live.
 
 14. **`zeta capture decode --capture <id> --kind <mode> [--handler <h>] [--packets]`,**
     locally and with `--node`. It prints the job. There is no `--then-tail`: the result is
-    the record's note (`zeta job show`), and the capture file when `--packets` was given.
+    the record's note (`zeta job context --job <id>`), and the capture file when `--packets` was given.
 15. **The agent's note** says what a replay is for (checking a decoder against a recording,
     comparing handlers), that it proves nothing live, and that its events are on the
     `replay` feed with the recording's times.
