@@ -812,3 +812,72 @@ async fn graph_put_of_a_replay_is_refused() {
     }
     node.job_stop(&id).await.ok();
 }
+
+#[tokio::test]
+async fn a_replay_with_packets_captures_every_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let ids = write_aprs(&node, 3);
+    let id = started(decode(&node, &ids[0], APRS, None, true).await);
+    until_stopped(&node, &id, Duration::from_secs(30)).await;
+    until("the packet capture closes", Duration::from_secs(10), || {
+        let l = node.packets().list();
+        l.len() == 1 && !l[0].writing && l[0].packets == 3
+    })
+    .await;
+    let list = node.packets().list();
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert_eq!(list[0].job, id);
+    assert_eq!(list[0].packets, 3);
+    let bytes = std::fs::read(&list[0].path).unwrap();
+    let whole = zeta_core::pcapng::whole_blocks(&bytes);
+    let (_, packets) = zeta_core::pcapng::read(&bytes[..whole]).unwrap();
+    assert_eq!(packets.len(), 3);
+    let spans: Vec<_> = ids.iter().map(|c| node.bursts().get(c).unwrap()).collect();
+    for p in &packets {
+        assert!(
+            spans
+                .iter()
+                .any(|c| (c.start_ns..=c.end_ns).contains(&p.t_ns)),
+            "{} outside every capture",
+            p.t_ns
+        );
+    }
+}
+
+#[tokio::test]
+async fn packets_on_a_mode_that_gives_none_is_refused_and_nothing_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let ids = write_adsb(&node, 1);
+    let Err(e) = decode(&node, &ids[0], MODE, None, true).await else {
+        panic!("refused")
+    };
+    let OpError::NoHandler { passed, .. } = &e else {
+        panic!("no handler: {e:?}")
+    };
+    assert!(
+        passed.iter().all(|p| p.why.contains("outputs no packet")),
+        "{passed:?}"
+    );
+    assert!(!passed.is_empty(), "{passed:?}");
+    assert!(node.job_list().is_empty());
+    assert!(node.packets().list().is_empty());
+}
+
+#[tokio::test]
+async fn a_replay_without_packets_has_no_lead() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let ids = write_aprs(&node, 1);
+    let mut feed = replay_feed(&node);
+    let id = started(decode(&node, &ids[0], APRS, None, false).await);
+    let params = &record(&node, &id).graph.nodes[0].params;
+    assert_eq!(params["lead_ms"], 0, "{params}");
+    // capture_in's first frame (a segment event) comes at once.
+    tokio::time::timeout(Duration::from_millis(200), feed.recv())
+        .await
+        .expect("a frame within 200 ms")
+        .unwrap();
+    until_stopped(&node, &id, Duration::from_secs(15)).await;
+}

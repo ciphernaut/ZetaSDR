@@ -75,6 +75,10 @@ pub const NODE_SOURCE: &str = "node";
 /// feed of this name the node registers when it opens, never a radio's.
 pub const REPLAY_SOURCE: &str = "replay";
 
+/// How long a replay with `packets` waits before its first sample: the packet capture
+/// attaches to the running job within it.
+const PACKET_LEAD_MS: u64 = 300;
+
 /// Why a source may not be named `id`: [`NODE_SOURCE`] and [`REPLAY_SOURCE`] name the
 /// node's own streams. `None` for any other id.
 pub fn reserved_source(id: &str) -> Option<String> {
@@ -2975,7 +2979,8 @@ impl Node {
                 id: source.clone(),
                 kind: crate::ops::CAPTURE_IN_STAGE.into(),
                 params: serde_json::json!({
-                    "captures": ids, "loop": false, "realtime": true, "lead_ms": 0,
+                    "captures": ids, "loop": false, "realtime": true,
+                    "lead_ms": if packets { PACKET_LEAD_MS } else { 0 },
                 }),
             },
         );
@@ -3032,6 +3037,14 @@ impl Node {
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
+        if packets {
+            // The attachment is made during `capture_in`'s lead, before its first sample.
+            // One that fails ends the replay: the op is its error.
+            if let Err(e) = crate::ops::packets_attach(self, id.clone(), None).await {
+                self.job_stop(&id).await?;
+                return Err(NodeError::Expand(e));
+            }
+        }
         Ok(id)
     }
 

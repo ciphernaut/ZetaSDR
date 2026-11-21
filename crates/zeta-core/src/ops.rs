@@ -8004,7 +8004,11 @@ async fn attach_one(
 /// gate is held from the checks to the launch, so two attaches to one job at once make
 /// one capture and the other is refused as already captured. Nothing is started on a
 /// refusal.
-async fn packets_attach(node: &Node, job: JobId, stream: Option<String>) -> Result<JobId, OpError> {
+pub(crate) async fn packets_attach(
+    node: &Node,
+    job: JobId,
+    stream: Option<String>,
+) -> Result<JobId, OpError> {
     if stream.is_some() {
         return Err(other(
             "packets reads the job's packet stream: pass stream null",
