@@ -3052,9 +3052,9 @@ impl Node {
         self.inner.launch(rec).await?;
         if packets {
             // The attachment is made during `capture_in`'s lead, before its first sample.
-            // One that fails ends the replay: the op is its error.
+            // One that fails ends the replay: the op is its error, whatever the stop says.
             if let Err(e) = crate::ops::packets_attach(self, id.clone(), None).await {
-                self.job_stop(&id).await?;
+                let _ = self.job_stop(&id).await;
                 return Err(NodeError::Expand(e));
             }
         }
