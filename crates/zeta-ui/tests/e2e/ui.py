@@ -5782,7 +5782,7 @@ MENU_ACTION_IDS = [
     "ssb_usb", "ssb_lsb", "wfm_transcribe", "fm_transcribe", "am_transcribe",
     "ssb_usb_transcribe", "ssb_lsb_transcribe", "measure", "plan", "set", "scan", "iq_read",
     "ask", "fit", "w2500", "w5000", "w6250", "w12500", "w25000", "denoise", "stereo", "mute",
-    "stop",
+    "send_to", "packets", "stop",
 ]
 
 
@@ -6005,8 +6005,10 @@ def scenario_box_menu_offers_only_what_fits(page, url, secret):
     wait_until(lambda: menu_side(page, "aprs_decode") == "elsewhere", 5.0, "APRS elsewhere")
     started = []
     try:
+        # APRS has two ready handlers: its entry opens a panel, the policy's pick starts.
+        menu_click(page, "aprs_decode")
         with page.expect_request(is_op("job_start")) as req:
-            menu_click(page, "aprs_decode")
+            page.locator('#ctx .ctx-sub[data-for="aprs_decode"] .ctx-item[data-mode="policy"]').click()
         body = json.loads(req.value.post_data)
         assert (body["kind"], body["source"]) == ("aprs_decode", "tone"), f"start {body}"
         wait_until(lambda: running_jobs(url, secret, "aprs_decode", "tone"), 5.0, "APRS on tone")
@@ -11157,6 +11159,210 @@ def scenario_handler_named_on_job_row(page, url, secret):
             stop_job(url, secret, job)
 
 
+def start_aprs(url, secret, handler=None):
+    """An `aprs_decode` job on the `aprs` source (by `handler`, or the policy's pick); its id."""
+    body = {"op": "job_start", "kind": "aprs_decode", "source": "aprs",
+            "center_hz": 144_800_000, "bandwidth_hz": 12_500, "deviation_hz": None,
+            "sideband": None, "elastic": False, "replace": []}
+    if handler:
+        body["handler"] = handler
+    return http_json(url, secret, "/op", body)["value"]
+
+
+def stop_aprs(url, secret):
+    """Every running aprs_decode and packets job on `aprs`, stopped, and its captures deleted."""
+    for kind in ("packets", "aprs_decode"):
+        for j in running_jobs(url, secret, kind, "aprs"):
+            stop_job(url, secret, j["id"])
+    wait_until(lambda: not any(c["writing"] for c in capture_ops(url, secret, "packets_list")),
+               10, "recordings ended")
+    for c in capture_ops(url, secret, "packets_list"):
+        capture_ops(url, secret, "packets_delete", capture=c["id"])
+
+
+def record_ops(page):
+    """The bodies of the page's POST /op, appended to the returned list as they are sent."""
+    sent = []
+
+    def on_request(r):
+        if r.method == "POST" and r.url.endswith("/op"):
+            try:
+                sent.append(json.loads(r.post_data or ""))
+            except ValueError:
+                pass
+
+    page.on("request", on_request)
+    return sent
+
+
+def first_level(page):
+    return page.evaluate(FIRST_LEVEL_JS, page.locator("#ctx-outline").element_handle())
+
+
+def sendto_panel_labels(page):
+    """The labels of the open job menu's Send to panel."""
+    return page.evaluate("""() => [...document.querySelectorAll(
+        '#ctx-outline .ctx-sub[data-for="send_to"] .ctx-item')].map((e) => e.textContent)""")
+
+
+def scenario_send_to_starts_a_sibling_from_the_job_menu(page, url, secret):
+    # A built-in APRS job's menu has a Send to group between Next and Stop listing the handler
+    # the group does not run (`alt`, not `built-in`); choosing it sends a job_start beside the
+    # job. With both handlers running, neither job's menu offers Send to.
+    stop_aprs(url, secret)
+    select_source(page, url, secret, "aprs")
+    first = start_aprs(url, secret, "builtin")
+    menu = page.locator("#ctx-outline")
+    try:
+        job_row(page, first).locator("button.more").click()
+        expect(menu).to_be_visible()
+        wait_until(lambda: "send_to" in first_level(page), 10, "the Send to group")
+        level = first_level(page)
+        assert level.index("group:next") < level.index("send_to") < level.index("stop"), level
+        menu_click(page, "send_to", "#ctx-outline")
+        assert sendto_panel_labels(page) == ["Alt lines (UI tests)"], sendto_panel_labels(page)
+        with page.expect_request(is_op("job_start")) as req:
+            menu.locator('.ctx-sub[data-for="send_to"] .ctx-item', has_text="Alt lines").click()
+        body = json.loads(req.value.post_data)
+        assert body["beside"] == first and body["handler"] == "alt", body
+        wait_until(lambda: len(running_jobs(url, secret, "aprs_decode", "aprs")) == 2, 15,
+                   "two aprs_decode jobs")
+        sib = next(j["id"] for j in running_jobs(url, secret, "aprs_decode", "aprs")
+                   if j["id"] != first)
+        for job in (first, sib):
+            close_menu(page, "#ctx-outline")
+            job_row(page, job).locator("button.more").click()
+            expect(menu).to_be_visible()
+            expect(menu.locator('.ctx-item[data-action="stop"]')).to_have_count(1)
+            assert "send_to" not in first_level(page), first_level(page)
+    finally:
+        close_menu(page, "#ctx-outline")
+        stop_aprs(url, secret)
+
+
+def scenario_send_to_shows_an_unavailable_handler_greyed(page, url, secret):
+    # A handler the mode lists as not ready is drawn disabled in Send to with its reason as the
+    # title, and a click sends nothing. No handler of the suite's node is unavailable (ADS-B
+    # runs on 2.4 MHz, which no source here serves), so modes_list is answered with `alt`
+    # marked unavailable.
+    reason = "alt program is not installed (UI test)"
+
+    def route(r):
+        body = r.request.post_data or ""
+        if '"modes_list"' not in body:
+            return r.continue_()
+        resp = r.fetch()
+        data = resp.json()
+        for m in data["value"]["modes"]:
+            for h in m.get("handlers", []):
+                if m["id"] == "aprs_decode" and h["id"] == "alt":
+                    h["state"] = "unavailable"
+                    h["reason"] = reason
+        return r.fulfill(response=resp, json=data)
+
+    stop_aprs(url, secret)
+    page.route("**/op", route)
+    try:
+        select_source(page, url, secret, "aprs")
+        job = start_aprs(url, secret, "builtin")
+        sent = record_ops(page)
+        menu = page.locator("#ctx-outline")
+        job_row(page, job).locator("button.more").click()
+        expect(menu).to_be_visible()
+        wait_until(lambda: "send_to" in first_level(page), 10, "the Send to group")
+        menu_click(page, "send_to", "#ctx-outline")
+        item = menu.locator('.ctx-sub[data-for="send_to"] .ctx-item[data-mode="alt"]')
+        expect(item).to_have_attribute("aria-disabled", "true")
+        expect(item).to_have_attribute("title", reason)
+        item.click(force=True)
+        page.wait_for_timeout(500)
+        assert not [b for b in sent if b.get("op") == "job_start"], sent
+        assert len(running_jobs(url, secret, "aprs_decode", "aprs")) == 1
+    finally:
+        page.unroute("**/op", route)
+        stop_aprs(url, secret)
+
+
+def scenario_capture_packets_via_another_handler(page, url, secret):
+    # An `alt` job gives no packets: its menu reads Capture packets via built-in, which starts
+    # the built-in handler beside it (needs packet) and attaches the capture to that job. The
+    # alt job's menu then follows that member's capture: Stop packet capture via built-in
+    # stops the capture and starts nothing.
+    stop_aprs(url, secret)
+    select_source(page, url, secret, "aprs")
+    alt = start_aprs(url, secret, "alt")
+    menu = page.locator("#ctx-outline")
+    try:
+        sent = record_ops(page)
+        job_row(page, alt).locator("button.more").click()
+        item = menu_item(page, "packets", "#ctx-outline")
+        expect(item).to_have_text("Capture packets via built-in")
+        item.click()
+        # Requests reach `sent` while the page is driven: pump it between looks.
+        wait_until(lambda: page.wait_for_timeout(100) or any(b.get("op") == "job_attach" for b in sent),
+                   15, "the attach")
+        start = next(b for b in sent if b.get("op") == "job_start")
+        assert start["beside"] == alt and start["handler"] == "builtin", start
+        assert start["needs"] == ["packet"], start
+        sib = next(j["id"] for j in running_jobs(url, secret, "aprs_decode", "aprs")
+                   if j["id"] != alt)
+        attach = next(b for b in sent if b.get("op") == "job_attach")
+        assert (attach["kind"], attach["job"]) == ("packets", sib), attach
+        wait_until(lambda: running_jobs(url, secret, "packets", "aprs"), 15, "a packets job")
+        capture = running_jobs(url, secret, "packets", "aprs")[0]["id"]
+        sent.clear()
+        job_row(page, alt).locator("button.more").click()
+        item = menu_item(page, "packets", "#ctx-outline")
+        expect(item).to_have_text("Stop packet capture via built-in")
+        with page.expect_request(is_op("job_stop")) as req:
+            item.click()
+        assert json.loads(req.value.post_data)["job"] == capture
+        wait_until(lambda: not running_jobs(url, secret, "packets", "aprs"), 15, "capture stopped")
+        page.wait_for_timeout(500)
+        assert not [b for b in sent if b.get("op") == "job_start"], sent
+        # Capture is offered again, attached to the member without starting a job.
+        job_row(page, alt).locator("button.more").click()
+        expect(menu_item(page, "packets", "#ctx-outline")).to_have_text(
+            "Capture packets via built-in")
+    finally:
+        close_menu(page, "#ctx-outline")
+        stop_aprs(url, secret)
+
+
+def scenario_decode_menu_lists_a_modes_handlers(page, url, secret):
+    # The APRS Decode entry opens a panel: the policy's pick (policy) first, then each ready
+    # handler. The first sends no handler key; the third sends `alt`.
+    stop_aprs(url, secret)
+    select_source(page, url, secret, "aprs")
+    wait_span(page, MENU_SPAN_S)
+    drag_menu(page, 0.25, 0.75)
+    try:
+        wait_until(lambda: menu_side(page, "aprs_decode") == "near", 5.0, "APRS near")
+        menu_item(page, "aprs_decode").click()
+        labels = page.evaluate("""() => [...document.querySelectorAll(
+            '#ctx .ctx-sub[data-for="aprs_decode"] .ctx-item')].map((e) => e.textContent)""")
+        assert labels == ["built-in (policy)", "built-in", "Alt lines (UI tests)"], labels
+        panel = page.locator('#ctx .ctx-sub[data-for="aprs_decode"]')
+        with page.expect_request(is_op("job_start")) as req:
+            panel.locator('.ctx-item[data-mode="alt"]').click()
+        body = json.loads(req.value.post_data)
+        assert body["kind"] == "aprs_decode" and body["handler"] == "alt", body
+        wait_until(lambda: running_jobs(url, secret, "aprs_decode", "aprs"), 15, "the alt job")
+        stop_aprs(url, secret)
+        # The stopped job's outline leaves the waterfall (only the page's own spectrum job is
+        # left drawn) before the next drag: a press on it would retune the stopped job.
+        wait_until(lambda: outlines(page).count() <= 1, 15, "the stopped job's outline gone")
+        wait_span(page, MENU_SPAN_S)
+        drag_menu(page, 0.25, 0.75)
+        menu_item(page, "aprs_decode").click()
+        with page.expect_request(is_op("job_start")) as req:
+            page.locator('#ctx .ctx-sub[data-for="aprs_decode"] .ctx-item[data-mode="policy"]').click()
+        body = json.loads(req.value.post_data)
+        assert "handler" not in body, body
+    finally:
+        stop_aprs(url, secret)
+
+
 def scenario_fake_pair_has_three_ready_handlers(page, url, secret):
     # Plan 43's fixture (ui.rs `fake_modes`, `fake_handlers`): `fake_pair` runs by its own
     # program, by `alt` (the same subject, other fields) and by `quiet` (never prints).
@@ -12162,7 +12368,7 @@ def main(argv):
                         seen = page.evaluate("window.__cspViolations || []")
                         assert not seen, f"Content-Security-Policy violations: {seen}"
                 except Exception as e:  # noqa: BLE001 - report any failure with its scenario
-                    print(f"FAIL {name}: {type(e).__name__}: {e}")
+                    print(f"FAIL {name}: {type(e).__name__}: {e}"); import traceback; traceback.print_exc(file=sys.stdout)
                     for line in console:
                         print(f"  console {line}")
                     return 1

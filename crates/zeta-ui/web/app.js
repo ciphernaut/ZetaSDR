@@ -1475,6 +1475,7 @@ function start(api) {
     attachOp,
     muteFor,
     packetsFor,
+    jobs: () => state.lastJobs,
     ask: askAgent,
     transcript: state.transcript,
     ov: state.ov,

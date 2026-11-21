@@ -195,7 +195,7 @@
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
 // as for #ctx.
 
-import { GROUPS, action as entryOf, groupOf, offered, sectionOf } from "./actions.js";
+import { GROUPS, action as entryOf, groupOf, offered, sectionOf, subOf } from "./actions.js";
 import { channelHolding, planGroups, planNoVoice } from "./plans.js";
 import { bandText, mhzText, registerLines, registerText } from "./units.js";
 import { capHz } from "./waterfall.js";
@@ -609,7 +609,7 @@ export function clampSpan(startNs, endNs, newest) {
 class Menu {
   constructor(
     wf,
-    { applyOp, attachOp, ask, transcript, ov, plan = () => null, planPolicy = () => "none", ringSeconds = () => null, command = () => {}, muteFor = () => null, packetsFor = () => null, onOrigins = () => {}, sets = () => [], sources = () => [], isAudio = () => false, play = () => {}, transcribe = () => {}, playing = () => false },
+    { applyOp, attachOp, ask, transcript, ov, plan = () => null, planPolicy = () => "none", ringSeconds = () => null, command = () => {}, muteFor = () => null, packetsFor = () => null, jobs = () => [], onOrigins = () => {}, sets = () => [], sources = () => [], isAudio = () => false, play = () => {}, transcribe = () => {}, playing = () => false },
   ) {
     this.isAudio = isAudio;
     this.play = play;
@@ -621,6 +621,7 @@ class Menu {
     this.onOrigins = onOrigins;
     this.muteFor = muteFor;
     this.packetsFor = packetsFor;
+    this.jobs = jobs;
     this.applyOp = applyOp;
     this.ringSeconds = ringSeconds;
     this.attachOp = attachOp;
@@ -798,6 +799,7 @@ class Menu {
       sel,
       mute: this.muteFor(job),
       packets: this.packetsFor(job),
+      jobs: this.jobs(),
       rows: this.rows,
       audio: !job.input && this.isAudio(job),
       running: job.state?.status === "running",
@@ -897,13 +899,17 @@ class Menu {
         );
         nodes.push(group);
       }
-      if (entry.sub) {
+      const sub = subOf(entry, ctx);
+      if (sub) {
         const panel = this.panel(this.rootOf(container), item, container);
         panel.dataset.for = entry.id;
         panel.append(
-          ...entry.sub(ctx).map((x) => {
-            const el = this.button(null, x.label, () => this.choose(entry, x.run));
+          ...sub.map((x) => {
+            // A greyed element says why in its title and runs nothing.
+            const el = this.button(null, x.label, x.disabled ? null : () => this.choose(entry, x.run));
             el.dataset.mode = x.key;
+            if (x.disabled) el.setAttribute("aria-disabled", "true");
+            if (x.title) el.title = x.title;
             this.leaves(el, panel);
             return el;
           }),
@@ -1042,7 +1048,7 @@ class Menu {
   // SSB entry's dial in the footer while it is hovered or focused.
   item(entry, ctx) {
     const label = typeof entry.label === "function" ? entry.label(ctx) : entry.label;
-    const item = this.button(entry.id, label, entry.sub ? null : () => this.choose(entry));
+    const item = this.button(entry.id, label, subOf(entry, ctx) ? null : () => this.choose(entry));
     const refused = entry.disabled ? entry.disabled(ctx) : null;
     if (refused) {
       item.setAttribute("aria-disabled", "true");
@@ -1486,7 +1492,8 @@ class Menu {
 
   // The job_start of a job entry (a Transcribe entry: its Decode twin's) with `tuning` (by
   // default the entry's jobTuning); its result or null.
-  startJob(action, s, tuning = jobTuning(action, s)) {
+  // `handler` (a handler id) is sent only when given: without it the policy picks.
+  startJob(action, s, tuning = jobTuning(action, s), handler = null) {
     const job = jobOf(action);
     const t = tuning;
     return this.applyOp({
@@ -1499,7 +1506,30 @@ class Menu {
       sideband: job.sideband,
       elastic: false,
       replace: [],
+      ...(handler === null ? {} : { handler }),
     });
+  }
+
+  // Send to: a sibling of `job` running `handler` on its band (job_start beside it, with the
+  // streams `needs`); the new job's id, or null when the node refused (applyOp has noted why,
+  // as for a failed startJob).
+  async sendTo(job, handler, needs = []) {
+    const t = job.tuning;
+    const r = await this.applyOp({
+      op: "job_start",
+      kind: job.kind,
+      source: job.source,
+      center_hz: t.center_hz,
+      bandwidth_hz: t.bandwidth_hz,
+      deviation_hz: null,
+      sideband: null,
+      elastic: false,
+      replace: [],
+      handler,
+      needs,
+      beside: job.id,
+    });
+    return r && r.result === "job" && r.value ? r.value : null;
   }
 
   // A scan time-shares the radio but blocks nothing: the waterfall lets go of the source first

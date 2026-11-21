@@ -28,9 +28,12 @@
 //               closes it); every other entry closes the menu first
 //     items(ctx) -> [{key, label, title, run(ctx)}]   entries drawn after it, one per element (a
 //               plan's named groups)
-//     sub(ctx) -> [{key, label, run(ctx)}]   the entry opens these as its submenu (`.ctx-sub
-//               [data-for=<id>]`), each `.ctx-item[data-mode=<key>]`; an entry whose sub is
-//               empty is not offered
+//     sub(ctx) -> [{key, label, run(ctx), disabled, title}] | null   the entry opens these as
+//               its submenu (`.ctx-sub[data-for=<id>]`), each `.ctx-item[data-mode=<key>]`; an
+//               element with `disabled` is drawn aria-disabled with `title` (why) and runs
+//               nothing; an entry whose sub is empty is not offered, and one whose sub answers
+//               null is a plain entry (a decoder with one ready handler); subOf(entry, ctx)
+//               reads it
 //     run(ctx)  what choosing it does
 //   GROUPS   per surface, its groups in menu order: [{id, label, direct, prefix}]. A group's
 //            only line stands in the first level reading `<label> › <its label>` when the group
@@ -52,6 +55,13 @@
 //            `outputs`, else the row's own (a job with no `handler`), [] without a row. A mode's
 //            `outputs` are the union over its ready handlers, so a job is judged by its own
 //            handler's (the packets entry here, agent.js's audio rule)
+//   groupHandlers(job, jobs, row) -> the handler ids a Send to leaves out: those run by the
+//            job's group and by any other running, unowned job of its kind on its source and
+//            band (a record with no `handler` counts as the row's first)
+//   packetVia(job, row, jobs) -> how the packets entry captures when the job's own handler
+//            gives none: {member} (a running group member whose handler gives packets),
+//            {handler, name} (the handler to start beside the job), or null
+//   subOf(entry, ctx) -> the entry's submenu elements, or null
 //
 // Offered: nothing the node would accept is hidden. Every decoder and demodulator entry is on
 // the box menu; a decoder whose row does not fit the selection (rowFits: the width the entry
@@ -236,7 +246,19 @@
 //                          aprs_decode's built-in and the frame rows), so the node writes its
 //                          packets to a pcapng capture (Explore lists it); reads `Stop packet
 //                          capture` while a `packets` job takes its input (job_stop on that
-//                          job)
+//                          job). A job whose handler gives none reads `Capture packets via
+//                          <name>` (packetVia): it follows a group member that gives packets
+//                          (attach to it, or `Stop packet capture via <name>` while one runs
+//                          there), else sends host.sendTo(job, handler, ["packet"]) and attaches
+//                          to the job that starts
+//   send_to  Send to ›      (its own group, between Next and Stop) opens one element per handler
+//                          of the mode that the job's group does not run (groupHandlers): a
+//                          ready one starts a sibling (job_start beside=<job>), another is
+//                          drawn disabled with its reason as the title; not offered for an
+//                          attached or owned job, a mode with one handler, or nothing to list
+//   Decode ›  a decoder entry whose mode has two or more ready handlers opens `<policy's pick>
+//                          (policy)` (no handler sent) then each ready handler by name
+//                          (startJob's `handler`)
 //   classify, identify, measure, watch  (Next, after Listen and Transcribe under the heading
 //                          `On its band`, with no heading when those two are not offered) the
 //                          box entries' runs on the job's band (`sel`,
@@ -265,6 +287,7 @@ export const GROUPS = {
     { id: "toggles", label: "Toggles", direct: true },
     { id: "mix", label: "Mix", direct: true },
     { id: "next", label: "Next" },
+    { id: "sendto", label: "Send to" },
     { id: "stop", label: "Stop", direct: true },
   ],
 };
@@ -334,6 +357,98 @@ export function jobOutputs(job, row) {
   return jobHandler(job, row)?.outputs ?? row.outputs ?? [];
 }
 
+// The same band, as a job record's `tuning` says (the lease band).
+const sameBand = (a, b) =>
+  !!a && !!b && a.center_hz === b.center_hz && a.bandwidth_hz === b.bandwidth_hz;
+
+// Whether `j` is a running decoder job of `job`'s kind on its source (not an attached job).
+const sibling = (j, job) =>
+  j.kind === job.kind && j.source === job.source && !j.input && j.state?.status === "running";
+
+// The handler ids `job` (a job_list record) cannot be sent to, from `jobs` (the last job_list)
+// and its mode row `row`: those its group runs (the first job and the jobs sent from it), and
+// those of any other running, unowned job of its kind on its source and tuning (the node
+// refuses that start as a duplicate). A record with no `handler` counts as the row's first.
+export function groupHandlers(job, jobs, row) {
+  const first = row?.handlers?.[0]?.id ?? null;
+  const g = job.group ?? job.id;
+  const ids = new Set();
+  const add = (j) => {
+    const h = j.handler ?? first;
+    if (h != null) ids.add(h);
+  };
+  add(job);
+  for (const j of jobs || []) {
+    if (!sibling(j, job)) continue;
+    if (j.id === g || j.group === g || (j.owner == null && sameBand(j.tuning, job.tuning))) add(j);
+  }
+  return [...ids];
+}
+
+// How the packets entry captures for `job` when its own handler gives none: `{member}` (a
+// running job of its group whose handler gives packets), `{handler, name}` (the handler to start
+// beside it: the mode's pick when that gives packets and is free, else the first that does), or
+// null.
+export function packetVia(job, row, jobs) {
+  if (!row || jobOutputs(job, row).includes("packet")) return null;
+  const g = job.group ?? job.id;
+  const member = (jobs || []).find(
+    (j) => j.id !== job.id && sibling(j, job) && (j.id === g || j.group === g)
+      && jobOutputs(j, row).includes("packet"),
+  );
+  if (member) return { member };
+  const taken = groupHandlers(job, jobs, row);
+  const free = (row.handlers || []).filter(
+    (h) => h.state === "ready" && (h.outputs || []).includes("packet") && !taken.includes(h.id),
+  );
+  const pick = free.find((h) => h.id === row.handler) || free[0];
+  return pick ? { handler: pick.id, name: pick.name } : null;
+}
+
+// The packets entry for ctx `c`: {label, run}, or null when it is not offered.
+function packetsEntry(c) {
+  const row = rowOf(c, c.job.kind);
+  if (c.packets) {
+    return { label: "Stop packet capture", run: () => c.host.capturePackets(c.job, c.packets) };
+  }
+  if (jobOutputs(c.job, row).includes("packet")) {
+    return { label: "Capture packets", run: () => c.host.capturePackets(c.job, null) };
+  }
+  const via = packetVia(c.job, row, c.jobs);
+  if (!via) return null;
+  if (via.member) {
+    // The member's own capture: the entry follows it.
+    const m = via.member;
+    const name = jobHandler(m, row)?.name ?? m.handler;
+    const running = c.host.packetsFor(m);
+    return running
+      ? { label: `Stop packet capture via ${name}`, run: () => c.host.capturePackets(m, running) }
+      : { label: `Capture packets via ${name}`, run: () => c.host.capturePackets(m, null) };
+  }
+  return {
+    label: `Capture packets via ${via.name}`,
+    run: async () => {
+      const id = await c.host.sendTo(c.job, via.handler, ["packet"]);
+      if (id) await c.host.capturePackets({ id }, null);
+    },
+  };
+}
+
+// The Send to submenu's elements for ctx `c`: every handler of the job's mode its group does not
+// run, in the mode's order; a ready one starts the sibling, another is drawn disabled with its
+// reason.
+function sendToSub(c) {
+  const row = rowOf(c, c.job.kind);
+  const taken = groupHandlers(c.job, c.jobs, row);
+  return (row?.handlers || [])
+    .filter((h) => !taken.includes(h.id))
+    .map((h) =>
+      h.state === "ready"
+        ? { key: h.id, label: h.name, run: (k) => k.host.sendTo(k.job, h.id) }
+        : { key: h.id, label: h.name, disabled: true, title: h.reason },
+    );
+}
+
 // A job's band as usable for its next steps: a tuning with a width (a mix has none).
 const banded = (c) => {
   const t = c.job.tuning;
@@ -350,7 +465,23 @@ const job = (kind, deviation = null, sideband = null) => ({ kind, deviation, sid
 const decoder = (id, label, kind = id) => ({
   id, label, group: "decode", on: ["box"], job: job(kind), run: start(id),
   elsewhere: (c) => !rowFits(id, rowOf(c, kind), c.sel),
+  sub: (c) => decoderHandlers(id, rowOf(c, kind)),
 });
+// A decoder entry's submenu: the mode's ready handlers, the policy's pick first; null (a plain
+// entry) with fewer than two.
+function decoderHandlers(id, row) {
+  const ready = (row?.handlers || []).filter((h) => h.state === "ready");
+  if (ready.length < 2) return null;
+  const pick = ready.find((h) => h.id === row.handler);
+  return [
+    { key: "policy", label: `${pick ? pick.name : row.handler} (policy)`, run: start(id) },
+    ...ready.map((h) => ({
+      key: h.id,
+      label: h.name,
+      run: (c) => c.host.startJob(id, c.sel, undefined, h.id),
+    })),
+  ];
+}
 // A demodulator entry: fitted to the signal first. Always offered: a demodulator has no row to
 // read a width from.
 const demod = (id, label, j) => ({
@@ -385,9 +516,15 @@ export const ACTIONS = [
   },
   {
     id: "packets", group: "next", on: ["job"],
-    label: (c) => (c.packets ? "Stop packet capture" : "Capture packets"),
-    applies: (c) => c.running && !c.job.input && jobOutputs(c.job, rowOf(c, c.job.kind)).includes("packet"),
-    run: (c) => c.host.capturePackets(c.job, c.packets),
+    label: (c) => packetsEntry(c)?.label ?? "Capture packets",
+    applies: (c) => c.running && !c.job.input && packetsEntry(c) !== null,
+    run: (c) => packetsEntry(c).run(),
+  },
+  {
+    id: "send_to", label: "Send to", group: "sendto", on: ["job"],
+    applies: (c) => c.running && !c.job.input && c.job.owner == null
+      && (rowOf(c, c.job.kind)?.handlers?.length ?? 0) > 1,
+    sub: sendToSub,
   },
   demod("fm_demod", "NBFM audio", job("fm_demod", 5000)),
   demod("wfm_demod", "FM broadcast audio", job("wfm_demod", 75000)),
@@ -513,8 +650,15 @@ export function sectionOf(entry, surface) {
 function isOffered(entry, ctx) {
   if (!entry.on.includes(ctx.surface)) return false;
   if (entry.applies && !entry.applies(ctx)) return false;
-  if (entry.sub && entry.sub(ctx).length === 0) return false;
+  const sub = subOf(entry, ctx);
+  if (sub && sub.length === 0) return false;
   return true;
+}
+
+// The submenu elements of `entry` for ctx, or null when it has none now (no `sub`, or its `sub`
+// answers null: a decoder with one ready handler is a plain entry).
+export function subOf(entry, ctx) {
+  return entry.sub ? entry.sub(ctx) : null;
 }
 
 export function offered(surface, ctx) {
