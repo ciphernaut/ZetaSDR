@@ -393,6 +393,7 @@ async fn run_test(
         replace: vec![],
         handler: Some(handler.into()),
         needs: vec![],
+        beside: None,
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,

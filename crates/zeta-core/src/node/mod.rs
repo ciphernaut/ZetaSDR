@@ -278,12 +278,14 @@ fn next_stop_token() -> u64 {
 }
 
 /// The handler a start runs, as its record keeps it: the id (`None` for a kind of no
-/// mode row), whether the start named it, and the stream kinds the start needed.
+/// mode row), whether the start named it, the stream kinds the start needed, and the Send
+/// to group it joins (`job_start`'s `beside`; `None` for a start beside no job).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StartHandler {
     pub handler: Option<String>,
     pub named: bool,
     pub needs: Vec<StreamKind>,
+    pub group: Option<JobId>,
 }
 
 impl StartHandler {
@@ -297,7 +299,7 @@ impl StartHandler {
 }
 
 /// A new `Running` record of an operator's job of `kind` on the radio: a fresh id, an
-/// empty context, no input, owner or audio policy.
+/// empty context, no input, owner, audio policy or group.
 fn running_record(
     kind: &str,
     source: SourceId,
@@ -327,6 +329,7 @@ fn running_record(
         handler: None,
         handler_named: false,
         needs: Vec::new(),
+        group: None,
     }
 }
 
@@ -1061,6 +1064,24 @@ impl Inner {
             other => *ctx = other,
         }
         persist(&self.jobs_dir, &entry.record)
+    }
+
+    /// Put the job `id` in the Send to group `group` (its record's `group`) and persist
+    /// the record. Called under the job's source's gate, once a sibling beside it has
+    /// launched (see [`Node::set_group`]). A write that fails is also recorded in
+    /// `persist_errors`: the group holds in memory, and the record's next write keeps it.
+    fn set_group(&self, id: &JobId, group: &JobId) -> Result<(), NodeError> {
+        let mut jobs = self.jobs.lock().unwrap();
+        let entry = jobs
+            .get_mut(id)
+            .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+        entry.record.group = Some(group.clone());
+        persist(&self.jobs_dir, &entry.record).inspect_err(|e| {
+            self.persist_errors
+                .lock()
+                .unwrap()
+                .push(format!("job {}: group not written: {e}", id.0));
+        })
     }
 
     /// The audio stream an attached job reads from `job`: with `stream` (a voice's role)
@@ -2518,6 +2539,7 @@ impl Node {
             handler: None,
             handler_named: false,
             needs: Vec::new(),
+            group: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2575,6 +2597,7 @@ impl Node {
             handler: None,
             handler_named: false,
             needs: Vec::new(),
+            group: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2688,6 +2711,7 @@ impl Node {
             handler: None,
             handler_named: false,
             needs: Vec::new(),
+            group: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2786,6 +2810,7 @@ impl Node {
             handler: None,
             handler_named: false,
             needs: Vec::new(),
+            group: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -3048,8 +3073,8 @@ impl Node {
     /// (relaunching the elastic jobs a tune moved, stopping those a scan
     /// displaces) is returned, for [`Node::after_gate`] once the guard is dropped. The
     /// record keeps `audio_policy` and `handler` (the handler `graph` was expanded for,
-    /// whether the start named it and what it needed), and starts with `context` (an
-    /// identify's `dwell_scale`).
+    /// whether the start named it, what it needed and the Send to group it joins), and
+    /// starts with `context` (an identify's `dwell_scale`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn job_start_gated(
         &self,
@@ -3069,6 +3094,7 @@ impl Node {
             handler: handler.handler,
             handler_named: handler.named,
             needs: handler.needs,
+            group: handler.group,
             ..running_record(kind, source, tuning, graph, capture_rate_hz, elastic)
         };
         self.start_record_gated(rec, guard, &[]).await
@@ -3244,6 +3270,23 @@ impl Node {
                 .then_with(|| a.id.0.cmp(&b.id.0))
         });
         v
+    }
+
+    /// The running records of the Send to group `group` (their `group` is it), oldest
+    /// first. The job the group is named after counts only while it runs and once a
+    /// sibling has started beside it.
+    pub fn group_members(&self, group: &JobId) -> Vec<JobRecord> {
+        self.job_list()
+            .into_iter()
+            .filter(|r| r.state == JobState::Running && r.group.as_ref() == Some(group))
+            .collect()
+    }
+
+    /// Put the job `id` in the Send to group `group`; see [`Inner::set_group`]. Only
+    /// `job_start` with `beside` calls it, on the job it named, under that job's source's
+    /// gate after the sibling launched.
+    pub(crate) fn set_group(&self, id: &JobId, group: &JobId) -> Result<(), NodeError> {
+        self.inner.set_group(id, group)
     }
 
     pub fn job_context(&self, id: &JobId) -> Option<serde_json::Value> {
@@ -3827,6 +3870,7 @@ mod tests {
             handler: None,
             handler_named: false,
             needs: Vec::new(),
+            group: None,
         }
     }
 

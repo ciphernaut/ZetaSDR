@@ -196,6 +196,7 @@ async fn python_plugin_runs_in_a_job_via_graph_put() {
             replace: vec![],
             handler: None,
             needs: vec![],
+            beside: None,
         })
         .await
         .unwrap()

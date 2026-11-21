@@ -997,6 +997,7 @@ async fn a_signal_inside_another_jobs_band_is_ignored() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     assert!(matches!(node.apply(op).await, Ok(OpResult::Job(_))));
     until(
@@ -1248,6 +1249,7 @@ async fn dwell_scale_by_hand_lengthens_each_rows_dwell() {
             replace: vec![],
             handler: None,
             needs: vec![],
+            beside: None,
         };
         let Ok(OpResult::Job(id)) = node.apply(op).await else {
             panic!("identify did not start");
@@ -1808,6 +1810,7 @@ async fn watch_is_neither_elastic_nor_attachable() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let e = node.apply(op).await.unwrap_err();
     assert!(e.to_string().contains("watch cannot be elastic"), "{e}");
@@ -2185,6 +2188,7 @@ async fn a_sinked_decoder_resumed_at_another_capture_rate_keeps_its_sink() {
             handler: None,
             handler_named: false,
             needs: Vec::new(),
+            group: None,
         };
         let path = dir
             .path()
@@ -2688,6 +2692,7 @@ async fn a_replace_of_the_watch_completes_while_a_sink_restart_is_pending() {
         replace: vec![watch.clone()],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let replace = node.apply(op);
     tokio::pin!(replace);
@@ -2785,6 +2790,7 @@ async fn a_replace_of_the_decoder_during_its_sink_restart_leaves_it_stopped() {
         replace: vec![decoder.clone()],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let n = node.clone();
     let replace = tokio::spawn(async move { n.apply(op).await });
@@ -3745,6 +3751,7 @@ async fn a_hand_started_decoder_inside_the_band_is_left_alone() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let hand = match node.apply(op).await {
         Ok(OpResult::Job(j)) => j,
@@ -3830,6 +3837,7 @@ async fn a_replace_of_a_span_watch_stops_its_decoders() {
         replace: vec![watch.clone()],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let measure = match node.apply(op).await {
         Ok(OpResult::Job(j)) => j,

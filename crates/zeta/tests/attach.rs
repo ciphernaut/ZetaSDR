@@ -95,6 +95,7 @@ async fn start(node: &Node, kind: JobKind, bandwidth_hz: u64) -> JobId {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -299,6 +300,7 @@ async fn job_start_with_transcribe_is_refused() {
             replace: vec![],
             handler: None,
             needs: vec![],
+            beside: None,
         })
         .await;
     assert_eq!(
@@ -546,6 +548,7 @@ fn job_start_op(kind: &str, source: SourceId, center_hz: u64, bandwidth_hz: u64)
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     }
 }
 

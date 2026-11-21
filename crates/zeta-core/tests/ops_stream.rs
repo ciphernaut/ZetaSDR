@@ -526,6 +526,7 @@ fn op_name_matches_the_serialised_tag() {
             replace: vec![],
             handler: None,
             needs: vec![],
+            beside: None,
         },
         Op::JobRetune {
             job: JobId("j".into()),
@@ -624,6 +625,7 @@ async fn read_only_ops_are_logged_without_their_result() {
             replace: vec![],
             handler: None,
             needs: vec![],
+            beside: None,
         })
         .await
         .unwrap()
@@ -685,6 +687,7 @@ fn job_start(kind: JobKind, bandwidth_hz: u64) -> Op {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     }
 }
 

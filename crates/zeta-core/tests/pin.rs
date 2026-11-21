@@ -225,6 +225,7 @@ fn start(kind: JobKind, t: Tuning, elastic: bool, replace: Vec<JobId>) -> Op {
         replace,
         handler: None,
         needs: vec![],
+        beside: None,
     }
 }
 
@@ -566,6 +567,7 @@ fn running(kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord {
         handler: None,
         handler_named: false,
         needs: Vec::new(),
+        group: None,
     }
 }
 

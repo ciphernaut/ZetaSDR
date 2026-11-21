@@ -204,6 +204,7 @@ fn start(kind: JobKind, t: Tuning, elastic: bool) -> Op {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     }
 }
 

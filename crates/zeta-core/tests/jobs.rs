@@ -1079,3 +1079,295 @@ async fn the_same_mode_on_the_same_band_with_another_handler_is_not_a_duplicate(
     assert_eq!(h::try_start(&node, Some(ALT), &[]).await, again(&alt));
     assert_eq!(node.job_list().len(), 2);
 }
+
+// Plan 43: Send to starts a sibling beside a running job, and both carry its group.
+
+/// [`handler_node`], with its radio.
+async fn handler_node_with_radio(dir: &Path, packets: bool) -> (Node, Arc<h::Radio>) {
+    let radio = h::Radio::new();
+    let ports: Vec<Arc<dyn Port>> = vec![radio.clone()];
+    let node = Node::open(h::cfg(dir, packets), h::stages(None), ports)
+        .await
+        .unwrap();
+    (node, radio)
+}
+
+/// The id of a job a start answered.
+fn started(r: Result<OpResult, OpError>) -> JobId {
+    match r {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("a job: {r:?}"),
+    }
+}
+
+/// Wait until every job of `ids` is listed `Running`.
+async fn until_running(node: &Node, ids: &[&JobId]) {
+    common::until("the jobs run", Duration::from_secs(10), || {
+        ids.iter()
+            .all(|id| listed(node, id).state == JobState::Running)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_sibling_starts_beside_a_running_job_and_both_carry_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio) = handler_node_with_radio(dir.path(), false).await;
+    let first = h::start(&node, None, &[]).await;
+    until_running(&node, &[&first]).await;
+    let tunes = radio.tunes();
+    let sib = started(h::start_beside(&node, &first, Some(ALT), &[]).await);
+    until_running(&node, &[&first, &sib]).await;
+    assert_eq!(listed(&node, &first).group, Some(first.clone()));
+    let rec = listed(&node, &sib);
+    assert_eq!(rec.group, Some(first.clone()));
+    assert_eq!(
+        (rec.handler.as_deref(), rec.handler_named),
+        (Some(ALT), true)
+    );
+    assert_eq!(rec.tuning, listed(&node, &first).tuning);
+    assert_eq!(radio.tunes(), tunes, "the sibling's start tunes nothing");
+    assert_eq!(on_disk(dir.path(), &first).group, Some(first.clone()));
+    assert_eq!(on_disk(dir.path(), &sib).group, Some(first.clone()));
+    let wire = serde_json::to_value(listed(&node, &sib)).unwrap();
+    assert_eq!(wire["group"], first.0.as_str());
+}
+
+#[tokio::test]
+async fn send_to_from_a_sibling_joins_its_group() {
+    let dir = tempfile::tempdir().unwrap();
+    h::write_handler(dir.path(), "alt2", false);
+    let node = handler_node(dir.path(), false).await;
+    let first = h::start(&node, None, &[]).await;
+    let sib = started(h::start_beside(&node, &first, Some(ALT), &[]).await);
+    let third = started(h::start_beside(&node, &sib, Some("alt2"), &[]).await);
+    until_running(&node, &[&first, &sib, &third]).await;
+    for id in [&first, &sib, &third] {
+        assert_eq!(listed(&node, id).group, Some(first.clone()), "{id:?}");
+    }
+    let members: Vec<JobId> = node
+        .group_members(&first)
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(members, vec![first, sib, third], "oldest first");
+}
+
+#[tokio::test]
+async fn beside_refuses_a_handler_the_group_already_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let first = h::start(&node, None, &[]).await;
+    let refused = |handler: &str, member: &JobId| {
+        Err(OpError::Duplicate {
+            message: format!(
+                "handler {handler} already runs beside job {} as job {}",
+                first.0, member.0
+            ),
+            job: member.clone(),
+        })
+    };
+    assert_eq!(
+        h::start_beside(&node, &first, Some(OWN), &[]).await,
+        refused(OWN, &first)
+    );
+    assert_eq!(
+        listed(&node, &first).group,
+        None,
+        "a refusal writes no group"
+    );
+    let sib = started(h::start_beside(&node, &first, Some(ALT), &[]).await);
+    assert_eq!(
+        h::start_beside(&node, &first, Some(ALT), &[]).await,
+        refused(ALT, &sib)
+    );
+    // Named from the sibling, `beside job` is the job named.
+    assert_eq!(
+        h::start_beside(&node, &sib, Some(OWN), &[]).await,
+        Err(OpError::Duplicate {
+            message: format!(
+                "handler {OWN} already runs beside job {} as job {}",
+                sib.0, first.0
+            ),
+            job: first.clone(),
+        })
+    );
+    assert_eq!(node.job_list().len(), 2);
+}
+
+/// A job outside the group running the handler on the band is the ordinary duplicate,
+/// checked after the group's (design call 28).
+#[tokio::test]
+async fn beside_a_handler_run_outside_the_group_is_a_duplicate_naming_that_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let first = h::start(&node, None, &[]).await;
+    let stranger = h::start(&node, Some(ALT), &[]).await;
+    assert_eq!(
+        h::start_beside(&node, &first, Some(ALT), &[]).await,
+        Err(OpError::Duplicate {
+            message: format!(
+                "an identical {MODE} already runs on {} at 1090000000/2400000 Hz as job {}",
+                h::RADIO,
+                stranger.0
+            ),
+            job: stranger.clone(),
+        })
+    );
+    assert_eq!(listed(&node, &first).group, None);
+    assert_eq!(listed(&node, &stranger).group, None);
+}
+
+#[tokio::test]
+async fn beside_without_a_handler_names_the_free_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let first = h::start(&node, None, &[]).await;
+    assert_eq!(
+        h::start_beside(&node, &first, None, &[]).await,
+        Err(OpError::Other {
+            message: format!("beside needs a handler: one of {ALT}"),
+        })
+    );
+    started(h::start_beside(&node, &first, Some(ALT), &[]).await);
+    assert_eq!(
+        h::start_beside(&node, &first, None, &[]).await,
+        Err(OpError::Other {
+            message: "beside needs a handler: none is free".into(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn beside_refuses_a_band_that_is_not_the_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let first = h::start(&node, None, &[]).await;
+    let refused = |field: &str, asked: &str, its: &str| {
+        Err(OpError::Other {
+            message: format!(
+                "beside job {}: {field} is {asked}, the job's is {its}",
+                first.0
+            ),
+        })
+    };
+    let apply = |op: serde_json::Value| node.apply(serde_json::from_value(op).unwrap());
+    let mut op = h::beside_op(&node, &first, Some(ALT), &[]);
+    op["center_hz"] = 1_090_001_000u64.into();
+    assert_eq!(
+        apply(op).await,
+        refused("center_hz", "1090001000", "1090000000")
+    );
+    let mut op = h::beside_op(&node, &first, Some(ALT), &[]);
+    op["bandwidth_hz"] = 2_000_000u64.into();
+    assert_eq!(
+        apply(op).await,
+        refused("bandwidth_hz", "2000000", "2400000")
+    );
+    // A `replace` is refused with it: Send to stops nothing.
+    let mut op = h::beside_op(&node, &first, Some(ALT), &[]);
+    op["replace"] = serde_json::json!([first.0]);
+    assert_eq!(
+        apply(op).await,
+        Err(OpError::Other {
+            message: "beside: replace must be empty (Send to stops nothing)".into(),
+        })
+    );
+    // An unknown job is `unknown`.
+    let ghost = JobId::new();
+    let mut op = h::beside_op(&node, &first, Some(ALT), &[]);
+    op["beside"] = ghost.0.clone().into();
+    assert!(matches!(
+        apply(op).await,
+        Err(OpError::Unknown { field, value, .. }) if field == "job" && value == ghost.0
+    ));
+    assert_eq!(node.job_list().len(), 1, "nothing started");
+    assert_eq!(listed(&node, &first).group, None);
+}
+
+#[tokio::test]
+async fn beside_refuses_a_job_that_cannot_be_sent_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let Ok(OpResult::Job(fm)) = node.apply(fm_op(None, &[])).await else {
+        panic!("fm_demod start")
+    };
+    until_running(&node, &[&fm]).await;
+    let op = serde_json::json!({
+        "op": "job_start", "kind": MODE, "source": h::RADIO,
+        "center_hz": 100_000_000u64, "bandwidth_hz": 12_500u64,
+        "deviation_hz": null, "sideband": null, "elastic": false, "replace": [],
+        "handler": ALT, "needs": [], "beside": fm.0,
+    });
+    assert_eq!(
+        node.apply(serde_json::from_value(op).unwrap()).await,
+        Err(OpError::Other {
+            message: format!("job {} cannot be sent from: fm_demod has no handlers", fm.0),
+        })
+    );
+}
+
+#[tokio::test]
+async fn beside_refuses_a_stopped_job_and_writes_no_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let first = h::start(&node, None, &[]).await;
+    node.job_stop(&first).await.unwrap();
+    common::until("the job stops", Duration::from_secs(10), || {
+        listed(&node, &first).state == JobState::Stopped
+    })
+    .await;
+    assert_eq!(
+        h::start_beside(&node, &first, Some(ALT), &[]).await,
+        Err(OpError::Other {
+            message: format!("job {} is stopped", first.0),
+        })
+    );
+    assert_eq!(listed(&node, &first).group, None);
+    assert_eq!(node.job_list().len(), 1);
+}
+
+#[tokio::test]
+async fn stopping_the_first_member_leaves_its_sibling_running_in_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let first = h::start(&node, None, &[]).await;
+    let sib = started(h::start_beside(&node, &first, Some(ALT), &[]).await);
+    until_running(&node, &[&first, &sib]).await;
+    node.job_stop(&first).await.unwrap();
+    common::until("the first job stops", Duration::from_secs(10), || {
+        listed(&node, &first).state == JobState::Stopped
+    })
+    .await;
+    let rec = listed(&node, &sib);
+    assert_eq!(rec.state, JobState::Running);
+    assert_eq!(rec.group, Some(first.clone()));
+    let members: Vec<JobId> = node
+        .group_members(&first)
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(members, vec![sib]);
+}
+
+#[tokio::test]
+async fn a_failed_sibling_start_leaves_the_first_job_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let first = h::start(&node, None, &[]).await;
+    until_running(&node, &[&first]).await;
+    let before = listed(&node, &first);
+    h::alt_goes_missing(&node);
+    assert_eq!(
+        h::start_beside(&node, &first, Some(ALT), &[]).await,
+        Err(OpError::Other {
+            message: format!("{MODE}: handler {ALT} is unavailable: {}", h::ALT_MISSING),
+        })
+    );
+    let after = listed(&node, &first);
+    assert_eq!(after.state, JobState::Running);
+    assert_eq!(after.group, None);
+    assert_eq!(after.tuning, before.tuning);
+    assert_eq!(on_disk(dir.path(), &first).group, None);
+    assert_eq!(node.job_list().len(), 1);
+}

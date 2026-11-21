@@ -299,6 +299,7 @@ fn running(id: &JobId, kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord
         handler: None,
         handler_named: false,
         needs: Vec::new(),
+        group: None,
     }
 }
 
@@ -458,6 +459,7 @@ async fn job_start_records_the_capture_rate() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let id = match node.apply(op).await.unwrap() {
         OpResult::Job(id) => id,

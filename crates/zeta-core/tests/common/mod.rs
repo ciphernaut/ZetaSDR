@@ -120,6 +120,7 @@ pub fn cfg(dir: &Path, resume: bool) -> NodeConfig {
 /// `external_decode` stage (core cannot depend on it).
 pub mod handlers {
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -347,11 +348,13 @@ pub mod handlers {
         r
     }
 
-    /// A radio that tunes to exactly the band asked for, 20 MHz wide at most.
+    /// A radio that tunes to exactly the band asked for, 20 MHz wide at most, counting
+    /// its tunes.
     pub struct Radio {
         id: SourceId,
         caps: Capabilities,
         cur: Mutex<Option<Tuning>>,
+        tunes: AtomicUsize,
         tx: broadcast::Sender<IqBlock>,
     }
 
@@ -374,8 +377,14 @@ pub mod handlers {
                     sweep: None,
                 },
                 cur: Mutex::new(None),
+                tunes: AtomicUsize::new(0),
                 tx: broadcast::channel(1).0,
             })
+        }
+
+        /// How many times the radio has been tuned.
+        pub fn tunes(&self) -> usize {
+            self.tunes.load(Ordering::SeqCst)
         }
     }
 
@@ -388,6 +397,7 @@ pub mod handlers {
             &self.caps
         }
         async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+            self.tunes.fetch_add(1, Ordering::SeqCst);
             *self.cur.lock().unwrap() = Some(t);
             Ok(t)
         }
@@ -449,6 +459,40 @@ pub mod handlers {
         needs: &[StreamKind],
     ) -> Result<OpResult, OpError> {
         node.apply(start_op(handler, needs)).await
+    }
+
+    /// A `job_start` with `beside` naming `beside`, `handler` and `needs`, copying kind,
+    /// source and band from the job's record (as the CLI and the page fill them), as JSON
+    /// for a test to change.
+    pub fn beside_op(
+        node: &Node,
+        beside: &JobId,
+        handler: Option<&str>,
+        needs: &[&str],
+    ) -> serde_json::Value {
+        let rec = node
+            .job_list()
+            .into_iter()
+            .find(|r| &r.id == beside)
+            .expect("the job beside is listed");
+        serde_json::json!({
+            "op": "job_start", "kind": rec.kind, "source": rec.source.0,
+            "center_hz": rec.tuning.center_hz.0, "bandwidth_hz": rec.tuning.bandwidth_hz.0,
+            "deviation_hz": null, "sideband": null, "elastic": false, "replace": [],
+            "handler": handler, "needs": needs, "beside": beside.0,
+        })
+    }
+
+    /// What [`beside_op`] answers.
+    pub async fn start_beside(
+        node: &Node,
+        beside: &JobId,
+        handler: Option<&str>,
+        needs: &[&str],
+    ) -> Result<OpResult, OpError> {
+        let op = beside_op(node, beside, handler, needs);
+        node.apply(serde_json::from_value(op).expect("a job_start op"))
+            .await
     }
 }
 

@@ -199,8 +199,9 @@ How wide the source's capture is when a job or a set tunes it free. `fit` (the d
 - replace: array; ids from `job list` (strings), `[]` for none
 - handler: string or null; a mode row's kind only: a handler id of the mode (`modes list`'s `handlers[].id`); `null` for the handler policy's choice
 - needs: array; a mode row's kind only: the stream kinds the job must output, among `event`, `packet` and `audio` (`["packet"]` for a job to capture); `[]` for none
+- beside: string or null
 
-JSON: `{"op":"job_start","kind":"passthrough","source":"<id>","center_hz":144800000,"bandwidth_hz":12500,"deviation_hz":null,"sideband":null,"dwell_ms":null,"average":null,"bits":null,"method":null,"bin_hz":null,"audio_policy":null,"dwell_scale":null,"elastic":false,"replace":[],"handler":null,"needs":[]}`
+JSON: `{"op":"job_start","kind":"passthrough","source":"<id>","center_hz":144800000,"bandwidth_hz":12500,"deviation_hz":null,"sideband":null,"dwell_ms":null,"average":null,"bits":null,"method":null,"bin_hz":null,"audio_policy":null,"dwell_scale":null,"elastic":false,"replace":[],"handler":null,"needs":[],"beside":null}`
 
 CLI: `zeta job start --kind passthrough --source <id> --center-hz 144800000 --bandwidth-hz 12500`
 

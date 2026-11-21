@@ -107,13 +107,21 @@ pub struct JobRecord {
     /// the handler again chooses among those giving them. Empty for none.
     #[serde(default)]
     pub needs: Vec<crate::types::StreamKind>,
+    /// The Send to group the job runs in: the id of the job the first Send to named
+    /// (`job_start`'s `beside`), on that job and on every sibling started beside it or
+    /// beside a sibling; `null` on a job never sent from. A bare key: the job it names may
+    /// have stopped, or its record have been pruned. Not `plan_start`'s or `jobs_stop`'s
+    /// `group` (a channel plan's group).
+    #[serde(default)]
+    #[schemars(schema_with = "crate::types::nullable::<JobId>")]
+    pub group: Option<JobId>,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
 /// cannot override that for deserialisation); a record is always written with
 /// `format`, `input`, `capture_rate_hz`, `elastic`, `operator_graph`, `owner`,
-/// `audio_policy`, `stream`, `sinks`, `handler`, `handler_named` and `needs`, so the
-/// published schema requires them.
+/// `audio_policy`, `stream`, `sinks`, `handler`, `handler_named`, `needs` and `group`,
+/// so the published schema requires them.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -134,6 +142,7 @@ fn require_format(schema: &mut schemars::Schema) {
             "handler",
             "handler_named",
             "needs",
+            "group",
         ] {
             if !req.iter().any(|r| r == f) {
                 req.push(f.into());
@@ -202,5 +211,35 @@ mod tests {
         assert_eq!(written["handler_named"], false);
         assert!(r.needs.is_empty());
         assert_eq!(written["needs"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_record_without_group_loads_and_writes_null() {
+        let v = serde_json::json!({
+            "id": "01J00000000000000000000000",
+            "kind": "adsb_decode",
+            "graph": {"id": "g", "nodes": [], "edges": []},
+            "source": "s",
+            "tuning": {"center_hz": 1, "bandwidth_hz": 1},
+            "state": {"status": "running"},
+            "context": {},
+            "created_ns": 0
+        });
+        let r: JobRecord = serde_json::from_value(v).unwrap();
+        // A record from before Send to: in no group, written as `null`.
+        assert_eq!(r.group, None);
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["group"],
+            serde_json::Value::Null
+        );
+        let schema = serde_json::to_value(schemars::schema_for!(JobRecord)).unwrap();
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "group"),
+            "a record is always written with its group"
+        );
     }
 }

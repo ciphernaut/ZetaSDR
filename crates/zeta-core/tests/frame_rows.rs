@@ -195,6 +195,7 @@ async fn start(node: &Node, kind: JobKind) -> JobId {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,

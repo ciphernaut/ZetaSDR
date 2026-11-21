@@ -353,6 +353,27 @@ pub enum Op {
         /// for none; any other kind is refused one (`<kind> has no handlers`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         needs: Vec<StreamKind>,
+        /// Send to: start another handler of a running decoder's mode on its band, beside
+        /// it, disturbing nothing (`null`, or left out, for an ordinary start). `kind`,
+        /// `source`, `center_hz` and `bandwidth_hz` must be the named job's (its record's
+        /// `tuning`), `deviation_hz` and `sideband` `null` and `elastic` `false`, else
+        /// `beside job <id>: <field> is <asked>, the job's is <its>`; `replace` must be
+        /// `[]` (`beside: replace must be empty (Send to stops nothing)`); `handler` must
+        /// be named (`beside needs a handler: one of <the ready handlers the group does
+        /// not run>`, or `none is free`), and one a running member of the group already
+        /// runs is a `duplicate` naming that member (`handler <h> already runs beside job
+        /// <id> as job <member>`), as is one a job outside the group runs on the band.
+        /// An unknown job is `unknown`; one that is not running is `job <id> is <state>`;
+        /// an attached job, one a watch or an identify runs, an elastic one and one of no
+        /// mode row are `job <id> cannot be sent from: <why>`. The start tunes nothing.
+        /// The two share a group, the record field `group`: the named job's when it has
+        /// one, else its own id, which is then written on the named job once the sibling
+        /// runs (a start that fails writes nothing). `job_stop` stops one member.
+        // Left out when `null`, so a node or a CLI of this build can still start a job
+        // on an older node, which refuses a field it does not know.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(schema_with = "crate::types::nullable::<JobId>")]
+        beside: Option<JobId>,
     },
     /// Attach a job of an attachable `kind` (`transcribe` or `packets`) to the running job
     /// `job`. It reads one of that job's output streams instead of the radio, holds no
@@ -1395,14 +1416,14 @@ fn require_attach_stream(schema: &mut schemars::Schema) {
     }
 }
 
-/// `job_start`'s `handler` and `needs`, required last in its schema.
-const HANDLER_FIELDS: [&str; 2] = ["handler", "needs"];
+/// `job_start`'s `handler`, `needs` and `beside`, required last in its schema.
+const HANDLER_FIELDS: [&str; 3] = ["handler", "needs", "beside"];
 
 /// `job_start` requires its look, `dwell_ms`, `average`, `bits`, `method` and
 /// `bin_hz`, then `audio_policy` and `dwell_scale`, after `sideband` (the field order
 /// agents read), and like `deviation_hz` shows no default for them; they still default
-/// to `null` when a request from before them leaves them out. So too `handler` and
-/// `needs`, after `replace` (`null` and `[]` when left out).
+/// to `null` when a request from before them leaves them out. So too `handler`, `needs`
+/// and `beside`, after `replace` (`null`, `[]` and `null` when left out).
 fn require_the_look(schema: &mut schemars::Schema) {
     const LOOK: [&str; 7] = [
         "dwell_ms",
@@ -4818,6 +4839,165 @@ fn check_handler_fields(
     Ok(())
 }
 
+/// What a `job_start` with `beside` asks, as [`check_beside`] compares it with the job.
+struct BesideAsk<'a> {
+    kind: &'a JobKind,
+    source: &'a SourceId,
+    tuning: Tuning,
+    deviation_hz: Option<u64>,
+    sideband: Option<Sideband>,
+    elastic: bool,
+    replace: &'a [JobId],
+    handler: Option<&'a str>,
+}
+
+/// The Send to group a `job_start` with `beside` joins, as [`check_beside`] found it.
+struct Beside {
+    /// The job `beside` named.
+    job: JobId,
+    /// The group: the job's own, else its id.
+    group: JobId,
+    /// The job is in no group yet: once the sibling runs, its `group` is written.
+    new_group: bool,
+    /// The running members and the handler each runs (the named job alone when it has
+    /// no group yet), oldest first.
+    members: Vec<(JobId, String)>,
+}
+
+impl Beside {
+    /// The refusal of a start of `handler` that a running member already runs.
+    fn repeat(&self, handler: Option<&str>) -> Option<OpError> {
+        let h = handler?;
+        let (member, _) = self.members.iter().find(|(_, runs)| runs == h)?;
+        Some(OpError::Duplicate {
+            job: member.clone(),
+            message: format!(
+                "handler {h} already runs beside job {} as job {}",
+                self.job.0, member.0
+            ),
+        })
+    }
+}
+
+/// `job_start`'s `beside` (see [`Op::JobStart`]), under the source's gate once the
+/// handler is resolved (before, when none is named, so the policy is not consulted): the
+/// job is known (`unknown`), `running`, of a mode row, on the radio, not owned and not
+/// elastic; `replace` is empty; the band is the job's record's (`tuning`), the first
+/// field that differs named; a `handler` is named (else the ready ones the group does not
+/// run are listed). A handler the group runs is refused by [`Beside::repeat`], before
+/// the ordinary duplicate check.
+fn check_beside(
+    node: &Node,
+    beside: &JobId,
+    ask: &BesideAsk<'_>,
+    modes: &ModeRegistry,
+) -> Result<Beside, OpError> {
+    let jobs = node.job_list();
+    let Some(rec) = jobs.iter().find(|r| &r.id == beside) else {
+        return Err(unknown_job(node, beside));
+    };
+    if rec.state != JobState::Running {
+        return Err(other(format!(
+            "job {} is {}",
+            beside.0,
+            status_name(&rec.state)
+        )));
+    }
+    let cannot = |why: String| other(format!("job {} cannot be sent from: {why}", beside.0));
+    if let Some(input) = &rec.input {
+        return Err(cannot(format!("it is attached to job {}", input.0)));
+    }
+    if let Some(owner) = &rec.owner {
+        let by = match jobs.iter().find(|r| &r.id == owner) {
+            Some(o) => format!("{} {}", o.kind, owner.0),
+            None => format!("job {}", owner.0),
+        };
+        return Err(cannot(format!("it is run by {by}")));
+    }
+    if rec.elastic {
+        return Err(cannot("it is elastic".into()));
+    }
+    let Some(mode) = node
+        .expandable_kind(&rec.kind)
+        .and_then(|k| k.loaded_mode(modes).ok().flatten())
+    else {
+        return Err(cannot(format!("{} has no handlers", rec.kind)));
+    };
+    if !ask.replace.is_empty() {
+        return Err(other(
+            "beside: replace must be empty (Send to stops nothing)",
+        ));
+    }
+    let null = || "null".to_string();
+    let fields = [
+        ("kind", ask.kind.name().to_string(), rec.kind.clone()),
+        ("source", ask.source.0.clone(), rec.source.0.clone()),
+        (
+            "center_hz",
+            ask.tuning.center_hz.0.to_string(),
+            rec.tuning.center_hz.0.to_string(),
+        ),
+        (
+            "bandwidth_hz",
+            ask.tuning.bandwidth_hz.0.to_string(),
+            rec.tuning.bandwidth_hz.0.to_string(),
+        ),
+        (
+            "deviation_hz",
+            ask.deviation_hz.map_or_else(null, |d| d.to_string()),
+            null(),
+        ),
+        (
+            "sideband",
+            ask.sideband.map_or_else(null, |s| {
+                serde_json::to_value(s)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default()
+            }),
+            null(),
+        ),
+        ("elastic", ask.elastic.to_string(), rec.elastic.to_string()),
+    ];
+    if let Some((field, asked, its)) = fields.into_iter().find(|(_, a, i)| a != i) {
+        return Err(other(format!(
+            "beside job {}: {field} is {asked}, the job's is {its}",
+            beside.0
+        )));
+    }
+    // A record with no handler runs the row's own, as the duplicate rule reads it.
+    let own = mode.own_handler();
+    let runs = |r: &JobRecord| r.handler.clone().unwrap_or_else(|| own.clone());
+    let (group, members) = match &rec.group {
+        Some(g) => (
+            g.clone(),
+            node.group_members(g)
+                .iter()
+                .map(|r| (r.id.clone(), runs(r)))
+                .collect(),
+        ),
+        None => (rec.id.clone(), vec![(rec.id.clone(), runs(rec))]),
+    };
+    if ask.handler.is_none() {
+        let free: Vec<&str> = mode
+            .handlers
+            .iter()
+            .filter(|h| h.state == ModeState::Ready && !members.iter().any(|(_, r)| r == &h.id))
+            .map(|h| h.id.as_str())
+            .collect();
+        return Err(other(match free.is_empty() {
+            true => "beside needs a handler: none is free".to_string(),
+            false => format!("beside needs a handler: one of {}", free.join(", ")),
+        }));
+    }
+    Ok(Beside {
+        job: rec.id.clone(),
+        group,
+        new_group: rec.group.is_none(),
+        members,
+    })
+}
+
 /// `job_start`'s `dwell_scale`: `identify` only (else `other`), in
 /// 1..=[`IDENTIFY_DWELL_SCALE_MAX`] (else `out_of_range`).
 fn check_dwell_scale(kind: &JobKind, dwell_scale: Option<u32>) -> Result<(), OpError> {
@@ -5357,6 +5537,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             replace,
             handler,
             needs,
+            beside,
         } => {
             check_startable(&kind)?;
             if elastic && !kind.elastic_capable() {
@@ -5379,6 +5560,25 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 center_hz,
                 bandwidth_hz,
             };
+            let ask = BesideAsk {
+                kind: &kind,
+                source: &source,
+                tuning,
+                deviation_hz,
+                sideband,
+                elastic,
+                replace: &replace,
+                handler: handler.as_deref(),
+            };
+            if let Some(b) = &beside
+                && kind == JobKind::Scan
+            {
+                // A scan is of no mode row, so no job it can be sent beside is a scan:
+                // the check refuses it, naming why.
+                let _gate = node.gate_guard(&source).await;
+                check_beside(node, b, &ask, &node.modes())?;
+                return Err(other(format!("{} has no handlers", kind.name())));
+            }
             if kind == JobKind::Scan {
                 // No tune here: the scan leases its whole band and steps the
                 // source itself; on a held source it waits (a lossy one is a conflict).
@@ -5467,8 +5667,19 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             let guard = Some(node.gate_guard(&source).await);
             // The handler that runs, decided under the gate with the registry in force,
             // which the expansion below uses too; refused before anything is stopped or
-            // tuned.
+            // tuned. Beside a job a handler must be named: the policy is not consulted
+            // for a sibling.
             let modes = node.modes();
+            if let Some(b) = &beside
+                && handler.is_none()
+            {
+                // It refuses a sibling with no handler, naming the free ones.
+                let refused = check_beside(node, b, &ask, &modes)
+                    .err()
+                    .unwrap_or_else(|| other("beside needs a handler"));
+                drop(guard);
+                return Err(refused);
+            }
             let resolved = match kind.start_handler(
                 handler.as_deref(),
                 &needs,
@@ -5480,6 +5691,19 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                     drop(guard);
                     return Err(e);
                 }
+            };
+            // Then the job and the band beside it, and a handler its group runs; the
+            // ordinary duplicate check below still names a job outside the group.
+            let sibling = match beside.as_ref().map(|b| {
+                check_beside(node, b, &ask, &modes)
+                    .and_then(|s| s.repeat(resolved.as_deref()).map_or(Ok(s), Err))
+            }) {
+                Some(Err(e)) => {
+                    drop(guard);
+                    return Err(e);
+                }
+                Some(Ok(s)) => Some(s),
+                None => None,
             };
             // An identical rigid job already runs: refuse, naming it, before anything
             // is stopped or tuned, so a `replace` on a refused start stops nothing. A
@@ -5582,6 +5806,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                                     handler: resolved.clone(),
                                     named: handler.is_some(),
                                     needs: needs.clone(),
+                                    group: sibling.as_ref().map(|s| s.group.clone()),
                                 },
                             ),
                             match dwell_scale {
@@ -5591,6 +5816,14 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                             guard.as_ref(),
                         )
                         .await;
+                    // The job sent from joins the group it names once the sibling runs,
+                    // under the same gate: a start that failed wrote nothing. A write
+                    // that fails is in `persist_errors`; the group holds in memory.
+                    if r.is_ok()
+                        && let Some(s) = sibling.as_ref().filter(|s| s.new_group)
+                    {
+                        let _ = node.set_group(&s.job, &s.group);
+                    }
                     // The tune above moved the capture; the lease, inside it,
                     // tuned nothing more, so the elastic jobs follow from here.
                     let after = match after {

@@ -1898,6 +1898,7 @@ impl Command {
                 replace: replace.into_ids(),
                 handler,
                 needs: needs.into_iter().map(Into::into).collect(),
+                beside: None,
             },
             Command::Job(JobCmd::Attach {
                 kind,

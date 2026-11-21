@@ -121,6 +121,7 @@ async fn start(node: &Node, kind: JobKind) -> JobId {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     match node.apply(op).await.unwrap() {
         OpResult::Job(id) => id,
@@ -167,6 +168,7 @@ async fn resume_reexpands_a_builtin_graph_for_the_actual_rate() {
         handler: None,
         handler_named: false,
         needs: Vec::new(),
+        group: None,
     };
     let jobs = dir.path().join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();
@@ -392,6 +394,7 @@ async fn resume_fills_in_the_squelch_params_of_a_pre_squelch_record() {
             handler: None,
             handler_named: false,
             needs: Vec::new(),
+            group: None,
         };
         std::fs::write(
             jobs.join(format!("{}.json", rec.id.0)),
@@ -579,6 +582,7 @@ fn write_plan12_ch59(dir: &Path, rate_hz: u64) -> JobId {
         handler: None,
         handler_named: false,
         needs: Vec::new(),
+        group: None,
     };
     let jobs = dir.join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();
@@ -691,6 +695,7 @@ fn write_old_adsb(dir: &Path, operator_graph: bool) -> JobId {
         handler: None,
         handler_named: false,
         needs: Vec::new(),
+        group: None,
     };
     let jobs = dir.join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();

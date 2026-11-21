@@ -301,6 +301,7 @@ async fn identify(node: &Node, center_hz: u64) -> (JobId, tokio::task::JoinHandl
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let id = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -608,6 +609,7 @@ async fn identify_is_neither_elastic_nor_attachable() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let e = node.apply(op).await.unwrap_err();
     assert!(e.to_string().contains("identify cannot be elastic"), "{e}");
@@ -674,6 +676,7 @@ async fn a_replace_of_identify_completes_while_a_child_is_stopped() {
         replace: vec![id.clone()],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let replace = node.apply(op);
     tokio::pin!(replace);
@@ -1249,6 +1252,7 @@ async fn trials_stay_on_the_band_when_the_capture_is_no_wider() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let id = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,

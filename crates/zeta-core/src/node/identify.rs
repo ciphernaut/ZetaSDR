@@ -399,6 +399,7 @@ impl Inner {
             handler,
             handler_named: false,
             needs: Vec::new(),
+            group: None,
         };
         let child = rec.id.clone();
         // Recorded first, so a run resumed after a restart can stop it (see `stale`).

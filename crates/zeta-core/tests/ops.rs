@@ -225,6 +225,7 @@ async fn job_start_passthrough_then_list_then_stop() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let id = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -368,6 +369,7 @@ async fn source_ensure_during_job_start_does_not_retune() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let ensure = Op::SourceEnsure {
         source,
@@ -480,6 +482,7 @@ async fn job_start_holds_the_gate_through_its_tune_and_lease() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     // B: 2 MHz around A's band, asked while A's slow tune is under way. A holds the
     // source's gate from its tune through its lease, so B waits behind A (it cannot
@@ -1193,6 +1196,7 @@ async fn conflict_reports_current_tuning_and_real_options() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -1305,6 +1309,7 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -2044,6 +2049,7 @@ fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     }
 }
 
@@ -3500,6 +3506,7 @@ fn a_job_start_without_a_dwell_scale_is_written_without_it() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let plain = serde_json::to_value(start(None)).unwrap();
     assert!(plain.get("dwell_scale").is_none(), "{plain}");
@@ -3592,6 +3599,7 @@ async fn start_on(node: &Node, source: &str, kind: JobKind, elastic: bool) -> Jo
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -3804,6 +3812,7 @@ async fn job_start_on_a_faulted_source_is_refused_naming_the_source() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     match node.apply(start(100_000_000)).await {
         Err(OpError::Other { message }) => {
@@ -4146,6 +4155,7 @@ fn start_look(kind: JobKind, dwell_ms: Option<u64>, average: Option<u32>) -> Op 
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     }
 }
 

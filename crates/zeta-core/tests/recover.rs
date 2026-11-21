@@ -250,6 +250,7 @@ async fn start_measure(node: &Node) -> JobId {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -413,6 +414,7 @@ async fn a_record_failed_in_an_earlier_episode_is_not_recovered() {
         handler: None,
         handler_named: false,
         needs: Vec::new(),
+        group: None,
     };
     let jobs = dir.path().join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();
@@ -945,6 +947,7 @@ async fn a_heal_does_not_wait_for_a_self_sweep() {
         replace: vec![],
         handler: None,
         needs: vec![],
+        beside: None,
     };
     let scan = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,

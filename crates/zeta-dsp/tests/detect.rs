@@ -125,6 +125,7 @@ async fn detect_publishes_new_and_gone_for_a_synthesised_burst() {
             replace: vec![],
             handler: None,
             needs: vec![],
+            beside: None,
         })
         .await
         .unwrap()
