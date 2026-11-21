@@ -23,7 +23,7 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::launch::{AfterGate, StageRunning, supervise};
+use super::launch::{AfterGate, Ending, StageRunning, supervise};
 use super::origin::{OriginQuery, described, judged, measured_modulation, origins_of};
 use super::persist::now;
 use super::{Inner, NodeError, source_fault_reason};
@@ -168,7 +168,7 @@ impl Inner {
             Some(port),
             set,
             token,
-            (vec![out.clone()], None, Vec::new()),
+            Ending::streams(vec![out.clone()]),
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run

@@ -3,6 +3,7 @@
 //! [`super::scan`], the `identify` job's controller in [`super::identify`].
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -34,8 +35,44 @@ use crate::types::{JobId, Provenance, SourceId, Span, StreamId, StreamKind, Time
 /// its first stage ended cleanly, before the supervisor cancels it, ms.
 pub const DRAIN_TIMEOUT_MS: u64 = 2000;
 
+/// [`DRAIN_TIMEOUT_MS`] for a replay (a record with `replay`), ms: past a program's exit
+/// grace and its events' drain, so its decoder finishes the recording.
+pub const REPLAY_DRAIN_TIMEOUT_MS: u64 = 8000;
+
 /// A draining job's stage tasks with the streams each outputs to.
 pub(super) type Drain = HashMap<tokio::task::Id, Vec<StreamId>>;
+
+/// A replay's count of the events it decoded, and the tees that count them (see
+/// [`Inner::tee_replay`]).
+#[derive(Default)]
+pub(super) struct ReplayTally {
+    events: Arc<AtomicU64>,
+    tees: Vec<JoinHandle<()>>,
+}
+
+/// What [`supervise`] ends with a job's stage tasks.
+pub(super) struct Ending {
+    /// The job's streams, unregistered at the end.
+    pub(super) streams: Vec<StreamId>,
+    /// A draining job's stage tasks and the drain's bound, ms.
+    pub(super) drain: Option<(Drain, u64)>,
+    /// The job's proposal watchers.
+    pub(super) watchers: Vec<JoinHandle<()>>,
+    /// A replay's count of what it decoded.
+    pub(super) tally: Option<ReplayTally>,
+}
+
+impl Ending {
+    /// Only `streams`: a job that does not drain, watch for proposals or replay.
+    pub(super) fn streams(streams: Vec<StreamId>) -> Self {
+        Self {
+            streams,
+            drain: None,
+            watchers: Vec::new(),
+            tally: None,
+        }
+    }
+}
 
 /// What a launch under the source's gate leaves for once the gate is released
 /// (see [`Inner::launch_gated`]): each takes the gate itself.
@@ -282,6 +319,12 @@ impl Inner {
         let attached = rec.input.is_some();
         // A job on no radio and no input job drains when a stage ends (see `supervise`).
         let drains = rec.leaseless() && !attached;
+        let drain_ms = match rec.replay {
+            Some(_) => REPLAY_DRAIN_TIMEOUT_MS,
+            None => DRAIN_TIMEOUT_MS,
+        };
+        // A replay counts what it decodes, for the note it ends with.
+        let mut tally = rec.replay.is_some().then(ReplayTally::default);
         // On error the port moved anyway: `launch_gated` relaunches every elastic job.
         let (prov, run, ended) = self.record_running(rec, &token)?;
 
@@ -434,6 +477,9 @@ impl Inner {
                 let rules = (identity.clone(), station.clone());
                 self.tee_rules(rec, run, rules, &pairs(&job_outputs[before..]), &token);
             }
+            if let Some(tally) = &mut tally {
+                self.tee_replay(tally, &pairs(&job_outputs[first_output..]), &token);
+            }
             let ids: Vec<StreamId> = outputs.into_iter().map(|(_, s)| s).collect();
             let own = ids.clone();
             let (params, bus, cancel) = (n.params.clone(), self.bus.clone(), token.clone());
@@ -487,7 +533,12 @@ impl Inner {
             port,
             set,
             token,
-            (streams, drains.then_some(drain), watchers),
+            Ending {
+                streams,
+                drain: drains.then_some((drain, drain_ms)),
+                watchers,
+                tally,
+            },
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run
@@ -662,6 +713,53 @@ impl Inner {
                     }
                 }
             });
+        }
+    }
+
+    /// Count into `tally` the events a replay decoded on its `Event` outputs among
+    /// `outputs`: the payloads with both `replay` and `handler` (the envelope's events;
+    /// `capture_in`'s `segment` events and bare diagnostics carry no `handler`). One task
+    /// per output, each subscribed before this returns and kept in `tally` for the
+    /// supervisor to await. A tee ends when its stream is unregistered, or on `token`
+    /// once it has counted what is buffered; a lag only skips events.
+    pub(super) fn tee_replay(
+        &self,
+        tally: &mut ReplayTally,
+        outputs: &[(StreamKind, StreamId)],
+        token: &CancellationToken,
+    ) {
+        for (_, sid) in outputs.iter().filter(|(k, _)| *k == StreamKind::Event) {
+            let Some(mut rx) = self.bus.subscribe(sid) else {
+                continue;
+            };
+            let (events, token) = (tally.events.clone(), token.clone());
+            let count = move |frame: Frame| {
+                if let Payload::Event(v) = &frame.payload
+                    && v.get("replay").is_some()
+                    && v.get("handler").is_some()
+                {
+                    events.fetch_add(1, Ordering::Relaxed);
+                }
+            };
+            tally.tees.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        r = rx.recv() => match r {
+                            Ok(frame) => count(frame),
+                            Err(RecvError::Lagged(_)) => continue,
+                            Err(RecvError::Closed) => return,
+                        },
+                        _ = token.cancelled() => loop {
+                            match rx.try_recv() {
+                                Ok(frame) => count(frame),
+                                Err(TryRecvError::Lagged(_)) => continue,
+                                Err(TryRecvError::Empty | TryRecvError::Closed) => return,
+                            }
+                        },
+                    }
+                }
+            }));
         }
     }
 
@@ -1223,13 +1321,18 @@ fn node_outputs(
 /// With `drain` (a job on no radio and no input job: its stage tasks and their output
 /// streams), a stage that ends cleanly stops nothing: its output streams are
 /// unregistered, so each consumer sees its input close, flushes and ends in turn, and
-/// the rest are cancelled once all have ended or [`DRAIN_TIMEOUT_MS`] after the first
-/// clean end. A failure still cancels at once.
+/// the rest are cancelled once all have ended or the drain's bound (ms:
+/// [`DRAIN_TIMEOUT_MS`], [`REPLAY_DRAIN_TIMEOUT_MS`] for a replay) after the first clean
+/// end. A failure still cancels at once.
 ///
 /// `watchers` (the job's proposal watchers, see [`super::propose::watch_for_proposals`])
 /// are awaited once the stages have ended and the token is cancelled, at most
 /// [`super::propose::PROPOSAL_DRAIN_MS`], so a proposal from the job's last events is
 /// noted before its session record is written.
+///
+/// `tally` (a replay's, see [`Inner::tee_replay`]): its tees are awaited then too, and a
+/// replay that did not fail notes in its context what it decoded (see [`replay_note`])
+/// before its record is finished.
 pub(super) async fn supervise(
     inner: Arc<Inner>,
     id: JobId,
@@ -1237,12 +1340,21 @@ pub(super) async fn supervise(
     port: Option<Arc<dyn Port>>,
     mut set: JoinSet<Result<(), StageError>>,
     token: CancellationToken,
-    (streams, mut drain, watchers): (Vec<StreamId>, Option<Drain>, Vec<JoinHandle<()>>),
+    Ending {
+        streams,
+        drain,
+        watchers,
+        tally,
+    }: Ending,
 ) {
+    let (mut drain, drain_ms) = match drain {
+        Some((d, ms)) => (Some(d), ms),
+        None => (None, DRAIN_TIMEOUT_MS),
+    };
     let mut failure = None;
     // Whether a stage ended the job (not a stop, nothing failing).
     let mut stage_ended = false;
-    // When a draining job's first clean end gave the rest `DRAIN_TIMEOUT_MS`.
+    // When a draining job's first clean end gave the rest `drain_ms`.
     let mut deadline: Option<tokio::time::Instant> = None;
     loop {
         let next = match deadline.filter(|_| !token.is_cancelled()) {
@@ -1267,7 +1379,7 @@ pub(super) async fn supervise(
                             inner.bus.unregister(&s);
                         }
                         deadline.get_or_insert_with(|| {
-                            tokio::time::Instant::now() + Duration::from_millis(DRAIN_TIMEOUT_MS)
+                            tokio::time::Instant::now() + Duration::from_millis(drain_ms)
                         });
                     }
                     None => token.cancel(),
@@ -1292,6 +1404,18 @@ pub(super) async fn supervise(
         token.cancel();
         super::propose::drain_watchers(watchers).await;
     }
+    // A replay's count tees take what is buffered on the cancelled token, then end.
+    let events = match tally {
+        Some(tally) => {
+            token.cancel();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            for tee in tally.tees {
+                let _ = tokio::time::timeout_at(deadline, tee).await;
+            }
+            Some(tally.events.load(Ordering::Relaxed))
+        }
+        None => None,
+    };
     // An elastic job being relaunched keeps its record `Running` and its lease
     // for the relaunch (see `Inner::relaunch_elastic`). A run whose entry a later
     // run took leaves the record, the lease and the port to that run.
@@ -1323,6 +1447,19 @@ pub(super) async fn supervise(
             .map(|e| e.record.clone());
         if let Some(rec) = ending {
             super::propose::record_session(&inner, &rec);
+        }
+        // A replay that did not fail (it ended, or was stopped) says what it decoded,
+        // written before the record is finished so the terminal record holds it.
+        if let (None, Some(events)) = (&failure, events) {
+            let context = inner
+                .jobs
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|e| e.record.context.clone());
+            if let Some(patch) = context.map(|c| replay_note(&c, events)) {
+                let _ = inner.context_merge(&id, patch);
+            }
         }
         let end = match failure {
             Some(reason) => JobState::Failed { reason },
@@ -1382,6 +1519,31 @@ pub(super) async fn supervise(
     {
         inner.leases.idle_if_unheld(port.as_ref()).await;
     }
+}
+
+/// The context patch a replay ends with, from its `context` and the `events` it decoded:
+/// its `replay` object (`capture`, `captures`, `source`, `start_ns`, `end_ns`) with
+/// `events` added, and `note: "replayed <n> capture(s) from <source>: <events> event(s)"`.
+fn replay_note(context: &serde_json::Value, events: u64) -> serde_json::Value {
+    let mut replay = context
+        .get("replay")
+        .and_then(|r| r.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let n = replay
+        .get("captures")
+        .and_then(|c| c.as_array())
+        .map_or(0, Vec::len);
+    let source = replay
+        .get("source")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    replay.insert("events".into(), events.into());
+    serde_json::json!({
+        "replay": replay,
+        "note": format!("replayed {n} capture(s) from {source}: {events} event(s)"),
+    })
 }
 
 impl Inner {

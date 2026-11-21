@@ -102,12 +102,17 @@ fn write_aprs(node: &Node, n: usize) -> Vec<String> {
 /// A set of `n` captures of 500 ms of silence at 1090 MHz, 2.4 MHz wide at 2.4 MHz,
 /// which `adsb_decode`'s handlers take; their ids by start time.
 fn write_adsb(node: &Node, n: usize) -> Vec<String> {
+    write_adsb_set(node, "adsb", n)
+}
+
+/// [`write_adsb`] as the set `set`.
+fn write_adsb_set(node: &Node, set: &str, n: usize) -> Vec<String> {
     let iq = vec![num_complex::Complex::new(0.0f32, 0.0); ADSB_RATE_HZ as usize / 2];
     (0..n)
         .map(|i| {
             write_capture(
                 node,
-                "adsb",
+                set,
                 (ADSB_CENTER_HZ, ADSB_RATE_HZ as u64, ADSB_RATE_HZ),
                 T0_NS + i as u64 * GAP_NS,
                 &iq,
@@ -452,6 +457,127 @@ async fn a_second_replay_of_the_same_capture_mode_and_handler_is_a_duplicate() {
     // Once the first has ended, the same replay starts again.
     let again = started(decode(&node, &ids[0], MODE, None, false).await);
     node.job_stop(&again).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_finished_replay_notes_what_it_decoded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let ids = write_aprs(&node, 3);
+    let id = started(decode(&node, &ids[0], APRS, None, false).await);
+    until_stopped(&node, &id, Duration::from_secs(20)).await;
+    let rec = record(&node, &id);
+    let replay = &rec.context["replay"];
+    assert_eq!(replay["events"], 3, "{}", rec.context);
+    // The rest of what the replay noted at its start is kept.
+    assert_eq!(replay["captures"], json!(ids), "{replay}");
+    assert_eq!(replay["source"], RADIO, "{replay}");
+    assert_eq!(
+        rec.context["note"],
+        format!("replayed 3 capture(s) from {RADIO}: 3 event(s)"),
+        "{}",
+        rec.context
+    );
+}
+
+#[tokio::test]
+async fn a_replay_that_decodes_nothing_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let mut iq = vec![num_complex::Complex::new(0.0f32, 0.0); APRS_RATE_HZ as usize];
+    // A second of unit-power noise.
+    zeta_dsp::synth::awgn(&mut iq, 0.0, 7);
+    let cap = write_capture(
+        &node,
+        "noise",
+        (APRS_CENTER_HZ, APRS_BAND_HZ, APRS_RATE_HZ),
+        T0_NS,
+        &iq,
+    );
+    let id = started(decode(&node, &cap, APRS, None, false).await);
+    until_stopped(&node, &id, Duration::from_secs(20)).await;
+    let rec = record(&node, &id);
+    assert_eq!(rec.state, JobState::Stopped);
+    assert_eq!(rec.context["replay"]["events"], 0, "{}", rec.context);
+    assert_eq!(
+        rec.context["note"],
+        format!("replayed 1 capture(s) from {RADIO}: 0 event(s)"),
+        "{}",
+        rec.context
+    );
+}
+
+#[tokio::test]
+async fn a_handler_that_never_exits_is_given_eight_seconds_and_the_job_still_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    // 500 ms of recording, into the stand-in decoder that ends only when cancelled.
+    let ids = write_adsb(&node, 1);
+    let cap = node.bursts().get(&ids[0]).unwrap();
+    let length = Duration::from_nanos(cap.end_ns - cap.start_ns);
+    let mut feed = replay_feed(&node);
+    let id = started(decode(&node, &ids[0], MODE, None, false).await);
+    // `capture_in` ends its pause after the last block once the recording has played
+    // from its `segment` event.
+    let played = loop {
+        let f = tokio::time::timeout(Duration::from_secs(10), feed.recv())
+            .await
+            .expect("the segment event in time")
+            .unwrap();
+        if event_of(&f).is_some_and(|ev| ev["protocol"] == "segment") {
+            break tokio::time::Instant::now();
+        }
+    };
+    let pause = Duration::from_millis(zeta_dsp::capture_in::LOOP_PAUSE_MS_DEFAULT);
+    until_stopped(&node, &id, Duration::from_secs(20)).await;
+    let after_end = played.elapsed().saturating_sub(length + pause);
+    assert!(
+        (Duration::from_millis(2500)..Duration::from_secs(10)).contains(&after_end),
+        "stopped {after_end:?} after the recording ended"
+    );
+    let rec = record(&node, &id);
+    assert_eq!(rec.state, JobState::Stopped);
+    assert!(
+        rec.context["note"]
+            .as_str()
+            .is_some_and(|n| n.starts_with("replayed 1 capture(s) from ")),
+        "{}",
+        rec.context
+    );
+}
+
+#[tokio::test]
+async fn two_replays_of_one_capture_keep_one_finished_record_per_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let a = write_adsb_set(&node, "a", 1);
+    let b = write_adsb_set(&node, "b", 1);
+    for (cap, handler) in [
+        (&a[0], None),
+        (&a[0], None),
+        (&a[0], Some(ALT)),
+        (&b[0], None),
+    ] {
+        let id = started(decode(&node, cap, MODE, handler, false).await);
+        node.job_stop(&id).await.unwrap();
+    }
+    let finished = |cap: &str| -> Vec<Option<String>> {
+        let mut hs: Vec<_> = node
+            .job_list()
+            .into_iter()
+            .filter(|r| r.replay.as_deref() == Some(cap) && r.state == JobState::Stopped)
+            .map(|r| r.handler)
+            .collect();
+        hs.sort();
+        hs
+    };
+    // The second run of `a` by its own handler took the first's place; `alt`'s run and
+    // the run of another recording on the same band each keep theirs.
+    assert_eq!(
+        finished(&a[0]),
+        [Some(ALT.to_string()), Some(OWN.to_string())]
+    );
+    assert_eq!(finished(&b[0]), [Some(OWN.to_string())]);
 }
 
 /// A port of id `id`, never fed.

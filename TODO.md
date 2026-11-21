@@ -10,7 +10,6 @@ From the operator, 2026-11-20 and 2026-11-21. Spec: `docs/superpowers/specs/2026
 - **Plan 45:** OnAir's other modes, rows with no decoder of their own (with the `policy` placeholder), and the two patches to offer upstream. Not planned. Gist: one handler-file entry per mode, each with a `modes check` against the row's synthesised capture; AIS and APRS with packets first; rows with `decoder: null` for modes only OnAir decodes; the patches (a file source that reads a pipe, sample time to its Wireshark hub) proven in `onair-rx` first.
 - **Plan 42 follow-ups**, from the branch's last review. One line each:
   - **The agent's allow gates do not cover `handler_policy_set`:** only the prose says to change the ranking on the operator's word.
-  - **Packets still in a program's socket when it exits cleanly are lost:** the packet reader is stopped with the run, with no drain like the events'. Matters to plan 44's replay, whose input ends.
   - **A hand-written graph row naming `external_decode` is listed with `packet`** (`template::outputs`) while its launch gives it events only: the mismatch `nbfm_demod` has.
   - **Events on tcp with packets on stdout:** stdout is not read until the event port connects, so a program writing packets first can block on a full pipe.
   - **A handler `unavailable` at start stays so across modes reloads** until a restart, as rows do: a program installed later is not found until then.

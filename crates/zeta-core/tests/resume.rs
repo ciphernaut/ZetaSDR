@@ -808,6 +808,41 @@ async fn a_packets_attachment_does_not_resume() {
     .await;
 }
 
+#[tokio::test]
+async fn a_replay_found_running_is_stopped_with_a_note_and_not_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = JobId::new();
+    let rec = JobRecord {
+        source: SourceId("node".into()),
+        operator_graph: true,
+        replay: Some("01CAPTURE".into()),
+        context: serde_json::json!({"replay": {"capture": "01CAPTURE", "captures": ["01CAPTURE"]}}),
+        ..running(&id, "passthrough", band(48_000), 1)
+    };
+    write_records(dir.path(), &[rec]);
+    let (_src, port) = source_with(dir.path(), true);
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    let rec = record(&node, &id);
+    assert_eq!(rec.state, JobState::Stopped);
+    assert_eq!(
+        rec.context["note"], "a replay does not resume: run it again",
+        "{}",
+        rec.context
+    );
+    // What the replay noted at its start is kept.
+    assert_eq!(rec.context["replay"]["capture"], "01CAPTURE");
+    assert_eq!(on_disk(dir.path(), &id).state, JobState::Stopped);
+    assert!(
+        node.bus()
+            .list()
+            .iter()
+            .all(|s| s.provenance.job.as_ref() != Some(&id)),
+        "no stream of the replay"
+    );
+}
+
 // Plan 42: a relaunch keeps the job's handler, or decides it again.
 
 use common::handlers::{self as h, ALT, MODE, OWN};

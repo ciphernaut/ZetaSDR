@@ -981,7 +981,8 @@ impl Inner {
     }
 
     /// Forget the terminal records that a later re-run replaced (the same kind on the
-    /// same source and band with the same handler, started after it ended), then those
+    /// same source and band with the same handler, and for a replay of the same capture,
+    /// started after it ended), then those
     /// that ended earliest beyond [`JOB_HISTORY_MAX`], removing their files (best
     /// effort: a file that will not go is retried at the next prune). Called with `jobs`
     /// locked after a record turns terminal; that record ended last, so it survives. A
@@ -1027,10 +1028,17 @@ impl Inner {
                     .map(|m| m.own_handler())
             });
         }
-        fn key<'a>(
-            e: &'a JobEntry,
-            own: &'a HashMap<&str, Option<String>>,
-        ) -> (&'a str, &'a SourceId, u64, u64, Option<&'a str>) {
+        // A replay's key also names the capture it replayed: one of another recording on
+        // the same band is no re-run of it.
+        type Key<'a> = (
+            &'a str,
+            &'a SourceId,
+            u64,
+            u64,
+            Option<&'a str>,
+            Option<&'a str>,
+        );
+        fn key<'a>(e: &'a JobEntry, own: &'a HashMap<&str, Option<String>>) -> Key<'a> {
             let r = &e.record;
             let handler = r
                 .handler
@@ -1042,6 +1050,7 @@ impl Inner {
                 r.tuning.center_hz.0,
                 r.tuning.bandwidth_hz.0,
                 handler,
+                r.replay.as_deref(),
             )
         }
         // Per band, the terminal record that started last.
@@ -1292,21 +1301,29 @@ impl Inner {
 /// The note a `packets` record left running by the last node carries once `open` stops it.
 const PACKETS_NO_RESUME_NOTE: &str = "packet capture does not resume: attach again";
 
-/// A `packets` attachment does not resume across a restart: each `packets` record that
-/// was `Running` is set `Stopped` with [`PACKETS_NO_RESUME_NOTE`] as its context's
-/// `note` (its `capture`, `packets` and `bytes` kept) and persisted, so `open` loads it
-/// as it is; its file stays in the packet store, closed.
-fn stop_packet_captures(dir: &Path, records: &mut [JobRecord]) -> Result<(), NodeError> {
-    for rec in records
-        .iter_mut()
-        .filter(|r| r.kind == JobKind::Packets.name() && r.state == JobState::Running)
-    {
+/// The note a replay record left running by the last node carries once `open` stops it.
+pub(crate) const REPLAY_NO_RESUME_NOTE: &str = "a replay does not resume: run it again";
+
+/// A `packets` attachment and a replay do not resume across a restart: each such record
+/// that was `Running` is set `Stopped` with [`PACKETS_NO_RESUME_NOTE`] or
+/// [`REPLAY_NO_RESUME_NOTE`] as its context's `note` (the rest of its context kept: a
+/// capture's `capture`, `packets` and `bytes`, a replay's `replay`) and persisted, so
+/// `open` loads it as it is; a packet capture's file stays in the packet store, closed.
+fn stop_unresumable(dir: &Path, records: &mut [JobRecord]) -> Result<(), NodeError> {
+    for rec in records.iter_mut().filter(|r| r.state == JobState::Running) {
+        let note = if rec.kind == JobKind::Packets.name() {
+            PACKETS_NO_RESUME_NOTE
+        } else if rec.replay.is_some() {
+            REPLAY_NO_RESUME_NOTE
+        } else {
+            continue;
+        };
         rec.state = JobState::Stopped;
         match rec.context.as_object_mut() {
             Some(m) => {
-                m.insert("note".into(), PACKETS_NO_RESUME_NOTE.into());
+                m.insert("note".into(), note.into());
             }
-            None => rec.context = serde_json::json!({"note": PACKETS_NO_RESUME_NOTE}),
+            None => rec.context = serde_json::json!({ "note": note }),
         }
         persist(dir, rec)?;
     }
@@ -1436,8 +1453,9 @@ impl Node {
     /// whose input does not run is kept as `Failed` with `input job <id> not
     /// running`, and one that failed that way resumes once its input runs. A
     /// `packets` attachment never resumes: one left `Running` is set `Stopped` with
-    /// the note `packet capture does not resume: attach again` (see
-    /// [`stop_packet_captures`]); its input resumes as any job does.
+    /// the note `packet capture does not resume: attach again`; its input resumes as any
+    /// job does. Nor does a replay: one left `Running` is set `Stopped` with the note
+    /// `a replay does not resume: run it again` (see [`stop_unresumable`]).
     /// Without `cfg.resume` every record is loaded as persisted, untouched.
     /// Either way, before any of that, each attached source pinned in its record
     /// (`state_dir/sources`) is held at its pin (see [`Node::source_pin`]), so a
@@ -1483,7 +1501,7 @@ impl Node {
         let (mut records, mut load_errors) = load(&jobs_dir)?;
         let job_load_errors = load_errors.len();
         if cfg.resume {
-            stop_packet_captures(&jobs_dir, &mut records)?;
+            stop_unresumable(&jobs_dir, &mut records)?;
         }
         let (station, station_error) = crate::station::load(&cfg.state_dir);
         load_errors.extend(station_error);

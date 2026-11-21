@@ -44,7 +44,8 @@
 //!
 //! **Ending.** Cancel kills and reaps the child and returns `Cancelled`. When the input
 //! closes, the child's input is closed and it gets [`EXIT_GRACE`] to finish; a clean exit
-//! then is `Ok(())` (lines still unread are published first). Any other exit is
+//! then is `Ok(())` (lines still unread are published first, and the packet output is
+//! read until the program closes it, at most [`DRAIN`] more). Any other exit is
 //! `Failed("<mode id>: <program> exited with <status> (<stderr tail>)")`.
 
 use std::collections::BTreeMap;
@@ -86,7 +87,8 @@ const CONNECT_RETRY: Duration = Duration::from_millis(100);
 /// How long a closed or failed packet output waits before it is noted: a program exiting
 /// closes it first, and the run ending meanwhile ends the packet reader without a note.
 pub const PACKET_LOST_GRACE: Duration = Duration::from_secs(1);
-/// How long output lines still unread are published after the child exits.
+/// How long output lines still unread are published after the child exits, and how long
+/// a run whose input is done still reads the packet output until the program closes it.
 const DRAIN: Duration = Duration::from_secs(1);
 /// How often the job's `external.unparsed` count is noted at most.
 const NOTE_EVERY: Duration = Duration::from_secs(1);
@@ -520,8 +522,8 @@ pub async fn run_row(
         external: Mutex::new(serde_json::Map::new()),
     });
     // The packet output is read once the events' output is connected; the task ends
-    // with the run.
-    let packet_task = match &block.packets {
+    // with the run (one whose input is done drains it first).
+    let mut packet_task = match &block.packets {
         None => None,
         Some(p) => {
             let source = match p.via {
@@ -576,6 +578,15 @@ pub async fn run_row(
     let result = pump(reader, &mut writer, &mut child, &publisher, ends).await;
     publisher.note_unparsed(true);
     writer.0.abort();
+    // A run whose input is done reads the packets the program still writes as it ends,
+    // until it closes its packet output (or a cancel); a cancelled or failed run drops
+    // them.
+    if let (Ok(()), Some(task)) = (&result, packet_task.as_mut()) {
+        tokio::select! {
+            _ = tokio::time::timeout(DRAIN, &mut task.0) => {}
+            _ = cancel.cancelled() => {}
+        }
+    }
     drop(packet_task);
     proc::reap(&mut child, id).await;
     drop(fifo_dir);

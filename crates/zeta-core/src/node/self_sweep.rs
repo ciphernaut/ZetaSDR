@@ -11,7 +11,7 @@ use tokio::sync::{OwnedMutexGuard, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::launch::{StageRunning, supervise};
+use super::launch::{Ending, StageRunning, supervise};
 use super::scan::{Look, SweepTiming, TIMING_EVERY_NS, dwell_rows_per_s, refusal_reason};
 use super::{Inner, JobOutput, NodeError};
 use crate::job::JobRecord;
@@ -124,7 +124,7 @@ impl Inner {
             Some(port),
             set,
             token,
-            (vec![out.clone()], None, Vec::new()),
+            Ending::streams(vec![out.clone()]),
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run

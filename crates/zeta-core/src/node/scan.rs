@@ -20,7 +20,7 @@ use tokio::sync::{OwnedMutexGuard, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::launch::{AfterGate, StageRunning, supervise};
+use super::launch::{AfterGate, Ending, StageRunning, supervise};
 use super::self_sweep::SweepStart;
 use super::{Inner, JobOutput, NodeError, ring_seconds_for, source_fault_reason};
 use crate::graph::{self, GraphError, NodeId};
@@ -359,7 +359,7 @@ impl Inner {
             Some(port),
             set,
             token,
-            (vec![out.clone()], None, Vec::new()),
+            Ending::streams(vec![out.clone()]),
         ));
         if let Some(e) = self.jobs.lock().unwrap().get_mut(&id)
             && e.run == run

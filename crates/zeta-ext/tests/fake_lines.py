@@ -25,6 +25,9 @@ on 127.0.0.1 at PORT and, once connected, write the file's bytes in 5-byte chunk
 little-endian pcap whose 24-byte header goes first, then one record every N ms.
 `--pcap-close-after N` closes the connection after the header and N records (the
 program goes on), first writing `--pcap-cut-bytes K` (default 0) bytes of the next.
+`--pcap-after-eof` writes nothing on the connection until stdin's EOF; the program
+then exits 0 at once and a forked child (keeping no stdout) writes the pieces 100 ms
+later and closes the connection, as a program whose last packets leave as it ends.
 `--pcap-refuse` never listens. `--pcap-stdout` writes the packet output to stdout
 instead of a port (the lines then go by $FAKE_VIA=tcp:...), with SIGPIPE at its
 default as a C program has it, so a write to a pipe nobody reads kills it; with
@@ -39,6 +42,7 @@ import struct
 import sys
 import threading
 import time
+import warnings
 
 WAV_HEADER_LEN = 44
 PCAP_HEADER_LEN = 24
@@ -86,11 +90,50 @@ def pcap_pieces(data: bytes, interval: bool) -> list:
     return pieces
 
 
-def serve_pcap(srv, data: bytes, interval_ms: int, close_after, cut: int) -> None:
+class AfterEof:
+    """The connection `--pcap-after-eof` holds back, and what to write on it at EOF."""
+
+    conn = None
+    pieces = []
+    interval_ms = 0
+    accepted = threading.Event()
+
+
+def write_pieces(conn, pieces: list, interval_ms: int) -> None:
+    """Write the header, then each record `interval_ms` after the last."""
+    for i, piece in enumerate(pieces):
+        if i > 1:
+            time.sleep(interval_ms / 1000)
+        write_chunked(conn, piece)
+
+
+def finish_after_eof() -> None:
+    """At stdin's EOF: fork a child that writes the held-back pieces 100 ms later and
+    closes the connection; the program goes on to exit."""
+    if not AfterEof.accepted.wait(5):
+        return
+    warnings.simplefilter("ignore", DeprecationWarning)
+    if os.fork() != 0:
+        return
+    # The child: no stdout, so the program's output ends with the program.
+    os.close(1)
+    time.sleep(0.1)
+    write_pieces(AfterEof.conn, AfterEof.pieces, AfterEof.interval_ms)
+    AfterEof.conn.shutdown(socket.SHUT_RDWR)
+    AfterEof.conn.close()
+    os._exit(0)
+
+
+def serve_pcap(srv, data: bytes, interval_ms: int, close_after, cut: int, after_eof: bool) -> None:
     """Accept one connection, write the pieces and keep the socket open, or with
-    `close_after` close it after that many records and `cut` bytes of the next."""
+    `close_after` close it after that many records and `cut` bytes of the next, or with
+    `after_eof` hold it for `finish_after_eof`."""
     conn, _ = srv.accept()
     pieces = pcap_pieces(data, interval_ms > 0 or close_after is not None)
+    if after_eof:
+        AfterEof.conn, AfterEof.pieces, AfterEof.interval_ms = conn, pieces, interval_ms
+        AfterEof.accepted.set()
+        return
     for i, piece in enumerate(pieces):
         if close_after is not None and i == close_after + 1:
             write_chunked(conn, piece[:cut])
@@ -136,7 +179,10 @@ def start_pcap(args) -> None:
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
     srv.listen(1)
-    threading.Thread(target=serve_pcap, args=(srv, data, interval, close_after, cut), daemon=True).start()
+    after_eof = "--pcap-after-eof" in args
+    threading.Thread(
+        target=serve_pcap, args=(srv, data, interval, close_after, cut, after_eof), daemon=True
+    ).start()
 
 
 def read_wav_header(src, out) -> bool:
@@ -231,6 +277,8 @@ def main() -> int:
             send()
             next_at = total + repeat
     sys.stderr.write(f"fake_lines: input closed after {total} bytes\n")
+    if "--pcap-after-eof" in args:
+        finish_after_eof()
     return 0
 
 

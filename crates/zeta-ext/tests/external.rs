@@ -860,6 +860,39 @@ async fn a_programs_packets_reach_its_packet_output() {
     assert!(matches!(result_within(r.handle, 10).await, Ok(())));
 }
 
+/// A program whose packets leave after its input ended, as it exits: the run reads its
+/// packet output to the end (the program closing it) before it ends.
+#[tokio::test]
+async fn packets_written_as_the_input_ends_are_still_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.pcap");
+    let records: Vec<Vec<u8>> = (0u8..3).map(|i| vec![0x8d, i, 0xa5, i, 0x5a]).collect();
+    std::fs::write(&file, pcap(&records)).unwrap();
+    let reg = registry(&[packets_row(
+        "fake_pk",
+        &file,
+        &["--pcap-after-eof", "--pcap-interval-ms", "100"],
+    )]);
+    let stage = ExternalDecodeStage::new(Arc::new(reg)).with_env([
+        ("FAKE_LINES", r#"{"text":"up","n":1}"#),
+        ("FAKE_AFTER_BYTES", "0"),
+    ]);
+    let mut r = start_with(stage, "fake_pk", true);
+    let mut rx = r.bus.subscribe(r.packets.as_ref().unwrap()).unwrap();
+    next_event(&mut r.rx_out, 10).await.expect("an event");
+    send(&r.tx, 4, 480, 48_000);
+    drop(r.tx);
+    assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+    let mut got = Vec::new();
+    while let Ok(f) = rx.try_recv() {
+        match f.payload {
+            Payload::Packet { data, .. } => got.push(data.to_vec()),
+            other => panic!("expected a packet, got {:?}", other.kind()),
+        }
+    }
+    assert_eq!(got, records);
+}
+
 #[tokio::test]
 async fn packets_are_not_built_with_nobody_reading() {
     let dir = tempfile::tempdir().unwrap();
