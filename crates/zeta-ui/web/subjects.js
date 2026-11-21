@@ -1194,6 +1194,7 @@ class SubjectsPane {
       subjects,
       cols,
       members.every((x) => x.watched),
+      legendSources(this.store.sources(id), (x) => x.name),
     );
   }
 

@@ -11211,12 +11211,81 @@ def scenario_sibling_fields_are_marked_in_the_table(page, url, secret):
         expect(chips.nth(2)).to_have_class(re.compile(r"\bmark-differs\b"))
         expect(chips.nth(2)).to_have_text("differs")
         assert "subject-legend" in sec.evaluate("e => e.querySelector('h3').nextElementSibling.className")
+        assert cell("level").get_attribute("title") == cell("level").text_content()
         colour = lambda loc: loc.evaluate("e => getComputedStyle(e).color")
         assert colour(cell("own_only")) != colour(cell("level")), "a mark must show"
         assert not errors, f"console errors: {errors}"
     finally:
         stop_job(url, secret, sib)
         stop_job(url, secret, own)
+
+
+def scenario_a_watch_section_marks_its_subjects(page, url, secret):
+    # In-page (a live watch fixture is costly): a watch keeps decoder D (the row's own
+    # handler) and a sibling S sent from it (record `group` = the watch, plan 43 R5) heard on
+    # the same subject; the watch's section marks and has a legend like a job's.
+    login(page, url, secret)
+    r = page.evaluate(
+        """async () => {
+          const { mountSubjects, mountSubjectsPane } = await import('./subjects.js');
+          const handlers = [{id: "builtin", name: "built-in"}, {id: "alt", name: "Alt"}];
+          const row = {
+            protocol: "m",
+            event: {summary: "{id} {name?}"},
+            subject: {key: "id", name: "pairs", waterfall: "summary", heading: null,
+                      label: null,
+                      columns: [{field: "name", label: "Name", unit: null},
+                                {field: "own_only", label: "Own", unit: null},
+                                {field: "alt_only", label: "Alt", unit: null},
+                                {field: "level", label: "Level", unit: null}]},
+          };
+          const api = {op: async (o) => o.op === "modes_list"
+            ? {value: {modes: [{id: "m"}]}}
+            : {value: {mode: {row, handlers}}}};
+          const view = {get: (k) => (k === "subject_dim_s" ? 60 : 300), onChange() {}};
+          const store = mountSubjects(api, view);
+          await store.lookup(["m"]);
+          const run = {status: "running"};
+          const W = "W0123456";
+          const watch = {id: W, kind: "watch", source: "tone", state: run,
+                         context: {watch: {decoding: [{job: "D", mode: "m"}]}}};
+          const d = {id: "D", kind: "m", source: "tone", handler: "builtin", state: run,
+                     tuning: {center_hz: 148637500, bandwidth_hz: 12500}};
+          const sib = {id: "S", kind: "m", source: "tone", handler: "alt", group: W, state: run,
+                       tuning: {center_hz: 148637500, bandwidth_hz: 12500}};
+          const jobs = [watch, d, sib];
+          store.sync(jobs);
+          const el = document.createElement("div");
+          document.body.append(el);
+          const pane = mountSubjectsPane(el, store, view, {jobs: () => jobs});
+          const tell = (job, f) => store.event(job, {id: "K", protocol: "m", ...f});
+          tell(d, {name: "Alpha", own_only: "x", level: 1, handler: "builtin", summary: "K"});
+          pane.render();
+          const lone = {legend: el.querySelectorAll(".subject-legend").length,
+                        marks: el.querySelectorAll('[class*="mark-"]').length};
+          tell(sib, {name: "Alfa", alt_only: "y", level: 2, handler: "alt", summary: "K"});
+          pane.render();
+          const sec = el.querySelector(`section.subject-job[data-job="${W}"]`);
+          const td = (c) => sec.querySelector(`tr.subject[data-key="K"] td[data-col="${c}"]`);
+          const out = {
+            lone, sections: el.querySelectorAll("section").length,
+            legend: sec.querySelectorAll(".subject-legend .chip").length,
+            afterH3: sec.querySelector("h3").nextElementSibling.className,
+            own: td("own_only").className, alt: td("alt_only").className,
+            name: td("name").className, nameTitle: td("name").title,
+            level: td("level").className, levelTitle: td("level").title,
+          };
+          pane.destroy();
+          el.remove();
+          store.destroy();
+          return out;
+        }""")
+    assert r["lone"] == {"legend": 0, "marks": 0}, r
+    assert r["sections"] == 1, r
+    assert r["legend"] == 3 and r["afterH3"] == "subject-legend", r
+    assert r["own"] == "mark-1" and r["alt"] == "mark-2", r
+    assert r["name"] == "mark-differs" and "Alpha" in r["nameTitle"] and "Alfa" in r["nameTitle"], r
+    assert r["level"] == "" and r["levelTitle"] == "2", r
 
 
 def scenario_marks_stay_when_a_member_stops(page, url, secret):
