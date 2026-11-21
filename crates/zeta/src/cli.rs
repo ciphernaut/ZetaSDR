@@ -1335,10 +1335,16 @@ pub enum JobCmd {
     Start {
         /// Job kind: a built-in kind (passthrough, spectrum, fm_demod, wfm_demod,
         /// am_demod, ssb_demod, measure, scan, or a decoder) or a mode id (`modes list`)
-        #[arg(long, value_name = "KIND", value_parser = parse_job_kind)]
-        kind: JobKind,
+        #[arg(long, value_name = "KIND", value_parser = parse_job_kind, required_unless_present = "beside")]
+        kind: Option<JobKind>,
         #[command(flatten)]
-        band: BandArgs,
+        band: StartBandArgs,
+        /// Start beside a running job of a mode: the same band on the same source, run by
+        /// another handler (`--handler` is then required). Left out, the kind, `--source`,
+        /// `--center-hz` and `--bandwidth-hz` are read from that job; a value given is
+        /// sent as given, and the node refuses it unless it equals the job's
+        #[arg(long, value_name = "JOB", requires = "handler")]
+        beside: Option<String>,
         /// FM peak deviation in Hz (100..=75000), fm_demod and wfm_demod only;
         /// absent = the kind's default (5000 for fm_demod, 75000 for wfm_demod)
         #[arg(long, value_name = "HZ")]
@@ -1699,6 +1705,68 @@ pub struct BandArgs {
     bandwidth_hz: u64,
 }
 
+/// The band of `job start`: required, unless `--beside` names the job it is read from.
+#[derive(Debug, Args)]
+pub struct StartBandArgs {
+    /// Source id
+    #[arg(long, required_unless_present = "beside")]
+    source: Option<String>,
+    /// Centre frequency, Hz
+    #[arg(long, value_name = "HZ", required_unless_present = "beside")]
+    center_hz: Option<u64>,
+    /// Bandwidth, Hz
+    #[arg(long, value_name = "HZ", required_unless_present = "beside")]
+    bandwidth_hz: Option<u64>,
+}
+
+/// What a `job start --beside` left out, filled from the named job's record.
+#[derive(Clone, Debug)]
+pub struct BesideFill {
+    pub job: JobId,
+    kind: bool,
+    source: bool,
+    center_hz: bool,
+    bandwidth_hz: bool,
+}
+
+impl BesideFill {
+    /// Find the job in `jobs` (a `job_list` answer) and fill the op's missing kind and
+    /// band from it; a value given stays as given. An unknown job is `no job <id>`.
+    pub fn fill(&self, op: &mut Op, jobs: &[zeta_core::job::JobRecord]) -> Result<(), OpError> {
+        let rec = jobs
+            .iter()
+            .find(|r| r.id == self.job)
+            .ok_or_else(|| OpError::Other {
+                message: format!("no job {}", self.job.0),
+            })?;
+        let Op::JobStart {
+            kind,
+            source,
+            center_hz,
+            bandwidth_hz,
+            ..
+        } = op
+        else {
+            return Ok(());
+        };
+        if self.kind
+            && let Some(k) = JobKind::from_name(&rec.kind)
+        {
+            *kind = k;
+        }
+        if self.source {
+            *source = rec.source.clone();
+        }
+        if self.center_hz {
+            *center_hz = rec.tuning.center_hz;
+        }
+        if self.bandwidth_hz {
+            *bandwidth_hz = rec.tuning.bandwidth_hz;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct JobArg {
     /// Job id
@@ -1806,6 +1874,27 @@ impl Command {
         )
     }
 
+    /// For `job start --beside`, what the command line left out and the job to read it
+    /// from; `None` for any other command.
+    pub fn beside_fill(&self) -> Option<BesideFill> {
+        let Command::Job(JobCmd::Start {
+            kind,
+            band,
+            beside: Some(job),
+            ..
+        }) = self
+        else {
+            return None;
+        };
+        Some(BesideFill {
+            job: JobId(job.clone()),
+            kind: kind.is_none(),
+            source: band.source.is_none(),
+            center_hz: band.center_hz.is_none(),
+            bandwidth_hz: band.bandwidth_hz.is_none(),
+        })
+    }
+
     /// The operation this subcommand applies; `None` for `serve`. Fails only
     /// when `graph put`, `graph start` or `signature propose --framing-file` cannot read
     /// or parse its file.
@@ -1866,6 +1955,7 @@ impl Command {
             Command::Job(JobCmd::Start {
                 kind,
                 band: b,
+                beside,
                 deviation_hz,
                 sideband,
                 dwell_ms,
@@ -1881,10 +1971,11 @@ impl Command {
                 replace,
                 ..
             }) => Op::JobStart {
-                kind,
-                source: SourceId(b.source),
-                center_hz: Hz(b.center_hz),
-                bandwidth_hz: Hz(b.bandwidth_hz),
+                // With `--beside` a left-out value is filled from the job ([`BesideFill`]).
+                kind: kind.unwrap_or(JobKind::Passthrough),
+                source: SourceId(b.source.unwrap_or_default()),
+                center_hz: Hz(b.center_hz.unwrap_or_default()),
+                bandwidth_hz: Hz(b.bandwidth_hz.unwrap_or_default()),
                 deviation_hz,
                 sideband: sideband.map(Into::into),
                 dwell_ms,
@@ -1898,7 +1989,7 @@ impl Command {
                 replace: replace.into_ids(),
                 handler,
                 needs: needs.into_iter().map(Into::into).collect(),
-                beside: None,
+                beside: beside.map(JobId),
             },
             Command::Job(JobCmd::Attach {
                 kind,

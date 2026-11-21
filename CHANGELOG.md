@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Send to: `job_start` takes `beside`, a running job of a mode, and starts a sibling on the same
+  band and source by another handler, to compare two decoders on one signal or to capture packets
+  from a handler that gives them. Nothing is tuned or stopped; both records carry `group`, a
+  `job_retune` of either moves the whole group under one gate, `job_stop` stops one, and a
+  relaunch never puts two members on one handler. CLI `zeta job start --beside <job> --handler
+  <id>`, which reads the kind and band from the job. A node rolled back past this build resumes
+  no jobs (records carry `group`).
 - Packet capture for Wireshark (phase A): `job_attach` of `packets` writes an APRS job's AX.25
   frames (`LINKTYPE_AX25_KISS`) or a frame row's frames (`LINKTYPE_USER0`) to a pcapng under the
   state directory, each packet with the frame's own time and a comment naming the job, source and

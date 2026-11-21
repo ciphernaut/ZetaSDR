@@ -169,6 +169,7 @@ async fn main() -> ExitCode {
     let then_tail = cli.command.then_tail();
     let keep = cli.command.keep();
     let plan = cli.command.plan_filter();
+    let beside = cli.command.beside_fill();
     let op = match cli.command.into_op() {
         Ok(op) => op,
         Err(e) => return print(serde_json::to_string_pretty(&e), 2),
@@ -243,6 +244,11 @@ async fn main() -> ExitCode {
     let code = match op {
         None => transport::serve(node, &serve_args, speech, secret.as_deref()).await,
         Some(mut op) => {
+            if let Some(fill) = &beside
+                && let Err(e) = fill.fill(&mut op, &node.job_list())
+            {
+                return print(serde_json::to_string_pretty(&e), 2);
+            }
             if cli::wants_roles(&op)
                 && let Ok(zeta_core::ops::OpResult::Sets(sets)) = node.apply(Op::SetList {}).await
             {

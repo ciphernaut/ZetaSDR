@@ -519,6 +519,62 @@ fn job_start_handler_and_needs_reach_the_op() {
     assert_eq!(op["needs"], serde_json::json!(["packet"]), "{op}");
 }
 
+/// `job start --beside JOB --handler ID` reads the named job and fills the kind and the
+/// band it left out; the job id and the handler reach the op.
+#[test]
+fn job_start_beside_fills_the_band_from_the_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = zeta(
+        dir.path(),
+        &[
+            "job",
+            "start",
+            "--kind",
+            "passthrough",
+            "--source",
+            "tone",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ],
+    )
+    .assert()
+    .success();
+    let id = json(&first.get_output().stdout)["value"]
+        .as_str()
+        .expect("a job id")
+        .to_string();
+    zeta(
+        dir.path(),
+        &["job", "start", "--beside", &id, "--handler", "alt"],
+    )
+    .assert()
+    .code(2);
+    let op = last_logged_op(dir.path());
+    assert_eq!(op["op"], "job_start", "{op}");
+    assert_eq!(op["beside"], id, "{op}");
+    assert_eq!(op["handler"], "alt", "{op}");
+    assert_eq!(op["kind"], "passthrough", "{op}");
+    assert_eq!(op["source"], "tone", "{op}");
+    assert_eq!(op["center_hz"], 100_000_000, "{op}");
+    assert_eq!(op["bandwidth_hz"], 48_000, "{op}");
+}
+
+/// An unknown job named by `--beside` is the CLI's own error, naming it.
+#[test]
+fn job_start_beside_of_an_unknown_job_is_an_error_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(
+        dir.path(),
+        &["job", "start", "--beside", "nope", "--handler", "alt"],
+    )
+    .assert()
+    .code(2);
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(text.contains("no job nope"), "{text}");
+}
+
 #[test]
 fn source_ensure_replace_flag_round_trips_to_the_op() {
     let dir = tempfile::tempdir().unwrap();
