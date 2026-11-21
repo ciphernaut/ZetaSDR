@@ -15,7 +15,8 @@ header first (exiting 3 unless it starts `RIFF....WAVE`), print
 `{"wav": {"rate_hz": R, "bits": B, "channels": C}}` as its first line, then count
 only the bytes after the header and exit 3 should a second `RIFF` follow.
 $FAKE_REPEAT_BYTES (default 0: never) writes the lines again each time that many
-more input bytes have arrived after the last write.
+more input bytes have arrived after the last write; `--repeat-bytes N` does the same for
+one row (the variable is node-wide when a node runs this) and wins over it.
 `--lines-file PATH` takes the lines from that file instead of $FAKE_LINES, which is
 node-wide when a node runs this as a mode row: two rows differ by their `args`.
 `--pcap-port PORT --pcap-file PATH` gives a packet output beside the lines: listen
@@ -170,6 +171,8 @@ def main() -> int:
     via = os.environ.get("FAKE_VIA", "stdout")
     exit_after = os.environ.get("FAKE_EXIT_AFTER") == "1"
     repeat = int(os.environ.get("FAKE_REPEAT_BYTES", "0"))
+    if "--repeat-bytes" in args:
+        repeat = int(args[args.index("--repeat-bytes") + 1])
     next_at = 0
 
     start_pcap(args)

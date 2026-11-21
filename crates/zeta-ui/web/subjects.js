@@ -20,22 +20,38 @@
 //         its fields, so actions.js jobOutputs(job, rowOf(kind)) answers whether a job plays
 //         audio
 //     store.event(job, payload) -> subject | null   merges the event: non-null, non-blank fields
-//         into `state`, the fix into `position`, `count` and `last_seen`. Null when the job's row has
+//         into `state` and, the envelope's aside (`protocol`, `handler`, `summary`, `t_ns`,
+//         `position`, `access`), into `by` under the event's source key (sourceKey), the fix
+//         into `position`, `count` and `last_seen`. Null when the job's row has
 //         no subject, the job has an `owner` (a watch's run or its trial) or is a running identify's
 //         current trial (`context.identify.current`, as of the last `sync`), or the key is not a
 //         string, number or boolean, or is blank: such an event is unkeyed. The key is trimmed.
 //     store.subjectOf(job, payload) -> subject | null   the same test and lookup, no merge
 //     Subjects are kept per group (plan 31 spec 4.7): a watch's kept decoders (agent.js groupOf,
-//     as of the last `sync`) share their watch's, keyed (watch id, key); any other job is its own
-//     group, keyed (job id, key). Every call below taking a `jobId` takes a group id or a job id
-//     (resolved to its group).
+//     as of the last `sync`) share their watch's, keyed (watch id, key); siblings (plan 43 call
+//     14: jobs whose records carry one `group`, the id of the job first sent from, a bare key
+//     that may name a stopped job) share that group's; any other job is its own group, keyed
+//     (job id, key). Every call below taking a `jobId` takes a group id or a job id (resolved
+//     to its group).
 //     store.groupOf(job, jobs = the last sync's) -> {key, kind, title} | null   agent.js groupOf
 //     store.groupId(jobId) -> the group id of a job id (the watch's for a kept decoder, else
-//         itself), as of the last `sync`
+//         the record's `group`, else itself; a group sent from a kept decoder is the watch's),
+//         as of the last `sync`. An event of a job no sync has seen yet goes by its record's
+//         `group`.
 //     store.sync(jobs)   regroups (a decoder heard before its watch named it moves its subjects
-//         under the watch, the newer of two on one key standing), drops the subjects of groups
-//         whose job (the watch, for a merged group) is not `running`; notes the running
-//         identifies' current trials
+//         under the watch, the newer of two on one key standing; a sibling heard before its
+//         record showed its `group` moves its subjects into the group, two on one key becoming
+//         one with what both said, the sibling's copy announced dropped), drops the subjects of
+//         groups none of whose jobs runs (the job; a watch's, the watch; a sibling group's, any
+//         member); notes the running identifies' current trials
+//     store.sources(jobId) -> [{key, mode, handler, name, slot}]   the group's sources in the
+//         order they first supplied a field: `name` the handler's from the row's `handlers` (the
+//         id when unknown), `slot` the theme's pin for the handler id (setHandlerSlots), else the
+//         next free of 1 to 4, the fifth and later sharing 4
+//     store.setHandlerSlots(map)   the theme's `handlers` (handler id -> slot 1..4); re-slots and
+//         fires onChange
+//     store.heardBy(jobId) -> number   the subjects of the job's group with a `by` entry for that
+//         job's source key (its last event's, else its record's kind and `handler`)
 //     store.isTrial(jobId) -> bool   a running identify's current trial
 //     store.list(jobId) -> subject[]   least recently heard first, a copy (never per message)
 //     store.size(jobId) -> number
@@ -56,10 +72,23 @@
 //     A subject past view `subject_dim_s` of silence is dim, past `subject_drop_s` dropped
 //     (checked each second, from this page's clock, so a longer `subject_dim_s` un-dims it at
 //     the next check); a selection goes with its subject.
-//   A subject: {job, group, heard, center_hz, key, state, position, first_seen, last_seen, count,
-//     dim, row}. `job` is the id of the job first heard on, `group` its group's id, `heard` the
-//     job last heard on and `center_hz` its tuning's centre then (when it had one), `state` a null-prototype object of every field heard, whose last non-null, non-blank value
-//     stands, `position` {lat, lon, alt_m} or null, the altitude surviving a fix without one.
+//   A subject: {job, group, heard, center_hz, key, state, by, position, first_seen, last_seen,
+//     count, dim, row}. `job` is the id of the job first heard on, `group` its group's id, `heard`
+//     the job last heard on and `center_hz` its tuning's centre then (when it had one), `state` a
+//     null-prototype object of every field heard, whose last non-null, non-blank value stands,
+//     `by` Map<source key, {mode, handler, name, fields: {[field]: {v, t}}}> (what each source
+//     said: each field's latest value and when, by this page's clock), `position` {lat, lon,
+//     alt_m} or null, the altitude surviving a fix without one.
+//   sourceKey(job, payload, row) -> "<mode>@<handler>"   the event's `handler`, else (an older
+//     node) the row's own, the first of its `handlers`
+//   marksOf(subject, slots) -> Map<field, {mark: null | 1..4 | "differs", title: string | null}>
+//     how each field of `state` and `by` is drawn (plan 43 call 15); `slots` maps a source key
+//     to its slot (store.sources'). With fewer than two sources in `by` every field is plain
+//     (`{mark: null, title: null}`). A string field two or more sources hold different values
+//     for (trimmed, case kept) is `differs`, titled `<name>: <value> · <name>: <value>` in slot
+//     order; else a field every source holds is plain, one only one holds is that source's
+//     slot titled `only <name>`, and one some hold is plain titled `from <name>, <name>`. The
+//     envelope's fields and the key (each member's, in a merged group) are always plain.
 //   subjectLabel(subject) -> state[row.subject.label] when present, else the key
 //   subjectSummary(subject) -> the row's summary template filled from the merged state
 //   subjectValues(subject) -> [{label, text, title}]   the row's columns through metricText
@@ -80,7 +109,8 @@
 //     usual tail. It stays while its watch runs and holds subjects, every decoder lost or not,
 //     and goes when the watch stops.
 //     One `section.subject-job[data-job]` per other running job with subjects or whose row has table
-//     columns, so a job heard nothing from yet says `0 aircraft` (an `h3` and a table of
+//     columns (a sibling group's members one section, `data-job` the group's id, headed by its
+//     first listed member), so a job heard nothing from yet says `0 aircraft` (an `h3` and a table of
 //     `tr.subject[data-job][data-key]`, classes `dim`, `selected` and `station`: a fixed
 //     station's own row, its row's `subject.station.key` non-null and its state matching
 //     `station.when`, plan 35), and one for a subject job
@@ -110,8 +140,9 @@
 //     included, has equal non-blank values in both; a subject whose state matches every pair of
 //     its row's `subject.merge_skip` (`skipsMerge`: a VDL2 ground station) joins none and stands
 //     alone, its key column showing its own key. A group's state is its members' merged,
-//     newest last seen winning, its position the newest member's with one, `count` the sum,
-//     `dim` when all are. Its key column (`data-col` the first `merge` field) shows the first
+//     newest last seen winning, its `by` the union of theirs, its position the newest member's
+//     with one, `count` the sum, `dim` when all are. A sibling group is one job here, its
+//     subjects members like any other's. Its key column (`data-col` the first `merge` field) shows the first
 //     `merge` field the group has; then the union of the rows' columns, `Via` (the members'
 //     protocols) and the usual tail. Its `tr.subject[data-job][data-key]` names the newest
 //     member, the one a press selects; it is `selected` when any member is. A job alone in its
@@ -214,6 +245,100 @@ export function subjectValues(s) {
   });
 }
 
+// ---- what each source said (plan 43 calls 13-16) ------------------------------------------
+
+// The fields the node's envelope sets on every event (zeta-core's ENVELOPE_FIELDS and the
+// handler file's extras): never a source's own say, never marked.
+const ENVELOPE = new Set(["protocol", "handler", "summary", "t_ns", "position", "access"]);
+const SLOTS = 4;
+
+// The handler an event came from: its `handler`, else (an older node) the row's own, the
+// first of the row's `handlers`.
+function handlerOf(p, row) {
+  const named = p && typeof p === "object" ? p.handler : null;
+  if (typeof named === "string" && named !== "") return named;
+  return row?.handlers?.[0]?.id ?? "builtin";
+}
+
+export function sourceKey(job, p, row) {
+  return `${job.kind}@${handlerOf(p, row)}`;
+}
+
+// A handler's `name` from the row's `handlers`, its id when the row does not list it.
+function handlerName(row, id) {
+  return (row?.handlers ?? []).find((h) => h.id === id)?.name ?? id;
+}
+
+// A source's slot from `slots` (a Map, or an object), else its place in `s.by`.
+function slotIn(slots, key, at) {
+  const v = slots instanceof Map ? slots.get(key) : slots?.[key];
+  return Number.isInteger(v) && v >= 1 && v <= SLOTS ? v : Math.min(at + 1, SLOTS);
+}
+
+const PLAIN = Object.freeze({ mark: null, title: null });
+
+export function marksOf(s, slots) {
+  const sources = [...(s.by ?? new Map()).entries()]
+    .map(([key, src], i) => ({ key, src, slot: slotIn(slots, key, i), at: i }))
+    .sort((a, b) => a.slot - b.slot || a.at - b.at);
+  const fields = new Set(Object.keys(s.state ?? {}));
+  for (const { src } of sources) for (const f of Object.keys(src.fields)) fields.add(f);
+  // The key field: the subject's row's, and each member's in a merged group.
+  const keys = new Set([s.row?.subject?.key, ...(s.members ?? []).map((m) => m.row?.subject?.key)]);
+  const out = new Map();
+  for (const f of fields) {
+    if (sources.length < 2 || ENVELOPE.has(f) || keys.has(f)) {
+      out.set(f, PLAIN);
+      continue;
+    }
+    const holders = sources.filter(({ src }) => Object.hasOwn(src.fields, f));
+    const texts = holders
+      .filter(({ src }) => typeof src.fields[f].v === "string")
+      .map((h) => ({ h, text: h.src.fields[f].v.trim() }));
+    if (texts.length >= 2 && new Set(texts.map((x) => x.text)).size > 1) {
+      const title = texts.map(({ h, text }) => `${h.src.name}: ${text}`).join(" · ");
+      out.set(f, { mark: "differs", title });
+    } else if (holders.length === sources.length || holders.length === 0) {
+      out.set(f, PLAIN);
+    } else if (holders.length === 1) {
+      out.set(f, { mark: holders[0].slot, title: `only ${holders[0].src.name}` });
+    } else {
+      out.set(f, { mark: null, title: `from ${holders.map((h) => h.src.name).join(", ")}` });
+    }
+  }
+  return out;
+}
+
+// `into` gains what `from` said: each source's fields, the newer `t` standing.
+function mergeBy(into, from) {
+  for (const [key, src] of from) {
+    const have = into.get(key);
+    if (!have) {
+      into.set(key, { ...src, fields: Object.assign(Object.create(null), src.fields) });
+      continue;
+    }
+    for (const [f, x] of Object.entries(src.fields)) {
+      if (!Object.hasOwn(have.fields, f) || have.fields[f].t <= x.t) have.fields[f] = x;
+    }
+  }
+}
+
+// Two copies of one subject become `into`: its state the two merged (the later heard's
+// values standing), every source's say, the later fix, the counts summed.
+function foldSubject(into, from) {
+  const later = from.last_seen > into.last_seen ? from : into;
+  const earlier = later === from ? into : from;
+  into.state = Object.assign(Object.create(null), earlier.state, later.state);
+  mergeBy(into.by, from.by);
+  into.position = later.position ?? earlier.position;
+  if (later.center_hz !== undefined) into.center_hz = later.center_hz;
+  into.heard = later.heard;
+  into.first_seen = Math.min(into.first_seen, from.first_seen);
+  into.last_seen = later.last_seen;
+  into.count += from.count;
+  into.dim = into.dim && from.dim;
+}
+
 // ---- the store --------------------------------------------------------------------------
 
 export function mountSubjects(api, view, selection = new Selection()) {
@@ -239,6 +364,12 @@ class SubjectStore {
     // is the last heard even when two events share a millisecond.
     this.jobs = new Map();
     this.groups = new Map(); // a kept decoder's id -> its watch's id, as of the last sync
+    this.siblings = new Map(); // a job's id -> its record's `group`, as of the last sync
+    // group id -> source key -> {key, mode, handler}, in the order the sources first
+    // supplied a field to one of the group's subjects
+    this.sourceOrder = new Map();
+    this.jobSources = new Map(); // job id -> the source key of its last keyed event
+    this.handlerSlots = {}; // the theme's `handlers`: handler id -> slot
     this.lastJobs = [];
     this.trials = new Set(); // the running identifies' current trials
     this.changeCbs = [];
@@ -318,20 +449,84 @@ class SubjectStore {
     return watchGroupOf(job, jobs);
   }
 
+  // The watch's group, else the record's `group` (a bare key: it may name a stopped job,
+  // never resolved to a record), else the job itself; a group sent from a watch's kept
+  // decoder is the watch's.
   groupId(jobId) {
-    return this.groups.get(jobId) ?? jobId;
+    const g = this.groups.get(jobId) ?? this.siblings.get(jobId) ?? jobId;
+    return this.groups.get(g) ?? g;
+  }
+
+  // `groupId` for a job record, its own `group` standing in until a sync has seen it (a
+  // sibling's first events can come before the next poll).
+  groupFor(job) {
+    if (this.groups.has(job.id) || this.siblings.has(job.id)) return this.groupId(job.id);
+    const g = typeof job.group === "string" && job.group !== "" ? job.group : job.id;
+    return this.groups.get(g) ?? g;
   }
 
   subjectOf(job, p) {
     const k = this.keyed(job, p);
-    return k ? (this.jobs.get(this.groupId(job.id))?.get(k.key) ?? null) : null;
+    return k ? (this.jobs.get(this.groupFor(job))?.get(k.key) ?? null) : null;
+  }
+
+  // The group's sources, `order` (`sourceOrder`'s) noting `key` when new.
+  noteSource(group, key, src) {
+    let order = this.sourceOrder.get(group);
+    if (!order) {
+      order = new Map();
+      this.sourceOrder.set(group, order);
+    }
+    if (!order.has(key)) order.set(key, { key, mode: src.mode, handler: src.handler });
+  }
+
+  sources(jobId) {
+    const order = [...(this.sourceOrder.get(this.groupId(jobId))?.values() ?? [])];
+    const pinned = (h) => {
+      const v = Object.hasOwn(this.handlerSlots, h) ? this.handlerSlots[h] : null;
+      return Number.isInteger(v) && v >= 1 && v <= SLOTS ? v : null;
+    };
+    const out = order.map((o) => ({
+      key: o.key,
+      mode: o.mode,
+      handler: o.handler,
+      name: handlerName(this.rows.get(o.mode), o.handler),
+      slot: pinned(o.handler),
+    }));
+    const taken = new Set(out.map((o) => o.slot).filter((n) => n !== null));
+    for (const o of out) {
+      if (o.slot !== null) continue;
+      let n = 1;
+      while (n < SLOTS && taken.has(n)) n++;
+      o.slot = n;
+      taken.add(n);
+    }
+    return out;
+  }
+
+  setHandlerSlots(map) {
+    this.handlerSlots = map && typeof map === "object" ? { ...map } : {};
+    this.changed();
+  }
+
+  heardBy(jobId) {
+    let key = this.jobSources.get(jobId);
+    if (!key) {
+      const job = this.lastJobs.find((j) => j.id === jobId);
+      const row = job && this.rows.get(job.kind);
+      if (!row) return 0;
+      key = `${job.kind}@${job.handler ?? handlerOf(null, row)}`;
+    }
+    let n = 0;
+    for (const s of this.jobs.get(this.groupId(jobId))?.values() ?? []) if (s.by.has(key)) n++;
+    return n;
   }
 
   event(job, p) {
     if (this.destroyed) return null;
     const k = this.keyed(job, p);
     if (!k) return null;
-    const group = this.groupId(job.id);
+    const group = this.groupFor(job);
     let subjects = this.jobs.get(group);
     if (!subjects) {
       subjects = new Map();
@@ -347,6 +542,7 @@ class SubjectStore {
         heard: job.id,
         key: k.key,
         state: Object.create(null),
+        by: new Map(),
         position: null,
         first_seen: now,
         last_seen: now,
@@ -358,10 +554,20 @@ class SubjectStore {
     subjects.set(k.key, s);
     s.heard = job.id;
     if (typeof job.tuning?.center_hz === "number") s.center_hz = job.tuning.center_hz;
+    const key = sourceKey(job, p, k.row);
+    this.jobSources.set(job.id, key);
+    let src = s.by.get(key);
+    if (!src) {
+      const handler = handlerOf(p, k.row);
+      src = { mode: job.kind, handler, name: handlerName(k.row, handler), fields: Object.create(null) };
+      s.by.set(key, src);
+    }
+    this.noteSource(group, key, src);
     for (const [field, v] of Object.entries(p)) {
       if (v === null || v === undefined) continue;
       if (typeof v === "string" && v.trim() === "") continue;
       s.state[field] = v;
+      if (!ENVELOPE.has(field)) src.fields[field] = { v, t: now };
     }
     const fix = positionOf(p);
     if (fix) {
@@ -392,40 +598,71 @@ class SubjectStore {
       const g = watchGroupOf(j, live);
       if (g) this.groups.set(j.id, g.key);
     }
+    this.siblings = new Map();
+    for (const j of this.lastJobs) {
+      if (typeof j.group === "string" && j.group !== "") this.siblings.set(j.id, j.group);
+    }
+    const known = new Set(this.lastJobs.map((j) => j.id));
+    for (const id of [...this.jobSources.keys()]) if (!known.has(id)) this.jobSources.delete(id);
     let dropped = false;
-    // A decoder heard before its watch named it: its subjects move under the watch.
-    for (const [jobId, group] of this.groups) {
+    // A decoder heard before its watch named it, or a sibling before its record showed its
+    // `group`: its subjects move under the group.
+    for (const jobId of new Set([...this.groups.keys(), ...this.siblings.keys()])) {
+      const group = this.groupId(jobId);
       const own = this.jobs.get(jobId);
-      if (!own) continue;
-      this.jobs.delete(jobId);
-      let into = this.jobs.get(group);
-      if (!into) {
-        into = new Map();
-        this.jobs.set(group, into);
-      }
-      for (const s of own.values()) {
-        const other = into.get(s.key);
-        if (other && other.last_seen > s.last_seen) {
-          for (const cb of this.dropCbs) cb(s.job, s.key);
-          continue;
-        }
-        if (other) for (const cb of this.dropCbs) cb(other.job, other.key);
-        into.delete(s.key);
-        s.group = group;
-        into.set(s.key, s);
-      }
-      // The last heard stays last.
-      const order = [...into.values()].sort((a, b) => a.last_seen - b.last_seen);
-      into.clear();
-      for (const s of order) into.set(s.key, s);
+      if (group === jobId || !own) continue;
+      this.moveInto(jobId, own, group, !this.groups.has(jobId));
       dropped = true;
     }
+    // A group lives while its job runs, or (a watch's, a sibling group's) any member does.
+    const alive = new Set([...running, ...live.map((j) => this.groupId(j.id))]);
     for (const [group, subjects] of [...this.jobs]) {
-      if (running.has(group)) continue;
+      if (alive.has(group)) continue;
       for (const key of [...subjects.keys()]) this.drop(group, key);
       dropped = true;
     }
+    for (const group of [...this.sourceOrder.keys()]) {
+      if (!alive.has(group)) this.sourceOrder.delete(group);
+    }
     if (dropped) this.changed();
+  }
+
+  // The subjects `own` heard under `jobId` move into `group`. A key the group already holds:
+  // for a sibling (`fold`) the two become one, the group's standing with what both said; for
+  // a watch's decoder the newer stands. The one that goes is announced dropped.
+  moveInto(jobId, own, group, fold) {
+    this.jobs.delete(jobId);
+    let into = this.jobs.get(group);
+    if (!into) {
+      into = new Map();
+      this.jobs.set(group, into);
+    }
+    for (const src of this.sourceOrder.get(jobId)?.values() ?? []) this.noteSource(group, src.key, src);
+    this.sourceOrder.delete(jobId);
+    for (const s of own.values()) {
+      const other = into.get(s.key);
+      if (other && fold) {
+        foldSubject(other, s);
+        const sel = this.selected();
+        if (sel && sel.job === s.job && sel.key === s.key) {
+          this.setSelected({ job: other.job, group, key: s.key });
+        }
+        for (const cb of this.dropCbs) cb(s.job, s.key);
+        continue;
+      }
+      if (other && other.last_seen > s.last_seen) {
+        for (const cb of this.dropCbs) cb(s.job, s.key);
+        continue;
+      }
+      if (other) for (const cb of this.dropCbs) cb(other.job, other.key);
+      into.delete(s.key);
+      s.group = group;
+      into.set(s.key, s);
+    }
+    // The last heard stays last.
+    const order = [...into.values()].sort((a, b) => a.last_seen - b.last_seen);
+    into.clear();
+    for (const s of order) into.set(s.key, s);
   }
 
   list(jobId) {
@@ -537,6 +774,9 @@ class SubjectStore {
     clearInterval(this.timer);
     this.jobs.clear();
     this.groups.clear();
+    this.siblings.clear();
+    this.sourceOrder.clear();
+    this.jobSources.clear();
     this.changeCbs = [];
     this.learnCbs = [];
     this.dropCbs = [];
@@ -630,6 +870,9 @@ function groupOf(members, fields, row) {
   const newest = members[members.length - 1];
   const state = Object.create(null);
   for (const m of members) Object.assign(state, m.state);
+  // Every member's sources (plan 43 call 29), so marksOf reads a group as a subject.
+  const by = new Map();
+  for (const m of members) mergeBy(by, m.by ?? new Map());
   const fixed = members.filter((m) => m.position);
   const newestFirst = [...members].reverse();
   let keyText = newest.key;
@@ -648,6 +891,7 @@ function groupOf(members, fields, row) {
     key: newest.key,
     keyText,
     state,
+    by,
     position: fixed.length > 0 ? fixed[fixed.length - 1].position : null,
     first_seen: Math.min(...members.map((m) => m.first_seen)),
     last_seen: newest.last_seen,
@@ -1070,10 +1314,11 @@ class SubjectsPane {
     });
   }
 
-  drawJobSection(sec, { job, watched }) {
+  // A job's section, or a sibling group's (`id` the group's, `job` its first member).
+  drawJobSection(sec, { id, job, watched }) {
     const row = this.store.rowOf(job.kind);
     const cols = this.columns(row);
-    const subjects = this.held(sec, this.sorted(job.id, this.store.list(job.id).reverse(), cols));
+    const subjects = this.held(sec, this.sorted(id, this.store.list(job.id).reverse(), cols));
     this.drawSection(sec, `${job.kind} ${job.source}, ${subjects.length} ${row.subject.name}`, subjects, cols, watched);
   }
 
@@ -1103,8 +1348,19 @@ class SubjectsPane {
     const all = new Map((this.jobs() || []).map((j) => [j.id, j]));
     const watchOf = (x) => {
       const id = this.store.groupId(x.job.id);
-      return id !== x.job.id && all.has(id) ? all.get(id) : null;
+      const w = id !== x.job.id ? all.get(id) : null;
+      return w && w.context?.watch ? w : null;
     };
+    // A sibling group (plan 43 call 14) is one entry, its first member's, under the group's
+    // id: one section, and one member of a merge across rows (call 29).
+    const seen = new Set();
+    wanted = wanted.flatMap((x) => {
+      if (watchOf(x)) return [x];
+      const groupId = this.store.groupId(x.job.id);
+      if (seen.has(groupId)) return [];
+      seen.add(groupId);
+      return [{ ...x, groupId }];
+    });
     const byName = new Map(); // subject.name -> the merging jobs' entries
     for (const x of wanted) {
       if (watchOf(x)) continue;
@@ -1128,7 +1384,7 @@ class SubjectsPane {
       }
       const name = this.store.rowOf(x.job.kind).subject.name;
       const members = byName.get(name);
-      if (!members || members.length < 2 || !members.includes(x)) parts.push({ id: x.job.id, ...x });
+      if (!members || members.length < 2 || !members.includes(x)) parts.push({ ...x, id: x.groupId });
       else if (members[0] === x) {
         members.sort((a, b) => order.get(a.job.id) - order.get(b.job.id));
         parts.push({ id: mergedId(name), name, members });

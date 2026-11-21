@@ -9304,6 +9304,164 @@ def scenario_subjects_store_merge_units_and_fill(page, url, secret):
     assert r["watchStopped"] is None and r["watchStoppedSize"] == 0, r
 
 
+def scenario_subject_store_keeps_each_sources_fields(page, url, secret):
+    # Plan 43 calls 13-16, 29: a sibling group (the records' `group`) shares its subjects;
+    # each subject keeps what each source (`<mode>@<handler>`) said, and `marksOf` turns that
+    # into per-field marks.
+    login(page, url, secret)
+    r = page.evaluate(
+        """async () => {
+          const { mountSubjects, mountSubjectsPane, sourceKey, marksOf } =
+            await import('./subjects.js');
+          const handlers = [{id: "builtin", name: "built-in"}, {id: "alt", name: "Alt"}];
+          const row = {
+            protocol: "m",
+            event: {summary: "{id} {name?}"},
+            subject: {key: "id", name: "pairs", waterfall: "summary", heading: null,
+                      label: null, merge: ["id"],
+                      columns: [{field: "name", label: "Name", unit: null},
+                                {field: "own_only", label: "Own", unit: null},
+                                {field: "alt_only", label: "Alt", unit: null},
+                                {field: "level", label: "Level", unit: null}]},
+          };
+          const other = {...row, protocol: "n"};
+          const out = {
+            keyNamed: sourceKey({kind: "m"}, {handler: "alt"}, {handlers}),
+            keyOwn: sourceKey({kind: "m"}, {id: "K"}, {handlers}),
+          };
+          const api = {op: async (o) => o.op === "modes_list"
+            ? {value: {modes: [{id: "m"}, {id: "n"}]}}
+            : {value: {mode: {row: o.id === "m" ? row : other,
+                              handlers: o.id === "m" ? handlers : [handlers[0]]}}}};
+          const view = {get: (k) => (k === "subject_dim_s" ? 60 : 300), onChange() {}};
+          const store = mountSubjects(api, view);
+          await store.lookup(["m", "n"]);
+          const run = {status: "running"};
+          const stopped = {status: "stopped"};
+          const j1 = {id: "J1", kind: "m", source: "tone", group: "G", handler: "builtin",
+                      state: run};
+          const j2 = {id: "J2", kind: "m", source: "tone", group: "G", handler: "alt",
+                      state: run};
+          store.sync([j1, j2]);
+          const slotsOf = (g) => new Map(store.sources(g).map((x) => [x.key, x.slot]));
+          const plain = (m) => [...m.values()].every((x) => x.mark === null && x.title === null);
+          const first = store.event(j1, {id: "K", name: "Alpha", own_only: "x", level: 1,
+                                         protocol: "m", handler: "builtin", summary: "K Alpha"});
+          out.loneMarksPlain = plain(marksOf(first, slotsOf("G")));
+          out.loneMarkCount = marksOf(first, slotsOf("G")).size;
+          const s = store.event(j2, {id: "K", name: "Alfa", alt_only: "y", level: 2,
+                                     protocol: "m", handler: "alt", summary: "K Alfa"});
+          out.listed = store.list("G").length;
+          out.listedViaJob = store.list("J2").length;
+          out.level = s.state.level;
+          out.bySize = s.by.size;
+          out.byKeys = [...s.by.keys()];
+          out.byAlt = s.by.get("m@alt") && {mode: s.by.get("m@alt").mode,
+                                           handler: s.by.get("m@alt").handler,
+                                           alt_only: s.by.get("m@alt").fields.alt_only.v,
+                                           t: typeof s.by.get("m@alt").fields.alt_only.t};
+          const marks = marksOf(s, slotsOf("G"));
+          out.marks = Object.fromEntries(
+            ["name", "own_only", "alt_only", "level", "id", "protocol", "summary"]
+              .map((f) => [f, marks.get(f) ?? null]));
+          out.sources = store.sources("G");
+          let changes = 0;
+          store.onChange(() => { changes += 1; });
+          store.setHandlerSlots({alt: 4});
+          out.changesOnPin = changes;
+          out.pinnedSlots = store.sources("G").map((x) => [x.handler, x.slot]);
+          out.pinnedMark = marksOf(s, slotsOf("G")).get("alt_only");
+          store.setHandlerSlots({});
+          out.heardBy1 = store.heardBy("J1");
+          out.heardBy2 = store.heardBy("J2");
+          out.groupIds = [store.groupId("J1"), store.groupId("J2"), store.groupId("X")];
+          // The pane draws the group once: one section, one row (never a section per member,
+          // nor a merge across rows of one row's siblings).
+          const el = document.createElement("div");
+          document.body.append(el);
+          let jobsNow = [j1, j2];
+          const pane = mountSubjectsPane(el, store, view, {jobs: () => jobsNow});
+          pane.render();
+          out.paneSections = [...el.querySelectorAll("section")].map(
+            (x) => `${x.className}:${x.dataset.job ?? x.dataset.name}`);
+          out.paneRows = el.querySelectorAll("tr.subject").length;
+          out.paneGroupIds = pane.groupIds();
+          // Another row's job on the same subject: the merged view's group carries every
+          // member's `by` (call 29).
+          const j5 = {id: "J5", kind: "n", source: "tone", handler: "builtin", state: run};
+          jobsNow = [j1, j2, j5];
+          store.sync(jobsNow);
+          store.event(j5, {id: "K", name: "Alpha", protocol: "n", handler: "builtin"});
+          const merged = pane.mergeGroups([j1, j5], {subject: {merge: ["id"]}});
+          out.mergedGroups = merged.length;
+          out.mergedBy = merged[0] && [...merged[0].by.keys()].sort();
+          pane.render();
+          out.mergedRows = el.querySelectorAll("tr.subject").length;
+          out.mergedSections = el.querySelectorAll("section").length;
+          pane.destroy();
+          el.remove();
+          // The first member stops: the sibling keeps the group and all it heard.
+          store.sync([{...j1, state: stopped}, j2]);
+          out.afterFirstStops = store.list("G").length;
+          out.afterFirstStopsBy = store.list("G")[0]?.by.size ?? null;
+          store.sync([{...j1, state: stopped}, {...j2, state: stopped}]);
+          out.afterBothStop = store.list("G").length;
+          // A sibling heard before a poll showed its `group`: its subject moves into the group
+          // and joins the one already there, listed once with both sources.
+          const j3 = {id: "J3", kind: "m", source: "tone", handler: "builtin", state: run};
+          const j4 = {id: "J4", kind: "m", source: "tone", handler: "alt", state: run};
+          store.sync([j3, j4]);
+          store.event(j3, {id: "L", name: "Lima", handler: "builtin"});
+          store.event(j4, {id: "L", name: "Lima", alt_only: "z", handler: "alt"});
+          out.beforeGroup = [store.list("J3").length, store.list("J4").length];
+          const drops = [];
+          store.onDrop((j, k) => drops.push([j, k]));
+          store.sync([{...j3, group: "J3"}, {...j4, group: "J3"}]);
+          out.afterGroup = store.list("J3").map((x) => [x.key, x.job, x.by.size, x.count]);
+          out.afterGroupViaSibling = store.list("J4").length;
+          out.subjectsInStore = [...store.jobs.values()].reduce((n, m) => n + m.size, 0);
+          out.lateDrops = drops;
+          out.lateMarks = Object.fromEntries(marksOf(store.list("J3")[0], slotsOf("J3")));
+          store.destroy();
+          return out;
+        }""")
+    assert r["keyNamed"] == "m@alt" and r["keyOwn"] == "m@builtin", r
+    assert r["loneMarksPlain"] is True and r["loneMarkCount"] > 0, r
+    assert r["listed"] == 1 and r["listedViaJob"] == 1, r
+    assert r["level"] == 2 and r["bySize"] == 2, r
+    assert r["byKeys"] == ["m@builtin", "m@alt"], r
+    assert r["byAlt"] == {"mode": "m", "handler": "alt", "alt_only": "y", "t": "number"}, r
+    m = r["marks"]
+    assert m["name"] == {"mark": "differs", "title": "built-in: Alpha · Alt: Alfa"}, m
+    assert m["own_only"] == {"mark": 1, "title": "only built-in"}, m
+    assert m["alt_only"] == {"mark": 2, "title": "only Alt"}, m
+    for f in ("level", "id", "protocol", "summary"):
+        assert m[f] == {"mark": None, "title": None}, (f, m)
+    assert r["sources"] == [
+        {"key": "m@builtin", "mode": "m", "handler": "builtin", "name": "built-in", "slot": 1},
+        {"key": "m@alt", "mode": "m", "handler": "alt", "name": "Alt", "slot": 2},
+    ], r["sources"]
+    assert r["changesOnPin"] >= 1, r
+    assert r["pinnedSlots"] == [["builtin", 1], ["alt", 4]], r
+    assert r["pinnedMark"] == {"mark": 4, "title": "only Alt"}, r
+    assert r["heardBy1"] == 1 and r["heardBy2"] == 1, r
+    assert r["groupIds"] == ["G", "G", "X"], r
+    assert r["paneSections"] == ["subject-job:G"], r["paneSections"]
+    assert r["paneRows"] == 1 and r["paneGroupIds"] == ["G"], r
+    assert r["mergedGroups"] == 1, r
+    assert r["mergedBy"] == ["m@alt", "m@builtin", "n@builtin"], r
+    assert r["mergedRows"] == 1 and r["mergedSections"] == 1, r
+    assert r["afterFirstStops"] == 1 and r["afterFirstStopsBy"] == 2, r
+    assert r["afterBothStop"] == 0, r
+    assert r["beforeGroup"] == [1, 1], r
+    assert r["afterGroup"] == [["L", "J3", 2, 2]], r
+    assert r["afterGroupViaSibling"] == 1 and r["subjectsInStore"] == 1, r
+    # The sibling's own copy is folded in: announced gone, so a map marker of it goes.
+    assert r["lateDrops"] == [["J4", "L"]], r
+    assert r["lateMarks"]["alt_only"] == {"mark": 2, "title": "only Alt"}, r["lateMarks"]
+    assert r["lateMarks"]["name"] == {"mark": None, "title": None}, r["lateMarks"]
+
+
 def scenario_subjects_table_merges_three_aircraft(page, url, secret):
     errors = page_errors(page)
     select_source(page, url, secret, "tone")
@@ -10960,6 +11118,18 @@ def scenario_handler_named_on_job_row(page, url, secret):
     finally:
         for job in jobs.values():
             stop_job(url, secret, job)
+
+
+def scenario_fake_pair_has_three_ready_handlers(page, url, secret):
+    # Plan 43's fixture (ui.rs `fake_modes`, `fake_handlers`): `fake_pair` runs by its own
+    # program, by `alt` (the same subject, other fields) and by `quiet` (never prints).
+    modes = http_json(url, secret, "/op", {"op": "modes_list", "family": None,
+                                           "state": None})["value"]["modes"]
+    pair = next(m for m in modes if m["id"] == "fake_pair")
+    assert [h["id"] for h in pair["handlers"]] == ["fake_lines", "alt", "quiet"], pair["handlers"]
+    for h in pair["handlers"]:
+        assert h["state"] == "ready", h
+    assert pair["state"] == "ready", pair
 
 
 def scenario_explore_delete_all_removes_every_capture(page, url, secret):

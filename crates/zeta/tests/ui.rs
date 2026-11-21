@@ -677,6 +677,20 @@ const FAKE_VDL2_LINES: &str = "{\"icao\":\"7C0000\",\"addr_type\":\"Aircraft\",\
 {\"icao\":\"7C0000\",\"addr_type\":\"Aircraft\",\"dst\":\"1A2B3C\",\"reg\":\"VH-ZET\",\"flight\":\"ZET1\",\"text\":\"beta\"}\n\
 {\"icao\":\"1A2B3C\",\"addr_type\":\"Ground station\",\"dst\":\"7C0000\",\"reg\":\"VH-ZET\",\"flight\":null,\"text\":\"uplink\"}";
 
+/// What `fake_pair`'s own program prints (plan 43): PAIR1 at the demo station, with `name`
+/// (which `alt` gives differently), `own_only` (which `alt` lacks) and `level` 1.
+const FAKE_PAIR_OWN_LINES: &str = "{\"id\":\"PAIR1\",\"name\":\"Alpha\",\"own_only\":\"x\",\"level\":1,\
+\"lat\":-27.3842,\"lon\":153.1175}";
+
+/// What `alt` prints for a `fake_pair` job: PAIR1 again, `name` differing, `alt_only` (which
+/// the row's own lacks) and `level` 2.
+const FAKE_PAIR_ALT_LINES: &str = "{\"id\":\"PAIR1\",\"name\":\"Alfa\",\"alt_only\":\"y\",\"level\":2,\
+\"lat\":-27.3842,\"lon\":153.1175}";
+
+/// `fake_pair`'s programs print their line again every second of the 48 kHz cs16 IQ, so
+/// either handler can be heard first and each goes on being heard.
+const FAKE_PAIR_REPEAT_BYTES: &str = "192000";
+
 /// A modes directory under `dir` holding the fake rows and their lines files; its path.
 fn fake_modes(dir: &Path) -> PathBuf {
     use serde_json::json;
@@ -690,8 +704,48 @@ fn fake_modes(dir: &Path) -> PathBuf {
     std::fs::write(&acars_file, FAKE_ACARS_LINES).expect("write fake_acars.lines");
     let vdl2_file = dir.join("fake_vdl2.lines");
     std::fs::write(&vdl2_file, FAKE_VDL2_LINES).expect("write fake_vdl2.lines");
+    let pair_file = dir.join("fake_pair.lines");
+    std::fs::write(&pair_file, FAKE_PAIR_OWN_LINES).expect("write fake_pair.lines");
     let number = json!({"type": ["number", "null"]});
     let text = json!({"type": ["string", "null"]});
+    // Plan 43: one subject two handlers give (`alt`'s entry in `fake_handlers`), each with a
+    // field the other lacks, so both lines are valid by one schema.
+    let mut pair = fake_subject_row(
+        "fake_pair",
+        &pair_file,
+        json!({
+            "schema": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "name": text,
+                "own_only": text,
+                "alt_only": text,
+                "level": number,
+                "lat": number,
+                "lon": number,
+            }},
+            "summary": "{id} {name?} {level?}",
+        }),
+        json!({"lat": "lat", "lon": "lon"}),
+        json!({
+            "key": "id",
+            "name": "pairs",
+            "waterfall": "summary",
+            "columns": [
+                {"field": "name", "label": "Name", "unit": null},
+                {"field": "own_only", "label": "Own only", "unit": null},
+                {"field": "alt_only", "label": "Alt only", "unit": null},
+                {"field": "level", "label": "Level", "unit": null},
+            ],
+            "heading": null,
+            "label": null,
+        }),
+    );
+    pair["decoder"]["args"] = json!([
+        "--lines-file",
+        pair_file.to_str().unwrap(),
+        "--repeat-bytes",
+        FAKE_PAIR_REPEAT_BYTES
+    ]);
     let rows = [
         fake_pos_row(),
         fake_subject_row(
@@ -807,6 +861,7 @@ fn fake_modes(dir: &Path) -> PathBuf {
                             "addressed": "dst"},
             }),
         ),
+        pair,
     ];
     for row in rows {
         let file = format!("{}.json", row["id"].as_str().unwrap());
@@ -820,30 +875,65 @@ fn fake_modes(dir: &Path) -> PathBuf {
 const ALT_APRS_LINES: &str =
     "{\"src\":\"N0CALL\",\"dst\":\"APRS\",\"path\":[],\"info\":\">alt handler\"}";
 
-/// A handlers directory under `dir` holding `alt`, a second handler of `aprs_decode`:
-/// zeta-ext's `fake_lines` (pinned with `ZETA_HANDLER_FAKE_LINES`) on the channel's IQ,
-/// printing [`ALT_APRS_LINES`] 2 s into a job, with no `packets` output, so the mode's
-/// `outputs` (the union) list `packet` while a job run by `alt` gives none; its path.
+/// A handlers directory under `dir` holding `alt` and `quiet`, both zeta-ext's `fake_lines`
+/// (pinned with `ZETA_HANDLER_FAKE_LINES`) on the channel's IQ; its path.
+/// - `alt` is a second handler of `aprs_decode`, printing [`ALT_APRS_LINES`] 2 s into a job,
+///   with no `packets` output, so the mode's `outputs` (the union) list `packet` while a job
+///   run by `alt` gives none; and of `fake_pair`, printing [`FAKE_PAIR_ALT_LINES`] 2 s in and
+///   every second after.
+/// - `quiet` is a third handler of `fake_pair` whose lines file is empty: it never prints, a
+///   silent sibling (plan 43).
 fn fake_handlers(dir: &Path) -> PathBuf {
     let handlers = dir.join("handlers");
     std::fs::create_dir_all(&handlers).expect("create handlers dir");
     let lines = dir.join("alt_aprs.lines");
     std::fs::write(&lines, ALT_APRS_LINES).expect("write alt_aprs.lines");
-    let file = serde_json::json!({
-        "id": "alt",
-        "name": "Alt lines (UI tests)",
-        "programs": ["fake_lines"],
-        "install": {"url": "https://example.invalid/alt"},
-        "modes": {
-            "aprs_decode": {
-                "args": ["--lines-file", lines.to_str().unwrap()],
-                "input": {"stream": "iq", "format": "cs16", "rate_hz": 48000, "via": "stdin"},
-                "output": {"via": "stdout", "port": null, "parser": "json_lines"}
+    let pair = dir.join("alt_pair.lines");
+    std::fs::write(&pair, FAKE_PAIR_ALT_LINES).expect("write alt_pair.lines");
+    let silent = dir.join("quiet_pair.lines");
+    std::fs::write(&silent, "").expect("write quiet_pair.lines");
+    let input =
+        serde_json::json!({"stream": "iq", "format": "cs16", "rate_hz": 48000, "via": "stdin"});
+    let output = serde_json::json!({"via": "stdout", "port": null, "parser": "json_lines"});
+    let files = [
+        serde_json::json!({
+            "id": "alt",
+            "name": "Alt lines (UI tests)",
+            "programs": ["fake_lines"],
+            "install": {"url": "https://example.invalid/alt"},
+            "modes": {
+                "aprs_decode": {
+                    "args": ["--lines-file", lines.to_str().unwrap()],
+                    "input": input,
+                    "output": output,
+                },
+                "fake_pair": {
+                    "args": ["--lines-file", pair.to_str().unwrap(),
+                             "--repeat-bytes", FAKE_PAIR_REPEAT_BYTES],
+                    "input": input,
+                    "output": output,
+                }
             }
-        }
-    });
-    let text = serde_json::to_string_pretty(&file).unwrap();
-    std::fs::write(handlers.join("alt.json"), text).expect("write alt.json");
+        }),
+        serde_json::json!({
+            "id": "quiet",
+            "name": "Quiet lines (UI tests)",
+            "programs": ["fake_lines"],
+            "install": {"url": "https://example.invalid/quiet"},
+            "modes": {
+                "fake_pair": {
+                    "args": ["--lines-file", silent.to_str().unwrap()],
+                    "input": input,
+                    "output": output,
+                }
+            }
+        }),
+    ];
+    for file in files {
+        let text = serde_json::to_string_pretty(&file).unwrap();
+        let name = format!("{}.json", file["id"].as_str().unwrap());
+        std::fs::write(handlers.join(&name), text).unwrap_or_else(|e| panic!("write {name}: {e}"));
+    }
     handlers
 }
 
