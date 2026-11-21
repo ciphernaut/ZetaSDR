@@ -582,7 +582,9 @@ pub enum CaptureCmd {
         capture: String,
     },
     /// Replay a capture's set into a decoder mode's handler, paced in real time (no
-    /// radio, no lease); the job's events go to the `replay` feed
+    /// radio, no lease); the job's events go to the `replay` feed. Locally it waits for
+    /// the replay to end and prints its record, the note saying what was decoded; with
+    /// `--node` it prints the job at once
     Decode {
         /// A capture id (from `capture list`)
         #[arg(long, value_name = "ID")]

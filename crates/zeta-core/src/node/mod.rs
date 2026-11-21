@@ -5,7 +5,7 @@ mod capture;
 mod identify;
 mod jsonlog;
 mod launch;
-pub use launch::DRAIN_TIMEOUT_MS;
+pub use launch::{DRAIN_TIMEOUT_MS, REPLAY_DRAIN_TIMEOUT_MS};
 mod origin;
 pub use origin::{
     Agree, Confirmed, Described, From as OriginFrom, FromKind, Grade, Heard, ORIGIN_LEVEL_SPAN_DB,

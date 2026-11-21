@@ -309,7 +309,7 @@ Not run live when written: replay a stored capture through a mode's handler inst
 
 On the CLI: `zeta capture decode --capture <id> --kind <mode> [--handler <h>] [--packets]`. On the page: Explore's capture row, **Send to** and the mode's name (modes that do not fit are greyed with their reason).
 
-**Read the note.** `zeta job show <job id>`: the replay ends `stopped` with a note of how many events it decoded, and `job_context.replay` names the captures and the radio that recorded them. A silent replay says the decoder found nothing in that recording, not that the band is empty.
+**Read the note.** The replay ends `stopped` with a note of how many events it decoded, and `job_context.replay` names the captures and the radio that recorded them. A local `zeta capture decode` waits for the replay to end and prints its record, note included; with `--node` it prints the job at once, and `zeta job context --job <job id>` reads the note once it has ended. A silent replay says the decoder found nothing in that recording, not that the band is empty.
 
 **Compare two handlers.** Replay the same capture once per handler (`--handler dump1090`, then `--handler onair`), and read each job's events and `N subjects`. The replays are one group on the page, marked per handler as in "Compare two decoders", and a replay of the same capture, mode and handler while one runs is a `duplicate`.
 

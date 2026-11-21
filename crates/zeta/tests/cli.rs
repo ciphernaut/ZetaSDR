@@ -4858,3 +4858,60 @@ fn capture_decode_of_an_unknown_capture_names_the_field() {
     );
     assert!(text.contains("capture"), "{text}");
 }
+
+/// A local one-shot `capture decode` (no `--node`, no serve) waits for its replay to end
+/// and prints the finished record, its note saying what was decoded: a one-shot that
+/// printed at once would end the node, and the replay with it, mid-recording.
+#[test]
+fn a_local_capture_decode_prints_the_finished_replay_with_its_note() {
+    use zeta_core::bursts::{BurstPolicy, BurstStore, NewCapture};
+    use zeta_core::types::{Hz, JobId, SourceId};
+    let dir = tempfile::tempdir().unwrap();
+    let iq = zeta_dsp::fixtures::aprs_packet_iq("N0CALL", "APZETA", ">replay", 48_000, 0.0);
+    let start_ns = 1_760_000_000_000_000_000u64;
+    let id = BurstStore::open(&dir.path().join("state"), BurstPolicy::default())
+        .unwrap()
+        .write(
+            NewCapture {
+                source: SourceId("tone".into()),
+                set: JobId("set".into()),
+                center_hz: Hz(144_800_000),
+                bandwidth_hz: Hz(12_500),
+                sample_rate_hz: Hz(48_000),
+                start_ns,
+                end_ns: start_ns + iq.len() as u64 * 1_000_000_000 / 48_000,
+                features: serde_json::json!({}),
+                signal: None,
+                job: JobId("job".into()),
+                watch: None,
+                allocations: serde_json::json!([]),
+            },
+            &iq,
+        )
+        .unwrap()
+        .id;
+    let out = zeta(
+        dir.path(),
+        &[
+            "capture",
+            "decode",
+            "--capture",
+            &id,
+            "--kind",
+            "aprs_decode",
+        ],
+    )
+    .timeout(std::time::Duration::from_secs(60))
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let v = json(&out);
+    let rec = &v["value"][0];
+    assert_eq!(rec["replay"], id.as_str(), "{v}");
+    assert_eq!(rec["state"]["status"], "stopped", "{v}");
+    let note = rec["context"]["note"].as_str().unwrap_or_default();
+    assert!(note.starts_with("replayed "), "{v}");
+    assert_eq!(note, "replayed 1 capture(s) from tone: 1 event(s)", "{v}");
+}

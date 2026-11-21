@@ -26,6 +26,11 @@ const RING_POLL: Duration = Duration::from_millis(20);
 /// Longest `--then-tail` waits for the job's streams to appear.
 const STREAM_WAIT: Duration = Duration::from_secs(2);
 
+/// How long past its recording's length and its drain bound a local `capture decode` waits
+/// for the replay to end (its packet lead, the launch), and the poll interval.
+const REPLAY_WAIT_MARGIN: Duration = Duration::from_secs(5);
+const REPLAY_POLL: Duration = Duration::from_millis(100);
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Usage errors exit 1, not clap's 2: exit 2 is reserved for `OpError`.
@@ -277,16 +282,17 @@ async fn one_shot(
             | Op::MixStart { .. }
             | Op::GraphStart { .. }
             | Op::BitsStart { .. }
-            | Op::CaptureDecode { .. }
     );
     if let Op::IqRead { selection } | Op::Classify { selection } = &op {
         wait_for_ring(node, selection).await;
     }
+    let replays = matches!(op, Op::CaptureDecode { .. });
     match node.apply(op).await {
         Ok(zeta_core::ops::OpResult::Job(id)) if then_tail.is_some() => {
             let t = then_tail.expect("checked");
             then_tail_job(node, id, t, keep).await
         }
+        Ok(zeta_core::ops::OpResult::Job(id)) if replays => replay_finished(node, id).await,
         Ok(mut r) => {
             cli::narrow_plans(&mut r, plan);
             if starts_job {
@@ -296,6 +302,35 @@ async fn one_shot(
         }
         Err(e) => print(serde_json::to_string_pretty(&e), 2),
     }
+}
+
+/// A local `capture decode`: the node lives only as long as this process, so wait until
+/// the replay `id` leaves `running` (at most its recording's length, the replay drain
+/// bound and [`REPLAY_WAIT_MARGIN`]), then print its record as `job_list` answers one, the
+/// note in its context saying what was decoded. Exit 2 unless it ended `stopped`.
+async fn replay_finished(node: &zeta_core::node::Node, id: zeta_core::types::JobId) -> ExitCode {
+    use zeta_core::job::JobState;
+    let record = || node.job_list().into_iter().find(|r| r.id == id);
+    let length = record().map_or(Duration::ZERO, |r| {
+        let replay = &r.context["replay"];
+        let at = |k: &str| replay[k].as_u64().unwrap_or(0);
+        Duration::from_nanos(at("end_ns").saturating_sub(at("start_ns")))
+    });
+    let drain = Duration::from_millis(zeta_core::node::REPLAY_DRAIN_TIMEOUT_MS);
+    let deadline = tokio::time::Instant::now() + length + drain + REPLAY_WAIT_MARGIN;
+    while record().is_some_and(|r| r.state == JobState::Running)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(REPLAY_POLL).await;
+    }
+    let Some(rec) = record() else {
+        return fail(&format!("job {}: not listed", id.0));
+    };
+    let code = if rec.state == JobState::Stopped { 0 } else { 2 };
+    print(
+        serde_json::to_string_pretty(&zeta_core::ops::OpResult::Jobs(vec![rec])),
+        code,
+    )
 }
 
 /// `job start --then-tail`: report a job that is not running (before or
