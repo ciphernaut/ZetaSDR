@@ -432,6 +432,18 @@ async fn a_second_replay_of_the_same_capture_mode_and_handler_is_a_duplicate() {
             ),
         })
     );
+    // Another capture of the set is the same recording: a duplicate too, named as asked.
+    let r = decode(&node, &ids[1], MODE, None, false).await;
+    assert_eq!(
+        r,
+        Err(OpError::Duplicate {
+            job: first.clone(),
+            message: format!(
+                "capture {} is already replaying as {MODE} via {OWN}: job {}",
+                ids[1], first.0
+            ),
+        })
+    );
     assert_eq!(record(&node, &first).state, JobState::Running);
     let other = started(decode(&node, &ids[0], MODE, Some(ALT), false).await);
     assert_eq!(node.job_list().len(), 2);

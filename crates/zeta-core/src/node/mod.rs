@@ -2969,12 +2969,14 @@ impl Node {
                 kind: StreamKind::Iq,
             }));
         graph::validate(&graph, &self.inner.registry)?;
-        // One replay of a capture per mode and handler: checked and launched under one
-        // hold of the gate.
+        // One replay of a recording (whichever capture of its set was named) per mode and
+        // handler: checked and launched under one hold of the gate.
         let _gate = self.inner.replay_gate.lock().await;
+        let same_set = serde_json::json!(ids);
         let running = self.job_list().into_iter().find(|r| {
             r.state == JobState::Running
-                && r.replay.as_deref() == Some(capture)
+                && r.replay.is_some()
+                && r.context["replay"]["captures"] == same_set
                 && r.kind == kind
                 && r.handler == resolved
         });

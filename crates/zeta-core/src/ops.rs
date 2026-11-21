@@ -915,9 +915,10 @@ pub enum Op {
     /// (`<mode>: handler <id> is unavailable: <reason>`, `<mode>: handler <id> outputs
     /// no packet`, `no_handler`); a mode the recording cannot hold is refused by its
     /// expansion (`out_of_range` on `bandwidth_hz` for a band narrower than the mode's
-    /// handler needs, or wider than its channel rate); and a replay of the same capture,
-    /// mode and handler while one runs is a `duplicate`: `capture <id> is already
-    /// replaying as <kind> via <handler>: job <job>`.
+    /// handler needs, or wider than its channel rate); and a replay of the same recording
+    /// (any capture of its set), mode and handler while one runs is a `duplicate` naming
+    /// the capture asked for: `capture <id> is already replaying as <kind> via <handler>:
+    /// job <job>`.
     #[schemars(transform = require_packets)]
     CaptureDecode {
         /// Any capture of the set, an id from `capture_list`.
