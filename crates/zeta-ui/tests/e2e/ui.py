@@ -221,7 +221,8 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     expect(page.locator('.src-tab[data-id="tone"]')).to_be_visible()
     page.wait_for_timeout(500)
     health = http_json(url, secret, "/health")
-    assert health["ws_connections"] <= 3, f"duplicate sockets: {health}"
+    # ops + waterfall + feed + the replay feed (plan 44).
+    assert health["ws_connections"] <= 4, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
     expect(page.locator("#transcript")).to_contain_text("source_list → ok (14 sources)")
@@ -5567,7 +5568,8 @@ def scenario_quiet_channel_row_is_tagged_squelch(page, url, secret):
 
 def scenario_every_job_on_the_source_is_watched(page, url, secret):
     # Six measure jobs and four fm_demods on tone: every row counts or is tagged, no row
-    # says "not watched", and the page holds ops + waterfall + feed = 3 sockets throughout.
+    # says "not watched", and the page holds ops + waterfall + feed + the replay feed (plan 44)
+    # = 4 sockets throughout.
     select_source(page, url, secret, "tone")
     page.wait_for_function(BRIGHT_AT_RIGHT_JS, timeout=5_000)
     jobs = []
@@ -5590,7 +5592,7 @@ def scenario_every_job_on_the_source_is_watched(page, url, secret):
             expect(job_row(page, j).locator(".kind .tag.squelch")).to_be_visible(timeout=5_000)
         expect(page.locator('#jobs .job .events[title^="not watched"]')).to_have_count(0)
         counts = stable_ws_connections(url, secret)
-        assert max(counts) <= 3, f"ws_connections {counts}"
+        assert max(counts) <= 4, f"ws_connections {counts}"
     finally:
         for j in jobs:
             stop_job(url, secret, j)
@@ -5654,7 +5656,8 @@ def scenario_ws_busy_is_noted_once(page, url, secret):
     hog = page.context.new_page()
     try:
         hog.goto(url + "/ui/")
-        # ops + waterfall here, no feed yet; plus whatever the hog page holds.
+        # ops + waterfall + the replay feed here, no feed yet; plus whatever the hog page
+        # holds.
         free = MAX_WS - stable_ws_connections(url, secret)[-1]
         assert hog.evaluate(HOG_JS, [free, ops, proto]) == free, "hog sockets did not open"
         page.evaluate("window.zetaTest.hideFeeds(false)")
@@ -5666,15 +5669,15 @@ def scenario_ws_busy_is_noted_once(page, url, secret):
         expect(busy).to_have_count(1)
         expect(busy.locator(".count")).to_have_text("")
         hog.evaluate("window.hog.forEach((ws) => ws.close())")
-        # ops + waterfall + the feed, once the hog's sockets are gone and the backoff (at
-        # most 8 s) has run out.
+        # ops + waterfall + the replay feed + the feed, once the hog's sockets are gone and
+        # the backoff (at most 8 s) has run out.
         deadline = time.monotonic() + 15.0
         counts = []
         while time.monotonic() < deadline:
             counts = stable_ws_connections(url, secret)
-            if counts[-1] == 3 and len(set(counts)) == 1:
+            if counts[-1] == 4 and len(set(counts)) == 1:
                 break
-        assert counts and counts[-1] == 3, f"the refused feed never opened: {counts}"
+        assert counts and counts[-1] == 4, f"the refused feed never opened: {counts}"
     finally:
         hog.close()
 
@@ -9751,7 +9754,8 @@ def scenario_subjects_survive_a_source_switch(page, url, secret):
 def scenario_subjects_follow_every_job_on_another_source(page, url, secret):
     # Every job on the shown source is watched (its feed), and so is every subject job on
     # another source, on that source's feed: five decoders on `retune` cost one socket more
-    # (ops + waterfall + feed + retune's feed), none is "not watched", all fill their tables.
+    # (ops + waterfall + feed + the replay feed + retune's feed), none is "not watched", all
+    # fill their tables.
     select_source(page, url, secret, "tone")
     jobs = []
     try:
@@ -9766,7 +9770,7 @@ def scenario_subjects_follow_every_job_on_another_source(page, url, secret):
             expect(rows).to_have_count(3, timeout=10_000)
         expect(page.locator("#subjects section.subject-job .not-watched")).to_have_count(0)
         counts = stable_ws_connections(url, secret)
-        assert max(counts) <= 4, f"ws_connections {counts}"
+        assert max(counts) <= 5, f"ws_connections {counts}"
         # A node that lists no feed for the other source: its jobs say so.
         page.evaluate("window.zetaTest.hideFeeds(true)")
         page.evaluate("window.zetaTest.dropOtherFeeds()")
@@ -11729,6 +11733,181 @@ def scenario_theme_pins_a_handler_to_a_slot(page, url, secret):
         run_cmd(page, "view reset")
         stop_job(url, secret, sib)
         stop_job(url, secret, own)
+
+
+# ---- replays of a stored capture (plan 44) ----------------------------------------------
+
+# A replay's band on each source it is captured from: a mode row that fits it decodes there.
+REPLAY_BANDS = {"aprs": (144_800_000, 12_500), "tone": (100_000_000, 40_000)}
+# Each window of a replayed set: the fake handlers print only after 2 s of their 48 kHz input
+# (ui.rs FAKE_POS_AFTER_BYTES), so a window is longer than that on its own (ruling R4).
+REPLAY_WINDOW_MS = 3_000
+
+
+def replay_set(url, secret, source):
+    """A set of two whole REPLAY_WINDOW_MS windows captured on `source` at its REPLAY_BANDS
+    band; its captures, newest first."""
+    centre, width = REPLAY_BANDS[source]
+    return two_captures_of(url, secret, source, centre, width, REPLAY_WINDOW_MS)
+
+
+def decode_capture(url, secret, capture, kind, handler=None, packets=False):
+    """`capture_decode` of the capture id `capture` as `kind` (by `handler`, else the
+    policy's pick); the replay's job id."""
+    return http_json(url, secret, "/op", {"op": "capture_decode", "capture": capture,
+                                          "kind": kind, "handler": handler,
+                                          "packets": packets})["value"]
+
+
+def replay_capture(url, secret, source, kind, handler=None, packets=False):
+    """A fresh set captured on `source` (replay_set) replayed as `kind`: (the capture id the
+    replay names, its job id)."""
+    capture = replay_set(url, secret, source)[0]["id"]
+    return capture, decode_capture(url, secret, capture, kind, handler, packets)
+
+
+def replay_section(page, capture):
+    return page.locator(f'#subjects section.subject-replay[data-capture="{capture}"]')
+
+
+def open_replay(page, capture):
+    """The Subjects pane shown once a replay's subjects make it eligible; the section of the
+    replays of `capture`, waited for."""
+    expect(pane_tab(page)).to_be_visible(timeout=30_000)
+    open_subjects(page)
+    sec = replay_section(page, capture)
+    expect(sec).to_have_count(1, timeout=30_000)
+    return sec
+
+
+def map_tracks(page):
+    """How many tracks (a job's, or a subject's) the map holds."""
+    return page.evaluate("() => import('./app.js').then((m) => m.state.map.tracks.size)")
+
+
+def scenario_a_replay_lists_its_subjects_as_a_group_of_its_own(page, url, secret):
+    # An APRS set replayed as aprs_decode: its station is listed in a section of the capture's
+    # own, titled from the capture; it draws no ribbon and no map track.
+    clear_captures(url, secret)
+    stop_aprs(url, secret)
+    errors = page_errors(page)
+    select_source(page, url, secret, "aprs")
+    capture = replay_set(url, secret, "aprs")[0]["id"]
+    ribbons = page.locator("#waterfall .ov-ribbon")
+    before = ribbons.count()
+    tracks = map_tracks(page)
+    job = decode_capture(url, secret, capture, "aprs_decode")
+    try:
+        sec = open_replay(page, capture)
+        expect(sec.locator('tr.subject[data-key="VK3ABC"]')).to_have_count(1, timeout=10_000)
+        expect(sec.locator("h3")).to_have_text(
+            re.compile(r"^replay of \d\d:\d\d:\d\d 144\.8000 MHz"), timeout=10_000)
+        expect(page.locator("#subjects section.subject-job")).to_have_count(0)
+        assert ribbons.count() <= before, (before, ribbons.count())
+        expect(page.locator("#waterfall .ov-ribbon", has_text="VK3ABC")).to_have_count(0)
+        assert map_tracks(page) == tracks, (tracks, map_tracks(page))
+        assert not errors, errors
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_a_replay_group_outlives_its_job_and_closes_on_its_button(page, url, secret):
+    clear_captures(url, secret)
+    select_source(page, url, secret, "aprs")
+    capture, job = replay_capture(url, secret, "aprs", "aprs_decode")
+    try:
+        sec = open_replay(page, capture)
+        row = sec.locator('tr.subject[data-key="VK3ABC"]')
+        expect(row).to_have_count(1, timeout=10_000)
+        wait_until(lambda: job_status(url, secret, job) != "running", 30, "the replay ended")
+        for _ in range(2):
+            page.evaluate("window.zetaTest.poll()")
+            page.wait_for_timeout(1_200)
+        expect(sec).to_have_count(1)
+        expect(row).to_have_count(1)
+        sec.locator("button.close").click()
+        expect(sec).to_have_count(0, timeout=5_000)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_two_handlers_replaying_one_capture_merge_and_mark(page, url, secret):
+    # fake_pair's own program and `alt` both print PAIR1 (ui.rs FAKE_PAIR_OWN_LINES and
+    # FAKE_PAIR_ALT_LINES), each with a field the other lacks: one row, marked per handler.
+    clear_captures(url, secret)
+    select_source(page, url, secret, "tone")
+    modes = http_json(url, secret, "/op", {"op": "modes_list", "family": None,
+                                           "state": None})["value"]["modes"]
+    names = {h["id"]: h["name"]
+             for h in next(m for m in modes if m["id"] == "fake_pair")["handlers"]}
+    capture = replay_set(url, secret, "tone")[0]["id"]
+    own = decode_capture(url, secret, capture, "fake_pair", "fake_lines")
+    alt = decode_capture(url, secret, capture, "fake_pair", "alt")
+    try:
+        sec = open_replay(page, capture)
+        expect(page.locator("#subjects section.subject-replay")).to_have_count(1)
+        expect(sec.locator("tr.subject")).to_have_count(1, timeout=10_000)
+        row = sec.locator('tr.subject[data-key="PAIR1"]')
+        expect(row.locator('td[data-col="alt_only"]')).to_have_text("y", timeout=20_000)
+        expect(row.locator('td[data-col="own_only"]')).to_have_text("x", timeout=20_000)
+        expect(sec.locator(".mark-1").first).to_be_visible()
+        expect(sec.locator(".mark-2").first).to_be_visible()
+        legend = sec.locator(".subject-legend .chip")
+        for h in ("fake_lines", "alt"):
+            expect(legend.filter(has_text=names[h])).to_have_count(1)
+    finally:
+        stop_job(url, secret, alt)
+        stop_job(url, secret, own)
+
+
+def scenario_a_finished_replay_row_shows_its_note(page, url, secret):
+    clear_captures(url, secret)
+    select_source(page, url, secret, "aprs")
+    capture, job = replay_capture(url, secret, "aprs", "aprs_decode")
+    try:
+        expect(job_row(page, job).locator(".source")).to_have_text("replay")
+        wait_until(lambda: job_status(url, secret, job) != "running", 30, "the replay ended")
+        expect(job_row(page, job).locator(".state")).to_have_text(
+            re.compile(r"^replayed "), timeout=10_000)
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_a_replay_is_no_sibling_of_a_live_job(page, url, secret):
+    # A live built-in aprs_decode job and an `alt` replay of a capture of its band: the live
+    # job's Send to still offers `alt`, and the replay's station (alt prints N0CALL) is in the
+    # replay's section only.
+    clear_captures(url, secret)
+    stop_aprs(url, secret)
+    select_source(page, url, secret, "aprs")
+    capture = replay_set(url, secret, "aprs")[0]["id"]
+    live = start_aprs(url, secret, "builtin")
+    replay = None
+    menu = page.locator("#ctx-outline")
+    try:
+        mine = page.locator(f'#subjects section.subject-job[data-job="{live}"]')
+        open_subjects(page)
+        expect(mine.locator('tr.subject[data-key="VK3ABC"]')).to_have_count(1, timeout=20_000)
+        job_row(page, live).locator("button.more").click()
+        wait_until(lambda: "send_to" in first_level(page), 10, "the Send to group")
+        menu_click(page, "send_to", "#ctx-outline")
+        before = sendto_panel_labels(page)
+        close_menu(page, "#ctx-outline")
+        replay = decode_capture(url, secret, capture, "aprs_decode", "alt")
+        sec = open_replay(page, capture)
+        expect(sec.locator('tr.subject[data-key="N0CALL"]')).to_have_count(1, timeout=30_000)
+        job_row(page, live).locator("button.more").click()
+        expect(menu).to_be_visible()
+        wait_until(lambda: "send_to" in first_level(page), 10, "the Send to group")
+        menu_click(page, "send_to", "#ctx-outline")
+        assert sendto_panel_labels(page) == before, (before, sendto_panel_labels(page))
+        expect(mine.locator('tr.subject[data-key="N0CALL"]')).to_have_count(0)
+        expect(mine.locator("tr.subject")).to_have_count(1)
+    finally:
+        close_menu(page, "#ctx-outline")
+        if replay:
+            stop_job(url, secret, replay)
+        stop_aprs(url, secret)
 
 
 def scenario_explore_delete_all_removes_every_capture(page, url, secret):

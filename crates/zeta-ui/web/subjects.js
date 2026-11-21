@@ -34,17 +34,23 @@
 //     (job id, key). Every call below taking a `jobId` takes a group id or a job id (resolved
 //     to its group).
 //     store.groupOf(job, jobs = the last sync's) -> {key, kind, title} | null   agent.js groupOf
-//     store.groupId(jobId) -> the group id of a job id (the watch's for a kept decoder, else
-//         the record's `group`, else itself; a group sent from a kept decoder is the watch's
-//         for as long as the watch runs, the decoder dropped or not),
+//     store.groupId(jobId) -> the group id of a job id (a replay's, before any other rule:
+//         `replay:<capture id>` (REPLAY_GROUP), the capture its record's `replay` names, so
+//         every replay of one capture shares it, plan 44 call 19; else the watch's for a kept
+//         decoder, else the record's `group`, else itself; a group sent from a kept decoder is
+//         the watch's for as long as the watch runs, the decoder dropped or not),
 //         as of the last `sync`. An event of a job no sync has seen yet goes by its record's
-//         `group`.
+//         `replay`, else its `group`.
 //     store.sync(jobs)   regroups (a decoder heard before its watch named it moves its subjects
 //         under the watch, the newer of two on one key standing; a sibling heard before its
 //         record showed its `group` moves its subjects into the group, two on one key becoming
 //         one with what both said, the sibling's copy announced dropped), drops the subjects of
 //         groups none of whose jobs runs (the job; a watch's, the watch; a sibling group's, any
-//         member); notes the running identifies' current trials
+//         member; never a replay's group, which stays until closed); notes the running
+//         identifies' current trials
+//     store.replayGroups() -> the replay groups holding subjects, in the order first heard
+//     store.closeGroup(id)   drops every subject of group `id` (each announced to onDrop) and
+//         its sources; the Subjects pane's `×` on a replay's section calls it
 //     store.sources(jobId) -> [{key, mode, handler, name, slot}]   the group's sources in the
 //         order they first supplied a field: `name` the handler's from the row's `handlers` (the
 //         id when unknown), `slot` the theme's pin for the handler id (setHandlerSlots), else the
@@ -72,7 +78,9 @@
 //     store.destroy()   its callbacks go; the selection itself is the page's and stays
 //     A subject past view `subject_dim_s` of silence is dim, past `subject_drop_s` dropped
 //     (checked each second, from this page's clock, so a longer `subject_dim_s` un-dims it at
-//     the next check); a selection goes with its subject.
+//     the next check); a selection goes with its subject. A replay group's subjects take
+//     their `first_seen`/`last_seen` (and each source field's time) from the events' `t_ns`
+//     (ms; the recording's times) and neither dim nor drop.
 //   A subject: {job, group, heard, center_hz, key, state, by, position, first_seen, last_seen,
 //     count, dim, row}. `job` is the id of the job first heard on, `group` its group's id, `heard`
 //     the job last heard on and `center_hz` its tuning's centre then (when it had one), `state` a
@@ -123,6 +131,14 @@
 //     its rows keep their order (a header click sorts once, a new row goes last), resuming on
 //     leave. A press (`pointerdown`) on a row selects it, so a row moving cannot lose a click, and
 //     a selection (from here or the map) scrolls its row into view.
+//     A replay group (store.replayGroups) draws, after every live section, one
+//     `section.subject-replay[data-capture=<capture id>]` (plan 44 call 19), its subjects merged
+//     and marked across handlers as a sibling group's are, its columns its last-heard subject's
+//     row's, `Last seen` the recording's `HH:MM:SS` (local time), headed `replay of <HH:MM:SS>
+//     <centre> MHz` (the capture's `start_ns` and `center_hz` from one `capture_list` per new
+//     capture, mhzText; `replay of <capture id>` while unknown or once the list no longer holds
+//     it) in a `span.title` beside a `button.close` (`×`) that closes the group. A replay is
+//     no subject job: it has no `subject-job` section and takes no part in a merge across rows.
 //     A register site selected on the map (selection.js, `opts.selection`, else the store's)
 //     draws, first in the pane, one `section.subject-site` headed `Site` with one
 //     `tr.site-selected`: the site's name, its holders (`, `-joined) and what the register
@@ -155,21 +171,40 @@
 //     textContent.
 //     pane.render()   draws now, unless hidden
 //     pane.eligible() -> bool   a running job's row has table columns, a trial's not counting,
-//         or a running watch holds subjects (app.js shows the pane)
-//     pane.groupIds() -> the ids of the groups the pane lists: the running subject jobs' groups
-//         and the running watches holding subjects (app.js counts their subjects)
+//         a running watch holds subjects, or a replay group does (app.js shows the pane)
+//     pane.groupIds() -> the ids of the groups the pane lists: the running subject jobs' groups,
+//         the running watches holding subjects and the replay groups (app.js counts their
+//         subjects)
 //     pane.destroy()
 
 import { groupOf as watchGroupOf } from "./agent.js";
 import { distanceBearing, positionOf } from "./map.js";
 import { Selection, isSite } from "./selection.js";
-import { metricText } from "./units.js";
+import { metricText, mhzText } from "./units.js";
 import { homeOf } from "./view.js";
 
 const TICK_MS = 1000;
 const RENDER_MS = 500;
 const SORT_STEP_MS = 10_000;
+// A failed `capture_list` (a replay section's title) is not asked again sooner than this.
+const CAPTURE_RETRY_MS = 5_000;
 const MERGE_SECTION_CLASS = "subject-merged";
+const REPLAY_SECTION_CLASS = "subject-replay";
+// A replay's group id is this and the id of the capture it names (plan 44 call 19).
+export const REPLAY_GROUP = "replay:";
+
+const isReplayGroup = (id) => typeof id === "string" && id.startsWith(REPLAY_GROUP);
+
+// The group of a replay record (its `replay`, the capture id it names), else null.
+function replayGroupOf(job) {
+  return typeof job?.replay === "string" && job.replay !== "" ? REPLAY_GROUP + job.replay : null;
+}
+
+// `HH:MM:SS` of `ms` (ms since the epoch) on this page's clock (local time).
+function clockText(ms) {
+  const d = new Date(ms);
+  return [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":");
+}
 
 const isRunning = (j) => !!(j && j.state && j.state.status === "running");
 
@@ -384,6 +419,9 @@ class SubjectStore {
     // supplied a field to one of the group's subjects
     this.sourceOrder = new Map();
     this.jobSources = new Map(); // job id -> the source key of its last keyed event
+    // A replay's id -> the capture id it names: its group is REPLAY_GROUP + that, kept after
+    // the job is gone, as its group is (plan 44)
+    this.replays = new Map();
     this.handlerSlots = {}; // the theme's `handlers`: handler id -> slot
     this.lastJobs = [];
     this.trials = new Set(); // the running identifies' current trials
@@ -468,6 +506,8 @@ class SubjectStore {
   // never resolved to a record), else the job itself; a group sent from a watch's kept
   // decoder is the watch's while the watch runs.
   groupId(jobId) {
+    const capture = this.replays.get(jobId);
+    if (capture !== undefined) return REPLAY_GROUP + capture;
     const g = this.groups.get(jobId) ?? this.siblings.get(jobId) ?? jobId;
     return this.groups.get(g) ?? this.keptGroups.get(g) ?? g;
   }
@@ -475,6 +515,11 @@ class SubjectStore {
   // `groupId` for a job record, its own `group` standing in until a sync has seen it (a
   // sibling's first events can come before the next poll).
   groupFor(job) {
+    const replay = replayGroupOf(job);
+    if (replay) {
+      this.replays.set(job.id, job.replay);
+      return replay;
+    }
     if (this.groups.has(job.id) || this.siblings.has(job.id)) return this.groupId(job.id);
     const g = typeof job.group === "string" && job.group !== "" ? job.group : job.id;
     return this.groups.get(g) ?? this.keptGroups.get(g) ?? g;
@@ -555,7 +600,8 @@ class SubjectStore {
       subjects = new Map();
       this.jobs.set(group, subjects);
     }
-    const now = Date.now();
+    // A replay's times are the recording's (the event's `t_ns`), not this page's clock.
+    const now = isReplayGroup(group) && Number.isFinite(p.t_ns) ? p.t_ns / 1e6 : Date.now();
     let s = subjects.get(k.key);
     if (s) subjects.delete(k.key);
     else {
@@ -616,6 +662,7 @@ class SubjectStore {
         .map((j) => j.context.identify.current),
     );
     this.lastJobs = jobs || [];
+    for (const j of this.lastJobs) if (replayGroupOf(j)) this.replays.set(j.id, j.replay);
     this.groups = new Map();
     for (const j of live) {
       const g = watchGroupOf(j, live);
@@ -646,15 +693,16 @@ class SubjectStore {
       this.moveInto(jobId, own, group, !this.groups.has(jobId));
       dropped = true;
     }
-    // A group lives while its job runs, or (a watch's, a sibling group's) any member does.
+    // A group lives while its job runs, or (a watch's, a sibling group's) any member does; a
+    // replay's until it is closed (store.closeGroup).
     const alive = new Set([...running, ...live.map((j) => this.groupId(j.id))]);
     for (const [group, subjects] of [...this.jobs]) {
-      if (alive.has(group)) continue;
+      if (alive.has(group) || isReplayGroup(group)) continue;
       for (const key of [...subjects.keys()]) this.drop(group, key);
       dropped = true;
     }
     for (const group of [...this.sourceOrder.keys()]) {
-      if (!alive.has(group)) this.sourceOrder.delete(group);
+      if (!alive.has(group) && !isReplayGroup(group)) this.sourceOrder.delete(group);
     }
     if (dropped) this.changed();
   }
@@ -768,6 +816,19 @@ class SubjectStore {
     for (const cb of this.changeCbs) cb();
   }
 
+  // The replays' groups holding subjects (REPLAY_GROUP ids), in the order first heard.
+  replayGroups() {
+    return [...this.jobs.keys()].filter(isReplayGroup);
+  }
+
+  // Every subject of group `id` dropped (announced as any drop) and its sources forgotten.
+  closeGroup(id) {
+    const subjects = this.jobs.get(id);
+    for (const key of [...(subjects?.keys() ?? [])]) this.drop(id, key);
+    this.sourceOrder.delete(id);
+    this.changed();
+  }
+
   drop(jobId, key) {
     const group = this.groupId(jobId);
     const subjects = this.jobs.get(group);
@@ -786,6 +847,8 @@ class SubjectStore {
     const dropMs = this.view.get("subject_drop_s") * 1000;
     let changed = false;
     for (const [jobId, subjects] of [...this.jobs]) {
+      // A replay's times are the recording's: its rows neither dim nor drop on this clock.
+      if (isReplayGroup(jobId)) continue;
       for (const s of [...subjects.values()]) {
         const age = now - s.last_seen;
         if (age >= dropMs) {
@@ -810,6 +873,7 @@ class SubjectStore {
     this.keptGroups.clear();
     this.sourceOrder.clear();
     this.jobSources.clear();
+    this.replays.clear();
     this.changeCbs = [];
     this.learnCbs = [];
     this.dropCbs = [];
@@ -1010,6 +1074,11 @@ class SubjectsPane {
     this.sorts = new Map(); // section id -> {col, dir}
     this.pending = null; // the throttled redraw's timer
     this.lastRender = 0;
+    // capture id -> its `capture_list` record, or null when the list no longer holds it: what
+    // titles a replay's section, asked once per capture (again after a failed list)
+    this.captures = new Map();
+    this.capturesAsked = null; // the `capture_list` in flight, or null
+    this.capturesFailed = -Infinity; // Date.now() of the last failed one
     this.destroyed = false;
     this.onClick = (ev) => this.click(ev);
     this.onPress = (ev) => this.press(ev);
@@ -1040,7 +1109,8 @@ class SubjectsPane {
   subjectJobs() {
     return (this.jobs() || []).filter((j) => {
       const row = this.store.rowOf(j.kind);
-      return isRunning(j) && !j.owner && !this.store.isTrial(j.id) && row && row.subject;
+      // A replay's subjects are its capture's group (drawReplaySection), never a live view's.
+      return isRunning(j) && !j.owner && !j.replay && !this.store.isTrial(j.id) && row && row.subject;
     });
   }
 
@@ -1056,6 +1126,7 @@ class SubjectsPane {
     return (
       this.subjectJobs().some((j) => this.store.rowOf(j.kind).subject.columns.length > 0) ||
       this.heldWatches().length > 0 ||
+      this.store.replayGroups().length > 0 ||
       isSite(this.selection.get())
     );
   }
@@ -1065,6 +1136,7 @@ class SubjectsPane {
       ...new Set([
         ...this.subjectJobs().map((j) => this.store.groupId(j.id)),
         ...this.heldWatches().map((j) => j.id),
+        ...this.store.replayGroups(),
       ]),
     ];
   }
@@ -1083,11 +1155,21 @@ class SubjectsPane {
       this.selection.set(null);
       return;
     }
+    const close = ev.target.closest(`section.${REPLAY_SECTION_CLASS} button.close`);
+    if (close) {
+      this.store.closeGroup(REPLAY_GROUP + close.closest("section").dataset.capture);
+      this.render();
+      return;
+    }
     const th = ev.target.closest("th[data-col]");
     if (!th) return;
-    const el = th.closest(`section.subject-job, section.${MERGE_SECTION_CLASS}`);
+    const el = th.closest(`section.subject-job, section.${MERGE_SECTION_CLASS}, section.${REPLAY_SECTION_CLASS}`);
     if (!el) return;
-    const id = el.classList.contains(MERGE_SECTION_CLASS) ? mergedId(el.dataset.name) : el.dataset.job;
+    const id = el.classList.contains(MERGE_SECTION_CLASS)
+      ? mergedId(el.dataset.name)
+      : el.classList.contains(REPLAY_SECTION_CLASS)
+        ? REPLAY_GROUP + el.dataset.capture
+        : el.dataset.job;
     const col = th.dataset.col;
     const cur = this.sorts.get(id);
     this.sorts.set(id, { col, dir: cur && cur.col === col ? -cur.dir : 1 });
@@ -1111,13 +1193,16 @@ class SubjectsPane {
 
   // The table's columns for a row: {col, label, text(s, values), value(s)}. `key` replaces the
   // key column and `extra` goes after the row's own columns (the merged section's).
-  columns(row, { key = null, extra = [], afterKey = [] } = {}) {
+  // A replay's (`recorded`) Last seen is the recording's clock time, not an age.
+  columns(row, { key = null, extra = [], afterKey = [], recorded = false } = {}) {
     const sub = row.subject;
     key ??= { col: sub.key, label: sub.key, text: (s) => s.key, value: (s) => s.key };
     const lastSeen = {
       col: "last_seen",
       label: "Last seen",
-      text: (s) => `${Math.max(0, Math.round((Date.now() - s.last_seen) / 1000))} s`,
+      text: recorded
+        ? (s) => clockText(s.last_seen)
+        : (s) => `${Math.max(0, Math.round((Date.now() - s.last_seen) / 1000))} s`,
       value: (s) => s.last_seen,
     };
     const ofColumn = (c, i) => ({
@@ -1287,13 +1372,17 @@ class SubjectsPane {
     return kept;
   }
 
-  // The section `id`, made on first use: a job's (`subject-job[data-job]`), or with `name` the
-  // merged one (`subject-merged[data-name]`).
-  section(id, name = null) {
+  // The section `id`, made on first use: a job's (`subject-job[data-job]`), with `name` the
+  // merged one (`subject-merged[data-name]`), with `capture` a replay group's
+  // (`subject-replay[data-capture]`, its heading's text in a span beside a `button.close`).
+  section(id, name = null, capture = null) {
     let sec = this.sections.get(id);
     if (sec) return sec;
     const el = document.createElement("section");
-    if (name === null) {
+    if (capture !== null) {
+      el.className = REPLAY_SECTION_CLASS;
+      el.dataset.capture = capture;
+    } else if (name === null) {
       el.className = "subject-job";
       el.dataset.job = id;
     } else {
@@ -1301,6 +1390,18 @@ class SubjectsPane {
       el.dataset.name = name;
     }
     const h3 = document.createElement("h3");
+    let title = null;
+    if (capture !== null) {
+      title = document.createElement("span");
+      title.className = "title";
+      const close = document.createElement("button");
+      close.type = "button";
+      close.className = "close";
+      close.setAttribute("aria-label", "Close this replay's subjects");
+      close.title = "Close this replay's subjects";
+      close.textContent = "×";
+      h3.append(title, close);
+    }
     const note = document.createElement("div");
     note.className = "not-watched";
     note.textContent = "not watched (its source has no event feed)";
@@ -1311,7 +1412,7 @@ class SubjectsPane {
     const body = document.createElement("tbody");
     table.append(thead, body);
     el.append(h3, table);
-    sec = { el, h3, note, table, head, body, sig: "", rows: new Map(), hover: false, order: null };
+    sec = { el, h3, title, note, table, head, body, sig: "", rows: new Map(), hover: false, order: null };
     table.addEventListener("pointerenter", () => {
       sec.hover = true;
     });
@@ -1356,7 +1457,7 @@ class SubjectsPane {
   }
 
   drawSection(sec, heading, subjects, cols, watched, sources = []) {
-    setText(sec.h3, heading);
+    setText(sec.title ?? sec.h3, heading);
     if (watched) sec.note.remove();
     else if (!sec.note.isConnected) sec.h3.after(sec.note);
     this.drawLegend(sec, sources);
@@ -1431,6 +1532,50 @@ class SubjectsPane {
       watched,
       sources,
     );
+  }
+
+  // A replay group's section (plan 44 call 19): every replay of one capture, merged and
+  // marked as siblings are, titled from the capture's record; drawn while it holds subjects.
+  drawReplaySection(sec, { id, capture }) {
+    const list = this.store.list(id);
+    const row = list[list.length - 1].row;
+    const cols = this.columns(row, { recorded: true });
+    const subjects = this.held(sec, this.sorted(id, list.reverse(), cols));
+    const rec = this.captureOf(capture);
+    const heading =
+      rec && Number.isFinite(rec.start_ns) && Number.isFinite(rec.center_hz)
+        ? `replay of ${clockText(rec.start_ns / 1e6)} ${mhzText(rec.center_hz)} MHz`
+        : `replay of ${capture}`;
+    this.drawSection(sec, heading, subjects, cols, true, legendSources(this.store.sources(id), (x) => x.name));
+  }
+
+  // The capture's `capture_list` record: null when the list no longer holds it, undefined
+  // while not known (one list asked for, its answer redrawing the pane; after a failed one,
+  // a draw CAPTURE_RETRY_MS later asks again).
+  captureOf(id) {
+    if (this.captures.has(id)) return this.captures.get(id);
+    if (this.capturesAsked || Date.now() - this.capturesFailed < CAPTURE_RETRY_MS) return undefined;
+    this.capturesAsked = (async () => {
+      let r = null;
+      try {
+        r = await this.store.api.op({ op: "capture_list", signal: null });
+      } catch {
+        r = null;
+      }
+      this.capturesAsked = null;
+      if (this.destroyed) return;
+      if (!r || r.result !== "captures" || !Array.isArray(r.value)) {
+        this.capturesFailed = Date.now();
+        return;
+      }
+      const held = new Map(r.value.filter((c) => c && typeof c.id === "string").map((c) => [c.id, c]));
+      for (const g of this.store.replayGroups()) {
+        const c = g.slice(REPLAY_GROUP.length);
+        this.captures.set(c, held.get(c) ?? null);
+      }
+      this.render();
+    })();
+    return undefined;
   }
 
   drawMergedSection(sec, { id, name, members }) {
@@ -1580,6 +1725,8 @@ class SubjectsPane {
       )
       .sort((a, b) => b.watched - a.watched);
     const parts = this.parts(wanted, jobs);
+    // The replays' groups, after the live views: a capture's subjects stay until closed.
+    for (const id of this.store.replayGroups()) parts.push({ id, capture: id.slice(REPLAY_GROUP.length) });
     const ids = new Set(parts.map((p) => p.id));
     for (const [id, sec] of [...this.sections]) {
       if (ids.has(id)) continue;
@@ -1591,8 +1738,9 @@ class SubjectsPane {
       if (!listed.has(id)) this.sorts.delete(id);
     }
     parts.forEach((part, i) => {
-      const sec = this.section(part.id, part.name ?? null);
-      if (part.group) this.drawWatchSection(sec, part);
+      const sec = this.section(part.id, part.name ?? null, part.capture ?? null);
+      if (part.capture !== undefined) this.drawReplaySection(sec, part);
+      else if (part.group) this.drawWatchSection(sec, part);
       else if (part.members) this.drawMergedSection(sec, part);
       else this.drawJobSection(sec, part);
       const at = first + i;

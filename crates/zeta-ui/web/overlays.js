@@ -118,7 +118,18 @@
 //                            yet, or whose row is not yet known, is held (at most
 //                            PENDING_MAX, a poll asked for) and handed on by the next sync
 //                            that knows it. A source whose feed becomes the selected one's
-//                            is left to that feed.
+//                            is left to that feed. A replay (a record with `replay`, plan
+//                            44) is never followed here, never outlined (rigidBand).
+//                            The replay feed: the node's one feed of every replay's events
+//                            (GET /streams: kind `event`, job null, source REPLAY_SOURCE,
+//                            `replay`; never `node`, which is the ops stream's shape), opened
+//                            at mount (ov.openReplayFeed), again on each sync while the node
+//                            lists none, and resolved again after a drop. Its frames go to
+//                            ov.onEvent alone (no ribbon, counter, label or mark), in order,
+//                            once their job is a replay in the last poll (in any state) with
+//                            its row settled; until then they are held (PENDING_MAX), a poll
+//                            is asked for (one in flight) and the row looked up, and a frame
+//                            whose job two fresh polls do not list is dropped.
 //     ov.follows(jobId) -> bool  whether the job's events reach ov.onEvent: a running job on
 //                            the selected source (the feed), or a positioned job on another
 //                            source whose feed is subscribed here; false for any other (a
@@ -263,7 +274,8 @@
 //     ov.onEvent(fn)         fn(job, payload) for every non-spectrum event of a job on the
 //                            selected source,
 //                            before it is drawn, and of a positioned job on another source
-//                            (the map reads `position` from them)
+//                            (the map reads `position` from them), and of a replay (the
+//                            replay feed; the map and the transcript skip those)
 //     ov.rateOf(jobId) -> number   the job's events counted in the last 60 s (a ring of event
 //         times, pruned on read and on a 5 s tick that redraws each `.rate` cell, so a decoder
 //         that falls silent counts down); a ribbon of a job with a `group` ends ` · <handler
@@ -332,13 +344,18 @@ export function channelColour(jobId) {
 
 const isRunning = (j) => !!(j && j.state && j.state.status === "running");
 
+// The node's feed of the replays' events (plan 44): a stream of kind `event`, no job, this
+// source. Never `node`: GET /streams lists the ops stream under that shape.
+export const REPLAY_SOURCE = "replay";
+
 // Whether `job` (a running `job_list` record) holds its source rigidly with a usable tuning.
-// A job on source `node` (a mix, a `bits` job replaying a capture) holds no radio and draws
-// no outline, whatever band its record carries.
+// A job on source `node` (a mix, a `bits` job replaying a capture, a replay) holds no radio
+// and draws no outline, whatever band its record carries.
 function rigidBand(job) {
   const t = job.tuning;
   return (
     job.source !== "node" &&
+    !job.replay &&
     !job.elastic &&
     !job.input &&
     job.kind !== "scan" &&
@@ -464,6 +481,9 @@ class Overlays {
     this.otherPending = []; // {source, frame, seen}: frames of jobs not yet followed
     this.subjects = subjects; // the row cache and the subjects (subjects.js)
     this.overCap = new Set(); // positioned job ids on other sources that have no feed
+    this.replayFeed = null; // the `replay` feed: {id, sub}, or null (not listed yet)
+    this.replayOpening = false; // a GET /streams for it is resolving
+    this.replayHeld = []; // {frame, seen}: replay frames whose job or row is not known yet
     this.destroyed = false;
     // Above zero inside a pass over many outlines (ov.layout, ov.sync, ov.syncOutlines):
     // layoutTags only marks the tags dirty, and the pass lays them out once at its end.
@@ -485,6 +505,7 @@ class Overlays {
       this.layout();
     });
     this.ro.observe(this.layer);
+    this.openReplayFeed();
   }
 
   // ---- jobs ----------------------------------------------------------------------------
@@ -531,6 +552,7 @@ class Overlays {
       this.lookup(jobs);
       // A source without a feed (an older node, or one listed late) is asked again each poll.
       if (!this.feed) this.openFeed();
+      if (!this.replayFeed) this.openReplayFeed();
       for (const j of want) {
         // A `graph_put` restarted the job (perhaps with its squelch off): forget the old state.
         const sq = this.squelches.get(j.id);
@@ -547,6 +569,7 @@ class Overlays {
       this.setSpeaking(this.speaking);
       this.syncPositioned(jobs);
       this.replayPending(fresh);
+      this.flushReplays(fresh);
     });
   }
 
@@ -766,7 +789,8 @@ class Overlays {
   syncPositioned(jobs) {
     if (this.destroyed) return;
     const followed = jobs.filter((j) => {
-      if (j.source === this.sourceId || j.kind === "spectrum" || !isRunning(j)) return false;
+      // A replay's events come on the `replay` feed (ov.openReplayFeed), never a source's.
+      if (j.replay || j.source === this.sourceId || j.kind === "spectrum" || !isRunning(j)) return false;
       const row = this.subjects ? this.subjects.rowOf(j.kind) : null;
       return !!row && !!(row.position || row.subject);
     });
@@ -850,6 +874,88 @@ class Overlays {
       this.otherPending.splice(0, this.otherPending.length - PENDING_MAX);
     }
     this.askPoll();
+  }
+
+  // ---- the replay feed (plan 44) -------------------------------------------------------
+
+  // Subscribes the node's `replay` feed, once: at mount, and on each sync while the node
+  // lists none (an older node, or a failed request). After a drop its id is resolved again.
+  async openReplayFeed() {
+    if (this.destroyed || this.replayFeed || this.replayOpening) return;
+    this.replayOpening = true;
+    let id;
+    try {
+      id = await this.findFeed(REPLAY_SOURCE);
+    } catch {
+      return; // a failed request: the next sync asks again
+    } finally {
+      this.replayOpening = false;
+    }
+    if (this.destroyed || this.replayFeed || id === null) return;
+    const feed = { id, sub: null };
+    feed.sub = this.api.streamText(id, (msg) => this.onReplayMessage(feed, msg), null, {
+      onReconnect: async () => {
+        const next = await this.findFeed(REPLAY_SOURCE);
+        if (next) feed.id = next;
+        return next;
+      },
+    });
+    this.replayFeed = feed;
+  }
+
+  closeReplayFeed() {
+    if (this.replayFeed) this.replayFeed.sub.close();
+    this.replayFeed = null;
+    this.replayHeld = [];
+  }
+
+  // A frame of the replay feed: its job's events go to ov.onEvent alone (the Subjects pane),
+  // drawing nothing here, in order; one whose job or row is not known yet waits (flushReplays).
+  onReplayMessage(feed, msg) {
+    if (this.destroyed || this.replayFeed !== feed || msg.type !== "frame") return;
+    this.replayHeld.push({ frame: msg, seen: 0 });
+    if (this.replayHeld.length > PENDING_MAX) {
+      this.replayHeld.splice(0, this.replayHeld.length - PENDING_MAX);
+    }
+    this.flushReplays(false);
+  }
+
+  // Hands the held replay frames on, in order, each once its job is in the last poll (in
+  // any state: a replay often ends before the poll that lists it) and its row is settled; a
+  // later frame of a job waits behind its earlier ones. A job not listed asks for one poll
+  // (askPoll: one in flight); a frame whose job a second fresh poll still does not list is
+  // dropped. A row not yet known is looked up (whatever the job's state).
+  flushReplays(fresh) {
+    if (!this.replayHeld.length || this.destroyed) return;
+    const held = this.replayHeld;
+    this.replayHeld = [];
+    const waiting = new Set(); // job ids with a frame still held in this pass
+    const unknownKinds = new Set();
+    let ask = false;
+    for (const h of held) {
+      const id = h.frame.job;
+      const job = this.lastJobs.find((x) => x.id === id && x.replay);
+      if (job && !waiting.has(id) && this.rowKnown(job)) {
+        const p = h.frame.payload;
+        const obj = p && typeof p === "object" && !Array.isArray(p);
+        if (obj && (Array.isArray(p.db) || Array.isArray(p.q))) continue;
+        for (const fn of this.eventFns) fn(job, p);
+        continue;
+      }
+      if (job && !this.rowKnown(job)) unknownKinds.add(job.kind);
+      if (!job) {
+        if (fresh && ++h.seen >= 2) continue;
+        ask = true;
+      }
+      waiting.add(id);
+      this.replayHeld.push(h);
+    }
+    if (ask) this.askPoll();
+    if (unknownKinds.size && this.subjects) {
+      this.subjects.lookup([...unknownKinds]).then((learned) => {
+        if (learned && !this.destroyed) this.flushReplays(false);
+      });
+    }
   }
 
   // The rigid holders' bands (the source's pin among them) outlined, or the capture when
@@ -2178,6 +2284,7 @@ class Overlays {
     clearInterval(this.rateTimer);
     this.ro.disconnect();
     this.closeFeed();
+    this.closeReplayFeed();
     for (const source of [...this.otherFeeds.keys()]) this.closeOtherFeed(source);
     for (const [key, o] of this.outlines) if (o.tag) this.untag(o, key); // the rail's
     this.clearSiteChannels();

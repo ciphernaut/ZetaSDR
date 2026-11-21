@@ -1381,6 +1381,9 @@ function start(api) {
   state.map.onChange(paintMapCount);
   state.ov.onEvent((job, p) => {
     state.subjects?.event(job, p);
+    // A replay's events (the `replay` feed) are the Subjects pane's alone: no map track, no
+    // lit site, no transcript line passing for live traffic (plan 44 call 18).
+    if (job.replay) return;
     // A watch starting or dropping a decoder moves its row between polls (plan 31 spec 4.7).
     if (p && p.protocol === "watch" && p.job && (p.state === "decoding" || p.state === "lost")) {
       if (!pollPaused && state.jobs) state.jobs.refresh();

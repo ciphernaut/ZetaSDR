@@ -57,7 +57,8 @@
 //            handler's (the packets entry here, agent.js's audio rule)
 //   groupHandlers(job, jobs, row) -> the handler ids a Send to leaves out: those run by the
 //            job's group and by any other running, unowned job of its kind on its source and
-//            band (a record with no `handler` counts as the row's first)
+//            band (a record with no `handler` counts as the row's first); a replay (a record
+//            with `replay`) is never one of those
 //   packetVia(job, row, jobs) -> how the packets entry captures when the job's own handler
 //            gives none: {member} (a running group member whose handler gives packets),
 //            {handler, name} (the handler to start beside the job), or null
@@ -361,9 +362,14 @@ export function jobOutputs(job, row) {
 const sameBand = (a, b) =>
   !!a && !!b && a.center_hz === b.center_hz && a.bandwidth_hz === b.bandwidth_hz;
 
-// Whether `j` is a running decoder job of `job`'s kind on its source (not an attached job).
+// Whether `j` is a running decoder job of `job`'s kind on its source (not an attached job,
+// not a replay: a recording's decode is no sibling of a live job, plan 44 call 20).
 const sibling = (j, job) =>
-  j.kind === job.kind && j.source === job.source && !j.input && j.state?.status === "running";
+  j.kind === job.kind &&
+  j.source === job.source &&
+  !j.input &&
+  !j.replay &&
+  j.state?.status === "running";
 
 // The handler ids `job` (a job_list record) cannot be sent to, from `jobs` (the last job_list)
 // and its mode row `row`: those its group runs (the first job and the jobs sent from it), and

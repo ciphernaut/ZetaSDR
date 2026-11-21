@@ -53,12 +53,14 @@
 //                               newest fix, whichever source the page shows, or the newest
 //                               of its subject's when the store has merged the event into
 //                               one (call the store first). Fixes are kept while the map is
-//                               hidden, so the track is whole when it shows.
+//                               hidden, so the track is whole when it shows. A replay's
+//                               (a record with `replay`, plan 44) is no fix: ignored.
 //     map.sync()                after each jobs poll: the tracks of jobs no longer running
 //                               (stopped, failed, forgotten) are dropped with their marker
 //                               and so are the lit sets keyed by those jobs' ids; a
 //                               selection whose job is gone is cleared (a subject whose job
-//                               and group are not running, a site clicked in such a job's set)
+//                               and group are not running, unless the group is a replay's,
+//                               which outlives its jobs; a site clicked in such a job's set)
 //     map.origin(key, answer, {activity, litAt})   light the sites of an origin answer (plan 32
 //                               spec 4.4: an `origin` event's payload, a classification's
 //                               `origins`, a job's `job_context.origins`) as the set `key`: a
@@ -148,7 +150,7 @@
 //   when nothing else has (no home, no fix).
 
 import { Selection, isSite, sameSite } from "./selection.js";
-import { slotMap, subjectLabel, subjectValues } from "./subjects.js";
+import { REPLAY_GROUP, slotMap, subjectLabel, subjectValues } from "./subjects.js";
 import { bandText, emissionWords, levelText, metricText, powerText } from "./units.js";
 import { homeOf } from "./view.js";
 
@@ -900,7 +902,7 @@ class MapPane {
   }
 
   event(job, p) {
-    if (this.destroyed) return;
+    if (this.destroyed || job.replay) return;
     const subject = this.subjects?.subjectOf(job, p);
     if (subject) {
       this.subjectEvent(subject, p);
@@ -1101,7 +1103,10 @@ class MapPane {
     const sel = this.selection.get();
     const lost =
       (isSite(sel) && !ONE_SHOT_KEY.test(sel.set) && !running.has(sel.set)) ||
-      (sel?.kind === "subject" && !running.has(sel.job) && !running.has(sel.group));
+      (sel?.kind === "subject" &&
+        !running.has(sel.job) &&
+        !running.has(sel.group) &&
+        !String(sel.group).startsWith(REPLAY_GROUP));
     if (lost) this.selection.set(null);
   }
 

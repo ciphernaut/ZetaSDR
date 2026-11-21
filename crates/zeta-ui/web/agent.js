@@ -61,7 +61,10 @@
 //       (stopped, failed) for view.get("finished_rows_s") seconds after this page first saw
 //       them finished (0: never; without `view`, 60 s); view.onClear drops the finished rows
 //       at once. A finished row shows `.reason` (the state's reason, or `stopped`) and no
-//       Stop, ▶ or Transcribe button. A row of an elastic job (the page's own spectrum job)
+//       Stop, ▶ or Transcribe button. A replay's row (a record with `replay`, plan 44) is
+//       `.job.replay`, its `.source` reading `replay`; once stopped its `.state` reads the
+//       record's `context.note` (what it decoded) in place of `stopped`, with no `.reason`
+//       unless the state gives one. A row of an elastic job (the page's own spectrum job)
 //       reads `<kind> elastic` and has only Stop. The row of the page's own automatic scan
 //       (the id in sessionStorage[AUTO_SCAN_KEY], coarse.js) reads `scan auto`; a scan the
 //       page did not start reads `scan`. A scan its source sweeps for itself (its
@@ -554,6 +557,13 @@ function autoScanId() {
   }
 }
 
+// A replay record's end note (`context.note`: `replayed <n> capture(s) from <source>: <events>
+// event(s)`), or null.
+function replayNote(job) {
+  const n = job.context?.note;
+  return typeof n === "string" && n.trim() !== "" ? n : null;
+}
+
 const isFinished = (j) => !!(j.state && (j.state.status === "stopped" || j.state.status === "failed"));
 
 export function setSquelchTag(row, event) {
@@ -684,7 +694,10 @@ function jobRow(
   const row = document.createElement("div");
   const attached = !!job.input;
   const finished = isFinished(job);
-  row.className = ["job", attached && "attached", finished && "finished"].filter(Boolean).join(" ");
+  const replay = !!job.replay;
+  row.className = ["job", attached && "attached", finished && "finished", replay && "replay"]
+    .filter(Boolean)
+    .join(" ");
   row.dataset.id = job.id;
   row.dataset.job = job.id;
   row.dataset.colour = String(channelColour(job.id));
@@ -694,10 +707,14 @@ function jobRow(
   }
   const status = job.state && job.state.status ? job.state.status : "?";
   row.dataset.state = status;
+  // A replay that ended with no reason given (plan 44 call 21): what it decoded (its
+  // context's note) stands in for `stopped`.
+  const note = replay && status === "stopped" && !job.state?.reason ? replayNote(job) : null;
   const cells = [
     ["kind", attached ? `↳ ${job.kind}${job.stream ? ` (${job.stream})` : ""}` : job.kind],
-    ["source", job.source],
-    ["state", status],
+    // A replay holds no radio: its source is the recording, named `replay`.
+    ["source", replay ? "replay" : job.source],
+    ["state", note ?? status],
     ["id", job.id.slice(-6)],
     ["events", ""],
   ];
@@ -724,7 +741,8 @@ function jobRow(
     span.className = cls;
     span.textContent = text;
     span.dir = "auto";
-    if (TITLED.includes(cls)) span.title = text;
+    if (TITLED.includes(cls) || (cls === "state" && note)) span.title = text;
+    if (cls === "source" && replay) span.title = `a replay of capture ${job.replay}`;
     if (cls === "id") span.title = job.id;
     if (cls === "rate" && text) span.title = "events in the last 60 s";
     if (cls === "heard") span.title = "subjects this handler has heard";
@@ -803,7 +821,7 @@ function jobRow(
     row.append(span);
   }
   if (job.state && job.state.reason) row.title = job.state.reason;
-  if (finished) {
+  if (finished && !note) {
     const reason = document.createElement("span");
     reason.className = "reason";
     reason.textContent = (job.state && job.state.reason) || "stopped";
