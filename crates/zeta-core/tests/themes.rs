@@ -689,3 +689,90 @@ fn builtin_mark_colours_meet_3_to_1_on_the_background() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// CIELAB (D65) `(L*, a*, b*)` of a `#rrggbb` sRGB colour.
+fn lab(hex: &str) -> (f64, f64, f64) {
+    let h = hex.strip_prefix('#').filter(|h| h.len() == 6);
+    let h = h.unwrap_or_else(|| panic!("{hex} is not #rrggbb"));
+    let lin = |i: usize| {
+        let c = f64::from(u8::from_str_radix(&h[i..i + 2], 16).unwrap()) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (r, g, b) = (lin(0), lin(2), lin(4));
+    let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
+    let f = |t: f64| {
+        if t > 216.0 / 24389.0 {
+            t.cbrt()
+        } else {
+            (24389.0 / 27.0 * t + 16.0) / 116.0
+        }
+    };
+    let (fx, fy, fz) = (f(x), f(y), f(z));
+    (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+}
+
+/// The least CIE76 colour difference (ΔE*ab) two handler marks of one theme may have.
+const MARK_MIN_DELTA_E: f64 = 30.0;
+/// The least difference of CIELAB hue angle (h_ab, degrees) two handler marks of one
+/// theme may have. The marks of slots 1 and 3 (and of 2 and 4) share a font style, so
+/// for them hue is the cue: a light and a deeper tint of one hue (terminal's old lime
+/// and pale lime, ΔE 38 but 3° apart) read as one mark, though ΔE and RGB distance pass.
+const MARK_MIN_HUE_DEG: f64 = 30.0;
+
+#[test]
+fn builtin_handler_marks_differ_from_each_other() {
+    let css = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../zeta-ui/web/style.css"
+    ))
+    .expect("read the core stylesheet");
+    let root = &css[css.find(":root {").unwrap()..];
+    let root = &root[..root.find("\n}").unwrap()];
+    let base = |name: &str| -> String {
+        let line = root
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("{name} is not in :root"));
+        line.split(';').next().unwrap().trim().to_string()
+    };
+    let mut failures = Vec::new();
+    for id in AA_THEMES {
+        let bytes = BUILTIN
+            .iter()
+            .find(|(k, _)| *k == format!("{id}/theme.json"))
+            .unwrap()
+            .1;
+        let json: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let marks: Vec<(usize, String)> = (1..=4)
+            .map(|n| {
+                let name = format!("--c-handler-{n}");
+                let c = json["tokens"][&name]
+                    .as_str()
+                    .map_or_else(|| base(&name), String::from);
+                (n, c)
+            })
+            .collect();
+        for (i, (n, a)) in marks.iter().enumerate() {
+            for (m, b) in &marks[i + 1..] {
+                let (la, lb) = (lab(a), lab(b));
+                let de =
+                    ((la.0 - lb.0).powi(2) + (la.1 - lb.1).powi(2) + (la.2 - lb.2).powi(2)).sqrt();
+                let (ha, hb) = (la.2.atan2(la.1).to_degrees(), lb.2.atan2(lb.1).to_degrees());
+                let dh = (ha - hb).rem_euclid(360.0);
+                let dh = dh.min(360.0 - dh);
+                if de < MARK_MIN_DELTA_E || dh < MARK_MIN_HUE_DEG {
+                    failures.push(format!(
+                        "{id}: slots {n} {a} and {m} {b} are ΔE {de:.1}, {dh:.0}° apart"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

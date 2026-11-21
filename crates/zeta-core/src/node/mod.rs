@@ -1094,11 +1094,16 @@ impl Inner {
     /// the record. Called under the job's source's gate, once a sibling beside it has
     /// launched (see [`Node::set_group`]). A write that fails is also recorded in
     /// `persist_errors`: the group holds in memory, and the record's next write keeps it.
+    /// A job no longer `Running` (`job_stop` takes no gate, so it may have stopped while
+    /// the sibling launched) is left as it is: a stopped record gains no group.
     fn set_group(&self, id: &JobId, group: &JobId) -> Result<(), NodeError> {
         let mut jobs = self.jobs.lock().unwrap();
         let entry = jobs
             .get_mut(id)
             .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+        if entry.record.state != JobState::Running {
+            return Ok(());
+        }
         entry.record.group = Some(group.clone());
         persist(&self.jobs_dir, &entry.record).inspect_err(|e| {
             self.persist_errors
@@ -3908,6 +3913,60 @@ mod tests {
         let mut graph_mix = rec("graph", None, None);
         graph_mix.graph = crate::ops::mix_graph(None);
         assert!(!mixable(&graph_mix));
+    }
+
+    /// A job stopped while its sibling launched (`job_stop` takes no gate) gains no
+    /// group, in memory or on disk; a running one joins it.
+    #[tokio::test]
+    async fn a_stopped_record_gains_no_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = NodeConfig {
+            source_positions: Default::default(),
+            burst_policy: Default::default(),
+            state_dir: dir.path().join("state"),
+            ring_seconds: 1.0,
+            ring_budget_bytes: u64::MAX,
+            scan_dwell_ms: 20,
+            backends: vec![crate::stage::Backend::Cpu],
+            resume: false,
+            owns_state_dir: true,
+            bank_factory: None,
+            modes_dir: None,
+            handlers_dir: None,
+            sets_dir: None,
+        };
+        let node = Node::open(cfg, crate::stage::StageRegistry::new(), vec![])
+            .await
+            .unwrap();
+        let running = rec("fm_demod", None, None);
+        let mut stopped = rec("fm_demod", None, None);
+        stopped.state = JobState::Stopped;
+        let (run_id, stop_id) = (running.id.clone(), stopped.id.clone());
+        for r in [running, stopped] {
+            node.inner
+                .jobs
+                .lock()
+                .unwrap()
+                .insert(r.id.clone(), JobEntry::loaded(r, Timestamp(0)));
+        }
+        node.set_group(&stop_id, &stop_id).unwrap();
+        node.set_group(&run_id, &run_id).unwrap();
+        let group = |id: &JobId| {
+            let jobs = node.inner.jobs.lock().unwrap();
+            jobs[id].record.group.clone()
+        };
+        assert_eq!(group(&stop_id), None);
+        assert_eq!(group(&run_id), Some(run_id.clone()));
+        let jobs_dir = &node.inner.jobs_dir;
+        assert!(
+            !jobs_dir.join(format!("{}.json", stop_id.0)).exists(),
+            "a stopped record is not rewritten"
+        );
+        let on_disk: JobRecord = serde_json::from_slice(
+            &std::fs::read(jobs_dir.join(format!("{}.json", run_id.0))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk.group, Some(run_id));
     }
 
     #[test]

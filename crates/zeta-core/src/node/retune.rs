@@ -171,10 +171,28 @@ impl Node {
             .ok_or_else(|| NodeError::UnknownSource(source.clone()))?;
         let (members, _restarts, guard) = self.inner.group_restarts_then_gate(group, source).await;
         if !members.iter().any(|r| &r.id == id) {
-            return Err(NodeError::Other(format!(
-                "job {} is not running in this node (one-shot: use --node against zeta serve)",
-                id.0
-            )));
+            // Stopped (or ended) since the op's check: say so, as that check does.
+            let state = self
+                .inner
+                .jobs
+                .lock()
+                .unwrap()
+                .get(id)
+                .map(|e| e.record.state.clone());
+            return Err(NodeError::Other(match state {
+                Some(s) if s != JobState::Running => {
+                    let v = serde_json::to_value(&s).unwrap_or_default();
+                    format!(
+                        "job {} is {}",
+                        id.0,
+                        v["status"].as_str().unwrap_or_default()
+                    )
+                }
+                _ => format!(
+                    "job {} is not running in this node (one-shot: use --node against zeta serve)",
+                    id.0
+                ),
+            }));
         }
         // Checked before the gate too; a member may have joined since.
         if let Some(m) = members.iter().find(|r| replace.contains(&r.id)) {

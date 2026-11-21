@@ -9381,6 +9381,12 @@ def scenario_subject_store_keeps_each_sources_fields(page, url, secret):
           out.changesOnPin = changes;
           out.pinnedSlots = store.sources("G").map((x) => [x.handler, x.slot]);
           out.pinnedMark = marksOf(s, slotsOf("G")).get("alt_only");
+          // Two handlers a theme pins to one slot: the first in order keeps it, the other
+          // takes the next free slot, so their marks still differ.
+          store.setHandlerSlots({builtin: 2, alt: 2});
+          out.samePinSlots = store.sources("G").map((x) => [x.handler, x.slot]);
+          store.setHandlerSlots({builtin: 1, alt: 1});
+          out.samePinOneSlots = store.sources("G").map((x) => [x.handler, x.slot]);
           store.setHandlerSlots({});
           out.heardBy1 = store.heardBy("J1");
           out.heardBy2 = store.heardBy("J2");
@@ -9477,6 +9483,8 @@ def scenario_subject_store_keeps_each_sources_fields(page, url, secret):
     assert r["changesOnPin"] >= 1, r
     assert r["pinnedSlots"] == [["builtin", 1], ["alt", 4]], r
     assert r["pinnedMark"] == {"mark": 4, "title": "only Alt"}, r
+    assert r["samePinSlots"] == [["builtin", 2], ["alt", 1]], r
+    assert r["samePinOneSlots"] == [["builtin", 1], ["alt", 2]], r
     assert r["heardBy1"] == 1 and r["heardBy2"] == 1, r
     assert r["groupIds"] == ["G", "G", "X"], r
     assert r["paneSections"] == ["subject-job:G"], r["paneSections"]
@@ -11580,8 +11588,9 @@ def scenario_sibling_fields_are_marked_in_the_table(page, url, secret):
 
 def scenario_a_watch_section_marks_its_subjects(page, url, secret):
     # In-page (a live watch fixture is costly): a watch keeps decoder D (the row's own
-    # handler) and a sibling S sent from it (record `group` = the watch, plan 43 R5) heard on
-    # the same subject; the watch's section marks and has a legend like a job's.
+    # handler) and a sibling S sent from it, heard on the same subject. As the node writes
+    # them, both records' `group` is D; the store resolves it to the watch while the watch
+    # runs (plan 43 R5), so the watch's section marks and has a legend like a job's.
     login(page, url, secret)
     r = page.evaluate(
         """async () => {
@@ -11607,9 +11616,9 @@ def scenario_a_watch_section_marks_its_subjects(page, url, secret):
           const W = "W0123456";
           const watch = {id: W, kind: "watch", source: "tone", state: run,
                          context: {watch: {decoding: [{job: "D", mode: "m"}]}}};
-          const d = {id: "D", kind: "m", source: "tone", handler: "builtin", state: run,
-                     tuning: {center_hz: 148637500, bandwidth_hz: 12500}};
-          const sib = {id: "S", kind: "m", source: "tone", handler: "alt", group: W, state: run,
+          const d = {id: "D", kind: "m", source: "tone", handler: "builtin", group: "D",
+                     state: run, tuning: {center_hz: 148637500, bandwidth_hz: 12500}};
+          const sib = {id: "S", kind: "m", source: "tone", handler: "alt", group: "D", state: run,
                        tuning: {center_hz: 148637500, bandwidth_hz: 12500}};
           const jobs = [watch, d, sib];
           store.sync(jobs);

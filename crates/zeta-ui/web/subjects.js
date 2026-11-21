@@ -506,9 +506,17 @@ class SubjectStore {
       mode: o.mode,
       handler: o.handler,
       name: handlerName(this.rows.get(o.mode), o.handler),
-      slot: pinned(o.handler),
+      slot: null,
     }));
-    const taken = new Set(out.map((o) => o.slot).filter((n) => n !== null));
+    // A pinned slot goes to the first source in order pinned to it; a later one pinned
+    // to the same slot takes the next free slot, as an unpinned source does.
+    const taken = new Set();
+    for (const o of out) {
+      const pin = pinned(o.handler);
+      if (pin === null || taken.has(pin)) continue;
+      o.slot = pin;
+      taken.add(pin);
+    }
     for (const o of out) {
       if (o.slot !== null) continue;
       let n = 1;

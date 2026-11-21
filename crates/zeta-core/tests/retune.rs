@@ -1037,6 +1037,79 @@ async fn retuning_one_member_moves_the_whole_group() {
     assert_eq!(record(&node, &first).handler.as_deref(), Some(h::OWN));
 }
 
+/// The common case: the group moves to a band inside the capture it is on. Both
+/// members follow under their ids and the radio is not tuned.
+#[tokio::test]
+async fn a_group_retuned_inside_its_capture_does_not_tune_the_radio() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio, _) = group_node(dir.path(), false).await;
+    // A 6 MHz capture holding HERE and, 500 kHz up, NEARBY.
+    let capture = Tuning {
+        center_hz: Hz(1_090_000_000),
+        bandwidth_hz: Hz(6_000_000),
+    };
+    const NEARBY: Tuning = Tuning {
+        center_hz: Hz(1_090_500_000),
+        bandwidth_hz: Hz(2_400_000),
+    };
+    pin(&node, capture).await;
+    let (first, sib) = pair(&node).await;
+    let tunes = radio.tunes();
+    assert_eq!(
+        retune_to(&node, &first, NEARBY, &[]).await,
+        Ok(OpResult::Job(first.clone()))
+    );
+    running_at(&node, &[&first, &sib], NEARBY).await;
+    assert_eq!(radio.tunes(), tunes, "the group retune tuned nothing");
+    assert_eq!(source(&node).await.current, Some(capture));
+    for id in [&first, &sib] {
+        assert_eq!(record(&node, id).group, Some(first.clone()), "{id:?}");
+    }
+    assert_eq!(record(&node, &sib).handler.as_deref(), Some(ALT));
+}
+
+/// The named member stopped while its group's retune waited for the gate (a stop takes
+/// none): the retune says it is stopped, as the op's own check would, and the sibling
+/// runs on where it was.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test]
+async fn a_member_stopped_before_the_gate_is_named_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio, _) = group_node(dir.path(), false).await;
+    let node = Arc::new(node);
+    let (first, sib) = pair(&node).await;
+    let gate = node.debug_gate(&SourceId(RADIO.into())).await;
+    let retuning = {
+        let (node, first) = (node.clone(), first.clone());
+        tokio::spawn(async move { retune_to(&node, &first, THERE, &[]).await })
+    };
+    // The retune is past its own check and waits on the gate.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!retuning.is_finished(), "the retune waits for the gate");
+    // The stop marks the record under the jobs lock alone; its supervisor's ending may
+    // wait on the gate, so the stop returns only once the gate is let go.
+    let stopping = {
+        let (node, first) = (node.clone(), first.clone());
+        tokio::spawn(async move { stop(&node, &first).await })
+    };
+    common::until("the member is stopped", Duration::from_secs(10), || {
+        record(&node, &first).state == JobState::Stopped
+    })
+    .await;
+    drop(gate);
+    tokio::time::timeout(Duration::from_secs(10), stopping)
+        .await
+        .expect("the stop ends")
+        .unwrap();
+    match retuning.await.unwrap() {
+        Err(OpError::Other { message }) => {
+            assert_eq!(message, format!("job {} is stopped", first.0))
+        }
+        r => panic!("expected the member named stopped, got {r:?}"),
+    }
+    running_at(&node, &[&sib], HERE).await;
+}
+
 #[tokio::test]
 async fn a_group_retune_conflicts_only_with_holders_outside_it() {
     let dir = tempfile::tempdir().unwrap();
