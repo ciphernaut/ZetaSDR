@@ -247,7 +247,8 @@ impl Inner {
             station: self.station.lock().unwrap().clone(),
             bursts: Some(self.bursts.clone()),
             packets: Some(self.packets.clone()),
-            ..StageContext::new(rec.source.clone())
+            replay: rec.replay.clone(),
+            ..StageContext::new(streams_source(&rec))
         }
         .with_note(Arc::new(move |v| {
             if let Some(inner) = inner.upgrade() {
@@ -997,7 +998,7 @@ impl Inner {
         }
         let t = now();
         let prov = Provenance {
-            source: rec.source.clone(),
+            source: streams_source(&rec),
             job: Some(rec.id.clone()),
             channel: None,
             span: Span {
@@ -1643,4 +1644,14 @@ fn register_event_stream(
 /// `outputs` as the (kind, stream) pairs the event tees and the proposal watcher take.
 fn pairs(outputs: &[JobOutput]) -> Vec<(StreamKind, StreamId)> {
     outputs.iter().map(|o| (o.kind, o.id.clone())).collect()
+}
+
+/// The source a job's streams name: [`super::REPLAY_SOURCE`] for a replay
+/// (`capture_decode`), whose events then reach only the `replay` feed; the record's own
+/// source for every other job.
+fn streams_source(rec: &JobRecord) -> SourceId {
+    match rec.replay {
+        Some(_) => SourceId(super::REPLAY_SOURCE.into()),
+        None => rec.source.clone(),
+    }
 }

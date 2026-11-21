@@ -288,6 +288,7 @@ fn running() -> JobRecord {
         handler_named: false,
         needs: Vec::new(),
         group: None,
+        replay: None,
     }
 }
 

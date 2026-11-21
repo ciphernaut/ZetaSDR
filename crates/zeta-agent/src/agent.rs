@@ -152,7 +152,7 @@ impl OwnJobs {
     pub fn record(&mut self, tool: &str, arguments: &Value, result: &Value) {
         let value = &result["value"];
         match tool {
-            "job_start" | "job_attach" | "graph_start" | "bits_start" => {
+            "job_start" | "job_attach" | "graph_start" | "bits_start" | "capture_decode" => {
                 if let Some(id) = value.as_str() {
                     self.jobs.insert(id.to_string());
                     if tool == "job_start" && arguments["kind"] == "identify" {
@@ -582,7 +582,13 @@ mod tests {
         let job = |id: &str| json!({"result": "job", "value": id});
         own.record("bits_start", &json!({"capture": "01CAP"}), &job("01BITS"));
         own.record("graph_start", &json!({}), &job("01GRAPH"));
+        own.record(
+            "capture_decode",
+            &json!({"capture": "01CAP", "kind": "aprs_decode"}),
+            &job("01REPLAY"),
+        );
         assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01BITS"})));
+        assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01REPLAY"})));
         assert!(own.allows_stop(&json!({"op": "job_stop", "job": "01GRAPH"})));
         assert!(!own.allows_stop(&json!({"op": "job_stop", "job": "01OTHER"})));
     }

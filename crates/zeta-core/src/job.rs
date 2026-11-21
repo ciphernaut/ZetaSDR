@@ -115,13 +115,19 @@ pub struct JobRecord {
     #[serde(default)]
     #[schemars(schema_with = "crate::types::nullable::<JobId>")]
     pub group: Option<JobId>,
+    /// The capture a `capture_decode` job replays (the id the request named); absent,
+    /// not `null`, on every other job, so a node built before replays still reads each
+    /// record that is not one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<String>,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
 /// cannot override that for deserialisation); a record is always written with
 /// `format`, `input`, `capture_rate_hz`, `elastic`, `operator_graph`, `owner`,
 /// `audio_policy`, `stream`, `sinks`, `handler`, `handler_named`, `needs` and `group`,
-/// so the published schema requires them.
+/// so the published schema requires them. `replay` is written only on a replay's record,
+/// so it stays optional.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()
@@ -241,5 +247,39 @@ mod tests {
                 .any(|f| f == "group"),
             "a record is always written with its group"
         );
+    }
+
+    #[test]
+    fn a_record_without_replay_loads_and_writes_no_replay_member() {
+        let v = serde_json::json!({
+            "id": "01J00000000000000000000000",
+            "kind": "aprs_decode",
+            "graph": {"id": "g", "nodes": [], "edges": []},
+            "source": "s",
+            "tuning": {"center_hz": 1, "bandwidth_hz": 1},
+            "state": {"status": "running"},
+            "context": {},
+            "created_ns": 0
+        });
+        let mut r: JobRecord = serde_json::from_value(v).unwrap();
+        // Not a replay: no member at all, so a node built before replays reads it.
+        assert_eq!(r.replay, None);
+        let written = serde_json::to_value(&r).unwrap();
+        assert!(written.get("replay").is_none(), "{written}");
+        let schema = serde_json::to_value(schemars::schema_for!(JobRecord)).unwrap();
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "replay"),
+            "a record that is not a replay is written without it"
+        );
+        assert!(schema["properties"].get("replay").is_some(), "{schema}");
+        // A replay's record names its capture, and reads back the same.
+        r.replay = Some("01CAP".into());
+        let written = serde_json::to_value(&r).unwrap();
+        assert_eq!(written["replay"], "01CAP");
+        assert_eq!(serde_json::from_value::<JobRecord>(written).unwrap(), r);
     }
 }

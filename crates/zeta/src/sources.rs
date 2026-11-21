@@ -121,14 +121,10 @@ fn split_id(s: &str) -> Option<(&str, &str)> {
 }
 
 /// A source may not be named like the node's own placeholder source, which a mix's record
-/// carries.
+/// carries, or like the source a replay's streams name
+/// ([`zeta_core::node::reserved_source`]).
 fn refuse_reserved(id: &str) -> Result<(), String> {
-    if id == zeta_core::node::NODE_SOURCE {
-        return Err(format!(
-            "source id {id:?} is reserved for the node's own streams"
-        ));
-    }
-    Ok(())
+    zeta_core::node::reserved_source(id).map_or(Ok(()), Err)
 }
 
 /// `ID=PATH.sigmf-meta[,tune_min_hz=N,tune_max_hz=M]`: the options start at the first
@@ -644,6 +640,11 @@ mod tests {
                 "source id \"node\" is reserved for the node's own streams"
             );
         }
+        // A replay's streams name the source `replay`.
+        assert_eq!(
+            parse_soapy("replay=driver=x").unwrap_err(),
+            "source id \"replay\" is reserved for the node's own streams"
+        );
         assert!(parse_plugin("node=/x").is_ok());
         assert!(parse_soapy("h=").is_err());
         assert!(parse_soapy("h").is_err());

@@ -892,6 +892,47 @@ pub enum Op {
         #[schemars(required, schema_with = "crate::types::nullable::<u8>")]
         order: Option<u8>,
     },
+    /// Replay a stored IQ capture into a decoder mode's graph: check a decoder against a
+    /// recording, or compare two handlers on the same one. The whole set of `capture` is
+    /// replayed, once and paced in real time, each capture in start order, into the
+    /// mode row `kind` expanded for the capture's centre, width and sample rate (no
+    /// channel bank) behind a `capture_in` node. The job is leaseless: it holds no lease,
+    /// tunes no radio and its record's source is `node`; its kind is the mode's id, its
+    /// band the first capture's, `handler` and `handler_named` as `job_start` writes
+    /// them, its `replay` field the capture named, and `job_context.replay` gives
+    /// `capture`, `captures` (the set's ids by start time), `source` (the radio that
+    /// recorded it), `start_ns` (the first capture's start) and `end_ns` (the last
+    /// one's end). Every event it publishes carries `replay: <capture>` and the
+    /// recording's own times (`t_ns`), and goes only to the `replay` feed (the event
+    /// feed of the source `replay`, which no radio may be named), never to a radio's
+    /// feed or `events.log`. It ends `stopped` once the set has played and the decoder
+    /// has drained, and never resumes. The result is the job's id, as `job_start`
+    /// answers.
+    ///
+    /// Refused, nothing started: an unknown `capture` is `unknown`, naming the known
+    /// ones; a `kind` that is no mode row is `<kind> has no handlers`; a handler that is
+    /// not ready or lacks packets when asked is refused as by `job_start`
+    /// (`<mode>: handler <id> is unavailable: <reason>`, `<mode>: handler <id> outputs
+    /// no packet`, `no_handler`); a mode the recording cannot hold is refused by its
+    /// expansion (`out_of_range` on `bandwidth_hz` for a band narrower than the mode's
+    /// handler needs, or wider than its channel rate); and a replay of the same capture,
+    /// mode and handler while one runs is a `duplicate`: `capture <id> is already
+    /// replaying as <kind> via <handler>: job <job>`.
+    #[schemars(transform = require_packets)]
+    CaptureDecode {
+        /// Any capture of the set, an id from `capture_list`.
+        capture: String,
+        /// A mode row's id (`modes_list`).
+        kind: String,
+        /// The handler to run, one of the mode's `handlers`; `null` for the handler
+        /// policy's choice.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+        handler: Option<String>,
+        /// Ask for a handler that gives packets (as `job_start`'s `needs: ["packet"]`).
+        #[serde(default)]
+        packets: bool,
+    },
     /// Band-plan allocations in `region` and known signatures overlapping the
     /// band, from every registered knowledge provider.
     KnowledgeLookup {
@@ -1424,6 +1465,24 @@ fn require_attach_stream(schema: &mut schemars::Schema) {
     }
     if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties")
         && let Some(serde_json::Value::Object(p)) = props.get_mut("stream")
+    {
+        p.remove("default");
+    }
+}
+
+/// `capture_decode` requires its `packets`, after `handler`, and shows no default for
+/// it; it still defaults to `false` when a request leaves it out.
+fn require_packets(schema: &mut schemars::Schema) {
+    if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
+        req.retain(|f| f != "packets");
+        let at = req
+            .iter()
+            .position(|f| f == "handler")
+            .map_or(req.len(), |i| i + 1);
+        req.insert(at, "packets".into());
+    }
+    if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties")
+        && let Some(serde_json::Value::Object(p)) = props.get_mut("packets")
     {
         p.remove("default");
     }
@@ -4078,6 +4137,7 @@ impl Op {
             Op::GraphPut { .. } => "graph_put",
             Op::GraphStart { .. } => "graph_start",
             Op::BitsStart { .. } => "bits_start",
+            Op::CaptureDecode { .. } => "capture_decode",
             Op::KnowledgeLookup { .. } => "knowledge_lookup",
             Op::OriginLookup { .. } => "origin_lookup",
             Op::RegisterSite { .. } => "register_site",
@@ -6052,6 +6112,16 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             order,
         } => node
             .bits_start(&capture, modulation, symbol_rate_baud, order)
+            .await
+            .map(OpResult::Job)
+            .map_err(|e| node_error(node, e)),
+        Op::CaptureDecode {
+            capture,
+            kind,
+            handler,
+            packets,
+        } => node
+            .capture_decode(&capture, &kind, handler.as_deref(), packets)
             .await
             .map(OpResult::Job)
             .map_err(|e| node_error(node, e)),

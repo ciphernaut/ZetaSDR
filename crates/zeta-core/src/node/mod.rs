@@ -71,6 +71,18 @@ const BUS_CAPACITY: usize = 256;
 /// Provenance source of the node's own streams (the `ops` stream).
 pub const NODE_SOURCE: &str = "node";
 
+/// Provenance source of a replay's streams (`capture_decode`): its events reach the one
+/// feed of this name the node registers when it opens, never a radio's.
+pub const REPLAY_SOURCE: &str = "replay";
+
+/// Why a source may not be named `id`: [`NODE_SOURCE`] and [`REPLAY_SOURCE`] name the
+/// node's own streams. `None` for any other id.
+pub fn reserved_source(id: &str) -> Option<String> {
+    [NODE_SOURCE, REPLAY_SOURCE]
+        .contains(&id)
+        .then(|| format!("source id {id:?} is reserved for the node's own streams"))
+}
+
 fn node_provenance(span: Span) -> Provenance {
     Provenance {
         source: SourceId(NODE_SOURCE.into()),
@@ -298,6 +310,26 @@ impl StartHandler {
     }
 }
 
+/// The set of the burst capture `id` (every capture sharing its `set`), sorted by
+/// `(start_ns, id)`: what `bits_start` and `capture_decode` replay. `Expand(Unknown)`
+/// naming `capture`, with the known ids, for a capture not in the store.
+fn capture_set(
+    store: &crate::bursts::BurstStore,
+    id: &str,
+) -> Result<Vec<crate::bursts::CaptureRecord>, NodeError> {
+    let all = store.list();
+    let Some(named) = all.iter().find(|r| r.id == id).map(|r| r.set.clone()) else {
+        return Err(NodeError::Expand(OpError::Unknown {
+            field: "capture".into(),
+            value: id.to_string(),
+            known: all.into_iter().map(|r| r.id).collect(),
+        }));
+    };
+    let mut set: Vec<_> = all.into_iter().filter(|r| r.set == named).collect();
+    set.sort_by_key(|r| (r.start_ns, r.id.clone()));
+    Ok(set)
+}
+
 /// A new `Running` record of an operator's job of `kind` on the radio: a fresh id, an
 /// empty context, no input, owner, audio policy or group.
 fn running_record(
@@ -330,6 +362,7 @@ fn running_record(
         handler_named: false,
         needs: Vec::new(),
         group: None,
+        replay: None,
     }
 }
 
@@ -557,6 +590,9 @@ struct Inner {
     relaunching: tokio::sync::Mutex<()>,
     /// Held across [`Node::mix_start`], so two starts of one set make one mix.
     mix_gate: tokio::sync::Mutex<()>,
+    /// Held across a [`Node::capture_decode`], from its duplicate check to its launch,
+    /// so two requests for one replay make one job.
+    replay_gate: tokio::sync::Mutex<()>,
     /// Held across a `job_attach` of `packets`, from its "already captured" check to
     /// its launch, so two attaches to one job make one capture.
     packets_gate: tokio::sync::Mutex<()>,
@@ -1523,6 +1559,9 @@ impl Node {
                 end_ns: t,
             }),
         );
+        // The replays' one feed, open before any replay starts; with no `events.log`
+        // tee, the log stays a record of what was received.
+        bus.register_feed(&SourceId(REPLAY_SOURCE.into()));
         let mut node = Node {
             inner: Arc::new(Inner {
                 state_dir: cfg.state_dir.clone(),
@@ -1578,6 +1617,7 @@ impl Node {
                 runs: std::sync::atomic::AtomicU64::new(0),
                 relaunching: tokio::sync::Mutex::new(()),
                 mix_gate: tokio::sync::Mutex::new(()),
+                replay_gate: tokio::sync::Mutex::new(()),
                 packets_gate: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
                 verdicts: Mutex::new(HashMap::new()),
@@ -1712,7 +1752,8 @@ impl Node {
     /// Attach a port and start feeding its blocks into that source's ring and
     /// channel bank (made now for the port's current band, if it has one, and
     /// remade whenever its blocks show a new band). A second port with an
-    /// attached source's id is `DuplicateSource`. Does not resume jobs. A port that
+    /// attached source's id is `DuplicateSource`, and one named as the node's own streams
+    /// are ([`reserved_source`]) is `Other`. Does not resume jobs. A port that
     /// reports heals ([`Port::healed`], a supervised worker) is watched from now on (a
     /// port `open` attaches, once `open` has resumed the jobs; a heal meanwhile is
     /// recovered then): each heal recovers the source (see [`Inner::recover_source`]); one that reports
@@ -1721,6 +1762,9 @@ impl Node {
     pub fn add_port(&self, port: Arc<dyn Port>) -> Result<(), NodeError> {
         let inner = &self.inner;
         let source = port.id().clone();
+        if let Some(why) = reserved_source(&source.0) {
+            return Err(NodeError::Other(why));
+        }
         {
             let mut ports = inner.ports.write().unwrap();
             if ports.contains_key(&source) {
@@ -2570,6 +2614,7 @@ impl Node {
             handler_named: false,
             needs: Vec::new(),
             group: None,
+            replay: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2628,6 +2673,7 @@ impl Node {
             handler_named: false,
             needs: Vec::new(),
             group: None,
+            replay: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2742,6 +2788,7 @@ impl Node {
             handler_named: false,
             needs: Vec::new(),
             group: None,
+            replay: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2762,20 +2809,12 @@ impl Node {
         symbol_rate_baud: Option<crate::types::Baud>,
         order: Option<u8>,
     ) -> Result<JobId, NodeError> {
-        let store = self.bursts();
-        let Some(named) = store.get(capture) else {
-            return Err(NodeError::Expand(OpError::Unknown {
-                field: "capture".into(),
-                value: capture.to_string(),
-                known: store.list().into_iter().map(|r| r.id).collect(),
-            }));
-        };
-        let mut set: Vec<_> = store
-            .list()
-            .into_iter()
-            .filter(|r| r.set == named.set)
-            .collect();
-        set.sort_by_key(|r| (r.start_ns, r.id.clone()));
+        let set = capture_set(&self.bursts(), capture)?;
+        let named = set
+            .iter()
+            .find(|r| r.id == capture)
+            .cloned()
+            .expect("the set holds the capture named");
         // A record that does not read as one (an older store's `{}`) measured nothing.
         let features: crate::classify::FeatureRecord = serde_json::from_value(
             named.features.clone(),
@@ -2841,6 +2880,135 @@ impl Node {
             handler_named: false,
             needs: Vec::new(),
             group: None,
+            replay: None,
+        };
+        let id = rec.id.clone();
+        self.inner.launch(rec).await?;
+        Ok(id)
+    }
+
+    /// Replay the set of the burst capture `capture` into the mode row `kind`, run by
+    /// `handler` (`None`: the policy's choice, among those giving packets when
+    /// `packets`): a leaseless record on [`NODE_SOURCE`] of kind `kind`, band the first
+    /// capture's, marked `replay` with `capture`, whose graph is the row expanded for the
+    /// capture's rate with no bank, behind a `capture_in` node playing the set once,
+    /// paced. Its streams' source is [`REPLAY_SOURCE`]. See
+    /// [`Op::CaptureDecode`](crate::ops::Op::CaptureDecode) for the refusals, each an
+    /// `Expand` of the op's error.
+    pub async fn capture_decode(
+        &self,
+        capture: &str,
+        kind: &str,
+        handler: Option<&str>,
+        packets: bool,
+    ) -> Result<JobId, NodeError> {
+        let set = capture_set(&self.bursts(), capture)?;
+        let (first, last) = (&set[0], &set[set.len() - 1]);
+        let modes = self.inner.modes();
+        let no_handlers = || {
+            NodeError::Expand(OpError::Other {
+                message: format!("{kind} has no handlers"),
+            })
+        };
+        let k = JobKind::from_name(kind).ok_or_else(no_handlers)?;
+        if !matches!(k.loaded_mode(&modes), Ok(Some(_))) {
+            return Err(no_handlers());
+        }
+        let needs = match packets {
+            true => vec![StreamKind::Packet],
+            false => Vec::new(),
+        };
+        let resolved = k
+            .start_handler(handler, &needs, &modes, &self.handler_policy())
+            .map_err(NodeError::Expand)?;
+        let tuning = Tuning {
+            center_hz: first.center_hz,
+            bandwidth_hz: first.bandwidth_hz,
+        };
+        let mut graph = k
+            .expand_voiced(
+                &SourceId(NODE_SOURCE.into()),
+                tuning,
+                first.sample_rate_hz,
+                None,
+                (None, None, None),
+                resolved.as_deref(),
+                &modes,
+            )
+            .map_err(NodeError::Expand)?;
+        // The row's roots are its `channel` stages, fed on a radio by the job's IQ
+        // stream: here by `capture_in`.
+        let roots: Vec<graph::NodeId> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "channel" && !graph.edges.iter().any(|e| e.to == n.id))
+            .map(|n| n.id.clone())
+            .collect();
+        if roots.is_empty() {
+            return Err(NodeError::Other(format!(
+                "mode {kind}: its graph has no channel stage to replay into"
+            )));
+        }
+        let source = graph::NodeId(crate::ops::CAPTURE_IN_STAGE.into());
+        let ids: Vec<&str> = set.iter().map(|r| r.id.as_str()).collect();
+        graph.nodes.insert(
+            0,
+            graph::Node {
+                id: source.clone(),
+                kind: crate::ops::CAPTURE_IN_STAGE.into(),
+                params: serde_json::json!({
+                    "captures": ids, "loop": false, "realtime": true, "lead_ms": 0,
+                }),
+            },
+        );
+        graph
+            .edges
+            .extend(roots.into_iter().map(|to| crate::graph::Edge {
+                from: source.clone(),
+                to,
+                kind: StreamKind::Iq,
+            }));
+        graph::validate(&graph, &self.inner.registry)?;
+        // One replay of a capture per mode and handler: checked and launched under one
+        // hold of the gate.
+        let _gate = self.inner.replay_gate.lock().await;
+        let running = self.job_list().into_iter().find(|r| {
+            r.state == JobState::Running
+                && r.replay.as_deref() == Some(capture)
+                && r.kind == kind
+                && r.handler == resolved
+        });
+        if let Some(r) = running {
+            return Err(NodeError::Expand(OpError::Duplicate {
+                message: format!(
+                    "capture {capture} is already replaying as {kind} via {}: job {}",
+                    resolved.as_deref().unwrap_or_default(),
+                    r.id.0
+                ),
+                job: r.id,
+            }));
+        }
+        let rec = JobRecord {
+            context: serde_json::json!({ "replay": {
+                "capture": capture,
+                "captures": ids,
+                "source": first.source.0,
+                "start_ns": first.start_ns,
+                "end_ns": last.end_ns,
+            }}),
+            operator_graph: true,
+            handler: resolved,
+            handler_named: handler.is_some(),
+            needs,
+            replay: Some(capture.to_string()),
+            ..running_record(
+                kind,
+                SourceId(NODE_SOURCE.into()),
+                tuning,
+                graph,
+                None,
+                false,
+            )
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -3901,6 +4069,7 @@ mod tests {
             handler_named: false,
             needs: Vec::new(),
             group: None,
+            replay: None,
         }
     }
 

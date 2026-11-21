@@ -568,6 +568,7 @@ fn running(kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord {
         handler_named: false,
         needs: Vec::new(),
         group: None,
+        replay: None,
     }
 }
 

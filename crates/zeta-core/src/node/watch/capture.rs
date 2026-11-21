@@ -141,6 +141,7 @@ async fn start(
         handler_named: false,
         needs: Vec::new(),
         group: None,
+        replay: None,
     };
     let id = rec.id.clone();
     w.capturing.push((id.clone(), signal.clone()));

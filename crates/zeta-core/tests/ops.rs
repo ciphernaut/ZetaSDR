@@ -535,7 +535,7 @@ fn variants(op: &Value) -> &Vec<Value> {
 fn every_op_variant_denies_unknown_fields_and_requires_all() {
     let s = schema();
     let vs = variants(&s["op"]);
-    assert_eq!(vs.len(), 55, "one schema per Op variant");
+    assert_eq!(vs.len(), 56, "one schema per Op variant");
     for v in vs {
         assert_eq!(v["additionalProperties"], Value::Bool(false), "{v}");
         let mut props: Vec<&String> = v["properties"]
@@ -558,8 +558,14 @@ fn every_op_variant_denies_unknown_fields_and_requires_all() {
     assert!(serde_json::from_value::<Op>(bad).is_err());
 }
 
+/// Members a strict object may leave out, by the end of the object's path: written only
+/// when they say something. A replay's record names its capture in `replay`; every other
+/// record has none, so a node from before replays still reads it.
+const OPTIONAL_MEMBERS: [(&str, &str); 1] = [(".$defs.JobRecord", "replay")];
+
 /// Every object schema with properties, anywhere under `v` (including `$defs`),
-/// forbids extra fields and requires every property.
+/// forbids extra fields and requires every property but those [`OPTIONAL_MEMBERS`]
+/// names.
 fn check_strict(v: &Value, path: &str) {
     match v {
         Value::Object(m) => {
@@ -569,7 +575,16 @@ fn check_strict(v: &Value, path: &str) {
                     Some(&Value::Bool(false)),
                     "{path} allows extra fields"
                 );
-                let mut want: Vec<&str> = props.keys().map(String::as_str).collect();
+                let optional = |k: &str| {
+                    OPTIONAL_MEMBERS
+                        .iter()
+                        .any(|(p, f)| path.ends_with(p) && *f == k)
+                };
+                let mut want: Vec<&str> = props
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|k| !optional(k))
+                    .collect();
                 let mut req: Vec<&str> = m
                     .get("required")
                     .and_then(Value::as_array)
@@ -1792,8 +1807,12 @@ async fn stream_tail_unknown_stream_lists_known() {
     };
     let a = node.bus().register(StreamKind::Event, prov("a"));
     let b = node.bus().register(StreamKind::Audio, prov("b"));
-    // The node's own `ops` stream is always known too.
-    let mut want = vec![a.0, b.0, node.ops_stream().0];
+    // The node's own `ops` stream and the replays' feed are always known too.
+    let replay = node
+        .bus()
+        .feed_of(&SourceId(zeta_core::node::REPLAY_SOURCE.into()))
+        .unwrap();
+    let mut want = vec![a.0, b.0, node.ops_stream().0, replay.0];
     want.sort();
     let op = Op::StreamTail {
         stream: StreamId("nope".into()),

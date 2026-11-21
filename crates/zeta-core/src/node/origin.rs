@@ -3583,6 +3583,7 @@ mod tests {
             handler_named: false,
             needs: Vec::new(),
             group: None,
+            replay: None,
         }
     }
 

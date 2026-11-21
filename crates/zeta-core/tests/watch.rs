@@ -2189,6 +2189,7 @@ async fn a_sinked_decoder_resumed_at_another_capture_rate_keeps_its_sink() {
             handler_named: false,
             needs: Vec::new(),
             group: None,
+            replay: None,
         };
         let path = dir
             .path()
