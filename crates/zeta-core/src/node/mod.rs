@@ -2600,9 +2600,11 @@ impl Node {
     /// `input`, the input's `source` and `tuning`, and launched without a lease (see
     /// [`crate::stream_in`]); the launch points every `stream_in` node at the input's
     /// audio stream, or with `voice` the stream of that voice of the input, which the
-    /// record keeps as its `stream`. `UnknownJob` for an unknown input; `InputNotRunning`,
-    /// `NoVoice` and `NoAudioStream` as [`Node::job_voice_stream`]; on error nothing is
-    /// recorded.
+    /// record keeps as its `stream`. A job attached to a replay is a replay too: it takes
+    /// the input's `replay`, so its streams are the `replay` source's, nothing of it is
+    /// logged as heard (`transcripts.log`), no mix reads it and it never resumes.
+    /// `UnknownJob` for an unknown input; `InputNotRunning`, `NoVoice` and
+    /// `NoAudioStream` as [`Node::job_voice_stream`]; on error nothing is recorded.
     pub async fn job_attach(
         &self,
         kind: &str,
@@ -2610,12 +2612,16 @@ impl Node {
         voice: Option<&str>,
         graph: Graph,
     ) -> Result<JobId, NodeError> {
-        let (source, tuning) = {
+        let (source, tuning, replay) = {
             let jobs = self.inner.jobs.lock().unwrap();
             let e = jobs
                 .get(input)
                 .ok_or_else(|| NodeError::UnknownJob(input.clone()))?;
-            (e.record.source.clone(), e.record.tuning)
+            (
+                e.record.source.clone(),
+                e.record.tuning,
+                e.record.replay.clone(),
+            )
         };
         let rec = JobRecord {
             format: JOB_RECORD_FORMAT,
@@ -2639,7 +2645,7 @@ impl Node {
             handler_named: false,
             needs: Vec::new(),
             group: None,
-            replay: None,
+            replay,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;

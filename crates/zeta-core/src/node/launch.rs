@@ -301,8 +301,10 @@ impl Inner {
 
         let token = self.shutdown.child_token();
         let graph = rec.graph.clone();
-        // A `transcribe` job's record for its transcript tees (see `tee_transcripts`).
-        let tee = (rec.kind == JobKind::Transcribe.name()).then(|| rec.clone());
+        // A `transcribe` job's record for its transcript tees (see `tee_transcripts`); not
+        // one attached to a replay: `transcripts.log` keeps what was heard on the air.
+        let tee =
+            (rec.kind == JobKind::Transcribe.name() && rec.replay.is_none()).then(|| rec.clone());
         // A `bits` or `graph` job's or a mode row's job's record for its watch (proposals,
         // the row's first proof: see `super::propose::watch_for_proposals`).
         let proposer = super::propose::watches(self, &rec).then(|| rec.clone());
@@ -324,8 +326,9 @@ impl Inner {
             Some(_) => REPLAY_DRAIN_TIMEOUT_MS,
             None => DRAIN_TIMEOUT_MS,
         };
-        // A replay counts what it decodes, for the note it ends with.
-        let mut tally = rec.replay.is_some().then(ReplayTally::default);
+        // A replay counts what it decodes, for the note it ends with; a job attached to
+        // one (a replay by its input's mark) replays nothing itself and notes nothing.
+        let mut tally = (rec.replay.is_some() && !attached).then(ReplayTally::default);
         // On error the port moved anyway: `launch_gated` relaunches every elastic job.
         let (prov, run, ended) = self.record_running(rec, &token)?;
 

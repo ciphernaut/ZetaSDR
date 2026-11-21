@@ -3,20 +3,26 @@
 //! recording's times and nowhere a radio's are.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use zeta_core::bursts::NewCapture;
+use zeta_core::graph::{Edge, Graph, GraphId, Node as GraphNode, NodeId};
 use zeta_core::job::{JobRecord, JobState};
 use zeta_core::node::{Node, REPLAY_SOURCE};
 use zeta_core::ops::{Op, OpError, OpResult, SourceInfo};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
-use zeta_core::stream::{Frame, Payload};
-use zeta_core::types::{Capabilities, Claim, Hz, JobId, SampleFormat, SourceId};
+use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
+use zeta_core::stream::{Frame, Payload, StreamBus};
+use zeta_core::types::{
+    Capabilities, Claim, Hz, JobId, SampleFormat, SourceId, StreamId, StreamKind,
+};
 
 mod common;
 use common::handlers::{self as h, ALT, MODE, OWN, RADIO};
@@ -348,8 +354,64 @@ fn mix_inputs(node: &Node, mix: &JobId) -> u64 {
 /// (as a voice row's does): `aprs_decode` with its decoder taken out.
 const LISTEN: &str = "aprs_listen";
 
-/// [`open`] with the [`LISTEN`] row among the operator's rows.
+/// A `transcribe` stand-in (the real one lives in another crate): on its first audio frame
+/// it publishes one `transcript` event with that frame's provenance on its one output and
+/// sets `sent`, then drains its input until it closes.
+struct Transcriber {
+    spec: StageSpec,
+    sent: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Stage for Transcriber {
+    fn spec(&self) -> &StageSpec {
+        &self.spec
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        mut inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        _ctx: StageContext,
+    ) -> Result<(), StageError> {
+        let (Some(rx), Some(out)) = (inputs.first_mut(), outputs.first()) else {
+            return Err(StageError::Failed("expected 1 input, 1 output".into()));
+        };
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                r = rx.recv() => match r {
+                    Ok(frame) if !self.sent.load(Ordering::SeqCst) => {
+                        let ev = json!({"protocol": "transcript", "text": "hello"});
+                        bus.publish(Frame::new(
+                            out.clone(),
+                            frame.provenance.clone(),
+                            Payload::Event(ev),
+                        ));
+                        self.sent.store(true, Ordering::SeqCst);
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
+            }
+        }
+    }
+}
+
+/// [`open`] with the [`LISTEN`] row among the operator's rows and a [`Transcriber`] as
+/// the `transcribe` stage, setting `sent`.
 async fn open_with_listen(dir: &Path) -> Node {
+    open_listening(dir, Arc::default()).await
+}
+
+/// [`open_with_listen`], the [`Transcriber`] setting `sent`.
+async fn open_listening(dir: &Path, sent: Arc<AtomicBool>) -> Node {
     let cfg = h::cfg(dir, false);
     let (_, text) = zeta_core::modes::ModeRegistry::embedded()
         .into_iter()
@@ -369,7 +431,116 @@ async fn open_with_listen(dir: &Path) -> Node {
     let modes = cfg.modes_dir.clone().unwrap();
     std::fs::write(modes.join(format!("{LISTEN}.json")), row.to_string()).unwrap();
     let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
-    Node::open(cfg, h::stages(None), ports).await.unwrap()
+    let mut stages = h::stages(None);
+    stages.register(Arc::new(Transcriber {
+        spec: StageSpec {
+            kind: "transcribe",
+            inputs: vec![StreamKind::Audio],
+            outputs: vec![StreamKind::Event],
+            params_schema: schemars::json_schema!({"type": "object"}),
+        },
+        sent,
+    }));
+    Node::open(cfg, stages, ports).await.unwrap()
+}
+
+/// A `transcribe` job's graph over the audio of the job `job`: `stream_in` into the
+/// stand-in.
+fn transcribe_graph(node: &Node, job: &JobId) -> Graph {
+    let (input, stt) = (NodeId::new(), NodeId::new());
+    let stream = node.job_audio_stream(job).expect("the job outputs audio");
+    Graph {
+        id: GraphId::new(),
+        nodes: vec![
+            GraphNode {
+                id: input.clone(),
+                kind: "stream_in".into(),
+                params: json!({"job": job.0, "kind": "audio", "stream": stream.0}),
+            },
+            GraphNode {
+                id: stt.clone(),
+                kind: "transcribe".into(),
+                params: json!({}),
+            },
+        ],
+        edges: vec![Edge {
+            from: input,
+            to: stt,
+            kind: StreamKind::Audio,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn a_job_attached_to_a_replay_is_a_replay_and_logs_no_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let sent = Arc::new(AtomicBool::new(false));
+    let node = open_listening(dir.path(), sent.clone()).await;
+    let cap = write_noise(&node, 3);
+    let mut feed = replay_feed(&node);
+    let replay = started(decode(&node, &cap, LISTEN, None, false).await);
+    let id = node
+        .job_attach(
+            "transcribe",
+            &replay,
+            None,
+            transcribe_graph(&node, &replay),
+        )
+        .await
+        .unwrap();
+    until("the stand-in transcribed", Duration::from_secs(10), || {
+        sent.load(Ordering::SeqCst)
+    })
+    .await;
+    until_stopped(&node, &replay, Duration::from_secs(20)).await;
+    until("the attached job ended", Duration::from_secs(10), || {
+        record(&node, &id).state != JobState::Running
+    })
+    .await;
+    // `transcripts.log` (what was heard on the air) has no line of it.
+    let log = dir.path().join("state").join("transcripts.log");
+    let log = std::fs::read_to_string(log).unwrap_or_default();
+    assert!(!log.contains(&id.0), "{log}");
+    // It is a replay of what its input replays, and its transcript went to the replay feed.
+    let rec = record(&node, &id);
+    assert_eq!(rec.replay.as_deref(), Some(cap.as_str()));
+    assert_eq!(rec.replay, record(&node, &replay).replay);
+    let mut heard = false;
+    while let Ok(f) = feed.try_recv() {
+        if f.provenance.job.as_ref() == Some(&id) {
+            assert_eq!(f.provenance.source, SourceId(REPLAY_SOURCE.into()));
+            assert_eq!(event_of(&f).unwrap()["protocol"], "transcript");
+            heard = true;
+        }
+    }
+    assert!(heard, "the attached job's transcript is on the replay feed");
+}
+
+#[tokio::test]
+async fn a_job_attached_to_a_replay_does_not_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = {
+        let node = open_with_listen(dir.path()).await;
+        let cap = write_noise(&node, 10);
+        let replay = started(decode(&node, &cap, LISTEN, None, false).await);
+        node.job_attach(
+            "transcribe",
+            &replay,
+            None,
+            transcribe_graph(&node, &replay),
+        )
+        .await
+        .unwrap()
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let node = open_with_listen(dir.path()).await;
+    let rec = record(&node, &id);
+    assert_eq!(rec.state, JobState::Stopped);
+    assert_eq!(
+        rec.context["note"], "a replay does not resume: run it again",
+        "{}",
+        rec.context
+    );
 }
 
 #[tokio::test]

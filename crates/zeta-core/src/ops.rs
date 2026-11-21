@@ -907,8 +907,10 @@ pub enum Op {
     /// recording's own times (`t_ns`), and goes only to the `replay` feed (the event
     /// feed of the source `replay`, which no radio may be named), never to a radio's
     /// feed or `events.log`. It ends `stopped` once the set has played and the decoder
-    /// has drained, and never resumes. The result is the job's id, as `job_start`
-    /// answers.
+    /// has drained, and never resumes. A job attached to it (`job_attach`) is a replay
+    /// too: its `replay` is its input's, its events go only to the `replay` feed, no
+    /// transcript of it reaches `transcripts.log`, no mix reads it, and it never resumes.
+    /// The result is the job's id, as `job_start` answers.
     ///
     /// Refused, nothing started: an unknown `capture` is `unknown`, naming the known
     /// ones; a `kind` that is no mode row is `<kind> has no handlers`; a handler that is
