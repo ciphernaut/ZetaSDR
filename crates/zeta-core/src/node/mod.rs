@@ -483,12 +483,15 @@ impl JobOutput {
 }
 
 /// Whether a mix may read `rec`: not an attached job (it is a chain over a job's audio),
-/// a job a controller owns (a trial), another mix (a `mix` job, or any job whose graph
-/// holds a `mix` node, as a `graph_start` of one does) or a job centred on a plan
-/// channel that carries no voice (CB ch22 and ch23: data, its noise is no one talking).
+/// a job a controller owns (a trial), a replay (`capture_decode`: a recording, not live
+/// traffic; its row's own play button still plays it), another mix (a `mix` job, or any
+/// job whose graph holds a `mix` node, as a `graph_start` of one does) or a job centred
+/// on a plan channel that carries no voice (CB ch22 and ch23: data, its noise is no one
+/// talking).
 fn mixable(rec: &JobRecord) -> bool {
     rec.input.is_none()
         && rec.owner.is_none()
+        && rec.replay.is_none()
         && crate::plans::no_voice_at(rec.tuning.center_hz.0).is_none()
         && rec.kind != JobKind::Mix.name()
         && !rec

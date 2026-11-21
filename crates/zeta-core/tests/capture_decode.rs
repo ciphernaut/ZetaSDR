@@ -323,6 +323,111 @@ async fn a_replay_stays_out_of_the_radios_feed_and_the_event_log() {
     }
 }
 
+/// One capture of `secs` seconds of unit-power noise at the APRS band, which `aprs_decode`
+/// replays to its end decoding nothing; its id.
+fn write_noise(node: &Node, secs: usize) -> String {
+    let mut iq = vec![num_complex::Complex::new(0.0f32, 0.0); APRS_RATE_HZ as usize * secs];
+    zeta_dsp::synth::awgn(&mut iq, 0.0, 7);
+    write_capture(
+        node,
+        "noise",
+        (APRS_CENTER_HZ, APRS_BAND_HZ, APRS_RATE_HZ),
+        T0_NS,
+        &iq,
+    )
+}
+
+/// `job_context.mix.inputs` of the mix `mix` (0 until the stage notes one).
+fn mix_inputs(node: &Node, mix: &JobId) -> u64 {
+    node.job_context(mix).unwrap()["mix"]["inputs"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
+/// A mode row whose graph's demodulator's audio is no stage's input, so the job outputs it
+/// (as a voice row's does): `aprs_decode` with its decoder taken out.
+const LISTEN: &str = "aprs_listen";
+
+/// [`open`] with the [`LISTEN`] row among the operator's rows.
+async fn open_with_listen(dir: &Path) -> Node {
+    let cfg = h::cfg(dir, false);
+    let (_, text) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("aprs_decode.json"))
+        .expect("embedded aprs_decode");
+    let mut row: Value = serde_json::from_str(text).unwrap();
+    row["id"] = LISTEN.into();
+    let d = &mut row["decoder"];
+    d["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|n| n["id"] != "decode");
+    d["edges"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|e| e["to"] != "decode");
+    let modes = cfg.modes_dir.clone().unwrap();
+    std::fs::write(modes.join(format!("{LISTEN}.json")), row.to_string()).unwrap();
+    let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
+    Node::open(cfg, h::stages(None), ports).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_replay_is_not_among_the_live_mixs_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open_with_listen(dir.path()).await;
+    let cap = write_noise(&node, 4);
+    let id = started(decode(&node, &cap, LISTEN, None, false).await);
+    node.job_audio_stream(&id)
+        .expect("the replay outputs audio");
+    // The page's Listen to all: a mix of every source.
+    let m = started(node.apply(Op::MixStart { sources: None }).await);
+    // Four of the mix's polls (each 500 ms) while the replay runs: it never joins.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            mix_inputs(&node, &m),
+            0,
+            "{}",
+            node.job_context(&m).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        record(&node, &id).state,
+        JobState::Running,
+        "ran throughout"
+    );
+    node.job_stop(&m).await.unwrap();
+    node.job_stop(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_replay_ended_by_job_stop_notes_what_it_decoded_so_far() {
+    // Ruling R8: a stop did not fail the replay, so it ends with its note too.
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let cap = write_noise(&node, 10);
+    let mut feed = replay_feed(&node);
+    let id = started(decode(&node, &cap, APRS, None, false).await);
+    // Under way: `capture_in`'s first frame is out.
+    tokio::time::timeout(Duration::from_secs(5), feed.recv())
+        .await
+        .expect("a frame of the replay")
+        .unwrap();
+    node.job_stop(&id).await.unwrap();
+    until_stopped(&node, &id, Duration::from_secs(10)).await;
+    let rec = record(&node, &id);
+    assert!(
+        rec.context["note"]
+            .as_str()
+            .is_some_and(|n| n.starts_with("replayed ")),
+        "{}",
+        rec.context
+    );
+    assert_eq!(rec.context["replay"]["events"], 0, "{}", rec.context);
+}
+
 #[tokio::test]
 async fn an_unknown_capture_is_refused_with_the_known_ones() {
     let dir = tempfile::tempdir().unwrap();
