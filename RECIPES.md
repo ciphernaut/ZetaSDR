@@ -311,7 +311,7 @@ On the CLI: `zeta capture decode --capture <id> --kind <mode> [--handler <h>] [-
 
 **Read the note.** The replay ends `stopped` with a note of how many events it decoded, and `job_context.replay` names the captures and the radio that recorded them. A local `zeta capture decode` waits for the replay to end and prints its record, note included; with `--node` it prints the job at once, and `zeta job context --job <job id>` reads the note once it has ended. A silent replay says the decoder found nothing in that recording, not that the band is empty.
 
-**Compare two handlers.** Replay the same capture once per handler (`--handler dump1090`, then `--handler onair`), and read each job's events and `N subjects`. The replays are one group on the page, marked per handler as in "Compare two decoders", and a replay of the same capture, mode and handler while one runs is a `duplicate`.
+**Compare two handlers.** Replay the same capture once per handler (`--handler dump1090`, then `--handler onair`), and read each job's events and `N subjects`. The replays of one recording (whichever capture of its set each names) are one group on the page, titled from the set's first capture and marked per handler as in "Compare two decoders", and a replay of the same recording, mode and handler while one runs is a `duplicate`.
 
 **Events and times.** A replay's events go only to the `replay` feed, never a radio's feed or `events.log`, and each carries `replay: <capture>` with the recording's own time in `t_ns`: read it against the capture's `start_ns`, not the clock.
 

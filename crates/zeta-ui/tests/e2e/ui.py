@@ -11801,6 +11801,12 @@ def replay_set(url, secret, source):
     return two_captures_of(url, secret, source, centre, width, REPLAY_WINDOW_MS)
 
 
+def set_first(captures):
+    """The id of the first capture (by start time) of a set's `captures`: the capture a replay
+    section of that recording is keyed on and titled from (ruling R17)."""
+    return min(captures, key=lambda c: (c["start_ns"], c["id"]))["id"]
+
+
 def decode_capture(url, secret, capture, kind, handler=None, packets=False):
     """`capture_decode` of the capture id `capture` as `kind` (by `handler`, else the
     policy's pick); the replay's job id."""
@@ -11810,9 +11816,9 @@ def decode_capture(url, secret, capture, kind, handler=None, packets=False):
 
 
 def replay_capture(url, secret, source, kind, handler=None, packets=False):
-    """A fresh set captured on `source` (replay_set) replayed as `kind`: (the capture id the
-    replay names, its job id)."""
-    capture = replay_set(url, secret, source)[0]["id"]
+    """A fresh set captured on `source` (replay_set) replayed as `kind`, naming the set's first
+    capture: (that capture's id, the replay's job id)."""
+    capture = set_first(replay_set(url, secret, source))
     return capture, decode_capture(url, secret, capture, kind, handler, packets)
 
 
@@ -11822,7 +11828,7 @@ def replay_section(page, capture):
 
 def open_replay(page, capture):
     """The Subjects pane shown once a replay's subjects make it eligible; the section of the
-    replays of `capture`, waited for."""
+    replays of the recording whose first capture is `capture`, waited for."""
     expect(pane_tab(page)).to_be_visible(timeout=30_000)
     open_subjects(page)
     sec = replay_section(page, capture)
@@ -11842,7 +11848,7 @@ def scenario_a_replay_lists_its_subjects_as_a_group_of_its_own(page, url, secret
     stop_aprs(url, secret)
     errors = page_errors(page)
     select_source(page, url, secret, "aprs")
-    capture = replay_set(url, secret, "aprs")[0]["id"]
+    capture = set_first(replay_set(url, secret, "aprs"))
     ribbons = page.locator("#waterfall .ov-ribbon")
     before = ribbons.count()
     tracks = map_tracks(page)
@@ -11884,15 +11890,19 @@ def scenario_a_replay_group_outlives_its_job_and_closes_on_its_button(page, url,
 def scenario_two_handlers_replaying_one_capture_merge_and_mark(page, url, secret):
     # fake_pair's own program and `alt` both print PAIR1 (ui.rs FAKE_PAIR_OWN_LINES and
     # FAKE_PAIR_ALT_LINES), each with a field the other lacks: one row, marked per handler.
+    # The two name different captures of one set: one recording, one section, keyed on and
+    # titled from the set's first capture (ruling R17).
     clear_captures(url, secret)
     select_source(page, url, secret, "tone")
     modes = http_json(url, secret, "/op", {"op": "modes_list", "family": None,
                                            "state": None})["value"]["modes"]
     names = {h["id"]: h["name"]
              for h in next(m for m in modes if m["id"] == "fake_pair")["handlers"]}
-    capture = replay_set(url, secret, "tone")[0]["id"]
+    captures = replay_set(url, secret, "tone")
+    capture = set_first(captures)
+    other = next(c["id"] for c in captures if c["id"] != capture)
     own = decode_capture(url, secret, capture, "fake_pair", "fake_lines")
-    alt = decode_capture(url, secret, capture, "fake_pair", "alt")
+    alt = decode_capture(url, secret, other, "fake_pair", "alt")
     menu = page.locator("#ctx-outline")
     try:
         # A replay is no one's sibling (ruling R9): its running row's menu has no Send to,
@@ -11906,6 +11916,8 @@ def scenario_two_handlers_replaying_one_capture_merge_and_mark(page, url, secret
         close_menu(page, "#ctx-outline")
         sec = open_replay(page, capture)
         expect(page.locator("#subjects section.subject-replay")).to_have_count(1)
+        expect(sec.locator("h3")).to_have_text(
+            re.compile(r"^replay of \d\d:\d\d:\d\d 100\.0000 MHz"), timeout=10_000)
         expect(sec.locator("tr.subject")).to_have_count(1, timeout=10_000)
         row = sec.locator('tr.subject[data-key="PAIR1"]')
         expect(row.locator('td[data-col="alt_only"]')).to_have_text("y", timeout=20_000)
@@ -11933,7 +11945,7 @@ def scenario_two_modes_replaying_one_capture_draw_a_table_each(page, url, secret
     fold = next(m for m in modes if m["id"] == "fake_fold")
     ready = [h for h in fold["handlers"] if h["state"] == "ready"]
     assert len(ready) == 1, fold["handlers"]
-    capture = replay_set(url, secret, "tone")[0]["id"]
+    capture = set_first(replay_set(url, secret, "tone"))
     pair = decode_capture(url, secret, capture, "fake_pair")
     folded = decode_capture(url, secret, capture, "fake_fold")
     try:
@@ -11984,7 +11996,7 @@ def scenario_a_replay_is_no_sibling_of_a_live_job(page, url, secret):
     clear_captures(url, secret)
     stop_aprs(url, secret)
     select_source(page, url, secret, "aprs")
-    capture = replay_set(url, secret, "aprs")[0]["id"]
+    capture = set_first(replay_set(url, secret, "aprs"))
     live = start_aprs(url, secret, "builtin")
     replay = None
     menu = page.locator("#ctx-outline")

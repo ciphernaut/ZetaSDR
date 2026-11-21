@@ -35,8 +35,10 @@
 //     to its group).
 //     store.groupOf(job, jobs = the last sync's) -> {key, kind, title} | null   agent.js groupOf
 //     store.groupId(jobId) -> the group id of a job id (a replay's, before any other rule:
-//         `replay:<capture id>` (REPLAY_GROUP), the capture its record's `replay` names, so
-//         every replay of one capture shares it, plan 44 call 19; else the watch's for a kept
+//         `replay:<capture id>` (REPLAY_GROUP), the first capture of the set its record
+//         replays (`context.replay.captures[0]`, else its `replay`), so every replay of one
+//         recording shares it whichever capture of the set it names, plan 44 call 19 and
+//         ruling R17; else the watch's for a kept
 //         decoder, else the record's `group`, else itself; a group sent from a kept decoder is
 //         the watch's for as long as the watch runs, the decoder dropped or not),
 //         as of the last `sync`. An event of a job no sync has seen yet goes by its record's
@@ -132,7 +134,8 @@
 //     leave. A press (`pointerdown`) on a row selects it, so a row moving cannot lose a click, and
 //     a selection (from here or the map) scrolls its row into view.
 //     A replay group (store.replayGroups) draws, after every live section, one
-//     `section.subject-replay[data-capture=<capture id>]` (plan 44 call 19), its subjects merged
+//     `section.subject-replay[data-capture=<the set's first capture id>]` (plan 44 call 19,
+//     ruling R17), its subjects merged
 //     and marked across handlers as a sibling group's are, one `table[data-mode]` per mode its
 //     subjects were first heard from (in the order first heard; captioned `<mode>, <n> <subject
 //     name>`, its columns that mode's row's, sorted apart), `Last seen` the recording's
@@ -197,9 +200,20 @@ export const REPLAY_GROUP = "replay:";
 
 const isReplayGroup = (id) => typeof id === "string" && id.startsWith(REPLAY_GROUP);
 
-// The group of a replay record (its `replay`, the capture id it names), else null.
+// The capture a replay record's group is keyed on: the first of the set it replays
+// (`context.replay.captures[0]`, whichever capture of the set it names: one recording, ruling
+// R17), else the capture its `replay` names (a record with no set, as a job attached to a
+// replay); null for a record that is no replay.
+function replayCaptureOf(job) {
+  if (typeof job?.replay !== "string" || job.replay === "") return null;
+  const first = job.context?.replay?.captures?.[0];
+  return typeof first === "string" && first !== "" ? first : job.replay;
+}
+
+// The group of a replay record (REPLAY_GROUP and replayCaptureOf's capture), else null.
 function replayGroupOf(job) {
-  return typeof job?.replay === "string" && job.replay !== "" ? REPLAY_GROUP + job.replay : null;
+  const capture = replayCaptureOf(job);
+  return capture ? REPLAY_GROUP + capture : null;
 }
 
 // The mode a subject was first heard from (its first source's), the key of its replay table.
@@ -524,7 +538,7 @@ class SubjectStore {
   groupFor(job) {
     const replay = replayGroupOf(job);
     if (replay) {
-      this.replays.set(job.id, job.replay);
+      this.replays.set(job.id, replayCaptureOf(job));
       return replay;
     }
     if (this.groups.has(job.id) || this.siblings.has(job.id)) return this.groupId(job.id);
@@ -669,7 +683,10 @@ class SubjectStore {
         .map((j) => j.context.identify.current),
     );
     this.lastJobs = jobs || [];
-    for (const j of this.lastJobs) if (replayGroupOf(j)) this.replays.set(j.id, j.replay);
+    for (const j of this.lastJobs) {
+      const capture = replayCaptureOf(j);
+      if (capture) this.replays.set(j.id, capture);
+    }
     this.groups = new Map();
     for (const j of live) {
       const g = watchGroupOf(j, live);

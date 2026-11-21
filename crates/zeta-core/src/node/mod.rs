@@ -1035,8 +1035,10 @@ impl Inner {
                     .map(|m| m.own_handler())
             });
         }
-        // A replay's key also names the capture it replayed: one of another recording on
-        // the same band is no re-run of it.
+        // A replay's key also names the recording it replayed, as its set's first capture
+        // (`context.replay.captures[0]`, whichever capture of the set was named; the
+        // named one for a record that has no set, such as a job attached to a replay):
+        // one of another recording on the same band is no re-run of it.
         type Key<'a> = (
             &'a str,
             &'a SourceId,
@@ -1057,7 +1059,9 @@ impl Inner {
                 r.tuning.center_hz.0,
                 r.tuning.bandwidth_hz.0,
                 handler,
-                r.replay.as_deref(),
+                r.replay
+                    .as_deref()
+                    .map(|named| r.context["replay"]["captures"][0].as_str().unwrap_or(named)),
             )
         }
         // Per band, the terminal record that started last.

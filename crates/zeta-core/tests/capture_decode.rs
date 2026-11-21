@@ -850,26 +850,31 @@ async fn a_handler_that_never_exits_is_given_eight_seconds_and_the_job_still_sto
 }
 
 #[tokio::test]
-async fn two_replays_of_one_capture_keep_one_finished_record_per_handler() {
+async fn two_replays_of_one_recording_keep_one_finished_record_per_handler() {
     let dir = tempfile::tempdir().unwrap();
     let (node, _radio) = open(dir.path()).await;
-    let a = write_adsb_set(&node, "a", 1);
+    let a = write_adsb_set(&node, "a", 2);
     let b = write_adsb_set(&node, "b", 1);
+    // The second run of `a` names the other capture of its set: the same recording
+    // (ruling R17).
     for (cap, handler) in [
         (&a[0], None),
-        (&a[0], None),
+        (&a[1], None),
         (&a[0], Some(ALT)),
         (&b[0], None),
     ] {
         let id = started(decode(&node, cap, MODE, handler, false).await);
         node.job_stop(&id).await.unwrap();
     }
-    let finished = |cap: &str| -> Vec<Option<String>> {
+    let finished = |set: &[String]| -> Vec<(Option<String>, String)> {
         let mut hs: Vec<_> = node
             .job_list()
             .into_iter()
-            .filter(|r| r.replay.as_deref() == Some(cap) && r.state == JobState::Stopped)
-            .map(|r| r.handler)
+            .filter(|r| {
+                r.replay.as_ref().is_some_and(|named| set.contains(named))
+                    && r.state == JobState::Stopped
+            })
+            .map(|r| (r.handler, r.replay.unwrap()))
             .collect();
         hs.sort();
         hs
@@ -877,10 +882,13 @@ async fn two_replays_of_one_capture_keep_one_finished_record_per_handler() {
     // The second run of `a` by its own handler took the first's place; `alt`'s run and
     // the run of another recording on the same band each keep theirs.
     assert_eq!(
-        finished(&a[0]),
-        [Some(ALT.to_string()), Some(OWN.to_string())]
+        finished(&a),
+        [
+            (Some(ALT.to_string()), a[0].clone()),
+            (Some(OWN.to_string()), a[1].clone())
+        ]
     );
-    assert_eq!(finished(&b[0]), [Some(OWN.to_string())]);
+    assert_eq!(finished(&b), [(Some(OWN.to_string()), b[0].clone())]);
 }
 
 /// A port of id `id`, never fed.
