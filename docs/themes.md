@@ -51,7 +51,7 @@ them; the loader does not enforce it, so check the licence of any font you ship 
 
 ## `theme.json`
 
-Every field is required except `fonts`. Unknown fields are refused naming the field, `footprints`
+Every field is required except `fonts` and `handlers`. Unknown fields are refused naming the field, `footprints`
 among them (it is reserved, see Footprints).
 
 | field | rule |
@@ -66,6 +66,7 @@ among them (it is reserved, see Footprints).
 | `layout.map_tiles` | optional, one of `osm`, `osm-dark`, `opentopo`, `esri-street`, `esri-imagery` (keyless providers only; `osm-dark` is OpenStreetMap's tiles under a dark filter on the tile layer alone): the map's tile provider while the view's `map_tiles` is `auto` (`<html data-map-tiles>`); absent, a dark `color_scheme` gets `osm-dark` and a light one `osm`; any other value is refused naming `layout.map_tiles` |
 | `tokens` | an object of custom properties from the list below; an unknown key is refused naming it |
 | `ramp` | the waterfall's colour stops: 2 to 16 of `[t, [r, g, b]]`, `t` strictly ascending, the first exactly 0 and the last exactly 1, channels 0-255 |
+| `handlers` | optional; a map of handler id (`^[a-z0-9][a-z0-9_-]*$`) to a slot, 1 to 4, pinning that handler's mark (see Handler marks); refused as `handlers.<id>` when the id is not one or the slot is out of range |
 | `fonts` | optional; each `{family, file, weight}` names a file in the folder and becomes an `@font-face` under the theme (`weight` is a CSS range such as `400 700`); use the family through `--font-ui` and `--font-mono`. `family` and `weight` may not contain a quote or the characters refused in token values |
 
 ```json
@@ -112,6 +113,29 @@ Each token is a custom property the core stylesheet declares in `:root`.
 - `--c-channel-6`: per-channel colour 6.
 - `--c-idle`: a quiet channel.
 - `--c-speaking`: a channel being heard.
+- `--c-handler-1`: the mark colour of handler slot 1.
+- `--c-handler-2`: the mark colour of handler slot 2.
+- `--c-handler-3`: the mark colour of handler slot 3.
+- `--c-handler-4`: the mark colour of handler slot 4 (a fifth handler and later share it).
+- `--handler-style-1`: slot 1's `font-style` (`normal`).
+- `--handler-style-2`: slot 2's `font-style` (`italic`).
+- `--handler-style-3`: slot 3's `font-style` (`normal`).
+- `--handler-style-4`: slot 4's `font-style` (`italic`).
+- `--c-differs`: the colour of a field two handlers hold different values for.
+
+#### Handler marks
+
+When several handlers hear one subject, the Subjects pane merges them into one row and draws each
+value in the mark of the handler that supplied it: `.mark-1` to `.mark-4`, set from
+`--c-handler-N` and `--handler-style-N`. The styles alternate, so slots 1 and 2 tell apart without
+colour; keep a mark readable without its colour, and at least 3:1 against `--bg`. A field two
+handlers disagree on takes `.mark-differs`, `--c-differs` with a dotted underline. A handler takes
+the next slot in the order it first supplied a field; `theme.json`'s optional `handlers` key pins
+handler ids to slots instead, `1` to `4`:
+
+```json
+"handlers": { "onair": 2 }
+```
 - `--wf-bg`: the waterfall canvas ground; any opaque CSS colour (`#hex`, `rgb()`, `hsl()`, a name, `color-mix()`); one the browser cannot parse falls back to `#000030`.
 - `--wf-select`: the drag rectangle's colour; any opaque CSS colour, `#ffffff` when it does not parse.
 - `--wf-select-alpha`: the drag rectangle's fill opacity.
@@ -260,6 +284,9 @@ Jobs:
   `.short`, `.job-tag .channel`, `.job-tag .centre`, a `.dot` and a `.snippet`.
 - `.outline`: a job's band on the waterfall (`.outline-label` and `.outline-handle` inside).
 - `.ov-ribbon`: a ribbon on the waterfall, with a protocol class (`.aprs`, `.transcript`, ...).
+- `.mark-1`, `.mark-2`, `.mark-3`, `.mark-4`: a merged subject's value, drawn in its handler's
+  slot; `.mark-differs`: a field two handlers hold different values for.
+- `.subject-legend`: the line under the Subjects heading naming each handler in its mark.
 
 State hooks (classes and attributes the page toggles; style them, never depend on their timing):
 

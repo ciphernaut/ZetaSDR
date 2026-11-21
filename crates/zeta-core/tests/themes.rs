@@ -611,3 +611,81 @@ fn psytrance_ramp_low_end_stays_dark() {
         "psytrance ramp at 0.1 ({low}) is not distinct from --wf-bg {floor}"
     );
 }
+
+#[test]
+fn theme_json_takes_handler_slots_and_refuses_a_slot_out_of_range() {
+    use zeta_core::themes::theme_json::{ThemeError, parse, validate};
+    let with = |handlers: serde_json::Value| {
+        let mut v = valid("mine");
+        v["handlers"] = handlers;
+        let t = parse(&v.to_string())?;
+        validate(&t, "mine", &Default::default())?;
+        Ok::<_, ThemeError>(t)
+    };
+    let t = with(json!({"onair": 2})).unwrap();
+    assert_eq!(t.handlers["onair"], 2);
+    assert_eq!(
+        with(json!({"onair": 5})).unwrap_err().field,
+        "handlers.onair"
+    );
+    assert_eq!(
+        with(json!({"onair": 0})).unwrap_err().field,
+        "handlers.onair"
+    );
+    assert_eq!(
+        with(json!({"On Air": 1})).unwrap_err().field,
+        "handlers.On Air"
+    );
+}
+
+#[test]
+fn builtin_mark_colours_meet_3_to_1_on_the_background() {
+    let css = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../zeta-ui/web/style.css"
+    ))
+    .expect("read the core stylesheet");
+    let root = &css[css.find(":root {").unwrap()..];
+    let root = &root[..root.find("\n}").unwrap()];
+    let base = |name: &str| -> String {
+        let line = root
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("{name} is not in :root"));
+        line.split(';').next().unwrap().trim().to_string()
+    };
+    let mut failures = Vec::new();
+    for id in AA_THEMES {
+        let bytes = BUILTIN
+            .iter()
+            .find(|(k, _)| *k == format!("{id}/theme.json"))
+            .unwrap()
+            .1;
+        let json: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let get = |name: &str| {
+            json["tokens"][name]
+                .as_str()
+                .map_or_else(|| base(name), String::from)
+        };
+        let bg = get("--bg");
+        let mut seen = Vec::new();
+        for name in [
+            "--c-handler-1",
+            "--c-handler-2",
+            "--c-handler-3",
+            "--c-handler-4",
+            "--c-differs",
+        ] {
+            let colour = get(name);
+            let ratio = contrast(&colour, &bg);
+            if ratio < 3.0 {
+                failures.push(format!("{id}: {name} {colour} is {ratio:.2} on {bg}"));
+            }
+            if seen.contains(&colour) {
+                failures.push(format!("{id}: {name} repeats {colour}"));
+            }
+            seen.push(colour);
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

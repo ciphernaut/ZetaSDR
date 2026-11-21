@@ -23,6 +23,15 @@
   --c-channel-6: var(--accent);
   --c-idle: var(--dim);         /* a quiet channel */
   --c-speaking: var(--ok);      /* a channel being heard */
+  --c-handler-1: #ff9e64;       /* a handler's mark, slot 1: the merged subject's values */
+  --c-handler-2: #7dcfff;
+  --c-handler-3: #c3e88d;
+  --c-handler-4: #e0a3ff;       /* slot 4 also takes a fifth handler and later */
+  --handler-style-1: normal;    /* the slot's font-style, so marks differ without colour */
+  --handler-style-2: italic;
+  --handler-style-3: normal;
+  --handler-style-4: italic;
+  --c-differs: #ff6b9d;         /* a field two handlers hold different values for */
   --wf-bg: #000030;             /* waterfall canvas ground, both themes */
   --wf-select: #ffffff;         /* the drag rectangle */
   --wf-select-alpha: 0.08;      /* the drag rectangle's fill opacity */
@@ -917,6 +926,13 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 /* The source bar's live numbers: plain shows them in the tab's title only. */
 .health { display: none; }
 .health .v { font-variant-numeric: tabular-nums; }
+
+/* ---- handler marks: a merged subject's values, one slot per handler ---- */
+.mark-1 { color: var(--c-handler-1); font-style: var(--handler-style-1); }
+.mark-2 { color: var(--c-handler-2); font-style: var(--handler-style-2); }
+.mark-3 { color: var(--c-handler-3); font-style: var(--handler-style-3); }
+.mark-4 { color: var(--c-handler-4); font-style: var(--handler-style-4); }
+.mark-differs { color: var(--c-differs); text-decoration: underline dotted; }
 
 /* ---- the rail (spec 4.4) ---- */
 /* A job's colour (overlays.js channelColour): its outline, tag, ribbons and row share it. */

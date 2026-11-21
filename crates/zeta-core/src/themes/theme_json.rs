@@ -101,10 +101,14 @@ pub struct ThemeJson {
     pub ramp: Vec<(f64, [u8; 3])>,
     #[serde(default)]
     pub fonts: Vec<FontFace>,
+    /// Which mark (slot 1 to 4) a handler id takes on the page, such as `{"onair": 2}`.
+    /// Optional; it pins that handler's sources to the slot.
+    #[serde(default)]
+    pub handlers: BTreeMap<String, u8>,
 }
 
 /// The top-level fields of `theme.json`.
-const FIELDS: [&str; 8] = [
+const FIELDS: [&str; 9] = [
     "id",
     "name",
     "description",
@@ -113,6 +117,7 @@ const FIELDS: [&str; 8] = [
     "tokens",
     "ramp",
     "fonts",
+    "handlers",
 ];
 
 /// Parse a `theme.json` (a leading UTF-8 BOM is skipped). A failure names the field it
@@ -164,6 +169,21 @@ pub fn parse(text: &str) -> Result<ThemeJson, ThemeError> {
     if obj.contains_key("fonts") {
         check::<Vec<FontFace>>("fonts", field("fonts"))?;
     }
+    if obj.contains_key("handlers") {
+        check::<BTreeMap<String, serde_json::Value>>("handlers", field("handlers"))?;
+        // A slot out of range is named by its handler, not as a type error on the map.
+        if let Some((id, _)) = field("handlers")
+            .as_object()
+            .into_iter()
+            .flatten()
+            .find(|(_, slot)| slot.as_u64().is_none_or(|n| n > 255))
+        {
+            return Err(ThemeError::new(
+                format!("handlers.{id}"),
+                "a slot is 1 to 4",
+            ));
+        }
+    }
     serde_json::from_value(v).map_err(|e| ThemeError::new("theme.json", e.to_string()))
 }
 
@@ -187,6 +207,16 @@ pub fn is_theme_id(id: &str) -> bool {
     !b.is_empty()
         && b.len() <= 32
         && b[0].is_ascii_lowercase()
+        && b[1..]
+            .iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
+}
+
+/// `^[a-z0-9][a-z0-9_-]*$`: a handler's id.
+fn is_handler_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    !b.is_empty()
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
         && b[1..]
             .iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
@@ -245,6 +275,15 @@ pub fn validate(
         }
     }
     validate_ramp(&t.ramp)?;
+    for (id, slot) in &t.handlers {
+        let field = format!("handlers.{id}");
+        if !is_handler_id(id) {
+            return Err(ThemeError::new(field, "not a handler id"));
+        }
+        if !(1..=4).contains(slot) {
+            return Err(ThemeError::new(field, "a slot is 1 to 4"));
+        }
+    }
     for (i, f) in t.fonts.iter().enumerate() {
         for (name, value) in [("family", &f.family), ("weight", &f.weight)] {
             let what = bad_value(value).or_else(|| value.contains('"').then_some("`\"`"));
