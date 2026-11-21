@@ -156,6 +156,17 @@
 //       the shown source are listed under it; a plan member's channels sit there directly,
 //       a watch member's group (the watch's row and its decoders) nests inside it: two
 //       levels at most. A watch row's Stop is the watch's job_stop, a member row's its own.
+//       Jobs sent from one another (plan 43 Send to: a record's `group`, one id for the lot) fold
+//       too: two or more running members make a `details.job-group[data-plan=<group id>]
+//       [data-kind="siblings"]` (key `sib:<id>` in groupEls), the oldest member's row (created_ns)
+//       as the summary with a `.group-text` (`<kind> × <n> handlers`), the others under it in the
+//       order they started. A group of one running member is an ordinary row. A group with a
+//       member in a set's group, or a watch's decoder, nests in that group (one level in). A
+//       row of a job with a `group` shows its handler tag (`.tag.handler`, even when the mode
+//       has one ready handler), `span.rate` (`<n>/min`, rate(job): overlays.js rateOf, the
+//       events of the last 60 s; empty when the page has no feed for the job's source) and, for
+//       a mode with a subject, `span.heard` (`<n> <subject.name>`, heard(job): the subject
+//       store's heardBy).
 //   groupOf(job, jobs, sets = []) -> {key, kind: "watch" | "set", title} | null
 //       the watch `job` decodes for: a running, unowned job named in some running watch's
 //       context.watch.decoding[].job (`key` the watch id, `title` `<watch kind> <id tail>`);
@@ -668,7 +679,7 @@ function voiceSelect(job, voices, role, onVoice) {
 function jobRow(
   job,
   onStop,
-  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits, onOrigins, onMore, audioKind, scanInfo, onLook, voiceOf, onVoice },
+  { onPlay, onTranscribe, onGraph, playing, squelch, plan, position, onHot, mixText, mute, onBits, onOrigins, onMore, audioKind, scanInfo, onLook, voiceOf, onVoice, rate, heard },
 ) {
   const row = document.createElement("div");
   const attached = !!job.input;
@@ -698,7 +709,16 @@ function jobRow(
   // A mode with more than one ready handler: the one this job runs, named in its kind cell.
   const modeRow = attached ? null : audioKind?.(job.kind);
   const ready = (modeRow?.handlers ?? []).filter((h) => h.state === "ready").length;
-  const handler = ready > 1 ? jobHandler(job, modeRow) : undefined;
+  const handler = ready > 1 || job.group ? jobHandler(job, modeRow) : undefined;
+  // A member of a Send to group: its events a minute and the subjects it has heard.
+  if (job.group && !attached && status === "running") {
+    const n = rate ? rate(job) : null;
+    cells.splice(cells.length - 1, 0, ["rate", n === null || n === undefined ? "" : `${n}/min`]);
+    const h = heard ? heard(job) : null;
+    if (modeRow?.subject && h !== null && h !== undefined) {
+      cells.splice(cells.length - 1, 0, ["heard", `${h} ${modeRow.subject.name || "subjects"}`]);
+    }
+  }
   for (const [cls, text] of cells) {
     const span = document.createElement("span");
     span.className = cls;
@@ -706,6 +726,8 @@ function jobRow(
     span.dir = "auto";
     if (TITLED.includes(cls)) span.title = text;
     if (cls === "id") span.title = job.id;
+    if (cls === "rate" && text) span.title = "events in the last 60 s";
+    if (cls === "heard") span.title = "subjects this handler has heard";
     if (cls === "kind" && job.elastic) {
       const tag = document.createElement("span");
       tag.className = "tag elastic";
@@ -943,7 +965,7 @@ function jobGroup(plan, kind = "plan") {
   });
   const summary = document.createElement("summary");
   summary.dir = "auto";
-  if (kind === "watch" || kind === "set") {
+  if (kind === "watch" || kind === "set" || kind === "siblings") {
     const text = document.createElement("span");
     text.className = "group-text";
     text.dir = "auto";
@@ -1030,6 +1052,8 @@ export function startJobs(
     onOrigins = null,
     onMore = null,
     audioKind = null,
+    rate = null,
+    heard = null,
     countEl = null,
     lastEvent = null,
     activity = null,
@@ -1157,6 +1181,8 @@ export function startJobs(
         }
       : null,
     mixText,
+    rate,
+    heard,
     mute,
     onBits,
     onOrigins,
@@ -1279,10 +1305,25 @@ export function startJobs(
       setOf.set(j.id, g.key);
       setInfo.set(g.key, sets.find((s) => s.id === g.key));
     }
+    // Then a Send to group's running members (plan 43: the record's `group`): two or more
+    // fold as one group. A group of one running member is an ordinary row.
+    const sibMembers = new Map(); // group id -> its running members, oldest first
+    for (const j of shown) {
+      if (!j.group || j.input || j.state?.status !== "running") continue;
+      if (!sibMembers.has(j.group)) sibMembers.set(j.group, []);
+      sibMembers.get(j.group).push(j);
+    }
+    for (const [key, list] of sibMembers) {
+      if (list.length < 2) sibMembers.delete(key);
+      else list.sort((a, b) => Number(a.created_ns ?? 0) - Number(b.created_ns ?? 0));
+    }
+    const sibOf = new Map(); // member id -> group id
+    for (const [key, list] of sibMembers) for (const j of list) sibOf.set(j.id, key);
+    const sibKey = (key) => `sib:${key}`; // a sibling group's key in groupEls
     const planOf = new Map();
     const members = new Map(); // plan -> its foldable jobs (not the attached ones)
     for (const j of shown) {
-      if (watchOf.has(j.id) || setOf.has(j.id)) continue;
+      if (watchOf.has(j.id) || setOf.has(j.id) || sibOf.has(j.id)) continue;
       const plan = foldPlan(j, now, jobs);
       if (!plan) continue;
       planOf.set(j.id, plan);
@@ -1291,12 +1332,16 @@ export function startJobs(
     }
     for (const [plan, list] of members) if (list.length <= JOBS_FOLD_MIN) members.delete(plan);
     const setKey = (id) => `set:${id}`; // a set's key in groupEls (apart from plan ids)
-    const live = new Set([...members.keys(), ...decoders.keys(), ...[...setInfo.keys()].map(setKey)]);
+    const live = new Set([
+      ...members.keys(), ...decoders.keys(), ...[...setInfo.keys()].map(setKey),
+      ...[...sibMembers.keys()].map(sibKey),
+    ]);
     for (const key of [...groupEls.keys()]) if (!live.has(key)) groupEls.delete(key);
     const inside = new Map(); // plan -> its rows, in list order
     const watchRows = new Map(); // watch id -> {watch, row}: its own row
     const decoderRows = new Map(); // watch id -> its decoders' rows, in list order
     const setRows = new Map(); // set id -> its rows on the shown source, in list order
+    const sibRows = new Map(); // group id -> {member id -> its row and the rows attached to it}
     const here = shownSource ? shownSource() ?? null : null;
     const out = [];
     // `node` (j's row, or a watch member's group) under j's set when j (or its input) is one
@@ -1314,6 +1359,32 @@ export function startJobs(
       return true;
     };
     shown.forEach((j, i) => {
+      const sib = sibOf.get(j.input ?? j.id);
+      if (sib) {
+        // The group stands where its first row stood: inside the watch whose decoder is a
+        // member, else the set a member belongs to, else in the list.
+        if (!sibRows.has(sib)) {
+          if (groupEls.get(sibKey(sib))?.dataset.kind !== "siblings") {
+            groupEls.set(sibKey(sib), jobGroup(sib, "siblings"));
+          }
+          sibRows.set(sib, new Map());
+          const node = groupEls.get(sibKey(sib));
+          const list = sibMembers.get(sib);
+          const watch = list.map((m) => watchOf.get(m.id)).find(Boolean);
+          const inSet = list.find((m) => setOf.has(m.id));
+          if (watch) {
+            if (!decoderRows.has(watch)) decoderRows.set(watch, []);
+            decoderRows.get(watch).push(node);
+          } else if (!inSet || !intoSet(inSet, node)) {
+            out.push(node);
+          }
+        }
+        const byJob = sibRows.get(sib);
+        const id = j.input ?? j.id;
+        if (!byJob.has(id)) byJob.set(id, []);
+        byJob.get(id).push(rows[i]);
+        return;
+      }
       if (decoders.has(j.id)) {
         if (groupEls.get(j.id)?.dataset.kind !== "watch") groupEls.set(j.id, jobGroup(j.id, "watch"));
         watchRows.set(j.id, { watch: j, row: rows[i] });
@@ -1357,6 +1428,20 @@ export function startJobs(
       text.title = t;
       placeChildren(summary, [row, text]);
       placeChildren(g, [summary, ...list]);
+    }
+    // A Send to group: its oldest running member's row as the summary, the others under it
+    // in the order they were started.
+    for (const [key, byJob] of sibRows) {
+      const g = groupEls.get(sibKey(key));
+      const list = sibMembers.get(key);
+      const summary = g.querySelector("summary");
+      const text = summary.querySelector(".group-text");
+      const t = `${list[0].kind} × ${list.length} handlers`;
+      if (text.textContent !== t) text.textContent = t;
+      text.title = t;
+      const [head, ...rest] = byJob.get(list[0].id);
+      placeChildren(summary, [head, text]);
+      placeChildren(g, [summary, ...rest, ...list.slice(1).flatMap((m) => byJob.get(m.id) ?? [])]);
     }
     // A set's group: its name and the count per source as its summary, its rows on the shown
     // source (a watch member's group among them) under it.

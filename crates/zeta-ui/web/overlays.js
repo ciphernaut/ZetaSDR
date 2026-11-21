@@ -264,15 +264,23 @@
 //                            selected source,
 //                            before it is drawn, and of a positioned job on another source
 //                            (the map reads `position` from them)
+//     ov.rateOf(jobId) -> number   the job's events counted in the last 60 s (a ring of event
+//         times, pruned on read and on a 5 s tick that redraws each `.rate` cell, so a decoder
+//         that falls silent counts down); a ribbon of a job with a `group` ends ` · <handler
+//         name>` (the keyed subject ribbon's title does)
 //     ov.jobRow(job, counter)  shows `counter` (when > 0) in that job's row `.events` cell
 //     ov.destroy()
 
+import { jobHandler } from "./actions.js";
 import { SQUELCH_KINDS, setSquelchTag } from "./agent.js";
 import { channelLabel } from "./plans.js";
 import { matchesPairs, subjectLabel, subjectSummary } from "./subjects.js";
 import { bandText, mhzText } from "./units.js";
 
 export const RIBBON_TTL_MS = 60_000;
+// The window of a job's events a minute (ov.rateOf), and how often the rows are redrawn.
+export const RATE_WINDOW_MS = 60_000;
+const RATE_TICK_MS = 5000;
 export const OTHER_EVENT_CHARS = 80;
 // At most this many `job_context` reads seeding squelch gates are in flight at once; the
 // reads chain, each answer sends the next.
@@ -432,6 +440,8 @@ class Overlays {
     this.seedGen = 0; // bumped by ov.reseedAll: a read issued before it is discarded
     this.counters = new Map(); // job id -> non-spectrum events seen on the feed
     this.lastEvents = new Map(); // job id -> performance.now() of its last counted event
+    this.eventTimes = new Map(); // job id -> performance.now() of each counted event in the window
+    this.rateTimer = setInterval(() => this.tickRates(), RATE_TICK_MS);
     this.stationEvents = new Map(); // job id -> performance.now() of its last station frame
     this.hotJob = null; // the job id whose tag, outline and row show `hot`
     this.speaking = []; // the job ids a mix is playing now: `speaking` on each
@@ -487,6 +497,7 @@ class Overlays {
     this.pending = [];
     this.counters.clear();
     this.lastEvents.clear();
+    this.eventTimes.clear();
     this.stationEvents.clear();
     this.squelches.clear();
     this.gateless.clear();
@@ -543,6 +554,7 @@ class Overlays {
   forget(jobId) {
     this.counters.delete(jobId);
     this.lastEvents.delete(jobId);
+    this.eventTimes.delete(jobId);
     this.stationEvents.delete(jobId);
     this.squelches.delete(jobId);
     this.gateless.delete(jobId);
@@ -943,7 +955,10 @@ class Overlays {
     // Every non-spectrum event counts in the job row, whatever its shape.
     const n = (this.counters.get(job.id) || 0) + 1;
     this.counters.set(job.id, n);
-    this.lastEvents.set(job.id, performance.now());
+    const at = performance.now();
+    this.lastEvents.set(job.id, at);
+    if (!this.eventTimes.has(job.id)) this.eventTimes.set(job.id, []);
+    this.eventTimes.get(job.id).push(at);
     if (this.isStationFrame(job, p)) this.stationEvents.set(job.id, performance.now());
     this.jobRow(job, n);
     if (obj) {
@@ -980,18 +995,18 @@ class Overlays {
       }
       if (typeof p.summary === "string") {
         if (this.subjectRibbon(job, p)) return;
-        this.ribbon(tuningCentre(job), p.summary, typeof p.protocol === "string" ? p.protocol : "event", owner);
+        this.ribbon(tuningCentre(job), p.summary + this.handlerTail(job), typeof p.protocol === "string" ? p.protocol : "event", owner);
         return;
       }
       if (typeof p.protocol === "string") {
         const text = protocolText(p);
         if (text !== null) {
-          this.ribbon(tuningCentre(job), text, p.protocol, owner);
+          this.ribbon(tuningCentre(job), text + this.handlerTail(job), p.protocol, owner);
           return;
         }
       }
       if ("src" in p && "info" in p) {
-        this.ribbon(tuningCentre(job), `${p.src} > ${p.dst}: ${p.info}`, "aprs", owner);
+        this.ribbon(tuningCentre(job), `${p.src} > ${p.dst}: ${p.info}${this.handlerTail(job)}`, "aprs", owner);
         return;
       }
     }
@@ -1010,6 +1025,35 @@ class Overlays {
 
   lastEvent(jobId) {
     return this.lastEvents.get(jobId) ?? null;
+  }
+
+  // The events counted for the job in the last RATE_WINDOW_MS: its times older than that are
+  // dropped here (and by the tick), so a decoder that falls silent counts down.
+  rateOf(jobId) {
+    const times = this.eventTimes.get(jobId);
+    if (!times) return 0;
+    const from = performance.now() - RATE_WINDOW_MS;
+    let i = 0;
+    while (i < times.length && times[i] < from) i++;
+    if (i > 0) times.splice(0, i);
+    return times.length;
+  }
+
+  // Each `.rate` cell in the job rows drawn again, the quiet ones included.
+  tickRates() {
+    if (this.destroyed || !this.jobsEl) return;
+    for (const cell of this.jobsEl.querySelectorAll(".job .rate")) {
+      const id = cell.closest(".job")?.dataset.id;
+      if (id && cell.textContent !== "") cell.textContent = `${this.rateOf(id)}/min`;
+    }
+  }
+
+  // ` · <handler name>` for a job of a Send to group (its record's `group`), else "": the
+  // ribbons of siblings tell which handler decoded them.
+  handlerTail(job) {
+    if (!job.group) return "";
+    const h = jobHandler(job, this.subjects?.rowOf(job.kind));
+    return h ? ` · ${h.name}` : "";
   }
 
   lastStationEvent(jobId) {
@@ -1054,6 +1098,8 @@ class Overlays {
     if (!cell) return;
     cell.textContent = counter > 0 ? String(counter) : "";
     cell.title = counter > 0 ? `${counter} events since this page started watching` : "";
+    const rate = row.querySelector(".rate");
+    if (rate) rate.textContent = `${this.rateOf(job.id)}/min`;
   }
 
   // ---- drawing -------------------------------------------------------------------------
@@ -1079,7 +1125,7 @@ class Overlays {
       if (!s) return false;
       this.keyedRibbon(
         `job:${job.id}:${k.key}`, hz, () => subjectSummary(s), row.protocol, s.count,
-        () => store.held(job.id, k.key), job.id,
+        () => store.held(job.id, k.key), job.id, this.handlerTail(job),
       );
       return true;
     }
@@ -1088,7 +1134,10 @@ class Overlays {
       const label = last ? subjectLabel(last) : "";
       return `${row.protocol} ${store.size(job.id)} ${row.subject.name}, last ${label}`;
     };
-    this.keyedRibbon(`job:${job.id}`, hz, line, row.protocol, 1, () => store.held(job.id, null), job.id);
+    this.keyedRibbon(
+      `job:${job.id}`, hz, line, row.protocol, 1, () => store.held(job.id, null), job.id,
+      this.handlerTail(job),
+    );
     return true;
   }
 
@@ -1096,7 +1145,7 @@ class Overlays {
   // drawn at once; a message to one only notes what it says, and a timer draws it at most every
   // KEYED_RIBBON_MS, so no message measures anything. `held()` true keeps it from scrolling or
   // expiring while its subject is heard.
-  keyedRibbon(key, hz, text, cls, count, held, job = null) {
+  keyedRibbon(key, hz, text, cls, count, held, job = null, tail = "") {
     if (this.destroyed) return null;
     let r = this.ribbons.find((o) => o.key === key);
     const fresh = !r;
@@ -1104,6 +1153,8 @@ class Overlays {
       r = this.makeRibbon(hz, typeof text === "function" ? String(text()) : String(text), cls, key, job);
       r.countText = "";
       r.drawn = 0;
+      r.tail = tail;
+      if (tail) r.el.title += tail;
     }
     r.held = held;
     r.hz = hz;
@@ -1135,7 +1186,7 @@ class Overlays {
     if (text === r.text && countText === r.countText && !moved) return;
     r.text = text;
     r.bodyEl.textContent = text;
-    r.el.title = text;
+    r.el.title = text + (r.tail ?? "");
     r.countText = countText;
     r.countEl.textContent = countText;
     this.limitWidth(r);
@@ -2119,6 +2170,7 @@ class Overlays {
   destroy() {
     this.destroyed = true;
     clearInterval(this.timer);
+    clearInterval(this.rateTimer);
     this.ro.disconnect();
     this.closeFeed();
     for (const source of [...this.otherFeeds.keys()]) this.closeOtherFeed(source);

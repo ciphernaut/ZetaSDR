@@ -280,6 +280,9 @@ Jobs:
   the job's state; a finished row also has `.finished`. A running scan's row also has
   `.sweep-ms` (the last sweep's time) and `select.scan-look` (the look: fast, averaged, long
   look, and coarse and fast where the source has a lossy depth).
+- `.job-group[data-kind="siblings"]`: the fold of jobs sent from one another (Send to): the
+  oldest member's row is its summary, the others sit under it. Each member's row has `.job .rate`
+  (its events in the last minute, `3/min`) and `.job .heard` (the subjects it has heard, `2 pairs`).
 - `.job-tag`: a job's tag in the rail (or on its outline). Its parts are `.job-tag .kind`,
   `.short`, `.job-tag .channel`, `.job-tag .centre`, a `.dot` and a `.snippet`.
 - `.outline`: a job's band on the waterfall (`.outline-label` and `.outline-handle` inside).

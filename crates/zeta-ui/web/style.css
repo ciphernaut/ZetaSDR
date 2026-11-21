@@ -560,6 +560,7 @@ details.turn > pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 2px
 .job > .band { order: 5; }
 .job > .source { order: 6; }
 .job > .events { order: 7; }
+.job > .rate, .job > .heard { order: 7; }
 .job > .mix-now { order: 8; }
 .job > .pos { order: 9; }
 .job > .sweep-ms { order: 9; color: var(--dim); font-size: 11px; }
@@ -581,6 +582,7 @@ details.turn > pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 2px
 .job button.mute[aria-pressed="true"] { border-color: var(--dim); color: var(--dim); }
 .job .mix-now { color: var(--ok); font-size: 11px; }
 .job .events { color: var(--user); }
+.job .rate, .job .heard { color: var(--dim); font-size: 11px; }
 .job .actions { display: flex; gap: 4px; justify-content: flex-end; }
 .job .actions button { padding: 0 6px; }
 .job button.play { min-width: 2.2em; }
@@ -636,6 +638,25 @@ details.turn > pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 2px
 .job-group[data-kind="watch"] > summary > .group-text::before { content: "▾ "; }
 .job-group[data-kind="watch"]:not([open]) > summary > .group-text::before { content: "▸ "; }
 .job-group[data-kind="watch"] > .job { padding-inline-start: 12px; }
+/* A Send to group (plan 43): the oldest member's row is the summary, its siblings under it,
+   as a watch's decoders are. */
+.job-group[data-kind="siblings"] > summary {
+  display: block;
+  list-style: none;
+  color: inherit;
+  white-space: normal;
+}
+.job-group[data-kind="siblings"] > summary::-webkit-details-marker { display: none; }
+.job-group[data-kind="siblings"] > summary > .group-text {
+  display: block;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.job-group[data-kind="siblings"] > summary > .group-text::before { content: "▾ "; }
+.job-group[data-kind="siblings"]:not([open]) > summary > .group-text::before { content: "▸ "; }
+.job-group[data-kind="siblings"] > .job { padding-inline-start: 12px; }
 /* A set's jobs under its name (plan 31 spec 5.5): the summary its text and the set's Stop;
    its rows, and a watch member's nested group, indented under it. */
 .job-group[data-kind="set"] > summary {

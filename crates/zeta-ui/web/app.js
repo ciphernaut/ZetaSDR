@@ -1549,6 +1549,10 @@ function start(api) {
     onHot: (id, on) => state.ov?.setHot(id, on),
     squelch: (id) => (state.ov ? state.ov.squelch(id) : null),
     lastEvent: (id) => (state.ov ? state.ov.lastEvent(id) : null),
+    // A Send to member's row: its events in the last minute (null: the page has no feed for
+    // its source) and the subjects it has heard.
+    rate: (job) => (state.ov && job.source === state.selected ? state.ov.rateOf(job.id) : null),
+    heard: (job) => state.subjects?.heardBy(job.id) ?? null,
     activity: (id) =>
       state.ov ? state.ov.activity(id) : { watched: false, speaking: false, hot: false },
     watchedMix: () => (state.mix ? state.mix.jobId : null),

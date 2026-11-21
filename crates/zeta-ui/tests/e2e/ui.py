@@ -2155,6 +2155,7 @@ THEME_HOOKS = [
     ".src-tab.default", ".src-tab .default-mark",
     "html[data-map-tiles]", "#map .map-tile-note",
     ".mark-1", ".mark-differs", ".subject-legend",
+    '.job-group[data-kind="siblings"]', ".job .rate", ".job .heard",
 ]
 
 
@@ -11389,6 +11390,86 @@ def start_pair_siblings(page, url, secret):
     return own, sib
 
 
+def sibling_by(url, secret, own, handler, kind="fake_pair", source="tone", centre=100_000_000,
+               bandwidth_hz=40_000):
+    """A sibling of job `own` run by `handler` (plan 43): its job id."""
+    return http_json(url, secret, "/op", {
+        "op": "job_start", "kind": kind, "source": source, "center_hz": centre,
+        "bandwidth_hz": bandwidth_hz, "deviation_hz": None, "sideband": None, "elastic": False,
+        "replace": [], "handler": handler, "beside": own})["value"]
+
+
+def scenario_siblings_fold_as_one_group_in_the_job_list(page, url, secret):
+    select_source(page, url, secret, "tone")
+    own, sib = start_pair_siblings(page, url, secret)
+    try:
+        group = page.locator('#jobs details.job-group[data-kind="siblings"]')
+        expect(group).to_have_count(1, timeout=10_000)
+        assert group.get_attribute("data-plan") == own, group.get_attribute("data-plan")
+        first = group.locator(f'> summary .job[data-id="{own}"]')
+        expect(first).to_have_count(1)
+        expect(group.locator(f'> summary .job[data-id="{sib}"]')).to_have_count(0)
+        second = group.locator(f'> .job[data-id="{sib}"]')
+        expect(second).to_have_count(1)
+        expect(page.locator(f'#jobs .job[data-id="{own}"]')).to_have_count(1)
+        expect(page.locator(f'#jobs .job[data-id="{sib}"]')).to_have_count(1)
+        expect(first.locator(".kind .tag.handler")).to_have_count(1)
+        expect(second.locator(".kind .tag.handler")).to_have_text("Alt lines (UI tests)")
+        for row in (first, second):
+            expect(row.locator(".rate")).to_have_text(re.compile(r"^[1-9]\d*/min$"), timeout=15_000)
+            expect(row.locator(".heard")).to_have_text("1 pairs", timeout=15_000)
+        assert first.locator(".rate").get_attribute("title") == "events in the last 60 s"
+        stop_job(url, secret, own)
+        expect(group).to_have_count(0, timeout=10_000)
+        row = page.locator(f'#jobs > .job[data-id="{sib}"]')
+        expect(row).to_have_count(1, timeout=10_000)
+        expect(row.locator(".kind .tag.handler")).to_have_text("Alt lines (UI tests)")
+    finally:
+        stop_job(url, secret, sib)
+        stop_job(url, secret, own)
+
+
+def scenario_a_silent_sibling_shows_zero(page, url, secret):
+    select_source(page, url, secret, "tone")
+    own = start_subject_job(page, url, secret, "fake_pair")
+    sib = sibling_by(url, secret, own, "quiet")
+    try:
+        first = page.locator(f'#jobs details.job-group[data-kind="siblings"] > summary '
+                             f'.job[data-id="{own}"]')
+        expect(first.locator(".rate")).to_have_text(re.compile(r"^[1-9]\d*/min$"), timeout=15_000)
+        quiet = page.locator(f'#jobs details.job-group[data-kind="siblings"] > .job[data-id="{sib}"]')
+        expect(quiet.locator(".rate")).to_have_text("0/min", timeout=15_000)
+        expect(quiet.locator(".heard")).to_have_text("0 pairs", timeout=15_000)
+        expect(first.locator(".heard")).to_have_text("1 pairs", timeout=15_000)
+    finally:
+        stop_job(url, secret, sib)
+        stop_job(url, secret, own)
+
+
+def scenario_a_sibling_ribbon_names_its_handler(page, url, secret):
+    select_source(page, url, secret, "aprs")
+    names = lambda: page.evaluate(
+        "() => [...document.querySelectorAll('#waterfall .ov-ribbon')]"
+        ".map((r) => `${r.textContent}\\n${r.title}`)")
+    lone = start_job(url, secret, "aprs_decode", "aprs", 144_800_000, 12_500)
+    sib = None
+    try:
+        wait_until(lambda: any("VK3ABC" in t for t in names()), 20.0, "the lone job's ribbon")
+        modes = http_json(url, secret, "/op", {"op": "modes_list", "family": None,
+                                               "state": None})["value"]["modes"]
+        aprs = next(m for m in modes if m["id"] == "aprs_decode")
+        for h in aprs["handlers"]:
+            assert not any(h["name"] in t for t in names()), (h["name"], names())
+        sib = sibling_by(url, secret, lone, "alt", kind="aprs_decode", source="aprs",
+                         centre=144_800_000, bandwidth_hz=12_500)
+        wait_until(lambda: any("Alt lines (UI tests)" in t for t in names()), 30.0,
+                   "the sibling's ribbon names its handler")
+    finally:
+        if sib:
+            stop_job(url, secret, sib)
+        stop_job(url, secret, lone)
+
+
 def scenario_sibling_fields_are_marked_in_the_table(page, url, secret):
     errors = page_errors(page)
     select_source(page, url, secret, "tone")
@@ -12368,7 +12449,7 @@ def main(argv):
                         seen = page.evaluate("window.__cspViolations || []")
                         assert not seen, f"Content-Security-Policy violations: {seen}"
                 except Exception as e:  # noqa: BLE001 - report any failure with its scenario
-                    print(f"FAIL {name}: {type(e).__name__}: {e}"); import traceback; traceback.print_exc(file=sys.stdout)
+                    print(f"FAIL {name}: {type(e).__name__}: {e}")
                     for line in console:
                         print(f"  console {line}")
                     return 1
