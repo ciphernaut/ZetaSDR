@@ -295,6 +295,30 @@ On the CLI: `zeta job start --beside <job id> --handler onair [--needs packet]`.
 
 **Gotchas.** A node rolled back past this build resumes no jobs (the records carry `group`). The marks' colours and styles come from the theme: `--c-handler-1..4`, `--handler-style-1..4`, and `handlers` in `theme.json` pins a handler to a slot.
 
+## Check a decoder against a recording
+
+Not run live when written: replay a stored capture through a mode's handler instead of waiting for the air. Needs a capture in `zeta capture list` wide enough for the mode (a recording too narrow is refused by the mode's own range error).
+
+**Capture.** Record a burst capture of the band while it is busy, or use one already listed: `zeta capture list` gives each capture's id, centre, width, time and subjects.
+
+**Replay.** One op; the capture's whole set is played once, in real time, from its first sample, and nothing is retuned or leased, so live jobs are not disturbed.
+
+```json
+{"op":"capture_decode","capture":"<capture id>","kind":"adsb_decode","handler":null,"packets":false}
+```
+
+On the CLI: `zeta capture decode --capture <id> --kind <mode> [--handler <h>] [--packets]`. On the page: Explore's capture row, **Send to** and the mode's name (modes that do not fit are greyed with their reason).
+
+**Read the note.** `zeta job show <job id>`: the replay ends `stopped` with a note of how many events it decoded, and `job_context.replay` names the captures and the radio that recorded them. A silent replay says the decoder found nothing in that recording, not that the band is empty.
+
+**Compare two handlers.** Replay the same capture once per handler (`--handler dump1090`, then `--handler onair`), and read each job's events and `N subjects`. The replays are one group on the page, marked per handler as in "Compare two decoders", and a replay of the same capture, mode and handler while one runs is a `duplicate`.
+
+**Events and times.** A replay's events go only to the `replay` feed, never a radio's feed or `events.log`, and each carries `replay: <capture>` with the recording's own time in `t_ns`: read it against the capture's `start_ns`, not the clock.
+
+**Packets.** `--packets` starts the packet capture before the first sample (attaching `packets` to a running replay would miss what was already decoded); open it in Wireshark as in "Packet capture for Wireshark". The handler must output `packet`.
+
+**Gotchas.** A replay proves nothing live: it supersedes no signature, tallies nothing at the station and uploads nothing. It never resumes: after a restart, run it again.
+
 ## Make your own theme
 
 Verified on the plan 26 build; the folder format and every hook are in `docs/themes.md`.

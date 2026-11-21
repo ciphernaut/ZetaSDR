@@ -386,7 +386,8 @@ Four plans, each working software on its own:
 2. **Send to and the merged subject.** `job_start.beside`, the job menu's Send to, the
    capture entry's fallback, the group in the job list, per-handler subject fields, marks
    and theme tokens.
-3. **Stored captures.** `capture_decode` and Explore's Send to.
+3. **Stored captures.** `capture_decode` and Explore's Send to (built as plan 44,
+   `docs/superpowers/plans/2026-11-22-capture-decode.md`).
 4. **OnAir's other modes**, batches 2 and 3, and the upstream patches.
 
 ## What's left to the builder
