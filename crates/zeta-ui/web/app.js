@@ -1414,6 +1414,8 @@ function start(api) {
     wf: () => state.wf,
     onOrigins: (key, answer) => state.map?.origin(key, answer),
     onBits: (id) => state.bits?.setJob(id),
+    // Send to's popup (mounted below, with the waterfall's menus).
+    menu: () => state.menu,
   });
   state.bits = mountBitsPane($("#bits"), api, state.view, state.transcript, {
     panes: state.panes,
@@ -1476,6 +1478,7 @@ function start(api) {
   state.menu = mountMenu(state.wf, {
     applyOp,
     attachOp,
+    panes: state.panes,
     muteFor,
     packetsFor,
     jobs: () => state.lastJobs,

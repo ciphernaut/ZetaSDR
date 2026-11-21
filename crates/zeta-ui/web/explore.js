@@ -1,6 +1,6 @@
 // explore.js: the Explore pane (plan 19 spec 5.7), the captures the node holds.
 //
-// mountExplorePane(el, api, view, transcript, {panes, ov, wf, onBits, onOrigins})
+// mountExplorePane(el, api, view, transcript, {panes, ov, wf, onBits, onOrigins, menu})
 //   -> {render(), eligible(), destroy()}
 //   Polls `capture_list` once at load, then every EXPLORE_POLL_MS while the pane is shown, has
 //   been shown once this load, a `capture` job runs (fed by noteJobs(jobs) from each job_list;
@@ -15,7 +15,9 @@
 //   `symbol_rate_baud` the row's `input.bits-rate`, prefilled from the features' symbol rate,
 //   null when empty so the node fills it; the transcript says `started bits <id> on <kHz> kHz`
 //   or the error, then the Bits pane is selected; a rate typed and the focus in it survive
-//   the 2 s redraw).
+//   the 2 s redraw), and last `button[data-act="sendto"]` reading `Send to ›`, which opens
+//   `menu()`'s (menu.js) openCapture at the button for the row's record: the modes that fit the
+//   recording, each with its handlers (actions.js's `capture` surface; plan 44).
 //   Above the rows a `.explore-tools` bar holds Delete all (`button[data-action="delete-all"]`,
 //   armed like Delete: `sure?` for DELETE_CONFIRM_MS, then a second click deletes every
 //   capture that is not pinned, one `capture_delete` each, and notes
@@ -99,9 +101,10 @@ export function mountExplorePane(
   api,
   view,
   transcript,
-  { panes = null, ov = () => null, wf = () => null, onBits = null, onOrigins = null } = {},
+  { panes = null, ov = () => null, wf = () => null, onBits = null, onOrigins = null, menu = () => null } = {},
 ) {
   const pane = new ExplorePane(el, api, view, transcript, panes, ov, wf);
+  pane.menu = menu; // () => menu.js's Menu (or null), whose capture popup Send to opens
   pane.onBits = onBits; // (job id) after a bits_start: the Bits pane shows that job
   // (`capture:<id>`, answer) after a capture_classify with `origins`: the map lights them
   pane.onOrigins = onOrigins;
@@ -287,6 +290,14 @@ class ExplorePane {
         b.textContent = label;
         td.append(b);
       }
+      // Not a data-action: the menu's entries run it, not click().
+      const send = document.createElement("button");
+      send.type = "button";
+      send.dataset.act = "sendto";
+      send.setAttribute("aria-haspopup", "menu");
+      send.title = "replay the recording into a decoder mode (capture_decode)";
+      send.textContent = "Send to ›";
+      td.append(send);
       tr.append(td);
       body.append(tr);
     }
@@ -466,6 +477,12 @@ class ExplorePane {
   }
 
   async click(ev) {
+    const send = ev.target.closest('tr.capture button[data-act="sendto"]');
+    if (send) {
+      const c = this.captures.find((x) => x.id === send.closest("tr.capture").dataset.id);
+      if (c) this.menu()?.openCapture(send, c);
+      return;
+    }
     const b = ev.target.closest("button[data-action]");
     if (b && b.dataset.action === "delete-all") return this.removeAll();
     const sig = ev.target.closest("tr.signature");

@@ -5786,7 +5786,7 @@ MENU_ACTION_IDS = [
     "ssb_usb", "ssb_lsb", "wfm_transcribe", "fm_transcribe", "am_transcribe",
     "ssb_usb_transcribe", "ssb_lsb_transcribe", "measure", "plan", "set", "scan", "iq_read",
     "ask", "fit", "w2500", "w5000", "w6250", "w12500", "w25000", "denoise", "stereo", "mute",
-    "send_to", "packets", "stop",
+    "send_to", "packets", "stop", "replay", "replay_elsewhere",
 ]
 
 
@@ -5809,8 +5809,58 @@ def scenario_menu_entry_table_is_whole(page, url, secret):
     missing = [i for i in MENU_ACTION_IDS if i not in ids]
     assert not missing, f"ids gone from the table: {missing}"
     for e in got:
-        assert e["on"] and set(e["on"]) <= {"box", "job"}, f"surfaces {e}"
+        assert e["on"] and set(e["on"]) <= {"box", "job", "capture"}, f"surfaces {e}"
         assert all(isinstance(g, str) and g for g in e["groups"]), f"groups {e}"
+        assert all(e["known"]), f"groups not in GROUPS {e}"
+    # The capture surface (Explore's Send to, plan 44): its two entries only; `replay` stands
+    # once per ready row that fits the recording (by name), plain with one ready handler and
+    # no packets, else a submenu of the policy, every handler (a not ready one greyed with its
+    # reason) and each packet-giving one `with packets`; the rest under `replay_elsewhere`,
+    # greyed with why.
+    assert sorted(e["id"] for e in got if "capture" in e["on"]) == ["replay", "replay_elsewhere"]
+    assert all(e["on"] == ["capture"] for e in got if "capture" in e["on"]), got
+    drawn = page.evaluate(
+        """async () => {
+          const a = await import('./actions.js');
+          const h = (id, outputs = ['event'], state = 'ready') =>
+            ({id, name: id.toUpperCase(), state, reason: state === 'ready' ? null : 'gone', outputs});
+          const row = (id, name, band, handlers) =>
+            ({id, name, state: 'ready', band, handlers, handler: handlers[0].id});
+          const rows = [
+            row('one', 'Zulu', {bandwidth_hz: 10000}, [h('builtin')]),
+            row('two', 'Alpha', {bandwidth_hz: 12500, range_hz: [100e6, 200e6]},
+                [h('builtin', ['event', 'packet'])]),
+            row('three', 'Mike', {bandwidth_hz: 5000}, [h('builtin'), h('x'), h('y', [], 'unavailable')]),
+            row('wide', 'Wide', {bandwidth_hz: 2e6, min_hz: 1e6}, [h('builtin')]),
+            row('far', 'Far', {bandwidth_hz: 5000, range_hz: [[1e9, 1.1e9], [2e9, 2.1e9]]}, [h('builtin')]),
+            {...row('off', 'Off', {bandwidth_hz: 5000}, [h('builtin', [], 'unavailable')]),
+             state: 'unavailable', handler: null},
+          ];
+          const ctx = {host: null, capture: {id: 'c'}, rows,
+                       sel: {centerHz: 144.8e6, bandwidthHz: 12500}};
+          return a.offered('capture', ctx).map((e) => {
+            const sub = a.subOf(e, {...ctx, surface: 'capture'});
+            return [e.id, e.mode ?? null, e.label,
+                    sub && sub.map((x) => [x.key, x.label, x.data?.handler ?? null,
+                                           x.data?.packets ?? null, !!x.disabled, x.title ?? null])];
+          });
+        }""")
+    assert drawn == [
+        ["replay", "two", "Alpha", [
+            ["policy", "BUILTIN (policy)", None, None, False, None],
+            ["builtin", "BUILTIN", "builtin", None, False, None],
+            ["builtin:packets", "BUILTIN with packets", "builtin", "1", False, None]]],
+        ["replay", "three", "Mike", [
+            ["policy", "BUILTIN (policy)", None, None, False, None],
+            ["builtin", "BUILTIN", "builtin", None, False, None],
+            ["x", "X", "x", None, False, None],
+            ["y", "Y", "y", None, True, "gone"]]],
+        ["replay", "one", "Zulu", None],
+        ["replay_elsewhere", None, "elsewhere", [
+            ["far", "Far", None, None, True,
+             "works 1000.0000–1100.0000, 2000.0000–2100.0000 MHz"],
+            ["wide", "Wide", None, None, True, "needs 1000.0 kHz, the recording is 12.5 kHz"]]],
+    ], drawn
 
 
 # The first level of an open menu: [action, or "group:<id>" for a group's opener] of each
@@ -11962,6 +12012,189 @@ def scenario_a_replay_is_no_sibling_of_a_live_job(page, url, secret):
         if replay:
             stop_job(url, secret, replay)
         stop_aprs(url, secret)
+
+
+def open_explore(page):
+    """Select the Explore tab once it shows, unless it is selected."""
+    tab = pane_tab(page, "explore")
+    expect(tab).to_be_visible(timeout=20_000)
+    if tab.get_attribute("aria-selected") != "true":
+        tab.click()
+    expect(page.locator("#explore")).to_be_visible()
+
+
+def capture_send_to(page, capture):
+    """Explore shown and the Send to popup of capture `capture`'s row open; the popup."""
+    open_explore(page)
+    row = page.locator(f'#explore tr.capture[data-id="{capture}"]')
+    expect(row).to_have_count(1, timeout=20_000)
+    button = row.locator('button[data-act="sendto"]')
+    expect(button).to_have_text("Send to ›")
+    button.click()
+    menu = page.locator("#ctx-outline")
+    expect(menu).to_be_visible()
+    expect(menu.locator(".ctx-item").first).to_be_visible()
+    return menu
+
+
+def replay_item(menu, mode):
+    return menu.locator(f'.ctx-item[data-action="replay"][data-mode="{mode}"]')
+
+
+def replay_panel(menu, mode):
+    """The submenu of mode `mode`'s entry in the open capture popup, opened."""
+    replay_item(menu, mode).click()
+    panel = menu.locator(f'.ctx-sub[data-for="replay"][data-mode="{mode}"]')
+    expect(panel).to_be_visible()
+    return panel
+
+
+def replays_of(url, secret, capture):
+    """The job_list records of the replays naming capture `capture`."""
+    return [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            if j.get("replay") == capture]
+
+
+# The capture popup's first level: [action, mode, label, disabled] of each shown `.ctx-item`
+# outside its submenus.
+CAPTURE_LEVEL_JS = """(root) => [...root.querySelectorAll('.ctx-item')]
+  .filter((e) => !e.closest('.ctx-sub') && e.closest('[hidden]') === null)
+  .map((e) => [e.dataset.action, e.dataset.mode ?? null, e.textContent,
+               e.getAttribute('aria-disabled') === 'true'])"""
+
+
+def scenario_explore_send_to_lists_the_modes_that_fit(page, url, secret):
+    # A capture of the APRS band: Send to › opens a popup whose first level is every ready
+    # mode row that fits the recording (its width at least the row's narrowest, its band in
+    # the row's ranges), by name, then one `elsewhere` entry whose submenu holds the others,
+    # greyed, each titled with why (spec 2026-11-22 call 16). Escape closes it.
+    clear_captures(url, secret)
+    stop_aprs(url, secret)
+    errors = page_errors(page)
+    select_source(page, url, secret, "aprs")
+    centre, width = REPLAY_BANDS["aprs"]
+    capture = two_captures_of(url, secret, "aprs", centre, width)[0]
+    assert (capture["center_hz"], capture["bandwidth_hz"]) == (centre, width), capture
+    rows = mode_rows(url, secret)
+    ready = {i: r for i, r in rows.items() if r["state"] == "ready"}
+    narrow = {i for i, r in ready.items()
+              if width < (r["band"].get("min_hz") or r["band"]["bandwidth_hz"])}
+    away = {i for i, r in ready.items()
+            if i not in narrow and not in_ranges(r, centre - width / 2, centre + width / 2)}
+    fit = sorted((r["name"], i) for i, r in ready.items() if i not in narrow | away)
+    assert "aprs_decode" in [i for _, i in fit] and "adsb_decode" in narrow, (fit, narrow)
+    menu = capture_send_to(page, capture["id"])
+    try:
+        level = menu.evaluate(CAPTURE_LEVEL_JS)
+        replays = [x for x in level if x[0] == "replay"]
+        assert [(x[2], x[1]) for x in replays] == fit, (replays, fit)
+        assert not any(x[3] for x in replays), replays
+        assert level[-1][0] == "replay_elsewhere" and level[-1][2] == "elsewhere", level
+        menu.locator('.ctx-item[data-action="replay_elsewhere"]').click()
+        panel = menu.locator('.ctx-sub[data-for="replay_elsewhere"]')
+        expect(panel).to_be_visible()
+        far = panel.locator(".ctx-item")
+        assert sorted(far.evaluate_all("els => els.map((e) => e.dataset.mode)")) == \
+            sorted(narrow | away), far.all_text_contents()
+        for mode in narrow | away:
+            item = panel.locator(f'.ctx-item[data-mode="{mode}"]')
+            expect(item).to_have_attribute("aria-disabled", "true")
+            expect(item).to_have_attribute(
+                "title", re.compile("^needs " if mode in narrow else "^works "))
+        expect(panel.locator('.ctx-item[data-mode="adsb_decode"]')).to_have_attribute(
+            "title", re.compile(r"^needs \d+\.\d kHz, the recording is 12\.5 kHz$"))
+        close_menu(page, "#ctx-outline")
+        assert not errors, errors
+    finally:
+        close_menu(page, "#ctx-outline")
+
+
+def scenario_explore_send_to_replays_through_the_chosen_handler(page, url, secret):
+    # APRS has two ready handlers: its entry opens `<pick> (policy)` and each handler; choosing
+    # `alt` sends capture_decode for the capture by that handler without packets, notes the
+    # replay, and the Subjects pane (the mode has a subject) comes up.
+    clear_captures(url, secret)
+    stop_aprs(url, secret)
+    select_source(page, url, secret, "aprs")
+    capture = two_captures_of(url, secret, "aprs", *REPLAY_BANDS["aprs"])[0]["id"]
+    menu = capture_send_to(page, capture)
+    try:
+        panel = replay_panel(menu, "aprs_decode")
+        labels = panel.locator(".ctx-item").all_text_contents()
+        assert labels[0].endswith(" (policy)"), labels
+        alt = panel.locator('.ctx-item[data-handler="alt"]:not([data-packets])')
+        expect(alt).to_have_count(1)
+        with page.expect_request(is_op("capture_decode")) as req:
+            alt.click()
+        body = json.loads(req.value.post_data)
+        assert body["capture"] == capture and body["kind"] == "aprs_decode", body
+        assert body["handler"] == "alt" and body["packets"] is False, body
+        expect(menu).to_be_hidden()
+        expect(page.locator("#transcript .line.note",
+                            has_text="replaying aprs_decode from the capture")).to_have_count(1)
+        wait_until(lambda: [j for j in replays_of(url, secret, capture)
+                            if j.get("handler") == "alt"], 10, "the alt replay")
+        expect(pane_tab(page)).to_have_attribute("aria-selected", "true", timeout=5_000)
+    finally:
+        close_menu(page, "#ctx-outline")
+        for j in replays_of(url, secret, capture):
+            stop_job(url, secret, j["id"])
+
+
+def scenario_explore_send_to_with_packets_lists_a_packet_capture(page, url, secret):
+    # The built-in APRS decoder gives packets: its `with packets` entry sends packets: true,
+    # and the replay's packet capture shows in Explore as any does (spec call 17).
+    clear_captures(url, secret)
+    stop_aprs(url, secret)
+    select_source(page, url, secret, "aprs")
+    capture = replay_set(url, secret, "aprs")[0]["id"]
+    menu = capture_send_to(page, capture)
+    try:
+        panel = replay_panel(menu, "aprs_decode")
+        item = panel.locator('.ctx-item[data-packets="1"]')
+        expect(item).to_have_count(1)
+        expect(item).to_have_text("built-in with packets")
+        with page.expect_request(is_op("capture_decode")) as req:
+            item.click()
+        body = json.loads(req.value.post_data)
+        assert body["handler"] == "builtin" and body["packets"] is True, body
+        job = wait_until(lambda: replays_of(url, secret, capture), 10, "the replay")[0]["id"]
+        rec = wait_until(
+            lambda: next((c for c in capture_ops(url, secret, "packets_list")
+                          if c["job"] == job), None), 30, "the replay's packet capture")
+        open_explore(page)
+        expect(page.locator(f'#explore tr.packet-capture[data-id="{rec["id"]}"]')) \
+            .to_have_count(1, timeout=20_000)
+    finally:
+        close_menu(page, "#ctx-outline")
+        for j in replays_of(url, secret, capture):
+            stop_job(url, secret, j["id"])
+        stop_aprs(url, secret)
+
+
+def scenario_explore_send_to_shows_a_refusal(page, url, secret):
+    # The capture deleted by an op after its popup opened: choosing a mode shows the node's
+    # refusal in the transcript, notes no replay, and starts no job.
+    clear_captures(url, secret)
+    stop_aprs(url, secret)
+    select_source(page, url, secret, "aprs")
+    capture = two_captures_of(url, secret, "aprs", *REPLAY_BANDS["aprs"])[0]["id"]
+    menu = capture_send_to(page, capture)
+    try:
+        panel = replay_panel(menu, "aprs_decode")
+        clear_captures(url, secret)
+        with page.expect_request(is_op("capture_decode")):
+            panel.locator('.ctx-item[data-mode="policy"]').click()
+        line = page.locator("#transcript .line.error",
+                            has_text=re.compile(rf"^capture_decode .*→ unknown field=capture value={capture}"))
+        expect(line).to_have_count(1, timeout=10_000)
+        page.wait_for_timeout(500)
+        expect(page.locator("#transcript .line.note", has_text="replaying ")).to_have_count(0)
+        assert replays_of(url, secret, capture) == []
+    finally:
+        close_menu(page, "#ctx-outline")
+        for j in replays_of(url, secret, capture):
+            stop_job(url, secret, j["id"])
 
 
 def scenario_explore_delete_all_removes_every_capture(page, url, secret):

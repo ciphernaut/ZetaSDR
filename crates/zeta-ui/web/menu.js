@@ -103,19 +103,31 @@
 //     menu.openOutline(job, x, y, role = null)  shows #ctx-outline for a running job (a
 //                           `job_list` record) at client (x, y), kept inside the viewport; the
 //                           first entry is focused; `role` the voice its Listen and Transcribe use
-//     menu.closeOutline()   hides it
+//     menu.openCapture(anchor, capture)  shows #ctx-outline as capture `capture`'s Send to (a
+//                           `capture_list` record; actions.js's `capture` surface, captureCtx)
+//                           under Explore's row button `anchor`, or over it when the viewport has
+//                           no room under it; the first entry is focused; its footer reads
+//                           capture=<id> center_hz=<c> bandwidth_hz=<bw>
+//     menu.closeOutline()   hides it (either use)
+//     menu.decodeCapture(capture, mode, handler, packets)  the capture surface's run:
+//                           capture_decode {capture: <id>, kind: <mode id>, handler, packets}
+//                           through applyOp (a refusal is its own line), then the note
+//                           `replaying <mode id> from the capture` and, for a mode row with a
+//                           `subject`, the Subjects pane selected unless it is (`panes`)
 //     menu.closeAll()       hides both menus and the set picker and erases the box (app.js, when
 //                           `dir` or `time_flow` changes under them: they were placed for the
 //                           other direction)
 //     menu.destroy()
 //     The table's runs (actions.js) call the Menu's own methods: classify, iqRead, askAbout,
 //     startJob, fitAndStart, decodeAcross, scan, openSet, command, planGroupsOf (a box's ctx
-//     `sel`), and fitOutline, retuneWidth, toggle, mute, stopJob (a job). A job's ctx carries
+//     `sel`), fitOutline, retuneWidth, toggle, mute, stopJob (a job), and decodeCapture (a
+//     capture). A job's ctx carries
 //     its band as `sel` (jobCtx), so its next steps run the box entries' runs.
 //   HOVER_DWELL_MS  the hover intent's dwell (see Groups); ELSEWHERE  the `elsewhere` heading
 //   JOB_SPAN_NS     the span a job's What is this? reads (the newest painted, on the shown source)
 //   mountMenu's opts also take isAudio(job), play(job, {role}), transcribe(job, {role}) and
-//     playing(id): app.js's, for a job menu's Listen and Transcribe (the row's ▶ and Transcribe)
+//     playing(id): app.js's, for a job menu's Listen and Transcribe (the row's ▶ and Transcribe);
+//     and `panes` (panes.js's strip), which decodeCapture selects the Subjects pane on
 //   DENOISE_KINDS   the job kinds whose demodulator node takes `denoise`, by its stage kind
 //
 // Entries: actions.js's table, whose header says what each does and when it is offered;
@@ -194,6 +206,9 @@
 // Every retune is {op: job_retune, job, center_hz, bandwidth_hz, replace: []}. #ctx-outline-footer
 // reads job=<id> center_hz=<c> bandwidth_hz=<bw>. Escape, a press outside, Up/Down and Enter act
 // as for #ctx.
+// A capture's Send to (openCapture, plan 44) is drawn in #ctx-outline too, from actions.js's
+// `capture` entries on the capture's ctx (captureCtx), with the same keys, submenus and
+// closing; it and a job's menu are never open at once.
 
 import { GROUPS, action as entryOf, groupOf, offered, sectionOf, subOf } from "./actions.js";
 import { channelHolding, planGroups, planNoVoice } from "./plans.js";
@@ -609,8 +624,9 @@ export function clampSpan(startNs, endNs, newest) {
 class Menu {
   constructor(
     wf,
-    { applyOp, attachOp, ask, transcript, ov, plan = () => null, planPolicy = () => "none", ringSeconds = () => null, command = () => {}, muteFor = () => null, packetsFor = () => null, jobs = () => [], onOrigins = () => {}, sets = () => [], sources = () => [], isAudio = () => false, play = () => {}, transcribe = () => {}, playing = () => false },
+    { applyOp, attachOp, ask, transcript, ov, plan = () => null, planPolicy = () => "none", ringSeconds = () => null, command = () => {}, muteFor = () => null, packetsFor = () => null, jobs = () => [], onOrigins = () => {}, sets = () => [], sources = () => [], isAudio = () => false, play = () => {}, transcribe = () => {}, playing = () => false, panes = null },
   ) {
+    this.panes = panes;
     this.isAudio = isAudio;
     this.play = play;
     this.transcribe = transcribe;
@@ -651,8 +667,10 @@ class Menu {
     this.el.append(this.footer);
     document.body.append(this.el);
 
-    // The outline menu and the job it is open for (a job_list record) or null.
+    // The outline menu and the job it is open for (a job_list record) or null; or the capture
+    // (a capture_list record) whose Send to it shows (openCapture), or null.
     this.outlineJob = null;
+    this.outlineCapture = null;
     this.outlineEl = document.createElement("div");
     this.outlineEl.id = "ctx-outline";
     this.outlineEl.setAttribute("role", "menu");
@@ -882,6 +900,8 @@ class Menu {
       if (now && now !== section && (after || nodes.length > 0)) nodes.push(this.sep(now));
       section = now;
       const item = this.item(entry, ctx);
+      // One of an `each` entry's elements: its key.
+      if (entry.mode !== undefined) item.dataset.mode = entry.mode;
       this.leaves(item, container);
       nodes.push(item);
       if (entry.items) {
@@ -903,10 +923,12 @@ class Menu {
       if (sub) {
         const panel = this.panel(this.rootOf(container), item, container);
         panel.dataset.for = entry.id;
+        if (entry.mode !== undefined) panel.dataset.mode = entry.mode;
         panel.append(
           ...sub.map((x) => {
             // A greyed element says why in its title and runs nothing.
             const el = this.button(null, x.label, x.disabled ? null : () => this.choose(entry, x.run));
+            Object.assign(el.dataset, x.data || {});
             el.dataset.mode = x.key;
             if (x.disabled) el.setAttribute("aria-disabled", "true");
             if (x.title) el.title = x.title;
@@ -1073,8 +1095,10 @@ class Menu {
   async choose(entry, run = (c) => entry.run(c)) {
     if (this.fitting !== null) return;
     const box = !this.el.hidden;
-    if (box ? !this.sel : !this.outlineJob) return;
-    const ctx = box ? this.boxCtx() : this.jobCtx(this.outlineJob, this.outlineRole);
+    if (box ? !this.sel : !this.outlineJob && !this.outlineCapture) return;
+    const ctx = box ? this.boxCtx()
+      : this.outlineCapture ? this.captureCtx(this.outlineCapture)
+        : this.jobCtx(this.outlineJob, this.outlineRole);
     if (entry.disabled && entry.disabled(ctx)) return;
     if (box) this.showFooter(ctx.sel, entry.id);
     if (!entry.keep) {
@@ -1159,6 +1183,7 @@ class Menu {
     this.setFitting(null);
     this.outlineJob = job;
     this.outlineRole = role;
+    this.outlineCapture = null;
     const t = job.tuning || {};
     this.paint(this.outlineEl, this.outlineFooter, this.jobCtx(job, role));
     this.outlineFooter.textContent =
@@ -1171,12 +1196,77 @@ class Menu {
     this.outlineEl.querySelector(".ctx-item")?.focus({ preventScroll: true });
   }
 
+  // The capture surface's ctx (actions.js) for `capture`, a capture_list record: its band as a
+  // selection on its source, as it was recorded.
+  captureCtx(capture) {
+    return {
+      surface: "capture",
+      host: this,
+      capture,
+      sel: {
+        sourceId: capture.source,
+        centerHz: capture.center_hz,
+        bandwidthHz: capture.bandwidth_hz,
+        startNs: capture.start_ns,
+        endNs: capture.end_ns,
+        clamped: false,
+      },
+      rows: this.rows,
+    };
+  }
+
+  // Shows #ctx-outline as `capture`'s Send to (a capture_list record; Explore's row button
+  // `anchor`): under the button, or over it when there is no room under it, kept inside the
+  // viewport; the first entry focused. The mode rows are read first (once per page).
+  async openCapture(anchor, capture) {
+    const r = anchor.getBoundingClientRect();
+    await this.modeRows();
+    if (!this.el.hidden) this.close();
+    this.fitGen += 1;
+    this.setFitting(null);
+    this.outlineJob = null;
+    this.outlineRole = null;
+    this.outlineCapture = capture;
+    this.paint(this.outlineEl, this.outlineFooter, this.captureCtx(capture));
+    this.outlineFooter.textContent =
+      `capture=${capture.id} center_hz=${capture.center_hz} bandwidth_hz=${capture.bandwidth_hz}`;
+    this.outlineEl.hidden = false;
+    const w = this.outlineEl.offsetWidth;
+    const h = this.outlineEl.offsetHeight;
+    const y = r.bottom + h <= window.innerHeight ? r.bottom : r.top - h;
+    this.outlineEl.style.left = `${Math.max(0, Math.min(r.left, window.innerWidth - w))}px`;
+    this.outlineEl.style.top = `${Math.max(0, Math.min(y, window.innerHeight - h))}px`;
+    this.outlineEl.querySelector(".ctx-item")?.focus({ preventScroll: true });
+  }
+
   closeOutline() {
     this.cancelDwell();
     this.outlineEl.hidden = true;
     this.outlineJob = null;
+    this.outlineCapture = null;
     this.fitGen += 1;
     this.setFitting(null);
+  }
+
+  // A capture's Send to: capture_decode of `capture` (a capture_list record) as mode row
+  // `mode` (modes_list's), run by `handler` (null: the policy's pick), its packets captured
+  // with `packets`. Noted `replaying <mode id> from the capture` once the node started it, and
+  // the Subjects pane selected (unless it is the one selected) for a mode with a subject; a
+  // refusal is the op's own line (applyOp). The replay's job id, or null.
+  async decodeCapture(capture, mode, handler, packets) {
+    const r = await this.applyOp({
+      op: "capture_decode",
+      capture: capture.id,
+      kind: mode.id,
+      handler,
+      packets,
+    });
+    if (!r || r.result !== "job" || !r.value) return null;
+    this.t.note(`replaying ${mode.id} from the capture`);
+    if (mode.subject && this.panes && this.panes.current() !== "subjects") {
+      this.panes.select("subjects");
+    }
+    return r.value;
   }
 
   // Closes whatever is open (both menus, a fit in either cancelled, and the set picker) and

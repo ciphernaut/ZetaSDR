@@ -1,6 +1,7 @@
 // actions.js: the one entry table of the page's popup menus. The box menu (#ctx, after a drag on
 // the waterfall), a running job's menu (#ctx-outline: its outline's right-click, a long press on
-// its tag, or its row's ⋯) and a job row's audio buttons (agent.js) all draw from it, so a feature adds a row
+// its tag, or its row's ⋯), a capture's Send to (#ctx-outline too: Explore's row button, plan 44)
+// and a job row's audio buttons (agent.js) all draw from it, so a feature adds a row
 // here and not a line to each menu. This header says which entries there are, where they sit,
 // when they are offered and what each does (its `run` calls menu.js's Menu, the host).
 //
@@ -11,7 +12,8 @@
 //               on|off, Mute|Unmute in mix)
 //     group     the group it sits in: a group id of GROUPS[surface] (the same on every surface),
 //               or {box, job} when it differs
-//     on        the surfaces it is offered on: "box" (a selection) and/or "job" (a running job)
+//     on        the surfaces it is offered on: "box" (a selection) and/or "job" (a running job),
+//               or "capture" (a stored IQ capture: Explore's Send to)
 //     job       for an entry that starts a job: {kind, deviation, sideband} (deviation_hz and
 //               sideband of its job_start); a Transcribe entry has `twin` instead, the id of the
 //               entry whose job it starts before attaching a transcriber
@@ -31,9 +33,14 @@
 //     sub(ctx) -> [{key, label, run(ctx), disabled, title}] | null   the entry opens these as
 //               its submenu (`.ctx-sub[data-for=<id>]`), each `.ctx-item[data-mode=<key>]`; an
 //               element with `disabled` is drawn aria-disabled with `title` (why) and runs
-//               nothing; an entry whose sub is empty is not offered, and one whose sub answers
+//               nothing; an element's `data` ({name: value}) is set on its item's dataset; an
+//               entry whose sub is empty is not offered, and one whose sub answers
 //               null is a plain entry (a decoder with one ready handler); subOf(entry, ctx)
 //               reads it
+//     each(ctx) -> [{key, label, sub, run}]   the entry stands once per element instead, each
+//               `.ctx-item[data-action=<id>][data-mode=<key>]` with the element's label, `sub`
+//               (the elements its submenu would answer; null: a plain entry) and `run`; such a
+//               submenu's panel is `.ctx-sub[data-for=<id>][data-mode=<key>]` (offered expands it)
 //     run(ctx)  what choosing it does
 //   GROUPS   per surface, its groups in menu order: [{id, label, direct, prefix}]. A group's
 //            only line stands in the first level reading `<label> › <its label>` when the group
@@ -46,10 +53,17 @@
 //   action(id) -> the entry, or undefined
 //   groupOf(entry, surface) -> the entry's group id on that surface
 //   sectionOf(entry, surface) -> the entry's section heading on that surface, or undefined
-//   offered(surface, ctx) -> the entries offered on a surface for ctx, in table order
+//   offered(surface, ctx) -> the entries offered on a surface for ctx, in table order (an entry
+//            with `each` as its elements)
 //   runAction(id, ctx)  runs an entry that applies to ctx (agent.js's row buttons)
 //   rowRanges(row), rowMeets(row, sel), rowFits(id, row, sel)   what the box's decoder entries
 //            read from modes_list (see Offered)
+//   rowMisfit(row, sel, asked = sel.bandwidthHz) -> {need} | {ranges} | null   how a row does
+//            not fit a band `sel` ({centerHz, bandwidthHz}) when a job on it asks for `asked`
+//            Hz: `need` its narrowest when `asked` is under it (said first), else `ranges`
+//            (rowRanges) when `sel` meets none of them; null when it fits. rowFits is it on the
+//            entry's jobTuning; the capture surface reads it on the recording as it is (its
+//            centre and width: a recording cannot be moved or widened)
 //   jobHandler(job, row) -> the entry of `row.handlers` the job runs (its `handler`), or
 //            undefined; jobOutputs(job, row) -> the stream kinds the job emits: that handler's
 //            `outputs`, else the row's own (a job with no `handler`), [] without a row. A mode's
@@ -87,6 +101,10 @@
 //        whether the job has an audio stream to play (not an attached job), `running` whether it
 //        runs, `role` the voice to play and transcribe (null: the main stream), `play(job,
 //        {role})` and `transcribe(job, {role})` the row's ▶ and Transcribe callbacks (app.js)
+//   capture: {surface: "capture", host, capture, sel, rows}: `capture` a capture_list record,
+//        `sel` its band as a selection on its source ({sourceId, centerHz, bandwidthHz,
+//        startNs, endNs, clamped: false}: the capture's centre, width and span, menu.js
+//        captureCtx), `rows` as in a box's ctx
 //
 // What each entry does (`.ctx-item[data-action]`; its run calls menu.js's Menu). The box's,
 // on the selection (`sel`) on the source the waterfall shows:
@@ -269,8 +287,23 @@
 //                          menu.js jobCtx), for a job with a band (not a mix); What is this? only
 //                          on the shown source, over its newest JOB_SPAN_NS
 //   stop   Stop            job_stop
+// A capture's (Explore's `Send to ›` on a capture row, menu.js openCapture; plan 44 calls 16 and
+// 17), on the recording as it is, all in the first level:
+//   replay   one per `ready` row of modes_list that fits the recording (rowMisfit null), by
+//            name, reading the row's name (`data-mode` its id). A row with under two ready
+//            handlers and none whose `outputs` list `packet` is a plain entry:
+//            host.decodeCapture(capture, row, null, false). Any other opens a submenu:
+//            `<pick> (policy)` (no handler), every handler of the mode by name (`data-handler`;
+//            one not ready greyed, its reason the title), then `<name> with packets`
+//            (`data-handler`, `data-packets="1"`) per ready handler giving `packet`; each runs
+//            host.decodeCapture(capture, row, <handler or null>, <packets>)
+//   replay_elsewhere  elsewhere   (after them) a submenu of the ready rows that do not fit, by
+//            name, each greyed (a recording cannot be moved or widened) and titled why:
+//            `needs <narrowest> kHz, the recording is <its width> kHz` or `works <lo>–<hi> MHz`
+//            (each of the row's ranges, comma-separated); not offered when every ready row fits
 
 import { DENOISE_KINDS, FIT_KINDS, jobTuning, videoRefusal } from "./menu.js";
+import { khzText, mhzText } from "./units.js";
 
 // The width presets of a running demodulator's menu, in Hz.
 const WIDTHS = [2500, 5000, 6250, 12500, 25000];
@@ -294,6 +327,7 @@ export const GROUPS = {
     { id: "sendto", label: "Send to" },
     { id: "stop", label: "Stop", direct: true },
   ],
+  capture: [{ id: "replay", label: "Send to", direct: true }],
 };
 
 // The demodulator node of `job` (a job_list record with its graph) that takes `denoise`, or null.
@@ -329,15 +363,22 @@ export function rowMeets(row, sel) {
   return ranges.some(([a, b]) => lo <= b && hi >= a);
 }
 
+// How modes_list row `row` does not fit band `sel` ({centerHz, bandwidthHz}) when a job on it
+// asks for `asked` Hz: {need} (the row's narrowest, `min_hz` else `bandwidth_hz` as the node's
+// Band::fits, when `asked` is under it), else {ranges} (rowRanges, when `sel` meets none of
+// them); null when it fits. A row the page has not read fits.
+export function rowMisfit(row, sel, asked = sel.bandwidthHz) {
+  if (!row || !row.band) return null;
+  const need = row.band.min_hz ?? row.band.bandwidth_hz;
+  if (typeof need === "number" && asked < need) return { need };
+  return rowMeets(row, sel) ? null : { ranges: rowRanges(row) };
+}
+
 // Whether an entry `id` whose job is a modes_list row `row` fits selection `sel`: the width the
 // entry asks for on it (menu.js jobTuning: the box as drawn, or widened to what the entry
-// needs) is at least the row's narrowest (`min_hz`, else `bandwidth_hz`, as the node's
-// Band::fits), and the selection meets the row's ranges. A row the page has not read fits.
+// needs) is at least the row's narrowest, and the selection meets the row's ranges (rowMisfit).
 export function rowFits(id, row, sel) {
-  if (!row || !row.band) return true;
-  const need = row.band.min_hz ?? row.band.bandwidth_hz;
-  const asked = jobTuning(id, sel).bandwidthHz;
-  return !(typeof need === "number" && asked < need) && rowMeets(row, sel);
+  return rowMisfit(row, sel, jobTuning(id, sel).bandwidthHz) === null;
 }
 
 // The modes_list row of job kind `kind` in ctx (undefined before the rows are read).
@@ -481,15 +522,61 @@ const decoder = (id, label, kind = id) => ({
 function decoderHandlers(id, row) {
   const ready = (row?.handlers || []).filter((h) => h.state === "ready");
   if (ready.length < 2) return null;
+  return handlerSub(row, (c, handler) => c.host.startJob(id, c.sel, undefined, handler));
+}
+
+const givesPackets = (h) => (h.outputs || []).includes("packet");
+
+// A mode row's handlers as a submenu, each element running `run(ctx, handler, packets)`:
+// `<pick> (policy)` (handler null: the policy picks), then each ready handler by name
+// (`data-handler`); with `all`, every handler, one not ready greyed with its reason; with
+// `packets`, after them `<name> with packets` (`data-packets="1"`) for each ready handler whose
+// outputs list `packet`.
+function handlerSub(row, run, { all = false, packets = false } = {}) {
+  const handlers = row.handlers || [];
+  const ready = handlers.filter((h) => h.state === "ready");
   const pick = ready.find((h) => h.id === row.handler);
   return [
-    { key: "policy", label: `${pick ? pick.name : row.handler} (policy)`, run: start(id) },
-    ...ready.map((h) => ({
-      key: h.id,
-      label: h.name,
-      run: (c) => c.host.startJob(id, c.sel, undefined, h.id),
+    { key: "policy", label: `${pick ? pick.name : row.handler} (policy)`, run: (c) => run(c, null, false) },
+    ...(all ? handlers : ready).map((h) =>
+      h.state === "ready"
+        ? { key: h.id, label: h.name, data: { handler: h.id }, run: (c) => run(c, h.id, false) }
+        : { key: h.id, label: h.name, data: { handler: h.id }, disabled: true, title: h.reason },
+    ),
+    ...(packets ? ready.filter(givesPackets) : []).map((h) => ({
+      key: `${h.id}:packets`,
+      label: `${h.name} with packets`,
+      data: { handler: h.id, packets: "1" },
+      run: (c) => run(c, h.id, true),
     })),
   ];
+}
+
+// The capture surface's rows: modes_list's ready ones, by name, each with how it does not fit
+// the recording (rowMisfit on the capture's centre and width as they are; null: it fits).
+const replayRows = (c) =>
+  (c.rows || [])
+    .filter((r) => r.state === "ready")
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((row) => ({ row, misfit: rowMisfit(row, c.sel) }));
+
+// A replay entry's submenu, or null for a plain entry (see the header).
+function replaySub(row) {
+  const ready = (row.handlers || []).filter((h) => h.state === "ready");
+  if (ready.length < 2 && !ready.some(givesPackets)) return null;
+  return handlerSub(
+    row,
+    (c, handler, packets) => c.host.decodeCapture(c.capture, row, handler, packets),
+    { all: true, packets: true },
+  );
+}
+
+// Why a ready row that does not fit recording `sel` is greyed (`m` its rowMisfit).
+function misfitText(m, sel) {
+  if (m.need !== undefined) {
+    return `needs ${khzText(m.need)} kHz, the recording is ${khzText(sel.bandwidthHz)} kHz`;
+  }
+  return `works ${m.ranges.map(([a, b]) => `${mhzText(a)}–${mhzText(b)}`).join(", ")} MHz`;
 }
 // A demodulator entry: fitted to the signal first. Always offered: a demodulator has no row to
 // read a width from.
@@ -605,6 +692,29 @@ export const ACTIONS = [
   { id: "iq_read", label: "Save selection as SigMF", group: "capture", on: ["box"], run: (c) => c.host.iqRead(c.sel) },
   { id: "ask", label: "Send to agent", group: "agent", on: ["box"], run: (c) => c.host.askAbout(c.sel) },
 
+  // A capture's Send to: the recording replayed into a mode's handler (plan 44).
+  {
+    id: "replay", group: "replay", on: ["capture"],
+    each: (c) =>
+      replayRows(c)
+        .filter((x) => x.misfit === null)
+        .map(({ row }) => ({
+          key: row.id,
+          label: row.name,
+          sub: replaySub(row),
+          run: (k) => k.host.decodeCapture(k.capture, row, null, false),
+        })),
+  },
+  {
+    id: "replay_elsewhere", label: "elsewhere", group: "replay", on: ["capture"],
+    sub: (c) =>
+      replayRows(c)
+        .filter((x) => x.misfit !== null)
+        .map(({ row, misfit }) => ({
+          key: row.id, label: row.name, disabled: true, title: misfitText(misfit, c.sel),
+        })),
+  },
+
   // A running job's own entries.
   {
     id: "fit", label: "Fit to signal", group: "fit", on: ["job"], applies: fits, keep: true,
@@ -670,12 +780,22 @@ export function subOf(entry, ctx) {
   return entry.sub ? entry.sub(ctx) : null;
 }
 
+// An entry with `each` as its element `x`: x's label, submenu and run, marked with x's key as
+// `mode`.
+const expand = (entry, x) => ({
+  ...entry, each: undefined, mode: x.key, label: x.label, sub: () => x.sub ?? null, run: x.run,
+});
+
 export function offered(surface, ctx) {
-  return ACTIONS.filter((a) => isOffered(a, { ...ctx, surface }));
+  const c = { ...ctx, surface };
+  return ACTIONS.flatMap((a) =>
+    a.each ? (a.on.includes(surface) ? a.each(c).map((x) => expand(a, x)) : []) : [a],
+  ).filter((a) => isOffered(a, c));
 }
 
 export function runAction(id, ctx) {
   const entry = action(id);
-  if (!entry || !isOffered(entry, ctx)) return undefined;
+  // An entry with `each` runs only as one of its elements (offered).
+  if (!entry || entry.each || !isOffered(entry, ctx)) return undefined;
   return entry.run(ctx);
 }
