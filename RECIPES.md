@@ -273,6 +273,28 @@ Each packet is one Mode S frame under `DLT_USER 148` (USER1), dissected as ZetaS
 
 **Gotchas.** A packet takes the time the handler's events take, the start of the latest block of samples fed to it, so frames heard within one block share a time. dump1090's Mode A/C replies are read and dropped; only Mode S frames are captured. OnAir writes Mode S as `USER0`, and its handler file names that `mode_s`: both handlers' captures read alike. Without `needs`, a policy that ranks a handler with no packets first runs it, and the attach is refused naming the handler that has them.
 
+## Compare two decoders
+
+Not run live when written: two handlers of one mode on one band, side by side. Needs a mode with more than one ready handler (`modes_show <mode>`: `handlers` with their `state`), such as `adsb_decode` with `dump1090` and `onair`, and a radio on the mode's band.
+
+**Check.** `job_list`: a running job of the mode, with a handler of its own. The sibling needs the other handler `ready` and none of the mode's jobs already on it (a second start is a `duplicate`).
+
+**Start the sibling.** One op; kind, source and band come from the running job, and nothing is retuned or stopped.
+
+```json
+{"op":"job_start","beside":"<job id>","handler":"onair"}
+```
+
+On the CLI: `zeta job start --beside <job id> --handler onair [--needs packet]`. On the page: the job's menu, **Send to** and the handler's name (unavailable handlers are greyed with their reason).
+
+**Verify.** `job_list`: both records carry the same `group`. On the page the two fold as one group, each row with its handler, `N/min` (events in the last 60 s) and `N subjects`. In Subjects an aircraft both hear is one row and one marker; a field only one handler gave is drawn in that handler's mark, a field they give differently carries the `differs` mark, and a legend under the heading names the sources.
+
+**Compare.** Leave both running for the same span, then read each row's `N/min` and `N subjects`, and count the subjects only one heard. Numbers are never compared by the page; read them side by side.
+
+**Move or stop.** A retune from either member's menu moves the whole group, ids kept. Stopping is per job: the stopped job's rows and marks stay.
+
+**Gotchas.** A node rolled back past this build resumes no jobs (the records carry `group`). The marks' colours and styles come from the theme: `--c-handler-1..4`, `--handler-style-1..4`, and `handlers` in `theme.json` pins a handler to a slot.
+
 ## Make your own theme
 
 Verified on the plan 26 build; the folder format and every hook are in `docs/themes.md`.
