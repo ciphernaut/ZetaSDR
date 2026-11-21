@@ -248,6 +248,9 @@ impl Stage for SondehubStage {
         ctx: StageContext,
     ) -> Result<(), StageError> {
         let fail = |m: String| StageError::Failed(format!("{SONDEHUB_KIND}: {m}"));
+        if ctx.replay.is_some() {
+            return Err(fail("a replay uploads nothing".into()));
+        }
         self.check_params(&params).map_err(&fail)?;
         let p: SondehubParams =
             serde_json::from_value(params).map_err(|e| fail(format!("params: {e}")))?;

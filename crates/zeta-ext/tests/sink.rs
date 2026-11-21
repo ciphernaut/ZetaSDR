@@ -378,3 +378,33 @@ async fn an_omitted_position_without_a_station_idles_with_a_context_note() {
     assert!(!r.handle.is_finished());
     stop(r).await;
 }
+
+#[tokio::test]
+async fn the_sink_refuses_a_replay() {
+    let (url, seen) = api(200).await;
+    let bus = Arc::new(StreamBus::new(64));
+    let (tx, rx_in) = broadcast::channel(64);
+    let mut ctx = StageContext::new(SourceId("s".into()));
+    ctx.replay = Some("a-capture".into());
+    let params = json!({
+        "callsign": "TEST", "lat": -27.5, "lon": 153.0, "alt_m": 10.0,
+        "batch_ms": 1000, "url": url
+    });
+    let end = SondehubStage::new()
+        .run(
+            params,
+            vec![rx_in],
+            vec![],
+            bus,
+            CancellationToken::new(),
+            ctx,
+        )
+        .await;
+    let Err(StageError::Failed(m)) = end else {
+        panic!("a replay is refused: {end:?}");
+    };
+    assert!(m.ends_with("a replay uploads nothing"), "{m}");
+    drop(tx);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(seen.lock().unwrap().is_empty(), "a request was made");
+}

@@ -307,11 +307,12 @@ impl Inner {
         // the row's first proof: see `super::propose::watch_for_proposals`).
         let proposer = super::propose::watches(self, &rec).then(|| rec.clone());
         // A job whose mode row declares `subject.identity` or `subject.station`: its record
-        // and the rules, for its rules tees (see `tee_rules`).
+        // and the rules, for its rules tees (see `tee_rules`). A replay has none: it
+        // confirms no origin and tallies no station.
         let rules = mode
             .as_ref()
             .and_then(|m| m.subject.as_ref())
-            .filter(|s| s.identity.is_some() || s.station.is_some())
+            .filter(|s| rec.replay.is_none() && (s.identity.is_some() || s.station.is_some()))
             .map(|s| (rec.clone(), s.identity.clone(), s.station.clone()));
         // A `watch`'s controller runs beside its stages (see `super::watch`).
         let watch =

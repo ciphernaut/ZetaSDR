@@ -4625,6 +4625,16 @@ fn unknown_job(node: &Node, job: &JobId) -> OpError {
     }
 }
 
+/// The refusal of a `graph_put` of a replay (`capture_decode`): its graph is its mode's,
+/// built for the recording it replays.
+fn replay_refusal(node: &Node, job: &JobId) -> Option<OpError> {
+    node.job_list()
+        .iter()
+        .find(|r| &r.id == job)
+        .is_some_and(|r| r.replay.is_some())
+        .then(|| other("a replay's graph is its mode's"))
+}
+
 /// The refusal of a `job_retune` or `graph_put` (`stop` false) or a `job_stop` (`stop`
 /// true) of `job` when a controller started it (its record's `owner`: a watch's identify
 /// run or that run's trial child): the controller's dwell is not the caller's to spoil,
@@ -6093,14 +6103,16 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             .find(|r| r.id == job)
             .map(|r| OpResult::Graph(r.graph))
             .ok_or_else(|| unknown_job(node, &job)),
-        Op::GraphPut { job, graph } => match owned_refusal(node, &job, false) {
-            Some(e) => Err(e),
-            None => node
-                .job_graph_put(&job, graph)
-                .await
-                .map(|()| OpResult::Ok)
-                .map_err(|e| node_error(node, e)),
-        },
+        Op::GraphPut { job, graph } => {
+            match replay_refusal(node, &job).or_else(|| owned_refusal(node, &job, false)) {
+                Some(e) => Err(e),
+                None => node
+                    .job_graph_put(&job, graph)
+                    .await
+                    .map(|()| OpResult::Ok)
+                    .map_err(|e| node_error(node, e)),
+            }
+        }
         Op::GraphStart { graph } => node
             .graph_start(graph)
             .await

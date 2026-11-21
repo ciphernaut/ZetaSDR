@@ -433,7 +433,7 @@ fn on_frame(
         return false;
     };
     if let Some(proof) = &watch.proof {
-        if proof.proves(v) && !proof.seen.swap(true, Ordering::SeqCst) {
+        if proof.proves(v) && !proof.seen.swap(true, Ordering::SeqCst) && rec.replay.is_none() {
             inner.supersede_by(&rec.kind, rec.tuning, now().0);
         }
         if proof.seen.load(Ordering::SeqCst) {
@@ -656,10 +656,11 @@ pub fn framing_from_hypothesis(h: &Value, candidate: &Value) -> Value {
 /// Whether the job `rec` writes a session record: a `capture`, `bits` or `graph` job,
 /// or a frame row's.
 fn keeps_session(inner: &Inner, rec: &JobRecord) -> bool {
-    rec.kind == JobKind::Capture.name()
-        || rec.kind == BITS_KIND
-        || rec.kind == GRAPH_KIND
-        || frame_row(inner, &rec.kind).is_some()
+    rec.replay.is_none()
+        && (rec.kind == JobKind::Capture.name()
+            || rec.kind == BITS_KIND
+            || rec.kind == GRAPH_KIND
+            || frame_row(inner, &rec.kind).is_some())
 }
 
 /// The session record of the exploration job `rec` (as it stands at its end), ended

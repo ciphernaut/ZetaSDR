@@ -23,6 +23,7 @@ use common::handlers::{self as h, ALT, MODE, OWN, RADIO};
 use common::until;
 
 const APRS: &str = "aprs_decode";
+const APRS_COPY: &str = "aprs_copy";
 const APRS_CENTER_HZ: u64 = 144_800_000;
 const APRS_BAND_HZ: u64 = 12_500;
 const APRS_RATE_HZ: u32 = 48_000;
@@ -650,4 +651,99 @@ async fn a_source_may_not_be_named_replay() {
             .feed_of(&SourceId(REPLAY_SOURCE.into()))
             .is_some()
     );
+}
+
+/// An accepted signature on the APRS capture's band, put in the store directly (as
+/// `tests/proposals.rs` makes one through a classifier).
+fn accepted_signature(node: &Node) -> zeta_core::signatures::SignatureRecord {
+    use zeta_core::signatures::NewSignature;
+    let features = serde_json::from_value(json!({
+        "bandwidth_hz": APRS_BAND_HZ, "center_hz": APRS_CENTER_HZ, "symbol_rate_baud": 1_200,
+        "snr_db": 20.0, "burst": true, "duty": 0.5, "bursts": 2, "burst_ms": 50.0,
+        "period_ms": 100.0, "order": 2, "tone_spacing_hz": 1_000, "symbol_rate_line": null,
+    }))
+    .unwrap();
+    let new = NewSignature {
+        name: None,
+        features,
+        modulation: "fsk".into(),
+        framing: None,
+        crc_frames: 0,
+        evidence: "test".into(),
+        source: SourceId(RADIO.into()),
+        station: None,
+        captures: Vec::new(),
+        jobs: Vec::new(),
+        allocation: None,
+        proposed_by: "test".into(),
+    };
+    let sig = node.signatures().propose(new, T0_NS).unwrap();
+    node.signatures()
+        .accept(&sig.id, None, "test", T0_NS)
+        .unwrap()
+}
+/// The embedded APRS row as a second mode row, `aprs_copy`: a mode id (the built-in
+/// `aprs_decode` kind has no row watch), written to `dir`'s modes directory for [`open`].
+fn write_aprs_copy(dir: &Path) {
+    let (_, text) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("aprs_decode.json"))
+        .expect("embedded aprs_decode");
+    let mut row: Value = serde_json::from_str(text).unwrap();
+    row["id"] = APRS_COPY.into();
+    let modes = dir.join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    std::fs::write(modes.join(format!("{APRS_COPY}.json")), row.to_string()).unwrap();
+}
+
+#[tokio::test]
+async fn a_replay_supersedes_no_signature() {
+    let dir = tempfile::tempdir().unwrap();
+    write_aprs_copy(dir.path());
+    let (node, _radio) = open(dir.path()).await;
+    let sig = accepted_signature(&node);
+    let before = node.signatures().list(None);
+    let ids = write_aprs(&node, 2);
+    let mut feed = replay_feed(&node);
+    let id = started(decode(&node, &ids[0], APRS_COPY, None, false).await);
+    // A decoded frame proves the row, which a live job's would let supersede.
+    let f = envelope(&mut feed, Duration::from_secs(15)).await;
+    assert_eq!(event_of(&f).unwrap()["fcs_ok"], true);
+    until_stopped(&node, &id, Duration::from_secs(20)).await;
+    let after = node.signatures().list(None);
+    assert_eq!(after, before, "{after:?}");
+    assert_eq!(after[0].id, sig.id);
+}
+
+#[tokio::test]
+async fn a_replay_keeps_no_session_and_tallies_no_station() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let ids = write_aprs(&node, 2);
+    let before = node.sessions().len();
+    let id = started(decode(&node, &ids[0], APRS, None, false).await);
+    until_stopped(&node, &id, Duration::from_secs(20)).await;
+    assert_eq!(node.sessions().len(), before);
+    let rec = record(&node, &id);
+    assert!(rec.context.get("stations").is_none(), "{}", rec.context);
+}
+
+#[tokio::test]
+async fn graph_put_of_a_replay_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let ids = write_aprs(&node, 1);
+    let id = started(decode(&node, &ids[0], APRS, None, false).await);
+    let graph = record(&node, &id).graph;
+    let r = node
+        .apply(Op::GraphPut {
+            job: id.clone(),
+            graph,
+        })
+        .await;
+    match r {
+        Err(OpError::Other { message: m }) => assert_eq!(m, "a replay's graph is its mode's"),
+        r => panic!("refused: {r:?}"),
+    }
+    node.job_stop(&id).await.ok();
 }
