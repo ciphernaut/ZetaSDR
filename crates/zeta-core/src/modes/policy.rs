@@ -35,7 +35,8 @@ pub struct Passed {
     pub id: String,
     /// Why it was passed over: its `reason` when it is not ready (`broken` or
     /// `unavailable` when it has none), `outputs no <kind>` when it lacks a kind the
-    /// start needs.
+    /// start needs, `runs beside it as job <id>` when a relaunch finds another member
+    /// of the job's Send to group holding it.
     pub why: String,
 }
 

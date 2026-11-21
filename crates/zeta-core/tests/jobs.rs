@@ -1371,3 +1371,51 @@ async fn a_failed_sibling_start_leaves_the_first_job_as_it_was() {
     assert_eq!(on_disk(dir.path(), &first).group, None);
     assert_eq!(node.job_list().len(), 1);
 }
+
+/// History keeps one terminal record per handler: a stopped job of another handler on
+/// the same band is no re-run of the first (both records stay, run side by side or one
+/// after the other), while a re-run on the same handler still takes its predecessor's
+/// slot. A record from before handlers counts as the row's own handler's.
+#[tokio::test]
+async fn a_stopped_job_of_another_handler_keeps_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = handler_node(dir.path(), false).await;
+    let ids = |node: &Node| {
+        let mut ids: Vec<JobId> = node.job_list().into_iter().map(|r| r.id).collect();
+        ids.sort();
+        ids
+    };
+    let sorted = |mut v: Vec<JobId>| {
+        v.sort();
+        v
+    };
+    // Side by side, then stopped.
+    let own = h::start(&node, Some(OWN), &[]).await;
+    let alt = h::start(&node, Some(ALT), &[]).await;
+    node.job_stop(&own).await.unwrap();
+    node.job_stop(&alt).await.unwrap();
+    assert_eq!(ids(&node), sorted(vec![own.clone(), alt.clone()]));
+    // One after the other: alt again, started after the own job ended.
+    let alt2 = h::start(&node, Some(ALT), &[]).await;
+    node.job_stop(&alt2).await.unwrap();
+    assert_eq!(ids(&node), sorted(vec![own.clone(), alt2.clone()]));
+    // The own record made one from before handlers: the next own job is its re-run.
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let p = dir
+        .path()
+        .join("state")
+        .join("jobs")
+        .join(format!("{}.json", own.0));
+    let mut old: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    old["handler"] = serde_json::Value::Null;
+    old["handler_named"] = false.into();
+    std::fs::write(&p, old.to_string()).unwrap();
+    let node = handler_node(dir.path(), false).await;
+    assert_eq!(listed(&node, &own).handler, None);
+    let own2 = h::start(&node, None, &[]).await;
+    assert_eq!(listed(&node, &own2).handler.as_deref(), Some(OWN));
+    node.job_stop(&own2).await.unwrap();
+    assert_eq!(ids(&node), sorted(vec![alt2, own2]));
+}

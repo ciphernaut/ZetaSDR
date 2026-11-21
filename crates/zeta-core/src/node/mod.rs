@@ -591,6 +591,10 @@ struct Inner {
     /// heal during `open` is recovered after its resume; `None` after, when
     /// [`Node::add_port`] starts a port's watcher at once.
     unwatched_heals: Mutex<Option<Vec<HealCounter>>>,
+    /// The Send to group members a resume pass ([`Inner::resume_records`]) has still to
+    /// relaunch, by id: they hold their handlers in their groups before they run (see
+    /// [`Inner::resolve_for_relaunch`]). Locked after `jobs` when both are held.
+    resuming: Mutex<HashMap<JobId, JobRecord>>,
 }
 
 /// A port's heal counter ([`Port::healed`]) with its source, for `recover::watch_healed`.
@@ -941,13 +945,13 @@ impl Inner {
     }
 
     /// Forget the terminal records that a later re-run replaced (the same kind on the
-    /// same source and band, started after it ended), then those that ended earliest beyond
-    /// [`JOB_HISTORY_MAX`], removing their files (best effort: a file that
-    /// will not go is retried at the next prune). Called with `jobs` locked
-    /// after a record turns terminal; that record ended last, so it survives.
-    /// A record the heal of its source would relaunch (recoverable in the
-    /// source's open fault episode) is never forgotten while the episode lasts:
-    /// it still counts toward the cap, and older ones go in its place.
+    /// same source and band with the same handler, started after it ended), then those
+    /// that ended earliest beyond [`JOB_HISTORY_MAX`], removing their files (best
+    /// effort: a file that will not go is retried at the next prune). Called with `jobs`
+    /// locked after a record turns terminal; that record ended last, so it survives. A
+    /// record the heal of its source would relaunch (recoverable in the source's open
+    /// fault episode) is never forgotten while the episode lasts: it still counts toward
+    /// the cap, and older ones go in its place.
     fn prune_history(&self, jobs: &mut HashMap<JobId, JobEntry>) {
         let is_terminal =
             |e: &JobEntry| matches!(e.record.state, JobState::Stopped | JobState::Failed { .. });
@@ -965,36 +969,56 @@ impl Inner {
             self.forget(jobs, &id);
         }
         // A re-run takes its predecessor's slot: a terminal record goes once a terminal
-        // record of the same kind on the same source and band started after it ended
-        // (two that ran side by side are no re-run of each other). Never one another
-        // record names as its input or owner, one the heal of its source would relaunch,
-        // or one whose run has not released yet (as for an owned record above). A record
-        // mid-restart (a `graph_put`'s, briefly `stopped`) takes no part: it runs again.
+        // record of the same kind on the same source and band, run by the same handler
+        // (a record naming none runs the row's own, as the duplicate rule reads it),
+        // started after it ended (two that ran side by side are no re-run of each
+        // other). Never one another record names as its input or owner, one the heal of
+        // its source would relaunch, or one whose run has not released yet (as for an
+        // owned record above). A record mid-restart (a `graph_put`'s, briefly `stopped`)
+        // takes no part: it runs again.
         let in_play = |e: &JobEntry| is_terminal(e) && e.record.owner.is_none() && !e.restarting;
         let named: std::collections::HashSet<&JobId> = jobs
             .values()
             .flat_map(|e| e.record.input.iter().chain(e.record.owner.iter()))
             .collect();
-        fn key(e: &JobEntry) -> (&str, &SourceId, u64, u64) {
+        // Each in-play kind's own handler, read once: `None` for a kind of no mode row.
+        let modes = self.modes();
+        let mut own: HashMap<&str, Option<String>> = HashMap::new();
+        for e in jobs.values().filter(|e| in_play(e)) {
+            own.entry(&e.record.kind).or_insert_with(|| {
+                self.expandable_kind(&e.record.kind)
+                    .and_then(|k| k.loaded_mode(&modes).ok().flatten())
+                    .map(|m| m.own_handler())
+            });
+        }
+        fn key<'a>(
+            e: &'a JobEntry,
+            own: &'a HashMap<&str, Option<String>>,
+        ) -> (&'a str, &'a SourceId, u64, u64, Option<&'a str>) {
             let r = &e.record;
+            let handler = r
+                .handler
+                .as_deref()
+                .or_else(|| own.get(r.kind.as_str()).and_then(|h| h.as_deref()));
             (
                 &r.kind,
                 &r.source,
                 r.tuning.center_hz.0,
                 r.tuning.bandwidth_hz.0,
+                handler,
             )
         }
         // Per band, the terminal record that started last.
         let mut last: HashMap<_, (Timestamp, &JobId)> = HashMap::new();
         for e in jobs.values().filter(|e| in_play(e)) {
             let this = (e.record.created_ns, &e.record.id);
-            let kept = last.entry(key(e)).or_insert(this);
+            let kept = last.entry(key(e, &own)).or_insert(this);
             if (this.0.0, this.1) > (kept.0.0, kept.1) {
                 *kept = this;
             }
         }
         let rerun = |e: &JobEntry| {
-            last.get(&key(e))
+            last.get(&key(e, &own))
                 .is_some_and(|(started, id)| *id != &e.record.id && started.0 >= e.ended_ns.0)
         };
         let replaced: Vec<JobId> = jobs
@@ -1556,6 +1580,7 @@ impl Node {
                 episodes: Mutex::new(HashMap::new()),
                 restarts: Mutex::new(HashMap::new()),
                 unwatched_heals: Mutex::new(Some(Vec::new())),
+                resuming: Mutex::new(HashMap::new()),
             }),
             load_errors,
             job_load_errors,

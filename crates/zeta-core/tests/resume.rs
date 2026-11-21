@@ -870,6 +870,76 @@ async fn a_chosen_handler_gone_at_restart_is_chosen_again_and_noted() {
     assert_eq!(disk.context["handler"]["now"], OWN);
 }
 
+// Plan 43: a Send to group never holds one handler twice.
+
+/// A job sent from (its handler chosen, the row's own) and a sibling beside it on alt,
+/// on a node opened on `dir`; the two ids.
+async fn sent_from(dir: &Path) -> (JobId, JobId) {
+    let node = handler_node(dir, false).await;
+    let first = h::start(&node, None, &[]).await;
+    let rec = record(&node, &first);
+    assert_eq!(
+        (rec.handler.as_deref(), rec.handler_named),
+        (Some(OWN), false)
+    );
+    let sibling = match h::start_beside(&node, &first, Some(ALT), &[]).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("a sibling beside: {r:?}"),
+    };
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (first, sibling)
+}
+
+/// The first job's own handler gone at restart: it is chosen again, but alt runs
+/// beside it as its sibling, so it is passed over and the first fails saying so; the
+/// sibling resumes on alt.
+#[tokio::test]
+async fn a_rechosen_member_never_takes_its_siblings_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, sibling) = sent_from(dir.path()).await;
+
+    let cfg = h::cfg(dir.path(), false);
+    let mut modes = h::registry(&h::stages(None), &cfg, false);
+    h::own_missing(&mut modes);
+    let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
+    let node = Node::open_with_modes(cfg, h::stages(None), ports, Some(Arc::new(modes)))
+        .await
+        .unwrap();
+    common::until("the first is failed", Duration::from_secs(10), || {
+        matches!(record(&node, &first).state, JobState::Failed { .. })
+    })
+    .await;
+    let rec = record(&node, &first);
+    let JobState::Failed { reason } = &rec.state else {
+        unreachable!()
+    };
+    assert!(
+        reason.contains(&format!("{ALT}: runs beside it as job {}", sibling.0)),
+        "{reason}"
+    );
+    assert!(reason.contains(h::OWN_MISSING), "{reason}");
+    let sib = record(&node, &sibling);
+    assert_eq!(sib.state, JobState::Running, "{:?}", sib.state);
+    assert_eq!(sib.handler.as_deref(), Some(ALT));
+}
+
+/// With both handlers there at restart, each member resumes on its own handler and
+/// stays in the group.
+#[tokio::test]
+async fn a_group_resumes_member_by_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, sibling) = sent_from(dir.path()).await;
+
+    let node = handler_node(dir.path(), false).await;
+    for (id, handler) in [(&first, OWN), (&sibling, ALT)] {
+        let rec = record(&node, id);
+        assert_eq!(rec.state, JobState::Running, "{id:?}: {:?}", rec.state);
+        assert_eq!(rec.handler.as_deref(), Some(handler));
+        assert_eq!(rec.group.as_ref(), Some(&first));
+    }
+}
+
 #[tokio::test]
 async fn a_named_handler_gone_at_restart_fails_the_job() {
     let dir = tempfile::tempdir().unwrap();

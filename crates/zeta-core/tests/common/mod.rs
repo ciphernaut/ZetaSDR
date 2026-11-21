@@ -261,6 +261,21 @@ pub mod handlers {
         node.modes_handle().set(Arc::new(reg));
     }
 
+    /// What probing says of the row's own program when it is not found.
+    pub const OWN_MISSING: &str = "dump1090: missing";
+
+    /// Make the row's own program missing in `reg`, as probing finds it.
+    pub fn own_missing(reg: &mut ModeRegistry) {
+        reg.set_handler_program(MODE, OWN, None, Some(OWN_MISSING.into()));
+    }
+
+    /// [`alt_goes_missing`] for the row's own handler.
+    pub fn own_goes_missing(node: &Node) {
+        let mut reg = (*node.modes()).clone();
+        own_missing(&mut reg);
+        node.modes_handle().set(Arc::new(reg));
+    }
+
     /// Stands in for `external_decode`: it emits nothing on its events and ends when
     /// cancelled. A job run by the handler `packets_for` names gets a packet output too,
     /// on which it publishes one `user0` packet every 20 ms.

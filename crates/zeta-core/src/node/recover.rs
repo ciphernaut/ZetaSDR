@@ -23,6 +23,8 @@ use super::persist::{now, persist};
 use super::{Inner, JobEntry, NodeError, gain_error, resume_capture, source_fault_reason};
 use crate::job::{JobRecord, JobState};
 use crate::lease::LeaseError;
+use crate::modes::ModeHandler;
+use crate::modes::policy::Passed;
 use crate::ops::JobKind;
 use crate::port::{Port, Starting, Tuning, measured_line, measuring_line};
 use crate::stream::{Frame, Payload};
@@ -176,7 +178,9 @@ impl Inner {
     /// job fails with it, as a missing program fails it); when the policy chose it,
     /// `Ok(Some(_))` with the policy's choice again among the handlers giving what the
     /// start needed (`rec.needs`) and why the old one was passed over, or `Err` with the
-    /// `no_handler` words when none is left.
+    /// `no_handler` words when none is left. A handler another member of `rec`'s Send to
+    /// group holds ([`Inner::held_in_group`]) is never chosen again: it is passed over as
+    /// `runs beside it as job <id>`, so a group never runs one handler twice.
     pub(super) fn resolve_for_relaunch(&self, rec: &JobRecord) -> Result<Option<Rechosen>, String> {
         let Some(was) = rec.handler.as_deref() else {
             return Ok(None);
@@ -206,17 +210,65 @@ impl Inner {
             return Err(named_refusal);
         }
         let policy = self.handler_policy.lock().unwrap().clone();
-        match crate::modes::policy::pick(mode, &m.handlers, &rec.needs, &policy) {
+        let held = self.held_in_group(rec, &m.own_handler());
+        let free: Vec<ModeHandler> = m
+            .handlers
+            .iter()
+            .filter(|h| !held.contains_key(&h.id))
+            .cloned()
+            .collect();
+        match crate::modes::policy::pick(mode, &free, &rec.needs, &policy) {
             Ok(h) => Ok(Some(Rechosen {
                 now: h.id.clone(),
                 why,
             })),
             Err(passed) => Err(crate::ops::OpError::NoHandler {
                 mode: mode.clone(),
-                passed,
+                // In the mode's order, the held ones among them.
+                passed: m
+                    .handlers
+                    .iter()
+                    .filter_map(|h| match held.get(&h.id) {
+                        Some((_, by)) => Some(Passed {
+                            id: h.id.clone(),
+                            why: format!("runs beside it as job {}", by.0),
+                        }),
+                        None => passed.iter().find(|p| p.id == h.id).cloned(),
+                    })
+                    .collect(),
             }
             .to_string()),
         }
+    }
+
+    /// The handlers the other members of `rec`'s Send to group hold, each with the
+    /// oldest member holding it (`own` for a record naming none, the row's own): the
+    /// records of that group under another id that are `Running`, or that the resume
+    /// pass under way has still to relaunch ([`Inner::resuming`]), so a restart, a
+    /// recovery and a retune read the same. Empty for a record in no group.
+    fn held_in_group(&self, rec: &JobRecord, own: &str) -> HashMap<String, (Timestamp, JobId)> {
+        let mut held: HashMap<String, (Timestamp, JobId)> = HashMap::new();
+        let Some(group) = &rec.group else {
+            return held;
+        };
+        let jobs = self.jobs.lock().unwrap();
+        let resuming = self.resuming.lock().unwrap();
+        let running = jobs
+            .values()
+            .map(|e| &e.record)
+            .filter(|r| r.state == JobState::Running);
+        for r in running.chain(resuming.values()) {
+            if r.group.as_ref() != Some(group) || r.id == rec.id {
+                continue;
+            }
+            let handler = r.handler.clone().unwrap_or_else(|| own.to_string());
+            let this = (r.created_ns, r.id.clone());
+            let kept = held.entry(handler).or_insert_with(|| this.clone());
+            if (this.0.0, &this.1) < (kept.0.0, &kept.1) {
+                *kept = this;
+            }
+        }
+        held
     }
 
     /// Settle the handler `rec` relaunches with ([`Inner::resolve_for_relaunch`]),
@@ -313,8 +365,26 @@ impl Inner {
             after: Vec::new(),
             error: None,
         };
+        // The group members this pass relaunches hold their handlers until their turn.
+        let members: Vec<&JobRecord> = records
+            .iter()
+            .filter(|r| r.group.is_some())
+            .filter(|r| only.as_ref().is_none_or(|s| &r.source == s.source))
+            .filter(|r| relaunch(self, r))
+            .collect();
+        let members: Vec<JobId> = {
+            let mut resuming = self.resuming.lock().unwrap();
+            members
+                .into_iter()
+                .map(|r| {
+                    resuming.insert(r.id.clone(), r.clone());
+                    r.id.clone()
+                })
+                .collect()
+        };
         let mut records = records.into_iter();
         for rec in records.by_ref() {
+            self.resuming.lock().unwrap().remove(&rec.id);
             let in_scope = only.as_ref().is_none_or(|s| &rec.source == s.source);
             if !in_scope || !relaunch(self, &rec) {
                 out.skipped.push(rec);
@@ -357,6 +427,10 @@ impl Inner {
                 .insert(failed.id.clone(), JobEntry::loaded(failed, now()));
         }
         out.skipped.extend(records);
+        let mut resuming = self.resuming.lock().unwrap();
+        for id in &members {
+            resuming.remove(id);
+        }
         out
     }
 
