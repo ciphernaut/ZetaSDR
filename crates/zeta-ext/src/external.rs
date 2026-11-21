@@ -561,6 +561,7 @@ pub async fn run_row(
         out,
         bus: &bus,
         source: &ctx.source,
+        replay: ctx.replay.as_deref(),
         last_prov,
         notes,
         unparsed: Mutex::new(Unparsed::default()),
@@ -727,6 +728,8 @@ struct Publisher<'a> {
     out: StreamId,
     bus: &'a StreamBus,
     source: &'a SourceId,
+    /// The capture a replay job reads, marked on every event.
+    replay: Option<&'a str>,
     last_prov: Arc<Mutex<Option<Provenance>>>,
     notes: Arc<Notes>,
     unparsed: Mutex<Unparsed>,
@@ -900,12 +903,13 @@ impl Publisher<'_> {
             m.extend(extra);
         }
         let prov = provenance(&self.last_prov, self.source);
-        let ev = zeta_core::modes::summary::envelope(
+        let mut ev = zeta_core::modes::summary::envelope(
             self.row,
             self.handler,
             prov.span.start_ns.0,
             fields,
         );
+        zeta_core::modes::summary::mark_replay(&mut ev, self.replay);
         self.bus
             .publish(Frame::new(self.out.clone(), prov, Payload::Event(ev)));
     }
@@ -1349,6 +1353,52 @@ impl Converter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_program_event_of_a_replay_carries_the_capture() {
+        let row = zeta_core::modes::parse(include_str!("../../../modes/adsb_decode.json")).unwrap();
+        let bus = StreamBus::new(8);
+        let prov = Provenance {
+            source: SourceId("s".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(1),
+                end_ns: Timestamp(2),
+            },
+        };
+        let out = bus.register(StreamKind::Event, prov);
+        let mut rx = bus.subscribe(&out).unwrap();
+        let source = SourceId("s".into());
+        let extra = BTreeMap::new();
+        let publisher = |replay| Publisher {
+            row: &row,
+            handler: "h",
+            parser: Parser::JsonLines,
+            fields: None,
+            extra: &extra,
+            out: out.clone(),
+            bus: &bus,
+            source: &source,
+            replay,
+            last_prov: Arc::new(Mutex::new(None)),
+            notes: Arc::new(Notes {
+                ctx: StageContext::new(source.clone()),
+                external: Mutex::new(serde_json::Map::new()),
+            }),
+            unparsed: Mutex::new(Unparsed::default()),
+        };
+        let seen =
+            |rx: &mut tokio::sync::broadcast::Receiver<Frame>| match rx.try_recv().unwrap().payload
+            {
+                Payload::Event(v) => v,
+                _ => panic!("an event"),
+            };
+        publisher(Some("01CAP")).publish(br#"{"icao":"7C6B2E"}"#);
+        assert_eq!(seen(&mut rx)["replay"], "01CAP");
+        publisher(None).publish(br#"{"icao":"7C6B2E"}"#);
+        assert!(seen(&mut rx).get("replay").is_none());
+    }
 
     fn conv(format: SampleFormat, x: &[Complex<f32>]) -> Vec<u8> {
         Converter::new(48_000, 48_000, format).unwrap().convert(x)

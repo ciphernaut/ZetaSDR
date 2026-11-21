@@ -157,6 +157,14 @@ pub fn envelope(row: &ModeRow, handler: &str, start_ns: u64, mut fields: Value) 
     fields
 }
 
+/// Mark `event` as a replay of the capture `replay`: an object gains `"replay": id`.
+/// `None` (a live job) and a value that is not an object leave it as it is.
+pub fn mark_replay(event: &mut Value, replay: Option<&str>) {
+    if let (Some(id), Value::Object(m)) = (replay, event) {
+        m.insert("replay".into(), id.into());
+    }
+}
+
 /// `YYYY-MM-DDTHH:MM:SS[.f]Z` (UTC, 1-9 fraction digits) as nanoseconds since the
 /// UNIX epoch; `None` when malformed, out of range or before 1970.
 fn parse_utc_ns(s: &str) -> Option<u64> {
@@ -221,6 +229,27 @@ fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_envelope_of_a_replay_carries_the_capture() {
+        let row = crate::modes::parse(include_str!("../../../../modes/adsb_decode.json")).unwrap();
+        let mut ev = envelope(&row, "builtin", 7, json!({"icao": "7C6B2E"}));
+        mark_replay(&mut ev, Some("01CAP"));
+        assert_eq!(ev["replay"], "01CAP");
+        assert_eq!(ev["icao"], "7C6B2E");
+        assert!(ev.get("protocol").is_some());
+    }
+
+    #[test]
+    fn an_envelope_of_a_live_job_has_no_replay_member() {
+        let row = crate::modes::parse(include_str!("../../../../modes/adsb_decode.json")).unwrap();
+        let mut ev = envelope(&row, "builtin", 7, json!({"icao": "7C6B2E"}));
+        mark_replay(&mut ev, None);
+        assert!(ev.get("replay").is_none());
+        let mut not_object = json!(3);
+        mark_replay(&mut not_object, Some("01CAP"));
+        assert_eq!(not_object, json!(3));
+    }
 
     #[test]
     fn fills_fields() {

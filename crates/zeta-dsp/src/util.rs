@@ -23,13 +23,15 @@ pub fn event(
     protocol: &str,
     mut fields: serde_json::Value,
 ) -> serde_json::Value {
-    match &ctx.mode {
+    let mut ev = match &ctx.mode {
         Some(row) => zeta_core::modes::summary::envelope(row, BUILTIN, start_ns, fields),
         None => {
             fields["protocol"] = protocol.into();
             fields
         }
-    }
+    };
+    zeta_core::modes::summary::mark_replay(&mut ev, ctx.replay.as_deref());
+    ev
 }
 
 /// `len` samples of the unit-magnitude complex exponential `exp(j 2 pi f n / rate)`.

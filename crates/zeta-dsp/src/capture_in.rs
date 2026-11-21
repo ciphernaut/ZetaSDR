@@ -68,6 +68,10 @@ pub struct CaptureInParams {
     /// [`LOOP_PAUSE_MS_MIN_UNPACED`] for a loop that is not `realtime`.
     #[serde(default = "default_loop_pause_ms")]
     pub loop_pause_ms: u64,
+    /// A wait before the first capture's first block, once per run, in milliseconds: the
+    /// chain downstream gets that long to be ready. Frame times stay the recorded ones.
+    #[serde(default)]
+    pub lead_ms: u64,
 }
 
 impl CaptureInParams {
@@ -213,6 +217,7 @@ impl Stage for CaptureInStage {
             .await
             .map_err(|e| failed(format!("load task: {e}")))?
             .map_err(failed)?;
+        pause(&cancel, p.lead_ms).await?;
         let mut pass: u64 = 0;
         loop {
             for (index, cap) in set.iter().enumerate() {
@@ -222,7 +227,7 @@ impl Stage for CaptureInStage {
                     "index": index,
                     "captures": set.len(),
                 }}));
-                let ev = serde_json::json!({
+                let mut ev = serde_json::json!({
                     "protocol": "segment",
                     "index": index,
                     "capture": cap.record.id,
@@ -230,6 +235,7 @@ impl Stage for CaptureInStage {
                     "t_ns": start_ns,
                     "summary": format!("segment {index}: {}", cap.record.id),
                 });
+                zeta_core::modes::summary::mark_replay(&mut ev, ctx.replay.as_deref());
                 let prov = Provenance {
                     span: frame_span(Timestamp(start_ns), 0, 0),
                     ..ev_base.clone()
@@ -341,6 +347,11 @@ mod tests {
 
     /// Spawn the stage over `store` with `params`, its `iq` and `event` outputs subscribed.
     fn start(store: Arc<BurstStore>, params: Value) -> Running {
+        start_replay(store, params, None)
+    }
+
+    /// [`start`] in a context marked as a replay of `replay`.
+    fn start_replay(store: Arc<BurstStore>, params: Value, replay: Option<&str>) -> Running {
         let prov = Provenance {
             source: SourceId("s".into()),
             job: Some(JobId("job".into())),
@@ -356,7 +367,8 @@ mod tests {
         let iq = bus.subscribe(&iq_out).unwrap();
         let ev = bus.subscribe(&ev_out).unwrap();
         let cancel = CancellationToken::new();
-        let ctx = StageContext::new(SourceId("s".into())).with_bursts(store);
+        let mut ctx = StageContext::new(SourceId("s".into())).with_bursts(store);
+        ctx.replay = replay.map(str::to_string);
         let c = cancel.clone();
         let started = Instant::now();
         let handle = tokio::spawn(async move {
@@ -514,6 +526,52 @@ mod tests {
             r.handle.await.unwrap(),
             Err(StageError::Cancelled)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_lead_delays_the_first_block() {
+        let (_dir, store, ids) = store(&[(RATE, T_A, 200)]);
+        let mut r = start(
+            store,
+            serde_json::json!({"captures": ids, "realtime": false, "lead_ms": 200}),
+        );
+        let early = tokio::time::timeout(Duration::from_millis(150), r.iq.recv()).await;
+        assert!(early.is_err(), "no block within the lead");
+        let f = tokio::time::timeout(Duration::from_millis(600), r.iq.recv())
+            .await
+            .expect("a block within 600 ms")
+            .unwrap();
+        assert_eq!(block(&f).t0, Timestamp(T_A), "the recorded time");
+        assert!(r.started.elapsed() >= Duration::from_millis(200));
+        r.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_the_lead_ends_cancelled() {
+        let (_dir, store, ids) = store(&[(RATE, T_A, 200)]);
+        let r = start(
+            store,
+            serde_json::json!({"captures": ids, "realtime": false, "lead_ms": 60_000}),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        r.cancel.cancel();
+        let res = tokio::time::timeout(Duration::from_secs(2), r.handle)
+            .await
+            .expect("ends promptly")
+            .unwrap();
+        assert!(matches!(res, Err(StageError::Cancelled)), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn a_replay_context_marks_the_segment_event() {
+        let (_dir, store, ids) = store(&[(RATE, T_A, 100)]);
+        let params = serde_json::json!({"captures": ids, "realtime": false});
+        let mut r = start_replay(store.clone(), params.clone(), Some("01CAP"));
+        assert_eq!(event(&next(&mut r.ev).await)["replay"], "01CAP");
+        r.cancel.cancel();
+        let mut r = start(store, params);
+        assert!(event(&next(&mut r.ev).await).get("replay").is_none());
+        r.cancel.cancel();
     }
 
     #[tokio::test]

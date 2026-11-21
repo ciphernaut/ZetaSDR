@@ -799,6 +799,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: 
 - outputs: iq, event
 - params.captures: array
+- params.lead_ms: integer (optional, default 0)
 - params.loop: boolean (optional, default false)
 - params.loop_pause_ms: integer (optional, default 500)
 - params.realtime: boolean (optional, default true)

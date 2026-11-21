@@ -102,6 +102,9 @@ pub struct StageContext {
     /// The node's packet capture store, `Some` for every job in a node (only a
     /// `packet_capture` stage writes to it).
     pub packets: Option<Arc<crate::packets::PacketStore>>,
+    /// The id of the capture this job replays into a decoder, `Some` only for a replay
+    /// job: its events carry it as `replay` ([`crate::modes::summary::mark_replay`]).
+    pub replay: Option<String>,
 }
 
 impl StageContext {
@@ -118,6 +121,7 @@ impl StageContext {
             station: None,
             bursts: None,
             packets: None,
+            replay: None,
         }
     }
 
