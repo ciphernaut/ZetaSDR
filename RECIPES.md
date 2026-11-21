@@ -313,7 +313,7 @@ On the CLI: `zeta capture decode --capture <id> --kind <mode> [--handler <h>] [-
 
 **Compare two handlers.** Replay the same capture once per handler (`--handler dump1090`, then `--handler onair`), and read each job's events and `N subjects`. The replays of one recording (whichever capture of its set each names) are one group on the page, titled from the set's first capture and marked per handler as in "Compare two decoders", and a replay of the same recording, mode and handler while one runs is a `duplicate`.
 
-**Events and times.** A replay's events go only to the `replay` feed, never a radio's feed or `events.log`, and each carries `replay: <capture>` with the recording's own time in `t_ns`: read it against the capture's `start_ns`, not the clock.
+**Events and times.** A replay's events go only to the `replay` feed, never a radio's feed or `events.log`; every decoded event carries `replay: <capture>`, and its events carry the recording's own time in `t_ns`: read it against the capture's `start_ns`, not the clock.
 
 **Packets.** `--packets` starts the packet capture before the first sample (attaching `packets` to a running replay would miss what was already decoded); open it in Wireshark as in "Packet capture for Wireshark". The handler must output `packet`.
 

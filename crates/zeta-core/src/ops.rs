@@ -903,10 +903,10 @@ pub enum Op {
     /// them, its `replay` field the capture named, and `job_context.replay` gives
     /// `capture`, `captures` (the set's ids by start time), `source` (the radio that
     /// recorded it), `start_ns` (the first capture's start) and `end_ns` (the last
-    /// one's end). Every event it publishes carries `replay: <capture>` and the
-    /// recording's own times (`t_ns`), and goes only to the `replay` feed (the event
-    /// feed of the source `replay`, which no radio may be named), never to a radio's
-    /// feed or `events.log`. It ends `stopped` once the set has played and the decoder
+    /// one's end). Every decoded event (each event a decoder gives in the mode's
+    /// envelope) carries `replay: <capture>`, and its events carry the recording's own
+    /// times (`t_ns`) and go only to the `replay` feed (the event feed of the source
+    /// `replay`, which no radio may be named), never to a radio's feed or `events.log`. It ends `stopped` once the set has played and the decoder
     /// has drained, and never resumes. A job attached to it (`job_attach`) is a replay
     /// too: its `replay` is its input's, its events go only to the `replay` feed, no
     /// transcript of it reaches `transcripts.log`, no mix reads it, and it never resumes.
@@ -933,7 +933,9 @@ pub enum Op {
         #[serde(deserialize_with = "crate::modes::nullable")]
         #[schemars(required, schema_with = "crate::types::nullable::<String>")]
         handler: Option<String>,
-        /// Ask for a handler that gives packets (as `job_start`'s `needs: ["packet"]`).
+        /// Ask for a handler that gives packets (as `job_start`'s `needs: ["packet"]`) and
+        /// capture them from the first sample: the replay waits 300 ms before its first
+        /// block, and a `packets` job is attached to it in that lead, under the same call.
         #[serde(default)]
         packets: bool,
     },
