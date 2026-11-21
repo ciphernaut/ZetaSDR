@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Replay: `capture_decode` plays a stored IQ capture's whole set, once and in real time, into a
+  decoder mode's handler, to check a decoder against a recording or compare two handlers on it.
+  CLI `zeta capture decode --capture <id> --kind <mode> [--handler <id>] [--packets]`. The job
+  holds no lease and tunes no radio, ends with a note of what it decoded, never resumes, and
+  proves nothing live (no signature, session, station tally or upload). Its events go to the
+  `replay` feed, which no source may be named, carrying `replay` and the recording's own times;
+  `packets` writes a packet capture from the first sample. The packet reader of a program job
+  now drains what its decoder wrote before it stopped, which a short burst needs. A node rolled
+  back past this build reads every record that is not a replay.
 - Send to: `job_start` takes `beside`, a running job of a mode, and starts a sibling on the same
   band and source by another handler, to compare two decoders on one signal or to capture packets
   from a handler that gives them. Nothing is tuned or stopped; both records carry `group`, a

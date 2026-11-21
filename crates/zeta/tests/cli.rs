@@ -4831,3 +4831,30 @@ fn any_two_speech_backend_flags_are_a_usage_error() {
             ));
     }
 }
+
+/// `capture decode` of a capture the store does not hold is refused naming the field.
+#[test]
+fn capture_decode_of_an_unknown_capture_names_the_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = zeta(
+        dir.path(),
+        &[
+            "capture",
+            "decode",
+            "--capture",
+            "01NOPE",
+            "--kind",
+            "aprs_decode",
+        ],
+    )
+    .assert()
+    .failure()
+    .get_output()
+    .clone();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("capture"), "{text}");
+}

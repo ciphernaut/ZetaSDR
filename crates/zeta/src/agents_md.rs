@@ -229,6 +229,7 @@ fn example_for(op: &str, field: &str) -> Option<Value> {
         ("register_site", "provider") => Some("acma".into()),
         // A ranking set, not cleared.
         ("handler_policy_set", "mode") => Some("adsb_decode".into()),
+        ("capture_decode", "kind") => Some("aprs_decode".into()),
         ("handler_policy_set", "order") => Some(serde_json::json!(["dump1090"])),
         _ => None,
     }
@@ -274,6 +275,18 @@ fn hint(op: &str, field: &str) -> Option<&'static str> {
         ),
         "stream" if op == "job_attach" => Some(
             "a voice of the job, one of its row's `voices` in `modes_list`; `null` for its main audio stream",
+        ),
+        "capture" if op == "capture_decode" => {
+            Some("an id from `capture list`: its whole set is replayed, from the first capture")
+        }
+        "kind" if op == "capture_decode" => {
+            Some("a mode row's id (`modes list`), not a built-in job kind")
+        }
+        "handler" if op == "capture_decode" => Some(
+            "a handler id of the mode (`modes list`'s `handlers[].id`); `null` for the handler policy's choice",
+        ),
+        "packets" if op == "capture_decode" => Some(
+            "`true` writes the handler's packets to a capture file from the recording's first sample (it must output `packet`); `false` for none",
         ),
         "source" => Some("an id from `source list`"),
         "plan" => Some("an id from `channel_plans`"),
@@ -657,6 +670,10 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
     }
     if op == "bits_start" {
         return "zeta bits start --capture <id> [--modulation fsk|psk|ook] [--symbol-rate-baud N] [--order N] [--then-tail MAX_FRAMES,TIMEOUT_MS] [--keep]".into();
+    }
+    if op == "capture_decode" {
+        return "zeta capture decode --capture <id> --kind aprs_decode [--handler ID] [--packets]"
+            .into();
     }
     if op == "origin_lookup" {
         return "zeta origin lookup --job ID | --source S --center-hz N --bandwidth-hz N [--modulation fm,fsk]".into();

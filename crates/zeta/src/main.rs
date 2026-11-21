@@ -277,6 +277,7 @@ async fn one_shot(
             | Op::MixStart { .. }
             | Op::GraphStart { .. }
             | Op::BitsStart { .. }
+            | Op::CaptureDecode { .. }
     );
     if let Op::IqRead { selection } | Op::Classify { selection } = &op {
         wait_for_ring(node, selection).await;

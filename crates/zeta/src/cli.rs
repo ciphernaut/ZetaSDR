@@ -581,6 +581,23 @@ pub enum CaptureCmd {
         #[arg(long)]
         capture: String,
     },
+    /// Replay a capture's set into a decoder mode's handler, paced in real time (no
+    /// radio, no lease); the job's events go to the `replay` feed
+    Decode {
+        /// A capture id (from `capture list`)
+        #[arg(long, value_name = "ID")]
+        capture: String,
+        /// The decoder mode's id (from `modes list`), e.g. `aprs_decode`
+        #[arg(long, value_name = "MODE")]
+        kind: String,
+        /// The mode's handler (`handlers list`); absent = the handler policy's choice
+        #[arg(long, value_name = "ID")]
+        handler: Option<String>,
+        /// Write the handler's packets to a capture file from the first sample (the
+        /// handler must give packets)
+        #[arg(long)]
+        packets: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1833,7 +1850,7 @@ impl Command {
                 | Command::Bits(BitsCmd::Start { .. })
                 | Command::Station(StationCmd::Set { .. } | StationCmd::Clear)
                 | Command::Handlers(HandlersCmd::Policy(HandlerPolicyCmd::Set { .. }))
-                | Command::Capture(CaptureCmd::Delete { .. })
+                | Command::Capture(CaptureCmd::Delete { .. } | CaptureCmd::Decode { .. })
                 | Command::Packets(PacketsCmd::Delete { .. })
                 | Command::Signature(
                     SignatureCmd::Propose { .. }
@@ -2150,6 +2167,17 @@ impl Command {
             Command::Capture(CaptureCmd::Show { capture }) => Op::CaptureShow { capture },
             Command::Capture(CaptureCmd::Classify { capture }) => Op::CaptureClassify { capture },
             Command::Capture(CaptureCmd::Delete { capture }) => Op::CaptureDelete { capture },
+            Command::Capture(CaptureCmd::Decode {
+                capture,
+                kind,
+                handler,
+                packets,
+            }) => Op::CaptureDecode {
+                capture,
+                kind,
+                handler,
+                packets,
+            },
             Command::Packets(PacketsCmd::List) => Op::PacketsList {},
             Command::Packets(PacketsCmd::Delete { capture }) => Op::PacketsDelete { capture },
             Command::Signature(SignatureCmd::List { state }) => Op::SignatureList { state },
@@ -2719,5 +2747,66 @@ mod serve_tests {
         assert!(e.contains("--max-streams must be at least 1"), "{e}");
         let e = serve(&["--max-streams", "many"]).unwrap_err().to_string();
         assert!(e.contains("--max-streams must be a whole number"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod cli_capture_decode_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Command {
+        let mut v = vec!["zeta", "capture", "decode"];
+        v.extend_from_slice(args);
+        Cli::try_parse_from(v).unwrap().command
+    }
+
+    #[test]
+    fn capture_decode_parses_to_its_op() {
+        match parse(&["--capture", "C", "--kind", "aprs_decode"])
+            .into_op()
+            .unwrap()
+        {
+            Some(Op::CaptureDecode {
+                capture,
+                kind,
+                handler,
+                packets,
+            }) => {
+                assert_eq!(capture, "C");
+                assert_eq!(kind, "aprs_decode");
+                assert_eq!(handler, None);
+                assert!(!packets);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_decode_takes_a_handler_and_packets() {
+        match parse(&[
+            "--capture",
+            "C",
+            "--kind",
+            "adsb_decode",
+            "--handler",
+            "dump1090",
+            "--packets",
+        ])
+        .into_op()
+        .unwrap()
+        {
+            Some(Op::CaptureDecode {
+                handler, packets, ..
+            }) => {
+                assert_eq!(handler.as_deref(), Some("dump1090"));
+                assert!(packets);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_decode_mutates() {
+        assert!(parse(&["--capture", "C", "--kind", "aprs_decode"]).mutates());
     }
 }
