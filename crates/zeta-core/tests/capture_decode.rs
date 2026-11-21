@@ -657,6 +657,23 @@ async fn a_mode_the_recording_cannot_hold_is_refused_before_anything_starts() {
 }
 
 #[tokio::test]
+async fn a_recording_outside_the_modes_range_is_refused_before_anything_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio) = open(dir.path()).await;
+    // 2.4 MHz at 1090 MHz: wide enough for APRS, far outside the APRS row's range.
+    let ids = write_adsb(&node, 1);
+    match decode(&node, &ids[0], APRS, None, false).await {
+        Err(OpError::Other { message }) => assert_eq!(
+            message,
+            "aprs_decode works 144.384–145.181, 430.337–434.663 MHz; the recording is 1088.800–1091.200 MHz"
+        ),
+        r => panic!("a range refusal: {r:?}"),
+    }
+    assert!(node.job_list().is_empty());
+    assert_eq!(radio.tunes(), 0);
+}
+
+#[tokio::test]
 async fn a_named_handler_runs_the_replay() {
     let dir = tempfile::tempdir().unwrap();
     let (node, _radio) = open(dir.path()).await;

@@ -2971,6 +2971,30 @@ impl Node {
                 &modes,
             )
             .map_err(NodeError::Expand)?;
+        // A recording cannot be moved: one whose band meets none of the row's ranges is
+        // refused (after the width, as the page's Send to says them), worded as its title.
+        if let Ok(Some(mode)) = k.loaded_mode(&modes)
+            && let Some(ranges) = &mode.row.band.range_hz
+        {
+            let half = tuning.bandwidth_hz.0 / 2;
+            let (lo, hi) = (tuning.center_hz.0 - half, tuning.center_hz.0 + half);
+            if !ranges.0.iter().any(|&[a, b]| lo <= b && hi >= a) {
+                let mhz = |hz: u64| format!("{:.3}", hz as f64 / 1e6);
+                let works: Vec<String> = ranges
+                    .0
+                    .iter()
+                    .map(|&[a, b]| format!("{}–{}", mhz(a), mhz(b)))
+                    .collect();
+                return Err(NodeError::Expand(OpError::Other {
+                    message: format!(
+                        "{kind} works {} MHz; the recording is {}–{} MHz",
+                        works.join(", "),
+                        mhz(lo),
+                        mhz(hi)
+                    ),
+                }));
+            }
+        }
         // The row's roots are its `channel` stages, fed on a radio by the job's IQ
         // stream: here by `capture_in`.
         let roots: Vec<graph::NodeId> = graph
