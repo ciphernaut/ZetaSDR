@@ -92,7 +92,8 @@
 //     envelope's fields and the key (each member's, in a merged group) are always plain.
 //   subjectLabel(subject) -> state[row.subject.label] when present, else the key
 //   subjectSummary(subject) -> the row's summary template filled from the merged state
-//   subjectValues(subject) -> [{label, text, title}]   the row's columns through metricText
+//   subjectValues(subject, slots = null) -> [{label, text, title, mark, markTitle}]   the row's columns through
+//       metricText; `mark`/`markTitle` from marksOf when `slots` (a Map of source key -> slot) is given, else null
 //   fillSummary(template, fields) -> string   summary.rs's `fill`: `{f}`, `{f?}` (dropped with
 //     the separators before it), `{a?b}`, each with an optional `:.N` or `:+.N`; trimmed at
 //     both ends
@@ -239,11 +240,21 @@ export function subjectSummary(s) {
   return fillSummary(s.row.event.summary, s.state);
 }
 
-export function subjectValues(s) {
+// The row's columns as text. With `slots` (a Map of source key -> slot 1..4, complete for the
+// subject's sources) each also says its `mark` (null, 1..4 or "differs") and `markTitle`
+// (names the handler(s), never colour alone); without, both are null.
+export function subjectValues(s, slots = null) {
+  const marks = slots ? marksOf(s, slots) : null;
   return s.row.subject.columns.map((c) => {
     const text = metricText(s.state[c.field], c.unit);
-    return { label: c.label, text, title: text };
+    const m = marks?.get(c.field);
+    return { label: c.label, text, title: text, mark: m?.mark ?? null, markTitle: m?.title ?? null };
   });
+}
+
+// A source list ([{key, slot}]) as the Map `marksOf` takes.
+export function slotMap(sources) {
+  return new Map((sources ?? []).map((x) => [x.key, x.slot]));
 }
 
 // ---- what each source said (plan 43 calls 13-16) ------------------------------------------
@@ -812,6 +823,36 @@ function setText(el, text, title = null) {
   if (title !== null && el.title !== title) el.title = title;
 }
 
+// `el` wears the class of `mark` (null, 1..4 or "differs") and none of the others.
+export function setMark(el, mark) {
+  for (let n = 1; n <= SLOTS; n++) el.classList.toggle(`mark-${n}`, mark === n);
+  el.classList.toggle("mark-differs", mark === "differs");
+}
+
+// A section's sources for its legend and marks, from the store's `sources(jobId)`: `label` the
+// chip's text, `title` what it says on hover.
+function legendSources(list, labelOf) {
+  return list.map((x) => ({ key: x.key, slot: x.slot, label: labelOf(x), title: `${x.mode} by ${x.name}` }));
+}
+
+// Several groups' sources as one list (the merged section's): a source once, its slot kept
+// unless another took it, then the next free (the fifth and later sharing 4).
+function unionSources(lists) {
+  const out = [];
+  const taken = new Set();
+  for (const x of lists.flat()) {
+    if (out.some((o) => o.key === x.key)) continue;
+    let slot = x.slot;
+    if (taken.has(slot)) {
+      slot = 1;
+      while (slot < SLOTS && taken.has(slot)) slot++;
+    }
+    taken.add(slot);
+    out.push({ ...x, slot });
+  }
+  return out;
+}
+
 // ---- one table across rows (spec 4.8) ---------------------------------------------------
 
 const mergedId = (name) => `merged:${name}`;
@@ -1273,10 +1314,44 @@ class SubjectsPane {
     return sec;
   }
 
-  drawSection(sec, heading, subjects, cols, watched) {
+  // The legend under the heading: a chip per source in its mark, then `differs`; only with two
+  // or more `sources` ([{key, slot, label, title}]).
+  drawLegend(sec, sources) {
+    if (sources.length < 2) {
+      sec.legend?.remove();
+      sec.legendSig = "";
+      return;
+    }
+    if (!sec.legend) {
+      sec.legend = document.createElement("p");
+      sec.legend.className = "subject-legend";
+    }
+    const sig = JSON.stringify(sources.map((x) => [x.key, x.slot, x.label, x.title]));
+    if (sig !== sec.legendSig) {
+      sec.legendSig = sig;
+      const chips = sources.map((x) => {
+        const chip = document.createElement("span");
+        chip.className = `chip mark-${x.slot}`;
+        chip.dataset.source = x.key;
+        chip.textContent = x.label;
+        chip.title = x.title;
+        return chip;
+      });
+      const differs = document.createElement("span");
+      differs.className = "chip mark-differs";
+      differs.textContent = "differs";
+      differs.title = "the handlers gave different values";
+      sec.legend.replaceChildren(...chips, differs);
+    }
+    if (sec.legend.previousElementSibling !== sec.h3) sec.h3.after(sec.legend);
+  }
+
+  drawSection(sec, heading, subjects, cols, watched, sources = []) {
     setText(sec.h3, heading);
     if (watched) sec.note.remove();
     else if (!sec.note.isConnected) sec.h3.after(sec.note);
+    this.drawLegend(sec, sources);
+    const slots = slotMap(sources);
     sec.table.hidden = subjects.length === 0;
     // A table hidden under the pointer sends no leave.
     if (sec.table.hidden) sec.hover = false;
@@ -1319,10 +1394,15 @@ class SubjectsPane {
       tr.classList.toggle("dim", s.dim);
       tr.classList.toggle("selected", holds(s, sel));
       tr.classList.toggle("station", isStation(s));
-      const values = subjectValues(s);
+      const values = subjectValues(s, sources.length >= 2 ? slots : null);
+      const byField = new Map(s.row.subject.columns.map((c, i) => [c.field, values[i]]));
       cols.forEach((c, n) => {
         const text = c.text(s, values);
-        setText(tr.children[n], text, text);
+        const v = byField.get(c.col);
+        const mark = text !== "" && v ? v.mark : null;
+        const why = text !== "" && v?.markTitle ? v.markTitle : null;
+        setText(tr.children[n], text, why ? `${text} (${why})` : text);
+        setMark(tr.children[n], mark);
       });
       if (sec.body.children[i] !== tr) sec.body.insertBefore(tr, sec.body.children[i] || null);
     });
@@ -1333,7 +1413,15 @@ class SubjectsPane {
     const row = this.store.rowOf(job.kind);
     const cols = this.columns(row);
     const subjects = this.held(sec, this.sorted(id, this.store.list(job.id).reverse(), cols));
-    this.drawSection(sec, `${job.kind} ${job.source}, ${subjects.length} ${row.subject.name}`, subjects, cols, watched);
+    const sources = legendSources(this.store.sources(id), (x) => x.name);
+    this.drawSection(
+      sec,
+      `${job.kind} ${job.source}, ${subjects.length} ${row.subject.name}`,
+      subjects,
+      cols,
+      watched,
+      sources,
+    );
   }
 
   drawMergedSection(sec, { id, name, members }) {
@@ -1348,7 +1436,13 @@ class SubjectsPane {
     ).sort((a, b) => b.last_seen - a.last_seen);
     const subjects = this.held(sec, this.sorted(id, groups, cols));
     const via = members.map((x) => `${x.job.kind} ${x.job.source}`).join(", ");
-    this.drawSection(sec, `${name}, ${subjects.length} (${via})`, subjects, cols, members.every((x) => x.watched));
+    // Every member group's sources, a chip reading `<protocol> <name>`.
+    const sources = unionSources(
+      members.map((x) =>
+        legendSources(this.store.sources(x.job.id), (src) => `${this.store.rowOf(src.mode)?.protocol ?? src.mode} ${src.name}`),
+      ),
+    );
+    this.drawSection(sec, `${name}, ${subjects.length} (${via})`, subjects, cols, members.every((x) => x.watched), sources);
   }
 
   // The sections to draw, in order: a job's own, or for the jobs whose rows declare `merge` and

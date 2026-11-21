@@ -1684,6 +1684,7 @@ async function applyTheme() {
   root.dataset.rail = theme.layout?.rail === false ? "off" : "on";
   themeDock = theme.layout?.dock ?? null;
   themeTiles = theme;
+  state.subjects?.setHandlerSlots(theme.handlers ?? {});
   applyDock();
   applyMapTiles();
   applyRail();

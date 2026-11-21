@@ -148,7 +148,7 @@
 //   when nothing else has (no home, no fix).
 
 import { Selection, isSite, sameSite } from "./selection.js";
-import { subjectLabel, subjectValues } from "./subjects.js";
+import { slotMap, subjectLabel, subjectValues } from "./subjects.js";
 import { bandText, emissionWords, levelText, metricText, powerText } from "./units.js";
 import { homeOf } from "./view.js";
 
@@ -326,16 +326,25 @@ function ageText(ms) {
 }
 
 // A subject's popup, as it stands when opened: its name, its values and its age.
-function subjectPopup(s) {
+function subjectPopup(s, sources = []) {
   const box = document.createElement("div");
   const label = subjectLabel(s);
   const name = document.createElement("div");
   name.textContent = label === s.key ? label : `${label} (${s.key})`;
   box.append(name);
-  for (const v of subjectValues(s)) {
+  for (const v of subjectValues(s, sources.length >= 2 ? slotMap(sources) : null)) {
     if (v.text === "") continue;
     const line = document.createElement("div");
-    line.textContent = `${v.label}: ${v.text}`;
+    if (v.mark === null) {
+      line.textContent = `${v.label}: ${v.text}`;
+    } else {
+      // The value in its handler's mark; the title names the handler(s), never colour alone.
+      const span = document.createElement("span");
+      span.className = v.mark === "differs" ? "mark-differs" : `mark-${v.mark}`;
+      span.title = v.markTitle ?? "";
+      span.textContent = v.text;
+      line.append(`${v.label}: `, span);
+    }
     box.append(line);
   }
   const age = document.createElement("div");
@@ -975,7 +984,7 @@ class MapPane {
       // No iconSize: `div.map-subject` sizes itself, its arrow on the fix (style.css).
       const icon = this.L.divIcon({ html: t.box, className: "map-subject-icon", iconSize: null });
       t.marker = this.L.marker(last, { icon }).addTo(this.map);
-      t.marker.bindPopup(() => subjectPopup(t.subject));
+      t.marker.bindPopup(() => subjectPopup(t.subject, this.subjects.sources(t.job)));
       t.marker.on("click", () => this.subjects.select(t.job, t.key));
       const sel = this.subjects.selected();
       this.markOne(t, !!sel && sel.job === t.job && sel.key === t.key);

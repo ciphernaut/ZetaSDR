@@ -2154,6 +2154,7 @@ THEME_HOOKS = [
     ".map-tab", "html[data-main]", "html[data-dock]", "section.pane.dock",
     ".src-tab.default", ".src-tab .default-mark",
     "html[data-map-tiles]", "#map .map-tile-note",
+    ".mark-1", ".mark-differs", ".subject-legend",
 ]
 
 
@@ -2168,10 +2169,15 @@ def scenario_theme_hooks(page, url, secret):
     page.set_viewport_size(WIDE)
     select_source(page, url, secret, "tone")
     demod = None
+    pair_jobs = []
     try:
         # Off the tone, so its squelch stays closed (the idle state hook).
         demod = start_job(url, secret, "fm_demod", "tone", 100_015_000, 12_500, deviation_hz=5000)
         row = job_row(page, demod)
+        # The handler marks (plan 43) need two handlers of one subject.
+        own, sib = start_pair_siblings(page, url, secret)
+        pair_jobs = [own, sib]
+        expect(page.locator("#subjects .subject-legend")).to_have_count(1, timeout=20_000)
         page.evaluate("window.zetaTest.ribbon('hooks')")
         run_cmd(page, "view set main map")
         expect(page.locator("#map")).to_be_visible()
@@ -2197,8 +2203,9 @@ def scenario_theme_hooks(page, url, secret):
         page.keyboard.press("Escape")
     finally:
         run_cmd(page, "view reset")
-        if demod:
-            stop_job(url, secret, demod)
+        for job in [demod, *pair_jobs]:
+            if job:
+                stop_job(url, secret, job)
 
 
 def scenario_source_bar_shows_live_numbers(page, url, secret):
@@ -11160,6 +11167,132 @@ def scenario_fake_pair_has_three_ready_handlers(page, url, secret):
     for h in pair["handlers"]:
         assert h["state"] == "ready", h
     assert pair["state"] == "ready", pair
+
+
+def start_pair_siblings(page, url, secret):
+    """`fake_pair` by its own handler, its row's fields waited for, then `alt` beside it (plan
+    43): (own job id, sibling job id). The own handler takes slot 1 by being heard first."""
+    own = start_subject_job(page, url, secret, "fake_pair")
+    open_subjects(page)
+    expect(subject_row(page, "PAIR1").locator('td[data-col="own_only"]')).to_have_text(
+        "x", timeout=15_000)
+    sib = http_json(url, secret, "/op", {
+        "op": "job_start", "kind": "fake_pair", "source": "tone", "center_hz": 100_000_000,
+        "bandwidth_hz": 40_000, "deviation_hz": None, "sideband": None, "elastic": False,
+        "replace": [], "handler": "alt", "beside": own})["value"]
+    return own, sib
+
+
+def scenario_sibling_fields_are_marked_in_the_table(page, url, secret):
+    errors = page_errors(page)
+    select_source(page, url, secret, "tone")
+    own, sib = start_pair_siblings(page, url, secret)
+    try:
+        sec = page.locator("#subjects section.subject-job")
+        expect(sec).to_have_count(1)
+        row = subject_row(page, "PAIR1")
+        expect(row).to_have_count(1)
+        cell = lambda col: row.locator(f'td[data-col="{col}"]')
+        expect(cell("alt_only")).to_have_text("y", timeout=15_000)
+        expect(cell("own_only")).to_have_class(re.compile(r"\bmark-1\b"))
+        assert "only" in cell("own_only").get_attribute("title")
+        expect(cell("alt_only")).to_have_class(re.compile(r"\bmark-2\b"))
+        expect(cell("name")).to_have_class(re.compile(r"\bmark-differs\b"))
+        title = cell("name").get_attribute("title")
+        assert "Alpha" in title and "Alfa" in title, title
+        assert not re.search(r"\bmark-", cell("level").get_attribute("class") or "")
+        legend = sec.locator("p.subject-legend")
+        expect(legend).to_have_count(1)
+        chips = legend.locator(".chip")
+        expect(chips).to_have_count(3)
+        assert chips.nth(0).text_content() != chips.nth(1).text_content()
+        expect(chips.nth(0)).to_have_class(re.compile(r"\bmark-1\b"))
+        expect(chips.nth(1)).to_have_class(re.compile(r"\bmark-2\b"))
+        expect(chips.nth(2)).to_have_class(re.compile(r"\bmark-differs\b"))
+        expect(chips.nth(2)).to_have_text("differs")
+        assert "subject-legend" in sec.evaluate("e => e.querySelector('h3').nextElementSibling.className")
+        colour = lambda loc: loc.evaluate("e => getComputedStyle(e).color")
+        assert colour(cell("own_only")) != colour(cell("level")), "a mark must show"
+        assert not errors, f"console errors: {errors}"
+    finally:
+        stop_job(url, secret, sib)
+        stop_job(url, secret, own)
+
+
+def scenario_marks_stay_when_a_member_stops(page, url, secret):
+    select_source(page, url, secret, "tone")
+    own, sib = start_pair_siblings(page, url, secret)
+    try:
+        row = subject_row(page, "PAIR1")
+        expect(row.locator('td[data-col="alt_only"]')).to_have_text("y", timeout=15_000)
+        stop_job(url, secret, own)
+        expect(row).to_have_count(1)
+        page.wait_for_timeout(1_500)
+        expect(row).to_have_count(1)
+        expect(row.locator('td[data-col="own_only"]')).to_have_class(re.compile(r"\bmark-1\b"))
+        expect(row.locator('td[data-col="alt_only"]')).to_have_class(re.compile(r"\bmark-2\b"))
+        expect(page.locator("#subjects .subject-legend .chip")).to_have_count(3)
+        stop_job(url, secret, sib)
+        expect(row).to_have_count(0, timeout=15_000)
+    finally:
+        stop_job(url, secret, sib)
+        stop_job(url, secret, own)
+
+
+def scenario_a_lone_decoder_draws_no_marks(page, url, secret):
+    select_source(page, url, secret, "tone")
+    job = start_subject_job(page, url, secret, "fake_pair")
+    try:
+        open_subjects(page)
+        cell = subject_row(page, "PAIR1").locator('td[data-col="own_only"]')
+        expect(cell).to_have_text("x", timeout=15_000)
+        expect(page.locator('#subjects [class*="mark-"]')).to_have_count(0)
+        expect(page.locator("#subjects .subject-legend")).to_have_count(0)
+        assert cell.get_attribute("title") == "x", cell.get_attribute("title")
+    finally:
+        stop_job(url, secret, job)
+
+
+def scenario_map_popup_marks_its_values(page, url, secret):
+    page.route(TILE_HOSTS, lambda r: r.abort())
+    select_source(page, url, secret, "tone")
+    run_cmd(page, "view set main map")
+    expect(page.locator("#map")).to_be_visible()
+    own, sib = start_pair_siblings(page, url, secret)
+    try:
+        marker = page.locator("#map .map-subject")
+        expect(marker).to_have_count(1, timeout=15_000)
+        popup = page.locator("#map .leaflet-popup-content")
+
+        def popup_marked():
+            marker.click()
+            return (popup.locator("span.mark-1").count() > 0
+                    and popup.locator("span.mark-differs").count() > 0)
+
+        wait_until(popup_marked, 20, "a popup with marked values")
+        assert "only" in popup.locator("span.mark-1").first.get_attribute("title")
+    finally:
+        run_cmd(page, "view reset")
+        stop_job(url, secret, sib)
+        stop_job(url, secret, own)
+
+
+def scenario_theme_pins_a_handler_to_a_slot(page, url, secret):
+    select_source(page, url, secret, "tone")
+    own, sib = start_pair_siblings(page, url, secret)
+    try:
+        alt = subject_row(page, "PAIR1").locator('td[data-col="alt_only"]')
+        expect(alt).to_have_class(re.compile(r"\bmark-2\b"), timeout=15_000)
+        run_cmd(page, "view set theme fixture_handlers")
+        expect(page.locator("html")).to_have_attribute("data-theme", "fixture_handlers")
+        expect(alt).to_have_class(re.compile(r"\bmark-4\b"), timeout=10_000)
+        expect(alt).not_to_have_class(re.compile(r"\bmark-2\b"))
+        run_cmd(page, "view set theme console")
+        expect(alt).to_have_class(re.compile(r"\bmark-2\b"), timeout=10_000)
+    finally:
+        run_cmd(page, "view reset")
+        stop_job(url, secret, sib)
+        stop_job(url, secret, own)
 
 
 def scenario_explore_delete_all_removes_every_capture(page, url, secret):

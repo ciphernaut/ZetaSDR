@@ -939,7 +939,8 @@ fn fake_handlers(dir: &Path) -> PathBuf {
 
 /// A themes directory under `dir`: `fixture_theme`, an operator theme (accent `#ff00ff`, no
 /// rail, a black-to-magenta ramp, no style.css), `fixture_dock_right` (the same, with
-/// `layout.dock` right), and a broken `console` override (an unknown
+/// `layout.dock` right), `fixture_handlers` (the same, with `handlers` pinning `alt` to mark
+/// slot 4), and a broken `console` override (an unknown
 /// `footprints` key), which leaves the built-in console in force; its path.
 fn fake_themes(dir: &Path) -> PathBuf {
     use serde_json::json;
@@ -968,7 +969,11 @@ fn fake_themes(dir: &Path) -> PathBuf {
     let mut dock_right = fixture.clone();
     dock_right["id"] = json!("fixture_dock_right");
     dock_right["layout"] = json!({"rail": false, "ribbon_tilt_deg": 0, "dock": "right"});
-    for theme in [fixture, broken, hsl, bad, dock_right] {
+    // An operator theme that pins the `alt` handler to mark slot 4 (plan 43).
+    let mut handlers = fixture.clone();
+    handlers["id"] = json!("fixture_handlers");
+    handlers["handlers"] = json!({"alt": 4});
+    for theme in [fixture, broken, hsl, bad, dock_right, handlers] {
         let folder = themes.join(theme["id"].as_str().unwrap());
         std::fs::create_dir_all(&folder).expect("create a theme folder");
         let text = serde_json::to_string_pretty(&theme).unwrap();

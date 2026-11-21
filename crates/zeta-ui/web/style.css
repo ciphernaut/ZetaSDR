@@ -933,6 +933,9 @@ html[data-footprint="narrow"][data-drawer="open"] #side {
 .mark-3 { color: var(--c-handler-3); font-style: var(--handler-style-3); }
 .mark-4 { color: var(--c-handler-4); font-style: var(--handler-style-4); }
 .mark-differs { color: var(--c-differs); text-decoration: underline dotted; }
+/* The line under a Subjects heading naming each handler in its mark. */
+.subject-legend { margin: 0 0 0.3em; font-size: 0.85em; display: flex; flex-wrap: wrap; gap: 0.3em 0.9em; }
+.subject-legend .chip { white-space: nowrap; }
 
 /* ---- the rail (spec 4.4) ---- */
 /* A job's colour (overlays.js channelColour): its outline, tag, ribbons and row share it. */
