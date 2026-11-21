@@ -892,3 +892,322 @@ async fn the_ops_stream_logs_job_retune_with_its_outcome() {
     assert_eq!(p["outcome"], "error");
     assert_eq!(p["error"]["error"], "unknown");
 }
+
+// Plan 43: a Send to group retunes as one lease move, its members relaunched in turn.
+
+mod common;
+use common::handlers::{self as h, ALT};
+use std::sync::atomic::AtomicBool;
+
+/// What [`Refusing`] says of a node it refuses.
+const REFUSED: &str = "alt will not start again";
+
+/// Stands in for `external_decode` as [`h::External`] does, but refuses a node of the
+/// handler `refuse` names once `armed`: the graph check of a launch (a relaunch's) fails.
+struct Refusing {
+    inner: Arc<dyn Stage>,
+    refuse: &'static str,
+    armed: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Stage for Refusing {
+    fn spec(&self) -> &StageSpec {
+        self.inner.spec()
+    }
+    fn backend(&self) -> Backend {
+        self.inner.backend()
+    }
+    fn outputs_for(&self, params: &serde_json::Value) -> Vec<StreamKind> {
+        self.inner.outputs_for(params)
+    }
+    fn check_params(&self, params: &serde_json::Value) -> Result<(), String> {
+        let handler = params.get("handler").and_then(|h| h.as_str());
+        match self.armed.load(Ordering::SeqCst) && handler == Some(self.refuse) {
+            true => Err(REFUSED.into()),
+            false => Ok(()),
+        }
+    }
+    async fn run(
+        &self,
+        params: serde_json::Value,
+        inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: CancellationToken,
+        ctx: StageContext,
+    ) -> Result<(), StageError> {
+        self.inner
+            .run(params, inputs, outputs, bus, cancel, ctx)
+            .await
+    }
+}
+
+/// A node on [`h::Radio`] with `adsb_decode`'s handlers `dump1090` (the row's own) and
+/// `alt` (packets beside its events when `packets`), and the switch that makes alt's
+/// next launch fail.
+async fn group_node(dir: &Path, packets: bool) -> (Node, Arc<h::Radio>, Arc<AtomicBool>) {
+    let mut stages = StageRegistry::new();
+    zeta_dsp::register_all(&mut stages);
+    stages.register(Arc::new(StreamInStage::new()));
+    stages.register(Arc::new(
+        zeta_core::packet_capture::PacketCaptureStage::new(),
+    ));
+    let armed = Arc::new(AtomicBool::new(false));
+    stages.register(Arc::new(Refusing {
+        inner: h::External::new(packets.then_some(ALT)),
+        refuse: ALT,
+        armed: armed.clone(),
+    }));
+    let radio = h::Radio::new();
+    let node = Node::open(
+        h::cfg(dir, packets),
+        stages,
+        vec![radio.clone() as Arc<dyn Port>],
+    )
+    .await
+    .unwrap();
+    (node, radio, armed)
+}
+
+/// The ADS-B band the pair starts on and the band outside its capture they move to.
+const HERE: Tuning = Tuning {
+    center_hz: Hz(1_090_000_000),
+    bandwidth_hz: Hz(2_400_000),
+};
+const THERE: Tuning = Tuning {
+    center_hz: Hz(1_093_000_000),
+    bandwidth_hz: Hz(2_400_000),
+};
+
+/// The row's own decoder and a sibling on alt beside it, both running.
+async fn pair(node: &Node) -> (JobId, JobId) {
+    let first = h::start(node, None, &[]).await;
+    let sib = match h::start_beside(node, &first, Some(ALT), &[]).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("the sibling: {r:?}"),
+    };
+    running_at(node, &[&first, &sib], HERE).await;
+    (first, sib)
+}
+
+/// Wait until every job of `ids` is `Running` at `band`.
+async fn running_at(node: &Node, ids: &[&JobId], band: Tuning) {
+    common::until("the jobs run at the band", Duration::from_secs(10), || {
+        ids.iter().all(|id| {
+            let r = record(node, id);
+            r.state == JobState::Running && r.tuning == band
+        })
+    })
+    .await;
+}
+
+async fn retune_to(
+    node: &Node,
+    id: &JobId,
+    band: Tuning,
+    replace: &[&JobId],
+) -> Result<OpResult, OpError> {
+    retune(node, id, band.center_hz.0, band.bandwidth_hz.0, replace).await
+}
+
+#[tokio::test]
+async fn retuning_one_member_moves_the_whole_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio, _) = group_node(dir.path(), false).await;
+    let (first, sib) = pair(&node).await;
+    let tunes = radio.tunes();
+    assert_eq!(
+        retune_to(&node, &sib, THERE, &[]).await,
+        Ok(OpResult::Job(sib.clone()))
+    );
+    running_at(&node, &[&first, &sib], THERE).await;
+    assert_eq!(radio.tunes(), tunes + 1, "one tune for the group");
+    let s = source(&node).await;
+    assert_eq!(s.current, Some(THERE));
+    let mut holders = s.holders;
+    holders.sort();
+    let mut both = vec![first.clone(), sib.clone()];
+    both.sort();
+    assert_eq!(holders, both);
+    for id in [&first, &sib] {
+        assert_eq!(record(&node, id).group, Some(first.clone()), "{id:?}");
+    }
+    assert_eq!(record(&node, &sib).handler.as_deref(), Some(ALT));
+    assert_eq!(record(&node, &first).handler.as_deref(), Some(h::OWN));
+}
+
+#[tokio::test]
+async fn a_group_retune_conflicts_only_with_holders_outside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio, _) = group_node(dir.path(), false).await;
+    let (first, sib) = pair(&node).await;
+    let fm = match node
+        .apply(h::start_kind_op(
+            JobKind::FmDemod,
+            1_089_000_000,
+            12_500,
+            None,
+            &[],
+        ))
+        .await
+    {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("fm_demod: {r:?}"),
+    };
+    let graphs = (record(&node, &first).graph.id, record(&node, &sib).graph.id);
+    let tunes = radio.tunes();
+    match retune_to(&node, &sib, THERE, &[]).await {
+        Err(OpError::Conflict { holders, .. }) => assert_eq!(holders, vec![fm.clone()]),
+        r => panic!("expected a conflict, got {r:?}"),
+    }
+    for id in [&first, &sib] {
+        let r = record(&node, id);
+        assert_eq!((r.state, r.tuning), (JobState::Running, HERE), "{id:?}");
+    }
+    assert_eq!(
+        (record(&node, &first).graph.id, record(&node, &sib).graph.id),
+        graphs,
+        "nothing relaunched"
+    );
+    assert_eq!(radio.tunes(), tunes, "the conflict tuned nothing");
+    assert_eq!(source(&node).await.holders.len(), 3);
+    // With the holder outside replaced, the group moves.
+    assert_eq!(
+        retune_to(&node, &sib, THERE, &[&fm]).await,
+        Ok(OpResult::Job(sib.clone()))
+    );
+    running_at(&node, &[&first, &sib], THERE).await;
+    assert_eq!(record(&node, &fm).state, JobState::Stopped);
+}
+
+#[tokio::test]
+async fn a_member_that_fails_its_relaunch_leaves_the_others_standing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio, armed) = group_node(dir.path(), false).await;
+    let (first, sib) = pair(&node).await;
+    armed.store(true, Ordering::SeqCst);
+    assert_eq!(
+        retune_to(&node, &first, THERE, &[]).await,
+        Ok(OpResult::Job(first.clone()))
+    );
+    running_at(&node, &[&first], THERE).await;
+    match record(&node, &sib).state {
+        JobState::Failed { reason } => assert!(reason.contains(REFUSED), "{reason}"),
+        s => panic!("the sibling should have failed: {s:?}"),
+    }
+    assert_eq!(source(&node).await.holders, vec![first]);
+}
+
+/// A member that cannot be settled (its named handler gone) refuses the whole retune
+/// naming it, before any lease moves.
+#[tokio::test]
+async fn a_member_whose_handler_is_gone_refuses_the_whole_retune() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio, _) = group_node(dir.path(), false).await;
+    let (first, sib) = pair(&node).await;
+    h::alt_goes_missing(&node);
+    let tunes = radio.tunes();
+    assert_eq!(
+        retune_to(&node, &first, THERE, &[]).await,
+        Err(other(format!(
+            "job {}, a member of the retuned job's group: handler {ALT} is unavailable: {}",
+            sib.0,
+            h::ALT_MISSING
+        )))
+    );
+    for id in [&first, &sib] {
+        let r = record(&node, id);
+        assert_eq!((r.state, r.tuning), (JobState::Running, HERE), "{id:?}");
+    }
+    assert_eq!(radio.tunes(), tunes, "nothing moved");
+}
+
+#[tokio::test]
+async fn a_packet_capture_follows_its_member_through_a_group_retune() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio, _) = group_node(dir.path(), true).await;
+    let (first, sib) = pair(&node).await;
+    let cap = match node
+        .apply(
+            serde_json::from_value(serde_json::json!({
+                "op": "job_attach", "kind": "packets", "job": sib.0,
+                "language": null, "stream": null
+            }))
+            .unwrap(),
+        )
+        .await
+    {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("attach packets: {r:?}"),
+    };
+    assert_eq!(
+        retune_to(&node, &first, THERE, &[]).await,
+        Ok(OpResult::Job(first.clone()))
+    );
+    running_at(&node, &[&first, &sib, &cap], THERE).await;
+    let rec = record(&node, &cap);
+    assert_eq!(rec.input, Some(sib.clone()));
+    assert_eq!(rec.tuning, record(&node, &sib).tuning);
+}
+
+#[tokio::test]
+async fn replace_may_not_name_a_member_of_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio, _) = group_node(dir.path(), false).await;
+    let (first, sib) = pair(&node).await;
+    let tunes = radio.tunes();
+    assert_eq!(
+        retune_to(&node, &first, THERE, &[&sib]).await,
+        Err(other(format!(
+            "replace names job {}, a member of the retuned job's group",
+            sib.0
+        )))
+    );
+    for id in [&first, &sib] {
+        let r = record(&node, id);
+        assert_eq!((r.state, r.tuning), (JobState::Running, HERE), "{id:?}");
+    }
+    assert_eq!(radio.tunes(), tunes);
+}
+
+/// A member whose graph an operator put (`graph_put`) would lose it to the group's
+/// re-expansion: the retune is refused naming it, before anything moves.
+#[tokio::test]
+async fn a_member_running_an_operator_graph_refuses_the_group_retune() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio, _) = group_node(dir.path(), false).await;
+    let (first, sib) = pair(&node).await;
+    let mut graph = match node.apply(Op::GraphGet { job: sib.clone() }).await {
+        Ok(OpResult::Graph(g)) => g,
+        r => panic!("graph_get: {r:?}"),
+    };
+    let decode = graph
+        .nodes
+        .iter_mut()
+        .find(|n| n.kind == "external_decode")
+        .unwrap();
+    decode.params["operator"] = true.into();
+    node.apply(Op::GraphPut {
+        job: sib.clone(),
+        graph,
+    })
+    .await
+    .unwrap();
+    running_at(&node, &[&sib], HERE).await;
+    assert!(record(&node, &sib).operator_graph);
+    let tunes = radio.tunes();
+    assert_eq!(
+        retune_to(&node, &first, THERE, &[]).await,
+        Err(other(format!(
+            "job {}, a member of the retuned job's group, runs an operator graph \
+             (graph_put): stop it, or put a new graph",
+            sib.0
+        )))
+    );
+    for id in [&first, &sib] {
+        let r = record(&node, id);
+        assert_eq!((r.state, r.tuning), (JobState::Running, HERE), "{id:?}");
+    }
+    assert_eq!(radio.tunes(), tunes);
+}

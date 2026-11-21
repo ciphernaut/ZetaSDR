@@ -452,6 +452,19 @@ pub enum Op {
     /// <id> is <state>`; an unknown id is `unknown`. The result is the job's id, as
     /// `job_start` answers.
     ///
+    /// A job of a Send to group (its `group`, from `job_start` with `beside`) with another
+    /// member running moves with the whole group, as one lease move under the source's
+    /// gate: every member's handler is settled first (a member whose named handler is no
+    /// longer ready refuses the retune naming it, `job <id>, a member of the retuned
+    /// job's group: <reason>`, and nothing moves), then every member's lease moves to the
+    /// band together (one tune at most; a `conflict` names only the holders outside the
+    /// group, and every lease is put back), then each member is relaunched on it, the job
+    /// named first. A member whose relaunch fails is `failed` with its reason and the
+    /// others run on; each member's attached jobs follow it. A `replace` naming a member
+    /// is refused, `replace names job <id>, a member of the retuned job's group`, and so
+    /// is a group with a member whose graph an operator `graph_put` replaced. The result
+    /// is the id of the job named.
+    ///
     /// A `scan` its source sweeps for itself (`job_context.scan.method` `source`) is
     /// re-aimed instead: under the source's gate the source's running sweep moves to the
     /// new span (and `bin_hz`, when given) on what it already holds, the Kiwi's open
@@ -8114,6 +8127,22 @@ async fn job_retune(
     if replace.contains(&job) {
         return Err(other(format!("job {} cannot replace itself", job.0)));
     }
+    // A Send to group moves as one: the members running beside the job (itself
+    // included), never stopped by its retune.
+    let members = match &rec.group {
+        Some(g) => node.group_members(g),
+        None => Vec::new(),
+    };
+    if let Some(m) = members.iter().find(|m| replace.contains(&m.id)) {
+        return Err(other(group_replace_refusal(&m.id)));
+    }
+    if let Some(m) = members.iter().find(|m| m.id != job && m.operator_graph) {
+        return Err(other(format!(
+            "job {}, a member of the retuned job's group, runs an operator graph \
+             (graph_put): stop it, or put a new graph",
+            m.id.0
+        )));
+    }
     let want = Tuning {
         center_hz,
         bandwidth_hz,
@@ -8121,15 +8150,18 @@ async fn job_retune(
     let port = checked_port(node, &rec.source, &want)?;
     // The row's own width rule (a program row's `min_hz`), before the gate: the
     // expansion would refuse it only after the lease moved and the radio tuned. The
-    // program is the job's handler's.
+    // program is the job's handler's, and each group member's handler's.
     let modes = node.modes();
     if let Some(row) = kind.mode_row(&modes)? {
         let max = port.capabilities().max_bandwidth_hz.value().0;
-        let block = rec
-            .handler
-            .as_deref()
-            .and_then(|h| modes.program_block(&row.id.0, h));
-        template::check_band(row, block.as_ref(), want, max)?;
+        let handlers = std::iter::once(&rec).chain(members.iter().filter(|m| m.id != job));
+        for r in handlers {
+            let block = r
+                .handler
+                .as_deref()
+                .and_then(|h| modes.program_block(&row.id.0, h));
+            template::check_band(row, block.as_ref(), want, max)?;
+        }
     }
     match node.job_retune(&job, &kind, want, &replace).await {
         Ok(()) => Ok(OpResult::Job(job)),
@@ -8138,6 +8170,15 @@ async fn job_retune(
             Err(node_error(node, e))
         }
     }
+}
+
+/// `job_retune`'s refusal of a `replace` naming `member`, a member of the retuned job's
+/// Send to group: a group retune moves it with the job.
+pub(crate) fn group_replace_refusal(member: &JobId) -> String {
+    format!(
+        "replace names job {}, a member of the retuned job's group",
+        member.0
+    )
 }
 
 /// `job_retune` of a `scan`: a scan its source sweeps for itself (its context's

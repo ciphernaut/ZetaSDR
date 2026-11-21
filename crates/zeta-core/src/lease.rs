@@ -794,6 +794,74 @@ impl LeaseManager {
         r
     }
 
+    /// Move every lease `holders` hold on `port` to `want` under the gate the caller
+    /// holds (a Send to group's `job_retune`): their leases are set aside together,
+    /// `want` is granted once as [`LeaseManager::retune_locked`] grants it (inside the
+    /// current capture untuned whatever else holds the source, unless a time-shared
+    /// lease does; else as a rigid request, one tune at most, or a conflict naming only
+    /// the holders outside the group), then leased to each holder. On an error every
+    /// set-aside lease is put back where it was. Also whether it tuned the port. With no
+    /// holders nothing is leased and the answer is the current capture, untuned.
+    pub(crate) async fn retune_group_locked(
+        &self,
+        port: &dyn Port,
+        holders: &[JobId],
+        want: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> Result<(Tuning, bool), LeaseError> {
+        let source = port.id().clone();
+        self.assert_gate(&source, guard);
+        let Some((first, rest)) = holders.split_first() else {
+            return Ok((port.current().unwrap_or(want), false));
+        };
+        let held = |l: &Lease| holders.contains(&l.job);
+        // Each set-aside lease with its place in the source's list, to put it back there.
+        let old: Vec<(usize, Lease)> = {
+            let mut leases = self.leases.lock().unwrap();
+            let v = leases.entry(source.clone()).or_default();
+            let old = v
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| held(l))
+                .map(|(i, l)| (i, l.clone()))
+                .collect();
+            v.retain(|l| !held(l));
+            // As `retune_locked`: a time-shared lease leaves no capture to keep.
+            let shared = v.iter().any(|l| l.time_shared);
+            if !shared && let Some(cur) = port.current().filter(|c| fits(&want, c)) {
+                v.extend(holders.iter().map(|h| Lease::new(h.clone(), want, false)));
+                return Ok((cur, false));
+            }
+            if v.is_empty() {
+                leases.remove(&source);
+            }
+            old
+        };
+        let r = self
+            .ensure_as(port, first.clone(), want, false, false, guard)
+            .await;
+        let mut leases = self.leases.lock().unwrap();
+        match &r {
+            Ok(_) => {
+                let v = leases.entry(source).or_default();
+                for h in rest {
+                    v.retain(|l| &l.job != h);
+                    v.push(Lease::new(h.clone(), want, false));
+                }
+            }
+            Err(_) if !old.is_empty() => {
+                let v = leases.entry(source).or_default();
+                // In the order they stood: each goes back to its place among the others.
+                for (i, l) in old {
+                    let at = i.min(v.len());
+                    v.insert(at, l);
+                }
+            }
+            Err(_) => {}
+        }
+        r
+    }
+
     /// [`LeaseManager::pin_locked`], taking the source's gate.
     pub async fn pin(&self, port: &dyn Port, want: Tuning) -> Result<(Tuning, bool), LeaseError> {
         let guard = self.gate_guard(port.id()).await;
@@ -1707,6 +1775,82 @@ mod tests {
         // j2's lease is put back.
         assert_eq!(m.holders(p.id()), vec![(j1, far), (j2, inside)]);
         assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A Send to group's retune: every member's lease set aside together, the band
+    /// outside the capture granted once (one tune), then leased to each member.
+    #[tokio::test]
+    async fn retune_group_locked_moves_every_holder_and_tunes_once() {
+        let (p, m, a, b) = (
+            FakePort::new(),
+            LeaseManager::new(),
+            JobId::new(),
+            JobId::new(),
+        );
+        let here = t(100_000_000, 2_400_000);
+        m.ensure(&p, a.clone(), here, false).await.unwrap();
+        m.ensure(&p, b.clone(), here, false).await.unwrap();
+        let tunes = p.tunes.load(std::sync::atomic::Ordering::SeqCst);
+        let far = t(433_000_000, 2_400_000);
+        let guard = m.gate_guard(p.id()).await;
+        let (got, tuned) = m
+            .retune_group_locked(&p, &[a.clone(), b.clone()], far, &guard)
+            .await
+            .unwrap();
+        assert!(tuned);
+        assert_eq!(got, far);
+        assert_eq!(m.holders(p.id()), vec![(a.clone(), far), (b.clone(), far)]);
+        assert_eq!(
+            p.tunes.load(std::sync::atomic::Ordering::SeqCst),
+            tunes + 1,
+            "one tune for the group"
+        );
+        // Inside the new capture: moved untuned.
+        let inside = t(433_100_000, 100_000);
+        assert_eq!(
+            m.retune_group_locked(&p, &[a.clone(), b.clone()], inside, &guard)
+                .await
+                .unwrap(),
+            (far, false)
+        );
+        assert_eq!(m.holders(p.id()), vec![(a, inside), (b, inside)]);
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), tunes + 1);
+    }
+
+    /// A rigid holder outside the group makes the move a conflict naming it alone, and
+    /// every member's lease is put back where it was.
+    #[tokio::test]
+    async fn retune_group_locked_restores_every_lease_on_a_conflict() {
+        let (p, m, a, b, third) = (
+            FakePort::new(),
+            LeaseManager::new(),
+            JobId::new(),
+            JobId::new(),
+            JobId::new(),
+        );
+        let here = t(100_000_000, 2_400_000);
+        m.ensure(&p, a.clone(), here, false).await.unwrap();
+        m.ensure(&p, third.clone(), t(100_500_000, 12_500), false)
+            .await
+            .unwrap();
+        m.ensure(&p, b.clone(), here, false).await.unwrap();
+        let before = m.holders(p.id());
+        let tunes = p.tunes.load(std::sync::atomic::Ordering::SeqCst);
+        let guard = m.gate_guard(p.id()).await;
+        match m
+            .retune_group_locked(&p, &[a, b], t(433_000_000, 2_400_000), &guard)
+            .await
+        {
+            Err(LeaseError::Conflict {
+                holders, current, ..
+            }) => {
+                assert_eq!(holders, vec![third]);
+                assert_eq!(current, here);
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        assert_eq!(m.holders(p.id()), before, "every lease back, in its place");
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), tunes);
     }
 
     #[tokio::test]
