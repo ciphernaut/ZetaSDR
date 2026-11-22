@@ -90,7 +90,8 @@
           "text": "/text",
           "downlink": "/downlink"
         }
-      }
+      },
+      "const": { "crc_ok": true }
     },
     "aprs_decode": {
       "args": [

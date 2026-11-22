@@ -1433,6 +1433,11 @@ fn the_embedded_onair_handler_serves_the_bus_modes() {
         packets.link_type_numbers().into_iter().collect::<Vec<_>>(),
         [(101, zeta_core::stream::LinkType::RawIp)]
     );
+    // OnAir publishes an ACARS message only when its CRC fitted: crc_ok is a constant.
+    assert_eq!(
+        reg.handler_consts("acars_decode", "onair"),
+        std::collections::BTreeMap::from([("crc_ok".to_string(), serde_json::json!(true))])
+    );
 }
 
 /// `handlers/onair.json` ships in the node: OnAir is `adsb_decode`'s second handler,
@@ -2098,7 +2103,8 @@ async fn a_node_with_no_handlers_beyond_the_rows_lists_modes_as_before() {
     assert_eq!(state("junk_mode"), ModeState::Broken);
 }
 
-/// A program row's own `decoder.output` takes no `const`: only a handler file's entry does.
+/// A program row's own `decoder.output` takes no `const`: only a handler file's entry
+/// does, beside its `output`. The key is unknown there, as any other.
 #[test]
 fn a_row_refuses_constants_of_its_own() {
     let (_, text) = ModeRegistry::embedded()
@@ -2114,8 +2120,7 @@ fn a_row_refuses_constants_of_its_own() {
             .is_none()
     );
     v["decoder"]["output"]["const"] = serde_json::json!({"msg": 1});
-    let row = parse(&v.to_string()).unwrap();
-    let e = validate(&row, &stages()).unwrap_err();
-    assert_eq!(e.field, "decoder.output.const", "{e}");
-    assert_eq!(e.error, "only a handler file's entry gives constants");
+    let e = parse(&v.to_string()).unwrap_err();
+    assert_eq!(e.field, "const", "{e}");
+    assert!(e.error.starts_with("unknown field `const`"), "{e}");
 }

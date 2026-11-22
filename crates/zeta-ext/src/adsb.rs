@@ -144,6 +144,7 @@ impl AdsbDecodeStage {
                     program: p.clone(),
                     handler: zeta_core::modes::handler_file::own_handler_id(&row),
                     extra: Default::default(),
+                    consts: Default::default(),
                     row,
                 })
             }
@@ -198,6 +199,7 @@ impl Stage for AdsbDecodeStage {
             path: &r.program,
             handler: &r.handler,
             extra: &r.extra,
+            consts: &r.consts,
         };
         crate::external::run_row(
             program, &self.env, run_dir, inputs, outputs, bus, cancel, ctx,

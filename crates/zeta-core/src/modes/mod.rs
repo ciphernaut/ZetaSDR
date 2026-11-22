@@ -668,14 +668,31 @@ impl ModeRegistry {
     /// `extra`, each read from a program's line as `output.fields` reads; empty for the
     /// row's own handler, a broken one, and one the mode does not have.
     pub fn handler_extra(&self, mode: &str, handler: &str) -> BTreeMap<String, FieldPath> {
+        self.handler_entry(mode, handler)
+            .map(|e| e.extra.clone())
+            .unwrap_or_default()
+    }
+
+    /// The event fields `handler` sets to a constant for `mode`, after the field map: a
+    /// handler file entry's `const`; empty under [`ModeRegistry::handler_extra`]'s
+    /// conditions.
+    pub fn handler_consts(&self, mode: &str, handler: &str) -> BTreeMap<String, serde_json::Value> {
+        self.handler_entry(mode, handler)
+            .map(|e| e.consts.clone())
+            .unwrap_or_default()
+    }
+
+    /// The handler file entry that serves `mode` as `handler`: `None` for the row's own
+    /// handler, a broken one, and one the mode does not have.
+    fn handler_entry(&self, mode: &str, handler: &str) -> Option<&HandlerEntry> {
         let files = self.handler_files.iter().filter(|f| f.id == handler);
         let own = self.get(mode).is_some_and(|m| m.own_handler() == handler);
         let entry = files
             .filter(|f| f.state == ModeState::Ready && !own)
             .find_map(|f| f.handler.as_ref()?.modes.get(mode));
         match (entry, self.handler(mode, handler)) {
-            (Some(e), Some(h)) if h.state != ModeState::Broken => e.extra.clone(),
-            _ => BTreeMap::new(),
+            (Some(e), Some(h)) if h.state != ModeState::Broken => Some(e),
+            _ => None,
         }
     }
 

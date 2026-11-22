@@ -6,7 +6,7 @@
 //! ([`ModeRegistry::program_block`]), never taken from the graph, so a `graph_put`
 //! cannot run an arbitrary program. Every event carries the handler's id (`handler`; a
 //! program row's own is its first program), and a handler file's fields its entry's `extra`
-//! names beside the row's. The stage
+//! names beside the row's, and the constants its `const` gives. The stage
 //! reaches the registry through a [`ModesHandle`] set once the registry is loaded (the
 //! stage registry the rows validate against is built first) and replaced on a reload,
 //! read at each run; a run with the handle still empty fails `external_decode: no mode
@@ -195,6 +195,9 @@ pub(crate) struct Resolved {
     /// The event fields the handler adds beside the row's (a handler file entry's
     /// `extra`; none for the row's own).
     pub extra: BTreeMap<String, FieldPath>,
+    /// The event fields the handler sets to a constant (a handler file entry's `const`;
+    /// none for the row's own).
+    pub consts: BTreeMap<String, Value>,
 }
 
 /// [`resolve`] of the handler `handler` of mode `id` (`None`: the row's own, as
@@ -232,6 +235,7 @@ pub(crate) fn resolve_handler(
             program,
             handler: m.own_handler(),
             extra: BTreeMap::new(),
+            consts: BTreeMap::new(),
         });
     };
     let found = m
@@ -253,6 +257,7 @@ pub(crate) fn resolve_handler(
         row: m.row.clone(),
         block,
         extra: reg.handler_extra(id, h),
+        consts: reg.handler_consts(id, h),
         program,
         handler: h.to_string(),
     })
@@ -331,6 +336,7 @@ impl Stage for ExternalDecodeStage {
             path: &r.program,
             handler: &r.handler,
             extra: &r.extra,
+            consts: &r.consts,
         };
         run_row(
             program, &self.env, run_dir, inputs, outputs, bus, cancel, ctx,
@@ -353,6 +359,8 @@ pub struct Program<'a> {
     /// The fields it adds to each event beside the row's, read from the line by their
     /// pointers as `output.fields` reads (a pointer that finds nothing adds no key).
     pub extra: &'a BTreeMap<String, FieldPath>,
+    /// The fields it sets to a constant on each event, after the mapped ones.
+    pub consts: &'a BTreeMap<String, Value>,
 }
 
 /// Run `p`'s program as its mode's decoder (see the module docs), a fifo input in a
@@ -560,7 +568,7 @@ pub async fn run_row(
         parser: block.output.parser,
         fields: block.output.fields.as_ref(),
         extra: p.extra,
-        consts: &block.output.consts,
+        consts: p.consts,
         out,
         bus: &bus,
         source: &ctx.source,

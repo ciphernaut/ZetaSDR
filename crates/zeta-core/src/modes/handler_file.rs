@@ -51,7 +51,8 @@ pub struct HandlerEntry {
     #[serde(default)]
     pub extra: BTreeMap<String, FieldPath>,
     /// Row event fields given a constant value on every event, after the field map
-    /// (`{"protocol": "pocsag"}`); empty for none.
+    /// (`{"crc_ok": true}`); empty for none. They travel beside the program block, as
+    /// `extra` does ([`super::ModeRegistry::handler_consts`]).
     #[serde(default, rename = "const")]
     pub consts: BTreeMap<String, serde_json::Value>,
 }
@@ -74,7 +75,7 @@ struct EntryFields {
     #[serde(default)]
     extra: BTreeMap<String, FieldPath>,
     /// Row event fields given a constant value on every event, after the field map
-    /// (`{"protocol": "pocsag"}`); empty for none.
+    /// (`{"crc_ok": true}`); empty for none.
     #[serde(default, rename = "const")]
     consts: BTreeMap<String, serde_json::Value>,
 }
@@ -115,13 +116,11 @@ impl HandlerEntry {
     /// entry's `args`, `input`, `output`, `packets` and `demod`.
     pub fn program_block(&self, file: &HandlerFile) -> ProgramBlock {
         let b = &self.block;
-        let mut output = b.output.clone();
-        output.consts = self.consts.clone();
         ProgramBlock {
             programs: file.programs.clone(),
             args: b.args.clone(),
             input: b.input.clone(),
-            output,
+            output: b.output.clone(),
             install: file.install.clone(),
             demod: b.demod.clone(),
             packets: b.packets.clone(),
@@ -287,8 +286,9 @@ pub fn validate_entry(
     Ok(())
 }
 
-/// One `const` of an entry: a field of the row's event schema, not also read from the
-/// program, not the subject key, and a scalar the schema's `type` accepts.
+/// One `const` of an entry: no key the event envelope sets, a field of the row's event
+/// schema, not also read from the program, not the subject key, and a scalar the
+/// schema's `type` accepts.
 fn check_const(
     key: &str,
     value: &serde_json::Value,
@@ -297,6 +297,9 @@ fn check_const(
     entry: &HandlerEntry,
 ) -> Result<(), RowError> {
     let at = format!("const.{key}");
+    if is_envelope_key(key) {
+        return Err(error(at, "the event envelope sets it"));
+    }
     let Some(property) = properties.get(key) else {
         return Err(error(at, "not in the row's event schema"));
     };
@@ -511,26 +514,47 @@ mod tests {
                 "address": {"type": "integer"},
                 "kind": {"type": ["string", "null"]},
                 "obj": {"type": "object"},
+                "callsign": {"type": "string"},
                 "protocol": {"type": "string"}
             }
         });
         row
     }
 
+    /// An entry's constants travel beside its program block, as its `extra` does: the
+    /// registry gives them for the mode and handler.
     #[test]
     fn an_entry_gives_constants() {
-        let row = typed_row();
-        let f = parse_handler_file(&file(|v| {
-            v["modes"]["adsb_decode"]["const"] = serde_json::json!({"protocol": "pocsag"});
-        }))
-        .unwrap()
-        .0;
-        let e = &f.modes["adsb_decode"];
-        validate_entry(&f, e, &row).unwrap();
-        assert_eq!(
-            e.program_block(&f).output.consts["protocol"],
-            serde_json::json!("pocsag")
+        let text = file(|v| {
+            v["modes"]["adsb_decode"]["const"] = serde_json::json!({"on_ground": false});
+        });
+        let reg = super::super::ModeRegistry::load_handler_texts(
+            &crate::stage::StageRegistry::new(),
+            &[("alt.json", &text)],
         );
+        let f = reg.handler_files().iter().find(|f| f.id == "alt").unwrap();
+        assert_eq!(f.broken_entries(), Vec::<String>::new());
+        assert_eq!(
+            reg.handler_consts("adsb_decode", "alt"),
+            BTreeMap::from([("on_ground".to_string(), serde_json::json!(false))])
+        );
+        // The row's own handler, and one the mode does not have, give none.
+        assert!(reg.handler_consts("adsb_decode", "dump1090").is_empty());
+        assert!(reg.handler_consts("adsb_decode", "nope").is_empty());
+    }
+
+    /// An entry's `output` is a program row's: `const` is no key of it, and the entry
+    /// that writes it there does not parse.
+    #[test]
+    fn a_constant_under_output_breaks_the_entry() {
+        let (f, broken) = parse_handler_file(&file(|v| {
+            v["modes"]["adsb_decode"]["output"]["const"] = serde_json::json!({"on_ground": false});
+        }))
+        .unwrap();
+        assert!(f.modes.is_empty());
+        let e = &broken["adsb_decode"];
+        assert_eq!(e.field, "const", "{e}");
+        assert!(e.error.starts_with("unknown field `const`"), "{e}");
     }
 
     #[test]
@@ -549,6 +573,15 @@ mod tests {
             })
         };
         let is = |f: &str, e: &str| (f.to_string(), e.to_string());
+        // The envelope's own keys, checked first: `protocol` is in the schema too.
+        for key in [
+            "protocol", "handler", "summary", "t_ns", "position", "access",
+        ] {
+            assert_eq!(
+                one(key, "x".into()),
+                is(&format!("const.{key}"), "the event envelope sets it")
+            );
+        }
         assert_eq!(
             one("nope", 1.into()),
             is("const.nope", "not in the row's event schema")
@@ -570,16 +603,16 @@ mod tests {
             is("const.kind", "not a string or null")
         );
         assert_eq!(
-            one("protocol", serde_json::Value::Null),
-            is("const.protocol", "not a string")
+            one("callsign", serde_json::Value::Null),
+            is("const.callsign", "not a string")
         );
         assert_eq!(
-            one("protocol", serde_json::json!({"a": 1})),
-            is("const.protocol", "not a string")
+            one("callsign", serde_json::json!({"a": 1})),
+            is("const.callsign", "not a string")
         );
         assert_eq!(
-            one("protocol", serde_json::json!(["a"])),
-            is("const.protocol", "not a string")
+            one("callsign", serde_json::json!(["a"])),
+            is("const.callsign", "not a string")
         );
         assert_eq!(
             one("icao", "7C6B2E".into()),
@@ -591,16 +624,16 @@ mod tests {
         // Also read by the map (an `extra` name is never in the schema, so cannot be both).
         assert_eq!(
             refused(&row, &|m| {
-                m["output"]["fields"]["protocol"] = "/p".into();
-                m["const"] = serde_json::json!({"protocol": "x"});
+                m["output"]["fields"]["callsign"] = "/c".into();
+                m["const"] = serde_json::json!({"callsign": "x"});
             }),
-            is("const.protocol", "also read from the program")
+            is("const.callsign", "also read from the program")
         );
         // One bad and one good entry: the good one loads.
         let (f, broken) = parse_handler_file(&file(|v| {
             v["modes"]["pocsag_decode"] = v["modes"]["adsb_decode"].clone();
-            v["modes"]["pocsag_decode"]["const"] = serde_json::json!({"protocol": "pocsag"});
-            v["modes"]["adsb_decode"]["const"] = serde_json::json!({"protocol": {"a": 1}});
+            v["modes"]["pocsag_decode"]["const"] = serde_json::json!({"callsign": "ZETA"});
+            v["modes"]["adsb_decode"]["const"] = serde_json::json!({"callsign": {"a": 1}});
         }))
         .unwrap();
         assert!(broken.is_empty());
