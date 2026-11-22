@@ -1363,8 +1363,8 @@ fn a_handler_file_adds_a_handler_to_each_mode_it_lists() {
             .is_some()
     );
 
-    // A mode no file lists has its own handler only; a graph row's is `builtin`.
-    assert_eq!(handler_ids(&reg, "aprs_decode"), ["builtin"]);
+    // A mode no operator file lists has its own handler and the embedded ones; a graph row's own is `builtin`.
+    assert_eq!(handler_ids(&reg, "aprs_decode"), ["builtin", "onair"]);
     let builtin = reg.handler("aprs_decode", "builtin").unwrap();
     assert!(builtin.in_process);
     assert_eq!(builtin.state, ModeState::Ready);
@@ -1378,6 +1378,51 @@ fn a_handler_file_adds_a_handler_to_each_mode_it_lists() {
 /// `handlers/onair.json` ships in the node: OnAir is `adsb_decode`'s second handler,
 /// giving events and packets, ready when `onair-rx` is found and otherwise unavailable
 /// with the probe's line; never broken. The row's own handler gives packets too.
+#[test]
+fn the_embedded_onair_handler_serves_the_bus_modes() {
+    let mut reg = ModeRegistry::load(&stages(), None);
+    zeta_core::modes::handlers::probe_handler_files(&mut reg);
+    let file = reg
+        .handler_files()
+        .iter()
+        .find(|f| f.id == "onair")
+        .expect("the embedded onair file");
+    assert_eq!(file.broken_entries(), Vec::<String>::new());
+    let events = [StreamKind::Event];
+    let both = [StreamKind::Event, StreamKind::Packet];
+    // (mode id, the streams its OnAir entry gives, its input rate)
+    let modes: [(&str, &[StreamKind], u64); 4] = [
+        ("pocsag_decode", &events, 1_000_000),
+        ("flex_decode", &events, 1_000_000),
+        ("acars_decode", &events, 1_000_000),
+        ("aprs_decode", &both, 240_000),
+    ];
+    for (id, outputs, rate) in modes {
+        assert_eq!(
+            handler_ids(&reg, id).last(),
+            Some(&"onair".to_string()),
+            "{id}"
+        );
+        let h = reg.handler(id, "onair").unwrap();
+        assert_eq!(h.outputs, outputs, "{id}");
+        assert!(!h.in_process, "{id}");
+        // Only ever the missing program keeps it from ready.
+        if h.state != ModeState::Ready {
+            let reason = h.reason.as_deref().unwrap_or_default();
+            assert!(reason.starts_with("onair-rx: missing"), "{id}: {reason}");
+        }
+        let block = reg.program_block(id, "onair").unwrap();
+        assert_eq!(block.programs, ["onair-rx"], "{id}");
+        assert_eq!(block.input.rate_hz, rate, "{id}");
+    }
+    let aprs = reg.program_block("aprs_decode", "onair").unwrap();
+    let packets = aprs.packets.as_ref().expect("onair's packets");
+    assert_eq!(
+        packets.link_type_numbers().into_iter().collect::<Vec<_>>(),
+        [(3, zeta_core::stream::LinkType::Ax25)]
+    );
+}
+
 #[test]
 fn the_embedded_onair_handler_serves_adsb() {
     let mut reg = ModeRegistry::load(&stages(), None);
@@ -1843,7 +1888,7 @@ async fn handler_policy_set_refuses_an_id_no_mode_has() {
     );
     // Another mode's handler is not this one's.
     let r = policy_set(&node, Some("aprs_decode"), &["alt"]).await;
-    assert_eq!(r, unknown("order", "alt", ids(&["builtin"])));
+    assert_eq!(r, unknown("order", "alt", ids(&["builtin", "onair"])));
     // The node-wide ranking: every handler id of every mode, once each, sorted.
     let mut every: Vec<String> = node
         .modes()

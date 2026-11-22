@@ -1000,3 +1000,36 @@ fn a_fifo_rows_run_makes_its_subdirectory_under_the_run_dir() {
         "nothing under the default run directory"
     );
 }
+
+/// OnAir's entries for the bus modes pass `zeta modes check <id> --handler onair`, each
+/// recorded as `<id>@onair`. It needs `onair-rx`: `ZETA_HANDLER_ONAIR_RX` names it (an
+/// executable file, not looked up on `PATH`), and without it the test says so and passes.
+#[test]
+fn onair_passes_the_bus_modes_checks() {
+    use std::os::unix::fs::PermissionsExt;
+    let program = std::env::var_os("ZETA_HANDLER_ONAIR_RX")
+        .map(std::path::PathBuf::from)
+        .filter(|p| {
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        });
+    let Some(program) = program else {
+        eprintln!("onair check skipped: onair-rx not found");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    for id in [
+        "pocsag_decode",
+        "flex_decode",
+        "acars_decode",
+        "aprs_decode",
+    ] {
+        let (out, code) = stdout(
+            check(dir.path(), &[id, "--handler", "onair", "--strict"])
+                .env("ZETA_HANDLER_ONAIR_RX", &program),
+        );
+        assert_eq!(out.trim(), format!("{id}@onair: ok"), "{out}");
+        println!("{}", out.trim());
+        assert_eq!(code, 0, "{id}");
+    }
+}

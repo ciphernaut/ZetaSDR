@@ -6,6 +6,10 @@
 -- ME field and type code, and the parity. It is written from the Mode S frame format
 -- (ICAO Annex 10, Volume IV) and checks no parity.
 --
+-- An APRS job served by OnAir writes its frames as bare AX.25 (link type 3,
+-- LINKTYPE_AX25): Wireshark's own AX.25 dissector reads them, so this file has nothing
+-- to add for them.
+--
 -- Install: copy this file to Wireshark's personal Lua plugins directory
 -- (`~/.local/lib/wireshark/plugins/` on Linux; Help > About Wireshark > Folders names
 -- it), or load it for one run: `wireshark -X lua_script:zetasdr.lua capture.pcapng`.

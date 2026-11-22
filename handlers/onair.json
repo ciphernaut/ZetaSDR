@@ -1,15 +1,30 @@
 {
   "id": "onair",
   "name": "OnAir",
-  "programs": ["onair-rx"],
-  "install": { "url": "https://on-air.dev" },
+  "programs": [
+    "onair-rx"
+  ],
+  "install": {
+    "url": "https://on-air.dev"
+  },
   "modes": {
     "adsb_decode": {
       "args": [
-        "--mode", "adsb", "--rate", "$rate_hz", "--format", "cs16",
-        "--pcap-port", "$packet_port"
+        "--mode",
+        "adsb",
+        "--rate",
+        "$rate_hz",
+        "--format",
+        "cs16",
+        "--pcap-port",
+        "$packet_port"
       ],
-      "input": { "stream": "iq", "format": "cs16", "rate_hz": 2400000, "via": "stdin" },
+      "input": {
+        "stream": "iq",
+        "format": "cs16",
+        "rate_hz": 2400000,
+        "via": "stdin"
+      },
       "output": {
         "via": "stdout",
         "parser": "json_lines",
@@ -31,9 +46,150 @@
         "via": "tcp",
         "port": "$packet_port",
         "parser": "pcap",
-        "link_types": { "147": "mode_s" }
+        "link_types": {
+          "147": "mode_s"
+        }
       },
-      "extra": { "df": "/df", "tc": "/tc", "level_dbfs": "/level_dbfs" }
+      "extra": {
+        "df": "/df",
+        "tc": "/tc",
+        "level_dbfs": "/level_dbfs"
+      }
+    },
+    "pocsag_decode": {
+      "args": [
+        "--mode",
+        "pocsag",
+        "--rate",
+        "$rate_hz",
+        "--format",
+        "cs16",
+        "--freq",
+        "$center_hz"
+      ],
+      "input": {
+        "stream": "iq",
+        "format": "cs16",
+        "rate_hz": 1000000,
+        "via": "stdin"
+      },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "address": "/address",
+          "function": "/function",
+          "baud": "/baud",
+          "kind": "/type",
+          "text": "/text"
+        }
+      },
+      "extra": {
+        "damaged": "/damaged"
+      }
+    },
+    "flex_decode": {
+      "args": [
+        "--mode",
+        "flex",
+        "--rate",
+        "$rate_hz",
+        "--format",
+        "cs16",
+        "--freq",
+        "$center_hz"
+      ],
+      "input": {
+        "stream": "iq",
+        "format": "cs16",
+        "rate_hz": 1000000,
+        "via": "stdin"
+      },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "capcode": "/address",
+          "baud": "/baud",
+          "levels": "/levels",
+          "kind": "/type",
+          "text": "/text"
+        }
+      },
+      "extra": {
+        "damaged": "/damaged"
+      }
+    },
+    "acars_decode": {
+      "args": [
+        "--mode",
+        "acars",
+        "--rate",
+        "$rate_hz",
+        "--format",
+        "cs16",
+        "--freq",
+        "$center_hz"
+      ],
+      "input": {
+        "stream": "iq",
+        "format": "cs16",
+        "rate_hz": 1000000,
+        "via": "stdin"
+      },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "reg": "/tail",
+          "flight": "/flight",
+          "label": "/label",
+          "msg_no": "/msg_num",
+          "text": "/text",
+          "downlink": "/downlink"
+        }
+      }
+    },
+    "aprs_decode": {
+      "args": [
+        "--mode",
+        "aprs",
+        "--rate",
+        "$rate_hz",
+        "--format",
+        "cs16",
+        "--freq",
+        "$center_hz",
+        "--pcap-port",
+        "$packet_port"
+      ],
+      "input": {
+        "stream": "iq",
+        "format": "cs16",
+        "rate_hz": 240000,
+        "via": "stdin"
+      },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "src": "/from",
+          "dst": "/to",
+          "path": "/path",
+          "info": "/info",
+          "fcs_ok": "/fcs_ok",
+          "lat": "/lat",
+          "lon": "/lon"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap",
+        "link_types": {
+          "3": "ax25"
+        }
+      }
     }
   }
 }
