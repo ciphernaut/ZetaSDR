@@ -6,7 +6,7 @@ Design note for plan 46. The design above it is the operator's, approved 2026-11
 restate either. It records what a read of OnAir (`a63c3a8`) and of the node found for the
 six modes plan 45 left, the scope the operator chose, and the call made for each open
 point. Where this note and the two above differ, this note is the later word; every such
-place is marked **differs**. Status: draft, awaiting the operator's approval.
+place is marked **differs**. Status: approved by the operator 2026-11-23.
 
 ## Intent
 
@@ -154,8 +154,8 @@ as plans of their own.
   handler that lacks a kind of output the mode's in-process handler gives. The mode's
   own ranking still picks it, and so does naming it on the start: both are the operator
   saying so for that mode. **Differs:** plan 45's "no change to how a handler is chosen".
-  *Open: the operator's to confirm (see the question put with this note); the other
-  answer is no rule, with the consequence written into the handler's notes.*
+  Put to the operator as an open point with this rule as the proposal; approved with the
+  note.
 - No change to rows, the page or the operation set.
 
 ## Non-goals
