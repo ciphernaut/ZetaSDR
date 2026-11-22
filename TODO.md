@@ -543,6 +543,17 @@ From the operator, 2026-11-03, after UAT 19.1.A was done by hand. Two tools want
 
 Both are the operator's tools, run on their word (an `allow`-class gate for TX). Specs are to be scheduled; the measured facts from the 19.1.A run (the ring holds just under 10 s, a pin moves the radio where an ensure does not, the 5 % edge mask hides a signal 1 MHz from a 2 MHz capture's centre) go in the first one.
 
+## Sets: a `sondes` set, one wide watch held to the sonde rows
+
+From the operator, 2026-11-22, parked: the handlers arriving with the alternative-handler plans will widen what such a set can start, so it is written once they are in.
+
+A sonde was up and no watch was running; the two started after it landed were an unrestricted wide watch, which spent its identify on a telemetry link and on a stray carrier, and a 100 kHz watch from the page held to one sonde row, beside the sonde's frequency.
+
+- A set, not a plan: sondes follow no channel raster, so a plan would guess frequencies or hold dozens of idle decoders.
+- One member, as `pagers_au` has: a `watch` over the sonde band (400.05-406 MHz as far as one capture reaches) with `modes` naming the sonde rows and a `width_hz` window of about 4-25 kHz.
+- Not several narrow watches: they help only where the frequency is known, and there a pre-placed decoder does better. An optional second member is that decoder, on the frequency the operator's nearest launch site usually uses (the operator's own set, since the frequency is theirs).
+- Unchecked: how a watch picks between several listed `modes` (`pagers_au` lists one), and whether the width window keeps it off wide interference humps and stray carriers. Run it on a recorded capture of the band before it ships.
+
 ## Watch: the identify dwell misses a marginal sonde the detector now sees
 
 Seen on the B210 2026-11-03 during UAT 19.1.D: the watch raised a weak RS41 (5 kHz, 4800 Bd, 15 dB, far off and high up) as `new`, but its identify ended `unknown` and, with `on_unknown: capture`, spent the run's 32 captures on a signal a decoder row proves: at that strength a frame comes only now and then (3 in 10 s, then none in 20 s), so one 5 s dwell sees none. The dwell now grows with the watch's retry (`dwell_scale` 1, 3, then 6 times each row's `identify.dwell_ms`, capped at 60 s). Its cost: the watch runs one identify at a time and starts nothing else meanwhile, and the scale applies to every row an identify tries, so a third try holds back every other new signal for six times the dwells of all the rows it tries: about 2.5 minutes on the sonde band (three sonde rows, M17, P25 and DMR, 24 s of dwell at 1x). Two more edges of that cost: the watch does not cancel a dwelling identify whose signal has gone, so a lost signal still holds the watch for the rest of its dwells; and in a span watch a signal's `tries` also counts the direct-started decoders it lost, so its first identify can already start at 3x. Still open, to spec:
