@@ -1030,6 +1030,7 @@ fn onair_passes_the_bus_modes_checks() {
         "ais_decode",
         "vdl2_decode",
         "rs41_decode",
+        "m20_decode",
     ] {
         let (out, code) = stdout(
             check(dir.path(), &[id, "--handler", "onair", "--strict"])
@@ -1045,6 +1046,7 @@ fn onair_passes_the_bus_modes_checks() {
         assert_eq!(code, 0, "{id}");
     }
     // Not run: hfdl_decode's fixture is still pending (its entry is validated by the
-    // registry test); m20_decode and dfm_decode have no OnAir entry (see TODO.md).
+    // registry test); dfm_decode's row has no test.
     println!("hfdl_decode@onair: not run, its fixture is pending");
+    println!("dfm_decode@onair: not run, its row has no test");
 }
