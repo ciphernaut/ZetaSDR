@@ -9000,7 +9000,10 @@ def close_popup(page):
     """Close the map's open popup, if any, so it covers no marker the next click needs."""
     close = page.locator("#map .leaflet-popup-close-button")
     if close.count() > 0:
-        close.click()
+        # Clicked in the page in one step: a popup redrawn by a subject's next fix replaces the
+        # button, and a locator click waiting for it to hold still then retries until it times
+        # out on a slow runner.
+        close.evaluate_all("(els) => els.forEach((e) => e.click())")
         expect(close).to_have_count(0)
 
 
