@@ -1060,6 +1060,14 @@ async fn job_start_refuses_an_unavailable_graph_row() {
     let mut reg = ModeRegistry::load(&stages(), None);
     let reason = "c2dec: missing (apt install codec2; u) — modes: pocsag_decode";
     reg.set_program("pocsag_decode", None, Some(reason.into()));
+    // OnAir's handler is missing too, whatever this host has, so that no other handler
+    // takes the start the row's own cannot (the node's probe leaves it so).
+    reg.set_handler_program(
+        "pocsag_decode",
+        "onair",
+        None,
+        Some("onair-rx: missing".into()),
+    );
     let node = Node::open_with_modes(
         cfg(dir.path(), &modes),
         stages(),
