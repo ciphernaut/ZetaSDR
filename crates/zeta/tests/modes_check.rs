@@ -1028,13 +1028,23 @@ fn onair_passes_the_bus_modes_checks() {
         "acars_decode",
         "aprs_decode",
         "ais_decode",
+        "vdl2_decode",
+        "rs41_decode",
     ] {
         let (out, code) = stdout(
             check(dir.path(), &[id, "--handler", "onair", "--strict"])
-                .env("ZETA_HANDLER_ONAIR_RX", &program),
+                .env("ZETA_HANDLER_ONAIR_RX", &program)
+                // The VDL2 row's recorded fixture lives in the repository's `modes`.
+                .env(
+                    "ZETA_FIXTURES_DIR",
+                    concat!(env!("CARGO_MANIFEST_DIR"), "/../../modes"),
+                ),
         );
         assert_eq!(out.trim(), format!("{id}@onair: ok"), "{out}");
         println!("{}", out.trim());
         assert_eq!(code, 0, "{id}");
     }
+    // Not run: hfdl_decode's fixture is still pending (its entry is validated by the
+    // registry test); m20_decode and dfm_decode have no OnAir entry (see TODO.md).
+    println!("hfdl_decode@onair: not run, its fixture is pending");
 }

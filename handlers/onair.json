@@ -152,6 +152,59 @@
         "parser": "pcap",
         "link_types": { "101": "raw_ip" }
       }
+    },
+    "vdl2_decode": {
+      "args": [
+        "--mode", "vdl2", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 250000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "icao": "/icao",
+          "addr_type": "/addr_type",
+          "dst": "/dst",
+          "frame_type": "/frame"
+        }
+      },
+      "extra": { "proto": "/proto" }
+    },
+    "hfdl_decode": {
+      "args": [
+        "--mode", "hfdl", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 24000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": { "icao": "/icao", "pdu": "/kind" }
+      },
+      "extra": { "snr_db": "/snr_db", "uplink": "/uplink" }
+    },
+    "rs41_decode": {
+      "args": [
+        "--mode", "rs41", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 2000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "id": "/id",
+          "lat": "/lat",
+          "lon": "/lon",
+          "alt": "/alt_m",
+          "vel_v": "/vspeed_ms",
+          "vel_h": "/hspeed_ms",
+          "sats": "/sats",
+          "batt": "/batt_v"
+        }
+      },
+      "extra": { "temp_c": "/temp_c" }
     }
   }
 }

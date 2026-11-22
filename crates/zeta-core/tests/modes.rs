@@ -1391,12 +1391,15 @@ fn the_embedded_onair_handler_serves_the_bus_modes() {
     let events = [StreamKind::Event];
     let both = [StreamKind::Event, StreamKind::Packet];
     // (mode id, the streams its OnAir entry gives, its input rate)
-    let modes: [(&str, &[StreamKind], u64); 5] = [
+    let modes: [(&str, &[StreamKind], u64); 8] = [
         ("pocsag_decode", &events, 1_000_000),
         ("flex_decode", &events, 1_000_000),
         ("acars_decode", &events, 1_000_000),
         ("aprs_decode", &both, 240_000),
         ("ais_decode", &both, 250_000),
+        ("vdl2_decode", &events, 250_000),
+        ("hfdl_decode", &events, 24_000),
+        ("rs41_decode", &events, 2_000_000),
     ];
     for (id, outputs, rate) in modes {
         assert_eq!(

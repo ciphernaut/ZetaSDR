@@ -971,9 +971,10 @@ async fn a_node_opened_without_the_cli_probes_its_handler_files() {
     assert_eq!(onair.state, zeta_core::modes::ModeState::Unavailable);
     assert_eq!(onair.program, None);
     let reason = onair.reason.clone().unwrap_or_default();
-    assert_eq!(
-        reason,
-        "onair-rx: missing (https://on-air.dev) — modes: adsb_decode"
+    assert!(
+        reason.starts_with("onair-rx: missing (https://on-air.dev) — modes: ")
+            && reason.contains("adsb_decode"),
+        "{reason}"
     );
     let r = h::try_start(&node, Some("onair"), &[]).await;
     assert_eq!(
