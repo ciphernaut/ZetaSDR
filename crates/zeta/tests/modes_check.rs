@@ -16,8 +16,6 @@ const NO_SONDE: [(&str, &str); 3] = [
     ("ZETA_HANDLER_DFM09MOD", "/nonexistent/zeta-test/dfm09mod"),
     ("ZETA_HANDLER_M20MOD", "/nonexistent/zeta-test/m20mod"),
 ];
-/// The aircraft data-link rows' programs, pinned to a path none lives at, whatever the
-/// host has.
 /// The pager decoder's program, pinned to a path none lives at, whatever the host has.
 const NO_MULTIMON: (&str, &str) = (
     "ZETA_HANDLER_MULTIMON_NG",
@@ -27,6 +25,10 @@ const NO_MULTIMON: (&str, &str) = (
 const NO_C2DEC: (&str, &str) = ("ZETA_HANDLER_C2DEC", "/nonexistent/zeta-test/c2dec");
 /// The P25 row's vocoder, pinned to a path none lives at: its check runs without it.
 const NO_ZETA_MBE: (&str, &str) = ("ZETA_HANDLER_ZETA_MBE", "/nonexistent/zeta-test/zeta-mbe");
+/// OnAir's wrapper, pinned to a path none lives at: a test that runs it sets it again.
+const NO_ONAIR_RX: (&str, &str) = ("ZETA_HANDLER_ONAIR_RX", "/nonexistent/zeta-test/onair-rx");
+/// The aircraft data-link rows' programs, pinned to a path none lives at, whatever the
+/// host has.
 const NO_AIRCRAFT_LINKS: [(&str, &str); 2] = [
     ("ZETA_HANDLER_DUMPVDL2", "/nonexistent/zeta-test/dumpvdl2"),
     ("ZETA_HANDLER_DUMPHFDL", "/nonexistent/zeta-test/dumphfdl"),
@@ -34,7 +36,7 @@ const NO_AIRCRAFT_LINKS: [(&str, &str); 2] = [
 
 /// `zeta --state-dir <dir>/state --modes-dir <dir>/modes modes check <args>` with no
 /// remote node, no operator rows but the test's own, and dump1090, the sonde decoders,
-/// dumpvdl2, dumphfdl, multimon-ng, c2dec and zeta-mbe missing.
+/// dumpvdl2, dumphfdl, multimon-ng, c2dec, zeta-mbe and onair-rx missing.
 fn check(dir: &Path, args: &[&str]) -> Command {
     let modes = dir.join("modes");
     std::fs::create_dir_all(&modes).unwrap();
@@ -50,6 +52,7 @@ fn check(dir: &Path, args: &[&str]) -> Command {
         .env(NO_MULTIMON.0, NO_MULTIMON.1)
         .env(NO_C2DEC.0, NO_C2DEC.1)
         .env(NO_ZETA_MBE.0, NO_ZETA_MBE.1)
+        .env(NO_ONAIR_RX.0, NO_ONAIR_RX.1)
         .arg("--state-dir")
         .arg(dir.join("state"))
         .arg("--modes-dir")
@@ -1002,15 +1005,16 @@ fn a_fifo_rows_run_makes_its_subdirectory_under_the_run_dir() {
 }
 
 /// OnAir's entries for the bus modes pass `zeta modes check <id> --handler onair`, each
-/// recorded as `<id>@onair`. It needs `onair-rx`: `ZETA_HANDLER_ONAIR_RX` names it (an
-/// executable file, not looked up on `PATH`), and without it the test says so and passes.
+/// recorded as `<id>@onair`. It needs `onair-rx`: the test-only `ZETA_TEST_ONAIR_RX`
+/// names it (an executable file, not looked up on `PATH`), passed to the node as
+/// `ZETA_HANDLER_ONAIR_RX`; unset, the test says so and passes. The node's own
+/// `ZETA_HANDLER_ONAIR_RX` in the caller's environment is never read: [`check`] pins it.
 #[test]
 fn onair_passes_the_bus_modes_checks() {
     use std::os::unix::fs::PermissionsExt;
-    // Unset: onair-rx is not on this host. Set: it must name an executable file.
-    let Some(program) = std::env::var_os("ZETA_HANDLER_ONAIR_RX").map(std::path::PathBuf::from)
-    else {
-        eprintln!("onair check skipped: onair-rx not found");
+    // Unset: no onair-rx to test. Set: it must name an executable file.
+    let Some(program) = std::env::var_os("ZETA_TEST_ONAIR_RX").map(std::path::PathBuf::from) else {
+        eprintln!("onair check skipped: ZETA_TEST_ONAIR_RX is not set");
         return;
     };
     let executable = program
@@ -1018,7 +1022,7 @@ fn onair_passes_the_bus_modes_checks() {
         .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
     assert!(
         executable,
-        "ZETA_HANDLER_ONAIR_RX is set to {}, which is not an executable file",
+        "ZETA_TEST_ONAIR_RX is set to {}, which is not an executable file",
         program.display()
     );
     let dir = tempfile::tempdir().unwrap();

@@ -951,14 +951,37 @@ async fn a_named_handler_that_is_unavailable_is_refused_with_its_reason() {
     assert_eq!(listed(&node, &id).handler.as_deref(), Some(OWN));
 }
 
+/// Set in the re-run of [`a_node_opened_without_the_cli_probes_its_handler_files`] whose
+/// environment pins `onair-rx` missing.
+const NO_ONAIR_CHILD: &str = "ZETA_JOBS_NO_ONAIR_CHILD";
+
 /// A node opened directly (no `zeta` crate probe before it) looks up its handler files'
 /// programs itself: the embedded OnAir with no `onair-rx` is unavailable, with the
 /// lookup's reason, and a start naming it is refused with that reason rather than
-/// failing at launch.
+/// failing at launch. The lookup reads the process's environment, so the test re-runs
+/// itself in a child whose `ZETA_HANDLER_ONAIR_RX` names no program (no `set_var` in a
+/// threaded test binary): whatever the developer's shell or `PATH` has, it is missing.
 #[tokio::test]
 async fn a_node_opened_without_the_cli_probes_its_handler_files() {
-    if let Some(p) = zeta_core::modes::handlers::find_handler(&["onair-rx".into()]) {
-        eprintln!("skipped: onair-rx is installed here ({})", p.display());
+    if std::env::var_os(NO_ONAIR_CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_node_opened_without_the_cli_probes_its_handler_files",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(NO_ONAIR_CHILD, "1")
+            .env("ZETA_HANDLER_ONAIR_RX", "/nonexistent/zeta-test/onair-rx")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{text}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(text.contains("1 passed"), "{text}");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -971,10 +994,11 @@ async fn a_node_opened_without_the_cli_probes_its_handler_files() {
     assert_eq!(onair.state, zeta_core::modes::ModeState::Unavailable);
     assert_eq!(onair.program, None);
     let reason = onair.reason.clone().unwrap_or_default();
-    assert!(
-        reason.starts_with("onair-rx: missing (https://on-air.dev) — modes: ")
-            && reason.contains("adsb_decode"),
-        "{reason}"
+    assert_eq!(
+        reason,
+        "onair-rx: missing (https://on-air.dev) — modes: acars_decode, adsb_decode, \
+         ais_decode, aprs_decode, dfm_decode, flex_decode, hfdl_decode, m20_decode, \
+         pocsag_decode, rs41_decode, vdl2_decode"
     );
     let r = h::try_start(&node, Some("onair"), &[]).await;
     assert_eq!(

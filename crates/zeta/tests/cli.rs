@@ -19,13 +19,15 @@ fn zeta_bin() -> Command {
     cmd.env_remove("ZETA_NODE")
         .env_remove("ZETA_SECRET")
         .env("XDG_CONFIG_HOME", common::no_xdg_config())
-        // multimon-ng and c2dec are pinned missing, whatever the host has: a test that
-        // wants the FLEX row ready, or M17 with its speech, sets them again.
+        // multimon-ng, c2dec and onair-rx are pinned missing, whatever the host has: a
+        // test that wants the FLEX row ready, M17 with its speech, or OnAir's handler
+        // ready, sets them again.
         .env(
             "ZETA_HANDLER_MULTIMON_NG",
             "/nonexistent/zeta-test/multimon-ng",
         )
-        .env("ZETA_HANDLER_C2DEC", "/nonexistent/zeta-test/c2dec");
+        .env("ZETA_HANDLER_C2DEC", "/nonexistent/zeta-test/c2dec")
+        .env("ZETA_HANDLER_ONAIR_RX", "/nonexistent/zeta-test/onair-rx");
     cmd
 }
 
@@ -4316,18 +4318,14 @@ fn handlers_list_names_each_modes_handlers() {
         .filter(|l| l.starts_with("adsb_decode "))
         .collect();
     // dump1090's Beast output is its packets; the embedded onair follows alt (by id),
-    // ready or not as this host has `onair-rx`.
+    // unavailable: `onair-rx` is pinned missing.
     assert_eq!(
-        adsb[..2],
+        adsb,
         [
             "adsb_decode dump1090 ready event,packet",
-            "adsb_decode alt unavailable event"
+            "adsb_decode alt unavailable event",
+            "adsb_decode onair unavailable event,packet"
         ],
-        "{out}"
-    );
-    assert_eq!(adsb.len(), 3, "{out}");
-    assert!(
-        adsb[2].starts_with("adsb_decode onair ") && adsb[2].ends_with(" event,packet"),
         "{out}"
     );
     assert!(
