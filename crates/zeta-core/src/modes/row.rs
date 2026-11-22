@@ -741,7 +741,7 @@ pub enum InputVia {
 /// What the program writes and how zeta reads it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields, transform = require_all)]
+#[schemars(deny_unknown_fields, transform = program_output_schema)]
 pub struct ProgramOutput {
     pub via: OutputVia,
     /// With `via: tcp`, the port (`"$port"`, the one zeta picks); `null` otherwise.
@@ -752,6 +752,10 @@ pub struct ProgramOutput {
     /// non-null value winning; `null` takes the whole object.
     #[serde(default)]
     pub fields: Option<BTreeMap<String, FieldPath>>,
+    /// Event field ← constant, set on every event after the field map. Only a handler
+    /// file's entry gives them (its `const`); a row's own `decoder.output` is refused one.
+    #[serde(default, rename = "const", skip_serializing_if = "BTreeMap::is_empty")]
+    pub consts: BTreeMap<String, serde_json::Value>,
 }
 
 /// Where in a program's parsed line an event field is read, in one of three forms:
@@ -921,6 +925,14 @@ pub struct RowTest {
 /// Make every property of an object schema required, without a `default`: a field a row
 /// file may leave out (`#[serde(default)]`) is always present, `null` when absent, in
 /// what the node reports.
+/// [`require_all`], except `const`, which a row may leave out.
+fn program_output_schema(schema: &mut schemars::Schema) {
+    require_all(schema);
+    if let Some(r) = schema.get_mut("required").and_then(|r| r.as_array_mut()) {
+        r.retain(|n| n != "const");
+    }
+}
+
 pub(crate) fn require_all(schema: &mut schemars::Schema) {
     let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) else {
         return;
@@ -1296,6 +1308,14 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
                 return Err(absent(format!("derive[{i}].into.{key}")));
             }
         }
+    }
+    if let Decoder::Program(p) = &row.decoder
+        && !p.output.consts.is_empty()
+    {
+        return Err(RowError::new(
+            "decoder.output.const",
+            "only a handler file's entry gives constants",
+        ));
     }
     if let Decoder::Program(ProgramBlock {
         output: ProgramOutput {

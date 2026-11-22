@@ -560,6 +560,7 @@ pub async fn run_row(
         parser: block.output.parser,
         fields: block.output.fields.as_ref(),
         extra: p.extra,
+        consts: &block.output.consts,
         out,
         bus: &bus,
         source: &ctx.source,
@@ -736,6 +737,8 @@ struct Publisher<'a> {
     fields: Option<&'a BTreeMap<String, FieldPath>>,
     /// The handler's `extra` fields, added beside the mapped ones.
     extra: &'a BTreeMap<String, FieldPath>,
+    /// The handler's constants, set on every event after the mapped fields.
+    consts: &'a BTreeMap<String, Value>,
     out: StreamId,
     bus: &'a StreamBus,
     source: &'a SourceId,
@@ -912,6 +915,9 @@ impl Publisher<'_> {
         }
         if let (Value::Object(m), Some(Value::Object(extra))) = (&mut fields, extra) {
             m.extend(extra);
+        }
+        if let Value::Object(m) = &mut fields {
+            m.extend(self.consts.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
         let prov = provenance(&self.last_prov, self.source);
         let mut ev = zeta_core::modes::summary::envelope(
@@ -1382,12 +1388,14 @@ mod tests {
         let mut rx = bus.subscribe(&out).unwrap();
         let source = SourceId("s".into());
         let extra = BTreeMap::new();
+        let consts = BTreeMap::new();
         let publisher = |replay| Publisher {
             row: &row,
             handler: "h",
             parser: Parser::JsonLines,
             fields: None,
             extra: &extra,
+            consts: &consts,
             out: out.clone(),
             bus: &bus,
             source: &source,
@@ -1409,6 +1417,57 @@ mod tests {
         assert_eq!(seen(&mut rx)["replay"], "01CAP");
         publisher(None).publish(br#"{"icao":"7C6B2E"}"#);
         assert!(seen(&mut rx).get("replay").is_none());
+    }
+
+    /// The constants land after the field map, over a mapped value; the envelope's own
+    /// `protocol` still wins, so the test names another field.
+    #[test]
+    fn constants_are_set_after_the_fields() {
+        let row = zeta_core::modes::parse(include_str!("../../../modes/adsb_decode.json")).unwrap();
+        let bus = StreamBus::new(8);
+        let prov = Provenance {
+            source: SourceId("s".into()),
+            job: None,
+            channel: None,
+            span: Span {
+                start_ns: Timestamp(1),
+                end_ns: Timestamp(2),
+            },
+        };
+        let out = bus.register(StreamKind::Event, prov);
+        let mut rx = bus.subscribe(&out).unwrap();
+        let source = SourceId("s".into());
+        let fields = BTreeMap::from([
+            ("msg".to_string(), FieldPath::One("/a".into())),
+            ("squawk".to_string(), FieldPath::One("/squawk".into())),
+        ]);
+        let extra = BTreeMap::new();
+        let consts = BTreeMap::from([("squawk".to_string(), serde_json::json!("7700"))]);
+        let publisher = Publisher {
+            row: &row,
+            handler: "h",
+            parser: Parser::JsonLines,
+            fields: Some(&fields),
+            extra: &extra,
+            consts: &consts,
+            out,
+            bus: &bus,
+            source: &source,
+            replay: None,
+            last_prov: Arc::new(Mutex::new(None)),
+            notes: Arc::new(Notes {
+                ctx: StageContext::new(source.clone()),
+                external: Mutex::new(serde_json::Map::new()),
+            }),
+            unparsed: Mutex::new(Unparsed::default()),
+        };
+        publisher.publish(br#"{"a": 7, "squawk": "x", "other": 1}"#);
+        let Payload::Event(ev) = rx.try_recv().unwrap().payload else {
+            panic!("an event")
+        };
+        assert_eq!(ev["msg"], 7);
+        assert_eq!(ev["squawk"], "7700");
+        assert!(ev.get("other").is_none());
     }
 
     fn conv(format: SampleFormat, x: &[Complex<f32>]) -> Vec<u8> {

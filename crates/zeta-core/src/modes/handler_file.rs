@@ -50,6 +50,10 @@ pub struct HandlerEntry {
     /// `output.fields` reads; empty for none.
     #[serde(default)]
     pub extra: BTreeMap<String, FieldPath>,
+    /// Row event fields given a constant value on every event, after the field map
+    /// (`{"protocol": "pocsag"}`); empty for none.
+    #[serde(default, rename = "const")]
+    pub consts: BTreeMap<String, serde_json::Value>,
 }
 
 /// A [`HandlerEntry`] as a file writes it, every key at one level.
@@ -69,6 +73,10 @@ struct EntryFields {
     /// `output.fields` reads; empty for none.
     #[serde(default)]
     extra: BTreeMap<String, FieldPath>,
+    /// Row event fields given a constant value on every event, after the field map
+    /// (`{"protocol": "pocsag"}`); empty for none.
+    #[serde(default, rename = "const")]
+    consts: BTreeMap<String, serde_json::Value>,
 }
 
 impl From<EntryFields> for HandlerEntry {
@@ -82,6 +90,7 @@ impl From<EntryFields> for HandlerEntry {
                 demod: e.demod,
             },
             extra: e.extra,
+            consts: e.consts,
         }
     }
 }
@@ -106,11 +115,13 @@ impl HandlerEntry {
     /// entry's `args`, `input`, `output`, `packets` and `demod`.
     pub fn program_block(&self, file: &HandlerFile) -> ProgramBlock {
         let b = &self.block;
+        let mut output = b.output.clone();
+        output.consts = self.consts.clone();
         ProgramBlock {
             programs: file.programs.clone(),
             args: b.args.clone(),
             input: b.input.clone(),
-            output: b.output.clone(),
+            output,
             install: file.install.clone(),
             demod: b.demod.clone(),
             packets: b.packets.clone(),
@@ -270,6 +281,58 @@ pub fn validate_entry(
         }
         check_path(path, &at)?;
     }
+    for (key, value) in &entry.consts {
+        check_const(key, value, row, properties, entry)?;
+    }
+    Ok(())
+}
+
+/// One `const` of an entry: a field of the row's event schema, not also read from the
+/// program, not the subject key, and a scalar the schema's `type` accepts.
+fn check_const(
+    key: &str,
+    value: &serde_json::Value,
+    row: &ModeRow,
+    properties: &serde_json::Map<String, serde_json::Value>,
+    entry: &HandlerEntry,
+) -> Result<(), RowError> {
+    let at = format!("const.{key}");
+    let Some(property) = properties.get(key) else {
+        return Err(error(at, "not in the row's event schema"));
+    };
+    let read = entry
+        .block
+        .output
+        .fields
+        .as_ref()
+        .is_some_and(|f| f.contains_key(key));
+    if row.subject.as_ref().is_some_and(|s| s.key == key) {
+        return Err(error(at, "the row's subject key is read from the program"));
+    }
+    if read || entry.extra.contains_key(key) {
+        return Err(error(at, "also read from the program"));
+    }
+    let kind = |t: &str| match t {
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        _ => false,
+    };
+    let types: Vec<&str> = match &property["type"] {
+        serde_json::Value::String(t) => vec![t.as_str()],
+        serde_json::Value::Array(a) => a.iter().filter_map(|t| t.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    if types.is_empty() || !types.iter().any(|t| kind(t)) {
+        let named = if types.is_empty() {
+            "scalar".to_string()
+        } else {
+            types.join(" or ")
+        };
+        return Err(error(at, format!("not a {named}")));
+    }
     Ok(())
 }
 
@@ -366,7 +429,9 @@ mod tests {
         let keys: Vec<&str> = entry.keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            ["args", "demod", "extra", "input", "output", "packets"]
+            [
+                "args", "const", "demod", "extra", "input", "output", "packets"
+            ]
         );
     }
 
@@ -434,5 +499,112 @@ mod tests {
                 format!("extra.{name}: the event envelope sets it")
             );
         }
+    }
+
+    fn typed_row() -> ModeRow {
+        let mut row =
+            super::super::parse(include_str!("../../../../modes/adsb_decode.json")).unwrap();
+        row.event.schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "icao": {"type": "string"},
+                "address": {"type": "integer"},
+                "kind": {"type": ["string", "null"]},
+                "obj": {"type": "object"},
+                "protocol": {"type": "string"}
+            }
+        });
+        row
+    }
+
+    #[test]
+    fn an_entry_gives_constants() {
+        let row = typed_row();
+        let f = parse_handler_file(&file(|v| {
+            v["modes"]["adsb_decode"]["const"] = serde_json::json!({"protocol": "pocsag"});
+        }))
+        .unwrap()
+        .0;
+        let e = &f.modes["adsb_decode"];
+        validate_entry(&f, e, &row).unwrap();
+        assert_eq!(
+            e.program_block(&f).output.consts["protocol"],
+            serde_json::json!("pocsag")
+        );
+    }
+
+    #[test]
+    fn a_constant_must_fit_the_row() {
+        let row = typed_row();
+        let refused = |row: &ModeRow, edit: &dyn Fn(&mut serde_json::Value)| {
+            let f = parse_handler_file(&file(|v| edit(&mut v["modes"]["adsb_decode"])))
+                .unwrap()
+                .0;
+            let e = validate_entry(&f, &f.modes["adsb_decode"], row).unwrap_err();
+            (e.field, e.error)
+        };
+        let one = |key: &'static str, value: serde_json::Value| {
+            refused(&row, &move |m| {
+                m["const"] = serde_json::json!({ key: value.clone() })
+            })
+        };
+        let is = |f: &str, e: &str| (f.to_string(), e.to_string());
+        assert_eq!(
+            one("nope", 1.into()),
+            is("const.nope", "not in the row's event schema")
+        );
+        assert_eq!(
+            one("df", 1.into()),
+            is("const.df", "not in the row's event schema")
+        );
+        assert_eq!(
+            one("address", "x".into()),
+            is("const.address", "not a integer")
+        );
+        assert_eq!(
+            one("address", 1.5.into()),
+            is("const.address", "not a integer")
+        );
+        assert_eq!(
+            one("kind", 3.into()),
+            is("const.kind", "not a string or null")
+        );
+        assert_eq!(
+            one("protocol", serde_json::Value::Null),
+            is("const.protocol", "not a string")
+        );
+        assert_eq!(
+            one("protocol", serde_json::json!({"a": 1})),
+            is("const.protocol", "not a string")
+        );
+        assert_eq!(
+            one("protocol", serde_json::json!(["a"])),
+            is("const.protocol", "not a string")
+        );
+        assert_eq!(
+            one("icao", "7C6B2E".into()),
+            is(
+                "const.icao",
+                "the row's subject key is read from the program"
+            )
+        );
+        // Also read by the map (an `extra` name is never in the schema, so cannot be both).
+        assert_eq!(
+            refused(&row, &|m| {
+                m["output"]["fields"]["protocol"] = "/p".into();
+                m["const"] = serde_json::json!({"protocol": "x"});
+            }),
+            is("const.protocol", "also read from the program")
+        );
+        // One bad and one good entry: the good one loads.
+        let (f, broken) = parse_handler_file(&file(|v| {
+            v["modes"]["pocsag_decode"] = v["modes"]["adsb_decode"].clone();
+            v["modes"]["pocsag_decode"]["const"] = serde_json::json!({"protocol": "pocsag"});
+            v["modes"]["adsb_decode"]["const"] = serde_json::json!({"protocol": {"a": 1}});
+        }))
+        .unwrap();
+        assert!(broken.is_empty());
+        validate_entry(&f, &f.modes["pocsag_decode"], &row).unwrap();
+        assert!(validate_entry(&f, &f.modes["adsb_decode"], &row).is_err());
     }
 }

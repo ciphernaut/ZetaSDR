@@ -10,7 +10,10 @@ row's own decoder. The node embeds the `*.json` files here and reads the operato
   [`decoder`](../modes/adsb_decode.json) has them.
 - `modes`: by mode id, a program block as a program row's (`args`, `input`, `output`,
   optional `packets` and `demod`), whose `output.fields` maps the row's subject key, and
-  `extra`: fields the handler adds that the row's event schema lacks.
+  `extra`: fields the handler adds that the row's event schema lacks, and
+  `const`: row event fields given a constant value (a string, number, boolean or null the
+  schema's `type` accepts) on every event, after the field map; not the subject key, nor a
+  field the program also gives.
 
 A broken file, or an entry naming no mode or failing validation, is reported at startup
 and never stops the node.

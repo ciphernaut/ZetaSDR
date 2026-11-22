@@ -2038,3 +2038,25 @@ async fn a_node_with_no_handlers_beyond_the_rows_lists_modes_as_before() {
     assert_eq!(state("rs41_decode"), ModeState::Unavailable);
     assert_eq!(state("junk_mode"), ModeState::Broken);
 }
+
+/// A program row's own `decoder.output` takes no `const`: only a handler file's entry does.
+#[test]
+fn a_row_refuses_constants_of_its_own() {
+    let (_, text) = ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("adsb_decode.json"))
+        .expect("embedded adsb_decode");
+    let mut v: serde_json::Value = serde_json::from_str(text).unwrap();
+    // Without constants a row serialises as before.
+    let row = parse(text).unwrap();
+    assert!(
+        serde_json::to_value(&row).unwrap()["decoder"]["output"]
+            .get("const")
+            .is_none()
+    );
+    v["decoder"]["output"]["const"] = serde_json::json!({"msg": 1});
+    let row = parse(&v.to_string()).unwrap();
+    let e = validate(&row, &stages()).unwrap_err();
+    assert_eq!(e.field, "decoder.output.const", "{e}");
+    assert_eq!(e.error, "only a handler file's entry gives constants");
+}
