@@ -937,6 +937,20 @@ fn fake_handlers(dir: &Path) -> PathBuf {
         let name = format!("{}.json", file["id"].as_str().unwrap());
         std::fs::write(handlers.join(&name), text).unwrap_or_else(|e| panic!("write {name}: {e}"));
     }
+    // The embedded `onair` file serves many rows (APRS among them), which would add a third
+    // handler to every scenario written for `builtin` and `alt`. An operator file replaces the
+    // embedded one of its id: this one keeps only OnAir's ADS-B entry.
+    let mut onair: serde_json::Value =
+        serde_json::from_str(include_str!("../../../handlers/onair.json")).expect("onair.json");
+    onair["modes"]
+        .as_object_mut()
+        .expect("onair.json modes")
+        .retain(|mode, _| mode == "adsb_decode");
+    std::fs::write(
+        handlers.join("onair.json"),
+        serde_json::to_string_pretty(&onair).unwrap(),
+    )
+    .expect("write onair.json");
     handlers
 }
 
@@ -1286,6 +1300,9 @@ impl Nodes {
             &[
                 ("ZETA_HANDLER_FAKE_LINES", fake_lines),
                 ("ZETA_HANDLER_DUMP1090", fake_dump1090),
+                // OnAir stays unavailable whatever this host has installed, so the
+                // scenarios see the same handlers everywhere.
+                ("ZETA_HANDLER_ONAIR_RX", "/nonexistent/zeta-test/onair-rx"),
                 ("ZETA_PLUGIN_ENV_FAKE_LINES", FAKE_POS_LINES),
                 ("ZETA_PLUGIN_ENV_FAKE_AFTER_BYTES", FAKE_POS_AFTER_BYTES),
             ],
