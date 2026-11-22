@@ -250,6 +250,100 @@
         }
       },
       "extra": { "temp_c": "/temp_c" }
+    },
+    "rds_decode": {
+      "args": [
+        "--mode", "rds", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 500000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "pi": "/pi",
+          "group": "/group",
+          "pty": "/pty",
+          "tp": "/tp",
+          "ps": "/ps",
+          "rt": "/rt"
+        }
+      }
+    },
+    "dmr_decode": {
+      "args": [
+        "--mode", "dmr", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 48000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "type": "/type",
+          "src": "/src",
+          "dst": "/dst",
+          "call": "/call",
+          "encrypted": "/encrypted",
+          "emergency": "/emergency",
+          "silent": "/silent",
+          "color_code": "/color_code",
+          "slot": "/slot",
+          "eot": "/eot",
+          "control": "/control",
+          "network": "/network"
+        }
+      },
+      "const": { "audio": false },
+      "extra": { "alias": "/alias" }
+    },
+    "p25_decode": {
+      "args": [
+        "--mode", "p25", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 250000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "type": "/type",
+          "src": "/src",
+          "dst": "/dst",
+          "call": "/call",
+          "encrypted": "/encrypted",
+          "emergency": "/emergency",
+          "silent": "/silent",
+          "nac": "/nac",
+          "algid": "/algid",
+          "kid": "/kid",
+          "eot": "/eot",
+          "control": "/control",
+          "network": "/network"
+        }
+      },
+      "const": { "audio": false }
+    },
+    "m17_decode": {
+      "args": [
+        "--mode", "m17", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 250000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "src": "/src",
+          "dst": "/dst",
+          "can": "/can",
+          "type": "/type",
+          "encryption": "/encryption",
+          "lat": "/lat",
+          "lon": "/lon",
+          "eot": "/eot"
+        }
+      }
     }
   }
 }

@@ -1035,6 +1035,10 @@ fn onair_passes_the_bus_modes_checks() {
         "vdl2_decode",
         "rs41_decode",
         "m20_decode",
+        "rds_decode",
+        "dmr_decode",
+        "p25_decode",
+        "m17_decode",
     ] {
         let (out, code) = stdout(
             check(dir.path(), &[id, "--handler", "onair", "--strict"])

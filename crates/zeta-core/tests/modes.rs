@@ -1378,8 +1378,8 @@ fn a_handler_file_adds_a_handler_to_each_mode_it_lists() {
     assert_eq!(builtin.state, ModeState::Ready);
     assert_eq!(builtin.outputs, reg.get("aprs_decode").unwrap().outputs);
     assert_eq!(reg.program_block("aprs_decode", "builtin"), None);
-    // A graph row with helper programs is `builtin` and in process too.
-    assert_eq!(handler_ids(&reg, "dmr_decode"), ["builtin"]);
+    // A graph row with helper programs is `builtin` and in process too, OnAir's after it.
+    assert_eq!(handler_ids(&reg, "dmr_decode"), ["builtin", "onair"]);
     assert!(reg.handler("dmr_decode", "builtin").unwrap().in_process);
 }
 
@@ -1399,7 +1399,7 @@ fn the_embedded_onair_handler_serves_the_bus_modes() {
     let events = [StreamKind::Event];
     let both = [StreamKind::Event, StreamKind::Packet];
     // (mode id, the streams its OnAir entry gives, its input rate)
-    let modes: [(&str, &[StreamKind], u64); 10] = [
+    let modes: [(&str, &[StreamKind], u64); 14] = [
         ("pocsag_decode", &events, 1_000_000),
         ("flex_decode", &events, 1_000_000),
         ("acars_decode", &events, 1_000_000),
@@ -1410,6 +1410,10 @@ fn the_embedded_onair_handler_serves_the_bus_modes() {
         ("rs41_decode", &events, 2_000_000),
         ("dfm_decode", &events, 2_000_000),
         ("m20_decode", &events, 2_000_000),
+        ("rds_decode", &events, 500_000),
+        ("dmr_decode", &events, 48_000),
+        ("p25_decode", &events, 250_000),
+        ("m17_decode", &events, 250_000),
     ];
     for (id, outputs, rate) in modes {
         assert_eq!(
@@ -1446,6 +1450,15 @@ fn the_embedded_onair_handler_serves_the_bus_modes() {
         reg.handler_consts("acars_decode", "onair"),
         std::collections::BTreeMap::from([("crc_ok".to_string(), serde_json::json!(true))])
     );
+    // The voice modes' audio is not tapped: DMR and P25 say so, M17's row has no such field.
+    for id in ["dmr_decode", "p25_decode"] {
+        assert_eq!(
+            reg.handler_consts(id, "onair"),
+            std::collections::BTreeMap::from([("audio".to_string(), serde_json::json!(false))]),
+            "{id}"
+        );
+    }
+    assert!(reg.handler_consts("m17_decode", "onair").is_empty());
 }
 
 /// `handlers/onair.json` ships in the node: OnAir is `adsb_decode`'s second handler,
