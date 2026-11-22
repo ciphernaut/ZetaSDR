@@ -855,6 +855,15 @@ Keep live examples out of the repository: no site names, frequencies, distances 
 
 Cleanup round 2 gave plans named channel groups (`channel_plans` `groups`) and `plan_start` a `group` in place of `channels`, but a set's `plan_start` member has no `group` field (`Member::PlanStart` in `sets.rs`, whose check passes `(channels, None)` to `check_plan_start_fields`), so a set file still types a channel list where a group would do. Add `group` to the member, exclusive with `channels`, checked at load and started as `plan_start` takes it.
 
+## Sets and plans: the operator's own, kept on the host
+
+From the operator, 2026-11-22, parked. A node already reads the operator's sets from `--sets-dir`, but two things an operator's set needs still mean a code change or a step by hand after every `set_start`.
+
+- **A `job_start` member cannot carry an attach.** Only `Member::PlanStart` has `attach` and `language` (`sets.rs`), and a plan is a numbered raster. A set of single-frequency voice members, the usual shape of an operator's set built from licensed or measured centres, starts its demodulators and decoders and leaves every `transcribe` to `job_attach` by hand, lost again at `set_stop`. Give the member `attach`, `language` and, for a kind with several voices, `stream` (a list, so one member can have both slots transcribed), checked at load as `job_attach` checks them, started with the member, recorded in the set's instance and stopped with it.
+- **Channel plans are compiled in.** `plans.rs` holds each `ChannelPlan` as a constant in `PLANS`, so an operator cannot add one without a build. Read operator plans from a `--plans-dir` (default `$XDG_CONFIG_HOME/zetasdr/plans`), one `*.json` file each, with the mode registry's rules as sets have them: read after the built-in ones, an operator plan with a built-in's `id` replaces it, a file that does not parse or validate is listed `broken` and never stops the node. A plan file lists its channels either as segments on a raster or as explicit centres with their own numbers, since an operator's channels are often assignments that share no raster; `no_voice`, `deviation_hz`, notes and groups as the built-in plans have them. `channel_plans`, `plan_start`, `jobs_stop` and a set's `plan_start` member then take them as they take a built-in plan.
+
+Both are data on the host, never in the repository: the files name the operator's own frequencies.
+
 ## Plans: a `pocsag_au` channel plan
 
 From the operator, 2026-11-09: there is no POCSAG channel plan, only the `pagers_au` set (a span watch that starts decoders on carriers it detects). An always-on plan (one pocsag_decode per register-assigned pager channel in the region, as `acars_vhf` does for ACARS) would decode a quiet channel's first page without waiting for detection. Build it from the register's assignments rather than a hand list, and keep the set as the default.
