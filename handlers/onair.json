@@ -190,6 +190,56 @@
           "3": "ax25"
         }
       }
+    },
+    "ais_decode": {
+      "args": [
+        "--mode",
+        "ais",
+        "--rate",
+        "$rate_hz",
+        "--format",
+        "cs16",
+        "--freq",
+        "$center_hz",
+        "--pcap-port",
+        "$packet_port"
+      ],
+      "input": {
+        "stream": "iq",
+        "format": "cs16",
+        "rate_hz": 250000,
+        "via": "stdin"
+      },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "mmsi": "/mmsi",
+          "msg_type": "/msg_type",
+          "channel": "/channel",
+          "repeat": "/repeat",
+          "nmea": "/nmea",
+          "lat": "/lat",
+          "lon": "/lon",
+          "sog_kt": "/sog_kt",
+          "cog_deg": "/cog_deg",
+          "heading_deg": "/heading_deg",
+          "nav_status": "/nav_status",
+          "name": "/name",
+          "callsign": "/callsign",
+          "destination": "/destination",
+          "imo": "/imo",
+          "ship_type": "/ship_type"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap",
+        "link_types": {
+          "101": "raw_ip"
+        }
+      }
     }
   }
 }

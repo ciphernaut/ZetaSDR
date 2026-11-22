@@ -1391,11 +1391,12 @@ fn the_embedded_onair_handler_serves_the_bus_modes() {
     let events = [StreamKind::Event];
     let both = [StreamKind::Event, StreamKind::Packet];
     // (mode id, the streams its OnAir entry gives, its input rate)
-    let modes: [(&str, &[StreamKind], u64); 4] = [
+    let modes: [(&str, &[StreamKind], u64); 5] = [
         ("pocsag_decode", &events, 1_000_000),
         ("flex_decode", &events, 1_000_000),
         ("acars_decode", &events, 1_000_000),
         ("aprs_decode", &both, 240_000),
+        ("ais_decode", &both, 250_000),
     ];
     for (id, outputs, rate) in modes {
         assert_eq!(
@@ -1420,6 +1421,12 @@ fn the_embedded_onair_handler_serves_the_bus_modes() {
     assert_eq!(
         packets.link_type_numbers().into_iter().collect::<Vec<_>>(),
         [(3, zeta_core::stream::LinkType::Ax25)]
+    );
+    let ais = reg.program_block("ais_decode", "onair").unwrap();
+    let packets = ais.packets.as_ref().expect("onair's AIS packets");
+    assert_eq!(
+        packets.link_type_numbers().into_iter().collect::<Vec<_>>(),
+        [(101, zeta_core::stream::LinkType::RawIp)]
     );
 }
 
@@ -1624,8 +1631,7 @@ fn a_malformed_entry_breaks_only_itself() {
         reg.handler("adsb_decode", "alt").unwrap().state,
         ModeState::Ready
     );
-    assert_eq!(handler_ids(&reg, "ais_decode")[..1], ["builtin"]);
-    assert_eq!(handler_ids(&reg, "ais_decode").len(), 1);
+    assert_eq!(handler_ids(&reg, "ais_decode"), ["builtin", "onair"]);
     let lines = reg.startup_lines();
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(

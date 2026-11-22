@@ -1023,6 +1023,7 @@ fn onair_passes_the_bus_modes_checks() {
         "flex_decode",
         "acars_decode",
         "aprs_decode",
+        "ais_decode",
     ] {
         let (out, code) = stdout(
             check(dir.path(), &[id, "--handler", "onair", "--strict"])
