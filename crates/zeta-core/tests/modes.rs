@@ -1375,9 +1375,9 @@ fn a_handler_file_adds_a_handler_to_each_mode_it_lists() {
     assert!(reg.handler("dmr_decode", "builtin").unwrap().in_process);
 }
 
-/// `handlers/onair.json` ships in the node: OnAir is `adsb_decode`'s second handler,
-/// giving events and packets, ready when `onair-rx` is found and otherwise unavailable
-/// with the probe's line; never broken. The row's own handler gives packets too.
+/// `handlers/onair.json` serves the bus modes: each is a handler of its row, last in its
+/// list, whose program is `onair-rx`, at the receiver's input rate; the modes with packets
+/// give events and packets, the others events only; none is broken.
 #[test]
 fn the_embedded_onair_handler_serves_the_bus_modes() {
     let mut reg = ModeRegistry::load(&stages(), None);
@@ -1430,6 +1430,9 @@ fn the_embedded_onair_handler_serves_the_bus_modes() {
     );
 }
 
+/// `handlers/onair.json` ships in the node: OnAir is `adsb_decode`'s second handler,
+/// giving events and packets, ready when `onair-rx` is found and otherwise unavailable
+/// with the probe's line; never broken. The row's own handler gives packets too.
 #[test]
 fn the_embedded_onair_handler_serves_adsb() {
     let mut reg = ModeRegistry::load(&stages(), None);

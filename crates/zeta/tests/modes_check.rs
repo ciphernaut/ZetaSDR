@@ -1007,16 +1007,20 @@ fn a_fifo_rows_run_makes_its_subdirectory_under_the_run_dir() {
 #[test]
 fn onair_passes_the_bus_modes_checks() {
     use std::os::unix::fs::PermissionsExt;
-    let program = std::env::var_os("ZETA_HANDLER_ONAIR_RX")
-        .map(std::path::PathBuf::from)
-        .filter(|p| {
-            p.metadata()
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        });
-    let Some(program) = program else {
+    // Unset: onair-rx is not on this host. Set: it must name an executable file.
+    let Some(program) = std::env::var_os("ZETA_HANDLER_ONAIR_RX").map(std::path::PathBuf::from)
+    else {
         eprintln!("onair check skipped: onair-rx not found");
         return;
     };
+    let executable = program
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    assert!(
+        executable,
+        "ZETA_HANDLER_ONAIR_RX is set to {}, which is not an executable file",
+        program.display()
+    );
     let dir = tempfile::tempdir().unwrap();
     for id in [
         "pocsag_decode",
