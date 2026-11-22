@@ -16,5 +16,11 @@ row's own decoder. The node embeds the `*.json` files here and reads the operato
   key the event envelope sets (`protocol`, `handler`, `summary`, `t_ns`, `position`,
   `access`), the subject key, nor a field the program also gives.
 
+The operator's node-wide handler ranking does not prefer a handler whose `outputs` lack a
+kind the mode's own decoder gives (events but no audio, on a voice mode): that handler is
+ordered as if the ranking did not name it, so one entry cannot take speech away from every
+voice job. Rank it for the mode, or name it when starting a job, to run it; nothing is
+excluded, and it runs when it is the best one ready.
+
 A broken file, or an entry naming no mode or failing validation, is reported at startup
 and never stops the node.

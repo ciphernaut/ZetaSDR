@@ -44,6 +44,12 @@ pub struct Passed {
 /// kind of `needs`, ordered by the mode's ranking, the node-wide ranking, in-process
 /// first, then `handlers`' own order.
 ///
+/// The node-wide ranking counts for a handler only when its outputs hold every kind the
+/// first handler (the row's own decoder) gives; one that gives less is ordered as if the
+/// ranking did not name it, so a ranking of events-only handlers cannot take speech away
+/// from every voice job. The mode's own ranking is not so limited, and nothing is
+/// excluded: such a handler is still picked when it is the best one left.
+///
 /// With none left, every handler and why it was passed over, in `handlers`' order.
 pub fn pick<'a>(
     mode: &str,
@@ -54,18 +60,16 @@ pub fn pick<'a>(
     let none: &[String] = &[];
     let ranking = policy.modes.get(mode).map_or(none, Vec::as_slice);
     let rank = |list: &[String], id: &str| list.iter().position(|r| r == id).unwrap_or(usize::MAX);
+    let own = handlers.first().map_or(&[][..], |h| h.outputs.as_slice());
+    let all_rank = |h: &ModeHandler| match own.iter().all(|k| h.outputs.contains(k)) {
+        true => rank(&policy.all, &h.id),
+        false => usize::MAX,
+    };
     handlers
         .iter()
         .enumerate()
         .filter(|(_, h)| passed_over(h, needs).is_none())
-        .min_by_key(|(i, h)| {
-            (
-                rank(ranking, &h.id),
-                rank(&policy.all, &h.id),
-                !h.in_process,
-                *i,
-            )
-        })
+        .min_by_key(|(i, h)| (rank(ranking, &h.id), all_rank(h), !h.in_process, *i))
         .map(|(_, h)| h)
         .ok_or_else(|| {
             handlers
@@ -292,6 +296,44 @@ mod tests {
             .modes
             .insert("aprs_decode".into(), vec!["onair".into()]);
         assert_eq!(picked(&hs, &[], &other), "dump1090");
+    }
+
+    const EV_AUDIO: &[StreamKind] = &[StreamKind::Event, StreamKind::Audio];
+
+    #[test]
+    fn the_node_wide_ranking_passes_over_a_handler_that_gives_less() {
+        let hs = [
+            h("builtin", true, true, EV_AUDIO),
+            h("onair", false, true, EV),
+        ];
+        assert_eq!(picked(&hs, &[], &ranked(&[], &["onair"])), "builtin");
+    }
+
+    #[test]
+    fn the_modes_own_ranking_still_picks_it() {
+        let hs = [
+            h("builtin", true, true, EV_AUDIO),
+            h("onair", false, true, EV),
+        ];
+        assert_eq!(picked(&hs, &[], &ranked(&["onair"], &[])), "onair");
+    }
+
+    #[test]
+    fn a_handler_that_gives_as_much_is_still_ranked_node_wide() {
+        let hs = [
+            h("builtin", true, true, EV),
+            h("onair", false, true, EV_PKT),
+        ];
+        assert_eq!(picked(&hs, &[], &ranked(&[], &["onair"])), "onair");
+    }
+
+    #[test]
+    fn a_lesser_handler_is_picked_when_nothing_else_is_ready() {
+        let hs = [
+            h("builtin", true, false, EV_AUDIO),
+            h("onair", false, true, EV),
+        ];
+        assert_eq!(picked(&hs, &[], &ranked(&[], &["onair"])), "onair");
     }
 
     #[test]

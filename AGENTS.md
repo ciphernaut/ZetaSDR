@@ -723,7 +723,7 @@ JSON: `{"op":"handler_policy_set","mode":"adsb_decode","order":["dump1090"]}`
 
 CLI: `zeta handlers policy set --mode adsb_decode dump1090 [HANDLER]... (no --mode: the node-wide ranking; no handlers: clears it)`
 
-The ranking is the operator's choice, as a job is: set it only when the request asks for it, read the ids from `modes_list`'s `handlers` first, and report the policy it leaves. It changes which handler a later start with `handler: null` runs (a set's, a watch's and an identify's decoders included), never a running job's. A capture needs no ranking: start the job with `needs: ["packet"]`.
+The ranking is the operator's choice, as a job is: set it only when the request asks for it, read the ids from `modes_list`'s `handlers` first, and report the policy it leaves. It changes which handler a later start with `handler: null` runs (a set's, a watch's and an identify's decoders included), never a running job's. The node-wide ranking does not prefer a handler that lacks an output the row's own decoder gives (a handler with events but no audio, on a voice mode): it orders that handler as if the ranking did not name it. Rank such a handler for the mode, or name it in `job_start`'s `handler`, to run it; nothing is excluded, and it still runs when it is the only one ready. A capture needs no ranking: start the job with `needs: ["packet"]`.
 
 ### handler_policy_get
 
