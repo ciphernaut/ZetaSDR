@@ -9,8 +9,9 @@
 -- An APRS job served by OnAir writes its frames as bare AX.25 (link type 3,
 -- LINKTYPE_AX25): Wireshark's own AX.25 dissector reads them, so this file has nothing
 -- to add for them. An AIS job served by OnAir writes each message's NMEA sentence as raw IP
--- (link type 101) in UDP to port 10110: Wireshark's own IP, UDP and NMEA dissectors read
--- it, so nothing is added for those either.
+-- (link type 101) in UDP to port 10110: Wireshark's own IP and UDP dissectors read it, the
+-- sentence readable in the payload (Wireshark 4.2 has no NMEA 0183 dissector; whether a newer
+-- one decodes it is unverified), and nothing is added for those either.
 --
 -- Install: copy this file to Wireshark's personal Lua plugins directory
 -- (`~/.local/lib/wireshark/plugins/` on Linux; Help > About Wireshark > Folders names

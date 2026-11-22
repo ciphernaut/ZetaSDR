@@ -12,12 +12,15 @@
   `pocsag_decode` took 0.36 s of user CPU by OnAir against 0.06 s by the row, a total of one
   run and not a rate. `zeta modes check <id> --handler onair --strict` passes for every one of
   them but `hfdl_decode` and `dfm_decode`, which have no fixture or test to check against.
-  `onair-rx` 0.2.0 is needed: an older wrapper fails these jobs at launch with `onair-rx: no
-  mode <m>`. A node with no `onair-rx` is unchanged.
+  `onair-rx` 0.2.0 is needed: an older wrapper (0.1.0) has no `--freq`, which every new entry
+  passes, so such a job ends at launch with the wrapper's usage text and exit 2, while `handlers
+  list` still says `ready` (read from the 0.1.0 source, not run). A node with no `onair-rx` is
+  unchanged.
 - A handler entry may carry `const`: row event fields given a constant value on every event, after
-  the field map (see `handlers/README.md`). A constant for the subject key, for a field the
-  program also gives, or of a type the row's schema refuses fails that entry alone. No shipped
-  entry uses it.
+  the field map (see `handlers/README.md`). A constant for a key the event envelope sets
+  (`protocol`, `handler`, `summary`, ...), for the subject key, for a field the program also
+  gives, or of a type the row's schema refuses fails that entry alone. OnAir's ACARS entry sets
+  `crc_ok` true: OnAir publishes a message only when its CRC fitted.
 - Replay: `capture_decode` plays a stored IQ capture's whole set, once and in real time, into a
   decoder mode's handler, to check a decoder against a recording or compare two handlers on it.
   CLI `zeta capture decode --capture <id> --kind <mode> [--handler <id>] [--packets]`. The job

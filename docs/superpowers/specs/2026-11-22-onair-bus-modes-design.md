@@ -32,7 +32,7 @@ their own. What is worth giving back to OnAir is proven in `onair-rx` first.
 - **The bus's time is decode time.** Events arrive inside the `feed()` of the block that
   completed them, so the wrapper knows the sample they belong to.
 - **The hub has no in-process reader.** It writes pcapng files, a loopback TCP stream and
-  GSMTAP over UDP, and stamps every packet with the clock: all seventeen callers leave the
+  GSMTAP over UDP, and stamps every packet with the clock: all sixteen callers leave the
   time argument out.
 - **OnAir's receivers want wide input**: 1 Msps for ACARS and the pagers, 240 ksps for
   packet, 250 ksps for AIS, where the rows are 10 to 25 kHz channels. The node resamples up
@@ -85,7 +85,7 @@ their own. What is worth giving back to OnAir is proven in `onair-rx` first.
   receiver's `rate_hz` and the `fields` map. AIS and APRS gain `packets` (`pcap`), with
   link types `ais` (raw IP carrying NMEA over UDP) and `ax25` named in the node's table
   and the Lua file's notes.
-- A handler entry may give a constant for a row field (`"protocol": "pocsag"`), where the
+- A handler entry may give a constant for a row field (`"crc_ok": true`), where the
   program's value is spelled differently or absent. This is the one change to the handler
   file's shape; whether it is a `const` map beside `fields` is the builder's.
 - No change to rows, the policy, the page or the operation set.
