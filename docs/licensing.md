@@ -41,7 +41,9 @@ wrapper the operator builds and installs, which is kept outside this repository 
 licence and prints the attribution line with its version. What ships here is
 `handlers/onair.json`, a handler file naming the wrapper's arguments and output fields;
 OnAir and the wrapper are never linked or shipped, and without them OnAir's handlers are only
-`unavailable`.
+`unavailable`. The wrapper builds OnAir with a small patch (a sink on its Wireshark hub); the
+patch and the build are the operator's, kept with the wrapper, and nothing of it is in this
+repository.
 
 ## To decide
 

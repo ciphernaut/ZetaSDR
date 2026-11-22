@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- OnAir serves ten more modes: `handlers/onair.json` gains entries for `pocsag_decode`,
+  `flex_decode`, `acars_decode`, `vdl2_decode`, `hfdl_decode` and the sonde rows `rs41_decode`,
+  `dfm_decode` and `m20_decode` (events), and for `aprs_decode` (AX.25) and `ais_decode` (NMEA
+  over UDP port 10110), which also give packets for Wireshark. Each entry runs `onair-rx` on the
+  row's narrow channel resampled up to the receiver's own minimum rate (1 MHz for the pagers and
+  ACARS, 2 MHz for the sondes, 250 kHz for AIS and VDL2, 240 kHz for APRS, 24 kHz for HFDL), so a
+  job by OnAir costs more CPU than the row's own decoder; one `modes check` run of
+  `pocsag_decode` took 0.36 s of user CPU by OnAir against 0.06 s by the row, a total of one
+  run and not a rate. `zeta modes check <id> --handler onair --strict` passes for every one of
+  them but `hfdl_decode` and `dfm_decode`, which have no fixture or test to check against.
+  `onair-rx` 0.2.0 is needed: an older wrapper fails these jobs at launch with `onair-rx: no
+  mode <m>`. A node with no `onair-rx` is unchanged.
+- A handler entry may carry `const`: row event fields given a constant value on every event, after
+  the field map (see `handlers/README.md`). A constant for the subject key, for a field the
+  program also gives, or of a type the row's schema refuses fails that entry alone. No shipped
+  entry uses it.
 - Replay: `capture_decode` plays a stored IQ capture's whole set, once and in real time, into a
   decoder mode's handler, to check a decoder against a recording or compare two handlers on it.
   CLI `zeta capture decode --capture <id> --kind <mode> [--handler <id>] [--packets]`. The job

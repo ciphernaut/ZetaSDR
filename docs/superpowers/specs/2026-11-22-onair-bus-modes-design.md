@@ -5,7 +5,7 @@ Design note for plan 45. The design itself is the operator's, approved 2026-11-2
 does not restate it. It records what a read of OnAir (`a63c3a8`) and a throwaway spike in
 `onair-rx` (branch `spike-generic`) found that the design did not say, and the call made
 for each. Where this note and the parent spec differ, this note is the later word; every
-such place is marked **differs**. Status: awaiting the operator's approval.
+such place is marked **differs**. Status: approved by the operator 2026-11-22.
 
 ## Intent, unchanged
 

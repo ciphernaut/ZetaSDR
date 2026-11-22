@@ -374,6 +374,8 @@ receivers passing sample time to its Wireshark hub (it stamps decode time). OnAi
 focused pull requests with a test and a DCO sign-off; they would come from the operator's
 account.
 
+What plan 45 found and decided differently from this section is in `2026-11-22-onair-bus-modes-design.md`.
+
 ## Delivery
 
 Four plans, each working software on its own:

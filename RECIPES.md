@@ -319,6 +319,28 @@ On the CLI: `zeta capture decode --capture <id> --kind <mode> [--handler <h>] [-
 
 **Gotchas.** A replay proves nothing live: it supersedes no signature, tallies nothing at the station and uploads nothing. It never resumes: after a restart, run it again.
 
+## A second opinion on a decoder
+
+Not run live when written: a mode's other handler (OnAir, through `onair-rx` 0.2.0 installed by the operator) run beside a job of the same mode, and its frames read in Wireshark for the modes that give them. The modes OnAir serves are `adsb_decode`, `pocsag_decode`, `flex_decode`, `acars_decode`, `aprs_decode`, `ais_decode`, `vdl2_decode`, `hfdl_decode`, `rs41_decode`, `dfm_decode` and `m20_decode`.
+
+**Check.** `modes_show <mode>` (CLI `zeta modes show <mode>`, or `zeta handlers list`): `handlers` lists `onair` with its `state`, and its `outputs`. `ready` needs `onair-rx` on `PATH` or named by `ZETA_HANDLER_ONAIR_RX`; an older wrapper (0.1.0) fails the job at launch with `onair-rx: no mode <m>`. Only ADS-B, APRS and AIS list `packet`.
+
+**Start** by OnAir beside a running job of the mode, which leaves the radio where it is:
+
+```json
+{"op":"job_start","beside":"<job id>","handler":"onair"}
+```
+
+Or on its own band, `{"op":"job_start","kind":"pocsag_decode", ... ,"handler":"onair"}` (the other fields as in "Aircraft frames for Wireshark"). On the CLI: `zeta job start --beside <job id> --handler onair`. Read the two as in "Compare two decoders".
+
+**The wide input costs CPU.** OnAir's receivers need more rate than the row's channel has: the node resamples the narrow channel up to what the entry asks for, 1 MHz for POCSAG, FLEX and ACARS, 2 MHz for the sondes, 250 kHz for AIS and VDL2, 240 kHz for APRS, 24 kHz for HFDL. The only figure measured is one `zeta modes check pocsag_decode` run: 0.36 s of user CPU by OnAir against 0.06 s by the row's own decoder, over about 1.4 s of wall time, with the check feeding faster than real time. That is a total of one run, not a rate; the live cost is open (UAT 45.5). Watch `job_list`'s rows and the node's CPU before leaving a 1 MHz sibling running.
+
+**Packets for AIS and APRS.** Start with `needs: ["packet"]` (CLI `--needs packet`) and attach as in "Packet capture for Wireshark". AIS arrives as NMEA 0183, each sentence in raw IP and UDP to port 10110 (link type 101), which Wireshark reads as NMEA; APRS arrives as AX.25 (link type 3), read by Wireshark's own AX.25 dissector (the node's Lua dissector is not involved). A digipeater's copy of an APRS frame is a packet with no event.
+
+**What differs from the row's own decoder.** ACARS position and `alt_ft` come from the row's `derive` on the text. AIS has messages 1 and 2 only, not channels 75 and 76. VDL2 has no text, registration, flight or label from OnAir, so those fields are empty. A repaired APRS frame has `fcs_ok` false. OnAir gives one event per sonde per 5 s. `onair-rx` writes text above 0x7e as Latin-1 characters, so a UTF-8 comment shows garbled.
+
+**Gotchas.** `hfdl_decode` and `dfm_decode` entries are validated but were not checked against a capture. A short replay (`capture_decode`) can lose the last message, since `onair-rx` does not flush at the end of its input.
+
 ## Make your own theme
 
 Verified on the plan 26 build; the folder format and every hook are in `docs/themes.md`.
