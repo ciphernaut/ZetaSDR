@@ -1383,11 +1383,12 @@ fn a_handler_file_adds_a_handler_to_each_mode_it_lists() {
     assert!(reg.handler("dmr_decode", "builtin").unwrap().in_process);
 }
 
-/// `handlers/onair.json` serves the bus modes: each is a handler of its row, last in its
-/// list, whose program is `onair-rx`, at the receiver's input rate; the modes with packets
-/// give events and packets, the others events only; none is broken.
+/// `handlers/onair.json` serves its modes, the bus modes and the polled ones: each is a
+/// handler of its row, last in its list, whose program is `onair-rx`, at the receiver's
+/// input rate; the modes with packets give events and packets, the others events only;
+/// none is broken.
 #[test]
-fn the_embedded_onair_handler_serves_the_bus_modes() {
+fn the_embedded_onair_handler_serves_its_modes() {
     let mut reg = ModeRegistry::load(&stages(), None);
     zeta_core::modes::handlers::probe_handler_files(&mut reg);
     let file = reg

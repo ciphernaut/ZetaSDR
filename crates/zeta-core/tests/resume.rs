@@ -960,6 +960,52 @@ async fn a_rechosen_member_never_takes_its_siblings_handler() {
     assert_eq!(sib.handler.as_deref(), Some(ALT));
 }
 
+/// Plan 46: a relaunch whose sibling holds the row's own handler still ranks the rest
+/// against the row's own outputs. `alt` (events and packets) is chosen by the mode's
+/// ranking, its sibling runs the row's own (events); at restart alt is gone and the
+/// node-wide ranking names `alt3`, which gives as much as the row's own (but less than
+/// alt): it is chosen, not `alt2` by handler order.
+#[tokio::test]
+async fn a_relaunch_beside_the_rows_own_ranks_against_the_rows_own_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = || {
+        h::write_handler(dir.path(), "alt2", false);
+        h::write_handler(dir.path(), "alt3", false);
+        h::cfg(dir.path(), true)
+    };
+    let open = |alt_missing: bool| {
+        let cfg = cfg();
+        let modes = h::registry(&h::stages(None), &cfg, alt_missing);
+        let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
+        Node::open_with_modes(cfg, h::stages(None), ports, Some(Arc::new(modes)))
+    };
+    let node = open(false).await.unwrap();
+    for (mode, order) in [(Some(MODE), ALT), (None, "alt3")] {
+        let ranked = node
+            .apply(Op::HandlerPolicySet {
+                mode: mode.map(|m| zeta_core::modes::ModeId(m.into())),
+                order: vec![order.into()],
+            })
+            .await;
+        assert!(ranked.is_ok(), "{ranked:?}");
+    }
+    let first = h::start(&node, None, &[]).await;
+    assert_eq!(record(&node, &first).handler.as_deref(), Some(ALT));
+    let sibling = match h::start_beside(&node, &first, Some(OWN), &[]).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("a sibling beside: {r:?}"),
+    };
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let node = open(true).await.unwrap();
+    let rec = record(&node, &first);
+    assert_eq!(rec.state, JobState::Running, "{:?}", rec.state);
+    assert_eq!(rec.handler.as_deref(), Some("alt3"));
+    let sib = record(&node, &sibling);
+    assert_eq!(sib.handler.as_deref(), Some(OWN));
+}
+
 /// With both handlers there at restart, each member resumes on its own handler and
 /// stays in the group.
 #[tokio::test]

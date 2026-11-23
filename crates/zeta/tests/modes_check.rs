@@ -1004,14 +1004,14 @@ fn a_fifo_rows_run_makes_its_subdirectory_under_the_run_dir() {
     );
 }
 
-/// OnAir's entries for the bus modes pass `zeta modes check <id> --handler onair`, each
-/// recorded as `<id>@onair`, and analog video, which OnAir does not serve, is refused. It
-/// needs `onair-rx`: the test-only `ZETA_TEST_ONAIR_RX` names it (an executable file, not
-/// looked up on `PATH`), passed to the node as `ZETA_HANDLER_ONAIR_RX`; unset, the test
-/// says so and passes. The node's own `ZETA_HANDLER_ONAIR_RX` in the caller's
+/// OnAir's entries for the bus modes and the polled ones that have a check pass
+/// `zeta modes check <id> --handler onair`, each recorded as `<id>@onair`, and analog
+/// video, which OnAir does not serve, is refused. It needs `onair-rx`: the test-only
+/// `ZETA_TEST_ONAIR_RX` names it (an executable file, not looked up on `PATH`), passed
+/// to the node as `ZETA_HANDLER_ONAIR_RX`; unset, the test says so and passes. The node's own `ZETA_HANDLER_ONAIR_RX` in the caller's
 /// environment is never read: [`check`] pins it.
 #[test]
-fn onair_passes_the_bus_modes_checks() {
+fn onair_passes_its_modes_checks() {
     use std::os::unix::fs::PermissionsExt;
     // Unset: no onair-rx to test. Set: it must name an executable file.
     let Some(program) = std::env::var_os("ZETA_TEST_ONAIR_RX").map(std::path::PathBuf::from) else {

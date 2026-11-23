@@ -44,44 +44,63 @@ pub struct Passed {
 /// kind of `needs`, ordered by the mode's ranking, the node-wide ranking, in-process
 /// first, then `handlers`' own order.
 ///
-/// The node-wide ranking counts for a handler only when its outputs hold every kind the
-/// first handler (the row's own decoder) gives; one that gives less is ordered as if the
-/// ranking did not name it, so a ranking of events-only handlers cannot take speech away
-/// from every voice job. The mode's own ranking is not so limited, and nothing is
-/// excluded: such a handler is still picked when it is the best one left.
+/// The node-wide ranking counts for a handler only when its outputs hold every kind of
+/// `own`, the outputs of the row's own decoder (passed apart from `handlers`, which a
+/// relaunch gives without the ones a Send to sibling holds, the row's own among them);
+/// one that gives less is ordered as if the ranking did not name it, so a ranking of
+/// events-only handlers cannot take speech away from every voice job. When such a lesser
+/// handler comes out first, the lesser ones the ranking names take that place in the
+/// ranking's order. The mode's own ranking is not so limited, and nothing is excluded:
+/// a lesser handler is still picked when it is the best one left.
 ///
 /// With none left, every handler and why it was passed over, in `handlers`' order.
 pub fn pick<'a>(
     mode: &str,
     handlers: &'a [ModeHandler],
+    own: &[StreamKind],
     needs: &[StreamKind],
     policy: &HandlerPolicy,
 ) -> Result<&'a ModeHandler, Vec<Passed>> {
     let none: &[String] = &[];
     let ranking = policy.modes.get(mode).map_or(none, Vec::as_slice);
     let rank = |list: &[String], id: &str| list.iter().position(|r| r == id).unwrap_or(usize::MAX);
-    let own = handlers.first().map_or(&[][..], |h| h.outputs.as_slice());
-    let all_rank = |h: &ModeHandler| match own.iter().all(|k| h.outputs.contains(k)) {
+    let full = |h: &ModeHandler| own.iter().all(|k| h.outputs.contains(k));
+    let all_rank = |h: &ModeHandler| match full(h) {
         true => rank(&policy.all, &h.id),
         false => usize::MAX,
     };
-    handlers
+    // A lesser handler the node-wide ranking names.
+    let lesser_named = |h: &ModeHandler| !full(h) && policy.all.contains(&h.id);
+    let ready: Vec<&ModeHandler> = handlers
+        .iter()
+        .filter(|h| passed_over(h, needs).is_none())
+        .collect();
+    let first = ready
         .iter()
         .enumerate()
-        .filter(|(_, h)| passed_over(h, needs).is_none())
         .min_by_key(|(i, h)| (rank(ranking, &h.id), all_rank(h), !h.in_process, *i))
-        .map(|(_, h)| h)
-        .ok_or_else(|| {
-            handlers
-                .iter()
-                .filter_map(|h| {
-                    passed_over(h, needs).map(|why| Passed {
-                        id: h.id.clone(),
-                        why,
-                    })
+        .map(|(_, h)| *h);
+    // A lesser one the ranking names came out first from a place it holds as if unnamed:
+    // of the lesser ones it names (at the same rank in the mode's own), its first takes it.
+    let first = match first {
+        Some(w) if lesser_named(w) => ready
+            .iter()
+            .copied()
+            .filter(|h| lesser_named(h) && rank(ranking, &h.id) == rank(ranking, &w.id))
+            .min_by_key(|h| rank(&policy.all, &h.id)),
+        first => first,
+    };
+    first.ok_or_else(|| {
+        handlers
+            .iter()
+            .filter_map(|h| {
+                passed_over(h, needs).map(|why| Passed {
+                    id: h.id.clone(),
+                    why,
                 })
-                .collect()
-        })
+            })
+            .collect()
+    })
 }
 
 /// Why [`choose`] found no handler.
@@ -107,7 +126,8 @@ pub fn choose<'a>(
     policy: &HandlerPolicy,
 ) -> Result<&'a ModeHandler, Refusal> {
     let Some(id) = named else {
-        return pick(&m.row.id.0, &m.handlers, needs, policy).map_err(Refusal::NoneLeft);
+        return pick(&m.row.id.0, &m.handlers, &m.outputs, needs, policy)
+            .map_err(Refusal::NoneLeft);
     };
     let Some(h) = m.handlers.iter().find(|h| h.id == id) else {
         return Err(Refusal::Unknown(
@@ -159,7 +179,7 @@ pub fn reported(m: &LoadedMode, policy: &HandlerPolicy) -> Reported {
     if m.state == ModeState::Broken {
         return own();
     }
-    let Ok(picked) = pick(&m.row.id.0, &m.handlers, &[], policy) else {
+    let Ok(picked) = pick(&m.row.id.0, &m.handlers, &m.outputs, &[], policy) else {
         return own();
     };
     let mut outputs: Vec<StreamKind> = Vec::new();
@@ -251,8 +271,19 @@ mod tests {
     const EV: &[StreamKind] = &[StreamKind::Event];
     const EV_PKT: &[StreamKind] = &[StreamKind::Event, StreamKind::Packet];
 
+    /// [`pick`]'s handler among `handlers`, the first of them the row's own.
     fn picked(handlers: &[ModeHandler], needs: &[StreamKind], policy: &HandlerPolicy) -> String {
-        match pick(MODE, handlers, needs, policy) {
+        picked_against(&handlers[0].outputs, handlers, needs, policy)
+    }
+
+    /// [`pick`]'s handler among `handlers` for a row whose own handler gives `own`.
+    fn picked_against(
+        own: &[StreamKind],
+        handlers: &[ModeHandler],
+        needs: &[StreamKind],
+        policy: &HandlerPolicy,
+    ) -> String {
+        match pick(MODE, handlers, own, needs, policy) {
             Ok(h) => h.id.clone(),
             Err(passed) => panic!("nothing picked: {passed:?}"),
         }
@@ -336,6 +367,54 @@ mod tests {
         assert_eq!(picked(&hs, &[], &ranked(&[], &["onair"])), "onair");
     }
 
+    /// A relaunch whose Send to sibling holds the row's own handler passes the others
+    /// only; the baseline is still the row's own outputs, not the first one passed.
+    #[test]
+    fn the_baseline_is_the_rows_own_when_a_sibling_holds_it() {
+        let free = [
+            h("alt", false, false, EV_PKT),
+            h("alt2", false, true, EV),
+            h("alt3", false, true, EV),
+        ];
+        assert_eq!(
+            picked_against(EV, &free, &[], &ranked(&[], &["alt3"])),
+            "alt3"
+        );
+    }
+
+    #[test]
+    fn lesser_handlers_keep_the_node_wide_order_among_themselves() {
+        let hs = [
+            h("builtin", true, false, EV_AUDIO),
+            h("a", false, true, EV),
+            h("b", false, true, EV),
+        ];
+        assert_eq!(picked(&hs, &[], &ranked(&[], &["b", "a"])), "b");
+    }
+
+    /// The node-wide ranking still never lifts a lesser handler over one it does not
+    /// name: an unnamed handler ahead of the lesser ones keeps its place.
+    #[test]
+    fn a_lesser_handler_the_ranking_names_takes_no_unnamed_ones_place() {
+        let hs = [
+            h("builtin", true, false, EV_AUDIO),
+            h("full", false, true, EV_AUDIO),
+            h("a", false, true, EV),
+            h("b", false, true, EV),
+        ];
+        assert_eq!(picked(&hs, &[], &ranked(&[], &["b", "a"])), "full");
+    }
+
+    #[test]
+    fn a_broken_first_handler_with_no_outputs_leaves_the_ranking_as_before() {
+        let hs = [
+            h("builtin", true, false, &[]),
+            h("a", false, true, EV),
+            h("b", false, true, EV),
+        ];
+        assert_eq!(picked(&hs, &[], &ranked(&[], &["b"])), "b");
+    }
+
     #[test]
     fn an_unavailable_ranked_handler_is_passed_over() {
         let hs = [h("dump1090", false, true, EV), h("onair", false, false, EV)];
@@ -362,7 +441,14 @@ mod tests {
             h("dump1090", false, true, EV),
             h("onair", false, false, EV_PKT),
         ];
-        let passed = pick(MODE, &hs, &[StreamKind::Packet], &ranked(&["onair"], &[])).unwrap_err();
+        let passed = pick(
+            MODE,
+            &hs,
+            EV,
+            &[StreamKind::Packet],
+            &ranked(&["onair"], &[]),
+        )
+        .unwrap_err();
         assert_eq!(
             passed,
             [

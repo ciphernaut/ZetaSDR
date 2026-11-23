@@ -217,7 +217,8 @@ impl Inner {
             .filter(|h| !held.contains_key(&h.id))
             .cloned()
             .collect();
-        match crate::modes::policy::pick(mode, &free, &rec.needs, &policy) {
+        // The ranking's baseline is the row's own outputs, even when a sibling holds it.
+        match crate::modes::policy::pick(mode, &free, &m.outputs, &rec.needs, &policy) {
             Ok(h) => Ok(Some(Rechosen {
                 now: h.id.clone(),
                 why,
