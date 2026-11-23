@@ -706,6 +706,68 @@ async fn modes_list_carries_access() {
 }
 
 #[test]
+fn a_row_with_a_bad_content_word_is_broken() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&renamed_pocsag("Other")).unwrap();
+    v["id"] = "other_content".into();
+    v["content"] = "other".into();
+    std::fs::write(dir.path().join("other_content.json"), v.to_string()).unwrap();
+    let reg = ModeRegistry::load(&stages(), Some(dir.path()));
+    let m = reg.get("other_content").expect("listed");
+    assert_eq!(m.state, ModeState::Broken);
+    let reason = m.reason.as_deref().unwrap();
+    assert!(
+        reason.starts_with("content:") && reason.contains("unknown variant"),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn modes_list_and_show_carry_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&renamed_pocsag("Carrier")).unwrap();
+    v["id"] = "carrier_decode".into();
+    v["content"] = "network_traffic".into();
+    std::fs::write(modes.join("carrier_decode.json"), v.to_string()).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let Ok(OpResult::Modes { modes }) = node
+        .apply(Op::ModesList {
+            family: None,
+            state: None,
+        })
+        .await
+    else {
+        panic!("expected modes");
+    };
+    let infos: Vec<serde_json::Value> = modes
+        .iter()
+        .map(|m| serde_json::to_value(m).unwrap())
+        .collect();
+    let carrier = infos.iter().find(|m| m["id"] == "carrier_decode").unwrap();
+    assert_eq!(carrier["content"], "network_traffic");
+    // Every embedded row reports null.
+    for m in infos.iter().filter(|m| m["id"] != "carrier_decode") {
+        assert_eq!(m["content"], serde_json::Value::Null, "{}", m["id"]);
+    }
+    let Ok(OpResult::Mode { mode }) = node
+        .apply(Op::ModesShow {
+            id: "carrier_decode".into(),
+        })
+        .await
+    else {
+        panic!("expected a mode");
+    };
+    assert_eq!(
+        serde_json::to_value(&mode.row).unwrap()["content"],
+        "network_traffic"
+    );
+}
+
+#[test]
 fn the_rows_thin_their_tracks_as_planned() {
     let plan = [
         ("adsb_decode", 100, 500.0),

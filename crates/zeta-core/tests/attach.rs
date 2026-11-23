@@ -1565,6 +1565,58 @@ async fn a_row_made_restricted_stops_its_capture_on_relaunch() {
     assert_eq!(record(&node, &input).tuning.center_hz, Hz(100_002_000));
 }
 
+/// A row that says what it carries: its job's context holds `content` from launch (and
+/// again after a relaunch), its capture's parameters carry it, and its capture is not
+/// refused as a restricted row's is. A row with none leaves both without the member.
+#[tokio::test]
+async fn a_content_row_puts_content_in_its_jobs_context_and_its_captures_params() {
+    const ROW: &str = "aprs_network";
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = packets_node(dir.path()).await;
+    let file = dir.path().join("modes").join(format!("{ROW}.json"));
+    let (_, aprs) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("aprs_decode.json"))
+        .unwrap();
+    let mut row: serde_json::Value = serde_json::from_str(aprs).unwrap();
+    row["id"] = ROW.into();
+    row["content"] = "network_traffic".into();
+    std::fs::write(&file, row.to_string()).unwrap();
+    node.reload_modes().unwrap();
+    let plain = start_kind(&node, "aprs_decode").await;
+    let input = start_kind(&node, ROW).await;
+    // Written when the stages start.
+    common::until("the content note", Duration::from_secs(10), || {
+        node.job_context(&input)
+            .is_some_and(|c| c["content"] == "network_traffic")
+    })
+    .await;
+    assert!(node.job_context(&plain).unwrap().get("content").is_none());
+    let att = attach_packets_ok(&node, &input).await;
+    assert_eq!(capture_params(&node, &att)["content"], "network_traffic");
+    let plain_att = attach_packets_ok(&node, &plain).await;
+    assert!(capture_params(&node, &plain_att).get("content").is_none());
+    // A relaunch (the retune) keeps both.
+    let retune = Op::JobRetune {
+        job: input.clone(),
+        center_hz: Hz(100_002_000),
+        bandwidth_hz: Hz(12_500),
+        bin_hz: None,
+        replace: vec![],
+    };
+    assert_eq!(node.apply(retune).await, Ok(OpResult::Job(input.clone())));
+    common::until("the capture follows", Duration::from_secs(10), || {
+        capture_params(&node, &att)["center_hz"] == 100_002_000u64
+    })
+    .await;
+    assert_eq!(capture_params(&node, &att)["content"], "network_traffic");
+    assert_eq!(
+        node.job_context(&input).unwrap()["content"],
+        "network_traffic"
+    );
+    assert_running_for(&node, &att, 300).await;
+}
+
 /// A row made unreadable after its job was captured stops the capture on relaunch too.
 #[tokio::test]
 async fn a_row_made_unreadable_stops_its_capture_on_relaunch() {

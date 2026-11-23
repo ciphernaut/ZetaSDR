@@ -97,6 +97,11 @@ pub struct ModeRow {
     /// for the rest. Nothing gates on it yet.
     #[serde(default)]
     pub access: Option<Access>,
+    /// What the row carries (`network_traffic`); `null` for the rest. Reported by
+    /// `modes_list`, written into a job's context as `content` and copied to a packet
+    /// capture's record. Nothing reads it yet.
+    #[serde(default)]
+    pub content: Option<Content>,
 }
 
 /// How widely a row's events may be shown.
@@ -113,6 +118,23 @@ impl Access {
     pub fn word(self) -> &'static str {
         match self {
             Access::Restricted => "restricted",
+        }
+    }
+}
+
+/// What a row carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Content {
+    // No variant doc, as on `Access`: it would turn the schema into a `oneOf`.
+    NetworkTraffic,
+}
+
+impl Content {
+    /// The word as the row file and the job's context spell it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Content::NetworkTraffic => "network_traffic",
         }
     }
 }
@@ -1042,7 +1064,7 @@ pub fn parse(text: &str) -> Result<ModeRow, RowError> {
 }
 
 /// The field whose value is not one of its allowed words (`subject.waterfall`,
-/// `subject.columns[<i>].unit`, `position.alt_unit`, `access`, `derive[<i>].extract`),
+/// `subject.columns[<i>].unit`, `position.alt_unit`, `access`, `content`, `derive[<i>].extract`),
 /// read from the row's JSON.
 fn bad_word_field(text: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
@@ -1052,6 +1074,12 @@ fn bad_word_field(text: &str) -> Option<String> {
         && word(a, &[Access::Restricted.word()])
     {
         return Some("access".into());
+    }
+    if let Some(c) = v.get("content")
+        && !c.is_null()
+        && word(c, &[Content::NetworkTraffic.word()])
+    {
+        return Some("content".into());
     }
     if let Some(a) = v.pointer("/position/alt_unit")
         && word(a, &["m", "ft"])

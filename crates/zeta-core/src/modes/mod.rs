@@ -37,13 +37,13 @@ use crate::stage::StageRegistry;
 use crate::types::StreamKind;
 
 pub use row::{
-    Access, AltUnit, Band, Container, Decoder, DecoderKind, Demod, Derive, ENVELOPE_FIELDS, Event,
-    Extractor, FRAME_PARSERS, Family, FieldPath, FrameBlock, FrameDemod, Handler, HandlerBlock,
-    IDENTITY_REGISTERS, IDENTITY_STRIPS, Identify, Identity, InputStream, InputVia, Install,
-    ModeId, ModeRow, OutputVia, PacketParserKind, Parser, PositionMap, ProgramBlock, ProgramInput,
-    ProgramOutput, ProgramPackets, Proof, QUICK_ATTEMPTS, Ranges, RowError, RowTest, SampleFormat,
-    Station, Subject, SubjectColumn, SubjectUnit, SubjectWaterfall, TestSpec, center_khz_text,
-    is_mode_id, parse, validate,
+    Access, AltUnit, Band, Container, Content, Decoder, DecoderKind, Demod, Derive,
+    ENVELOPE_FIELDS, Event, Extractor, FRAME_PARSERS, Family, FieldPath, FrameBlock, FrameDemod,
+    Handler, HandlerBlock, IDENTITY_REGISTERS, IDENTITY_STRIPS, Identify, Identity, InputStream,
+    InputVia, Install, ModeId, ModeRow, OutputVia, PacketParserKind, Parser, PositionMap,
+    ProgramBlock, ProgramInput, ProgramOutput, ProgramPackets, Proof, QUICK_ATTEMPTS, Ranges,
+    RowError, RowTest, SampleFormat, Station, Subject, SubjectColumn, SubjectUnit,
+    SubjectWaterfall, TestSpec, center_khz_text, is_mode_id, parse, validate,
 };
 pub(crate) use row::{FRAME_DECODE_STAGE, require_all};
 
@@ -1067,6 +1067,7 @@ fn placeholder(id: &str) -> ModeRow {
         subject: None,
         derive: vec![],
         access: None,
+        content: None,
     }
 }
 

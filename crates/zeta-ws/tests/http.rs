@@ -431,6 +431,7 @@ fn new_packet_capture() -> zeta_core::packets::NewPacketCapture {
         link_type: zeta_core::stream::LinkType::Ax25Kiss,
         mode: None,
         access: None,
+        content: None,
         handler: None,
     }
 }
@@ -506,6 +507,27 @@ async fn only_a_packet_capture_id_is_served() {
         let resp = get(&ts, &format!("/captures/{name}")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
     }
+    ts.stop().await;
+}
+
+/// A capture of a row with `content` is served as any other: nothing gates on it.
+#[tokio::test]
+async fn a_capture_of_a_content_row_is_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = spawn(dir.path()).await;
+    let mut w = ts
+        .node
+        .packets()
+        .begin(zeta_core::packets::NewPacketCapture {
+            mode: Some("net_traffic".into()),
+            content: Some(zeta_core::modes::Content::NetworkTraffic),
+            ..new_packet_capture()
+        })
+        .unwrap();
+    let id = w.id().to_string();
+    w.write(1, b"one").unwrap();
+    let resp = get(&ts, &format!("/captures/{id}.pcapng")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
     ts.stop().await;
 }
 

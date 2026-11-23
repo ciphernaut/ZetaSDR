@@ -331,6 +331,10 @@ impl Inner {
         let mut tally = (rec.replay.is_some() && !attached).then(ReplayTally::default);
         // On error the port moved anyway: `launch_gated` relaunches every elastic job.
         let (prov, run, ended) = self.record_running(rec, &token)?;
+        // What the row carries, in the job's context at every start and relaunch.
+        if let Some(c) = mode.as_ref().and_then(|m| m.content) {
+            let _ = self.context_merge(&id, serde_json::json!({ "content": c.word() }));
+        }
 
         // One stream per edge; a node with no incoming edge whose stage takes input
         // reads the job's IQ stream (a job on the radio only). Each node's outputs get
@@ -1266,6 +1270,10 @@ impl Inner {
                 match &handler {
                     Some(h) => p.insert("handler".into(), h.clone().into()),
                     None => p.remove("handler"),
+                };
+                match row.and_then(|r| r.content) {
+                    Some(c) => p.insert("content".into(), c.word().into()),
+                    None => p.remove("content"),
                 };
             }
         }

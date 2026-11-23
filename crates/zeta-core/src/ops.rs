@@ -21,8 +21,8 @@ use crate::knowledge::{Allocation, Signature, nearest_of};
 use crate::lease::{Decision, LeaseError};
 use crate::modes::policy::{HandlerPolicy, Passed};
 use crate::modes::{
-    Access, Band as ModeBand, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry, ModeRow,
-    ModeState, Subject, is_mode_id, template,
+    Access, Band as ModeBand, Content, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry,
+    ModeRow, ModeState, Subject, is_mode_id, template,
 };
 use crate::node::{AfterGate, Node, NodeError, StartHandler};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
@@ -1701,6 +1701,8 @@ pub struct AttachTo<'a> {
     pub mode: Option<&'a str>,
     /// `packets`: that row's `access` (`None`: unrestricted, or no row).
     pub access: Option<Access>,
+    /// `packets`: that row's `content` (`None`: none, or no row).
+    pub content: Option<Content>,
     /// `packets`: the handler the input runs (`None`: a kind of no row, or a record from
     /// before handlers), which the capture records.
     pub handler: Option<&'a str>,
@@ -1717,6 +1719,7 @@ impl<'a> AttachTo<'a> {
             center_hz: Hz(0),
             mode: None,
             access: None,
+            content: None,
             handler: None,
         }
     }
@@ -2007,6 +2010,9 @@ impl JobKind {
                     "access": input.access,
                 });
                 // Named only when there is one: a capture of no row's job is as before.
+                if let Some(c) = input.content {
+                    capture["content"] = c.word().into();
+                }
                 if let Some(h) = input.handler {
                     capture["handler"] = h.into();
                 }
@@ -3613,6 +3619,11 @@ pub struct ModeInfo {
     #[schemars(required, schema_with = "crate::types::nullable::<Access>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub access: Option<Access>,
+    /// `'network_traffic'` on a row that carries data-network traffic; `null` otherwise.
+    /// Nothing reads it yet.
+    #[schemars(required, schema_with = "crate::types::nullable::<Content>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub content: Option<Content>,
     /// The stream kinds a job of the row emits (`event`, `audio`, ...); a row whose
     /// `outputs` lists `audio` can be played and transcribed. Empty for a broken row.
     pub outputs: Vec<StreamKind>,
@@ -3652,6 +3663,7 @@ impl ModeInfo {
             missing: r.missing,
             subject: m.row.subject.clone(),
             access: m.row.access,
+            content: m.row.content,
             outputs: r.outputs,
             voices: m.voices.clone(),
             handlers: ModeHandlerInfo::of(m, modes),
@@ -8073,6 +8085,7 @@ pub(crate) async fn packets_attach(
         center_hz: input.tuning.center_hz,
         mode: row.map(|r| r.id.0.as_str()),
         access: row.and_then(|r| r.access),
+        content: row.and_then(|r| r.content),
         handler: handler.as_deref(),
         ..AttachTo::new(&job, &packets)
     };

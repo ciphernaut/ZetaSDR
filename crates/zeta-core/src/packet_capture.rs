@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::modes::Access;
+use crate::modes::{Access, Content};
 use crate::packets::{NewPacketCapture, PacketStore, PacketWriter};
 use crate::stage::{Backend, Stage, StageContext, StageError, StageNote, StageSpec};
 use crate::stream::{Frame, LinkType, Payload, StreamBus};
@@ -42,6 +42,9 @@ pub struct PacketCaptureParams {
     #[serde(deserialize_with = "crate::modes::nullable")]
     #[schemars(required, schema_with = "crate::modes::nullable_enum::<Access>")]
     pub access: Option<Access>,
+    /// The row's content; left out for none.
+    #[serde(default)]
+    pub content: Option<Content>,
     /// The handler the decoder job runs; left out for a job of none.
     #[serde(default)]
     pub handler: Option<String>,
@@ -121,6 +124,7 @@ impl Stage for PacketCaptureStage {
             link_type: LinkType::User0,
             mode: p.mode,
             access: p.access,
+            content: p.content,
             handler: p.handler,
         };
         let (tx, items) = mpsc::channel::<Item>(QUEUE);
@@ -426,6 +430,31 @@ mod tests {
         assert_eq!(r.link_type, LinkType::Ax25Kiss);
         assert!(r.writing);
         h.abort();
+    }
+
+    #[tokio::test]
+    async fn the_capture_records_its_rows_content_and_a_params_without_it_reads_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rig = Rig::new(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let mut with = params();
+        with["content"] = "network_traffic".into();
+        let h = rig.spawn(with, rig.ctx());
+        rig.publish(T0, packet(LinkType::Ax25Kiss, &[1, 2, 3]));
+        until(|| first(&rig.store).is_some_and(|r| r.packets == 1)).await;
+        assert_eq!(
+            first(&rig.store).unwrap().content,
+            Some(crate::modes::Content::NetworkTraffic)
+        );
+        rig.bus.unregister(&rig.input);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+        let tmp = tempfile::tempdir().unwrap();
+        let rig = Rig::new(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let h = rig.spawn(params(), rig.ctx());
+        rig.publish(T0, packet(LinkType::Ax25Kiss, &[1, 2, 3]));
+        until(|| first(&rig.store).is_some_and(|r| r.packets == 1)).await;
+        assert_eq!(first(&rig.store).unwrap().content, None);
+        rig.bus.unregister(&rig.input);
+        assert!(matches!(h.await.unwrap(), Ok(())));
     }
 
     #[tokio::test]

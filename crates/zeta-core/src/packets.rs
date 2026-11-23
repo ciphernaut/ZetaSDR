@@ -17,7 +17,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bursts::BurstPolicy;
-use crate::modes::Access;
+use crate::modes::{Access, Content};
 use crate::pcapng;
 use crate::stream::LinkType;
 use crate::types::{Hz, JobId, SourceId, Timestamp};
@@ -52,6 +52,10 @@ pub struct PacketCaptureRecord {
     /// The row's access.
     #[schemars(required, schema_with = "crate::modes::nullable_enum::<Access>")]
     pub access: Option<Access>,
+    /// The row's content; `null` for none, and in an index written before it.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::modes::nullable_enum::<Content>")]
+    pub content: Option<Content>,
     /// The handler the decoder job ran (`modes_list`'s `handlers`); `null` for a job of
     /// no row, and in an index written before handlers.
     #[serde(default)]
@@ -81,6 +85,7 @@ pub struct NewPacketCapture {
     pub link_type: LinkType,
     pub mode: Option<String>,
     pub access: Option<Access>,
+    pub content: Option<Content>,
     /// The handler the decoder job runs; `None` for a job of no row.
     pub handler: Option<String>,
 }
@@ -285,6 +290,7 @@ impl PacketStore {
             link_type: new.link_type,
             mode: new.mode.clone(),
             access: new.access,
+            content: new.content,
             handler: new.handler.clone(),
             created_ns: Timestamp(now_ns()),
             last_ns: Timestamp(now_ns()),
@@ -558,6 +564,7 @@ mod tests {
             link_type: LinkType::Ax25Kiss,
             mode: Some("aprs".into()),
             access: None,
+            content: None,
             handler: None,
         }
     }
@@ -604,6 +611,30 @@ mod tests {
             read_file(&r)[0].comment.as_deref(),
             Some("job=j1 handler=alt source=s1 freq_hz=144800000")
         );
+    }
+
+    #[test]
+    fn a_captures_content_is_in_its_record_and_an_old_index_reads_it_as_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        let with = NewPacketCapture {
+            content: Some(Content::NetworkTraffic),
+            ..new_capture()
+        };
+        drop(store.begin(with).unwrap());
+        let r = store.list().remove(0);
+        assert_eq!(r.content, Some(Content::NetworkTraffic));
+        let wire = serde_json::to_value(&r).unwrap();
+        assert_eq!(wire["content"], "network_traffic");
+        // The same record in an index written before `content`.
+        drop(store);
+        let index = tmp.path().join("packets").join(INDEX_FILE);
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+        v[0].as_object_mut().unwrap().remove("content");
+        std::fs::write(&index, v.to_string()).unwrap();
+        let store = open(tmp.path(), PACKET_CAPTURE_MAX_BYTES);
+        assert_eq!(store.list().remove(0).content, None);
     }
 
     #[test]
