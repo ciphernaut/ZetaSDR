@@ -562,6 +562,87 @@ async fn a_node_without_a_sets_dir_lists_the_builtins() {
     );
 }
 
+/// The set `id` of `sets` (a `set_list` answer).
+fn listed<'a>(sets: &'a [SetInfo], id: &str) -> Option<&'a SetInfo> {
+    sets.iter().find(|s| s.id == id)
+}
+
+#[tokio::test]
+async fn a_set_file_changed_after_open_is_read_again_by_the_next_set_list() {
+    let dir = tempfile::tempdir().unwrap();
+    // The directory does not exist yet when the node opens.
+    let sets_dir = dir.path().join("sets");
+    let node = open(dir.path(), Some(&sets_dir)).await;
+    assert!(listed(&set_list(&node).await, "mine").is_none());
+
+    // A new file is listed by the next `set_list`, with no restart.
+    let mine = |name: &str| {
+        one_member(
+            "mine",
+            &watch_member(1_000_000, r#"{"modes": ["pocsag_decode"]}"#),
+        )
+        .replace(r#""name": "mine""#, &format!(r#""name": "{name}""#))
+    };
+    write_set(&sets_dir, "mine.json", &mine("first"));
+    let sets = set_list(&node).await;
+    let s = listed(&sets, "mine").expect("mine listed");
+    assert_eq!((s.name.as_str(), s.state), ("first", SetState::Ready));
+
+    // An edit of the file, the same length, is read too.
+    write_set(&sets_dir, "mine.json", &mine("again"));
+    let sets = set_list(&node).await;
+    assert_eq!(listed(&sets, "mine").unwrap().name, "again");
+
+    // An edit that breaks the file lists it broken; a file that meant to replace a
+    // built-in set leaves that set in force.
+    write_set(
+        &sets_dir,
+        "mine.json",
+        &mine("again").replace("148500000", "null"),
+    );
+    write_set(&sets_dir, "ais.json", r#"{"id": "ais", "name": "Mine"}"#);
+    let sets = set_list(&node).await;
+    assert_eq!(listed(&sets, "mine").unwrap().state, SetState::Broken);
+    assert_eq!(listed(&sets, "ais").unwrap().file, "sets/ais.json");
+    assert_eq!(
+        listed(&sets, "ais@ais.json").unwrap().state,
+        SetState::Broken
+    );
+
+    // A removed file's set is gone, and the built-in ones stay.
+    std::fs::remove_file(sets_dir.join("mine.json")).unwrap();
+    std::fs::remove_file(sets_dir.join("ais.json")).unwrap();
+    let ids: Vec<String> = set_list(&node).await.into_iter().map(|s| s.id).collect();
+    assert_eq!(
+        ids,
+        [
+            "airband",
+            "airband_vhf",
+            "airband_vhf_and_sos",
+            "ais",
+            "pagers_au"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sets_that_did_not_change_are_not_loaded_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let sets_dir = set_files(dir.path());
+    let node = open(dir.path(), Some(&sets_dir)).await;
+    let first = node.sets();
+    set_list(&node).await;
+    assert!(
+        Arc::ptr_eq(&first, &node.sets()),
+        "one registry while the files stand"
+    );
+    write_set(&sets_dir, "more.json", &two_radio_set("more", 300_200_000));
+    assert!(
+        !Arc::ptr_eq(&first, &node.sets()),
+        "a new file is a new registry"
+    );
+}
+
 // ---- set_start and set_stop ----
 
 const TWO: &str = "two_radio";
@@ -898,6 +979,41 @@ async fn conflict_on_b(a_id: &str) {
     assert_eq!(running_jobs(&node), vec![holder]);
     assert!(running_of(&node, TWO).await.is_none());
     assert!(!instance_file(dir.path(), TWO).exists());
+}
+
+#[tokio::test]
+async fn a_set_written_after_open_starts_and_an_edited_running_set_still_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (Radio::new("a"), Radio::new("b"));
+    let node = open_two(dir.path(), &a, &b).await;
+    let sets_dir = dir.path().join("sets");
+
+    // Unknown until its file is written; then `set_start` reads it.
+    let op = || set_op("late", AB, None, &[]);
+    match node.apply(op()).await {
+        Err(OpError::Unknown { field, .. }) => assert_eq!(field, "set"),
+        other => panic!("expected unknown, got {other:?}"),
+    }
+    write_set(&sets_dir, "late.json", &two_radio_set("late", 300_200_000));
+    let r = started_set(&node, op()).await;
+    assert_eq!(r.started.len(), 5, "{:?}", r.refused);
+
+    // The file changes while the set runs: its `m` member moves. The running instance
+    // is the node's own record, so `set_stop` still stops every job it started, and
+    // the next start runs the file as it now stands.
+    write_set(&sets_dir, "late.json", &two_radio_set("late", 300_300_000));
+    assert!(running_of(&node, "late").await.is_some());
+    let (stopped, ended, failed) = stopped_set(&node, "late").await;
+    assert_eq!((stopped.len(), ended.len(), failed), (5, 0, 0));
+    let r = started_set(&node, op()).await;
+    let m = r.job("m");
+    let rec = node.job_list().into_iter().find(|j| j.id == m).unwrap();
+    assert_eq!(rec.tuning.center_hz, Hz(300_300_000));
+
+    // A set whose file is removed while it runs can still be stopped.
+    std::fs::remove_file(sets_dir.join("late.json")).unwrap();
+    let (stopped, _, failed) = stopped_set(&node, "late").await;
+    assert_eq!((stopped.len(), failed), (5, 0));
 }
 
 #[tokio::test]

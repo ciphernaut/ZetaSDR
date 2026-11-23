@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Sets: a serving node reads its operator sets directory (`--sets-dir`) again whenever the files
+  there have changed, so a set file added, edited or removed is in force at the next `set_list`,
+  `set_start` or `set_stop` with no restart. A set that is running keeps the jobs it started:
+  `set_stop` stops them whatever its file now says, and the next `set_start` runs the file as it
+  stands. A set an edit breaks is listed `broken` and reported on stderr once.
 - OnAir serves ten more modes: `handlers/onair.json` gains entries for `pocsag_decode`,
   `flex_decode`, `acars_decode`, `vdl2_decode`, `hfdl_decode` and the sonde rows `rs41_decode`,
   `dfm_decode` and `m20_decode` (events), and for `aprs_decode` (AX.25) and `ais_decode` (NMEA

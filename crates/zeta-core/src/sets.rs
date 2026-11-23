@@ -6,6 +6,8 @@
 //! embedded set's `id` replaces it, and loading never fails. A file that does not parse
 //! or validate is kept `broken` with its reason; one that meant to replace a set leaves
 //! that set in force and is listed beside it as `<id>@<file name>`.
+//! A node loads them again when the operator directory's files have changed
+//! ([`DirStamp`]), so an edit needs no restart.
 //!
 //! A set names roles (`radios`), never sources: the request maps each role to a source.
 //! Its `members` are `job_start` and `plan_start` requests without `source`, `elastic`
@@ -549,6 +551,50 @@ pub struct LoadedSet {
     pub file: String,
 }
 
+/// The `*.json` files of `operator_dir`, by file name; a missing or unreadable
+/// directory reads as empty.
+fn operator_files(operator_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = operator_dir
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json") && p.is_file())
+        .collect();
+    files.sort();
+    files
+}
+
+/// What the operator directory's set files were at one moment: each file's path,
+/// length and a hash of its bytes (`None` for a file that could not be read). Two
+/// stamps that differ mean a file was added, removed or changed, so a node compares
+/// the directory's stamp with the one its registry was loaded under and loads again
+/// when they differ ([`SetRegistry::load`] reads the same files). It is taken from the
+/// contents, not the modification times: two writes inside one tick of the file
+/// system's clock would leave those equal, and set files are a few kilobytes each.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirStamp(Vec<(PathBuf, Option<(u64, u64)>)>);
+
+impl DirStamp {
+    /// The stamp of `operator_dir` as it stands (`None`, or a missing directory: empty).
+    pub fn of(operator_dir: Option<&Path>) -> DirStamp {
+        use std::hash::{Hash, Hasher};
+        DirStamp(
+            operator_files(operator_dir)
+                .into_iter()
+                .map(|p| {
+                    let seen = std::fs::read(&p).ok().map(|bytes| {
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        bytes.hash(&mut h);
+                        (bytes.len() as u64, h.finish())
+                    });
+                    (p, seen)
+                })
+                .collect(),
+        )
+    }
+}
+
 /// Every set the node knows, sorted by id.
 #[derive(Clone, Debug, Default)]
 pub struct SetRegistry {
@@ -577,15 +623,7 @@ impl SetRegistry {
         for (file, text) in EMBEDDED {
             reg.add(file.to_string(), text, modes, stages);
         }
-        let mut files: Vec<PathBuf> = operator_dir
-            .and_then(|d| std::fs::read_dir(d).ok())
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "json") && p.is_file())
-            .collect();
-        files.sort();
-        for path in files {
+        for path in operator_files(operator_dir) {
             let file = path.display().to_string();
             match std::fs::read_to_string(&path) {
                 Ok(text) => reg.add(file, &text, modes, stages),

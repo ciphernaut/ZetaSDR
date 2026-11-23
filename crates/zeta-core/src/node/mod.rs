@@ -145,8 +145,9 @@ pub struct NodeConfig {
     /// embedded files (the CLI resolves the default,
     /// [`crate::modes::default_handlers_dir`]). A missing directory reads as empty.
     pub handlers_dir: Option<PathBuf>,
-    /// The operator's named sets (`--sets-dir`), read after the embedded ones at `open`
-    /// and validated against the mode rows; `None` is no operator directory: only the
+    /// The operator's named sets (`--sets-dir`), read after the embedded ones at `open`,
+    /// and again by a set op when its files have changed, and validated against the mode
+    /// rows; `None` is no operator directory: only the
     /// embedded sets (the CLI resolves the default, [`crate::sets::default_operator_dir`]).
     /// A missing directory reads as empty.
     pub sets_dir: Option<PathBuf>,
@@ -536,8 +537,12 @@ struct Inner {
     handlers_dir: Option<PathBuf>,
     /// Held across [`Node::reload_modes`] (no await inside).
     reloading: Mutex<()>,
-    /// The named sets, loaded at `open` from `NodeConfig.sets_dir` over the embedded ones.
-    sets: Arc<crate::sets::SetRegistry>,
+    /// The named sets, loaded from `sets_dir` over the embedded ones, with the stamp of
+    /// that directory they were loaded under: [`Inner::sets`] loads them again when the
+    /// directory's files have changed since.
+    sets: Mutex<(crate::sets::DirStamp, Arc<crate::sets::SetRegistry>)>,
+    /// The operator's sets directory as configured (`NodeConfig.sets_dir`).
+    sets_dir: Option<PathBuf>,
     /// `state_dir/set-instances` ([`SET_INSTANCES_DIR`]): one [`crate::sets::SetInstance`]
     /// file per running set, apart from an operator `--sets-dir` of set files.
     instances_dir: PathBuf,
@@ -658,6 +663,33 @@ impl Inner {
             .entry(source.clone())
             .or_insert_with(|| Arc::new(tokio::sync::watch::channel(0).0))
             .clone()
+    }
+
+    /// The named sets as the operator directory's files stand now: the registry held,
+    /// or, when the directory's stamp differs from the one it was loaded under, a fresh
+    /// load against the modes as they stand (the stamp reads the directory's few small
+    /// files, so every set op may ask). A set that became broken in that load is
+    /// reported on stderr once, as at startup. A caller keeps the registry it got for
+    /// the whole of one use. A running set's instance is the node's own record and is
+    /// untouched: `set_stop` stops its jobs whatever its file now says.
+    pub(crate) fn sets(&self) -> Arc<crate::sets::SetRegistry> {
+        let stamp = crate::sets::DirStamp::of(self.sets_dir.as_deref());
+        let mut held = self.sets.lock().unwrap();
+        if held.0 != stamp {
+            let fresh = crate::sets::SetRegistry::load(
+                &self.modes(),
+                &self.registry,
+                self.sets_dir.as_deref(),
+            );
+            let known = held.1.startup_lines();
+            for line in fresh.startup_lines() {
+                if !known.contains(&line) {
+                    eprintln!("{line}");
+                }
+            }
+            *held = (stamp, Arc::new(fresh));
+        }
+        held.1.clone()
     }
 
     /// The decoder modes as they stand now: one registry, which a caller keeps for the
@@ -1567,6 +1599,9 @@ impl Node {
                 modes.set(Arc::new(probed));
             }
         }
+        // The stamp first: a file written while the sets load differs from it at the
+        // next read, and is loaded then.
+        let sets_stamp = crate::sets::DirStamp::of(cfg.sets_dir.as_deref());
         let sets = Arc::new(crate::sets::SetRegistry::load(
             &modes.get().unwrap_or_default(),
             &registry,
@@ -1612,7 +1647,8 @@ impl Node {
                 modes_dir: cfg.modes_dir.clone(),
                 handlers_dir: cfg.handlers_dir.clone(),
                 reloading: Mutex::new(()),
-                sets,
+                sets: Mutex::new((sets_stamp, sets)),
+                sets_dir: cfg.sets_dir.clone(),
                 instances_dir,
                 set_instances: Mutex::new(set_instances),
                 set_gate: tokio::sync::Mutex::new(()),
@@ -1845,9 +1881,12 @@ impl Node {
         *self.inner.themes.write().unwrap() = themes;
     }
 
-    /// The named sets (`set_list`): the embedded ones and the operator's `sets_dir`.
+    /// The named sets (`set_list`): the embedded ones and the operator's `sets_dir`, as
+    /// its files stand now. A file added, removed or written since the last read is
+    /// loaded before this answers, so a set op never needs a restart to see an edit;
+    /// while nothing changed, every caller gets the same registry.
     pub fn sets(&self) -> Arc<crate::sets::SetRegistry> {
-        self.inner.sets.clone()
+        self.inner.sets()
     }
 
     /// The running sets' instances by set id (`state_dir/set-instances`, read back at `open`).
