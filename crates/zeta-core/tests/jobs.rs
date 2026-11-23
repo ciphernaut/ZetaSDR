@@ -997,8 +997,9 @@ async fn a_node_opened_without_the_cli_probes_its_handler_files() {
     assert_eq!(
         reason,
         "onair-rx: missing (https://on-air.dev) — modes: acars_decode, adsb_decode, \
-         ais_decode, aprs_decode, dfm_decode, flex_decode, hfdl_decode, m20_decode, \
-         pocsag_decode, rs41_decode, vdl2_decode"
+         ais_decode, aprs_decode, dfm_decode, dmr_decode, dvbt_decode, flex_decode, \
+         hfdl_decode, m17_decode, m20_decode, p25_decode, pocsag_decode, rds_decode, \
+         rs41_decode, vdl2_decode"
     );
     let r = h::try_start(&node, Some("onair"), &[]).await;
     assert_eq!(

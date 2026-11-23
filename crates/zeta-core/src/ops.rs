@@ -1091,7 +1091,9 @@ pub enum Op {
     /// Rank the handlers of mode `mode`, or with `mode: null` of every mode (the
     /// node-wide ranking), for the policy that picks a mode's handler (`modes_list`'s
     /// `handler`): among the mode's ready handlers, one lacking an output the start needs
-    /// is passed over; then the mode's ranking leads, then the node-wide one, then an
+    /// is passed over; then the mode's ranking leads, then the node-wide one (only for a
+    /// handler giving every output the row's own decoder gives: one giving less, an
+    /// events-only handler on a voice mode, is ordered as if it did not name it), then an
     /// in-process handler goes before a program, then the row's own before the handler
     /// files' (by id). `order` lists handler ids (`modes_list`'s `handlers[].id`), first
     /// preferred; an id it leaves out goes after those it names, and an empty `order`
