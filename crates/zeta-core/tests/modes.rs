@@ -1399,7 +1399,7 @@ fn the_embedded_onair_handler_serves_the_bus_modes() {
     let events = [StreamKind::Event];
     let both = [StreamKind::Event, StreamKind::Packet];
     // (mode id, the streams its OnAir entry gives, its input rate)
-    let modes: [(&str, &[StreamKind], u64); 14] = [
+    let modes: [(&str, &[StreamKind], u64); 15] = [
         ("pocsag_decode", &events, 1_000_000),
         ("flex_decode", &events, 1_000_000),
         ("acars_decode", &events, 1_000_000),
@@ -1414,6 +1414,7 @@ fn the_embedded_onair_handler_serves_the_bus_modes() {
         ("dmr_decode", &events, 48_000),
         ("p25_decode", &events, 250_000),
         ("m17_decode", &events, 250_000),
+        ("dvbt_decode", &events, 10_000_000),
     ];
     for (id, outputs, rate) in modes {
         assert_eq!(
@@ -1459,6 +1460,78 @@ fn the_embedded_onair_handler_serves_the_bus_modes() {
         );
     }
     assert!(reg.handler_consts("m17_decode", "onair").is_empty());
+    // Analog video missed the listing bar (no one rate locks a full FPV swing and keeps
+    // real time on an empty channel): OnAir is not one of its handlers.
+    assert_eq!(handler_ids(&reg, "video_decode"), ["builtin"]);
+    assert!(reg.handler("video_decode", "onair").is_none());
+    assert_eq!(reg.program_block("video_decode", "onair"), None);
+}
+
+/// OnAir's `dvbt_decode` entry reads the wrapper's status lines (`fixtures/
+/// onair-dvbt-status.jsonl`: two lines `onair-rx` wrote on its own generated multiplex,
+/// one before lock and one locked with the service list) as the node's `json_lines` stage
+/// does: `output.fields` onto the row's fields, `extra` beside them. Each event passes the
+/// row's schema; the locked one carries the signalling and `services` names `ZETA TEST`.
+#[test]
+fn the_onair_dvbt_entry_maps_a_status_line() {
+    use zeta_core::modes::FieldPath;
+    let mut reg = ModeRegistry::load(&stages(), None);
+    zeta_core::modes::handlers::probe_handler_files(&mut reg);
+    let block = reg.program_block("dvbt_decode", "onair").unwrap();
+    let fields = block.output.fields.expect("the entry's field map");
+    let extra = reg.handler_extra("dvbt_decode", "onair");
+    assert_eq!(extra.keys().collect::<Vec<_>>(), ["services"]);
+    assert!(reg.handler_consts("dvbt_decode", "onair").is_empty());
+    // As zeta-ext's `apply_fields`: the first pointer that resolves to a non-null value.
+    let map = |paths: &std::collections::BTreeMap<String, FieldPath>, line: &serde_json::Value| {
+        paths
+            .iter()
+            .filter_map(|(k, p)| {
+                let v = p
+                    .pointers()
+                    .iter()
+                    .filter_map(|p| line.pointer(p))
+                    .find(|v| !v.is_null())?;
+                Some((k.clone(), v.clone()))
+            })
+            .collect::<serde_json::Map<_, _>>()
+    };
+    let schema = &reg.get("dvbt_decode").unwrap().row.event.schema;
+    let validator = jsonschema::validator_for(schema).unwrap();
+    let text = include_str!("fixtures/onair-dvbt-status.jsonl");
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| {
+            let line: serde_json::Value = serde_json::from_str(l).unwrap();
+            let mut ev = map(&fields, &line);
+            ev.extend(map(&extra, &line));
+            serde_json::Value::Object(ev)
+        })
+        .collect();
+    assert_eq!(events.len(), 2);
+    for ev in &events {
+        assert!(validator.is_valid(ev), "{ev}");
+        assert!(ev["locked"].is_boolean(), "{ev}");
+    }
+    let (searching, locked) = (&events[0], &events[1]);
+    assert_eq!(searching["locked"], false);
+    assert_eq!(searching["lock"], "searching");
+    assert!(searching.get("bandwidth_hz").is_none(), "{searching}");
+    assert_eq!(locked["locked"], true);
+    assert_eq!(locked["lock"], "locked");
+    assert_eq!(locked["bandwidth_hz"], 8_000_000);
+    assert_eq!(locked["mode"], "8K");
+    assert_eq!(locked["guard"], "1/8");
+    assert_eq!(locked["constellation"], "64-QAM");
+    assert_eq!(locked["code_rate"], "3/4");
+    assert!(locked["snr_db"].is_number(), "{locked}");
+    let names: Vec<&str> = locked["services"]
+        .as_array()
+        .expect("services")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(names.contains(&"ZETA TEST"), "{locked}");
 }
 
 /// `handlers/onair.json` ships in the node: OnAir is `adsb_decode`'s second handler,

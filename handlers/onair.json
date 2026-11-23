@@ -344,6 +344,30 @@
           "eot": "/eot"
         }
       }
+    },
+    "dvbt_decode": {
+      "args": [
+        "--mode", "dvbt", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 10000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "locked": "/locked",
+          "lock": "/lock",
+          "bandwidth_hz": "/bandwidth_hz",
+          "mode": "/mode",
+          "guard": "/guard",
+          "constellation": "/constellation",
+          "code_rate": "/code_rate",
+          "hierarchy": "/hierarchy",
+          "lp_code_rate": "/lp_code_rate",
+          "snr_db": "/snr_db"
+        }
+      },
+      "extra": { "services": "/services" }
     }
   }
 }

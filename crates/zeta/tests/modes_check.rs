@@ -1005,10 +1005,11 @@ fn a_fifo_rows_run_makes_its_subdirectory_under_the_run_dir() {
 }
 
 /// OnAir's entries for the bus modes pass `zeta modes check <id> --handler onair`, each
-/// recorded as `<id>@onair`. It needs `onair-rx`: the test-only `ZETA_TEST_ONAIR_RX`
-/// names it (an executable file, not looked up on `PATH`), passed to the node as
-/// `ZETA_HANDLER_ONAIR_RX`; unset, the test says so and passes. The node's own
-/// `ZETA_HANDLER_ONAIR_RX` in the caller's environment is never read: [`check`] pins it.
+/// recorded as `<id>@onair`, and analog video, which OnAir does not serve, is refused. It
+/// needs `onair-rx`: the test-only `ZETA_TEST_ONAIR_RX` names it (an executable file, not
+/// looked up on `PATH`), passed to the node as `ZETA_HANDLER_ONAIR_RX`; unset, the test
+/// says so and passes. The node's own `ZETA_HANDLER_ONAIR_RX` in the caller's
+/// environment is never read: [`check`] pins it.
 #[test]
 fn onair_passes_the_bus_modes_checks() {
     use std::os::unix::fs::PermissionsExt;
@@ -1054,7 +1055,24 @@ fn onair_passes_the_bus_modes_checks() {
         assert_eq!(code, 0, "{id}");
     }
     // Not run: hfdl_decode's fixture is still pending (its entry is validated by the
-    // registry test); dfm_decode's row has no test.
+    // registry test); dfm_decode's and dvbt_decode's rows have no test (DVB-T's entry is
+    // pinned against the wrapper's own lines instead).
     println!("hfdl_decode@onair: not run, its fixture is pending");
     println!("dfm_decode@onair: not run, its row has no test");
+    println!("dvbt_decode@onair: not run, its row has no test");
+    // Analog video is not OnAir's (it missed the listing bar): the check refuses the handler.
+    let out = check(
+        dir.path(),
+        &["video_decode", "--handler", "onair", "--strict"],
+    )
+    .env("ZETA_HANDLER_ONAIR_RX", &program)
+    .output()
+    .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        err.contains("mode video_decode has no handler onair"),
+        "{err}"
+    );
+    println!("video_decode@onair: not listed");
 }
