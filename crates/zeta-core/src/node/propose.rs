@@ -273,7 +273,7 @@ fn mode_row(inner: &Inner, kind: &str) -> Option<ModeRow> {
 
 /// The frame row `kind` names, if it names one.
 fn frame_row(inner: &Inner, kind: &str) -> Option<ModeRow> {
-    mode_row(inner, kind).filter(|r| matches!(r.decoder, Decoder::Frame(_)))
+    mode_row(inner, kind).filter(|r| matches!(r.decoder, Some(Decoder::Frame(_))))
 }
 
 /// Whether the job `rec` watches its frames for a proposal: a `bits` or `graph` job.
@@ -506,7 +506,7 @@ fn job_captures(rec: &JobRecord) -> Vec<String> {
 /// tuning, and the row's demodulator (else the bits plan's rate and order).
 fn tuning_features(rec: &JobRecord, row: Option<&ModeRow>) -> FeatureRecord {
     let demod = row.and_then(|r| match &r.decoder {
-        Decoder::Frame(b) => Some(&b.demod),
+        Some(Decoder::Frame(b)) => Some(&b.demod),
         _ => None,
     });
     let bits = &rec.context["bits"];

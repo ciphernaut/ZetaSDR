@@ -1090,3 +1090,38 @@ async fn a_rechosen_handler_still_satisfies_the_starts_needs() {
     );
     assert!(reason.contains(h::ALT_MISSING), "{reason}");
 }
+
+/// Plan 47: a job of a row with no decoder of its own, started through `alt`, whose
+/// handler file is gone at restart: the node starts, and the job fails with the row's
+/// reason (there is no decoder of the row's own to fall back on).
+#[tokio::test]
+async fn a_stored_job_of_a_row_whose_handler_is_gone_fails_with_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
+        // `nodec_cfg` rewrites the files: a node with the handler, then without it.
+        Node::open(h::nodec_cfg(dir.path(), Some(true)), h::stages(None), ports)
+    };
+    let node = open().await.unwrap();
+    let id = match node.apply(h::nodec_op(None)).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("nodec_decode start: {r:?}"),
+    };
+    assert_eq!(record(&node, &id).handler.as_deref(), Some(ALT));
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
+    let node = Node::open(h::nodec_cfg(dir.path(), None), h::stages(None), ports)
+        .await
+        .expect("the node starts");
+    let rec = record(&node, &id);
+    assert_eq!(
+        rec.state,
+        JobState::Failed {
+            reason: format!("mode {} is unavailable: {}", h::NODEC, h::NO_DECODER_REASON),
+        }
+    );
+    assert_eq!(rec.handler.as_deref(), Some(ALT));
+    assert_eq!(on_disk(dir.path(), &id).state, rec.state);
+}

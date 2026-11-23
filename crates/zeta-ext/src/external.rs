@@ -225,7 +225,7 @@ pub(crate) fn resolve_handler(
                 m.reason.as_deref().unwrap_or("not ready")
             )));
         }
-        let Decoder::Program(block) = &m.row.decoder else {
+        let Some(Decoder::Program(block)) = &m.row.decoder else {
             return Err(failed(format!("{prefix}: mode {id} is not a program row")));
         };
         let program = find_program(m.program.clone(), block, id)?;
@@ -300,7 +300,7 @@ impl Stage for ExternalDecodeStage {
             let block = match handler {
                 Some(h) => reg.program_block(id, h),
                 None => reg.get(id).and_then(|m| match &m.row.decoder {
-                    Decoder::Program(b) => Some(b.clone()),
+                    Some(Decoder::Program(b)) => Some(b.clone()),
                     _ => None,
                 }),
             };
@@ -1559,7 +1559,7 @@ mod tests {
     #[test]
     fn args_are_substituted() {
         let row = zeta_core::modes::parse(include_str!("../../../modes/adsb_decode.json")).unwrap();
-        let Decoder::Program(mut block) = row.decoder else {
+        let Some(Decoder::Program(mut block)) = row.decoder else {
             panic!("a program row")
         };
         block.args = [
@@ -1594,7 +1594,7 @@ mod tests {
     #[test]
     fn substitute_fills_center_khz() {
         let row = zeta_core::modes::parse(include_str!("../../../modes/adsb_decode.json")).unwrap();
-        let Decoder::Program(mut block) = row.decoder else {
+        let Some(Decoder::Program(mut block)) = row.decoder else {
             panic!("a program row")
         };
         block.args = ["$center_khz", "$center_hz"].map(String::from).to_vec();

@@ -1854,8 +1854,9 @@ impl JobKind {
     /// lacks one of `needs`), else the choice of `policy` among the mode's ready handlers
     /// giving every kind of `needs`. A mode no handler can serve is refused as
     /// [`JobKind::mode_row`] refuses it when it has only the row's own handler and
-    /// nothing is needed, else `no_handler` naming each handler and why it was passed
-    /// over.
+    /// nothing is needed, or when it has no decoder of its own and no handler of it is
+    /// ready, else `no_handler` naming each handler and why it was passed over. The answer
+    /// is never the stand-in of a row with no decoder (never ready).
     pub fn start_handler(
         &self,
         named: Option<&str>,
@@ -1885,7 +1886,10 @@ impl JobKind {
                 Err(other(format!("{mode}: {why}")))
             }
             Err(Refusal::NoneLeft(passed)) => {
-                let only_own = needs.is_empty() && m.handlers.len() <= 1;
+                // A row with no decoder of its own and no ready handler is refused with
+                // its reason, which names each handler and why, whatever was needed.
+                let only_own = (needs.is_empty() && m.handlers.len() <= 1)
+                    || (!m.has_decoder() && !m.startable());
                 Err(match self.mode_row(modes) {
                     Err(e) if only_own => e,
                     _ => OpError::NoHandler {
@@ -3576,7 +3580,11 @@ pub struct ModeInfo {
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub reason: Option<String>,
-    pub decoder_kind: DecoderKind,
+    /// The kind of the row's own decoder; `null` for a row with none, which only a
+    /// handler file's entry runs.
+    #[schemars(required, schema_with = "crate::modes::nullable_enum::<DecoderKind>")]
+    #[serde(deserialize_with = "crate::modes::nullable")]
+    pub decoder_kind: Option<DecoderKind>,
     /// The file the row came from: `modes/<id>.json` for a built-in row, the path for an
     /// operator row (the file to fix when the row is broken).
     pub file: String,
@@ -3637,7 +3645,7 @@ impl ModeInfo {
             modulation: m.row.modulation.clone(),
             state: r.state,
             reason: r.reason,
-            decoder_kind: m.row.decoder.kind(),
+            decoder_kind: m.row.decoder_kind(),
             file: m.file.clone(),
             program: r.program.as_ref().map(|p| p.display().to_string()),
             checked: m.checked,
@@ -3698,12 +3706,14 @@ pub struct ModeHandlerInfo {
 
 impl ModeHandlerInfo {
     /// `m`'s handlers, as reported, from `modes` (`m`'s registry, which holds the handler
-    /// files their `extra` comes from).
+    /// files their `extra` comes from): the stand-in of a row with no decoder of its own
+    /// left out ([`LoadedMode::listed_handlers`]).
     pub fn of(m: &LoadedMode, modes: &ModeRegistry) -> Vec<Self> {
         let mode = &m.row.id.0;
         m.handlers
             .iter()
             .enumerate()
+            .filter(|(i, _)| *i > 0 || m.has_decoder())
             .map(|(i, h)| ModeHandlerInfo {
                 id: h.id.clone(),
                 name: h.name.clone(),
@@ -6270,7 +6280,7 @@ fn handler_policy_set(
     let modes = node.modes();
     let mut known: Vec<String> = match &mode {
         Some(id) => match modes.get(&id.0) {
-            Some(m) => m.handlers.iter().map(|h| h.id.clone()).collect(),
+            Some(m) => m.listed_handlers().map(|h| h.id.clone()).collect(),
             None => {
                 return Err(OpError::Unknown {
                     field: "mode".into(),
@@ -6282,7 +6292,7 @@ fn handler_policy_set(
         None => modes
             .all()
             .iter()
-            .flat_map(|m| m.handlers.iter().map(|h| h.id.clone()))
+            .flat_map(|m| m.listed_handlers().map(|h| h.id.clone()))
             .collect(),
     };
     if mode.is_none() {
@@ -8091,10 +8101,12 @@ pub(crate) fn mode_handler(
     let m = modes
         .get(mode)
         .ok_or_else(|| other(format!("unknown mode {mode}")))?;
+    // A row with no decoder of its own run by its own (`None`) gets the stand-in, refused
+    // below as not ready.
     let h = m.handler(handler).ok_or_else(|| OpError::Unknown {
         field: "handler".into(),
         value: handler.unwrap_or_default().to_string(),
-        known: m.handlers.iter().map(|h| h.id.clone()).collect(),
+        known: m.listed_handlers().map(|h| h.id.clone()).collect(),
     })?;
     if let Some(why) = crate::modes::policy::unready(&h) {
         return Err(other(format!("{mode}: {why}")));
@@ -8110,9 +8122,12 @@ pub(crate) fn mode_handler(
 /// handlers, which runs the row's own) the own handler of `row`, the job's row; `None` for
 /// a job of no row.
 pub(crate) fn capture_handler(handler: Option<&str>, row: Option<&ModeRow>) -> Option<String> {
-    handler
-        .map(String::from)
-        .or_else(|| row.map(crate::modes::handler_file::own_handler_id))
+    handler.map(String::from).or_else(|| {
+        // A row with no decoder of its own has no own handler to record (its jobs always
+        // name theirs).
+        row.filter(|r| r.decoder.is_some())
+            .map(crate::modes::handler_file::own_handler_id)
+    })
 }
 
 /// The mode row a running job of `kind` expands from, whose id and `access` its capture

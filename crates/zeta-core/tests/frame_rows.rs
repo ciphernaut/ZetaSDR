@@ -207,8 +207,8 @@ async fn start(node: &Node, kind: JobKind) -> JobId {
 fn a_frame_row_parses_validates_and_lists_its_kind() {
     let row = parse(&row_json().to_string()).unwrap();
     validate(&row, &stages()).unwrap();
-    assert_eq!(row.decoder.kind(), DecoderKind::Frame);
-    let Decoder::Frame(block) = &row.decoder else {
+    assert_eq!(row.decoder_kind(), Some(DecoderKind::Frame));
+    let Some(Decoder::Frame(block)) = &row.decoder else {
         panic!("a frame row");
     };
     assert_eq!(block.framing, framing());

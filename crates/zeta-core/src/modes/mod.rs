@@ -47,7 +47,14 @@ pub use row::{
 };
 pub(crate) use row::{FRAME_DECODE_STAGE, require_all};
 
-pub use handler_file::{BUILTIN, HandlerBlockSpec, HandlerEntry, HandlerFile};
+pub use handler_file::{BUILTIN, HandlerBlockSpec, HandlerEntry, HandlerFile, NO_DECODER};
+
+/// The reason of the stand-in own handler of a row with no decoder of its own.
+pub const STAND_IN_REASON: &str = "the row has no decoder of its own";
+
+/// The reason of a row with no decoder of its own while no handler for it is ready, before
+/// each listed handler's own (see [`LoadedMode::reason`]).
+pub const NO_DECODER_REASON: &str = "no decoder of its own, and no handler for it is ready";
 
 /// Where a loaded row stands: `ready` (parsed, validated and, for a program row or a
 /// graph row with `handlers`, its required programs found; an optional one missing is
@@ -74,6 +81,9 @@ pub struct LoadedMode {
     pub row: ModeRow,
     pub state: ModeState,
     /// Why the row is not ready (`<field>: <error>` for a broken one); `null` when ready.
+    /// A row with no decoder of its own is never ready itself: [`NO_DECODER_REASON`],
+    /// then `; <id>: <reason>` for each handler file's handler of it in order, kept up
+    /// to date as each handler's probe answer is recorded.
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     #[serde(deserialize_with = "nullable")]
     pub reason: Option<String>,
@@ -103,8 +113,9 @@ pub struct LoadedMode {
     #[serde(default)]
     pub voices: Vec<String>,
     /// Every handler of the mode: the row's own first (whose state, reason, program,
-    /// missing and checked are the row's above), then each handler file's entry for the
-    /// mode, by file id. Not in what the node reports yet.
+    /// missing and checked are the row's above; for a row with no decoder of its own the
+    /// stand-in [`NO_DECODER`], never ready), then each handler file's entry for the
+    /// mode, by file id. Reported by the node without the stand-in.
     #[serde(skip)]
     #[schemars(skip)]
     pub handlers: Vec<ModeHandler>,
@@ -120,9 +131,21 @@ impl LoadedMode {
     }
 
     /// The id of the row's own handler: `builtin` for a graph or frame row, its first
-    /// program for a program row.
+    /// program for a program row, [`NO_DECODER`] for a row with no decoder of its own.
     pub fn own_handler(&self) -> String {
         handler_file::own_handler_id(&self.row)
+    }
+
+    /// Whether the row has a decoder of its own (`decoder` not `null`).
+    pub fn has_decoder(&self) -> bool {
+        self.row.decoder.is_some()
+    }
+
+    /// The handlers the node reports (`modes_list`, `modes_show`, the ids a refusal
+    /// lists): [`LoadedMode::handlers`] without the stand-in of a row with no decoder.
+    pub fn listed_handlers(&self) -> impl Iterator<Item = &ModeHandler> {
+        let skip = usize::from(!self.has_decoder());
+        self.handlers.iter().skip(skip)
     }
 
     /// The mode's handler `id` (`None`: the row's own); `None` when it has none of that
@@ -170,10 +193,14 @@ pub struct ModeHandler {
 
 impl ModeHandler {
     /// `row`'s own handler as a ready row has it, before any probe: what a graph of the
-    /// row alone (no registry) is expanded for.
+    /// row alone (no registry) is expanded for. A row with no decoder has the stand-in
+    /// ([`ModeHandler::stand_in`]).
     pub fn of_row(row: &ModeRow) -> ModeHandler {
+        if row.decoder.is_none() {
+            return ModeHandler::stand_in(String::new());
+        }
         let id = handler_file::own_handler_id(row);
-        let in_process = !matches!(row.decoder, Decoder::Program(_));
+        let in_process = !matches!(row.decoder, Some(Decoder::Program(_)));
         ModeHandler {
             name: match in_process {
                 true => "built-in".into(),
@@ -188,6 +215,24 @@ impl ModeHandler {
             missing: Vec::new(),
             checked: None,
             file: String::new(),
+        }
+    }
+
+    /// The own handler of a row with no decoder of its own (from `file`): [`NO_DECODER`],
+    /// not in process, giving nothing, `unavailable` with [`STAND_IN_REASON`]. It keeps
+    /// the row's own place first in [`LoadedMode::handlers`], and is never ready.
+    pub fn stand_in(file: String) -> ModeHandler {
+        ModeHandler {
+            id: NO_DECODER.into(),
+            name: NO_DECODER.into(),
+            in_process: false,
+            outputs: Vec::new(),
+            state: ModeState::Unavailable,
+            reason: Some(STAND_IN_REASON.into()),
+            program: None,
+            missing: Vec::new(),
+            checked: None,
+            file,
         }
     }
 }
@@ -484,10 +529,15 @@ impl ModeRegistry {
         }
         let outputs = template::outputs(&row, stages);
         let voices = template::voices(&row, stages);
+        // A row with no decoder of its own is never ready itself: a handler is.
+        let (state, reason) = match row.decoder {
+            Some(_) => (ModeState::Ready, None),
+            None => (ModeState::Unavailable, Some(NO_DECODER_REASON.to_string())),
+        };
         let loaded = LoadedMode {
             row,
-            state: ModeState::Ready,
-            reason: None,
+            state,
+            reason,
             file,
             program: None,
             checked: None,
@@ -628,6 +678,7 @@ impl ModeRegistry {
         }
         for m in &mut self.modes {
             m.handlers[1..].sort_by(|a, b| a.id.cmp(&b.id));
+            no_decoder_reason(m);
         }
     }
 
@@ -652,7 +703,7 @@ impl ModeRegistry {
         }
         if i == 0 {
             return match &m.row.decoder {
-                Decoder::Program(p) => Some(p.clone()),
+                Some(Decoder::Program(p)) => Some(p.clone()),
                 _ => None,
             };
         }
@@ -723,6 +774,7 @@ impl ModeRegistry {
                 };
                 h.program = program;
                 h.reason = reason;
+                no_decoder_reason(m);
             }
             None => {}
         }
@@ -752,12 +804,13 @@ impl ModeRegistry {
     /// program, a graph row's first handler, `None` when that one is missing) and, when
     /// a required handler is missing, `reason`, which makes the row unavailable (else it
     /// is ready). It starts the row's probe over: `missing` is cleared, for
-    /// [`ModeRegistry::set_missing`] to fill. A broken row stays broken.
+    /// [`ModeRegistry::set_missing`] to fill. A broken row stays broken, and a row with
+    /// no decoder of its own has no program of its own: it is left as it is.
     pub fn set_program(&mut self, id: &str, program: Option<PathBuf>, reason: Option<String>) {
         let Some(m) = self.modes.iter_mut().find(|m| m.row.id.0 == id) else {
             return;
         };
-        if m.state == ModeState::Broken {
+        if m.state == ModeState::Broken || !m.has_decoder() {
             return;
         }
         m.state = match reason {
@@ -794,7 +847,7 @@ impl ModeRegistry {
     /// handler for the mode with the same program block and neither is broken.
     pub fn carry_programs(&mut self, old: &ModeRegistry) {
         for m in &mut self.modes {
-            if m.state == ModeState::Broken || m.row.decoder.handler_blocks().is_empty() {
+            if m.state == ModeState::Broken || m.row.handler_blocks().is_empty() {
                 continue;
             }
             let Some(o) = old.get(&m.row.id.0) else {
@@ -824,16 +877,15 @@ impl ModeRegistry {
             }
         }
         for (mode, o) in carried {
-            let h = self
-                .modes
-                .iter_mut()
-                .find(|m| m.row.id.0 == mode)
-                .and_then(|m| m.handlers.iter_mut().skip(1).find(|h| h.id == o.id));
-            if let Some(h) = h {
+            let Some(m) = self.modes.iter_mut().find(|m| m.row.id.0 == mode) else {
+                continue;
+            };
+            if let Some(h) = m.handlers.iter_mut().skip(1).find(|h| h.id == o.id) {
                 h.program = o.program;
                 h.state = o.state;
                 h.reason = o.reason;
             }
+            no_decoder_reason(m);
         }
     }
 
@@ -896,10 +948,14 @@ impl ModeRegistry {
     }
 }
 
-/// The row's own handler of `m`, from the row as loaded.
+/// The row's own handler of `m`, from the row as loaded: the stand-in for a row with no
+/// decoder of its own.
 fn own_handler(m: &LoadedMode) -> ModeHandler {
+    if !m.has_decoder() {
+        return ModeHandler::stand_in(m.file.clone());
+    }
     let id = handler_file::own_handler_id(&m.row);
-    let in_process = !matches!(m.row.decoder, Decoder::Program(_));
+    let in_process = !matches!(m.row.decoder, Some(Decoder::Program(_)));
     ModeHandler {
         name: match in_process {
             true => "built-in".into(),
@@ -917,8 +973,33 @@ fn own_handler(m: &LoadedMode) -> ModeHandler {
     }
 }
 
-/// Copy the row's probe answer and checked time into its own handler, `handlers[0]`.
+/// The reason of `m`, a row with no decoder of its own that is not broken, from its
+/// handlers as they stand: [`NO_DECODER_REASON`], then `; <id>: <reason>` for each
+/// handler file's handler in order (its state's word when it has no reason). Called each
+/// time a handler's answer changes, so the probe's missing program is in it; any other
+/// row is left as it is.
+fn no_decoder_reason(m: &mut LoadedMode) {
+    if m.has_decoder() || m.state == ModeState::Broken {
+        return;
+    }
+    let mut reason = NO_DECODER_REASON.to_string();
+    for h in m.listed_handlers() {
+        let why = h.reason.as_deref().unwrap_or(match h.state {
+            ModeState::Ready => "ready",
+            ModeState::Broken => "broken",
+            ModeState::Unavailable => "unavailable",
+        });
+        reason.push_str(&format!("; {}: {why}", h.id));
+    }
+    m.reason = Some(reason);
+}
+
+/// Copy the row's probe answer and checked time into its own handler, `handlers[0]`;
+/// the stand-in of a row with no decoder keeps its own.
 fn sync_own(m: &mut LoadedMode) {
+    if !m.has_decoder() {
+        return;
+    }
     let (state, reason, program) = (m.state, m.reason.clone(), m.program.clone());
     let (missing, checked) = (m.missing.clone(), m.checked);
     if let Some(h) = m.handlers.first_mut() {
@@ -959,11 +1040,11 @@ fn placeholder(id: &str) -> ModeRow {
         modulation: vec![],
         label: String::new(),
         protocol: String::new(),
-        decoder: Decoder::Graph {
+        decoder: Some(Decoder::Graph {
             nodes: vec![],
             edges: vec![],
             handlers: vec![],
-        },
+        }),
         event: Event {
             schema: serde_json::json!({}),
             summary: String::new(),

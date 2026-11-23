@@ -29,12 +29,10 @@ const INSTALL_URL: &str = "https://github.com/ciphernaut/zeta-mbe";
 /// The job-context note for calls heard without their vocoder: the program and how to
 /// get it, from the row's handler 0 when the stage runs one.
 pub fn no_vocoder_note(ctx: &StageContext) -> String {
-    let install = ctx.mode.as_ref().and_then(|row| {
-        row.decoder
-            .handler_blocks()
-            .first()
-            .map(|b| b.install.clone())
-    });
+    let install = ctx
+        .mode
+        .as_ref()
+        .and_then(|row| row.handler_blocks().first().map(|b| b.install.clone()));
     let (how, url) = match &install {
         Some(i) => (i.hint(), i.url.as_str()),
         None => (Some(format!("bash {INSTALL_SCRIPT}")), INSTALL_URL),

@@ -640,7 +640,7 @@ async fn accepting_a_framed_signature_writes_the_learned_row_and_it_decodes() {
     // It is listed ready at once, and decodes the signal.
     let info = listed(&node, &id).await.expect("listed");
     assert_eq!(info.state, ModeState::Ready, "{info:?}");
-    assert_eq!(info.decoder_kind, DecoderKind::Frame);
+    assert_eq!(info.decoder_kind, Some(DecoderKind::Frame));
     let job = start(&node, JobKind::from_name(&id).unwrap(), CENTER_HZ).await;
     let first = first_frame(&node, &job).await;
     assert_eq!(first["protocol"], "frame", "{first}");

@@ -126,7 +126,7 @@ pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
     // without each.
     let mut rows: Vec<(String, Vec<(usize, bool)>)> = Vec::new();
     for m in modes.all().iter().filter(|m| m.state != ModeState::Broken) {
-        let blocks = m.row.decoder.handler_blocks();
+        let blocks = m.row.handler_blocks();
         if blocks.is_empty() {
             continue;
         }
@@ -799,6 +799,93 @@ mod tests {
         n.params[key].as_u64().unwrap()
     }
 
+    /// A row with no decoder of its own (`kind`'s row in `modes`) expands only through a
+    /// handler file's entry: by its own (no handler named) it is refused naming the row,
+    /// never a panic; by each of its ready handlers, at its own band on a source as wide,
+    /// it is a valid graph ending in `external_decode`.
+    fn expands_only_through_a_handler(
+        kind: &JobKind,
+        modes: &zeta_core::modes::ModeRegistry,
+        registry: &zeta_core::stage::StageRegistry,
+    ) {
+        let src = SourceId("src".into());
+        let m = modes.get(kind.name()).unwrap();
+        assert!(!m.has_decoder(), "{kind:?}");
+        let band = &m.row.band;
+        let center = band
+            .centers_hz
+            .first()
+            .copied()
+            .or_else(|| {
+                band.range_hz
+                    .as_ref()
+                    .map(|r| r.0[0][0] + band.bandwidth_hz)
+            })
+            .unwrap_or(100_000_000);
+        let tuning = Tuning {
+            center_hz: Hz(center),
+            bandwidth_hz: Hz(band.bandwidth_hz),
+        };
+        let rate = Hz(band.bandwidth_hz);
+        let e = kind
+            .expand(&src, tuning, rate, None, None, None, modes)
+            .unwrap_err();
+        assert!(e.to_string().contains(&m.row.id.0), "{kind:?}: {e}");
+        for h in m.listed_handlers().filter(|h| h.state == ModeState::Ready) {
+            let g = kind
+                .expand_voiced(
+                    &src,
+                    tuning,
+                    rate,
+                    None,
+                    (None, None, None),
+                    Some(&h.id),
+                    modes,
+                )
+                .unwrap_or_else(|e| panic!("{kind:?} by {}: {e}", h.id));
+            validate(&g, registry).unwrap_or_else(|e| panic!("{kind:?} by {}: {e}", h.id));
+            assert!(
+                g.nodes.iter().any(|n| n.kind == "external_decode"),
+                "{kind:?} by {}: {g:?}",
+                h.id
+            );
+        }
+    }
+
+    /// Plan 47: an operator row with no decoder of its own and a handler file serving it.
+    #[test]
+    fn a_row_with_no_decoder_expands_only_through_a_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let (modes_dir, handlers_dir) = (dir.path().join("modes"), dir.path().join("handlers"));
+        std::fs::create_dir_all(&modes_dir).unwrap();
+        std::fs::create_dir_all(&handlers_dir).unwrap();
+        let mut row: serde_json::Value =
+            serde_json::from_str(include_str!("../../../modes/adsb_decode.json")).unwrap();
+        row["id"] = "nodec_decode".into();
+        row["decoder"] = serde_json::Value::Null;
+        row["test"] = serde_json::Value::Null;
+        std::fs::write(modes_dir.join("nodec_decode.json"), row.to_string()).unwrap();
+        let alt = serde_json::json!({
+            "id": "alt", "name": "Alt", "programs": ["zeta-alt-decoder"],
+            "install": {"url": "https://example.invalid/alt"},
+            "modes": {"nodec_decode": {
+                "args": ["--port", "$port"],
+                "input": {"stream": "iq", "format": "cs16", "rate_hz": 2400000, "via": "stdin"},
+                "output": {"via": "tcp", "port": "$port", "parser": "sbs"}
+            }}
+        });
+        std::fs::write(handlers_dir.join("alt.json"), alt.to_string()).unwrap();
+        let registry = registry(None, &ModesHandle::default(), None);
+        let modes = zeta_core::modes::ModeRegistry::load_with(
+            &registry,
+            Some(&modes_dir),
+            Some(&handlers_dir),
+        );
+        let kind = JobKind::from_name("nodec_decode").unwrap();
+        assert!(modes.get("nodec_decode").unwrap().startable());
+        expands_only_through_a_handler(&kind, &modes, &registry);
+    }
+
     #[test]
     fn every_job_kind_expands_to_a_valid_graph() {
         let schema = schema();
@@ -856,6 +943,11 @@ mod tests {
                     .expand_attached(&AttachTo::new(&job, &stream), "en")
                     .unwrap();
                 validate(&g, &registry).unwrap_or_else(|e| panic!("{kind:?} attached: {e}"));
+                continue;
+            }
+            // A row with no decoder of its own runs only by a handler file's entry.
+            if modes.get(kind.name()).is_some_and(|m| !m.has_decoder()) {
+                expands_only_through_a_handler(&kind, &modes, &registry);
                 continue;
             }
             for rate in [
@@ -954,7 +1046,7 @@ mod tests {
                                             JobKind::Mode(id) => modes
                                                 .get(&id.0)
                                                 .and_then(|m| match &m.row.decoder {
-                                                    zeta_core::modes::Decoder::Program(p) => {
+                                                    Some(zeta_core::modes::Decoder::Program(p)) => {
                                                         p.demod.as_ref().map(|d| match d {
                                                             zeta_core::modes::Demod::Nbfm {
                                                                 audio_rate_hz,

@@ -21,13 +21,17 @@ use super::row::{
 /// The id a graph or frame row's own decoder goes by; never a handler file's.
 pub const BUILTIN: &str = "builtin";
 
+/// The id of the stand-in own handler of a row with no decoder of its own (never ready,
+/// never picked, listed or recorded); never a handler file's, nor a program row's.
+pub const NO_DECODER: &str = "none";
+
 /// One handler file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct HandlerFile {
     /// The handler's id in every mode it serves: `^[a-z0-9][a-z0-9_-]*$`, never
-    /// `builtin`, nor a mode's own program.
+    /// `builtin` or `none`, nor a mode's own program.
     pub id: String,
     /// The handler's name for people (`OnAir`).
     pub name: String,
@@ -137,10 +141,11 @@ pub fn is_handler_id(id: &str) -> bool {
 
 /// The id of `row`'s own handler: `builtin` for a graph or frame row, its first program's
 /// file name for a program row (`dump1090` for `/opt/x/dump1090`; the program is still
-/// looked up by the whole entry).
+/// looked up by the whole entry), [`NO_DECODER`] for a row with no decoder of its own.
 pub fn own_handler_id(row: &ModeRow) -> String {
     match &row.decoder {
-        super::Decoder::Program(p) => p
+        None => NO_DECODER.into(),
+        Some(super::Decoder::Program(p)) => p
             .programs
             .first()
             .map(|first| {
@@ -196,6 +201,9 @@ pub fn parse_handler_file(
     if file.id == BUILTIN {
         return Err(error("id", "builtin is a row's own decoder's id"));
     }
+    if file.id == NO_DECODER {
+        return Err(error("id", "none is reserved"));
+    }
     if !is_handler_id(&file.id) {
         return Err(error(
             "id",
@@ -234,8 +242,9 @@ fn is_envelope_key(name: &str) -> bool {
 
 /// Check `file`'s entry `entry` against the row it serves: the program block as a
 /// program row's is checked, `output.fields` naming only the row's event fields and
-/// mapping its subject key, and `extra` naming no envelope key and only fields the row's
-/// event schema lacks.
+/// mapping its subject key (and, for a row with no decoder of its own, every field of its
+/// schema but the envelope's that no `const` or derive fills), and `extra` naming no
+/// envelope key and only fields the row's event schema lacks.
 /// The field is named from the entry (`output.fields`, `extra.<name>`, `args[0]`).
 pub fn validate_entry(
     file: &HandlerFile,
@@ -268,6 +277,25 @@ pub fn validate_entry(
                 "output.fields",
                 format!("no mapping for {} (the row's subject key)", sub.key),
             ));
+        }
+        // A row with no decoder of its own has nothing else to fill its fields: the map
+        // names each, as a program row's own does (a constant or a derive fills one too).
+        if row.decoder.is_none() {
+            let derived: Vec<&String> = row.derive.iter().flat_map(|d| d.into.values()).collect();
+            let unmapped = properties.keys().find(|name| {
+                !super::ENVELOPE_FIELDS.contains(&name.as_str())
+                    && !fields.contains_key(*name)
+                    && !entry.consts.contains_key(*name)
+                    && !derived.contains(name)
+            });
+            if let Some(name) = unmapped {
+                return Err(error(
+                    "output.fields",
+                    format!(
+                        "{name} is not mapped, and the row has no decoder of its own to fill it"
+                    ),
+                ));
+            }
         }
     }
     for (name, path) in &entry.extra {
@@ -379,7 +407,7 @@ mod tests {
         let text = include_str!("../../../../modes/adsb_decode.json");
         let mut row = super::super::row::parse(text).unwrap();
         assert_eq!(own_handler_id(&row), "dump1090");
-        let super::super::Decoder::Program(p) = &mut row.decoder else {
+        let Some(super::super::Decoder::Program(p)) = &mut row.decoder else {
             panic!("a program row")
         };
         p.programs = vec!["/opt/x/dump1090".into(), "readsb".into()];

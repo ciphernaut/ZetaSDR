@@ -39,7 +39,7 @@ const NO_PROGRAM: &str = "adsb_decode: no dump1090 program (install dump1090 or 
 pub fn find_dump1090() -> Option<PathBuf> {
     let row = embedded_row();
     match &row.decoder {
-        Decoder::Program(b) => crate::proc::find_handler(&b.programs),
+        Some(Decoder::Program(b)) => crate::proc::find_handler(&b.programs),
         _ => None,
     }
 }
@@ -52,7 +52,7 @@ fn embedded_row() -> ModeRow {
 
 /// Whether `row` is a program row whose block has a `packets` output.
 fn has_packets(row: &ModeRow) -> bool {
-    matches!(&row.decoder, Decoder::Program(b) if b.packets.is_some())
+    matches!(&row.decoder, Some(Decoder::Program(b)) if b.packets.is_some())
 }
 
 /// `adsb_decode` takes no parameters.
@@ -134,7 +134,7 @@ impl AdsbDecodeStage {
             Runs::Fixed(None) => Err(StageError::Failed(NO_PROGRAM.into())),
             Runs::Fixed(Some(p)) => {
                 let row = embedded_row();
-                let Decoder::Program(block) = &row.decoder else {
+                let Some(Decoder::Program(block)) = &row.decoder else {
                     return Err(StageError::Failed(format!(
                         "{ADSB_MODE}: the embedded row is not a program row"
                     )));

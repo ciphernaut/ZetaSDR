@@ -857,7 +857,7 @@ async fn a_strangers_record_survives_reruns_of_another_job() {
 mod common;
 use common::handlers::{self as h, ALT, MODE, OWN};
 use zeta_core::modes::policy::Passed;
-use zeta_core::ops::{JobKind, OpError, OpResult};
+use zeta_core::ops::{JobKind, Op, OpError, OpResult};
 use zeta_core::types::StreamKind;
 
 /// A node on [`h::Radio`] with the `alt` handler file (packets beside its events when
@@ -1444,4 +1444,243 @@ async fn a_stopped_job_of_another_handler_keeps_its_record() {
     assert_eq!(listed(&node, &own2).handler.as_deref(), Some(OWN));
     node.job_stop(&own2).await.unwrap();
     assert_eq!(ids(&node), sorted(vec![alt2, own2]));
+}
+
+// Plan 47: a row with no decoder of its own starts only through a handler.
+
+/// A node on [`h::Radio`] over [`h::nodec_cfg`] (`handler` as there) with the
+/// `external_decode` stand-in, its sets read from `<dir>/sets`.
+async fn nodec_node(dir: &Path, handler: Option<bool>) -> Node {
+    let ports: Vec<Arc<dyn Port>> = vec![h::Radio::new()];
+    let cfg = NodeConfig {
+        sets_dir: Some(dir.join("sets")),
+        ..h::nodec_cfg(dir, handler)
+    };
+    Node::open(cfg, h::stages(None), ports).await.unwrap()
+}
+
+/// `mode nodec_decode is unavailable: <reason>`.
+fn nodec_refusal(reason: &str) -> Result<OpResult, OpError> {
+    Err(OpError::Other {
+        message: format!("mode {} is unavailable: {reason}", h::NODEC),
+    })
+}
+
+#[tokio::test]
+async fn a_row_with_no_decoder_starts_through_its_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = nodec_node(dir.path(), Some(true)).await;
+    // Named by none, the policy's pick runs, and the record names it.
+    let Ok(OpResult::Job(id)) = node.apply(h::nodec_op(None)).await else {
+        panic!("nodec_decode start")
+    };
+    let rec = listed(&node, &id);
+    assert_eq!(
+        (rec.handler.as_deref(), rec.handler_named),
+        (Some(ALT), false)
+    );
+    assert_eq!(
+        decode_params(&rec),
+        serde_json::json!({"mode": h::NODEC, "handler": ALT})
+    );
+    assert_eq!(on_disk(dir.path(), &id).handler.as_deref(), Some(ALT));
+    node.job_stop(&id).await.unwrap();
+    // Named, it runs; the stand-in is refused with its reason, never launched.
+    let Ok(OpResult::Job(named)) = node.apply(h::nodec_op(Some(ALT))).await else {
+        panic!("nodec_decode start naming alt")
+    };
+    assert_eq!(listed(&node, &named).handler.as_deref(), Some(ALT));
+    node.job_stop(&named).await.unwrap();
+    let before = node.job_list().len();
+    assert_eq!(
+        node.apply(h::nodec_op(Some("none"))).await,
+        Err(OpError::Other {
+            message: format!(
+                "{}: handler none is unavailable: the row has no decoder of its own",
+                h::NODEC
+            ),
+        })
+    );
+    // An unknown one names the handlers there are, the stand-in left out.
+    assert_eq!(
+        node.apply(h::nodec_op(Some("nope"))).await,
+        Err(OpError::Unknown {
+            field: "handler".into(),
+            value: "nope".into(),
+            known: vec![ALT.into()],
+        })
+    );
+    assert_eq!(node.job_list().len(), before, "nothing more started");
+
+    // No handler file serving it: refused with the row's reason.
+    let dir = tempfile::tempdir().unwrap();
+    let node = nodec_node(dir.path(), None).await;
+    let refusal = nodec_refusal(h::NO_DECODER_REASON);
+    assert_eq!(node.apply(h::nodec_op(None)).await, refusal);
+    let needs = h::start_kind_op(
+        JobKind::Mode(zeta_core::modes::ModeId(h::NODEC.into())),
+        1_090_000_000,
+        2_400_000,
+        None,
+        &[StreamKind::Packet],
+    );
+    assert_eq!(node.apply(needs).await, refusal);
+    assert!(node.job_list().is_empty(), "nothing started");
+
+    // Its handler's program missing: the reason names it.
+    let dir = tempfile::tempdir().unwrap();
+    let node = nodec_node(dir.path(), Some(false)).await;
+    let why = node
+        .modes()
+        .handler(h::NODEC, ALT)
+        .and_then(|a| a.reason.clone())
+        .unwrap();
+    let reason = format!("{}; {ALT}: {why}", h::NO_DECODER_REASON);
+    assert_eq!(node.apply(h::nodec_op(None)).await, nodec_refusal(&reason));
+    assert!(node.job_list().is_empty(), "nothing started");
+}
+
+/// Every other way a job starts refuses a row with no decoder and no handler, with the
+/// row's reason: a set's member, a set's watch naming it, a watch's `graph_put` naming
+/// it, a plan, and a capture's replay. (Identify passes over it: `identify.rs`.)
+#[tokio::test]
+async fn nothing_starts_a_row_with_no_decoder_and_no_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let sets = dir.path().join("sets");
+    std::fs::create_dir_all(&sets).unwrap();
+    let member = |id: &str, kind: &str, params: &str| {
+        format!(
+            r#"{{"id": "{id}", "radio": "r", "op": "job_start", "kind": "{kind}",
+                "center_hz": 1090000000, "bandwidth_hz": 2400000, "deviation_hz": null,
+                "sideband": null{params}}}"#
+        )
+    };
+    let set = format!(
+        r#"{{"id": "nodec", "name": "nodec", "notes": "", "radios": {{"r": {{"note": "any"}}}},
+            "members": [{}, {}]}}"#,
+        member("decoder", h::NODEC, ""),
+        member(
+            "watch",
+            "watch",
+            &format!(r#", "params": {{"modes": ["{}"]}}"#, h::NODEC)
+        ),
+    );
+    std::fs::write(sets.join("nodec.json"), set).unwrap();
+    let node = nodec_node(dir.path(), None).await;
+    let reason = h::NO_DECODER_REASON;
+
+    // A set: each member refused, nothing started.
+    let r = node
+        .apply(Op::SetStart {
+            set: "nodec".into(),
+            radios: [("r".to_string(), Some(SourceId(h::RADIO.into())))]
+                .into_iter()
+                .collect(),
+            members: None,
+            replace: vec![],
+        })
+        .await;
+    let Ok(OpResult::SetStart {
+        started, refused, ..
+    }) = r
+    else {
+        panic!("set_start: {r:?}")
+    };
+    assert!(started.is_empty(), "{started:?}");
+    let refusals: Vec<(String, String)> = refused
+        .iter()
+        .map(|r| (r.member.clone(), r.error.to_string()))
+        .collect();
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    for (member, error) in &refusals {
+        assert!(error.contains(reason), "{member}: {error}");
+    }
+
+    // A watch's `modes` naming it, put on a running watch.
+    let watch = h::start_kind_op(JobKind::Watch, 1_090_000_000, 2_400_000, None, &[]);
+    let Ok(OpResult::Job(watch)) = node.apply(watch).await else {
+        panic!("watch start")
+    };
+    let mut graph = listed(&node, &watch).graph;
+    let detect = graph.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+    detect.params["modes"] = serde_json::json!([h::NODEC]);
+    let r = node
+        .apply(Op::GraphPut {
+            job: watch.clone(),
+            graph,
+        })
+        .await;
+    let e = r.expect_err("graph_put naming the row");
+    assert!(e.to_string().contains(reason), "{e}");
+    node.job_stop(&watch).await.unwrap();
+
+    // A plan.
+    let r = node
+        .apply(Op::PlanStart {
+            plan: "uhf_cb_au".into(),
+            channels: Some(vec![1]),
+            group: None,
+            kind: JobKind::Mode(zeta_core::modes::ModeId(h::NODEC.into())),
+            source: SourceId(h::RADIO.into()),
+            deviation_hz: None,
+            sideband: None,
+            attach: None,
+            language: None,
+            replace: vec![],
+        })
+        .await;
+    let text = match &r {
+        Ok(OpResult::PlanStart {
+            started, refused, ..
+        }) => {
+            assert!(started.is_empty(), "{started:?}");
+            serde_json::to_string(refused).unwrap()
+        }
+        Err(e) => e.to_string(),
+        r => panic!("plan_start: {r:?}"),
+    };
+    assert!(text.contains(reason), "{text}");
+
+    // A capture's replay.
+    let rate = 2_400_000u64;
+    let iq = vec![Complex::new(0.0f32, 0.0); rate as usize / 10];
+    let capture = node
+        .bursts()
+        .write(
+            zeta_core::bursts::NewCapture {
+                source: SourceId(h::RADIO.into()),
+                set: JobId("nodec".into()),
+                center_hz: Hz(1_090_000_000),
+                bandwidth_hz: Hz(rate),
+                sample_rate_hz: Hz(rate),
+                start_ns: 1_760_000_000_000_000_000,
+                end_ns: 1_760_000_000_100_000_000,
+                features: serde_json::json!({}),
+                signal: None,
+                job: JobId("nodec".into()),
+                watch: None,
+                allocations: serde_json::json!([]),
+            },
+            &iq,
+        )
+        .unwrap()
+        .id;
+    for packets in [false, true] {
+        let r = node
+            .apply(Op::CaptureDecode {
+                capture: capture.clone(),
+                kind: h::NODEC.into(),
+                handler: None,
+                packets,
+            })
+            .await;
+        assert_eq!(r, nodec_refusal(reason), "packets {packets}");
+    }
+    assert!(
+        node.job_list()
+            .iter()
+            .all(|r| r.kind != h::NODEC && r.state != JobState::Running),
+        "{:?}",
+        node.job_list()
+    );
 }

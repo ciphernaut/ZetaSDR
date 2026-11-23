@@ -522,10 +522,15 @@ async fn handlers_list(
     };
     let modes = handle.get().unwrap_or_default();
     for m in modes.all() {
-        // A mode listed without its handlers still has the row's own.
-        let handlers = match m.handlers.is_empty() {
-            true => m.handler(None).into_iter().collect(),
-            false => m.handlers.clone(),
+        // A mode listed without its handlers still has the row's own; a row with no
+        // decoder of its own lists its handler files' only, as `modes_list` does.
+        let handlers: Vec<_> = match m.handlers.is_empty() {
+            true => m
+                .handler(None)
+                .filter(|_| m.has_decoder())
+                .into_iter()
+                .collect(),
+            false => m.listed_handlers().cloned().collect(),
         };
         for h in handlers {
             let line = handler_line(&m.row.id.0, &h.id, h.state, &h.outputs, h.checked);

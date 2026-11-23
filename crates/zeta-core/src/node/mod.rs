@@ -104,6 +104,13 @@ pub fn ring_seconds_for(budget_bytes: u64, rate_hz: u64, max_seconds: f64) -> f6
     s.max(1.0).min(max_seconds)
 }
 
+/// The handler policy a node on `state_dir` reads at open (`handler-policy.json`; the
+/// empty policy when there is none or it cannot be read), for a caller with no node open:
+/// `zeta modes check` checks the handler it picks.
+pub fn read_handler_policy(state_dir: &Path) -> crate::modes::policy::HandlerPolicy {
+    persist::load_handler_policy(state_dir).0
+}
+
 /// The note an accept leaves when a `learned_<id>` row file (`mode`) was already there: the
 /// operator's, kept as is. A retract or delete never removes a file whose record says so.
 fn kept_note(mode: &str) -> String {

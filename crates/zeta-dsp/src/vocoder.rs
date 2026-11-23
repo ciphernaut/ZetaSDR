@@ -287,15 +287,7 @@ pub fn program(
     match &ctx.mode {
         Some(row) => match resolve(row, index) {
             Ok(p) => Ok(Some(p)),
-            Err(_)
-                if row
-                    .decoder
-                    .handler_blocks()
-                    .get(index)
-                    .is_some_and(|b| b.optional) =>
-            {
-                Ok(None)
-            }
+            Err(_) if row.handler_blocks().get(index).is_some_and(|b| b.optional) => Ok(None),
             Err(e) => Err(e),
         },
         None => match find_handler(&[fallback.to_string()]) {

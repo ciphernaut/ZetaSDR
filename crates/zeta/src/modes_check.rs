@@ -103,7 +103,10 @@ enum Outcome {
 /// With `handler`, each mode's handler of that id is checked in place of the row's own
 /// (the row's own when it is that id): every mode that has one, or `only` (which must).
 /// A handler file's handler prints and records as `<id>@<handler>`, and a pass is always
-/// recorded (it ran, so its program was found).
+/// recorded (it ran, so its program was found). A row with no decoder of its own is
+/// checked, without `handler`, by the handler the node's policy (`handler-policy.json`
+/// in `state_dir`) picks, printed and recorded the same way; with none ready it is
+/// skipped, `no decoder of its own and no handler ready` (failed with `strict`).
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     state_dir: PathBuf,
@@ -134,9 +137,9 @@ pub async fn run(
             return ExitCode::FAILURE;
         };
         if let Some(h) = &handler
-            && m.handler(Some(h)).is_none()
+            && handler_of(m, h).is_none()
         {
-            let ids: Vec<&str> = m.handlers.iter().map(|h| h.id.as_str()).collect();
+            let ids: Vec<&str> = m.listed_handlers().map(|h| h.id.as_str()).collect();
             eprintln!(
                 "zeta: mode {id} has no handler {h} (its handlers: {})",
                 ids.join(", ")
@@ -145,11 +148,14 @@ pub async fn run(
         }
     }
     if let Some(h) = &handler
-        && !modes.all().iter().any(|m| m.handler(Some(h)).is_some())
+        && !modes.all().iter().any(|m| handler_of(m, h).is_some())
     {
         eprintln!("zeta: no mode has handler {h}");
         return ExitCode::FAILURE;
     }
+    // The ranking a row with no decoder of its own is checked by: the one a node on this
+    // state directory reads.
+    let policy = zeta_core::node::read_handler_policy(&state_dir);
     let ctx = Ctx {
         state_dir,
         registry,
@@ -164,13 +170,21 @@ pub async fn run(
         if only.as_ref().is_some_and(|o| o != id) {
             continue;
         }
-        // The handler file's handler of the mode to check; `None` for the row's own.
-        let other = match &handler {
-            None => None,
-            Some(h) => match m.handler(Some(h)) {
+        // The handler file's handler of the mode to check; `None` for the row's own. A row
+        // with no decoder of its own is checked by the handler the policy picks; with
+        // none ready it is a skip.
+        let (other, none_ready) = match &handler {
+            None if !m.has_decoder() && m.state != ModeState::Broken => {
+                match zeta_core::modes::policy::choose(m, None, &[], &policy) {
+                    Ok(h) => (Some(h.clone()), false),
+                    Err(_) => (None, true),
+                }
+            }
+            None => (None, false),
+            Some(h) => match handler_of(m, h) {
                 None => continue,
-                Some(_) if *h == m.own_handler() => None,
-                Some(found) => Some(found),
+                Some(_) if *h == m.own_handler() => (None, false),
+                Some(found) => (Some(found), false),
             },
         };
         let key = match &other {
@@ -178,6 +192,7 @@ pub async fn run(
             Some(h) => format!("{id}@{}", h.id),
         };
         let outcome = match &other {
+            None if none_ready => skipped(strict, NO_HANDLER_READY.into()),
             None => check_row(m, &ctx, strict).await,
             Some(h) => check_handler(m, h, &modes, &ctx, strict).await,
         };
@@ -189,8 +204,8 @@ pub async fn run(
         println!("{line}");
         match outcome {
             Outcome::Ok => {
-                let found = other.is_some()
-                    || (!m.row.decoder.handler_blocks().is_empty() && m.missing.is_empty());
+                let found =
+                    other.is_some() || (!m.row.handler_blocks().is_empty() && m.missing.is_empty());
                 if found {
                     let at = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -214,6 +229,16 @@ pub async fn run(
     }
 }
 
+/// Why a row with no decoder of its own, none of whose handlers is ready, is not checked.
+const NO_HANDLER_READY: &str = "no decoder of its own and no handler ready";
+
+/// `m`'s handler `h` as `--handler` names it: any of its handlers but the stand-in of a
+/// row with no decoder of its own, which is none of its handlers.
+fn handler_of(m: &LoadedMode, h: &str) -> Option<ModeHandler> {
+    m.handler(Some(h))
+        .filter(|_| m.has_decoder() || h != zeta_core::modes::NO_DECODER)
+}
+
 /// A skip, or with `strict` a failure.
 fn skipped(strict: bool, why: String) -> Outcome {
     match strict {
@@ -234,7 +259,7 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
     if m.state == ModeState::Unavailable {
         // The first handler list not on this host (the first list when all are found
         // now: the probe said otherwise).
-        let blocks = m.row.decoder.handler_blocks();
+        let blocks = m.row.handler_blocks();
         let missing = blocks
             .iter()
             .filter(|b| !b.optional)
@@ -248,7 +273,7 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
     if strict && !m.missing.is_empty() {
         // The first optional handler not on this host (the first optional one when all
         // are found now: the probe said otherwise).
-        let blocks = m.row.decoder.handler_blocks();
+        let blocks = m.row.handler_blocks();
         let optional: Vec<_> = blocks.iter().filter(|b| b.optional).collect();
         let handler = optional
             .iter()

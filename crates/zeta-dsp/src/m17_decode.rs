@@ -75,12 +75,10 @@ const C2DEC_URL: &str = "https://github.com/drowe67/codec2";
 /// how to get it (the row's handler 0 install hint, for this host's package managers) and
 /// when the node looks again (the stage looks it up once, at start).
 fn no_c2dec_note(ctx: &StageContext) -> String {
-    let install = ctx.mode.as_ref().and_then(|row| {
-        row.decoder
-            .handler_blocks()
-            .first()
-            .map(|b| b.install.clone())
-    });
+    let install = ctx
+        .mode
+        .as_ref()
+        .and_then(|row| row.handler_blocks().first().map(|b| b.install.clone()));
     let (hint, url) = match &install {
         Some(i) => (i.hint(), i.url.as_str()),
         None => (None, C2DEC_URL),
@@ -1322,7 +1320,7 @@ mod tests {
         let _env = VOCODER_ENV.lock().await;
         set_vocoder("/nonexistent/zeta-test/c2dec");
         let mut row = (*mode()).clone();
-        let zeta_core::modes::Decoder::Graph { handlers, .. } = &mut row.decoder else {
+        let Some(zeta_core::modes::Decoder::Graph { handlers, .. }) = &mut row.decoder else {
             panic!("a graph row")
         };
         handlers[0].optional = false;

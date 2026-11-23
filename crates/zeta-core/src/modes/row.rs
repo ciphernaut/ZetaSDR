@@ -61,7 +61,10 @@ pub struct ModeRow {
     pub label: String,
     /// The `protocol` value of the mode's events (`aprs`, `pocsag`, ...).
     pub protocol: String,
-    pub decoder: Decoder,
+    /// The row's own decoder; `null` for a row with none, which only a handler file's
+    /// entry runs (the key is required all the same).
+    #[serde(deserialize_with = "super::nullable")]
+    pub decoder: Option<Decoder>,
     pub event: Event,
     pub identify: Identify,
     /// The iNTERCEPT catalogue entry ids this mode proves.
@@ -483,6 +486,21 @@ impl Decoder {
                 .collect(),
             Decoder::Frame(_) => vec![],
         }
+    }
+}
+
+impl ModeRow {
+    /// The kind of the row's own decoder; `None` for a row with none.
+    pub fn decoder_kind(&self) -> Option<DecoderKind> {
+        self.decoder.as_ref().map(Decoder::kind)
+    }
+
+    /// [`Decoder::handler_blocks`] of the row's own decoder; none for a row with none.
+    pub fn handler_blocks(&self) -> Vec<HandlerBlock<'_>> {
+        self.decoder
+            .as_ref()
+            .map(Decoder::handler_blocks)
+            .unwrap_or_default()
     }
 }
 
@@ -1297,13 +1315,13 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             }
         }
     }
-    if let Decoder::Program(ProgramBlock {
+    if let Some(Decoder::Program(ProgramBlock {
         output: ProgramOutput {
             fields: Some(fields),
             ..
         },
         ..
-    }) = &row.decoder
+    })) = &row.decoder
     {
         for (key, path) in fields {
             if !properties.contains_key(key) {
@@ -1346,7 +1364,28 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             ),
         ));
     }
-    let frame_row = matches!(row.decoder, Decoder::Frame(_));
+    let Some(decoder) = &row.decoder else {
+        // A row with no decoder of its own: a handler file's program decodes it, so
+        // nothing in process can try it quickly, and no synthesised capture proves it.
+        if id.quick.is_some() {
+            return Err(RowError::new(
+                "identify.quick",
+                "a row with no decoder has no quick test",
+            ));
+        }
+        if row
+            .test
+            .as_ref()
+            .is_some_and(|t| matches!(t.kind, TestSpec::Synth(_)))
+        {
+            return Err(RowError::new(
+                "test.kind",
+                "a row with no decoder is checked on a fixture",
+            ));
+        }
+        return Ok(());
+    };
+    let frame_row = matches!(decoder, Decoder::Frame(_));
     match id.quick.as_deref() {
         Some("frame") if !frame_row => {
             return Err(RowError::new(
@@ -1362,7 +1401,7 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
         }
         _ => {}
     }
-    match &row.decoder {
+    match decoder {
         Decoder::Graph {
             nodes,
             edges,
@@ -1378,7 +1417,18 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             }
             validate_graph(nodes, edges, stages)
         }
-        Decoder::Program(p) => validate_program(p),
+        Decoder::Program(p) => {
+            validate_program(p)?;
+            // Its own handler goes by its first program's file name: `none` is the
+            // stand-in of a row with no decoder.
+            if super::handler_file::own_handler_id(row) == super::handler_file::NO_DECODER {
+                return Err(RowError::new(
+                    "decoder.programs[0]",
+                    "none is reserved: it names a row with no decoder of its own",
+                ));
+            }
+            Ok(())
+        }
         Decoder::Frame(b) => validate_frame(b, stages),
     }
 }
@@ -1855,7 +1905,7 @@ mod tests {
         );
         let row = parse(&audio_row(true)).unwrap();
         validate(&row, &no_stages()).unwrap();
-        let Decoder::Program(p) = &row.decoder else {
+        let Some(Decoder::Program(p)) = &row.decoder else {
             panic!("a program row");
         };
         assert_eq!(
@@ -2138,7 +2188,7 @@ mod tests {
         };
         let row = parse(&wav("s16")).unwrap();
         validate(&row, &no_stages()).unwrap();
-        let Decoder::Program(p) = &row.decoder else {
+        let Some(Decoder::Program(p)) = &row.decoder else {
             panic!("a program row");
         };
         assert_eq!(p.input.container, Container::Wav);
@@ -2223,7 +2273,7 @@ mod tests {
 
     /// The program block of a row.
     fn program(row: &ModeRow) -> &ProgramBlock {
-        let Decoder::Program(p) = &row.decoder else {
+        let Some(Decoder::Program(p)) = &row.decoder else {
             panic!("a program row");
         };
         p
@@ -2724,7 +2774,7 @@ mod tests {
     fn a_frame_row_validates_its_framing_through_the_stage() {
         let row = parse(FRAME).unwrap();
         validate(&row, &frame_stages()).unwrap();
-        assert_eq!(row.decoder.kind(), DecoderKind::Frame);
+        assert_eq!(row.decoder_kind(), Some(DecoderKind::Frame));
         let e = validate(&row, &no_stages()).unwrap_err();
         assert_eq!(
             e.to_string(),
@@ -2790,18 +2840,18 @@ mod tests {
         let e = validate(&row, &no_stages()).unwrap_err();
         assert_eq!(e.field, "decoder", "{e}");
         assert!(e.error.contains("unknown stage kind"), "{e}");
-        let blocks = row.decoder.handler_blocks();
+        let blocks = row.handler_blocks();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].programs, ["c2dec"]);
         assert_eq!(blocks[0].install.debian.as_deref(), Some("codec2"));
-        let Decoder::Graph { handlers, .. } = &parse(POCSAG).unwrap().decoder else {
+        let Some(Decoder::Graph { handlers, .. }) = &parse(POCSAG).unwrap().decoder else {
             panic!("graph row");
         };
         assert!(handlers.is_empty(), "a row without the key has none");
-        assert!(parse(POCSAG).unwrap().decoder.handler_blocks().is_empty());
+        assert!(parse(POCSAG).unwrap().handler_blocks().is_empty());
         // A program row's one block.
         let adsb = parse(ADSB).unwrap();
-        let blocks = adsb.decoder.handler_blocks();
+        let blocks = adsb.handler_blocks();
         assert_eq!(blocks.len(), 1);
         assert_eq!(
             blocks[0].programs.first().map(String::as_str),
@@ -2835,13 +2885,13 @@ mod tests {
     #[test]
     fn an_optional_handler_parses_and_defaults_false() {
         let handlers = |row: &ModeRow| match &row.decoder {
-            Decoder::Graph { handlers, .. } => handlers.clone(),
+            Some(Decoder::Graph { handlers, .. }) => handlers.clone(),
             _ => panic!("graph row"),
         };
         // The built-in M17 row's `c2dec` is optional; left out, a handler is required.
         let row = parse(M17).unwrap();
         assert!(handlers(&row)[0].optional);
-        assert!(row.decoder.handler_blocks()[0].optional);
+        assert!(row.handler_blocks()[0].optional);
         let row = parse(&edited(M17, |v| {
             v["decoder"]["handlers"][0]
                 .as_object_mut()
@@ -2850,14 +2900,14 @@ mod tests {
         }))
         .unwrap();
         assert!(!handlers(&row)[0].optional);
-        assert!(!row.decoder.handler_blocks()[0].optional);
+        assert!(!row.handler_blocks()[0].optional);
         let e = parse(&edited(M17, |v| {
             v["decoder"]["handlers"][0]["optional"] = 1.into()
         }))
         .unwrap_err();
         assert_eq!(e.field, "decoder.handlers[0].optional", "{e}");
         // A program row's block is never optional.
-        assert!(!parse(ADSB).unwrap().decoder.handler_blocks()[0].optional);
+        assert!(!parse(ADSB).unwrap().handler_blocks()[0].optional);
     }
 
     #[test]
@@ -2866,7 +2916,7 @@ mod tests {
             v["decoder"]["handlers"][0]["install"]["script"] = "tools/install-vocoders.sh".into()
         }))
         .unwrap();
-        let blocks = row.decoder.handler_blocks();
+        let blocks = row.handler_blocks();
         assert_eq!(
             blocks[0].install.script.as_deref(),
             Some("tools/install-vocoders.sh")
@@ -2876,7 +2926,7 @@ mod tests {
             Some("bash tools/install-vocoders.sh")
         );
         let row = parse(M17).unwrap();
-        let blocks = row.decoder.handler_blocks();
+        let blocks = row.handler_blocks();
         assert_eq!(blocks[0].install.script, None);
         assert_eq!(
             blocks[0].install.hint().as_deref(),
@@ -2939,7 +2989,7 @@ mod tests {
             v["decoder"]["handlers"][0]["install"]["flatpak"] = "org.example.Codec2".into();
         }))
         .unwrap();
-        let i = &row.decoder.handler_blocks()[0].install;
+        let i = &row.handler_blocks()[0].install;
         assert_eq!(i.snap.as_deref(), Some("codec2"));
         assert_eq!(i.flatpak.as_deref(), Some("org.example.Codec2"));
         let e = parse(&edited(M17, |v| {
@@ -3112,5 +3162,20 @@ mod tests {
             e.to_string(),
             "identify.quick: frame needs decoder.kind frame"
         );
+    }
+
+    /// A program row's own handler goes by its first program's file name: `none`, the
+    /// stand-in of a row with no decoder, is refused there.
+    #[test]
+    fn a_program_named_none_is_reserved() {
+        let text = edited(ADSB, |v| {
+            v["decoder"]["programs"] = serde_json::json!(["/opt/x/none", "dump1090"])
+        });
+        let e = validate(&parse(&text).unwrap(), &no_stages()).unwrap_err();
+        assert_eq!(e.field, "decoder.programs[0]", "{e}");
+        let text = edited(ADSB, |v| {
+            v["decoder"]["programs"] = serde_json::json!(["dump1090", "none"])
+        });
+        assert_eq!(validate(&parse(&text).unwrap(), &no_stages()), Ok(()));
     }
 }

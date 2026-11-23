@@ -212,6 +212,16 @@ async fn node_unstarted(
     meta: &Path,
     wrap: impl FnOnce(Arc<dyn Port>) -> Arc<dyn Port>,
 ) -> (Node, Arc<FileSource>) {
+    node_unstarted_with(dir, meta, wrap, None).await
+}
+
+/// [`node_unstarted`] reading the operator rows of `modes_dir`.
+async fn node_unstarted_with(
+    dir: &Path,
+    meta: &Path,
+    wrap: impl FnOnce(Arc<dyn Port>) -> Arc<dyn Port>,
+    modes_dir: Option<PathBuf>,
+) -> (Node, Arc<FileSource>) {
     let cfg = NodeConfig {
         source_positions: Default::default(),
         sets_dir: None,
@@ -226,7 +236,7 @@ async fn node_unstarted(
         // No channel bank: an unoptimised PFB at 2.048 MHz drops about a third of the
         // blocks, and no decoder proves on what is left (the bank's own tests cover it).
         bank_factory: None,
-        modes_dir: None,
+        modes_dir,
         handlers_dir: None,
     };
     let opts = FileOpts {
@@ -1449,5 +1459,40 @@ async fn identify_skips_video_decode_on_a_narrow_band() {
     let video = outcome(&events, "video_decode").expect("video_decode listed");
     assert_eq!(video["outcome"], "skipped_band", "{video}");
     assert!(video["job"].is_null(), "{video}");
+    stop_all(&node).await;
+}
+
+/// Plan 47: a row with no decoder of its own and no handler for it, fitting the band,
+/// is passed over as `unavailable` with the row's reason, and never started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identify_passes_over_a_row_with_no_decoder_and_no_handler() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let (_, text) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("adsb_decode.json"))
+        .unwrap();
+    let mut row: Value = serde_json::from_str(text).unwrap();
+    row["id"] = "nodec_decode".into();
+    row["decoder"] = Value::Null;
+    row["test"] = Value::Null;
+    row["band"] = serde_json::json!({
+        "bandwidth_hz": BANDWIDTH_HZ, "centers_hz": [APRS_HZ], "min_hz": null,
+        "range_hz": [APRS_HZ - 100_000, APRS_HZ + 100_000]
+    });
+    std::fs::write(modes.join("nodec_decode.json"), row.to_string()).unwrap();
+    let (node, src) = node_unstarted_with(dir.path(), &fixtures().tone, |p| p, Some(modes)).await;
+    src.start();
+    let (id, events) = identify(&node, APRS_HZ).await;
+    let events = ended(&node, &id, events, Duration::from_secs(60)).await;
+    let e = outcome(&events, "nodec_decode").expect("nodec_decode's candidate");
+    assert_eq!(e["outcome"], "unavailable", "{e}");
+    assert!(e["job"].is_null(), "{e}");
+    assert_eq!(
+        e["evidence"], "no decoder of its own, and no handler for it is ready",
+        "{e}"
+    );
     stop_all(&node).await;
 }

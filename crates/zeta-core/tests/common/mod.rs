@@ -230,6 +230,79 @@ pub mod handlers {
         modes
     }
 
+    /// Plan 47's row with no decoder of its own: `adsb_decode` as `nodec_decode`, its
+    /// `decoder`, `test` and `catalogue` emptied.
+    pub const NODEC: &str = "nodec_decode";
+    /// The reason of [`NODEC`] when no handler file has an entry for it.
+    pub const NO_DECODER_REASON: &str = "no decoder of its own, and no handler for it is ready";
+
+    /// `<dir>/modes` holding [`NODEC`]; the modes directory.
+    pub fn write_nodec_row(dir: &Path) -> PathBuf {
+        let (_, text) = ModeRegistry::embedded()
+            .into_iter()
+            .find(|(f, _)| f.ends_with("adsb_decode.json"))
+            .expect("embedded adsb_decode");
+        let mut row: serde_json::Value = serde_json::from_str(text).unwrap();
+        row["id"] = NODEC.into();
+        row["name"] = "No decoder of its own".into();
+        row["decoder"] = serde_json::Value::Null;
+        row["test"] = serde_json::Value::Null;
+        row["catalogue"] = serde_json::json!([]);
+        row["identify"]["quick"] = serde_json::Value::Null;
+        let modes = dir.join("modes");
+        std::fs::create_dir_all(&modes).unwrap();
+        std::fs::write(modes.join(format!("{NODEC}.json")), row.to_string()).unwrap();
+        modes
+    }
+
+    /// Write `<dir>/handlers/alt.json` serving [`NODEC`] with adsb's input and output,
+    /// and packets, run by `<dir>/bin/zeta-alt-decoder` (a stub, so the node finds it)
+    /// when `found`, else by a program no host has; and the embedded OnAir replaced by a
+    /// file serving no mode. The handlers directory.
+    pub fn write_nodec_handler(dir: &Path, found: bool) -> PathBuf {
+        let handlers = write_handler(dir, ALT, true);
+        let path = handlers.join(format!("{ALT}.json"));
+        let mut file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = file["modes"][MODE].clone();
+        file["modes"] = serde_json::json!({ NODEC: entry });
+        if !found {
+            file["programs"] = serde_json::json!(["/nonexistent/zeta-test/zeta-alt-decoder"]);
+        }
+        std::fs::write(&path, file.to_string()).unwrap();
+        handlers
+    }
+
+    /// [`super::cfg`] (resuming) over [`write_nodec_row`]'s row, with
+    /// [`write_nodec_handler`]'s file (`Some(found)`) or with no handler file serving it
+    /// (`None`: OnAir's replaced by one serving no mode).
+    pub fn nodec_cfg(dir: &Path, handler: Option<bool>) -> NodeConfig {
+        let handlers = match handler {
+            Some(found) => write_nodec_handler(dir, found),
+            None => {
+                let handlers = write_nodec_handler(dir, true);
+                std::fs::remove_file(handlers.join(format!("{ALT}.json"))).unwrap();
+                handlers
+            }
+        };
+        NodeConfig {
+            handlers_dir: Some(handlers),
+            modes_dir: Some(write_nodec_row(dir)),
+            ..super::cfg(dir, true)
+        }
+    }
+
+    /// A `job_start` of [`NODEC`] on [`RADIO`] at 1090 MHz, 2.4 MHz wide, with `handler`.
+    pub fn nodec_op(handler: Option<&str>) -> Op {
+        start_kind_op(
+            JobKind::Mode(zeta_core::modes::ModeId(NODEC.into())),
+            1_090_000_000,
+            2_400_000,
+            handler,
+            &[],
+        )
+    }
+
     /// [`super::cfg`] (resuming) reading the handlers directory [`write_alt`] writes and
     /// the row [`write_events_only_row`] writes.
     pub fn cfg(dir: &Path, packets: bool) -> NodeConfig {

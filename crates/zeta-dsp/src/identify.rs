@@ -263,9 +263,9 @@ type Attempt = Arc<dyn Fn(Vec<Complex<f32>>, u64) -> AttemptFuture + Send + Sync
 /// Whether `classify` lists `row` at all: every row but a graph row with no quick
 /// attempt (`identify.quick: null`, today `m17_decode`), which has neither an
 /// in-process attempt nor a program, so only `identify` tries it. A program row stays a
-/// candidate and takes its slot as `skipped_quick`.
+/// candidate and takes its slot as `skipped_quick`, as does a row with no decoder of its own.
 fn classify_candidate(row: &ModeRow) -> bool {
-    !(matches!(row.decoder, Decoder::Graph { .. }) && row.identify.quick.is_none())
+    !(matches!(row.decoder, Some(Decoder::Graph { .. })) && row.identify.quick.is_none())
 }
 
 /// The in-crate attempt `row`'s `identify.quick` names (the names
@@ -282,7 +282,7 @@ fn quick_attempt(row: &ModeRow) -> Option<Attempt> {
         "rds" => Some(blocking(rds_attempt)),
         "ais" => Some(blocking(ais_attempt)),
         "frame" => {
-            let Decoder::Frame(block) = &row.decoder else {
+            let Some(Decoder::Frame(block)) = &row.decoder else {
                 return None;
             };
             let block = Arc::new(block.clone());

@@ -163,7 +163,7 @@ pub fn is_executable(p: &Path) -> bool {
 /// row has no such handler.
 pub fn resolve(row: &ModeRow, index: usize) -> Result<PathBuf, String> {
     let id = &row.id.0;
-    let blocks = row.decoder.handler_blocks();
+    let blocks = row.handler_blocks();
     let programs = blocks
         .get(index)
         .ok_or_else(|| format!("{id}: no handler {index}"))?

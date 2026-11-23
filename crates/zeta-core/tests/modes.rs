@@ -459,7 +459,7 @@ fn the_rs41_row_is_an_audio_program_row() {
     let reg = ModeRegistry::load(&stages(), None);
     let m = reg.get("rs41_decode").expect("rs41_decode embedded");
     assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
-    let Decoder::Program(block) = &m.row.decoder else {
+    let Some(Decoder::Program(block)) = &m.row.decoder else {
         panic!("a program row")
     };
     assert_eq!(block.input.stream, InputStream::Audio);
@@ -475,7 +475,7 @@ fn the_rs41_row_is_an_audio_program_row() {
     assert_eq!(m.row.identify.priority, 1);
     for (id, program) in [("dfm_decode", "dfm09mod"), ("m20_decode", "m20mod")] {
         let m = reg.get(id).expect(id);
-        let Decoder::Program(block) = &m.row.decoder else {
+        let Some(Decoder::Program(block)) = &m.row.decoder else {
             panic!("{id}: a program row")
         };
         assert_eq!(block.programs, [program]);
@@ -1047,7 +1047,7 @@ fn pocsag_with_a_missing_handler(id: &str) -> serde_json::Value {
 fn a_graph_row_with_handlers_validates() {
     let row = parse(&pocsag_with_a_missing_handler("pocsag_voc").to_string()).unwrap();
     validate(&row, &stages()).unwrap();
-    assert_eq!(row.decoder.handler_blocks().len(), 1);
+    assert_eq!(row.handler_blocks().len(), 1);
 }
 
 /// A graph row its probe left unavailable is refused by `job_start` with its reason,
@@ -1142,7 +1142,7 @@ fn every_embedded_row_emits_events_today() {
             "aprs_decode" => &[StreamKind::Event, StreamKind::Packet],
             // dump1090's Beast output is the ADS-B row's packets.
             "adsb_decode" => &[StreamKind::Event, StreamKind::Packet],
-            _ if matches!(m.row.decoder, Decoder::Frame(_)) => {
+            _ if matches!(m.row.decoder, Some(Decoder::Frame(_))) => {
                 &[StreamKind::Event, StreamKind::Packet]
             }
             _ => &[StreamKind::Event],
@@ -1158,7 +1158,7 @@ fn rows_that_cut_frames_list_packet() {
         let id = m.row.id.0.as_str();
         let lists = m.outputs.contains(&StreamKind::Packet);
         match &m.row.decoder {
-            Decoder::Frame(_) => {
+            Some(Decoder::Frame(_)) => {
                 assert_eq!(m.outputs, [StreamKind::Event, StreamKind::Packet], "{id}");
             }
             // APRS cuts frames in process; ADS-B's program writes them (Beast).
@@ -1181,11 +1181,11 @@ fn the_m17_row_names_c2dec() {
     let reg = ModeRegistry::load(&stages(), None);
     let m = reg.get("m17_decode").expect("m17_decode listed");
     assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
-    let blocks = m.row.decoder.handler_blocks();
+    let blocks = m.row.handler_blocks();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].programs, ["c2dec".to_string()]);
     assert!(blocks[0].optional);
-    let p25 = reg.get("p25_decode").unwrap().row.decoder.handler_blocks();
+    let p25 = reg.get("p25_decode").unwrap().row.handler_blocks();
     assert!(p25[0].optional);
     let v = serde_json::to_value(&m.row).unwrap();
     assert_eq!(v["family"], "amateur_voice");
@@ -2218,4 +2218,238 @@ fn a_row_refuses_constants_of_its_own() {
     let e = parse(&v.to_string()).unwrap_err();
     assert_eq!(e.field, "const", "{e}");
     assert!(e.error.starts_with("unknown field `const`"), "{e}");
+}
+
+// Plan 47: a row with no decoder of its own, run only by a handler file's entry.
+
+mod common;
+use common::handlers::{self as hf, NO_DECODER_REASON, NODEC};
+
+/// [`hf::NODEC`]'s row as written, `edit` applied, parsed and validated.
+fn nodec_row(edit: impl FnOnce(&mut serde_json::Value)) -> Result<(), zeta_core::modes::RowError> {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = hf::write_nodec_row(dir.path());
+    let text = std::fs::read_to_string(modes.join(format!("{NODEC}.json"))).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    edit(&mut v);
+    validate(&parse(&v.to_string())?, &stages())
+}
+
+#[tokio::test]
+async fn a_row_with_no_decoder_loads_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(hf::nodec_cfg(dir.path(), None), stages(), vec![])
+        .await
+        .unwrap();
+    let reg = node.modes();
+    let m = reg.get(NODEC).unwrap();
+    assert!(!m.has_decoder());
+    assert!(!m.startable());
+    assert_eq!(m.state, ModeState::Unavailable);
+    // The stand-in own handler, never ready.
+    let own = &m.handlers[0];
+    assert_eq!(own.id, zeta_core::modes::handler_file::NO_DECODER);
+    assert_eq!((own.name.as_str(), own.in_process), ("none", false));
+    assert_eq!(own.state, ModeState::Unavailable);
+    assert_eq!(
+        own.reason.as_deref(),
+        Some("the row has no decoder of its own")
+    );
+    assert!(own.outputs.is_empty());
+    assert_eq!(m.handlers.len(), 1);
+
+    let info = listed_one(&node, NODEC).await;
+    assert_eq!(info.state, ModeState::Unavailable);
+    assert_eq!(info.reason.as_deref(), Some(NO_DECODER_REASON));
+    assert_eq!(info.decoder_kind, None);
+    assert!(info.handlers.is_empty(), "{:?}", info.handlers);
+    assert_eq!(info.handler, None);
+    assert!(info.outputs.is_empty());
+    assert!(info.voices.is_empty());
+    assert_eq!(info.program, None);
+    let v = serde_json::to_value(&info).unwrap();
+    assert_eq!(v["decoder_kind"], serde_json::Value::Null);
+    let s = shown(&node, NODEC).await;
+    assert_eq!(s.row.decoder, None);
+    assert_eq!(
+        (&s.state, &s.reason, &s.handler, &s.handlers, &s.outputs),
+        (
+            &info.state,
+            &info.reason,
+            &info.handler,
+            &info.handlers,
+            &info.outputs
+        )
+    );
+    // The row file writes `"decoder": null`, and it is required.
+    let wire = serde_json::to_value(&s.row).unwrap();
+    assert_eq!(wire["decoder"], serde_json::Value::Null);
+    let e = nodec_row(|v| {
+        v.as_object_mut().unwrap().remove("decoder");
+    })
+    .unwrap_err();
+    assert_eq!(e.field, "decoder", "{e}");
+}
+
+#[tokio::test]
+async fn a_row_with_no_decoder_is_ready_through_a_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(hf::nodec_cfg(dir.path(), Some(true)), stages(), vec![])
+        .await
+        .unwrap();
+    let program = dir.path().join("bin/zeta-alt-decoder");
+    let info = listed_one(&node, NODEC).await;
+    assert_eq!(info.state, ModeState::Ready, "{:?}", info.reason);
+    assert_eq!(info.reason, None);
+    assert_eq!(info.decoder_kind, None);
+    let ids: Vec<&str> = info.handlers.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, [hf::ALT]);
+    assert_eq!(info.handler.as_deref(), Some(hf::ALT));
+    assert_eq!(info.outputs, [StreamKind::Event, StreamKind::Packet]);
+    assert_eq!(info.outputs, info.handlers[0].outputs);
+    assert_eq!(info.program, Some(program.display().to_string()));
+    let s = shown(&node, NODEC).await;
+    assert_eq!(
+        (&s.state, &s.reason, &s.handler, &s.handlers, &s.outputs),
+        (
+            &info.state,
+            &info.reason,
+            &info.handler,
+            &info.handlers,
+            &info.outputs
+        )
+    );
+    assert_eq!(s.program, Some(program));
+    assert!(node.modes().get(NODEC).unwrap().startable());
+}
+
+/// The reason of a row with no decoder whose handlers are there but not ready names each
+/// one and why, after the probe found its program missing (ruling R1).
+#[tokio::test]
+async fn a_row_with_no_decoder_names_its_handlers_that_are_not_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(hf::nodec_cfg(dir.path(), Some(false)), stages(), vec![])
+        .await
+        .unwrap();
+    let reg = node.modes();
+    let alt = reg.handler(NODEC, hf::ALT).unwrap();
+    assert_eq!(alt.state, ModeState::Unavailable, "{alt:?}");
+    let why = alt.reason.clone().unwrap();
+    assert!(
+        why.starts_with("/nonexistent/zeta-test/zeta-alt-decoder: missing"),
+        "{why}"
+    );
+    let reason = format!("{NO_DECODER_REASON}; alt: {why}");
+    let info = listed_one(&node, NODEC).await;
+    assert_eq!(info.state, ModeState::Unavailable);
+    assert_eq!(info.reason.as_deref(), Some(reason.as_str()));
+    let ids: Vec<&str> = info.handlers.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, [hf::ALT]);
+    assert_eq!(shown(&node, NODEC).await.reason, Some(reason.clone()));
+    assert_eq!(
+        reg.get(NODEC).unwrap().reason.as_deref(),
+        Some(reason.as_str())
+    );
+}
+
+#[test]
+fn a_handler_file_named_none_is_broken() {
+    let reg = with_handler_files(&[("n.json", &adsb_handler_file("none", |_| {}))]);
+    let file = operator_file(&reg);
+    assert_eq!(file.state, ModeState::Broken);
+    assert_eq!(file.reason.as_deref(), Some("id: none is reserved"));
+    assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "onair"]);
+}
+
+#[test]
+fn a_row_with_no_decoder_and_a_quick_test_is_broken() {
+    assert_eq!(nodec_row(|_| {}), Ok(()));
+    let e = nodec_row(|v| v["identify"]["quick"] = "aprs".into()).unwrap_err();
+    assert_eq!(
+        (e.field.as_str(), e.error.as_str()),
+        ("identify.quick", "a row with no decoder has no quick test")
+    );
+}
+
+#[test]
+fn a_row_with_no_decoder_and_a_synth_test_is_broken() {
+    let (_, text) = ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("adsb_decode.json"))
+        .unwrap();
+    let adsb: serde_json::Value = serde_json::from_str(text).unwrap();
+    let e = nodec_row(|v| v["test"] = adsb["test"].clone()).unwrap_err();
+    assert_eq!(
+        (e.field.as_str(), e.error.as_str()),
+        ("test.kind", "a row with no decoder is checked on a fixture")
+    );
+    // A fixture test passes.
+    let fixture = serde_json::json!({
+        "kind": "fixture", "path": "fixtures/nodec.sigmf-meta",
+        "expect": {"icao": "7C6B28"}, "within_ms": 5000
+    });
+    assert_eq!(nodec_row(|v| v["test"] = fixture), Ok(()));
+}
+
+#[test]
+fn an_entry_for_a_row_with_no_decoder_must_map_every_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = hf::write_nodec_row(dir.path());
+    let handlers = hf::write_nodec_handler(dir.path(), true);
+    let path = handlers.join("alt.json");
+    let file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    // Every property of the row's schema but the envelope's and `squawk` mapped.
+    let fields: serde_json::Map<String, serde_json::Value> = [
+        "icao",
+        "msg",
+        "callsign",
+        "altitude_ft",
+        "ground_speed_kt",
+        "track_deg",
+        "lat",
+        "lon",
+        "vertical_rate_fpm",
+        "on_ground",
+    ]
+    .iter()
+    .map(|f| (f.to_string(), format!("/{f}").into()))
+    .collect();
+    // The file with its entry a JSON-lines one over `fields`, `edit` applied, served for
+    // `mode`.
+    let load = |mode: &str, edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut f = file.clone();
+        let mut e = f["modes"][NODEC].take();
+        e["output"] = serde_json::json!({"via": "stdout", "parser": "json_lines"});
+        e["output"]["fields"] = fields.clone().into();
+        e["args"] = serde_json::json!([]);
+        e.as_object_mut().unwrap().remove("packets");
+        edit(&mut e);
+        f["modes"] = serde_json::json!({ mode: e });
+        std::fs::write(&path, f.to_string()).unwrap();
+        ModeRegistry::load_with(&stages(), Some(&modes), Some(&handlers))
+    };
+    let reg = load(NODEC, &|_| {});
+    let alt = reg.handler(NODEC, hf::ALT).unwrap();
+    assert_eq!(alt.state, ModeState::Broken);
+    assert_eq!(
+        alt.reason.as_deref(),
+        Some(
+            "output.fields: squawk is not mapped, and the row has no decoder of its own to \
+             fill it"
+        )
+    );
+    // Mapped, or given as a constant, it is filled.
+    let reg = load(NODEC, &|e| {
+        e["output"]["fields"]["squawk"] = "/squawk".into()
+    });
+    let alt = reg.handler(NODEC, hf::ALT).unwrap();
+    assert_eq!(alt.state, ModeState::Ready, "{:?}", alt.reason);
+    let reg = load(NODEC, &|e| e["const"] = serde_json::json!({"squawk": null}));
+    let alt = reg.handler(NODEC, hf::ALT).unwrap();
+    assert_eq!(alt.state, ModeState::Ready, "{:?}", alt.reason);
+    // A row with a decoder of its own fills what an entry leaves out.
+    let reg = load("adsb_decode", &|_| {});
+    let alt = reg.handler("adsb_decode", hf::ALT).unwrap();
+    assert_eq!(alt.state, ModeState::Ready, "{:?}", alt.reason);
 }

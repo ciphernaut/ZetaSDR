@@ -289,7 +289,7 @@ pub fn learned_row(rec: &SignatureRecord, mode_id: &str) -> crate::modes::ModeRo
         modulation,
         label: rec.name.clone(),
         protocol: FRAME_PROTOCOL.into(),
-        decoder: Decoder::Frame(FrameBlock {
+        decoder: Some(Decoder::Frame(FrameBlock {
             demod: FrameDemod {
                 modulation: Modulation::from_label(&rec.modulation).unwrap_or(Modulation::Fsk),
                 symbol_rate_baud: rec.symbol_rate_baud.map_or(0, |b| b.0),
@@ -298,7 +298,7 @@ pub fn learned_row(rec: &SignatureRecord, mode_id: &str) -> crate::modes::ModeRo
             },
             framing: rec.framing.clone().unwrap_or(Value::Null),
             parser: OPAQUE_PARSER.into(),
-        }),
+        })),
         event: Event {
             schema: serde_json::json!({"type": "object", "properties": {
                 "protocol": {"type": "string"},

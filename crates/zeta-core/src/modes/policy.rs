@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{LoadedMode, ModeHandler, ModeState};
+use super::{LoadedMode, ModeHandler, ModeState, NO_DECODER};
 use crate::types::StreamKind;
 
 /// The operator's rankings of handlers: per mode, and node-wide. An id a ranking names
@@ -53,7 +53,10 @@ pub struct Passed {
 /// ranking's order. The mode's own ranking is not so limited, and nothing is excluded:
 /// a lesser handler is still picked when it is the best one left.
 ///
-/// With none left, every handler and why it was passed over, in `handlers`' order.
+/// With none left, every handler and why it was passed over, in `handlers`' order, but
+/// the stand-in of a row with no decoder of its own ([`NO_DECODER`], never ready and
+/// never listed). Its outputs are none, so for such a row `own` is empty and every
+/// handler counts in the node-wide ranking.
 pub fn pick<'a>(
     mode: &str,
     handlers: &'a [ModeHandler],
@@ -93,6 +96,7 @@ pub fn pick<'a>(
     first.ok_or_else(|| {
         handlers
             .iter()
+            .filter(|h| h.id != NO_DECODER)
             .filter_map(|h| {
                 passed_over(h, needs).map(|why| Passed {
                     id: h.id.clone(),
@@ -129,9 +133,11 @@ pub fn choose<'a>(
         return pick(&m.row.id.0, &m.handlers, &m.outputs, needs, policy)
             .map_err(Refusal::NoneLeft);
     };
+    // The stand-in of a row with no decoder is found (and refused as not ready), but not
+    // listed among the ids there are.
     let Some(h) = m.handlers.iter().find(|h| h.id == id) else {
         return Err(Refusal::Unknown(
-            m.handlers.iter().map(|h| h.id.clone()).collect(),
+            m.listed_handlers().map(|h| h.id.clone()).collect(),
         ));
     };
     if let Some(why) = unready(h) {
@@ -166,7 +172,9 @@ pub struct Reported {
 }
 
 /// `m`'s fields as reported under `policy`. With only the row's own handler they are the
-/// row's own (`m.state`, `m.reason`, ...). `checked` is always the row's own.
+/// row's own (`m.state`, `m.reason`, ...). `checked` is always the row's own. A row with
+/// no decoder of its own reads as its handler files' handlers: `ready` through the one
+/// picked, else its own `unavailable`, its reason naming each of them.
 pub fn reported(m: &LoadedMode, policy: &HandlerPolicy) -> Reported {
     let own = || Reported {
         state: m.state,
@@ -413,6 +421,47 @@ mod tests {
             h("b", false, true, EV),
         ];
         assert_eq!(picked(&hs, &[], &ranked(&[], &["b"])), "b");
+    }
+
+    /// A row with no decoder of its own: its stand-in first, never ready, giving nothing,
+    /// so every handler counts in the node-wide ranking; with none ready, what was passed
+    /// over leaves the stand-in out.
+    #[test]
+    fn a_row_with_no_decoder_is_ranked_node_wide() {
+        let mut none = h(super::super::handler_file::NO_DECODER, false, false, &[]);
+        none.reason = Some("the row has no decoder of its own".into());
+        let hs = [
+            none.clone(),
+            h("alt", false, true, EV_PKT),
+            h("onair", false, true, EV_PKT),
+        ];
+        assert_eq!(
+            picked_against(&[], &hs, &[], &ranked(&[], &["onair"])),
+            "onair"
+        );
+        assert_eq!(
+            picked_against(&[], &hs, &[], &HandlerPolicy::default()),
+            "alt"
+        );
+        let hs = [
+            none,
+            h("alt", false, false, EV_PKT),
+            h("onair", false, false, EV_PKT),
+        ];
+        let passed = pick(MODE, &hs, &[], &[], &ranked(&[], &["onair"])).unwrap_err();
+        assert_eq!(
+            passed,
+            [
+                Passed {
+                    id: "alt".into(),
+                    why: "alt: missing".into(),
+                },
+                Passed {
+                    id: "onair".into(),
+                    why: "onair: missing".into(),
+                },
+            ]
+        );
     }
 
     #[test]

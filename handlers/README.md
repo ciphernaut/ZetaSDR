@@ -5,7 +5,8 @@ row's own decoder. The node embeds the `*.json` files here and reads the operato
 `--handlers-dir` (default `$XDG_CONFIG_HOME/zetasdr/handlers`, else
 `~/.config/zetasdr/handlers`); an operator file replaces the embedded one of its `id`.
 
-- `id`: the handler's id, `^[a-z0-9][a-z0-9_-]*$`; never `builtin`, nor a mode's own program.
+- `id`: the handler's id, `^[a-z0-9][a-z0-9_-]*$`; never `builtin` or `none` (reserved),
+  nor a mode's own program.
 - `name`: its name for people; `programs`, `install`: as a program row's
   [`decoder`](../modes/adsb_decode.json) has them.
 - `modes`: by mode id, a program block as a program row's (`args`, `input`, `output`,
@@ -15,6 +16,19 @@ row's own decoder. The node embeds the `*.json` files here and reads the operato
   schema's `type` accepts) on every event, after the field map (`{"crc_ok": true}`); not a
   key the event envelope sets (`protocol`, `handler`, `summary`, `t_ns`, `position`,
   `access`), the subject key, nor a field the program also gives.
+
+A row may have no decoder of its own (`"decoder": null`): only a handler file's entry runs
+it. Such a row is listed `ready` while one of its entries is ready and `unavailable`
+otherwise, with the reason `no decoder of its own, and no handler for it is ready`, then
+`; <id>: <reason>` for each entry (the missing program, say); its `decoder_kind` is `null`
+and its `handlers` are its entries only. A job of it always records its handler, the
+policy's pick when the start names none. Its entry's `output.fields`, when it maps the
+program's line, names every field of the row's event schema but the envelope's
+(`protocol`, `summary`, `t_ns`, `position`) that no `const` or row `derive` fills, since
+nothing else does (`output.fields: <name> is not mapped, and the row has no decoder of its
+own to fill it`). The row takes no `identify.quick`, and its `test` is a fixture, which
+`zeta modes check <id>` runs through the handler the policy picks (`<id>@<handler>: ok`;
+with none ready, `<id>: skipped: no decoder of its own and no handler ready`).
 
 A handler job outputs events, and packets when its entry has `packets`; never audio or
 pictures. Where the row says on each event whether speech is produced, the entry gives

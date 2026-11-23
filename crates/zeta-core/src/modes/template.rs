@@ -57,7 +57,7 @@ pub fn expand(
     if !handler.in_process {
         let block = match (block, &row.decoder) {
             (Some(b), _) => b,
-            (None, Decoder::Program(b)) if own => b,
+            (None, Some(Decoder::Program(b))) if own => b,
             (None, _) => {
                 return Err(OpError::Other {
                     message: format!("mode {}: handler {} has no program", row.id.0, handler.id),
@@ -67,7 +67,10 @@ pub fn expand(
         let named = (!own).then_some(handler.id.as_str());
         return program_graph(row, block, named, tuning, out_rate_hz);
     }
-    match &row.decoder {
+    let Some(decoder) = &row.decoder else {
+        return Err(no_decoder(row));
+    };
+    match decoder {
         Decoder::Graph { nodes, edges, .. } => {
             let ids: HashMap<&NodeId, NodeId> =
                 nodes.iter().map(|n| (&n.id, NodeId::new())).collect();
@@ -109,6 +112,14 @@ pub fn expand(
         }
         Decoder::Program(block) => program_graph(row, block, None, tuning, out_rate_hz),
         Decoder::Frame(block) => Ok(frame_graph(block, tuning, out_rate_hz)),
+    }
+}
+
+/// `mode <id> has no decoder of its own`: what expanding or checking a band of a row
+/// with none, without a handler's block, is.
+fn no_decoder(row: &ModeRow) -> OpError {
+    OpError::Other {
+        message: format!("mode {} has no decoder of its own", row.id.0),
     }
 }
 
@@ -180,15 +191,16 @@ fn program_graph(
 /// once, and `packet` when any node's stage lists it and no `packet` edge leaves that
 /// node (the stage's packets then reach the job's output). A program row emits events,
 /// and packets too with a `packets` block; a frame row emits events and packets (its
-/// audio stays inside its chain).
+/// audio stays inside its chain). A row with no decoder of its own emits nothing itself.
 pub fn outputs(row: &ModeRow, stages: &StageRegistry) -> Vec<StreamKind> {
     let (nodes, edges) = match &row.decoder {
-        Decoder::Graph { nodes, edges, .. } => (nodes, edges),
-        Decoder::Frame(_) => return vec![StreamKind::Event, StreamKind::Packet],
-        Decoder::Program(p) if p.packets.is_some() => {
+        None => return Vec::new(),
+        Some(Decoder::Graph { nodes, edges, .. }) => (nodes, edges),
+        Some(Decoder::Frame(_)) => return vec![StreamKind::Event, StreamKind::Packet],
+        Some(Decoder::Program(p)) if p.packets.is_some() => {
             return vec![StreamKind::Event, StreamKind::Packet];
         }
-        Decoder::Program(_) => return vec![StreamKind::Event],
+        Some(Decoder::Program(_)) => return vec![StreamKind::Event],
     };
     let mut out: Vec<StreamKind> = Vec::new();
     for n in nodes
@@ -230,18 +242,19 @@ pub fn names_audio_policy(row: &ModeRow) -> bool {
         }
     }
     match &row.decoder {
-        Decoder::Graph { nodes, .. } => nodes.iter().any(|n| names(&n.params)),
-        Decoder::Program(_) | Decoder::Frame(_) => false,
+        Some(Decoder::Graph { nodes, .. }) => nodes.iter().any(|n| names(&n.params)),
+        Some(Decoder::Program(_) | Decoder::Frame(_)) | None => false,
     }
 }
 
 /// The voices a job of `row` has beside its main audio stream: the [`Stage::voice_roles`]
 /// of a graph row's terminal nodes (no edge leaves them) with their template params, in
-/// node order, each once. Empty for a program or frame row, and for a row with one voice.
+/// node order, each once. Empty for a program or frame row, a row with no decoder of its
+/// own, and a row with one voice.
 ///
 /// [`Stage::voice_roles`]: crate::stage::Stage::voice_roles
 pub fn voices(row: &ModeRow, stages: &StageRegistry) -> Vec<String> {
-    let Decoder::Graph { nodes, edges, .. } = &row.decoder else {
+    let Some(Decoder::Graph { nodes, edges, .. }) = &row.decoder else {
         return Vec::new();
     };
     let mut out: Vec<String> = Vec::new();
@@ -343,8 +356,8 @@ fn demod_node(demod: &Demod) -> Node {
 /// Refuse a band narrower than an IQ program or a frame row needs: `band.min_hz` (else
 /// `band.bandwidth_hz`) is the least, `band.bandwidth_hz` the suggestion, the source rate
 /// `source_rate_hz` the most. `block` is the program that runs (a handler's,
-/// [`super::ModeRegistry::program_block`]); `None` reads the row's own decoder. A `graph`
-/// row run in process takes any band its channel can cut.
+/// [`super::ModeRegistry::program_block`]); `None` reads the row's own decoder (an error
+/// for a row with none). A `graph` row run in process takes any band its channel can cut.
 pub fn check_band(
     row: &ModeRow,
     block: Option<&ProgramBlock>,
@@ -352,9 +365,10 @@ pub fn check_band(
     source_rate_hz: u64,
 ) -> Result<(), OpError> {
     let checked = match (block, &row.decoder) {
-        (Some(b), _) | (None, Decoder::Program(b)) => b.input.stream == InputStream::Iq,
-        (None, Decoder::Frame(_)) => true,
-        (None, Decoder::Graph { .. }) => false,
+        (Some(b), _) | (None, Some(Decoder::Program(b))) => b.input.stream == InputStream::Iq,
+        (None, Some(Decoder::Frame(_))) => true,
+        (None, Some(Decoder::Graph { .. })) => false,
+        (None, None) => return Err(no_decoder(row)),
     };
     if !checked {
         return Ok(());
@@ -408,5 +422,56 @@ mod tests {
         v["decoder"]["packets"] = serde_json::Value::Null;
         let row = super::super::parse(&v.to_string()).unwrap();
         assert_eq!(outputs(&row, &stages), [StreamKind::Event]);
+    }
+
+    /// A row with no decoder of its own gives nothing itself, and expands or checks a
+    /// band only by a handler's block: without one it is an error naming the row.
+    #[test]
+    fn a_row_with_no_decoder_expands_only_by_a_handlers_block() {
+        use crate::types::Hz;
+        let stages = StageRegistry::new();
+        let mut v: serde_json::Value = serde_json::from_str(ADSB).unwrap();
+        let block: ProgramBlock = serde_json::from_value({
+            let mut d = v["decoder"].clone();
+            d.as_object_mut().unwrap().remove("kind");
+            d
+        })
+        .unwrap();
+        v["id"] = "nodec_decode".into();
+        v["decoder"] = serde_json::Value::Null;
+        let row = super::super::parse(&v.to_string()).unwrap();
+        assert_eq!(row.decoder, None);
+        assert!(outputs(&row, &stages).is_empty());
+        assert!(voices(&row, &stages).is_empty());
+        assert!(!names_audio_policy(&row));
+        assert!(row.handler_blocks().is_empty());
+        let tuning = Tuning {
+            center_hz: Hz(1_090_000_000),
+            bandwidth_hz: Hz(2_400_000),
+        };
+        let none = ModeHandler::of_row(&row);
+        assert_eq!(none.id, super::super::handler_file::NO_DECODER);
+        let policy = AudioPolicy::default();
+        let e = expand(&row, &none, None, tuning, 2_400_000, policy).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "mode nodec_decode: handler none has no program"
+        );
+        let in_process = ModeHandler {
+            in_process: true,
+            ..none.clone()
+        };
+        let e = expand(&row, &in_process, None, tuning, 2_400_000, policy).unwrap_err();
+        assert_eq!(e.to_string(), "mode nodec_decode has no decoder of its own");
+        let e = check_band(&row, None, tuning, 2_400_000).unwrap_err();
+        assert_eq!(e.to_string(), "mode nodec_decode has no decoder of its own");
+        // A handler's block runs it.
+        let alt = ModeHandler {
+            id: "alt".into(),
+            ..none
+        };
+        let g = expand(&row, &alt, Some(&block), tuning, 2_400_000, policy).unwrap();
+        assert!(g.nodes.iter().any(|n| n.kind == EXTERNAL_DECODE_KIND));
+        assert_eq!(check_band(&row, Some(&block), tuning, 2_400_000), Ok(()));
     }
 }

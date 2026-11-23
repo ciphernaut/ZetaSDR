@@ -178,7 +178,9 @@ impl Inner {
     /// job fails with it, as a missing program fails it); when the policy chose it,
     /// `Ok(Some(_))` with the policy's choice again among the handlers giving what the
     /// start needed (`rec.needs`) and why the old one was passed over, or `Err` with the
-    /// `no_handler` words when none is left. A handler another member of `rec`'s Send to
+    /// `no_handler` words when none is left (for a row with no decoder of its own, none
+    /// of whose handlers is ready, the start's refusal `mode <id> is unavailable:
+    /// <reason>`). A handler another member of `rec`'s Send to
     /// group holds ([`Inner::held_in_group`]) is never chosen again: it is passed over as
     /// `runs beside it as job <id>`, so a group never runs one handler twice.
     pub(super) fn resolve_for_relaunch(&self, rec: &JobRecord) -> Result<Option<Rechosen>, String> {
@@ -186,8 +188,9 @@ impl Inner {
             return Ok(None);
         };
         let modes = self.modes();
-        let Some(m) = self
-            .expandable_kind(&rec.kind)
+        let kind = self.expandable_kind(&rec.kind);
+        let Some(m) = kind
+            .as_ref()
             .and_then(|k| k.loaded_mode(&modes).ok().flatten())
         else {
             return Ok(None);
@@ -223,6 +226,15 @@ impl Inner {
                 now: h.id.clone(),
                 why,
             })),
+            // A row with no decoder of its own, none of whose handlers is ready: there is
+            // no own decoder to fall back on, and the start's refusal says why.
+            Err(_) if !m.has_decoder() && !m.startable() => {
+                let refusal = kind.as_ref().and_then(|k| k.mode_row(&modes).err());
+                Err(refusal.map_or_else(
+                    || crate::modes::NO_DECODER_REASON.to_string(),
+                    |e| e.to_string(),
+                ))
+            }
             Err(passed) => Err(crate::ops::OpError::NoHandler {
                 mode: mode.clone(),
                 // In the mode's order, the held ones among them.

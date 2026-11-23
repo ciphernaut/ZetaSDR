@@ -1076,3 +1076,123 @@ fn onair_passes_its_modes_checks() {
     );
     println!("video_decode@onair: not listed");
 }
+
+// Plan 47: a row with no decoder of its own is checked through the handler the policy
+// picks.
+
+/// `adsb_decode` as the operator row `nodec_decode` with no decoder of its own, checked
+/// on a fixture of 100 ms of silence at 1090 MHz for the identity `7C6B28`.
+fn write_nodec_row(dir: &Path) {
+    let iq = vec![num_complex::Complex::new(0.0f32, 0.0); 240_000];
+    let meta = write_fixture(dir, "nodec", &iq, 2_400_000, 1_090_000_000);
+    let mut row: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/adsb_decode.json")).unwrap();
+    row["decoder"] = serde_json::Value::Null;
+    row["test"] = serde_json::json!({
+        "kind": "fixture", "path": meta.display().to_string(),
+        "expect": {"icao": "7C6B28"}, "within_ms": 5000
+    });
+    write_whole_row(dir, "nodec_decode", row);
+}
+
+/// A handler file `id` serving `nodec_decode` by `fake_lines` printing the identity the
+/// row's test expects; the handlers directory.
+fn write_nodec_handler(dir: &Path, id: &str) -> std::path::PathBuf {
+    let lines = dir.join(format!("{id}.lines"));
+    std::fs::write(&lines, r#"{"icao": "7C6B28"}"#).unwrap();
+    let handlers = dir.join("handlers");
+    std::fs::create_dir_all(&handlers).unwrap();
+    let file = serde_json::json!({
+        "id": id,
+        "name": id,
+        "programs": [fake_lines().display().to_string()],
+        "install": {"url": "https://example.invalid/alt"},
+        "modes": {
+            "nodec_decode": {
+                "args": ["--lines-file", lines.display().to_string()],
+                "input": {"stream": "iq", "format": "cs16", "rate_hz": 2400000, "via": "stdin"},
+                "output": {"via": "stdout", "port": null, "parser": "json_lines"}
+            }
+        }
+    });
+    std::fs::write(handlers.join(format!("{id}.json")), file.to_string()).unwrap();
+    handlers
+}
+
+/// The `modes-checked.json` the checks above wrote.
+fn checked(dir: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(dir.join("state/modes-checked.json")).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+#[test]
+fn a_row_with_no_decoder_is_checked_through_the_policys_pick() {
+    let dir = tempfile::tempdir().unwrap();
+    write_nodec_row(dir.path());
+    write_nodec_handler(dir.path(), "alt");
+    let handlers = write_nodec_handler(dir.path(), "zed");
+    let run = |args: &[&str]| stdout(check(dir.path(), args).arg("--handlers-dir").arg(&handlers));
+    // No ranking: the first of the two by id.
+    let (out, code) = run(&["nodec_decode"]);
+    assert_eq!(out.trim(), "nodec_decode@alt: ok", "{out}");
+    assert_eq!(code, 0);
+    // Ranked, the other.
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("handler-policy.json"),
+        r#"{"modes": {"nodec_decode": ["zed"]}, "all": []}"#,
+    )
+    .unwrap();
+    let (out, code) = run(&["nodec_decode"]);
+    assert_eq!(out.trim(), "nodec_decode@zed: ok", "{out}");
+    assert_eq!(code, 0);
+    let c = checked(dir.path());
+    assert!(c["nodec_decode@alt"].is_u64(), "{c}");
+    assert!(c["nodec_decode@zed"].is_u64(), "{c}");
+    assert!(c.get("nodec_decode").is_none(), "{c}");
+    // `--handler` names one, as for any row; the stand-in is none of its handlers.
+    let (out, code) = run(&["nodec_decode", "--handler", "alt"]);
+    assert_eq!(out.trim(), "nodec_decode@alt: ok", "{out}");
+    assert_eq!(code, 0);
+    let out = check(dir.path(), &["nodec_decode", "--handler", "none"])
+        .arg("--handlers-dir")
+        .arg(&handlers)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("mode nodec_decode has no handler none (its handlers: alt, zed)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_row_with_no_decoder_is_a_skip_with_no_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    write_nodec_row(dir.path());
+    let why = "no decoder of its own and no handler ready";
+    let (out, code) = stdout(&mut check(dir.path(), &["nodec_decode"]));
+    assert_eq!(out.trim(), format!("nodec_decode: skipped: {why}"), "{out}");
+    assert_eq!(code, 0);
+    let (out, code) = stdout(&mut check(dir.path(), &["--strict", "nodec_decode"]));
+    assert_eq!(out.trim(), format!("nodec_decode: fail: {why}"), "{out}");
+    assert_eq!(code, 1);
+    // A handler whose program is missing is no ready handler either.
+    let handlers = write_nodec_handler(dir.path(), "alt");
+    let file = handlers.join("alt.json");
+    let text = std::fs::read_to_string(&file).unwrap();
+    let missing = text.replace(
+        &fake_lines().display().to_string(),
+        "/nonexistent/zeta-test/alt-rx",
+    );
+    std::fs::write(&file, missing).unwrap();
+    let (out, code) = stdout(
+        check(dir.path(), &["nodec_decode"])
+            .arg("--handlers-dir")
+            .arg(&handlers),
+    );
+    assert_eq!(out.trim(), format!("nodec_decode: skipped: {why}"), "{out}");
+    assert_eq!(code, 0);
+}
