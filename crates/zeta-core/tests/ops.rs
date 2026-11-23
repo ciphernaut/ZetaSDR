@@ -2951,7 +2951,7 @@ fn adsb_row_expands_to_channel_then_external_decode() {
         );
         assert_eq!(
             g.nodes[1].params,
-            serde_json::json!({"mode": "adsb_decode"})
+            serde_json::json!({"mode": "adsb_decode", "bandwidth_hz": bw})
         );
         assert_eq!(g.edges.len(), 1);
         assert_eq!(g.edges[0].kind, StreamKind::Iq);

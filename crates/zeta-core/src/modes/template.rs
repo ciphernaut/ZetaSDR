@@ -125,7 +125,7 @@ fn no_decoder(row: &ModeRow) -> OpError {
 
 /// A program's graph: a `channel` at `out_rate_hz` into [`EXTERNAL_DECODE_KIND`] (an
 /// audio program hearing the channel through its `demod` first), the decode node's
-/// params `{"mode": <row id>}`, with `"handler": <id>` for a handler not the row's own.
+/// params `{"mode": <row id>, "bandwidth_hz": <the job's>}`, with `"handler": <id>` for a handler not the row's own.
 fn program_graph(
     row: &ModeRow,
     block: &ProgramBlock,
@@ -142,7 +142,7 @@ fn program_graph(
             "out_rate_hz": out_rate_hz,
         }),
     };
-    let mut params = serde_json::json!({ "mode": row.id.0 });
+    let mut params = serde_json::json!({ "mode": row.id.0, "bandwidth_hz": tuning.bandwidth_hz.0 });
     if let Some(h) = handler {
         params["handler"] = h.into();
     }
@@ -473,5 +473,23 @@ mod tests {
         let g = expand(&row, &alt, Some(&block), tuning, 2_400_000, policy).unwrap();
         assert!(g.nodes.iter().any(|n| n.kind == EXTERNAL_DECODE_KIND));
         assert_eq!(check_band(&row, Some(&block), tuning, 2_400_000), Ok(()));
+    }
+
+    /// A program's decode node carries the job's band width, for `$bandwidth_hz`.
+    #[test]
+    fn a_programs_decode_node_carries_the_jobs_bandwidth() {
+        let row = super::super::parse(include_str!("../../../../modes/adsb_decode.json")).unwrap();
+        let Some(Decoder::Program(block)) = row.decoder.clone() else {
+            panic!("a program row")
+        };
+        for bw in [1_500_000, 2_000_000] {
+            let tuning = Tuning {
+                center_hz: crate::types::Hz(1_090_000_000),
+                bandwidth_hz: crate::types::Hz(bw),
+            };
+            let g = program_graph(&row, &block, None, tuning, 2_400_000).unwrap();
+            let n = g.nodes.iter().find(|n| n.kind == EXTERNAL_DECODE_KIND);
+            assert_eq!(n.unwrap().params["bandwidth_hz"], bw);
+        }
     }
 }

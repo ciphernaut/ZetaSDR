@@ -14,7 +14,8 @@
 //!
 //! **A run.** Pick a free loopback port when the args or output use `$port`; substitute
 //! `$port`, `$rate_hz` (the row's `input.rate_hz`), `$center_hz` (the first IQ frame's
-//! centre, waited for only when used) and `$fifo` (the named pipe the input goes to with
+//! centre, waited for only when used), `$bandwidth_hz` (the job's band width in Hz, from
+//! the stage's params; a retune relaunches the stage with the new one) and `$fifo` (the named pipe the input goes to with
 //! `via: fifo`, in a directory of its own under the stage's run directory,
 //! `<state_dir>/run` on a node, removed when the run ends; a stage without one fails a
 //! fifo row); spawn ([`crate::proc`]); feed the IQ
@@ -117,6 +118,10 @@ pub struct ExternalParams {
     /// row's own (a program row's decoder).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler: Option<String>,
+    /// The job's band width in Hz, for `$bandwidth_hz`; a retune relaunches the stage
+    /// with the new tuning's. Absent (a stage placed by hand) it reads as 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth_hz: Option<u64>,
 }
 
 /// IQ or audio in (as the row's `input.stream` says), one event per parsed output line
@@ -337,6 +342,7 @@ impl Stage for ExternalDecodeStage {
             handler: &r.handler,
             extra: &r.extra,
             consts: &r.consts,
+            bandwidth_hz: p.bandwidth_hz.unwrap_or(0),
         };
         run_row(
             program, &self.env, run_dir, inputs, outputs, bus, cancel, ctx,
@@ -361,6 +367,9 @@ pub struct Program<'a> {
     pub extra: &'a BTreeMap<String, FieldPath>,
     /// The fields it sets to a constant on each event, after the mapped ones.
     pub consts: &'a BTreeMap<String, Value>,
+    /// The job's band width in Hz, what `$bandwidth_hz` is (0 when the stage was given
+    /// none).
+    pub bandwidth_hz: u64,
 }
 
 /// Run `p`'s program as its mode's decoder (see the module docs), a fifo input in a
@@ -448,7 +457,12 @@ pub async fn run_row(
     if let Some(f) = &fifo {
         make_fifo(f).map_err(|e| fail(format!("cannot make fifo {}: {e}", f.display())))?;
     }
-    let args = substitute(block, (port, packet_port), center_hz, fifo.as_deref());
+    let args = substitute(
+        block,
+        (port, packet_port),
+        (center_hz, p.bandwidth_hz),
+        fifo.as_deref(),
+    );
     let mut child = proc::spawn(
         program,
         &args,
@@ -685,11 +699,11 @@ async fn pump(
 }
 
 /// The row's args with `$port` and `$packet_port` (`ports`), `$rate_hz`, `$center_hz`,
-/// `$center_khz` and `$fifo` substituted.
+/// `$center_khz`, `$bandwidth_hz` and `$fifo` substituted.
 fn substitute(
     block: &ProgramBlock,
     (port, packet_port): (u16, u16),
-    center_hz: u64,
+    (center_hz, bandwidth_hz): (u64, u64),
     fifo: Option<&Path>,
 ) -> Vec<String> {
     let fifo = fifo.map(|f| f.display().to_string()).unwrap_or_default();
@@ -700,6 +714,7 @@ fn substitute(
             a.replace("$packet_port", &packet_port.to_string())
                 .replace("$port", &port.to_string())
                 .replace("$rate_hz", &block.input.rate_hz.to_string())
+                .replace("$bandwidth_hz", &bandwidth_hz.to_string())
                 .replace("$center_hz", &center_hz.to_string())
                 .replace("$center_khz", &zeta_core::modes::center_khz_text(center_hz))
                 .replace("$fifo", &fifo)
@@ -1576,7 +1591,7 @@ mod tests {
             substitute(
                 &block,
                 (30_005, 30_006),
-                1_090_000_000,
+                (1_090_000_000, 0),
                 Some(Path::new("/run/x/input"))
             ),
             [
@@ -1599,7 +1614,7 @@ mod tests {
         };
         block.args = ["$center_khz", "$center_hz"].map(String::from).to_vec();
         assert_eq!(
-            substitute(&block, (0, 0), 8_942_500, None),
+            substitute(&block, (0, 0), (8_942_500, 0), None),
             ["8942.5", "8942500"]
         );
     }

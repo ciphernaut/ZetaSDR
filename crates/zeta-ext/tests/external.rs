@@ -686,6 +686,35 @@ async fn a_handler_files_program_runs_for_the_rows_mode() {
     );
 }
 
+/// A program's arguments take the job's band width from `$bandwidth_hz`, and a run
+/// after a retune (the graph is rebuilt with the new tuning) takes the new one.
+#[tokio::test]
+async fn a_programs_arguments_take_the_jobs_bandwidth() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = dir.path().join("alt-lines");
+    std::fs::write(&lines, r#"{"text":"{argv}","n":2}"#).unwrap();
+    let rows = [json_row("fake_json", "cs16", "stdin", &[])];
+    let reg = Arc::new(registry_with_alt_as(&rows, "fake_json", &lines, |e| {
+        e["args"] = json!([
+            "--lines-file",
+            lines.display().to_string(),
+            "--width",
+            "$bandwidth_hz"
+        ]);
+    }));
+    for bw in [1_500_000u64, 2_000_000] {
+        let stage = ExternalDecodeStage::new(reg.clone());
+        let params = json!({"mode": "fake_json", "handler": "alt", "bandwidth_hz": bw});
+        let mut r = start_params(stage, params, false);
+        send(&r.tx, 4, 480, 48_000);
+        let v = next_event(&mut r.rx_out, 10).await.expect("an event");
+        let text = v["text"].as_str().unwrap_or_default();
+        assert!(text.ends_with(&format!("--width {bw}")), "{v}");
+        drop(r.tx);
+        assert!(matches!(result_within(r.handle, 10).await, Ok(())));
+    }
+}
+
 /// A handler file entry's `extra` fields are read from the line by their pointers and
 /// added beside the row's; the row's own handler adds none.
 #[tokio::test]

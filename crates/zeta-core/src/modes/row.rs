@@ -651,7 +651,7 @@ pub struct ProgramBlock {
     pub programs: Vec<String>,
     /// Arguments, with `$port`, `$packet_port` (a second port zeta picks, for `packets`),
     /// `$rate_hz`, `$center_hz`, `$center_khz` (the centre in kHz, an integer when it
-    /// divides) and `$fifo` (the named pipe of `input.via: fifo`) substituted.
+    /// divides), `$bandwidth_hz` (the job's band width in Hz, a whole number) and `$fifo` (the named pipe of `input.via: fifo`) substituted.
     pub args: Vec<String>,
     pub input: ProgramInput,
     pub output: ProgramOutput,
@@ -1019,12 +1019,13 @@ const GRAPH_PLACEHOLDERS: [(&str, u64); 3] = [
     ("$out_rate_hz", 48_000),
 ];
 /// The placeholders a program's `args` may use.
-const PROGRAM_PLACEHOLDERS: [&str; 6] = [
+const PROGRAM_PLACEHOLDERS: [&str; 7] = [
     "$port",
     "$packet_port",
     "$rate_hz",
     "$center_hz",
     "$center_khz",
+    "$bandwidth_hz",
     "$fifo",
 ];
 /// The event fields the node adds after a program's `decoder.output.fields` map, exempt

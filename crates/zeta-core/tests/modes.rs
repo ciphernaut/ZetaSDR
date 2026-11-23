@@ -439,7 +439,7 @@ fn an_audio_program_row_expands_to_channel_nbfm_external() {
     );
     assert_eq!(
         g.nodes[2].params,
-        serde_json::json!({"mode": "audio_sonde"})
+        serde_json::json!({"mode": "audio_sonde", "bandwidth_hz": 12_500})
     );
     let edges: Vec<(&NodeId, &NodeId, StreamKind)> =
         g.edges.iter().map(|e| (&e.from, &e.to, e.kind)).collect();

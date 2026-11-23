@@ -243,7 +243,7 @@ def main() -> int:
     tail = b""
 
     def send() -> None:
-        text = lines.replace("{bytes}", str(total)).replace("{head}", head.hex()).replace("{in}", in_path)
+        text = lines.replace("{bytes}", str(total)).replace("{head}", head.hex()).replace("{in}", in_path).replace("{argv}", " ".join(args))
         out.write((text + "\n").encode())
         out.flush()
         sys.stderr.write(f"fake_lines: sent lines after {total} bytes\n")

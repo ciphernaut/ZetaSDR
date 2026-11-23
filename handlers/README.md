@@ -17,6 +17,10 @@ row's own decoder. The node embeds the `*.json` files here and reads the operato
   key the event envelope sets (`protocol`, `handler`, `summary`, `t_ns`, `position`,
   `access`), the subject key, nor a field the program also gives.
 
+An entry's `args` take the placeholders of a program row's (`$port`, `$packet_port`,
+`$rate_hz`, `$center_hz`, `$center_khz`, `$fifo`) and `$bandwidth_hz`: the job's band width in
+Hz, a whole number (a retune to a new width relaunches the program with the new one).
+
 A row may have no decoder of its own (`"decoder": null`): only a handler file's entry runs
 it. Such a row is listed `ready` while one of its entries is ready and `unavailable`
 otherwise, with the reason `no decoder of its own, and no handler for it is ready`, then

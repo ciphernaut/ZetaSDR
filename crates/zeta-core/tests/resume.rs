@@ -900,7 +900,10 @@ async fn a_chosen_handler_gone_at_restart_is_chosen_again_and_noted() {
         rec.context["handler"],
         serde_json::json!({"was": ALT, "now": OWN, "why": h::ALT_MISSING})
     );
-    assert_eq!(decode_params(&rec), serde_json::json!({"mode": MODE}));
+    assert_eq!(
+        decode_params(&rec),
+        serde_json::json!({"mode": MODE, "bandwidth_hz": 2_400_000})
+    );
     let disk = on_disk(dir.path(), &id);
     assert_eq!(disk.handler.as_deref(), Some(OWN));
     assert_eq!(disk.context["handler"]["now"], OWN);

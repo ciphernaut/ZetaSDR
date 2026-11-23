@@ -902,7 +902,10 @@ async fn job_start_takes_the_policys_handler_and_records_it() {
         (rec.handler.as_deref(), rec.handler_named),
         (Some(OWN), false)
     );
-    assert_eq!(decode_params(&rec), serde_json::json!({"mode": MODE}));
+    assert_eq!(
+        decode_params(&rec),
+        serde_json::json!({"mode": MODE, "bandwidth_hz": 2_400_000})
+    );
     // `job_list` gives it, and the record on disk keeps it.
     let wire = serde_json::to_value(&rec).unwrap();
     assert_eq!(wire["handler"], OWN);
@@ -918,7 +921,7 @@ async fn job_start_takes_the_policys_handler_and_records_it() {
     );
     assert_eq!(
         decode_params(&rec),
-        serde_json::json!({"mode": MODE, "handler": ALT})
+        serde_json::json!({"mode": MODE, "handler": ALT, "bandwidth_hz": 2_400_000})
     );
     node.job_stop(&named).await.unwrap();
     // A kind of no mode row records none.
@@ -1481,7 +1484,7 @@ async fn a_row_with_no_decoder_starts_through_its_handler() {
     );
     assert_eq!(
         decode_params(&rec),
-        serde_json::json!({"mode": h::NODEC, "handler": ALT})
+        serde_json::json!({"mode": h::NODEC, "handler": ALT, "bandwidth_hz": 2_400_000})
     );
     assert_eq!(on_disk(dir.path(), &id).handler.as_deref(), Some(ALT));
     node.job_stop(&id).await.unwrap();

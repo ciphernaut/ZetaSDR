@@ -200,6 +200,7 @@ impl Stage for AdsbDecodeStage {
             handler: &r.handler,
             extra: &r.extra,
             consts: &r.consts,
+            bandwidth_hz: 0,
         };
         crate::external::run_row(
             program, &self.env, run_dir, inputs, outputs, bus, cancel, ctx,
