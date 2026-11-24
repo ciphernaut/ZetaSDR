@@ -42,6 +42,12 @@ When it can't run, it **passes** and prints `ui e2e skipped: <reason>`, so check
 It runs the scenarios in four shards at once, each with its own nodes (ui.py's `SHARD_STARTS`;
 `ZETA_UI_SHARDS=<n>` overrides, `ZETA_UI_ONLY=a,b` runs those in one shard).
 `ZETA_UI_PROFILE=<file>` writes the slowest lines of each scenario there.
+A shard is killed after ui.rs's `DEADLINE`, or `ZETA_UI_DEADLINE_S` seconds.
+
+CI's `ui` job runs only a smoke set (`SMOKE` in `ci.yml`) on a push, because on the hosted
+runner the whole suite is CPU-bound and failed on load. The whole suite is a local gate before
+landing; on GitHub it runs only from "Run workflow". A renamed smoke scenario fails the job
+(`no scenario`), so update `SMOKE` along with the rename.
 
 ### Flaky in CI only
 

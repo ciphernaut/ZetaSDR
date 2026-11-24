@@ -32,8 +32,9 @@
 //! The scenarios run in [`SHARDS`] shards at once (`ZETA_UI_SHARDS=<n>` overrides), each
 //! against its own set of those nodes and its own Chromium: ui.py's `SHARD_STARTS` cuts the
 //! scenarios into contiguous blocks. A shard still running after [`DEADLINE`] (450 s) of wall
-//! clock is killed and the test fails. `ZETA_UI_ONLY=a,b` runs only those scenarios, in one
-//! shard.
+//! clock, or `ZETA_UI_DEADLINE_S` seconds when set, is killed and the test fails; ui.py runs
+//! unbuffered, so a killed shard still shows the scenarios it passed. `ZETA_UI_ONLY=a,b` runs
+//! only those scenarios, in one shard.
 //!
 //! Skipped, with `ui e2e skipped: <reason>` on stdout, only when Playwright for `python3` or
 //! its Chromium is missing. `python3` runs without `-I`: Playwright is commonly installed in
@@ -382,7 +383,9 @@ fn video_fixture(dir: &Path) -> PathBuf {
 /// shards went past this, so there are four (SHARDS), 251 s, 258 s, 253 s and 249 s, or 315 s
 /// at most pinned to four CPUs (`taskset -c 0-3`); pinned to two, the suite is CPU-bound and
 /// a shard passes this whether there are three or four. Each shard prints its own time: move
-/// SHARD_STARTS from a `ZETA_UI_PROFILE` run, or add a shard, before raising this.
+/// SHARD_STARTS from a `ZETA_UI_PROFILE` run, or add a shard, before raising this. CI's hosted
+/// runner takes about 1.8 times as long per scenario (2026-11-22: shards at 426-450 s), so
+/// `ci.yml` sets its own `ZETA_UI_DEADLINE_S` instead of moving this.
 const DEADLINE: Duration = Duration::from_secs(450);
 
 /// The shards run at once by default (ui.py's `SHARD_STARTS` says where each begins), each
@@ -1415,6 +1418,8 @@ impl Nodes {
             .env("ZETA_BIN", env!("CARGO_BIN_EXE_zeta"))
             .env("ZETA_UI_REBUILD_META", &self.rebuild_meta)
             .env("ZETA_UI_KIWI_CARRIERS", kiwi_carriers())
+            // A shard killed at the deadline loses whatever a buffered stdout still held.
+            .env("PYTHONUNBUFFERED", "1")
             .current_dir(repo_root())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1430,6 +1435,14 @@ fn kiwi_carriers() -> String {
         .map(|c| c.hz.to_string())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// The wall-clock limit on each shard: `ZETA_UI_DEADLINE_S`, else [`DEADLINE`].
+fn deadline() -> Duration {
+    match std::env::var("ZETA_UI_DEADLINE_S") {
+        Ok(s) => Duration::from_secs(s.parse().expect("ZETA_UI_DEADLINE_S is whole seconds")),
+        Err(_) => DEADLINE,
+    }
 }
 
 /// How many shards run at once: `ZETA_UI_SHARDS`, else [`SHARDS`]; 1 with `ZETA_UI_ONLY`.
@@ -1451,6 +1464,7 @@ fn ui_scenarios_pass_in_headless_chromium() {
     }
     let only = std::env::var_os("ZETA_UI_ONLY");
     let shards = shard_count(only.is_some());
+    let limit = deadline();
     let nodes: Vec<Nodes> = (0..shards).map(|_| Nodes::start()).collect();
     let started = Instant::now();
     let runs: Vec<_> = nodes
@@ -1461,14 +1475,14 @@ fn ui_scenarios_pass_in_headless_chromium() {
             let child = n.run_ui(shard.as_deref(), only.as_deref());
             std::thread::spawn(move || {
                 let at = Instant::now();
-                (wait_with_deadline(child, DEADLINE), at.elapsed())
+                (wait_with_deadline(child, limit), at.elapsed())
             })
         })
         .collect();
     let mut failed = Vec::new();
     for (i, run) in runs.into_iter().enumerate() {
         let ((status, stdout, stderr), took) = run.join().expect("ui.py waiter");
-        // Each shard's own wall time, against DEADLINE (SHARD_STARTS is cut from these).
+        // Each shard's own wall time, against the limit (SHARD_STARTS is cut from these).
         println!(
             "--- shard {i}/{shards} ({:.1} s)\n{stdout}",
             took.as_secs_f64()
@@ -1476,7 +1490,7 @@ fn ui_scenarios_pass_in_headless_chromium() {
         match status {
             None => failed.push(format!(
                 "shard {i}/{shards}: ui.py still running after {} s; killed\n--- stderr\n{stderr}",
-                DEADLINE.as_secs()
+                limit.as_secs()
             )),
             Some(status) if !status.success() => failed.push(format!(
                 "shard {i}/{shards}: ui.py failed ({status}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}"

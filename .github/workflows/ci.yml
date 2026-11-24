@@ -78,11 +78,15 @@ jobs:
 
   ui:
     runs-on: ubuntu-24.04
-    # A normal run takes about 11 minutes (the suite alone about 7, in four shards, each
-    # killed after ui.rs's DEADLINE of 7.5). Chromium's system packages come from the
-    # runner's Ubuntu mirror, which once took 10 minutes for 20 MB: the margin absorbs that
-    # and still stops a hung suite long before GitHub's 6 hours.
-    timeout-minutes: 30
+    # A push runs a smoke set of the page's scenarios in one shard; the whole suite runs
+    # locally before work lands, and here only from "Run workflow". On the hosted runner the
+    # whole suite is CPU-bound: four shards took 426-450 s against ui.rs's DEADLINE of 450
+    # (2026-11-22), so a push went red for the runner's load rather than the page. The smoke
+    # set keeps what only a clean machine shows, such as a page with no operator handlers
+    # installed. A manual run gives each shard 15 minutes (ZETA_UI_DEADLINE_S). Chromium's
+    # system packages come from the runner's Ubuntu mirror, which once took 10 minutes for
+    # 20 MB: the margin absorbs that and still stops a hung suite long before GitHub's 6 hours.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,8 +103,21 @@ jobs:
           uv pip install --python "$RUNNER_TEMP/venv/bin/python" playwright==1.64.1
           "$RUNNER_TEMP/venv/bin/python" -m playwright install --with-deps chromium
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
-      - name: UI end to end (fails if it skipped)
+      - name: UI end to end, the smoke set on a push and all of it on a manual run (fails if it skipped)
+        env:
+          ZETA_UI_DEADLINE_S: "900"
+          SMOKE: >-
+            wrong_secret_shows_error_and_starts_nothing,login_and_tabs,command_line_applies_op,
+            waterfall_decodes_quantised_rows,decode_starts_job_and_logs_op,theme_switch,
+            every_job_on_the_source_is_watched,menu_entry_table_is_whole,
+            a_decode_entry_for_a_row_with_no_ready_handler_is_greyed,wfm_decode_plays_audio,
+            a_map_site_can_be_selected,handler_named_on_job_row,
+            send_to_shows_an_unavailable_handler_greyed
         run: |
+          echo "runner CPUs: $(nproc)"
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            export ZETA_UI_ONLY="${SMOKE// /}"
+          fi
           set -o pipefail
           cargo test -p zeta --test ui -- --nocapture 2>&1 | tee ui.log
           if grep -q 'ui e2e skipped:' ui.log; then
