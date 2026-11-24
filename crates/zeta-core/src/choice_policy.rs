@@ -160,6 +160,13 @@ impl ChoicePolicy {
         if !(b.slice_s > 0.0 && b.slice_s.is_finite()) {
             return Err("budget.slice_s must be above 0".into());
         }
+        if let Some(c) = self.confidence_stop
+            && !(0.0..=1.0).contains(&c)
+        {
+            return Err(format!(
+                "confidence_stop must be from 0 to 1, or null (got {c})"
+            ));
+        }
         Ok(())
     }
 

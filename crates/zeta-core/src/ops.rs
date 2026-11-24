@@ -1120,16 +1120,27 @@ pub enum Op {
     /// The handler policy: `modes`, each mode's ranking by mode id (`{}` for none), and
     /// `all`, the node-wide ranking (`[]` for none).
     HandlerPolicyGet {},
-    /// Replace the choice policy: how far a `choose` goes for each surface (`menu`, `watch`,
+    /// Change the choice policy; give exactly one of `lease` and `policy` (both, or neither,
+    /// is `other`). `lease` (`share` or `widen`) changes only step 3's lease setting and
+    /// keeps every other value: the node merges it into its current policy. `policy`
+    /// replaces the whole value: how far a `choose` goes for each surface (`menu`, `watch`,
     /// `agent`, `client`: `default` step when none is asked for, never past `cap`, both 1
     /// to 3 with `default` at most `cap`), whether step 3 may `widen` a held capture or
     /// only `share` a running one, the trial `budget` (`trial_s` and `concurrent` at least
-    /// 1, `slice_s` above 0) and `confidence_stop` (`null` for none). A surface left out
-    /// takes its built-in ceiling. Checked before anything is written: a value that fails
-    /// is `other`, naming the surface or field. Kept in `choice-policy.json` in the state
-    /// directory across restarts. The result is the policy as stored.
+    /// 1, `slice_s` above 0) and `confidence_stop` (`null` for none, else 0 to 1). A
+    /// surface left out takes its built-in ceiling. Checked before anything is written: a
+    /// value that fails is `other`, naming the surface or field. Kept in
+    /// `choice-policy.json` in the state directory across restarts. The result is the
+    /// policy as stored.
     ChoicePolicySet {
-        policy: crate::choice_policy::ChoicePolicy,
+        /// The whole policy; `null` with `lease`.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "nullable_choice_policy")]
+        policy: Option<crate::choice_policy::ChoicePolicy>,
+        /// Only the lease setting, `share` or `widen`; `null` with `policy`.
+        #[serde(deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "nullable_lease_setting")]
+        lease: Option<crate::choice_policy::LeaseSetting>,
     },
     /// The choice policy as stored (the built-in one when never set).
     ChoicePolicyGet {},
@@ -3318,6 +3329,19 @@ pub struct PlanStarted {
 fn nullable_op_error(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
     let error = g.subschema_for::<OpError>();
     schemars::json_schema!({ "anyOf": [error, { "type": "null" }] })
+}
+
+/// Schema of `choice_policy_set`'s `policy`: a [`crate::choice_policy::ChoicePolicy`] or
+/// `null` (an `anyOf`, as an object's schema has no `type` to add `null` to).
+fn nullable_choice_policy(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let policy = g.subschema_for::<crate::choice_policy::ChoicePolicy>();
+    schemars::json_schema!({ "anyOf": [policy, { "type": "null" }] })
+}
+
+/// Schema of `choice_policy_set`'s `lease`: a [`crate::choice_policy::LeaseSetting`] or `null`.
+fn nullable_lease_setting(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let lease = g.subschema_for::<crate::choice_policy::LeaseSetting>();
+    schemars::json_schema!({ "anyOf": [lease, { "type": "null" }] })
 }
 
 /// A channel `plan_start` skipped because an identical rigid job already runs there.
@@ -6414,12 +6438,20 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
         }
         Op::HandlerPolicySet { mode, order } => handler_policy_set(node, mode, order),
         Op::HandlerPolicyGet {} => Ok(OpResult::HandlerPolicy(node.handler_policy())),
-        Op::ChoicePolicySet { policy } => {
-            policy
-                .validate()
-                .map_err(|message| OpError::Other { message })?;
-            node.set_choice_policy(policy)
-                .map(OpResult::ChoicePolicy)
+        Op::ChoicePolicySet { policy, lease } => {
+            let set = match (policy, lease) {
+                (Some(p), None) => {
+                    p.validate().map_err(|message| OpError::Other { message })?;
+                    node.set_choice_policy(|held| *held = p)
+                }
+                (None, Some(l)) => node.set_choice_policy(|held| held.lease = l),
+                _ => {
+                    return Err(OpError::Other {
+                        message: "choice_policy_set takes exactly one of policy and lease".into(),
+                    });
+                }
+            };
+            set.map(OpResult::ChoicePolicy)
                 .map_err(|e| node_error(node, e))
         }
         Op::ChoicePolicyGet {} => Ok(OpResult::ChoicePolicy(node.choice_policy())),

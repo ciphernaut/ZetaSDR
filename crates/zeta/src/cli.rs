@@ -1947,22 +1947,6 @@ impl Command {
         )
     }
 
-    /// For `choice policy set --lease`, the lease to put on the node's current policy;
-    /// `None` for any other command.
-    pub fn choice_lease(&self) -> Option<zeta_core::choice_policy::LeaseSetting> {
-        use zeta_core::choice_policy::LeaseSetting;
-        match self {
-            Command::Choice(ChoiceCmd::Policy(ChoicePolicyCmd::Set {
-                file: None,
-                lease: Some(l),
-            })) => Some(match l {
-                LeaseArg::Share => LeaseSetting::Share,
-                LeaseArg::Widen => LeaseSetting::Widen,
-            }),
-            _ => None,
-        }
-    }
-
     /// For `job start --beside`, what the command line left out and the job to read it
     /// from; `None` for any other command.
     pub fn beside_fill(&self) -> Option<BesideFill> {
@@ -2282,19 +2266,25 @@ impl Command {
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
             Command::Choice(ChoiceCmd::Policy(ChoicePolicyCmd::Get)) => Op::ChoicePolicyGet {},
             Command::Choice(ChoiceCmd::Policy(ChoicePolicyCmd::Set { file, lease })) => {
+                use zeta_core::choice_policy::LeaseSetting;
                 match (file, lease) {
                     (Some(f), _) => {
                         let v = read_json(&f)?;
                         Op::ChoicePolicySet {
-                            policy: serde_json::from_value(v).map_err(|e| OpError::Other {
-                                message: format!("{}: {e}", f.display()),
-                            })?,
+                            policy: Some(serde_json::from_value(v).map_err(|e| {
+                                OpError::Other {
+                                    message: format!("{}: {e}", f.display()),
+                                }
+                            })?),
+                            lease: None,
                         }
                     }
-                    // The current policy with this lease: `main` fills it in once the
-                    // node is open (`choice_lease`).
-                    (None, Some(_)) => Op::ChoicePolicySet {
-                        policy: Default::default(),
+                    (None, Some(l)) => Op::ChoicePolicySet {
+                        policy: None,
+                        lease: Some(match l {
+                            LeaseArg::Share => LeaseSetting::Share,
+                            LeaseArg::Widen => LeaseSetting::Widen,
+                        }),
                     },
                     (None, None) => {
                         return Err(OpError::Other {
@@ -2933,5 +2923,31 @@ mod cli_capture_decode_tests {
     #[test]
     fn capture_decode_mutates() {
         assert!(parse(&["--capture", "C", "--kind", "aprs_decode"]).mutates());
+    }
+}
+
+#[cfg(test)]
+mod cli_choice_policy_tests {
+    use super::*;
+    use zeta_core::choice_policy::LeaseSetting;
+
+    #[test]
+    fn choice_policy_set_lease_maps_straight_to_the_op() {
+        let cmd = Cli::try_parse_from(["zeta", "choice", "policy", "set", "--lease", "widen"])
+            .unwrap()
+            .command;
+        assert!(cmd.mutates());
+        assert_eq!(
+            cmd.into_op().unwrap(),
+            Some(Op::ChoicePolicySet {
+                policy: None,
+                lease: Some(LeaseSetting::Widen),
+            })
+        );
+        let get = Cli::try_parse_from(["zeta", "choice", "policy", "get"])
+            .unwrap()
+            .command;
+        assert!(!get.mutates());
+        assert_eq!(get.into_op().unwrap(), Some(Op::ChoicePolicyGet {}));
     }
 }

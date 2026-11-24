@@ -738,15 +738,16 @@ What `modes_list`'s `handler` is chosen from. A mode with no ranking of its own 
 
 ### choice_policy_set
 
-Replace the choice policy: how far a `choose` goes for each surface (`menu`, `watch`, `agent`, `client`: `default` step when none is asked for, never past `cap`, both 1 to 3 with `default` at most `cap`), whether step 3 may `widen` a held capture or only `share` a running one, the trial `budget` (`trial_s` and `concurrent` at least 1, `slice_s` above 0) and `confidence_stop` (`null` for none). A surface left out takes its built-in ceiling. Checked before anything is written: a value that fails is `other`, naming the surface or field. Kept in `choice-policy.json` in the state directory across restarts. The result is the policy as stored.
+Change the choice policy; give exactly one of `lease` and `policy` (both, or neither, is `other`). `lease` (`share` or `widen`) changes only step 3's lease setting and keeps every other value: the node merges it into its current policy. `policy` replaces the whole value: how far a `choose` goes for each surface (`menu`, `watch`, `agent`, `client`: `default` step when none is asked for, never past `cap`, both 1 to 3 with `default` at most `cap`), whether step 3 may `widen` a held capture or only `share` a running one, the trial `budget` (`trial_s` and `concurrent` at least 1, `slice_s` above 0) and `confidence_stop` (`null` for none, else 0 to 1). A surface left out takes its built-in ceiling. Checked before anything is written: a value that fails is `other`, naming the surface or field. Kept in `choice-policy.json` in the state directory across restarts. The result is the policy as stored.
 
-- policy: object (ChoicePolicy: budget{concurrent,slice_s,trial_s}, confidence_stop, lease, surfaces{})
+- policy: any
+- lease: any
 
-JSON: `{"op":"choice_policy_set","policy":{"budget":{"concurrent":0,"slice_s":null,"trial_s":0},"confidence_stop":null,"lease":null,"surfaces":{}}}`
+JSON: `{"op":"choice_policy_set","policy":null,"lease":null}`
 
-CLI: `zeta choice policy set --lease share|widen, or --file policy.json (the whole policy)`
+CLI: `zeta choice policy set --lease share|widen (the lease alone), or --file policy.json (the whole policy)`
 
-The operator's choice, as a job is: set it only on the operator's word, never to get a deeper trial for yourself. It replaces the whole policy, so read `choice_policy_get` first and send it back with the one change. Per surface (`menu` the page's box menu, `watch`, `agent` you, `client` the CLI, HTTP and MCP) `default` is the step taken when none is asked for and `cap` the deepest step it may ask for, 1 to 3 with `default` at most `cap`; a request past the cap runs to the cap and says `not tried: capped at step <n> for <surface>`. `lease` `share` lets step 3 use only a running capture that covers the band; `widen` also lets it grow a held capture without moving any holder's band. `budget`: `trial_s` seconds in all, `concurrent` trials at once, `slice_s` seconds of the ring one trial replays. A value that fails is refused naming the surface or field, and nothing is written.
+The operator's choice, as a job is: set it only on the operator's word, never to get a deeper trial for yourself. Give `lease` alone for the common change: it sets only step 3's lease and keeps every other value. Give `policy` alone to replace the whole value, so read `choice_policy_get` first and send it back with the one change; both, or neither, is refused. Per surface (`menu` the page's box menu, `watch`, `agent` you, `client` the CLI, HTTP and MCP) `default` is the step taken when none is asked for and `cap` the deepest step it may ask for, 1 to 3 with `default` at most `cap`; a request past the cap runs to the cap and says `not tried: capped at step <n> for <surface>`. `lease` `share` lets step 3 use only a running capture that covers the band; `widen` also lets it grow a held capture without moving any holder's band. `budget`: `trial_s` seconds in all, `concurrent` trials at once, `slice_s` seconds of the ring one trial replays. `confidence_stop` is `null` or 0 to 1. A value that fails is refused naming the surface or field, and nothing is written.
 
 ### choice_policy_get
 

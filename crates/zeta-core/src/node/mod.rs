@@ -3857,17 +3857,20 @@ impl Node {
         self.inner.choice_policy.lock().unwrap().clone()
     }
 
-    /// Replace the choice policy with `policy`: written to `choice-policy.json` first,
-    /// then kept in memory; a failed write leaves the old policy. The policy is not
-    /// validated here (`choice_policy_set` does). The result is the policy.
+    /// Change the choice policy with `change`, applied to a copy of the current one
+    /// under the lock: written to `choice-policy.json` first, then kept in memory; a
+    /// failed write leaves the old policy. The result is not validated here
+    /// (`choice_policy_set` does). The result is the policy.
     pub fn set_choice_policy(
         &self,
-        policy: crate::choice_policy::ChoicePolicy,
+        change: impl FnOnce(&mut crate::choice_policy::ChoicePolicy),
     ) -> Result<crate::choice_policy::ChoicePolicy, NodeError> {
         let mut held = self.inner.choice_policy.lock().unwrap();
-        persist_choice_policy(&self.inner.state_dir, &policy)?;
-        *held = policy.clone();
-        Ok(policy)
+        let mut next = held.clone();
+        change(&mut next);
+        persist_choice_policy(&self.inner.state_dir, &next)?;
+        *held = next.clone();
+        Ok(next)
     }
 
     /// Hold `source` at `want` without a job: a rigid lease under
