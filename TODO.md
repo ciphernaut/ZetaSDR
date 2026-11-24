@@ -272,6 +272,8 @@ Wanted: a deterministic mapping from that answer to a job, as data and not code:
 
 Spec first: it is a feature, not cleanup. The menu grouping above is the part that can land now and leaves the first line free for it.
 
+- **Plan 48** (2026-11-24): spec `docs/superpowers/specs/2026-11-24-classify-chooses-the-job-design.md`, plan `docs/superpowers/plans/2026-11-24-classify-chooses-the-job.md`. Approved, not built. Demodulators as mode rows, one ranked choice in `classify`, a `choose` job climbing the proof ladder (free, off air, on air) under a per-surface policy, the watch on probation, and the layer-3 slot. Part 48.5 (`borrow`, a trial on an idle radio under a lease that yields) is its own plan, later.
+
 ## UI: a selected job lit on the waterfall
 
 From the operator, 2026-11-01 (after the B210 day). Built in cleanup round 3: a running job's next steps (listen, transcribe, What is this?, identify, measure, watch on its band) in its outline menu's Next and behind its row's ⋯, from the one entry table. Left: selecting a job (a click on its row, tag or outline) should light it on the waterfall as a sticky selection, not only on hover (`hot` from plan 18 is hover-only), so the operator can see which job the next action applies to; and the wide footprint's tag has no menu of its own (the narrow one's long press opens the outline menu).
