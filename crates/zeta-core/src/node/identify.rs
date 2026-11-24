@@ -24,6 +24,7 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use super::choose::NOT_COVERED;
 use super::launch::{AfterGate, Ending, StageRunning, supervise};
 use super::origin::{OriginQuery, described, judged, measured_modulation, origins_of};
 use super::persist::now;
@@ -190,6 +191,22 @@ impl Inner {
         tokio::spawn(async move { inner.launch(rec).await })
     }
 
+    /// [`Inner::launch_task`] under the source's gate `gate`, held until the lease is
+    /// taken, then dropped before what the launch left for after it runs.
+    fn launch_task_gated(
+        self: &Arc<Self>,
+        rec: JobRecord,
+        gate: OwnedMutexGuard<()>,
+    ) -> tokio::task::JoinHandle<Result<(), NodeError>> {
+        let inner = self.clone();
+        tokio::spawn(async move {
+            let (r, after) = inner.launch_gated(rec, Some(&gate)).await;
+            drop(gate);
+            inner.after_gate(after).await;
+            r
+        })
+    }
+
     /// Stop `stale`, the child a run before a restart was trying, gated. A resume
     /// launches identify before its child (the same band, the older record), so the
     /// child may not be listed yet: wait up to [`MEASURE_WAIT`] for its entry (a record
@@ -347,22 +364,26 @@ impl Inner {
             .publish(Frame::new(r.out.clone(), prov, Payload::Event(payload)));
     }
 
-    /// Start `mode`'s job on the job's source at `tuning` (the job's band, or its width
-    /// on the measured centre), inside the capture the job holds (so granted without a
-    /// retune). The launch runs in its own task, so a
-    /// stop of the job never drops it half way: a stop under the source's gate (which
-    /// the launch's lease waits on) leaves it to a task that stops the child once it
-    /// is up; any other waits for it and stops the child. `Ok(None)`: cancelled.
+    /// Start `mode`'s job on the trier's source at `tuning`, owned by `t.owner`, as
+    /// `t.lease` allows: inside the capture identify holds (so granted without a retune),
+    /// or, for a trier holding no lease, only under the source's gate and only where the
+    /// running capture holds the band untuned
+    /// ([`crate::lease::LeaseManager::covers_untuned`]; else [`NOT_COVERED`]). The launch
+    /// runs in its own task, so a stop of the job never drops it half way: a stop under
+    /// the source's gate (which the launch's lease waits on) leaves it to a task that
+    /// stops the child once it is up; any other waits for it and stops the child.
+    /// `Ok(None)`: cancelled.
     async fn start_child(
         self: &Arc<Self>,
-        r: &Run,
+        t: &Trier<'_>,
         mode: &LoadedMode,
         tuning: Tuning,
     ) -> Result<Option<JobId>, String> {
         let kind = JobKind::from_name(&mode.row.id.0)
             .ok_or_else(|| format!("{} is not a job kind", mode.row.id.0))?;
-        let capture = r.port.current().unwrap_or(r.tuning);
-        let bin_rate = self.bank_bin_rate(&r.prov.source, capture);
+        let source = t.port.id().clone();
+        let capture = t.port.current().unwrap_or(t.band);
+        let bin_rate = self.bank_bin_rate(&source, capture);
         // The policy's handler, as a start that names none gets it.
         let modes = self.modes();
         let handler = self
@@ -370,7 +391,7 @@ impl Inner {
             .map_err(|e| e.to_string())?;
         let graph = kind
             .expand_voiced(
-                &r.prov.source,
+                &source,
                 tuning,
                 capture.bandwidth_hz,
                 bin_rate,
@@ -384,7 +405,7 @@ impl Inner {
             id: JobId::new(),
             kind: kind.name().to_string(),
             graph,
-            source: r.prov.source.clone(),
+            source: source.clone(),
             tuning,
             state: JobState::Running,
             context: serde_json::json!({}),
@@ -393,7 +414,7 @@ impl Inner {
             capture_rate_hz: Some(capture.bandwidth_hz.0),
             elastic: false,
             operator_graph: false,
-            owner: r.owner.clone(),
+            owner: t.owner.clone(),
             audio_policy: None,
             stream: None,
             sinks: Vec::new(),
@@ -404,17 +425,33 @@ impl Inner {
             replay: None,
         };
         let child = rec.id.clone();
-        // Recorded first, so a run resumed after a restart can stop it (see `stale`).
-        let _ = self.context_merge(&r.id, serde_json::json!({"identify": {"current": child.0}}));
-        let mut launch = self.launch_task(rec);
+        let mut launch = match t.lease {
+            TrialLease::Own => {
+                // Recorded first, so a run resumed after a restart can stop it (see
+                // `stale`).
+                let current = serde_json::json!({"identify": {"current": child.0}});
+                let _ = self.context_merge(t.id, current);
+                self.launch_task(rec)
+            }
+            TrialLease::Share => {
+                let gate = tokio::select! {
+                    g = self.leases.gate_guard(&source) => g,
+                    _ = t.cancel.cancelled() => return Ok(None),
+                };
+                if !self.leases.covers_untuned(t.port.as_ref(), tuning, &gate) {
+                    return Err(NOT_COVERED.into());
+                }
+                self.launch_task_gated(rec, gate)
+            }
+        };
         tokio::select! {
             res = &mut launch => match res {
                 Ok(Ok(())) => Ok(Some(child)),
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(e) => Err(format!("launch task: {e}")),
             },
-            _ = r.cancel.cancelled() => {
-                if self.gated(&r.id) {
+            _ = t.cancel.cancelled() => {
+                if self.gated(t.id) {
                     let inner = self.clone();
                     tokio::spawn(async move {
                         if matches!(launch.await, Ok(Ok(()))) {
@@ -422,13 +459,43 @@ impl Inner {
                         }
                     });
                 } else if matches!(launch.await, Ok(Ok(()))) {
-                    // Gated: the job's own lease is still held, so there is nothing to
-                    // idle, and the stop never waits on the source's gate.
-                    let _ = self.stop_gated(&child).await;
+                    self.stop_trial(&t.lease, &child).await;
                 }
                 Ok(None)
             }
         }
+    }
+
+    /// Stop a trier's child: gated under identify's own lease (there is nothing to
+    /// idle, and the stop never waits on the source's gate), plainly for a trier that
+    /// holds none.
+    pub(super) async fn stop_trial(&self, lease: &TrialLease, child: &JobId) {
+        let _ = match lease {
+            TrialLease::Own => self.stop_gated(child).await,
+            TrialLease::Share => self.stop(child).await,
+        };
+    }
+
+    /// One row's trial on the live band: `mode`'s job started at `tuning`
+    /// ([`Inner::start_child`]; set in `child` once it runs, for the caller's guard to
+    /// stop) and its proof awaited on its own events for `dwell_ms`
+    /// ([`Inner::await_proof`]). `Err`: it did not start, and why. `Cancelled` when the
+    /// trier is, `child` then set only if it started.
+    pub(super) async fn trial_row(
+        self: &Arc<Self>,
+        t: &Trier<'_>,
+        mode: &LoadedMode,
+        tuning: Tuning,
+        dwell_ms: u64,
+        child: &mut Option<JobId>,
+    ) -> Result<Attempt, String> {
+        let Some(started) = self.start_child(t, mode, tuning).await? else {
+            return Ok(Attempt::Cancelled);
+        };
+        *child = Some(started.clone());
+        Ok(self
+            .await_proof(t.cancel, mode, &started, ProofFrom::Own, dwell_ms)
+            .await)
     }
 
     /// Wait up to `dwell_ms` for `mode`'s proof on `child`'s events, read `from` its own
@@ -537,6 +604,33 @@ impl Inner {
             }
         }
     }
+}
+
+/// The controller a live trial runs for ([`Inner::trial_row`]): an `identify` run, or a
+/// `choose` at step 3.
+pub(super) struct Trier<'a> {
+    /// The controller.
+    pub id: &'a JobId,
+    /// The source its children run on.
+    pub port: &'a Arc<dyn Port>,
+    /// The controller's band: taken as the capture when the port reports none.
+    pub band: Tuning,
+    /// Each child's owner.
+    pub owner: Option<JobId>,
+    /// The controller's cancellation.
+    pub cancel: &'a CancellationToken,
+    /// How a child gets the radio.
+    pub lease: TrialLease,
+}
+
+/// How a trier's child gets the radio.
+pub(super) enum TrialLease {
+    /// Inside the capture the trier's own lease holds (identify): the child is recorded
+    /// as `identify.current` before it launches, and stopped gated.
+    Own,
+    /// The trier holds none (a `choose`): the child launches only where a running
+    /// capture already holds its band, and is stopped plainly.
+    Share,
 }
 
 /// Where [`Inner::await_proof`] reads a child's events.
@@ -660,6 +754,14 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         port: r.port.clone(),
         child: None,
     };
+    let trier = Trier {
+        id: &r.id,
+        port: &r.port,
+        band: r.tuning,
+        owner: r.owner.clone(),
+        cancel: &r.cancel,
+        lease: TrialLease::Own,
+    };
     let mut attempts = 0;
     // One pass in score order: a row that cannot run publishes its candidate at its turn.
     for s in &scored {
@@ -700,21 +802,23 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         }
         let id = mode.row.id.0.as_str();
         let (trial, recentred) = row_trial(&mode.row.identify, r.tuning, trial, recentred);
-        let child = match inner.start_child(&r, mode, trial).await {
-            Ok(Some(c)) => c,
-            Ok(None) => return Err(StageError::Cancelled),
+        let dwell_ms = identify_dwell_ms(mode.row.identify.dwell_ms, r.dwell_scale);
+        let attempt = match inner
+            .trial_row(&trier, mode, trial, dwell_ms, &mut current.child)
+            .await
+        {
+            Ok(a) => a,
             Err(e) => {
                 inner.candidate(&r, id, score, Outcome::Unavailable, &e, None, fit);
                 continue;
             }
         };
+        // Cancelled before the child started: nothing to stop.
+        let Some(child) = current.child.clone() else {
+            return Err(StageError::Cancelled);
+        };
         attempts += 1;
-        current.child = Some(child.clone());
-        let dwell_ms = identify_dwell_ms(mode.row.identify.dwell_ms, r.dwell_scale);
-        match inner
-            .await_proof(&r.cancel, mode, &child, ProofFrom::Own, dwell_ms)
-            .await
-        {
+        match attempt {
             Attempt::Cancelled => {
                 current.stop().await;
                 return Err(StageError::Cancelled);

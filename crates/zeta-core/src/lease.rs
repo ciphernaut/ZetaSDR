@@ -603,6 +603,27 @@ impl LeaseManager {
         rigid_decision(port, &held, &want, false)
     }
 
+    /// Whether a rigid job on `band` would be leased on `port`'s capture as it runs, under
+    /// the source's gate the caller holds (`guard`): something holds the source (a job,
+    /// elastic or rigid, or a pin; an unheld port is idle or about to be) and its current
+    /// capture holds the band, so the lease is granted untuned and moves no holder
+    /// ([`Decision::Fits`]). Never on a source a scan time-shares, even one whose lease
+    /// gives way: a grant there would take the scan's turn.
+    pub fn covers_untuned(
+        &self,
+        port: &dyn Port,
+        band: Tuning,
+        guard: &OwnedMutexGuard<()>,
+    ) -> bool {
+        let scanned = self
+            .leases
+            .lock()
+            .unwrap()
+            .get(port.id())
+            .is_some_and(|v| v.iter().any(|l| l.time_shared));
+        !scanned && matches!(self.decide(port, band, guard), Decision::Fits(_))
+    }
+
     /// [`LeaseManager::ensure_locked`], the lease marked `pin` when asked (so it
     /// is never listed among the holders, not even for an instant). A rigid request
     /// is decided by [`LeaseManager::decide`]'s rule, then leased or tuned.
@@ -2200,6 +2221,21 @@ mod tests {
             }
             assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert_eq!(p.current(), Some(cur), "{state:?}");
+        }
+    }
+
+    /// A trial may start only where a running capture holds its band as it is: under a
+    /// rigid or an elastic holder whose capture holds it, never on an unheld port, outside
+    /// the capture, or beside a scan (whether its lease gives way or not).
+    #[tokio::test]
+    async fn covers_untuned_only_inside_a_held_capture_and_never_beside_a_scan() {
+        for state in STATES {
+            let (p, m, _, want) = in_state(state);
+            let guard = m.gate_guard(p.id()).await;
+            let covered = m.covers_untuned(&p, want, &guard);
+            let expect = matches!(state, State::ElasticInside | State::RigidInside);
+            assert_eq!(covered, expect, "{state:?}");
+            assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }
 

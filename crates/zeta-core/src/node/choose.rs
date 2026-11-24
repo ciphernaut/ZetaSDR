@@ -9,13 +9,17 @@
 //! `could_prove` rows ([`replay_trials`]), `budget.concurrent` at a time, each judged by
 //! its row's identify rule within `budget.trial_s` in all; the first proof settles the
 //! job. A slice under 1 s, or one the trial quota cannot hold even shortened to 1 s, is
-//! not tried, and `not_tried` says why.
+//! not tried, and `not_tried` says why. Step 3 tries the rows still in `could_prove` on
+//! the live band, one at a time in score order within what is left of `budget.trial_s`
+//! ([`Inner::step_three`]): each as an ordinary job the `choose` owns, started only where
+//! a running capture already holds the row's band (lease setting `share`), or after
+//! growing a held capture to hold it, every holder keeping its band (`widen`).
 //!
 //! The job's event stream carries `{"protocol": "choice", "step", "choice"}` when step
 //! 1 answers and whenever the answer changes, then `{"protocol": "verdict", "choice"}`;
 //! `context.choose` keeps the ask, `choice` (the latest), `slice`, `trials` and
 //! `verdict`. With `start` the verdict's job is started on the job's source (`started`,
-//! or `start_error`). The job ends `stopped`, a `cannot_tell` included: a source with
+//! or `start_error`); a step-3 proof's job is kept running as that job instead. The job ends `stopped`, a `cannot_tell` included: a source with
 //! no ring answers `cannot_tell`, its reason that the source is not capturing.
 
 use std::sync::Arc;
@@ -29,24 +33,29 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::identify::{Attempt, ProofFrom};
+use super::identify::{Attempt, ProofFrom, TrialLease, Trier};
 use super::launch::{AfterGate, Ending, StageRunning, supervise};
 use super::persist::now;
 use super::{Inner, Node, NodeError, REPLAY_SOURCE, source_fault_reason};
 use crate::choice::{Alternative, Choice, ChoiceJob, NotTried, Settled, choose_now, job_for};
-use crate::choice_policy::{Budget, Surface};
+use crate::choice_policy::{Budget, LeaseSetting, Surface};
 use crate::classify::Measurement;
 use crate::graph::{Graph, GraphId};
 use crate::job::JobRecord;
-use crate::ops::{JobKind, Op, OpError, OpResult};
+use crate::ops::{JobKind, Op, OpError, OpResult, identify_dwell_ms};
 use crate::port::{Port, Tuning};
 use crate::ring::RingError;
 use crate::stage::StageError;
 use crate::stream::{Frame, Payload};
 use crate::types::{Hz, JobId, Provenance, Selection, SourceId, Span, StreamId, StreamKind};
 
-/// Step 2's note when the ring holds under a second of the band.
-pub const RING_SHORT: &str = "not tried: the ring holds under 1 s";
+/// Step 2's note when the ring holds under a second of the band once its oldest
+/// [`RING_MARGIN_NS`] are set aside.
+pub const RING_SHORT: &str =
+    "not tried: the ring holds under 1 s once its oldest 100 ms are set aside";
+/// Step 3's note of a row no running capture holds the band of (and, under `widen`, no
+/// held capture could grow to).
+pub const NOT_COVERED: &str = "not tried: no running capture covers it";
 /// Step 2's note when the trial quota cannot hold a second of the slice.
 pub const OVER_QUOTA: &str = "not tried: the slice exceeds the trial quota";
 /// The note of a row the trial budget left no time for.
@@ -301,26 +310,23 @@ impl Inner {
     }
 
     /// Step 2: replay the trial `slice` through `choice.could_prove`
-    /// ([`replay_trials`]). The answer: `choice` revised by the first proof (step 2,
-    /// `proved`, the old answer its runner-up), or `choice` with [`OVER_BUDGET`] for the
-    /// rows the budget left untried. `Cancelled` when the job is.
+    /// ([`replay_trials`]) until `deadline`. The answer: `choice` revised by the first
+    /// proof (step 2, `proved`, the old answer its runner-up), or `choice` with
+    /// [`OVER_BUDGET`] for the rows the budget left untried. `Cancelled` when the job is.
     async fn step_two(
         self: &Arc<Self>,
         r: &mut Run,
         choice: &Choice,
         m: &Measurement,
         slice: &TrialSlice,
-        budget: Budget,
+        (budget, deadline): (Budget, Instant),
     ) -> Result<Choice, StageError> {
         let mut next = choice.clone();
         let sel = &slice.sel;
         let job = (&r.id, &r.cancel);
-        let replays = replay_trials(self, job, &slice.id, &choice.could_prove, budget).await;
-        r.ctx.insert(
-            "trials".into(),
-            serde_json::to_value(&replays.trials).expect("trials serialise"),
-        );
-        self.choose_context(r);
+        let rows = &choice.could_prove;
+        let replays = replay_trials(self, job, &slice.id, rows, (budget, deadline)).await;
+        self.add_trials(r, &replays.trials);
         if r.cancel.is_cancelled() {
             return Err(StageError::Cancelled);
         }
@@ -335,7 +341,7 @@ impl Inner {
                 bandwidth_hz: job.bandwidth_hz,
             };
             self.supersede_by(&mode.row.id.0, band, now().0);
-            return Ok(proved_at_two(choice, &mode.row.id.0, job, evidence));
+            return Ok(proved_at(choice, (2, &mode.row.id.0), job, vec![evidence]));
         }
         next.not_tried
             .extend(replays.unstarted.into_iter().map(|row| NotTried {
@@ -344,6 +350,193 @@ impl Inner {
             }));
         Ok(next)
     }
+
+    /// Append `trials` to `context.choose.trials` and write the context.
+    fn add_trials(&self, r: &mut Run, trials: &[Trial]) {
+        let all = r
+            .ctx
+            .entry("trials")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Value::Array(all) = all {
+            all.extend(
+                trials
+                    .iter()
+                    .map(|t| serde_json::to_value(t).expect("a trial serialises")),
+            );
+        }
+        self.choose_context(r);
+    }
+
+    /// Step 3: try each of `choice.could_prove` (in its order, the score's) on the live
+    /// band, one at a time, until `deadline`: the row's job for the measurement `m` in
+    /// `sel` ([`job_for`]), started on `port` as an ordinary job the `choose` owns
+    /// ([`Inner::trial_row`]) only where a running capture already holds its band
+    /// untuned, and judged by the row's identify rule for its dwell (cut to what is left
+    /// of the budget). Under [`LeaseSetting::Widen`] a band no capture holds first grows
+    /// the held one ([`widen_for`]; `widened the capture to <centre>/<width> Hz for a
+    /// trial` in the answer's evidence); a row still uncovered is [`NOT_COVERED`], one
+    /// the budget leaves no time for [`OVER_BUDGET`]. Every trial is in
+    /// `context.choose.trials` (`step: 3`). The answer: `choice` revised by the first
+    /// proof (step 3, `proved`, the old answer its runner-up) with, when `keep`, the
+    /// proved job still running in its guard; else `choice` with the notes. Every other
+    /// trial job is stopped. `Cancelled` when the job is.
+    async fn step_three(
+        self: &Arc<Self>,
+        r: &mut Run,
+        (port, lease): (&Arc<dyn Port>, LeaseSetting),
+        choice: &Choice,
+        (m, sel): (&Measurement, &Selection),
+        (deadline, keep): (Instant, bool),
+    ) -> Result<(Choice, Option<TrialGuard>), StageError> {
+        let modes = self.modes();
+        let region = self.region();
+        let (id, cancel) = (r.id.clone(), r.cancel.clone());
+        let trier = Trier {
+            id: &id,
+            port,
+            band: r.tuning,
+            owner: Some(id.clone()),
+            cancel: &cancel,
+            lease: TrialLease::Share,
+        };
+        let mut next = choice.clone();
+        let mut widened = Vec::new();
+        let budget_left = |c: &Choice, row: &str| {
+            !c.not_tried
+                .iter()
+                .any(|n| n.row.as_deref() == Some(row) && n.reason == OVER_BUDGET)
+        };
+        let note = |c: &mut Choice, row: &str, reason: &str| {
+            c.not_tried.push(NotTried {
+                row: Some(row.to_string()),
+                reason: reason.into(),
+            })
+        };
+        for row in &choice.could_prove {
+            // Step 2 found the budget spent before this row.
+            if !budget_left(choice, row) {
+                continue;
+            }
+            let trial = |job: Option<&JobId>, outcome, evidence| Trial {
+                step: 3,
+                row: row.clone(),
+                job: job.map(|j| j.0.clone()),
+                outcome,
+                evidence,
+            };
+            let Some(mode) = modes.get(row) else {
+                self.add_trials(r, &[trial(None, "unavailable", format!("no row {row}"))]);
+                continue;
+            };
+            let job = job_for(mode, m, sel, &region);
+            let band = Tuning {
+                center_hz: job.center_hz,
+                bandwidth_hz: job.bandwidth_hz,
+            };
+            let dwell = |deadline: Instant| {
+                let left = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
+                let left = u64::try_from(left).unwrap_or(u64::MAX);
+                Some(identify_dwell_ms(mode.row.identify.dwell_ms, 1).min(left)).filter(|d| *d > 0)
+            };
+            let Some(dwell_ms) = dwell(deadline) else {
+                note(&mut next, row, OVER_BUDGET);
+                continue;
+            };
+            let mut guard = TrialGuard {
+                inner: self.clone(),
+                job: None,
+            };
+            let mut attempt = self
+                .trial_row(&trier, mode, band, dwell_ms, &mut guard.job)
+                .await;
+            if lease == LeaseSetting::Widen
+                && matches!(&attempt, Err(e) if e == NOT_COVERED)
+                && let Some(got) = widen_for(self, port.as_ref(), band).await
+            {
+                widened.push(format!(
+                    "widened the capture to {}/{} Hz for a trial",
+                    got.center_hz.0, got.bandwidth_hz.0
+                ));
+                // The holders' restart took some of the budget.
+                let Some(dwell_ms) = dwell(deadline) else {
+                    note(&mut next, row, OVER_BUDGET);
+                    continue;
+                };
+                attempt = self
+                    .trial_row(&trier, mode, band, dwell_ms, &mut guard.job)
+                    .await;
+            }
+            let started = guard.job.clone();
+            match attempt {
+                Err(e) if e == NOT_COVERED => note(&mut next, row, NOT_COVERED),
+                Err(e) => self.add_trials(r, &[trial(None, "unavailable", e)]),
+                Ok(Attempt::Cancelled) => {
+                    guard.stop().await;
+                    return Err(StageError::Cancelled);
+                }
+                Ok(Attempt::NoFrame(why)) => {
+                    guard.stop().await;
+                    self.add_trials(r, &[trial(started.as_ref(), "no_frame", why)]);
+                }
+                Ok(Attempt::Proved { evidence, .. }) => {
+                    let t = trial(started.as_ref(), "proved", evidence.clone());
+                    self.add_trials(r, &[t]);
+                    if !keep {
+                        guard.stop().await;
+                    }
+                    self.supersede_by(row, band, now().0);
+                    let lines = widened.into_iter().chain([evidence]).collect();
+                    // The notes of the rows before it stand.
+                    let proved = proved_at(&next, (3, row), job, lines);
+                    return Ok((proved, keep.then_some(guard)));
+                }
+            }
+            if r.cancel.is_cancelled() {
+                return Err(StageError::Cancelled);
+            }
+        }
+        next.evidence.extend(widened);
+        Ok((next, None))
+    }
+}
+
+/// Grow `port`'s held capture to hold `band` as well, the smallest band holding both
+/// (every holder keeps its band, restarting on the new capture:
+/// [`Node::source_widen_held`], which never tunes an unheld port), in its own task (see
+/// [`start_task`]: the holders' relaunch launches jobs). The capture granted, or `None`
+/// when the port cannot capture both at once or the widen is refused.
+async fn widen_for(inner: &Arc<Inner>, port: &dyn Port, band: Tuning) -> Option<Tuning> {
+    let cur = port.current()?;
+    let edges = |t: Tuning| {
+        let half = t.bandwidth_hz.0 / 2;
+        (
+            t.center_hz.0.saturating_sub(half),
+            t.center_hz.0.saturating_add(half),
+        )
+    };
+    let ((bl, bh), (cl, ch)) = (edges(band), edges(cur));
+    let (lo, hi) = (bl.min(cl), bh.max(ch));
+    if hi - lo > port.capabilities().max_bandwidth_hz.value().0 {
+        return None;
+    }
+    let want = Tuning {
+        center_hz: Hz(lo + (hi - lo) / 2),
+        bandwidth_hz: Hz(hi - lo),
+    };
+    widen_task(inner, port.id(), want).await.ok()?.ok()
+}
+
+/// [`Node::source_widen_held`] of `source` to `want`, in its own task (see
+/// [`start_task`]).
+fn widen_task(
+    inner: &Arc<Inner>,
+    source: &SourceId,
+    want: Tuning,
+) -> JoinHandle<Result<Tuning, NodeError>> {
+    let (node, source) = (Node::handle(inner), source.clone());
+    tokio::spawn(async move { node.source_widen_held(&source, want).await })
 }
 
 /// The `choose` job's body: (1) the selection ([`Inner::newest_slice`]; none is a
@@ -352,14 +545,19 @@ impl Inner {
 /// step reaches 2 and step 1 proved nothing, the same samples written as the trial
 /// slice ([`Inner::write_slice`], pinned until just before the verdict) and
 /// [`Inner::step_two`] over it, unless the selection is under 1 s ([`RING_SHORT`]) or
-/// layer 1 measured nothing ([`UNMEASURED`]); then the verdict, and with `start` the
-/// verdict's job started.
+/// layer 1 measured nothing ([`UNMEASURED`]); (3) when the job's step reaches 3 and
+/// nothing proved yet, [`Inner::step_three`] on the live band with what is left of the
+/// trials' budget; then the verdict, and with `start` the verdict's job: a step-3
+/// proof's own job, kept running and disowned, else one started.
 async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Result<(), StageError> {
     if let Some(f) = port.fault() {
         return Err(StageError::Failed(source_fault_reason(port.id(), &f)));
     }
     let node = Node::handle(&inner);
-    let budget = inner.choice_policy.lock().unwrap().budget;
+    let (budget, lease) = {
+        let policy = inner.choice_policy.lock().unwrap();
+        (policy.budget, policy.lease)
+    };
     let capped = r
         .ask
         .capped
@@ -415,7 +613,7 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
     } else if step_two && classified.measurement.is_none() {
         note(&mut choice, UNMEASURED.into());
     } else if step_two && !choice.could_prove.is_empty() {
-        match inner.write_slice(&node, sel, (samples, rate, ring_center)) {
+        match inner.write_slice(&node, sel.clone(), (samples, rate, ring_center)) {
             Ok(s) => {
                 r.ctx.insert("slice".into(), s.id.clone().into());
                 slice = Some(s);
@@ -424,8 +622,27 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
         }
     }
     inner.publish_choice(&mut r, &choice);
+    // Both trial steps share the budget's seconds.
+    let deadline = Instant::now() + Duration::from_secs(budget.trial_s.into());
     if let (Some(s), Some(m)) = (&slice, &classified.measurement) {
-        let revised = inner.step_two(&mut r, &choice, m, s, budget).await?;
+        let revised = inner
+            .step_two(&mut r, &choice, m, s, (budget, deadline))
+            .await?;
+        if revised != choice {
+            choice = revised;
+            inner.publish_choice(&mut r, &choice);
+        }
+    }
+    // The proved step-3 job, kept to be the started one.
+    let mut kept = None;
+    if r.ask.step >= 3
+        && choice.settled != Settled::Proved
+        && let Some(m) = &classified.measurement
+    {
+        let on = (&port, lease);
+        let at = (deadline, r.ask.start);
+        let (revised, k) = inner.step_three(&mut r, on, &choice, (m, &sel), at).await?;
+        kept = k;
         if revised != choice {
             choice = revised;
             inner.publish_choice(&mut r, &choice);
@@ -433,7 +650,11 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
     }
     // Unpinned before the verdict's job starts and the verdict is published.
     drop(slice);
-    if r.ask.start
+    if let Some(job) = kept.as_mut().and_then(|k| k.job.take()) {
+        // An ordinary job from now on, kept in the history when it stops.
+        inner.disown(&job);
+        r.ctx.insert("started".into(), job.0.into());
+    } else if r.ask.start
         && let Some(job) = &choice.job
     {
         let started = start_task(&inner, &r.source, job).await;
@@ -467,10 +688,15 @@ fn cannot_tell(reason: String, not_tried: Vec<NotTried>) -> Choice {
     }
 }
 
-/// `prev` settled by a step-2 decode of `row` (`evidence` its `decode <row>: ...`
-/// line): `job`, `proved` at step 2 with layer 1's line and the decode as evidence,
-/// `prev`'s answer its runner-up, `row` out of `could_prove`.
-fn proved_at_two(prev: &Choice, row: &str, job: ChoiceJob, evidence: String) -> Choice {
+/// `prev` settled at `step` by a decode of `row` (`evidence` what the trial noted, its
+/// `decode <row>: ...` line last): `job`, `proved` at `step` with layer 1's line and
+/// `evidence`, `prev`'s answer its runner-up, `row` out of `could_prove`.
+fn proved_at(
+    prev: &Choice,
+    (step, row): (u8, &str),
+    job: ChoiceJob,
+    evidence: Vec<String>,
+) -> Choice {
     let layer1 = prev
         .evidence
         .iter()
@@ -488,9 +714,9 @@ fn proved_at_two(prev: &Choice, row: &str, job: ChoiceJob, evidence: String) -> 
     Choice {
         job: Some(job),
         row: Some(row.to_string()),
-        step: 2,
+        step,
         settled: Settled::Proved,
-        evidence: layer1.chain(std::iter::once(evidence)).collect(),
+        evidence: layer1.chain(evidence).collect(),
         runner_up,
         could_prove: prev
             .could_prove
@@ -559,13 +785,16 @@ fn replay_task(
     })
 }
 
-/// One trial of step 2, as `context.choose.trials` lists it.
+/// One trial of step 2 or 3, as `context.choose.trials` lists it.
 #[derive(Clone, Debug, Serialize)]
 struct Trial {
+    /// 2 for a replay of the slice, 3 for a job on the live band.
+    step: u8,
     row: String,
-    /// The replay job; `null` when it did not start.
+    /// The trial's job (a replay, or a job on the live band); `null` when it did not
+    /// start.
     job: Option<String>,
-    /// `proved`, `no_frame`, `unavailable` (the replay did not start) or `stopped`
+    /// `proved`, `no_frame`, `unavailable` (the job did not start) or `stopped`
     /// (another trial settled the job, or the job ended first).
     outcome: &'static str,
     evidence: String,
@@ -583,17 +812,16 @@ struct Replays {
 
 /// The step-2 trial engine: replay the capture `slice` through each of `rows` in order
 /// ([`replay_trial`]), each replay owned by the job `owner`, at most `budget.concurrent`
-/// at once, each spawned under `cancel` and judged until `budget.trial_s` from now has
-/// passed. The first proof stops the trials still running and starts no more; a row not
-/// started by the deadline is `unstarted`.
+/// at once, each spawned under `cancel` and judged until `deadline` (the end of the
+/// trials' `budget.trial_s`). The first proof stops the trials still running and starts
+/// no more; a row not started by the deadline is `unstarted`.
 async fn replay_trials(
     inner: &Arc<Inner>,
     (owner, cancel): (&JobId, &CancellationToken),
     slice: &str,
     rows: &[String],
-    budget: Budget,
+    (budget, deadline): (Budget, Instant),
 ) -> Replays {
-    let deadline = Instant::now() + Duration::from_secs(budget.trial_s.into());
     let settle = cancel.child_token();
     let concurrent = usize::try_from(budget.concurrent)
         .unwrap_or(usize::MAX)
@@ -636,6 +864,7 @@ async fn replay_trial(
     deadline: Instant,
 ) -> (Trial, Option<String>) {
     let trial = |job: Option<&JobId>, outcome, evidence| Trial {
+        step: 2,
         row: row.clone(),
         job: job.map(|j| j.0.clone()),
         outcome,
@@ -663,7 +892,7 @@ async fn replay_trial(
             );
         }
     };
-    let mut guard = ReplayGuard {
+    let mut guard = TrialGuard {
         inner: inner.clone(),
         job: Some(job.clone()),
     };
@@ -690,14 +919,14 @@ async fn replay_trial(
     }
 }
 
-/// A trial's replay job: stopped by [`ReplayGuard::stop`], or, on any other exit of the
-/// trial (a panic, an abort), from a task the drop spawns.
-struct ReplayGuard {
+/// A trial's job (a replay, or a job on the live band): stopped by [`TrialGuard::stop`],
+/// or, on any other exit of the trial (a panic, an abort), from a task the drop spawns.
+struct TrialGuard {
     inner: Arc<Inner>,
     job: Option<JobId>,
 }
 
-impl ReplayGuard {
+impl TrialGuard {
     async fn stop(&mut self) {
         if let Some(job) = self.job.take() {
             let _ = self.inner.stop(&job).await;
@@ -705,7 +934,7 @@ impl ReplayGuard {
     }
 }
 
-impl Drop for ReplayGuard {
+impl Drop for TrialGuard {
     fn drop(&mut self) {
         let Some(job) = self.job.take() else {
             return;

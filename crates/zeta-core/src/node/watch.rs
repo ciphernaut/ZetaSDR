@@ -1117,7 +1117,7 @@ impl Inner {
 
     /// Clear `id`'s owner: a decoder the watch keeps is an ordinary job, kept in the
     /// history when it stops.
-    fn disown(&self, id: &JobId) {
+    pub(super) fn disown(&self, id: &JobId) {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(e) = jobs.get_mut(id)
             && e.record.owner.is_some()

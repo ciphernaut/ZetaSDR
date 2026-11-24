@@ -1,25 +1,29 @@
 //! The `choose` job (design 5.3): step 1 answers at once from the ring, as `classify`
 //! does; step 2 writes the ring slice into the burst store and replays it through the
-//! decoder rows that could prove otherwise. Each test runs a node over a synthesised
-//! capture played in real time into a 10 s ring.
+//! decoder rows that could prove otherwise; step 3 tries them on the live band where a
+//! running capture holds it, or after growing a held one. Each test runs a node over a
+//! synthesised capture played in real time into a 10 s ring.
 
 mod common;
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use num_complex::Complex;
 use serde_json::Value;
 use tokio::sync::broadcast;
 use zeta_core::capture::{CaptureMeta, write_cf32};
+use zeta_core::choice_policy::{ChoicePolicy, LeaseSetting};
 use zeta_core::job::JobState;
 use zeta_core::node::Node;
 use zeta_core::ops::{Op, OpError, OpResult};
-use zeta_core::port::Port;
+use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::StageRegistry;
 use zeta_core::stream::{Frame, Payload};
-use zeta_core::types::{Hz, JobId, SourceId, Timestamp};
+use zeta_core::types::{Capabilities, Claim, Hz, JobId, SampleFormat, SourceId, Timestamp};
 use zeta_dsp::synth::{awgn, nbfm_modulate};
 use zeta_source_file::{FileOpts, FileSource};
 
@@ -322,10 +326,7 @@ async fn a_short_ring_skips_step_two_and_says_so() {
         .iter()
         .filter_map(|n| n["reason"].as_str())
         .collect();
-    assert!(
-        reasons.contains(&"not tried: the ring holds under 1 s"),
-        "{v}"
-    );
+    assert!(reasons.contains(&RING_SHORT), "{v}");
     assert!(trials(&node).is_empty(), "{:?}", node.bursts().list());
 }
 
@@ -569,4 +570,432 @@ async fn stopping_a_choose_in_step_two_stops_its_replays_and_unpins_the_slice() 
     // Stopped before a verdict.
     let ctx = node.job_context(&id).unwrap();
     assert!(ctx["choose"]["verdict"].is_null(), "{ctx:#}");
+}
+
+/// Step 2's note when the ring holds under a second once its oldest 100 ms are set aside.
+const RING_SHORT: &str = "not tried: the ring holds under 1 s once its oldest 100 ms are set aside";
+/// Step 3's note of a row no running capture holds.
+const NOT_COVERED: &str = "not tried: no running capture covers it";
+
+/// The choice policy with `lease` and a slice of half a second, too short for step 2
+/// (the ring holds 10 s): its trials, if any, are step 3's.
+async fn live_only(node: &Node, lease: LeaseSetting) {
+    let mut policy = ChoicePolicy {
+        lease,
+        ..ChoicePolicy::default()
+    };
+    policy.budget.slice_s = 0.5;
+    let r = node
+        .apply(Op::ChoicePolicySet {
+            policy: Some(policy),
+            lease: None,
+        })
+        .await;
+    assert!(matches!(r, Ok(OpResult::ChoicePolicy(_))), "{r:?}");
+}
+
+/// The `not_tried` reasons of a choice.
+fn reasons(choice: &Value) -> Vec<&str> {
+    choice["not_tried"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["reason"].as_str())
+        .collect()
+}
+
+/// The step-3 trials in a `choose` context.
+fn live_trials(ctx: &Value) -> Vec<&Value> {
+    ctx["trials"]
+        .as_array()
+        .map(|a| a.iter().filter(|t| t["step"] == 3).collect())
+        .unwrap_or_default()
+}
+
+/// The running jobs of `kind`.
+fn running(node: &Node, kind: &str) -> Vec<zeta_core::job::JobRecord> {
+    node.job_list()
+        .into_iter()
+        .filter(|r| r.state == JobState::Running && r.kind == kind)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn step_three_proves_on_the_live_band_under_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    live_only(&node, LeaseSetting::Share).await;
+    // A rigid job holds the capture, which holds the DMR band.
+    let fm = start_fm(&node).await;
+    let mut feed = feed(&node);
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 3})),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(v["row"], "dmr_decode", "{v}");
+    assert_eq!(v["step"], 3, "{v}");
+    assert_eq!(v["settled"], "proved", "{v}");
+    assert_eq!(v["job"]["kind"], "dmr_decode", "{v}");
+    assert_eq!(v["runner_up"]["row"], "fm_demod", "{v}");
+    assert!(
+        v["evidence"].as_array().unwrap().iter().any(|e| e
+            .as_str()
+            .is_some_and(|e| e.starts_with("decode dmr_decode: "))),
+        "{v}"
+    );
+    // Step 2 had no slice to replay: nothing was written.
+    assert!(reasons(v).contains(&RING_SHORT), "{v}");
+    assert!(trials(&node).is_empty(), "{:?}", node.bursts().list());
+    let live = live_trials(&ctx);
+    let proved: Vec<_> = live.iter().filter(|t| t["outcome"] == "proved").collect();
+    assert_eq!(proved.len(), 1, "{ctx:#}");
+    assert_eq!(proved[0]["row"], "dmr_decode", "{ctx:#}");
+    let ev = events(&mut feed, &id);
+    let protocols: Vec<&str> = ev.iter().filter_map(|e| e["protocol"].as_str()).collect();
+    assert_eq!(protocols, ["choice", "choice", "verdict"], "{ev:#?}");
+    assert_eq!(ev[1]["step"], 3, "{:#}", ev[1]);
+    // The holder runs on, alone again once the trials are stopped.
+    assert_eq!(state(&node, &fm), Some(JobState::Running));
+    until("only the holder holds the source", ENDS_WITHIN, || {
+        node.lease_holders(&rx())
+            .iter()
+            .map(|(j, _)| j)
+            .collect::<Vec<_>>()
+            == [&fm]
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_three_child_is_stopped_unless_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    live_only(&node, LeaseSetting::Share).await;
+    let fm = start_fm(&node).await;
+    // Without `start`: every trial job is stopped, and goes with its run.
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 3})),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    assert_eq!(ctx["verdict"]["step"], 3, "{ctx:#}");
+    let live = live_trials(&ctx);
+    assert!(!live.is_empty(), "{ctx:#}");
+    let jobs: Vec<JobId> = live
+        .iter()
+        .filter_map(|t| t["job"].as_str().map(|j| JobId(j.into())))
+        .collect();
+    until("the trial jobs stop and go", ENDS_WITHIN, || {
+        node.job_list().iter().all(|r| !jobs.contains(&r.id))
+    })
+    .await;
+    assert!(running(&node, "dmr_decode").is_empty());
+    assert!(ctx["started"].is_null(), "{ctx:#}");
+    // With `start`: the proved trial job is the verdict's job, kept running, and no
+    // second one is started.
+    let id = start(
+        &node,
+        choose_op(
+            DMR_HZ,
+            20_000,
+            serde_json::json!({"up_to": 3, "start": true}),
+        ),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(v["row"], "dmr_decode", "{v}");
+    assert_eq!(v["step"], 3, "{v}");
+    let proved = live_trials(&ctx)
+        .into_iter()
+        .find(|t| t["outcome"] == "proved")
+        .expect("a proved trial");
+    assert_eq!(ctx["started"], proved["job"], "{ctx:#}");
+    let kept = running(&node, "dmr_decode");
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    let k = &kept[0];
+    assert_eq!(ctx["started"], k.id.0.as_str(), "{ctx:#}");
+    // An ordinary job now, on the verdict's band.
+    assert_eq!(k.owner, None, "{k:?}");
+    assert_eq!(k.tuning.center_hz.0, v["job"]["center_hz"], "{k:?}");
+    assert_eq!(k.tuning.bandwidth_hz.0, v["job"]["bandwidth_hz"], "{k:?}");
+    match node.apply(Op::JobStop { job: k.id.clone() }).await {
+        Ok(OpResult::Ok) => {}
+        r => panic!("the kept job is the operator's to stop: {r:?}"),
+    }
+    assert_eq!(state(&node, &fm), Some(JobState::Running));
+}
+
+/// The frequency the [`Growing`] radio hears the DMR call on.
+const CALL_HZ: u64 = DMR_HZ;
+/// The rigid holder's band: its 48 kHz capture's lower edge is 4.5 kHz below the call,
+/// inside the call's 12.5 kHz channel.
+const HOLDER_HZ: u64 = CALL_HZ + 19_500;
+
+/// A radio hearing one DMR call at [`CALL_HZ`]. It tunes to the centre asked, 48 kHz
+/// wide for a band up to 48 kHz and 96 kHz above that (its widest), and delivers the
+/// call where it falls in the capture, synthesised for the capture's rate and offset,
+/// in real time in 100 ms blocks. It counts its tunes.
+struct Growing {
+    id: SourceId,
+    caps: Capabilities,
+    cur: Mutex<Option<Tuning>>,
+    tunes: AtomicUsize,
+    tx: broadcast::Sender<IqBlock>,
+}
+
+impl Growing {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            id: rx(),
+            caps: Capabilities {
+                tune_min_hz: Claim::Asserted(Hz(1_000_000)),
+                tune_max_hz: Claim::Asserted(Hz(6_000_000_000)),
+                max_bandwidth_hz: Claim::Asserted(Hz(96_000)),
+                formats: vec![SampleFormat::Cf32],
+                channels: 1,
+                rx: true,
+                tx: false,
+                remote: false,
+                push: true,
+                usable_fraction: Claim::Asserted(1.0),
+                depths: vec![],
+                sweep: None,
+            },
+            cur: Mutex::new(None),
+            tunes: AtomicUsize::new(0),
+            tx: broadcast::channel(64).0,
+        })
+    }
+
+    fn tunes(&self) -> usize {
+        self.tunes.load(Ordering::SeqCst)
+    }
+
+    /// Play the call into the current capture until the radio is dropped.
+    fn start(self: &Arc<Self>) {
+        let me = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut clip: Option<(Tuning, Vec<Complex<f32>>)> = None;
+            let (mut at, mut t_ns) = (0usize, 0u64);
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                tick.tick().await;
+                let Some(me) = me.upgrade() else { return };
+                let Some(cur) = *me.cur.lock().unwrap() else {
+                    continue;
+                };
+                if clip.as_ref().is_none_or(|(t, _)| *t != cur) {
+                    let offset = CALL_HZ as f64 - cur.center_hz.0 as f64;
+                    clip = Some((cur, call_iq(cur.bandwidth_hz.0 as u32, offset)));
+                    at = 0;
+                }
+                let (_, iq) = clip.as_ref().unwrap();
+                let n = (cur.bandwidth_hz.0 / 10) as usize;
+                let block: Vec<Complex<f32>> = (0..n).map(|i| iq[(at + i) % iq.len()]).collect();
+                at = (at + n) % iq.len();
+                let _ = me.tx.send(IqBlock {
+                    t0: Timestamp(t_ns),
+                    sample_rate_hz: cur.bandwidth_hz,
+                    center_hz: cur.center_hz,
+                    samples: block.into(),
+                });
+                t_ns += 100_000_000;
+            }
+        });
+    }
+}
+
+#[async_trait]
+impl Port for Growing {
+    fn id(&self) -> &SourceId {
+        &self.id
+    }
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    async fn tune(&self, t: Tuning) -> Result<Tuning, PortError> {
+        self.tunes.fetch_add(1, Ordering::SeqCst);
+        if t.bandwidth_hz.0 > 96_000 {
+            return Err(PortError::OutOfRange {
+                field: "bandwidth_hz",
+                value: t.bandwidth_hz.0,
+                min: 1,
+                max: 96_000,
+                suggested: None,
+            });
+        }
+        let rate = if t.bandwidth_hz.0 <= 48_000 {
+            48_000
+        } else {
+            96_000
+        };
+        let got = Tuning {
+            center_hz: t.center_hz,
+            bandwidth_hz: Hz(rate),
+        };
+        *self.cur.lock().unwrap() = Some(got);
+        Ok(got)
+    }
+    fn current(&self) -> Option<Tuning> {
+        *self.cur.lock().unwrap()
+    }
+    fn subscribe(&self) -> IqReceiver {
+        self.tx.subscribe()
+    }
+}
+
+/// The DMR call of [`dmr_iq`] at `rate_hz`, `offset_hz` from the capture's centre.
+fn call_iq(rate_hz: u32, offset_hz: f64) -> Vec<Complex<f32>> {
+    let params = serde_json::json!({
+        "family": "dmr", "color_code": 5, "src": 9990001, "dst": 9990, "superframes": 6,
+        "offset_hz": offset_hz,
+    });
+    let (spec, imp) = zeta_dsp::synth::parse_params(params.as_object().unwrap().clone()).unwrap();
+    let mut iq = zeta_dsp::synth::synthesise(&spec, &imp, rate_hz, CALL_HZ);
+    awgn(&mut iq, 25.0, 13);
+    iq
+}
+
+/// A node over a [`Growing`] radio held by a rigid `fm_demod` at [`HOLDER_HZ`], its
+/// ring holding 2.5 s of that capture, and the choice policy [`live_only`] with `lease`.
+async fn node_growing(dir: &Path, lease: LeaseSetting) -> (Node, Arc<Growing>, JobId) {
+    let radio = Growing::new();
+    let port: Arc<dyn Port> = radio.clone();
+    let mut reg = StageRegistry::new();
+    zeta_dsp::register_all(&mut reg);
+    let mut cfg = common::cfg(dir, true);
+    cfg.ring_seconds = 10.0;
+    let node = Node::open(cfg, reg, vec![port]).await.unwrap();
+    for c in zeta_dsp::classifiers(node.modes_handle()) {
+        node.add_classifier(c);
+    }
+    radio.start();
+    live_only(&node, lease).await;
+    let op = serde_json::from_value(serde_json::json!({
+        "op": "job_start", "kind": "fm_demod", "source": "rx",
+        "center_hz": HOLDER_HZ, "bandwidth_hz": 12_500,
+        "deviation_hz": null, "sideband": null, "elastic": false, "replace": [],
+    }))
+    .unwrap();
+    let holder = start(&node, op).await;
+    assert_eq!(radio.current().unwrap().bandwidth_hz, Hz(48_000));
+    until("the ring fills", Duration::from_secs(10), || {
+        node.ring(&rx())
+            .is_some_and(|r| r.read().unwrap().held_s() >= 2.5)
+    })
+    .await;
+    (node, radio, holder)
+}
+
+/// A `choose` on the call at the capture's lower edge: the selection (as wide as the
+/// digital voice rows' 12.5 kHz, so they could prove it) lies inside the capture, the
+/// call's channel does not.
+fn edge_op() -> Op {
+    choose_op(CALL_HZ + 2_000, 13_000, serde_json::json!({"up_to": 3}))
+}
+
+/// The ops `ops.log` holds, by name.
+fn logged_ops(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("state").join("ops.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| v["op"]["op"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_skips_a_band_no_capture_covers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio, holder) = node_growing(dir.path(), LeaseSetting::Share).await;
+    let (tunes, capture) = (radio.tunes(), radio.current());
+    let id = start(&node, edge_op()).await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(v["row"], "fm_demod", "{v}");
+    assert_eq!(v["settled"], "best_guess", "{v}");
+    let could: Vec<&str> = v["could_prove"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(could.contains(&"dmr_decode"), "{v}");
+    // Each row that could prove otherwise is not tried, and no trial job ran.
+    for row in &could {
+        let n = v["not_tried"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["row"] == *row && n["reason"] == NOT_COVERED);
+        assert!(n.is_some(), "{row}: {v}");
+    }
+    assert!(live_trials(&ctx).is_empty(), "{ctx:#}");
+    // Nothing was tuned or moved, and nothing but the choose was asked of the node.
+    assert_eq!(radio.tunes(), tunes);
+    assert_eq!(radio.current(), capture);
+    let held = node.lease_holders(&rx());
+    assert_eq!(held.iter().map(|(j, _)| j).collect::<Vec<_>>(), [&holder]);
+    let ops = logged_ops(dir.path());
+    assert_eq!(
+        ops,
+        ["choice_policy_set", "job_start", "job_start"],
+        "{ops:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn widen_grows_a_held_capture_and_keeps_every_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio, holder) = node_growing(dir.path(), LeaseSetting::Widen).await;
+    let held = node.lease_holders(&rx());
+    let id = start(&node, edge_op()).await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(v["row"], "dmr_decode", "{v}");
+    assert_eq!(v["step"], 3, "{v}");
+    assert_eq!(v["settled"], "proved", "{v}");
+    // The capture grew once, to hold the call's channel beside the holder's band, and
+    // the answer says so.
+    let cur = radio.current().unwrap();
+    assert_eq!(cur.bandwidth_hz, Hz(96_000), "{cur:?}");
+    let job = &v["job"];
+    let (lo, hi) = (cur.center_hz.0 - 48_000, cur.center_hz.0 + 48_000);
+    let c = job["center_hz"].as_u64().unwrap();
+    let w = job["bandwidth_hz"].as_u64().unwrap();
+    assert!(lo <= c - w / 2 && c + w / 2 <= hi, "{job} in {cur:?}");
+    let line = format!(
+        "widened the capture to {}/{} Hz for a trial",
+        cur.center_hz.0, cur.bandwidth_hz.0
+    );
+    let evidence: Vec<&str> = v["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(evidence.iter().filter(|e| **e == line).count(), 1, "{v}");
+    assert!(
+        evidence.last().unwrap().starts_with("decode dmr_decode: "),
+        "{v}"
+    );
+    // Every holder keeps its band and runs on the grown capture; the trial jobs went.
+    assert_eq!(state(&node, &holder), Some(JobState::Running));
+    until(
+        "only the holder holds the source, on its band",
+        ENDS_WITHIN,
+        || node.lease_holders(&rx()) == held,
+    )
+    .await;
+    let rec = node
+        .job_list()
+        .into_iter()
+        .find(|r| r.id == holder)
+        .unwrap();
+    assert_eq!(rec.tuning.center_hz, Hz(HOLDER_HZ), "{rec:?}");
 }
