@@ -1,6 +1,8 @@
 # The selection menu: decoders from the mode rows, six groups (plan 40)
 
-2026-11-15. Small enough that this page is the spec and the plan. Not built yet.
+2026-11-15. Small enough that this page is the spec and the plan.
+
+**Status (2026-11-24): never built as a plan; half superseded.** Cleanup round 3 built its structural half in another shape (one entry table in `actions.js`, seven first-level groups with What is this? first, groups opening on a hover dwell, the rows that fit the box first in Decode and the rest under `elsewhere` by `rowFits`/`rowMisfit` on `range_hz` and `min_hz`), which supersedes this page's six lines, click-only groups, `plausible()` and the place of Decode across this band. What is still open is in `TODO.md`, "UI: the popup menus, after the grouping": Decode entries made from the rows (DVB-T and operator rows included, a not-ready row greyed with its reason), the width from the row (`rowTuning`, the nominal-width cap, `videoRefusal` for every row), the tuning footer on decoder entries, and the one transcription setting. The rest of this page is kept as written.
 
 ## Intent
 
