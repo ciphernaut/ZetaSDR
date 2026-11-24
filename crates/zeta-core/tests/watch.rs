@@ -4713,3 +4713,58 @@ async fn an_unreachable_register_leaves_known_from_rows_only() {
     n_decoders_without_identify(&node, &watch, 2).await;
     stop_all(&node).await;
 }
+
+/// A span watch listing `fm_demod`, over an FSK burst on channel 1 of `uhf_cb_au`, starts
+/// the demodulator directly (no identify): `start_on` gives it the plan's deviation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_started_fm_demod_on_a_plan_channel_gets_the_plans_deviation() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let plan = zeta_core::plans::plan("uhf_cb_au").unwrap();
+    let channel_hz = zeta_core::plans::channels(plan)[0].1;
+    let centre_hz = channel_hz - OFFSET_HZ;
+    let burst = fsk_burst(OFFSET_HZ, FSK_BAUD, FSK_DEVIATION_HZ);
+    let meta = write(dir.path(), "cb", &cycle(burst, 9), centre_hz);
+    let src = file_source_with("rx", &meta, false);
+    let node = node_over(dir.path(), vec![(src.clone() as Arc<dyn Port>, src)], None).await;
+    let tuning = Tuning {
+        center_hz: Hz(centre_hz),
+        bandwidth_hz: Hz(RATE_HZ as u64),
+    };
+    let mut g = JobKind::Watch
+        .expand(
+            &rx(),
+            tuning,
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    let detect = g.nodes.iter_mut().find(|n| n.kind == "detect").unwrap();
+    detect.params = span_params(&["fm_demod"]);
+    let watch = node
+        .job_start("watch", rx(), tuning, g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+        .unwrap();
+    until("a demodulator", Duration::from_secs(60), || {
+        node.job_list().into_iter().any(|r| r.kind == "fm_demod")
+    })
+    .await;
+    let rec = node
+        .job_list()
+        .into_iter()
+        .find(|r| r.kind == "fm_demod")
+        .unwrap();
+    let demod = rec
+        .graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "nbfm_demod")
+        .unwrap();
+    assert_eq!(demod.params["deviation_hz"], 2_500, "{rec:?}");
+    assert!(state(&node, &watch).is_some());
+    stop_all(&node).await;
+}

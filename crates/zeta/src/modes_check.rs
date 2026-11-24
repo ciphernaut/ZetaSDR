@@ -323,7 +323,7 @@ fn check_demod(m: &LoadedMode, ctx: &Ctx) -> Outcome {
         &modes,
     ) {
         Ok(_) => Outcome::Ok,
-        Err(e) => Outcome::Fail(format!("{e:?}")),
+        Err(e) => Outcome::Fail(e.to_string()),
     }
 }
 

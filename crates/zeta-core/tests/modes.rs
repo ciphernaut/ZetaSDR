@@ -2144,13 +2144,17 @@ async fn the_handler_policy_refuses_a_demodulator_row() {
     let node = Node::open(alt_cfg(dir.path()), stages(), vec![])
         .await
         .unwrap();
-    let r = policy_set(&node, Some("fm_demod"), &[]).await;
-    assert_eq!(
-        r,
-        Err(OpError::Other {
-            message: "fm_demod is a demodulator row: handler_policy_set takes decoder rows".into(),
-        })
-    );
+    for id in ["fm_demod", "wfm_demod", "am_demod", "ssb_demod"] {
+        let r = policy_set(&node, Some(id), &[]).await;
+        assert_eq!(
+            r,
+            Err(OpError::Other {
+                message: format!(
+                    "{id} is a demodulator row: handler_policy_set takes decoder rows"
+                ),
+            })
+        );
+    }
     // Nothing was written.
     assert_eq!(policy_get(&node).await, HandlerPolicy::default());
 }
