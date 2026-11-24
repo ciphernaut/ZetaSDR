@@ -14,7 +14,7 @@
 //! ([`Inner::step_three`]): each as an ordinary job the `choose` owns, started only where
 //! a running capture already holds the row's band (lease setting `share`), or after
 //! growing a held capture to hold it, every holder keeping its band (`widen`). A trial's
-//! lease gives way to any foreground request that moves the capture off it.
+//! lease gives way to any foreground request that changes the capture.
 //!
 //! The job's event stream carries `{"protocol": "choice", "step", "choice"}` when step
 //! 1 answers and whenever the answer changes, then `{"protocol": "verdict", "choice"}`;
@@ -473,7 +473,7 @@ impl Inner {
                 return Err(StageError::Cancelled);
             }
             let started = guard.job.clone();
-            // A foreground request moved the capture off the trial: its lease went.
+            // A foreground request changed the capture: the trial's lease went.
             if yielded.is_cancelled() {
                 guard.stop().await;
                 if started.is_some() {
@@ -678,10 +678,15 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
     // Unpinned before the verdict's job starts and the verdict is published.
     drop(slice);
     let kept = match kept.as_mut().and_then(|k| k.job.take()) {
-        Some(job) if inner.leases.settle_trial(&job) => Some(job),
         Some(job) => {
-            let _ = inner.stop(&job).await;
-            None
+            // Under the gate: no request is between its decision and its tune.
+            let gate = inner.leases.gate_guard(&r.source).await;
+            let settled = inner.leases.settle_trial(&r.source, &job, &gate);
+            drop(gate);
+            if !settled {
+                let _ = inner.stop(&job).await;
+            }
+            settled.then_some(job)
         }
         None => None,
     };
