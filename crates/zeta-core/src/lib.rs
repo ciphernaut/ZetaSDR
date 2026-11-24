@@ -5,6 +5,7 @@ pub mod bank;
 pub mod bits;
 pub mod bursts;
 pub mod capture;
+pub mod choice;
 pub mod classify;
 pub mod emission;
 pub mod graph;

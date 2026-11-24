@@ -4141,6 +4141,15 @@ pub enum OpResult {
             schema_with = "crate::types::nullable::<crate::classify::FeatureRecord>"
         )]
         features: Option<Box<crate::classify::FeatureRecord>>,
+        /// The one job the band answers (`crate::choice::choose_now`): the job, its
+        /// evidence, runner-up and the rows that could prove otherwise; `null` from
+        /// `capture_classify` and from an older node.
+        #[serde(default)]
+        #[schemars(
+            required,
+            schema_with = "crate::types::nullable::<crate::choice::Choice>"
+        )]
+        choice: Option<Box<crate::choice::Choice>>,
     },
     /// A source's gain after `source_set_gain`.
     Gain(GainInfo),
@@ -8574,6 +8583,7 @@ async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
         origins,
         register: register.map(Box::new),
         features: measurement.map(|m| Box::new(m.features)),
+        choice: None,
     })
 }
 
@@ -8633,10 +8643,14 @@ pub(crate) async fn classify_samples(
     Ok((scored, samples, rate, center))
 }
 
-/// Run the classifier set over the selection's band and span of the source ring. A row
-/// proved on the band supersedes the accepted signatures it overlaps.
+/// Run the classifier set over the selection's band and span of the source ring, and
+/// choose the band's job from the answer (step 1). A row proved on the band supersedes
+/// the accepted signatures it overlaps.
 async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     let (classified, ..) = classify_samples(node, &sel).await?;
+    let modes = node.modes();
+    let choice =
+        crate::choice::choose_now(&modes, modes.weights(), &classified, &sel, &node.region());
     let Classification {
         labels,
         tried,
@@ -8657,6 +8671,7 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         origins,
         register: register.map(Box::new),
         features: measurement.map(|m| Box::new(m.features)),
+        choice: Some(Box::new(choice)),
     })
 }
 

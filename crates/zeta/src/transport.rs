@@ -181,6 +181,10 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     match client.apply(&op).await {
         Ok(Ok(mut r)) => {
             crate::cli::narrow_plans(&mut r, plan.as_deref());
+            // On stderr, so the answer on stdout stays one JSON document.
+            if let Some(line) = crate::cli::choice_line(&r) {
+                eprintln!("{line}");
+            }
             print(serde_json::to_string_pretty(&r), 0)
         }
         Ok(Err(e)) => print(serde_json::to_string_pretty(&e), 2),

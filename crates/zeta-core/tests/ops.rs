@@ -1022,13 +1022,20 @@ async fn classify_op_runs_stub_and_returns_empty_labels() {
         origins,
         register,
         features,
+        choice,
     }) = node.apply(Op::Classify { selection }).await
     else {
         panic!("expected Classification");
     };
     assert!(labels.is_empty() && tried.is_empty() && allocations.is_empty());
-    // The stub measured nothing: no features.
+    // The stub measured nothing: no features, and nothing to choose from.
     assert!(features.is_none());
+    let choice = choice.expect("classify answers a choice");
+    assert!(choice.job.is_none(), "{choice:?}");
+    assert_eq!(
+        choice.reason.as_deref(),
+        Some("layer 1 did not measure the band")
+    );
     // No provider describes the band: no register answer.
     assert!(register.is_none());
     // Every classify scores its origins; with no register there are none to light.

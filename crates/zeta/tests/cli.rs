@@ -2753,10 +2753,20 @@ fn classify_names_the_wfm_fixture_fm_broadcast_radio() {
     .assert()
     .success()
     .get_output()
-    .stdout
     .clone();
-    let v = json(&out);
+    // The choice first, on its own line on stderr; stdout stays the JSON answer.
+    let err = String::from_utf8_lossy(&out.stderr);
+    let line = err
+        .lines()
+        .find(|l| l.starts_with("choice: "))
+        .unwrap_or("");
+    assert!(
+        line.starts_with("choice: wfm_demod ") && line.ends_with(" Hz (best_guess, step 1)"),
+        "{err}"
+    );
+    let v = json(&out.stdout);
     assert_eq!(v["result"], "classification", "{v}");
+    assert_eq!(v["value"]["choice"]["job"]["kind"], "wfm_demod", "{v}");
     let labels = v["value"]["labels"].as_array().expect("labels array");
     // A 0.5 s span is shorter than every row's `min_span_ms`.
     let tried = v["value"]["tried"].as_array().expect("tried array");

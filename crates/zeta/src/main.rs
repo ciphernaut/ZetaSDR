@@ -295,6 +295,10 @@ async fn one_shot(
         Ok(zeta_core::ops::OpResult::Job(id)) if replays => replay_finished(node, id).await,
         Ok(mut r) => {
             cli::narrow_plans(&mut r, plan);
+            // On stderr, so the answer on stdout stays one JSON document.
+            if let Some(line) = cli::choice_line(&r) {
+                eprintln!("{line}");
+            }
             if starts_job {
                 tokio::time::sleep(JOB_START_GRACE).await;
             }

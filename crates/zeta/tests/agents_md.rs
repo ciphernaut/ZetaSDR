@@ -368,3 +368,35 @@ fn origin_lookup_is_in_the_guide() {
         assert!(md.contains(needle), "missing {needle}");
     }
 }
+
+#[test]
+fn the_classify_note_lists_all_ten_labels() {
+    let md = zeta()
+        .arg("agents-md")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let md = String::from_utf8(md).unwrap();
+    let start = md.find("### classify\n").expect("a classify section");
+    let rest = &md[start + "### classify\n".len()..];
+    let note = &rest[..rest.find("\n### ").unwrap_or(rest.len())];
+    for label in [
+        "noise", "ook", "fsk", "wfm", "psk", "am", "ssb", "fm", "carrier", "unknown",
+    ] {
+        assert!(
+            note.contains(&format!("`{label}`")),
+            "missing label {label}"
+        );
+    }
+    for needle in [
+        "`features`",
+        "`choice`",
+        "`could_prove`",
+        "`runner_up`",
+        "`cannot_tell`",
+    ] {
+        assert!(note.contains(needle), "missing {needle}");
+    }
+}

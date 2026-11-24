@@ -114,6 +114,12 @@ pub struct Scored<'a> {
     /// near one of its centres (true for a row without a range); a row out of range
     /// scores nothing for the centre and never fits.
     pub in_range: bool,
+    /// Whether the measured bandwidth lies within 0.5-1.5 times the row's (the
+    /// `weights.bandwidth` term).
+    pub fits_width: bool,
+    /// Whether the layer-1 label is one the row presents as (the `weights.modulation`
+    /// term).
+    pub fits_label: bool,
 }
 
 /// The `ready` and `unavailable` rows of `modes` (a broken row is never tried) scored
@@ -128,7 +134,9 @@ pub struct Scored<'a> {
 /// (never for an empty list); plus the best `catalogue(id)` among the row's `catalogue`
 /// ids, so a catalogue match can lift a row above 1; plus `allocation(row)` (the
 /// register's term, [`allocation_term`]). Highest score first; equal scores
-/// by `identify.priority` (highest first), then `family`, then `id`.
+/// by `identify.priority` (highest first), then `family`, then `id`. Decoder rows only:
+/// a demodulator row proves nothing, so it is never a candidate (the choice ranks them
+/// with [`score_demodulators`]).
 pub fn score_rows<'a>(
     weights: &Weights,
     modes: &'a ModeRegistry,
@@ -138,13 +146,54 @@ pub fn score_rows<'a>(
     catalogue: &dyn Fn(&str) -> f32,
     allocation: &dyn Fn(&LoadedMode) -> f32,
 ) -> Vec<Scored<'a>> {
+    let at = (center_hz, bandwidth_hz, layer1);
+    score_role(
+        super::Role::Decoder,
+        weights,
+        modes,
+        at,
+        catalogue,
+        allocation,
+    )
+}
+
+/// [`score_rows`] over the demodulator rows instead of the decoders: the order the
+/// choice offers them in for a layer-1 label.
+pub fn score_demodulators<'a>(
+    weights: &Weights,
+    modes: &'a ModeRegistry,
+    center_hz: u64,
+    bandwidth_hz: u64,
+    layer1: &str,
+    catalogue: &dyn Fn(&str) -> f32,
+    allocation: &dyn Fn(&LoadedMode) -> f32,
+) -> Vec<Scored<'a>> {
+    let at = (center_hz, bandwidth_hz, layer1);
+    score_role(
+        super::Role::Demodulator,
+        weights,
+        modes,
+        at,
+        catalogue,
+        allocation,
+    )
+}
+
+/// The rows of `role`, scored and ordered as [`score_rows`] says, at `(center_hz,
+/// bandwidth_hz, layer1)`.
+fn score_role<'a>(
+    role: super::Role,
+    weights: &Weights,
+    modes: &'a ModeRegistry,
+    (center_hz, bandwidth_hz, layer1): (u64, u64, &str),
+    catalogue: &dyn Fn(&str) -> f32,
+    allocation: &dyn Fn(&LoadedMode) -> f32,
+) -> Vec<Scored<'a>> {
     let mut scored: Vec<Scored> = modes
         .all()
         .iter()
         .filter(|m| matches!(m.state, ModeState::Ready | ModeState::Unavailable))
-        // A demodulator row proves nothing, so it is never a candidate (plan 48 task 3
-        // keeps it out of the rest of the lists too).
-        .filter(|m| m.role() == super::Role::Decoder)
+        .filter(|m| m.role() == role)
         .map(|m| {
             let band = &m.row.band;
             let in_range = band
@@ -187,6 +236,8 @@ pub fn score_rows<'a>(
                 score,
                 fits_band: in_range_or_none && band.fits(bandwidth_hz),
                 in_range: in_range_or_none,
+                fits_width: width,
+                fits_label: modulation,
             }
         })
         .collect();

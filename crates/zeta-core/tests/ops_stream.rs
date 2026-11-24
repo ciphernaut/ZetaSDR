@@ -438,6 +438,7 @@ fn variant_name_matches_the_serialised_tag() {
             origins: None,
             register: None,
             features: None,
+            choice: None,
         },
         OpResult::Ok,
         OpResult::Schema(serde_json::json!({})),

@@ -2255,6 +2255,32 @@ impl Command {
     }
 }
 
+/// The line `zeta classify` prints before its answer: `choice: <kind> <center> Hz <width>
+/// Hz (<settled>, step <n>)`, or `choice: cannot tell: <reason>`; `None` for any other
+/// result, and for an answer without a choice (an older node's).
+pub fn choice_line(result: &zeta_core::ops::OpResult) -> Option<String> {
+    let zeta_core::ops::OpResult::Classification {
+        choice: Some(c), ..
+    } = result
+    else {
+        return None;
+    };
+    Some(match &c.job {
+        Some(j) => format!(
+            "choice: {} {} Hz {} Hz ({}, step {})",
+            j.kind,
+            j.center_hz.0,
+            j.bandwidth_hz.0,
+            c.settled.name(),
+            c.step
+        ),
+        None => format!(
+            "choice: cannot tell: {}",
+            c.reason.as_deref().unwrap_or("no reason given")
+        ),
+    })
+}
+
 /// Keep only plan `id` in a `channel_plans` result.
 pub fn narrow_plans(result: &mut zeta_core::ops::OpResult, id: Option<&str>) {
     if let (Some(id), zeta_core::ops::OpResult::ChannelPlans { plans }) = (id, result) {
