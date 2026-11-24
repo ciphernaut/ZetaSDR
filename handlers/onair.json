@@ -491,7 +491,8 @@
       "packets": {
         "via": "tcp",
         "port": "$packet_port",
-        "parser": "pcap"
+        "parser": "pcap",
+        "link_types": { "148": { "other": 149 } }
       }
     },
     "wifi_decode": {

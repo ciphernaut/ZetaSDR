@@ -1570,6 +1570,26 @@ fn the_embedded_onair_handler_serves_its_modes() {
     assert_eq!(reg.program_block("video_decode", "onair"), None);
 }
 
+/// OnAir writes Z-Wave MPDUs as link type 148 (USER1), which the node names for Mode S:
+/// the entry remaps it to USER2 (149), so a capture is not dissected as Mode S.
+#[test]
+fn the_onair_zwave_entry_writes_user2_not_mode_s() {
+    let mut reg = ModeRegistry::load(&stages(), None);
+    zeta_core::modes::handlers::probe_handler_files(&mut reg);
+    let file = reg
+        .handler_files()
+        .iter()
+        .find(|f| f.id == "onair")
+        .unwrap();
+    assert_eq!(file.broken_entries(), Vec::<String>::new());
+    let block = reg.program_block("zwave_decode", "onair").unwrap();
+    let packets = block.packets.as_ref().expect("onair's Z-Wave packets");
+    assert_eq!(
+        packets.link_type_numbers().into_iter().collect::<Vec<_>>(),
+        [(148, zeta_core::stream::LinkType::Other(149))]
+    );
+}
+
 /// OnAir's `dvbt_decode` entry reads the wrapper's status lines (`fixtures/
 /// onair-dvbt-status.jsonl`: two lines `onair-rx` wrote on its own generated multiplex,
 /// one before lock and one locked with the service list) as the node's `json_lines` stage
