@@ -1565,14 +1565,24 @@ impl Node {
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
         let (mut records, mut load_errors) = load(&jobs_dir)?;
         let job_load_errors = load_errors.len();
-        // A transient job is never resumed nor kept: a record left by the last node goes.
-        records.retain(|r| {
-            let keep = !r.transient;
-            if !keep {
-                let _ = std::fs::remove_file(jobs_dir.join(format!("{}.json", r.id.0)));
-            }
-            keep
-        });
+        // A transient job is never resumed nor kept: a record left by the last node goes,
+        // with the records it owns (a live trial). Only the node that owns the state and
+        // resumes touches it: a read-only one-shot beside a running `serve` must not
+        // delete a live job's file.
+        if cfg.owns_state_dir && cfg.resume {
+            let gone: std::collections::HashSet<JobId> = records
+                .iter()
+                .filter(|r| r.transient)
+                .map(|r| r.id.clone())
+                .collect();
+            records.retain(|r| {
+                let keep = !r.transient && !r.owner.as_ref().is_some_and(|o| gone.contains(o));
+                if !keep {
+                    let _ = std::fs::remove_file(jobs_dir.join(format!("{}.json", r.id.0)));
+                }
+                keep
+            });
+        }
         if cfg.resume {
             stop_unresumable(&jobs_dir, &mut records)?;
         }

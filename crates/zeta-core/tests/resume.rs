@@ -1130,3 +1130,47 @@ async fn a_stored_job_of_a_row_whose_handler_is_gone_fails_with_the_reason() {
     assert_eq!(rec.handler.as_deref(), Some(ALT));
     assert_eq!(on_disk(dir.path(), &id).state, rec.state);
 }
+
+/// A transient `choose` record and a running child it owns (a live trial).
+fn transient_pair(dir: &Path) -> (JobId, JobId) {
+    let (parent, child) = (JobId::new(), JobId::new());
+    let mut p = running(&parent, "choose", band(48_000), 1);
+    p.transient = true;
+    let mut c = running(&child, "passthrough", band(9_600), 2);
+    c.owner = Some(parent.clone());
+    write_records(dir, &[p, c]);
+    (parent, child)
+}
+
+fn job_file(dir: &Path, id: &JobId) -> std::path::PathBuf {
+    dir.join("state")
+        .join("jobs")
+        .join(format!("{}.json", id.0))
+}
+
+#[tokio::test]
+async fn open_forgets_a_transient_job_and_the_jobs_it_owns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (parent, child) = transient_pair(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![Radio::new()])
+        .await
+        .unwrap();
+    assert!(node.job_list().is_empty(), "{:?}", node.job_list());
+    assert!(!job_file(dir.path(), &parent).exists());
+    assert!(!job_file(dir.path(), &child).exists());
+}
+
+#[tokio::test]
+async fn a_node_that_does_not_own_the_state_leaves_a_transient_record_in_place() {
+    for (owns, resume) in [(false, true), (true, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, child) = transient_pair(dir.path());
+        let mut c = cfg(dir.path());
+        c.owns_state_dir = owns;
+        c.resume = resume;
+        let node = Node::open(c, registry(), vec![Radio::new()]).await.unwrap();
+        assert!(job_file(dir.path(), &parent).exists(), "{owns} {resume}");
+        assert!(job_file(dir.path(), &child).exists(), "{owns} {resume}");
+        drop(node);
+    }
+}
