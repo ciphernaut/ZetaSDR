@@ -90,6 +90,16 @@ async fn node_with(
     ring_seconds: f64,
     trial_keep_bytes: u64,
 ) -> Node {
+    node_opts(dir, iq, (center_hz, ring_seconds, trial_keep_bytes), None).await
+}
+
+/// [`node_with`] over a source that tunes like a radio over `tune_range` when given.
+async fn node_opts(
+    dir: &Path,
+    iq: &[Complex<f32>],
+    (center_hz, ring_seconds, trial_keep_bytes): (u64, f64, u64),
+    tune_range: Option<(Hz, Hz)>,
+) -> Node {
     let meta = CaptureMeta {
         sample_rate_hz: Hz(RATE_HZ as u64),
         center_hz: Hz(center_hz),
@@ -101,7 +111,7 @@ async fn node_with(
         realtime: true,
         block_samples: (RATE_HZ / 10) as usize,
         repeat: true,
-        tune_range: None,
+        tune_range,
     };
     let src = Arc::new(FileSource::open(rx(), &meta, opts).unwrap());
     let port: Arc<dyn Port> = src.clone();
@@ -574,8 +584,12 @@ async fn stopping_a_choose_in_step_two_stops_its_replays_and_unpins_the_slice() 
 
 /// Step 2's note when the ring holds under a second once its oldest 100 ms are set aside.
 const RING_SHORT: &str = "not tried: the ring holds under 1 s once its oldest 100 ms are set aside";
+/// Step 2's note under a policy slice too short for it.
+const POLICY_SLICE_SHORT: &str = "not tried: the policy's slice_s is under 1 s";
 /// Step 3's note of a row no running capture holds.
 const NOT_COVERED: &str = "not tried: no running capture covers it";
+/// Step 3's note of a row whose trial gave way to a foreground request.
+const GAVE_WAY: &str = "not tried: a foreground request took the capture";
 
 /// The choice policy with `lease` and a slice of half a second, too short for step 2
 /// (the ring holds 10 s): its trials, if any, are step 3's.
@@ -647,7 +661,7 @@ async fn step_three_proves_on_the_live_band_under_share() {
         "{v}"
     );
     // Step 2 had no slice to replay: nothing was written.
-    assert!(reasons(v).contains(&RING_SHORT), "{v}");
+    assert!(reasons(v).contains(&POLICY_SLICE_SHORT), "{v}");
     assert!(trials(&node).is_empty(), "{:?}", node.bursts().list());
     let live = live_trials(&ctx);
     let proved: Vec<_> = live.iter().filter(|t| t["outcome"] == "proved").collect();
@@ -864,6 +878,15 @@ fn call_iq(rate_hz: u32, offset_hz: f64) -> Vec<Complex<f32>> {
 /// A node over a [`Growing`] radio held by a rigid `fm_demod` at [`HOLDER_HZ`], its
 /// ring holding 2.5 s of that capture, and the choice policy [`live_only`] with `lease`.
 async fn node_growing(dir: &Path, lease: LeaseSetting) -> (Node, Arc<Growing>, JobId) {
+    node_growing_held(dir, lease, false).await
+}
+
+/// [`node_growing`], the holder an elastic `spectrum` when `elastic`.
+async fn node_growing_held(
+    dir: &Path,
+    lease: LeaseSetting,
+    elastic: bool,
+) -> (Node, Arc<Growing>, JobId) {
     let radio = Growing::new();
     let port: Arc<dyn Port> = radio.clone();
     let mut reg = StageRegistry::new();
@@ -876,10 +899,11 @@ async fn node_growing(dir: &Path, lease: LeaseSetting) -> (Node, Arc<Growing>, J
     }
     radio.start();
     live_only(&node, lease).await;
+    let kind = if elastic { "spectrum" } else { "fm_demod" };
     let op = serde_json::from_value(serde_json::json!({
-        "op": "job_start", "kind": "fm_demod", "source": "rx",
+        "op": "job_start", "kind": kind, "source": "rx",
         "center_hz": HOLDER_HZ, "bandwidth_hz": 12_500,
-        "deviation_hz": null, "sideband": null, "elastic": false, "replace": [],
+        "deviation_hz": null, "sideband": null, "elastic": elastic, "replace": [],
     }))
     .unwrap();
     let holder = start(&node, op).await;
@@ -998,4 +1022,167 @@ async fn widen_grows_a_held_capture_and_keeps_every_holder() {
         .find(|r| r.id == holder)
         .unwrap();
     assert_eq!(rec.tuning.center_hz, Hz(HOLDER_HZ), "{rec:?}");
+}
+
+/// The far band the tunable source is moved to, inside its range, outside the capture.
+const FAR_HZ: u64 = 450_000_000;
+
+/// A node over the FM voice fixture on a source that tunes over 400 to 500 MHz, held
+/// only by an elastic `spectrum` (as the page's view holds it), with the choice policy
+/// [`live_only`] under `share`; then a `choose` to step 3 on the voice, once one of its
+/// live trial jobs runs. The node, the spectrum, the choose and that trial job.
+async fn trial_beside_a_spectrum(dir: &Path) -> (Node, JobId, JobId, JobId) {
+    let range = (Hz(400_000_000), Hz(500_000_000));
+    let node = node_opts(dir, &voice_iq(), (DMR_HZ, 10.0, u64::MAX), Some(range)).await;
+    live_only(&node, LeaseSetting::Share).await;
+    let op = serde_json::from_value(serde_json::json!({
+        "op": "job_start", "kind": "spectrum", "source": "rx",
+        "center_hz": DMR_HZ, "bandwidth_hz": 48_000,
+        "deviation_hz": null, "sideband": null, "elastic": true, "replace": [],
+    }))
+    .unwrap();
+    let spectrum = start(&node, op).await;
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 3})),
+    )
+    .await;
+    let mut child = None;
+    until("a live trial job runs", ENDS_WITHIN, || {
+        child = live_job(&node, &id);
+        child.is_some()
+    })
+    .await;
+    (node, spectrum, id, child.unwrap())
+}
+
+/// The running live trial job (not a replay) the `choose` `id` owns.
+fn live_job(node: &Node, id: &JobId) -> Option<JobId> {
+    node.job_list()
+        .into_iter()
+        .find(|r| {
+            r.owner.as_ref() == Some(id) && r.replay.is_none() && r.state == JobState::Running
+        })
+        .map(|r| r.id)
+}
+
+/// The trial job `child` is stopped once its lease gave way, the `choose` `id` ends
+/// with the row it was trying noted [`GAVE_WAY`], and the source is at [`FAR_HZ`].
+async fn gave_way(node: &Node, id: &JobId, child: &JobId) {
+    until("the trial job stops and goes", ENDS_WITHIN, || {
+        node.job_list().iter().all(|r| &r.id != child)
+    })
+    .await;
+    let ctx = ended(node, id).await;
+    let v = &ctx["verdict"];
+    assert!(reasons(v).contains(&GAVE_WAY), "{v}");
+    let stopped = live_trials(&ctx)
+        .into_iter()
+        .find(|t| t["job"] == child.0.as_str())
+        .expect("the trial is recorded");
+    assert_eq!(stopped["outcome"], "stopped", "{ctx:#}");
+    let cur = match node.apply(Op::SourceList {}).await {
+        Ok(OpResult::Sources(s)) => s.into_iter().find(|s| s.id == rx()).unwrap().current,
+        r => panic!("source_list: {r:?}"),
+    };
+    assert_eq!(cur.map(|c| c.center_hz), Some(Hz(FAR_HZ)), "{cur:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trial_gives_way_to_the_views_retune() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, spectrum, id, child) = trial_beside_a_spectrum(dir.path()).await;
+    // The page moves its view off the capture (`source_ensure`, its spectrum then
+    // relaunched there): granted, though a trial runs on the old capture.
+    let r = node
+        .apply(Op::SourceEnsure {
+            source: rx(),
+            center_hz: Hz(FAR_HZ),
+            bandwidth_hz: Hz(48_000),
+            replace: vec![],
+            widen: false,
+        })
+        .await;
+    assert!(matches!(r, Ok(OpResult::Tuning(_))), "{r:?}");
+    gave_way(&node, &id, &child).await;
+    assert_eq!(state(&node, &spectrum), Some(JobState::Running));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trial_gives_way_to_a_job_start_that_needs_a_retune() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _, id, child) = trial_beside_a_spectrum(dir.path()).await;
+    let op = serde_json::from_value(serde_json::json!({
+        "op": "job_start", "kind": "fm_demod", "source": "rx",
+        "center_hz": FAR_HZ, "bandwidth_hz": 12_500,
+        "deviation_hz": null, "sideband": null, "elastic": false, "replace": [],
+    }))
+    .unwrap();
+    let fm = start(&node, op).await;
+    gave_way(&node, &id, &child).await;
+    assert_eq!(state(&node, &fm), Some(JobState::Running));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_a_choose_in_step_three_stops_its_trial() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &voice_iq(), DMR_HZ, 10.0).await;
+    live_only(&node, LeaseSetting::Share).await;
+    let fm = start_fm(&node).await;
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 3})),
+    )
+    .await;
+    let mut child = None;
+    until("a live trial job runs", ENDS_WITHIN, || {
+        child = live_job(&node, &id);
+        child.is_some()
+    })
+    .await;
+    let child = child.unwrap();
+    // The choose's to stop, not the operator's.
+    let refused = node.apply(Op::JobStop { job: child.clone() }).await;
+    assert!(matches!(refused, Err(OpError::Other { .. })), "{refused:?}");
+    match node.apply(Op::JobStop { job: id.clone() }).await {
+        Ok(OpResult::Ok) => {}
+        r => panic!("stop: {r:?}"),
+    }
+    until("the choose job stops", ENDS_WITHIN, || {
+        state(&node, &id) == Some(JobState::Stopped)
+    })
+    .await;
+    until("its trial job stops and goes", ENDS_WITHIN, || {
+        node.job_list().iter().all(|r| r.id != child)
+    })
+    .await;
+    let ctx = node.job_context(&id).unwrap();
+    assert!(ctx["choose"]["verdict"].is_null(), "{ctx:#}");
+    until("only the holder holds the source", ENDS_WITHIN, || {
+        node.lease_holders(&rx())
+            .iter()
+            .map(|(j, _)| j)
+            .collect::<Vec<_>>()
+            == [&fm]
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn widen_never_tunes_a_source_only_an_elastic_job_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, radio, spectrum) = node_growing_held(dir.path(), LeaseSetting::Widen, true).await;
+    let (tunes, capture) = (radio.tunes(), radio.current());
+    let id = start(&node, edge_op()).await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(v["row"], "fm_demod", "{v}");
+    assert!(reasons(v).contains(&NOT_COVERED), "{v}");
+    assert!(live_trials(&ctx).is_empty(), "{ctx:#}");
+    let evidence = v["evidence"].to_string();
+    assert!(!evidence.contains("widened the capture"), "{v}");
+    // Nothing rigid holds the radio, so nothing grew it.
+    assert_eq!(radio.tunes(), tunes);
+    assert_eq!(radio.current(), capture);
+    assert_eq!(state(&node, &spectrum), Some(JobState::Running));
 }

@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use tokio::sync::OwnedMutexGuard;
+use tokio_util::sync::CancellationToken;
 
 use super::launch::AfterGate;
 use super::{Inner, Node, NodeError};
@@ -328,19 +329,22 @@ impl Node {
         want: Tuning,
         replace: &[JobId],
     ) -> Result<Tuning, NodeError> {
-        self.move_capture(source, Some(want), replace, false).await
+        self.move_capture(source, Some(want), replace, None).await
     }
 
     /// [`Node::source_widen`] for a `choose`'s step-3 trial under the `widen` lease
     /// setting: no `replace`, and only while something rigid holds the source (read
     /// under the gate, [`crate::lease::LeaseManager::held_band`]), so an unheld radio is
-    /// never tuned; else `Other("nothing holds source <id>: ...")`, nothing changed.
+    /// never tuned, and only while `cancel` (the trial's) has not fired once the gate is
+    /// taken, so a stopped trial restarts no holder; else `Other(...)`, nothing changed.
     pub(crate) async fn source_widen_held(
         &self,
         source: &SourceId,
         want: Tuning,
+        cancel: &CancellationToken,
     ) -> Result<Tuning, NodeError> {
-        self.move_capture(source, Some(want), &[], true).await
+        self.move_capture(source, Some(want), &[], Some(cancel))
+            .await
     }
 
     /// `source_fit`: narrow `source`'s capture to the jobs holding it. Under one hold
@@ -350,18 +354,19 @@ impl Node {
     /// the capture it already has restarts nothing. A source no job or pin holds is
     /// `Other("nothing holds source <id>: ...")`.
     pub async fn source_fit(&self, source: &SourceId) -> Result<Tuning, NodeError> {
-        self.move_capture(source, None, &[], false).await
+        self.move_capture(source, None, &[], None).await
     }
 
     /// The body of [`Node::source_widen`] (`want` given) and [`Node::source_fit`]
-    /// (`None`: the band bounding the holders, read under the gate); with `held_only`
-    /// a source nothing rigid holds is refused ([`Node::source_widen_held`]).
+    /// (`None`: the band bounding the holders, read under the gate); for a `trial`
+    /// (its cancellation) a source nothing rigid holds is refused, and so is any once
+    /// the trial is stopped ([`Node::source_widen_held`]).
     async fn move_capture(
         &self,
         source: &SourceId,
         want: Option<Tuning>,
         replace: &[JobId],
-        held_only: bool,
+        trial: Option<&CancellationToken>,
     ) -> Result<Tuning, NodeError> {
         let port = self
             .port(source)
@@ -370,8 +375,14 @@ impl Node {
         // then the gate.
         let (_restarts, guard) = self.inner.restarts_then_gate(source).await;
         let narrow = want.is_none();
+        if trial.is_some_and(CancellationToken::is_cancelled) {
+            return Err(NodeError::Other(format!(
+                "the trial on source {} was stopped: nothing was changed",
+                source.0
+            )));
+        }
         let want = match (want, self.inner.leases.held_band(source, &guard)) {
-            (Some(_), None) if held_only => {
+            (Some(_), None) if trial.is_some() => {
                 return Err(NodeError::Other(format!(
                     "nothing holds source {}: a trial never tunes an unheld radio",
                     source.0

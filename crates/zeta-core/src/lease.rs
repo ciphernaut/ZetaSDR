@@ -13,6 +13,12 @@
 //! [`LeaseManager::resume_shared_locked`] once nothing rigid, no pin and no other
 //! time-shared lease holds the source, watching [`LeaseManager::changes`] (bumped by
 //! every yield and every release) rather than polling.
+//!
+//! A trial's lease (a `choose`'s step-3 job, marked before it launches with
+//! [`LeaseManager::mark_trial`]) gives way too, but only when it must: every request
+//! is decided as if it were not there, and it is taken away (its token fired, nobody
+//! waiting to take it back) once a tune moves the capture off its band, or a request
+//! takes the whole source (a scan, a measurement).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -87,6 +93,10 @@ struct Lease {
     elastic: bool,
     pin: bool,
     yields: Option<CancellationToken>,
+    /// A trial's lease ([`LeaseManager::mark_trial`]): `yields` holds its token, and
+    /// it gives way only to a tune that moves the capture off its band
+    /// ([`LeaseManager::yield_trials`]), never to every grant as a scan's does.
+    trial: bool,
 }
 
 impl Lease {
@@ -98,6 +108,7 @@ impl Lease {
             elastic,
             pin: false,
             yields: None,
+            trial: false,
         }
     }
 }
@@ -138,6 +149,31 @@ pub struct LeaseManager {
     /// The sources whose capture policy is [`CapturePolicy::Widest`]
     /// ([`LeaseManager::set_capture_policy`]).
     widest: Mutex<HashSet<SourceId>>,
+    /// The holders whose rigid lease is a trial's, with the token fired when it gives
+    /// way ([`LeaseManager::mark_trial`]).
+    trials: Mutex<HashMap<JobId, CancellationToken>>,
+}
+
+/// Why a trial's band is not covered by a running capture
+/// ([`LeaseManager::covers_untuned`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Uncovered {
+    /// Nothing holds the source (an unheld port is idle, or about to be).
+    Unheld,
+    /// A scan time-shares it, whether or not its lease gives way.
+    Scanned,
+    /// The band lies outside the running capture.
+    Outside,
+}
+
+impl std::fmt::Display for Uncovered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Uncovered::Unheld => "nothing holds the source",
+            Uncovered::Scanned => "a scan time-shares the source",
+            Uncovered::Outside => "the band lies outside the running capture",
+        })
+    }
 }
 
 fn band(t: &Tuning) -> (u64, u64) {
@@ -429,11 +465,13 @@ impl LeaseManager {
         let Some(v) = leases.get_mut(source) else {
             return;
         };
-        let gone: Vec<Lease> = v.iter().filter(|l| l.yields.is_some()).cloned().collect();
+        // A trial's lease gives way only to what moves the capture off it.
+        let shared = |l: &Lease| l.yields.is_some() && !l.trial;
+        let gone: Vec<Lease> = v.iter().filter(|l| shared(l)).cloned().collect();
         if gone.is_empty() {
             return;
         }
-        v.retain(|l| l.yields.is_none());
+        v.retain(|l| !shared(l));
         if v.is_empty() {
             leases.remove(source);
         }
@@ -505,6 +543,7 @@ impl LeaseManager {
             elastic: false,
             pin: false,
             yields: Some(token.clone()),
+            trial: false,
         });
         drop(leases);
         self.unwait(&source, &holder);
@@ -603,25 +642,100 @@ impl LeaseManager {
         rigid_decision(port, &held, &want, false)
     }
 
-    /// Whether a rigid job on `band` would be leased on `port`'s capture as it runs, under
-    /// the source's gate the caller holds (`guard`): something holds the source (a job,
-    /// elastic or rigid, or a pin; an unheld port is idle or about to be) and its current
-    /// capture holds the band, so the lease is granted untuned and moves no holder
-    /// ([`Decision::Fits`]). Never on a source a scan time-shares, even one whose lease
-    /// gives way: a grant there would take the scan's turn.
+    /// `Ok` when a rigid job on `band` would be leased on `port`'s capture as it runs,
+    /// under the source's gate the caller holds (`guard`): something holds the source
+    /// (a job, elastic or rigid, or a pin; a trial's lease does not count) and its
+    /// current capture holds the band, so the lease is granted untuned and moves no
+    /// holder ([`Decision::Fits`]). Else why not: nothing holds it, a scan time-shares
+    /// it (even one whose lease gives way: a grant there would take the scan's turn), or
+    /// the band lies outside the capture.
     pub fn covers_untuned(
         &self,
         port: &dyn Port,
         band: Tuning,
         guard: &OwnedMutexGuard<()>,
-    ) -> bool {
-        let scanned = self
-            .leases
-            .lock()
-            .unwrap()
-            .get(port.id())
-            .is_some_and(|v| v.iter().any(|l| l.time_shared));
-        !scanned && matches!(self.decide(port, band, guard), Decision::Fits(_))
+    ) -> Result<(), Uncovered> {
+        let (scanned, held) =
+            self.leases
+                .lock()
+                .unwrap()
+                .get(port.id())
+                .map_or((false, false), |v| {
+                    let scanned = v.iter().any(|l| l.time_shared);
+                    (scanned, !standing(v).is_empty())
+                });
+        match self.decide(port, band, guard) {
+            _ if scanned => Err(Uncovered::Scanned),
+            Decision::Fits(_) => Ok(()),
+            _ if !held => Err(Uncovered::Unheld),
+            _ => Err(Uncovered::Outside),
+        }
+    }
+
+    /// Mark `holder`'s next rigid lease as a trial's (a `choose`'s step-3 job, before it
+    /// launches): a lease that gives way, `token` fired when it does
+    /// ([`LeaseManager::yield_trials`]). The mark goes with [`LeaseManager::release`],
+    /// [`LeaseManager::unmark_trial`] or [`LeaseManager::settle_trial`].
+    pub(crate) fn mark_trial(&self, holder: JobId, token: CancellationToken) {
+        self.trials.lock().unwrap().insert(holder, token);
+    }
+
+    /// Drop `holder`'s trial mark (a trial that did not launch).
+    pub(crate) fn unmark_trial(&self, holder: &JobId) {
+        self.trials.lock().unwrap().remove(holder);
+    }
+
+    /// Make `holder`'s trial lease an ordinary rigid one (the trial proved, and its job
+    /// is kept); `false`, and nothing held, when it gave way first.
+    pub(crate) fn settle_trial(&self, holder: &JobId) -> bool {
+        self.trials.lock().unwrap().remove(holder);
+        let mut leases = self.leases.lock().unwrap();
+        let mut held = false;
+        for l in leases.values_mut().flatten() {
+            if &l.job == holder && l.trial {
+                (l.trial, l.yields, held) = (false, None, true);
+            }
+        }
+        held
+    }
+
+    /// Take away the trials' leases on `source` whose band `capture` does not hold
+    /// (every one with `None`: a request for the whole source), each token fired and
+    /// the source's changes bumped. Never listed as waiting: a trial that gave way
+    /// ends. Called by every tune of a port, once it is granted.
+    fn yield_trials(
+        &self,
+        leases: &mut HashMap<SourceId, Vec<Lease>>,
+        source: &SourceId,
+        capture: Option<&Tuning>,
+    ) {
+        let Some(v) = leases.get_mut(source) else {
+            return;
+        };
+        let off = |l: &Lease| l.trial && capture.is_none_or(|c| !fits(&l.band, c));
+        let gone: Vec<Lease> = v.iter().filter(|l| off(l)).cloned().collect();
+        if gone.is_empty() {
+            return;
+        }
+        v.retain(|l| !off(l));
+        if v.is_empty() {
+            leases.remove(source);
+        }
+        for l in gone {
+            if let Some(t) = &l.yields {
+                t.cancel();
+            }
+        }
+        self.changed(source);
+    }
+
+    /// Tune `port` to `want`, then take away the trials' leases the granted capture
+    /// leaves out ([`LeaseManager::yield_trials`]). Every tune of a port here goes
+    /// through it.
+    async fn tune(&self, port: &dyn Port, want: Tuning) -> Result<Tuning, PortError> {
+        let got = port.tune(want).await?;
+        self.yield_trials(&mut self.leases.lock().unwrap(), port.id(), Some(&got));
+        Ok(got)
     }
 
     /// [`LeaseManager::ensure_locked`], the lease marked `pin` when asked (so it
@@ -636,8 +750,15 @@ impl LeaseManager {
         pin: bool,
         guard: &OwnedMutexGuard<()>,
     ) -> Result<(Tuning, bool), LeaseError> {
+        // A marked holder's rigid lease is a trial's, which gives way.
+        let trial = match elastic || pin {
+            true => None,
+            false => self.trials.lock().unwrap().get(&holder).cloned(),
+        };
         let lease = |band: Tuning| Lease {
             pin,
+            trial: trial.is_some(),
+            yields: trial.clone(),
             ..Lease::new(holder.clone(), band, elastic)
         };
         let source = port.id().clone();
@@ -717,7 +838,7 @@ impl LeaseManager {
             {
                 (got, false)
             }
-            _ => (port.tune(ask).await?, true),
+            _ => (self.tune(port, ask).await?, true),
         };
         let mut leases = self.leases.lock().unwrap();
         let v = leases.entry(source).or_default();
@@ -955,6 +1076,8 @@ impl LeaseManager {
             });
         }
         self.yield_shared(&mut leases, &source);
+        // A scan takes the whole source: no trial outlasts its steps.
+        self.yield_trials(&mut leases, &source, None);
         let token = yields.then(CancellationToken::new);
         leases.entry(source.clone()).or_default().push(Lease {
             job: holder.clone(),
@@ -963,6 +1086,7 @@ impl LeaseManager {
             elastic: false,
             pin: false,
             yields: token.clone(),
+            trial: false,
         });
         drop(leases);
         self.unwait(&source, &holder);
@@ -987,8 +1111,10 @@ impl LeaseManager {
         let mut leases = self.leases.lock().unwrap();
         let v = leases.get(&source).map(|v| standing(v)).unwrap_or_default();
         let Some(first) = v.iter().find(|l| !l.elastic && !except.contains(&l.job)) else {
-            // Granted: what gives way goes now.
+            // Granted: what gives way goes now, a trial too (the request asks for the
+            // whole source).
             self.yield_shared(&mut leases, &source);
+            self.yield_trials(&mut leases, &source, None);
             return Ok(());
         };
         let cur = port.current().unwrap_or(first.band);
@@ -1031,7 +1157,7 @@ impl LeaseManager {
             return Ok(None);
         }
         self.primed.lock().unwrap().remove(port.id());
-        port.tune(step).await.map(Some)
+        self.tune(port, step).await.map(Some)
     }
 
     /// Set how `source`'s capture is chosen when a rigid job tunes it free
@@ -1147,7 +1273,7 @@ impl LeaseManager {
         };
         self.yield_shared(&mut self.leases.lock().unwrap(), &source);
         self.primed.lock().unwrap().remove(&source);
-        let got = port.tune(want).await?;
+        let got = self.tune(port, want).await?;
         if got == cur {
             return Ok((got, false, Vec::new()));
         }
@@ -1155,7 +1281,7 @@ impl LeaseManager {
             return Ok((got, true, rigid(&held)));
         }
         // The port granted another band than asked: back to the capture the holders run on.
-        port.tune(cur).await?;
+        self.tune(port, cur).await?;
         let holders = rigid(&held);
         let options = conflict_options(
             port,
@@ -1225,7 +1351,7 @@ impl LeaseManager {
             {
                 return Ok((cur, false));
             }
-            let got = port.tune(want).await?;
+            let got = self.tune(port, want).await?;
             self.primed
                 .lock()
                 .unwrap()
@@ -1270,6 +1396,7 @@ impl LeaseManager {
             v.retain(|j| j != holder);
             !v.is_empty()
         });
+        self.trials.lock().unwrap().remove(holder);
         for source in freed {
             self.changed(&source);
         }
@@ -2233,10 +2360,65 @@ mod tests {
             let (p, m, _, want) = in_state(state);
             let guard = m.gate_guard(p.id()).await;
             let covered = m.covers_untuned(&p, want, &guard);
-            let expect = matches!(state, State::ElasticInside | State::RigidInside);
+            let expect = match state {
+                State::ElasticInside | State::RigidInside => Ok(()),
+                State::Unheld => Err(Uncovered::Unheld),
+                State::ScanInside | State::YieldingScanInside => Err(Uncovered::Scanned),
+                State::ElasticOutside | State::RigidOutside => Err(Uncovered::Outside),
+            };
             assert_eq!(covered, expect, "{state:?}");
             assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
+    }
+
+    /// A trial's lease is decided as if it were not there and gives way only to a tune
+    /// that moves the capture off its band: a request inside the capture leaves it, one
+    /// that tunes elsewhere takes it away (its token fired, nobody waiting). A settled
+    /// trial's lease is an ordinary one, which a request must respect.
+    #[tokio::test]
+    async fn a_trial_gives_way_only_to_a_tune_that_moves_the_capture_off_it() {
+        let (p, m) = (FakePort::new(), LeaseManager::new());
+        let spectrum = JobId::new();
+        let cur = t(100_000_000, 1_000_000);
+        m.ensure(&p, spectrum.clone(), cur, true).await.unwrap();
+        let (trial, token) = (JobId::new(), CancellationToken::new());
+        m.mark_trial(trial.clone(), token.clone());
+        m.ensure(&p, trial.clone(), t(100_100_000, 12_500), false)
+            .await
+            .unwrap();
+        // Not a holder any request respects; an elastic-only source is no cover.
+        assert!(!m.held_standing(p.id()));
+        let guard = m.gate_guard(p.id()).await;
+        let inside = t(100_200_000, 12_500);
+        assert_eq!(m.covers_untuned(&p, inside, &guard), Ok(()));
+        drop(guard);
+        // A rigid request inside the capture: granted untuned, the trial stays.
+        let other = JobId::new();
+        m.ensure(&p, other.clone(), inside, false).await.unwrap();
+        assert!(!token.is_cancelled());
+        m.release(&other);
+        // A rigid request elsewhere tunes, as if the trial were not there, and takes it.
+        let tunes = p.tunes.load(std::sync::atomic::Ordering::SeqCst);
+        m.ensure(&p, other.clone(), t(433_000_000, 100_000), false)
+            .await
+            .unwrap();
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), tunes + 1);
+        assert!(token.is_cancelled());
+        assert!(!m.holders(p.id()).iter().any(|(j, _)| j == &trial));
+        assert!(m.waiting(p.id()).is_empty());
+        assert!(!m.settle_trial(&trial));
+        // A settled trial holds like any rigid job.
+        let (kept, token) = (JobId::new(), CancellationToken::new());
+        m.mark_trial(kept.clone(), token.clone());
+        m.ensure(&p, kept.clone(), t(433_000_000, 12_500), false)
+            .await
+            .unwrap();
+        assert!(m.settle_trial(&kept));
+        m.release(&other);
+        assert!(m.held_standing(p.id()));
+        let r = m.ensure(&p, other, t(900_000_000, 100_000), false).await;
+        assert!(matches!(r, Err(LeaseError::Conflict { .. })), "{r:?}");
+        assert!(!token.is_cancelled());
     }
 
     /// A time-shared lease that gives way is taken away by a request granted, under the

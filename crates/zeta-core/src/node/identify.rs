@@ -24,7 +24,6 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::choose::NOT_COVERED;
 use super::launch::{AfterGate, Ending, StageRunning, supervise};
 use super::origin::{OriginQuery, described, judged, measured_modulation, origins_of};
 use super::persist::now;
@@ -33,6 +32,7 @@ use crate::classify::{Band, Measurement, Outcome};
 use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::{Allocation, nearest_of};
 use crate::learned::{LEARNED_VERDICT_MIN, label_score, learned_match};
+use crate::lease::Uncovered;
 use crate::modes::Proof;
 use crate::modes::score::{allocation_match, allocation_term, passed_over, score_rows};
 use crate::modes::{Identify, LoadedMode};
@@ -368,7 +368,9 @@ impl Inner {
     /// `t.lease` allows: inside the capture identify holds (so granted without a retune),
     /// or, for a trier holding no lease, only under the source's gate and only where the
     /// running capture holds the band untuned
-    /// ([`crate::lease::LeaseManager::covers_untuned`]; else [`NOT_COVERED`]). The launch
+    /// ([`crate::lease::LeaseManager::covers_untuned`]; else [`NotStarted::Uncovered`]),
+    /// its lease a trial's, which gives way to a foreground request
+    /// ([`crate::lease::LeaseManager::mark_trial`], `t.cancel` its token). The launch
     /// runs in its own task, so a stop of the job never drops it half way: a stop under
     /// the source's gate (which the launch's lease waits on) leaves it to a task that
     /// stops the child once it is up; any other waits for it and stops the child.
@@ -378,7 +380,7 @@ impl Inner {
         t: &Trier<'_>,
         mode: &LoadedMode,
         tuning: Tuning,
-    ) -> Result<Option<JobId>, String> {
+    ) -> Result<Option<JobId>, NotStarted> {
         let kind = JobKind::from_name(&mode.row.id.0)
             .ok_or_else(|| format!("{} is not a job kind", mode.row.id.0))?;
         let source = t.port.id().clone();
@@ -438,21 +440,22 @@ impl Inner {
                     g = self.leases.gate_guard(&source) => g,
                     _ = t.cancel.cancelled() => return Ok(None),
                 };
-                if !self.leases.covers_untuned(t.port.as_ref(), tuning, &gate) {
-                    return Err(NOT_COVERED.into());
+                if let Err(why) = self.leases.covers_untuned(t.port.as_ref(), tuning, &gate) {
+                    return Err(NotStarted::Uncovered(why));
                 }
+                self.leases.mark_trial(child.clone(), t.cancel.clone());
                 self.launch_task_gated(rec, gate)
             }
         };
-        tokio::select! {
+        let started = tokio::select! {
             res = &mut launch => match res {
-                Ok(Ok(())) => Ok(Some(child)),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(e) => Err(format!("launch task: {e}")),
+                Ok(Ok(())) => Ok(Some(child.clone())),
+                Ok(Err(e)) => Err(NotStarted::Failed(e.to_string())),
+                Err(e) => Err(NotStarted::Failed(format!("launch task: {e}"))),
             },
             _ = t.cancel.cancelled() => {
                 if self.gated(t.id) {
-                    let inner = self.clone();
+                    let (inner, child) = (self.clone(), child.clone());
                     tokio::spawn(async move {
                         if matches!(launch.await, Ok(Ok(()))) {
                             let _ = inner.stop(&child).await;
@@ -463,7 +466,12 @@ impl Inner {
                 }
                 Ok(None)
             }
+        };
+        // A trial mark no lease took (the launch failed or was undone) goes.
+        if !matches!(started, Ok(Some(_))) {
+            self.leases.unmark_trial(&child);
         }
+        started
     }
 
     /// Stop a trier's child: gated under identify's own lease (there is nothing to
@@ -478,21 +486,25 @@ impl Inner {
 
     /// One row's trial on the live band: `mode`'s job started at `tuning`
     /// ([`Inner::start_child`]; set in `child` once it runs, for the caller's guard to
-    /// stop) and its proof awaited on its own events for `dwell_ms`
-    /// ([`Inner::await_proof`]). `Err`: it did not start, and why. `Cancelled` when the
-    /// trier is, `child` then set only if it started.
+    /// stop) and its proof awaited on its own events for `dwell_ms`, cut to what is left
+    /// before `until` once it runs ([`Inner::await_proof`]). `Err`: it did not start,
+    /// and why. `Cancelled` when the trier is, `child` then set only if it started.
     pub(super) async fn trial_row(
         self: &Arc<Self>,
         t: &Trier<'_>,
         mode: &LoadedMode,
-        tuning: Tuning,
-        dwell_ms: u64,
+        (tuning, dwell_ms, until): (Tuning, u64, Option<tokio::time::Instant>),
         child: &mut Option<JobId>,
-    ) -> Result<Attempt, String> {
+    ) -> Result<Attempt, NotStarted> {
         let Some(started) = self.start_child(t, mode, tuning).await? else {
             return Ok(Attempt::Cancelled);
         };
         *child = Some(started.clone());
+        // The start took its share of the budget.
+        let dwell_ms = until.map_or(dwell_ms, |until| {
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            dwell_ms.min(u64::try_from(left.as_millis()).unwrap_or(u64::MAX))
+        });
         Ok(self
             .await_proof(t.cancel, mode, &started, ProofFrom::Own, dwell_ms)
             .await)
@@ -623,13 +635,38 @@ pub(super) struct Trier<'a> {
     pub lease: TrialLease,
 }
 
+/// Why a trial's job did not start ([`Inner::start_child`]).
+#[derive(Debug)]
+pub(super) enum NotStarted {
+    /// No running capture holds its band (a trier holding no lease only).
+    Uncovered(Uncovered),
+    /// The start failed, worded.
+    Failed(String),
+}
+
+impl From<String> for NotStarted {
+    fn from(why: String) -> Self {
+        NotStarted::Failed(why)
+    }
+}
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotStarted::Uncovered(why) => write!(f, "no running capture covers it: {why}"),
+            NotStarted::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
 /// How a trier's child gets the radio.
 pub(super) enum TrialLease {
     /// Inside the capture the trier's own lease holds (identify): the child is recorded
     /// as `identify.current` before it launches, and stopped gated.
     Own,
     /// The trier holds none (a `choose`): the child launches only where a running
-    /// capture already holds its band, and is stopped plainly.
+    /// capture already holds its band, on a lease that gives way to a foreground
+    /// request (the trier's `cancel` fired when it does), and is stopped plainly.
     Share,
 }
 
@@ -804,11 +841,12 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         let (trial, recentred) = row_trial(&mode.row.identify, r.tuning, trial, recentred);
         let dwell_ms = identify_dwell_ms(mode.row.identify.dwell_ms, r.dwell_scale);
         let attempt = match inner
-            .trial_row(&trier, mode, trial, dwell_ms, &mut current.child)
+            .trial_row(&trier, mode, (trial, dwell_ms, None), &mut current.child)
             .await
         {
             Ok(a) => a,
             Err(e) => {
+                let e = e.to_string();
                 inner.candidate(&r, id, score, Outcome::Unavailable, &e, None, fit);
                 continue;
             }
