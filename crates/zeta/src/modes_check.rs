@@ -13,7 +13,7 @@ use tokio::sync::broadcast;
 use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::job::JobState;
 use zeta_core::modes::{
-    LoadedMode, ModeHandler, ModeRegistry, ModeState, ModesHandle, RowTest, TestSpec,
+    LoadedMode, ModeHandler, ModeRegistry, ModeState, ModesHandle, Role, RowTest, TestSpec,
 };
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::stream::Payload;
@@ -253,6 +253,10 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
         return Outcome::Fail(m.reason.clone().unwrap_or_default());
     }
     let skip = |why: String| skipped(strict, why);
+    // A demodulator has no capture to decode: it is checked by expanding it.
+    if m.role() == Role::Demodulator {
+        return check_demod(m, ctx);
+    }
     let Some(test) = &m.row.test else {
         return skip("no test".into());
     };
@@ -286,6 +290,41 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
     // Named, so neither a ranking nor another handler can change what the row's own
     // check runs.
     run_in_scratch(m, test, &m.own_handler(), ctx, strict).await
+}
+
+/// A demodulator row's outcome: its job kind expands at a synthetic tuning (the row's
+/// first centre or range start, its own bandwidth, over a source rate that holds it).
+fn check_demod(m: &LoadedMode, ctx: &Ctx) -> Outcome {
+    let Some(modes) = ctx.modes.get() else {
+        return Outcome::Fail("no modes loaded".into());
+    };
+    let Some(kind) = JobKind::from_name(&m.row.id.0) else {
+        return Outcome::Fail(format!("{} is not a job kind", m.row.id.0));
+    };
+    let band = &m.row.band;
+    let center_hz = band
+        .centers_hz
+        .first()
+        .copied()
+        .or_else(|| band.range_hz.as_ref()?.0.first().map(|span| span[0]))
+        .unwrap_or(100_000_000);
+    let tuning = zeta_core::port::Tuning {
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(band.bandwidth_hz),
+    };
+    let rate_hz = (band.bandwidth_hz * 4).max(2_400_000);
+    match kind.expand_voiced(
+        &SourceId("check".into()),
+        tuning,
+        Hz(rate_hz),
+        None,
+        (None, None, None),
+        None,
+        &modes,
+    ) {
+        Ok(_) => Outcome::Ok,
+        Err(e) => Outcome::Fail(format!("{e:?}")),
+    }
 }
 
 /// The outcome of `m`'s row test run by the handler file's handler `h`: failed when it is

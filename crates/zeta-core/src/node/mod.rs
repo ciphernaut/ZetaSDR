@@ -2997,6 +2997,15 @@ impl Node {
             })
         };
         let k = JobKind::from_name(kind).ok_or_else(no_handlers)?;
+        // The four built-in demodulator kinds have no `mode_id`, so the row is read by name.
+        if modes
+            .get(kind)
+            .is_some_and(|m| m.role() == crate::modes::Role::Demodulator)
+        {
+            return Err(NodeError::Expand(OpError::Other {
+                message: format!("{kind} is a demodulator row: capture_decode takes decoder rows"),
+            }));
+        }
         if !matches!(k.loaded_mode(&modes), Ok(Some(_))) {
             return Err(no_handlers());
         }

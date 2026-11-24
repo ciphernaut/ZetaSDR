@@ -621,12 +621,29 @@ async fn a_kind_that_is_no_mode_row_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (node, _radio) = open(dir.path()).await;
     let ids = write_aprs(&node, 1);
-    for kind in ["bits", "fm_demod"] {
+    for kind in ["bits"] {
         let r = decode(&node, &ids[0], kind, None, false).await;
         assert_eq!(
             r,
             Err(OpError::Other {
                 message: format!("{kind} has no handlers"),
+            })
+        );
+    }
+    assert!(node.job_list().is_empty());
+}
+
+#[tokio::test]
+async fn capture_decode_refuses_a_demodulator_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let ids = write_aprs(&node, 1);
+    for kind in ["fm_demod", "wfm_demod", "am_demod", "ssb_demod"] {
+        let r = decode(&node, &ids[0], kind, None, false).await;
+        assert_eq!(
+            r,
+            Err(OpError::Other {
+                message: format!("{kind} is a demodulator row: capture_decode takes decoder rows"),
             })
         );
     }

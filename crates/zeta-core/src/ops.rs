@@ -2625,8 +2625,12 @@ impl JobKind {
                 }],
                 edges: vec![],
             },
+            // Unreachable while `DEMOD_KINDS` and these kinds agree; an error, not a
+            // panic, if they ever diverge.
             JobKind::FmDemod | JobKind::WfmDemod | JobKind::AmDemod | JobKind::SsbDemod => {
-                unreachable!("expanded from the demodulator's row above")
+                return Err(OpError::Other {
+                    message: format!("{} has no demodulator row to expand", self.name()),
+                });
             }
         })
     }
@@ -6378,6 +6382,14 @@ fn handler_policy_set(
     let modes = node.modes();
     let mut known: Vec<String> = match &mode {
         Some(id) => match modes.get(&id.0) {
+            Some(m) if m.role() == crate::modes::Role::Demodulator => {
+                return Err(OpError::Other {
+                    message: format!(
+                        "{} is a demodulator row: handler_policy_set takes decoder rows",
+                        id.0
+                    ),
+                });
+            }
             Some(m) => m.listed_handlers().map(|h| h.id.clone()).collect(),
             None => {
                 return Err(OpError::Unknown {

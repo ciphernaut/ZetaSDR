@@ -120,6 +120,18 @@ fn modes_check_passes_the_in_crate_rows() {
     assert_eq!(code, 0, "{out}");
 }
 
+/// A demodulator row has no capture to decode: it is checked by expanding it at a
+/// synthetic tuning, so it passes even `--strict`.
+#[test]
+fn modes_check_checks_a_builtin_row_by_its_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    let (out, _) = stdout(&mut check(dir.path(), &["--strict"]));
+    for id in ["fm_demod", "wfm_demod", "am_demod", "ssb_demod"] {
+        assert!(out.lines().any(|l| l == format!("{id}: ok")), "{out}");
+    }
+    assert!(!out.contains("fm_demod: fail"), "{out}");
+}
+
 #[test]
 fn modes_check_strict_fails_on_a_missing_handler() {
     let dir = tempfile::tempdir().unwrap();
@@ -146,11 +158,11 @@ fn an_unknown_id_lists_the_known_ones() {
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(
         err.contains(
-            "unknown mode nope (known: acars_decode, adsb_decode, ais_decode, aprs_decode, \
-             ble_decode, dfm_decode, dmr_decode, dvbs_ip_decode, dvbt_decode, flex_decode, \
-             gsmr_decode, hfdl_decode, lorawan_decode, lte_decode, m17_decode, m20_decode, \
-             p25_decode, pocsag_decode, rds_decode, rs41_decode, tetra_decode, thread_decode, \
-             vdl2_decode"
+            "unknown mode nope (known: acars_decode, adsb_decode, ais_decode, am_demod, \
+             aprs_decode, ble_decode, dfm_decode, dmr_decode, dvbs_ip_decode, dvbt_decode, \
+             flex_decode, fm_demod, gsmr_decode, hfdl_decode, lorawan_decode, lte_decode, \
+             m17_decode, m20_decode, p25_decode, pocsag_decode, rds_decode, rs41_decode, \
+             ssb_demod, tetra_decode, thread_decode, vdl2_decode"
         ),
         "{err}"
     );

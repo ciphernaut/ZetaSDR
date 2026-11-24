@@ -393,7 +393,8 @@ export function rowFits(id, row, sel) {
 }
 
 // The modes_list row of job kind `kind` in ctx (undefined before the rows are read).
-const rowOf = (c, kind) => (c.rows || []).find((r) => r.id === kind);
+// A demodulator row (`role: "demodulator"`) is not a decoder: no entry, packet capture or Send to reads it.
+const rowOf = (c, kind) => (c.rows || []).find((r) => r.id === kind && r.role !== "demodulator");
 
 // The handler job `job` (a job_list record) runs, from its mode row `row` (modes_list's, or
 // modes_show's as subjects.js keeps it, with `handlers`): the entry whose `id` is the job's
@@ -580,7 +581,7 @@ function handlerSub(row, run, { all = false, packets = false } = {}) {
 // the recording (rowMisfit on the capture's centre and width as they are; null: it fits).
 const replayRows = (c) =>
   (c.rows || [])
-    .filter((r) => r.state === "ready")
+    .filter((r) => r.state === "ready" && r.role !== "demodulator")
     .sort((a, b) => a.name.localeCompare(b.name))
     .map((row) => ({ row, misfit: rowMisfit(row, c.sel) }));
 
@@ -681,7 +682,7 @@ export const ACTIONS = [
     // The ready rows no wider than the selection whose ranges it meets.
     sub: (c) =>
       (c.rows || [])
-        .filter((r) => r.state === "ready" && typeof r.band?.bandwidth_hz === "number"
+        .filter((r) => r.state === "ready" && r.role !== "demodulator" && typeof r.band?.bandwidth_hz === "number"
           && r.band.bandwidth_hz <= c.sel.bandwidthHz && rowMeets(r, c.sel))
         .map((row) => ({
           key: row.id,

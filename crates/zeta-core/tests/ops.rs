@@ -2254,6 +2254,57 @@ fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
 }
 
 #[tokio::test]
+async fn plan_regions_match_case_insensitively() {
+    for region in ["au", "AU", "Au"] {
+        let dir = tempfile::tempdir().unwrap();
+        let node = demod_node(dir.path(), &[], Some(region)).await;
+        let r = node
+            .apply(start_at(JobKind::FmDemod, cb_centre(), None))
+            .await;
+        assert_eq!(
+            started(&node, r).graph.nodes[1].params["deviation_hz"],
+            2_500,
+            "{region}"
+        );
+    }
+}
+
+/// No `world` plan carries a deviation, so what is checked is that a `world` plan
+/// applies in any region: the plan is found for a station in `US`.
+#[test]
+fn a_world_plan_applies_in_any_region() {
+    let plan = zeta_core::plans::plan("acars_vhf").unwrap();
+    assert_eq!(plan.region, "world");
+    assert_eq!(plan.deviation_hz, None);
+    let centre = zeta_core::plans::channels(plan)[0].1;
+    for region in ["US", "au", "EU"] {
+        let (found, _) = zeta_core::plans::plan_channel_at(centre, region).expect(region);
+        assert_eq!(found.id, "acars_vhf", "{region}");
+    }
+    // A plan of one region is not found from another.
+    let cb = zeta_core::plans::channels(zeta_core::plans::plan("uhf_cb_au").unwrap())[0].1;
+    assert!(zeta_core::plans::plan_channel_at(cb, "US").is_none());
+}
+
+#[tokio::test]
+async fn a_start_differing_only_by_an_implicit_default_is_a_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = demod_node(dir.path(), &[], None).await;
+    // Off any plan the default deviation is 5000 Hz; asking for it is the same job.
+    let r = node
+        .apply(start_at(JobKind::FmDemod, 100_005_000, None))
+        .await;
+    let first = started(&node, r).id;
+    match node
+        .apply(start_at(JobKind::FmDemod, 100_005_000, Some(5_000)))
+        .await
+    {
+        Err(OpError::Duplicate { job, .. }) => assert_eq!(job, first),
+        other => panic!("expected a duplicate, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn deviation_out_of_range_names_field() {
     let dir = tempfile::tempdir().unwrap();
     let node = Node::open(

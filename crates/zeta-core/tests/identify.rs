@@ -430,6 +430,39 @@ async fn stop_all(node: &Node) {
     .await;
 }
 
+/// A demodulator row proves nothing: no ranking lists it and no trial runs it.
+#[test]
+fn score_rows_never_returns_a_demodulator_row() {
+    let modes = zeta_core::modes::ModeRegistry::load(&registry(), None);
+    assert!(modes.get("fm_demod").is_some(), "the row is loaded");
+    let scored = score_rows(&modes, 146_500_000, 12_500, "fm", &|_| 0.0, &|_| 0.0);
+    assert!(!scored.is_empty());
+    for s in &scored {
+        assert!(
+            !zeta_core::modes::DEMOD_KINDS.contains(&s.mode.row.id.0.as_str()),
+            "{}",
+            s.mode.row.id.0
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identify_never_trials_a_demodulator_row() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &fixtures().pocsag_on_aprs).await;
+    let (id, events) = identify(&node, APRS_HZ).await;
+    let events = ended(&node, &id, events, Duration::from_secs(60)).await;
+    assert!(!events.is_empty());
+    for e in &events {
+        let mode = e["mode"].as_str().unwrap_or_default();
+        assert!(
+            !zeta_core::modes::DEMOD_KINDS.contains(&mode),
+            "a demodulator row was considered: {e}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identify_on_pocsag_ends_with_a_verdict_and_one_running_child() {
     let _one = SERIAL.lock().await;

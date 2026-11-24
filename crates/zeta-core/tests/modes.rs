@@ -2139,6 +2139,23 @@ async fn handler_policy_set_persists_and_get_returns_it() {
 }
 
 #[tokio::test]
+async fn the_handler_policy_refuses_a_demodulator_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(alt_cfg(dir.path()), stages(), vec![])
+        .await
+        .unwrap();
+    let r = policy_set(&node, Some("fm_demod"), &[]).await;
+    assert_eq!(
+        r,
+        Err(OpError::Other {
+            message: "fm_demod is a demodulator row: handler_policy_set takes decoder rows".into(),
+        })
+    );
+    // Nothing was written.
+    assert_eq!(policy_get(&node).await, HandlerPolicy::default());
+}
+
+#[tokio::test]
 async fn handler_policy_set_refuses_an_id_no_mode_has() {
     let dir = tempfile::tempdir().unwrap();
     let node = Node::open(alt_cfg(dir.path()), stages(), vec![])
