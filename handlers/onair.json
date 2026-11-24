@@ -368,6 +368,182 @@
         }
       },
       "extra": { "services": "/services" }
+    },
+    "ble_decode": {
+      "args": [
+        "--mode", "ble", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz", "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 4000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "mac": "/mac",
+          "name": "/name",
+          "rssi_db": "/rssi_db"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap"
+      }
+    },
+    "lorawan_decode": {
+      "args": [
+        "--mode", "lorawan", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz", "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 2000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "devaddr": "/devaddr",
+          "hex": "/hex",
+          "kind": "/kind",
+          "snr_db": "/snr_db",
+          "sf": "/sf",
+          "modulation": "/modulation",
+          "freq_hz": "/freq_hz"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap"
+      }
+    },
+    "zigbee_decode": {
+      "args": [
+        "--mode", "zigbee", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz", "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 4000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "frame_type": "/frame_type",
+          "seq": "/seq",
+          "pan": "/pan",
+          "src": "/src",
+          "dst": "/dst",
+          "nwk_src": "/nwk_src",
+          "nwk_dst": "/nwk_dst",
+          "secured": "/secured",
+          "len": "/len"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap"
+      }
+    },
+    "thread_decode": {
+      "args": [
+        "--mode", "thread", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz", "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 4000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "frame_type": "/frame_type",
+          "seq": "/seq",
+          "pan": "/pan",
+          "src": "/src",
+          "dst": "/dst",
+          "secured": "/secured",
+          "len": "/len",
+          "kind": "/kind"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap"
+      }
+    },
+    "zwave_decode": {
+      "args": [
+        "--mode", "zwave", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz", "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 2000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "home_id": "/home_id",
+          "src": "/src",
+          "dst": "/dst",
+          "frame_type": "/frame_type",
+          "rate_bps": "/rate_bps",
+          "freq_hz": "/freq_hz",
+          "secured": "/secured",
+          "len": "/len"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap"
+      }
+    },
+    "wifi_decode": {
+      "args": [
+        "--mode", "wifi", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz", "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 20000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "frame_type": "/frame_type",
+          "bssid": "/bssid",
+          "ssid": "/ssid",
+          "channel": "/channel",
+          "freq_hz": "/freq_hz",
+          "security": "/security",
+          "len": "/len"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap"
+      }
+    },
+    "wisun_decode": {
+      "args": [
+        "--mode", "wisun", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz", "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 2000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "frame_type": "/frame_type",
+          "seq": "/seq",
+          "pan": "/pan",
+          "src": "/src",
+          "dst": "/dst",
+          "freq_hz": "/freq_hz",
+          "rate_bps": "/rate_bps",
+          "len": "/len"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap"
+      }
     }
   }
 }

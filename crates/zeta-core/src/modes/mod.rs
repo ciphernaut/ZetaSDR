@@ -286,7 +286,7 @@ pub(crate) fn nullable_enum<T: JsonSchema>(g: &mut schemars::SchemaGenerator) ->
 }
 
 /// The embedded rows, one file each under `modes/` in the repo.
-const EMBEDDED: [(&str, &str); 17] = [
+const EMBEDDED: [(&str, &str); 24] = [
     (
         "modes/acars_decode.json",
         include_str!("../../../../modes/acars_decode.json"),
@@ -302,6 +302,10 @@ const EMBEDDED: [(&str, &str); 17] = [
     (
         "modes/aprs_decode.json",
         include_str!("../../../../modes/aprs_decode.json"),
+    ),
+    (
+        "modes/ble_decode.json",
+        include_str!("../../../../modes/ble_decode.json"),
     ),
     (
         "modes/dfm_decode.json",
@@ -322,6 +326,10 @@ const EMBEDDED: [(&str, &str); 17] = [
     (
         "modes/hfdl_decode.json",
         include_str!("../../../../modes/hfdl_decode.json"),
+    ),
+    (
+        "modes/lorawan_decode.json",
+        include_str!("../../../../modes/lorawan_decode.json"),
     ),
     (
         "modes/m17_decode.json",
@@ -348,12 +356,32 @@ const EMBEDDED: [(&str, &str); 17] = [
         include_str!("../../../../modes/rs41_decode.json"),
     ),
     (
+        "modes/thread_decode.json",
+        include_str!("../../../../modes/thread_decode.json"),
+    ),
+    (
         "modes/vdl2_decode.json",
         include_str!("../../../../modes/vdl2_decode.json"),
     ),
     (
         "modes/video_decode.json",
         include_str!("../../../../modes/video_decode.json"),
+    ),
+    (
+        "modes/wifi_decode.json",
+        include_str!("../../../../modes/wifi_decode.json"),
+    ),
+    (
+        "modes/wisun_decode.json",
+        include_str!("../../../../modes/wisun_decode.json"),
+    ),
+    (
+        "modes/zigbee_decode.json",
+        include_str!("../../../../modes/zigbee_decode.json"),
+    ),
+    (
+        "modes/zwave_decode.json",
+        include_str!("../../../../modes/zwave_decode.json"),
     ),
 ];
 

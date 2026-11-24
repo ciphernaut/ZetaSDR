@@ -1,0 +1,55 @@
+{
+  "id": "ble_decode",
+  "name": "Bluetooth LE advertising",
+  "family": "iot",
+  "band": {
+    "bandwidth_hz": 2000000,
+    "centers_hz": [2402000000, 2426000000, 2480000000],
+    "range_hz": [2400000000, 2483500000],
+    "min_hz": 2000000
+  },
+  "modulation": ["fsk"],
+  "label": "Bluetooth LE",
+  "protocol": "ble",
+  "decoder": null,
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": {"type": "string"},
+        "mac": {"type": "string"},
+        "name": {"type": ["string", "null"]},
+        "rssi_db": {"type": "number"}
+      }
+    },
+    "summary": "{name?mac} {rssi_db?:.0} dB"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 10000,
+    "min_span_ms": 0,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": [],
+  "content": "network_traffic",
+  "subject": {
+    "key": "mac",
+    "name": "devices",
+    "waterfall": "summary",
+    "columns": [
+      {"field": "name", "label": "Name", "unit": null},
+      {"field": "rssi_db", "label": "Level (dB below full scale)", "unit": null}
+    ],
+    "heading": null,
+    "label": null
+  },
+  "notes": "Bluetooth Low Energy advertising (LE 1M PHY, GFSK), decoded by OnAir's receiver through the onair-rx handler; the row has no decoder of its own, so only a handler runs it. One job reads one advertising channel: start it on 2402, 2426 or 2480 MHz (channels 37, 38 and 39) with a band of 2 MHz; the handler takes 4 MHz of IQ (OnAir's own minimum, a decimation to 4 samples a bit), so the node resamples to it. Each event is a good advertising packet naming a device: `mac` (the advertiser's address, or the scanner's for a scan or connection request; lower-case hex without separators), `name` (the packet's own name, null when it has none: a device names itself in some of its packets only) and `rssi_db` (the packet's level in dB below full scale, not calibrated). Advertising only: connections are not followed and nothing is decrypted; the packets (the access address, the dewhitened PDU and its CRC, link type 251) go to a packet capture, an extended advertisement, which names no device, among them. Ranges and bands: the three advertising channels at 2402, 2426 and 2480 MHz and the 2400 to 2483.5 MHz ISM band are the Bluetooth Core Specification's (LE advertising channels 37, 38 and 39); identify and classify try the row anywhere in that band, and a job started by hand runs anywhere. Listing bar: measured on the build host (12 cores) through a scratch node's release build, 30 s of the generated capture looping on a file source and fed in real time; the job skipped no input, onair-rx used 0.15 of a core and the node 0.29 of a core (load average 12.2 to 8.2, with another build running).",
+  "test": {
+    "kind": "fixture",
+    "path": "onair/ble.sigmf-meta",
+    "expect": {"mac": "c0ffee123456"},
+    "within_ms": 20000
+  }
+}

@@ -3334,22 +3334,46 @@ fn modes_list_prints_the_embedded_rows() {
             "adsb_decode",
             "ais_decode",
             "aprs_decode",
+            "ble_decode",
             "dfm_decode",
             "dmr_decode",
             "dvbt_decode",
             "flex_decode",
             "hfdl_decode",
+            "lorawan_decode",
             "m17_decode",
             "m20_decode",
             "p25_decode",
             "pocsag_decode",
             "rds_decode",
             "rs41_decode",
+            "thread_decode",
             "vdl2_decode",
-            "video_decode"
+            "video_decode",
+            "wifi_decode",
+            "wisun_decode",
+            "zigbee_decode",
+            "zwave_decode"
         ]
     );
-    assert!(rows.iter().all(|m| m["state"] == "ready"), "{v}");
+    // The rows with no decoder of their own wait for OnAir's wrapper, pinned missing here.
+    let only_a_handler = [
+        "ble_decode",
+        "lorawan_decode",
+        "thread_decode",
+        "wifi_decode",
+        "wisun_decode",
+        "zigbee_decode",
+        "zwave_decode",
+    ];
+    for m in rows {
+        let id = m["id"].as_str().unwrap();
+        let want = match only_a_handler.contains(&id) {
+            true => "unavailable",
+            false => "ready",
+        };
+        assert_eq!(m["state"], want, "{id}: {v}");
+    }
     let out = zeta(
         dir.path(),
         &[

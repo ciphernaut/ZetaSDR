@@ -488,7 +488,8 @@ mod tests {
         // video, rds and m17 at 0.4 (tv, broadcast, then amateur_voice), then dmr and p25
         // (two_way, by id) at 0.4 with priority -1; then at 0 rs41 (priority 1),
         // then tv (dvbt, outside its range), aviation (acars, adsb, hfdl, vdl2), maritime (ais),
-        // pagers (flex, pocsag), weather_science (dfm, m20), amateur_digital.
+        // pagers (flex, pocsag), iot (ble, lorawan, thread, wifi, wisun, zigbee, zwave),
+        // weather_science (dfm, m20), amateur_digital.
         assert_eq!(
             order,
             [
@@ -506,6 +507,13 @@ mod tests {
                 "ais_decode",
                 "flex_decode",
                 "pocsag_decode",
+                "ble_decode",
+                "lorawan_decode",
+                "thread_decode",
+                "wifi_decode",
+                "wisun_decode",
+                "zigbee_decode",
+                "zwave_decode",
                 "dfm_decode",
                 "m20_decode",
                 "aprs_decode"

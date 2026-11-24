@@ -55,7 +55,7 @@ Poll for the end state (several suites have an `until` helper) instead of readin
 
 ### Build notes
 
-- **Profile:** the dev profile optimises `zeta-dsp`, `rustfft`, `num-complex` and `nnnoiseless`, because the tests run sources in real time.
+- **Profile:** the dev profile optimises `zeta-dsp`, `zeta-ext`, `rustfft`, `num-complex` and `nnnoiseless`, because the tests run sources in real time.
 - **Disk:** `target/debug` grows to tens of GB. When the disk fills, delete it or old `target/debug/deps` files.
 - **Shared target dir:** with one `CARGO_TARGET_DIR` shared between worktrees, cargo can serve a stale artifact of a path crate. Use a private `CARGO_TARGET_DIR` for gate runs, or `touch crates/*/src/lib.rs`.
 - **Real SoapySDR hardware:** build with `RUSTFLAGS="--cfg soapy"` and `libsoapysdr-dev` installed. `crates/zeta-source-soapy-driver` links libSoapySDR and stays outside the workspace.

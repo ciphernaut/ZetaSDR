@@ -21,24 +21,31 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 17] = [
+const EMBEDDED: [&str; 24] = [
     "acars_decode",
     "adsb_decode",
     "ais_decode",
     "aprs_decode",
+    "ble_decode",
     "dfm_decode",
     "dmr_decode",
     "dvbt_decode",
     "flex_decode",
     "hfdl_decode",
+    "lorawan_decode",
     "m17_decode",
     "m20_decode",
     "p25_decode",
     "pocsag_decode",
     "rds_decode",
     "rs41_decode",
+    "thread_decode",
     "vdl2_decode",
     "video_decode",
+    "wifi_decode",
+    "wisun_decode",
+    "zigbee_decode",
+    "zwave_decode",
 ];
 
 fn cfg(dir: &Path, modes_dir: &Path) -> NodeConfig {
@@ -82,6 +89,19 @@ fn embedded_rows_parse_and_validate() {
     let reg = ModeRegistry::load(&stages, None);
     assert_eq!(reg.ids(), EMBEDDED);
     for m in reg.all() {
+        if !m.has_decoder() {
+            // Only a handler runs it, and none has been probed here.
+            assert_eq!(m.state, ModeState::Unavailable, "{}", m.row.id.0);
+            assert!(
+                m.reason
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with(NO_DECODER_REASON)),
+                "{}: {:?}",
+                m.row.id.0,
+                m.reason
+            );
+            continue;
+        }
         assert_eq!(m.state, ModeState::Ready, "{}: {:?}", m.row.id.0, m.reason);
         assert_eq!(m.reason, None);
     }
@@ -234,7 +254,12 @@ async fn a_node_without_a_modes_dir_lists_only_the_embedded_rows() {
     let node = Node::open(cfg, stages(), vec![]).await.unwrap();
     assert_eq!(node.modes().ids(), EMBEDDED);
     for m in node.modes().all() {
-        assert_eq!(m.state, ModeState::Ready);
+        // A row with no decoder of its own waits for a probed handler.
+        let want = match m.has_decoder() {
+            true => ModeState::Ready,
+            false => ModeState::Unavailable,
+        };
+        assert_eq!(m.state, want, "{}", m.row.id.0);
         assert_eq!(m.file, format!("modes/{}.json", m.row.id.0));
     }
 }
@@ -749,9 +774,14 @@ async fn modes_list_and_show_carry_content() {
         .collect();
     let carrier = infos.iter().find(|m| m["id"] == "carrier_decode").unwrap();
     assert_eq!(carrier["content"], "network_traffic");
-    // Every embedded row reports null.
+    // Every embedded row with a decoder of its own reports null; one with none, the
+    // modes only OnAir decodes, says what it carries.
     for m in infos.iter().filter(|m| m["id"] != "carrier_decode") {
-        assert_eq!(m["content"], serde_json::Value::Null, "{}", m["id"]);
+        let want = match m["decoder_kind"].is_null() {
+            true => serde_json::json!("network_traffic"),
+            false => serde_json::Value::Null,
+        };
+        assert_eq!(m["content"], want, "{}", m["id"]);
     }
     let Ok(OpResult::Mode { mode }) = node
         .apply(Op::ModesShow {
@@ -1207,6 +1237,8 @@ fn every_embedded_row_emits_events_today() {
             _ if matches!(m.row.decoder, Some(Decoder::Frame(_))) => {
                 &[StreamKind::Event, StreamKind::Packet]
             }
+            // A row with no decoder of its own gives nothing until a handler is ready.
+            _ if m.row.decoder.is_none() => &[],
             _ => &[StreamKind::Event],
         };
         assert_eq!(m.outputs, want, "{}", m.row.id.0);
@@ -1462,7 +1494,7 @@ fn the_embedded_onair_handler_serves_its_modes() {
     let events = [StreamKind::Event];
     let both = [StreamKind::Event, StreamKind::Packet];
     // (mode id, the streams its OnAir entry gives, its input rate)
-    let modes: [(&str, &[StreamKind], u64); 15] = [
+    let modes: [(&str, &[StreamKind], u64); 22] = [
         ("pocsag_decode", &events, 1_000_000),
         ("flex_decode", &events, 1_000_000),
         ("acars_decode", &events, 1_000_000),
@@ -1478,6 +1510,14 @@ fn the_embedded_onair_handler_serves_its_modes() {
         ("p25_decode", &events, 250_000),
         ("m17_decode", &events, 250_000),
         ("dvbt_decode", &events, 10_000_000),
+        // The modes only OnAir decodes: events and each mode's packets.
+        ("ble_decode", &both, 4_000_000),
+        ("lorawan_decode", &both, 2_000_000),
+        ("zigbee_decode", &both, 4_000_000),
+        ("thread_decode", &both, 4_000_000),
+        ("zwave_decode", &both, 2_000_000),
+        ("wifi_decode", &both, 20_000_000),
+        ("wisun_decode", &both, 2_000_000),
     ];
     for (id, outputs, rate) in modes {
         assert_eq!(
@@ -1766,7 +1806,9 @@ fn an_operator_file_replaces_the_embedded_one_of_its_id() {
 fn a_broken_handler_file_never_fails_the_load() {
     let reg = with_handler_files(&[("bad.json", "{")]);
     assert_eq!(reg.ids(), EMBEDDED);
-    assert_eq!(reg.ready().count(), EMBEDDED.len());
+    // The rows with no decoder of their own are not ready before a handler is probed.
+    let own = reg.all().iter().filter(|m| m.has_decoder()).count();
+    assert_eq!(reg.ready().count(), own);
     let file = operator_file(&reg);
     assert_eq!(file.state, ModeState::Broken);
     assert!(file.file.ends_with("bad.json"), "{file:?}");
@@ -2071,6 +2113,7 @@ async fn handler_policy_set_refuses_an_id_no_mode_has() {
         .all()
         .iter()
         .flat_map(|m| m.handlers.iter().map(|h| h.id.clone()))
+        .filter(|id| id != "none")
         .collect();
     every.sort();
     every.dedup();
@@ -2182,7 +2225,8 @@ async fn modes_list_gives_each_modes_handlers_and_the_policys_pick() {
 
 /// With no handler beyond each row's own (the embedded OnAir file replaced by an
 /// operator file of its id serving no mode), every mode's own fields read as the row's
-/// (the pre-handler listing), and its one handler is the row's own.
+/// (the pre-handler listing), and its one handler is the row's own (a row with no
+/// decoder of its own lists none, and is unavailable).
 #[tokio::test]
 async fn a_node_with_no_handlers_beyond_the_rows_lists_modes_as_before() {
     let dir = tempfile::tempdir().unwrap();
@@ -2249,6 +2293,14 @@ async fn a_node_with_no_handlers_beyond_the_rows_lists_modes_as_before() {
             s.checked,
         );
         assert_eq!(shown_now, before, "{id}");
+        if !m.has_decoder() {
+            // A row with no decoder of its own has no handler of its own, and the file
+            // that served it is gone: it lists none and none would run.
+            assert!(info.handlers.is_empty(), "{id}");
+            assert_eq!(info.handler, None, "{id}");
+            assert_eq!(info.state, ModeState::Unavailable, "{id}");
+            continue;
+        }
         assert_eq!(info.handlers.len(), 1, "{id}");
         assert_eq!(info.handlers[0].id, m.handlers[0].id, "{id}");
         let own = (m.state == ModeState::Ready).then(|| m.handlers[0].id.clone());
@@ -2258,6 +2310,56 @@ async fn a_node_with_no_handlers_beyond_the_rows_lists_modes_as_before() {
     let state = |id: &str| list.iter().find(|m| m.id.0 == id).unwrap().state;
     assert_eq!(state("rs41_decode"), ModeState::Unavailable);
     assert_eq!(state("junk_mode"), ModeState::Broken);
+}
+
+/// Plan 47: every embedded row with no decoder of its own says what it carries, is
+/// checked on a generated fixture under `onair/`, has no quick test, and its notes name
+/// where its ranges come from.
+#[test]
+fn the_embedded_rows_with_no_decoder_carry_content_and_a_fixture_test() {
+    let mut seen = Vec::new();
+    for (file, text) in ModeRegistry::embedded() {
+        let row = parse(text).unwrap();
+        if row.decoder.is_some() {
+            continue;
+        }
+        let id = &row.id.0;
+        seen.push(id.clone());
+        assert_eq!(
+            row.content,
+            Some(zeta_core::modes::Content::NetworkTraffic),
+            "{file}"
+        );
+        assert!(row.identify.quick.is_none(), "{id}");
+        let test = row.test.as_ref().unwrap_or_else(|| panic!("{id}: no test"));
+        let v = serde_json::to_value(test).unwrap();
+        assert_eq!(v["kind"], "fixture", "{id}");
+        let path = v["path"].as_str().unwrap();
+        assert!(
+            path.starts_with("onair/") && path.ends_with(".sigmf-meta"),
+            "{id}: {path}"
+        );
+        assert!(!v["expect"].as_object().unwrap().is_empty(), "{id}");
+        let notes = row.notes.as_deref().unwrap_or_default();
+        assert!(
+            notes.contains("Ranges and bands:"),
+            "{id}: its notes name where its ranges come from"
+        );
+    }
+    for id in [
+        "ble_decode",
+        "lorawan_decode",
+        "zigbee_decode",
+        "thread_decode",
+        "zwave_decode",
+        "wifi_decode",
+        "wisun_decode",
+    ] {
+        assert!(
+            seen.iter().any(|s| s == id),
+            "{id} has no decoder: {seen:?}"
+        );
+    }
 }
 
 /// A program row's own `decoder.output` takes no `const`: only a handler file's entry

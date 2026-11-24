@@ -1,0 +1,61 @@
+{
+  "id": "lorawan_decode",
+  "name": "LoRaWAN",
+  "family": "iot",
+  "band": {
+    "bandwidth_hz": 2000000,
+    "centers_hz": [],
+    "range_hz": [[433050000, 434790000], [863000000, 870000000], [902000000, 928000000]],
+    "min_hz": 125000
+  },
+  "modulation": ["css", "fsk"],
+  "label": "LoRaWAN",
+  "protocol": "lorawan",
+  "decoder": null,
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": {"type": "string"},
+        "devaddr": {"type": ["string", "null"]},
+        "hex": {"type": "string"},
+        "kind": {"type": "string"},
+        "snr_db": {"type": ["number", "null"]},
+        "sf": {"type": ["integer", "null"]},
+        "modulation": {"type": "string"},
+        "freq_hz": {"type": ["integer", "null"]}
+      }
+    },
+    "summary": "{devaddr?kind} {modulation} SF{sf?} {snr_db?:.1} dB"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 30000,
+    "min_span_ms": 0,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": [],
+  "content": "network_traffic",
+  "subject": {
+    "key": "devaddr",
+    "name": "devices",
+    "waterfall": "summary",
+    "columns": [
+      {"field": "modulation", "label": "Modulation", "unit": null},
+      {"field": "sf", "label": "SF", "unit": null},
+      {"field": "snr_db", "label": "SNR (dB)", "unit": null},
+      {"field": "freq_hz", "label": "Frequency (Hz)", "unit": null}
+    ],
+    "heading": null,
+    "label": null
+  },
+  "notes": "LoRaWAN, decoded by OnAir's receiver through the onair-rx handler; the row has no decoder of its own, so only a handler runs it. One job reads every channel of one regional plan that lies inside its band: start it with a band of 2 MHz on the plan's channels (the handler takes 2 MHz of IQ, and exits at start when no channel plan has a channel inside the band; the plan is the one with the most channels inside). Each event is a frame with a good CRC, or a downlink that OnAir reads as LoRaWAN: `devaddr` (eight lower-case hex digits on a data frame; a join request has none, its EUIs are in `hex`), `hex` (the PHY payload as OnAir's bus spells it, upper-case byte pairs separated by spaces), `kind` (always `lorawan`), `modulation` (`lora` or `fsk`), `sf` (the spreading factor, 0 for an FSK frame), `snr_db` (in the LoRa bandwidth) and `freq_hz` (the channel's centre). Nothing is decrypted and no MIC is checked; the PHY payloads (behind a LoRaTap header, link type 270) go to a packet capture. Ranges and bands: the plans OnAir decodes (EU868, US915, AU915, AS923-1 to 4 and EU433) and so the ranges 433.05 to 434.79, 863 to 870 and 902 to 928 MHz are the LoRa Alliance's Regional Parameters (RP002); the channels are 125, 250 and 500 kHz wide, so a job may be as narrow as one 125 kHz channel, and a plan the receiver does not carry (IN865, KR920) is not decoded. Listing bar: measured on the build host (12 cores) through a scratch node's release build, 30 s of the generated capture looping on a file source and fed in real time; the job skipped no input, onair-rx used 0.24 of a core and the node 0.08 of a core (load average 7.8 to 6.5, with another build running).",
+  "test": {
+    "kind": "fixture",
+    "path": "onair/lorawan.sigmf-meta",
+    "expect": {"devaddr": "26011a2b"},
+    "within_ms": 30000
+  }
+}

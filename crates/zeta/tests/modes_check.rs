@@ -147,8 +147,9 @@ fn an_unknown_id_lists_the_known_ones() {
     assert!(
         err.contains(
             "unknown mode nope (known: acars_decode, adsb_decode, ais_decode, aprs_decode, \
-             dfm_decode, dmr_decode, dvbt_decode, flex_decode, hfdl_decode, m17_decode, m20_decode, p25_decode, pocsag_decode, rds_decode, \
-             rs41_decode, vdl2_decode"
+             ble_decode, dfm_decode, dmr_decode, dvbt_decode, flex_decode, hfdl_decode, \
+             lorawan_decode, m17_decode, m20_decode, p25_decode, pocsag_decode, rds_decode, \
+             rs41_decode, thread_decode, vdl2_decode"
         ),
         "{err}"
     );
@@ -1053,6 +1054,51 @@ fn onair_passes_its_modes_checks() {
         assert_eq!(out.trim(), format!("{id}@onair: ok"), "{out}");
         println!("{}", out.trim());
         assert_eq!(code, 0, "{id}");
+    }
+    // The modes only OnAir decodes (plan 47) are checked on pairs `onair-gen` makes into
+    // a directory of their own (the script writes `onair/<mode>.sigmf-*`), not the
+    // repository's fixtures.
+    let ids = [
+        "ble_decode",
+        "lorawan_decode",
+        "zigbee_decode",
+        "thread_decode",
+        "zwave_decode",
+        "wifi_decode",
+        "wisun_decode",
+    ];
+    match std::env::var_os("ZETA_TEST_ONAIR_GEN").map(std::path::PathBuf::from) {
+        None => {
+            for id in ids {
+                println!("{id}@onair: not run, ZETA_TEST_ONAIR_GEN is not set");
+            }
+        }
+        Some(gen_bin) => {
+            let fixtures = tempfile::tempdir().unwrap();
+            let made = Command::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/onair-fixtures.sh"
+            ))
+            .arg(&gen_bin)
+            .arg(fixtures.path())
+            .output()
+            .unwrap();
+            assert!(
+                made.status.success(),
+                "onair-fixtures.sh: {}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+            for id in ids {
+                let (out, code) = stdout(
+                    check(dir.path(), &[id, "--handler", "onair", "--strict"])
+                        .env("ZETA_HANDLER_ONAIR_RX", &program)
+                        .env("ZETA_FIXTURES_DIR", fixtures.path()),
+                );
+                assert_eq!(out.trim(), format!("{id}@onair: ok"), "{out}");
+                println!("{}", out.trim());
+                assert_eq!(code, 0, "{id}");
+            }
+        }
     }
     // Not run: hfdl_decode's fixture is still pending (its entry is validated by the
     // registry test); dfm_decode's and dvbt_decode's rows have no test (DVB-T's entry is

@@ -1,0 +1,61 @@
+{
+  "id": "wifi_decode",
+  "name": "Wi-Fi access points",
+  "family": "iot",
+  "band": {
+    "bandwidth_hz": 20000000,
+    "centers_hz": [],
+    "range_hz": [[2400000000, 2483500000], [5150000000, 5895000000], [5925000000, 7125000000]],
+    "min_hz": 20000000
+  },
+  "modulation": ["ofdm"],
+  "label": "Wi-Fi",
+  "protocol": "wifi",
+  "decoder": null,
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": {"type": "string"},
+        "frame_type": {"type": "string"},
+        "bssid": {"type": "string"},
+        "ssid": {"type": ["string", "null"]},
+        "channel": {"type": ["integer", "null"]},
+        "freq_hz": {"type": ["integer", "null"]},
+        "security": {"type": ["string", "null"]},
+        "len": {"type": "integer"}
+      }
+    },
+    "summary": "{ssid?bssid} {security?} ch {channel?}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 5000,
+    "min_span_ms": 0,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": [],
+  "content": "network_traffic",
+  "subject": {
+    "key": "bssid",
+    "name": "networks",
+    "waterfall": "summary",
+    "columns": [
+      {"field": "ssid", "label": "Name", "unit": null},
+      {"field": "channel", "label": "Channel", "unit": null},
+      {"field": "security", "label": "Security", "unit": null},
+      {"field": "frame_type", "label": "Frame", "unit": null}
+    ],
+    "heading": null,
+    "label": "ssid"
+  },
+  "notes": "Wi-Fi access points (IEEE 802.11), decoded by OnAir's receiver through the onair-rx handler; the row has no decoder of its own, so only a handler runs it. One job reads one 20 MHz channel: start it on a channel's centre with a band of 20 MHz (the handler takes 20 MHz of IQ, the receiver's minimum; the frequency picks the band). An event is a beacon, a probe response or a FILS discovery frame, the frames an access point is read from: `frame_type`, `bssid` (12 hex digits), `ssid` (null for a hidden network), `channel` (the beacon's own channel element, else the radiotap frequency's), `freq_hz`, `security` (OnAir's word: `Open`, `WEP`, `WPA`, `WPA2`, `WPA2/WPA3`, `WPA3`, `OWE (Enhanced Open)`, an enterprise one with `-Enterprise`; null on a FILS discovery frame, which has none) and `len`. There is no data rate: OnAir's radiotap header has none, so the rate a frame was received at is not known. Every frame whose FCS passed, data frames too, goes to a packet capture (a radiotap header and the 802.11 frame, link type 127); nothing is decrypted. Ranges and bands: the 2.4, 5 and 6 GHz bands (2400 to 2483.5, 5150 to 5895 and 5925 to 7125 MHz) are IEEE 802.11's, across regions, and a 20 MHz channel is the narrowest an 802.11 receiver reads; only the 2.4 GHz scene has a test signal, so the 5 and 6 GHz paths (OFDM, several channels in a wide input) are untested. Listing bar: measured on the build host (12 cores) through a scratch node's release build, 30 s of the generated capture looping on a file source and fed in real time; the job skipped no input, onair-rx used 0.46 of a core and the node 0.46 of a core (load average 3.8 to 4.7, with another build running).",
+  "test": {
+    "kind": "fixture",
+    "path": "onair/wifi.sigmf-meta",
+    "expect": {"bssid": "00040e123456", "ssid": "OnAir-Home"},
+    "within_ms": 20000
+  }
+}

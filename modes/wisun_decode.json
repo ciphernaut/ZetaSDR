@@ -1,0 +1,69 @@
+{
+  "id": "wisun_decode",
+  "name": "Wi-SUN FAN",
+  "family": "iot",
+  "band": {
+    "bandwidth_hz": 2000000,
+    "centers_hz": [],
+    "range_hz": [
+      [470000000, 510000000],
+      [779000000, 787000000],
+      [863000000, 876000000],
+      [902000000, 928000000],
+      [2400000000, 2483500000]
+    ],
+    "min_hz": 100000
+  },
+  "modulation": ["fsk"],
+  "label": "Wi-SUN",
+  "protocol": "wisun",
+  "decoder": null,
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": {"type": "string"},
+        "frame_type": {"type": "string"},
+        "seq": {"type": ["integer", "null"]},
+        "pan": {"type": ["string", "null"]},
+        "src": {"type": ["string", "null"]},
+        "dst": {"type": ["string", "null"]},
+        "freq_hz": {"type": ["integer", "null"]},
+        "rate_bps": {"type": ["integer", "null"]},
+        "len": {"type": "integer"}
+      }
+    },
+    "summary": "{frame_type} {src?} PAN {pan?}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 15000,
+    "min_span_ms": 0,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": [],
+  "content": "network_traffic",
+  "subject": {
+    "key": "src",
+    "name": "devices",
+    "waterfall": "summary",
+    "columns": [
+      {"field": "frame_type", "label": "Frame", "unit": null},
+      {"field": "pan", "label": "PAN", "unit": null},
+      {"field": "dst", "label": "Destination", "unit": null},
+      {"field": "freq_hz", "label": "Frequency (Hz)", "unit": null},
+      {"field": "rate_bps", "label": "Rate (bit/s)", "unit": null}
+    ],
+    "heading": null,
+    "label": null
+  },
+  "notes": "Wi-SUN FAN (IEEE 802.15.4g SUN FSK), decoded by OnAir's receiver through the onair-rx handler; the row has no decoder of its own, so only a handler runs it. One job reads every channel of the band plan inside its band, at once (nodes hop, and nothing is followed): start it with a band of 2 MHz (the handler takes 2 MHz of IQ, the receiver's minimum, which holds a few channels: at 921.5 MHz, the four 400 kHz channels and the 200 kHz ones around them); the plan is the receiver's own pick for the centre frequency. It exits at start when the plan has no channel inside the band. Each event is a frame whose FCS passed: `frame_type` (a Wi-SUN frame type such as `pan_advert`, `pan_config`, `eapol`, `data`, `ack`, else the MAC's), `seq`, `pan` (4 hex digits), `src` and `dst` (16 hex digits, the EUI-64, or 4 for a short address; a broadcast has no `dst`), `freq_hz` (the channel's centre) and `rate_bps` (50000, 100000 or 150000), both read from the receiver's own frame log and null where it has not yet got the frame, and `len`. Bit rates of 200 and 300 kbit/s (600 kHz channels) are not demodulated. PAN configurations and data frames stay encrypted: no key is loaded. The MPDUs (without their FCS, link type 230) go to a packet capture. Ranges and bands: the spans are the Wi-SUN FAN PHY band plans as OnAir carries them (470 to 510 MHz CN470, 779 to 787 CN779, 863 to 876 EU, 902 to 928 NA, ANZ, JP, KR and the rest, 2400 to 2483.5 the worldwide 2.4 GHz plan), across regions; channels are 100 to 600 kHz wide, and the narrowest the table carries is 100 kHz. Listing bar: measured on the build host (12 cores) through a scratch node's release build, 30 s of the generated capture looping on a file source and fed in real time; the job skipped no input, onair-rx used 0.11 of a core and the node 0.08 of a core (load average 4.7 to 4.4, with another build running).",
+  "test": {
+    "kind": "fixture",
+    "path": "onair/wisun.sigmf-meta",
+    "expect": {"src": "00124bfffe1a2b3c"},
+    "within_ms": 30000
+  }
+}

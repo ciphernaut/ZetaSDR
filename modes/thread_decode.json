@@ -1,0 +1,80 @@
+{
+  "id": "thread_decode",
+  "name": "Thread (IEEE 802.15.4)",
+  "family": "iot",
+  "band": {
+    "bandwidth_hz": 2000000,
+    "centers_hz": [
+      2405000000,
+      2410000000,
+      2415000000,
+      2420000000,
+      2425000000,
+      2430000000,
+      2435000000,
+      2440000000,
+      2445000000,
+      2450000000,
+      2455000000,
+      2460000000,
+      2465000000,
+      2470000000,
+      2475000000,
+      2480000000
+    ],
+    "range_hz": [2400000000, 2483500000],
+    "min_hz": 2000000
+  },
+  "modulation": ["oqpsk"],
+  "label": "Thread",
+  "protocol": "thread",
+  "decoder": null,
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": {"type": "string"},
+        "frame_type": {"type": "string"},
+        "seq": {"type": ["integer", "null"]},
+        "pan": {"type": ["string", "null"]},
+        "src": {"type": ["string", "null"]},
+        "dst": {"type": ["string", "null"]},
+        "secured": {"type": ["boolean", "null"]},
+        "len": {"type": "integer"},
+        "kind": {"type": ["string", "null"]}
+      }
+    },
+    "summary": "{kind?frame_type}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 15000,
+    "min_span_ms": 0,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": [],
+  "content": "network_traffic",
+  "subject": {
+    "key": "src",
+    "name": "devices",
+    "waterfall": "summary",
+    "columns": [
+      {"field": "frame_type", "label": "Frame", "unit": null},
+      {"field": "pan", "label": "PAN", "unit": null},
+      {"field": "dst", "label": "Destination", "unit": null},
+      {"field": "secured", "label": "Secured", "unit": null},
+      {"field": "kind", "label": "What", "unit": null}
+    ],
+    "heading": null,
+    "label": null
+  },
+  "notes": "Thread frames on IEEE 802.15.4, decoded by OnAir's receiver (the Zigbee receiver in its Thread mode) through the onair-rx handler; the row has no decoder of its own, so only a handler runs it. One job reads one channel: start it on a 2.4 GHz channel's centre with a band of 2 MHz (the handler takes 4 MHz of IQ, OnAir's minimum). Each event is a frame whose check sequence passed: `frame_type`, `seq`, `pan` (4 hex digits), `src` and `dst` (4 hex digits for a short address, 16 for an extended one; null on a frame with none), `secured` (the link layer is: MAC security, or an AES-CCM level OnAir says is encrypted) and `kind`, OnAir's own sentence for what the frame is (a beacon with its network name, an encrypted data frame, a 6LoWPAN IPHC frame with its MLE command): opaque text, not a vocabulary. Thread has no Zigbee network layer, so there is no `nwk_src` or `nwk_dst`. Nothing is decrypted and no key is loaded; each PSDU with its FCS (link type 195) goes to a packet capture. Ranges and bands: Thread runs on IEEE 802.15.4's 2.4 GHz channels 11 to 26 only (2405 MHz plus 5 MHz a channel, 2 MHz wide), which are also OnAir's Thread tuning; identify and classify try the row inside 2400 to 2483.5 MHz. Listing bar: measured on the build host (12 cores) through a scratch node's release build, 30 s of the generated capture looping on a file source and fed in real time; the job skipped no input, onair-rx used 0.57 of a core and the node 0.28 of a core (load average 5.1 to 4.6, with another build running).",
+  "test": {
+    "kind": "fixture",
+    "path": "onair/thread.sigmf-meta",
+    "expect": {"pan": "7a31", "src": "5000", "frame_type": "beacon"},
+    "within_ms": 20000
+  }
+}

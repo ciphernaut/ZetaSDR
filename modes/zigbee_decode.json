@@ -1,0 +1,80 @@
+{
+  "id": "zigbee_decode",
+  "name": "Zigbee (IEEE 802.15.4)",
+  "family": "iot",
+  "band": {
+    "bandwidth_hz": 2000000,
+    "centers_hz": [
+      2405000000,
+      2410000000,
+      2415000000,
+      2420000000,
+      2425000000,
+      2430000000,
+      2435000000,
+      2440000000,
+      2445000000,
+      2450000000,
+      2455000000,
+      2460000000,
+      2465000000,
+      2470000000,
+      2475000000,
+      2480000000
+    ],
+    "range_hz": [[2400000000, 2483500000], [868000000, 868600000], [902000000, 928000000]],
+    "min_hz": 2000000
+  },
+  "modulation": ["oqpsk"],
+  "label": "Zigbee",
+  "protocol": "zigbee",
+  "decoder": null,
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": {"type": "string"},
+        "frame_type": {"type": "string"},
+        "seq": {"type": ["integer", "null"]},
+        "pan": {"type": ["string", "null"]},
+        "src": {"type": ["string", "null"]},
+        "dst": {"type": ["string", "null"]},
+        "nwk_src": {"type": ["string", "null"]},
+        "nwk_dst": {"type": ["string", "null"]},
+        "secured": {"type": ["boolean", "null"]},
+        "len": {"type": "integer"}
+      }
+    },
+    "summary": "{frame_type} {src?} to {dst?} PAN {pan?}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 15000,
+    "min_span_ms": 0,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": [],
+  "content": "network_traffic",
+  "subject": {
+    "key": "src",
+    "name": "devices",
+    "waterfall": "summary",
+    "columns": [
+      {"field": "frame_type", "label": "Frame", "unit": null},
+      {"field": "pan", "label": "PAN", "unit": null},
+      {"field": "dst", "label": "Destination", "unit": null},
+      {"field": "secured", "label": "Secured", "unit": null}
+    ],
+    "heading": null,
+    "label": null
+  },
+  "notes": "Zigbee frames on IEEE 802.15.4, decoded by OnAir's receiver through the onair-rx handler; the row has no decoder of its own, so only a handler runs it. One job reads one channel: start it on a channel's centre with a band of 2 MHz (the handler takes 4 MHz of IQ, OnAir's minimum, and the frequency picks the PHY: O-QPSK at 2.4 GHz, the BPSK PHY below 1 GHz). Each event is a frame whose check sequence passed: `frame_type` (`beacon`, `data`, `ack`, `command`, or OnAir's names for the 2015 types), `seq`, `pan` (4 hex digits), `src` and `dst` (4 hex digits for a short address, 16 for an extended one; null on a frame with none, such as an ack), `nwk_src` and `nwk_dst` (when the Zigbee network header is in the clear) and `secured` (the MAC, NWK or APS layer is secured). Nothing is decrypted and no key is loaded; each PSDU with its FCS (link type 195) goes to a packet capture. Ranges and bands: the sixteen 2.4 GHz channels 11 to 26 (2405 MHz plus 5 MHz a channel, 2 MHz wide) are IEEE 802.15.4's channel page 0, and the sub-GHz ranges (868 to 868.6 MHz, 902 to 928 MHz) are its BPSK PHY's channels 0 to 10; the sub-GHz BPSK PHY has no test signal and is untested, so the row's check proves the 2.4 GHz PHY only. Listing bar: measured on the build host (12 cores) through a scratch node's release build, 30 s of the generated capture looping on a file source and fed in real time; the job skipped no input, onair-rx used 0.58 of a core and the node 0.28 of a core (load average 6.2 to 5.3, with another build running).",
+  "test": {
+    "kind": "fixture",
+    "path": "onair/zigbee.sigmf-meta",
+    "expect": {"frame_type": "command", "pan": "ffff", "dst": "ffff"},
+    "within_ms": 20000
+  }
+}

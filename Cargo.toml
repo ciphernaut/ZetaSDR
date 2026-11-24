@@ -26,6 +26,11 @@ opt-level = 3
 [profile.dev.package.zeta-dsp]
 opt-level = 3
 
+# An external handler's input is converted to its format in `zeta-ext`: unoptimised, a
+# 20 MHz Wi-Fi or 4 MHz Bluetooth LE job falls behind real time and skips input.
+[profile.dev.package.zeta-ext]
+opt-level = 3
+
 [profile.dev.package.nnnoiseless]
 opt-level = 3
 
