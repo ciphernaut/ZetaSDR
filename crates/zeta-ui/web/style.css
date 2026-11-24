@@ -1014,3 +1014,4 @@ canvas.video-main { width: 100%; height: 100%; object-fit: contain; image-render
 /* A canvas has no ::after: the strip's "no lock" label sits on the thumb's cell. */
 #video .video-strip .thumb-cell.nolock::after { content: "no lock"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); font-size: 11px; color: var(--text); pointer-events: none; }
 .ctx-item[aria-disabled="true"] { opacity: .45; cursor: default; }
+.ctx-item.revising { font-style: italic; }

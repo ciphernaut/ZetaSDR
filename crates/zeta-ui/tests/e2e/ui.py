@@ -22,6 +22,7 @@ ZETA_UI_URL_LLM (for the `/ask` scenarios), and a node whose ring is a few secon
 """
 
 import base64
+import itertools
 import json
 import os
 import re
@@ -251,7 +252,7 @@ def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
     for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2",
-                   "ism", "dmr", "kiwi"):
+                   "ism", "dmr", "cbvoice", "kiwi"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -5781,7 +5782,7 @@ TRANSCRIBE_ENTRIES = [
 
 # Every `data-action` the two menus had before they were drawn from one table (actions.js).
 MENU_ACTION_IDS = [
-    "classify", "capture", "identify", "watch", "decode_across", "aprs_decode", "pocsag_decode",
+    "choice_start", "classify", "capture", "identify", "watch", "decode_across", "aprs_decode", "pocsag_decode",
     "rds_decode", "adsb_decode", "acars_decode", "video", "fm_demod", "wfm_demod", "am_demod",
     "ssb_usb", "ssb_lsb", "wfm_transcribe", "fm_transcribe", "am_transcribe",
     "ssb_usb_transcribe", "ssb_lsb_transcribe", "measure", "plan", "set", "scan", "iq_read",
@@ -6112,6 +6113,123 @@ def box_on(page, url, secret, source, hz):
     close_menu(page)
     drag_hz(page, hz, view_hz)
     return box_of(page)
+
+
+# The `cbvoice` source loops voice on CB channel 20, 700 Hz above its centre (ui.rs
+# `cbvoice_fixture`), keyed on for 2 s and off for 2 s. A box over it lands on either period,
+# so the scenarios reopen the menu until its first entry reads the choice (R4).
+CBVOICE_CENTER_HZ = 476_900_700
+
+
+def choice_entry(page, url, secret, source, hz, prefix, within_s=90):
+    """The box menu's `choice_start` item once it reads `prefix`, the box `hz` wide about the
+    middle of `source`'s view. A box over keyed-on and keyed-off periods alike reads as AM or
+    OOK to layer 1, and the box spans more of them the longer the waterfall has run: so the
+    source is shown afresh (the box then spans about MENU_SPAN_S) until a box lands on a
+    keyed-on period (R4)."""
+    deadline = time.monotonic() + within_s
+    select_source(page, url, secret, source)
+    while True:
+        wait_span(page, MENU_SPAN_S)
+        drag_menu(page, 0.0, 1.0)
+        view_hz = box_of(page)[1]
+        close_menu(page)
+        drag_hz(page, hz, view_hz)
+        item = page.locator('#ctx .ctx-item[data-action="choice_start"]')
+        try:
+            expect(item).to_have_text(re.compile("^" + re.escape(prefix)), timeout=5_000)
+            return item
+        except AssertionError:
+            if time.monotonic() > deadline:
+                raise
+        # The session holds: only the page and its waterfall start afresh.
+        fresh_spectrum_jobs(url, secret)
+        page.goto(url + "/ui/")
+        page.click(f'.src-tab[data-id="{source}"]')
+
+
+def choose_jobs(url, secret):
+    return [j for j in http_json(url, secret, "/op", {"op": "job_list", "all": True})["value"]
+            if j["kind"] == "choose"]
+
+
+def scenario_the_first_box_entry_is_the_choice(page, url, secret):
+    item = choice_entry(page, url, secret, "cbvoice", 12_500, "Start fm_demod here:")
+    first = page.locator("#ctx .ctx-item").first
+    expect(first).to_have_attribute("data-action", "choice_start")
+    expect(item).to_have_text(re.compile(r"^Start fm_demod here: \d+\.\d kHz \S"))
+    # The Listen group leads with the chosen demodulator.
+    listen = page.locator('#ctx .ctx-item[data-group="listen"]')
+    listen.click()
+    expect(page.locator('#ctx .ctx-sub[data-group="listen"] .ctx-item').first
+           ).to_have_attribute("data-action", "fm_demod")
+    close_menu(page)
+
+
+def scenario_the_choice_entry_starts_its_job(page, url, secret):
+    item = choice_entry(page, url, secret, "cbvoice", 12_500, "Start fm_demod here:")
+    job = None
+    try:
+        with page.expect_request(is_op("job_start")) as req:
+            item.click()
+        body = json.loads(req.value.post_data)
+        assert body["kind"] == "fm_demod" and body["source"] == "cbvoice", body
+        assert body["deviation_hz"] == 2500, body
+        assert abs(body["center_hz"] - CBVOICE_CENTER_HZ) <= 300, body
+        jobs = wait_until(lambda: running_jobs(url, secret, "fm_demod", "cbvoice"), 15,
+                          "a running fm_demod on cbvoice")
+        job = jobs[0]["id"]
+        expect(page.locator("#ctx")).to_be_hidden()
+    finally:
+        if job:
+            stop_job(url, secret, job)
+
+
+def scenario_the_choice_entry_revises_to_dmr(page, url, secret):
+    # The `dmr` source loops a repeater (DMR_HZ): step 1 may read it as plain FM; the transient
+    # choose job's proof revises the entry in place.
+    select_source(page, url, secret, "dmr")
+    wait_span(page, MENU_SPAN_S)
+    drag_menu(page, 0.0, 1.0)
+    view_hz = box_of(page)[1]
+    close_menu(page)
+    drag_hz(page, 12_500, view_hz)
+    item = page.locator('#ctx .ctx-item[data-action="choice_start"]')
+    expect(item).to_have_text(re.compile(r"^Start dmr_decode here:"), timeout=15_000)
+    expect(item).not_to_have_class(re.compile("revising"), timeout=15_000)
+    close_menu(page)
+
+
+def scenario_closing_the_menu_stops_its_choose(page, url, secret):
+    item = choice_entry(page, url, secret, "cbvoice", 12_500, "Start ")
+    expect(item).to_be_visible()
+    close_menu(page)
+    wait_until(lambda: not choose_jobs(url, secret), 3, "no choose job after the menu closed")
+
+
+def scenario_listen_puts_the_chosen_demodulator_first(page, url, secret):
+    login(page, url, secret)
+    got = page.evaluate(
+        """async () => {
+          const a = await import('./actions.js');
+          const ids = (job) => {
+            const ctx = {host: null, rows: [], sets: [], plan: null, src: null,
+                         sel: {sourceId: 'x', centerHz: 100e6, bandwidthHz: 12500},
+                         choice: job && {job, row: job.kind, step: 1, settled: 'best_guess'}};
+            return a.offered('box', ctx).filter((e) => a.groupOf(e, 'box') === 'listen')
+              .map((e) => e.id);
+          };
+          const j = (kind, params = {}) => ({kind, center_hz: 100e6, bandwidth_hz: 6000, params});
+          return {none: ids(null), am: ids(j('am_demod')), lsb: ids(j('ssb_demod', {sideband: 'lsb'})),
+                  usb: ids(j('ssb_demod', {sideband: 'usb'})), dmr: ids(j('dmr_decode'))};
+        }""")
+    base = ["fm_demod", "wfm_demod", "am_demod", "ssb_usb", "ssb_lsb"]
+    twins = [i for i in got["none"] if i not in base]
+    assert got["none"][:5] == base and len(twins) == 5, got
+    assert got["dmr"] == got["none"], got
+    assert got["am"] == ["am_demod", "fm_demod", "wfm_demod", "ssb_usb", "ssb_lsb"] + twins, got
+    assert got["lsb"] == ["ssb_lsb", "fm_demod", "wfm_demod", "am_demod", "ssb_usb"] + twins, got
+    assert got["usb"] == ["ssb_usb", "fm_demod", "wfm_demod", "am_demod", "ssb_lsb"] + twins, got
 
 
 def scenario_a_row_with_no_decoder_has_a_decode_entry(page, url, secret):

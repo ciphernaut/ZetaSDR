@@ -170,6 +170,14 @@
 // span is clamped to the newest SPAN_LIMIT_NS before the newest painted column (on opening
 // and again when an entry is chosen); the footer says so when it was.
 //
+// The choice: opening the box menu asks `classify` quietly (not the transcript) for its `choice`,
+// which the first entry (`choice_start`: `Start <kind> here: <width> kHz <row>`, ` (not
+// proved)` for a best-guess decoder, `Can't tell: <reason>` greyed) shows; then it starts a
+// transient `choose` job (surface `menu`, up to step 2), whose revisions (its event stream,
+// and its record's context.choose.choice each CHOOSE_POLL_MS) replace the label in place,
+// the entry carrying the class `revising` meanwhile. Closing or reopening the menu stops the
+// job. The Listen group leads with the chosen demodulator (actions.js offered).
+//
 // Closing: Escape, a pointer press outside the menu, or choosing an entry. Up/Down move the
 // focus between the entries of one level; Enter or Space chooses one.
 //
@@ -217,6 +225,8 @@ import { capHz } from "./waterfall.js";
 
 // How far past the ring's earliest sample a `too_old` retry starts, as the front moves on.
 const RING_FRONT_MARGIN_NS = 300_000_000;
+// How often the box's transient `choose` job's context is read for a revision.
+const CHOOSE_POLL_MS = 500;
 export const SPAN_LIMIT_NS = 8_000_000_000;
 export const LABEL_STEP_PX = 18;
 // The label spacing in Hz while the waterfall cannot map Hz to pixels (band not known yet).
@@ -656,6 +666,13 @@ class Menu {
     // The fit in progress (its generation token) or null; close() bumps fitGen.
     this.fitting = null;
     this.fitGen = 0;
+    // The node's choice for the open box (classify's, then its transient `choose` job's
+    // revisions), the choose job's id while it runs and the generation guarding both.
+    this.choice = null;
+    this.chooseJob = null;
+    this.chooseGen = 0;
+    this.chooseTimer = null;
+    this.chooseSub = null;
     this.labelKeys = [];
     this.pointer = { x: 0, y: 0 };
     // modes_list's rows (a promise), read once per page; `rows` once it answered.
@@ -792,6 +809,8 @@ class Menu {
       plan: this.plan(),
       sets: this.readySets(),
       rows: this.rows,
+      choice: this.choice,
+      revising: this.chooseJob !== null,
       src: (this.sources() || []).find((x) => x.id === this.sel.sourceId),
     };
   }
@@ -1076,6 +1095,9 @@ class Menu {
     const label = typeof entry.label === "function" ? entry.label(ctx) : entry.label;
     const item = this.button(entry.id, label, subOf(entry, ctx) ? null : () => this.choose(entry));
     const refused = entry.disabled ? entry.disabled(ctx) : null;
+    const title = entry.title ? entry.title(ctx) : null;
+    if (title) item.title = title;
+    if (entry.revising?.(ctx)) item.classList.add("revising");
     if (refused) {
       item.setAttribute("aria-disabled", "true");
       item.dataset.refused = "true";
@@ -1118,6 +1140,8 @@ class Menu {
     this.fitGen += 1;
     this.setFitting(null);
     this.sel = { ...sel, sourceId: this.wf.sourceId };
+    this.stopChoose();
+    this.choice = null;
     this.paint(this.el, this.footer, this.boxCtx());
     this.showFooter(this.current());
     // The rows' first answer draws the menu again (Decode across's rows).
@@ -1128,12 +1152,152 @@ class Menu {
       });
     }
     this.el.hidden = false;
+    this.pursueChoice(this.sel, this.chooseGen);
     // Keep it inside the viewport.
     const w = this.el.offsetWidth;
     const h = this.el.offsetHeight;
     this.el.style.left = `${Math.max(0, Math.min(x, window.innerWidth - w))}px`;
     this.el.style.top = `${Math.max(0, Math.min(y, window.innerHeight - h))}px`;
     this.el.querySelector(".ctx-item")?.focus({ preventScroll: true });
+  }
+
+  // Ends the box's choice work: the poll, and its transient `choose` job if still running.
+  stopChoose() {
+    this.chooseGen += 1;
+    clearTimeout(this.chooseTimer);
+    this.chooseTimer = null;
+    this.chooseSub?.close();
+    this.chooseSub = null;
+    const id = this.chooseJob;
+    this.chooseJob = null;
+    if (id !== null) this.ov.api.op({ op: "job_stop", job: id }).catch(() => {});
+  }
+
+  // classify on the box for its choice, quietly (not the transcript); null when it failed.
+  // A span the ring no longer holds is tried once more on the newest span, as reclassify does.
+  async classifyChoice(s) {
+    const selection = this.selection(s);
+    try {
+      const r = await this.ov.api.op({ op: "classify", selection });
+      return r?.value?.choice ?? null;
+    } catch (e) {
+      const d = e?.json?.detail;
+      const end = newestNs(this.wf);
+      if (e?.json?.error !== "ring" || d?.cause !== "too_old" || end === null) return null;
+      const len = selection.span.end_ns - selection.span.start_ns;
+      const from = Math.round(Math.max(end - len, d.earliest_ns + RING_FRONT_MARGIN_NS));
+      if (!Number.isFinite(from) || from >= end) return null;
+      const span = { start_ns: from, end_ns: Math.round(end) };
+      try {
+        const r = await this.ov.api.op({ op: "classify", selection: { ...selection, span } });
+        return r?.value?.choice ?? null;
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  // The box menu's first entry: classify's choice at once, then a transient `choose` (menu
+  // surface, up to step 2) whose context holds the revisions, read every CHOOSE_POLL_MS and
+  // drawn in place. `gen` is chooseGen at the opening: a close or a new box ends it all.
+  async pursueChoice(at, gen) {
+    const live = () => gen === this.chooseGen && this.sel === at && !this.el.hidden;
+    const show = () => {
+      if (live() && this.fitting === null) this.repaint();
+    };
+    const first = await this.classifyChoice(this.current());
+    if (!live()) return;
+    this.choice = first;
+    let id;
+    try {
+      const r = await this.ov.api.op({
+        op: "job_start",
+        kind: "choose",
+        source: at.sourceId,
+        center_hz: at.centerHz,
+        bandwidth_hz: at.bandwidthHz,
+        deviation_hz: null,
+        sideband: null,
+        elastic: false,
+        replace: [],
+        choose: { up_to: 2, surface: "menu", start: false, transient: true },
+      });
+      id = r.value;
+    } catch {
+      show();
+      return;
+    }
+    if (!live()) {
+      this.ov.api.op({ op: "job_stop", job: id }).catch(() => {});
+      return;
+    }
+    this.chooseJob = id;
+    show();
+    // A revision: the answer `c` (null: none new) and whether the job is done. Only the
+    // job this opening started, while its menu is open.
+    const take = (c, done) => {
+      if (!live() || this.chooseJob !== id) return;
+      const changed = c != null && JSON.stringify(c) !== JSON.stringify(this.choice);
+      if (changed) this.choice = c;
+      // A done job ended by itself: nothing to stop, only the poll and the subscription.
+      if (done) this.chooseJob = null;
+      if (changed || done) show();
+      if (done) this.stopChoose();
+    };
+    // The job's own events carry every revision, the last one with its verdict just before the
+    // job (a transient one) is forgotten, which a poll can miss; the poll covers what came
+    // before the subscription.
+    this.ov.api
+      .streams()
+      .then((all) => {
+        const sid = all.find((x) => x.kind === "event" && x.provenance?.job === id)?.id;
+        if (!sid || !live() || this.chooseJob !== id) return;
+        this.chooseSub = this.ov.api.streamText(
+          sid,
+          (msg) => {
+            const p = msg.type === "frame" ? msg.payload : null;
+            if (p && (p.protocol === "choice" || p.protocol === "verdict")) {
+              take(p.choice, p.protocol === "verdict");
+            }
+          },
+          null,
+          { reconnect: false },
+        );
+      })
+      .catch(() => {});
+    const tick = async () => {
+      // A transient job is forgotten the moment it stops, so one missing from the list has
+      // ended and the last choice stands (job_context would answer an unknown job: a 422 the
+      // browser logs as an error).
+      let ctx = null;
+      try {
+        const jobs = (await this.ov.api.op({ op: "job_list", all: true })).value ?? [];
+        ctx = jobs.find((j) => j.id === id)?.context?.choose ?? null;
+      } catch {
+        // The node did not answer: try again.
+        ctx = undefined;
+      }
+      if (!live() || this.chooseJob !== id) return;
+      if (ctx !== undefined) take(ctx?.choice, ctx === null || ctx.verdict != null);
+      if (this.chooseJob === id) this.chooseTimer = setTimeout(tick, CHOOSE_POLL_MS);
+    };
+    this.chooseTimer = setTimeout(tick, CHOOSE_POLL_MS);
+  }
+
+  // The choice entry: its job as the node chose it (a measured centre, width and parameters).
+  startChoice(choice, s) {
+    const j = choice.job;
+    return this.applyOp({
+      op: "job_start",
+      kind: j.kind,
+      source: s.sourceId,
+      center_hz: j.center_hz,
+      bandwidth_hz: j.bandwidth_hz,
+      deviation_hz: j.params?.deviation_hz ?? null,
+      sideband: j.params?.sideband ?? null,
+      elastic: false,
+      replace: [],
+    });
   }
 
   // Draws the open box menu again (the rows came after it opened), keeping its open submenus
@@ -1173,6 +1337,7 @@ class Menu {
 
   close() {
     this.cancelDwell();
+    this.stopChoose();
     this.el.hidden = true;
     this.wf.clearSelection();
     // A fit in progress is cancelled: its result no longer belongs to an open menu.

@@ -23,6 +23,9 @@
 //     section   a heading the entry starts in its group (a `.ctx-sep` before the first entry
 //               of a section: the Transcribe twins under the demodulators, a job's band steps
 //               under Next); a string, or {box, job} per surface (sectionOf)
+//     title(ctx) -> string | null   the hover title of its item (a greyed entry's `disabled` wins)
+//     revising(ctx) -> bool   true while the node still revises what the entry says: the item
+//               carries the class `revising` (the choice entry while its `choose` runs)
 //     elsewhere(ctx) -> bool   true where the entry's data says the selection is not where it
 //               fits: it is drawn after its group's fitting entries, under an `elsewhere`
 //               heading, fully usable (the decoder rows outside their ranges or widths)
@@ -321,6 +324,7 @@ const WIDTHS = [2500, 5000, 6250, 12500, 25000];
 
 export const GROUPS = {
   box: [
+    { id: "choice", label: "Start", direct: true },
     { id: "what", label: "What is this?", direct: true },
     { id: "listen", label: "Listen", prefix: true },
     { id: "decode", label: "Decode", prefix: true },
@@ -517,6 +521,30 @@ const banded = (c) => {
   return c.job.kind !== "mix" && !!t && Number.isFinite(t.center_hz)
     && Number.isFinite(t.bandwidth_hz) && t.bandwidth_hz > 0 && !!c.sel;
 };
+// The choice entry's label: `Start <kind> here: <width> kHz <row label>` (` (not proved)` for
+// a best-guess decoder), or `Can't tell: <reason>`.
+function choiceLabel(c) {
+  const ch = c.choice;
+  if (!ch?.job) return `Can't tell: ${ch?.reason ?? "no job fits"}`;
+  const row = (c.rows || []).find((r) => r.id === ch.row);
+  const guess = !ch.job.kind.endsWith("_demod") && ch.settled === "best_guess" ? " (not proved)" : "";
+  return `Start ${ch.job.kind} here: ${khzText(ch.job.bandwidth_hz)} kHz ${row?.name ?? ch.row}${guess}`;
+}
+
+// The choice entry's hover title: the runner-up.
+function choiceTitle(c) {
+  const alt = c.choice?.runner_up;
+  return alt ? `runner-up: ${alt.job.kind} ${khzText(alt.job.bandwidth_hz)} kHz` : null;
+}
+
+// The Listen entry of the chosen demodulator (null: the choice is no demodulator).
+function chosenListenId(choice) {
+  const j = choice?.job;
+  if (!j || !j.kind.endsWith("_demod")) return null;
+  if (j.kind === "ssb_demod") return j.params?.sideband === "lsb" ? "ssb_lsb" : "ssb_usb";
+  return j.kind;
+}
+
 const start = (id) => (c) => c.host.startJob(id, c.sel);
 const fitted = (id) => (c) => c.host.fitAndStart(id, c.sel);
 const job = (kind, deviation = null, sideband = null) => ({ kind, deviation, sideband });
@@ -629,6 +657,16 @@ export const ACTIONS = [
   },
   // On a job: its band over the newest span of its source, which the page has only for the
   // shown source (menu.js jobCtx).
+  // The node's choice for the box (menu.js Menu.pursueChoice: classify's `choice`, revised in
+  // place by a transient `choose` job): the job it would start, or why it cannot tell.
+  {
+    id: "choice_start", label: choiceLabel, group: "choice", on: ["box"],
+    title: choiceTitle,
+    revising: (c) => c.revising === true,
+    applies: (c) => c.choice != null,
+    disabled: (c) => (c.choice.job ? null : c.choice.reason ?? "no job fits"),
+    run: (c) => c.host.startChoice(c.choice, c.sel),
+  },
   {
     id: "classify", label: "What is this?", group: { box: "what", job: "next" }, on: ["box", "job"],
     section: { job: "On its band" },
@@ -824,9 +862,15 @@ const expand = (entry, x) => ({
 
 export function offered(surface, ctx) {
   const c = { ...ctx, surface };
-  return ACTIONS.flatMap((a) =>
+  const list = ACTIONS.flatMap((a) =>
     a.each ? (a.on.includes(surface) ? a.each(c).map((x) => expand(a, x)) : []) : [a],
   ).filter((a) => isOffered(a, c));
+  // The box's Listen group leads with the chosen demodulator (before the first demodulator,
+  // ahead of the Transcribe twins).
+  const chosen = surface === "box" ? list.findIndex((e) => e.id === chosenListenId(c.choice)) : -1;
+  const first = list.findIndex((e) => groupOf(e, surface) === "listen" && !e.twin);
+  if (chosen > first && first >= 0) list.splice(first, 0, ...list.splice(chosen, 1));
+  return list;
 }
 
 export function runAction(id, ctx) {

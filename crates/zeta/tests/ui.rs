@@ -333,6 +333,26 @@ fn dmr_fixture(dir: &Path) -> PathBuf {
     zeta_dsp::fixtures::write_fixture(dir, "dmr", &iq, 48_000, DMR_CENTER_HZ)
 }
 
+/// The `cbvoice` fixture's capture centre: `uhf_cb_au` channel 20.
+const CBVOICE_CENTER_HZ: u64 = 476_900_000;
+
+/// Voice on a CB channel: [`speech_like`](zeta_dsp::fixtures::speech_like) frequency
+/// modulated at 2500 Hz deviation, 700 Hz above [`CBVOICE_CENTER_HZ`], keyed on for 2 s and
+/// off for 2 s (the carrier stays up, unmodulated: a box over both periods still reads as
+/// FM), 8 s at 48 kHz, looped by the file source; the meta path.
+fn cbvoice_fixture(dir: &Path) -> PathBuf {
+    const RATE: u32 = 48_000;
+    let mut audio = zeta_dsp::fixtures::speech_like(RATE, 8.0);
+    for (n, a) in audio.iter_mut().enumerate() {
+        // Off for the second 2 s of every 4.
+        if (n / RATE as usize / 2) % 2 == 1 {
+            *a = 0.0;
+        }
+    }
+    let iq = zeta_dsp::synth::nbfm_modulate(&audio, RATE, RATE, 2500.0, 700.0);
+    zeta_dsp::fixtures::write_fixture(dir, "cbvoice", &iq, RATE, CBVOICE_CENTER_HZ)
+}
+
 /// Recording `meta` (a `<name>.sigmf-meta` written by `write_fixture`) labelled at
 /// `center_hz` as `<stem>.sigmf-{meta,data}` beside it, its data hard-linked (copied where a
 /// link fails); the new meta path.
@@ -1268,6 +1288,8 @@ impl Nodes {
         let fsk = format!("fsk={}", fsk_fixture(dir.path()).display());
         // A DMR repeater with a call on each slot: the job row's stream picker.
         let dmr = format!("dmr={}", dmr_fixture(dir.path()).display());
+        // Voice on CB channel 20 (+700 Hz), keyed on 2 s and off 2 s: the box menu's choice.
+        let cbvoice = format!("cbvoice={}", cbvoice_fixture(dir.path()).display());
         // Two sources carry the same analog video recording (the video scenarios).
         let video_meta = video_fixture(dir.path());
         let video = format!("video={}", video_meta.display());
@@ -1333,6 +1355,8 @@ impl Nodes {
                 &fsk,
                 "--source-file",
                 &dmr,
+                "--source-file",
+                &cbvoice,
                 "--source-file",
                 &video,
                 "--source-file",
