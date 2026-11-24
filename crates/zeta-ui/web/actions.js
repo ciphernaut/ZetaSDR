@@ -157,6 +157,17 @@
 //                                             out_of_range, shown in the transcript)
 //   acars_decode  ACARS                      job_start kind=acars_decode, deviation_hz null,
 //                                             bandwidth_hz at least ACARS_MIN_BANDWIDTH_HZ
+//   ble_decode  Bluetooth LE                 the rows with no decoder of their own, which only
+//   lorawan_decode  LoRaWAN                  a handler file's entry runs (OnAir's: plan 47),
+//   zigbee_decode  Zigbee                    each labelled as its row (`label`): job_start
+//   thread_decode  Thread                    kind=<id> on the selection as is, deviation_hz
+//   zwave_decode  Z-Wave                     null; offered only when modes_list lists the row
+//   wifi_decode  Wi-Fi                       (`applies`; not before the rows are read), and
+//   wisun_decode  Wi-SUN                     greyed (`disabled`: aria-disabled, its title the
+//   tetra_decode  TETRA                      row's `reason`) while the row is not `ready`
+//   gsmr_decode  GSM-R
+//   lte_decode  LTE
+//   dvbs_ip_decode  DVB-S IP
 //   video      Video                          job_start kind=video_decode at the box's centre
 //                                             and width as drawn (never fitted, never a grid);
 //                                             greyed (`disabled`: aria-disabled, its title the lease's
@@ -517,6 +528,17 @@ const decoder = (id, label, kind = id) => ({
   elsewhere: (c) => !rowFits(id, rowOf(c, kind), c.sel),
   sub: (c) => decoderHandlers(id, rowOf(c, kind)),
 });
+// The decoder entry of a row with no decoder of its own, which only a handler file's entry
+// runs (plan 47: the rows OnAir alone decodes): offered only when modes_list lists the row,
+// and greyed, titled with the row's `reason`, while the row is not ready.
+const handled = (id, label) => ({
+  ...decoder(id, label),
+  applies: (c) => rowOf(c, id) !== undefined,
+  disabled: (c) => {
+    const row = rowOf(c, id);
+    return row && row.state !== "ready" ? (row.reason ?? row.state) : null;
+  },
+});
 // A decoder entry's submenu: the mode's ready handlers, the policy's pick first; null (a plain
 // entry) with fewer than two.
 function decoderHandlers(id, row) {
@@ -637,6 +659,17 @@ export const ACTIONS = [
   decoder("rds_decode", "RDS (FM station data)"),
   decoder("adsb_decode", "ADS-B (dump1090)"),
   decoder("acars_decode", "ACARS"),
+  handled("ble_decode", "Bluetooth LE"),
+  handled("lorawan_decode", "LoRaWAN"),
+  handled("zigbee_decode", "Zigbee"),
+  handled("thread_decode", "Thread"),
+  handled("zwave_decode", "Z-Wave"),
+  handled("wifi_decode", "Wi-Fi"),
+  handled("wisun_decode", "Wi-SUN"),
+  handled("tetra_decode", "TETRA"),
+  handled("gsmr_decode", "GSM-R"),
+  handled("lte_decode", "LTE"),
+  handled("dvbs_ip_decode", "DVB-S IP"),
   {
     ...decoder("video", "Video", "video_decode"),
     disabled: (c) => videoRefusal(c.src, c.sel.bandwidthHz),

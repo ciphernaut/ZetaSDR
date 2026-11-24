@@ -132,7 +132,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (14 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (15 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -225,7 +225,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 4, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (14 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (15 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -251,7 +251,7 @@ def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
     for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2",
-                   "dmr", "kiwi"):
+                   "ism", "dmr", "kiwi"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -591,7 +591,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (14 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (15 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -6086,6 +6086,118 @@ def scenario_decode_menu_lists_new_kinds(page, url, secret):
     assert menu_side(page, "acars_decode") == "elsewhere", menu_side(page, "acars_decode")
     expect(menu_item(page, "pocsag_decode")).to_have_text("POCSAG")
     expect(menu_item(page, "acars_decode")).to_have_text("ACARS")
+    close_menu(page)
+
+
+# Plan 47's rows with no decoder of their own, which only a handler (OnAir) runs: each has a
+# Decode entry, labelled as its row (`label`), shown only when modes_list lists the row.
+NO_DECODER_ENTRIES = [
+    ("ble_decode", "Bluetooth LE"), ("lorawan_decode", "LoRaWAN"), ("zigbee_decode", "Zigbee"),
+    ("thread_decode", "Thread"), ("zwave_decode", "Z-Wave"), ("wifi_decode", "Wi-Fi"),
+    ("wisun_decode", "Wi-SUN"), ("tetra_decode", "TETRA"), ("gsmr_decode", "GSM-R"),
+    ("lte_decode", "LTE"), ("dvbs_ip_decode", "DVB-S IP"),
+]
+
+# The two devices `alt` prints for a `ble_decode` job (ui.rs ALT_BLE_LINES).
+ALT_BLE_MACS = ["a1b2c3d4e5f6", "0a1b2c3d4e5f"]
+
+
+def box_on(page, url, secret, source, hz):
+    """Show `source` and open the box menu on a selection about `hz` wide about the middle
+    of its view; the box's (center_hz, bandwidth_hz)."""
+    select_source(page, url, secret, source)
+    wait_span(page, MENU_SPAN_S)
+    drag_menu(page, 0.0, 1.0)
+    view_hz = box_of(page)[1]
+    close_menu(page)
+    drag_hz(page, hz, view_hz)
+    return box_of(page)
+
+
+def scenario_a_row_with_no_decoder_has_a_decode_entry(page, url, secret):
+    # Bluetooth LE has no decoder of its own; on the suite's node `alt` is its only handler
+    # (ui.rs fake_handlers). On a box at 2426 MHz at least the row's 2 MHz wide (the `ism`
+    # source), the Decode group shows it above the `elsewhere` heading as a plain entry; it
+    # starts a `ble_decode` job run by `alt`, whose two devices reach the Subjects pane.
+    row = mode_rows(url, secret)["ble_decode"]
+    need = row["band"].get("min_hz") or row["band"]["bandwidth_hz"]
+    assert row["state"] == "ready" and row["decoder_kind"] is None, row
+    assert [h["id"] for h in row["handlers"]] == ["alt"], row["handlers"]
+    c, bw = box_on(page, url, secret, "ism", need * 1.1)
+    assert need <= bw < need * 1.5 and in_ranges(row, c - bw / 2, c + bw / 2), f"box {c} {bw}"
+    assert abs(c - 2_426_000_000) < 200_000, f"box {c} {bw}"
+    wait_until(lambda: menu_side(page, "ble_decode") == "near", 5.0, "Bluetooth LE near")
+    item = menu_item(page, "ble_decode")
+    expect(item).to_have_text("Bluetooth LE")
+    expect(item).not_to_have_attribute("aria-disabled", "true")
+    expect(page.locator('#ctx .ctx-sub[data-for="ble_decode"]')).to_have_count(0)
+    job = None
+    try:
+        with page.expect_request(is_op("job_start")) as req:
+            item.click()
+        body = json.loads(req.value.post_data)
+        got = (body["kind"], body["source"], body["bandwidth_hz"])
+        assert got == ("ble_decode", "ism", bw), body
+        assert "handler" not in body, body
+        jobs = wait_until(lambda: running_jobs(url, secret, "ble_decode", "ism"), 15,
+                          "a ble_decode job on ism")
+        assert len(jobs) == 1, jobs
+        job = jobs[0]["id"]
+        assert jobs[0]["handler"] == "alt", jobs[0]
+        job_row(page, job)
+        open_subjects(page)
+        sec = page.locator(f'#subjects section.subject-job[data-job="{job}"]')
+        for mac in ALT_BLE_MACS:
+            expect(sec.locator(f'tr.subject[data-key="{mac}"]')).to_have_count(1, timeout=20_000)
+        expect(sec.locator("tr.subject")).to_have_count(len(ALT_BLE_MACS))
+    finally:
+        for j in running_jobs(url, secret, "ble_decode", "ism"):
+            stop_job(url, secret, j["id"])
+
+
+def scenario_a_decode_entry_for_a_row_with_no_ready_handler_is_greyed(page, url, secret):
+    # Zigbee has no decoder of its own and no ready handler on the suite's node (OnAir is
+    # pointed at a program that does not exist): on the same box its entry is greyed, titled
+    # with the row's reason, and choosing it starts nothing. Each of the eleven entries stands
+    # exactly when modes_list lists its row.
+    rows = mode_rows(url, secret)
+    row = rows["zigbee_decode"]
+    assert row["state"] != "ready" and row["reason"], row
+    assert row["reason"].startswith("no decoder of its own"), row["reason"]
+    c, bw = box_on(page, url, secret, "ism", 2_200_000)
+    assert in_ranges(row, c - bw / 2, c + bw / 2), f"box {c} {bw}"
+    item = menu_item(page, "zigbee_decode")
+    expect(item).to_have_text("Zigbee")
+    expect(item).to_have_attribute("aria-disabled", "true", timeout=10_000)
+    expect(item).to_have_attribute("title", row["reason"])
+    root = page.locator("#ctx")
+    for mode, label in NO_DECODER_ENTRIES:
+        entry = root.locator(f'.ctx-item[data-action="{mode}"]')
+        if mode in rows:
+            expect(entry).to_have_count(1)
+            expect(entry).to_have_text(label)
+        else:
+            expect(entry).to_have_count(0)
+    sent = []
+    page.on("request", lambda r: sent.append(r.post_data or "") if r.url.endswith("/op") else None)
+    item.click(force=True)
+    page.wait_for_timeout(500)
+    assert not any('"job_start"' in b for b in sent), sent
+    assert not running_jobs(url, secret, "zigbee_decode", "ism")
+    close_menu(page)
+
+
+def scenario_a_decode_entry_falls_elsewhere_off_its_band(page, url, secret):
+    # Off its band (a box at 100 MHz, wide enough for the row), Bluetooth LE stands under the
+    # Decode submenu's `elsewhere` heading, fully usable, as every decoder does off its ranges.
+    row = mode_rows(url, secret)["ble_decode"]
+    need = row["band"].get("min_hz") or row["band"]["bandwidth_hz"]
+    c, bw = box_on(page, url, secret, "video", need * 1.1)
+    assert bw >= need and not in_ranges(row, c - bw / 2, c + bw / 2), f"box {c} {bw}"
+    wait_until(lambda: menu_side(page, "ble_decode") == "elsewhere", 5.0, "Bluetooth LE elsewhere")
+    item = menu_item(page, "ble_decode")
+    expect(item).to_have_text("Bluetooth LE")
+    expect(item).not_to_have_attribute("aria-disabled", "true")
     close_menu(page)
 
 

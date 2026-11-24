@@ -332,6 +332,26 @@ fn dmr_fixture(dir: &Path) -> PathBuf {
     zeta_dsp::fixtures::write_fixture(dir, "dmr", &iq, 48_000, DMR_CENTER_HZ)
 }
 
+/// Recording `meta` (a `<name>.sigmf-meta` written by `write_fixture`) labelled at
+/// `center_hz` as `<stem>.sigmf-{meta,data}` beside it, its data hard-linked (copied where a
+/// link fails); the new meta path.
+fn relabel(meta: &Path, stem: &str, center_hz: u64) -> PathBuf {
+    let dir = meta.parent().expect("meta in a directory");
+    let text = std::fs::read_to_string(meta).expect("read meta");
+    let mut v: serde_json::Value = serde_json::from_str(&text).expect("meta JSON");
+    for c in v["captures"].as_array_mut().expect("meta captures") {
+        c["core:frequency"] = center_hz.into();
+    }
+    let data = dir.join(format!("{stem}.sigmf-data"));
+    let from = meta.with_extension("sigmf-data");
+    if std::fs::hard_link(&from, &data).is_err() {
+        std::fs::copy(&from, &data).expect("copy data");
+    }
+    let path = dir.join(format!("{stem}.sigmf-meta"));
+    std::fs::write(&path, serde_json::to_string(&v).unwrap()).expect("write meta");
+    path
+}
+
 /// An analog PAL video recording, as gen_video writes it: 26 fields (13 whole frames, so the
 /// file loops without a seam) of the test card, FM at 1.5 MHz per volt, 8 MHz at 100 MHz,
 /// noise 25 dB under the carrier (about 33 MB in `dir`).
@@ -878,12 +898,19 @@ fn fake_modes(dir: &Path) -> PathBuf {
 const ALT_APRS_LINES: &str =
     "{\"src\":\"N0CALL\",\"dst\":\"APRS\",\"path\":[],\"info\":\">alt handler\"}";
 
+/// What `alt` prints for a `ble_decode` job: two devices, shaped as the row's events (plan 47:
+/// the row has no decoder of its own, so `alt` is its only handler on the suite's node).
+const ALT_BLE_LINES: &str = "\
+    {\"protocol\":\"ble\",\"mac\":\"a1b2c3d4e5f6\",\"name\":\"Probe\",\"rssi_db\":-40}\n\
+    {\"protocol\":\"ble\",\"mac\":\"0a1b2c3d4e5f\",\"name\":null,\"rssi_db\":-52}";
+
 /// A handlers directory under `dir` holding `alt` and `quiet`, both zeta-ext's `fake_lines`
 /// (pinned with `ZETA_HANDLER_FAKE_LINES`) on the channel's IQ; its path.
 /// - `alt` is a second handler of `aprs_decode`, printing [`ALT_APRS_LINES`] 2 s into a job,
 ///   with no `packets` output, so the mode's `outputs` (the union) list `packet` while a job
 ///   run by `alt` gives none; and of `fake_pair`, printing [`FAKE_PAIR_ALT_LINES`] 2 s in and
-///   every second after.
+///   every second after; and of `ble_decode`, printing [`ALT_BLE_LINES`] once, on the
+///   channel at 2 MHz.
 /// - `quiet` is a third handler of `fake_pair` whose lines file is empty: it never prints, a
 ///   silent sibling (plan 43).
 fn fake_handlers(dir: &Path) -> PathBuf {
@@ -893,6 +920,8 @@ fn fake_handlers(dir: &Path) -> PathBuf {
     std::fs::write(&lines, ALT_APRS_LINES).expect("write alt_aprs.lines");
     let pair = dir.join("alt_pair.lines");
     std::fs::write(&pair, FAKE_PAIR_ALT_LINES).expect("write alt_pair.lines");
+    let ble = dir.join("alt_ble.lines");
+    std::fs::write(&ble, ALT_BLE_LINES).expect("write alt_ble.lines");
     let silent = dir.join("quiet_pair.lines");
     std::fs::write(&silent, "").expect("write quiet_pair.lines");
     let input =
@@ -914,6 +943,12 @@ fn fake_handlers(dir: &Path) -> PathBuf {
                     "args": ["--lines-file", pair.to_str().unwrap(),
                              "--repeat-bytes", FAKE_PAIR_REPEAT_BYTES],
                     "input": input,
+                    "output": output,
+                },
+                "ble_decode": {
+                    "args": ["--lines-file", ble.to_str().unwrap()],
+                    "input": {"stream": "iq", "format": "cs16", "rate_hz": 2_000_000,
+                              "via": "stdin"},
                     "output": output,
                 }
             }
@@ -1234,6 +1269,12 @@ impl Nodes {
         let video_meta = video_fixture(dir.path());
         let video = format!("video={}", video_meta.display());
         let video2 = format!("video2={}", video_meta.display());
+        // The same recording labelled at 2426 MHz, in the 2.4 GHz ISM band (Bluetooth LE's
+        // advertising channel 38): the Decode entries of the rows OnAir alone decodes.
+        let ism = format!(
+            "ism={}",
+            relabel(&video_meta, "ism", 2_426_000_000).display()
+        );
         let sock_dir = socket_dir();
         let sock = sock_dir.path().join("voiced.sock");
         let _voiced = fake_voiced(&sock);
@@ -1293,6 +1334,8 @@ impl Nodes {
                 &video,
                 "--source-file",
                 &video2,
+                "--source-file",
+                &ism,
                 "--source-kiwi",
                 &kiwi_flag,
             ],
