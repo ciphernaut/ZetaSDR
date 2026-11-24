@@ -446,6 +446,28 @@ fn a_watch_member_with_prefer_is_broken_at_load() {
 }
 
 #[test]
+fn a_trial_running_member_is_broken_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let sets_dir = dir.path().join("sets");
+    for kind in ["identify", "choose"] {
+        let member = format!(
+            r#"{{"id": "m", "radio": "radio", "op": "job_start", "kind": "{kind}",
+                "center_hz": 148500000, "bandwidth_hz": 12500, "deviation_hz": null,
+                "sideband": null}}"#
+        );
+        let id = format!("with_{kind}");
+        write_set(&sets_dir, &format!("{id}.json"), &one_member(&id, &member));
+    }
+    let sets = load(Some(&sets_dir));
+    for kind in ["identify", "choose"] {
+        assert_eq!(
+            broken(&sets, &format!("with_{kind}")),
+            format!("members[0].kind: {kind} cannot be a set member")
+        );
+    }
+}
+
+#[test]
 fn a_watch_member_narrower_than_its_row_is_broken_at_load() {
     let dir = tempfile::tempdir().unwrap();
     let sets_dir = dir.path().join("sets");

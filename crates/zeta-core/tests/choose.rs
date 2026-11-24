@@ -245,11 +245,8 @@ async fn choose_revises_fm_to_dmr_at_step_two() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn choose_on_voice_stays_fm_demod() {
     let dir = tempfile::tempdir().unwrap();
-    // A 5 kHz FM voice on the DMR fixture's frequency: as wide as the digital voice
-    // rows, so step 2 has rows to try.
-    let mut iq = nbfm_modulate(&speech_like(RATE_HZ, 3.0), RATE_HZ, RATE_HZ, 5_000.0, 0.0);
-    awgn(&mut iq, 25.0, 5);
-    let node = node_over(dir.path(), &iq, DMR_HZ, 10.0).await;
+    // As wide as the digital voice rows, so step 2 has rows to try.
+    let node = node_over(dir.path(), &voice_iq(), DMR_HZ, 10.0).await;
     let mut feed = feed(&node);
     let id = start(
         &node,
@@ -492,4 +489,84 @@ async fn a_slice_over_the_trial_quota_is_shortened_or_not_tried() {
         "{v}"
     );
     assert!(trials(&node).is_empty(), "{:?}", node.bursts().list());
+}
+
+/// A 5 kHz FM voice on the DMR fixture's frequency: step 2 tries the digital voice rows
+/// and none proves it.
+fn voice_iq() -> Vec<Complex<f32>> {
+    let mut iq = nbfm_modulate(&speech_like(RATE_HZ, 3.0), RATE_HZ, RATE_HZ, 5_000.0, 0.0);
+    awgn(&mut iq, 25.0, 5);
+    iq
+}
+
+/// The replay records in the job list (running or not).
+fn replays(node: &Node) -> Vec<zeta_core::job::JobRecord> {
+    node.job_list()
+        .into_iter()
+        .filter(|r| r.replay.is_some())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choose_leaves_no_replay_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &voice_iq(), DMR_HZ, 10.0).await;
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    assert!(!ctx["trials"].as_array().unwrap().is_empty(), "{ctx:#}");
+    // Its trials were its own: each goes once it ends.
+    until("the trial replays are forgotten", ENDS_WITHIN, || {
+        replays(&node).is_empty()
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_a_choose_in_step_two_stops_its_replays_and_unpins_the_slice() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &voice_iq(), DMR_HZ, 10.0).await;
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    until("a trial replay runs", ENDS_WITHIN, || {
+        replays(&node).iter().any(|r| r.state == JobState::Running)
+    })
+    .await;
+    let trial = replays(&node)
+        .into_iter()
+        .find(|r| r.state == JobState::Running)
+        .unwrap();
+    assert_eq!(trial.owner.as_ref(), Some(&id), "{trial:?}");
+    // The choose's to stop, not the operator's.
+    let refused = node
+        .apply(Op::JobStop {
+            job: trial.id.clone(),
+        })
+        .await;
+    assert!(matches!(refused, Err(OpError::Other { .. })), "{refused:?}");
+    assert!(trials(&node).iter().any(|r| r.pinned));
+    match node.apply(Op::JobStop { job: id.clone() }).await {
+        Ok(OpResult::Ok) => {}
+        r => panic!("stop: {r:?}"),
+    }
+    until("the choose job stops", ENDS_WITHIN, || {
+        state(&node, &id) == Some(JobState::Stopped)
+    })
+    .await;
+    until("its replays stop and go", ENDS_WITHIN, || {
+        replays(&node).is_empty()
+    })
+    .await;
+    let t = trials(&node);
+    assert_eq!(t.len(), 1, "{t:?}");
+    assert!(!t[0].pinned, "{t:?}");
+    // Stopped before a verdict.
+    let ctx = node.job_context(&id).unwrap();
+    assert!(ctx["choose"]["verdict"].is_null(), "{ctx:#}");
 }

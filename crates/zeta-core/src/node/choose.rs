@@ -40,6 +40,7 @@ use crate::graph::{Graph, GraphId};
 use crate::job::JobRecord;
 use crate::ops::{JobKind, Op, OpError, OpResult};
 use crate::port::{Port, Tuning};
+use crate::ring::RingError;
 use crate::stage::StageError;
 use crate::stream::{Frame, Payload};
 use crate::types::{Hz, JobId, Provenance, Selection, SourceId, Span, StreamId, StreamKind};
@@ -50,8 +51,14 @@ pub const RING_SHORT: &str = "not tried: the ring holds under 1 s";
 pub const OVER_QUOTA: &str = "not tried: the slice exceeds the trial quota";
 /// The note of a row the trial budget left no time for.
 pub const OVER_BUDGET: &str = "not tried: budget";
+/// The trial steps' note when layer 1 measured nothing to size a proved job by.
+pub const UNMEASURED: &str = "not tried: layer 1 did not measure the band";
 /// The shortest slice step 2 replays.
 const MIN_SLICE_NS: u64 = 1_000_000_000;
+/// How far after a ring's oldest sample a selection of all it holds starts: the next
+/// block written may evict that much before the selection is read (a ring of 1 s
+/// written in 100 ms blocks).
+const RING_MARGIN_NS: u64 = 100_000_000;
 /// Bytes one sample of a slice takes in the burst store (`cf32`).
 const SAMPLE_BYTES: u64 = 8;
 
@@ -249,70 +256,66 @@ impl Inner {
         let ring = self.rings.lock().unwrap().get(&r.source).cloned()?;
         let ring = ring.read().unwrap();
         let (start, latest) = (ring.latest_run_start()?, ring.latest()?);
-        let want_ns = (f64::from(slice_s) * 1e9) as u64;
-        let from = latest.0.saturating_sub(want_ns).max(start.0);
-        (latest.0 > from).then(|| {
-            let sel = Selection {
-                source: r.source.clone(),
-                span: Span {
-                    start_ns: crate::types::Timestamp(from),
-                    end_ns: latest,
-                },
-                center_hz: r.tuning.center_hz,
-                bandwidth_hz: r.tuning.bandwidth_hz,
-            };
-            (sel, latest.0 - from)
-        })
+        let (from, held_ns) = slice_span(start.0, latest.0, slice_s)?;
+        let sel = Selection {
+            source: r.source.clone(),
+            span: Span {
+                start_ns: crate::types::Timestamp(from),
+                end_ns: latest,
+            },
+            center_hz: r.tuning.center_hz,
+            bandwidth_hz: r.tuning.bandwidth_hz,
+        };
+        Some((sel, held_ns))
     }
 
-    /// Step 2: write `samples` (the selection `sel` of the ring at `rate`, centred
-    /// `ring_center`) as a trial capture, shortened to the newest the trial quota holds
-    /// (never under 1 s, else [`OVER_QUOTA`]), pinned until this returns, and replay it
-    /// through `choice.could_prove` ([`replay_trials`]). The answer: `choice` revised by
-    /// the first proof (step 2, `proved`, the old answer its runner-up), or `choice` with
-    /// [`OVER_BUDGET`] for the rows the budget left untried. `Cancelled` when the job is.
-    #[allow(clippy::too_many_arguments)]
-    async fn step_two(
-        self: &Arc<Self>,
+    /// Write `samples` (the selection `sel` of the ring at `rate`, centred
+    /// `ring_center`) as a trial capture, shortened to the newest the trial quota holds,
+    /// and pin it for the job. The `not tried: ...` reason when it cannot: the quota
+    /// holds under 1 s of it ([`OVER_QUOTA`]), or the write or the pin fails.
+    fn write_slice(
+        &self,
         node: &Node,
-        r: &mut Run,
-        choice: &Choice,
-        m: &Measurement,
         mut sel: Selection,
         (mut samples, rate, ring_center): (Vec<Complex<f32>>, Hz, Hz),
-        budget: Budget,
-    ) -> Result<Choice, StageError> {
-        let mut next = choice.clone();
+    ) -> Result<TrialSlice, String> {
         let fits = usize::try_from(self.bursts.policy().trial_keep_bytes / SAMPLE_BYTES)
             .unwrap_or(usize::MAX);
         if samples.len() > fits {
             if (fits as u64) < rate.0 {
-                next.not_tried.push(NotTried {
-                    row: None,
-                    reason: OVER_QUOTA.into(),
-                });
-                return Ok(next);
+                return Err(OVER_QUOTA.into());
             }
             let cut = samples.len() - fits;
             samples.drain(..cut);
             sel.span.start_ns.0 += cut as u64 * 1_000_000_000 / rate.0.max(1);
         }
-        let rec = match crate::ops::write_ring_slice(node, &sel, &samples, rate, ring_center, true)
-        {
-            Ok(rec) => rec,
-            Err(e) => {
-                next.not_tried.push(NotTried {
-                    row: None,
-                    reason: format!("not tried: the slice could not be written: {e}"),
-                });
-                return Ok(next);
-            }
-        };
-        drop(samples);
-        let _pinned = Pinned::new(self.bursts.clone(), &rec.id);
-        r.ctx.insert("slice".into(), rec.id.clone().into());
-        self.choose_context(r);
-        let replays = replay_trials(self, &r.cancel, &rec.id, &choice.could_prove, budget).await;
+        let rec = crate::ops::write_ring_slice(node, &sel, &samples, rate, ring_center, true)
+            .map_err(|e| format!("not tried: the slice could not be written: {e}"))?;
+        let pinned = Pinned::new(self.bursts.clone(), &rec.id)
+            .map_err(|e| format!("not tried: the slice could not be pinned: {e}"))?;
+        Ok(TrialSlice {
+            id: rec.id,
+            sel,
+            _pinned: pinned,
+        })
+    }
+
+    /// Step 2: replay the trial `slice` through `choice.could_prove`
+    /// ([`replay_trials`]). The answer: `choice` revised by the first proof (step 2,
+    /// `proved`, the old answer its runner-up), or `choice` with [`OVER_BUDGET`] for the
+    /// rows the budget left untried. `Cancelled` when the job is.
+    async fn step_two(
+        self: &Arc<Self>,
+        r: &mut Run,
+        choice: &Choice,
+        m: &Measurement,
+        slice: &TrialSlice,
+        budget: Budget,
+    ) -> Result<Choice, StageError> {
+        let mut next = choice.clone();
+        let sel = &slice.sel;
+        let job = (&r.id, &r.cancel);
+        let replays = replay_trials(self, job, &slice.id, &choice.could_prove, budget).await;
         r.ctx.insert(
             "trials".into(),
             serde_json::to_value(&replays.trials).expect("trials serialise"),
@@ -326,7 +329,7 @@ impl Inner {
             .proved
             .and_then(|(row, evidence)| modes.get(&row).map(|m| (m, evidence)));
         if let Some((mode, evidence)) = proved {
-            let job = job_for(mode, m, &sel, &self.region());
+            let job = job_for(mode, m, sel, &self.region());
             let band = Tuning {
                 center_hz: job.center_hz,
                 bandwidth_hz: job.bandwidth_hz,
@@ -344,10 +347,13 @@ impl Inner {
 }
 
 /// The `choose` job's body: (1) the selection ([`Inner::newest_slice`]; none is a
-/// `cannot_tell`), classified and chosen ([`choose_now`]), the policy's cap noted;
-/// (2) when the job's step reaches 2 and step 1 proved nothing, [`Inner::step_two`]
-/// over the same samples, unless the selection is under 1 s ([`RING_SHORT`]); then the
-/// verdict, and with `start` the verdict's job started.
+/// `cannot_tell`, and one the ring moved past before it was read is taken again once),
+/// classified and chosen ([`choose_now`]), the policy's cap noted; (2) when the job's
+/// step reaches 2 and step 1 proved nothing, the same samples written as the trial
+/// slice ([`Inner::write_slice`], pinned until just before the verdict) and
+/// [`Inner::step_two`] over it, unless the selection is under 1 s ([`RING_SHORT`]) or
+/// layer 1 measured nothing ([`UNMEASURED`]); then the verdict, and with `start` the
+/// verdict's job started.
 async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Result<(), StageError> {
     if let Some(f) = port.fault() {
         return Err(StageError::Failed(source_fault_reason(port.id(), &f)));
@@ -359,52 +365,74 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
         .capped
         .clone()
         .map(|reason| NotTried { row: None, reason });
-    let Some((sel, held_ns)) = inner.newest_slice(&r, budget.slice_s) else {
-        let reason = format!("source {} is not capturing", r.source.0);
-        let c = cannot_tell(reason, capped.into_iter().collect());
-        inner.publish_choice(&mut r, &c);
-        inner.choose_verdict(&mut r, &c);
-        return Ok(());
-    };
-    let classified = tokio::select! {
-        c = crate::ops::classify_samples(&node, &sel) => c,
-        _ = r.cancel.cancelled() => return Err(StageError::Cancelled),
-    };
-    let (classified, samples, rate, ring_center) = match classified {
-        Ok(c) => c,
-        Err(e) => {
-            let c = cannot_tell(e.to_string(), capped.into_iter().collect());
+    let not_capturing = || format!("source {} is not capturing", r.source.0);
+    // A selection the ring moved past before it was read (a block evicted its oldest
+    // samples in between) is taken again once, from the ring as it is then.
+    let mut classified = None;
+    for _ in 0..2 {
+        let Some((sel, held_ns)) = inner.newest_slice(&r, budget.slice_s) else {
+            break;
+        };
+        let c = tokio::select! {
+            c = crate::ops::classify_samples(&node, &sel) => c,
+            _ = r.cancel.cancelled() => return Err(StageError::Cancelled),
+        };
+        let too_old = matches!(
+            &c,
+            Err(OpError::Ring {
+                detail: RingError::TooOld { .. }
+            })
+        );
+        classified = Some((sel, held_ns, c));
+        if !too_old {
+            break;
+        }
+    }
+    let (sel, held_ns, classified) = match classified {
+        Some((sel, held_ns, Ok(c))) => (sel, held_ns, c),
+        found => {
+            let reason = match found {
+                Some((.., Err(e))) => e.to_string(),
+                _ => not_capturing(),
+            };
+            let c = cannot_tell(reason, capped.into_iter().collect());
             inner.publish_choice(&mut r, &c);
             inner.choose_verdict(&mut r, &c);
             return Ok(());
         }
     };
+    let (classified, samples, rate, ring_center) = classified;
     node.supersede_proved(&classified.tried, r.tuning);
     let modes = inner.modes();
     let mut choice = choose_now(&modes, modes.weights(), &classified, &sel, &inner.region());
     choice.not_tried.extend(capped);
     let step_two = r.ask.step >= 2 && choice.settled != Settled::Proved;
+    let note = |c: &mut Choice, reason: String| c.not_tried.push(NotTried { row: None, reason });
+    // The trial slice lives until the verdict, pinned, for every trial step.
+    let mut slice = None;
     if step_two && held_ns < MIN_SLICE_NS {
-        choice.not_tried.push(NotTried {
-            row: None,
-            reason: RING_SHORT.into(),
-        });
+        note(&mut choice, RING_SHORT.into());
+    } else if step_two && classified.measurement.is_none() {
+        note(&mut choice, UNMEASURED.into());
+    } else if step_two && !choice.could_prove.is_empty() {
+        match inner.write_slice(&node, sel, (samples, rate, ring_center)) {
+            Ok(s) => {
+                r.ctx.insert("slice".into(), s.id.clone().into());
+                slice = Some(s);
+            }
+            Err(reason) => note(&mut choice, reason),
+        }
     }
     inner.publish_choice(&mut r, &choice);
-    if step_two
-        && held_ns >= MIN_SLICE_NS
-        && !choice.could_prove.is_empty()
-        && let Some(m) = &classified.measurement
-    {
-        let ring = (samples, rate, ring_center);
-        let revised = inner
-            .step_two(&node, &mut r, &choice, m, sel, ring, budget)
-            .await?;
+    if let (Some(s), Some(m)) = (&slice, &classified.measurement) {
+        let revised = inner.step_two(&mut r, &choice, m, s, budget).await?;
         if revised != choice {
             choice = revised;
             inner.publish_choice(&mut r, &choice);
         }
     }
+    // Unpinned before the verdict's job starts and the verdict is published.
+    drop(slice);
     if r.ask.start
         && let Some(job) = &choice.job
     {
@@ -514,11 +542,21 @@ fn start_task(
     })
 }
 
-/// A `capture_decode` of the capture `slice` through `row`, in its own task (see
-/// [`start_task`]).
-fn replay_task(inner: &Arc<Inner>, slice: &str, row: &str) -> JoinHandle<Result<JobId, NodeError>> {
+/// A `capture_decode` of the capture `slice` through `row`, owned by the `choose` job
+/// `owner` (so the replay is the job's to stop, and goes once it ends), in its own task
+/// (see [`start_task`]).
+fn replay_task(
+    inner: &Arc<Inner>,
+    owner: &JobId,
+    slice: &str,
+    row: &str,
+) -> JoinHandle<Result<JobId, NodeError>> {
     let (node, slice, row) = (Node::handle(inner), slice.to_string(), row.to_string());
-    tokio::spawn(async move { node.capture_decode(&slice, &row, None, false).await })
+    let owner = Some(owner.clone());
+    tokio::spawn(async move {
+        node.capture_decode_owned(&slice, &row, None, false, owner)
+            .await
+    })
 }
 
 /// One trial of step 2, as `context.choose.trials` lists it.
@@ -544,13 +582,13 @@ struct Replays {
 }
 
 /// The step-2 trial engine: replay the capture `slice` through each of `rows` in order
-/// ([`replay_trial`]), at most `budget.concurrent` at once, each spawned under `cancel`
-/// and judged until `budget.trial_s` from now has passed. The first proof stops the
-/// trials still running and starts no more; a row not started by the deadline is
-/// `unstarted`.
+/// ([`replay_trial`]), each replay owned by the job `owner`, at most `budget.concurrent`
+/// at once, each spawned under `cancel` and judged until `budget.trial_s` from now has
+/// passed. The first proof stops the trials still running and starts no more; a row not
+/// started by the deadline is `unstarted`.
 async fn replay_trials(
     inner: &Arc<Inner>,
-    cancel: &CancellationToken,
+    (owner, cancel): (&JobId, &CancellationToken),
     slice: &str,
     rows: &[String],
     budget: Budget,
@@ -566,8 +604,8 @@ async fn replay_trials(
     loop {
         while !settle.is_cancelled() && set.len() < concurrent && Instant::now() < deadline {
             let Some(row) = queue.next() else { break };
-            let (inner, slice, row) = (inner.clone(), slice.to_string(), row.clone());
-            set.spawn(replay_trial(inner, slice, row, settle.clone(), deadline));
+            let at = (inner.clone(), owner.clone(), slice.to_string());
+            set.spawn(replay_trial(at, row.clone(), settle.clone(), deadline));
         }
         let Some(done) = set.join_next().await else {
             break;
@@ -586,13 +624,13 @@ async fn replay_trials(
     out
 }
 
-/// Replay `slice` through `row` and wait for the row's proof on the replay's events
-/// ([`Inner::await_proof`] on the replay feed, subscribed before the replay starts)
-/// until `deadline`, or until `settle` is cancelled; the replay is stopped either way.
-/// The trial and, for a proof, its `decode <row>: ...` line.
+/// Replay `slice` through `row`, the replay owned by `owner` ([`replay_task`]), and wait
+/// for the row's proof on the replay's events ([`Inner::await_proof`] on the replay
+/// feed, subscribed before the replay starts) until `deadline`, or until `settle` is
+/// cancelled; the replay is stopped either way. The trial and, for a proof, its
+/// `decode <row>: ...` line.
 async fn replay_trial(
-    inner: Arc<Inner>,
-    slice: String,
+    (inner, owner, slice): (Arc<Inner>, JobId, String),
     row: String,
     settle: CancellationToken,
     deadline: Instant,
@@ -615,7 +653,7 @@ async fn replay_trial(
         let why = "the replay feed is not open".to_string();
         return (trial(None, "unavailable", why), None);
     };
-    let job = match replay_task(&inner, &slice, &row).await {
+    let job = match replay_task(&inner, &owner, &slice, &row).await {
         Ok(Ok(job)) => job,
         Ok(Err(e)) => return (trial(None, "unavailable", e.to_string()), None),
         Err(e) => {
@@ -682,24 +720,79 @@ impl Drop for ReplayGuard {
     }
 }
 
-/// A trial capture pinned while its ladder runs: unpinned on drop, however the step ends.
+/// A trial capture pinned while the job's ladder runs: unpinned on drop, however the
+/// job ends, unless it was pinned already (then this neither pinned nor unpins it).
 struct Pinned {
     store: Arc<crate::bursts::BurstStore>,
     id: String,
+    /// Whether this guard pinned it.
+    ours: bool,
 }
 
 impl Pinned {
-    fn new(store: Arc<crate::bursts::BurstStore>, id: &str) -> Self {
-        let _ = store.pin(id);
-        Self {
+    /// Pin `id` in `store`; the store's refusal, worded, when it cannot.
+    fn new(store: Arc<crate::bursts::BurstStore>, id: &str) -> Result<Self, String> {
+        let ours = !store.get(id).is_some_and(|r| r.pinned);
+        if ours {
+            store.pin(id).map_err(|e| e.to_string())?;
+        }
+        Ok(Self {
             store,
             id: id.to_string(),
-        }
+            ours,
+        })
     }
 }
 
 impl Drop for Pinned {
     fn drop(&mut self) {
-        let _ = self.store.unpin(&self.id);
+        if self.ours {
+            let _ = self.store.unpin(&self.id);
+        }
+    }
+}
+
+/// The ring slice the trial steps replay: its capture, the selection it holds (the
+/// job's, shortened to the trial quota) and the pin that keeps it while the job runs.
+struct TrialSlice {
+    id: String,
+    sel: Selection,
+    _pinned: Pinned,
+}
+
+/// The newest `slice_s` seconds of a ring whose newest contiguous run starts at
+/// `run_start_ns` and ends at `latest_ns`: `(from_ns, held_ns)`. A run shorter than that
+/// starts [`RING_MARGIN_NS`] after its oldest sample, which the next block written may
+/// evict before the selection is read; `None` when nothing is left.
+fn slice_span(run_start_ns: u64, latest_ns: u64, slice_s: f32) -> Option<(u64, u64)> {
+    let want_ns = (f64::from(slice_s) * 1e9) as u64;
+    let oldest = run_start_ns.saturating_add(RING_MARGIN_NS);
+    let from = latest_ns.saturating_sub(want_ns).max(oldest);
+    (latest_ns > from).then(|| (from, latest_ns - from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S: u64 = 1_000_000_000;
+
+    /// A ring holding more than the slice gives the newest slice; one holding less gives
+    /// what it holds but its oldest margin, which a block written meanwhile may evict.
+    #[test]
+    fn the_slice_keeps_clear_of_the_oldest_samples() {
+        assert_eq!(slice_span(0, 10 * S, 2.0), Some((8 * S, 2 * S)));
+        assert_eq!(
+            slice_span(9 * S, 10 * S, 2.0),
+            Some((9 * S + RING_MARGIN_NS, S - RING_MARGIN_NS))
+        );
+        // A run of exactly the slice still keeps the margin.
+        assert_eq!(
+            slice_span(8 * S, 10 * S, 2.0),
+            Some((8 * S + RING_MARGIN_NS, 2 * S - RING_MARGIN_NS))
+        );
+        // A run no longer than the margin leaves nothing.
+        assert_eq!(slice_span(10 * S - RING_MARGIN_NS, 10 * S, 2.0), None);
+        assert_eq!(slice_span(10 * S, 10 * S, 2.0), None);
     }
 }

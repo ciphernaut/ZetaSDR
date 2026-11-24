@@ -3005,6 +3005,20 @@ impl Node {
         handler: Option<&str>,
         packets: bool,
     ) -> Result<JobId, NodeError> {
+        self.capture_decode_owned(capture, kind, handler, packets, None)
+            .await
+    }
+
+    /// [`Node::capture_decode`] with the record's `owner`: a controller's (a `choose`'s
+    /// trial), so the replay is the owner's to stop and goes once it ends.
+    pub(crate) async fn capture_decode_owned(
+        &self,
+        capture: &str,
+        kind: &str,
+        handler: Option<&str>,
+        packets: bool,
+        owner: Option<JobId>,
+    ) -> Result<JobId, NodeError> {
         let set = capture_set(&self.bursts(), capture)?;
         let (first, last) = (&set[0], &set[set.len() - 1]);
         let modes = self.inner.modes();
@@ -3140,6 +3154,7 @@ impl Node {
             handler_named: handler.is_some(),
             needs,
             replay: Some(capture.to_string()),
+            owner,
             ..running_record(
                 kind,
                 SourceId(NODE_SOURCE.into()),

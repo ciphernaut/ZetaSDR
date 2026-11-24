@@ -415,7 +415,10 @@ fn validate_member(
         } => {
             crate::ops::check_startable(kind).map_err(|e| SetError::new("kind", e.to_string()))?;
             // A capture-following, stepping or trial-running kind is no set's member.
-            if matches!(kind, JobKind::Spectrum | JobKind::Scan | JobKind::Identify) {
+            if matches!(
+                kind,
+                JobKind::Spectrum | JobKind::Scan | JobKind::Identify | JobKind::Choose
+            ) {
                 return Err(SetError::new(
                     "kind",
                     format!("{} cannot be a set member", kind.name()),
