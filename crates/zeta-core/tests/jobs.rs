@@ -1666,6 +1666,8 @@ async fn nothing_starts_a_row_with_no_decoder_and_no_handler() {
                 job: JobId("nodec".into()),
                 watch: None,
                 allocations: serde_json::json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             &iq,
         )

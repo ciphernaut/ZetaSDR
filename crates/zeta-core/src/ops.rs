@@ -13,7 +13,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub use crate::bits::Modulation;
-use crate::capture::{CaptureMeta, write_cf32};
 use crate::classify::{Band, Classification, Label, Tried};
 use crate::graph::{Edge, Graph, GraphError, GraphId, Node as GraphNode, NodeId};
 use crate::job::{JobRecord, JobState};
@@ -786,10 +785,12 @@ pub enum Op {
     JobContext {
         job: JobId,
     },
-    /// Save a selection under `state_dir/captures`: writes the whole ring
-    /// bandwidth over the span as a SigMF pair; the selection band is recorded
-    /// as an annotation. The capture is labelled with the ring's centre, and
-    /// the selection band must lie inside the ring's band.
+    /// Save a selection into the burst store: writes the whole ring bandwidth over the
+    /// span as a SigMF pair and a `capture_list` record (`capture` in the answer) whose
+    /// band is the selection's, so `capture_classify` and `capture_decode` read the
+    /// selection from it. It expires under the burst policy (`--bursts-keep-mb`,
+    /// `--bursts-keep-days`) unless pinned. The file is labelled with the ring's centre,
+    /// and the selection band must lie inside the ring's band.
     IqRead {
         selection: Selection,
     },
@@ -4050,13 +4051,18 @@ pub enum OpResult {
     Context(serde_json::Value),
     /// `path` is the `.sigmf-meta` file; the data file sits beside it.
     /// `center_hz` and `bandwidth_hz` are the band actually written (the
-    /// ring's), not the selection's.
+    /// ring's), not the selection's. `capture` is the burst store's record of it
+    /// (the selection's band within the file): `capture_list` shows it and it
+    /// expires under the burst policy.
+    #[schemars(transform = require_all_value)]
     Iq {
         sample_rate_hz: Hz,
         center_hz: Hz,
         bandwidth_hz: Hz,
         samples: usize,
         path: PathBuf,
+        #[serde(default)]
+        capture: Option<String>,
     },
     Streams(Vec<StreamInfo>),
     /// `missed`: frames skipped during the tail because it fell behind.
@@ -8738,34 +8744,57 @@ async fn stream_tail(
     })
 }
 
-/// Write the selection's span from the source ring as a cf32_le SigMF pair.
+/// Write the selection's span from the source ring into the burst store, as a cf32_le
+/// SigMF pair.
 fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     let (rate, center, samples) = ring_samples(node, &sel)?;
-    let dir = node.state_dir().join("captures");
-    std::fs::create_dir_all(&dir).map_err(other)?;
-    let name = ulid::Ulid::generate().to_string();
-    let half = sel.bandwidth_hz.0 / 2;
-    let meta = CaptureMeta {
-        sample_rate_hz: rate,
-        center_hz: center,
-        start: sel.span.start_ns,
-        annotations: vec![serde_json::json!({
-            "core:sample_start": 0,
-            "core:sample_count": samples.len(),
-            "core:freq_lower_edge": sel.center_hz.0.saturating_sub(half),
-            "core:freq_upper_edge": sel.center_hz.0.saturating_add(half),
-            "core:label": "selection",
-        })],
-    };
-    let path = write_cf32(&dir, &name, &meta, &samples).map_err(other)?;
+    let rec = write_ring_slice(node, &sel, &samples, rate, center, false)?;
     // Complex baseband: the written band is as wide as the sample rate.
     Ok(OpResult::Iq {
         sample_rate_hz: rate,
         center_hz: center,
         bandwidth_hz: rate,
         samples: samples.len(),
-        path,
+        path: rec.meta_path,
+        capture: Some(rec.id),
     })
+}
+
+/// Store the ring's `samples` (at `rate`, centred on `ring_center`) for the selection
+/// `sel` as a capture of the burst store: the record's band is the selection's, the file
+/// keeps the ring's centre, so the reading side extracts the band from it. It has a
+/// fresh `set` and `job` of its own, so replaying it replays this slice alone. A `trial`
+/// slice counts against the burst policy's trial quota instead of the operator's budget.
+pub fn write_ring_slice(
+    node: &Node,
+    sel: &Selection,
+    samples: &[Complex<f32>],
+    rate: Hz,
+    ring_center: Hz,
+    trial: bool,
+) -> Result<crate::bursts::CaptureRecord, OpError> {
+    let span_ns = samples.len() as u64 * 1_000_000_000 / rate.0.max(1);
+    node.bursts()
+        .write(
+            crate::bursts::NewCapture {
+                source: sel.source.clone(),
+                set: JobId(ulid::Ulid::generate().to_string()),
+                center_hz: sel.center_hz,
+                bandwidth_hz: sel.bandwidth_hz,
+                sample_rate_hz: rate,
+                start_ns: sel.span.start_ns.0,
+                end_ns: sel.span.start_ns.0 + span_ns,
+                features: serde_json::json!({}),
+                signal: None,
+                job: JobId(ulid::Ulid::generate().to_string()),
+                watch: None,
+                allocations: serde_json::json!([]),
+                file_center_hz: Some(ring_center),
+                trial,
+            },
+            samples,
+        )
+        .map_err(other)
 }
 
 #[cfg(test)]

@@ -419,6 +419,8 @@ fn write_fsk(node: &Node) -> String {
                 job: JobId("set1".into()),
                 watch: None,
                 allocations: json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             &iq,
         )

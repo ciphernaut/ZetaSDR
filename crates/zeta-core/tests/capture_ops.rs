@@ -55,6 +55,8 @@ fn new_capture(center_hz: u64, bandwidth_hz: u64, start_ns: u64) -> NewCapture {
         job: JobId("cap".into()),
         watch: None,
         allocations: serde_json::json!([]),
+        file_center_hz: None,
+        trial: false,
     }
 }
 
@@ -259,4 +261,56 @@ async fn capture_classify_reads_the_records_band_not_the_whole_file() {
     };
     let l1 = labels.iter().find(|l| l.layer == 1).expect("layer 1");
     assert_eq!(l1.name, "carrier", "{labels:?}");
+}
+
+#[tokio::test]
+async fn a_ring_slice_record_reads_its_selection_not_the_ring() {
+    use zeta_core::types::{Selection, Span, Timestamp};
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    // A pure tone 2 kHz above the selection's centre, which sits 10 kHz below the ring's
+    // centre (the ring is as wide as the sample rate).
+    let rate = RATE_HZ;
+    let ring_center = Hz(433_930_000);
+    let off = -8_000.0f64;
+    let iq: Vec<Complex<f32>> = (0..2 * rate as usize)
+        .map(|k| {
+            let ph = 2.0 * std::f64::consts::PI * (k as f64 * off / rate as f64);
+            Complex::from_polar(0.5, ph as f32)
+        })
+        .collect();
+    let sel = Selection {
+        source: SourceId("rx".into()),
+        span: Span {
+            start_ns: Timestamp(1),
+            end_ns: Timestamp(1 + 2_000_000_000),
+        },
+        center_hz: Hz(433_920_000),
+        bandwidth_hz: Hz(6_000),
+    };
+    let rec =
+        zeta_core::ops::write_ring_slice(&node, &sel, &iq, Hz(rate as u64), ring_center, false)
+            .unwrap();
+    assert_eq!(
+        (rec.center_hz, rec.bandwidth_hz),
+        (sel.center_hz, sel.bandwidth_hz)
+    );
+    assert!(!rec.trial);
+    assert_ne!(rec.set, rec.job);
+    let OpResult::Classification {
+        labels, origins, ..
+    } = node
+        .apply(Op::CaptureClassify { capture: rec.id })
+        .await
+        .unwrap()
+    else {
+        panic!("classification")
+    };
+    let l1 = labels.iter().find(|l| l.layer == 1).expect("layer 1");
+    assert_eq!(l1.name, "carrier", "{labels:?}");
+    let band = origins.expect("origins").band;
+    assert_eq!(
+        (band.center_hz, band.bandwidth_hz),
+        (Hz(433_920_000), Hz(6_000))
+    );
 }

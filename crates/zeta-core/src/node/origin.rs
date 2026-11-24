@@ -4054,6 +4054,8 @@ mod tests {
                     job: JobId("cap".into()),
                     watch: None,
                     allocations: serde_json::json!([]),
+                    file_center_hz: None,
+                    trial: false,
                 },
                 &vec![num_complex::Complex::new(0.1f32, 0.0); 480],
             )

@@ -297,7 +297,7 @@ async fn iq_read_writes_sigmf_pair() {
     };
     assert_eq!(rate, Hz(48_000));
     assert_eq!(samples, 2400);
-    assert!(path.starts_with(dir.path().join("state").join("captures")));
+    assert!(path.starts_with(dir.path().join("state").join("bursts")));
     let meta_path = path.with_extension("sigmf-meta");
     assert!(meta_path.exists());
     let meta = read_meta(&meta_path).unwrap();
@@ -307,6 +307,35 @@ async fn iq_read_writes_sigmf_pair() {
     assert_eq!(meta.start, start);
     let data = std::fs::metadata(path.with_extension("sigmf-data")).unwrap();
     assert_eq!(data.len(), 2400 * 8);
+}
+
+#[tokio::test]
+async fn iq_read_writes_into_the_burst_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, port) = file_source(dir.path());
+    let node = Node::open(cfg(dir.path()), registry(), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let selection = selection(&node, 100_010_000, 10_000).await;
+    let (id, path) = match node.apply(Op::IqRead { selection }).await {
+        Ok(OpResult::Iq { capture, path, .. }) => (capture.expect("a capture id"), path),
+        other => panic!("expected Iq, got {other:?}"),
+    };
+    let OpResult::Captures(list) = node.apply(Op::CaptureList { signal: None }).await.unwrap()
+    else {
+        panic!("captures")
+    };
+    let rec = list
+        .iter()
+        .find(|r| r.id == id)
+        .expect("capture_list holds it");
+    assert_eq!(rec.meta_path, path);
+    assert_eq!(
+        (rec.center_hz, rec.bandwidth_hz),
+        (Hz(100_010_000), Hz(10_000))
+    );
+    assert!(!rec.trial && !rec.pinned);
 }
 
 #[tokio::test]
@@ -332,7 +361,6 @@ async fn iq_read_labels_capture_centre_not_selection_centre() {
     assert_eq!(read_meta(&path).unwrap().center_hz, Hz(100_000_000));
     let meta: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let a = &meta["annotations"][0];
-    assert_eq!(a["core:label"], "selection");
     assert_eq!(a["core:sample_start"], 0);
     assert_eq!(a["core:sample_count"], 2400);
     assert_eq!(a["core:freq_lower_edge"], 100_005_000);

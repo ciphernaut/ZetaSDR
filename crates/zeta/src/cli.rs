@@ -128,6 +128,15 @@ pub struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub bursts_keep_mb: Option<u64>,
+    /// Keep at most MB megabytes of unpinned trial slices (a `choose` job's; default 64), counted apart from the burst captures
+    #[arg(
+        long,
+        global = true,
+        env = "ZETA_BURSTS_TRIAL_MB",
+        value_name = "MB",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub bursts_trial_mb: Option<u64>,
     /// Drop unpinned burst captures older than DAYS days (default 7)
     #[arg(
         long,
@@ -186,7 +195,12 @@ impl Cli {
                 .bursts_keep_mb
                 .map_or(d.keep_bytes, |mb| mb.saturating_mul(1 << 20)),
             keep_days: self.bursts_keep_days.unwrap_or(d.keep_days),
-            expire_at_open: self.bursts_keep_mb.is_some() || self.bursts_keep_days.is_some(),
+            trial_keep_bytes: self
+                .bursts_trial_mb
+                .map_or(d.trial_keep_bytes, |mb| mb.saturating_mul(1 << 20)),
+            expire_at_open: self.bursts_keep_mb.is_some()
+                || self.bursts_keep_days.is_some()
+                || self.bursts_trial_mb.is_some(),
         }
     }
 
@@ -224,6 +238,9 @@ impl Cli {
             }
             if from_env("bursts_keep_mb") {
                 cli.bursts_keep_mb = None;
+            }
+            if from_env("bursts_trial_mb") {
+                cli.bursts_trial_mb = None;
             }
             if from_env("bursts_keep_days") {
                 cli.bursts_keep_days = None;
@@ -333,6 +350,7 @@ impl Cli {
             || self.knowledge_acma.is_some()
             || self.bursts_keep_mb.is_some()
             || self.bursts_keep_days.is_some()
+            || self.bursts_trial_mb.is_some()
     }
 }
 

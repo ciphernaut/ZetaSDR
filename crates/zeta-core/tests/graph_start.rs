@@ -123,6 +123,8 @@ fn write_fsk_at(node: &Node, center_hz: u64) -> String {
                 job: JobId("cap".into()),
                 watch: None,
                 allocations: json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             &iq,
         )

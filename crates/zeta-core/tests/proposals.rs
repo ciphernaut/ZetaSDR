@@ -441,6 +441,8 @@ async fn no_proposal_when_an_accepted_signature_holds_the_band() {
                 job: JobId("hand".into()),
                 watch: None,
                 allocations: json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             &iq,
         )
@@ -488,6 +490,8 @@ async fn bits_on_framed(node: &Node) -> (String, JobId) {
                 job: JobId("set".into()),
                 watch: None,
                 allocations: json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             &iq,
         )

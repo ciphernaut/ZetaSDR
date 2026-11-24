@@ -111,8 +111,8 @@ From the operator, 2026-11-20 and 2026-11-21. Spec: `docs/superpowers/specs/2026
 
 From the operator, 2026-11-24, after UAT 47.5. Not planned. Gist: wide captures (a 10 to 20 MHz carrier is 100 to 160 MB a second as `cf32`) want a store sized in gigabytes, and a host with plenty of RAM can hold them in a tmpfs that takes memory only for what it holds (a ceiling set with `size=`, shrinking as captures expire, swappable under pressure). Today the burst store is the state directory's `bursts/`, beside everything that must survive a reboot, with one size limit (`--bursts-keep-mb`, default 256 MB) and no separate path. Shape: a `--bursts-dir` for unpinned burst captures (a tmpfs, say), its own keep limit, and pinning moving a capture onto the state directory's disk so it survives a reboot; `capture_list` and `capture_decode` see both. Raising `--bursts-keep-mb` on disk is the no-code answer meanwhile (what UAT 47.5 did). Two neighbours found the same day:
 
-- **`iq read`'s recordings never expire.** `iq_read` writes SigMF pairs into the state directory's `captures/`, which no limit or expiry covers: on the field host it held 33 pairs, 4.6 GB, the oldest weeks old. Give it the burst store's limits (or put it in the same store), and list it.
-- **`capture_decode` cannot replay an `iq read` recording.** It takes only burst store ids (`unknown` with the known list for anything else), so a ring slice saved on purpose has to be captured again as a burst. Let it take an `iq_read` recording too, or have `iq_read` write into the burst store.
+- `iq read`'s recordings never expire: done by plan 48 Task 7 (they are burst store captures under its limits).
+- `capture_decode` cannot replay an `iq read` recording: done by plan 48 Task 7 (`iq read` writes into the burst store).
 
 ## Cleanup: the rounds of small debts
 

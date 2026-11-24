@@ -322,6 +322,8 @@ mod tests {
             job: JobId("set".into()),
             watch: None,
             allocations: serde_json::json!([]),
+            file_center_hz: None,
+            trial: false,
         };
         store.write(new, &iq).unwrap().id
     }

@@ -18,17 +18,23 @@ pub const BURSTS_DIR: &str = "bursts";
 const INDEX_FILE: &str = "index.json";
 /// [`BurstPolicy::keep_bytes`] by default: 256 MiB.
 pub const BURSTS_KEEP_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+/// [`BurstPolicy::trial_keep_bytes`] by default: 64 MiB.
+pub const BURSTS_TRIAL_KEEP_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
 /// [`BurstPolicy::keep_days`] by default.
 pub const BURSTS_KEEP_DAYS_DEFAULT: u32 = 7;
 const NS_PER_DAY: u64 = 86_400 * 1_000_000_000;
 
 /// How much the store keeps: expiry removes the oldest unpinned captures until the
 /// unpinned bytes fit `keep_bytes`, then every unpinned capture older than `keep_days`.
+/// Trial captures (a `choose` job's slices) count against `trial_keep_bytes` only and the
+/// rest against `keep_bytes` only: neither kind ever expires the other for room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BurstPolicy {
     pub keep_bytes: u64,
     pub keep_days: u32,
+    /// The budget of the unpinned trial captures.
+    pub trial_keep_bytes: u64,
     /// Whether the node expires the store when it opens (true by default). The CLI
     /// turns it off for a one-shot that does not own the state directory or was given
     /// no policy of its own, so it never deletes what `zeta serve`'s policy keeps; the
@@ -41,6 +47,7 @@ impl Default for BurstPolicy {
         Self {
             keep_bytes: BURSTS_KEEP_BYTES_DEFAULT,
             keep_days: BURSTS_KEEP_DAYS_DEFAULT,
+            trial_keep_bytes: BURSTS_TRIAL_KEEP_BYTES_DEFAULT,
             expire_at_open: true,
         }
     }
@@ -87,6 +94,10 @@ pub struct CaptureRecord {
     /// `start_ns`: a window cut from an old recording is as new as its writing.
     #[serde(default)]
     pub written_ns: u64,
+    /// A slice a `choose` job's trial wrote: it counts against the trial quota, not the
+    /// operator's budget.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trial: bool,
 }
 
 impl CaptureRecord {
@@ -120,6 +131,11 @@ pub struct NewCapture {
     pub job: JobId,
     pub watch: Option<JobId>,
     pub allocations: Value,
+    /// The IQ file's centre when it differs from the record's band (a slice of a wider
+    /// ring); `None` when the file is centred on `center_hz`.
+    pub file_center_hz: Option<Hz>,
+    /// Written by a trial: kept under the trial quota.
+    pub trial: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -209,10 +225,11 @@ impl BurstStore {
             "zeta:source": rec.source.0,
             "zeta:set": rec.set.0,
             "zeta:allocations": rec.allocations,
+            "zeta:trial": rec.trial,
         });
         let meta = CaptureMeta {
             sample_rate_hz: rec.sample_rate_hz,
-            center_hz: rec.center_hz,
+            center_hz: rec.file_center_hz.unwrap_or(rec.center_hz),
             start: Timestamp(rec.start_ns),
             annotations: vec![annotation],
         };
@@ -237,6 +254,7 @@ impl BurstStore {
             allocations: rec.allocations,
             pinned: false,
             written_ns: now_ns(),
+            trial: rec.trial,
         };
         index.push(record.clone());
         if let Err(e) = self.persist(&index) {
@@ -325,7 +343,8 @@ impl BurstStore {
     }
 
     /// Apply the policy: the oldest unpinned captures go until the unpinned rest fit
-    /// `keep_bytes` (a pinned capture counts against no budget), then every unpinned capture older than
+    /// `keep_bytes` (a pinned capture counts against no budget; trials fit
+    /// `trial_keep_bytes` apart), then every unpinned capture older than
     /// `keep_days`. Returns the ids removed. A failed index write keeps the records
     /// (their files are left) for the next expiry.
     pub fn expire(&self) -> Vec<String> {
@@ -337,16 +356,26 @@ impl BurstStore {
     fn expire_except(&self, keep: Option<&str>) -> Vec<String> {
         let mut index = self.index.lock().unwrap();
         index.sort_by(|a, b| (a.age_from_ns(), &a.id).cmp(&(b.age_from_ns(), &b.id)));
-        // Pinned captures are the operator's: they count against no budget.
-        let mut total: u64 = index.iter().filter(|r| !r.pinned).map(|r| r.bytes).sum();
+        // Pinned captures are the operator's: they count against no budget. Trials and
+        // the rest each keep to their own budget.
         let mut gone = vec![false; index.len()];
-        for (i, r) in index.iter().enumerate() {
-            if total <= self.policy.keep_bytes {
-                break;
-            }
-            if !r.pinned && Some(r.id.as_str()) != keep {
-                gone[i] = true;
-                total -= r.bytes;
+        for (trial, budget) in [
+            (false, self.policy.keep_bytes),
+            (true, self.policy.trial_keep_bytes),
+        ] {
+            let mut total: u64 = index
+                .iter()
+                .filter(|r| !r.pinned && r.trial == trial)
+                .map(|r| r.bytes)
+                .sum();
+            for (i, r) in index.iter().enumerate() {
+                if total <= budget {
+                    break;
+                }
+                if !r.pinned && r.trial == trial && Some(r.id.as_str()) != keep {
+                    gone[i] = true;
+                    total -= r.bytes;
+                }
             }
         }
         let cutoff =
@@ -428,7 +457,7 @@ fn record_from_meta(meta_path: &Path) -> Option<CaptureRecord> {
     let md = std::fs::metadata(&data_path).ok()?;
     let rate = json["global"]["core:sample_rate"].as_u64()?;
     let cap = &json["captures"][0];
-    let center = cap["core:frequency"].as_u64()?;
+    cap["core:frequency"].as_u64()?;
     let start_ns = cap["core:datetime"]
         .as_str()
         .and_then(crate::capture::parse_iso8601)
@@ -449,7 +478,9 @@ fn record_from_meta(meta_path: &Path) -> Option<CaptureRecord> {
         data_path,
         source: SourceId(text("zeta:source")?),
         set: JobId(text("zeta:set")?),
-        center_hz: Hz(center),
+        // The band's centre, which is the file's `center` unless the file is a wider
+        // recording the record's band was cut from.
+        center_hz: Hz(lower + upper.saturating_sub(lower) / 2),
         bandwidth_hz: Hz(upper.saturating_sub(lower)),
         sample_rate_hz: Hz(rate),
         start_ns,
@@ -466,6 +497,7 @@ fn record_from_meta(meta_path: &Path) -> Option<CaptureRecord> {
         },
         pinned: false,
         written_ns,
+        trial: ann["zeta:trial"].as_bool().unwrap_or(false),
     })
 }
 
@@ -522,6 +554,8 @@ mod tests {
             job: JobId("job".into()),
             watch: None,
             allocations: serde_json::json!([]),
+            file_center_hz: None,
+            trial: false,
         }
     }
 
@@ -540,6 +574,7 @@ mod tests {
             BurstPolicy {
                 keep_bytes,
                 keep_days: 7,
+                trial_keep_bytes: u64::MAX,
                 expire_at_open: true,
             },
         )
@@ -649,6 +684,95 @@ mod tests {
         assert_eq!(ids, [recs[3].id.clone(), recs[2].id.clone()]);
         assert!(!recs[0].data_path.exists() && !recs[1].meta_path.exists());
         assert!(s.total_bytes() <= w * 5 / 2);
+    }
+
+    fn two_budgets(dir: &Path, keep_bytes: u64, trial_keep_bytes: u64) -> Arc<BurstStore> {
+        BurstStore::open(
+            dir,
+            BurstPolicy {
+                keep_bytes,
+                keep_days: 7,
+                trial_keep_bytes,
+                expire_at_open: true,
+            },
+        )
+        .unwrap()
+    }
+
+    fn trial_capture(start_ns: u64) -> NewCapture {
+        NewCapture {
+            trial: true,
+            ..new_capture(start_ns)
+        }
+    }
+
+    #[test]
+    fn a_trial_never_expires_an_operator_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WINDOW as u64 * 8;
+        // The operator's budget holds one; the trial quota holds two.
+        let s = two_budgets(dir.path(), w, w * 2);
+        let operator = s.write(new_capture(t(0)), &samples()).unwrap();
+        let trials: Vec<CaptureRecord> = (1..5)
+            .map(|i| s.write(trial_capture(t(i)), &samples()).unwrap())
+            .collect();
+        let ids: Vec<String> = s.list().into_iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            [&trials[3].id, &trials[2].id, &operator.id].map(String::clone)
+        );
+        assert!(operator.data_path.exists() && !trials[0].data_path.exists());
+        assert!(s.get(&trials[3].id).unwrap().trial);
+    }
+
+    #[test]
+    fn operator_captures_never_expire_a_trial() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WINDOW as u64 * 8;
+        let s = two_budgets(dir.path(), w, w);
+        let trial = s.write(trial_capture(t(0)), &samples()).unwrap();
+        let a = s.write(new_capture(t(1)), &samples()).unwrap();
+        let b = s.write(new_capture(t(2)), &samples()).unwrap();
+        assert!(s.get(&trial.id).is_some());
+        assert!(s.get(&a.id).is_none() && s.get(&b.id).is_some());
+    }
+
+    #[test]
+    fn a_pinned_trial_counts_against_neither_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WINDOW as u64 * 8;
+        let s = two_budgets(dir.path(), w, w);
+        let pinned = s.write(trial_capture(t(0)), &samples()).unwrap();
+        s.pin(&pinned.id).unwrap();
+        let next = s.write(trial_capture(t(1)), &samples()).unwrap();
+        let op = s.write(new_capture(t(2)), &samples()).unwrap();
+        for r in [&pinned, &next, &op] {
+            assert!(s.get(&r.id).is_some());
+        }
+    }
+
+    #[test]
+    fn a_trial_flag_and_a_file_centre_survive_a_rebuilt_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = two_budgets(dir.path(), u64::MAX, u64::MAX);
+        let rec = s
+            .write(
+                NewCapture {
+                    file_center_hz: Some(Hz(145_000_000)),
+                    ..trial_capture(t(0))
+                },
+                &samples(),
+            )
+            .unwrap();
+        let meta: Value = serde_json::from_slice(&std::fs::read(&rec.meta_path).unwrap()).unwrap();
+        assert_eq!(meta["captures"][0]["core:frequency"], 145_000_000);
+        assert_eq!(rec.center_hz, Hz(144_800_000));
+        drop(s);
+        std::fs::write(dir.path().join(BURSTS_DIR).join(INDEX_FILE), b"x").unwrap();
+        let s = two_budgets(dir.path(), u64::MAX, u64::MAX);
+        let back = s.get(&rec.id).unwrap();
+        assert!(back.trial);
+        assert_eq!(back.center_hz, Hz(144_800_000));
     }
 
     #[test]

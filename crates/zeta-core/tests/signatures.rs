@@ -79,6 +79,8 @@ fn new_capture(set: &str, features: serde_json::Value) -> NewCapture {
         job: JobId(set.into()),
         watch: None,
         allocations: serde_json::json!([]),
+        file_center_hz: None,
+        trial: false,
     }
 }
 

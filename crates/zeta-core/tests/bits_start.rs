@@ -153,6 +153,8 @@ fn write_iq(
                 job: JobId(set.into()),
                 watch: None,
                 allocations: json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             iq,
         )
@@ -541,6 +543,8 @@ async fn an_off_centre_ook_capture_is_shifted_to_its_measured_centre() {
                 job: JobId("wide".into()),
                 watch: None,
                 allocations: json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             &iq,
         )
@@ -694,6 +698,8 @@ fn write_fixture(node: &Node, name: &str, set: &str, start_ns: u64) -> String {
                 job: JobId(set.into()),
                 watch: None,
                 allocations: json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             &iq,
         )

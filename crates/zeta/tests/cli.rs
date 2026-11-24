@@ -861,8 +861,9 @@ fn iq_read_one_shot_writes_capture() {
     let v = json(&out);
     let meta = std::path::PathBuf::from(v["value"]["path"].as_str().expect("capture path"));
     assert!(meta.exists(), "{}", meta.display());
-    assert!(meta.starts_with(dir.path().join("state").join("captures")));
+    assert!(meta.starts_with(dir.path().join("state").join("bursts")));
     assert!(meta.with_extension("sigmf-data").exists());
+    assert!(v["value"]["capture"].is_string(), "{v}");
 }
 
 #[test]
@@ -4484,6 +4485,7 @@ fn bursts_keep_flags_reach_the_store() {
             BurstPolicy {
                 keep_bytes: u64::MAX,
                 keep_days: 7,
+                trial_keep_bytes: u64::MAX,
                 expire_at_open: true,
             },
         )
@@ -4510,6 +4512,8 @@ fn bursts_keep_flags_reach_the_store() {
                         job: JobId("job".into()),
                         watch: None,
                         allocations: serde_json::json!([]),
+                        file_center_hz: None,
+                        trial: false,
                     },
                     &samples,
                 )
@@ -4929,6 +4933,8 @@ fn a_local_capture_decode_prints_the_finished_replay_with_its_note() {
                 job: JobId("job".into()),
                 watch: None,
                 allocations: serde_json::json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             &iq,
         )

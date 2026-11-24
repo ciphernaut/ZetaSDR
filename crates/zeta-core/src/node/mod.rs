@@ -2547,10 +2547,6 @@ impl Node {
         fault
     }
 
-    pub(crate) fn state_dir(&self) -> &Path {
-        &self.inner.state_dir
-    }
-
     /// [`crate::stage::StageRegistry::readiness`] of the stage kind `kind` on this node.
     pub fn stage_readiness(&self, kind: &str) -> Option<crate::stage::Readiness> {
         self.inner.registry.readiness(kind)

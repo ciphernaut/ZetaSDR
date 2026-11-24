@@ -413,6 +413,7 @@ fn variant_name_matches_the_serialised_tag() {
             bandwidth_hz: Hz(1),
             samples: 0,
             path: "x.sigmf-meta".into(),
+            capture: None,
         },
         OpResult::Streams(vec![]),
         OpResult::Frames {

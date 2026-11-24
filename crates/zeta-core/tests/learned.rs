@@ -135,6 +135,8 @@ async fn write(
         job: JobId(set.into()),
         watch: None,
         allocations: serde_json::json!([]),
+        file_center_hz: None,
+        trial: false,
     };
     node.bursts().write(new, iq).unwrap()
 }
@@ -1022,6 +1024,8 @@ async fn a_proved_classify_supersedes_an_overlapping_learned_signature() {
         job: JobId("01PAGE".into()),
         watch: None,
         allocations: json!([]),
+        file_center_hz: None,
+        trial: false,
     };
     let cap = node.bursts().write(new, &iq).unwrap();
     // A features-only signature of the page on 148.6375 MHz, 12.5 kHz wide.

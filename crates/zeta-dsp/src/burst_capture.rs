@@ -618,6 +618,8 @@ async fn write(
             .allocations
             .clone()
             .unwrap_or_else(|| serde_json::json!([])),
+        file_center_hz: None,
+        trial: false,
     };
     let store = store.clone();
     let samples = cut.samples;

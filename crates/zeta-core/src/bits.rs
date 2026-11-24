@@ -535,6 +535,7 @@ mod tests {
             allocations: serde_json::json!([]),
             pinned: false,
             written_ns: 0,
+            trial: false,
         }
     }
 

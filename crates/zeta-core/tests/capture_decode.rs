@@ -76,6 +76,8 @@ fn write_capture(
                 job: JobId(set.into()),
                 watch: None,
                 allocations: json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             iq,
         )
@@ -1224,4 +1226,40 @@ async fn a_replay_without_packets_has_no_lead() {
         .expect("a frame within 200 ms")
         .unwrap();
     until_stopped(&node, &id, Duration::from_secs(15)).await;
+}
+
+#[tokio::test]
+async fn capture_decode_replays_a_ring_slice() {
+    use zeta_core::types::{Selection, Span, Timestamp};
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    // The ring is centred 10 kHz above the packet: the slice's file keeps the ring's
+    // centre and its record the selection's band.
+    let iq = zeta_dsp::synth::aprs_packet_iq("N0CALL", "APZETA", ">slice", APRS_RATE_HZ, -10_000.0);
+    let sel = Selection {
+        source: SourceId(RADIO.into()),
+        span: Span {
+            start_ns: Timestamp(T0_NS),
+            end_ns: Timestamp(T0_NS + iq.len() as u64 * 1_000_000_000 / APRS_RATE_HZ as u64),
+        },
+        center_hz: Hz(APRS_CENTER_HZ),
+        bandwidth_hz: Hz(APRS_BAND_HZ),
+    };
+    let rec = zeta_core::ops::write_ring_slice(
+        &node,
+        &sel,
+        &iq,
+        Hz(APRS_RATE_HZ as u64),
+        Hz(APRS_CENTER_HZ + 10_000),
+        false,
+    )
+    .unwrap();
+    let id = started(decode(&node, &rec.id, APRS, None, false).await);
+    until_stopped(&node, &id, Duration::from_secs(20)).await;
+    let job = record(&node, &id);
+    assert!(
+        job.context["replay"]["events"].as_u64().unwrap() >= 1,
+        "{}",
+        job.context
+    );
 }

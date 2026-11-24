@@ -391,6 +391,8 @@ async fn captures_are_served_with_the_bearer_and_404_without_a_record() {
                 job: JobId("cap".into()),
                 watch: None,
                 allocations: json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             &iq,
         )
@@ -490,6 +492,8 @@ async fn only_a_packet_capture_id_is_served() {
                 job: JobId("cap".into()),
                 watch: None,
                 allocations: json!([]),
+                file_center_hz: None,
+                trial: false,
             },
             &iq,
         )
