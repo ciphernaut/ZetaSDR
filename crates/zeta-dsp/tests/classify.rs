@@ -397,7 +397,7 @@ async fn classify_answers_the_measured_features_as_fields() {
     let f = classify_features(&node, CENTER, 20_000).await;
     assert!(f.bandwidth_hz.0 > 0, "{f:?}");
     let rms = f.audio_rms_hz.expect("audio_rms_hz");
-    assert!((300.0..2_500.0).contains(&rms), "{f:?}");
+    assert!((300..2_500).contains(&rms.0), "{f:?}");
     assert!(f.power99_hz.is_some_and(|w| w.0 > 0), "{f:?}");
     assert_eq!(f.ssb, None, "{f:?}");
 }

@@ -53,13 +53,17 @@ pub struct FeatureRecord {
     pub symbol_rate_line: Option<RateLine>,
     /// The width holding 99 % of the excess power around the peak; `None` when not
     /// measured (an older record, or a measure that did not keep it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    #[schemars(required)]
     pub power99_hz: Option<Hz>,
-    /// RMS frequency deviation of the discriminator audio, Hz; `None` when not measured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audio_rms_hz: Option<f32>,
+    /// RMS frequency deviation of the discriminator audio, whole Hz; `None` when not
+    /// measured.
+    #[serde(default)]
+    #[schemars(required)]
+    pub audio_rms_hz: Option<Hz>,
     /// The sideband and dial frequency when layer 1 read the signal as SSB.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    #[schemars(required)]
     pub ssb: Option<SsbFeature>,
 }
 

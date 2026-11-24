@@ -683,6 +683,8 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                         .any(|w| name.contains(w))
                         // A source sweep's `calibrated` says its levels are absolute.
                         && name != "calibrated"
+                        // A feature record's `symbol_rate_line` names where the rate was read.
+                        && name != "symbol_rate_line"
                         // A width rule's `center` is where to centre (`measured`, `dial`).
                         && !(name == "center" && path.ends_with(".ModeWidthRule"));
                     assert!(
@@ -719,9 +721,11 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                     );
                     // A learned signature's burst shape keeps the feature record's
                     // measured milliseconds (a number, maybe null), not a timeout; a
-                    // knowledge `Signature` inlines it as its nullable `burst`.
-                    let burst =
-                        path.ends_with(".Burst") || path.ends_with(".Signature.properties.burst");
+                    // knowledge `Signature` inlines it as its nullable `burst`; a `classify`
+                    // answer's `features` is the feature record itself.
+                    let burst = path.ends_with(".Burst")
+                        || path.ends_with(".Signature.properties.burst")
+                        || path.ends_with(".value.properties.features");
                     // A nullable one (`job_start`'s `dwell_ms`) is an integer or `null`.
                     if name.ends_with("_ms") && !burst {
                         let integer = s["type"] == "integer"

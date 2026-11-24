@@ -1567,6 +1567,14 @@ fn demod_graph(
     }
 }
 
+/// The schema of a `classify` answer's `features`: the feature record, every member
+/// written (`null` when not measured), or `null`.
+fn nullable_features(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let mut s = crate::types::nullable::<crate::classify::FeatureRecord>(g);
+    crate::knowledge::require_all(&mut s);
+    s
+}
+
 /// A result variant's `value` requires every property, its `#[serde(default)]` ones
 /// included: they are always written, and defaulted only for an older node's answer.
 fn require_all_value(schema: &mut schemars::Schema) {
@@ -4136,10 +4144,7 @@ pub enum OpResult {
         /// width, the audio's rms deviation, the SSB side and dial); `null` when layer 1
         /// could not measure it, and from an older node.
         #[serde(default)]
-        #[schemars(
-            required,
-            schema_with = "crate::types::nullable::<crate::classify::FeatureRecord>"
-        )]
+        #[schemars(required, schema_with = "nullable_features")]
         features: Option<Box<crate::classify::FeatureRecord>>,
         /// The one job the band answers (`crate::choice::choose_now`): the job, its
         /// evidence, runner-up and the rows that could prove otherwise; `null` from

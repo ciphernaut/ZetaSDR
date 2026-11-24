@@ -918,7 +918,9 @@ fn carry_extras(
     if iq.is_empty() || rate_hz == 0 {
         return;
     }
-    f.audio_rms_hz = Some(audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0) as f32);
+    f.audio_rms_hz = Some(Hz(
+        audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0).round() as u64
+    ));
     if label.name == "ssb" {
         let db = spectrum(iq);
         let floor = median(&db);
