@@ -200,6 +200,12 @@ fn note(op: &str) -> Option<&'static str> {
         "handler_policy_get" => Some(
             "What `modes_list`'s `handler` is chosen from. A mode with no ranking of its own and no node-wide ranking runs an in-process handler before a program, the row's own before a handler file's.",
         ),
+        "choice_policy_set" => Some(
+            "The operator's choice, as a job is: set it only on the operator's word, never to get a deeper trial for yourself. It replaces the whole policy, so read `choice_policy_get` first and send it back with the one change. Per surface (`menu` the page's box menu, `watch`, `agent` you, `client` the CLI, HTTP and MCP) `default` is the step taken when none is asked for and `cap` the deepest step it may ask for, 1 to 3 with `default` at most `cap`; a request past the cap runs to the cap and says `not tried: capped at step <n> for <surface>`. `lease` `share` lets step 3 use only a running capture that covers the band; `widen` also lets it grow a held capture without moving any holder's band. `budget`: `trial_s` seconds in all, `concurrent` trials at once, `slice_s` seconds of the ring one trial replays. A value that fails is refused naming the surface or field, and nothing is written.",
+        ),
+        "choice_policy_get" => Some(
+            "The policy a choice reads: the ceilings, the lease setting and the trial budget. Read it before telling the operator why a choice stopped at a step.",
+        ),
         "themes_list" => Some(
             "The themes the page can use, one row each: `id`, `name`, `description`, `color_scheme` (`dark` or `light`; `null` for a broken theme), `builtin`, `replaces_builtin` (an operator theme with a built-in's id), `file` (`themes/<id>` for a built-in, the folder's path for an operator theme) and `state` ready|broken with `reason` (`null` when ready; a broken theme's `reason` names the field, `<field>: <error>`). A theme is a folder holding `theme.json`, an optional `style.css` and the fonts and images it names. On the CLI, `zeta themes list`.",
         ),
@@ -643,6 +649,12 @@ fn cli_form(op: &str, fields: &[(&str, &Value)], defs: &Value) -> String {
     }
     if op == "handler_policy_get" {
         return "zeta handlers policy get".into();
+    }
+    if op == "choice_policy_set" {
+        return "zeta choice policy set --lease share|widen, or --file policy.json (the whole policy)".into();
+    }
+    if op == "choice_policy_get" {
+        return "zeta choice policy get".into();
     }
     if op == "set_list" {
         return "zeta sets".into();

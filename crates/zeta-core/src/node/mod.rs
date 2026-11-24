@@ -57,8 +57,8 @@ pub(crate) use launch::AfterGate;
 use launch::{feed_bank, feed_ring};
 pub(crate) use persist::now;
 use persist::{
-    SET_INSTANCES_DIR, io, load, load_handler_policy, load_instances, persist,
-    persist_handler_policy, persist_instance, remove_instance,
+    SET_INSTANCES_DIR, io, load, load_choice_policy, load_handler_policy, load_instances, persist,
+    persist_choice_policy, persist_handler_policy, persist_instance, remove_instance,
 };
 pub use sources::{GainSetting, SOURCE_RECORD_FORMAT, SourceRecord, load_source};
 use sources::{load_sources, persist_source};
@@ -513,6 +513,7 @@ struct Inner {
     /// The operator's handler rankings, loaded at `open` and written through on every
     /// change (`handler-policy.json`).
     handler_policy: Mutex<crate::modes::policy::HandlerPolicy>,
+    choice_policy: Mutex<crate::choice_policy::ChoicePolicy>,
     jobs_dir: PathBuf,
     /// `state_dir/sources`, one [`SourceRecord`] per source.
     sources_dir: PathBuf,
@@ -1562,6 +1563,8 @@ impl Node {
         load_errors.extend(station_error);
         let (handler_policy, policy_error) = load_handler_policy(&cfg.state_dir);
         load_errors.extend(policy_error);
+        let (choice_policy, choice_error) = load_choice_policy(&cfg.state_dir);
+        load_errors.extend(choice_error);
         let sources_dir = cfg.state_dir.join("sources");
         let (source_records, source_errors) = load_sources(&sources_dir);
         load_errors.extend(source_errors);
@@ -1643,6 +1646,7 @@ impl Node {
                 state_dir: cfg.state_dir.clone(),
                 station: Mutex::new(station),
                 handler_policy: Mutex::new(handler_policy),
+                choice_policy: Mutex::new(choice_policy),
                 jobs_dir,
                 sources_dir,
                 sources: Mutex::new(source_records),
@@ -3846,6 +3850,24 @@ impl Node {
         persist_handler_policy(&self.inner.state_dir, &next)?;
         *held = next.clone();
         Ok(next)
+    }
+
+    /// The operator's choice policy ([`crate::choice_policy::ChoicePolicy`]).
+    pub fn choice_policy(&self) -> crate::choice_policy::ChoicePolicy {
+        self.inner.choice_policy.lock().unwrap().clone()
+    }
+
+    /// Replace the choice policy with `policy`: written to `choice-policy.json` first,
+    /// then kept in memory; a failed write leaves the old policy. The policy is not
+    /// validated here (`choice_policy_set` does). The result is the policy.
+    pub fn set_choice_policy(
+        &self,
+        policy: crate::choice_policy::ChoicePolicy,
+    ) -> Result<crate::choice_policy::ChoicePolicy, NodeError> {
+        let mut held = self.inner.choice_policy.lock().unwrap();
+        persist_choice_policy(&self.inner.state_dir, &policy)?;
+        *held = policy.clone();
+        Ok(policy)
     }
 
     /// Hold `source` at `want` without a job: a rigid lease under

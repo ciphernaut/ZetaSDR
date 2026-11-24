@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::NodeError;
+use crate::choice_policy::ChoicePolicy;
 use crate::job::{JOB_RECORD_FORMAT, JobRecord};
 use crate::modes::policy::HandlerPolicy;
 use crate::types::Timestamp;
@@ -58,6 +59,40 @@ pub(super) fn persist_handler_policy(state_dir: &Path, p: &HandlerPolicy) -> Res
     let tmp = state_dir.join(format!("{HANDLER_POLICY_FILE}.tmp"));
     std::fs::write(&tmp, json).map_err(io)?;
     std::fs::rename(&tmp, state_dir.join(HANDLER_POLICY_FILE)).map_err(io)
+}
+
+/// The choice policy's file in the state directory.
+pub(super) const CHOICE_POLICY_FILE: &str = "choice-policy.json";
+
+/// Read the choice policy in `state_dir`: a missing file is the default policy, as is one
+/// that cannot be read, parsed or validated, which also gives one line saying why.
+pub(super) fn load_choice_policy(state_dir: &Path) -> (ChoicePolicy, Option<String>) {
+    let bad = |why: String| {
+        (
+            ChoicePolicy::default(),
+            Some(format!("unreadable {CHOICE_POLICY_FILE}: {why}")),
+        )
+    };
+    match std::fs::read(state_dir.join(CHOICE_POLICY_FILE)) {
+        Ok(b) => match serde_json::from_slice::<ChoicePolicy>(&b) {
+            Ok(p) => match p.validate() {
+                Ok(()) => (p, None),
+                Err(e) => bad(e),
+            },
+            Err(e) => bad(e.to_string()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (ChoicePolicy::default(), None),
+        Err(e) => bad(e.to_string()),
+    }
+}
+
+/// Write the choice policy into `state_dir` atomically: temp file, then rename.
+pub(super) fn persist_choice_policy(state_dir: &Path, p: &ChoicePolicy) -> Result<(), NodeError> {
+    std::fs::create_dir_all(state_dir).map_err(io)?;
+    let json = serde_json::to_vec_pretty(p).map_err(io)?;
+    let tmp = state_dir.join(format!("{CHOICE_POLICY_FILE}.tmp"));
+    std::fs::write(&tmp, json).map_err(io)?;
+    std::fs::rename(&tmp, state_dir.join(CHOICE_POLICY_FILE)).map_err(io)
 }
 
 /// The state directory's subdirectory of the running sets' instances: apart from

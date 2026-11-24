@@ -6,6 +6,7 @@ pub mod bits;
 pub mod bursts;
 pub mod capture;
 pub mod choice;
+pub mod choice_policy;
 pub mod classify;
 pub mod emission;
 pub mod graph;

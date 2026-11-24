@@ -1120,6 +1120,19 @@ pub enum Op {
     /// The handler policy: `modes`, each mode's ranking by mode id (`{}` for none), and
     /// `all`, the node-wide ranking (`[]` for none).
     HandlerPolicyGet {},
+    /// Replace the choice policy: how far a `choose` goes for each surface (`menu`, `watch`,
+    /// `agent`, `client`: `default` step when none is asked for, never past `cap`, both 1
+    /// to 3 with `default` at most `cap`), whether step 3 may `widen` a held capture or
+    /// only `share` a running one, the trial `budget` (`trial_s` and `concurrent` at least
+    /// 1, `slice_s` above 0) and `confidence_stop` (`null` for none). A surface left out
+    /// takes its built-in ceiling. Checked before anything is written: a value that fails
+    /// is `other`, naming the surface or field. Kept in `choice-policy.json` in the state
+    /// directory across restarts. The result is the policy as stored.
+    ChoicePolicySet {
+        policy: crate::choice_policy::ChoicePolicy,
+    },
+    /// The choice policy as stored (the built-in one when never set).
+    ChoicePolicyGet {},
     /// Run every registered classifier over the selection's band and span of
     /// the source ring (no upstream features).
     Classify {
@@ -4118,6 +4131,8 @@ pub enum OpResult {
     },
     /// `handler_policy_set`, `handler_policy_get`: the policy as stored.
     HandlerPolicy(HandlerPolicy),
+    /// `choice_policy_set`, `choice_policy_get`: the policy as stored.
+    ChoicePolicy(crate::choice_policy::ChoicePolicy),
     /// `classify`: every classifier's labels, the modes decode-to-identify
     /// considered with their score and outcome, and the allocations the knowledge
     /// providers hold for the selection's band from its source's vantage (the first
@@ -4280,6 +4295,8 @@ impl Op {
             Op::ModesShow { .. } => "modes_show",
             Op::HandlerPolicySet { .. } => "handler_policy_set",
             Op::HandlerPolicyGet {} => "handler_policy_get",
+            Op::ChoicePolicySet { .. } => "choice_policy_set",
+            Op::ChoicePolicyGet {} => "choice_policy_get",
             Op::Classify { .. } => "classify",
             Op::Schema {} => "schema",
         }
@@ -4306,6 +4323,7 @@ impl Op {
                 | Op::SetList {}
                 | Op::ModesShow { .. }
                 | Op::HandlerPolicyGet {}
+                | Op::ChoicePolicyGet {}
                 | Op::StationGet {}
                 | Op::CaptureList { .. }
                 | Op::CaptureShow { .. }
@@ -4365,6 +4383,7 @@ impl OpResult {
             OpResult::Sets(_) => "sets",
             OpResult::Mode { .. } => "mode",
             OpResult::HandlerPolicy(_) => "handler_policy",
+            OpResult::ChoicePolicy(_) => "choice_policy",
             OpResult::Classification { .. } => "classification",
             OpResult::Gain(_) => "gain",
             OpResult::PlanStart { .. } => "plan_start",
@@ -6395,6 +6414,15 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
         }
         Op::HandlerPolicySet { mode, order } => handler_policy_set(node, mode, order),
         Op::HandlerPolicyGet {} => Ok(OpResult::HandlerPolicy(node.handler_policy())),
+        Op::ChoicePolicySet { policy } => {
+            policy
+                .validate()
+                .map_err(|message| OpError::Other { message })?;
+            node.set_choice_policy(policy)
+                .map(OpResult::ChoicePolicy)
+                .map_err(|e| node_error(node, e))
+        }
+        Op::ChoicePolicyGet {} => Ok(OpResult::ChoicePolicy(node.choice_policy())),
         Op::Classify { selection } => classify(node, selection).await,
         Op::Schema {} => Ok(OpResult::Schema(node.schema())),
     }

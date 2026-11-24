@@ -398,6 +398,9 @@ pub enum Command {
     /// Work a burst capture's bits
     #[command(subcommand)]
     Bits(BitsCmd),
+    /// The choice policy: how far `classify`'s choice goes
+    #[command(subcommand)]
+    Choice(ChoiceCmd),
     /// The node's station: position, region and antennas
     #[command(subcommand)]
     Station(StationCmd),
@@ -970,6 +973,36 @@ pub enum HandlersCmd {
     /// The operator's ranking of handlers, which the policy picking a mode's handler reads
     #[command(subcommand)]
     Policy(HandlerPolicyCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ChoiceCmd {
+    /// How far a choice goes for each caller, and what its trials may spend
+    #[command(subcommand)]
+    Policy(ChoicePolicyCmd),
+}
+
+/// `choice policy set --lease`: a step-3 trial's lease.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum LeaseArg {
+    Share,
+    Widen,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ChoicePolicyCmd {
+    /// Print the choice policy
+    Get,
+    /// Replace the choice policy: from a JSON file (the whole policy), or the current one
+    /// with its lease setting changed
+    Set {
+        /// A JSON file holding the whole policy (see `choice policy get`)
+        #[arg(long, value_name = "JSON", conflicts_with = "lease")]
+        file: Option<std::path::PathBuf>,
+        /// Keep the current policy, with step 3's lease set to this
+        #[arg(long, value_enum)]
+        lease: Option<LeaseArg>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1870,6 +1903,7 @@ impl Command {
                 | Command::Bits(BitsCmd::Start { .. })
                 | Command::Station(StationCmd::Set { .. } | StationCmd::Clear)
                 | Command::Handlers(HandlersCmd::Policy(HandlerPolicyCmd::Set { .. }))
+                | Command::Choice(ChoiceCmd::Policy(ChoicePolicyCmd::Set { .. }))
                 | Command::Capture(CaptureCmd::Delete { .. } | CaptureCmd::Decode { .. })
                 | Command::Packets(PacketsCmd::Delete { .. })
                 | Command::Signature(
@@ -1911,6 +1945,22 @@ impl Command {
             Command::Job(JobCmd::Start { keep: true, .. })
                 | Command::Bits(BitsCmd::Start { keep: true, .. })
         )
+    }
+
+    /// For `choice policy set --lease`, the lease to put on the node's current policy;
+    /// `None` for any other command.
+    pub fn choice_lease(&self) -> Option<zeta_core::choice_policy::LeaseSetting> {
+        use zeta_core::choice_policy::LeaseSetting;
+        match self {
+            Command::Choice(ChoiceCmd::Policy(ChoicePolicyCmd::Set {
+                file: None,
+                lease: Some(l),
+            })) => Some(match l {
+                LeaseArg::Share => LeaseSetting::Share,
+                LeaseArg::Widen => LeaseSetting::Widen,
+            }),
+            _ => None,
+        }
     }
 
     /// For `job start --beside`, what the command line left out and the job to read it
@@ -2230,6 +2280,29 @@ impl Command {
                 role: None,
             },
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
+            Command::Choice(ChoiceCmd::Policy(ChoicePolicyCmd::Get)) => Op::ChoicePolicyGet {},
+            Command::Choice(ChoiceCmd::Policy(ChoicePolicyCmd::Set { file, lease })) => {
+                match (file, lease) {
+                    (Some(f), _) => {
+                        let v = read_json(&f)?;
+                        Op::ChoicePolicySet {
+                            policy: serde_json::from_value(v).map_err(|e| OpError::Other {
+                                message: format!("{}: {e}", f.display()),
+                            })?,
+                        }
+                    }
+                    // The current policy with this lease: `main` fills it in once the
+                    // node is open (`choice_lease`).
+                    (None, Some(_)) => Op::ChoicePolicySet {
+                        policy: Default::default(),
+                    },
+                    (None, None) => {
+                        return Err(OpError::Other {
+                            message: "choice policy set takes --file or --lease".into(),
+                        });
+                    }
+                }
+            }
             Command::Handlers(HandlersCmd::Policy(HandlerPolicyCmd::Get)) => {
                 Op::HandlerPolicyGet {}
             }
