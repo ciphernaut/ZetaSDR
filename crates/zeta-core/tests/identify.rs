@@ -1462,6 +1462,43 @@ async fn identify_skips_video_decode_on_a_narrow_band() {
     stop_all(&node).await;
 }
 
+/// A row marked `identify.when_named` is no candidate of an identify run that names
+/// nothing: the run publishes no event for it, in range and fitting the band as it is
+/// (the same row unmarked is listed). Naming it is a watch's `modes` or `candidates`
+/// (see `passed_over` in `modes/score.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_marked_when_named_is_tried_only_when_named() {
+    let _one = SERIAL.lock().await;
+    let mut listed = Vec::new();
+    for marked in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let modes = dir.path().join("modes");
+        std::fs::create_dir_all(&modes).unwrap();
+        let (_, text) = zeta_core::modes::ModeRegistry::embedded()
+            .into_iter()
+            .find(|(f, _)| f.ends_with("adsb_decode.json"))
+            .unwrap();
+        let mut row: Value = serde_json::from_str(text).unwrap();
+        row["id"] = "named_decode".into();
+        row["decoder"] = Value::Null;
+        row["test"] = Value::Null;
+        row["identify"]["when_named"] = marked.into();
+        row["band"] = serde_json::json!({
+            "bandwidth_hz": BANDWIDTH_HZ, "centers_hz": [APRS_HZ], "min_hz": null,
+            "range_hz": [APRS_HZ - 100_000, APRS_HZ + 100_000]
+        });
+        std::fs::write(modes.join("named_decode.json"), row.to_string()).unwrap();
+        let (node, src) =
+            node_unstarted_with(dir.path(), &fixtures().tone, |p| p, Some(modes)).await;
+        src.start();
+        let (id, events) = identify(&node, APRS_HZ).await;
+        let events = ended(&node, &id, events, Duration::from_secs(60)).await;
+        listed.push(outcome(&events, "named_decode").is_some());
+        stop_all(&node).await;
+    }
+    assert_eq!(listed, [true, false]);
+}
+
 /// Plan 47: a row with no decoder of its own and no handler for it, fitting the band,
 /// is passed over as `unavailable` with the row's reason, and never started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -73,7 +73,7 @@ use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::{Allocation, DEFAULT_REGION, band_assignments};
 use crate::modes::ModeRegistry;
 use crate::modes::ModeState;
-use crate::modes::score::score_rows;
+use crate::modes::score::{passed_over, score_rows};
 use crate::ops::{
     DETECT_GONE_MS_DEFAULT, DETECT_STAGE, DETECT_WIDTH_HZ_DEFAULT, IDENTIFY_DWELL_SCALES, JobKind,
     SONDEHUB_STAGE, WATCH_CONFIRM_MS_DEFAULT, WATCH_COOLDOWN_MS_DEFAULT, WATCH_HOLD_MS_DEFAULT,
@@ -137,7 +137,7 @@ fn span_fits(row_hz: u64, signal_hz: u64, floor_hz: u64) -> bool {
 fn identify_band(modes: &ModeRegistry, watch_hz: u64, s: &Signal) -> (u64, f32) {
     score_rows(modes, s.center_hz, s.bandwidth_hz, "", &|_| 0.0, &|_| 0.0)
         .into_iter()
-        .filter(|x| x.mode.startable() && x.in_range)
+        .filter(|x| x.mode.startable() && x.in_range && !passed_over(x.mode, None))
         .find(|x| {
             let band = &x.mode.row.band;
             width_fits(band.bandwidth_hz, s.bandwidth_hz) && band.bandwidth_hz <= watch_hz
@@ -2794,6 +2794,44 @@ mod tests {
 
     /// The width an identify run takes comes only from rows in range for the signal's
     /// centre: the 8 MHz `dvbt_decode` (174-862 MHz) sets it at 500 MHz, not at 1.3 GHz.
+    /// A wide row marked `identify.when_named` sets no identify band of a watch with
+    /// default modes; unmarked it would.
+    #[test]
+    fn a_row_marked_when_named_sets_no_identify_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let modes_dir = dir.path().join("modes");
+        std::fs::create_dir_all(&modes_dir).unwrap();
+        let (_, text) = ModeRegistry::embedded()
+            .into_iter()
+            .find(|(f, _)| f.ends_with("dvbt_decode.json"))
+            .unwrap();
+        let mut seen = Vec::new();
+        for marked in [false, true] {
+            let mut row: serde_json::Value = serde_json::from_str(text).unwrap();
+            row["id"] = "wide_decode".into();
+            row["band"] = serde_json::json!({
+                "bandwidth_hz": 9_000_000, "centers_hz": [], "min_hz": null, "range_hz": null
+            });
+            row["identify"]["when_named"] = marked.into();
+            std::fs::write(modes_dir.join("wide.json"), row.to_string()).unwrap();
+            let mut modes = ModeRegistry::load_with(
+                &crate::stage::StageRegistry::new(),
+                Some(&modes_dir),
+                None,
+            );
+            modes.set_program("wide_decode", Some("/stand-in".into()), None);
+            let signal = Signal {
+                center_hz: 1_300_000_000,
+                bandwidth_hz: 9_000_000,
+                ..tracked(0, 0).signal
+            };
+            seen.push(identify_band(&modes, 20_000_000, &signal));
+        }
+        assert_eq!(seen[0].0, 9_000_000, "{seen:?}");
+        assert!(seen[0].1 > 0.0, "{seen:?}");
+        assert_eq!(seen[1], (9_000_000, 0.0), "{seen:?}");
+    }
+
     #[test]
     fn identify_band_ignores_an_out_of_range_wide_row() {
         let mut modes = ModeRegistry::load(&crate::stage::StageRegistry::new(), None);
@@ -2806,10 +2844,10 @@ mod tests {
         let (band_hz, score) = identify_band(&modes, 20_000_000, &signal(500_000_000));
         assert_eq!(band_hz, 8_000_000);
         assert!(score > 0.0, "{score}");
-        // Out of dvbt's range its 8 MHz is not taken. `dvbs_ip_decode` has no range (a dish's
-        // intermediate frequency is the operator's), so it is in range anywhere: its 10 MHz.
-        let (band_hz, _) = identify_band(&modes, 20_000_000, &signal(1_300_000_000));
-        assert_eq!(band_hz, 10_000_000);
+        assert_eq!(
+            identify_band(&modes, 20_000_000, &signal(1_300_000_000)),
+            (7_000_000, 0.0)
+        );
     }
 
     #[test]

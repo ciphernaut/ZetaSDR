@@ -104,6 +104,13 @@ pub fn allocation_term(row: &LoadedMode, allocs: &[Allocation]) -> f32 {
     }
 }
 
+/// Whether identify's, classify's or a watch's own choice of rows passes over `mode`:
+/// its row says `identify.when_named` and `named` (the caller's list, `None` for none)
+/// does not hold it.
+pub fn passed_over(mode: &LoadedMode, named: Option<&[String]>) -> bool {
+    mode.row.identify.when_named && !named.is_some_and(|n| n.contains(&mode.row.id.0))
+}
+
 /// One row's score against a measured band.
 #[derive(Clone, Debug)]
 pub struct Scored<'a> {
@@ -476,6 +483,25 @@ mod tests {
             let (named, p25) = (&got[pos(row)], &got[pos("p25_decode")]);
             assert!((named.1 - p25.1).abs() < 1e-6, "they tie: {got:?}");
             assert!(pos(row) < pos("p25_decode"), "{row} first: {got:?}");
+        }
+    }
+
+    /// A row marked `identify.when_named` is passed over unless the caller names it.
+    #[test]
+    fn a_row_marked_when_named_is_passed_over_unless_named() {
+        let modes = registry();
+        let marked = modes.get("dvbs_ip_decode").unwrap();
+        assert!(marked.row.identify.when_named);
+        assert!(passed_over(marked, None));
+        assert!(passed_over(marked, Some(&["rds_decode".to_string()])));
+        assert!(!passed_over(marked, Some(&["dvbs_ip_decode".to_string()])));
+        // Every other embedded row is offered as before.
+        for m in modes
+            .all()
+            .iter()
+            .filter(|m| m.row.id.0 != "dvbs_ip_decode")
+        {
+            assert!(!passed_over(m, None), "{}", m.row.id.0);
         }
     }
 

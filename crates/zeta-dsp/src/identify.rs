@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use num_complex::Complex;
 use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement, Outcome, Tried};
 use zeta_core::knowledge::Allocation;
-use zeta_core::modes::score::{allocation_term, score_rows};
+use zeta_core::modes::score::{allocation_term, passed_over, score_rows};
 use zeta_core::modes::{Decoder, LoadedMode, ModeRow, ModeState, ModesHandle};
 use zeta_core::ops::channel_rate_hz;
 use zeta_core::types::Hz;
@@ -155,7 +155,7 @@ impl Classifier for DecodeToIdentify {
         // anti-goals); they are tried in the full score's order.
         let chosen: Vec<&str> = score_rows(&modes, m_center, m_bw, layer1, &catalogue, &|_| 0.0)
             .into_iter()
-            .filter(|s| s.in_range && classify_candidate(&s.mode.row))
+            .filter(|s| s.in_range && classify_candidate(&s.mode.row) && !passed_over(s.mode, None))
             .take(CLASSIFY_TRIES)
             .map(|s| s.mode.row.id.0.as_str())
             .collect();
@@ -587,7 +587,7 @@ mod tests {
         let catalogue = |id: &str| catalogue_score(id, center, bw, label);
         score_rows(modes, center, bw, label, &catalogue, allocation)
             .into_iter()
-            .filter(|s| s.in_range && classify_candidate(&s.mode.row))
+            .filter(|s| s.in_range && classify_candidate(&s.mode.row) && !passed_over(s.mode, None))
             .map(|s| s.mode.row.id.0.clone())
             .collect()
     }

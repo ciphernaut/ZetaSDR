@@ -631,6 +631,13 @@ pub struct Identify {
     /// when absent.
     #[serde(default)]
     pub as_asked: bool,
+    /// Passed over by identify's own choice of rows, classify's candidates and a watch's
+    /// default modes, and by the band an identify run takes, unless the caller names the
+    /// row (identify's `candidates`, a watch's `modes`, a set or plan member): for a row
+    /// that is heavy to try and has nothing in the band to say it is there. A job started
+    /// by hand is unchanged. `false` when absent.
+    #[serde(default)]
+    pub when_named: bool,
 }
 
 /// What counts as proof: any event, or an event whose `identify.field` is true.
@@ -1393,6 +1400,12 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             ),
         ));
     }
+    if id.when_named && id.quick.is_some() {
+        return Err(RowError::new(
+            "identify.when_named",
+            "a row tried only when named has no quick test (classify never offers it)",
+        ));
+    }
     let Some(decoder) = &row.decoder else {
         // A row with no decoder of its own: a handler file's program decodes it, so
         // nothing in process can try it quickly, and no synthesised capture proves it.
@@ -1885,6 +1898,19 @@ mod tests {
             check(|v| v["identify"]["quick"] = "adsb".into()),
             "identify.quick"
         );
+        // A row tried only when named has no quick test: classify never offers it.
+        assert_eq!(
+            check(|v| {
+                v["identify"]["when_named"] = true.into();
+                v["identify"]["quick"] = "aprs".into();
+            }),
+            "identify.when_named"
+        );
+        // Left out it is false; true alone is valid.
+        let row = parse(&edited(ADSB, |_| {})).unwrap();
+        assert!(!row.identify.when_named);
+        let row = parse(&edited(ADSB, |v| v["identify"]["when_named"] = true.into())).unwrap();
+        validate(&row, &no_stages()).unwrap();
         assert_eq!(
             check(|v| v["decoder"]["args"][0] = "--freq=$freq_hz".into()),
             "decoder.args[0]"

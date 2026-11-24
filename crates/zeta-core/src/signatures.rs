@@ -319,6 +319,7 @@ pub fn learned_row(rec: &SignatureRecord, mode_id: &str) -> crate::modes::ModeRo
             quick: Some(FRAME_PROTOCOL.into()),
             priority: 0,
             as_asked: false,
+            when_named: false,
         },
         catalogue: vec![],
         test: None,

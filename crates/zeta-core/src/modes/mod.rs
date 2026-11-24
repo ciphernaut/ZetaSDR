@@ -1102,6 +1102,7 @@ fn placeholder(id: &str) -> ModeRow {
             quick: None,
             priority: 0,
             as_asked: false,
+            when_named: false,
         },
         catalogue: vec![],
         test: None,

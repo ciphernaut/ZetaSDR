@@ -32,7 +32,7 @@ use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::{Allocation, nearest_of};
 use crate::learned::{LEARNED_VERDICT_MIN, label_score, learned_match};
 use crate::modes::Proof;
-use crate::modes::score::{allocation_match, allocation_term, score_rows};
+use crate::modes::score::{allocation_match, allocation_term, passed_over, score_rows};
 use crate::modes::{Identify, LoadedMode};
 use crate::ops::{IDENTIFY_DWELL_SCALE_MAX, IDENTIFY_MEASURE_MS, JobKind, identify_dwell_ms};
 use crate::port::{Port, Tuning};
@@ -632,6 +632,10 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         {
             continue;
         }
+        // A row marked `when_named` is no candidate of an identify that did not name it.
+        if passed_over(mode, r.candidates.as_deref()) {
+            continue;
+        }
         let fit = allocation_match(mode, &allocations);
         if !s.fits_band {
             let min = mode.row.band.min_hz.unwrap_or(mode.row.band.bandwidth_hz);
@@ -906,6 +910,7 @@ mod tests {
             quick: None,
             priority: 0,
             as_asked,
+            when_named: false,
         };
         // The band as asked, and the trial a measurement of the upper half of a wide
         // uneven signal moved it to.
