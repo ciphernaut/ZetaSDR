@@ -545,6 +545,113 @@
         "port": "$packet_port",
         "parser": "pcap"
       }
+    },
+    "tetra_decode": {
+      "args": [
+        "--mode", "tetra", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz", "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 2000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "freq_hz": "/freq_hz",
+          "mcc": "/mcc",
+          "mnc": "/mnc",
+          "colour_code": "/colour_code",
+          "la": "/la",
+          "network_time": "/network_time",
+          "neighbours": "/neighbours",
+          "snr_db": "/snr_db"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap",
+        "link_types": { "101": "raw_ip" }
+      }
+    },
+    "gsmr_decode": {
+      "args": [
+        "--mode", "gsmr", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz", "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 2000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "freq_hz": "/freq_hz",
+          "arfcn": "/arfcn",
+          "bsic": "/bsic",
+          "mcc": "/mcc",
+          "mnc": "/mnc",
+          "lac": "/lac",
+          "cell_id": "/cell_id",
+          "snr_db": "/snr_db"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap",
+        "link_types": { "101": "raw_ip" }
+      }
+    },
+    "lte_decode": {
+      "args": [
+        "--mode", "lte", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz", "--drop", "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 20000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "freq_hz": "/freq_hz",
+          "pci": "/pci",
+          "bandwidth_hz": "/bandwidth_hz",
+          "mcc": "/mcc",
+          "mnc": "/mnc",
+          "tac": "/tac",
+          "cell_id": "/cell_id",
+          "sibs": "/sibs",
+          "snr_db": "/snr_db"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap",
+        "link_types": { "101": "raw_ip" }
+      }
+    },
+    "dvbs_ip_decode": {
+      "args": [
+        "--mode", "dvbs", "--rate", "$rate_hz", "--format", "cs16",
+        "--freq", "$center_hz", "--width", "$bandwidth_hz", "--pcap-port", "$packet_port"
+      ],
+      "input": { "stream": "iq", "format": "cs16", "rate_hz": 10000000, "via": "stdin" },
+      "output": {
+        "via": "stdout",
+        "parser": "json_lines",
+        "fields": {
+          "locked": "/locked",
+          "standard": "/standard",
+          "symbol_rate": "/symbol_rate",
+          "modcod": "/modcod",
+          "snr_db": "/snr_db",
+          "datagrams": "/datagrams"
+        }
+      },
+      "packets": {
+        "via": "tcp",
+        "port": "$packet_port",
+        "parser": "pcap",
+        "link_types": { "101": "raw_ip" }
+      }
     }
   }
 }

@@ -2806,10 +2806,10 @@ mod tests {
         let (band_hz, score) = identify_band(&modes, 20_000_000, &signal(500_000_000));
         assert_eq!(band_hz, 8_000_000);
         assert!(score > 0.0, "{score}");
-        assert_eq!(
-            identify_band(&modes, 20_000_000, &signal(1_300_000_000)),
-            (7_000_000, 0.0)
-        );
+        // Out of dvbt's range its 8 MHz is not taken. `dvbs_ip_decode` has no range (a dish's
+        // intermediate frequency is the operator's), so it is in range anywhere: its 10 MHz.
+        let (band_hz, _) = identify_band(&modes, 20_000_000, &signal(1_300_000_000));
+        assert_eq!(band_hz, 10_000_000);
     }
 
     #[test]

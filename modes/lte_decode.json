@@ -1,0 +1,79 @@
+{
+  "id": "lte_decode",
+  "name": "LTE cells",
+  "family": "cellular_rail",
+  "band": {
+    "bandwidth_hz": 20000000,
+    "centers_hz": [],
+    "range_hz": [
+      [460000000, 470000000],
+      [617000000, 652000000],
+      [728000000, 821000000],
+      [852000000, 894000000],
+      [925000000, 960000000],
+      [1452000000, 1559000000],
+      [1805000000, 1995000000],
+      [2010000000, 2025000000],
+      [2110000000, 2200000000],
+      [2300000000, 2400000000],
+      [2496000000, 2690000000],
+      [3400000000, 3800000000]
+    ],
+    "min_hz": 1400000
+  },
+  "modulation": ["ofdm"],
+  "label": "LTE",
+  "protocol": "lte",
+  "decoder": null,
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": {"type": "string"},
+        "freq_hz": {"type": "integer"},
+        "pci": {"type": "integer"},
+        "bandwidth_hz": {"type": ["integer", "null"]},
+        "mcc": {"type": ["integer", "null"]},
+        "mnc": {"type": ["integer", "null"]},
+        "tac": {"type": ["integer", "null"]},
+        "cell_id": {"type": ["integer", "null"]},
+        "sibs": {"type": ["array", "null"], "items": {"type": "integer"}},
+        "snr_db": {"type": ["number", "null"]}
+      }
+    },
+    "summary": "PCI {pci} MCC {mcc?} MNC {mnc?} TAC {tac?} {snr_db?:.1} dB"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 15000,
+    "min_span_ms": 0,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": [],
+  "content": "network_traffic",
+  "subject": {
+    "key": "pci",
+    "name": "cells",
+    "waterfall": "summary",
+    "columns": [
+      {"field": "freq_hz", "label": "Frequency (Hz)", "unit": null},
+      {"field": "bandwidth_hz", "label": "Bandwidth (Hz)", "unit": null},
+      {"field": "mcc", "label": "MCC", "unit": null},
+      {"field": "mnc", "label": "MNC", "unit": null},
+      {"field": "tac", "label": "TAC", "unit": null},
+      {"field": "cell_id", "label": "Cell", "unit": null},
+      {"field": "snr_db", "label": "SNR (dB)", "unit": null}
+    ],
+    "heading": null,
+    "label": null
+  },
+  "notes": "LTE base stations (E-UTRA downlink), decoded by OnAir's receiver through the onair-rx handler; the row has no decoder of its own, so only a handler runs it. It reads what each cell broadcasts, not traffic: the cell search, the MIB and the system information. Each event is a cell, first when it is found and again when a member changes: `freq_hz` (the raster frequency: the nearest channel of TS 36.101's table, else the 100 kHz grid), `pci` (the physical cell id; a cell whose MIB is not read yet has `freq_hz` and `pci` only), `bandwidth_hz` (the MIB's), `mcc`, `mnc` (numbers), `tac` and `cell_id` (once SIB1 is read), `sibs` (the SIB numbers decoded so far) and `snr_db`. Nothing is decrypted. The handler takes 20 MHz of IQ, OnAir's usual: it holds a carrier of any width whole, so the system information of a 20 MHz cell is read as well as a 5 MHz one's (a 5 MHz cell needs 4.6 MHz of input at the least), and a job on a narrower band is resampled up to it. Each system information message goes to a packet capture as GSMTAP (type 13, LTE RRC) in IPv4 and UDP to port 4729 (link type 101). Ranges and bands: the spans are the downlink columns of 3GPP TS 36.101's E-UTRA operating bands below 4 GHz (Table 5.5-1), neighbouring bands merged (which bridges the unassigned 1920 to 1930 MHz), across regions; carriers are 1.4 to 20 MHz wide. **The entry runs onair-rx with `--drop`, so a replay can miss**: OnAir's LTE search takes about 2.8 s for each 0.2 s of input at 20 MHz on the build host (0.8 s at 4.6 MHz), so without `--drop` the job would fall behind real time; with it the receiver decodes the blocks it has time for (about one in fourteen) and reads a cell that stays on the air within a few blocks. A replay faster than real time (a capture read from a file) loses most of its input under `--drop`; `capture_decode` replays paced in real time, where it reads the cell. Listing bar: measured on the build host (12 cores) through a scratch node's release build, 30 s of the generated capture looping on a file source and fed in real time; the job skipped no input, onair-rx used 1.08 of a core and the node 0.45 of a core (load average 4.8 to 4.2). Measured on OnAir's 5 MHz cell and on its 20 MHz cell (1.08 of a core each, load 4.1 to 4.2), both input at 20 MHz, with `--drop` (without it the receiver cannot keep real time here).",
+  "test": {
+    "kind": "fixture",
+    "path": "onair/lte.sigmf-meta",
+    "expect": {"freq_hz": 1815000000, "pci": 301},
+    "within_ms": 30000
+  }
+}

@@ -286,7 +286,7 @@ pub(crate) fn nullable_enum<T: JsonSchema>(g: &mut schemars::SchemaGenerator) ->
 }
 
 /// The embedded rows, one file each under `modes/` in the repo.
-const EMBEDDED: [(&str, &str); 24] = [
+const EMBEDDED: [(&str, &str); 28] = [
     (
         "modes/acars_decode.json",
         include_str!("../../../../modes/acars_decode.json"),
@@ -316,6 +316,10 @@ const EMBEDDED: [(&str, &str); 24] = [
         include_str!("../../../../modes/dmr_decode.json"),
     ),
     (
+        "modes/dvbs_ip_decode.json",
+        include_str!("../../../../modes/dvbs_ip_decode.json"),
+    ),
+    (
         "modes/dvbt_decode.json",
         include_str!("../../../../modes/dvbt_decode.json"),
     ),
@@ -324,12 +328,20 @@ const EMBEDDED: [(&str, &str); 24] = [
         include_str!("../../../../modes/flex_decode.json"),
     ),
     (
+        "modes/gsmr_decode.json",
+        include_str!("../../../../modes/gsmr_decode.json"),
+    ),
+    (
         "modes/hfdl_decode.json",
         include_str!("../../../../modes/hfdl_decode.json"),
     ),
     (
         "modes/lorawan_decode.json",
         include_str!("../../../../modes/lorawan_decode.json"),
+    ),
+    (
+        "modes/lte_decode.json",
+        include_str!("../../../../modes/lte_decode.json"),
     ),
     (
         "modes/m17_decode.json",
@@ -354,6 +366,10 @@ const EMBEDDED: [(&str, &str); 24] = [
     (
         "modes/rs41_decode.json",
         include_str!("../../../../modes/rs41_decode.json"),
+    ),
+    (
+        "modes/tetra_decode.json",
+        include_str!("../../../../modes/tetra_decode.json"),
     ),
     (
         "modes/thread_decode.json",

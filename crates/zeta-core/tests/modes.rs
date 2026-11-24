@@ -21,7 +21,7 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 24] = [
+const EMBEDDED: [&str; 28] = [
     "acars_decode",
     "adsb_decode",
     "ais_decode",
@@ -29,16 +29,20 @@ const EMBEDDED: [&str; 24] = [
     "ble_decode",
     "dfm_decode",
     "dmr_decode",
+    "dvbs_ip_decode",
     "dvbt_decode",
     "flex_decode",
+    "gsmr_decode",
     "hfdl_decode",
     "lorawan_decode",
+    "lte_decode",
     "m17_decode",
     "m20_decode",
     "p25_decode",
     "pocsag_decode",
     "rds_decode",
     "rs41_decode",
+    "tetra_decode",
     "thread_decode",
     "vdl2_decode",
     "video_decode",
@@ -1494,7 +1498,7 @@ fn the_embedded_onair_handler_serves_its_modes() {
     let events = [StreamKind::Event];
     let both = [StreamKind::Event, StreamKind::Packet];
     // (mode id, the streams its OnAir entry gives, its input rate)
-    let modes: [(&str, &[StreamKind], u64); 22] = [
+    let modes: [(&str, &[StreamKind], u64); 26] = [
         ("pocsag_decode", &events, 1_000_000),
         ("flex_decode", &events, 1_000_000),
         ("acars_decode", &events, 1_000_000),
@@ -1518,6 +1522,10 @@ fn the_embedded_onair_handler_serves_its_modes() {
         ("zwave_decode", &both, 2_000_000),
         ("wifi_decode", &both, 20_000_000),
         ("wisun_decode", &both, 2_000_000),
+        ("tetra_decode", &both, 2_000_000),
+        ("gsmr_decode", &both, 2_000_000),
+        ("lte_decode", &both, 20_000_000),
+        ("dvbs_ip_decode", &both, 10_000_000),
     ];
     for (id, outputs, rate) in modes {
         assert_eq!(
@@ -2374,6 +2382,10 @@ fn the_embedded_rows_with_no_decoder_carry_content_and_a_fixture_test() {
         "zwave_decode",
         "wifi_decode",
         "wisun_decode",
+        "tetra_decode",
+        "gsmr_decode",
+        "lte_decode",
+        "dvbs_ip_decode",
     ] {
         assert!(
             seen.iter().any(|s| s == id),

@@ -1,0 +1,70 @@
+{
+  "id": "tetra_decode",
+  "name": "TETRA cells",
+  "family": "two_way",
+  "band": {
+    "bandwidth_hz": 2000000,
+    "centers_hz": [],
+    "range_hz": [
+      [380000000, 400000000],
+      [410000000, 430000000],
+      [450000000, 470000000],
+      [870000000, 876000000],
+      [915000000, 921000000]
+    ],
+    "min_hz": 25000
+  },
+  "modulation": ["pi4dqpsk"],
+  "label": "TETRA",
+  "protocol": "tetra",
+  "decoder": null,
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": {"type": "string"},
+        "freq_hz": {"type": "integer"},
+        "mcc": {"type": "integer"},
+        "mnc": {"type": "integer"},
+        "colour_code": {"type": "integer"},
+        "la": {"type": ["integer", "null"]},
+        "network_time": {"type": ["string", "null"]},
+        "neighbours": {"type": ["integer", "null"]},
+        "snr_db": {"type": ["number", "null"]}
+      }
+    },
+    "summary": "MCC {mcc} MNC {mnc} CC {colour_code} LA {la?} {snr_db?:.1} dB"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 15000,
+    "min_span_ms": 0,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": [],
+  "content": "network_traffic",
+  "subject": {
+    "key": "freq_hz",
+    "name": "cells",
+    "waterfall": "summary",
+    "columns": [
+      {"field": "mcc", "label": "MCC", "unit": null},
+      {"field": "mnc", "label": "MNC", "unit": null},
+      {"field": "colour_code", "label": "Colour code", "unit": null},
+      {"field": "la", "label": "Location area", "unit": null},
+      {"field": "neighbours", "label": "Neighbours", "unit": null},
+      {"field": "snr_db", "label": "SNR (dB)", "unit": null}
+    ],
+    "heading": null,
+    "label": null
+  },
+  "notes": "TETRA base stations (ETSI EN 300 392, voice plus data), decoded by OnAir's receiver through the onair-rx handler; the row has no decoder of its own, so only a handler runs it. It reads what each cell broadcasts in the clear on its downlink, not calls: a job takes 2 MHz of IQ (the handler's rate; the receiver reads 200 kHz at the least) and searches the middle 72 percent of it for 25 kHz carriers, each its own cell. Each event is a cell, first when it is read and again when a member of it changes (a measured value, `snr_db`, `freq_hz` as measured, or the network time's value, changes without a new event): `freq_hz` (the main carrier the cell announces, else the carrier as measured), `mcc`, `mnc` (numbers: a leading zero is lost) and `colour_code` (from the synchronisation burst), `la` (location area), `network_time` (OnAir's text of the network time, when the neighbour broadcast carries one), `neighbours` (how many neighbour cells it has broadcast) and `snr_db`. The receiver decodes a stretch of 2.3 s at a time, so an event comes up to one stretch after the signal. Nothing addressed to a terminal is decoded, encrypted signalling is given as received and no key is loaded. Each synchronisation burst and signalling block goes to a packet capture as GSMTAP (type 5, TETRA I1) in IPv4 and UDP to port 4729 (link type 101). Ranges and bands: the TETRA bands 380 to 400, 410 to 430, 450 to 470, 870 to 876 and 915 to 921 MHz are those of ETSI's TETRA standards (EN 300 392 series), across regions; carriers are 25 kHz wide, so a job may be as narrow as 25 kHz of the 2 MHz the handler reads. Listing bar: measured on the build host (12 cores) through a scratch node's release build, 30 s of the generated capture looping on a file source and fed in real time; the job skipped no input, onair-rx used 0.10 of a core and the node 0.08 of a core (load average 9.2 to 6.5).",
+  "test": {
+    "kind": "fixture",
+    "path": "onair/tetra.sigmf-meta",
+    "expect": {"freq_hz": 392412500, "mcc": 1, "mnc": 1, "colour_code": 5},
+    "within_ms": 30000
+  }
+}

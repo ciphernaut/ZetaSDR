@@ -1,0 +1,65 @@
+{
+  "id": "gsmr_decode",
+  "name": "GSM-R cells",
+  "family": "cellular_rail",
+  "band": {
+    "bandwidth_hz": 2000000,
+    "centers_hz": [],
+    "range_hz": [921000000, 925000000],
+    "min_hz": 200000
+  },
+  "modulation": ["gmsk"],
+  "label": "GSM-R",
+  "protocol": "gsmr",
+  "decoder": null,
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "protocol": {"type": "string"},
+        "freq_hz": {"type": "integer"},
+        "arfcn": {"type": ["integer", "null"]},
+        "bsic": {"type": ["integer", "null"]},
+        "mcc": {"type": ["integer", "null"]},
+        "mnc": {"type": ["integer", "null"]},
+        "lac": {"type": ["integer", "null"]},
+        "cell_id": {"type": ["integer", "null"]},
+        "snr_db": {"type": ["number", "null"]}
+      }
+    },
+    "summary": "ARFCN {arfcn?} BSIC {bsic?} LAC {lac?} cell {cell_id?}"
+  },
+  "identify": {
+    "proof": "event",
+    "min_events": 1,
+    "dwell_ms": 15000,
+    "min_span_ms": 0,
+    "quick": null,
+    "priority": 0
+  },
+  "catalogue": [],
+  "content": "network_traffic",
+  "subject": {
+    "key": "freq_hz",
+    "name": "cells",
+    "waterfall": "summary",
+    "columns": [
+      {"field": "arfcn", "label": "ARFCN", "unit": null},
+      {"field": "bsic", "label": "BSIC", "unit": null},
+      {"field": "mcc", "label": "MCC", "unit": null},
+      {"field": "mnc", "label": "MNC", "unit": null},
+      {"field": "lac", "label": "LAC", "unit": null},
+      {"field": "cell_id", "label": "Cell", "unit": null},
+      {"field": "snr_db", "label": "SNR (dB)", "unit": null}
+    ],
+    "heading": null,
+    "label": null
+  },
+  "notes": "GSM-R base stations (GSM for railways, 3GPP GSM), decoded by OnAir's receiver through the onair-rx handler; the row has no decoder of its own, so only a handler runs it. It reads what each cell broadcasts on its BCCH, not calls: a job takes 2 MHz of IQ (the receiver reads 1 MHz at the least) and searches it for 200 kHz carriers (the strongest 12, outside 4 percent of each edge). Each event is a cell, first when it is read and again when a member changes (`snr_db` and a measured `freq_hz` change without a new event): `freq_hz` (the carrier as measured, off the raster), `arfcn` (when the carrier is on the raster of GSM 850, 900, DCS 1800 or PCS 1900), `bsic` (NCC times 8 plus BCC), `mcc`, `mnc`, `lac` and `cell_id` (from System Information 3 or 4; null until read) and `snr_db`. The receiver decodes a stretch of 2.2 s at a time, so an event comes up to one stretch after the signal. Paging and access blocks are counted and not published; traffic is not decoded. Each BCCH block goes to a packet capture as GSMTAP (type 1, Um) in IPv4 and UDP to port 4729 (link type 101). Ranges and bands: GSM-R's downlink 921 to 925 MHz (R-GSM, the railway band at 876 to 880 MHz uplink) is 3GPP TS 45.005's; other railway allocations exist, the receiver reads any GSM 850, 900, 1800 or 1900 MHz carrier, and a job started by hand runs anywhere. The scene the check uses has two cells 1.6 MHz apart, so its centre is 923.0 MHz. Listing bar: measured on the build host (12 cores) through a scratch node's release build, 30 s of the generated capture looping on a file source and fed in real time; the job skipped no input, onair-rx used 0.51 of a core and the node 0.08 of a core (load average 6.1 to 4.8).",
+  "test": {
+    "kind": "fixture",
+    "path": "onair/gsmr.sigmf-meta",
+    "expect": {"freq_hz": 922200000, "arfcn": 960, "bsic": 10},
+    "within_ms": 30000
+  }
+}

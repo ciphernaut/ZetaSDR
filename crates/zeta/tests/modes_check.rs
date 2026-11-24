@@ -147,9 +147,10 @@ fn an_unknown_id_lists_the_known_ones() {
     assert!(
         err.contains(
             "unknown mode nope (known: acars_decode, adsb_decode, ais_decode, aprs_decode, \
-             ble_decode, dfm_decode, dmr_decode, dvbt_decode, flex_decode, hfdl_decode, \
-             lorawan_decode, m17_decode, m20_decode, p25_decode, pocsag_decode, rds_decode, \
-             rs41_decode, thread_decode, vdl2_decode"
+             ble_decode, dfm_decode, dmr_decode, dvbs_ip_decode, dvbt_decode, flex_decode, \
+             gsmr_decode, hfdl_decode, lorawan_decode, lte_decode, m17_decode, m20_decode, \
+             p25_decode, pocsag_decode, rds_decode, rs41_decode, tetra_decode, thread_decode, \
+             vdl2_decode"
         ),
         "{err}"
     );
@@ -1066,6 +1067,10 @@ fn onair_passes_its_modes_checks() {
         "zwave_decode",
         "wifi_decode",
         "wisun_decode",
+        "tetra_decode",
+        "gsmr_decode",
+        "lte_decode",
+        "dvbs_ip_decode",
     ];
     match std::env::var_os("ZETA_TEST_ONAIR_GEN").map(std::path::PathBuf::from) {
         None => {
