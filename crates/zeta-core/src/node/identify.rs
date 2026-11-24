@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::OwnedMutexGuard;
+use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -83,7 +84,7 @@ fn decoded_query(q: &OriginQuery, modulation: &[String], event: &serde_json::Val
 }
 
 /// How one attempt ended.
-enum Attempt {
+pub(super) enum Attempt {
     /// `event` is the event that completed the proof, as the decoder published it.
     Proved {
         evidence: String,
@@ -430,35 +431,59 @@ impl Inner {
         }
     }
 
-    /// Wait up to the row's `dwell_ms`, scaled by the run's `dwell_scale`
-    /// ([`identify_dwell_ms`]), for its proof on `child`'s event streams: events of the
-    /// row's `protocol` (with `proof: field`, those whose `field` is true), at least
-    /// `min_events` of them.
-    async fn await_proof(&self, r: &Run, mode: &LoadedMode, child: &JobId) -> Attempt {
+    /// Wait up to `dwell_ms` for `mode`'s proof on `child`'s events, read `from` its own
+    /// streams or the replay feed: events of the row's `protocol` (with `proof: field`,
+    /// those whose `field` is true), at least `min_events` of them. `Cancelled` once
+    /// `cancel` is.
+    pub(super) async fn await_proof(
+        &self,
+        cancel: &CancellationToken,
+        mode: &LoadedMode,
+        child: &JobId,
+        from: ProofFrom,
+        dwell_ms: u64,
+    ) -> Attempt {
         let row = &mode.row;
         let rule = &row.identify;
-        let mut rxs: Vec<_> = {
-            let jobs = self.jobs.lock().unwrap();
-            jobs.get(child)
-                .map(|e| e.outputs.clone())
-                .unwrap_or_default()
-                .iter()
-                .filter(|o| o.kind == StreamKind::Event)
-                .filter_map(|o| self.bus.subscribe(&o.id))
-                .map(Some)
-                .collect()
+        let (mut rxs, replay): (Vec<_>, bool) = match from {
+            ProofFrom::Own => {
+                let jobs = self.jobs.lock().unwrap();
+                let rxs = jobs
+                    .get(child)
+                    .map(|e| e.outputs.clone())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|o| o.kind == StreamKind::Event)
+                    .filter_map(|o| self.bus.subscribe(&o.id))
+                    .map(Some)
+                    .collect();
+                (rxs, false)
+            }
+            ProofFrom::Replay(rx) => (vec![Some(rx)], true),
         };
         let had_streams = !rxs.is_empty();
-        let dwell_ms = identify_dwell_ms(rule.dwell_ms, r.dwell_scale);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(dwell_ms);
         let need = rule.min_events.max(1);
         let mut seen = 0;
+        let state = || {
+            self.jobs
+                .lock()
+                .unwrap()
+                .get(child)
+                .map(|e| e.record.state.clone())
+        };
         loop {
+            // A replay has ended once its record has: its last frames are on the feed
+            // by then, so the drain below still reads them.
+            let ended = replay && state().is_none_or(|s| s != JobState::Running);
             for slot in rxs.iter_mut() {
                 let Some(rx) = slot else { continue };
                 loop {
                     match rx.try_recv() {
                         Ok(f) => {
+                            if replay && f.provenance.job.as_ref() != Some(child) {
+                                continue;
+                            }
                             let Payload::Event(v) = f.payload else {
                                 continue;
                             };
@@ -497,14 +522,8 @@ impl Inner {
                     }
                 }
             }
-            if had_streams && rxs.iter().all(Option::is_none) {
-                let state = self
-                    .jobs
-                    .lock()
-                    .unwrap()
-                    .get(child)
-                    .map(|e| e.record.state.clone());
-                return Attempt::NoFrame(match state {
+            if ended || (had_streams && rxs.iter().all(Option::is_none)) {
+                return Attempt::NoFrame(match state() {
                     Some(JobState::Failed { reason }) => format!("job failed: {reason}"),
                     _ => "job ended before a proof".into(),
                 });
@@ -513,11 +532,22 @@ impl Inner {
                 return Attempt::NoFrame(format!("no {} event in {dwell_ms} ms", row.protocol));
             }
             tokio::select! {
-                _ = r.cancel.cancelled() => return Attempt::Cancelled,
+                _ = cancel.cancelled() => return Attempt::Cancelled,
                 _ = tokio::time::sleep(POLL) => {}
             }
         }
     }
+}
+
+/// Where [`Inner::await_proof`] reads a child's events.
+pub(super) enum ProofFrom {
+    /// The child's own event streams, subscribed when the wait starts: a live child
+    /// (identify's).
+    Own,
+    /// The replay feed, subscribed before the child launched so no early frame is
+    /// missed: a replay (a `choose`'s trial). Only the child's frames count, and the
+    /// child's end is its record leaving `Running`.
+    Replay(broadcast::Receiver<Frame>),
 }
 
 /// The `identify` job's body: (1) measure [`IDENTIFY_MEASURE_MS`] of the ring over
@@ -680,7 +710,11 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
         };
         attempts += 1;
         current.child = Some(child.clone());
-        match inner.await_proof(&r, mode, &child).await {
+        let dwell_ms = identify_dwell_ms(mode.row.identify.dwell_ms, r.dwell_scale);
+        match inner
+            .await_proof(&r.cancel, mode, &child, ProofFrom::Own, dwell_ms)
+            .await
+        {
             Attempt::Cancelled => {
                 current.stop().await;
                 return Err(StageError::Cancelled);

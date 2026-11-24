@@ -2,6 +2,8 @@
 //! persistent jobs that resume after restart.
 
 mod capture;
+mod choose;
+pub(crate) use choose::ChooseAsk;
 mod identify;
 mod jsonlog;
 mod launch;
@@ -618,6 +620,8 @@ struct Inner {
     signature_gate: Mutex<()>,
     /// Cancelled when the `Node` is dropped; every job token is a child of it.
     shutdown: CancellationToken,
+    /// The `ops` event stream ([`Node::ops_stream`]).
+    ops_stream: StreamId,
     /// The verdicts of owned `identify` runs, by identify id, until their owner (a
     /// `watch`) takes them: an owned record is dropped as soon as it ends, context and
     /// all (see [`Inner::prune_history`]).
@@ -1469,13 +1473,16 @@ pub struct Node {
     load_errors: Vec<String>,
     /// How many of `load_errors` (the first) are job-record files.
     job_load_errors: usize,
-    /// The `ops` event stream: one frame per [`Node::apply`].
-    ops_stream: StreamId,
+    /// Whether dropping this shuts the node down: the `Node` [`Node::open`] made, not a
+    /// [`Node::handle`].
+    owner: bool,
 }
 
 impl Drop for Node {
     fn drop(&mut self) {
-        self.inner.shutdown.cancel();
+        if self.owner {
+            self.inner.shutdown.cancel();
+        }
     }
 }
 
@@ -1701,6 +1708,7 @@ impl Node {
                 replay_gate: tokio::sync::Mutex::new(()),
                 packets_gate: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
+                ops_stream,
                 verdicts: Mutex::new(HashMap::new()),
                 captured: Mutex::new(HashMap::new()),
                 episodes: Mutex::new(HashMap::new()),
@@ -1710,7 +1718,7 @@ impl Node {
             }),
             load_errors,
             job_load_errors,
-            ops_stream,
+            owner: true,
         };
         for port in ports {
             node.add_port(port)?;
@@ -2602,7 +2610,7 @@ impl Node {
         let payload = crate::ops::ops_payload(&logged, &outcome, elapsed_ms, transport);
         let mut line = payload.clone();
         self.inner.bus.publish(Frame::new(
-            self.ops_stream.clone(),
+            self.inner.ops_stream.clone(),
             node_provenance(Span {
                 start_ns,
                 end_ns: now(),
@@ -2624,7 +2632,7 @@ impl Node {
     /// The `ops` event stream: kind `Event`, provenance source
     /// [`NODE_SOURCE`], one frame per [`Node::apply`].
     pub fn ops_stream(&self) -> StreamId {
-        self.ops_stream.clone()
+        self.inner.ops_stream.clone()
     }
 
     pub fn ports(&self) -> Vec<(SourceId, Capabilities)> {

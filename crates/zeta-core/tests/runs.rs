@@ -247,6 +247,7 @@ fn start(kind: JobKind, t: Tuning, elastic: bool) -> Op {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     }
 }
 

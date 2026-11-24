@@ -61,6 +61,7 @@ async fn stream_tail_returns_events_from_running_job() {
             handler: None,
             needs: vec![],
             beside: None,
+            choose: None,
         })
         .await
     {

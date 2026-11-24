@@ -124,6 +124,7 @@ fn measure(center: u64, bw: u64) -> Op {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     }
 }
 
@@ -1286,6 +1287,7 @@ async fn a_scan_on_a_fake_kiwi_sweeps_for_itself_beside_a_demodulator() {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     let OpResult::Job(scan_id) = node.apply(scan).await.unwrap() else {
         panic!("expected a job");
@@ -1600,6 +1602,7 @@ async fn job_retune_re_aims_a_kiwi_scan_on_its_open_socket() {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     let OpResult::Job(id) = node.apply(scan).await.unwrap() else {
         panic!("expected a job");

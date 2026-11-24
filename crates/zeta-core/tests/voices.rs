@@ -284,6 +284,7 @@ fn start_op(kind: JobKind, center_hz: u64, audio_policy: Option<AudioPolicy>) ->
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     }
 }
 

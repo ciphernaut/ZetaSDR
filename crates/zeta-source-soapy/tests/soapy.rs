@@ -685,6 +685,7 @@ fn passthrough() -> Op {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     }
 }
 

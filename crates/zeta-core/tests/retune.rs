@@ -195,6 +195,7 @@ async fn start_as(node: &Node, kind: JobKind, band: Tuning, elastic: bool) -> Jo
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -826,6 +827,7 @@ async fn replace_and_graph_put_of_a_job_a_controller_owns_are_refused() {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     assert_eq!(
         node.apply(op).await,

@@ -1221,6 +1221,7 @@ async fn job_start_refuses_an_unavailable_graph_row() {
             handler: None,
             needs: vec![],
             beside: None,
+            choose: None,
         })
         .await
         .unwrap_err();

@@ -230,6 +230,7 @@ fn start(kind: JobKind, t: Tuning) -> Op {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     }
 }
 
@@ -1043,6 +1044,7 @@ async fn jobs_stop_stops_what_matches_and_keeps_the_elastic_spectrum() {
             handler: None,
             needs: vec![],
             beside: None,
+            choose: None,
         },
     )
     .await;

@@ -251,6 +251,7 @@ async fn start_measure(node: &Node) -> JobId {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -949,6 +950,7 @@ async fn a_heal_does_not_wait_for_a_self_sweep() {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     let scan = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,

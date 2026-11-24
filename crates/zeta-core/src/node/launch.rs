@@ -184,6 +184,9 @@ impl Inner {
                 if rec.kind == JobKind::Identify.name() {
                     return self.launch_identify(rec, port, gate, after).await;
                 }
+                if rec.kind == JobKind::Choose.name() {
+                    return self.launch_choose(rec, port, gate, after).await;
+                }
                 Some(port)
             }
         };

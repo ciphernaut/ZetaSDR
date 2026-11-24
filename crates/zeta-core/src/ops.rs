@@ -374,6 +374,15 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(schema_with = "crate::types::nullable::<JobId>")]
         beside: Option<JobId>,
+        /// `choose` only (`null`, or left out, for any other kind): how far the job
+        /// climbs and what it does with its answer (see [`ChooseParams`]); `null` is
+        /// every member's default. A `choose` takes no lease and stops nothing, so
+        /// `replace` must be `[]` and `beside` `null`.
+        // Left out when `null`, so a node or a CLI of this build can still start a job
+        // on an older node, which refuses a field it does not know.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(required, schema_with = "crate::types::nullable::<ChooseParams>")]
+        choose: Option<ChooseParams>,
     },
     /// Attach a job of an attachable `kind` (`transcribe` or `packets`) to the running job
     /// `job`. It reads one of that job's output streams instead of the radio, holds no
@@ -1253,6 +1262,51 @@ fn nullable_average(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     })
 }
 
+/// `job_start`'s `choose`: how far a `choose` job climbs the proof ladder (design 5.3)
+/// and what it does with its answer.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::modes::require_all)]
+pub struct ChooseParams {
+    /// The step to climb to, 1 to 3; `null` is the surface's default. A step above
+    /// the surface's cap is cut to it, and the answer's `not_tried` says so.
+    #[serde(default)]
+    #[schemars(required, schema_with = "nullable_choose_step")]
+    pub up_to: Option<u8>,
+    /// Who asks; `null` is the transport's (`ui` is `menu`, `agent` is `agent`,
+    /// every other caller `client`).
+    #[serde(default)]
+    #[schemars(required, schema_with = "nullable_surface")]
+    pub surface: Option<crate::choice_policy::Surface>,
+    /// Start the final answer's job (a `job_start` of its kind, centre, width and
+    /// parameters on the job's source) when the job ends.
+    #[serde(default)]
+    pub start: bool,
+    /// A short-lived ask (the page's box menu).
+    #[serde(default)]
+    pub transient: bool,
+}
+
+/// Schema of `ChooseParams.up_to`: `["integer","null"]` (1..=3).
+fn nullable_choose_step(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "format": "uint8",
+        "minimum": 1,
+        "maximum": 3,
+        "description": "The step to climb to, 1 to 3; `null` is the surface's default. A step above the surface's cap is cut to it, and the answer's `not_tried` says so."
+    })
+}
+
+/// Schema of `ChooseParams.surface`: a surface's name, or `null`.
+fn nullable_surface(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "enum": ["menu", "watch", "agent", "client", null],
+        "description": "Who asks: `menu`, `watch`, `agent` or `client`; `null` is the transport's (`ui` is `menu`, `agent` is `agent`, every other caller `client`)."
+    })
+}
+
 /// Schema of `job_start`'s `dwell_scale`: `["integer","null"]` (1..=6).
 fn nullable_dwell_scale(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
@@ -1702,12 +1756,15 @@ fn require_packets(schema: &mut schemars::Schema) {
 
 /// `job_start`'s `handler`, `needs` and `beside`, required last in its schema.
 const HANDLER_FIELDS: [&str; 3] = ["handler", "needs", "beside"];
+/// `job_start`'s `choose`, required after the handler fields.
+const CHOOSE_FIELD: &str = "choose";
 
 /// `job_start` requires its look, `dwell_ms`, `average`, `bits`, `method` and
 /// `bin_hz`, then `audio_policy` and `dwell_scale`, after `sideband` (the field order
 /// agents read), and like `deviation_hz` shows no default for them; they still default
 /// to `null` when a request from before them leaves them out. So too `handler`, `needs`
-/// and `beside`, after `replace` (`null`, `[]` and `null` when left out).
+/// and `beside`, after `replace` (`null`, `[]` and `null` when left out), then `choose`
+/// (`null` when left out).
 fn require_the_look(schema: &mut schemars::Schema) {
     const LOOK: [&str; 7] = [
         "dwell_ms",
@@ -1727,14 +1784,14 @@ fn require_the_look(schema: &mut schemars::Schema) {
         for (k, f) in LOOK.iter().enumerate() {
             req.insert(at + k, (*f).into());
         }
-        // The handler fields last, after `replace`.
-        for f in HANDLER_FIELDS {
+        // The handler fields last, after `replace`, then `choose`.
+        for f in HANDLER_FIELDS.iter().chain(&[CHOOSE_FIELD]) {
             req.retain(|r| r != f);
-            req.push(f.into());
+            req.push((*f).into());
         }
     }
     if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties") {
-        for f in LOOK.iter().chain(&HANDLER_FIELDS) {
+        for f in LOOK.iter().chain(&HANDLER_FIELDS).chain(&[CHOOSE_FIELD]) {
             if let Some(serde_json::Value::Object(p)) = props.get_mut(*f) {
                 p.remove("default");
             }
@@ -1823,6 +1880,10 @@ pub enum JobKind {
     Measure,
     Scan,
     Identify,
+    /// A controller that chooses the band's job (design 5.3): step 1 from the ring at
+    /// once, step 2 by replaying the ring slice through the rows that could prove
+    /// otherwise. It takes no lease.
+    Choose,
     Watch,
     Transcribe,
     Mix,
@@ -1833,7 +1894,7 @@ pub enum JobKind {
 }
 
 /// The built-in kinds, in the order `schema` lists them: every kind but [`JobKind::Mode`].
-pub static BUILTIN_KINDS: [JobKind; 19] = [
+pub static BUILTIN_KINDS: [JobKind; 20] = [
     JobKind::Passthrough,
     JobKind::Spectrum,
     JobKind::FmDemod,
@@ -1848,6 +1909,7 @@ pub static BUILTIN_KINDS: [JobKind; 19] = [
     JobKind::Measure,
     JobKind::Scan,
     JobKind::Identify,
+    JobKind::Choose,
     JobKind::Watch,
     JobKind::Transcribe,
     JobKind::Mix,
@@ -1975,6 +2037,7 @@ impl JobKind {
             JobKind::Measure => "measure",
             JobKind::Scan => "scan",
             JobKind::Identify => "identify",
+            JobKind::Choose => "choose",
             JobKind::Watch => "watch",
             JobKind::Transcribe => "transcribe",
             JobKind::Mix => "mix",
@@ -2129,9 +2192,9 @@ impl JobKind {
 
     /// Whether `job_retune` may move a running job of the kind to another band: the
     /// kinds whose one band the node expands a graph for. Not a `spectrum` (it shows the
-    /// capture), a `scan` (it sweeps), an `identify` or a `watch` (controllers), an
-    /// attached `transcribe` or `packets` (its input is retuned instead) or a `mix` (it
-    /// has no band).
+    /// capture), a `scan` (it sweeps), an `identify`, a `choose` or a `watch`
+    /// (controllers), an attached `transcribe` or `packets` (its input is retuned
+    /// instead) or a `mix` (it has no band).
     pub fn retunable(&self) -> bool {
         match self {
             JobKind::Passthrough
@@ -2149,6 +2212,7 @@ impl JobKind {
             JobKind::Spectrum
             | JobKind::Scan
             | JobKind::Identify
+            | JobKind::Choose
             | JobKind::Watch
             | JobKind::Transcribe
             | JobKind::Mix
@@ -2550,7 +2614,7 @@ impl JobKind {
                 }],
                 edges: vec![],
             },
-            JobKind::Identify => Graph {
+            JobKind::Identify | JobKind::Choose => Graph {
                 id: GraphId::new(),
                 nodes: vec![],
                 edges: vec![],
@@ -5284,6 +5348,67 @@ fn check_dwell_scale(kind: &JobKind, dwell_scale: Option<u32>) -> Result<(), OpE
     )
 }
 
+/// `job_start`'s `choose`: `choose` only (else `other`), its `up_to` a step from 1 to 3
+/// (else `out_of_range`).
+fn check_choose(kind: &JobKind, choose: Option<&ChooseParams>) -> Result<(), OpError> {
+    let Some(c) = choose else {
+        return Ok(());
+    };
+    if *kind != JobKind::Choose {
+        return Err(other(format!(
+            "choose applies only to kind choose; pass null (kind is {})",
+            kind.name()
+        )));
+    }
+    match c.up_to {
+        Some(n) => range("choose.up_to", u64::from(n), 1, 3).map_err(|mut e| {
+            if let OpError::OutOfRange { why, .. } = &mut e {
+                *why = Some("a step of the proof ladder: 1 free, 2 off air, 3 on air".into());
+            }
+            e
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Start a `choose` on `source` over `tuning` for the caller `transport`: its surface
+/// is `choose.surface`, else the transport's ([`crate::choice_policy::surface_of`]),
+/// and its step what the choice policy gives that surface for `choose.up_to`
+/// ([`crate::choice_policy::ChoicePolicy::steps`]); both are kept in its context. It
+/// takes no lease, tunes nothing and stops nothing, so `replace` and `beside` are
+/// refused.
+async fn start_choose(
+    node: &Node,
+    transport: &str,
+    (source, tuning): (SourceId, Tuning),
+    choose: ChooseParams,
+    replace: &[JobId],
+    beside: Option<&JobId>,
+) -> Result<OpResult, OpError> {
+    if !replace.is_empty() {
+        return Err(other("choose stops nothing: replace must be empty"));
+    }
+    if beside.is_some() {
+        return Err(other("choose is sent beside no job: beside must be null"));
+    }
+    checked_port(node, &source, &tuning)?;
+    let surface = choose
+        .surface
+        .unwrap_or_else(|| crate::choice_policy::surface_of(transport));
+    let (step, capped) = node.choice_policy().steps(surface, choose.up_to);
+    let ask = crate::node::ChooseAsk {
+        surface,
+        step,
+        capped,
+        start: choose.start,
+        transient: choose.transient,
+    };
+    node.choose_start(source, tuning, ask)
+        .await
+        .map(OpResult::Job)
+        .map_err(|e| node_error(node, e))
+}
+
 /// `job_start`'s checks of a scan's look: `dwell_ms` (1..=`SCAN_DWELL_MAX_MS`),
 /// `average` (1..=`SCAN_AVERAGE_MAX`), `bits` (which the source's depths decide,
 /// [`scan_bits_refusal`]), `method` and `bin_hz` (1..=`SCAN_BIN_MAX_HZ`) are for
@@ -5520,7 +5645,11 @@ pub(crate) fn check_plan_start_fields(
     if !kind.startable()
         || matches!(
             kind,
-            JobKind::Spectrum | JobKind::Scan | JobKind::Watch | JobKind::Identify
+            JobKind::Spectrum
+                | JobKind::Scan
+                | JobKind::Watch
+                | JobKind::Identify
+                | JobKind::Choose
         )
     {
         return Err(FieldError::new(
@@ -5805,6 +5934,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             handler,
             needs,
             beside,
+            choose,
         } => {
             check_startable(&kind)?;
             if elastic && !kind.elastic_capable() {
@@ -5824,6 +5954,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             });
             check_look(&kind, dwell_ms, average, bits, method, bin_hz)?;
             check_dwell_scale(&kind, dwell_scale)?;
+            check_choose(&kind, choose.as_ref())?;
             check_handler_fields(&kind, handler.as_deref(), &needs)?;
             // A scan the source sweeps takes no lease: there is no room to make.
             if method == Some(ScanMethod::Source) && !replace.is_empty() {
@@ -5836,6 +5967,11 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                 center_hz,
                 bandwidth_hz,
             };
+            if kind == JobKind::Choose {
+                let choose = choose.unwrap_or_default();
+                let at = (source, tuning);
+                return start_choose(node, transport, at, choose, &replace, beside.as_ref()).await;
+            }
             let ask = BesideAsk {
                 kind: &kind,
                 source: &source,

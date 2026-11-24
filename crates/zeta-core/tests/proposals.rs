@@ -279,6 +279,7 @@ async fn capture_job(node: &Node, bursts: u32) -> JobId {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     let job = match node.apply(op).await {
         Ok(OpResult::Job(j)) => j,
@@ -658,6 +659,7 @@ async fn frame_row_job(node: &Node) -> JobId {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,

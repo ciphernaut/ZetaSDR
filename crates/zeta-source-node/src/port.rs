@@ -245,6 +245,7 @@ impl Remote {
             handler: None,
             needs: vec![],
             beside: None,
+            choose: None,
         };
         let job = match apply(&self.client, &op).await? {
             OpResult::Job(id) => id,

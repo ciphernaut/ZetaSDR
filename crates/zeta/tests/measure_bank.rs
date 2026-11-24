@@ -109,6 +109,7 @@ async fn start_measure(node: &Node, center_hz: u64) -> JobId {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,

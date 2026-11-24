@@ -203,6 +203,11 @@ impl BurstStore {
         &self.dir
     }
 
+    /// What the store keeps.
+    pub fn policy(&self) -> BurstPolicy {
+        self.policy
+    }
+
     /// Write `samples` as one SigMF pair named by a fresh ULID, its one annotation over
     /// the whole window carrying the `zeta:` keys, add its record to the index (written
     /// atomically), then [`expire`](Self::expire).

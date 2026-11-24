@@ -226,6 +226,7 @@ async fn job_start_passthrough_then_list_then_stop() {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     let id = match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -399,6 +400,7 @@ async fn source_ensure_during_job_start_does_not_retune() {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     let ensure = Op::SourceEnsure {
         source,
@@ -512,6 +514,7 @@ async fn job_start_holds_the_gate_through_its_tune_and_lease() {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     // B: 2 MHz around A's band, asked while A's slow tune is under way. A holds the
     // source's gate from its tune through its lease, so B waits behind A (it cannot
@@ -742,7 +745,9 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                         // A worker record's `starting` is what its start is doing.
                         && name != "starting"
                         // A register link's `far_end` is the site at its other end.
-                        && name != "far_end";
+                        && name != "far_end"
+                        // `job_start`'s `choose.start` says to start the answer's job.
+                        && !(name == "start" && path.ends_with(".properties.choose"));
                     // `_ns` is an instant; `_ms` a duration (a timeout), plain integer.
                     assert!(
                         !time || name.ends_with("_ns") || name.ends_with("_ms"),
@@ -1257,6 +1262,7 @@ async fn conflict_reports_current_tuning_and_real_options() {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -1370,6 +1376,7 @@ async fn graph_put_rejects_unknown_stage_and_leaves_job_running() {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     let job = match node.apply(start).await {
         Ok(OpResult::Job(id)) => id,
@@ -2293,6 +2300,7 @@ fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     }
 }
 
@@ -3801,6 +3809,7 @@ fn a_job_start_without_a_dwell_scale_is_written_without_it() {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     let plain = serde_json::to_value(start(None)).unwrap();
     assert!(plain.get("dwell_scale").is_none(), "{plain}");
@@ -3894,6 +3903,7 @@ async fn start_on(node: &Node, source: &str, kind: JobKind, elastic: bool) -> Jo
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     match node.apply(op).await {
         Ok(OpResult::Job(id)) => id,
@@ -4107,6 +4117,7 @@ async fn job_start_on_a_faulted_source_is_refused_naming_the_source() {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     match node.apply(start(100_000_000)).await {
         Err(OpError::Other { message }) => {
@@ -4450,6 +4461,7 @@ fn start_look(kind: JobKind, dwell_ms: Option<u64>, average: Option<u32>) -> Op 
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     }
 }
 

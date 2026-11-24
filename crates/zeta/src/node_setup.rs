@@ -987,9 +987,9 @@ mod tests {
                                 "{kind:?} {rate} {bw} {min}"
                             );
                         }
-                        // An identify runs no graph: the node drives the source and its
-                        // child jobs itself.
-                        Ok(g) if kind == JobKind::Identify => {
+                        // An identify and a choose run no graph: the node drives the
+                        // source and their child jobs itself.
+                        Ok(g) if matches!(kind, JobKind::Identify | JobKind::Choose) => {
                             assert!(g.nodes.is_empty() && g.edges.is_empty(), "{g:?}");
                         }
                         // A scan expands to one bare `fft` node; the node writes the mask

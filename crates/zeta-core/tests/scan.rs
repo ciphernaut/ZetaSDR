@@ -825,6 +825,7 @@ fn start(kind: JobKind, center_hz: u64, bandwidth_hz: u64) -> Op {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     }
 }
 

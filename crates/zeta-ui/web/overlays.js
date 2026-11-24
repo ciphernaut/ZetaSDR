@@ -327,7 +327,7 @@ export const SNIPPET_CHARS = 40;
 const CAPTURE_KEY = "capture";
 const PIN_KEY = "pin";
 // Kinds job_retune refuses (an attached `transcribe` follows its input instead).
-export const NOT_RETUNABLE = ["spectrum", "scan", "identify", "watch", "transcribe", "mix"];
+export const NOT_RETUNABLE = ["spectrum", "scan", "identify", "choose", "watch", "transcribe", "mix"];
 export const HANDLE_PX = 8; // an edge handle's height (style.css .outline-handle)
 export const DRAG_CLICK_PX = 3; // less pointer travel than this is a click, not a drag
 export const LONG_PRESS_MS = 500; // a press this long on a narrow outline's tag opens its menu

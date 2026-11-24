@@ -122,6 +122,7 @@ async fn start(node: &Node, kind: JobKind) -> JobId {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     };
     match node.apply(op).await.unwrap() {
         OpResult::Job(id) => id,

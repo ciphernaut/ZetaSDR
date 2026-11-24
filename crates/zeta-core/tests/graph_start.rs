@@ -289,6 +289,7 @@ async fn job_start_refuses_the_graph_and_bits_kinds() {
                 handler: None,
                 needs: vec![],
                 beside: None,
+                choose: None,
             })
             .await
             .unwrap_err();

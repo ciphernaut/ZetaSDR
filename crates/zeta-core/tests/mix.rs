@@ -260,6 +260,7 @@ fn start_op(kind: JobKind, source: &str, center_hz: u64) -> Op {
         handler: None,
         needs: vec![],
         beside: None,
+        choose: None,
     }
 }
 

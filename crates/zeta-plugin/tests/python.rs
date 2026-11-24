@@ -197,6 +197,7 @@ async fn python_plugin_runs_in_a_job_via_graph_put() {
             handler: None,
             needs: vec![],
             beside: None,
+            choose: None,
         })
         .await
         .unwrap()

@@ -2063,6 +2063,7 @@ impl Command {
                 handler,
                 needs: needs.into_iter().map(Into::into).collect(),
                 beside: beside.map(JobId),
+                choose: None,
             },
             Command::Job(JobCmd::Attach {
                 kind,
