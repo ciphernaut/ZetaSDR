@@ -351,11 +351,10 @@ async fn a_range_only_catalogue_match_never_overturns_the_label() {
     let j = job(c);
     assert_eq!(j.kind, "am_demod", "{c:?}");
     assert_eq!(c.settled, Settled::BestGuess, "{c:?}");
-    // It stays evidence, ranked below the label.
+    // It only ranks the rows that list it: the demodulator lists none, so the choice's
+    // evidence names none.
     assert!(
-        c.evidence
-            .iter()
-            .any(|e| e == &format!("catalogue: {}", range_only[0].name)),
+        !c.evidence.iter().any(|e| e.starts_with("catalogue: ")),
         "{c:?}"
     );
 }

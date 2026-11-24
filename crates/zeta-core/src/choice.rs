@@ -170,8 +170,10 @@ pub fn choose_now(
                 && proved.is_none_or(|p| p.row.id != s.mode.row.id)
         })
         .partition(|s| s.mode.startable());
-    // An `fsk` wider than a voice channel is data, not a weak FM voice.
+    // An `fsk` wider than a voice channel is data, not a weak FM voice: `fm_demod` does
+    // not serve it.
     let fsk_data = label == "fsk" && bandwidth_hz > FSK_VOICE_MAX_HZ;
+    let fm_voice = |row: &LoadedMode| matches!(&row.row.decoder, Some(Decoder::Builtin(b)) if b.builtin == "fm_demod");
     let serving = score_demodulators(
         weights,
         modes,
@@ -183,7 +185,7 @@ pub fn choose_now(
     );
     let (demods, unready_demods): (Vec<&Scored>, Vec<&Scored>) = serving
         .iter()
-        .filter(|s| s.in_range && s.fits_label && !fsk_data)
+        .filter(|s| s.in_range && s.fits_label && !(fsk_data && fm_voice(s.mode)))
         .partition(|s| s.mode.startable());
     let could_prove: Vec<String> = ready.iter().map(|s| s.mode.row.id.0.clone()).collect();
     let not_tried: Vec<NotTried> = unready
@@ -191,20 +193,24 @@ pub fn choose_now(
         .chain(&unready_demods)
         .map(|s| not_ready(s.mode))
         .collect();
-    // An alternative's evidence: layer 1, its plan lines and the catalogue entries its
-    // row lists.
-    let alternative = |row: &LoadedMode| {
-        let (job, lines) = sized(row, m, sel, region);
-        let named = catalogue
+    // The catalogue's names for the entries `row` lists: the catalogue is evidence for
+    // a row only through them.
+    let named = |row: &LoadedMode| -> Vec<String> {
+        catalogue
             .iter()
             .filter(|(id, _)| row.row.catalogue.iter().any(|c| c == id))
-            .map(|(_, l)| format!("catalogue: {}", l.name));
+            .map(|(_, l)| format!("catalogue: {}", l.name))
+            .collect()
+    };
+    // An alternative's evidence: layer 1, its plan lines and its row's catalogue names.
+    let alternative = |row: &LoadedMode| {
+        let (job, lines) = sized(row, m, sel, region);
         Alternative {
             job,
             row: row.row.id.0.clone(),
             evidence: std::iter::once(layer1.clone())
                 .chain(lines)
-                .chain(named)
+                .chain(named(row))
                 .collect(),
         }
     };
@@ -241,11 +247,7 @@ pub fn choose_now(
     let (job, plan) = sized(row, m, sel, region);
     evidence.extend(decode);
     evidence.extend(plan);
-    evidence.extend(
-        catalogue
-            .iter()
-            .map(|(_, l)| format!("catalogue: {}", l.name)),
-    );
+    evidence.extend(named(row));
     Choice {
         job: Some(job),
         row: Some(row.row.id.0.clone()),
@@ -279,13 +281,13 @@ fn cannot_tell(
     }
 }
 
-/// `<row> is not ready: <reason>`.
+/// `not tried: <row> is not ready: <reason>`.
 fn not_ready(row: &LoadedMode) -> NotTried {
     let id = &row.row.id.0;
     let why = row.reason.as_deref().unwrap_or("not ready");
     NotTried {
         row: Some(id.clone()),
-        reason: format!("{id} is not ready: {why}"),
+        reason: format!("not tried: {id} is not ready: {why}"),
     }
 }
 
@@ -532,7 +534,7 @@ mod tests {
             unready.not_tried,
             [NotTried {
                 row: Some("vdl2_decode".into()),
-                reason: "vdl2_decode is not ready: vdl2: missing".into(),
+                reason: "not tried: vdl2_decode is not ready: vdl2: missing".into(),
             }]
         );
         modes.set_program("vdl2_decode", Some("/usr/bin/vdl2".into()), None);
@@ -557,5 +559,133 @@ mod tests {
         assert_eq!(choice.reason.as_deref(), Some("no row serves carrier"));
         assert!(choice.job.is_none() && choice.row.is_none(), "{choice:?}");
         assert_eq!(choice.evidence, ["layer 1: carrier 50 Hz"]);
+    }
+
+    type Edit = fn(&mut Value);
+
+    /// A registry of the embedded rows and, from an operator directory, a copy of each
+    /// `(embedded row, id, edit)`, every copy loaded ready.
+    fn with_rows(rows: &[(&str, &str, Edit)]) -> ModeRegistry {
+        let dir = tempfile::tempdir().unwrap();
+        let embedded = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modes");
+        for (base, id, edit) in rows {
+            let text = std::fs::read_to_string(embedded.join(format!("{base}.json"))).unwrap();
+            let mut row: Value = serde_json::from_str(&text).expect("an embedded row parses");
+            row["id"] = (*id).into();
+            edit(&mut row);
+            std::fs::write(dir.path().join(format!("{id}.json")), row.to_string()).unwrap();
+        }
+        let modes = ModeRegistry::load(&StageRegistry::new(), Some(dir.path()));
+        for (_, id, _) in rows {
+            let m = modes.get(id).expect("the copy loads");
+            assert!(m.startable(), "{id}: {:?} {:?}", m.state, m.reason);
+        }
+        modes
+    }
+
+    /// `choose_now` over a band measured `label`, `bandwidth_hz` wide at `center_hz`, in a
+    /// box `box_hz` wide.
+    fn choose(
+        modes: &ModeRegistry,
+        label: &str,
+        center_hz: u64,
+        bandwidth_hz: u64,
+        box_hz: u64,
+    ) -> Choice {
+        let c = Classification {
+            measurement: Some(measured(label, center_hz, bandwidth_hz, None)),
+            ..Classification::default()
+        };
+        choose_now(modes, modes.weights(), &c, &box_at(center_hz, box_hz), "AU")
+    }
+
+    /// A radiosonde decoder row (fm and fsk, 12500 Hz) moved to 433-435 MHz.
+    fn near_decoder(row: &mut Value) {
+        row["band"]["range_hz"] = serde_json::json!([433_000_000, 435_000_000]);
+    }
+
+    /// [`near_decoder`] listing a well-known centre away from [`OFF_PLAN_HZ`]: it scores
+    /// nothing for the centre there.
+    fn off_centre_decoder(row: &mut Value) {
+        near_decoder(row);
+        row["band"]["centers_hz"] = serde_json::json!([434_900_000]);
+    }
+
+    fn unchanged(_: &mut Value) {}
+
+    #[test]
+    fn a_decoder_within_the_margin_is_the_runner_up() {
+        let modes = with_rows(&[("rs41_decode", "near_decode", near_decoder)]);
+        let choice = choose(&modes, "fm", OFF_PLAN_HZ, 10_000, 25_000);
+        assert_eq!(choice.row.as_deref(), Some("fm_demod"), "{choice:?}");
+        assert_eq!(choice.could_prove, ["near_decode"]);
+        // Both score 1.0: within `runner_up_margin` (0.15).
+        let runner_up = choice.runner_up.as_ref().expect("a runner-up");
+        assert_eq!(runner_up.row, "near_decode");
+        assert_eq!(runner_up.job.bandwidth_hz, Hz(12_500));
+    }
+
+    #[test]
+    fn a_decoder_outside_the_margin_gives_way_to_the_next_demodulator() {
+        let modes = with_rows(&[
+            ("rs41_decode", "near_decode", off_centre_decoder),
+            ("fm_demod", "fm_narrow", unchanged),
+        ]);
+        let choice = choose(&modes, "fm", OFF_PLAN_HZ, 10_000, 25_000);
+        assert_eq!(choice.row.as_deref(), Some("fm_demod"), "{choice:?}");
+        // 0.6 against the demodulator's 1.0: a row that could prove, not the runner-up.
+        assert_eq!(choice.could_prove, ["near_decode"]);
+        let runner_up = choice.runner_up.as_ref().expect("a runner-up");
+        assert_eq!(runner_up.row, "fm_narrow", "{choice:?}");
+    }
+
+    #[test]
+    fn with_no_demodulator_the_runner_up_is_the_next_decoder() {
+        const VDL2_HZ: u64 = 136_975_000;
+        let modes = with_rows(&[("vdl2_decode", "vdl2_copy", unchanged)]);
+        let choice = choose(&modes, "psk", VDL2_HZ, 18_000, 25_000);
+        assert_eq!(choice.settled, Settled::BestGuess, "{choice:?}");
+        assert_eq!(choice.could_prove, ["vdl2_copy", "vdl2_decode"]);
+        assert_eq!(choice.row.as_deref(), Some("vdl2_copy"));
+        let runner_up = choice.runner_up.as_ref().expect("a runner-up");
+        assert_eq!(runner_up.row, "vdl2_decode");
+    }
+
+    /// A demodulator row serving fsk that is not `fm_demod`: the wide-fsk rule leaves it be.
+    fn fsk_wideband_demod(row: &mut Value) {
+        row["modulation"] = serde_json::json!(["fsk"]);
+    }
+
+    /// [`near_decoder`] 50 kHz wide, for a wide data signal.
+    fn wide_decoder(row: &mut Value) {
+        near_decoder(row);
+        row["band"]["bandwidth_hz"] = 50_000.into();
+    }
+
+    #[test]
+    fn a_wide_fsk_is_not_served_by_fm_demod() {
+        let embedded = ModeRegistry::load(&StageRegistry::new(), None);
+        // At a voice channel's width an fsk label may be a weak FM voice.
+        let narrow = choose(&embedded, "fsk", OFF_PLAN_HZ, 12_000, 100_000);
+        assert_eq!(narrow.row.as_deref(), Some("fm_demod"), "{narrow:?}");
+        // Over 25 kHz it is data: nothing embedded serves it here.
+        let wide = choose(&embedded, "fsk", OFF_PLAN_HZ, 40_000, 100_000);
+        assert_eq!(
+            wide.reason.as_deref(),
+            Some("no row serves fsk"),
+            "{wide:?}"
+        );
+        // A decoder that fits takes it, unproved.
+        let decoders = with_rows(&[("rs41_decode", "wide_decode", wide_decoder)]);
+        let decoded = choose(&decoders, "fsk", OFF_PLAN_HZ, 40_000, 100_000);
+        assert_eq!(decoded.row.as_deref(), Some("wide_decode"), "{decoded:?}");
+        assert_eq!(decoded.settled, Settled::BestGuess);
+        // The rule is `fm_demod`'s: another demodulator row serving fsk still serves it.
+        let both = with_rows(&[
+            ("rs41_decode", "wide_decode", wide_decoder),
+            ("wfm_demod", "fsk_wideband", fsk_wideband_demod),
+        ]);
+        let demod = choose(&both, "fsk", OFF_PLAN_HZ, 40_000, 100_000);
+        assert_eq!(demod.row.as_deref(), Some("fsk_wideband"), "{demod:?}");
     }
 }
