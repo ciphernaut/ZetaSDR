@@ -2,7 +2,7 @@
   "id": "onair",
   "name": "OnAir",
   "programs": ["onair-rx"],
-  "install": { "url": "https://on-air.dev" },
+  "install": { "url": "https://github.com/ciphernaut/onair-rx" },
   "modes": {
     "adsb_decode": {
       "args": [

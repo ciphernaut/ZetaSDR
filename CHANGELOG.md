@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The two wrappers have public homes, and the install pointers name them: `onair-rx` at
+  https://github.com/ciphernaut/onair-rx (OnAir's handler file) and `dvbt-rx` at
+  https://github.com/ciphernaut/dvbt-rx (the `dvbt_decode` row).
 - Modes only OnAir decodes: eleven rows with no decoder of their own, run by OnAir through
   `onair-rx` 0.4.0 and by nothing else: `zigbee_decode`, `thread_decode`, `wisun_decode`,
   `ble_decode`, `lorawan_decode`, `zwave_decode`, `wifi_decode`, `tetra_decode`, `gsmr_decode`,
