@@ -39,10 +39,13 @@ pictures. Where the row says on each event whether speech is produced, the entry
 that as a `const` (OnAir's DMR and P25: `{"audio": false}`); a transcriber attached to a
 handler job is refused (`job <id> has no audio stream`).
 
-The embedded `onair.json` runs OnAir's receivers through `onair-rx` 0.3.0, a program the
-operator installs. An entry has no notes field, so what OnAir gives for each mode, how it
+The embedded `onair.json` runs OnAir's receivers through `onair-rx` 0.4.0, a program the
+operator installs (an older one is probed `ready`, and a mode it lacks then fails at launch with
+`onair-rx: no mode <m>`: install it before the node). An entry has no notes field, so what OnAir gives for each mode, how it
 differs from the row's own decoder and what it was measured to cost are in
-[RECIPES.md](../RECIPES.md#a-second-opinion-on-a-decoder).
+[RECIPES.md](../RECIPES.md#a-second-opinion-on-a-decoder); the eleven rows only OnAir decodes, with
+no row decoder behind them, are in
+[RECIPES.md](../RECIPES.md#modes-only-onair-decodes).
 
 The operator's node-wide handler ranking does not prefer a handler whose `outputs` lack a
 kind the mode's own decoder gives (events but no audio, on a voice mode): that handler is

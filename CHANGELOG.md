@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Modes only OnAir decodes: eleven rows with no decoder of their own, run by OnAir through
+  `onair-rx` 0.4.0 and by nothing else: `zigbee_decode`, `thread_decode`, `wisun_decode`,
+  `ble_decode`, `lorawan_decode`, `zwave_decode`, `wifi_decode`, `tetra_decode`, `gsmr_decode`,
+  `lte_decode` and `dvbs_ip_decode`. A row may now have `decoder: null`: it reads `ready` while a
+  handler file's entry for it is, and `unavailable` otherwise with the reason `no decoder of its
+  own, and no handler for it is ready` (then each entry's own reason); `zeta modes check <id>`
+  checks the handler the policy picks, on a SigMF pair that `scripts/onair-fixtures.sh` has
+  OnAir's generator make. Each gives events and packets for Wireshark (Z-Wave's are
+  `LINKTYPE_USER2`, 149, since 148 is the node's Mode S), has a Decode entry in the page's box
+  menu (greyed with the row's reason when nothing can run it), and carries a new row field,
+  `content` (`network_traffic`), shown on `modes_list`, in a job's context and in a packet
+  capture's record; nothing reads it yet. A program's arguments take `$bandwidth_hz`, the job's
+  band width (the DVB-S IP entry passes it as `--width`). A row may set `identify.when_named`,
+  so that identify, classify's candidates and a watch's default modes pass over it unless named
+  (DVB-S IP, which has no range). LTE is listed with `--drop` because it does not keep real time
+  without it; a replay by `capture_decode` is at real time and reads a cell as a live job does.
+  Install `onair-rx` 0.4.0 before deploying a node with these rows: an older wrapper is probed
+  `ready` and the new modes then fail at launch with `onair-rx: no mode <m>`. A node with no
+  `onair-rx` lists the rows `unavailable`, and nothing else changes. The dev profile now
+  optimises `zeta-ext`, whose input conversion fell behind real time at 4 and 20 MHz.
 - Sets: a serving node reads its operator sets directory (`--sets-dir`) again whenever the files
   there have changed, so a set file added, edited or removed is in force at the next `set_list`,
   `set_start` or `set_stop` with no restart. A set that is running keeps the jobs it started:

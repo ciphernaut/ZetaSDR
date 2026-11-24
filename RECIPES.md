@@ -351,6 +351,53 @@ The entries for RDS, DMR, P25, M17 and DVB-T ask 500 kHz, 48 kHz, 250 kHz, 250 k
 
 **Gotchas.** `hfdl_decode` and `dfm_decode` entries are validated but were not checked against a capture. `dvbt_decode` has no check on the node (its row has no synthesised capture): a test pins its field map against two recorded lines of the wrapper, and the wrapper's own test locks it on OnAir's generator. A short replay (`capture_decode`) can lose the last message, since `onair-rx` does not flush at the end of its input; RDS, DMR, P25, M17 and DVB-T are read once more at the end instead (DVB-T: a replay shorter than 2 s that never locks gets its one `locked: false` event there). A DVB-T multiplex that is not 8 MHz wide gives `locked: false` as its first event and needs more than about 2.3 s (7 MHz) or 4.3 s (6 MHz) of capture to show a lock that is there, measured on the wrapper's generated multiplexes at 10 MHz (5 MHz was not measured): a `capture_decode` replay of a few seconds can miss it. The entries take `cs16`, which clamps at full scale: a radio's samples fit, but a file capture recorded above full scale (a synthesised one at unit power) is clipped on the way in, and DVB-T then locks with a low `snr_db` and no `services`. The node counts no dropped input for a handler: one that falls behind shows only as `input lagged, N frames skipped` on the node's stderr.
 
+## Modes only OnAir decodes
+
+Verified on the plan 47 build against generated signals only; no live traffic was heard (UAT 47). The spec is `docs/superpowers/specs/2026-11-23-onair-only-modes-design.md`.
+
+Eleven rows have no decoder of their own (`decoder: null`): `zigbee_decode`, `thread_decode`, `wisun_decode`, `ble_decode`, `lorawan_decode`, `zwave_decode`, `wifi_decode`, `tetra_decode`, `gsmr_decode`, `lte_decode` and `dvbs_ip_decode`. Only OnAir, through `onair-rx` 0.4.0, runs them, so each reads `ready` while the wrapper is there and `unavailable` otherwise, with the reason `no decoder of its own, and no handler for it is ready` and the missing program's line. Each carries `content: network_traffic`, a fact about the row that nothing reads yet (a policy will; see `TODO.md`, "Policies"); it shows on `modes_list`, in a job's context and in a packet capture's record. Their point is the packets: a capture job writes them for Wireshark.
+
+**Install first.** Put `onair-rx` 0.4.0 on the operator's `PATH` (or name it with `ZETA_HANDLER_ONAIR_RX`) before deploying a node build with these rows. An older wrapper is probed `ready`, and a job then ends at launch with `onair-rx: no mode <m>` and exit 2. It needs no FFmpeg at run time; for DVB-S it sets `DECT2_NOGPU`, and OnAir prints one stderr line saying its GPU decoder is off.
+
+**Check.** `zeta handlers list`: `onair` is `ready`, and `zeta modes show ble_decode` lists it under `handlers` with `packet` among its `outputs`; a row that is not ready says why in `reason`. `zeta modes check <id> --strict` runs the row's check through the handler the policy picks (`<id>@onair: ok`) on a generated pair (`scripts/onair-fixtures.sh`, which needs `onair-gen` and `jq`; the pairs are megabytes and never committed).
+
+**What each gives.** Every mode needs the signal's channel at the job's centre.
+
+| row | one job reads | events | packets | not decoded |
+|---|---|---|---|---|
+| `ble_decode` | one advertising channel (2402, 2426 or 2480 MHz) | a device: address, name, signal | Bluetooth LE | connections (not followed), other PHYs |
+| `zigbee_decode`, `thread_decode` | one 802.15.4 channel at the centre | a frame: type, PAN, addresses | IEEE 802.15.4; Thread adds its own analysis | secured payloads (no key); the sub-GHz PHY is untested |
+| `lorawan_decode` | every channel of one regional plan inside 2 MHz | a packet: device address, spreading factor, frequency | LoRaWAN | payloads (no key) |
+| `zwave_decode` | every channel of the region inside 2 MHz | a frame: home id, source node | Z-Wave (a user link type, below) | S0 and S2 payloads |
+| `wisun_decode` | every channel of the band plan inside 2 MHz | a frame: source address | Wi-SUN FAN | 200 and 300 kbit/s; encrypted frames stay so |
+| `wifi_decode` | 20 MHz at one centre | a beacon, probe response or FILS discovery: BSSID, SSID | every good frame, as 802.11 with radiotap | the higher rates, encrypted data |
+| `tetra_decode`, `gsmr_decode`, `lte_decode` | one carrier (TETRA and GSM-R 2 MHz, LTE 20 MHz) | a cell when first read and when what is known of it changes: identity and system information | the cell's broadcast channels, as GSMTAP over UDP | traffic, anything addressed to a terminal, paging |
+| `dvbs_ip_decode` | one DVB-S or DVB-S2 carrier at the IF, 10 MHz | a status line: lock, standard, symbol rate, datagram count | whole IP datagrams from GSE, MPE and ULE | DVB-S2X, the transport stream itself, encrypted payloads |
+
+No key is loaded or passed: frames are given as received. A packet's time is the first sample of the block it was drained after; for TETRA, GSM-R, LTE and DVB-S it trails the frame by up to a stretch of input (up to 2.3 s for TETRA; the wrapper's README gives each).
+
+**Start** from the page (the box menu's Decode entry: greyed with the row's reason when nothing can run it, hidden when the node does not list the row) or
+
+```json
+{"op":"job_start","kind":"ble_decode","source":"<source>","center_hz":2426000000,"bandwidth_hz":2000000,"needs":["packet"]}
+```
+
+On the CLI: `zeta job start --kind ble_decode --source <source> --center-hz 2426000000 --bandwidth-hz 2000000 --needs packet`; read the capture as in "Packet capture for Wireshark". A row's band is the standard's own, across regions, with the source in the row's notes (`modes_show`); the plan-based and wide rows list no centres, so give the one you measured.
+
+**One channel per job.** Bluetooth LE, Zigbee and Thread read one channel; a second channel is a second job. The wide ones take what the rate holds: Wi-Fi and LTE need 20 MHz, about 80 MB/s into the wrapper, so start them only on a source that holds that rate without dropping. Read the node's dropped-sample count and its stderr for `input lagged, N frames skipped`.
+
+**Cost.** Measured on the build host (12 cores, a release node, a looping generated pair in real time for 30 s, no dropped input), `onair-rx` and node cores per job: BLE 0.15 and 0.29, LoRaWAN 0.24 and 0.08, Zigbee 0.58 and 0.28, Thread 0.57 and 0.28, Z-Wave 0.03 and 0.08, Wi-Fi 0.46 and 0.46, Wi-SUN 0.11 and 0.08, TETRA 0.10 and 0.08, GSM-R 0.51 and 0.08, LTE 1.08 and 0.45, DVB-S IP 1.02 and 0.25. The host was loaded by other builds, so these are upper bounds. A host with two cores is unmeasured.
+
+**LTE.** The wrapper does not keep real time at 20 MHz on the build host, so `lte_decode`'s entry passes `--drop`: the receiver skips input that arrives while it is busy, as it does live. `capture_decode` replays at real time, so a replay reads cells as a live job does; a feed faster than real time would miss them. The handler takes 20 MHz and about 1.1 cores while a job runs, even for a 1.4 MHz carrier.
+
+**DVB-S IP is tried only when named.** The row has no range or centre, so identify, `classify`'s candidates and a watch's default modes pass over it (the row field `identify.when_named`); name it (identify's `candidates`, a watch's `modes`) or start it by hand and it runs anywhere. The entry passes `--width $bandwidth_hz`, the job's band width, which bounds the receiver's symbol-rate search.
+
+**Z-Wave in Wireshark.** OnAir writes Z-Wave as link type `USER1` (148), but 148 is the node's Mode S, so the node writes Z-Wave packets as `USER2` (`LINKTYPE_USER2`, 149). Wireshark has no Z-Wave dissector. Run `onair-rx --lua > onair.lua` and load it as a Wireshark Lua plugin, then open Preferences, Protocols, DLT_USER, Encapsulations Table, and add an entry: DLT `User 2 (DLT=149)`, payload protocol `onair_zwave` (the Lua dissector's name). The plugin itself registers `onair_zwave` for USER1; if you also load the node's `docs/wireshark/zetasdr.lua` for Mode S, check that table's USER1 row still names Mode S. The other ten modes open as their own protocols with no setup (802.11 with radiotap, 802.15.4, Bluetooth LE, LoRaWAN, GSMTAP).
+
+**Verify.** The job's record names `handler: onair` and its context carries `content: network_traffic`; events appear on its feed; the capture opens in Wireshark as the protocol in the table. With `onair-rx` moved aside the rows read `unavailable` with the reason, and their Decode entries are greyed.
+
+**Gotchas.** The Bluetooth LE line is the device only (address, name, signal), not the PDU type, channel or advertising data; the capture has them. A cell's line for TETRA, GSM-R and LTE is not repeated while only the measured frequency, SNR or network time moves, so a steady cell is quiet. Wi-SUN holds its last frames until the end of input, and the wrapper flushes them then. Where a receiver has no switch for something (Zigbee's sub-GHz PHY, Wi-Fi's rate), the wrapper's README and `UPSTREAM.md` say so.
+
 ## Make your own theme
 
 Verified on the plan 26 build; the folder format and every hook are in `docs/themes.md`.
