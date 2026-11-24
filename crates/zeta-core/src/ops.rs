@@ -21,8 +21,8 @@ use crate::knowledge::{Allocation, Signature, nearest_of};
 use crate::lease::{Decision, LeaseError};
 use crate::modes::policy::{HandlerPolicy, Passed};
 use crate::modes::{
-    Access, Band as ModeBand, Content, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry,
-    ModeRow, ModeState, Role, Subject, is_mode_id, template,
+    Access, Band as ModeBand, Content, DEMOD_KINDS, Decoder, DecoderKind, Family, LoadedMode,
+    ModeId, ModeRegistry, ModeRow, ModeState, Role, Subject, is_mode_id, template,
 };
 use crate::node::{AfterGate, Node, NodeError, StartHandler};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
@@ -1418,6 +1418,155 @@ pub fn is_bcp47(code: &str) -> bool {
 /// `ssb_demod` audio bandwidth, Hz, used by the `ssb_demod` job kind.
 pub const SSB_AUDIO_BANDWIDTH_HZ: u64 = 2_800;
 
+/// The parameters a demodulator row gives its kind when a start names none; `None` for
+/// each the kind has no such parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DemodDefaults {
+    pub deviation_hz: Option<u64>,
+    pub audio_lowpass_hz: Option<u64>,
+    pub deemphasis_us: Option<u64>,
+    pub audio_bandwidth_hz: Option<u64>,
+}
+
+/// The defaults of the demodulator row `row_id` of `modes`: its `params`, each missing
+/// one the constant of the kind its `builtin` names (the row's own id when it has no
+/// ready `builtin` row, as when the registry holds none).
+pub fn demod_defaults(modes: &ModeRegistry, row_id: &str) -> DemodDefaults {
+    let row = modes
+        .get(row_id)
+        .filter(|m| m.state == ModeState::Ready)
+        .and_then(|m| match &m.row.decoder {
+            Some(Decoder::Builtin(b)) => Some(b),
+            _ => None,
+        });
+    let kind = row.map_or(row_id, |b| b.builtin.as_str());
+    let (dev, low, deemph, bw) = match kind {
+        "fm_demod" => (
+            Some(FM_DEVIATION_DEFAULT_HZ),
+            Some(FM_AUDIO_LOWPASS_HZ),
+            Some(FM_DEEMPHASIS_US),
+            None,
+        ),
+        "wfm_demod" => (
+            Some(WFM_DEVIATION_DEFAULT_HZ),
+            None,
+            Some(WFM_DEEMPHASIS_US),
+            None,
+        ),
+        "ssb_demod" => (None, None, None, Some(SSB_AUDIO_BANDWIDTH_HZ)),
+        _ => (None, None, None, None),
+    };
+    let param = |key: &str, default: Option<u64>| {
+        default.map(|d| {
+            row.and_then(|b| b.params.get(key))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(d)
+        })
+    };
+    DemodDefaults {
+        deviation_hz: param("deviation_hz", dev),
+        audio_lowpass_hz: param("audio_lowpass_hz", low),
+        deemphasis_us: param("deemphasis_us", deemph),
+        audio_bandwidth_hz: param("audio_bandwidth_hz", bw),
+    }
+}
+
+/// The graph of the demodulator kind `builtin` at `tuning` (`out` the channel rate):
+/// the request's `deviation_hz` and `sideband`, else the row's `defaults`.
+fn demod_graph(
+    builtin: &str,
+    defaults: &DemodDefaults,
+    tuning: Tuning,
+    out: u64,
+    (deviation_hz, sideband): (Option<Hz>, Option<Sideband>),
+) -> Graph {
+    let bw = tuning.bandwidth_hz.0;
+    let (channel, demod) = (NodeId::new(), NodeId::new());
+    let mut channel_params = serde_json::json!({
+        "center_hz": tuning.center_hz.0,
+        "bandwidth_hz": bw,
+        "out_rate_hz": out,
+    });
+    let deviation = |fallback: u64| {
+        deviation_hz
+            .map(|d| d.0)
+            .or(defaults.deviation_hz)
+            .unwrap_or(fallback)
+    };
+    let (kind, demod_params) = match builtin {
+        "fm_demod" => {
+            let mut p = serde_json::json!({
+                "deviation_hz": deviation(FM_DEVIATION_DEFAULT_HZ),
+                "audio_rate_hz": AUDIO_RATE_HZ,
+                "squelch_db": null,
+                "squelch": true,
+                "audio_lowpass_hz": defaults.audio_lowpass_hz.unwrap_or(FM_AUDIO_LOWPASS_HZ),
+                "deemphasis_us": defaults.deemphasis_us.unwrap_or(FM_DEEMPHASIS_US),
+                "denoise": false,
+            });
+            // On a plan channel, with room for both neighbours at the channel rate: the
+            // adjacent-channel guard (the channel cut three raster steps wide).
+            if let Some((plan, _)) = crate::plans::channel_at(tuning.center_hz.0) {
+                let g = crate::plans::adjacent_hz(plan);
+                if bw + 2 * g <= out {
+                    channel_params["wide_hz"] = (bw + 2 * g).into();
+                    p["guard_hz"] = g.into();
+                    p["guard_db"] = crate::plans::GUARD_DB_DEFAULT.into();
+                    p["channel_hz"] = bw.into();
+                }
+            }
+            ("nbfm_demod", p)
+        }
+        "wfm_demod" => (
+            "wfm_demod",
+            serde_json::json!({
+                "deviation_hz": deviation(WFM_DEVIATION_DEFAULT_HZ),
+                "audio_rate_hz": AUDIO_RATE_HZ,
+                "deemphasis_us": defaults.deemphasis_us.unwrap_or(WFM_DEEMPHASIS_US),
+                "stereo": false,
+            }),
+        ),
+        "am_demod" => (
+            "am_demod",
+            serde_json::json!({
+                "audio_rate_hz": AUDIO_RATE_HZ,
+                "squelch_db": null,
+                "squelch": true,
+                "denoise": false,
+            }),
+        ),
+        _ => (
+            "ssb_demod",
+            serde_json::json!({
+                "sideband": sideband.unwrap_or(Sideband::Usb),
+                "audio_rate_hz": AUDIO_RATE_HZ,
+                "audio_bandwidth_hz": defaults.audio_bandwidth_hz.unwrap_or(SSB_AUDIO_BANDWIDTH_HZ),
+                "denoise": false,
+            }),
+        ),
+    };
+    Graph {
+        id: GraphId::new(),
+        nodes: vec![
+            GraphNode {
+                id: channel.clone(),
+                kind: "channel".into(),
+                params: channel_params,
+            },
+            GraphNode {
+                id: demod.clone(),
+                kind: kind.into(),
+                params: demod_params,
+            },
+        ],
+        edges: vec![Edge {
+            from: channel,
+            to: demod,
+            kind: StreamKind::Iq,
+        }],
+    }
+}
+
 /// A result variant's `value` requires every property, its `#[serde(default)]` ones
 /// included: they are always written, and defaulted only for an older node's answer.
 fn require_all_value(schema: &mut schemars::Schema) {
@@ -1799,6 +1948,27 @@ impl JobKind {
             JobKind::Capture => "capture",
             JobKind::Packets => "packets",
             JobKind::Mode(id) => &id.0,
+        }
+    }
+
+    /// The built-in demodulator kind the job kind runs and the defaults its row gives it:
+    /// a demodulator kind's own row, or the row of a `Mode` whose decoder is `builtin`.
+    /// `None` for every other kind.
+    pub(crate) fn demod(&self, modes: &ModeRegistry) -> Option<(&'static str, DemodDefaults)> {
+        match self {
+            JobKind::FmDemod | JobKind::WfmDemod | JobKind::AmDemod | JobKind::SsbDemod => {
+                let b = DEMOD_KINDS.iter().find(|k| **k == self.name())?;
+                Some((b, demod_defaults(modes, b)))
+            }
+            JobKind::Mode(id) => {
+                let m = modes.get(&id.0)?;
+                let Some(Decoder::Builtin(b)) = &m.row.decoder else {
+                    return None;
+                };
+                let b = DEMOD_KINDS.iter().find(|k| **k == b.builtin)?;
+                Some((b, demod_defaults(modes, &id.0)))
+            }
+            _ => None,
         }
     }
 
@@ -2298,6 +2468,17 @@ impl JobKind {
                 });
             }
         }
+        // A demodulator expands from its row's defaults: the kind's own row, or a
+        // variant row naming the kind as its `builtin`.
+        if let Some((builtin, defaults)) = self.demod(modes) {
+            return Ok(demod_graph(
+                builtin,
+                &defaults,
+                tuning,
+                out,
+                (deviation_hz, sideband),
+            ));
+        }
         if let Some(row) = row {
             let (h, block) = mode_handler(modes, row, handler)?;
             template::check_band(row, block.as_ref(), tuning, source_rate_hz.0)?;
@@ -2444,149 +2625,8 @@ impl JobKind {
                 }],
                 edges: vec![],
             },
-            JobKind::FmDemod => {
-                let (channel, demod) = (NodeId::new(), NodeId::new());
-                let mut channel_params = serde_json::json!({
-                    "center_hz": tuning.center_hz.0,
-                    "bandwidth_hz": bw,
-                    "out_rate_hz": out,
-                });
-                let mut demod_params = serde_json::json!({
-                    "deviation_hz": deviation_hz.map_or(FM_DEVIATION_DEFAULT_HZ, |d| d.0),
-                    "audio_rate_hz": AUDIO_RATE_HZ,
-                    "squelch_db": null,
-                    "squelch": true,
-                    "audio_lowpass_hz": FM_AUDIO_LOWPASS_HZ,
-                    "deemphasis_us": FM_DEEMPHASIS_US,
-                    "denoise": false,
-                });
-                // On a plan channel, with room for both neighbours at the channel rate: the
-                // adjacent-channel guard (the channel cut three raster steps wide).
-                if let Some((plan, _)) = crate::plans::channel_at(tuning.center_hz.0) {
-                    let g = crate::plans::adjacent_hz(plan);
-                    if bw + 2 * g <= out {
-                        channel_params["wide_hz"] = (bw + 2 * g).into();
-                        demod_params["guard_hz"] = g.into();
-                        demod_params["guard_db"] = crate::plans::GUARD_DB_DEFAULT.into();
-                        demod_params["channel_hz"] = bw.into();
-                    }
-                }
-                Graph {
-                    id: GraphId::new(),
-                    nodes: vec![
-                        GraphNode {
-                            id: channel.clone(),
-                            kind: "channel".into(),
-                            params: channel_params,
-                        },
-                        GraphNode {
-                            id: demod.clone(),
-                            kind: "nbfm_demod".into(),
-                            params: demod_params,
-                        },
-                    ],
-                    edges: vec![Edge {
-                        from: channel,
-                        to: demod,
-                        kind: StreamKind::Iq,
-                    }],
-                }
-            }
-            JobKind::WfmDemod => {
-                let (channel, demod) = (NodeId::new(), NodeId::new());
-                Graph {
-                    id: GraphId::new(),
-                    nodes: vec![
-                        GraphNode {
-                            id: channel.clone(),
-                            kind: "channel".into(),
-                            params: serde_json::json!({
-                                "center_hz": tuning.center_hz.0,
-                                "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": out,
-                            }),
-                        },
-                        GraphNode {
-                            id: demod.clone(),
-                            kind: "wfm_demod".into(),
-                            params: serde_json::json!({
-                                "deviation_hz": deviation_hz.map_or(WFM_DEVIATION_DEFAULT_HZ, |d| d.0),
-                                "audio_rate_hz": AUDIO_RATE_HZ,
-                                "deemphasis_us": WFM_DEEMPHASIS_US,
-                                "stereo": false,
-                            }),
-                        },
-                    ],
-                    edges: vec![Edge {
-                        from: channel,
-                        to: demod,
-                        kind: StreamKind::Iq,
-                    }],
-                }
-            }
-            JobKind::AmDemod => {
-                let (channel, demod) = (NodeId::new(), NodeId::new());
-                Graph {
-                    id: GraphId::new(),
-                    nodes: vec![
-                        GraphNode {
-                            id: channel.clone(),
-                            kind: "channel".into(),
-                            params: serde_json::json!({
-                                "center_hz": tuning.center_hz.0,
-                                "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": out,
-                            }),
-                        },
-                        GraphNode {
-                            id: demod.clone(),
-                            kind: "am_demod".into(),
-                            params: serde_json::json!({
-                                "audio_rate_hz": AUDIO_RATE_HZ,
-                                "squelch_db": null,
-                                "squelch": true,
-                                "denoise": false,
-                            }),
-                        },
-                    ],
-                    edges: vec![Edge {
-                        from: channel,
-                        to: demod,
-                        kind: StreamKind::Iq,
-                    }],
-                }
-            }
-            JobKind::SsbDemod => {
-                let (channel, demod) = (NodeId::new(), NodeId::new());
-                Graph {
-                    id: GraphId::new(),
-                    nodes: vec![
-                        GraphNode {
-                            id: channel.clone(),
-                            kind: "channel".into(),
-                            params: serde_json::json!({
-                                "center_hz": tuning.center_hz.0,
-                                "bandwidth_hz": tuning.bandwidth_hz.0,
-                                "out_rate_hz": out,
-                            }),
-                        },
-                        GraphNode {
-                            id: demod.clone(),
-                            kind: "ssb_demod".into(),
-                            params: serde_json::json!({
-                                "sideband": sideband.unwrap_or(Sideband::Usb),
-                                "audio_rate_hz": AUDIO_RATE_HZ,
-                                "audio_bandwidth_hz": SSB_AUDIO_BANDWIDTH_HZ,
-                                "denoise": false,
-                            }),
-                        },
-                    ],
-                    edges: vec![Edge {
-                        from: channel,
-                        to: demod,
-                        kind: StreamKind::Iq,
-                    }],
-                }
+            JobKind::FmDemod | JobKind::WfmDemod | JobKind::AmDemod | JobKind::SsbDemod => {
+                unreachable!("expanded from the demodulator's row above")
             }
         })
     }
@@ -4914,8 +4954,14 @@ pub(crate) fn check_start_params(
     kind: &JobKind,
     deviation_hz: Option<u64>,
     sideband: Option<Sideband>,
+    modes: Option<&ModeRegistry>,
 ) -> Result<Option<Hz>, OpError> {
-    if sideband.is_some() && *kind != JobKind::SsbDemod {
+    // The demodulator a variant row runs takes what that demodulator takes.
+    let builtin = match kind {
+        JobKind::Mode(_) => modes.and_then(|m| kind.demod(m)).map(|(b, _)| b),
+        k => Some(k.name()),
+    };
+    if sideband.is_some() && builtin != Some("ssb_demod") {
         return Err(other(format!(
             "sideband applies only to kind ssb_demod; pass null (kind is {})",
             kind.name()
@@ -4923,7 +4969,7 @@ pub(crate) fn check_start_params(
     }
     match deviation_hz {
         None => Ok(None),
-        Some(_) if !matches!(kind, JobKind::FmDemod | JobKind::WfmDemod) => Err(other(format!(
+        Some(_) if !matches!(builtin, Some("fm_demod" | "wfm_demod")) => Err(other(format!(
             "deviation_hz applies only to kinds fm_demod and wfm_demod; pass null (kind is {})",
             kind.name()
         ))),
@@ -5308,8 +5354,9 @@ pub(crate) fn check_start_fields(
     kind: &JobKind,
     deviation_hz: Option<u64>,
     sideband: Option<Sideband>,
+    modes: Option<&ModeRegistry>,
 ) -> Result<Option<Hz>, FieldError> {
-    check_start_params(kind, deviation_hz, sideband).map_err(|e| {
+    check_start_params(kind, deviation_hz, sideband, modes).map_err(|e| {
         let field = match &e {
             OpError::Other { message } if message.starts_with("sideband") => "sideband",
             _ => "deviation_hz",
@@ -5405,7 +5452,7 @@ pub(crate) fn check_plan_start_fields(
             other(format!("{} cannot be started per channel", kind.name())),
         ));
     }
-    let deviation = check_start_fields(kind, deviation_hz, sideband)?;
+    let deviation = check_start_fields(kind, deviation_hz, sideband, None)?;
     let language = check_attach_fields(attach, language)?;
     Ok(PlanFields {
         plan: p,
@@ -5689,7 +5736,16 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
                     message: format!("{} cannot be elastic", kind.name()),
                 });
             }
-            let deviation = check_start_params(&kind, deviation_hz, sideband)?;
+            let modes = node.modes();
+            let deviation = check_start_params(&kind, deviation_hz, sideband, Some(&modes))?;
+            // On a plan channel of the station's region, the plan's deviation when none
+            // was asked, as `plan_start` gives it (an `fm_demod` only).
+            let deviation = deviation.or_else(|| {
+                (kind == JobKind::FmDemod)
+                    .then(|| crate::plans::plan_deviation_at(center_hz.0, &node.region()))
+                    .flatten()
+                    .map(Hz)
+            });
             check_look(&kind, dwell_ms, average, bits, method, bin_hz)?;
             check_dwell_scale(&kind, dwell_scale)?;
             check_handler_fields(&kind, handler.as_deref(), &needs)?;
@@ -7379,16 +7435,18 @@ async fn set_start(
                 params,
                 audio_policy,
                 ..
-            } => match check_start_params(kind, *deviation_hz, *sideband).and_then(|d| {
-                // The member's policy, as `job_start` checks it.
-                check_audio_policy(kind, kind.mode_row(&modes)?, *audio_policy)?;
-                // A watch's `modes`, checked here as `job_start` checks them, so a row
-                // this node lacks is refused before its radio is held or tuned.
-                match set_watch_modes(kind, params.as_ref(), &modes, *bandwidth_hz) {
-                    Err(reason) => Err(other(format!("members[{index}].params.{reason}"))),
-                    Ok(()) => Ok(d),
-                }
-            }) {
+            } => match check_start_params(kind, *deviation_hz, *sideband, Some(&modes)).and_then(
+                |d| {
+                    // The member's policy, as `job_start` checks it.
+                    check_audio_policy(kind, kind.mode_row(&modes)?, *audio_policy)?;
+                    // A watch's `modes`, checked here as `job_start` checks them, so a row
+                    // this node lacks is refused before its radio is held or tuned.
+                    match set_watch_modes(kind, params.as_ref(), &modes, *bandwidth_hz) {
+                        Err(reason) => Err(other(format!("members[{index}].params.{reason}"))),
+                        Ok(()) => Ok(d),
+                    }
+                },
+            ) {
                 Ok(deviation) => SetMemberStart::Job {
                     kind: kind.clone(),
                     tuning: Tuning {

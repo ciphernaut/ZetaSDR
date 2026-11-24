@@ -41,10 +41,7 @@ use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{Decision, LeaseError, LeaseManager};
 use crate::modes::{MODES_CHECKED_FILE, ModeRegistry, ModeState, ModesHandle};
-use crate::ops::{
-    AudioPolicy, FM_DEVIATION_DEFAULT_HZ, JobKind, Op, OpError, OpResult, Sideband,
-    WFM_DEVIATION_DEFAULT_HZ,
-};
+use crate::ops::{AudioPolicy, JobKind, Op, OpError, OpResult, Sideband};
 use crate::port::{GainInfo, Port, PortError, Tuning};
 use crate::ring::IqRing;
 use crate::stage::{Backend, MixInput, StageRegistry};
@@ -656,6 +653,14 @@ struct Inner {
 type HealCounter = (SourceId, tokio::sync::watch::Receiver<u64>);
 
 impl Inner {
+    /// The region the node judges signals in; see [`Node::region`].
+    pub(crate) fn region(&self) -> String {
+        self.station.lock().unwrap().as_ref().map_or_else(
+            || crate::knowledge::DEFAULT_REGION.to_string(),
+            |s| s.region.clone(),
+        )
+    }
+
     /// A receiver that changes each time `feed_ring` has pushed a block of `source`
     /// into its ring, so a reader waits on the ring instead of polling it.
     pub(crate) fn ring_tick(&self, source: &SourceId) -> tokio::sync::watch::Receiver<u64> {
@@ -3265,18 +3270,21 @@ impl Node {
     ) -> Option<JobId> {
         let k = self.expandable_kind(kind)?;
         let modes = self.inner.modes();
+        let demod = k.demod(&modes);
         let own = k
             .loaded_mode(&modes)
             .ok()
             .flatten()
             .map(|m| m.own_handler());
         let runs = |r: &JobRecord| r.handler.clone().or_else(|| own.clone());
-        let norm = |(d, s): (Option<u64>, Option<Sideband>)| match k {
-            JobKind::FmDemod if !match_deviation => (None, None),
-            JobKind::WfmDemod if !match_deviation => (None, None),
-            JobKind::FmDemod => (Some(d.unwrap_or(FM_DEVIATION_DEFAULT_HZ)), None),
-            JobKind::WfmDemod => (Some(d.unwrap_or(WFM_DEVIATION_DEFAULT_HZ)), None),
-            JobKind::SsbDemod => (None, Some(s.unwrap_or(Sideband::Usb))),
+        let norm = |(d, s): (Option<u64>, Option<Sideband>)| match &demod {
+            Some((b, _)) if matches!(*b, "fm_demod" | "wfm_demod") && !match_deviation => {
+                (None, None)
+            }
+            Some((b, def)) if matches!(*b, "fm_demod" | "wfm_demod") => {
+                (Some(d.or(def.deviation_hz).unwrap_or_default()), None)
+            }
+            Some(("ssb_demod", _)) => (None, Some(s.unwrap_or(Sideband::Usb))),
             _ => (None, None),
         };
         let want = norm((deviation_hz, sideband));
@@ -3760,6 +3768,12 @@ impl Node {
     /// The node's station, when one is set.
     pub fn station(&self) -> Option<crate::station::Station> {
         self.inner.station.lock().unwrap().clone()
+    }
+
+    /// The region the node judges signals in: the station's, else
+    /// [`crate::knowledge::DEFAULT_REGION`].
+    pub fn region(&self) -> String {
+        self.inner.region()
     }
 
     /// Store `s` as the station: written to `station.json` first, then kept in memory;

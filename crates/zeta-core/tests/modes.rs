@@ -2736,11 +2736,102 @@ fn a_builtin_row_naming_an_unknown_kind_is_broken() {
     let reg = registry_with(&[("foo", row)]);
     let m = reg.get("foo_demod").unwrap();
     assert_eq!(m.state, ModeState::Broken);
+    let reason = m.reason.as_deref().unwrap();
     assert!(
-        m.reason.as_deref().unwrap().contains("foo_demod"),
-        "{:?}",
-        m.reason
+        reason.contains("decoder.builtin") && reason.contains("foo_demod"),
+        "{reason}"
     );
+}
+
+/// The reason the registry gives for the one operator row `row`, which must load broken.
+fn broken_reason(id: &str, row: serde_json::Value) -> String {
+    let reg = registry_with(&[("x", row)]);
+    let m = reg
+        .get(&format!("{id}@x.json"))
+        .or_else(|| reg.get(id))
+        .unwrap_or_else(|| panic!("{id} listed"));
+    assert_eq!(m.state, ModeState::Broken, "{id}");
+    m.reason.clone().unwrap()
+}
+
+fn variant_row(builtin: &str) -> serde_json::Value {
+    let mut row = embedded_row(builtin);
+    row["id"] = "my_demod".into();
+    row
+}
+
+#[test]
+fn a_builtin_row_must_prove_nothing() {
+    let mut row = variant_row("fm_demod");
+    row["identify"]["proof"] = "event".into();
+    let reason = broken_reason("my_demod", row);
+    assert!(reason.starts_with("identify.proof"), "{reason}");
+}
+
+#[test]
+fn proof_none_is_for_a_builtin_row_only() {
+    let mut row = embedded_row("pocsag_decode");
+    row["id"] = "my_pager".into();
+    row["identify"]["proof"] = "none".into();
+    let reason = broken_reason("my_pager", row);
+    assert!(reason.starts_with("identify.proof"), "{reason}");
+}
+
+#[test]
+fn a_builtin_rows_protocol_follows_its_kind() {
+    for (builtin, wrong) in [
+        ("fm_demod", "none"),
+        ("am_demod", "none"),
+        ("wfm_demod", "squelch"),
+        ("ssb_demod", "squelch"),
+    ] {
+        let mut row = variant_row(builtin);
+        row["protocol"] = wrong.into();
+        let reason = broken_reason("my_demod", row);
+        assert!(reason.starts_with("protocol"), "{builtin}: {reason}");
+    }
+}
+
+#[test]
+fn a_row_named_for_one_kind_may_not_name_another() {
+    let mut row = embedded_row("wfm_demod");
+    row["id"] = "fm_demod".into();
+    let reason = broken_reason("fm_demod", row);
+    assert_eq!(reason, "id: fm_demod is a built-in job kind");
+}
+
+fn rule_reason(rule: serde_json::Value) -> String {
+    let mut row = variant_row("fm_demod");
+    for (k, v) in rule.as_object().unwrap() {
+        row["band"]["width_rule"][k] = v.clone();
+    }
+    broken_reason("my_demod", row)
+}
+
+#[test]
+fn a_width_rule_scale_must_be_above_zero() {
+    let reason = rule_reason(serde_json::json!({"scale": 0.0}));
+    assert!(reason.starts_with("band.width_rule.scale"), "{reason}");
+}
+
+#[test]
+fn a_width_rule_fixed_width_must_be_above_zero() {
+    let reason = rule_reason(serde_json::json!({"fixed_hz": 0}));
+    assert!(reason.starts_with("band.width_rule.fixed_hz"), "{reason}");
+}
+
+#[test]
+fn a_width_rule_floor_may_not_exceed_its_fixed_width() {
+    let reason = rule_reason(serde_json::json!({"floor_hz": 7000, "fixed_hz": 6000}));
+    assert!(reason.starts_with("band.width_rule.floor_hz"), "{reason}");
+}
+
+#[test]
+fn an_absent_width_rule_serialises_as_null() {
+    let row = embedded_row("pocsag_decode");
+    let parsed = zeta_core::modes::parse(&row.to_string()).unwrap();
+    let back = serde_json::to_value(&parsed).unwrap();
+    assert_eq!(back["band"]["width_rule"], serde_json::Value::Null);
 }
 
 #[test]

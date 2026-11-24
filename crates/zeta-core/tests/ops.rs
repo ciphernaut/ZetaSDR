@@ -2051,6 +2051,185 @@ fn deviation_param_reaches_nbfm_node() {
     assert_eq!(g.nodes[1].params["deviation_hz"], 2_500);
 }
 
+#[test]
+fn the_builtin_rows_hold_the_old_constants() {
+    use zeta_core::ops::demod_defaults;
+    let modes = modes();
+    let fm = demod_defaults(&modes, "fm_demod");
+    assert_eq!(
+        (fm.deviation_hz, fm.audio_lowpass_hz, fm.deemphasis_us),
+        (Some(5_000), Some(3_400), Some(530))
+    );
+    let wfm = demod_defaults(&modes, "wfm_demod");
+    assert_eq!(
+        (wfm.deviation_hz, wfm.deemphasis_us),
+        (Some(75_000), Some(50))
+    );
+    assert_eq!(
+        demod_defaults(&modes, "ssb_demod").audio_bandwidth_hz,
+        Some(2_800)
+    );
+    assert_eq!(demod_defaults(&modes, "am_demod").deviation_hz, None);
+}
+
+/// A node on the DSP stages with `rows` (file stem, row) in its `--modes-dir`, a source
+/// `hackrf0` reaching UHF, and `region` as its station's when given.
+async fn demod_node(dir: &Path, rows: &[(&str, Value)], region: Option<&str>) -> Node {
+    let modes_dir = dir.join("modes");
+    std::fs::create_dir_all(&modes_dir).unwrap();
+    for (stem, row) in rows {
+        std::fs::write(modes_dir.join(format!("{stem}.json")), row.to_string()).unwrap();
+    }
+    let mut stages = StageRegistry::new();
+    zeta_dsp::register_all(&mut stages);
+    let mut c = cfg(dir);
+    c.modes_dir = Some(modes_dir);
+    let node = Node::open(c, stages, vec![Arc::new(WidePort::new("hackrf0"))])
+        .await
+        .unwrap();
+    if let Some(region) = region {
+        node.apply(Op::StationSet {
+            lat: -27.3842,
+            lon: 153.1175,
+            alt_m: 4.0,
+            region: region.into(),
+            antennas: None,
+        })
+        .await
+        .unwrap();
+    }
+    node
+}
+
+/// The centre of channel 1 of `uhf_cb_au`, from the plans module.
+fn cb_centre() -> u64 {
+    let plan = zeta_core::plans::plan("uhf_cb_au").unwrap();
+    zeta_core::plans::channels(plan)[0].1
+}
+
+fn start_at(kind: JobKind, center_hz: u64, deviation_hz: Option<u64>) -> Op {
+    let mut op = start_with(kind, deviation_hz);
+    if let Op::JobStart {
+        center_hz: c,
+        bandwidth_hz: b,
+        ..
+    } = &mut op
+    {
+        (*c, *b) = (Hz(center_hz), Hz(12_500));
+    }
+    op
+}
+
+/// The record of the job `r` started.
+fn started(node: &Node, r: Result<OpResult, OpError>) -> zeta_core::job::JobRecord {
+    let Ok(OpResult::Job(id)) = r else {
+        panic!("a job: {r:?}");
+    };
+    node.job_list().into_iter().find(|j| j.id == id).unwrap()
+}
+
+#[tokio::test]
+async fn a_direct_fm_demod_on_a_plan_channel_gets_the_plans_deviation() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = demod_node(dir.path(), &[], None).await;
+    let r = node
+        .apply(start_at(JobKind::FmDemod, cb_centre(), None))
+        .await;
+    assert_eq!(
+        started(&node, r).graph.nodes[1].params["deviation_hz"],
+        2_500
+    );
+}
+
+#[tokio::test]
+async fn an_asked_deviation_beats_the_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = demod_node(dir.path(), &[], None).await;
+    let r = node
+        .apply(start_at(JobKind::FmDemod, cb_centre(), Some(4_000)))
+        .await;
+    assert_eq!(
+        started(&node, r).graph.nodes[1].params["deviation_hz"],
+        4_000
+    );
+}
+
+#[tokio::test]
+async fn a_plan_of_another_region_gives_no_deviation() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = demod_node(dir.path(), &[], Some("US")).await;
+    let r = node
+        .apply(start_at(JobKind::FmDemod, cb_centre(), None))
+        .await;
+    assert_eq!(
+        started(&node, r).graph.nodes[1].params["deviation_hz"],
+        5_000
+    );
+}
+
+fn demod_row(id: &str, builtin: &str, params: Value) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../modes/{builtin}.json"));
+    let mut row: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    row["id"] = id.into();
+    row["decoder"]["params"] = params;
+    row
+}
+
+#[tokio::test]
+async fn an_operator_row_changes_the_default_deviation() {
+    let dir = tempfile::tempdir().unwrap();
+    let row = demod_row(
+        "fm_demod",
+        "fm_demod",
+        serde_json::json!({"deviation_hz": 3000}),
+    );
+    let node = demod_node(dir.path(), &[("fm_demod", row)], None).await;
+    // Off any plan: the row's deviation.
+    let r = node
+        .apply(start_at(JobKind::FmDemod, 100_005_000, None))
+        .await;
+    assert_eq!(
+        started(&node, r).graph.nodes[1].params["deviation_hz"],
+        3_000
+    );
+}
+
+#[tokio::test]
+async fn a_variant_row_starts_with_its_own_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let row = demod_row(
+        "fm_narrow",
+        "fm_demod",
+        serde_json::json!({"deviation_hz": 2000}),
+    );
+    let node = demod_node(dir.path(), &[("fm_narrow", row)], None).await;
+    let kind = JobKind::Mode(zeta_core::modes::ModeId("fm_narrow".into()));
+    let r = node.apply(start_at(kind.clone(), 100_005_000, None)).await;
+    let rec = started(&node, r);
+    assert_eq!(rec.kind, "fm_narrow");
+    assert_eq!(rec.graph.nodes[1].kind, "nbfm_demod");
+    assert_eq!(rec.graph.nodes[1].params["deviation_hz"], 2_000);
+    node.apply(Op::JobStop { job: rec.id }).await.unwrap();
+    // The deviation is accepted on a variant of fm_demod, a sideband is not.
+    let r = node
+        .apply(start_at(kind.clone(), 100_005_000, Some(1_500)))
+        .await;
+    assert_eq!(
+        started(&node, r).graph.nodes[1].params["deviation_hz"],
+        1_500
+    );
+    let mut ssb = start_at(kind, 100_005_000, None);
+    if let Op::JobStart { sideband, .. } = &mut ssb {
+        *sideband = Some(Sideband::Lsb);
+    }
+    match node.apply(ssb).await {
+        Err(OpError::Other { message }) => {
+            assert!(message.starts_with("sideband applies only"), "{message}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
 fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
     Op::JobStart {
         kind,

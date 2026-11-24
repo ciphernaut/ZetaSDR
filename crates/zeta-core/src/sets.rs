@@ -421,7 +421,8 @@ fn validate_member(
                     format!("{} cannot be a set member", kind.name()),
                 ));
             }
-            crate::ops::check_start_fields(kind, *deviation_hz, *sideband).map_err(field)?;
+            crate::ops::check_start_fields(kind, *deviation_hz, *sideband, Some(modes))
+                .map_err(field)?;
             // A row this node lacks or cannot run passes: refused when the set starts.
             if let Ok(row) = kind.mode_row(modes) {
                 crate::ops::check_audio_policy(kind, row, *audio_policy).map_err(|e| {

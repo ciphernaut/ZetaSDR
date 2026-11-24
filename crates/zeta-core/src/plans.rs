@@ -318,6 +318,27 @@ pub fn channel_at(hz: u64) -> Option<(&'static ChannelPlan, u32)> {
     })
 }
 
+/// [`channel_at`] among the plans of `region` (compared case-insensitively) and the
+/// `world` plans: a plan of another region says nothing about a signal here.
+pub fn plan_channel_at(center_hz: u64, region: &str) -> Option<(&'static ChannelPlan, u32)> {
+    PLANS
+        .iter()
+        .filter(|p| p.region.eq_ignore_ascii_case(region) || p.region == "world")
+        .find_map(|plan| {
+            channels(plan)
+                .into_iter()
+                .map(|(n, c)| (c.abs_diff(center_hz), n))
+                .filter(|&(d, _)| d <= CHANNEL_MATCH_HZ)
+                .min()
+                .map(|(_, n)| (plan, n))
+        })
+}
+
+/// The FM deviation of the plan channel at `center_hz` in `region`, when it has one.
+pub fn plan_deviation_at(center_hz: u64, region: &str) -> Option<u64> {
+    plan_channel_at(center_hz, region).and_then(|(p, _)| p.deviation_hz)
+}
+
 /// The plan channel at `hz` (as [`channel_at`]) when that channel carries no voice.
 pub fn no_voice_at(hz: u64) -> Option<(&'static ChannelPlan, u32)> {
     channel_at(hz).filter(|(p, n)| p.no_voice.contains(n))

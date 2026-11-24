@@ -379,7 +379,7 @@ pub struct Band {
     pub range_hz: Option<Ranges>,
     /// How a choice sizes and centres this row's job from a measured signal; `null`
     /// for the rest (they take the measured band as it is).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub width_rule: Option<WidthRule>,
 }
 
@@ -1292,6 +1292,27 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             return Err(RowError::new(
                 "band.range_hz",
                 format!("[{lo}, {hi}] must be [lo, hi] with lo < hi"),
+            ));
+        }
+    }
+    if let Some(w) = &row.band.width_rule {
+        if let Some(scale) = w.scale
+            && (scale.is_nan() || scale <= 0.0)
+        {
+            return Err(RowError::new(
+                "band.width_rule.scale",
+                format!("{scale} must be above 0"),
+            ));
+        }
+        if w.fixed_hz == Some(0) {
+            return Err(RowError::new("band.width_rule.fixed_hz", "must be above 0"));
+        }
+        if let (Some(floor), Some(fixed)) = (w.floor_hz, w.fixed_hz)
+            && floor > fixed
+        {
+            return Err(RowError::new(
+                "band.width_rule.floor_hz",
+                format!("{floor} is above fixed_hz {fixed}"),
             ));
         }
     }
