@@ -1882,6 +1882,8 @@ impl Command {
                 | Command::Jobs(JobsCmd::Stop { .. })
                 // The job form writes the job's context.
                 | Command::Origin(OriginCmd::Lookup { job: Some(_), .. })
+                // It writes a capture into the burst store.
+                | Command::Iq(IqCmd::Read(_))
         )
     }
 

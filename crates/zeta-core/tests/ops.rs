@@ -361,6 +361,7 @@ async fn iq_read_labels_capture_centre_not_selection_centre() {
     assert_eq!(read_meta(&path).unwrap().center_hz, Hz(100_000_000));
     let meta: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let a = &meta["annotations"][0];
+    assert_eq!(a["core:label"], "selection");
     assert_eq!(a["core:sample_start"], 0);
     assert_eq!(a["core:sample_count"], 2400);
     assert_eq!(a["core:freq_lower_edge"], 100_005_000);

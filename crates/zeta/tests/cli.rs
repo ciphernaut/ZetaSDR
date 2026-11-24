@@ -867,6 +867,49 @@ fn iq_read_one_shot_writes_capture() {
 }
 
 #[test]
+fn iq_read_is_refused_while_serve_holds_the_state_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let pid = std::process::id();
+    std::fs::write(state.join("serve.lock"), pid.to_string()).unwrap();
+    let out = zeta(
+        dir.path(),
+        &[
+            "iq",
+            "read",
+            "--source",
+            "tone",
+            "--start-ns",
+            "0",
+            "--end-ns",
+            "1000000000",
+            "--center-hz",
+            "100000000",
+            "--bandwidth-hz",
+            "48000",
+        ],
+    )
+    .assert()
+    .failure()
+    .get_output()
+    .stdout
+    .clone();
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains(&format!("zeta serve (pid {pid}) owns this state dir")),
+        "{text}"
+    );
+    let bursts = state.join("bursts");
+    let written = std::fs::read_dir(bursts).map_or(0, |d| {
+        d.filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "sigmf-data"))
+            .count()
+    });
+    assert_eq!(written, 0, "nothing written");
+}
+
+#[test]
 fn mutating_one_shot_refused_while_serve_lock_held() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");

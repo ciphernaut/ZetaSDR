@@ -35,10 +35,10 @@ pub struct BurstPolicy {
     pub keep_days: u32,
     /// The budget of the unpinned trial captures.
     pub trial_keep_bytes: u64,
-    /// Whether the node expires the store when it opens (true by default). The CLI
-    /// turns it off for a one-shot that does not own the state directory or was given
-    /// no policy of its own, so it never deletes what `zeta serve`'s policy keeps; the
-    /// expiry after each write applies either way.
+    /// Whether this process applies the policy: when the store opens and after each
+    /// write (true by default). The CLI turns it off for a one-shot that does not own
+    /// the state directory or was given no policy of its own, so it never deletes what
+    /// `zeta serve`'s policy keeps; such a process writes without expiring.
     pub expire_at_open: bool,
 }
 
@@ -96,7 +96,7 @@ pub struct CaptureRecord {
     pub written_ns: u64,
     /// A slice a `choose` job's trial wrote: it counts against the trial quota, not the
     /// operator's budget.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     pub trial: bool,
 }
 
@@ -213,7 +213,7 @@ impl BurstStore {
     ) -> std::io::Result<CaptureRecord> {
         let id = ulid::Ulid::generate().to_string();
         let half = rec.bandwidth_hz.0 / 2;
-        let annotation = serde_json::json!({
+        let mut annotation = serde_json::json!({
             "core:sample_start": 0,
             "core:sample_count": samples.len(),
             "core:freq_lower_edge": rec.center_hz.0.saturating_sub(half),
@@ -227,6 +227,10 @@ impl BurstStore {
             "zeta:allocations": rec.allocations,
             "zeta:trial": rec.trial,
         });
+        // A record narrower than its file is a selection cut from a wider recording.
+        if rec.file_center_hz.is_some() {
+            annotation["core:label"] = "selection".into();
+        }
         let meta = CaptureMeta {
             sample_rate_hz: rec.sample_rate_hz,
             center_hz: rec.file_center_hz.unwrap_or(rec.center_hz),
@@ -263,7 +267,9 @@ impl BurstStore {
             return Err(e);
         }
         drop(index);
-        self.expire_except(Some(&record.id));
+        if self.policy.expire_at_open {
+            self.expire_except(Some(&record.id));
+        }
         Ok(record)
     }
 
@@ -749,6 +755,41 @@ mod tests {
         for r in [&pinned, &next, &op] {
             assert!(s.get(&r.id).is_some());
         }
+    }
+
+    #[test]
+    fn a_store_not_applying_the_policy_never_expires_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WINDOW as u64 * 8;
+        let s = BurstStore::open(
+            dir.path(),
+            BurstPolicy {
+                keep_bytes: w,
+                keep_days: 7,
+                trial_keep_bytes: w,
+                expire_at_open: false,
+            },
+        )
+        .unwrap();
+        let a = s.write(new_capture(t(0)), &samples()).unwrap();
+        let b = s.write(new_capture(t(1)), &samples()).unwrap();
+        let c = s.write(trial_capture(t(2)), &samples()).unwrap();
+        let d = s.write(trial_capture(t(3)), &samples()).unwrap();
+        for r in [&a, &b, &c, &d] {
+            assert!(s.get(&r.id).is_some(), "{} expired", r.id);
+        }
+    }
+
+    #[test]
+    fn a_trial_flag_is_always_written_to_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = two_budgets(dir.path(), u64::MAX, u64::MAX);
+        s.write(new_capture(t(0)), &samples()).unwrap();
+        let index: Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join(BURSTS_DIR).join(INDEX_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(index[0]["trial"], false);
     }
 
     #[test]
