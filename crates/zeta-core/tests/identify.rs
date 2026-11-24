@@ -435,7 +435,15 @@ async fn stop_all(node: &Node) {
 fn score_rows_never_returns_a_demodulator_row() {
     let modes = zeta_core::modes::ModeRegistry::load(&registry(), None);
     assert!(modes.get("fm_demod").is_some(), "the row is loaded");
-    let scored = score_rows(&modes, 146_500_000, 12_500, "fm", &|_| 0.0, &|_| 0.0);
+    let scored = score_rows(
+        modes.weights(),
+        &modes,
+        146_500_000,
+        12_500,
+        "fm",
+        &|_| 0.0,
+        &|_| 0.0,
+    );
     assert!(!scored.is_empty());
     for s in &scored {
         assert!(
@@ -984,11 +992,19 @@ async fn the_verdict_carries_the_nearest_allocations_and_the_score_term() {
     let label = verdict["label"].as_str().unwrap();
     let center = verdict["features"]["center_hz"].as_u64().unwrap();
     let modes = node.modes();
-    let base = score_rows(&modes, center, BANDWIDTH_HZ, label, &|_| 0.0, &|_| 0.0)
-        .into_iter()
-        .find(|s| s.mode.row.id.0 == "pocsag_decode")
-        .unwrap()
-        .score;
+    let base = score_rows(
+        modes.weights(),
+        &modes,
+        center,
+        BANDWIDTH_HZ,
+        label,
+        &|_| 0.0,
+        &|_| 0.0,
+    )
+    .into_iter()
+    .find(|s| s.mode.row.id.0 == "pocsag_decode")
+    .unwrap()
+    .score;
     let score = pocsag["score"].as_f64().unwrap() as f32;
     assert!(score >= base + 0.2 - 1e-4, "{score} vs {base}: {pocsag}");
     // A row the designator does not fit (ACARS: 10 kHz, and 16 kHz is over 1.5 times

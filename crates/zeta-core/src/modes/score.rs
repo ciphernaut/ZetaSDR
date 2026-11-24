@@ -1,19 +1,10 @@
 //! Scoring the rows against a measured band (design 7.1): the order `classify` and
 //! `identify` try the modes in.
 
+use super::weights::Weights;
 use super::{LoadedMode, ModeRegistry, ModeState};
 use crate::knowledge::Allocation;
 
-/// Score for the measured centre lying near one of the row's well-known centres or, for
-/// a row without centres, in its `range_hz` (granted when it has neither).
-const CENTER_SCORE: f32 = 0.4;
-/// Score for the measured bandwidth lying within half to 1.5 times the row's.
-const BANDWIDTH_SCORE: f32 = 0.3;
-/// Score for the layer-1 label being one the row presents as.
-const MODULATION_SCORE: f32 = 0.3;
-/// Score for a licensed transmitter on the band whose emission fits the row
-/// ([`allocation_term`]).
-pub const ALLOCATION_SCORE: f32 = 0.2;
 /// An assignment's bandwidth fits a row's within these factors of `band.bandwidth_hz`.
 const ALLOCATION_WIDTH: (f64, f64) = (0.5, 1.5);
 /// The layer-1 labels each emission designator's modulation letter is compatible with:
@@ -85,12 +76,12 @@ pub(crate) fn designator_fits(letter: char, labels: &[String]) -> bool {
         .any(|l| labels.iter().any(|m| m == l))
 }
 
-/// [`ALLOCATION_SCORE`] divided by `1 + rank` when [`allocation_match`] finds a `tx`
+/// `weights.allocation` divided by `1 + rank` when [`allocation_match`] finds a `tx`
 /// assignment that fits `row`, else 0. `rank` counts the `tx` assignments (receivers and
 /// plan rows left out) before the one that fits, in `allocs` order: a provider lists the
 /// strongest expected candidate first, so the register reorders the rows without ever
 /// outweighing the old flat bonus.
-pub fn allocation_term(row: &LoadedMode, allocs: &[Allocation]) -> f32 {
+pub fn allocation_term(row: &LoadedMode, allocs: &[Allocation], weights: &Weights) -> f32 {
     match allocation_match(row, allocs) {
         Some(hit) => {
             let rank = allocs
@@ -98,7 +89,7 @@ pub fn allocation_term(row: &LoadedMode, allocs: &[Allocation]) -> f32 {
                 .filter(|a| is_tx(a))
                 .take_while(|a| !std::ptr::eq(*a, hit))
                 .count();
-            ALLOCATION_SCORE / (1 + rank) as f32
+            weights.allocation / (1 + rank) as f32
         }
         None => 0.0,
     }
@@ -127,18 +118,19 @@ pub struct Scored<'a> {
 
 /// The `ready` and `unavailable` rows of `modes` (a broken row is never tried) scored
 /// against a signal measured at `center_hz`, `bandwidth_hz` wide and labelled `layer1`:
-/// 0.4 when `center_hz` lies within `band.bandwidth_hz` of one of `band.centers_hz`, or,
+/// `weights.center` (0.4) when `center_hz` lies within `band.bandwidth_hz` of one of `band.centers_hz`, or,
 /// for a row that lists no centres, inside one of `band.range_hz`'s spans (or the row has
 /// neither, "anywhere"; a row whose `range_hz` and listed centres both exclude
 /// `center_hz` scores 0 for it, is not `in_range` and never `fits_band`; a row with
-/// centres is `in_range` anywhere in its spans, scored there without the term); 0.3
-/// when `bandwidth_hz` lies within 0.5-1.5 times `band.bandwidth_hz`; 0.3 when `layer1`
+/// centres is `in_range` anywhere in its spans, scored there without the term); `weights.bandwidth`
+/// (0.3) when `bandwidth_hz` lies within 0.5-1.5 times `band.bandwidth_hz`; `weights.modulation` (0.3) when `layer1`
 /// is in `modulation`
 /// (never for an empty list); plus the best `catalogue(id)` among the row's `catalogue`
 /// ids, so a catalogue match can lift a row above 1; plus `allocation(row)` (the
 /// register's term, [`allocation_term`]). Highest score first; equal scores
 /// by `identify.priority` (highest first), then `family`, then `id`.
 pub fn score_rows<'a>(
+    weights: &Weights,
     modes: &'a ModeRegistry,
     center_hz: u64,
     bandwidth_hz: u64,
@@ -179,9 +171,9 @@ pub fn score_rows<'a>(
                 .map(|id| catalogue(id))
                 .fold(0.0_f32, f32::max);
             let terms = [
-                (center, CENTER_SCORE),
-                (width, BANDWIDTH_SCORE),
-                (modulation, MODULATION_SCORE),
+                (center, weights.center),
+                (width, weights.bandwidth),
+                (modulation, weights.modulation),
             ];
             let score = terms
                 .iter()
@@ -219,6 +211,10 @@ mod tests {
     use super::*;
     use crate::stage::StageRegistry;
 
+    const CENTER_SCORE: f32 = 0.4;
+    const BANDWIDTH_SCORE: f32 = 0.3;
+    const ALLOCATION_SCORE: f32 = 0.2;
+
     fn ids(scored: &[Scored]) -> Vec<(String, f32, bool)> {
         scored
             .iter()
@@ -248,6 +244,7 @@ mod tests {
     fn aprs_at_144_800_scores_highest_and_wide_rows_do_not_fit() {
         let modes = registry();
         let got = ids(&score_rows(
+            &Weights::default(),
             &modes,
             144_800_000,
             12_500,
@@ -286,6 +283,7 @@ mod tests {
             }
         };
         let got = ids(&score_rows(
+            &Weights::default(),
             &modes,
             104_900_000,
             150_000,
@@ -300,6 +298,7 @@ mod tests {
         set_state(&mut modes, "rds_decode", ModeState::Broken);
         set_state(&mut modes, "adsb_decode", ModeState::Unavailable);
         let got = ids(&score_rows(
+            &Weights::default(),
             &modes,
             104_900_000,
             150_000,
@@ -330,11 +329,19 @@ mod tests {
             r.catalogue = vec![];
         });
         let sonde = |center_hz| {
-            score_rows(&modes, center_hz, 1, "noise", &|_| 0.0, &|_| 0.0)
-                .iter()
-                .find(|s| s.mode.row.id.0 == "sonde")
-                .unwrap()
-                .score
+            score_rows(
+                &Weights::default(),
+                &modes,
+                center_hz,
+                1,
+                "noise",
+                &|_| 0.0,
+                &|_| 0.0,
+            )
+            .iter()
+            .find(|s| s.mode.row.id.0 == "sonde")
+            .unwrap()
+            .score
         };
         assert!((sonde(402_500_000) - CENTER_SCORE).abs() < 1e-6);
         assert!(
@@ -347,7 +354,15 @@ mod tests {
         add_row(&mut modes, "both", |r| {
             r.band.range_hz = Some([400_050_000, 406_000_000].into());
         });
-        let both = score_rows(&modes, 1_090_000_000, 1, "noise", &|_| 0.0, &|_| 0.0);
+        let both = score_rows(
+            &Weights::default(),
+            &modes,
+            1_090_000_000,
+            1,
+            "noise",
+            &|_| 0.0,
+            &|_| 0.0,
+        );
         let both = both.iter().find(|s| s.mode.row.id.0 == "both").unwrap();
         assert!((both.score - CENTER_SCORE).abs() < 1e-6, "{}", both.score);
     }
@@ -370,7 +385,15 @@ mod tests {
             r.catalogue = vec![];
         });
         let pager = |center_hz| {
-            let scored = score_rows(&modes, center_hz, 12_500, "noise", &|_| 0.0, &|_| 0.0);
+            let scored = score_rows(
+                &Weights::default(),
+                &modes,
+                center_hz,
+                12_500,
+                "noise",
+                &|_| 0.0,
+                &|_| 0.0,
+            );
             let s = scored.iter().find(|s| s.mode.row.id.0 == "pager").unwrap();
             (s.in_range, s.fits_band, s.score)
         };
@@ -405,7 +428,15 @@ mod tests {
             r.catalogue = vec![];
         });
         let pager = |center_hz| {
-            let scored = score_rows(&modes, center_hz, 12_500, "noise", &|_| 0.0, &|_| 0.0);
+            let scored = score_rows(
+                &Weights::default(),
+                &modes,
+                center_hz,
+                12_500,
+                "noise",
+                &|_| 0.0,
+                &|_| 0.0,
+            );
             let s = scored.iter().find(|s| s.mode.row.id.0 == "pager").unwrap();
             (s.in_range, s.score)
         };
@@ -433,6 +464,7 @@ mod tests {
         add_row(&mut modes, "zz_sonde", |r| r.identify.priority = 1);
         add_row(&mut modes, "aa_sonde", |r| r.identify.priority = 0);
         let got = ids(&score_rows(
+            &Weights::default(),
             &modes,
             1_090_000_000,
             1,
@@ -449,6 +481,7 @@ mod tests {
         // A negative priority sorts after the default.
         add_row(&mut modes, "a_low", |r| r.identify.priority = -1);
         let got = ids(&score_rows(
+            &Weights::default(),
             &modes,
             1_090_000_000,
             1,
@@ -475,6 +508,7 @@ mod tests {
         let modes = registry();
         for (center_hz, row) in [(144_800_000, "aprs_decode"), (148_637_500, "pocsag_decode")] {
             let got = ids(&score_rows(
+                &Weights::default(),
                 &modes,
                 center_hz,
                 12_500,
@@ -512,7 +546,15 @@ mod tests {
     fn equal_scores_order_by_family_then_id() {
         let modes = registry();
         // Nothing matches but the empty centre lists of video, rds, dvbs_ip (no range either), m17, dmr and p25.
-        let got = ids(&score_rows(&modes, 1, 1, "noise", &|_| 0.0, &|_| 0.0));
+        let got = ids(&score_rows(
+            &Weights::default(),
+            &modes,
+            1,
+            1,
+            "noise",
+            &|_| 0.0,
+            &|_| 0.0,
+        ));
         let order: Vec<&str> = got.iter().map(|g| g.0.as_str()).collect();
         // video, rds, dvbs_ip and m17 at 0.4 (tv, broadcast, satellite, then amateur_voice), then dmr and p25
         // (two_way, by id) at 0.4 with priority -1; then at 0 rs41 (priority 1),
@@ -573,37 +615,63 @@ mod tests {
         let row = |id| modes.get(id).unwrap();
         let fm = [assignment(Some("16K0F1D"), None, "tx")];
         // POCSAG: 12.5 kHz, fm/fsk. ACARS: 10 kHz, am: 16 kHz is over 1.5 times.
-        assert_eq!(allocation_term(row("pocsag_decode"), &fm), ALLOCATION_SCORE);
-        assert_eq!(allocation_term(row("acars_decode"), &fm), 0.0);
+        assert_eq!(
+            allocation_term(row("pocsag_decode"), &fm, &Weights::default()),
+            ALLOCATION_SCORE
+        );
+        assert_eq!(
+            allocation_term(row("acars_decode"), &fm, &Weights::default()),
+            0.0
+        );
         // The modulation letter must suit the row: A3E is AM, not FM.
         let am = [assignment(Some("10K0A3E"), None, "tx")];
-        assert_eq!(allocation_term(row("pocsag_decode"), &am), 0.0);
-        assert_eq!(allocation_term(row("acars_decode"), &am), ALLOCATION_SCORE);
+        assert_eq!(
+            allocation_term(row("pocsag_decode"), &am, &Weights::default()),
+            0.0
+        );
+        assert_eq!(
+            allocation_term(row("acars_decode"), &am, &Weights::default()),
+            ALLOCATION_SCORE
+        );
         // No designator: the assignment's own bandwidth, and the modulation test passes.
         let bare = [assignment(None, Some(12_500), "tx")];
         assert_eq!(
-            allocation_term(row("pocsag_decode"), &bare),
+            allocation_term(row("pocsag_decode"), &bare, &Weights::default()),
             ALLOCATION_SCORE
         );
         // Receivers, plan rows and a width-less assignment never score.
         assert_eq!(
             allocation_term(
                 row("pocsag_decode"),
-                &[assignment(Some("16K0F1D"), None, "rx")]
+                &[assignment(Some("16K0F1D"), None, "rx")],
+                &Weights::default()
             ),
             0.0
         );
         let mut plan = assignment(Some("16K0F1D"), None, "tx");
         plan.kind = Some("plan".into());
-        assert_eq!(allocation_term(row("pocsag_decode"), &[plan]), 0.0);
         assert_eq!(
-            allocation_term(row("pocsag_decode"), &[assignment(None, None, "tx")]),
+            allocation_term(row("pocsag_decode"), &[plan], &Weights::default()),
+            0.0
+        );
+        assert_eq!(
+            allocation_term(
+                row("pocsag_decode"),
+                &[assignment(None, None, "tx")],
+                &Weights::default()
+            ),
             0.0
         );
         // The term is added to the row's score.
-        let with = score_rows(&modes, 148_637_500, 12_500, "fsk", &|_| 0.0, &|m| {
-            allocation_term(m, &fm)
-        });
+        let with = score_rows(
+            &Weights::default(),
+            &modes,
+            148_637_500,
+            12_500,
+            "fsk",
+            &|_| 0.0,
+            &|m| allocation_term(m, &fm, &Weights::default()),
+        );
         let pocsag = with
             .iter()
             .find(|s| s.mode.row.id.0 == "pocsag_decode")
@@ -624,11 +692,11 @@ mod tests {
             assignment(Some("16K0F1D"), None, "tx"),
         ];
         assert_eq!(
-            allocation_term(row("acars_decode"), &allocs),
+            allocation_term(row("acars_decode"), &allocs, &Weights::default()),
             ALLOCATION_SCORE
         );
         assert_eq!(
-            allocation_term(row("pocsag_decode"), &allocs),
+            allocation_term(row("pocsag_decode"), &allocs, &Weights::default()),
             ALLOCATION_SCORE / 2.0
         );
     }
@@ -644,7 +712,7 @@ mod tests {
             })
             .collect();
         for m in modes.all() {
-            let t = allocation_term(m, &allocs);
+            let t = allocation_term(m, &allocs, &Weights::default());
             assert!((0.0..=ALLOCATION_SCORE).contains(&t), "{}: {t}", m.row.id.0);
         }
     }
@@ -660,7 +728,11 @@ mod tests {
             assignment(Some("16K0F1D"), None, "tx"),
         ];
         assert_eq!(
-            allocation_term(modes.get("pocsag_decode").unwrap(), &allocs),
+            allocation_term(
+                modes.get("pocsag_decode").unwrap(),
+                &allocs,
+                &Weights::default()
+            ),
             ALLOCATION_SCORE
         );
     }
@@ -676,13 +748,21 @@ mod tests {
         ];
         let order = |pocsag_lead: f32, with: bool| -> Vec<String> {
             let catalogue = move |id: &str| if id == "pocsag" { pocsag_lead } else { 0.0 };
-            score_rows(&modes, 1, 1, "noise", &catalogue, &|m| {
-                if with {
-                    allocation_term(m, &allocs)
-                } else {
-                    0.0
-                }
-            })
+            score_rows(
+                &Weights::default(),
+                &modes,
+                1,
+                1,
+                "noise",
+                &catalogue,
+                &|m| {
+                    if with {
+                        allocation_term(m, &allocs, &Weights::default())
+                    } else {
+                        0.0
+                    }
+                },
+            )
             .iter()
             .map(|s| s.mode.row.id.0.clone())
             .collect()

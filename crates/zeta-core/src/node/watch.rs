@@ -142,16 +142,24 @@ fn identify_band(
     s: &Signal,
     named: Option<&[String]>,
 ) -> (u64, f32) {
-    score_rows(modes, s.center_hz, s.bandwidth_hz, "", &|_| 0.0, &|_| 0.0)
-        .into_iter()
-        .filter(|x| x.mode.startable() && x.in_range && !passed_over(x.mode, named))
-        .find(|x| {
-            let band = &x.mode.row.band;
-            width_fits(band.bandwidth_hz, s.bandwidth_hz) && band.bandwidth_hz <= watch_hz
-        })
-        .map_or((s.bandwidth_hz, 0.0), |x| {
-            (x.mode.row.band.bandwidth_hz, x.score)
-        })
+    score_rows(
+        modes.weights(),
+        modes,
+        s.center_hz,
+        s.bandwidth_hz,
+        "",
+        &|_| 0.0,
+        &|_| 0.0,
+    )
+    .into_iter()
+    .filter(|x| x.mode.startable() && x.in_range && !passed_over(x.mode, named))
+    .find(|x| {
+        let band = &x.mode.row.band;
+        width_fits(band.bandwidth_hz, s.bandwidth_hz) && band.bandwidth_hz <= watch_hz
+    })
+    .map_or((s.bandwidth_hz, 0.0), |x| {
+        (x.mode.row.band.bandwidth_hz, x.score)
+    })
 }
 
 /// The `dwell_scale` of a signal's identify run after `tries` tries that found nothing:

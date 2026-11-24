@@ -1,0 +1,10 @@
+{
+  "center": 0.4,
+  "bandwidth": 0.3,
+  "modulation": 0.3,
+  "allocation": 0.2,
+  "catalogue": 0.25,
+  "learned": 0.3,
+  "layer3": 0.0,
+  "runner_up_margin": 0.15
+}

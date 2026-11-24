@@ -584,8 +584,15 @@ fn flex_ais_and_aprs_are_tried_only_where_they_live() {
         reg.set_program(id, Some("/stand-in".into()), None);
     }
     let fit = |center_hz: u64, id: &str| {
-        let scored =
-            zeta_core::modes::score::score_rows(&reg, center_hz, 25_000, "fsk", &|_| 0.0, &|_| 0.0);
+        let scored = zeta_core::modes::score::score_rows(
+            reg.weights(),
+            &reg,
+            center_hz,
+            25_000,
+            "fsk",
+            &|_| 0.0,
+            &|_| 0.0,
+        );
         let s = scored.iter().find(|s| s.mode.row.id.0 == id).unwrap();
         (s.in_range, s.fits_band)
     };
@@ -630,6 +637,7 @@ fn rows_with_several_ranges_are_tried_in_each_and_not_between() {
     }
     let fit = |center_hz: u64, bandwidth_hz: u64, id: &str| {
         let scored = zeta_core::modes::score::score_rows(
+            reg.weights(),
             &reg,
             center_hz,
             bandwidth_hz,

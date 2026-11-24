@@ -1997,6 +1997,12 @@ impl Node {
         self.inner.modes()
     }
 
+    /// The ranking weights as they stand now: the embedded table, or the operator's
+    /// `weights.json` over it; reloaded with the modes.
+    pub fn weights(&self) -> Arc<crate::modes::weights::Weights> {
+        Arc::new(self.inner.modes().weights().clone())
+    }
+
     /// The handle the node holds its modes in: a classifier or provider given it reads
     /// the rows as they stand at each use, a reload included.
     pub fn modes_handle(&self) -> ModesHandle {

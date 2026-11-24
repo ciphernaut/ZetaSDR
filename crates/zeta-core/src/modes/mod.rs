@@ -25,6 +25,7 @@ mod row;
 pub mod score;
 pub mod summary;
 pub mod template;
+pub mod weights;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -498,6 +499,7 @@ impl From<Arc<ModeRegistry>> for ModesHandle {
 pub struct ModeRegistry {
     modes: Vec<LoadedMode>,
     handler_files: Vec<LoadedHandlerFile>,
+    weights: weights::Weights,
 }
 
 impl ModeRegistry {
@@ -560,6 +562,10 @@ impl ModeRegistry {
             reg.add(file.to_string(), text, stages);
         }
         for path in json_files(operator_dir) {
+            if path.file_name().is_some_and(|n| n == weights::WEIGHTS_FILE) {
+                reg.load_weights(&path);
+                continue;
+            }
             let file = path.display().to_string();
             match std::fs::read_to_string(&path) {
                 Ok(text) => reg.add(file, &text, stages),
@@ -574,6 +580,24 @@ impl ModeRegistry {
         }
         reg.modes.sort_by(|a, b| a.row.id.cmp(&b.row.id));
         reg
+    }
+
+    /// Read the operator's weights file over the embedded table; a broken one is listed
+    /// like a broken handler file (id `weights`) and the embedded weights stay.
+    fn load_weights(&mut self, path: &Path) {
+        let file = path.display().to_string();
+        match std::fs::read_to_string(path)
+            .map_err(|e| format!("file: {e}"))
+            .and_then(|t| weights::Weights::parse(&t))
+        {
+            Ok(w) => self.weights = w,
+            Err(reason) => self.add_broken_handler_file("weights".into(), file, reason),
+        }
+    }
+
+    /// The ranking weights: the embedded table, or the operator's over it.
+    pub fn weights(&self) -> &weights::Weights {
+        &self.weights
     }
 
     /// Parse, validate and add one row file: a ready row replaces the row with its id.

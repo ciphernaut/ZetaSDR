@@ -613,9 +613,17 @@ async fn identify_loop(inner: Arc<Inner>, r: Run) -> Result<(), StageError> {
     // The answer is already in hand for the verdict: a failed merge (the job was removed
     // under the run) only loses the context copy and the event, so the run goes on.
     let _ = inner.keep_origin(&r.id, r.port.id(), &origins);
-    let allocation = |m: &LoadedMode| allocation_term(m, &allocations);
     let modes = inner.modes();
-    let scored = score_rows(&modes, m_center, bw, &layer1, &|_| 0.0, &allocation);
+    let allocation = |m: &LoadedMode| allocation_term(m, &allocations, modes.weights());
+    let scored = score_rows(
+        modes.weights(),
+        &modes,
+        m_center,
+        bw,
+        &layer1,
+        &|_| 0.0,
+        &allocation,
+    );
     let faulted = |f: String| StageError::Failed(source_fault_reason(r.port.id(), &f));
     let mut current = ChildGuard {
         inner: inner.clone(),

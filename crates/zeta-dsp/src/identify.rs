@@ -147,19 +147,35 @@ impl Classifier for DecodeToIdentify {
         };
         let span_ms = iq.len() as u64 * 1000 / rate;
         let catalogue = |id: &str| catalogue_score(id, m_center, m_bw, layer1);
-        let allocation = |m: &LoadedMode| allocation_term(m, allocations);
         // One registry for the whole run, however the handle is reloaded meanwhile.
         let modes = self.modes.get().unwrap_or_default();
+        let allocation = |m: &LoadedMode| allocation_term(m, allocations, modes.weights());
         // The rows to try are chosen by the measurement alone (the register's term at
         // zero), so the register can only reorder them, never change the set (design 2,
         // anti-goals); they are tried in the full score's order.
-        let chosen: Vec<&str> = score_rows(&modes, m_center, m_bw, layer1, &catalogue, &|_| 0.0)
-            .into_iter()
-            .filter(|s| s.in_range && classify_candidate(&s.mode.row) && !passed_over(s.mode, None))
-            .take(CLASSIFY_TRIES)
-            .map(|s| s.mode.row.id.0.as_str())
-            .collect();
-        let scored = score_rows(&modes, m_center, m_bw, layer1, &catalogue, &allocation);
+        let chosen: Vec<&str> = score_rows(
+            modes.weights(),
+            &modes,
+            m_center,
+            m_bw,
+            layer1,
+            &catalogue,
+            &|_| 0.0,
+        )
+        .into_iter()
+        .filter(|s| s.in_range && classify_candidate(&s.mode.row) && !passed_over(s.mode, None))
+        .take(CLASSIFY_TRIES)
+        .map(|s| s.mode.row.id.0.as_str())
+        .collect();
+        let scored = score_rows(
+            modes.weights(),
+            &modes,
+            m_center,
+            m_bw,
+            layer1,
+            &catalogue,
+            &allocation,
+        );
         // Each channel is extracted once, when the first row that runs on it does.
         let mut chans: Vec<((i64, u64), Option<(Vec<Complex<f32>>, u64)>)> = Vec::new();
         let mut labels = Vec::new();
@@ -596,11 +612,19 @@ mod tests {
         allocation: &dyn Fn(&LoadedMode) -> f32,
     ) -> Vec<String> {
         let catalogue = |id: &str| catalogue_score(id, center, bw, label);
-        score_rows(modes, center, bw, label, &catalogue, allocation)
-            .into_iter()
-            .filter(|s| s.in_range && classify_candidate(&s.mode.row) && !passed_over(s.mode, None))
-            .map(|s| s.mode.row.id.0.clone())
-            .collect()
+        score_rows(
+            modes.weights(),
+            modes,
+            center,
+            bw,
+            label,
+            &catalogue,
+            allocation,
+        )
+        .into_iter()
+        .filter(|s| s.in_range && classify_candidate(&s.mode.row) && !passed_over(s.mode, None))
+        .map(|s| s.mode.row.id.0.clone())
+        .collect()
     }
 
     /// Decode-to-identify over the embedded rows and six operator rows on 300 MHz, more
@@ -663,7 +687,9 @@ mod tests {
                     bandwidth_hz: Some(Hz(row.row.band.bandwidth_hz)),
                     ..Allocation::default()
                 }];
-                let full = reachable(&modes, center, bw, label, &|r| allocation_term(r, &allocs));
+                let full = reachable(&modes, center, bw, label, &|r| {
+                    allocation_term(r, &allocs, modes.weights())
+                });
                 if full[..CLASSIFY_TRIES].contains(&sixth) {
                     found = Some((center, bw, label.clone(), measured, full, sixth, allocs));
                     break 'search;
