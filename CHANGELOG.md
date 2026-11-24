@@ -17,11 +17,17 @@
   band width (the DVB-S IP entry passes it as `--width`). A row may set `identify.when_named`,
   so that identify, classify's candidates and a watch's default modes pass over it unless named
   (DVB-S IP, which has no range). LTE is listed with `--drop` because it does not keep real time
-  without it; a replay by `capture_decode` is at real time and reads a cell as a live job does.
-  Install `onair-rx` 0.4.0 before deploying a node with these rows: an older wrapper is probed
-  `ready` and the new modes then fail at launch with `onair-rx: no mode <m>`. A node with no
-  `onair-rx` lists the rows `unavailable`, and nothing else changes. The dev profile now
-  optimises `zeta-ext`, whose input conversion fell behind real time at 4 and 20 MHz.
+  without it; a `capture_decode` replay of the generated 20 MHz capture (0.9 s, and 7.2 s of it
+  looped) gave one event with the cell whole and no input dropped, measured on the build host,
+  and a short replay is read from its first 0.2 s block. A node with no `onair-rx` lists the
+  rows `unavailable`, and nothing else changes. The dev profile now optimises `zeta-ext`, whose
+  input conversion fell behind real time at 4 and 20 MHz.
+- Deploy: install `onair-rx` 0.4.0 before deploying a node with these rows: an older wrapper is
+  probed `ready` and the new modes then fail at launch with `onair-rx: no mode <m>`.
+- Deploy: no rollback past this build without clearing jobs: a job it stores whose graph runs a
+  program (`external_decode`: dump1090, multimon-ng, OnAir and the other handlers) has
+  `bandwidth_hz` in that stage's params, which an older node's graph check refuses under
+  `deny_unknown_fields`, so an older node resumes such a job as `failed`.
 - Sets: a serving node reads its operator sets directory (`--sets-dir`) again whenever the files
   there have changed, so a set file added, edited or removed is in force at the next `set_list`,
   `set_start` or `set_stop` with no restart. A set that is running keeps the jobs it started:

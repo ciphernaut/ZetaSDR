@@ -160,14 +160,14 @@
 //   ble_decode  Bluetooth LE                 the rows with no decoder of their own, which only
 //   lorawan_decode  LoRaWAN                  a handler file's entry runs (OnAir's: plan 47),
 //   zigbee_decode  Zigbee                    each labelled as its row (`label`): job_start
-//   thread_decode  Thread                    kind=<id> on the selection as is, deviation_hz
-//   zwave_decode  Z-Wave                     null; offered only when modes_list lists the row
-//   wifi_decode  Wi-Fi                       (`applies`; not before the rows are read), and
-//   wisun_decode  Wi-SUN                     greyed (`disabled`: aria-disabled, its title the
-//   tetra_decode  TETRA                      row's `reason`) while the row is not `ready`
-//   gsmr_decode  GSM-R
-//   lte_decode  LTE
-//   dvbs_ip_decode  DVB-S IP
+//   thread_decode  Thread                    kind=<id>, deviation_hz null, bandwidth_hz at
+//   zwave_decode  Z-Wave                     least the row's `min_hz`, else its `bandwidth_hz`
+//   wifi_decode  Wi-Fi                       (read from the row, as the entries above widen to
+//   wisun_decode  Wi-SUN                     their own minimum); offered only when modes_list
+//   tetra_decode  TETRA                      lists the row (`applies`; not before the rows are
+//   gsmr_decode  GSM-R                       read), and greyed (`disabled`: aria-disabled, its
+//   lte_decode  LTE                          title the row's `reason`) while the row is not
+//   dvbs_ip_decode  DVB-S IP                 `ready`
 //   video      Video                          job_start kind=video_decode at the box's centre
 //                                             and width as drawn (never fitted, never a grid);
 //                                             greyed (`disabled`: aria-disabled, its title the lease's
@@ -389,7 +389,7 @@ export function rowMisfit(row, sel, asked = sel.bandwidthHz) {
 // entry asks for on it (menu.js jobTuning: the box as drawn, or widened to what the entry
 // needs) is at least the row's narrowest, and the selection meets the row's ranges (rowMisfit).
 export function rowFits(id, row, sel) {
-  return rowMisfit(row, sel, jobTuning(id, sel).bandwidthHz) === null;
+  return rowMisfit(row, sel, jobTuning(id, sel, row).bandwidthHz) === null;
 }
 
 // The modes_list row of job kind `kind` in ctx (undefined before the rows are read).
@@ -530,9 +530,11 @@ const decoder = (id, label, kind = id) => ({
 });
 // The decoder entry of a row with no decoder of its own, which only a handler file's entry
 // runs (plan 47: the rows OnAir alone decodes): offered only when modes_list lists the row,
-// and greyed, titled with the row's `reason`, while the row is not ready.
+// and greyed, titled with the row's `reason`, while the row is not ready. Its job's band is
+// widened to the row's narrowest (`rowMin`, menu.js jobTuning).
 const handled = (id, label) => ({
   ...decoder(id, label),
+  rowMin: true,
   applies: (c) => rowOf(c, id) !== undefined,
   disabled: (c) => {
     const row = rowOf(c, id);

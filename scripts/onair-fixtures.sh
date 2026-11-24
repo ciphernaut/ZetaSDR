@@ -15,6 +15,10 @@ if [ "$#" -ne 2 ]; then
   echo "usage: $0 <onair-gen> <dir>" >&2
   exit 2
 fi
+if ! command -v jq >/dev/null; then
+  echo "$0: needs jq (it reads modes/*.json and handlers/onair.json)" >&2
+  exit 2
+fi
 gen=$1
 dir=$2
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -35,10 +39,10 @@ for row in "$root"/modes/*.json; do
     status=1
     continue
   fi
-  if "$gen" --mode "$mode" --rate "$rate" --sigmf "$dir/onair/$mode" 2>/dev/null; then
+  if err=$("$gen" --mode "$mode" --rate "$rate" --sigmf "$dir/onair/$mode" 2>&1 >/dev/null); then
     echo "$id: onair/$mode.sigmf-{data,meta} at $rate Hz"
   else
-    echo "$id: onair-gen --mode $mode failed" >&2
+    echo "$id: onair-gen --mode $mode failed: $err" >&2
     status=1
   fi
 done

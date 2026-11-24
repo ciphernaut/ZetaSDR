@@ -134,10 +134,17 @@ fn span_fits(row_hz: u64, signal_hz: u64, floor_hz: u64) -> bool {
 /// row of `modes` (`score_rows` at the signal's centre and width) in range for the
 /// signal's centre that fits the signal (its measured width within [`WIDTH_FIT`] of the
 /// row's band) and a watch band `watch_hz` wide, else the signal's own width at score 0.
-fn identify_band(modes: &ModeRegistry, watch_hz: u64, s: &Signal) -> (u64, f32) {
+/// A row tried only when named (`identify.when_named`) counts only when the watch's
+/// `modes` (`named`, `None` for the default) hold it.
+fn identify_band(
+    modes: &ModeRegistry,
+    watch_hz: u64,
+    s: &Signal,
+    named: Option<&[String]>,
+) -> (u64, f32) {
     score_rows(modes, s.center_hz, s.bandwidth_hz, "", &|_| 0.0, &|_| 0.0)
         .into_iter()
-        .filter(|x| x.mode.startable() && x.in_range && !passed_over(x.mode, None))
+        .filter(|x| x.mode.startable() && x.in_range && !passed_over(x.mode, named))
         .find(|x| {
             let band = &x.mode.row.band;
             width_fits(band.bandwidth_hz, s.bandwidth_hz) && band.bandwidth_hz <= watch_hz
@@ -1122,9 +1129,14 @@ impl Inner {
         };
     }
 
-    /// [`identify_band`] of `s` with the node's rows and the watch's band.
+    /// [`identify_band`] of `s` with the node's rows, the watch's band and its `modes`.
     fn identify_band(&self, r: &Run, s: &Signal) -> (u64, f32) {
-        identify_band(&self.modes(), r.tuning.bandwidth_hz.0, s)
+        identify_band(
+            &self.modes(),
+            r.tuning.bandwidth_hz.0,
+            s,
+            r.seed.policy.modes.as_deref(),
+        )
     }
 
     /// The rows of the policy's `modes` that fit `s`, with their widths: ready, its
@@ -2825,7 +2837,7 @@ mod tests {
                 bandwidth_hz: 9_000_000,
                 ..tracked(0, 0).signal
             };
-            seen.push(identify_band(&modes, 20_000_000, &signal));
+            seen.push(identify_band(&modes, 20_000_000, &signal, None));
         }
         assert_eq!(seen[0].0, 9_000_000, "{seen:?}");
         assert!(seen[0].1 > 0.0, "{seen:?}");
@@ -2841,11 +2853,40 @@ mod tests {
             bandwidth_hz: 7_000_000,
             ..tracked(0, 0).signal
         };
-        let (band_hz, score) = identify_band(&modes, 20_000_000, &signal(500_000_000));
+        let (band_hz, score) = identify_band(&modes, 20_000_000, &signal(500_000_000), None);
         assert_eq!(band_hz, 8_000_000);
         assert!(score > 0.0, "{score}");
         assert_eq!(
-            identify_band(&modes, 20_000_000, &signal(1_300_000_000)),
+            identify_band(&modes, 20_000_000, &signal(1_300_000_000), None),
+            (7_000_000, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_watch_naming_a_row_marked_when_named_identifies_on_its_band() {
+        // dvbs_ip_decode is tried only when named (`identify.when_named`) and has no
+        // ranges: with its handler ready, a watch whose `modes` name it identifies a 7 MHz
+        // signal on the row's 10 MHz; one with the default modes, or naming another row,
+        // still passes it over and takes the signal's own width.
+        let mut modes = ModeRegistry::load(&crate::stage::StageRegistry::new(), None);
+        modes.set_handler_program("dvbs_ip_decode", "onair", Some("/stand-in".into()), None);
+        assert!(modes.get("dvbs_ip_decode").unwrap().startable());
+        let signal = Signal {
+            center_hz: 1_300_000_000,
+            bandwidth_hz: 7_000_000,
+            ..tracked(0, 0).signal
+        };
+        let named = ["dvbs_ip_decode".to_string()];
+        let (band_hz, score) = identify_band(&modes, 20_000_000, &signal, Some(&named));
+        assert_eq!(band_hz, 10_000_000);
+        assert!(score > 0.0, "{score}");
+        assert_eq!(
+            identify_band(&modes, 20_000_000, &signal, None),
+            (7_000_000, 0.0)
+        );
+        let other = ["dvbt_decode".to_string()];
+        assert_eq!(
+            identify_band(&modes, 20_000_000, &signal, Some(&other)),
             (7_000_000, 0.0)
         );
     }

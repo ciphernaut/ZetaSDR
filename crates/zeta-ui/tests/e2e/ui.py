@@ -6201,6 +6201,33 @@ def scenario_a_decode_entry_falls_elsewhere_off_its_band(page, url, secret):
     close_menu(page)
 
 
+def scenario_a_decode_entry_widens_a_narrow_box_to_its_row(page, url, secret):
+    # A box narrower than the row's narrowest (1 MHz at 2426 MHz, Bluetooth LE's `min_hz` 2 MHz)
+    # still offers the entry in the Decode group, not under `elsewhere`: like the older decoder
+    # entries, its job is widened to the row's narrowest, read from the row, and starts 2 MHz wide.
+    row = mode_rows(url, secret)["ble_decode"]
+    need = row["band"].get("min_hz") or row["band"]["bandwidth_hz"]
+    assert need == 2_000_000, row["band"]
+    c, bw = box_on(page, url, secret, "ism", 1_000_000)
+    assert bw < need and abs(c - 2_426_000_000) < 200_000, f"box {c} {bw}"
+    wait_until(lambda: menu_side(page, "ble_decode") == "near", 5.0, "Bluetooth LE near")
+    item = menu_item(page, "ble_decode")
+    expect(item).to_have_text("Bluetooth LE")
+    expect(item).not_to_have_attribute("aria-disabled", "true")
+    try:
+        with page.expect_request(is_op("job_start")) as req:
+            item.click()
+        body = json.loads(req.value.post_data)
+        got = (body["kind"], body["source"], body["center_hz"], body["bandwidth_hz"])
+        assert got == ("ble_decode", "ism", c, need), body
+        jobs = wait_until(lambda: running_jobs(url, secret, "ble_decode", "ism"), 15,
+                          "a ble_decode job on ism")
+        assert len(jobs) == 1 and jobs[0]["tuning"]["bandwidth_hz"] == need, jobs
+    finally:
+        for j in running_jobs(url, secret, "ble_decode", "ism"):
+            stop_job(url, secret, j["id"])
+
+
 def scenario_submenus_wait_for_the_pointer_to_rest(page, url, secret):
     # Hover intent: with Listen's submenu open, a pointer crossing Measure and Plans on its
     # way into Listen's panel leaves the panel open; resting on Measure past the dwell switches.

@@ -296,9 +296,11 @@ export function videoRefusal(src, bandwidthHz) {
 // The tuning a job entry uses for a selection: {centerHz, bandwidthHz}. SSB tunes the dial; FM
 // broadcast and RDS widen the band to at least WFM_MIN_BANDWIDTH_HZ, POCSAG to at least
 // POCSAG_MIN_BANDWIDTH_HZ and ACARS to at least ACARS_MIN_BANDWIDTH_HZ; ADS-B always asks for
-// ADSB_BANDWIDTH_HZ; everything else uses the selection as is. A Transcribe entry tunes as
-// its Decode twin.
-export function jobTuning(action, s) {
+// ADSB_BANDWIDTH_HZ; an entry of a row with no decoder of its own (`rowMin`, actions.js
+// handled) widens to at least its modes_list row `row`'s narrowest, `band.min_hz` else
+// `band.bandwidth_hz`; everything else, and such an entry before the rows are read, uses the
+// selection as is. A Transcribe entry tunes as its Decode twin.
+export function jobTuning(action, s, row = null) {
   action = (action && entryOf(action)?.twin) ?? action;
   const sb = jobOf(action)?.sideband ?? null;
   if (sb === "usb") return { centerHz: s.centerHz - SSB_DIAL_OFFSET_HZ, bandwidthHz: SSB_BANDWIDTH_HZ };
@@ -316,6 +318,8 @@ export function jobTuning(action, s) {
   if (action === "acars_decode") {
     return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, ACARS_MIN_BANDWIDTH_HZ) };
   }
+  const need = action && entryOf(action)?.rowMin ? (row?.band?.min_hz ?? row?.band?.bandwidth_hz) : null;
+  if (typeof need === "number") return { centerHz: s.centerHz, bandwidthHz: Math.max(s.bandwidthHz, need) };
   return { centerHz: s.centerHz, bandwidthHz: s.bandwidthHz };
 }
 
@@ -830,7 +834,7 @@ class Menu {
 
   // The selection, or with an SSB `action` the dial that entry tunes.
   showFooter(s, action = null) {
-    const t = jobTuning(action, s);
+    const t = jobTuning(action, s, this.rowOf(action));
     const sb = action && jobOf(action) ? jobOf(action).sideband : null;
     this.footer.textContent =
       `center_hz=${t.centerHz} bandwidth_hz=${t.bandwidthHz} ` +
@@ -1569,7 +1573,7 @@ class Menu {
         );
       }
     } else {
-      const t = fitTuning(job, fit, jobTuning(action, s), this.planAt);
+      const t = fitTuning(job, fit, jobTuning(action, s, this.rowOf(action)), this.planAt);
       r = await this.startJob(action, s, t);
       if (r) {
         this.t.note(fittedNote(kind, t, fit));
@@ -1580,10 +1584,17 @@ class Menu {
     }
   }
 
+  // The modes_list row of entry `action`'s job kind, or null (no such entry, or the rows not
+  // read yet).
+  rowOf(action) {
+    const kind = action ? jobOf(action)?.kind : undefined;
+    return (kind && (this.rows || []).find((r) => r.id === kind)) || null;
+  }
+
   // The job_start of a job entry (a Transcribe entry: its Decode twin's) with `tuning` (by
   // default the entry's jobTuning); its result or null.
   // `handler` (a handler id) is sent only when given: without it the policy picks.
-  startJob(action, s, tuning = jobTuning(action, s), handler = null) {
+  startJob(action, s, tuning = jobTuning(action, s, this.rowOf(action)), handler = null) {
     const job = jobOf(action);
     const t = tuning;
     return this.applyOp({
