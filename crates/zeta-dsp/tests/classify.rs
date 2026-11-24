@@ -5,13 +5,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use num_complex::Complex;
-use zeta_core::classify::{Classification, Label, Outcome};
+use zeta_core::classify::{Classification, FeatureRecord, Label, Outcome};
 use zeta_core::node::{Node, NodeConfig};
-use zeta_core::ops::{Op, OpResult};
+use zeta_core::ops::{Op, OpResult, Sideband};
 use zeta_core::port::Port;
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::types::{Hz, Selection, SourceId, Span, Timestamp};
-use zeta_dsp::fixtures::{aprs_packet_iq, nbfm_modulate, pocsag_packet_iq, tone, write_fixture};
+use zeta_dsp::fixtures::{
+    aprs_packet_iq, awgn, nbfm_modulate, pocsag_packet_iq, speech_like, ssb_modulate, tone,
+    write_fixture,
+};
 use zeta_source_file::{FileOpts, FileSource};
 
 const CENTER: u64 = 144_800_000;
@@ -107,12 +110,14 @@ async fn classify_span(
             allocations,
             origins,
             register,
+            ..
         }) => Classification {
             labels,
             tried,
             allocations,
             origins,
             register: register.map(|r| *r),
+            measurement: None,
         },
         other => panic!("expected a classification, got {other:?}"),
     };
@@ -364,4 +369,57 @@ async fn classify_proves_ais_on_its_channel() {
                 .ends_with(" AIS frames CRC-clean; first MMSI 503000001 type 1"),
         "{label:?}"
     );
+}
+
+/// `Op::Classify` over the first 2 s of `file0`: the measured features it answers.
+async fn classify_features(node: &Node, center_hz: u64, bandwidth_hz: u64) -> FeatureRecord {
+    let selection = Selection {
+        source: SourceId("file0".into()),
+        span: Span {
+            start_ns: Timestamp(0),
+            end_ns: Timestamp(2_000_000_000),
+        },
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(bandwidth_hz),
+    };
+    match node.apply(Op::Classify { selection }).await {
+        Ok(OpResult::Classification { features, .. }) => *features.expect("layer 1 measured"),
+        other => panic!("expected a classification, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn classify_answers_the_measured_features_as_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut iq = nbfm_modulate(&speech_like(48_000, 3.0), 48_000, 48_000, 2_500.0, 0.0);
+    awgn(&mut iq, 25.0, 5);
+    let node = node_over(dir.path(), &iq).await;
+    let f = classify_features(&node, CENTER, 20_000).await;
+    assert!(f.bandwidth_hz.0 > 0, "{f:?}");
+    let rms = f.audio_rms_hz.expect("audio_rms_hz");
+    assert!((300.0..2_500.0).contains(&rms), "{f:?}");
+    assert!(f.power99_hz.is_some_and(|w| w.0 > 0), "{f:?}");
+    assert_eq!(f.ssb, None, "{f:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn classify_answers_the_ssb_side_and_dial() {
+    // The voice-like fixture of layer1.rs: 700 + 1900 Hz plus a weak 2700 Hz line.
+    let audio: Vec<f32> = tone(48_000, 48_000, 700.0, 0.7)
+        .iter()
+        .zip(tone(48_000, 48_000, 1_900.0, 0.3))
+        .zip(tone(48_000, 48_000, 2_700.0, 0.15))
+        .map(|((a, b), c)| a + b + c)
+        .collect();
+    for (usb, side) in [(true, Sideband::Usb), (false, Sideband::Lsb)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut iq = ssb_modulate(&audio, 48_000, 48_000, usb, 0.0);
+        awgn(&mut iq, 20.0, 9);
+        let node = node_over(dir.path(), &iq).await;
+        let f = classify_features(&node, CENTER, 48_000).await;
+        let ssb = f.ssb.unwrap_or_else(|| panic!("no ssb feature: {f:?}"));
+        assert_eq!(ssb.sideband, side, "{f:?}");
+        // The suppressed carrier sits at the block centre.
+        assert!(ssb.dial_hz.0.abs_diff(CENTER) <= 250, "{f:?}");
+    }
 }

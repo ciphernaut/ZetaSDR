@@ -59,6 +59,9 @@ fn features() -> FeatureRecord {
         order: Some(2),
         tone_spacing_hz: Some(Hz(4_800)),
         symbol_rate_line: None,
+        power99_hz: None,
+        audio_rms_hz: None,
+        ssb: None,
     }
 }
 

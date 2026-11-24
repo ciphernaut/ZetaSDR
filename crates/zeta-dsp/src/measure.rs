@@ -10,9 +10,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use zeta_core::classify::{Band, Classifier, FeatureRecord, Label, Measurement, RateLine, Tried};
+use zeta_core::classify::{
+    Band, Classifier, FeatureRecord, Label, Measurement, RateLine, SsbFeature, Tried,
+};
 use zeta_core::knowledge::Allocation;
-use zeta_core::ops::{MEASURE_DC_MASK_HZ, channel_rate_hz};
+use zeta_core::ops::{MEASURE_DC_MASK_HZ, Sideband, channel_rate_hz};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Baud, Hz, Provenance, StreamId, StreamKind, Timestamp};
@@ -474,6 +476,9 @@ pub(crate) fn measure_band_noted(
             order: None,
             tone_spacing_hz: None,
             symbol_rate_line: None,
+            power99_hz: None,
+            audio_rms_hz: None,
+            ssb: None,
         };
         let note = RateNote {
             cv: 0.0,
@@ -577,6 +582,9 @@ pub(crate) fn measure_band_noted(
         order: fsk.map(|(o, _)| o).or(psk),
         tone_spacing_hz: fsk.map(|(_, s)| s),
         symbol_rate_line: rate.map(|(_, line)| line),
+        power99_hz: None,
+        audio_rms_hz: None,
+        ssb: None,
     };
     let note = RateNote {
         cv: v.cv,
@@ -875,6 +883,58 @@ pub fn ssb_dial_hz(center_hz: u64, usb: bool) -> u64 {
     }
 }
 
+/// The side (`usb` or `lsb`) holding at least `SSB_ONE_SIDE` of the occupied power
+/// `lo..=hi` of the spectrum `db`, with that share, when `f`'s band is an SSB voice
+/// band's width.
+fn ssb_side(
+    f: &FeatureRecord,
+    db: &[f32],
+    (lo, hi): (usize, usize),
+) -> Option<(&'static str, f64)> {
+    if !(SSB_BW_HZ.0..=SSB_BW_HZ.1).contains(&f.bandwidth_hz.0) {
+        return None;
+    }
+    let power = |k: usize| 10f64.powf(db[k] as f64 / 10.0);
+    let below: f64 = (lo..=hi).filter(|&k| k < SIZE / 2).map(power).sum();
+    let above: f64 = (lo..=hi).filter(|&k| k > SIZE / 2).map(power).sum();
+    let total: f64 = (lo..=hi).map(power).sum();
+    [("usb", above), ("lsb", below)]
+        .into_iter()
+        .find(|&(_, p)| total > 0.0 && p / total >= SSB_ONE_SIDE)
+        .map(|(side, p)| (side, p / total))
+}
+
+/// Fill `f`'s measured extras (the 99 % power width from `note`, the discriminator
+/// audio's RMS deviation, the SSB side and dial) for the record `classify` answers.
+/// The label's rules are untouched.
+fn carry_extras(
+    f: &mut FeatureRecord,
+    note: &RateNote,
+    label: &Label,
+    iq: &[Complex<f32>],
+    rate_hz: u64,
+) {
+    f.power99_hz = note.power99_hz.map(Hz);
+    if iq.is_empty() || rate_hz == 0 {
+        return;
+    }
+    f.audio_rms_hz = Some(audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0) as f32);
+    if label.name == "ssb" {
+        let db = spectrum(iq);
+        let floor = median(&db);
+        let gap = (GAP_HZ / (rate_hz as f64 / SIZE as f64)).floor() as usize;
+        let (lo, hi) = occupied(&db, argmax(&db), floor + OCCUPIED_DB, gap);
+        f.ssb = ssb_side(f, &db, (lo, hi)).map(|(side, _)| SsbFeature {
+            sideband: if side == "usb" {
+                Sideband::Usb
+            } else {
+                Sideband::Lsb
+            },
+            dial_hz: Hz(ssb_dial_hz(f.center_hz.0, side == "usb")),
+        });
+    }
+}
+
 /// [`layer1_label`]'s rules over `f` and its block `iq`; `runs` when `f`'s symbol rate
 /// is on-off keying's chip from its run lengths ([`RateLine::Runs`]) by `f`'s line.
 fn classify_block(
@@ -974,24 +1034,16 @@ fn classify_block(
                 format!("carrier line {carrier_db:.1} dB above the sidebands, cv {cv:.3}"),
             );
         }
-        if (SSB_BW_HZ.0..=SSB_BW_HZ.1).contains(&f.bandwidth_hz.0) {
-            let power = |k: usize| 10f64.powf(db[k] as f64 / 10.0);
-            let below: f64 = (lo..=hi).filter(|&k| k < SIZE / 2).map(power).sum();
-            let above: f64 = (lo..=hi).filter(|&k| k > SIZE / 2).map(power).sum();
-            let total: f64 = (lo..=hi).map(power).sum();
-            for (side, p) in [("usb", above), ("lsb", below)] {
-                if total > 0.0 && p / total >= SSB_ONE_SIDE {
-                    return (
-                        "ssb",
-                        0.6,
-                        format!(
-                            "{side}: no carrier line ({carrier_db:.1} dB), {:.0} % of the occupied power on one side, cv {cv:.3}, dial \u{2248} {} Hz ({side})",
-                            100.0 * p / total,
-                            ssb_dial_hz(f.center_hz.0, side == "usb")
-                        ),
-                    );
-                }
-            }
+        if let Some((side, share)) = ssb_side(f, &db, (lo, hi)) {
+            return (
+                "ssb",
+                0.6,
+                format!(
+                    "{side}: no carrier line ({carrier_db:.1} dB), {:.0} % of the occupied power on one side, cv {cv:.3}, dial \u{2248} {} Hz ({side})",
+                    100.0 * share,
+                    ssb_dial_hz(f.center_hz.0, side == "usb")
+                ),
+            );
         }
     }
     if cv >= AM_LOW_MIN_CV {
@@ -1260,6 +1312,8 @@ pub fn measure_selection(
     if band.is_whole(Hz(rate_hz)) {
         let (f, note) = measure_band_noted(iq, rate_hz, center_hz, rate_hz, None);
         let l = layer1_label_noted(&f, Some(&note), iq, rate_hz);
+        let mut f = f;
+        carry_extras(&mut f, &note, &l, iq, rate_hz);
         return Some((f, l));
     }
     let bw = band.bandwidth_hz.0;
@@ -1274,6 +1328,8 @@ pub fn measure_selection(
     let band_center = (center_hz as i64).saturating_add(band.offset_hz).max(0) as u64;
     let (f, note) = measure_band_noted(&chan, out_rate, band_center, bw, None);
     let l = layer1_label_noted(&f, Some(&note), &chan, out_rate);
+    let mut f = f;
+    carry_extras(&mut f, &note, &l, &chan, out_rate);
     Some((f, l))
 }
 

@@ -4132,6 +4132,15 @@ pub enum OpResult {
             schema_with = "crate::types::nullable::<crate::register::RegisterAnswer>"
         )]
         register: Option<Box<crate::register::RegisterAnswer>>,
+        /// Layer 1's measurement of the band (bandwidth, centre, snr, the 99 % power
+        /// width, the audio's rms deviation, the SSB side and dial); `null` when layer 1
+        /// could not measure it, and from an older node.
+        #[serde(default)]
+        #[schemars(
+            required,
+            schema_with = "crate::types::nullable::<crate::classify::FeatureRecord>"
+        )]
+        features: Option<Box<crate::classify::FeatureRecord>>,
     },
     /// A source's gain after `source_set_gain`.
     Gain(GainInfo),
@@ -8551,6 +8560,7 @@ async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
         allocations,
         origins,
         register,
+        measurement,
     } = node.classify_capture_scored(&rec).await.map_err(other)?;
     let band = Tuning {
         center_hz: rec.center_hz,
@@ -8563,6 +8573,7 @@ async fn capture_classify(node: &Node, id: &str) -> Result<OpResult, OpError> {
         allocations,
         origins,
         register: register.map(Box::new),
+        features: measurement.map(|m| Box::new(m.features)),
     })
 }
 
@@ -8595,10 +8606,13 @@ pub(crate) async fn classify_capture(
         .await)
 }
 
-/// Run the classifier set over the selection's band and span of the source ring. A row
-/// proved on the band supersedes the accepted signatures it overlaps.
-async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
-    let (rate, center, samples) = ring_samples(node, &sel)?;
+/// The classifier set's answer for the selection's band and span of the source ring,
+/// scored against the register, with the samples read, the ring's rate and its centre.
+pub(crate) async fn classify_samples(
+    node: &Node,
+    sel: &Selection,
+) -> Result<(Classification, Vec<Complex<f32>>, Hz, Hz), OpError> {
+    let (rate, center, samples) = ring_samples(node, sel)?;
     // `check_band` has proved the band lies inside the ring's.
     let band = Band {
         offset_hz: sel.center_hz.0 as i64 - center.0 as i64,
@@ -8614,13 +8628,23 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         .classifiers()
         .run_all(&samples, rate, center, band, None, allocations)
         .await;
+    let scored =
+        node.score_classification(classified, &sel.source, sel.center_hz, sel.bandwidth_hz, &d);
+    Ok((scored, samples, rate, center))
+}
+
+/// Run the classifier set over the selection's band and span of the source ring. A row
+/// proved on the band supersedes the accepted signatures it overlaps.
+async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
+    let (classified, ..) = classify_samples(node, &sel).await?;
     let Classification {
         labels,
         tried,
         allocations,
         origins,
         register,
-    } = node.score_classification(classified, &sel.source, sel.center_hz, sel.bandwidth_hz, &d);
+        measurement,
+    } = classified;
     let band = Tuning {
         center_hz: sel.center_hz,
         bandwidth_hz: sel.bandwidth_hz,
@@ -8632,6 +8656,7 @@ async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
         allocations,
         origins,
         register: register.map(Box::new),
+        features: measurement.map(|m| Box::new(m.features)),
     })
 }
 

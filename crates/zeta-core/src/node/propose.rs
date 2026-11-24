@@ -530,6 +530,9 @@ fn tuning_features(rec: &JobRecord, row: Option<&ModeRow>) -> FeatureRecord {
             .or_else(|| bits["order"].as_u64().and_then(|o| u8::try_from(o).ok())),
         tone_spacing_hz: None,
         symbol_rate_line: None,
+        power99_hz: None,
+        audio_rms_hz: None,
+        ssb: None,
     }
 }
 

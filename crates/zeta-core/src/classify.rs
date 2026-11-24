@@ -51,6 +51,25 @@ pub struct FeatureRecord {
     #[serde(default)]
     #[schemars(required)]
     pub symbol_rate_line: Option<RateLine>,
+    /// The width holding 99 % of the excess power around the peak; `None` when not
+    /// measured (an older record, or a measure that did not keep it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power99_hz: Option<Hz>,
+    /// RMS frequency deviation of the discriminator audio, Hz; `None` when not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_rms_hz: Option<f32>,
+    /// The sideband and dial frequency when layer 1 read the signal as SSB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssb: Option<SsbFeature>,
+}
+
+/// An SSB signal's side and its suppressed carrier (the dial frequency).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SsbFeature {
+    pub sideband: crate::ops::Sideband,
+    pub dial_hz: Hz,
 }
 
 /// Where layer 1 read a symbol rate: `runs`, on-off keying's chip from its on and off
@@ -142,6 +161,10 @@ pub struct Classification {
         schema_with = "crate::types::nullable::<crate::register::RegisterAnswer>"
     )]
     pub register: Option<crate::register::RegisterAnswer>,
+    /// Layer 1's measurement of the band, kept for the node's own use; not serialised.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub measurement: Option<Measurement>,
 }
 
 /// The band a classifier analyses within an IQ block: its centre's offset
@@ -291,6 +314,7 @@ impl ClassifierSet {
             }
         }
         out.allocations = allocations;
+        out.measurement = measured;
         out
     }
 
@@ -494,6 +518,9 @@ mod tests {
             order: None,
             tone_spacing_hz: None,
             symbol_rate_line: None,
+            power99_hz: None,
+            audio_rms_hz: None,
+            ssb: None,
         };
         let uses = Arc::new(Uses(Mutex::new(Vec::new()), Mutex::new(Vec::new())));
         let licence = Allocation {

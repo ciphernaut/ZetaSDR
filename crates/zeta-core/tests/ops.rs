@@ -1021,11 +1021,14 @@ async fn classify_op_runs_stub_and_returns_empty_labels() {
         allocations,
         origins,
         register,
+        features,
     }) = node.apply(Op::Classify { selection }).await
     else {
         panic!("expected Classification");
     };
     assert!(labels.is_empty() && tried.is_empty() && allocations.is_empty());
+    // The stub measured nothing: no features.
+    assert!(features.is_none());
     // No provider describes the band: no register answer.
     assert!(register.is_none());
     // Every classify scores its origins; with no register there are none to light.

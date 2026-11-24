@@ -686,6 +686,9 @@ mod tests {
                 order: None,
                 tone_spacing_hz: None,
                 symbol_rate_line: None,
+                power99_hz: None,
+                audio_rms_hz: None,
+                ssb: None,
             },
             label: Label {
                 layer: 1,

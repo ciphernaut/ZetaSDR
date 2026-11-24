@@ -87,6 +87,9 @@ async fn catalogue_uses_a_handed_measurement_without_measuring() {
             order: None,
             tone_spacing_hz: None,
             symbol_rate_line: None,
+            power99_hz: None,
+            audio_rms_hz: None,
+            ssb: None,
         },
         label: Label {
             layer: 1,

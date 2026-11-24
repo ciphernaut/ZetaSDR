@@ -2918,6 +2918,9 @@ impl Node {
             order: None,
             tone_spacing_hz: None,
             symbol_rate_line: None,
+            power99_hz: None,
+            audio_rms_hz: None,
+            ssb: None,
         });
         // The layer-1 label names the modulation when the request does not, and a
         // `noise` label keeps the chain off the measured centre; with the modulation

@@ -468,6 +468,9 @@ fn features(center_hz: u64, width_hz: u64, baud: Option<u32>) -> FeatureRecord {
         order: baud.map(|_| 2),
         tone_spacing_hz: None,
         symbol_rate_line: None,
+        power99_hz: None,
+        audio_rms_hz: None,
+        ssb: None,
     }
 }
 

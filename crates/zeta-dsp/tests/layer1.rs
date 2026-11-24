@@ -14,7 +14,7 @@ const WFM_RATE: u32 = 240_000;
 /// features.
 fn label(what: &str, iq: &[Complex<f32>], rate_hz: u32) -> Label {
     let f = measure(iq, rate_hz as u64, CENTER);
-    let (pf, l) = zeta_dsp::measure::measure_selection(
+    let (mut pf, l) = zeta_dsp::measure::measure_selection(
         iq,
         rate_hz as u64,
         CENTER,
@@ -24,6 +24,8 @@ fn label(what: &str, iq: &[Complex<f32>], rate_hz: u32) -> Label {
         },
     )
     .expect("a measurement");
+    // `classify` also answers the extras `measure` leaves out.
+    (pf.power99_hz, pf.audio_rms_hz, pf.ssb) = (None, None, None);
     assert_eq!(pf, f, "{what}");
     assert_eq!(layer1_label(&f, iq, rate_hz as u64).name, l.name, "{what}");
     eprintln!(
