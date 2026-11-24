@@ -1392,7 +1392,12 @@ const ORIGIN_FORMS: &str = "origin_lookup: give job, or source, center_hz and ba
 /// demodulator (`fsk_demod` → `fsk`, `psk_demod` → `psk`, `ook_demod` → `ook`); else
 /// none (unknown).
 pub fn job_modulation(rec: &JobRecord, modes: &ModeRegistry) -> Vec<String> {
-    if let Some(m) = modes.get(&rec.kind) {
+    // A demodulator row's `modulation` lists the labels it is offered for; the job
+    // itself reads the one it demodulates, below.
+    if let Some(m) = modes
+        .get(&rec.kind)
+        .filter(|m| m.role() == crate::modes::Role::Decoder)
+    {
         return m.row.modulation.clone();
     }
     let label = match rec.kind.as_str() {

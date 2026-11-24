@@ -37,13 +37,14 @@ use crate::stage::StageRegistry;
 use crate::types::StreamKind;
 
 pub use row::{
-    Access, AltUnit, Band, Container, Content, Decoder, DecoderKind, Demod, Derive,
-    ENVELOPE_FIELDS, Event, Extractor, FRAME_PARSERS, Family, FieldPath, FrameBlock, FrameDemod,
-    Handler, HandlerBlock, IDENTITY_REGISTERS, IDENTITY_STRIPS, Identify, Identity, InputStream,
-    InputVia, Install, ModeId, ModeRow, OutputVia, PacketParserKind, Parser, PositionMap,
-    ProgramBlock, ProgramInput, ProgramOutput, ProgramPackets, Proof, QUICK_ATTEMPTS, Ranges,
-    RowError, RowTest, SampleFormat, Station, Subject, SubjectColumn, SubjectUnit,
-    SubjectWaterfall, TestSpec, center_khz_text, is_mode_id, parse, validate,
+    Access, AltUnit, Band, BuiltinBlock, CenterRule, Container, Content, DEMOD_KINDS, Decoder,
+    DecoderKind, Demod, Derive, ENVELOPE_FIELDS, Event, Extractor, FRAME_PARSERS, Family,
+    FieldPath, FrameBlock, FrameDemod, Handler, HandlerBlock, IDENTITY_REGISTERS, IDENTITY_STRIPS,
+    Identify, Identity, InputStream, InputVia, Install, ModeId, ModeRow, OutputVia,
+    PacketParserKind, Parser, PositionMap, ProgramBlock, ProgramInput, ProgramOutput,
+    ProgramPackets, Proof, QUICK_ATTEMPTS, Ranges, Role, RowError, RowTest, SampleFormat, Station,
+    Subject, SubjectColumn, SubjectUnit, SubjectWaterfall, TestSpec, WidthRule, center_khz_text,
+    is_mode_id, parse, validate,
 };
 pub(crate) use row::{FRAME_DECODE_STAGE, require_all};
 
@@ -134,6 +135,11 @@ impl LoadedMode {
     /// program for a program row, [`NO_DECODER`] for a row with no decoder of its own.
     pub fn own_handler(&self) -> String {
         handler_file::own_handler_id(&self.row)
+    }
+
+    /// What the row is for: [`ModeRow::role`].
+    pub fn role(&self) -> Role {
+        self.row.role()
     }
 
     /// Whether the row has a decoder of its own (`decoder` not `null`).
@@ -286,7 +292,7 @@ pub(crate) fn nullable_enum<T: JsonSchema>(g: &mut schemars::SchemaGenerator) ->
 }
 
 /// The embedded rows, one file each under `modes/` in the repo.
-const EMBEDDED: [(&str, &str); 28] = [
+const EMBEDDED: [(&str, &str); 32] = [
     (
         "modes/acars_decode.json",
         include_str!("../../../../modes/acars_decode.json"),
@@ -298,6 +304,10 @@ const EMBEDDED: [(&str, &str); 28] = [
     (
         "modes/ais_decode.json",
         include_str!("../../../../modes/ais_decode.json"),
+    ),
+    (
+        "modes/am_demod.json",
+        include_str!("../../../../modes/am_demod.json"),
     ),
     (
         "modes/aprs_decode.json",
@@ -326,6 +336,10 @@ const EMBEDDED: [(&str, &str); 28] = [
     (
         "modes/flex_decode.json",
         include_str!("../../../../modes/flex_decode.json"),
+    ),
+    (
+        "modes/fm_demod.json",
+        include_str!("../../../../modes/fm_demod.json"),
     ),
     (
         "modes/gsmr_decode.json",
@@ -368,6 +382,10 @@ const EMBEDDED: [(&str, &str); 28] = [
         include_str!("../../../../modes/rs41_decode.json"),
     ),
     (
+        "modes/ssb_demod.json",
+        include_str!("../../../../modes/ssb_demod.json"),
+    ),
+    (
         "modes/tetra_decode.json",
         include_str!("../../../../modes/tetra_decode.json"),
     ),
@@ -382,6 +400,10 @@ const EMBEDDED: [(&str, &str); 28] = [
     (
         "modes/video_decode.json",
         include_str!("../../../../modes/video_decode.json"),
+    ),
+    (
+        "modes/wfm_demod.json",
+        include_str!("../../../../modes/wfm_demod.json"),
     ),
     (
         "modes/wifi_decode.json",
@@ -1080,6 +1102,7 @@ fn placeholder(id: &str) -> ModeRow {
             centers_hz: vec![],
             min_hz: None,
             range_hz: None,
+            width_rule: None,
         },
         modulation: vec![],
         label: String::new(),

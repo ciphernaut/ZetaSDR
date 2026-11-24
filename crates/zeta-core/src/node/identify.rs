@@ -467,6 +467,7 @@ impl Inner {
                             }
                             let proof = match rule.proof {
                                 Proof::Event => true,
+                                Proof::None => false,
                                 Proof::Field => rule.field.as_deref().is_some_and(|k| {
                                     v.get(k) == Some(&serde_json::Value::Bool(true))
                                 }),

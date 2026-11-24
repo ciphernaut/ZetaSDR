@@ -22,7 +22,7 @@ use crate::lease::{Decision, LeaseError};
 use crate::modes::policy::{HandlerPolicy, Passed};
 use crate::modes::{
     Access, Band as ModeBand, Content, DecoderKind, Family, LoadedMode, ModeId, ModeRegistry,
-    ModeRow, ModeState, Subject, is_mode_id, template,
+    ModeRow, ModeState, Role, Subject, is_mode_id, template,
 };
 use crate::node::{AfterGate, Node, NodeError, StartHandler};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
@@ -991,6 +991,7 @@ pub enum Op {
     /// The decoder modes the node knows, one row each (`modes/*.json` built in, then the
     /// operator's `--modes-dir`), sorted by id, narrowed to `family` and `state` when
     /// given (`null` for any).
+    #[schemars(transform = require_modes_role)]
     ModesList {
         #[serde(deserialize_with = "crate::modes::nullable")]
         #[schemars(required, schema_with = "crate::modes::nullable_enum::<Family>")]
@@ -998,6 +999,11 @@ pub enum Op {
         #[serde(deserialize_with = "crate::modes::nullable")]
         #[schemars(required, schema_with = "crate::modes::nullable_enum::<ModeState>")]
         state: Option<ModeState>,
+        /// Narrow to decoders or to demodulators (`null` for both); a request without
+        /// it reads as `null`.
+        #[serde(default, deserialize_with = "crate::modes::nullable")]
+        #[schemars(required, schema_with = "crate::modes::nullable_enum::<Role>")]
+        role: Option<Role>,
     },
     /// The themes the page can use, one row each (built-ins, then the operator's
     /// `--themes-dir`), sorted by id.
@@ -1438,6 +1444,20 @@ fn require_group(schema: &mut schemars::Schema) {
     }
     if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties")
         && let Some(serde_json::Value::Object(p)) = props.get_mut("group")
+    {
+        p.remove("default");
+    }
+}
+
+/// `modes_list` requires its `role`, last, and shows no default for it; it still defaults
+/// to `null` when a request from before it leaves it out.
+fn require_modes_role(schema: &mut schemars::Schema) {
+    if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
+        req.retain(|f| f != "role");
+        req.push("role".into());
+    }
+    if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties")
+        && let Some(serde_json::Value::Object(p)) = props.get_mut("role")
     {
         p.remove("default");
     }
@@ -3579,6 +3599,10 @@ pub struct ModeInfo {
     pub id: ModeId,
     pub name: String,
     pub family: Family,
+    /// `demodulator` for a `builtin` row (it turns the signal to audio and proves
+    /// nothing), `decoder` for the rest.
+    #[serde(default)]
+    pub role: Role,
     pub band: ModeBand,
     pub modulation: Vec<String>,
     pub state: ModeState,
@@ -3652,6 +3676,7 @@ impl ModeInfo {
             id: m.row.id.clone(),
             name: m.row.name.clone(),
             family: m.row.family,
+            role: m.row.role(),
             band: m.row.band.clone(),
             modulation: m.row.modulation.clone(),
             state: r.state,
@@ -6238,13 +6263,18 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
         Op::ChannelPlans {} => Ok(OpResult::ChannelPlans {
             plans: crate::plans::PLANS.iter().map(PlanInfo::from).collect(),
         }),
-        Op::ModesList { family, state } => {
+        Op::ModesList {
+            family,
+            state,
+            role,
+        } => {
             let (modes, policy) = (node.modes(), node.handler_policy());
             Ok(OpResult::Modes {
                 modes: modes
                     .all()
                     .iter()
                     .filter(|m| family.is_none_or(|f| m.row.family == f))
+                    .filter(|m| role.is_none_or(|r| m.row.role() == r))
                     .map(|m| ModeInfo::new(m, &modes, &policy))
                     .filter(|m| state.is_none_or(|s| m.state == s))
                     .collect(),

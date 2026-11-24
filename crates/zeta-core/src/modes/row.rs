@@ -361,7 +361,7 @@ impl Extractor {
 }
 
 /// The channel a mode's decoder expects.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields, rename = "ModeBand", transform = require_all)]
 pub struct Band {
@@ -377,7 +377,60 @@ pub struct Band {
     #[serde(default)]
     #[schemars(schema_with = "ranges_schema")]
     pub range_hz: Option<Ranges>,
+    /// How a choice sizes and centres this row's job from a measured signal; `null`
+    /// for the rest (they take the measured band as it is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_rule: Option<WidthRule>,
 }
+
+/// How a job of a demodulator row is sized and centred from a measurement.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, rename = "ModeWidthRule", transform = require_all)]
+pub struct WidthRule {
+    /// The measured width times this, when the measurement is trusted.
+    #[serde(default)]
+    pub scale: Option<f64>,
+    /// The narrowest width the rule gives.
+    #[serde(default)]
+    pub floor_hz: Option<u64>,
+    /// A fixed width, whatever was measured.
+    #[serde(default)]
+    pub fixed_hz: Option<u64>,
+    /// Layer-1 labels whose measured width is not trusted under the floor.
+    #[serde(default)]
+    pub distrust_below_floor: Vec<String>,
+    /// Where the job is centred.
+    #[serde(default)]
+    pub center: CenterRule,
+}
+
+/// Where a demodulator job is centred.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "ModeCenterRule")]
+pub enum CenterRule {
+    /// On the measured centre.
+    #[default]
+    Measured,
+    /// On the dial (the band's own centre).
+    Dial,
+}
+
+/// What a row is for: a decoder proves a signal by what it decodes; a demodulator
+/// (a `builtin` row) turns the signal to audio and proves nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "ModeRole")]
+pub enum Role {
+    // No variant docs: a `oneOf` would lose the top-level `type` `nullable` needs.
+    #[default]
+    Decoder,
+    Demodulator,
+}
+
+/// The built-in demodulator kinds a `builtin` row may name.
+pub const DEMOD_KINDS: [&str; 4] = ["fm_demod", "wfm_demod", "am_demod", "ssb_demod"];
 
 impl Band {
     /// Whether a box `bandwidth_hz` wide is wide enough for this mode: its `min_hz`,
@@ -468,6 +521,22 @@ pub enum Decoder {
     /// `channel → resample → <demod> → clock_recover → slicer → frame_decode`: the
     /// demodulator and the framing `frame_decode` cuts frames by.
     Frame(FrameBlock),
+    /// A built-in demodulator the node runs itself, with the row's `params` as its
+    /// defaults.
+    Builtin(BuiltinBlock),
+}
+
+/// A `builtin` decoder: the name of a built-in demodulator kind and its default
+/// parameters.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
+pub struct BuiltinBlock {
+    /// One of [`DEMOD_KINDS`].
+    pub builtin: String,
+    /// The kind's parameters (`deviation_hz`, `audio_lowpass_hz`, ...).
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Which kind of decoder a row has, as `modes_list` reports it.
@@ -477,6 +546,7 @@ pub enum DecoderKind {
     Graph,
     Program,
     Frame,
+    Builtin,
 }
 
 impl Decoder {
@@ -485,6 +555,7 @@ impl Decoder {
             Decoder::Graph { .. } => DecoderKind::Graph,
             Decoder::Program(_) => DecoderKind::Program,
             Decoder::Frame(_) => DecoderKind::Frame,
+            Decoder::Builtin(_) => DecoderKind::Builtin,
         }
     }
 
@@ -506,12 +577,20 @@ impl Decoder {
                     optional: h.optional,
                 })
                 .collect(),
-            Decoder::Frame(_) => vec![],
+            Decoder::Frame(_) | Decoder::Builtin(_) => vec![],
         }
     }
 }
 
 impl ModeRow {
+    /// What the row is for: a demodulator when its decoder is `builtin`.
+    pub fn role(&self) -> Role {
+        match self.decoder {
+            Some(Decoder::Builtin(_)) => Role::Demodulator,
+            _ => Role::Decoder,
+        }
+    }
+
     /// The kind of the row's own decoder; `None` for a row with none.
     pub fn decoder_kind(&self) -> Option<DecoderKind> {
         self.decoder.as_ref().map(Decoder::kind)
@@ -647,6 +726,8 @@ pub struct Identify {
 pub enum Proof {
     Event,
     Field,
+    /// A demodulator row: nothing it produces proves anything.
+    None,
 }
 
 /// An external decoder program.
@@ -1176,7 +1257,10 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
         "acars_decode",
         "adsb_decode",
     ];
+    let own_builtin = matches!(&row.decoder, Some(Decoder::Builtin(b))
+        if b.builtin == row.id.0 && DEMOD_KINDS.contains(&b.builtin.as_str()));
     if !DECODERS.contains(&row.id.0.as_str())
+        && !own_builtin
         && crate::ops::BUILTIN_KINDS
             .iter()
             .any(|k| k.name() == row.id.0)
@@ -1383,6 +1467,43 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
         }
     }
     let id = &row.identify;
+    let builtin = match &row.decoder {
+        Some(Decoder::Builtin(b)) => Some(b),
+        _ => None,
+    };
+    if let Some(b) = builtin {
+        if !DEMOD_KINDS.contains(&b.builtin.as_str()) {
+            return Err(RowError::new(
+                "decoder.builtin",
+                format!(
+                    "{:?} is not one of {} (the built-in demodulators)",
+                    b.builtin,
+                    DEMOD_KINDS.join(", ")
+                ),
+            ));
+        }
+        if id.proof != Proof::None {
+            return Err(RowError::new(
+                "identify.proof",
+                "a builtin row proves nothing: none",
+            ));
+        }
+        let want = match b.builtin.as_str() {
+            "fm_demod" | "am_demod" => "squelch",
+            _ => "none",
+        };
+        if row.protocol != want {
+            return Err(RowError::new(
+                "protocol",
+                format!("{:?} must be {want:?} for {}", row.protocol, b.builtin),
+            ));
+        }
+    } else if id.proof == Proof::None {
+        return Err(RowError::new(
+            "identify.proof",
+            "none is for a builtin row (a decoder proves by an event or a field)",
+        ));
+    }
     if id.proof == Proof::Field && id.field.is_none() {
         return Err(RowError::new(
             "identify.field",
@@ -1472,6 +1593,7 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             Ok(())
         }
         Decoder::Frame(b) => validate_frame(b, stages),
+        Decoder::Builtin(_) => Ok(()),
     }
 }
 

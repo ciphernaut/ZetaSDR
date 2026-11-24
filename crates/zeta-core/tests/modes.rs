@@ -5,8 +5,8 @@ use std::path::Path;
 
 use zeta_core::graph::NodeId;
 use zeta_core::modes::{
-    Access, Container, Decoder, Family, Identity, InputStream, ModeId, ModeRegistry, ModeState,
-    SubjectWaterfall, parse, policy::HandlerPolicy, template, validate,
+    Access, Container, Decoder, DecoderKind, Family, Identity, InputStream, ModeId, ModeRegistry,
+    ModeState, Role, SubjectWaterfall, parse, policy::HandlerPolicy, template, validate,
 };
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{ModeDetail, ModeInfo, Op, OpError, OpResult};
@@ -21,10 +21,11 @@ fn stages() -> StageRegistry {
     r
 }
 
-const EMBEDDED: [&str; 28] = [
+const EMBEDDED: [&str; 32] = [
     "acars_decode",
     "adsb_decode",
     "ais_decode",
+    "am_demod",
     "aprs_decode",
     "ble_decode",
     "dfm_decode",
@@ -32,6 +33,7 @@ const EMBEDDED: [&str; 28] = [
     "dvbs_ip_decode",
     "dvbt_decode",
     "flex_decode",
+    "fm_demod",
     "gsmr_decode",
     "hfdl_decode",
     "lorawan_decode",
@@ -42,10 +44,12 @@ const EMBEDDED: [&str; 28] = [
     "pocsag_decode",
     "rds_decode",
     "rs41_decode",
+    "ssb_demod",
     "tetra_decode",
     "thread_decode",
     "vdl2_decode",
     "video_decode",
+    "wfm_demod",
     "wifi_decode",
     "wisun_decode",
     "zigbee_decode",
@@ -172,7 +176,14 @@ async fn modes_list_filters_by_family_and_state() {
     let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
         .await
         .unwrap();
-    let list = async |family, state| match node.apply(Op::ModesList { family, state }).await {
+    let list = async |family, state| match node
+        .apply(Op::ModesList {
+            family,
+            state,
+            role: None,
+        })
+        .await
+    {
         Ok(OpResult::Modes { modes }) => modes,
         other => panic!("expected modes, got {other:?}"),
     };
@@ -297,6 +308,7 @@ async fn reload_modes_picks_up_a_new_row_and_keeps_program_state() {
         .apply(Op::ModesList {
             family: None,
             state: None,
+            role: None,
         })
         .await
         .unwrap()
@@ -407,8 +419,14 @@ fn a_built_in_kind_name_is_refused_as_a_row_id() {
         std::fs::write(dir.path().join(format!("{id}.json")), row.to_string()).unwrap();
     }
     let reg = ModeRegistry::load(&stages(), Some(dir.path()));
+    // The embedded `fm_demod` row stays in force; the broken file is listed beside it.
+    assert_eq!(reg.get("fm_demod").unwrap().state, ModeState::Ready);
     for id in ["fm_demod", "scan", "identify"] {
-        let m = reg.get(id).unwrap_or_else(|| panic!("{id} listed"));
+        let listed = match id {
+            "fm_demod" => "fm_demod@fm_demod.json",
+            id => id,
+        };
+        let m = reg.get(listed).unwrap_or_else(|| panic!("{id} listed"));
         assert_eq!(m.state, ModeState::Broken, "{id}");
         assert_eq!(
             m.reason.as_deref(),
@@ -525,6 +543,7 @@ async fn modes_list_and_show_carry_the_subject() {
         .apply(Op::ModesList {
             family: None,
             state: None,
+            role: None,
         })
         .await
     else {
@@ -723,6 +742,7 @@ async fn modes_list_carries_access() {
         .apply(Op::ModesList {
             family: None,
             state: None,
+            role: None,
         })
         .await
     else {
@@ -767,6 +787,7 @@ async fn modes_list_and_show_carry_content() {
         .apply(Op::ModesList {
             family: None,
             state: None,
+            role: None,
         })
         .await
     else {
@@ -1241,6 +1262,9 @@ fn every_embedded_row_emits_events_today() {
             _ if matches!(m.row.decoder, Some(Decoder::Frame(_))) => {
                 &[StreamKind::Event, StreamKind::Packet]
             }
+            // A demodulator gives audio, and its squelch's events when it has one.
+            "fm_demod" | "am_demod" => &[StreamKind::Audio, StreamKind::Event],
+            "wfm_demod" | "ssb_demod" => &[StreamKind::Audio],
             // A row with no decoder of its own gives nothing until a handler is ready.
             _ if m.row.decoder.is_none() => &[],
             _ => &[StreamKind::Event],
@@ -1305,6 +1329,7 @@ async fn modes_list_reports_outputs() {
         .apply(Op::ModesList {
             family: None,
             state: None,
+            role: None,
         })
         .await
     else {
@@ -2005,6 +2030,7 @@ async fn listed(node: &Node) -> Vec<ModeInfo> {
         .apply(Op::ModesList {
             family: None,
             state: None,
+            role: None,
         })
         .await
     {
@@ -2194,6 +2220,7 @@ async fn modes_list_gives_each_modes_handlers_and_the_policys_pick() {
         .apply(Op::ModesList {
             family: Some(Family::Aviation),
             state: Some(ModeState::Ready),
+            role: None,
         })
         .await;
     let Ok(OpResult::Modes { modes: ready }) = ready else {
@@ -2648,4 +2675,131 @@ fn an_entry_for_a_row_with_no_decoder_must_map_every_field() {
     let reg = load("adsb_decode", &|_| {});
     let alt = reg.handler("adsb_decode", hf::ALT).unwrap();
     assert_eq!(alt.state, ModeState::Ready, "{:?}", alt.reason);
+}
+
+/// The embedded `fm_demod` row as JSON, to adapt.
+fn embedded_row(id: &str) -> serde_json::Value {
+    let (_, text) = ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with(&format!("{id}.json")))
+        .unwrap_or_else(|| panic!("embedded {id}"));
+    serde_json::from_str(text).unwrap()
+}
+
+/// A registry over an operator directory holding `rows` (file stem, row).
+fn registry_with(rows: &[(&str, serde_json::Value)]) -> ModeRegistry {
+    let dir = tempfile::tempdir().unwrap();
+    for (stem, row) in rows {
+        std::fs::write(dir.path().join(format!("{stem}.json")), row.to_string()).unwrap();
+    }
+    ModeRegistry::load(&stages(), Some(dir.path()))
+}
+
+#[test]
+fn the_four_demodulator_rows_load_ready_with_role_demodulator() {
+    let reg = ModeRegistry::load(&stages(), None);
+    for id in zeta_core::modes::DEMOD_KINDS {
+        let m = reg.get(id).unwrap_or_else(|| panic!("{id} listed"));
+        assert_eq!(m.state, ModeState::Ready, "{id}: {:?}", m.reason);
+        assert_eq!(m.role(), Role::Demodulator, "{id}");
+        assert_eq!(m.row.decoder_kind(), Some(DecoderKind::Builtin), "{id}");
+        assert_eq!(m.voices, ["audio"], "{id}");
+        assert!(m.outputs.contains(&StreamKind::Audio), "{id}");
+    }
+    assert_eq!(reg.get("pocsag_decode").unwrap().role(), Role::Decoder);
+}
+
+#[test]
+fn a_builtin_row_may_carry_its_own_kind_name_and_no_other() {
+    let mut graph: serde_json::Value = serde_json::from_str(&renamed_pocsag("x")).unwrap();
+    graph["id"] = "fm_demod".into();
+    let mut scan = embedded_row("fm_demod");
+    scan["id"] = "scan".into();
+    scan["decoder"]["builtin"] = "scan".into();
+    let reg = registry_with(&[("a", embedded_row("fm_demod")), ("b", graph), ("c", scan)]);
+    assert_eq!(reg.get("fm_demod").unwrap().state, ModeState::Ready);
+    let broken = reg.get("fm_demod@b.json").unwrap();
+    assert_eq!(broken.state, ModeState::Broken);
+    assert_eq!(
+        broken.reason.as_deref(),
+        Some("id: fm_demod is a built-in job kind")
+    );
+    let scan = reg.get("scan").unwrap();
+    assert_eq!(scan.state, ModeState::Broken);
+}
+
+#[test]
+fn a_builtin_row_naming_an_unknown_kind_is_broken() {
+    let mut row = embedded_row("fm_demod");
+    row["id"] = "foo_demod".into();
+    row["decoder"]["builtin"] = "foo_demod".into();
+    let reg = registry_with(&[("foo", row)]);
+    let m = reg.get("foo_demod").unwrap();
+    assert_eq!(m.state, ModeState::Broken);
+    assert!(
+        m.reason.as_deref().unwrap().contains("foo_demod"),
+        "{:?}",
+        m.reason
+    );
+}
+
+#[test]
+fn an_operator_builtin_row_replaces_the_embedded_one() {
+    let mut row = embedded_row("fm_demod");
+    row["decoder"]["params"]["deviation_hz"] = 2500.into();
+    let reg = registry_with(&[("fm_demod", row)]);
+    let m = reg.get("fm_demod").unwrap();
+    assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
+    let Some(Decoder::Builtin(b)) = &m.row.decoder else {
+        panic!("a builtin row");
+    };
+    assert_eq!(b.params["deviation_hz"], 2500);
+}
+
+#[test]
+fn a_variant_row_names_a_builtin_under_its_own_id() {
+    let mut row = embedded_row("fm_demod");
+    row["id"] = "fm_narrow".into();
+    let reg = registry_with(&[("fm_narrow", row)]);
+    let m = reg.get("fm_narrow").unwrap();
+    assert_eq!(m.state, ModeState::Ready, "{:?}", m.reason);
+    assert_eq!(m.role(), Role::Demodulator);
+}
+
+#[tokio::test]
+async fn modes_list_filters_by_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let list = async |role| match node
+        .apply(Op::ModesList {
+            family: None,
+            state: None,
+            role,
+        })
+        .await
+    {
+        Ok(OpResult::Modes { modes }) => modes,
+        other => panic!("expected modes, got {other:?}"),
+    };
+    let ids = |v: Vec<ModeInfo>| v.into_iter().map(|m| m.id.0).collect::<Vec<_>>();
+    assert_eq!(
+        ids(list(Some(Role::Demodulator)).await),
+        ["am_demod", "fm_demod", "ssb_demod", "wfm_demod"]
+    );
+    let decoders = ids(list(Some(Role::Decoder)).await);
+    assert!(
+        decoders.iter().all(|i| !i.ends_with("_demod")),
+        "{decoders:?}"
+    );
+    assert_eq!(list(None).await.len(), EMBEDDED.len());
+    // A request without `role` reads as null.
+    let op: Op = serde_json::from_value(
+        serde_json::json!({"op": "modes_list", "family": null, "state": null}),
+    )
+    .unwrap();
+    assert!(matches!(op, Op::ModesList { role: None, .. }));
 }

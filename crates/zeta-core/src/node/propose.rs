@@ -359,7 +359,7 @@ pub(super) fn watch_for_proposals(
                 protocol: r.protocol.clone(),
                 field: match r.identify.proof {
                     crate::modes::Proof::Field => r.identify.field.clone(),
-                    crate::modes::Proof::Event => None,
+                    crate::modes::Proof::Event | crate::modes::Proof::None => None,
                 },
                 seen: seen.clone(),
             }),

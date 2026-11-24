@@ -1395,7 +1395,7 @@ class Menu {
   modeRows() {
     if (!this.modesRead) {
       this.modesRead = this.ov.api
-        .op({ op: "modes_list", family: null, state: null })
+        .op({ op: "modes_list", family: null, state: null, role: null })
         .then((r) => {
           this.rows = (r && r.value && r.value.modes) || [];
           return this.rows;

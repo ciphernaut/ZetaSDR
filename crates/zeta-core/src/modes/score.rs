@@ -150,6 +150,9 @@ pub fn score_rows<'a>(
         .all()
         .iter()
         .filter(|m| matches!(m.state, ModeState::Ready | ModeState::Unavailable))
+        // A demodulator row proves nothing, so it is never a candidate (plan 48 task 3
+        // keeps it out of the rest of the lists too).
+        .filter(|m| m.role() == super::Role::Decoder)
         .map(|m| {
             let band = &m.row.band;
             let in_range = band

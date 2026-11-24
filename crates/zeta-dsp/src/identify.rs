@@ -266,6 +266,7 @@ type Attempt = Arc<dyn Fn(Vec<Complex<f32>>, u64) -> AttemptFuture + Send + Sync
 /// candidate and takes its slot as `skipped_quick`, as does a row with no decoder of its own.
 fn classify_candidate(row: &ModeRow) -> bool {
     !(matches!(row.decoder, Some(Decoder::Graph { .. })) && row.identify.quick.is_none())
+        && !matches!(row.decoder, Some(Decoder::Builtin(_)))
 }
 
 /// The in-crate attempt `row`'s `identify.quick` names (the names
@@ -375,6 +376,16 @@ mod tests {
         let mut stages = StageRegistry::new();
         crate::register_all(&mut stages);
         DecodeToIdentify::new(Arc::new(ModeRegistry::load(&stages, None)).into())
+    }
+
+    #[test]
+    fn a_builtin_row_is_no_classify_candidate() {
+        let mut stages = StageRegistry::new();
+        crate::register_all(&mut stages);
+        let reg = ModeRegistry::load(&stages, None);
+        let fm = reg.get("fm_demod").expect("the fm_demod row");
+        assert!(!classify_candidate(&fm.row));
+        assert!(classify_candidate(&reg.get("pocsag_decode").unwrap().row));
     }
 
     #[tokio::test]

@@ -1,0 +1,52 @@
+{
+  "id": "fm_demod",
+  "name": "Narrow FM demodulator",
+  "family": "general",
+  "band": {
+    "bandwidth_hz": 12500,
+    "centers_hz": [],
+    "min_hz": null,
+    "width_rule": {
+      "scale": 1.25,
+      "floor_hz": 5000,
+      "fixed_hz": null,
+      "distrust_below_floor": [
+        "fm",
+        "fsk",
+        "unknown"
+      ],
+      "center": "measured"
+    }
+  },
+  "modulation": [
+    "fm",
+    "fsk"
+  ],
+  "label": "fm",
+  "protocol": "squelch",
+  "decoder": {
+    "kind": "builtin",
+    "builtin": "fm_demod",
+    "params": {
+      "deviation_hz": 5000,
+      "audio_lowpass_hz": 3400,
+      "deemphasis_us": 530
+    }
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "summary": "Narrow FM demodulator"
+  },
+  "identify": {
+    "proof": "none",
+    "min_events": 0,
+    "dwell_ms": 0,
+    "min_span_ms": 0
+  },
+  "catalogue": [],
+  "test": null,
+  "notes": "The narrow FM demodulator a choice falls back to when no decoder is proved: it turns the signal to audio and proves nothing."
+}

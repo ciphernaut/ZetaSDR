@@ -1,0 +1,43 @@
+{
+  "id": "am_demod",
+  "name": "AM demodulator",
+  "family": "general",
+  "band": {
+    "bandwidth_hz": 10000,
+    "centers_hz": [],
+    "min_hz": null,
+    "width_rule": {
+      "scale": 1.25,
+      "floor_hz": 5000,
+      "fixed_hz": null,
+      "distrust_below_floor": [],
+      "center": "measured"
+    }
+  },
+  "modulation": [
+    "am"
+  ],
+  "label": "am",
+  "protocol": "squelch",
+  "decoder": {
+    "kind": "builtin",
+    "builtin": "am_demod",
+    "params": {}
+  },
+  "event": {
+    "schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "summary": "AM demodulator"
+  },
+  "identify": {
+    "proof": "none",
+    "min_events": 0,
+    "dwell_ms": 0,
+    "min_span_ms": 0
+  },
+  "catalogue": [],
+  "test": null,
+  "notes": "The AM demodulator a choice falls back to when no decoder is proved: it turns the signal to audio and proves nothing."
+}

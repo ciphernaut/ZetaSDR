@@ -285,6 +285,7 @@ pub fn learned_row(rec: &SignatureRecord, mode_id: &str) -> crate::modes::ModeRo
             centers_hz: vec![center],
             min_hz: None,
             range_hz: None,
+            width_rule: None,
         },
         modulation,
         label: rec.name.clone(),

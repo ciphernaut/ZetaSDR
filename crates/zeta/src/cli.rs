@@ -2204,7 +2204,11 @@ impl Command {
             Command::Register(RegisterCmd::Site { provider, site_id }) => {
                 Op::RegisterSite { provider, site_id }
             }
-            Command::Modes(ModesCmd::List { family, state }) => Op::ModesList { family, state },
+            Command::Modes(ModesCmd::List { family, state }) => Op::ModesList {
+                family,
+                state,
+                role: None,
+            },
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
             Command::Handlers(HandlersCmd::Policy(HandlerPolicyCmd::Get)) => {
                 Op::HandlerPolicyGet {}

@@ -682,7 +682,9 @@ fn check_units(v: &Value, defs: &Value, path: &str, seen: &mut UnitsSeen) {
                         .iter()
                         .any(|w| name.contains(w))
                         // A source sweep's `calibrated` says its levels are absolute.
-                        && name != "calibrated";
+                        && name != "calibrated"
+                        // A width rule's `center` is where to centre (`measured`, `dial`).
+                        && !(name == "center" && path.ends_with(".ModeWidthRule"));
                     assert!(
                         !unit || name.ends_with("_hz") || name.ends_with("_baud"),
                         "{path}.{name} is a unit field without _hz/_baud"

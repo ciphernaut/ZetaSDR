@@ -112,6 +112,12 @@ pub fn expand(
         }
         Decoder::Program(block) => program_graph(row, block, None, tuning, out_rate_hz),
         Decoder::Frame(block) => Ok(frame_graph(block, tuning, out_rate_hz)),
+        Decoder::Builtin(b) => Err(OpError::Other {
+            message: format!(
+                "mode {}: a builtin row ({}) is not expanded as a template",
+                row.id.0, b.builtin
+            ),
+        }),
     }
 }
 
@@ -201,6 +207,13 @@ pub fn outputs(row: &ModeRow, stages: &StageRegistry) -> Vec<StreamKind> {
             return vec![StreamKind::Event, StreamKind::Packet];
         }
         Some(Decoder::Program(_)) => return vec![StreamKind::Event],
+        Some(Decoder::Builtin(_)) => {
+            return if row.protocol == "squelch" {
+                vec![StreamKind::Audio, StreamKind::Event]
+            } else {
+                vec![StreamKind::Audio]
+            };
+        }
     };
     let mut out: Vec<StreamKind> = Vec::new();
     for n in nodes
@@ -243,7 +256,7 @@ pub fn names_audio_policy(row: &ModeRow) -> bool {
     }
     match &row.decoder {
         Some(Decoder::Graph { nodes, .. }) => nodes.iter().any(|n| names(&n.params)),
-        Some(Decoder::Program(_) | Decoder::Frame(_)) | None => false,
+        Some(Decoder::Program(_) | Decoder::Frame(_) | Decoder::Builtin(_)) | None => false,
     }
 }
 
@@ -254,6 +267,9 @@ pub fn names_audio_policy(row: &ModeRow) -> bool {
 ///
 /// [`Stage::voice_roles`]: crate::stage::Stage::voice_roles
 pub fn voices(row: &ModeRow, stages: &StageRegistry) -> Vec<String> {
+    if matches!(row.decoder, Some(Decoder::Builtin(_))) {
+        return vec!["audio".to_string()];
+    }
     let Some(Decoder::Graph { nodes, edges, .. }) = &row.decoder else {
         return Vec::new();
     };
@@ -367,7 +383,7 @@ pub fn check_band(
     let checked = match (block, &row.decoder) {
         (Some(b), _) | (None, Some(Decoder::Program(b))) => b.input.stream == InputStream::Iq,
         (None, Some(Decoder::Frame(_))) => true,
-        (None, Some(Decoder::Graph { .. })) => false,
+        (None, Some(Decoder::Graph { .. } | Decoder::Builtin(_))) => false,
         (None, None) => return Err(no_decoder(row)),
     };
     if !checked {

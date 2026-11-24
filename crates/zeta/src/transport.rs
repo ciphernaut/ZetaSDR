@@ -195,6 +195,7 @@ async fn handlers_list(client: &NodeClient) -> ExitCode {
     let list = Op::ModesList {
         family: None,
         state: None,
+        role: None,
     };
     match client.apply(&list).await {
         Ok(Ok(OpResult::Modes { modes })) => {

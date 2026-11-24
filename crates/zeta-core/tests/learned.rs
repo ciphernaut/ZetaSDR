@@ -565,6 +565,7 @@ async fn listed(node: &Node, id: &str) -> Option<ModeInfo> {
     let op = Op::ModesList {
         family: None,
         state: None,
+        role: None,
     };
     match node.apply(op).await.unwrap() {
         OpResult::Modes { modes } => modes.into_iter().find(|m| m.id.0 == id),

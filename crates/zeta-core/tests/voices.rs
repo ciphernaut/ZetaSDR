@@ -410,6 +410,7 @@ async fn a_two_voice_row_lists_its_voices() {
         .apply(Op::ModesList {
             family: None,
             state: None,
+            role: None,
         })
         .await
     else {
