@@ -41,7 +41,12 @@ fn tone_band() -> Tuning {
 }
 
 async fn remote_jobs(srv: &TestServer) -> Vec<JobRecord> {
-    match srv.node.apply(Op::JobList {}).await.expect("job_list") {
+    match srv
+        .node
+        .apply(Op::JobList { all: false })
+        .await
+        .expect("job_list")
+    {
         OpResult::Jobs(jobs) => jobs,
         other => panic!("expected jobs, got {other:?}"),
     }

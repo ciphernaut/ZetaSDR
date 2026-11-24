@@ -3589,6 +3589,7 @@ mod tests {
             needs: Vec::new(),
             group: None,
             replay: None,
+            transient: false,
         }
     }
 

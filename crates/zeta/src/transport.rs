@@ -160,7 +160,10 @@ async fn remote(cli: Cli, url: &str) -> ExitCode {
     };
     // A `job start --beside`: the kind and band it left out, read from the node's job.
     if let Some(fill) = &beside {
-        match client.apply(&zeta_core::ops::Op::JobList {}).await {
+        match client
+            .apply(&zeta_core::ops::Op::JobList { all: false })
+            .await
+        {
             Ok(Ok(zeta_core::ops::OpResult::Jobs(jobs))) => {
                 if let Err(e) = fill.fill(&mut op, &jobs) {
                     return print(serde_json::to_string_pretty(&e), 2);

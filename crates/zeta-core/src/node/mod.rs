@@ -374,6 +374,7 @@ fn running_record(
         needs: Vec::new(),
         group: None,
         replay: None,
+        transient: false,
     }
 }
 
@@ -1048,13 +1049,14 @@ impl Inner {
     fn prune_history(&self, jobs: &mut HashMap<JobId, JobEntry>) {
         let is_terminal =
             |e: &JobEntry| matches!(e.record.state, JobState::Stopped | JobState::Failed { .. });
-        // An owned record (a watch's identify runs and their children) goes as soon as
+        // An owned or transient record (a watch's identify runs and their children, a
+        // transient choose) goes as soon as
         // it ends: it never takes one of the kept slots. Once its run has released (or
         // it was loaded, never launched), so its supervisor still finds the entry and
         // honours a gated stop (no idle under a gate the stopper holds).
         let owned: Vec<JobId> = jobs
             .values()
-            .filter(|e| e.record.owner.is_some() && is_terminal(e))
+            .filter(|e| (e.record.owner.is_some() || e.record.transient) && is_terminal(e))
             .filter(|e| e.cancel.is_none() && (e.released || e.run == 0))
             .map(|e| e.record.id.clone())
             .collect();
@@ -1563,6 +1565,14 @@ impl Node {
         std::fs::create_dir_all(&jobs_dir).map_err(io)?;
         let (mut records, mut load_errors) = load(&jobs_dir)?;
         let job_load_errors = load_errors.len();
+        // A transient job is never resumed nor kept: a record left by the last node goes.
+        records.retain(|r| {
+            let keep = !r.transient;
+            if !keep {
+                let _ = std::fs::remove_file(jobs_dir.join(format!("{}.json", r.id.0)));
+            }
+            keep
+        });
         if cfg.resume {
             stop_unresumable(&jobs_dir, &mut records)?;
         }
@@ -2715,6 +2725,7 @@ impl Node {
             needs: Vec::new(),
             group: None,
             replay,
+            transient: false,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2774,6 +2785,7 @@ impl Node {
             needs: Vec::new(),
             group: None,
             replay: None,
+            transient: false,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2889,6 +2901,7 @@ impl Node {
             needs: Vec::new(),
             group: None,
             replay: None,
+            transient: false,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2984,6 +2997,7 @@ impl Node {
             needs: Vec::new(),
             group: None,
             replay: None,
+            transient: false,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -4262,6 +4276,7 @@ mod tests {
             needs: Vec::new(),
             group: None,
             replay: None,
+            transient: false,
         }
     }
 

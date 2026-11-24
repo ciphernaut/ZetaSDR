@@ -289,6 +289,7 @@ fn running() -> JobRecord {
         needs: Vec::new(),
         group: None,
         replay: None,
+        transient: false,
     }
 }
 

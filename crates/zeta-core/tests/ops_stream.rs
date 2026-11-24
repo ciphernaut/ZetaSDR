@@ -539,7 +539,7 @@ fn op_name_matches_the_serialised_tag() {
             bin_hz: None,
             replace: vec![],
         },
-        Op::JobList {},
+        Op::JobList { all: false },
         Op::JobStop {
             job: JobId("j".into()),
         },
@@ -608,7 +608,7 @@ fn log_lines(dir: &Path) -> Vec<Value> {
 async fn read_only_ops_are_logged_without_their_result() {
     let dir = tempfile::tempdir().unwrap();
     let node = open(dir.path()).await;
-    node.apply(Op::JobList {}).await.unwrap();
+    node.apply(Op::JobList { all: false }).await.unwrap();
     node.apply(Op::ThemesList {}).await.unwrap();
     let id = match node
         .apply(Op::JobStart {

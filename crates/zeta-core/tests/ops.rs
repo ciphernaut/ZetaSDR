@@ -232,7 +232,7 @@ async fn job_start_passthrough_then_list_then_stop() {
         Ok(OpResult::Job(id)) => id,
         other => panic!("expected Job, got {other:?}"),
     };
-    match node.apply(Op::JobList {}).await {
+    match node.apply(Op::JobList { all: false }).await {
         Ok(OpResult::Jobs(jobs)) => {
             assert_eq!(jobs.len(), 1);
             assert_eq!(jobs[0].id, id);
@@ -245,7 +245,7 @@ async fn job_start_passthrough_then_list_then_stop() {
         node.apply(Op::JobStop { job: id.clone() }).await,
         Ok(OpResult::Ok)
     );
-    match node.apply(Op::JobList {}).await {
+    match node.apply(Op::JobList { all: false }).await {
         Ok(OpResult::Jobs(jobs)) => assert_eq!(jobs[0].state, JobState::Stopped),
         other => panic!("expected Jobs, got {other:?}"),
     }
@@ -592,8 +592,12 @@ fn every_op_variant_denies_unknown_fields_and_requires_all() {
 
 /// Members a strict object may leave out, by the end of the object's path: written only
 /// when they say something. A replay's record names its capture in `replay`; every other
-/// record has none, so a node from before replays still reads it.
-const OPTIONAL_MEMBERS: [(&str, &str); 1] = [(".$defs.JobRecord", "replay")];
+/// record has none, so a node from before replays still reads it. `transient` is
+/// written only on a transient job's record, for the same reason.
+const OPTIONAL_MEMBERS: [(&str, &str); 2] = [
+    (".$defs.JobRecord", "replay"),
+    (".$defs.JobRecord", "transient"),
+];
 
 /// Every object schema with properties, anywhere under `v` (including `$defs`),
 /// forbids extra fields and requires every property but those [`OPTIONAL_MEMBERS`]

@@ -425,6 +425,7 @@ impl Inner {
             needs: Vec::new(),
             group: None,
             replay: None,
+            transient: false,
         };
         let child = rec.id.clone();
         let mut launch = match t.lease {

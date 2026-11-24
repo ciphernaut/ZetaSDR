@@ -1186,3 +1186,94 @@ async fn widen_never_tunes_a_source_only_an_elastic_job_holds() {
     assert_eq!(radio.current(), capture);
     assert_eq!(state(&node, &spectrum), Some(JobState::Running));
 }
+
+/// `job_list`'s ids, with or without `all`.
+async fn listed(node: &Node, all: bool) -> Vec<JobId> {
+    match node.apply(Op::JobList { all }).await {
+        Ok(OpResult::Jobs(jobs)) => jobs.into_iter().map(|r| r.id).collect(),
+        r => panic!("job_list: {r:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transient_choose_is_listed_only_with_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    let id = start(
+        &node,
+        choose_op(
+            DMR_HZ,
+            20_000,
+            serde_json::json!({"up_to": 3, "transient": true}),
+        ),
+    )
+    .await;
+    let plain = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 3})),
+    )
+    .await;
+    assert_eq!(state(&node, &id), Some(JobState::Running));
+    let list = listed(&node, false).await;
+    assert!(list.contains(&plain) && !list.contains(&id), "{list:?}");
+    assert!(listed(&node, true).await.contains(&id));
+    // A read by id is not filtered.
+    assert!(node.job_context(&id).is_some());
+    // It is still an applied operation.
+    assert!(
+        logged_ops(dir.path()).iter().any(|o| o == "job_start"),
+        "{:?}",
+        logged_ops(dir.path())
+    );
+    node.apply(Op::JobStop { job: id }).await.unwrap();
+    node.apply(Op::JobStop { job: plain }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transient_choose_does_not_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    let id = start(
+        &node,
+        choose_op(
+            DMR_HZ,
+            20_000,
+            serde_json::json!({"up_to": 3, "transient": true}),
+        ),
+    )
+    .await;
+    assert_eq!(state(&node, &id), Some(JobState::Running));
+    let file = dir.path().join("state/jobs").join(format!("{}.json", id.0));
+    assert!(file.exists());
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    assert!(node.job_list().iter().all(|r| r.id != id), "resumed");
+    assert!(!file.exists(), "its record file is kept");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_transient_choose_leaves_no_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    let id = start(
+        &node,
+        choose_op(
+            DMR_HZ,
+            20_000,
+            serde_json::json!({"up_to": 1, "transient": true}),
+        ),
+    )
+    .await;
+    until("the record goes", ENDS_WITHIN, || {
+        state(&node, &id).is_none()
+    })
+    .await;
+    assert!(!listed(&node, true).await.contains(&id));
+    assert!(
+        !dir.path()
+            .join("state/jobs")
+            .join(format!("{}.json", id.0))
+            .exists()
+    );
+}

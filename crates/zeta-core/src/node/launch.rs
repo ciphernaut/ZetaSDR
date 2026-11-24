@@ -1518,8 +1518,8 @@ pub(super) async fn supervise(
                 // A relaunch keeps the lease; nothing was released.
                 e.released = !relaunch;
                 let gated = e.gated_stop.is_some();
-                // An owned record that ended goes now (see `Inner::prune_history`).
-                if e.record.owner.is_some() {
+                // An owned or transient record that ended goes now (see `Inner::prune_history`).
+                if e.record.owner.is_some() || e.record.transient {
                     inner.prune_history(&mut jobs);
                 }
                 gated

@@ -120,6 +120,11 @@ pub struct JobRecord {
     /// record that is not one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay: Option<String>,
+    /// A short-lived job (a `choose` started with `transient`): never resumed, dropped
+    /// from the history as soon as it stops, and left out of `job_list` unless asked
+    /// with `all`. Written only when set, so a node built before it reads every record.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transient: bool,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
@@ -127,7 +132,7 @@ pub struct JobRecord {
 /// `format`, `input`, `capture_rate_hz`, `elastic`, `operator_graph`, `owner`,
 /// `audio_policy`, `stream`, `sinks`, `handler`, `handler_named`, `needs` and `group`,
 /// so the published schema requires them. `replay` is written only on a replay's record,
-/// so it stays optional.
+/// and `transient` only on a transient job's, so they stay optional.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()

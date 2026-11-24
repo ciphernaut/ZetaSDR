@@ -1517,7 +1517,11 @@ pub enum JobCmd {
         replace: ReplaceArg,
     },
     /// List jobs
-    List,
+    List {
+        /// Also the transient jobs (a `choose` started with `transient`), left out by default
+        #[arg(long)]
+        all: bool,
+    },
     /// Stop a job
     Stop(JobArg),
     /// Show a job's context
@@ -2089,7 +2093,7 @@ impl Command {
                 bin_hz,
                 replace: replace.into_ids(),
             },
-            Command::Job(JobCmd::List) => Op::JobList {},
+            Command::Job(JobCmd::List { all }) => Op::JobList { all },
             Command::Job(JobCmd::Stop(a)) => Op::JobStop { job: job(a) },
             Command::Job(JobCmd::Context(a)) => Op::JobContext { job: job(a) },
             Command::Iq(IqCmd::Read(s)) => Op::IqRead {

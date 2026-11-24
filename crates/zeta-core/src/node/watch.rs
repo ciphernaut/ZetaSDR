@@ -1255,6 +1255,7 @@ impl Inner {
             needs: Vec::new(),
             group: None,
             replay: None,
+            transient: false,
         };
         let id = rec.id.clone();
         w.current = Some((id.clone(), t.signal.center_hz));
@@ -1362,6 +1363,7 @@ impl Inner {
                     needs: Vec::new(),
                     group: None,
                     replay: None,
+                    transient: false,
                 };
                 let id = rec.id.clone();
                 // In its own task, as identify's children: `launch`'s future runs this.

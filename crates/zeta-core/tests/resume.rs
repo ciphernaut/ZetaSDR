@@ -301,6 +301,7 @@ fn running(id: &JobId, kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord
         needs: Vec::new(),
         group: None,
         replay: None,
+        transient: false,
     }
 }
 

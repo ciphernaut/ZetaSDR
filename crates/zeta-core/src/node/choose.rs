@@ -90,7 +90,7 @@ pub(crate) struct ChooseAsk {
     pub capped: Option<String>,
     /// Start the verdict's job when the job ends.
     pub start: bool,
-    /// A short-lived ask (no effect yet).
+    /// A short-lived ask: the job is `JobRecord.transient`.
     pub transient: bool,
 }
 
@@ -121,6 +121,7 @@ impl Node {
         };
         let rec = JobRecord {
             context: serde_json::json!({ "choose": ask }),
+            transient: ask.transient,
             ..super::running_record(JobKind::Choose.name(), source, tuning, graph, None, false)
         };
         let id = rec.id.clone();

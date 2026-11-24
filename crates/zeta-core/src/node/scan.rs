@@ -1562,6 +1562,7 @@ mod tests {
             needs: Vec::new(),
             group: None,
             replay: None,
+            transient: false,
         };
         inner.jobs.lock().unwrap().insert(
             id.clone(),

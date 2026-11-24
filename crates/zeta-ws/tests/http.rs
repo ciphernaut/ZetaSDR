@@ -137,7 +137,7 @@ async fn wrong_secret_is_401_and_op_not_applied() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        ts.node.apply(Op::JobList {}).await,
+        ts.node.apply(Op::JobList { all: false }).await,
         Ok(OpResult::Jobs(vec![]))
     );
     ts.stop().await;

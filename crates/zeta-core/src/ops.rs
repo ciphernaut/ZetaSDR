@@ -742,7 +742,15 @@ pub enum Op {
         /// As on `job_start`: rigid holders of `source` that may be stopped to make room.
         replace: Vec<JobId>,
     },
-    JobList {},
+    /// List the jobs, oldest first. A transient job (a `choose` started with
+    /// `transient`) is left out unless `all` is true; `job_context` and `job_stop` take
+    /// its id regardless.
+    #[schemars(transform = require_all_flag)]
+    JobList {
+        /// Also the transient jobs. `false` when a request leaves it out.
+        #[serde(default)]
+        all: bool,
+    },
     JobStop {
         job: JobId,
     },
@@ -1809,6 +1817,21 @@ fn require_widen(schema: &mut schemars::Schema) {
     }
     if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties")
         && let Some(serde_json::Value::Object(p)) = props.get_mut("widen")
+    {
+        p.remove("default");
+    }
+}
+
+/// `job_list` requires `all` and shows no default for it, so a tool call always states
+/// it; a request from before the field leaves it out and reads `false`.
+fn require_all_flag(schema: &mut schemars::Schema) {
+    if let Some(serde_json::Value::Array(req)) = schema.get_mut("required")
+        && !req.iter().any(|f| f == "all")
+    {
+        req.push("all".into());
+    }
+    if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties")
+        && let Some(serde_json::Value::Object(p)) = props.get_mut("all")
     {
         p.remove("default");
     }
@@ -4359,7 +4382,7 @@ impl Op {
             Op::SignatureRetract { .. } => "signature_retract",
             Op::SignatureDelete { .. } => "signature_delete",
             Op::PlanStart { .. } => "plan_start",
-            Op::JobList {} => "job_list",
+            Op::JobList { .. } => "job_list",
             Op::JobStop { .. } => "job_stop",
             Op::JobsStop { .. } => "jobs_stop",
             Op::JobContext { .. } => "job_context",
@@ -4397,7 +4420,7 @@ impl Op {
             self,
             Op::SourceList {}
                 | Op::SourceFree { .. }
-                | Op::JobList {}
+                | Op::JobList { .. }
                 | Op::StreamList {}
                 | Op::StreamTail { .. }
                 | Op::Schema {}
@@ -6405,7 +6428,12 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             .await
             .map(OpResult::Job)
             .map_err(|e| node_error(node, e)),
-        Op::JobList {} => Ok(OpResult::Jobs(node.job_list())),
+        Op::JobList { all } => Ok(OpResult::Jobs(
+            node.job_list()
+                .into_iter()
+                .filter(|r| all || !r.transient)
+                .collect(),
+        )),
         Op::JobStop { job } => match owned_refusal(node, &job, true) {
             Some(e) => Err(e),
             None => node
@@ -9538,8 +9566,8 @@ mod tests {
             serde_json::json!({"op": "job_stop", "job": "j"})
         );
         assert_eq!(
-            serde_json::to_value(Op::JobList {}).unwrap(),
-            serde_json::json!({"op": "job_list"})
+            serde_json::to_value(Op::JobList { all: false }).unwrap(),
+            serde_json::json!({"op": "job_list", "all": false})
         );
         assert_eq!(
             serde_json::to_value(OpResult::Ok).unwrap(),
