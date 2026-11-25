@@ -103,7 +103,8 @@ async fn node_opts(
     node_rated(dir, iq, RATE_HZ, at, tune_range).await
 }
 
-/// [`node_opts`] over `iq` sampled at `rate_hz`.
+/// [`node_opts`] over `iq` sampled at `rate_hz`; the operator's rows are those in
+/// `dir/modes`, when there is one.
 async fn node_rated(
     dir: &Path,
     iq: &[Complex<f32>],
@@ -130,6 +131,9 @@ async fn node_rated(
     zeta_dsp::register_all(&mut reg);
     let mut cfg = common::cfg(dir, true);
     cfg.ring_seconds = ring_seconds;
+    if dir.join("modes").is_dir() {
+        cfg.modes_dir = Some(dir.join("modes"));
+    }
     if trial_keep_bytes != u64::MAX {
         cfg.burst_policy.trial_keep_bytes = trial_keep_bytes;
     }
@@ -1503,6 +1507,11 @@ fn logged_ops(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Under `share` a band no running capture covers is never tried. Since a row is tried
+/// at its own band (plan 49), the call's channel reaching past the capture is caught at
+/// step 1: the digital voice rows are set aside with the capture's reason and never reach
+/// step 3, whose `no running capture covers it` this test read before. The radio is still
+/// left untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn share_skips_a_band_no_capture_covers() {
     let dir = tempfile::tempdir().unwrap();
@@ -1537,6 +1546,40 @@ async fn share_skips_a_band_no_capture_covers() {
         ["choice_policy_set", "job_start", "job_start"],
         "{ops:?}"
     );
+}
+
+/// Under `widen` every row step 1 set aside for the capture stays in the answer: the
+/// proved row, a row step 3 tried (in `trials`), or one it never reached (still noted).
+/// The first set-aside row to prove ends step 3 before the rest are reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn widen_keeps_every_set_aside_row_in_the_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio, _holder) = node_growing(dir.path(), LeaseSetting::Widen).await;
+    let id = start(&node, edge_op()).await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(v["settled"], "proved", "{v}");
+    let tried: Vec<&str> = live_trials(&ctx)
+        .iter()
+        .filter_map(|t| t["row"].as_str())
+        .collect();
+    let noted: Vec<&str> = v["not_tried"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["row"].as_str())
+        .collect();
+    for row in ["dmr_decode", "p25_decode", "m17_decode"] {
+        let kept = v["row"] == row || tried.contains(&row) || noted.contains(&row);
+        assert!(kept, "{row} is nowhere in the answer: {ctx:#}");
+    }
+    // A row step 3 did not reach keeps its step-1 note.
+    for row in ["dmr_decode", "p25_decode", "m17_decode"] {
+        if v["row"] != row && !tried.contains(&row) {
+            let why = format!("not tried: the capture does not hold {row}'s 12500 Hz here");
+            assert!(notes(v).contains(&why.as_str()), "{row}: {v}");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2105,30 +2148,60 @@ const CHECK_RATE_HZ: u32 = 960_000;
 /// How far off the capture's centre each row's signal is put, so the cut moves it.
 const CHECK_OFFSET_HZ: f64 = 100_000.0;
 
+/// Whether `event` holds every field of a row test's `expect`, a `{near, within}` field
+/// within its tolerance (as `zeta modes check` compares).
+fn matches_expect(expect: &Value, event: &Value) -> bool {
+    expect.as_object().is_some_and(|want| {
+        want.iter().all(|(k, v)| {
+            let got = event.get(k.as_str());
+            match (
+                v.get("near").and_then(Value::as_f64),
+                v.get("within").and_then(Value::as_f64),
+            ) {
+                (Some(near), Some(within)) => got
+                    .and_then(Value::as_f64)
+                    .is_some_and(|g| (g - near).abs() <= within),
+                _ => got == Some(v),
+            }
+        })
+    })
+}
+
 /// Every built-in row with a synthesised check that the test node can run (an
-/// in-process decoder, its band inside the capture) still proves through a cut slice:
-/// its signal, 100 kHz off the centre of a 960 kS/s capture, is chosen up to step 2 on
-/// a box of the row's width, and the verdict is the row, proved. A row step 1 proves
-/// quickly needs no slice; one it does not is proved by its replay of the cut slice.
+/// in-process decoder, its band inside the capture) still proves through a cut slice.
+/// Its signal, 100 kHz off the centre of a 960 kS/s capture, is cut to the row's band
+/// with the binary's cutter, stored as a slice centred on that band, and replayed at the
+/// band as step 2 replays a row: it must give the event the row's check expects. A row
+/// with no quick decode is also chosen up to step 2 over a live capture of the signal,
+/// and must be proved there by its replay of a cut slice.
+///
+/// Program rows (`flex_decode`, `m20_decode`, `rs41_decode`, `adsb_decode`) are left out:
+/// they run through `zeta-ext`'s `external_decode`, which this node does not register. A
+/// check with `zeta-ext` (`zeta modes check`) is where they would be covered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_checked_row_still_proves_through_a_cut_slice() {
+    use zeta_core::cut::BandCutter;
     use zeta_core::modes::{Decoder, ModeRegistry, Role, TestSpec};
+    use zeta_core::types::{Selection, Span};
     let mut reg = StageRegistry::new();
     zeta_dsp::register_all(&mut reg);
     let modes = ModeRegistry::load(&reg, None);
+    // One node replays every row's cut slice.
+    let replay_dir = tempfile::tempdir().unwrap();
+    let replayer = Node::open(common::cfg(replay_dir.path(), true), reg.clone(), vec![])
+        .await
+        .unwrap();
+    let mut proved = Vec::new();
     let mut through_step_two = Vec::new();
-    let mut checked = Vec::new();
     for mode in modes.all() {
         let row = &mode.row;
-        let Some(TestSpec::Synth(params)) = row.test.as_ref().map(|t| &t.kind) else {
+        let Some(test) = row.test.as_ref() else {
             continue;
         };
-        let width = row
-            .test
-            .as_ref()
-            .and_then(|t| t.bandwidth_hz)
-            .unwrap_or(row.band.bandwidth_hz);
-        // A program row runs through `zeta-ext`, which this test node does not register.
+        let TestSpec::Synth(params) = &test.kind else {
+            continue;
+        };
+        let width = test.bandwidth_hz.unwrap_or(row.band.bandwidth_hz);
         let in_process = matches!(row.decoder, Some(Decoder::Graph { .. }));
         if mode.role() != Role::Decoder
             || !in_process
@@ -2137,6 +2210,7 @@ async fn every_checked_row_still_proves_through_a_cut_slice() {
         {
             continue;
         }
+        let id = row.id.0.as_str();
         let mut params = params.clone();
         params.insert("offset_hz".into(), CHECK_OFFSET_HZ.into());
         let (spec, imp) = zeta_dsp::synth::parse_params(params).unwrap();
@@ -2150,12 +2224,76 @@ async fn every_checked_row_still_proves_through_a_cut_slice() {
         });
         let ring_center = signal_hz - CHECK_OFFSET_HZ as u64;
         let mut iq = zeta_dsp::synth::synthesise(&spec, &imp, CHECK_RATE_HZ, ring_center);
-        // Loop the signal with a second of quiet between, as the check would see it.
+        // A second of quiet after the signal, as a looped capture has it.
         iq.extend(std::iter::repeat_n(
             Complex::new(0.0, 0.0),
             CHECK_RATE_HZ as usize,
         ));
         awgn(&mut iq, 25.0, 13);
+        // The cut step 1 makes: the row's band (its own width on the signal's centre).
+        let band = Tuning {
+            center_hz: Hz(signal_hz),
+            bandwidth_hz: Hz(width),
+        };
+        let offset = CHECK_OFFSET_HZ as i64;
+        let (cut, rate) = zeta_dsp::channel::Cutter
+            .cut(&iq, Hz(CHECK_RATE_HZ as u64), offset, band.bandwidth_hz)
+            .unwrap_or_else(|| panic!("{id}: the cut"));
+        assert!(rate.0 < CHECK_RATE_HZ as u64, "{id}: cut at {rate:?}");
+        let sel = Selection {
+            source: rx(),
+            span: Span {
+                start_ns: Timestamp(0),
+                end_ns: Timestamp(iq.len() as u64 * 1_000_000_000 / CHECK_RATE_HZ as u64),
+            },
+            center_hz: band.center_hz,
+            bandwidth_hz: band.bandwidth_hz,
+        };
+        let rec = zeta_core::ops::write_ring_slice(
+            &replayer.bursts(),
+            &sel,
+            band,
+            (&cut, rate, band.center_hz),
+            None,
+        )
+        .unwrap();
+        let bus = replayer.bus();
+        let feed = bus
+            .feed_of(&SourceId(zeta_core::node::REPLAY_SOURCE.into()))
+            .unwrap();
+        let mut events = bus.subscribe(&feed).unwrap();
+        let job = replayer
+            .debug_capture_decode_at(&rec.id, id, band)
+            .await
+            .unwrap_or_else(|e| panic!("{id}: the replay: {e}"));
+        let within = Duration::from_millis(test.within_ms) + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + within;
+        let event = loop {
+            let f = match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Ok(f)) => f,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                _ => panic!("{id}: no event as its check expects from the cut slice at {rate:?}"),
+            };
+            if f.provenance.job.as_ref() != Some(&job) {
+                continue;
+            }
+            if let Payload::Event(v) = f.payload
+                && v["protocol"] == row.protocol.as_str()
+                && matches_expect(&test.expect, &v)
+            {
+                break v;
+            }
+        };
+        eprintln!(
+            "{id}: proved from a slice cut to {width} Hz at {} S/s: {event}",
+            rate.0
+        );
+        let _ = replayer.apply(Op::JobStop { job }).await;
+        proved.push((id.to_string(), rate.0));
+        if row.identify.quick.is_some() {
+            continue;
+        }
+        // No quick decode: step 1 cannot prove it, so the ladder's step 2 must.
         let dir = tempfile::tempdir().unwrap();
         let node = node_rated(
             dir.path(),
@@ -2166,31 +2304,201 @@ async fn every_checked_row_still_proves_through_a_cut_slice() {
         )
         .await;
         cut_on(&node);
-        let id = start(
+        let choose = start(
             &node,
             choose_op(signal_hz, width, serde_json::json!({"up_to": 2})),
         )
         .await;
-        let ctx = ended(&node, &id).await;
+        let ctx = ended(&node, &choose).await;
         let v = &ctx["verdict"];
-        let id = row.id.0.as_str();
         assert_eq!(v["row"].as_str(), Some(id), "{id}: {v}");
-        assert_eq!(v["settled"], "proved", "{id}: {v}");
-        if v["step"] == 2 {
-            let slice = slice_of(&node, &ctx);
-            assert!(
-                slice.sample_rate_hz.0 < CHECK_RATE_HZ as u64,
-                "{id}: {slice:?}"
-            );
-            through_step_two.push(id.to_string());
-        }
-        checked.push(id.to_string());
+        assert_eq!(
+            (v["settled"].as_str(), v["step"].as_u64()),
+            (Some("proved"), Some(2)),
+            "{id}: {v}"
+        );
+        let slice = slice_of(&node, &ctx);
+        assert!(
+            slice.sample_rate_hz.0 < CHECK_RATE_HZ as u64,
+            "{id}: {slice:?}"
+        );
+        through_step_two.push(id.to_string());
     }
-    eprintln!("checked {checked:?}; through step 2 {through_step_two:?}");
+    eprintln!("proved through a direct cut {proved:?}; through step 2 {through_step_two:?}");
+    let rows: Vec<&str> = proved.iter().map(|(r, _)| r.as_str()).collect();
+    for id in [
+        "acars_decode",
+        "ais_decode",
+        "aprs_decode",
+        "dmr_decode",
+        "m17_decode",
+        "p25_decode",
+        "pocsag_decode",
+        "rds_decode",
+    ] {
+        assert!(rows.contains(&id), "{id}: {rows:?}");
+    }
     for id in ["dmr_decode", "p25_decode", "m17_decode"] {
         assert!(
             through_step_two.iter().any(|r| r == id),
             "{id}: {through_step_two:?}"
         );
     }
+}
+
+/// An operator's copy of the M17 row, `width_hz` wide, as `m17_narrow` in `dir/modes`.
+fn narrow_row(dir: &Path, width_hz: u64) {
+    let embedded = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modes/m17_decode.json");
+    let mut row: Value = serde_json::from_str(&std::fs::read_to_string(embedded).unwrap()).unwrap();
+    row["id"] = "m17_narrow".into();
+    row["band"]["bandwidth_hz"] = width_hz.into();
+    std::fs::create_dir_all(dir.join("modes")).unwrap();
+    std::fs::write(dir.join("modes/m17_narrow.json"), row.to_string()).unwrap();
+}
+
+/// The replay records of each kind seen while the `choose` `id` runs (polled: a replay
+/// leaves the list once it ends), then its `choose` context.
+async fn replays_while(node: &Node, id: &JobId) -> (Vec<zeta_core::job::JobRecord>, Value) {
+    let mut seen: Vec<zeta_core::job::JobRecord> = Vec::new();
+    let deadline = tokio::time::Instant::now() + ENDS_WITHIN;
+    while state(node, id) == Some(JobState::Running) {
+        for r in replays(node) {
+            if !seen.iter().any(|s| s.id == r.id) {
+                seen.push(r);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the choose never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (seen, ended(node, id).await)
+}
+
+/// A replay's channel stage band, `(centre, width)`.
+fn channel_band(r: &zeta_core::job::JobRecord) -> (u64, u64) {
+    let p = &r
+        .graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "channel")
+        .expect("a channel stage")
+        .params;
+    (
+        p["center_hz"].as_u64().unwrap(),
+        p["bandwidth_hz"].as_u64().unwrap(),
+    )
+}
+
+/// Two rows of different widths at one centre: the slice's record is their union (the
+/// 12.5 kHz rows'), cut from a 240 kS/s capture with the union's guard, and each row is
+/// replayed at its own width on the measured centre, the 12 kHz copy at 12 kHz.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rows_of_two_widths_replay_each_at_its_own_from_one_cut() {
+    const RING_RATE_HZ: u32 = 240_000;
+    let dir = tempfile::tempdir().unwrap();
+    narrow_row(dir.path(), 12_000);
+    let offset_hz = 40_000.0;
+    let params = serde_json::json!({
+        "family": "dmr", "color_code": 5, "src": 9990001, "dst": 9990, "superframes": 6,
+        "offset_hz": offset_hz,
+    });
+    let (spec, imp) = zeta_dsp::synth::parse_params(params.as_object().unwrap().clone()).unwrap();
+    let ring_center = DMR_HZ - offset_hz as u64;
+    let mut iq = zeta_dsp::synth::synthesise(&spec, &imp, RING_RATE_HZ, ring_center);
+    awgn(&mut iq, 25.0, 13);
+    let at = (ring_center, 10.0, u64::MAX);
+    let node = node_rated(dir.path(), &iq, RING_RATE_HZ, at, None).await;
+    cut_on(&node);
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let (seen, ctx) = replays_while(&node, &id).await;
+    let v = &ctx["verdict"];
+    let first = &ctx["choice"];
+    eprintln!(
+        "replays {:?}",
+        seen.iter()
+            .map(|r| (&r.kind, channel_band(r)))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        (v["row"].as_str(), v["step"].as_u64()),
+        (Some("dmr_decode"), Some(2)),
+        "{v}"
+    );
+    let measured = v["job"]["center_hz"].as_u64().unwrap();
+    let slice = slice_of(&node, &ctx);
+    assert_eq!(
+        (slice.center_hz, slice.bandwidth_hz),
+        (Hz(measured), Hz(12_500)),
+        "{slice:?}"
+    );
+    assert_eq!(file_center(&slice), measured);
+    // 15 625 Hz (the union's guard) at 240 kS/s: cut at 48 kS/s.
+    assert_eq!(slice.sample_rate_hz, Hz(48_000), "{slice:?}");
+    for (kind, width) in [("m17_narrow", 12_000), ("dmr_decode", 12_500)] {
+        let r = seen
+            .iter()
+            .find(|r| r.kind == kind)
+            .unwrap_or_else(|| panic!("no {kind} replay: {first}"));
+        assert_eq!(channel_band(r), (measured, width), "{kind}");
+    }
+}
+
+/// Near the capture's edge a 12.5 kHz row is not tried, with the capture's reason, while
+/// an 8 kHz row on the same signal still is: step 2 replays it alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn at_the_capture_edge_the_wider_row_is_not_tried_and_the_narrow_one_is() {
+    let dir = tempfile::tempdir().unwrap();
+    narrow_row(dir.path(), 8_000);
+    // The call 5.2 kHz inside the 48 kS/s capture's upper edge: past a 12.5 kHz row's
+    // half width, inside an 8 kHz row's.
+    let offset_hz = (RATE_HZ / 2) as f64 - 5_200.0;
+    let params = serde_json::json!({
+        "family": "dmr", "color_code": 5, "src": 9990001, "dst": 9990, "superframes": 6,
+        "offset_hz": offset_hz,
+    });
+    let (spec, imp) = zeta_dsp::synth::parse_params(params.as_object().unwrap().clone()).unwrap();
+    let ring_center = DMR_HZ - offset_hz as u64;
+    let mut iq = zeta_dsp::synth::synthesise(&spec, &imp, RATE_HZ, ring_center);
+    awgn(&mut iq, 25.0, 13);
+    let node = node_rated(
+        dir.path(),
+        &iq,
+        RATE_HZ,
+        (ring_center, 10.0, u64::MAX),
+        None,
+    )
+    .await;
+    cut_on(&node);
+    let id = start(
+        &node,
+        // As wide as the capture leaves room for: layer 1 then measures the call wide
+        // enough for the 12.5 kHz rows' width window.
+        choose_op(DMR_HZ, 10_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let (seen, ctx) = replays_while(&node, &id).await;
+    let v = &ctx["verdict"];
+    let could: Vec<&str> = v["could_prove"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(could.contains(&"m17_narrow"), "{v}");
+    for wide in ["dmr_decode", "p25_decode", "m17_decode"] {
+        assert!(!could.contains(&wide), "{v}");
+        let why = format!("not tried: the capture does not hold {wide}'s 12500 Hz here");
+        assert!(notes(v).contains(&why.as_str()), "{wide}: {v}");
+    }
+    assert_eq!(v["steps_run"], serde_json::json!([1, 2]), "{v}");
+    let kinds: Vec<&str> = seen.iter().map(|r| r.kind.as_str()).collect();
+    assert_eq!(kinds, ["m17_narrow"], "{ctx:#}");
+    let slice = slice_of(&node, &ctx);
+    assert_eq!(slice.bandwidth_hz, Hz(8_000), "{slice:?}");
 }

@@ -55,7 +55,7 @@ use super::persist::now;
 use super::{Inner, Node, NodeError, REPLAY_SOURCE, source_fault_reason};
 use crate::choice::{
     Alternative, Choice, ChoiceJob, NOT_HELD_LEAD, NotTried, Settled, capture_holds,
-    catalogue_entry, choose_now, job_band, job_for, trial_band, trial_bands,
+    catalogue_entry, choose_now, inside_capture, job_band, job_for, trial_band, trial_bands,
 };
 use crate::choice_policy::{Budget, LeaseSetting, Surface};
 use crate::classify::{Classification, Measurement};
@@ -174,8 +174,9 @@ impl StepOne {
     /// Step 1 for `sel` (`held_ns` long), classified `classified` from `samples` of a
     /// ring at `rate` centred `ring_center`: chosen with the ring as the capture
     /// ([`choose_now`]), and, when the `choose` may `climb` to step 2, the samples kept
-    /// for it ([`keep_for_trials`]). Nothing is kept for a proof or an empty
-    /// `could_prove`.
+    /// for it ([`keep_for_trials`]). Nothing is kept, and nothing cut, where step 2 will
+    /// write no slice: a proof, an empty `could_prove`, a selection under 1 s, or a
+    /// policy `slice_s` under 1 s.
     pub(super) async fn chosen(
         node: &Node,
         (sel, held_ns, climb): (Selection, u64, bool),
@@ -186,6 +187,8 @@ impl StepOne {
         let region = node.inner.region();
         let capture = Some((ring_center, rate));
         let choice = choose_now(&modes, modes.weights(), &classified, &sel, &region, capture);
+        let slice_s = node.inner.choice_policy.lock().unwrap().budget.slice_s;
+        let climb = climb && held_ns >= MIN_SLICE_NS && slice_s >= 1.0;
         let kept = match &classified.measurement {
             Some(m) if climb && choice.settled != Settled::Proved => {
                 match trial_band(&modes, &choice, m, &sel, &region) {
@@ -222,6 +225,8 @@ async fn keep_for_trials(
     (band, union): (Tuning, bool),
     (samples, rate, ring_center): (Vec<Complex<f32>>, Hz, Hz),
 ) -> Option<Kept> {
+    // A union's whole-Hz centre may leave it a hertz past the capture: brought back in.
+    let band = inside_capture(band, (ring_center, rate));
     let whole = |samples| Kept {
         samples,
         rate,
@@ -907,7 +912,8 @@ impl Inner {
         };
         // Under `widen` a row whose band the capture did not hold at step 1 is tried
         // too, after the listed ones: growing the capture may hold it. Its step-1 note
-        // gives way to what step 3 makes of it.
+        // gives way to what step 3 makes of it once it is reached; a row never reached
+        // keeps it.
         let set_aside: Vec<String> = match lease {
             LeaseSetting::Widen => choice
                 .not_tried
@@ -917,14 +923,15 @@ impl Inner {
                 .collect(),
             _ => Vec::new(),
         };
-        next.not_tried.retain(|n| {
-            !(n.reason.starts_with(NOT_HELD_LEAD)
-                && n.row.as_ref().is_some_and(|r| set_aside.contains(r)))
-        });
         for row in choice.could_prove.iter().chain(&set_aside) {
             // Step 2 found the budget spent before this row.
             if !budget_left(choice, row) {
                 continue;
+            }
+            if set_aside.contains(row) {
+                next.not_tried.retain(|n| {
+                    !(n.reason.starts_with(NOT_HELD_LEAD) && n.row.as_deref() == Some(row))
+                });
             }
             let trial = |job: Option<&JobId>, outcome, evidence| Trial {
                 step: 3,
@@ -1129,7 +1136,7 @@ async fn choose_loop(
         sel,
         held_ns,
         classified,
-        kept,
+        mut kept,
         mut choice,
     } = seed;
     choice.not_tried.extend(capped);
@@ -1151,7 +1158,7 @@ async fn choose_loop(
     } else if step_two && classified.measurement.is_none() {
         note(&mut choice, UNMEASURED.into());
     } else if step_two && !choice.could_prove.is_empty() {
-        let written = match kept {
+        let written = match kept.take() {
             Some(kept) => inner.write_slice(sel.clone(), kept).await,
             None => Err(UNCUT.into()),
         };
@@ -1162,10 +1169,9 @@ async fn choose_loop(
             }
             Err(reason) => note(&mut choice, reason),
         }
-    } else {
-        // No slice will be written: the samples go now, not at the verdict.
-        drop(kept);
     }
+    // Written or not, the samples go now, not after the step-3 dwells.
+    drop(kept);
     inner.publish_choice(&mut r, &choice);
     // Both trial steps share the budget's seconds.
     let deadline = Instant::now() + Duration::from_secs(budget.trial_s.into());

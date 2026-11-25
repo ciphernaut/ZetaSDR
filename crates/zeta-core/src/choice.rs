@@ -281,6 +281,9 @@ pub fn choose_now(
     } else if let Some(top) = guessable.first() {
         let runner_up = guessable.get(1).map(|d| alternative(d.mode));
         Ok((top.mode, Settled::BestGuess, vec![], runner_up))
+    } else if outside.iter().any(|s| s.fits_label) {
+        // A row serves it, but its band reaches past the capture.
+        Err(format!("no row the capture holds serves {label}"))
     } else {
         Err(format!("no row serves {label}"))
     };
@@ -390,6 +393,39 @@ pub(crate) fn union_band(bands: impl IntoIterator<Item = Tuning>) -> Option<Tuni
         center_hz: Hz(u64::try_from(c).ok()?),
         bandwidth_hz: Hz(u64::try_from(w).ok()?),
     })
+}
+
+/// `band`, a union of bands the capture `(centre, rate)` holds, brought inside the
+/// capture: its whole-Hz centre can leave it up to 1.5 Hz past an edge ([`union_band`]).
+/// It is cut back to the capture and centred again on whichever whole hertz keeps it
+/// inside, still holding every band it held there; failing both, the capture itself.
+pub(crate) fn inside_capture(band: Tuning, capture: (Hz, Hz)) -> Tuning {
+    if capture_holds(capture, band) {
+        return band;
+    }
+    let whole = Tuning {
+        center_hz: capture.0,
+        bandwidth_hz: capture.1,
+    };
+    // Doubled edges, as in `union_band`.
+    let edges = |t: Tuning| {
+        let (c, w) = (i128::from(t.center_hz.0), i128::from(t.bandwidth_hz.0));
+        (2 * c - w, 2 * c + w)
+    };
+    let ((lo, hi), (clo, chi)) = (edges(band), edges(whole));
+    let (lo, hi) = (lo.max(clo), hi.min(chi));
+    let mid = lo + hi;
+    [mid.div_euclid(4), (mid + 3).div_euclid(4)]
+        .into_iter()
+        .filter_map(|c| {
+            let w = (hi - 2 * c).max(2 * c - lo);
+            Some(Tuning {
+                center_hz: Hz(u64::try_from(c).ok()?),
+                bandwidth_hz: Hz(u64::try_from(w).ok()?),
+            })
+        })
+        .find(|t| lo <= hi && capture_holds(capture, *t))
+        .unwrap_or(whole)
 }
 
 /// The band step 2's slice is cut to: the smallest band holding every `could_prove`
@@ -602,6 +638,64 @@ mod tests {
                 "{u:?} {b:?}"
             );
         }
+    }
+
+    /// A union whose whole-Hz centre pushes it half a hertz past the capture's lower edge
+    /// is brought back inside, still holding every band it was made of; one the capture
+    /// already holds is kept as it is.
+    #[test]
+    fn a_union_rounded_past_the_capture_is_brought_inside() {
+        let cap = (Hz(1_000_000), Hz(48_000));
+        // One band on the lower edge, one whose odd width leaves the union's centre a
+        // quarter hertz off a whole one.
+        let (a, b) = (band(982_250, 12_500), band(982_501, 12_503));
+        assert!(capture_holds(cap, a) && capture_holds(cap, b));
+        let u = union_band([a, b]).unwrap();
+        assert!(!capture_holds(cap, u), "{u:?}");
+        let inside = inside_capture(u, cap);
+        assert!(capture_holds(cap, inside), "{inside:?}");
+        for b in [a, b] {
+            assert!(
+                capture_holds((inside.center_hz, inside.bandwidth_hz), b),
+                "{inside:?} {b:?}"
+            );
+        }
+        assert_eq!(inside_capture(a, cap), a);
+    }
+
+    /// When the only decoder that would serve a label is one the capture does not hold,
+    /// the reason says the capture is short, not that no row serves it.
+    #[test]
+    fn a_decoder_only_label_whose_rows_the_capture_does_not_hold_says_so() {
+        const VDL2_HZ: u64 = 136_975_000;
+        let mut modes = ModeRegistry::load(&StageRegistry::new(), None);
+        modes.set_program("vdl2_decode", Some("/usr/bin/vdl2".into()), None);
+        let c = Classification {
+            measurement: Some(measured("psk", VDL2_HZ, 18_000, None)),
+            ..Classification::default()
+        };
+        let sel = box_at(VDL2_HZ, 20_000);
+        // The signal 4 kHz inside the capture's upper edge: the row's 25 kHz is not held.
+        let cap = Some((Hz(VDL2_HZ - 20_000), Hz(48_000)));
+        let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU", cap);
+        assert_eq!(choice.settled, Settled::CannotTell, "{choice:?}");
+        assert_eq!(
+            choice.reason.as_deref(),
+            Some("no row the capture holds serves psk"),
+            "{choice:?}"
+        );
+        assert!(
+            choice
+                .not_tried
+                .iter()
+                .any(|n| n.row.as_deref() == Some("vdl2_decode")
+                    && n.reason
+                        == "not tried: the capture does not hold vdl2_decode's 25000 Hz here"),
+            "{choice:?}"
+        );
+        // Held, it is the best guess as before.
+        let held = choose_now(&modes, modes.weights(), &c, &sel, "AU", None);
+        assert_eq!(held.row.as_deref(), Some("vdl2_decode"), "{held:?}");
     }
 
     /// A band touching the capture's edge is held; one hertz past it is not.
