@@ -3349,3 +3349,193 @@ fn a_dotted_version_compares_by_number() {
     ));
     assert!(!version_at_least("v0.4.0", "0.1"));
 }
+
+// ---- Choice 49: a decoder row rides with a demodulator ----
+
+/// The embedded `rds_decode` row as JSON, renamed, for a row-file test.
+fn rds_row(id: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    let mut v: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/rds_decode.json")).unwrap();
+    v["id"] = id.into();
+    edit(&mut v);
+    v.to_string()
+}
+
+fn ride_load(files: &[(&str, String)]) -> (tempfile::TempDir, ModeRegistry) {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.path().join(name), text).unwrap();
+    }
+    let reg = ModeRegistry::load(&stages(), Some(dir.path()));
+    (dir, reg)
+}
+
+fn ride_broken(reg: &ModeRegistry, id: &str) -> String {
+    let m = reg.get(id).expect("listed");
+    assert_eq!(m.state, ModeState::Broken, "{id}");
+    m.reason.clone().unwrap()
+}
+
+#[test]
+fn rds_decode_rides_with_wfm_demod() {
+    let reg = ModeRegistry::load(&stages(), None);
+    let rds = reg.get("rds_decode").unwrap();
+    assert_eq!(rds.state, ModeState::Ready);
+    let rides = rds.row.rides.as_ref().expect("rides");
+    assert_eq!(rides.with, vec!["wfm_demod".to_string()]);
+    assert_eq!(rides.stream, zeta_core::modes::RideStream::Iq);
+    let ridden: Vec<&str> = reg
+        .ridden_by(rds)
+        .iter()
+        .map(|m| m.row.id.0.as_str())
+        .collect();
+    assert_eq!(ridden, vec!["wfm_demod"]);
+    let wfm = reg.get("wfm_demod").unwrap();
+    let riders: Vec<&str> = reg
+        .riders_of(wfm)
+        .iter()
+        .map(|m| m.row.id.0.as_str())
+        .collect();
+    assert_eq!(riders, vec!["rds_decode"]);
+    // No other embedded row rides, and a demodulator no row rides with has no riders.
+    assert_eq!(
+        reg.all().iter().filter(|m| m.row.rides.is_some()).count(),
+        1
+    );
+    assert!(reg.riders_of(reg.get("fm_demod").unwrap()).is_empty());
+    assert!(reg.ridden_by(wfm).is_empty());
+}
+
+#[test]
+fn a_variant_demodulator_row_is_ridden_too() {
+    let wfm: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/wfm_demod.json")).unwrap();
+    let mut v = wfm.clone();
+    v["id"] = "wfm_wide".into();
+    let (_d, reg) = ride_load(&[("wfm_wide.json", v.to_string())]);
+    let rds = reg.get("rds_decode").unwrap();
+    let ridden: Vec<&str> = reg
+        .ridden_by(rds)
+        .iter()
+        .map(|m| m.row.id.0.as_str())
+        .collect();
+    assert_eq!(ridden, vec!["wfm_demod", "wfm_wide"]);
+    let riders = reg.riders_of(reg.get("wfm_wide").unwrap());
+    assert_eq!(riders.len(), 1);
+    assert_eq!(riders[0].row.id.0, "rds_decode");
+}
+
+#[test]
+fn a_rides_naming_no_demodulator_kind_breaks_the_row() {
+    let (_d, reg) = ride_load(&[
+        (
+            "empty_rider.json",
+            rds_row("empty_rider", |v| {
+                v["rides"]["with"] = serde_json::json!([])
+            }),
+        ),
+        (
+            "not_demod.json",
+            rds_row("not_demod", |v| {
+                v["rides"]["with"] = serde_json::json!(["wfm_demod", "aprs_decode"]);
+            }),
+        ),
+    ]);
+    assert!(ride_broken(&reg, "empty_rider").starts_with("rides.with:"));
+    let r = ride_broken(&reg, "not_demod");
+    assert!(
+        r.starts_with("rides.with:") && r.contains("aprs_decode"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_demodulator_or_a_program_row_cannot_ride() {
+    let wfm: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/wfm_demod.json")).unwrap();
+    let mut demod = wfm.clone();
+    demod["id"] = "wfm_rides".into();
+    demod["rides"] = serde_json::json!({"with": ["fm_demod"], "stream": "iq"});
+    let rs41: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/rs41_decode.json")).unwrap();
+    let mut program = rs41.clone();
+    program["id"] = "rs41_rides".into();
+    program["rides"] = serde_json::json!({"with": ["fm_demod"], "stream": "iq"});
+    let (_d, reg) = ride_load(&[
+        ("wfm_rides.json", demod.to_string()),
+        ("rs41_rides.json", program.to_string()),
+        // A graph whose root channel feeds two edges, or an audio one, cannot be replaced.
+        (
+            "two_edges.json",
+            rds_row("two_edges", |v| {
+                v["decoder"]["edges"] = serde_json::json!([
+                    { "from": "channel", "to": "decode", "kind": "iq" },
+                    { "from": "channel", "to": "decode", "kind": "iq" }
+                ]);
+            }),
+        ),
+    ]);
+    let r = ride_broken(&reg, "wfm_rides");
+    assert!(r.starts_with("rides:") && r.contains("demodulator"), "{r}");
+    let r = ride_broken(&reg, "rs41_rides");
+    assert!(
+        r.starts_with("rides:") && r.contains("external program"),
+        "{r}"
+    );
+    // The edge-count rule is the graph's own or the rides rule: either way it is broken.
+    assert_eq!(reg.get("two_edges").unwrap().state, ModeState::Broken);
+    // The shipped riding row is not touched by the broken ones.
+    assert_eq!(reg.get("rds_decode").unwrap().state, ModeState::Ready);
+}
+
+#[test]
+fn a_graph_without_one_iq_root_channel_cannot_ride() {
+    let (_d, reg) = ride_load(&[(
+        "no_channel.json",
+        rds_row("no_channel", |v| {
+            v["decoder"]["nodes"][0]["kind"] = "resample".into();
+            v["decoder"]["nodes"][0]["params"] = serde_json::json!({"out_rate_hz": 240000});
+        }),
+    )]);
+    assert_eq!(reg.get("no_channel").unwrap().state, ModeState::Broken);
+}
+
+#[test]
+fn rides_audio_is_refused_until_built() {
+    let (_d, reg) = ride_load(&[(
+        "audio_rider.json",
+        rds_row("audio_rider", |v| v["rides"]["stream"] = "audio".into()),
+    )]);
+    assert_eq!(
+        ride_broken(&reg, "audio_rider"),
+        "rides.stream: audio is not built yet"
+    );
+}
+
+#[tokio::test]
+async fn modes_list_carries_rides() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let info = serde_json::to_value(listed_one(&node, "rds_decode").await).unwrap();
+    assert_eq!(
+        info["rides"],
+        serde_json::json!({"with": ["wfm_demod"], "stream": "iq"})
+    );
+    let typed = listed_one(&node, "rds_decode").await;
+    assert_eq!(typed.rides.unwrap().with, vec!["wfm_demod".to_string()]);
+    assert_eq!(
+        serde_json::to_value(listed_one(&node, "aprs_decode").await).unwrap()["rides"],
+        serde_json::Value::Null
+    );
+    let detail = serde_json::to_value(&shown(&node, "rds_decode").await.row).unwrap();
+    assert_eq!(detail["rides"]["stream"], "iq");
+    // An older node's answer has no `rides`: it reads as none.
+    let mut old = serde_json::to_value(listed_one(&node, "rds_decode").await).unwrap();
+    old.as_object_mut().unwrap().remove("rides");
+    let old: ModeInfo = serde_json::from_value(old).unwrap();
+    assert!(old.rides.is_none());
+}

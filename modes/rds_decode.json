@@ -55,6 +55,7 @@
     "quick": "rds"
   },
   "catalogue": ["radio-data-system-rds"],
+  "rides": { "with": ["wfm_demod"], "stream": "iq" },
   "test": {
     "kind": "synth",
     "family": "rds",

@@ -43,9 +43,9 @@ pub use row::{
     FieldPath, FrameBlock, FrameDemod, Handler, HandlerBlock, IDENTITY_REGISTERS, IDENTITY_STRIPS,
     Identify, Identity, InputStream, InputVia, Install, ModeId, ModeRow, OutputVia,
     PacketParserKind, Parser, PositionMap, ProgramBlock, ProgramInput, ProgramOutput,
-    ProgramPackets, Proof, QUICK_ATTEMPTS, Ranges, Role, RowError, RowTest, SampleFormat, Station,
-    Subject, SubjectColumn, SubjectUnit, SubjectWaterfall, TestSpec, VersionProbe, WidthRule,
-    center_khz_text, is_mode_id, parse, validate,
+    ProgramPackets, Proof, QUICK_ATTEMPTS, Ranges, RideStream, Rides, Role, RowError, RowTest,
+    SampleFormat, Station, Subject, SubjectColumn, SubjectUnit, SubjectWaterfall, TestSpec,
+    VersionProbe, WidthRule, center_khz_text, is_mode_id, parse, validate,
 };
 pub(crate) use row::{FRAME_DECODE_STAGE, require_all};
 
@@ -883,6 +883,45 @@ impl ModeRegistry {
     }
 
     /// The row with id `id`.
+    /// The demodulator kind `m` runs when it is a demodulator row: a built-in's own row,
+    /// or a variant whose decoder is a `builtin` of a demodulator kind.
+    fn demod_kind(m: &LoadedMode) -> Option<&str> {
+        match &m.row.decoder {
+            Some(Decoder::Builtin(b)) => DEMOD_KINDS.iter().copied().find(|k| *k == b.builtin),
+            _ => None,
+        }
+    }
+
+    /// The rows that ride with `demod` (a demodulator row, a variant included): every
+    /// row whose `rides.with` names the built-in `demod` runs, ready or not.
+    pub fn riders_of(&self, demod: &LoadedMode) -> Vec<&LoadedMode> {
+        let Some(kind) = Self::demod_kind(demod) else {
+            return Vec::new();
+        };
+        self.modes
+            .iter()
+            .filter(|m| {
+                m.row
+                    .rides
+                    .as_ref()
+                    .is_some_and(|r| r.with.iter().any(|w| w == kind))
+            })
+            .collect()
+    }
+
+    /// The demodulator rows `rider` rides with: every row (the built-in's and each
+    /// variant's) whose built-in is in `rider`'s `rides.with`, ready or not. Empty for
+    /// a row that does not ride.
+    pub fn ridden_by(&self, rider: &LoadedMode) -> Vec<&LoadedMode> {
+        let Some(r) = &rider.row.rides else {
+            return Vec::new();
+        };
+        self.modes
+            .iter()
+            .filter(|m| Self::demod_kind(m).is_some_and(|k| r.with.iter().any(|w| w == k)))
+            .collect()
+    }
+
     pub fn get(&self, id: &str) -> Option<&LoadedMode> {
         self.modes.iter().find(|m| m.row.id.0 == id)
     }
@@ -1236,6 +1275,7 @@ fn placeholder(id: &str) -> ModeRow {
         derive: vec![],
         access: None,
         content: None,
+        rides: None,
     }
 }
 

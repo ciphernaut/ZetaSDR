@@ -21,7 +21,7 @@ use crate::lease::{Decision, LeaseError};
 use crate::modes::policy::{HandlerPolicy, Passed};
 use crate::modes::{
     Access, Band as ModeBand, Content, DEMOD_KINDS, Decoder, DecoderKind, Family, LoadedMode,
-    ModeId, ModeRegistry, ModeRow, ModeState, Role, Subject, is_mode_id, template,
+    ModeId, ModeRegistry, ModeRow, ModeState, Rides, Role, Subject, is_mode_id, template,
 };
 use crate::node::{AfterGate, Node, NodeError, StartHandler};
 use crate::port::{GainInfo, Port, PortError, PortStats, Tuning, WorkerInfo};
@@ -3848,6 +3848,11 @@ pub struct ModeInfo {
     #[schemars(required, schema_with = "crate::types::nullable::<Content>")]
     #[serde(deserialize_with = "crate::modes::nullable")]
     pub content: Option<Content>,
+    /// The demodulators a decoder row can ride with and the stream it reads
+    /// (`{with: ["wfm_demod"], stream: "iq"}`); `null` for a row that does not ride.
+    #[schemars(required, schema_with = "crate::types::nullable::<Rides>")]
+    #[serde(default, deserialize_with = "crate::modes::nullable")]
+    pub rides: Option<Rides>,
     /// The stream kinds a job of the row emits (`event`, `audio`, ...); a row whose
     /// `outputs` lists `audio` can be played and transcribed. Empty for a broken row.
     pub outputs: Vec<StreamKind>,
@@ -3889,6 +3894,7 @@ impl ModeInfo {
             subject: m.row.subject.clone(),
             access: m.row.access,
             content: m.row.content,
+            rides: m.row.rides.clone(),
             outputs: r.outputs,
             voices: m.voices.clone(),
             handlers: ModeHandlerInfo::of(m, modes),

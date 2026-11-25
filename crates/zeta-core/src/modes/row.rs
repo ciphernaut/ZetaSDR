@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::graph::{Edge, Graph, GraphId, Node};
 use crate::stage::StageRegistry;
 use crate::stream::LinkType;
+use crate::types::StreamKind;
 
 /// A mode id: lowercase snake case, the string `job_start --kind` takes.
 #[derive(
@@ -102,6 +103,34 @@ pub struct ModeRow {
     /// capture's record. Nothing reads it yet.
     #[serde(default)]
     pub content: Option<Content>,
+    /// The demodulators this decoder row can ride with, and which of their streams it
+    /// reads; `null` for a row that only runs as a job of its own. Started by hand a
+    /// riding row still runs as its own job.
+    #[serde(default)]
+    pub rides: Option<Rides>,
+}
+
+/// A decoder row's riding: the built-in demodulator kinds (`DEMOD_KINDS`) it can be
+/// attached to, and the stream of theirs it reads. An entry of `with` matches the
+/// built-in row and every variant row naming the same `builtin`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct Rides {
+    /// Built-in demodulator kinds, never empty.
+    pub with: Vec<String>,
+    /// The demodulator's stream the row reads.
+    pub stream: RideStream,
+}
+
+/// The stream of a demodulator a riding row reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RideStream {
+    /// The demodulator's channelised IQ, at its centre, width and rate.
+    Iq,
+    /// What the listener hears. Reserved: a row naming it is broken until one needs it.
+    Audio,
 }
 
 /// How widely a row's events may be shown.
@@ -1330,6 +1359,9 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
             format!("{} is a built-in job kind", row.id.0),
         ));
     }
+    if let Some(r) = &row.rides {
+        validate_rides(row, r)?;
+    }
     let properties = row.event.schema["properties"]
         .as_object()
         .ok_or_else(|| RowError::new("event.schema", "must be an object with `properties`"))?;
@@ -1686,6 +1718,67 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
 
 /// A frame row's demodulator, parser and framing (checked by `stages`' `frame_decode`,
 /// its error's field under `decoder.framing`).
+/// The rules of a row's `rides`. A demodulator row, a program row (an external handler
+/// does not ride) and a row with no in-process graph cannot ride; the graph's root
+/// `channel` (the one node no edge enters) must have one leaving edge, of kind `iq`, so
+/// the demodulator's channel stream can take its place.
+fn validate_rides(row: &ModeRow, r: &Rides) -> Result<(), RowError> {
+    if r.with.is_empty() {
+        return Err(RowError::new(
+            "rides.with",
+            "must name at least one demodulator",
+        ));
+    }
+    if let Some(w) = r.with.iter().find(|w| !DEMOD_KINDS.contains(&w.as_str())) {
+        return Err(RowError::new(
+            "rides.with",
+            format!(
+                "{w:?} is not a demodulator kind (one of {})",
+                DEMOD_KINDS.join(", ")
+            ),
+        ));
+    }
+    if r.stream == RideStream::Audio {
+        return Err(RowError::new("rides.stream", "audio is not built yet"));
+    }
+    match &row.decoder {
+        Some(Decoder::Builtin(b)) if DEMOD_KINDS.contains(&b.builtin.as_str()) => Err(
+            RowError::new("rides", "a demodulator row cannot ride with a demodulator"),
+        ),
+        Some(Decoder::Graph { nodes, edges, .. }) => {
+            let roots: Vec<&Node> = nodes
+                .iter()
+                .filter(|n| n.kind == "channel" && !edges.iter().any(|e| e.to == n.id))
+                .collect();
+            let [root] = roots[..] else {
+                return Err(RowError::new(
+                    "rides",
+                    format!(
+                        "the decoder graph must have exactly one root channel node (it has {})",
+                        roots.len()
+                    ),
+                ));
+            };
+            let leaving: Vec<&Edge> = edges.iter().filter(|e| e.from == root.id).collect();
+            match leaving[..] {
+                [e] if e.kind == StreamKind::Iq => Ok(()),
+                _ => Err(RowError::new(
+                    "rides",
+                    "the root channel node must have exactly one leaving edge, of kind iq",
+                )),
+            }
+        }
+        Some(Decoder::Program(_)) => Err(RowError::new(
+            "rides",
+            "a row that runs an external program does not ride (only an in-process graph does)",
+        )),
+        _ => Err(RowError::new(
+            "rides",
+            "a riding row needs an in-process graph decoder",
+        )),
+    }
+}
+
 fn validate_frame(b: &FrameBlock, stages: &StageRegistry) -> Result<(), RowError> {
     let d = &b.demod;
     if d.symbol_rate_baud == 0 {
