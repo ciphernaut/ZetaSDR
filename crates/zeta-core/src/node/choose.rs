@@ -176,10 +176,11 @@ impl StepOne {
     /// ([`choose_now`]), and, when the `choose` may `climb` to step 2, the samples kept
     /// for it ([`keep_for_trials`]). Nothing is kept, and nothing cut, where step 2 will
     /// write no slice: a proof, an empty `could_prove`, a selection under 1 s, or a
-    /// policy `slice_s` under 1 s.
+    /// policy `slice_s` under 1 s (`slice_s` as the caller read it, so the note step 2
+    /// gives agrees with what was kept).
     pub(super) async fn chosen(
         node: &Node,
-        (sel, held_ns, climb): (Selection, u64, bool),
+        (sel, held_ns, climb, slice_s): (Selection, u64, bool, f32),
         classified: Classification,
         (samples, rate, ring_center): (Vec<Complex<f32>>, Hz, Hz),
     ) -> StepOne {
@@ -187,7 +188,6 @@ impl StepOne {
         let region = node.inner.region();
         let capture = Some((ring_center, rate));
         let choice = choose_now(&modes, modes.weights(), &classified, &sel, &region, capture);
-        let slice_s = node.inner.choice_policy.lock().unwrap().budget.slice_s;
         let climb = climb && held_ns >= MIN_SLICE_NS && slice_s >= 1.0;
         let kept = match &classified.measurement {
             Some(m) if climb && choice.settled != Settled::Proved => {
@@ -1297,7 +1297,7 @@ async fn step_one(
             Ok((classified, samples, rate, ring_center)) => {
                 node.supersede_proved(&classified.tried, r.tuning);
                 let block = (samples, rate, ring_center);
-                let at = (sel, held_ns, r.ask.step >= 2);
+                let at = (sel, held_ns, r.ask.step >= 2, slice_s);
                 let one = StepOne::chosen(node, at, classified, block);
                 return Ok(Ok(tokio::select! {
                     one = one => one,

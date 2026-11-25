@@ -497,7 +497,6 @@ fn unknown_lists_the_ready_rows_its_width_fits() {
     let c = measured_p99("unknown", DMR_HZ, 3_000, 9_000);
     let sel = box_at(DMR_HZ, 3_000);
     let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU", None);
-    eprintln!("{choice:?}");
     for row in ["dmr_decode", "p25_decode", "m17_decode"] {
         assert!(
             choice.could_prove.iter().any(|r| r == row),
@@ -526,12 +525,56 @@ fn unknown_never_starts_an_unproved_decoder() {
     assert!(!choice.could_prove.is_empty(), "{choice:?}");
 }
 
-/// Any other label keeps its label test.
+/// Any other label keeps its label test, even at a width that fits the 12.5 kHz rows.
 #[test]
 fn a_label_other_than_unknown_keeps_its_label_test() {
     let modes = registry(None);
-    let c = measured_p99("carrier", DMR_HZ, 3_000, 9_000);
-    let sel = box_at(DMR_HZ, 3_000);
+    let c = measured_p99("carrier", DMR_HZ, 12_000, 12_000);
+    let sel = box_at(DMR_HZ, 12_000);
     let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU", None);
-    assert!(choice.could_prove.is_empty(), "{choice:?}");
+    for row in ["dmr_decode", "p25_decode", "m17_decode"] {
+        assert!(
+            !choice.could_prove.iter().any(|r| r == row),
+            "{row}: {choice:?}"
+        );
+    }
+    // The same measurement read `unknown` lists them: the width is not what keeps them out.
+    let unknown = measured_p99("unknown", DMR_HZ, 12_000, 12_000);
+    let listed = choose_now(&modes, modes.weights(), &unknown, &sel, "AU", None);
+    assert!(
+        listed.could_prove.iter().any(|r| r == "dmr_decode"),
+        "{listed:?}"
+    );
+}
+
+/// For `unknown` the selection's width alone may fit a row: neither the occupied width
+/// nor `power99_hz` does here.
+#[test]
+fn unknown_lists_a_row_only_the_selections_width_fits() {
+    let modes = registry(None);
+    let c = measured_p99("unknown", DMR_HZ, 3_000, 3_000);
+    let narrow = choose_now(
+        &modes,
+        modes.weights(),
+        &c,
+        &box_at(DMR_HZ, 3_000),
+        "AU",
+        None,
+    );
+    assert!(
+        !narrow.could_prove.iter().any(|r| r == "dmr_decode"),
+        "{narrow:?}"
+    );
+    let wide = choose_now(
+        &modes,
+        modes.weights(),
+        &c,
+        &box_at(DMR_HZ, 12_000),
+        "AU",
+        None,
+    );
+    assert!(
+        wide.could_prove.iter().any(|r| r == "dmr_decode"),
+        "{wide:?}"
+    );
 }

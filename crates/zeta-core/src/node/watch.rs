@@ -921,7 +921,8 @@ fn classify_task(
             .0
             >= 2;
         let block = (samples, rate, ring_center);
-        Ok(StepOne::chosen(&node, (sel, held_ns, climb), classified, block).await)
+        let at = (sel, held_ns, climb, slice_s);
+        Ok(StepOne::chosen(&node, at, classified, block).await)
     })
 }
 

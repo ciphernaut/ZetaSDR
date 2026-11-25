@@ -2393,7 +2393,10 @@ fn channel_band(r: &zeta_core::job::JobRecord) -> (u64, u64) {
 
 /// Two rows of different widths at one centre: the slice's record is their union (the
 /// 12.5 kHz rows'), cut from a 240 kS/s capture with the union's guard, and each row is
-/// replayed at its own width on the measured centre, the 12 kHz copy at 12 kHz.
+/// replayed at its own width on the measured centre, the 12 kHz copy at 12 kHz. That
+/// both were replayed is read from the choose's own trials: a replay stopped by another
+/// row's proof may leave the job list before a poll sees it (two CPUs), so its band is
+/// checked only when it was seen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rows_of_two_widths_replay_each_at_its_own_from_one_cut() {
     const RING_RATE_HZ: u32 = 240_000;
@@ -2440,13 +2443,23 @@ async fn rows_of_two_widths_replay_each_at_its_own_from_one_cut() {
     assert_eq!(file_center(&slice), measured);
     // 15 625 Hz (the union's guard) at 240 kS/s: cut at 48 kS/s.
     assert_eq!(slice.sample_rate_hz, Hz(48_000), "{slice:?}");
+    let trials = ctx["trials"].as_array().expect("the choose's trials");
     for (kind, width) in [("m17_narrow", 12_000), ("dmr_decode", 12_500)] {
-        let r = seen
+        let trial = trials
             .iter()
-            .find(|r| r.kind == kind)
-            .unwrap_or_else(|| panic!("no {kind} replay: {first}"));
-        assert_eq!(channel_band(r), (measured, width), "{kind}");
+            .find(|t| t["row"] == kind && t["step"] == 2)
+            .unwrap_or_else(|| panic!("no step-2 trial of {kind}: {ctx:#}"));
+        let job = trial["job"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{kind}'s replay did not start: {trial}"));
+        if let Some(r) = seen.iter().find(|r| r.id.0 == job) {
+            assert_eq!(r.kind, kind, "{trial}");
+            assert_eq!(channel_band(r), (measured, width), "{kind}");
+        }
     }
+    // The proved row's replay runs until its proof: it is always seen.
+    let dmr = seen.iter().find(|r| r.kind == "dmr_decode");
+    assert!(dmr.is_some(), "no dmr_decode replay seen: {first}");
 }
 
 /// Near the capture's edge a 12.5 kHz row is not tried, with the capture's reason, while

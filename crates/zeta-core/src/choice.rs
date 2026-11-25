@@ -85,8 +85,9 @@ pub struct Choice {
     pub evidence: Vec<String>,
     #[schemars(required, schema_with = "crate::types::nullable::<Alternative>")]
     pub runner_up: Option<Alternative>,
-    /// The ready decoder rows that fit the label and the width, and whose own band the
-    /// capture holds, in score order: what a later step could still prove.
+    /// The ready decoder rows that fit the label (any label, for `unknown`) and the
+    /// width, and whose own band the capture holds, in score order: what a later step
+    /// could still prove.
     pub could_prove: Vec<String>,
     pub not_tried: Vec<NotTried>,
     /// Why the choice cannot tell; `null` otherwise.
@@ -109,7 +110,9 @@ pub(crate) fn catalogue_entry(label: &Label) -> Option<&str> {
 
 /// The choice for the band `sel` of `c`, step 1: a quick proof wins; otherwise the
 /// demodulator row that serves the layer-1 label best, sized by its width rule; otherwise
-/// the best ready decoder row that fits; otherwise `cannot_tell`. Ranked by `weights`
+/// the best ready decoder row that fits; otherwise `cannot_tell`. A decoder row fits the
+/// label it presents as, except for `unknown`, which any row of a fitting width is listed
+/// for (in `could_prove`, to be tried, never a best guess). Ranked by `weights`
 /// (the catalogue only ranks, at `weights.catalogue`); a plan channel of `region` at the
 /// measured centre gives the deviation, and the width when the measured one is distrusted.
 ///
@@ -155,8 +158,8 @@ pub fn choose_now(
         .iter()
         .find(|t| t.outcome == Outcome::Proved)
         .and_then(|t| modes.get(&t.mode));
-    // The decoder rows a later step could prove: they fit the label and the width, and
-    // are not the row already proved.
+    // The decoder rows a later step could prove: they fit the label (except for
+    // `unknown`, below) and the width, and are not the row already proved.
     let at = (center_hz, bandwidth_hz, label);
     let decoders = score_rows(
         weights,
