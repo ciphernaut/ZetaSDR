@@ -14,16 +14,24 @@ use crate::fft::{CpuFft, FftBackend, PowerSum, Window};
 /// Burst gating: the envelope is the mean power over chunks of this many ms ...
 pub(crate) const BURST_ENVELOPE_MS: u64 = 1;
 /// ... a chunk is on when it stands more than this many dB over the
-/// `FLOOR_PERCENTILE`th-percentile chunk ...
+/// `FLOOR_PERCENTILE`th-percentile chunk, or, when none does, off when it lies more than
+/// this many dB under it ...
 pub(crate) const BURST_ON_DB: f64 = 6.0;
 /// ... on-runs closer than this many ms are merged ...
 pub(crate) const BURST_MERGE_MS: u64 = 2;
 /// ... runs shorter than this many ms are dropped ...
 const BURST_MIN_MS: u64 = 1;
-/// ... and a window on for less than this fraction is measured over its runs only ...
+/// A window on for at least this fraction is measured over its runs only when they are
+/// at least `BURST_LONG_RUN_MS` long ([`gated_view`]): shorter runs over half the window
+/// are a train of keyed frames, measured whole as keying. `burst_capture` takes a window
+/// with no on-edge that is on for at least this fraction as a continuous signal.
 pub(crate) const BURST_DUTY_MAX: f32 = 0.5;
-/// ... unless its runs repeat faster than this many ms: shorter, denser on-off
-/// runs are keying, not bursts.
+/// ... runs (their median) at least this many ms long are a transmission keyed up, keyed
+/// down or cut by a drop-out, gated at any duty: the keyed-over generator's shortest run
+/// is hundreds of ms, the frames of an OOK remote's train 30 ms and a Mode S train's 20.
+pub(super) const BURST_LONG_RUN_MS: f32 = 100.0;
+/// A window is measured over its runs only when they repeat no faster than this many ms:
+/// shorter, denser on-off runs are keying, not bursts.
 pub(super) const BURST_MIN_PERIOD_MS: f32 = 20.0;
 /// The gate needs at least this many on-runs ...
 const BURST_MIN_BURSTS: usize = 2;
@@ -44,23 +52,29 @@ const CYCLO_SIZE: usize = 4096;
 pub struct Bursts {
     /// Sample ranges `[start, end)` the signal is on, in order.
     pub runs: Vec<(usize, usize)>,
-    /// On samples over all samples (1 for one run spanning the window).
+    /// On samples over all samples, whichever level the `FLOOR_PERCENTILE`th-percentile
+    /// chunk is on (1 for one run spanning the window).
     pub duty: f32,
     /// Median run length, ms; `None` without runs.
     pub burst_ms: Option<f32>,
     /// Median start-to-start interval of the runs, ms; `None` under two runs.
     pub period_ms: Option<f32>,
-    /// The off level: the `FLOOR_PERCENTILE`th-percentile chunk power (linear, per
-    /// sample) the chunks were compared with; 0 for an empty window.
+    /// The off level (linear, per sample): the `FLOOR_PERCENTILE`th-percentile chunk
+    /// power the chunks were compared with, or, when the off part lies under that chunk,
+    /// the median power of the off chunks; 0 for an empty window.
     pub off_power: f64,
 }
 
 /// The on-runs of `iq`: the mean power of each `BURST_ENVELOPE_MS` chunk is
-/// compared with the `FLOOR_PERCENTILE`th-percentile chunk, a chunk more than
-/// `BURST_ON_DB` over it is on, runs closer than `BURST_MERGE_MS` are merged
-/// and runs shorter than `BURST_MIN_MS` dropped. When no chunk stands out the
-/// window is one run spanning it (a continuous signal, whose floor is the
-/// signal itself, or plain noise). An empty window has no runs.
+/// compared with the `FLOOR_PERCENTILE`th-percentile chunk. When the off part is at
+/// least that share of the window the chunk is on the off level, and a chunk more than
+/// `BURST_ON_DB` over it is on. When none stands over it, the chunk is on the on level
+/// (a carrier up for most of the window), and a chunk more than `BURST_ON_DB` under it
+/// is off: so the off part is found from either side, and `duty` is the on share in
+/// both. Runs closer than `BURST_MERGE_MS` are merged and runs shorter than
+/// `BURST_MIN_MS` dropped. When no chunk stands out either way the window is one run
+/// spanning it (a continuous signal, or plain noise: one level). An empty window has
+/// no runs.
 pub fn burst_runs(iq: &[Complex<f32>], rate_hz: u64) -> Bursts {
     let ms = |samples: usize| (samples as f64 * 1_000.0 / rate_hz.max(1) as f64) as f32;
     let chunk = ((rate_hz * BURST_ENVELOPE_MS / 1_000) as usize).max(1);
@@ -75,11 +89,23 @@ pub fn burst_runs(iq: &[Complex<f32>], rate_hz: u64) -> Bursts {
             .copied()
             .unwrap_or(0.0)
     };
+    // A zero floor holds every chunk with power on; 0/0 is not on.
+    let over = |p: f64| 10.0 * (p / floor).log10() > BURST_ON_DB;
+    let under = |p: f64| 10.0 * (floor / p).log10() > BURST_ON_DB;
+    // The floor chunk is on the on level when nothing stands over it and something lies
+    // under it: the off part is then the chunks under it, and the off level theirs.
+    let from_above = !power.iter().any(|&p| over(p)) && power.iter().any(|&p| under(p));
+    let off_power = if from_above {
+        let mut off: Vec<f64> = power.iter().copied().filter(|&p| under(p)).collect();
+        off.sort_by(f64::total_cmp);
+        off[off.len() / 2]
+    } else {
+        floor
+    };
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let merge = (rate_hz * BURST_MERGE_MS / 1_000) as usize;
     for (i, &p) in power.iter().enumerate() {
-        // A zero floor holds every chunk with power on; 0/0 is not on.
-        let is_on = 10.0 * (p / floor).log10() > BURST_ON_DB;
+        let is_on = if from_above { !under(p) } else { over(p) };
         if !is_on {
             continue;
         }
@@ -105,7 +131,7 @@ pub fn burst_runs(iq: &[Complex<f32>], rate_hz: u64) -> Bursts {
         },
         burst_ms: (!lengths.is_empty()).then(|| median(&lengths)),
         period_ms: (!periods.is_empty()).then(|| median(&periods)),
-        off_power: floor,
+        off_power,
         runs,
     }
 }
@@ -195,8 +221,10 @@ pub(super) struct View<'a> {
 }
 
 /// What layer 1 measures of `iq`: its runs ([`burst_runs`]); the on-time
-/// ([`on_time`]) when the duty is under `BURST_DUTY_MAX` and the runs repeat no
-/// faster than `BURST_MIN_PERIOD_MS` (denser runs are keying), and there are
+/// ([`on_time`]) when the window holds an off part (a duty under 1) and, at a duty of
+/// `BURST_DUTY_MAX` or more, the runs are at least `BURST_LONG_RUN_MS` long (a carrier
+/// keyed up, keyed down or with a hole in it, not a train of frames), and the runs
+/// repeat no faster than `BURST_MIN_PERIOD_MS` (denser runs are keying), and there are
 /// at least `BURST_MIN_BURSTS` runs or one of at least `BURST_MIN_SINGLE_MS`
 /// (a lone shorter run is an outlier chunk), and the off chunks are noise
 /// (within `BURST_OFF_NEAR_FLOOR_DB` of the floor in the `bandwidth_hz` band
@@ -207,11 +235,9 @@ pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -
     let sparse = bursts.period_ms.is_none_or(|p| p >= BURST_MIN_PERIOD_MS);
     let enough = bursts.runs.len() >= BURST_MIN_BURSTS
         || (bursts.runs.len() == 1 && bursts.burst_ms.is_some_and(|ms| ms >= BURST_MIN_SINGLE_MS));
-    if bursts.duty < BURST_DUTY_MAX
-        && sparse
-        && enough
-        && off_is_noise(iq, rate_hz, bandwidth_hz, &bursts)
-    {
+    let bursty = bursts.duty < BURST_DUTY_MAX
+        || (bursts.duty < 1.0 && bursts.burst_ms.is_some_and(|ms| ms >= BURST_LONG_RUN_MS));
+    if bursty && sparse && enough && off_is_noise(iq, rate_hz, bandwidth_hz, &bursts) {
         let runs: Vec<&[Complex<f32>]> = bursts.runs.iter().map(|&(s, e)| &iq[s..e]).collect();
         let raw: Vec<Complex<f32>> = runs.iter().flat_map(|r| r.iter()).copied().collect();
         View {

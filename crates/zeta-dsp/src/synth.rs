@@ -391,8 +391,8 @@ pub struct KeyedOver {
     pub deviation_hz: f64,
     /// 1.0: speech at full deviation; 0.1: a quiet passage; 0.0: an unmodulated carrier.
     pub audio: f32,
-    /// The carrier is up over this share of the window, `(from, to)` in 0..=1. With `from`
-    /// after `to` the share wraps: the carrier is up but for a hole from `to` to `from`.
+    /// The carrier is up over this share of the window, `(from, to)` in 0..=1. A reversed
+    /// pair (`from` after `to`) means a hole: the carrier is up except from `to` to `from`.
     pub on: (f64, f64),
     /// The carrier's power (1) over the noise's, dB, the noise over the whole rate.
     pub snr_db: f32,

@@ -591,9 +591,8 @@ fn a_keyed_over_reads_fm_at_every_carrier_up_share() {
 }
 
 /// The gate finds the off part from either side: `duty` is the share the carrier is up,
-/// within 0.05, a hole of 100 ms in 2 s included.
+/// within 0.05, a hole of 200 ms in 2 s (a share of 0.9) included.
 #[test]
-#[ignore = "plan 49 A3/A4"]
 fn a_keyed_overs_duty_is_its_carrier_up_share() {
     // 0.05 and a rounding's slack: an f32 duty of exactly 0.05 off is within it.
     every_keyed_over(&speech_overs(), |c, f, _| match f.duty {

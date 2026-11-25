@@ -426,12 +426,14 @@ pub fn measure_band(
 /// band's centre (within one bin of `block_center_hz`): the radio was tuned for
 /// this band, its signal sits on the DC, and masking would hide what is measured.
 ///
-/// Burst gating: the window's on-runs ([`burst_runs`]) give `duty`, `bursts`,
-/// `burst_ms` and `period_ms`. When the duty is under 0.5 and the runs repeat
-/// no faster than 20 ms (denser runs are keying), the spectrum, SNR and
-/// occupied band are taken over the on-time ([`on_time`]), the symbol-rate
-/// searches over each run as received, and `burst` is set; otherwise the
-/// whole window is measured and `burst` compares 10 ms chunk powers.
+/// Burst gating: the window's on-runs ([`burst_runs`], the off part found from either
+/// side, so `duty` is the on share) give `duty`, `bursts`, `burst_ms` and `period_ms`.
+/// When the window holds an off part of noise ([`gated_view`]: on under half the window,
+/// or in runs of at least 100 ms at any duty) and the runs repeat no faster than 20 ms
+/// (denser runs are keying), the spectrum, SNR and occupied band are taken over the
+/// on-time ([`on_time`]), the symbol-rate searches over each run as received, and
+/// `burst` is set; otherwise the whole window is measured and `burst` compares 10 ms
+/// chunk powers.
 /// `symbol_rate_baud` is, when the envelope moves, on-off keying's run-length
 /// unit ([`ook_unit_rate`]: a two-level envelope whose runs are whole chips)
 /// or else the cyclostationary line ([`cyclo_symbol_rate`]); otherwise, or when
@@ -1725,6 +1727,97 @@ mod tests {
                 (got - want as f64).abs() <= want as f64 * 0.02,
                 "{spec:?}: {got}"
             );
+        }
+    }
+
+    /// A keyed NBFM over at [`RATE`] for 2 s: speech-like audio at 2.5 kHz deviation, the
+    /// carrier up over `on` (a reversed pair is a hole), `snr_db` over the noise.
+    fn over(on: (f64, f64), audio: f32, snr_db: f32) -> Vec<Complex<f32>> {
+        crate::fixtures::keyed_over(&crate::fixtures::KeyedOver {
+            rate_hz: RATE as u32,
+            seconds: 2.0,
+            deviation_hz: 2_500.0,
+            audio,
+            on,
+            snr_db,
+            seed: 29,
+        })
+    }
+
+    #[test]
+    fn a_hole_in_a_carrier_is_an_off_run() {
+        // The carrier is up but for 100 ms in the middle of 2 s: the 15th-percentile chunk
+        // is the carrier, and the off part lies under it.
+        for snr_db in [36.0, 15.0] {
+            let iq = over((0.525, 0.475), 1.0, snr_db);
+            let b = burst_runs(&iq, RATE);
+            eprintln!("hole at {snr_db} dB: {b:?}");
+            assert_eq!(b.runs.len(), 2, "{b:?}");
+            assert!((b.duty - 0.95).abs() <= 0.005, "duty {}", b.duty);
+            let n = iq.len() as f64;
+            let ms = RATE as f64 / 1_000.0;
+            let (gap_from, gap_to) = (b.runs[0].1 as f64, b.runs[1].0 as f64);
+            assert!((gap_from - 0.475 * n).abs() <= 2.0 * ms, "{b:?}");
+            assert!((gap_to - 0.525 * n).abs() <= 2.0 * ms, "{b:?}");
+            // The off level is the noise, not the carrier.
+            assert!(b.off_power < 0.1, "{b:?}");
+        }
+    }
+
+    #[test]
+    fn a_window_of_one_level_is_one_run() {
+        let carrier = over((0.0, 1.0), 1.0, 15.0);
+        let mut noise = vec![Complex::new(0.0f32, 0.0); 2 * RATE as usize];
+        awgn(&mut noise, 0.0, 31);
+        // A window shorter than one transform holds one level too.
+        let short = &carrier[..SIZE / 2];
+        for (what, iq) in [
+            ("carrier", &carrier[..]),
+            ("noise", &noise[..]),
+            ("short", short),
+        ] {
+            let b = burst_runs(iq, RATE);
+            eprintln!("{what}: {b:?}");
+            assert_eq!(b.runs, vec![(0, iq.len())], "{what}");
+            assert_eq!(b.duty, 1.0, "{what}");
+            let v = gated_view(iq, RATE, 12_500);
+            assert!(!v.gated, "{what}");
+            assert_eq!(v.on.len(), iq.len(), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_keyed_window_is_gated_at_any_duty() {
+        // Key-up and key-down at shares over and under half, so the off part is found from
+        // either side of the 15th-percentile chunk.
+        for d in [0.97, 0.75, 0.4] {
+            for (kind, on) in [("up", (1.0 - d, 1.0)), ("down", (0.0, d))] {
+                for snr_db in [36.0f32, 15.0] {
+                    let iq = over(on, 1.0, snr_db);
+                    let v = gated_view(&iq, RATE, 12_500);
+                    let what = format!("key-{kind} d {d} at {snr_db} dB");
+                    eprintln!("{what}: {:?}", v.bursts);
+                    assert!(v.gated, "{what}: {:?}", v.bursts);
+                    assert!(
+                        (f64::from(v.bursts.duty) - d).abs() <= 0.005,
+                        "{what}: duty {}",
+                        v.bursts.duty
+                    );
+                    // No 1 ms chunk of the on-time is noise: each stands `BURST_ON_DB` over it.
+                    let noise = 10f64.powf(-f64::from(snr_db) / 10.0);
+                    let chunk = (RATE / 1_000) as usize;
+                    for &(s, e) in &v.bursts.runs {
+                        for c in iq[s..e].chunks(chunk) {
+                            let p =
+                                c.iter().map(|x| x.norm_sqr() as f64).sum::<f64>() / c.len() as f64;
+                            assert!(
+                                10.0 * (p / noise).log10() > BURST_ON_DB,
+                                "{what}: a noise chunk in the on-time ({s}..{e})"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
