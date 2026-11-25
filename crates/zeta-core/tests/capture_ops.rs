@@ -288,9 +288,15 @@ async fn a_ring_slice_record_reads_its_selection_not_the_ring() {
         center_hz: Hz(433_920_000),
         bandwidth_hz: Hz(6_000),
     };
-    let rec =
-        zeta_core::ops::write_ring_slice(&node, &sel, &iq, Hz(rate as u64), ring_center, false)
-            .unwrap();
+    let rec = zeta_core::ops::write_ring_slice(
+        &node.bursts(),
+        &sel,
+        &iq,
+        Hz(rate as u64),
+        ring_center,
+        None,
+    )
+    .unwrap();
     assert_eq!(
         (rec.center_hz, rec.bandwidth_hz),
         (sel.center_hz, sel.bandwidth_hz)

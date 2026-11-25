@@ -6490,7 +6490,7 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             .job_context(&job)
             .map(OpResult::Context)
             .ok_or_else(|| unknown_job(node, &job)),
-        Op::IqRead { selection } => iq_read(node, selection),
+        Op::IqRead { selection } => iq_read(node, selection).await,
         Op::StreamList {} => {
             let mut v = node.bus().list();
             v.sort_by(|a, b| a.id.0.cmp(&b.id.0));
@@ -9007,16 +9007,22 @@ async fn stream_tail(
 }
 
 /// Write the selection's span from the source ring into the burst store, as a cf32_le
-/// SigMF pair.
-fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
+/// SigMF pair, on a blocking thread (not a runtime worker).
+async fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     let (rate, center, samples) = ring_samples(node, &sel)?;
-    let rec = write_ring_slice(node, &sel, &samples, rate, center, false)?;
+    let count = samples.len();
+    let store = node.bursts();
+    let rec = tokio::task::spawn_blocking(move || {
+        write_ring_slice(&store, &sel, &samples, rate, center, None)
+    })
+    .await
+    .map_err(other)??;
     // Complex baseband: the written band is as wide as the sample rate.
     Ok(OpResult::Iq {
         sample_rate_hz: rate,
         center_hz: center,
         bandwidth_hz: rate,
-        samples: samples.len(),
+        samples: count,
         path: rec.meta_path,
         capture: Some(rec.id),
     })
@@ -9025,38 +9031,40 @@ fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
 /// Store the ring's `samples` (at `rate`, centred on `ring_center`) for the selection
 /// `sel` as a capture of the burst store: the record's band is the selection's, the file
 /// keeps the ring's centre, so the reading side extracts the band from it. It has a
-/// fresh `set` and `job` of its own, so replaying it replays this slice alone. A `trial`
-/// slice counts against the burst policy's trial quota instead of the operator's budget.
+/// fresh `set` and `job` of its own, so replaying it replays this slice alone. A trial
+/// slice, written into its `trial` reservation ([`crate::bursts::BurstStore::write_trial`]),
+/// counts against the burst policy's trial quota instead of the operator's budget and is
+/// stored pinned. It writes files: call it off the runtime's workers.
 pub fn write_ring_slice(
-    node: &Node,
+    store: &crate::bursts::BurstStore,
     sel: &Selection,
     samples: &[Complex<f32>],
     rate: Hz,
     ring_center: Hz,
-    trial: bool,
+    trial: Option<crate::bursts::TrialReservation>,
 ) -> Result<crate::bursts::CaptureRecord, OpError> {
     let span_ns = samples.len() as u64 * 1_000_000_000 / rate.0.max(1);
-    node.bursts()
-        .write(
-            crate::bursts::NewCapture {
-                source: sel.source.clone(),
-                set: JobId(ulid::Ulid::generate().to_string()),
-                center_hz: sel.center_hz,
-                bandwidth_hz: sel.bandwidth_hz,
-                sample_rate_hz: rate,
-                start_ns: sel.span.start_ns.0,
-                end_ns: sel.span.start_ns.0 + span_ns,
-                features: serde_json::json!({}),
-                signal: None,
-                job: JobId(ulid::Ulid::generate().to_string()),
-                watch: None,
-                allocations: serde_json::json!([]),
-                file_center_hz: Some(ring_center),
-                trial,
-            },
-            samples,
-        )
-        .map_err(other)
+    let new = crate::bursts::NewCapture {
+        source: sel.source.clone(),
+        set: JobId(ulid::Ulid::generate().to_string()),
+        center_hz: sel.center_hz,
+        bandwidth_hz: sel.bandwidth_hz,
+        sample_rate_hz: rate,
+        start_ns: sel.span.start_ns.0,
+        end_ns: sel.span.start_ns.0 + span_ns,
+        features: serde_json::json!({}),
+        signal: None,
+        job: JobId(ulid::Ulid::generate().to_string()),
+        watch: None,
+        allocations: serde_json::json!([]),
+        file_center_hz: Some(ring_center),
+        trial: trial.is_some(),
+    };
+    match trial {
+        Some(reservation) => store.write_trial(new, samples, reservation),
+        None => store.write(new, samples),
+    }
+    .map_err(other)
 }
 
 #[cfg(test)]

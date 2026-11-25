@@ -1246,12 +1246,12 @@ async fn capture_decode_replays_a_ring_slice() {
         bandwidth_hz: Hz(APRS_BAND_HZ),
     };
     let rec = zeta_core::ops::write_ring_slice(
-        &node,
+        &node.bursts(),
         &sel,
         &iq,
         Hz(APRS_RATE_HZ as u64),
         Hz(APRS_CENTER_HZ + 10_000),
-        false,
+        None,
     )
     .unwrap();
     let id = started(decode(&node, &rec.id, APRS, None, false).await);

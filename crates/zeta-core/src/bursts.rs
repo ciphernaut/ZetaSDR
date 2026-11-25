@@ -3,6 +3,7 @@
 //! each, kept within the node's [`BurstPolicy`].
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use num_complex::Complex;
@@ -157,6 +158,32 @@ pub struct BurstStore {
     dir: PathBuf,
     policy: BurstPolicy,
     index: Mutex<Vec<CaptureRecord>>,
+    /// The trial bytes [`TrialReservation`]s hold now. Added to only under the index
+    /// lock, beside the pinned trial bytes it is checked with.
+    reserved: Arc<AtomicU64>,
+}
+
+/// Bytes of the trial quota held for a trial slice while it is written
+/// ([`BurstStore::reserve_trial`]): given back on drop, or taken over by the pinned
+/// capture [`BurstStore::write_trial`] stores.
+#[must_use = "a reservation is given back when dropped"]
+#[derive(Debug)]
+pub struct TrialReservation {
+    bytes: u64,
+    held: Arc<AtomicU64>,
+}
+
+impl TrialReservation {
+    /// The bytes held.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for TrialReservation {
+    fn drop(&mut self) {
+        self.held.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
 }
 
 impl BurstStore {
@@ -195,6 +222,7 @@ impl BurstStore {
             dir,
             policy,
             index: Mutex::new(kept),
+            reserved: Arc::new(AtomicU64::new(0)),
         };
         if rebuilt || store.index.lock().unwrap().len() != n {
             store.persist(&store.index.lock().unwrap())?;
@@ -214,11 +242,48 @@ impl BurstStore {
 
     /// Write `samples` as one SigMF pair named by a fresh ULID, its one annotation over
     /// the whole window carrying the `zeta:` keys, add its record to the index (written
-    /// atomically), then [`expire`](Self::expire).
+    /// atomically), then [`expire`](Self::expire). The files are written before the
+    /// index is locked: the store answers meanwhile, and lists the capture once its
+    /// record is in.
     pub fn write(
         &self,
         rec: NewCapture,
         samples: &[Complex<f32>],
+    ) -> std::io::Result<CaptureRecord> {
+        self.store(rec, samples, None)
+    }
+
+    /// [`write`](Self::write) a trial slice into the bytes `reservation` holds: stored
+    /// `trial` and pinned, the reservation's bytes taken over by the pin under the same
+    /// index lock, so the quota counts them once and expiry never takes the slice before
+    /// its job unpins it. Refused when the slice is larger than the reservation.
+    pub fn write_trial(
+        &self,
+        rec: NewCapture,
+        samples: &[Complex<f32>],
+        reservation: TrialReservation,
+    ) -> std::io::Result<CaptureRecord> {
+        if samples.len() as u64 * 8 > reservation.bytes {
+            return Err(std::io::Error::other(format!(
+                "the slice ({} bytes) is larger than its reservation ({} bytes)",
+                samples.len() as u64 * 8,
+                reservation.bytes
+            )));
+        }
+        self.store(
+            NewCapture { trial: true, ..rec },
+            samples,
+            Some(reservation),
+        )
+    }
+
+    /// [`write`](Self::write), pinned when a trial `reservation` is given (released once
+    /// the record is in, under the index lock).
+    fn store(
+        &self,
+        rec: NewCapture,
+        samples: &[Complex<f32>],
+        reservation: Option<TrialReservation>,
     ) -> std::io::Result<CaptureRecord> {
         let id = ulid::Ulid::generate().to_string();
         let half = rec.bandwidth_hz.0 / 2;
@@ -246,8 +311,10 @@ impl BurstStore {
             start: Timestamp(rec.start_ns),
             annotations: vec![annotation],
         };
-        let mut index = self.index.lock().unwrap();
+        // A fresh id names files no record has: no lock is needed to write them.
         let meta_path = write_cf32(&self.dir, &id, &meta, samples)?;
+        #[cfg(test)]
+        tests::writing();
         let record = CaptureRecord {
             data_path: self.dir.join(format!("{id}.sigmf-data")),
             meta_path,
@@ -265,17 +332,21 @@ impl BurstStore {
             job: rec.job,
             watch: rec.watch,
             allocations: rec.allocations,
-            pinned: false,
+            pinned: reservation.is_some(),
             written_ns: now_ns(),
             trial: rec.trial,
             training: None,
         };
+        let mut index = self.index.lock().unwrap();
         index.push(record.clone());
         if let Err(e) = self.persist(&index) {
             index.pop();
+            drop(index);
             remove_files(&record);
             return Err(e);
         }
+        // The pin holds the bytes from here: given back while the index is still locked.
+        drop(reservation);
         drop(index);
         if self.policy.expire_at_open {
             self.expire_except(Some(&record.id));
@@ -463,6 +534,44 @@ impl BurstStore {
             .sum()
     }
 
+    /// The trial bytes free for a new slice: `trial_keep_bytes` less the pinned trial
+    /// captures and the reservations held. A size, not a hold:
+    /// [`reserve_trial`](Self::reserve_trial) may still refuse it once another slice
+    /// reserved.
+    pub fn trial_room(&self) -> u64 {
+        let index = self.index.lock().unwrap();
+        self.room(&index)
+    }
+
+    /// Hold `bytes` of the trial quota for a slice to be written
+    /// ([`write_trial`](Self::write_trial)); `None` when they do not fit beside the
+    /// pinned trial captures and the reservations held. Taken under the index lock, so
+    /// two slices reserved at once never both pass the quota.
+    pub fn reserve_trial(&self, bytes: u64) -> Option<TrialReservation> {
+        let index = self.index.lock().unwrap();
+        if bytes > self.room(&index) {
+            return None;
+        }
+        self.reserved.fetch_add(bytes, Ordering::SeqCst);
+        Some(TrialReservation {
+            bytes,
+            held: self.reserved.clone(),
+        })
+    }
+
+    /// [`trial_room`](Self::trial_room) of the locked `index`.
+    fn room(&self, index: &[CaptureRecord]) -> u64 {
+        let pinned: u64 = index
+            .iter()
+            .filter(|r| r.pinned && r.trial)
+            .map(|r| r.bytes)
+            .sum();
+        self.policy
+            .trial_keep_bytes
+            .saturating_sub(pinned)
+            .saturating_sub(self.reserved.load(Ordering::SeqCst))
+    }
+
     /// The bytes of every capture held.
     pub fn total_bytes(&self) -> u64 {
         self.index.lock().unwrap().iter().map(|r| r.bytes).sum()
@@ -607,6 +716,19 @@ fn now_ns() -> u64 {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Run on this thread once a capture's files are written (a slow write).
+        static WRITING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// [`BurstStore::write`]'s hook: the thread's [`WRITING`], once.
+    pub(super) fn writing() {
+        if let Some(f) = WRITING.with_borrow_mut(Option::take) {
+            f();
+        }
+    }
+
     /// Samples in one test window.
     const WINDOW: usize = 1_000;
 
@@ -680,6 +802,49 @@ mod tests {
         assert_eq!(s.delete(&a.id), Ok(a.clone()));
         assert!(!a.data_path.exists());
         assert_eq!(s.delete(&a.id), Err(StoreError::Unknown(a.id.clone())));
+    }
+
+    #[test]
+    fn the_index_is_free_while_a_capture_is_written() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path(), u64::MAX);
+        let a = s.write(new_capture(t(0)), &samples()).unwrap();
+        // The second write stalls once its files are written, until `go`.
+        let (entered, started) = mpsc::channel();
+        let (go, wait) = mpsc::channel::<()>();
+        let writer = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                WRITING.with_borrow_mut(|w| {
+                    *w = Some(Box::new(move || {
+                        entered.send(()).unwrap();
+                        let _ = wait.recv();
+                    }));
+                });
+                s.write(new_capture(t(1)), &samples()).unwrap()
+            })
+        };
+        started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the write starts");
+        // Listed from another thread, so an index held by the write cannot hang the test.
+        let (listed, got) = mpsc::channel();
+        let lister = {
+            let s = s.clone();
+            std::thread::spawn(move || listed.send(s.list()).unwrap())
+        };
+        let during = got.recv_timeout(Duration::from_secs(2));
+        go.send(()).unwrap();
+        let b = writer.join().unwrap();
+        lister.join().unwrap();
+        let during = during.expect("list() answers while a capture is written");
+        // The capture being written is not listed until its record is in.
+        let ids: Vec<String> = during.into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, std::slice::from_ref(&a.id));
+        let ids: Vec<String> = s.list().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, [b.id, a.id]);
     }
 
     #[test]
@@ -793,6 +958,31 @@ mod tests {
         );
         assert!(operator.data_path.exists() && !trials[0].data_path.exists());
         assert!(s.get(&trials[3].id).unwrap().trial);
+    }
+
+    #[test]
+    fn a_reserved_trial_is_stored_pinned_and_counted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WINDOW as u64 * 8;
+        let s = two_budgets(dir.path(), u64::MAX, w * 2);
+        let r = s.reserve_trial(w).expect("one window fits");
+        assert_eq!((r.bytes(), s.trial_room()), (w, w));
+        assert!(s.reserve_trial(w + 1).is_none());
+        let rec = s.write_trial(new_capture(t(0)), &samples(), r).unwrap();
+        assert!(rec.trial && rec.pinned, "{rec:?}");
+        assert_eq!(s.get(&rec.id), Some(rec.clone()));
+        // The pin took the reservation's bytes over: one window is free, not none.
+        assert_eq!(s.trial_room(), w);
+        s.unpin(&rec.id).unwrap();
+        assert_eq!(s.trial_room(), w * 2);
+        // A slice larger than its reservation is refused, and nothing is held after.
+        let small = s.reserve_trial(w / 2).unwrap();
+        assert!(
+            s.write_trial(trial_capture(t(1)), &samples(), small)
+                .is_err()
+        );
+        assert_eq!(s.trial_room(), w * 2);
+        assert_eq!(s.list().len(), 1);
     }
 
     #[test]

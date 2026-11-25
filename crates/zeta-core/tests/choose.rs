@@ -718,6 +718,78 @@ async fn a_slice_the_pinned_trials_leave_no_room_for_is_not_tried() {
     assert_eq!(trials(&node).len(), 1, "{:?}", trials(&node));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_slices_at_once_both_fit_or_one_is_not_tried() {
+    // A quota of 2.5 s: two 2 s slices asked at once never both fit. Each choose writes
+    // its slice or is not tried, and the pinned trial bytes never pass the quota.
+    const QUOTA: u64 = SECOND_BYTES * 5 / 2;
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_with(dir.path(), &dmr_iq(), DMR_HZ, 10.0, QUOTA).await;
+    let store = node.bursts();
+    let watching = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let peak = {
+        let (store, watching) = (store.clone(), watching.clone());
+        tokio::spawn(async move {
+            let mut peak = 0;
+            while watching.load(Ordering::Relaxed) {
+                peak = peak.max(store.pinned_trial_bytes());
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            peak
+        })
+    };
+    let op = || choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2}));
+    let (a, b) = tokio::join!(start(&node, op()), start(&node, op()));
+    let ctxs = [ended(&node, &a).await, ended(&node, &b).await];
+    watching.store(false, Ordering::Relaxed);
+    let peak = peak.await.unwrap();
+    assert!(peak <= QUOTA, "pinned {peak} bytes, over the quota {QUOTA}");
+    for ctx in &ctxs {
+        assert!(
+            ctx["slice"].is_string()
+                || reasons(&ctx["verdict"])
+                    .contains(&"not tried: the slice exceeds the trial quota"),
+            "{ctx:#}"
+        );
+    }
+    assert!(
+        ctxs.iter().any(|c| c["slice"].is_string()),
+        "neither wrote: {ctxs:#?}"
+    );
+    // Every reservation was given back: the whole quota is free again.
+    let whole = store.reserve_trial(QUOTA);
+    assert!(whole.is_some(), "{:?}", store.list());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reservation_dropped_unwritten_frees_its_bytes() {
+    // A quota of 2.5 s: a reservation of 2 s leaves under a second for a choose's slice.
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_with(dir.path(), &dmr_iq(), DMR_HZ, 10.0, SECOND_BYTES * 5 / 2).await;
+    let store = node.bursts();
+    let held = store
+        .reserve_trial(SECOND_BYTES * 2)
+        .expect("2 s fit an empty quota");
+    assert!(store.reserve_trial(SECOND_BYTES).is_none());
+    let op = || choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2}));
+    let id = start(&node, op()).await;
+    let ctx = ended(&node, &id).await;
+    assert!(ctx["slice"].is_null(), "{ctx:#}");
+    assert!(
+        reasons(&ctx["verdict"]).contains(&"not tried: the slice exceeds the trial quota"),
+        "{ctx:#}"
+    );
+    // Given back unwritten: the next choose writes its whole slice and proves DMR.
+    drop(held);
+    let id = start(&node, op()).await;
+    let ctx = ended(&node, &id).await;
+    assert_eq!(ctx["verdict"]["row"], "dmr_decode", "{ctx:#}");
+    let slice = ctx["slice"].as_str().expect("a slice");
+    let t = store.get(slice).unwrap();
+    assert!(t.end_ns - t.start_ns >= 1_900_000_000, "{t:?}");
+    assert!(store.reserve_trial(SECOND_BYTES * 5 / 2).is_some());
+}
+
 /// A 5 kHz FM voice on the DMR fixture's frequency: step 2 tries the digital voice rows
 /// and none proves it.
 fn voice_iq() -> Vec<Complex<f32>> {

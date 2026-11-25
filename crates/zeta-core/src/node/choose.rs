@@ -97,9 +97,6 @@ const SAMPLE_BYTES: u64 = 8;
 /// What the node's `choose` jobs share (`Inner::choosing`).
 #[derive(Default)]
 pub(super) struct Choosing {
-    /// Held across a slice's sizing, write and pin ([`Inner::write_slice`]), so two
-    /// chooses never both fit beside the same pinned bytes.
-    slice_gate: std::sync::Mutex<()>,
     /// The trials running now across every `choose`, by class, and the replays waiting
     /// for a slot ([`Inner::trial_slot`]).
     slots: std::sync::Mutex<Slots>,
@@ -558,39 +555,63 @@ impl Inner {
 
     /// Write `samples` (the selection `sel` of the ring at `rate`, centred
     /// `ring_center`) as a trial capture, shortened to the newest the trial quota holds
-    /// beside the trial slices other chooses have pinned, and pin it for the job. The
-    /// `not tried: ...` reason when it cannot: the quota holds under 1 s of it
-    /// ([`OVER_QUOTA`]), or the write or the pin fails.
-    fn write_slice(
+    /// beside the trial slices other chooses have pinned or reserved, pinned for the job.
+    /// Its bytes are reserved first ([`BurstStore::reserve_trial`], a short lock), then
+    /// written on a blocking thread, so no lock is held and no runtime worker waits
+    /// across the write. The `not tried: ...` reason when it cannot: the quota holds
+    /// under 1 s of it ([`OVER_QUOTA`]), or the write fails.
+    ///
+    /// [`BurstStore::reserve_trial`]: crate::bursts::BurstStore::reserve_trial
+    async fn write_slice(
         &self,
-        node: &Node,
         mut sel: Selection,
         (mut samples, rate, ring_center): (Vec<Complex<f32>>, Hz, Hz),
     ) -> Result<TrialSlice, String> {
-        let _gate = self.choosing.slice_gate.lock().unwrap();
-        let room = self
-            .bursts
-            .policy()
-            .trial_keep_bytes
-            .saturating_sub(self.bursts.pinned_trial_bytes());
-        let fits = usize::try_from(room / SAMPLE_BYTES).unwrap_or(usize::MAX);
-        if samples.len() > fits {
-            if (fits as u64) < rate.0 {
-                return Err(OVER_QUOTA.into());
+        let reservation = loop {
+            let fits =
+                usize::try_from(self.bursts.trial_room() / SAMPLE_BYTES).unwrap_or(usize::MAX);
+            if samples.len() > fits {
+                if (fits as u64) < rate.0 {
+                    return Err(OVER_QUOTA.into());
+                }
+                let cut = samples.len() - fits;
+                samples.drain(..cut);
+                sel.span.start_ns.0 += cut as u64 * 1_000_000_000 / rate.0.max(1);
             }
-            let cut = samples.len() - fits;
-            samples.drain(..cut);
-            sel.span.start_ns.0 += cut as u64 * 1_000_000_000 / rate.0.max(1);
-        }
-        let rec = crate::ops::write_ring_slice(node, &sel, &samples, rate, ring_center, true)
-            .map_err(|e| format!("not tried: the slice could not be written: {e}"))?;
-        let pinned = Pinned::new(self.bursts.clone(), &rec.id)
-            .map_err(|e| format!("not tried: the slice could not be pinned: {e}"))?;
-        Ok(TrialSlice {
-            id: rec.id,
-            sel,
-            _pinned: pinned,
+            if let Some(r) = self
+                .bursts
+                .reserve_trial(samples.len() as u64 * SAMPLE_BYTES)
+            {
+                break r;
+            }
+            // Another slice reserved since the room was read: size it again.
+        };
+        let store = self.bursts.clone();
+        let unwritten =
+            |e: &dyn std::fmt::Display| format!("not tried: the slice could not be written: {e}");
+        // The pin's guard is made on the blocking thread: a job cancelled meanwhile
+        // drops it with the task's output, unpinning the slice.
+        tokio::task::spawn_blocking(move || {
+            let rec = crate::ops::write_ring_slice(
+                &store,
+                &sel,
+                &samples,
+                rate,
+                ring_center,
+                Some(reservation),
+            )
+            .map_err(|e| unwritten(&e))?;
+            Ok(TrialSlice {
+                _pinned: Pinned {
+                    store,
+                    id: rec.id.clone(),
+                },
+                id: rec.id,
+                sel,
+            })
         })
+        .await
+        .map_err(|e| unwritten(&e))?
     }
 
     /// Step 2: replay the trial `slice` through `choice.could_prove`
@@ -982,7 +1003,10 @@ async fn choose_loop(
     } else if step_two && classified.measurement.is_none() {
         note(&mut choice, UNMEASURED.into());
     } else if step_two && !choice.could_prove.is_empty() {
-        match inner.write_slice(&node, sel.clone(), (samples, rate, ring_center)) {
+        match inner
+            .write_slice(sel.clone(), (samples, rate, ring_center))
+            .await
+        {
             Ok(s) => {
                 r.ctx.insert("slice".into(), s.id.clone().into());
                 slice = Some(s);
@@ -1446,35 +1470,16 @@ impl Drop for TrialGuard {
     }
 }
 
-/// A trial capture pinned while the job's ladder runs: unpinned on drop, however the
-/// job ends, unless it was pinned already (then this neither pinned nor unpins it).
+/// A trial capture pinned while the job's ladder runs (stored pinned by
+/// [`crate::bursts::BurstStore::write_trial`]): unpinned on drop, however the job ends.
 struct Pinned {
     store: Arc<crate::bursts::BurstStore>,
     id: String,
-    /// Whether this guard pinned it.
-    ours: bool,
-}
-
-impl Pinned {
-    /// Pin `id` in `store`; the store's refusal, worded, when it cannot.
-    fn new(store: Arc<crate::bursts::BurstStore>, id: &str) -> Result<Self, String> {
-        let ours = !store.get(id).is_some_and(|r| r.pinned);
-        if ours {
-            store.pin(id).map_err(|e| e.to_string())?;
-        }
-        Ok(Self {
-            store,
-            id: id.to_string(),
-            ours,
-        })
-    }
 }
 
 impl Drop for Pinned {
     fn drop(&mut self) {
-        if self.ours {
-            let _ = self.store.unpin(&self.id);
-        }
+        let _ = self.store.unpin(&self.id);
     }
 }
 
