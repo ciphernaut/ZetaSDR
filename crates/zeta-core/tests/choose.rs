@@ -773,6 +773,189 @@ async fn two_chooses_never_run_more_trials_than_the_policy_allows() {
     assert_eq!(node.test_trial_peak(), 1);
 }
 
+/// The default choice policy with `concurrent` trial slots and `trial_s` of trials.
+#[cfg(feature = "test-fixtures")]
+async fn trial_budget(node: &Node, concurrent: u32, trial_s: u32) {
+    let mut policy = ChoicePolicy::default();
+    policy.budget.concurrent = concurrent;
+    policy.budget.trial_s = trial_s;
+    let r = node
+        .apply(Op::ChoicePolicySet {
+            policy: Some(policy),
+            lease: None,
+        })
+        .await;
+    assert!(matches!(r, Ok(OpResult::ChoicePolicy(_))), "{r:?}");
+}
+
+/// How long a test hook's step-3 trial waits for a slot it is expected to get.
+#[cfg(feature = "test-fixtures")]
+const SLOT_WITHIN: Duration = Duration::from_secs(5);
+
+/// Whether a replay runs now.
+#[cfg(feature = "test-fixtures")]
+fn a_replay_runs(node: &Node) -> bool {
+    replays(node).iter().any(|r| r.state == JobState::Running)
+}
+
+/// The step-2 trials of a `choose` context that ran a replay.
+#[cfg(feature = "test-fixtures")]
+fn replayed(ctx: &Value) -> Vec<&Value> {
+    ctx["trials"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|t| t["step"] == 2 && t["job"].is_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// The step-3 slots a test holds stand for other chooses' dwells (a test hook).
+#[cfg(feature = "test-fixtures")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_starts_while_live_trials_hold_every_slot_but_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &voice_iq(), DMR_HZ, 10.0).await;
+    trial_budget(&node, 3, 30).await;
+    // Two step-3 dwells hold two of the three slots; a third waits, as one slot is kept
+    // for replays.
+    let mut dwells = Vec::new();
+    for _ in 0..2 {
+        let slot = node.test_live_trial_slot(SLOT_WITHIN).await;
+        dwells.push(slot.expect("a step-3 trial takes a free slot"));
+    }
+    let third = node.test_live_trial_slot(ENDS_WITHIN);
+    tokio::pin!(third);
+    tokio::select! {
+        _ = &mut third => panic!("a third step-3 trial took the replays' slot"),
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    // The replay starts while the dwells hold their slots and the third still waits.
+    tokio::select! {
+        _ = &mut third => panic!("a third step-3 trial took the replays' slot"),
+        _ = until("a replay runs beside the dwells", ENDS_WITHIN, || a_replay_runs(&node)) => {}
+    }
+    let ctx = ended(&node, &id).await;
+    assert!(!replayed(&ctx).is_empty(), "{ctx:#}");
+    assert_eq!(node.test_live_trial_peak(), 2);
+    assert!(node.test_trial_peak() <= 3, "{}", node.test_trial_peak());
+    drop(dwells);
+    // The slots given back, the third step-3 trial is served.
+    assert!(
+        third.await.is_some(),
+        "the third step-3 trial never got a slot"
+    );
+}
+
+#[cfg(feature = "test-fixtures")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_replay_is_served_before_a_waiting_live_trial() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &voice_iq(), DMR_HZ, 10.0).await;
+    trial_budget(&node, 1, 30).await;
+    // One step-3 dwell holds the only slot; a second step-3 trial waits for it first.
+    let first = node.test_live_trial_slot(SLOT_WITHIN).await;
+    let first = first.expect("a step-3 trial takes the free slot");
+    let second = node.test_live_trial_slot(ENDS_WITHIN);
+    tokio::pin!(second);
+    tokio::select! {
+        _ = &mut second => panic!("a step-3 trial was served while the slot is held"),
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    // Then the choose's replay waits behind it too.
+    tokio::select! {
+        _ = &mut second => panic!("a step-3 trial was served while the slot is held"),
+        _ = until("the choose's replay waits for a slot", ENDS_WITHIN, || {
+            node.test_replays_waiting() == 1
+        }) => {}
+    }
+    assert!(!a_replay_runs(&node));
+    drop(first);
+    // The slot given back goes to the replay, not the step-3 trial that waited longer.
+    tokio::select! {
+        _ = &mut second => panic!("the waiting step-3 trial was served before the replay"),
+        _ = until("the replay runs", ENDS_WITHIN, || a_replay_runs(&node)) => {}
+    }
+    // The step-3 trial is served once no replay waits, and the choose still ends.
+    let second = second.await;
+    assert!(
+        second.is_some(),
+        "the waiting step-3 trial never got a slot"
+    );
+    drop(second);
+    let ctx = ended(&node, &id).await;
+    assert!(!replayed(&ctx).is_empty(), "{ctx:#}");
+}
+
+/// The running trial jobs on the live band a `choose` owns (its step 3).
+#[cfg(feature = "test-fixtures")]
+fn live_trial_jobs(node: &Node, owner: &JobId) -> Vec<zeta_core::job::JobRecord> {
+    node.job_list()
+        .into_iter()
+        .filter(|r| {
+            r.state == JobState::Running && r.owner.as_ref() == Some(owner) && r.replay.is_none()
+        })
+        .collect()
+}
+
+#[cfg(feature = "test-fixtures")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_one_slot_live_and_replay_share_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &voice_iq(), DMR_HZ, 10.0).await;
+    trial_budget(&node, 1, 15).await;
+    // A rigid job holds the capture, so step 3 may share it.
+    let fm = start_fm(&node).await;
+    let a = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 3})),
+    )
+    .await;
+    until("the first choose dwells at step 3", ENDS_WITHIN, || {
+        !live_trial_jobs(&node, &a).is_empty()
+    })
+    .await;
+    // A second choose's replays share the one slot with the first's dwells.
+    let b = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let running = |id: &JobId| state(&node, id) == Some(JobState::Running);
+    let deadline = tokio::time::Instant::now() + ENDS_WITHIN;
+    while running(&a) || running(&b) {
+        let replaying = replays(&node)
+            .into_iter()
+            .filter(|r| r.state == JobState::Running)
+            .count();
+        let dwelling = live_trial_jobs(&node, &a).len();
+        assert!(replaying + dwelling <= 1, "{replaying} + {dwelling}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the chooses never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let ctx_a = ended(&node, &a).await;
+    assert!(!live_trials(&ctx_a).is_empty(), "{ctx_a:#}");
+    let ctx_b = ended(&node, &b).await;
+    assert!(!replayed(&ctx_b).is_empty(), "{ctx_b:#}");
+    assert_eq!(node.test_trial_peak(), 1);
+    assert_eq!(node.test_live_trial_peak(), 1);
+    assert_eq!(state(&node, &fm), Some(JobState::Running));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_choose_leaves_no_replay_record() {
     let dir = tempfile::tempdir().unwrap();

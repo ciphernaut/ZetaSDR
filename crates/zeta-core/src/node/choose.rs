@@ -16,7 +16,10 @@
 //! slices other chooses have pinned, is not tried, and `not_tried` says why. Step 3
 //! tries the rows still in `could_prove` on the live band, one at a time in score order
 //! within what is left of `budget.trial_s` ([`Inner::step_three`]), each holding one of
-//! the node's trial slots: each as an ordinary job the `choose` owns, started only where
+//! the node's trial slots. Step 3's trials hold every slot but one between them (with
+//! one slot, that one), and a waiting replay is served before a waiting step-3 trial
+//! ([`TrialClass`]), so a new signal's replay does not queue behind another's dwell.
+//! Each step-3 trial runs as an ordinary job the `choose` owns, started only where
 //! a running capture already holds the row's band (lease setting `share`), or after
 //! growing a held capture to hold it, every holder keeping its band (`widen`). A trial's
 //! lease gives way to any foreground request that changes the capture.
@@ -97,10 +100,13 @@ pub(super) struct Choosing {
     /// Held across a slice's sizing, write and pin ([`Inner::write_slice`]), so two
     /// chooses never both fit beside the same pinned bytes.
     slice_gate: std::sync::Mutex<()>,
-    /// The trials running now across every `choose` ([`Inner::trial_slot`]).
-    trials: std::sync::Mutex<u32>,
+    /// The trials running now across every `choose`, by class, and the replays waiting
+    /// for a slot ([`Inner::trial_slot`]).
+    slots: std::sync::Mutex<Slots>,
     /// The most trials ever running at once (tests).
     peak: AtomicU32,
+    /// The most step-3 trials ever running at once (tests).
+    live_peak: AtomicU32,
     /// Woken whenever a trial ends, for the trials waiting for a slot.
     freed: tokio::sync::Notify,
     /// The step 1 a watch hands its `choose` child ([`StepOne`]), by the child's id, until
@@ -144,16 +150,79 @@ pub(super) struct StepOne {
     pub choice: Choice,
 }
 
+/// What a trial slot is for ([`Inner::trial_slot`]). Both classes share the policy's
+/// `budget.concurrent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TrialClass {
+    /// A step-2 replay of a trial slice: served before any waiting `Live` trial, as it
+    /// holds its slot about its slice's length.
+    Replay,
+    /// A step-3 trial on the live band, holding its slot for its dwell: at most
+    /// [`live_limit`] at once, so one slot is kept for replays.
+    Live,
+}
+
+/// The most step-3 trials that may run at once under `concurrent` slots: every slot but
+/// one, and with one slot, that one.
+fn live_limit(concurrent: u32) -> u32 {
+    concurrent.saturating_sub(1).max(1)
+}
+
+/// The node's trial slots in use, by class, and the replays waiting for one.
+#[derive(Default)]
+struct Slots {
+    replay: u32,
+    live: u32,
+    replays_waiting: u32,
+}
+
+impl Slots {
+    /// Whether a trial of `class` may take a slot now, under `concurrent` slots: any
+    /// free slot for a replay; for a step-3 trial, a free slot under [`live_limit`] while
+    /// no replay waits.
+    fn admits(&self, class: TrialClass, concurrent: u32) -> bool {
+        let limit = concurrent.max(1);
+        let free = self.replay + self.live < limit;
+        match class {
+            TrialClass::Replay => free,
+            TrialClass::Live => free && self.live < live_limit(limit) && self.replays_waiting == 0,
+        }
+    }
+
+    /// The count of running trials of `class`.
+    fn running(&mut self, class: TrialClass) -> &mut u32 {
+        match class {
+            TrialClass::Replay => &mut self.replay,
+            TrialClass::Live => &mut self.live,
+        }
+    }
+}
+
 /// One running trial's slot ([`Inner::trial_slot`]), given back on drop.
 struct TrialSlot {
     inner: Arc<Inner>,
+    class: TrialClass,
 }
 
 impl Drop for TrialSlot {
     fn drop(&mut self) {
         let c = &self.inner.choosing;
-        *c.trials.lock().unwrap() -= 1;
+        *c.slots.lock().unwrap().running(self.class) -= 1;
         c.freed.notify_waiters();
+    }
+}
+
+/// A replay counted as waiting for a slot ([`Slots::replays_waiting`]) while it lives,
+/// however its wait ends.
+struct ReplayWaiting<'a> {
+    choosing: &'a Choosing,
+}
+
+impl Drop for ReplayWaiting<'_> {
+    fn drop(&mut self) {
+        self.choosing.slots.lock().unwrap().replays_waiting -= 1;
+        // A step-3 trial held back only by this replay may go now.
+        self.choosing.freed.notify_waiters();
     }
 }
 
@@ -165,11 +234,40 @@ impl Node {
         self.inner.choosing.peak.load(Ordering::SeqCst)
     }
 
+    /// Tests only: the most step-3 trials that ever ran at once across the node's
+    /// chooses (a [`Node::test_live_trial_slot`] counted too).
+    pub fn test_live_trial_peak(&self) -> u32 {
+        self.inner.choosing.live_peak.load(Ordering::SeqCst)
+    }
+
+    /// Tests only: how many step-2 replays wait for a trial slot now.
+    pub fn test_replays_waiting(&self) -> u32 {
+        self.inner.choosing.slots.lock().unwrap().replays_waiting
+    }
+
+    /// Tests only: a step-3 trial's slot, as a dwell would hold it, waited for up to
+    /// `within`; `None` when none came free. Held until the answer is dropped.
+    pub async fn test_live_trial_slot(&self, within: Duration) -> Option<TestTrialSlot> {
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + within;
+        let slot = self
+            .inner
+            .trial_slot(TrialClass::Live, &cancel, deadline)
+            .await;
+        slot.map(|slot| TestTrialSlot { _slot: slot })
+    }
+
     /// Tests only: how many bands the node's chooses classified themselves (a watch's
     /// child takes the watch's step 1 instead).
     pub fn test_choose_classifications(&self) -> u64 {
         self.inner.choosing.classified.load(Ordering::SeqCst)
     }
+}
+
+/// Tests only: a trial slot [`Node::test_live_trial_slot`] holds, given back on drop.
+#[cfg(feature = "test-fixtures")]
+pub struct TestTrialSlot {
+    _slot: TrialSlot,
 }
 
 /// What a `choose` was asked, resolved at `job_start`: the first members of its
@@ -552,29 +650,44 @@ impl Inner {
         self.choosing.seeds.lock().unwrap().remove(id);
     }
 
-    /// A slot for one trial, waited for while the node's chooses already run the current
-    /// policy's `budget.concurrent` between them: `None` when `cancel` fires or
-    /// `deadline` passes first.
+    /// A slot for one trial of `class`, waited for while the node's chooses already run
+    /// the current policy's `budget.concurrent` between them ([`Slots::admits`]): a
+    /// step-3 trial also while [`live_limit`] step-3 trials run, or while a replay waits.
+    /// `None` when `cancel` fires or `deadline` passes first.
     async fn trial_slot(
         self: &Arc<Self>,
+        class: TrialClass,
         cancel: &CancellationToken,
         deadline: Instant,
     ) -> Option<TrialSlot> {
         let c = &self.choosing;
+        // Counted from the first refusal to the end of the wait, however it ends.
+        let mut waiting = None;
         loop {
             let freed = c.freed.notified();
             tokio::pin!(freed);
             // Registered before the count is read: a slot given back meanwhile wakes it.
             freed.as_mut().enable();
             {
-                let limit = self.choice_policy.lock().unwrap().budget.concurrent.max(1);
-                let mut running = c.trials.lock().unwrap();
-                if *running < limit {
-                    *running += 1;
-                    c.peak.fetch_max(*running, Ordering::SeqCst);
+                let concurrent = self.choice_policy.lock().unwrap().budget.concurrent;
+                let mut slots = c.slots.lock().unwrap();
+                if slots.admits(class, concurrent) {
+                    *slots.running(class) += 1;
+                    c.peak
+                        .fetch_max(slots.replay + slots.live, Ordering::SeqCst);
+                    if class == TrialClass::Live {
+                        c.live_peak.fetch_max(slots.live, Ordering::SeqCst);
+                    }
+                    drop(slots);
+                    drop(waiting);
                     return Some(TrialSlot {
                         inner: self.clone(),
+                        class,
                     });
+                }
+                if class == TrialClass::Replay && waiting.is_none() {
+                    slots.replays_waiting += 1;
+                    waiting = Some(ReplayWaiting { choosing: c });
                 }
             }
             tokio::select! {
@@ -661,7 +774,7 @@ impl Inner {
                 continue;
             }
             // Held for the trial: the node's trials share `budget.concurrent`.
-            let Some(_slot) = self.trial_slot(&r.cancel, deadline).await else {
+            let Some(_slot) = self.trial_slot(TrialClass::Live, &r.cancel, deadline).await else {
                 if r.cancel.is_cancelled() {
                     return Err(StageError::Cancelled);
                 }
@@ -1252,7 +1365,10 @@ async fn replay_trial(
     let Some(mode) = modes.get(&row) else {
         return Ok((trial(None, "unavailable", format!("no row {row}")), None));
     };
-    let Some(_slot) = inner.trial_slot(&settle, deadline).await else {
+    let Some(_slot) = inner
+        .trial_slot(TrialClass::Replay, &settle, deadline)
+        .await
+    else {
         return Err(row);
     };
     let feed = inner
@@ -1446,6 +1562,32 @@ mod tests {
             t["settled"],
             serde_json::json!({"row": "dmr_decode", "step": 3, "settled": "proved"})
         );
+    }
+
+    /// A step-3 trial takes every slot but one, and none while a replay waits; a replay
+    /// takes any free slot; with one slot, either takes it.
+    #[test]
+    fn step_three_leaves_a_slot_for_replays_and_waits_behind_them() {
+        let slots = |replay, live, replays_waiting| Slots {
+            replay,
+            live,
+            replays_waiting,
+        };
+        let (r, l) = (TrialClass::Replay, TrialClass::Live);
+        assert!(slots(0, 1, 0).admits(l, 3));
+        assert!(!slots(0, 2, 0).admits(l, 3));
+        assert!(slots(0, 2, 0).admits(r, 3));
+        assert!(!slots(1, 2, 0).admits(r, 3));
+        assert!(!slots(1, 0, 1).admits(l, 3));
+        assert!(slots(1, 0, 0).admits(l, 3));
+        // One slot: shared, nothing kept back.
+        assert!(slots(0, 0, 0).admits(l, 1));
+        assert!(slots(0, 0, 0).admits(r, 1));
+        assert!(!slots(0, 1, 0).admits(r, 1));
+        assert!(!slots(0, 0, 1).admits(l, 1));
+        // A policy of 0 slots is read as 1.
+        assert!(slots(0, 0, 0).admits(l, 0));
+        assert_eq!((live_limit(1), live_limit(2), live_limit(3)), (1, 1, 2));
     }
 
     const S: u64 = 1_000_000_000;
