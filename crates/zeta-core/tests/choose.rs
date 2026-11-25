@@ -322,6 +322,10 @@ async fn choose_on_voice_stays_fm_demod() {
     for t in ctx["trials"].as_array().unwrap() {
         assert_ne!(t["outcome"], "proved", "{t}");
     }
+    // A best guess leaves its slice without a training record.
+    let slices = trials(&node);
+    assert_eq!(slices.len(), 1, "{slices:?}");
+    assert_eq!(slices[0].training, None, "{slices:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -604,6 +608,7 @@ async fn stopping_a_choose_in_step_two_stops_its_replays_and_unpins_the_slice() 
     let t = trials(&node);
     assert_eq!(t.len(), 1, "{t:?}");
     assert!(!t[0].pinned, "{t:?}");
+    assert_eq!(t[0].training, None, "{t:?}");
     // Stopped before a verdict.
     let ctx = node.job_context(&id).unwrap();
     assert!(ctx["choose"]["verdict"].is_null(), "{ctx:#}");
@@ -687,7 +692,8 @@ async fn step_three_proves_on_the_live_band_under_share() {
             .is_some_and(|e| e.starts_with("decode dmr_decode: "))),
         "{v}"
     );
-    // Step 2 had no slice to replay: nothing was written.
+    // Step 2 had no slice to replay: nothing was written, so no record either (the
+    // training record of a step-3 proof is unit-tested in node/choose.rs).
     assert!(reasons(v).contains(&POLICY_SLICE_SHORT), "{v}");
     assert!(trials(&node).is_empty(), "{:?}", node.bursts().list());
     let live = live_trials(&ctx);

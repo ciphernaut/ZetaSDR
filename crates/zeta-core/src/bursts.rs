@@ -338,19 +338,26 @@ impl BurstStore {
         })
     }
 
-    /// Set the training record of the capture `id`: its index entry is rewritten
-    /// atomically, as [`pin`](Self::pin) does. The capture's expiry is unchanged.
+    /// Set the training record of the capture `id`: written into its `.sigmf-meta` as
+    /// `zeta:training` (atomically, so an index rebuilt from the metas keeps it), then
+    /// its index entry rewritten atomically, as [`pin`](Self::pin) does. A failure
+    /// leaves the previous record in memory and in the meta. The capture's expiry is
+    /// unchanged.
     pub fn annotate(&self, id: &str, training: Value) -> Result<(), StoreError> {
         let mut index = self.index.lock().unwrap();
         let rec = index
             .iter_mut()
             .find(|r| r.id == id)
             .ok_or_else(|| StoreError::Unknown(id.into()))?;
+        let meta_path = rec.meta_path.clone();
+        write_meta_training(&meta_path, Some(&training))
+            .map_err(|e| StoreError::Io(e.to_string()))?;
         let before = rec.training.replace(training);
         self.persist(&index).map_err(|e| {
             if let Some(r) = index.iter_mut().find(|r| r.id == id) {
-                r.training = before;
+                r.training = before.clone();
             }
+            let _ = write_meta_training(&meta_path, before.as_ref());
             StoreError::Io(e.to_string())
         })
     }
@@ -468,6 +475,22 @@ impl BurstStore {
     }
 }
 
+/// Set (or, with `None`, remove) `zeta:training` in the first annotation of the
+/// `.sigmf-meta` at `path`: a temp file, then a rename.
+fn write_meta_training(path: &Path, training: Option<&Value>) -> std::io::Result<()> {
+    let mut json: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let ann = json["annotations"][0]
+        .as_object_mut()
+        .ok_or_else(|| std::io::Error::other("the meta has no annotation"))?;
+    match training {
+        Some(t) => ann.insert("zeta:training".into(), t.clone()),
+        None => ann.remove("zeta:training"),
+    };
+    let tmp = path.with_extension("sigmf-meta.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&json)?)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// Rebuild the records from the `.sigmf-meta` files in `dir`, each read from its
 /// `zeta:` annotation; a meta that does not read, or without its data file, is skipped.
 /// `written_ns` is the data file's modification time.
@@ -531,7 +554,7 @@ fn record_from_meta(meta_path: &Path) -> Option<CaptureRecord> {
         pinned: false,
         written_ns,
         trial: ann["zeta:trial"].as_bool().unwrap_or(false),
-        training: None,
+        training: Some(ann["zeta:training"].clone()).filter(|v| !v.is_null()),
     })
 }
 
@@ -769,6 +792,75 @@ mod tests {
         let b = s.write(new_capture(t(2)), &samples()).unwrap();
         assert!(s.get(&trial.id).is_some());
         assert!(s.get(&a.id).is_none() && s.get(&b.id).is_some());
+    }
+
+    fn training() -> Value {
+        serde_json::json!({"sources": [], "settled": {"row": "dmr_decode", "step": 2}})
+    }
+
+    #[test]
+    fn annotate_an_unknown_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path(), u64::MAX);
+        assert_eq!(
+            s.annotate("nope", training()),
+            Err(StoreError::Unknown("nope".into()))
+        );
+    }
+
+    #[test]
+    fn an_annotation_survives_a_reopen_and_a_rebuilt_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path(), u64::MAX);
+        let rec = s.write(trial_capture(t(0)), &samples()).unwrap();
+        s.annotate(&rec.id, training()).unwrap();
+        drop(s);
+        let back = store(dir.path(), u64::MAX);
+        assert_eq!(back.get(&rec.id).unwrap().training, Some(training()));
+        drop(back);
+        // An unreadable index is rebuilt from the metas.
+        std::fs::write(dir.path().join(BURSTS_DIR).join(INDEX_FILE), b"not json").unwrap();
+        let rebuilt = store(dir.path(), u64::MAX);
+        let r = rebuilt.get(&rec.id).unwrap();
+        assert_eq!(r.training, Some(training()));
+        assert!(r.trial);
+    }
+
+    #[test]
+    fn a_failed_annotate_keeps_the_previous_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path(), u64::MAX);
+        let rec = s.write(trial_capture(t(0)), &samples()).unwrap();
+        s.annotate(&rec.id, training()).unwrap();
+        // A directory where the index's temp file goes makes its write fail.
+        let tmp = dir
+            .path()
+            .join(BURSTS_DIR)
+            .join(format!("{INDEX_FILE}.tmp"));
+        std::fs::create_dir(&tmp).unwrap();
+        let other = serde_json::json!({"settled": {"row": "other"}});
+        assert!(matches!(s.annotate(&rec.id, other), Err(StoreError::Io(_))));
+        assert_eq!(s.get(&rec.id).unwrap().training, Some(training()));
+        let meta: Value = serde_json::from_slice(&std::fs::read(&rec.meta_path).unwrap()).unwrap();
+        assert_eq!(meta["annotations"][0]["zeta:training"], training());
+    }
+
+    #[test]
+    fn an_annotated_trial_still_expires_under_the_trial_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WINDOW as u64 * 8;
+        let s = two_budgets(dir.path(), w * 10, w);
+        let a = s.write(trial_capture(t(0)), &samples()).unwrap();
+        s.annotate(&a.id, training()).unwrap();
+        assert!(!s.get(&a.id).unwrap().pinned);
+        // The quota holds one: the next trial takes the annotated one's place.
+        let b = s.write(trial_capture(t(1)), &samples()).unwrap();
+        assert!(s.get(&a.id).is_none() && !a.data_path.exists());
+        assert!(s.get(&b.id).is_some());
+        // An annotated trial counts: the older one goes when it is the newest.
+        s.annotate(&b.id, training()).unwrap();
+        let c = s.write(trial_capture(t(2)), &samples()).unwrap();
+        assert!(s.get(&b.id).is_none() && s.get(&c.id).is_some());
     }
 
     #[test]

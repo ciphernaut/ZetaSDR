@@ -98,7 +98,7 @@ pub struct Choice {
 }
 
 /// The catalogue entry a layer-2 catalogue label names (its evidence `catalogue <id>: ...`).
-fn catalogue_entry(label: &Label) -> Option<&str> {
+pub(crate) fn catalogue_entry(label: &Label) -> Option<&str> {
     if label.layer != 2 {
         return None;
     }

@@ -39,7 +39,9 @@ use super::identify::{Attempt, NotStarted, ProofFrom, TrialLease, Trier};
 use super::launch::{AfterGate, Ending, StageRunning, supervise};
 use super::persist::now;
 use super::{Inner, Node, NodeError, REPLAY_SOURCE, source_fault_reason};
-use crate::choice::{Alternative, Choice, ChoiceJob, NotTried, Settled, choose_now, job_for};
+use crate::choice::{
+    Alternative, Choice, ChoiceJob, NotTried, Settled, catalogue_entry, choose_now, job_for,
+};
 use crate::choice_policy::{Budget, LeaseSetting, Surface};
 use crate::classify::{Classification, Measurement};
 use crate::graph::{Graph, GraphId};
@@ -716,10 +718,11 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
     if let Some(s) = &slice
         && choice.settled == Settled::Proved
         && (2..=3).contains(&choice.step)
-    {
-        let _ = inner
+        && let Err(e) = inner
             .bursts
-            .annotate(&s.id, training_record(&classified, &choice));
+            .annotate(&s.id, training_record(&classified, &choice))
+    {
+        eprintln!("zeta: choose {}: training record: {e}", r.id.0);
     }
     // Unpinned before the verdict's job starts and the verdict is published.
     drop(slice);
@@ -763,12 +766,14 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
 /// label, the catalogue's, a learned signature's, layer 3's) and the answer.
 fn training_record(c: &Classification, choice: &Choice) -> Value {
     let layer1 = c.measurement.iter().map(|m| ("layer1", &m.label));
+    // A label's source is read from its layer and, in layer 2, from the evidence
+    // convention of the catalogue and the name prefix of the learned signatures.
     let others = c.labels.iter().filter_map(|l| match l.layer {
         1 => None,
         3 => Some(("layer3", l)),
-        2 if l.evidence.starts_with("catalogue ") => Some(("catalogue", l)),
+        2 if catalogue_entry(l).is_some() => Some(("catalogue", l)),
         2 if l.name.starts_with(crate::learned::LEARNED) => Some(("learned", l)),
-        _ => None,
+        _ => Some(("layer2", l)),
     });
     let sources: Vec<Value> = layer1
         .chain(others)
@@ -1112,6 +1117,61 @@ fn slice_span(run_start_ns: u64, latest_ns: u64, slice_s: f32) -> Option<(u64, u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn label(layer: u8, name: &str, evidence: &str) -> crate::classify::Label {
+        crate::classify::Label {
+            layer,
+            name: name.into(),
+            confidence: 0.5,
+            evidence: evidence.into(),
+        }
+    }
+
+    /// Each layer's labels keep their source; a layer-2 label of neither convention is
+    /// kept as `layer2`, never dropped; the answer is the choice's row, step and settled.
+    #[test]
+    fn a_training_record_names_each_source_and_the_answer() {
+        let c = Classification {
+            labels: vec![
+                label(2, "MPT 1327", "catalogue mpt: 1327"),
+                label(2, "learned pager", "learned abc: centre"),
+                label(2, "other", "something else"),
+                label(3, "dmr", ""),
+            ],
+            ..Classification::default()
+        };
+        let choice = Choice {
+            job: None,
+            row: Some("dmr_decode".into()),
+            step: 3,
+            settled: Settled::Proved,
+            evidence: vec![],
+            runner_up: None,
+            could_prove: vec![],
+            not_tried: vec![],
+            reason: None,
+        };
+        let t = training_record(&c, &choice);
+        let got: Vec<(&str, &str)> = t["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["source"].as_str().unwrap(), s["guess"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("catalogue", "MPT 1327"),
+                ("learned", "learned pager"),
+                ("layer2", "other"),
+                ("layer3", "dmr")
+            ]
+        );
+        assert_eq!(
+            t["settled"],
+            serde_json::json!({"row": "dmr_decode", "step": 3, "settled": "proved"})
+        );
+    }
 
     const S: u64 = 1_000_000_000;
 
