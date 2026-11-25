@@ -17,7 +17,8 @@ use zeta_core::port::Port;
 use zeta_core::stage::{Backend, StageRegistry};
 use zeta_core::types::{Hz, Selection, SourceId, Span, Timestamp};
 use zeta_dsp::synth::{
-    am_modulate, awgn, nbfm_modulate, pocsag_packet_iq, ssb_modulate, tone, wfm_stereo_modulate,
+    KeyedOver, am_modulate, awgn, keyed_over, nbfm_modulate, pocsag_packet_iq, ssb_modulate, tone,
+    wfm_stereo_modulate,
 };
 use zeta_source_file::{FileOpts, FileSource};
 
@@ -922,45 +923,10 @@ fn identify_ranks_the_decoders_as_before() {
     assert_eq!(none.could_prove, licensed.could_prove, "{licensed:?}");
 }
 
-/// Placeholder for track A's keyed-over generator (`zeta_dsp::synth::{KeyedOver,
-/// keyed_over}`), which has not landed on this branch: the same fields, a carrier keyed
-/// up over the whole window only. PLAN 49: delete this module, and the `use` of it in
-/// the test below, when the tracks merge.
-mod keyed_over_placeholder {
-    use num_complex::Complex;
-    use zeta_dsp::synth::{awgn, nbfm_modulate};
-
-    pub struct KeyedOver {
-        pub rate_hz: u32,
-        pub seconds: f32,
-        pub deviation_hz: f64,
-        pub audio: f32,
-        pub on: (f64, f64),
-        pub snr_db: f32,
-        pub seed: u64,
-    }
-
-    pub fn keyed_over(spec: &KeyedOver) -> Vec<Complex<f32>> {
-        assert_eq!(
-            spec.on,
-            (0.0, 1.0),
-            "the placeholder keys the whole window only"
-        );
-        assert_eq!(spec.audio, 0.0, "the placeholder holds a pause only");
-        let n = (f64::from(spec.rate_hz) * f64::from(spec.seconds)).round() as usize;
-        let audio = vec![0.0_f32; n];
-        let mut iq = nbfm_modulate(&audio, spec.rate_hz, spec.rate_hz, spec.deviation_hz, 0.0);
-        awgn(&mut iq, spec.snr_db, spec.seed);
-        iq
-    }
-}
-
 /// UAT 48.6 through the operation: a pause in a keyed over (the carrier up, no audio) on
 /// a plan channel, in noise, chooses `fm_demod` whatever layer 1 reads it as.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "plan 49: needs track A's keyed-over generator"]
 async fn a_keyed_over_in_a_pause_on_a_plan_channel_chooses_fm_demod() {
-    use keyed_over_placeholder::{KeyedOver, keyed_over};
     let channel = cb_channel_hz();
     for snr_db in [36.0, 15.0] {
         let dir = tempfile::tempdir().unwrap();
@@ -1138,4 +1104,33 @@ fn the_demodulators_width_is_no_narrower_than_the_riders_min() {
     let c = proved_by(measured("wfm", STATION_HZ, 280_000), "rds_wide", "WIDE");
     let choice = choose_for(&modes, &c, 400_000);
     assert_eq!(job(&choice).bandwidth_hz, Hz(350_000), "{choice:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn classify_on_a_keyed_over_chooses_fm_demod() {
+    // Off every channel plan, so layer 1's label alone chooses.
+    const OVER_HZ: u64 = 470_000_000;
+    // Spec 3.1: a watch classifies the slice the moment it detects the key-up, noise and
+    // then the carrier; whether the carrier is up for 90 % of it or 15 %, it is FM.
+    for share in [0.9, 0.15] {
+        let dir = tempfile::tempdir().unwrap();
+        let iq = keyed_over(&KeyedOver {
+            rate_hz: RATE_HZ,
+            seconds: (SPAN_NS as f64 / 1e9) as f32,
+            deviation_hz: 2_500.0,
+            audio: 1.0,
+            on: (1.0 - share, 1.0),
+            snr_db: 15.0,
+            seed: 49,
+        });
+        let node = node_over(dir.path(), &iq, RATE_HZ, OVER_HZ).await;
+        let a = classify(&node, OVER_HZ, 12_500).await;
+        let c = &a.choice;
+        assert_eq!(job(c).kind, "fm_demod", "share {share}: {c:?}");
+        let duty = a.features.and_then(|f| f.duty).expect("a duty");
+        assert!(
+            (f64::from(duty) - share).abs() <= 0.05,
+            "share {share}: duty {duty}"
+        );
+    }
 }

@@ -842,3 +842,76 @@ fn a_keyed_am_over_reads_am_not_ook() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// Rule 9 weighs the phase's motion against the envelope's, both in Hz, so a rate in
+/// radians per sample does not decide it (spec 49.1, last bullet). A speech over weak
+/// enough that the noise puts its CV in rule 9's range (0.1 to 0.2) reads FM, whole or
+/// keyed up, in a 12.5 kHz selection of a 48 kS/s and of a 192 kS/s block, and over the
+/// whole of each block. In radians per sample its phase (650 Hz RMS) fell under the CV in
+/// the selections and it read `am`. Low-index AM (m 0.2) still reads `am` through rule 9 at
+/// both rates, over the whole block and in 12.5 kHz.
+#[test]
+fn rule_9_weighs_the_phase_against_the_envelope_at_48_and_192_ks() {
+    let mut failed = Vec::new();
+    // The SNR is over the whole rate: a 12.5 kHz selection of the 192 kS/s block holds
+    // 6 dB more of it than one of the 48 kS/s block, and a whole block less.
+    for (rate, band_hz, snr_db) in [
+        (48_000u32, 12_500u64, 6.0f32),
+        (48_000, 48_000, 12.0),
+        (192_000, 12_500, 0.0),
+        (192_000, 192_000, 12.0),
+    ] {
+        for on in [(0.0, 1.0), (0.4, 1.0)] {
+            let over = zeta_dsp::fixtures::KeyedOver {
+                rate_hz: rate,
+                seconds: 2.0,
+                deviation_hz: 2_500.0,
+                audio: 1.0,
+                on,
+                snr_db,
+                seed: 7,
+            };
+            let c = zeta_dsp::fixtures::KeyedOverCase {
+                name: format!(
+                    "over up from {} at {rate} S/s in {band_hz} Hz, {snr_db} dB",
+                    on.0
+                ),
+                share: on.1 - on.0,
+                band_hz,
+                over,
+            };
+            let (_, l) = keyed(&c);
+            eprintln!("{}: {} ({})", c.name, l.name, l.evidence);
+            let cvs = quoted_cvs(&l.evidence);
+            if !cvs.iter().all(|cv| (0.1..0.2).contains(cv)) {
+                failed.push(format!("{}: cv {cvs:?} outside rule 9's range", c.name));
+            }
+            if !matches!(l.name.as_str(), "fm" | "fsk") {
+                failed.push(format!("{}: {} ({})", c.name, l.name, l.evidence));
+            }
+        }
+    }
+    for rate in [48_000u32, 192_000] {
+        let audio = tone(rate, rate as usize, 1_000.0, 1.0);
+        let mut iq = am_modulate(&audio, rate, rate, 0.2, 0.0);
+        awgn(&mut iq, 20.0, 7);
+        for hz in [u64::from(rate), 12_500] {
+            let (_, l) = zeta_dsp::measure::measure_selection(
+                &iq,
+                u64::from(rate),
+                CENTER,
+                zeta_core::classify::Band {
+                    offset_hz: 0,
+                    bandwidth_hz: zeta_core::types::Hz(hz),
+                },
+            )
+            .expect("a measurement");
+            let what = format!("am m 0.2 at {rate} S/s in {hz} Hz");
+            eprintln!("{what}: {} ({})", l.name, l.evidence);
+            if l.name != "am" || !l.evidence.contains("phase rms") {
+                failed.push(format!("{what}: {} ({})", l.name, l.evidence));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

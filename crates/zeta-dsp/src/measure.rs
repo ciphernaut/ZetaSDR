@@ -62,7 +62,7 @@ const MIN_LINE_HZ: f64 = 50.0;
 const NOISE_SNR_DB: f32 = 6.0;
 /// FM needs discriminator audio (from `FM_MIN_AUDIO_HZ` to half the occupied band, its
 /// drift taken out) whose RMS deviation beyond the envelope's motion is above this
-/// ([`deviation_over_envelope_hz`]); below it a constant-envelope signal is a carrier.
+/// ([`Motion::over_hz`]); below it a constant-envelope signal is a carrier.
 /// Measured over the carrier where it is up, on generators:
 /// - a bare carrier, keyed or steady, and one drifting linearly by up to 3 kHz in 2 s, or
 ///   warming up by 1 kHz with a 0.2 s time constant, at 15 and 36 dB: at most 1 Hz over
@@ -109,7 +109,7 @@ const PILOT_REGION_HZ: (f64, f64) = (15_000.0, 23_000.0);
 /// AM and SSB: envelope coefficient of variation at least this.
 const AM_MIN_CV: f32 = 0.25;
 /// Low-index AM (below `AM_MIN_CV`): envelope coefficient of variation at
-/// least this, with a carrier line and less RMS phase deviation than cv.
+/// least this, with a carrier line and the phase moving less than the envelope, in Hz.
 const AM_LOW_MIN_CV: f32 = 0.1;
 /// AM carrier line: the sideband level is the mean power of the bins this far
 /// from the centre, either side.
@@ -765,12 +765,12 @@ fn tone_pair(
 ///    dial frequency [`ssb_dial_hz`] gives.
 /// 9. `"am"` (0.6) for low-index AM: the same centre line, a CV of at least 0.1 and an
 ///    envelope CV of at least 0.1 within half the occupied band (so wideband noise on a
-///    bare carrier does not pass), and an RMS phase deviation of the discriminator audio
-///    (radians per sample, band-limited as for `fm`) below the CV, so the envelope moves
-///    more than the phase.
+///    bare carrier does not pass), and the discriminator audio's RMS deviation below the
+///    envelope's motion measured alike, both in Hz ([`motion_hz`]), so the envelope moves
+///    more than the phase whatever the rate.
 /// 10. `"fm"` (0.6) when the CV is below 0.2, the band is at most 25 kHz and the
 ///     discriminator audio, drift taken out, deviates by more than 40 Hz RMS beyond the
-///     envelope's motion in the same band ([`deviation_over_envelope_hz`]: noise moves
+///     envelope's motion in the same band ([`Motion::over_hz`]: noise moves
 ///     both alike, AM only the envelope); `"carrier"` (0.7) under the same gate when it
 ///     does not: a keyed carrier with no modulation where it is up, or one that drifts,
 ///     reads `carrier`, its keying in `duty`, `bursts` and `burst_ms`.
@@ -828,19 +828,32 @@ fn audio_rms_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64, joins: &[u
     steps_rms_hz(discriminator(iq), &held, rate_hz, bandwidth_hz)
 }
 
+/// How much the phase and the envelope of the samples move, both in Hz ([`motion_hz`]).
+struct Motion {
+    /// [`audio_rms_hz`]: the discriminator audio's RMS deviation, Hz.
+    phase_hz: f64,
+    /// The same measure of the log envelope's steps, Hz.
+    envelope_hz: f64,
+}
+
+impl Motion {
+    /// The phase's deviation beyond the envelope's, in quadrature: what modulates the
+    /// frequency, since additive noise moves both alike.
+    fn over_hz(&self) -> f64 {
+        (self.phase_hz.powi(2) - self.envelope_hz.powi(2))
+            .max(0.0)
+            .sqrt()
+    }
+}
+
 /// [`audio_rms_hz`] of `iq` and the same measure of its envelope's motion: the steps of
 /// the log envelope, `ln |x[n+1]| - ln |x[n]|`, read as if they were phase steps, held,
 /// detrended and band-limited alike. Additive noise on a carrier moves its log envelope
-/// and its phase alike, AM moves only the envelope and FM only the phase, so the phase's
-/// deviation beyond the envelope's (in quadrature) is what modulates the frequency.
-fn deviation_over_envelope_hz(
-    iq: &[Complex<f32>],
-    rate_hz: u64,
-    bandwidth_hz: u64,
-    joins: &[usize],
-) -> (f64, f64) {
+/// and its phase alike, AM moves only the envelope and FM only the phase. Both are in
+/// Hz, so comparing them does not depend on the rate.
+fn motion_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64, joins: &[usize]) -> Motion {
     let held = held_steps(iq, joins);
-    let phase = steps_rms_hz(discriminator(iq), &held, rate_hz, bandwidth_hz);
+    let phase_hz = steps_rms_hz(discriminator(iq), &held, rate_hz, bandwidth_hz);
     let log_env: Vec<f32> = iq
         .windows(2)
         .zip(&held)
@@ -853,8 +866,10 @@ fn deviation_over_envelope_hz(
             }
         })
         .collect();
-    let envelope = steps_rms_hz(log_env, &held, rate_hz, bandwidth_hz);
-    (phase, (phase * phase - envelope * envelope).max(0.0).sqrt())
+    Motion {
+        phase_hz,
+        envelope_hz: steps_rms_hz(log_env, &held, rate_hz, bandwidth_hz),
+    }
 }
 
 /// The phase steps of `iq` that count as no deviation ([`audio_rms_hz`]): where either
@@ -1173,22 +1188,23 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
     if cv >= AM_LOW_MIN_CV {
         let carrier_db = centre_line_db(&db, bin_hz);
         if carrier_db >= OCCUPIED_DB {
-            let phase_rms = (audio_rms_hz(iq, rate_hz, bw, &joins) * 2.0 * std::f64::consts::PI
-                / rate_hz as f64) as f32;
+            let m = motion_hz(iq, rate_hz, bw, &joins);
             let band_cv = envelope_band_cv(iq, rate_hz, bw);
-            if phase_rms < cv && band_cv >= AM_LOW_MIN_CV {
+            if m.phase_hz < m.envelope_hz && band_cv >= AM_LOW_MIN_CV {
                 return (
                     "am",
                     0.6,
                     format!(
-                        "carrier line {carrier_db:.1} dB above the sidebands, envelope {band_cv:.3} in band, phase rms {phase_rms:.4} rad below the cv"
+                        "carrier line {carrier_db:.1} dB above the sidebands, envelope {band_cv:.3} in band, phase rms {:.0} Hz below the envelope's {:.0} Hz",
+                        m.phase_hz, m.envelope_hz
                     ),
                 );
             }
         }
     }
     if cv < FM_MAX_CV && f.bandwidth_hz.0 <= FM_MAX_BW_HZ {
-        let (dev, over) = deviation_over_envelope_hz(iq, rate_hz, f.bandwidth_hz.0, &joins);
+        let m = motion_hz(iq, rate_hz, f.bandwidth_hz.0, &joins);
+        let (dev, over) = (m.phase_hz, m.over_hz());
         if over < FM_MIN_DEV_HZ {
             return (
                 "carrier",
