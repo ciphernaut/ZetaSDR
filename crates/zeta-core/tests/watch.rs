@@ -3415,7 +3415,8 @@ async fn hold_ms_on_the_detect_node_replaces_the_silence_constant() {
     let job = decoded(&node, &events, &watch).await;
     let cap = |n: &Node| n.job_context(&watch).map(|c| c["watch"]["cap"].clone());
     until("cap counts the decoder", Duration::from_secs(5), || {
-        cap(&node) == Some(serde_json::json!({"max": 16, "decoding": 1, "waiting": 0}))
+        cap(&node)
+            == Some(serde_json::json!({"max": 16, "decoding": 1, "waiting": 0, "choosing": 0}))
     })
     .await;
     port.mute();
@@ -3431,7 +3432,8 @@ async fn hold_ms_on_the_detect_node_replaces_the_silence_constant() {
     assert_eq!(lost["job"], job.0.as_str(), "{lost}");
     assert_eq!(lost["why"], "gone and silent", "{lost}");
     until("cap counts nothing", Duration::from_secs(5), || {
-        cap(&node) == Some(serde_json::json!({"max": 16, "decoding": 0, "waiting": 0}))
+        cap(&node)
+            == Some(serde_json::json!({"max": 16, "decoding": 0, "waiting": 0, "choosing": 0}))
     })
     .await;
     stop_all(&node).await;
@@ -4090,7 +4092,8 @@ async fn capped(node: &Node, events: &Events, watch: &JobId) -> u64 {
         "the third page waits: {waiting}"
     );
     until("cap {2, 2, 1}", Duration::from_secs(5), || {
-        cap_of(node, watch) == serde_json::json!({"max": CAP, "decoding": 2, "waiting": 1})
+        cap_of(node, watch)
+            == serde_json::json!({"max": CAP, "decoding": 2, "waiting": 1, "choosing": 0})
     })
     .await;
     hz
@@ -4124,7 +4127,8 @@ async fn the_cap_queues_and_a_freed_slot_is_taken_by_rank() {
     )
     .await;
     until("cap {2, 2, 0}", Duration::from_secs(5), || {
-        cap_of(&node, &watch) == serde_json::json!({"max": CAP, "decoding": 2, "waiting": 0})
+        cap_of(&node, &watch)
+            == serde_json::json!({"max": CAP, "decoding": 2, "waiting": 0, "choosing": 0})
     })
     .await;
     assert!(waiting_signals(&node, &watch).is_empty());
@@ -6082,4 +6086,124 @@ async fn a_watch_stopped_while_choosing_starts_nothing_and_leaves_no_slice_pinne
         node.job_list()
     );
     assert!(events.watch("decoding").is_empty(), "{:#?}", events.all());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tried_signal_holds_its_slot_and_the_watch_says_so() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let _unknown = zeta_core::node::watch::test_labels_read("unknown");
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    set_trial_s(&node, 60).await;
+    let watch = start_choice_watch(&node, serde_json::json!({"max_decoders": 1})).await;
+    let events = Events::of(&node, &watch);
+    let (e, _child) = choosing(&events).await;
+    // A second signal well clear of the first, while the only slot is held by the try.
+    let other = e["signal"]["center_hz"].as_u64().unwrap() + 100_000;
+    announce(&node, &watch, "new", other, 10_000);
+    until("the second signal waits", Duration::from_secs(10), || {
+        !events.watch("waiting").is_empty()
+    })
+    .await;
+    let waiting = &events.watch("waiting")[0];
+    let want = format!(
+        "waiting at {:.4} MHz: 0 of 1 decoding, 1 choosing",
+        other as f64 / 1e6
+    );
+    assert_eq!(waiting["summary"], want.as_str(), "{waiting}");
+    until("cap counts the try", Duration::from_secs(5), || {
+        cap_of(&node, &watch)
+            == serde_json::json!({"max": 1, "decoding": 0, "waiting": 1, "choosing": 1})
+    })
+    .await;
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tried_signal_that_goes_stops_its_choose_and_is_let_go() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let _unknown = zeta_core::node::watch::test_labels_read("unknown");
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    // Long enough that the choose is still trying when its signal goes.
+    set_trial_s(&node, 60).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (_e, child) = choosing(&events).await;
+    until("the trial slice is pinned", Duration::from_secs(20), || {
+        trial_slices(&node).iter().any(|t| t.pinned)
+    })
+    .await;
+    port.mute();
+    let ctx = |key: &str| {
+        node.job_context(&watch)
+            .map(|c| c["watch"][key].clone())
+            .unwrap_or(Value::Null)
+    };
+    until(
+        "the choose stops and the signal is let go",
+        Duration::from_secs(30),
+        || {
+            state(&node, &child) != Some(JobState::Running)
+                && trial_slices(&node).iter().all(|t| !t.pinned)
+                && ctx("choosing") == serde_json::json!([])
+                && ctx("signals") == serde_json::json!([])
+        },
+    )
+    .await;
+    // Let go, not tried and failed: no unknown counted, nothing started.
+    assert!(events.watch("unknown").is_empty(), "{:#?}", events.all());
+    assert!(events.watch("decoding").is_empty(), "{:#?}", events.all());
+    assert_eq!(
+        running(&node)
+            .into_iter()
+            .map(|(_, k)| k)
+            .collect::<Vec<_>>(),
+        ["watch"]
+    );
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_beside_one_being_tried_starts_no_second_choose() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let _unknown = zeta_core::node::watch::test_labels_read("unknown");
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    set_trial_s(&node, 60).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (e, child) = choosing(&events).await;
+    let (center, width) = (
+        e["signal"]["center_hz"].as_u64().unwrap(),
+        e["signal"]["bandwidth_hz"].as_u64().unwrap(),
+    );
+    let (off, narrow) = (width / 3, (width / 4).max(1));
+    let signals = || {
+        node.job_context(&watch)
+            .and_then(|c| c["watch"]["signals"].as_array().cloned())
+            .unwrap_or_default()
+    };
+    // The tracked signal reads narrow above its first centre...
+    announce(&node, &watch, "new", center + off, narrow);
+    until("the track moves", Duration::from_secs(5), || {
+        signals()
+            .first()
+            .is_some_and(|s| s["center_hz"] == center + off)
+    })
+    .await;
+    // ...and a new one below it, clear of the track but inside the band being tried.
+    announce(&node, &watch, "new", center - off, narrow);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(events.watch("choosing").len(), 1, "{:#?}", events.all());
+    assert_eq!(signals().len(), 1, "{:#?}", signals());
+    let ctx = node.job_context(&watch).unwrap();
+    let choosing = ctx["watch"]["choosing"].as_array().unwrap();
+    assert_eq!(choosing.len(), 1, "{ctx}");
+    assert_eq!(choosing[0]["choose"], child.0.as_str(), "{ctx}");
+    assert_eq!(state(&node, &child), Some(JobState::Running));
+    stop_all(&node).await;
 }
