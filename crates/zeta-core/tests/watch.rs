@@ -5794,3 +5794,271 @@ async fn check_modes_list_accepts_a_demodulator_row() {
     assert!(packets.contains("attach[0]: packets"), "{packets}");
     stop_all(&node).await;
 }
+
+// A signal layer 1 cannot name (plan 49.4): with decoder rows that fit its width the
+// watch keeps nothing and tries them with its own `choose` (event `choosing`); a proof
+// starts the decoder, no proof is an unknown try. Layer 1 is made to read `unknown` with
+// `test_labels_read`: the DMR generator reads FM at the watch's capture rate, and
+// `unknown` only near the detector's floor, where the detector itself wavers.
+
+/// Thirty-one tones 1 kHz apart [`OFFSET_HZ`] above the centre, under 25 dB of noise: a
+/// flat band about 30 kHz wide, too wide for every 12.5 kHz row's fit and too narrow for
+/// a 200 kHz one's (the watch reads it twice as wide). The tones repeat every
+/// millisecond, so the looped file has no seam.
+fn cb_wide() -> Vec<Complex<f32>> {
+    let n = RATE_HZ as usize * 2;
+    let mut iq = vec![Complex::new(0.0_f32, 0.0); n];
+    for k in -15_i64..=15 {
+        let f = OFFSET_HZ as f64 + k as f64 * 1_000.0;
+        let step = Complex::from_polar(1.0, 2.0 * std::f64::consts::PI * f / RATE_HZ as f64);
+        let mut z = Complex::from_polar(0.1, (k * k * 37 % 360) as f64 * 0.0174533);
+        for s in iq.iter_mut() {
+            *s += Complex::new(z.re as f32, z.im as f32);
+            z *= step;
+        }
+    }
+    zeta_dsp::synth::awgn(&mut iq, 25.0, 25);
+    iq
+}
+
+/// The policy's budget with `trial_s` set on `node`.
+async fn set_trial_s(node: &Node, trial_s: u32) {
+    let mut policy = zeta_core::choice_policy::ChoicePolicy::default();
+    policy.budget.trial_s = trial_s;
+    let r = node
+        .apply(Op::ChoicePolicySet {
+            policy: Some(policy),
+            lease: None,
+        })
+        .await;
+    assert!(matches!(r, Ok(OpResult::ChoicePolicy(_))), "{r:?}");
+}
+
+/// The watch's first `choosing` event, once published: the event and its `choose` child.
+async fn choosing(events: &Events) -> (Value, JobId) {
+    until("a choosing event", Duration::from_secs(40), || {
+        !events.watch("choosing").is_empty()
+    })
+    .await;
+    let e = events.watch("choosing")[0].clone();
+    let child = JobId(e["job"].as_str().expect("the choose child").into());
+    (e, child)
+}
+
+/// The rows a `choosing` event names.
+fn rows_of(e: &Value) -> Vec<String> {
+    e["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The trial slices the node holds.
+fn trial_slices(node: &Node) -> Vec<zeta_core::bursts::CaptureRecord> {
+    node.bursts()
+        .list()
+        .into_iter()
+        .filter(|r| r.trial)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_tries_an_unknown_signal_and_starts_what_proves() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let _unknown = zeta_core::node::watch::test_labels_read("unknown");
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_dmr()).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (e, child) = choosing(&events).await;
+    let rows = rows_of(&e);
+    assert!(rows.iter().any(|r| r == "dmr_decode"), "{e}");
+    let summary = e["summary"].as_str().unwrap();
+    assert!(summary.starts_with("choosing at "), "{summary}");
+    assert!(summary.contains("dmr_decode"), "{summary}");
+    assert_ne!(child, watch);
+
+    // The proof starts the decoder, kept `via: choose`, the transcriber attached.
+    let job = decoded(&node, &events, &watch).await;
+    let rec = record(&node, &job).unwrap();
+    assert_eq!(rec.kind, "dmr_decode", "{:#?}", events.all());
+    assert_eq!(rec.held, None);
+    let d = &events.watch("decoding")[0];
+    assert_eq!(d["mode"], "dmr_decode", "{d}");
+    assert_eq!(d["via"], "choose", "{d}");
+    assert!(
+        d["summary"].as_str().unwrap().contains("proved at step"),
+        "{d}"
+    );
+    until(
+        "a transcriber on the decoder",
+        Duration::from_secs(10),
+        || {
+            attached_to(&node, &job).is_some_and(|t| {
+                decoding(&node, &watch)
+                    .first()
+                    .is_some_and(|d| d["attached"] == t.0.as_str() && d["via"] == "choose")
+            })
+        },
+    )
+    .await;
+    until("the choose is let go", Duration::from_secs(5), || {
+        node.job_context(&watch).is_some_and(|c| {
+            c["watch"]["choosing"]
+                .as_array()
+                .is_some_and(|a| a.is_empty())
+        })
+    })
+    .await;
+    // Nothing was started on a guess, and the signal was never unknown.
+    assert!(events.watch("unknown").is_empty(), "{:#?}", events.all());
+    assert!(
+        node.job_list().iter().all(|r| r.kind != "fm_demod"),
+        "{:?}",
+        running(&node)
+    );
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_whose_unknown_proves_nothing_counts_an_unknown_try() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let _unknown = zeta_core::node::watch::test_labels_read("unknown");
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    set_trial_s(&node, 3).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (e, child) = choosing(&events).await;
+    let rows = rows_of(&e);
+    assert!(rows.iter().any(|r| r == "dmr_decode"), "{e}");
+    // Nothing is kept while it tries.
+    assert!(decoding(&node, &watch).is_empty());
+    until("an unknown", Duration::from_secs(40), || {
+        !events.watch("unknown").is_empty()
+    })
+    .await;
+    let unknown = &events.watch("unknown")[0];
+    let summary = unknown["summary"].as_str().unwrap();
+    assert!(summary.contains("its choose proved none of"), "{summary}");
+    assert!(summary.contains("dmr_decode"), "{summary}");
+    assert_ne!(state(&node, &child), Some(JobState::Running));
+    // An unknown try as today: counted, retried later.
+    let ctx = node.job_context(&watch).unwrap();
+    let signal = &ctx["watch"]["signals"][0];
+    assert_eq!(signal["tries"], 1, "{ctx}");
+    assert_eq!(signal["handled"], false, "{ctx}");
+    assert!(signal["next_retry_ns"].is_u64(), "{ctx}");
+    assert_eq!(ctx["watch"]["choosing"], serde_json::json!([]), "{ctx}");
+    assert!(events.watch("decoding").is_empty(), "{:#?}", events.all());
+    assert_eq!(
+        running(&node)
+            .into_iter()
+            .map(|(_, k)| k)
+            .collect::<Vec<_>>(),
+        ["watch"]
+    );
+    stop_all(&node).await;
+}
+
+/// A choosing watch over `iq` whose step 1 reads `label`, `detect` params `extra`: its
+/// first `unknown`, once the watch has published one; no `choose` and no trial slice.
+async fn unknown_without_a_choose(iq: &[Complex<f32>], label: &str, extra: Value) -> Value {
+    let _label = zeta_core::node::watch::test_labels_read(label);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), iq).await;
+    let watch = start_choice_watch(&node, extra).await;
+    let events = Events::of(&node, &watch);
+    until("an unknown", Duration::from_secs(40), || {
+        !events.watch("unknown").is_empty()
+    })
+    .await;
+    let unknown = events.watch("unknown")[0].clone();
+    // Long enough for a choose to have started and written its slice.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(events.watch("choosing").is_empty(), "{:#?}", events.all());
+    assert!(events.watch("decoding").is_empty(), "{:#?}", events.all());
+    assert!(trial_slices(&node).is_empty(), "{:?}", trial_slices(&node));
+    assert!(
+        node.job_list().iter().all(|r| r.kind != "choose"),
+        "{:?}",
+        node.job_list()
+    );
+    stop_all(&node).await;
+    unknown
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn noise_and_an_unknown_no_row_fits_start_no_choose() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let noise = unknown_without_a_choose(&cb_voice(), "noise", serde_json::json!({})).await;
+    let summary = noise["summary"].as_str().unwrap();
+    assert!(summary.contains("the band holds noise only"), "{summary}");
+    let wide = serde_json::json!({"width_hz": [4_000, 60_000]});
+    let unfit = unknown_without_a_choose(&cb_wide(), "unknown", wide).await;
+    let summary = unfit["summary"].as_str().unwrap();
+    assert!(summary.contains("no row serves unknown"), "{summary}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_stopped_while_choosing_starts_nothing_and_leaves_no_slice_pinned() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let _unknown = zeta_core::node::watch::test_labels_read("unknown");
+    let quiet = |node: &Node| {
+        node.job_list().iter().all(|r| r.state != JobState::Running)
+            && node.lease_holders(&rx()).is_empty()
+            && trial_slices(node).iter().all(|t| !t.pinned)
+    };
+
+    // Stopped mid-trial: voice no row proves, so the choose is still trying.
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (_e, child) = choosing(&events).await;
+    until("the trial slice is pinned", Duration::from_secs(20), || {
+        trial_slices(&node).iter().any(|t| t.pinned)
+    })
+    .await;
+    assert_eq!(state(&node, &child), Some(JobState::Running));
+    node.job_stop(&watch).await.unwrap();
+    until(
+        "the choose, its trials and its slice are let go",
+        Duration::from_secs(10),
+        || quiet(&node),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(quiet(&node), "{:?}", running(&node));
+    assert!(events.watch("decoding").is_empty(), "{:#?}", events.all());
+    drop(events);
+    drop(node);
+
+    // A proof the watch takes only after its stop: nothing is started.
+    let dir = tempfile::tempdir().unwrap();
+    let settle = zeta_core::node::watch::test_hold_choices();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_dmr()).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (_e, child) = choosing(&events).await;
+    until("the choose has proved", Duration::from_secs(40), || {
+        state(&node, &child) != Some(JobState::Running)
+    })
+    .await;
+    node.job_stop(&watch).await.unwrap();
+    settle.release();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(quiet(&node), "{:?}", running(&node));
+    assert!(
+        node.job_list().iter().all(|r| r.kind != "dmr_decode"),
+        "{:?}",
+        node.job_list()
+    );
+    assert!(events.watch("decoding").is_empty(), "{:#?}", events.all());
+}

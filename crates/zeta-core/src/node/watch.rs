@@ -40,7 +40,14 @@
 //! row could still prove otherwise starts held ([`PROBATION`], under `probation`: out of
 //! the mix, its transcript kept) while the watch's own transient `choose` child climbs
 //! the ladder; its verdict ([`settle`]) lifts the hold or replaces the job, its attached
-//! job stopped first. A demodulator's silence is its squelch staying shut.
+//! job stopped first. A demodulator's silence is its squelch staying shut. A signal step 1
+//! cannot tell (no job) that decoder rows could still prove (for `unknown`, the rows its
+//! width fits) keeps nothing: when the policy's step for the watch reaches step 2, the
+//! watch's own `choose` tries them ([`Inner::try_unknown`], event `choosing` naming them
+//! in `rows`, listed in `job_context.watch.choosing`), one per signal, holding a decoder
+//! slot, and stopped when its signal goes or the watch stops. Its proof starts the proved
+//! job `via: choose` with the `attach` kind ([`tried`]); anything else is the unknown try
+//! step 1 would have made. A row listed for `unknown` is never started on a guess.
 //!
 //! Every watch keeps at most the `detect` node's `max_decoders` decoders (spec 4.4),
 //! counting those on free sources: over the cap a signal that would take one is
@@ -58,8 +65,9 @@
 //! re-adoption confirmed within `gone_ms`.
 //!
 //! Events, `protocol: "watch"`, go on the job's event stream beside `detect`'s `signal`
-//! events: `state` `identifying | decoding | waiting | unknown | lost | capturing |
-//! captured`, with `signal`, `job`, `mode`, `source`, `placed` (`capture | free`),
+//! events: `state` `identifying | choosing | decoding | waiting | unknown | lost |
+//! capturing | captured`, with `signal`, `job` (for `choosing`, its `choose`), `mode`,
+//! `source`, `rows` (for `choosing`, the rows it tries), `placed` (`capture | free`),
 //! `features` and `allocations` and `origins` (for `unknown`), `captures` (for
 //! `captured`), `via` (for `decoding`: `identify | modes | choose`), `why` (for `lost`:
 //! `gone and silent | not seen again | unproven | relaunch failed`), `summary` and `t_ns`
@@ -357,6 +365,43 @@ fn test_rename_verdict(choice: &mut Option<Choice>) {
     {
         job.kind = row.clone();
         c.row = Some(row);
+    }
+}
+
+/// Tests only: the layer-1 label a choosing watch's step 1 is made to read.
+#[cfg(feature = "test-fixtures")]
+static TEST_LABEL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Tests only: every choosing watch's step 1 reads layer 1's label as `label` from now
+/// on, until the guard goes (a label such as `unknown`, which a generator does not give
+/// reliably at the watch's capture rate).
+#[cfg(feature = "test-fixtures")]
+pub fn test_labels_read(label: &str) -> LabelForce {
+    *TEST_LABEL.lock().unwrap() = Some(label.to_string());
+    LabelForce(())
+}
+
+/// Tests only: while it lives, step 1 reads the label [`test_labels_read`] gave.
+#[cfg(feature = "test-fixtures")]
+pub struct LabelForce(());
+
+#[cfg(feature = "test-fixtures")]
+impl Drop for LabelForce {
+    fn drop(&mut self) {
+        *TEST_LABEL.lock().unwrap() = None;
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+fn test_force_label(c: &mut crate::classify::Classification) {
+    let Some(label) = TEST_LABEL.lock().unwrap().clone() else {
+        return;
+    };
+    if let Some(m) = c.measurement.as_mut() {
+        m.label.name = label.clone();
+    }
+    for l in c.labels.iter_mut().filter(|l| l.layer == 1) {
+        l.name = label.clone();
     }
 }
 
@@ -860,9 +905,13 @@ fn classify_task(
             .newest_selection(&source, band, slice_s)
             .ok_or_else(|| format!("source {} is not capturing", source.0))?;
         let node = Node::handle(&inner);
-        let (classified, samples, rate, ring_center) = crate::ops::classify_samples(&node, &sel)
-            .await
-            .map_err(|e| e.to_string())?;
+        #[allow(unused_mut)]
+        let (mut classified, samples, rate, ring_center) =
+            crate::ops::classify_samples(&node, &sel)
+                .await
+                .map_err(|e| e.to_string())?;
+        #[cfg(feature = "test-fixtures")]
+        test_force_label(&mut classified);
         // The watch's own `choose` climbs to the policy's step for the watch.
         let climb = inner
             .choice_policy
@@ -948,6 +997,21 @@ struct Decoding {
     /// `unproven` when this passes while its signal is present.
     #[serde(skip)]
     unproven_by_ns: Option<u64>,
+}
+
+/// A signal step 1 could not tell that decoder rows could still prove, while the watch's
+/// own `choose` child tries them with nothing kept (`job_context.watch.choosing`): one per
+/// signal, holding a decoder slot until its verdict ([`tried`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Trying {
+    signal: Signal,
+    /// The `choose` child.
+    choose: JobId,
+    /// The rows it tries: step 1's `could_prove`.
+    rows: Vec<String>,
+    /// Why step 1 could not tell.
+    reason: String,
+    since_ns: u64,
 }
 
 /// A channel no new decoder starts on until `until_ns` (`job_context.watch.cooled`):
@@ -1082,6 +1146,8 @@ impl Run {
 struct State {
     signals: Vec<Tracked>,
     decoding: Vec<Decoding>,
+    /// The signals the watch's `choose` children try with nothing kept.
+    trying: Vec<Trying>,
     /// The policy's `max_decoders`, reported as `cap.max`.
     max_decoders: u32,
     /// The channels no new decoder starts on yet.
@@ -1125,9 +1191,15 @@ impl Drop for State {
         };
         let current = self.current.take().map(|(j, _)| j);
         let pending = self.pending.take();
-        let decoders = std::mem::take(&mut self.decoding)
+        let source = port.id().clone();
+        let decoders = std::mem::take(&mut self.trying)
             .into_iter()
-            .flat_map(Decoding::teardown)
+            .map(|t| (t.choose, source.clone()))
+            .chain(
+                std::mem::take(&mut self.decoding)
+                    .into_iter()
+                    .flat_map(Decoding::teardown),
+            )
             .collect();
         let captures = std::mem::take(&mut self.capturing)
             .into_iter()
@@ -1143,8 +1215,9 @@ impl Drop for State {
 
 /// Stop what a run of the watch on `source` started: the identify run `current` (and the
 /// decoder a proof it landed left, never adopted), a proved decoder being placed,
-/// `decoders` (in order: each kept job's `choose` child, its attached job, then the job
-/// itself, [`Decoding::teardown`]) and the capture children `captures`. Gated on `source`
+/// `decoders` (the `choose` children trying signals with nothing kept, then, in order,
+/// each kept job's `choose` child, its attached job and the job itself,
+/// [`Decoding::teardown`]) and the capture children `captures`. Gated on `source`
 /// (the watch's lease is held meanwhile, so there is nothing to idle, and a `replace`
 /// holding the gate never waits on it), plainly on another source.
 async fn release(
@@ -1202,6 +1275,7 @@ impl State {
         serde_json::json!({"watch": {
             "signals": self.signals,
             "decoding": self.decoding,
+            "choosing": self.trying,
             "current": self.current.as_ref().map(|(j, _)| j.0.clone()),
             "cooled": self.cooled,
             "known": match &self.register {
@@ -1220,9 +1294,10 @@ impl State {
         }})
     }
 
-    /// Whether every decoder slot is taken.
+    /// Whether every decoder slot is taken: a signal being tried with nothing kept holds
+    /// the slot its proof would take.
     fn full(&self) -> bool {
-        self.decoding.len() >= self.max_decoders as usize
+        self.decoding.len() + self.trying.len() >= self.max_decoders as usize
     }
 
     /// Drop the cooled channels whose cooldown has passed by `now`; whether any went.
@@ -1271,6 +1346,8 @@ struct Event<'a> {
     /// Why a `lost` decoder was stopped: `gone and silent`, `not seen again`,
     /// `unproven` or `relaunch failed`.
     why: Option<String>,
+    /// The rows a `choosing` signal's `choose` tries.
+    rows: Option<&'a [String]>,
 }
 
 impl Inner {
@@ -1296,6 +1373,7 @@ impl Inner {
             "captures": e.captures,
             "via": e.via,
             "why": e.why,
+            "rows": e.rows,
             "summary": summary,
             "t_ns": t.0,
         });
@@ -1955,9 +2033,11 @@ impl Inner {
     /// `probation`. The policy's `attach` kind is attached to it, then, while a decoder
     /// could still prove otherwise, the watch's own `choose` starts on the band
     /// ([`settle`] takes its verdict); one that cannot start leaves the first answer
-    /// standing, its hold lifted. A band nothing answers (`cannot_tell`, a read that
-    /// fails) or a job that does not start counts as an unknown try (event `unknown`).
-    /// Event `decoding`. `None`: cancelled.
+    /// standing, its hold lifted. An answer with no job but rows in `could_prove` keeps
+    /// nothing and has them tried ([`Inner::try_unknown`]) when the policy's step for the
+    /// watch reaches step 2. A band nothing answers (`cannot_tell` with nothing to try, a
+    /// read that fails) or a job that does not start counts as an unknown try (event
+    /// `unknown`). Event `decoding`. `None`: cancelled.
     async fn start_answer(
         self: &Arc<Self>,
         r: &Run,
@@ -1966,8 +2046,19 @@ impl Inner {
         answer: Result<StepOne, String>,
     ) -> Option<()> {
         let signal = w.signals[i].signal.clone();
+        let climbs = || {
+            self.choice_policy
+                .lock()
+                .unwrap()
+                .steps(Surface::Watch, None)
+                .0
+                >= 2
+        };
         let seed = match answer {
             Ok(s) if s.choice.job.is_some() => s,
+            Ok(s) if !s.choice.could_prove.is_empty() && climbs() => {
+                return self.try_unknown(r, w, (i, band), s).await;
+            }
             Ok(s) => {
                 let why = s.choice.reason.unwrap_or_else(|| "no job".into());
                 self.choice_unknown(r, w, i, format!("can't tell: {why}"))
@@ -1991,15 +2082,64 @@ impl Inner {
             reason: PROBATION.into(),
             since_ns: now().0,
         });
+        let (k, attach_error, sink_error) =
+            match self.keep_chosen(r, w, i, &job, held.clone()).await? {
+                Ok(kept) => kept,
+                Err(e) => {
+                    let why = format!("{} did not start: {e}", job.kind);
+                    self.choice_unknown(r, w, i, why).await;
+                    return Some(());
+                }
+            };
+        let id = w.decoding[k].job.clone();
+        let mut notes = Vec::new();
+        if unproved {
+            match self.start_choose(r, band, seed).await {
+                Ok(None) => return None,
+                Ok(Some(c)) => w.decoding[k].choose = Some(c),
+                Err(e) => {
+                    // Nothing will settle it: the first answer stands.
+                    if held.is_some() {
+                        let _ = self.set_held(&id, None);
+                        w.decoding[k].held = false;
+                    }
+                    notes.push(format!("choose did not start: {e}"));
+                }
+            }
+        }
+        let mut summary = chosen_summary(&job.kind, &signal, &r.prov.source, &choice);
+        if w.decoding[k].held {
+            summary.push_str(&format!(
+                "; held on {PROBATION} while its choose tries {}",
+                choice.could_prove.join(", ")
+            ));
+        }
+        notes.extend(kept_notes(attach_error, sink_error));
+        for n in notes {
+            summary.push_str(&format!("; {n}"));
+        }
+        self.decoding_event(r, &w.decoding[k], summary);
+        Some(())
+    }
+
+    /// Start the choice's `job` for the tracked signal `i` inside the capture under `held`
+    /// ([`Inner::start_chosen`]), keep it `via: choose`, then attach the policy's `attach`
+    /// kind to it ([`Inner::attach_to`]): its index in `decoding`, why it is not attached
+    /// and why its sink was refused. `Some(Err)`: it did not start; `None`: cancelled.
+    async fn keep_chosen(
+        self: &Arc<Self>,
+        r: &Run,
+        w: &mut State,
+        i: usize,
+        job: &ChoiceJob,
+        held: Option<Hold>,
+    ) -> Option<Result<(usize, Option<String>, Option<String>), String>> {
+        let signal = w.signals[i].signal.clone();
         let floor_hz = signal.bandwidth_hz;
-        let (id, sink) = match self.start_chosen(r, &job, held.clone(), floor_hz).await {
+        let (id, sink) = match self.start_chosen(r, job, held.clone(), floor_hz).await {
             Ok(None) => return None,
             Ok(Some(started)) => started,
-            Err(e) => {
-                let why = format!("{} did not start: {e}", job.kind);
-                self.choice_unknown(r, w, i, why).await;
-                return Some(());
-            }
+            Err(e) => return Some(Err(e)),
         };
         let t = now().0;
         let tracked = &mut w.signals[i];
@@ -2013,7 +2153,7 @@ impl Inner {
             mode: job.kind.clone(),
             job: id.clone(),
             source: r.prov.source.clone(),
-            signal: signal.clone(),
+            signal,
             since_ns: t,
             placed: Placed::Capture,
             via: Via::Choose,
@@ -2033,54 +2173,98 @@ impl Inner {
         if r.cancel.is_cancelled() {
             return None;
         }
-        let mut notes = Vec::new();
-        if unproved {
-            match self.start_choose(r, band, seed).await {
-                Ok(None) => return None,
-                Ok(Some(c)) => w.decoding[k].choose = Some(c),
-                Err(e) => {
-                    // Nothing will settle it: the first answer stands.
-                    if held.is_some() {
-                        let _ = self.set_held(&id, None);
-                        w.decoding[k].held = false;
-                    }
-                    notes.push(format!("choose did not start: {e}"));
-                }
-            }
-        }
-        let mut summary = format!(
-            "decoding {} at {} on {} (capture, choice: {} at step {})",
-            job.kind,
-            signal.mhz(),
-            r.prov.source.0,
-            choice.settled.name(),
-            choice.step,
-        );
-        if w.decoding[k].held {
-            summary.push_str(&format!(
-                "; held on {PROBATION} while its choose tries {}",
-                choice.could_prove.join(", ")
-            ));
-        }
-        if let Some(why) = attach_error {
-            notes.push(format!("not attached: {why}"));
-        }
-        if let Some(why) = sink_error {
-            notes.push(format!("sink refused: {why}"));
-        }
-        for n in notes {
-            summary.push_str(&format!("; {n}"));
-        }
+        Some(Ok((k, attach_error, sink_error)))
+    }
+
+    /// Event `decoding` for the kept job `d`, started by the choice.
+    fn decoding_event(&self, r: &Run, d: &Decoding, summary: String) {
         let e = Event {
-            signal: Some(&signal),
-            job: Some(&id),
-            mode: Some(&job.kind),
+            signal: Some(&d.signal),
+            job: Some(&d.job),
+            mode: Some(&d.mode),
             source: Some(&r.prov.source),
             placed: Some(Placed::Capture),
             via: Some(Via::Choose),
             ..Event::default()
         };
         self.watch_event(r, "decoding", summary, e);
+    }
+
+    /// Step 1's answer `seed` for the tracked signal `i` has no job, but decoder rows could
+    /// still prove it (`could_prove`; for `unknown`, the rows its width fits): nothing is
+    /// kept, and the watch's own `choose` starts on `band` to try them, handed the seed
+    /// ([`Inner::start_choose`]; [`tried`] takes its verdict). The signal is handled while
+    /// it runs. Event `choosing`, naming the rows (`rows`). A `choose` that does not start
+    /// counts an unknown try. `None`: cancelled.
+    async fn try_unknown(
+        self: &Arc<Self>,
+        r: &Run,
+        w: &mut State,
+        (i, band): (usize, Tuning),
+        seed: StepOne,
+    ) -> Option<()> {
+        let rows = seed.choice.could_prove.clone();
+        let reason = (seed.choice.reason.clone()).unwrap_or_else(|| "no job".into());
+        let choose = match self.start_choose(r, band, seed).await {
+            Ok(None) => return None,
+            Ok(Some(c)) => c,
+            Err(e) => {
+                let why = format!("can't tell: {reason}; choose did not start: {e}");
+                self.choice_unknown(r, w, i, why).await;
+                return Some(());
+            }
+        };
+        let tracked = &mut w.signals[i];
+        tracked.handled = true;
+        tracked.waiting = false;
+        let signal = tracked.signal.clone();
+        let summary = format!(
+            "choosing at {}: can't tell ({reason}); its choose tries {}",
+            signal.mhz(),
+            rows.join(", ")
+        );
+        let e = Event {
+            signal: Some(&signal),
+            job: Some(&choose),
+            source: Some(&r.prov.source),
+            rows: Some(&rows),
+            ..Event::default()
+        };
+        self.watch_event(r, "choosing", summary, e);
+        w.trying.push(Trying {
+            signal,
+            choose,
+            rows,
+            reason,
+            since_ns: now().0,
+        });
+        Some(())
+    }
+
+    /// The `choose` trying the tracked signal `i` proved `job` (`choice`): start it as
+    /// step 1's job would have started, unheld (event `decoding`); one that does not start
+    /// counts an unknown try. `None`: cancelled.
+    async fn start_proved(
+        self: &Arc<Self>,
+        r: &Run,
+        w: &mut State,
+        i: usize,
+        (choice, job): (&Choice, &ChoiceJob),
+    ) -> Option<()> {
+        let (k, attach_error, sink_error) = match self.keep_chosen(r, w, i, job, None).await? {
+            Ok(kept) => kept,
+            Err(e) => {
+                let why = format!("{} did not start: {e}", job.kind);
+                self.choice_unknown(r, w, i, why).await;
+                return Some(());
+            }
+        };
+        let d = &w.decoding[k];
+        let mut summary = chosen_summary(&d.mode, &d.signal, &r.prov.source, choice);
+        for n in kept_notes(attach_error, sink_error) {
+            summary.push_str(&format!("; {n}"));
+        }
+        self.decoding_event(r, d, summary);
         Some(())
     }
 
@@ -2374,6 +2558,7 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
     let mut w = State {
         signals: Vec::new(),
         decoding: Vec::new(),
+        trying: Vec::new(),
         max_decoders: r.seed.policy.max_decoders,
         cooled: std::mem::take(&mut r.seed.cooled),
         known: Vec::new(),
@@ -2417,13 +2602,19 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
                 .collect(),
         ),
     };
-    let decoders = match teardown {
-        true => std::mem::take(&mut w.decoding)
-            .into_iter()
-            .flat_map(Decoding::teardown)
-            .collect(),
+    // A signal's `choose` that keeps nothing never outlives the run (at the node's
+    // shutdown it ends with the node, and a transient job never resumes).
+    let trying = std::mem::take(&mut w.trying)
+        .into_iter()
+        .filter(|_| !shutdown)
+        .map(|t| (t.choose, r.prov.source.clone()));
+    let kept = match teardown {
+        true => std::mem::take(&mut w.decoding),
         false => Vec::new(),
     };
+    let decoders = trying
+        .chain(kept.into_iter().flat_map(Decoding::teardown))
+        .collect();
     release(&inner, &r.prov.source, current, pending, decoders, captures).await;
     if teardown {
         w.signals.clear();
@@ -2516,6 +2707,10 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
         }
         changed |= decoders(inner, r, w).await;
         changed |= settle(inner, r, w).await;
+        match tried(inner, r, w).await {
+            None => return cancelled(),
+            Some(c) => changed |= c,
+        }
         match chosen(inner, r, w).await {
             None => return cancelled(),
             Some(c) => changed |= c,
@@ -2751,7 +2946,11 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
                     .decoding
                     .iter()
                     .any(|d| d.signal.overlaps(s.center_hz, s.bandwidth_hz));
-                if decoded || inner.held_elsewhere(r, w, &s) {
+                let trying = w
+                    .trying
+                    .iter()
+                    .any(|t| t.signal.overlaps(s.center_hz, s.bandwidth_hz));
+                if decoded || trying || inner.held_elsewhere(r, w, &s) {
                     continue;
                 }
                 let (band_hz, score) = inner.identify_band(r, &s);
@@ -2791,7 +2990,14 @@ fn signals(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> bool {
                         w.signals[i].signal.bandwidth_hz,
                     )
                 });
-                match on || decoded || capturing {
+                // A signal being tried is let go by [`tried`], which stops its `choose`.
+                let trying = w.trying.iter().any(|t| {
+                    t.signal.overlaps(
+                        w.signals[i].signal.center_hz,
+                        w.signals[i].signal.bandwidth_hz,
+                    )
+                });
+                match on || decoded || capturing || trying {
                     true => w.signals[i].present = false,
                     false => {
                         w.signals.remove(i);
@@ -3185,6 +3391,102 @@ async fn replace(
     Some(())
 }
 
+/// The `decoding` summary of `kind` started by the choice `choice` for `signal`.
+fn chosen_summary(kind: &str, signal: &Signal, source: &SourceId, choice: &Choice) -> String {
+    format!(
+        "decoding {kind} at {} on {} (capture, choice: {} at step {})",
+        signal.mhz(),
+        source.0,
+        choice.settled.name(),
+        choice.step,
+    )
+}
+
+/// The notes of a kept job that runs without its attached job or its sink.
+fn kept_notes(attach_error: Option<String>, sink_error: Option<String>) -> Vec<String> {
+    let attach = attach_error.map(|why| format!("not attached: {why}"));
+    let sink = sink_error.map(|why| format!("sink refused: {why}"));
+    attach.into_iter().chain(sink).collect()
+}
+
+/// Take the verdict of each `choose` the watch runs on a signal it keeps nothing for
+/// ([`Inner::try_unknown`]), once it has ended: a proof starts the proved job inside the
+/// capture, kept `via: choose` with the policy's `attach` ([`Inner::start_proved`]);
+/// anything else (`cannot_tell`, an unproved guess, no verdict at all) is the unknown try
+/// step 1 would have made (event `unknown`, counted and retried after [`RETRY_MS`]). A
+/// row listed for `unknown` is never started on a guess. A signal that has gone stops its
+/// `choose` and is let go. Whether the state changed; `None`: cancelled.
+async fn tried(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Option<bool> {
+    let mut changed = false;
+    let present = |w: &State, t: &Trying| {
+        nearest(&w.signals, t.signal.center_hz, t.signal.bandwidth_hz)
+            .is_some_and(|i| w.signals[i].present)
+    };
+    let gone: Vec<JobId> = (w.trying.iter())
+        .filter(|t| !present(w, t))
+        .map(|t| t.choose.clone())
+        .collect();
+    for c in gone {
+        let Some(k) = w.trying.iter().position(|t| t.choose == c) else {
+            continue;
+        };
+        let t = w.trying.remove(k);
+        inner.stop_started(r, &t.choose, &r.prov.source).await;
+        inner.verdicts.lock().unwrap().remove(&t.choose);
+        if let Some(i) = nearest(&w.signals, t.signal.center_hz, t.signal.bandwidth_hz)
+            && !w.signals[i].present
+        {
+            w.signals.remove(i);
+        }
+        changed = true;
+    }
+    if choices_held() {
+        return Some(changed);
+    }
+    let ended: Vec<JobId> = (w.trying.iter())
+        .map(|t| t.choose.clone())
+        .filter(|c| !inner.runs(c))
+        .collect();
+    for c in ended {
+        let Some(k) = w.trying.iter().position(|t| t.choose == c) else {
+            continue;
+        };
+        let t = w.trying.remove(k);
+        changed = true;
+        let verdict = inner.verdicts.lock().unwrap().remove(&c);
+        #[allow(unused_mut)]
+        let mut choice: Option<Choice> = verdict.and_then(|v| serde_json::from_value(v).ok());
+        #[cfg(feature = "test-fixtures")]
+        test_rename_verdict(&mut choice);
+        let Some(i) = nearest(&w.signals, t.signal.center_hz, t.signal.bandwidth_hz) else {
+            continue;
+        };
+        match choice.as_ref().and_then(|c| c.job.as_ref().map(|j| (c, j))) {
+            Some((c, job)) if c.settled == Settled::Proved => {
+                if r.cancel.is_cancelled() {
+                    return None;
+                }
+                inner.start_proved(r, w, i, (c, job)).await?;
+            }
+            _ => {
+                let what = match &choice {
+                    None => "its choose ended without a verdict".to_string(),
+                    Some(c) => format!(
+                        "its choose proved none of {} (steps run: {})",
+                        t.rows.join(", "),
+                        (c.steps_run.iter().map(u8::to_string))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
+                let why = format!("can't tell: {}; {what}", t.reason);
+                inner.choice_unknown(r, w, i, why).await;
+            }
+        }
+    }
+    Some(changed)
+}
+
 /// `<n>` kHz from `hz`: whole kHz bare, else to one decimal.
 fn khz(hz: u64) -> String {
     match hz % 1_000 {
@@ -3458,7 +3760,7 @@ fn free_channel(
 
 /// With no identify in progress, stop any running job this watch owns that it does not
 /// keep (a stale identify run or its child resumed after a restart; a kept job's `choose`
-/// child is kept with it).
+/// child is kept with it, as is the `choose` trying a signal with nothing kept).
 async fn sweep(inner: &Arc<Inner>, r: &Run, w: &State) {
     let strays: Vec<JobId> = inner
         .jobs
@@ -3474,6 +3776,7 @@ async fn sweep(inner: &Arc<Inner>, r: &Run, w: &State) {
                 .any(|d| d.choose.as_ref() == Some(&e.record.id))
         })
         .filter(|e| !w.capturing.iter().any(|(j, _)| *j == e.record.id))
+        .filter(|e| !w.trying.iter().any(|t| t.choose == e.record.id))
         .map(|e| e.record.id.clone())
         .collect();
     for id in strays {
@@ -3854,6 +4157,7 @@ mod tests {
         let mut w = State {
             signals: Vec::new(),
             decoding: Vec::new(),
+            trying: Vec::new(),
             max_decoders: 1,
             cooled: vec![Cooled {
                 center_hz: 148_600_000,
