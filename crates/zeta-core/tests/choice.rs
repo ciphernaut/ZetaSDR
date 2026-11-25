@@ -481,3 +481,57 @@ fn a_row_the_capture_does_not_hold_is_not_tried_with_the_reason() {
         "{free:?}"
     );
 }
+
+/// `measured`, with `power99_hz` set.
+fn measured_p99(label: &str, center_hz: u64, bandwidth_hz: u64, power99_hz: u64) -> Classification {
+    let mut c = measured(label, center_hz, bandwidth_hz);
+    c.measurement.as_mut().unwrap().features.power99_hz = Some(Hz(power99_hz));
+    c
+}
+
+/// `unknown` waives the label term: the ready rows whose width window holds the occupied
+/// width, `power99_hz` or the box are listed, to be tried.
+#[test]
+fn unknown_lists_the_ready_rows_its_width_fits() {
+    let modes = registry(None);
+    let c = measured_p99("unknown", DMR_HZ, 3_000, 9_000);
+    let sel = box_at(DMR_HZ, 3_000);
+    let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU", None);
+    eprintln!("{choice:?}");
+    for row in ["dmr_decode", "p25_decode", "m17_decode"] {
+        assert!(
+            choice.could_prove.iter().any(|r| r == row),
+            "{row}: {choice:?}"
+        );
+    }
+    for row in ["rds_decode", "adsb_decode"] {
+        assert!(
+            !choice.could_prove.iter().any(|r| r == row),
+            "{row}: {choice:?}"
+        );
+    }
+}
+
+/// A row listed for `unknown` is tried, never started on this evidence.
+#[test]
+fn unknown_never_starts_an_unproved_decoder() {
+    let modes = registry(None);
+    let c = measured_p99("unknown", DMR_HZ, 3_000, 9_000);
+    let sel = box_at(DMR_HZ, 3_000);
+    let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU", None);
+    assert!(choice.job.is_none() && choice.row.is_none(), "{choice:?}");
+    assert_eq!(choice.settled, Settled::CannotTell, "{choice:?}");
+    assert_eq!(choice.reason.as_deref(), Some("no row serves unknown"));
+    assert!(choice.runner_up.is_none(), "{choice:?}");
+    assert!(!choice.could_prove.is_empty(), "{choice:?}");
+}
+
+/// Any other label keeps its label test.
+#[test]
+fn a_label_other_than_unknown_keeps_its_label_test() {
+    let modes = registry(None);
+    let c = measured_p99("carrier", DMR_HZ, 3_000, 9_000);
+    let sel = box_at(DMR_HZ, 3_000);
+    let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU", None);
+    assert!(choice.could_prove.is_empty(), "{choice:?}");
+}

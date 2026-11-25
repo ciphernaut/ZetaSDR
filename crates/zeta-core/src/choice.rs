@@ -167,12 +167,29 @@ pub fn choose_now(
         &catalogue_term,
         &allocation,
     );
+    // For `unknown` alone the label term is waived: a row is listed to be tried when its
+    // width window holds the occupied width, `power99_hz` or the selection's width.
+    let unknown = label == "unknown";
+    let widths = [
+        Some(bandwidth_hz),
+        f.power99_hz.map(|w| w.0),
+        Some(sel.bandwidth_hz.0),
+    ];
+    let width_fits = |s: &Scored| {
+        let bw = s.mode.row.band.bandwidth_hz as f64;
+        s.fits_width
+            || (unknown
+                && widths
+                    .iter()
+                    .flatten()
+                    .any(|&w| (bw * 0.5..=bw * 1.5).contains(&(w as f64))))
+    };
     let (ready, unready): (Vec<&Scored>, Vec<&Scored>) = decoders
         .iter()
         .filter(|s| {
             s.in_range
-                && s.fits_width
-                && s.fits_label
+                && width_fits(s)
+                && (s.fits_label || unknown)
                 && !passed_over(s.mode, None)
                 && proved.is_none_or(|p| p.row.id != s.mode.row.id)
         })
@@ -207,6 +224,9 @@ pub fn choose_now(
         .iter()
         .filter(|s| s.in_range && s.fits_label && !fsk_data(s.mode))
         .partition(|s| s.mode.startable());
+    // The rows a best guess may name: those that fit the label. A row listed for `unknown`
+    // alone is tried, never started on this evidence.
+    let guessable: Vec<&Scored> = ready.iter().copied().filter(|s| s.fits_label).collect();
     let could_prove: Vec<String> = ready.iter().map(|s| s.mode.row.id.0.clone()).collect();
     let not_tried: Vec<NotTried> = unready
         .iter()
@@ -252,14 +272,14 @@ pub fn choose_now(
     } else if label == "noise" {
         Err("the band holds noise only".to_string())
     } else if let Some(top) = demods.first() {
-        let runner_up = ready
+        let runner_up = guessable
             .first()
             .filter(|d| top.score - d.score <= weights.runner_up_margin)
             .or_else(|| demods.get(1))
             .map(|d| alternative(d.mode));
         Ok((top.mode, Settled::BestGuess, vec![], runner_up))
-    } else if let Some(top) = ready.first() {
-        let runner_up = ready.get(1).map(|d| alternative(d.mode));
+    } else if let Some(top) = guessable.first() {
+        let runner_up = guessable.get(1).map(|d| alternative(d.mode));
         Ok((top.mode, Settled::BestGuess, vec![], runner_up))
     } else {
         Err(format!("no row serves {label}"))
