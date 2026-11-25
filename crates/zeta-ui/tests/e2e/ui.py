@@ -6168,6 +6168,34 @@ def scenario_the_first_box_entry_is_the_choice(page, url, secret):
     close_menu(page)
 
 
+def scenario_the_menus_choose_takes_the_box_span(page, url, secret):
+    # Opening the box menu starts a transient choose over the box's own span (the node cuts it
+    # to its newest slice), and the page classifies nothing of its own: the first entry waits,
+    # greyed, for the choose's first answer.
+    select_source(page, url, secret, "cbvoice")
+    wait_span(page, MENU_SPAN_S)
+    drag_menu(page, 0.0, 1.0)
+    view_hz = box_of(page)[1]
+    close_menu(page)
+    ops = []
+    on_request = lambda r: is_op("classify")(r) and ops.append(r.url)
+    page.on("request", on_request)
+    try:
+        with page.expect_request(lambda r: is_op("job_start")(r)
+                                 and json.loads(r.post_data)["kind"] == "choose") as req:
+            drag_hz(page, 12_500, view_hz)
+        footer = page.locator("#ctx-footer").text_content()
+        m = re.search(r"start_ns=(\d+) end_ns=(\d+)", footer)
+        span = json.loads(req.value.post_data)["choose"]["span"]
+        assert span == {"start_ns": int(m.group(1)), "end_ns": int(m.group(2))}, (span, footer)
+        item = page.locator('#ctx .ctx-item[data-action="choice_start"]')
+        expect(item).to_have_text(re.compile(r"^(Start |Can't tell: )"), timeout=15_000)
+        assert not ops, f"the page classified on its own: {ops}"
+    finally:
+        page.remove_listener("request", on_request)
+    close_menu(page)
+
+
 def scenario_the_choice_entry_starts_its_job(page, url, secret):
     item = choice_entry(page, url, secret, "cbvoice", 12_500, "Start fm_demod here:")
     job = None

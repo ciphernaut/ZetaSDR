@@ -1293,6 +1293,13 @@ pub struct ChooseParams {
     /// A short-lived ask (the page's box menu).
     #[serde(default)]
     pub transient: bool,
+    /// The selection's span (the page's box), `end_ns` after `start_ns`: the job's
+    /// selection is its newest `budget.slice_s` the source's ring still holds, which
+    /// step 1 classifies and step 2 replays; `null` is the newest `budget.slice_s` of
+    /// the ring.
+    #[serde(default)]
+    #[schemars(required, schema_with = "crate::types::nullable::<crate::types::Span>")]
+    pub span: Option<crate::types::Span>,
 }
 
 /// Schema of `ChooseParams.up_to`: `["integer","null"]` (1..=3).
@@ -5383,6 +5390,11 @@ fn check_choose(kind: &JobKind, choose: Option<&ChooseParams>) -> Result<(), OpE
             kind.name()
         )));
     }
+    if let Some(span) = &c.span
+        && span.end_ns.0 <= span.start_ns.0
+    {
+        return Err(other("choose.span: end_ns must be after start_ns"));
+    }
     match c.up_to {
         Some(n) => range("choose.up_to", u64::from(n), 1, 3).map_err(|mut e| {
             if let OpError::OutOfRange { why, .. } = &mut e {
@@ -5425,6 +5437,7 @@ async fn start_choose(
         capped,
         start: choose.start,
         transient: choose.transient,
+        span: choose.span,
     };
     node.choose_start(source, tuning, ask)
         .await

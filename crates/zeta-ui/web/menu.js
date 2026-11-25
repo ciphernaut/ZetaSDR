@@ -170,13 +170,14 @@
 // span is clamped to the newest SPAN_LIMIT_NS before the newest painted column (on opening
 // and again when an entry is chosen); the footer says so when it was.
 //
-// The choice: opening the box menu asks `classify` quietly (not the transcript) for its `choice`,
-// which the first entry (`choice_start`: `Start <kind> here: <width> kHz <row>`, ` (not
-// proved)` for a best-guess decoder, `Can't tell: <reason>` greyed) shows; then it starts a
-// transient `choose` job (surface `menu`, up to step 2), whose revisions (its event stream,
-// and its record's context.choose.choice each CHOOSE_POLL_MS) replace the label in place,
-// the entry carrying the class `revising` meanwhile. Closing or reopening the menu stops the
-// job. The Listen group leads with the chosen demodulator (actions.js offered).
+// The choice: opening the box menu starts a transient `choose` job (surface `menu`, up to step
+// 2) over the box's own span (the node classifies, and replays, its newest slice), quietly
+// (not the transcript). The first entry (`choice_start`) reads `Choosing a job here…`, greyed,
+// until the job's step-1 answer (its event stream, and its record's context.choose.choice each
+// CHOOSE_POLL_MS), then `Start <kind> here: <width> kHz <row>` (` (not proved)` for a
+// best-guess decoder) or `Can't tell: <reason>` greyed, revised in place by its later events,
+// the entry carrying the class `revising` while the job runs. Closing or reopening the menu
+// stops the job. The Listen group leads with the chosen demodulator (actions.js offered).
 //
 // Closing: Escape, a pointer press outside the menu, or choosing an entry. Up/Down move the
 // focus between the entries of one level; Enter or Space chooses one.
@@ -666,9 +667,11 @@ class Menu {
     // The fit in progress (its generation token) or null; close() bumps fitGen.
     this.fitting = null;
     this.fitGen = 0;
-    // The node's choice for the open box (classify's, then its transient `choose` job's
-    // revisions), the choose job's id while it runs and the generation guarding both.
+    // The node's choice for the open box (its transient `choose` job's answers), whether the
+    // job is still asked or running (`choosing`), its id while it runs and the generation
+    // guarding them.
     this.choice = null;
+    this.choosing = false;
     this.chooseJob = null;
     this.chooseGen = 0;
     this.chooseTimer = null;
@@ -810,7 +813,7 @@ class Menu {
       sets: this.readySets(),
       rows: this.rows,
       choice: this.choice,
-      revising: this.chooseJob !== null,
+      revising: this.choosing,
       src: (this.sources() || []).find((x) => x.id === this.sel.sourceId),
     };
   }
@@ -1142,6 +1145,7 @@ class Menu {
     this.sel = { ...sel, sourceId: this.wf.sourceId };
     this.stopChoose();
     this.choice = null;
+    this.choosing = true;
     this.paint(this.el, this.footer, this.boxCtx());
     this.showFooter(this.current());
     // The rows' first answer draws the menu again (Decode across's rows).
@@ -1164,6 +1168,7 @@ class Menu {
   // Ends the box's choice work: the poll, and its transient `choose` job if still running.
   stopChoose() {
     this.chooseGen += 1;
+    this.choosing = false;
     clearTimeout(this.chooseTimer);
     this.chooseTimer = null;
     this.chooseSub?.close();
@@ -1173,41 +1178,16 @@ class Menu {
     if (id !== null) this.ov.api.op({ op: "job_stop", job: id }).catch(() => {});
   }
 
-  // classify on the box for its choice, quietly (not the transcript); null when it failed.
-  // A span the ring no longer holds is tried once more on the newest span, as reclassify does.
-  async classifyChoice(s) {
-    const selection = this.selection(s);
-    try {
-      const r = await this.ov.api.op({ op: "classify", selection });
-      return r?.value?.choice ?? null;
-    } catch (e) {
-      const d = e?.json?.detail;
-      const end = newestNs(this.wf);
-      if (e?.json?.error !== "ring" || d?.cause !== "too_old" || end === null) return null;
-      const len = selection.span.end_ns - selection.span.start_ns;
-      const from = Math.round(Math.max(end - len, d.earliest_ns + RING_FRONT_MARGIN_NS));
-      if (!Number.isFinite(from) || from >= end) return null;
-      const span = { start_ns: from, end_ns: Math.round(end) };
-      try {
-        const r = await this.ov.api.op({ op: "classify", selection: { ...selection, span } });
-        return r?.value?.choice ?? null;
-      } catch {
-        return null;
-      }
-    }
-  }
-
-  // The box menu's first entry: classify's choice at once, then a transient `choose` (menu
-  // surface, up to step 2) whose context holds the revisions, read every CHOOSE_POLL_MS and
-  // drawn in place. `gen` is chooseGen at the opening: a close or a new box ends it all.
+  // The box menu's first entry: a transient `choose` (menu surface, up to step 2) over the box's
+  // span, whose answers (its events, and its context read every CHOOSE_POLL_MS) are drawn in
+  // place, the first one ending the pending entry. `gen` is chooseGen at the opening: a close
+  // or a new box ends it all.
   async pursueChoice(at, gen) {
     const live = () => gen === this.chooseGen && this.sel === at && !this.el.hidden;
     const show = () => {
       if (live() && this.fitting === null) this.repaint();
     };
-    const first = await this.classifyChoice(this.current());
-    if (!live()) return;
-    this.choice = first;
+    const { span } = this.selection(this.current());
     let id;
     try {
       const r = await this.ov.api.op({
@@ -1220,10 +1200,13 @@ class Menu {
         sideband: null,
         elastic: false,
         replace: [],
-        choose: { up_to: 2, surface: "menu", start: false, transient: true },
+        choose: { up_to: 2, surface: "menu", start: false, transient: true, span },
       });
       id = r.value;
-    } catch {
+    } catch (e) {
+      if (!live()) return;
+      this.choosing = false;
+      this.choice = { job: null, reason: e?.message ?? "the node did not choose" };
       show();
       return;
     }
@@ -1240,7 +1223,10 @@ class Menu {
       const changed = c != null && JSON.stringify(c) !== JSON.stringify(this.choice);
       if (changed) this.choice = c;
       // A done job ended by itself: nothing to stop, only the poll and the subscription.
-      if (done) this.chooseJob = null;
+      if (done) {
+        this.chooseJob = null;
+        this.choosing = false;
+      }
       if (changed || done) show();
       if (done) this.stopChoose();
     };

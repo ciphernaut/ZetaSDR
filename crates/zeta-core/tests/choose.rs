@@ -349,6 +349,98 @@ async fn choose_up_to_one_never_writes_a_slice() {
     );
 }
 
+/// The newest sample time of the source's ring, once it holds `held_s` seconds.
+async fn latest_once_held(node: &Node, held_s: f64) -> u64 {
+    until("the ring holds enough", Duration::from_secs(20), || {
+        node.ring(&rx())
+            .is_some_and(|r| r.read().unwrap().held_s() >= held_s)
+    })
+    .await;
+    node.ring(&rx())
+        .unwrap()
+        .read()
+        .unwrap()
+        .latest()
+        .unwrap()
+        .0
+}
+
+/// `{"up_to": 2}` over the span `from_ns..to_ns`.
+fn over(from_ns: u64, to_ns: u64) -> Value {
+    serde_json::json!({"up_to": 2, "span": {"start_ns": from_ns, "end_ns": to_ns}})
+}
+
+const SECOND_NS: u64 = 1_000_000_000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_span_is_cut_to_its_newest_slice_for_both_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    let latest = latest_once_held(&node, 7.0).await;
+    let (from, to) = (latest - 6 * SECOND_NS, latest - 3 * SECOND_NS);
+    let id = start(&node, choose_op(DMR_HZ, 20_000, over(from, to))).await;
+    let ctx = ended(&node, &id).await;
+    assert_eq!(ctx["span"]["end_ns"], to, "the ask keeps the span: {ctx:#}");
+    // Step 2 replayed the span's newest 2 s, the slice step 1 classified.
+    let slice = ctx["slice"].as_str().expect("a trial slice");
+    let t = node.bursts().get(slice).unwrap();
+    assert_eq!((t.start_ns, t.end_ns), (to - 2 * SECOND_NS, to), "{t:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_span_the_ring_no_longer_holds_cannot_tell() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 3.0).await;
+    // A ring of 3 s that has run 6 s no longer holds its first 2 s.
+    until("the ring runs 6 s", Duration::from_secs(20), || {
+        node.ring(&rx())
+            .and_then(|r| r.read().unwrap().latest())
+            .is_some_and(|t| t.0 >= 6 * SECOND_NS)
+    })
+    .await;
+    let id = start(&node, choose_op(DMR_HZ, 20_000, over(0, 2 * SECOND_NS))).await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(v["settled"], "cannot_tell", "{v}");
+    assert_eq!(v["reason"], "the ring no longer holds the span", "{v}");
+    assert!(trials(&node).is_empty(), "{:?}", node.bursts().list());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_span_under_a_second_skips_step_two_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    let latest = latest_once_held(&node, 3.0).await;
+    let to = latest - SECOND_NS;
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, over(to - SECOND_NS / 2, to)),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(v["step"], 1, "{v}");
+    assert!(
+        reasons(v).contains(&"not tried: the selection's span is under 1 s"),
+        "{v}"
+    );
+    assert!(trials(&node).is_empty(), "{:?}", node.bursts().list());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_span_ending_before_it_starts_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    let r = node
+        .apply(choose_op(DMR_HZ, 20_000, over(2 * SECOND_NS, SECOND_NS)))
+        .await;
+    assert!(
+        matches!(&r, Err(OpError::Other { message }) if message.contains("choose.span")),
+        "{r:?}"
+    );
+    assert!(node.job_list().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_short_ring_skips_step_two_and_says_so() {
     let dir = tempfile::tempdir().unwrap();

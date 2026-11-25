@@ -2,8 +2,9 @@
 //! as far as its context's `choose.step` allows (the choice policy's step for the surface
 //! that asked, [`crate::choice_policy::ChoicePolicy::steps`]), taking no lease.
 //!
-//! Its selection is the job's band over the newest `budget.slice_s` seconds of the
-//! source's ring (what the ring holds, when less). Step 1 classifies it at once, as
+//! Its selection is the job's band over the newest `budget.slice_s` seconds of the span
+//! it was asked (the page's box), else of the source's ring (what the ring holds, when
+//! less; a span the ring no longer holds is a `cannot_tell`). Step 1 classifies it at once, as
 //! `classify` does, and chooses ([`choose_now`]). Step 2 writes the same slice into the
 //! burst store as a trial capture (pinned while the job runs) and replays it through the
 //! `could_prove` rows ([`replay_trials`]), `budget.concurrent` at a time, each judged by
@@ -71,6 +72,10 @@ pub const OVER_QUOTA: &str = "not tried: the slice exceeds the trial quota";
 pub const OVER_BUDGET: &str = "not tried: budget";
 /// The trial steps' note when layer 1 measured nothing to size a proved job by.
 pub const UNMEASURED: &str = "not tried: layer 1 did not measure the band";
+/// Step 2's note when the span asked is itself under the second step 2 needs.
+pub const SPAN_SHORT: &str = "not tried: the selection's span is under 1 s";
+/// The `cannot_tell` reason of a span asked that the ring no longer holds.
+pub const SPAN_GONE: &str = "the ring no longer holds the span";
 /// The shortest slice step 2 replays.
 const MIN_SLICE_NS: u64 = 1_000_000_000;
 /// How far after a ring's oldest sample a selection of all it holds starts: the next
@@ -102,6 +107,10 @@ pub(crate) struct ChooseAsk {
     pub start: bool,
     /// A short-lived ask: the job is `JobRecord.transient`.
     pub transient: bool,
+    /// The selection's span asked (`ChooseParams.span`): the job's selection is its
+    /// newest `budget.slice_s`; `None`, the ring's newest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<Span>,
 }
 
 impl Node {
@@ -193,6 +202,7 @@ impl Inner {
                     capped,
                     start: false,
                     transient: false,
+                    span: None,
                 }
             });
         let ctx = match serde_json::to_value(&ask) {
@@ -300,36 +310,67 @@ impl Inner {
         self.choose_event(r, payload);
     }
 
-    /// The job's selection: its band over the newest `slice_s` seconds of the source's
-    /// ring, or the newest contiguous run when that is shorter, with the span's length
-    /// in ns. `None` while the ring holds nothing.
-    fn newest_slice(&self, r: &Run, slice_s: f32) -> Option<(Selection, u64)> {
-        self.newest_selection(&r.source, r.tuning, slice_s)
+    /// The job's selection: its band over the newest `slice_s` seconds of its asked
+    /// span the ring holds, else of the ring ([`Inner::selection_of`]).
+    fn job_selection(&self, r: &Run, slice_s: f32) -> Result<(Selection, u64), String> {
+        let asked = r.ask.span.as_ref().map(|s| (s.start_ns.0, s.end_ns.0));
+        self.selection_of(&r.source, r.tuning, slice_s, asked)
     }
 
     /// The band `band` of `source` over the newest `slice_s` seconds of its ring, or the
     /// newest contiguous run when that is shorter, with the span's length in ns. `None`
-    /// while the ring holds nothing. What a `choose` (and a watch's step 1) classifies.
+    /// while the ring holds nothing. What a watch's step 1 classifies.
     pub(super) fn newest_selection(
         &self,
         source: &SourceId,
         band: Tuning,
         slice_s: f32,
     ) -> Option<(Selection, u64)> {
-        let ring = self.rings.lock().unwrap().get(source).cloned()?;
+        self.selection_of(source, band, slice_s, None).ok()
+    }
+
+    /// The band `band` of `source` over the newest `slice_s` seconds of `asked`
+    /// (`(start_ns, end_ns)`; `None`, all the ring holds) inside the ring's newest
+    /// contiguous run ([`slice_span`]), with the span's length in ns. Why there is none:
+    /// the source is not capturing, or the ring no longer holds the span asked
+    /// ([`SPAN_GONE`]).
+    fn selection_of(
+        &self,
+        source: &SourceId,
+        band: Tuning,
+        slice_s: f32,
+        asked: Option<(u64, u64)>,
+    ) -> Result<(Selection, u64), String> {
+        let not_capturing = || format!("source {} is not capturing", source.0);
+        let ring = self
+            .rings
+            .lock()
+            .unwrap()
+            .get(source)
+            .cloned()
+            .ok_or_else(not_capturing)?;
         let ring = ring.read().unwrap();
-        let (start, latest) = (ring.latest_run_start()?, ring.latest()?);
-        let (from, held_ns) = slice_span(start.0, latest.0, slice_s)?;
+        let (start, latest) = ring
+            .latest_run_start()
+            .zip(ring.latest())
+            .ok_or_else(not_capturing)?;
+        let (from, to) = slice_span(start.0, latest.0, slice_s, asked).ok_or_else(|| {
+            if asked.is_some() {
+                SPAN_GONE.to_string()
+            } else {
+                not_capturing()
+            }
+        })?;
         let sel = Selection {
             source: source.clone(),
             span: Span {
                 start_ns: crate::types::Timestamp(from),
-                end_ns: latest,
+                end_ns: crate::types::Timestamp(to),
             },
             center_hz: band.center_hz,
             bandwidth_hz: band.bandwidth_hz,
         };
-        Some((sel, held_ns))
+        Ok((sel, to - from))
     }
 
     /// Write `samples` (the selection `sel` of the ring at `rate`, centred
@@ -614,13 +655,14 @@ fn widen_task(
     tokio::spawn(async move { node.source_widen_held(&source, want, &cancel).await })
 }
 
-/// The `choose` job's body: (1) the selection ([`Inner::newest_slice`]; none is a
+/// The `choose` job's body: (1) the selection ([`Inner::job_selection`]; none is a
 /// `cannot_tell`, and one the ring moved past before it was read is taken again once),
 /// classified and chosen ([`choose_now`]), the policy's cap noted; (2) when the job's
 /// step reaches 2 and step 1 proved nothing, the same samples written as the trial
 /// slice ([`Inner::write_slice`], pinned until just before the verdict) and
 /// [`Inner::step_two`] over it, unless the policy's slice is under 1 s
-/// ([`POLICY_SLICE_SHORT`]), the selection is ([`RING_SHORT`]) or layer 1 measured
+/// ([`POLICY_SLICE_SHORT`]), the span asked is ([`SPAN_SHORT`]), the selection is
+/// ([`RING_SHORT`]) or layer 1 measured
 /// nothing ([`UNMEASURED`]); (3) when the job's step reaches 3 and
 /// nothing proved yet, [`Inner::step_three`] on the live band with what is left of the
 /// trials' budget; then the verdict, and with `start` the verdict's job: a step-3
@@ -641,13 +683,17 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
         .capped
         .clone()
         .map(|reason| NotTried { row: None, reason });
-    let not_capturing = || format!("source {} is not capturing", r.source.0);
     // A selection the ring moved past before it was read (a block evicted its oldest
     // samples in between) is taken again once, from the ring as it is then.
     let mut classified = None;
+    let mut none = None;
     for _ in 0..2 {
-        let Some((sel, held_ns)) = inner.newest_slice(&r, budget.slice_s) else {
-            break;
+        let (sel, held_ns) = match inner.job_selection(&r, budget.slice_s) {
+            Ok(s) => s,
+            Err(why) => {
+                none = Some(why);
+                break;
+            }
         };
         let c = tokio::select! {
             c = crate::ops::classify_samples(&node, &sel) => c,
@@ -667,9 +713,10 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
     let (sel, held_ns, classified) = match classified {
         Some((sel, held_ns, Ok(c))) => (sel, held_ns, c),
         found => {
-            let reason = match found {
-                Some((.., Err(e))) => e.to_string(),
-                _ => not_capturing(),
+            let reason = match (found, none) {
+                (_, Some(why)) => why,
+                (Some((.., Err(e))), None) => e.to_string(),
+                (_, None) => format!("source {} is not capturing", r.source.0),
             };
             let c = cannot_tell(reason, capped.into_iter().collect());
             inner.publish_choice(&mut r, &c);
@@ -686,8 +733,15 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
     let note = |c: &mut Choice, reason: String| c.not_tried.push(NotTried { row: None, reason });
     // The trial slice lives until the verdict, pinned, for every trial step.
     let mut slice = None;
+    let asked_short = r
+        .ask
+        .span
+        .as_ref()
+        .is_some_and(|s| s.end_ns.0.saturating_sub(s.start_ns.0) < MIN_SLICE_NS);
     if step_two && budget.slice_s < 1.0 {
         note(&mut choice, POLICY_SLICE_SHORT.into());
+    } else if step_two && asked_short {
+        note(&mut choice, SPAN_SHORT.into());
     } else if step_two && held_ns < MIN_SLICE_NS {
         note(&mut choice, RING_SHORT.into());
     } else if step_two && classified.measurement.is_none() {
@@ -1117,15 +1171,23 @@ struct TrialSlice {
     _pinned: Pinned,
 }
 
-/// The newest `slice_s` seconds of a ring whose newest contiguous run starts at
-/// `run_start_ns` and ends at `latest_ns`: `(from_ns, held_ns)`. A run shorter than that
-/// starts [`RING_MARGIN_NS`] after its oldest sample, which the next block written may
-/// evict before the selection is read; `None` when nothing is left.
-fn slice_span(run_start_ns: u64, latest_ns: u64, slice_s: f32) -> Option<(u64, u64)> {
+/// The newest `slice_s` seconds of the span `asked` (`None`: all of it) in a ring whose
+/// newest contiguous run starts at `run_start_ns` and ends at `latest_ns`:
+/// `(from_ns, to_ns)`. A run shorter than that starts [`RING_MARGIN_NS`] after its
+/// oldest sample, which the next block written may evict before the selection is read;
+/// `None` when nothing is left (the run holds none of the span).
+fn slice_span(
+    run_start_ns: u64,
+    latest_ns: u64,
+    slice_s: f32,
+    asked: Option<(u64, u64)>,
+) -> Option<(u64, u64)> {
     let want_ns = (f64::from(slice_s) * 1e9) as u64;
     let oldest = run_start_ns.saturating_add(RING_MARGIN_NS);
-    let from = latest_ns.saturating_sub(want_ns).max(oldest);
-    (latest_ns > from).then(|| (from, latest_ns - from))
+    let (lo, hi) = asked.unwrap_or((0, latest_ns));
+    let to = hi.min(latest_ns);
+    let from = to.saturating_sub(want_ns).max(oldest).max(lo);
+    (to > from).then_some((from, to))
 }
 
 #[cfg(test)]
@@ -1193,18 +1255,31 @@ mod tests {
     /// what it holds but its oldest margin, which a block written meanwhile may evict.
     #[test]
     fn the_slice_keeps_clear_of_the_oldest_samples() {
-        assert_eq!(slice_span(0, 10 * S, 2.0), Some((8 * S, 2 * S)));
+        assert_eq!(slice_span(0, 10 * S, 2.0, None), Some((8 * S, 10 * S)));
         assert_eq!(
-            slice_span(9 * S, 10 * S, 2.0),
-            Some((9 * S + RING_MARGIN_NS, S - RING_MARGIN_NS))
+            slice_span(9 * S, 10 * S, 2.0, None),
+            Some((9 * S + RING_MARGIN_NS, 10 * S))
         );
         // A run of exactly the slice still keeps the margin.
         assert_eq!(
-            slice_span(8 * S, 10 * S, 2.0),
-            Some((8 * S + RING_MARGIN_NS, 2 * S - RING_MARGIN_NS))
+            slice_span(8 * S, 10 * S, 2.0, None),
+            Some((8 * S + RING_MARGIN_NS, 10 * S))
         );
         // A run no longer than the margin leaves nothing.
-        assert_eq!(slice_span(10 * S - RING_MARGIN_NS, 10 * S, 2.0), None);
-        assert_eq!(slice_span(10 * S, 10 * S, 2.0), None);
+        assert_eq!(slice_span(10 * S - RING_MARGIN_NS, 10 * S, 2.0, None), None);
+        assert_eq!(slice_span(10 * S, 10 * S, 2.0, None), None);
+    }
+
+    /// An asked span gives its newest slice inside the run: cut to the slice, cut at
+    /// the newest sample, kept clear of the oldest, and nothing once the run has moved
+    /// past it.
+    #[test]
+    fn an_asked_span_gives_its_newest_slice_the_ring_holds() {
+        let at = |lo: u64, hi: u64| slice_span(4 * S, 10 * S, 2.0, Some((lo * S, hi * S)));
+        assert_eq!(at(5, 9), Some((7 * S, 9 * S)));
+        assert_eq!(at(6, 7), Some((6 * S, 7 * S)));
+        assert_eq!(at(9, 12), Some((9 * S, 10 * S)));
+        assert_eq!(at(3, 5), Some((4 * S + RING_MARGIN_NS, 5 * S)));
+        assert_eq!(at(1, 3), None);
     }
 }

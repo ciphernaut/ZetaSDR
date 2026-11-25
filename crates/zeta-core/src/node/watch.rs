@@ -1908,6 +1908,7 @@ impl Inner {
             capped,
             start: false,
             transient: true,
+            span: None,
         };
         let rec = choose_record(r.prov.source.clone(), band, ask, Some(r.id.clone()));
         let id = rec.id.clone();

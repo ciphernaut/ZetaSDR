@@ -521,10 +521,14 @@ const banded = (c) => {
   return c.job.kind !== "mix" && !!t && Number.isFinite(t.center_hz)
     && Number.isFinite(t.bandwidth_hz) && t.bandwidth_hz > 0 && !!c.sel;
 };
-// The choice entry's label: `Start <kind> here: <width> kHz <row label>` (` (not proved)` for
-// a best-guess decoder), or `Can't tell: <reason>`.
+// The choice entry's label while the node has not answered yet.
+const CHOOSING = "Choosing a job here…";
+// The choice entry's label: `Choosing a job here…` until the node's first answer, then `Start
+// <kind> here: <width> kHz <row label>` (` (not proved)` for a best-guess decoder), or `Can't
+// tell: <reason>`.
 function choiceLabel(c) {
   const ch = c.choice;
+  if (ch == null) return CHOOSING;
   if (!ch?.job) return `Can't tell: ${ch?.reason ?? "no job fits"}`;
   const row = (c.rows || []).find((r) => r.id === ch.row);
   const guess = !ch.job.kind.endsWith("_demod") && ch.settled === "best_guess" ? " (not proved)" : "";
@@ -657,14 +661,15 @@ export const ACTIONS = [
   },
   // On a job: its band over the newest span of its source, which the page has only for the
   // shown source (menu.js jobCtx).
-  // The node's choice for the box (menu.js Menu.pursueChoice: classify's `choice`, revised in
-  // place by a transient `choose` job): the job it would start, or why it cannot tell.
+  // The node's choice for the box (menu.js Menu.pursueChoice: a transient `choose` job's
+  // answers, pending until the first): the job it would start, or why it cannot tell.
   {
     id: "choice_start", label: choiceLabel, group: "choice", on: ["box"],
     title: choiceTitle,
     revising: (c) => c.revising === true,
-    applies: (c) => c.choice != null,
-    disabled: (c) => (c.choice.job ? null : c.choice.reason ?? "no job fits"),
+    applies: (c) => c.choice != null || c.revising === true,
+    disabled: (c) => (c.choice == null ? "the node is still choosing"
+      : c.choice.job ? null : c.choice.reason ?? "no job fits"),
     run: (c) => c.host.startChoice(c.choice, c.sel),
   },
   {
