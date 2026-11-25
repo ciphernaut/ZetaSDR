@@ -8,8 +8,8 @@
 //! burst store as a trial capture (pinned while the job runs) and replays it through the
 //! `could_prove` rows ([`replay_trials`]), `budget.concurrent` at a time, each judged by
 //! its row's identify rule within `budget.trial_s` in all; the first proof settles the
-//! job. A slice under 1 s, or one the trial quota cannot hold even shortened to 1 s, is
-//! not tried, and `not_tried` says why. Step 3 tries the rows still in `could_prove` on
+//! job. A slice under 1 s, or one the trial quota cannot hold even shortened to 1 s
+//! beside the slices other chooses have pinned, is not tried, and `not_tried` says why. Step 3 tries the rows still in `could_prove` on
 //! the live band, one at a time in score order within what is left of `budget.trial_s`
 //! ([`Inner::step_three`]): each as an ordinary job the `choose` owns, started only where
 //! a running capture already holds the row's band (lease setting `share`), or after
@@ -79,6 +79,14 @@ const MIN_SLICE_NS: u64 = 1_000_000_000;
 const RING_MARGIN_NS: u64 = 100_000_000;
 /// Bytes one sample of a slice takes in the burst store (`cf32`).
 const SAMPLE_BYTES: u64 = 8;
+
+/// What the node's `choose` jobs share (`Inner::choosing`).
+#[derive(Default)]
+pub(super) struct Choosing {
+    /// Held across a slice's sizing, write and pin ([`Inner::write_slice`]), so two
+    /// chooses never both fit beside the same pinned bytes.
+    slice_gate: std::sync::Mutex<()>,
+}
 
 /// What a `choose` was asked, resolved at `job_start`: the first members of its
 /// `context.choose`.
@@ -325,17 +333,23 @@ impl Inner {
     }
 
     /// Write `samples` (the selection `sel` of the ring at `rate`, centred
-    /// `ring_center`) as a trial capture, shortened to the newest the trial quota holds,
-    /// and pin it for the job. The `not tried: ...` reason when it cannot: the quota
-    /// holds under 1 s of it ([`OVER_QUOTA`]), or the write or the pin fails.
+    /// `ring_center`) as a trial capture, shortened to the newest the trial quota holds
+    /// beside the trial slices other chooses have pinned, and pin it for the job. The
+    /// `not tried: ...` reason when it cannot: the quota holds under 1 s of it
+    /// ([`OVER_QUOTA`]), or the write or the pin fails.
     fn write_slice(
         &self,
         node: &Node,
         mut sel: Selection,
         (mut samples, rate, ring_center): (Vec<Complex<f32>>, Hz, Hz),
     ) -> Result<TrialSlice, String> {
-        let fits = usize::try_from(self.bursts.policy().trial_keep_bytes / SAMPLE_BYTES)
-            .unwrap_or(usize::MAX);
+        let _gate = self.choosing.slice_gate.lock().unwrap();
+        let room = self
+            .bursts
+            .policy()
+            .trial_keep_bytes
+            .saturating_sub(self.bursts.pinned_trial_bytes());
+        let fits = usize::try_from(room / SAMPLE_BYTES).unwrap_or(usize::MAX);
         if samples.len() > fits {
             if (fits as u64) < rate.0 {
                 return Err(OVER_QUOTA.into());

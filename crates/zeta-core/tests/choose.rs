@@ -533,6 +533,68 @@ async fn a_slice_over_the_trial_quota_is_shortened_or_not_tried() {
     assert!(trials(&node).is_empty(), "{:?}", node.bursts().list());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_trial_slices_share_the_trial_quota() {
+    // A quota of 3 s: the first choose pins a 2 s slice, so the second, asked while the
+    // first's slice is pinned, gets the 1 s left; never more than the quota pinned.
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_with(dir.path(), &voice_iq(), DMR_HZ, 10.0, SECOND_BYTES * 3).await;
+    // The first climbs to step 3, its live trials keeping its slice pinned for seconds.
+    start_fm(&node).await;
+    let op = || choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2}));
+    let up_to_3 = choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 3}));
+    let first = start(&node, up_to_3).await;
+    until("the first slice is pinned", ENDS_WITHIN, || {
+        trials(&node).iter().any(|r| r.pinned)
+    })
+    .await;
+    let second = start(&node, op()).await;
+    until("both slices are pinned", ENDS_WITHIN, || {
+        let t = trials(&node);
+        let pinned: u64 = t.iter().filter(|r| r.pinned).map(|r| r.bytes).sum();
+        assert!(pinned <= SECOND_BYTES * 3, "over the quota: {t:?}");
+        t.iter().filter(|r| r.pinned).count() == 2
+    })
+    .await;
+    let ctx = ended(&node, &second).await;
+    let _ = ended(&node, &first).await;
+    let slice = ctx["slice"]
+        .as_str()
+        .expect("the second choose wrote a slice");
+    let t = node.bursts().get(slice).unwrap();
+    let held_ns = t.end_ns - t.start_ns;
+    assert!((900_000_000..=1_000_000_000).contains(&held_ns), "{t:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slice_the_pinned_trials_leave_no_room_for_is_not_tried() {
+    // A quota of 2.5 s: the first choose's 2 s slice leaves under 1 s for the second.
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_with(dir.path(), &voice_iq(), DMR_HZ, 10.0, SECOND_BYTES * 5 / 2).await;
+    // The first climbs to step 3, its live trials keeping its slice pinned for seconds.
+    start_fm(&node).await;
+    let op = || choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2}));
+    let up_to_3 = choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 3}));
+    let first = start(&node, up_to_3).await;
+    until("the first slice is pinned", ENDS_WITHIN, || {
+        trials(&node).iter().any(|r| r.pinned)
+    })
+    .await;
+    let second = start(&node, op()).await;
+    let ctx = ended(&node, &second).await;
+    assert!(
+        state(&node, &first) == Some(JobState::Running),
+        "the first choose ended before the second wrote"
+    );
+    assert!(ctx["slice"].is_null(), "{ctx:#}");
+    assert!(
+        reasons(&ctx["verdict"]).contains(&"not tried: the slice exceeds the trial quota"),
+        "{ctx:#}"
+    );
+    let _ = ended(&node, &first).await;
+    assert_eq!(trials(&node).len(), 1, "{:?}", trials(&node));
+}
+
 /// A 5 kHz FM voice on the DMR fixture's frequency: step 2 tries the digital voice rows
 /// and none proves it.
 fn voice_iq() -> Vec<Complex<f32>> {

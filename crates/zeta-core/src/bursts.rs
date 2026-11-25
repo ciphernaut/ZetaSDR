@@ -450,6 +450,19 @@ impl BurstStore {
             .collect()
     }
 
+    /// The bytes of the pinned trial captures (the slices `choose` jobs are replaying),
+    /// which no expiry removes: what a new slice must fit beside under
+    /// `trial_keep_bytes`.
+    pub fn pinned_trial_bytes(&self) -> u64 {
+        self.index
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.pinned && r.trial)
+            .map(|r| r.bytes)
+            .sum()
+    }
+
     /// The bytes of every capture held.
     pub fn total_bytes(&self) -> u64 {
         self.index.lock().unwrap().iter().map(|r| r.bytes).sum()
@@ -780,6 +793,23 @@ mod tests {
         );
         assert!(operator.data_path.exists() && !trials[0].data_path.exists());
         assert!(s.get(&trials[3].id).unwrap().trial);
+    }
+
+    #[test]
+    fn pinned_trial_bytes_count_only_pinned_trials() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = two_budgets(dir.path(), u64::MAX, u64::MAX);
+        let a = s.write(trial_capture(t(0)), &samples()).unwrap();
+        let b = s.write(trial_capture(t(1)), &samples()).unwrap();
+        let operator = s.write(new_capture(t(2)), &samples()).unwrap();
+        assert_eq!(s.pinned_trial_bytes(), 0);
+        s.pin(&a.id).unwrap();
+        s.pin(&operator.id).unwrap();
+        assert_eq!(s.pinned_trial_bytes(), a.bytes);
+        s.pin(&b.id).unwrap();
+        assert_eq!(s.pinned_trial_bytes(), a.bytes + b.bytes);
+        s.unpin(&a.id).unwrap();
+        assert_eq!(s.pinned_trial_bytes(), b.bytes);
     }
 
     #[test]

@@ -638,6 +638,8 @@ struct Inner {
     /// `watch`) takes them: an owned record is dropped as soon as it ends, context and
     /// all (see [`Inner::prune_history`]).
     verdicts: Mutex<HashMap<JobId, serde_json::Value>>,
+    /// What the `choose` jobs share: the trial slices' gate, the node-wide trial slots.
+    choosing: choose::Choosing,
     /// How owned `capture` runs ended (`{capture, failed}`, see [`capture::capture_finished`]),
     /// by capture id, until their watch takes them: as `verdicts`, the record goes at its end.
     captured: Mutex<HashMap<JobId, serde_json::Value>>,
@@ -1781,6 +1783,7 @@ impl Node {
                 shutdown: CancellationToken::new(),
                 ops_stream,
                 verdicts: Mutex::new(HashMap::new()),
+                choosing: choose::Choosing::default(),
                 captured: Mutex::new(HashMap::new()),
                 episodes: Mutex::new(HashMap::new()),
                 restarts: Mutex::new(HashMap::new()),
