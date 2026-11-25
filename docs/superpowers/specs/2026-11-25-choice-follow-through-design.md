@@ -1,8 +1,8 @@
 # Choice follow-through: what the live run of plan 48 left (plan 49)
 
-2026-11-25. Design, not yet reviewed by the operator: written without questions, so every call
-that is theirs has a recommended default here and is listed under 9. The plan follows in
-`docs/superpowers/plans/`.
+2026-11-25. Design, written without questions; the eight calls that were the operator's were put
+to them as defaults. Approved 2026-11-26 with every default accepted (section 9). The plan is
+`docs/superpowers/plans/2026-11-26-choice-follow-through.md`.
 
 Parent: `docs/superpowers/specs/2026-11-24-classify-chooses-the-job-design.md` (plan 48). Sources:
 `TODO.md`, "Left from plan 48 (2026-11-25)" and the two "minimum-version probe" lines under
@@ -477,8 +477,8 @@ Sizes are the operator's calibrated ones (`XS`, `S fix`, `S feature`, `M`).
   order 49.7, 49.6, 49.5, 49.4, 49.2, 49.3, which all meet in `choice.rs` and `choose.rs`.
 - **The page work is one sitting at the end:** 49.8's in-place revision first, then the labels of
   49.6, 49.4 and 49.3 on top of it, then the rebalance.
-- **A rough total**, going by plans of this shape before it, is 3 to 3.5 M tokens with reviews.
-  49.1 is the least certain part.
+- **A rough total** is in the plan, task by task: about 7.5 M tokens with reviews. This design first
+  guessed 3 to 3.5 M by counting parts, which was low. 49.1 is the least certain part.
 
 ## 7. Testing
 
@@ -561,44 +561,32 @@ the broadcast band.
   the Decode entries that only OnAir serves are greyed with `onair-rx <old> is older than
   <min>`. Restore it and reload: they are offered again.
 
-## 9. Open questions for the operator
+## 9. Decided by the operator, 2026-11-26
 
-Each has the default this design is written to.
+All eight were put as questions with a default; the operator took each default. Not chosen is
+kept in one line each, so a later change of mind knows what it would undo.
 
-1. **Does a rider attach only once it is proved, or whenever it is ready?**
-   Default: only when proved, with the entry in the running job's menu and a watch's `attach`
-   list for the rest. The alternative attaches RDS to every `wfm_demod` the choice starts. Every
-   station with RDS then shows its name without a second click, at the cost of an RDS decoder
-   running on stations without it.
-2. **May the register or a plan overturn layer 1's label, or only name the runner-up?**
-   Default: it may overturn, when every expected emission at the centre contradicts the label,
-   by a weight in `weights.json`. The alternative keeps the label's answer and puts the expected
-   demodulator in the runner-up. Then a pause in an over on a licensed FM channel stays
-   `cannot_tell`, and a rare real AM signal on an FM channel is not mis-started.
-3. **Should a watch spend trial time on every `unknown` signal?**
-   Default: yes, to its policy's step, within `budget.trial_s`. The alternative stops at step 2
-   for `unknown`. Then a carrier that keyed off before its slice was cut is never tried on air,
-   and a busy band spends no dwells on noise-like signals.
-4. **A version floor, or a list of what the program can do?**
-   Default: the version floor `TODO.md` asks for, and a program whose version cannot be read is
-   `unavailable`. The alternative is a probe that asks the program for its modes, closer to how
-   the speech server is probed. It needs a new argument in each wrapper and a release of each, and
-   it would mark single modes unavailable where a floor marks the whole handler.
-5. **How do step-2 replays get ahead of step-3 dwells?**
-   Default: one slot is kept for replays and they are served first. The alternative leaves a
-   watch's own step-3 trial out of the cap. That is simpler, and the node's trials are then no
-   longer bounded by `budget.concurrent`.
-6. **Is a view setting that turns the menu's choose off wanted?**
-   Default: no. The alternative is `view set` gaining it for a slow host. The tests could then
-   use it, and most scenarios would no longer exercise the page as it ships.
-7. **Should a slowly keyed bare carrier (hand-sent Morse) read `ook` or `carrier`?**
-   Default: `carrier`, with its keying in `duty`, `bursts` and `burst_ms`, since no row serves
-   either label today. The alternative keeps `ook` for it, which needs a rule that tells a keyed
-   carrier from an over's edge by the count and length of its runs.
-8. **Where do the voice captures for 49.1 live?**
-   Default: on the field host, outside the repository, with generators in the repository
-   standing for them. The alternative, a capture of the operator's own test transmission, could be
-   committed and would make the fixture real.
+1. **A rider attaches only once it is proved.** The running job's menu and a watch's `attach`
+   list cover the rest.
+   Not chosen: attaching every ready rider to each demodulator the choice starts.
+2. **The register or a plan may overturn layer 1's label,** when every expected emission at the
+   centre contradicts it, by a weight in `weights.json`.
+   Not chosen: the expected demodulator as the runner-up only.
+3. **A watch spends trial time on every `unknown` signal,** to its policy's step, within
+   `budget.trial_s`.
+   Not chosen: stopping at step 2 for `unknown`.
+4. **A version floor,** and a program whose version cannot be read is `unavailable`.
+   Not chosen: a probe that asks the program for its modes (it needs a release of each wrapper).
+5. **One trial slot is kept for step-2 replays, and they are served first.**
+   Not chosen: leaving a watch's own step-3 trial out of `budget.concurrent`.
+6. **No view setting turns the menu's choose off.**
+   Not chosen: `view set` gaining it for a slow host and the tests.
+7. **A slowly keyed bare carrier reads `carrier`,** with its keying in `duty`, `bursts` and
+   `burst_ms`.
+   Not chosen: a rule that keeps `ook` for it by the count and length of its runs.
+8. **The voice captures for 49.1 stay on the field host, outside the repository,** with generators
+   in the repository standing for them.
+   Not chosen: committing a capture of the operator's own test transmission.
 
 ## 10. Left to the builder
 
