@@ -426,6 +426,7 @@ impl Inner {
             group: None,
             replay: None,
             transient: false,
+            held: None,
         };
         let child = rec.id.clone();
         let mut launch = match t.lease {

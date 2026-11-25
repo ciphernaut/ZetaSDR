@@ -301,6 +301,27 @@ impl Inner {
                 .map(|inner| inner.mix_inputs(&mix_job))
                 .unwrap_or_default()
         }));
+        // An attached job asks after its input's record on each call, so a hold lifted
+        // (or set) while it runs is seen without a restart. An input whose record is gone
+        // (an owned job is forgotten as it stops) answers as it last did: a held job
+        // dropped stays held for the lines its transcriber kept.
+        let ctx = match rec.input.clone() {
+            Some(input) => {
+                let held_node = Arc::downgrade(self);
+                let last = std::sync::atomic::AtomicBool::new(false);
+                ctx.with_held(Arc::new(move || {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    match held_node.upgrade().and_then(|inner| inner.held_now(&input)) {
+                        Some(held) => {
+                            last.store(held, Relaxed);
+                            held
+                        }
+                        None => last.load(Relaxed),
+                    }
+                }))
+            }
+            None => ctx,
+        };
 
         let token = self.shutdown.child_token();
         let graph = rec.graph.clone();

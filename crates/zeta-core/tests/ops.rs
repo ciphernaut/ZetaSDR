@@ -593,10 +593,12 @@ fn every_op_variant_denies_unknown_fields_and_requires_all() {
 /// Members a strict object may leave out, by the end of the object's path: written only
 /// when they say something. A replay's record names its capture in `replay`; every other
 /// record has none, so a node from before replays still reads it. `transient` is
-/// written only on a transient job's record, for the same reason.
-const OPTIONAL_MEMBERS: [(&str, &str); 2] = [
+/// written only on a transient job's record, and `held` only on a held job's, for the
+/// same reason.
+const OPTIONAL_MEMBERS: [(&str, &str); 3] = [
     (".$defs.JobRecord", "replay"),
     (".$defs.JobRecord", "transient"),
+    (".$defs.JobRecord", "held"),
 ];
 
 /// Every object schema with properties, anywhere under `v` (including `$defs`),

@@ -2194,6 +2194,7 @@ async fn a_sinked_decoder_resumed_at_another_capture_rate_keeps_its_sink() {
             group: None,
             replay: None,
             transient: false,
+            held: None,
         };
         let path = dir
             .path()

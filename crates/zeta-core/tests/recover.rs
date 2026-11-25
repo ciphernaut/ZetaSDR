@@ -418,6 +418,7 @@ async fn a_record_failed_in_an_earlier_episode_is_not_recovered() {
         group: None,
         replay: None,
         transient: false,
+        held: None,
     };
     let jobs = dir.path().join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();

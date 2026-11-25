@@ -571,6 +571,7 @@ fn running(kind: &str, tuning: Tuning, created_ns: u64) -> JobRecord {
         group: None,
         replay: None,
         transient: false,
+        held: None,
     }
 }
 

@@ -125,6 +125,23 @@ pub struct JobRecord {
     /// with `all`. Written only when set, so a node built before it reads every record.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transient: bool,
+    /// The job runs held (a `watch`'s answer on probation while its `choose` settles):
+    /// the mix leaves it out, and a `transcribe` attached to it keeps its lines until the
+    /// hold lifts. Not a mute. Written only when set, so a node built before it reads
+    /// every record that is not held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<Hold>,
+}
+
+/// Why, and since when, a job is held ([`JobRecord::held`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct Hold {
+    /// What holds it: `probation` (a watch's unproved answer while its `choose` settles).
+    pub reason: String,
+    /// When the hold began, in nanoseconds since the Unix epoch.
+    pub since_ns: u64,
 }
 
 /// Schemars omits serde-defaulted fields from `required` (and `#[schemars(required)]`
@@ -132,7 +149,8 @@ pub struct JobRecord {
 /// `format`, `input`, `capture_rate_hz`, `elastic`, `operator_graph`, `owner`,
 /// `audio_policy`, `stream`, `sinks`, `handler`, `handler_named`, `needs` and `group`,
 /// so the published schema requires them. `replay` is written only on a replay's record,
-/// and `transient` only on a transient job's, so they stay optional.
+/// `transient` only on a transient job's and `held` only on a held job's, so they stay
+/// optional.
 fn require_format(schema: &mut schemars::Schema) {
     if let Some(req) = schema
         .ensure_object()

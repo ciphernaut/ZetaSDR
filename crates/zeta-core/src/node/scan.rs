@@ -1563,6 +1563,7 @@ mod tests {
             group: None,
             replay: None,
             transient: false,
+            held: None,
         };
         inner.jobs.lock().unwrap().insert(
             id.clone(),

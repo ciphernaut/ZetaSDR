@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bank::{BankFactory, ChannelBank, PFB_MIN_RATE_HZ};
 use crate::classify::{Classifier, ClassifierSet};
 use crate::graph::{self, Graph, GraphError};
-use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
+use crate::job::{Hold, JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
 use crate::lease::{Decision, LeaseError, LeaseManager};
 use crate::modes::{MODES_CHECKED_FILE, ModeRegistry, ModeState, ModesHandle};
@@ -375,6 +375,7 @@ fn running_record(
         group: None,
         replay: None,
         transient: false,
+        held: None,
     }
 }
 
@@ -493,13 +494,15 @@ impl JobOutput {
 /// Whether a mix may read `rec`: not an attached job (it is a chain over a job's audio),
 /// a job a controller owns (a trial), a replay (`capture_decode`: a recording, not live
 /// traffic; its row's own play button still plays it), another mix (a `mix` job, or any
-/// job whose graph holds a `mix` node, as a `graph_start` of one does) or a job centred
+/// job whose graph holds a `mix` node, as a `graph_start` of one does), a job centred
 /// on a plan channel that carries no voice (CB ch22 and ch23: data, its noise is no one
-/// talking).
+/// talking) or a held job ([`JobRecord::held`]: the mix takes it in at its first poll
+/// after the hold lifts).
 fn mixable(rec: &JobRecord) -> bool {
     rec.input.is_none()
         && rec.owner.is_none()
         && rec.replay.is_none()
+        && rec.held.is_none()
         && crate::plans::no_voice_at(rec.tuning.center_hz.0).is_none()
         && rec.kind != JobKind::Mix.name()
         && !rec
@@ -1195,6 +1198,28 @@ impl Inner {
             other => *ctx = other,
         }
         persist(&self.jobs_dir, &entry.record)
+    }
+
+    /// See [`Node::set_held`].
+    fn set_held(&self, id: &JobId, held: Option<Hold>) -> Result<(), NodeError> {
+        let mut jobs = self.jobs.lock().unwrap();
+        let entry = jobs
+            .get_mut(id)
+            .ok_or_else(|| NodeError::UnknownJob(id.clone()))?;
+        if entry.record.held == held {
+            return Ok(());
+        }
+        entry.record.held = held;
+        persist(&self.jobs_dir, &entry.record)
+    }
+
+    /// Whether the job `id` is held; `None` for a job the node does not know (any more).
+    fn held_now(&self, id: &JobId) -> Option<bool> {
+        self.jobs
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|e| e.record.held.is_some())
     }
 
     /// Put the job `id` in the Send to group `group` (its record's `group`) and persist
@@ -2736,6 +2761,7 @@ impl Node {
             group: None,
             replay,
             transient: false,
+            held: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2796,6 +2822,7 @@ impl Node {
             group: None,
             replay: None,
             transient: false,
+            held: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -2912,6 +2939,7 @@ impl Node {
             group: None,
             replay: None,
             transient: false,
+            held: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -3008,6 +3036,7 @@ impl Node {
             group: None,
             replay: None,
             transient: false,
+            held: None,
         };
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
@@ -3691,6 +3720,14 @@ impl Node {
         self.inner.context_merge(id, patch)
     }
 
+    /// Hold the job `job` (`Some`) or lift its hold (`None`), on its record and on disk.
+    /// A held job runs on, but the mix leaves it out and a `transcribe` attached to it
+    /// keeps its lines; a lift is seen without a restart of either (the mix's next poll,
+    /// the transcriber's next look).
+    pub fn set_held(&self, job: &JobId, held: Option<Hold>) -> Result<(), NodeError> {
+        self.inner.set_held(job, held)
+    }
+
     /// The source's IQ history; `None` until its first block arrives.
     pub fn ring(&self, source: &SourceId) -> Option<Arc<RwLock<IqRing>>> {
         self.inner.rings.lock().unwrap().get(source).cloned()
@@ -4287,6 +4324,7 @@ mod tests {
             group: None,
             replay: None,
             transient: false,
+            held: None,
         }
     }
 

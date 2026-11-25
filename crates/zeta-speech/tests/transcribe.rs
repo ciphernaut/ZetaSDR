@@ -1,6 +1,7 @@
 //! Transcribe stage: audio in, `transcript` events out, through a fake backend.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -703,4 +704,97 @@ async fn short_utterances_are_noted_in_the_job_context() {
         &serde_json::json!({"transcribe": {"short": 2}}),
         "{notes:?}"
     );
+}
+
+/// A rig whose input's hold is `held`, through the context's hook.
+fn start_held(fake: &Arc<FakeBackend>, held: &Arc<AtomicBool>) -> Rig {
+    let h = held.clone();
+    let ctx = StageContext::new(SourceId("s".into()))
+        .with_held(Arc::new(move || h.load(Ordering::SeqCst)));
+    start_ctx(
+        Some(fake.clone() as Arc<dyn SpeechBackend>),
+        Duration::from_secs(30),
+        serde_json::json!({}),
+        ctx,
+    )
+}
+
+/// Wait up to 5 s for the backend's `n`th call, then 300 ms for its answer to be
+/// published (or held).
+async fn until_calls(fake: &FakeBackend, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fake.calls().len() < n {
+        assert!(Instant::now() < deadline, "{n} backend calls");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Two 1 s utterances half a second apart from `T_BASE`, the second closed by wall-clock
+/// silence; their spans, once the backend has answered both.
+async fn two_utterances(rig: &Rig, fake: &FakeBackend) -> [(u64, u64); 2] {
+    let burst = speech_like(RATE as u32, 1.0);
+    let end1 = send(&rig.tx, &burst, 1, T_BASE);
+    let t2 = end1 + 500_000_000;
+    let end2 = send(&rig.tx, &burst, 1, t2);
+    until_calls(fake, 2).await;
+    [(T_BASE, end1), (t2, end2)]
+}
+
+#[tokio::test]
+async fn a_held_transcriber_publishes_its_lines_on_release_in_order() {
+    let fake = Arc::new(FakeBackend::new("held"));
+    let held = Arc::new(AtomicBool::new(true));
+    let mut rig = start_held(&fake, &held);
+    let spans = two_utterances(&rig, &fake).await;
+    assert!(rig.events.try_recv().is_err(), "nothing while held");
+
+    // Lifted with the input still open and silent: the lines come out in order, with
+    // the audio's own times.
+    held.store(false, Ordering::SeqCst);
+    let first = next_event(&mut rig.events).await;
+    let second = next_event(&mut rig.events).await;
+    for (v, (start, end)) in [&first, &second].into_iter().zip(spans) {
+        assert_eq!(v["text"], "held", "{v}");
+        assert_eq!((u(v, "start_ns"), u(v, "end_ns")), (start, end), "{v}");
+    }
+    // Unheld now: the next line is published as it comes.
+    let t3 = spans[1].1 + SEC;
+    let end3 = send(&rig.tx, &speech_like(RATE as u32, 1.0), 1, t3);
+    let third = next_event(&mut rig.events).await;
+    assert_eq!((u(&third, "start_ns"), u(&third, "end_ns")), (t3, end3));
+    let (res, rest) = finish(rig).await;
+    assert!(res.is_ok(), "{res:?}");
+    assert!(rest.is_empty(), "{rest:?}");
+}
+
+#[tokio::test]
+async fn a_held_transcriber_cancelled_publishes_nothing() {
+    let fake = Arc::new(FakeBackend::new("held"));
+    let held = Arc::new(AtomicBool::new(true));
+    let mut rig = start_held(&fake, &held);
+    two_utterances(&rig, &fake).await;
+    rig.cancel.cancel();
+    let res = tokio::time::timeout(Duration::from_secs(2), rig.run)
+        .await
+        .expect("cancel is prompt")
+        .unwrap();
+    assert!(matches!(res, Err(StageError::Cancelled)), "{res:?}");
+    assert!(rig.events.try_recv().is_err(), "nothing it held");
+}
+
+#[tokio::test]
+async fn a_held_transcriber_whose_input_closes_publishes_nothing() {
+    let fake = Arc::new(FakeBackend::new("held"));
+    let held = Arc::new(AtomicBool::new(true));
+    let rig = start_held(&fake, &held);
+    // One line answered and held, then the input closes on an utterance still open.
+    let burst = speech_like(RATE as u32, 1.0);
+    let end1 = send(&rig.tx, &burst, 1, T_BASE);
+    send(&rig.tx, &[0.0; FRAME], 1, end1 + SEC);
+    until_calls(&fake, 1).await;
+    send(&rig.tx, &burst, 1, end1 + 2 * SEC);
+    let (res, events) = finish(rig).await;
+    assert!(res.is_ok(), "{res:?}");
+    assert!(events.is_empty(), "{events:?}");
 }

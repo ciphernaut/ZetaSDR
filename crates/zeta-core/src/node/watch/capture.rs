@@ -143,6 +143,7 @@ async fn start(
         group: None,
         replay: None,
         transient: false,
+        held: None,
     };
     let id = rec.id.clone();
     w.capturing.push((id.clone(), signal.clone()));

@@ -1,5 +1,7 @@
 //! The `transcribe` stage: audio cut into utterances at gaps in time, each handed to the
-//! node's speech backend, the text published as `transcript` events.
+//! node's speech backend, the text published as `transcript` events. While the job's
+//! input is held (`StageContext::held`) the events are kept, then published in order, with
+//! their own times, once the hold lifts; a run that ends held publishes none of them.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -11,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zeta_core::stage::{Backend, Readiness, Stage, StageContext, StageError, StageSpec};
+use zeta_core::stage::{Backend, HeldHook, Readiness, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Provenance, Span, StreamId, StreamKind, Timestamp};
 use zeta_dsp::resample::Resampler;
@@ -40,6 +42,8 @@ const NOTE_EVERY: Duration = Duration::from_secs(1);
 const MAX_ERRORS: u32 = 2;
 /// Slack on the worker's outer bound past the backend's own (call timeout + queue wait).
 const OUTER_SLACK: Duration = Duration::from_secs(1);
+/// How often a run keeping events looks whether its input's hold has lifted.
+const HELD_POLL: Duration = Duration::from_millis(100);
 
 fn en() -> String {
     DEFAULT_LANGUAGE.to_string()
@@ -299,17 +303,41 @@ struct Worker {
     queue: VecDeque<Job>,
     in_flight: Option<InFlight>,
     errors: u32,
+    /// Whether the input is held now (the job's [`StageContext::held`] hook).
+    held: Option<HeldHook>,
+    /// The events made while the input was held, oldest first, for [`Self::release`].
+    kept: Vec<Frame>,
 }
 
 impl Worker {
-    fn publish(&self, span: &Span, mut event: serde_json::Value) {
+    /// Publish `event` with its own `span`, or keep it while the input is held.
+    fn publish(&mut self, span: &Span, mut event: serde_json::Value) {
         let Some(mut prov) = self.prov.clone() else {
             return;
         };
         prov.span = span.clone();
         event["stream"] = serde_json::json!(self.stream);
-        self.bus
-            .publish(Frame::new(self.out.clone(), prov, Payload::Event(event)));
+        let frame = Frame::new(self.out.clone(), prov, Payload::Event(event));
+        if self.is_held() {
+            self.kept.push(frame);
+        } else {
+            self.release();
+            self.bus.publish(frame);
+        }
+    }
+
+    fn is_held(&self) -> bool {
+        self.held.as_ref().is_some_and(|f| f())
+    }
+
+    /// Publish what was kept, in order, once the input is no longer held.
+    fn release(&mut self) {
+        if self.kept.is_empty() || self.is_held() {
+            return;
+        }
+        for frame in std::mem::take(&mut self.kept) {
+            self.bus.publish(frame);
+        }
     }
 
     /// Hand `u` to the backend now, queue it, or drop it when the queue is full.
@@ -490,6 +518,8 @@ impl Stage for TranscribeStage {
             queue: VecDeque::new(),
             in_flight: None,
             errors: 0,
+            held: ctx.held.clone(),
+            kept: Vec::new(),
         };
         let rx = &mut inputs[0];
         // Wall-clock silence after the last frame closes the open utterance; armed only
@@ -541,7 +571,9 @@ impl Stage for TranscribeStage {
                     }
                 }
                 _ = tokio::time::sleep_until(note_at), if note_held => {}
+                _ = tokio::time::sleep(HELD_POLL), if !w.kept.is_empty() => {}
             }
+            w.release();
             if acc.short() > noted && tokio::time::Instant::now() >= note_at {
                 noted = acc.short();
                 ctx.note(serde_json::json!({"transcribe": {"short": noted}}));
@@ -551,12 +583,18 @@ impl Stage for TranscribeStage {
                 note_held = acc.short() > noted;
             }
         }
-        // The input closed: transcribe what is still open or waiting.
-        if let Some(u) = acc.flush() {
+        // The input closed held (its job dropped on probation): what was kept, and what
+        // is still open or waiting, goes unpublished.
+        let held = w.is_held();
+        // Else transcribe what is still open or waiting.
+        if !held && let Some(u) = acc.flush() {
             w.offer(u);
         }
         if acc.short() > noted {
             ctx.note(serde_json::json!({"transcribe": {"short": acc.short()}}));
+        }
+        if held {
+            return Ok(());
         }
         while w.in_flight.is_some() {
             tokio::select! {
@@ -565,6 +603,8 @@ impl Stage for TranscribeStage {
                 a = w.next_answer() => w.answered(a)?,
             }
         }
+        // Anything kept is published only if the input is not held by now.
+        w.release();
         Ok(())
     }
 }

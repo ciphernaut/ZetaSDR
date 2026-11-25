@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use zeta_core::graph::{Graph, GraphError, GraphId, Node as GraphNode, NodeId};
-use zeta_core::job::{JobRecord, JobState};
+use zeta_core::job::{Hold, JobRecord, JobState};
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{JobKind, Op, OpError, OpResult, SourceInfo};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
@@ -156,15 +156,24 @@ impl Stage for Stand {
         outputs: Vec<StreamId>,
         bus: Arc<StreamBus>,
         cancel: CancellationToken,
-        _ctx: StageContext,
+        ctx: StageContext,
     ) -> Result<(), StageError> {
         let Some(rx) = inputs.first_mut() else {
             return Err(StageError::Failed("expected 1 input".into()));
         };
+        // The `transcribe` stand-in looks at its input's hold (its hook) every 20 ms and
+        // notes `held` at the first look and at each change.
+        let looks = self.spec.kind == "transcribe";
+        let mut held = None;
         loop {
+            if looks && held != Some(ctx.is_held()) {
+                held = Some(ctx.is_held());
+                ctx.note(json!({ "held": held }));
+            }
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                _ = tokio::time::sleep(Duration::from_millis(20)), if looks => {}
                 r = rx.recv() => match r {
                     Ok(frame) => {
                         // Audio-out stages pass the audio on; event outputs stay quiet.
@@ -851,4 +860,90 @@ async fn a_mix_never_sums_a_composite() {
     assert_eq!(outs.len(), 2);
     assert_eq!(node.job_audio_stream(&both).unwrap(), outs[1].1);
     assert!(hears(&node, &m, &both).await);
+}
+
+fn probation() -> Hold {
+    Hold {
+        reason: "probation".into(),
+        since_ns: 42,
+    }
+}
+
+#[tokio::test]
+async fn a_held_job_is_not_mixed_and_joins_when_lifted() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open_on(dir.path(), &[Radio::new("a")]).await;
+    let ch = demod(&node, "a", CH).await;
+    node.set_held(&ch, Some(probation())).unwrap();
+    let m = mix(&node, None).await;
+    // Another poll or two: the held job never joins, and runs on.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(mix_ctx(&node, &m)["inputs"], 0, "{}", mix_ctx(&node, &m));
+    assert!(!hears(&node, &m, &ch).await);
+    assert!(running(&node, &ch));
+
+    // Lifted: the same mix takes it in at a poll, with no restart of either.
+    let outputs = node.job_outputs(&m);
+    node.set_held(&ch, None).unwrap();
+    until_inputs(&node, &m, 1).await;
+    assert!(hears(&node, &m, &ch).await);
+    assert_eq!(node.job_outputs(&m), outputs);
+    assert_eq!(record(&node, &ch).held, None);
+}
+
+#[tokio::test]
+async fn held_survives_a_restart_on_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let radio = Radio::new("a");
+    let node = open_on(dir.path(), std::slice::from_ref(&radio)).await;
+    let ch = demod(&node, "a", CH).await;
+    let m = mix(&node, None).await;
+    node.set_held(&ch, Some(probation())).unwrap();
+    assert!(matches!(
+        node.set_held(&JobId("nope".into()), None),
+        Err(zeta_core::node::NodeError::UnknownJob(_))
+    ));
+    // An unheld record is written without the member.
+    let file = |id: &JobId| -> Value {
+        let path = dir.path().join("state/jobs").join(format!("{}.json", id.0));
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    };
+    assert!(file(&m).get("held").is_none(), "{}", file(&m));
+    assert_eq!(
+        file(&ch)["held"],
+        json!({"reason": "probation", "since_ns": 42})
+    );
+    drop(node);
+
+    let node = open_on(dir.path(), std::slice::from_ref(&radio)).await;
+    let rec = record(&node, &ch);
+    assert_eq!(rec.state, JobState::Running);
+    assert_eq!(rec.held, Some(probation()));
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(mix_ctx(&node, &m)["inputs"], 0, "{}", mix_ctx(&node, &m));
+
+    node.set_held(&ch, None).unwrap();
+    until_inputs(&node, &m, 1).await;
+    drop(node);
+    let node = open_on(dir.path(), std::slice::from_ref(&radio)).await;
+    assert_eq!(record(&node, &ch).held, None);
+    assert!(file(&ch).get("held").is_none(), "{}", file(&ch));
+}
+
+#[tokio::test]
+async fn an_attached_job_sees_its_inputs_hold_without_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open_on(dir.path(), &[Radio::new("a")]).await;
+    let ch = demod(&node, "a", CH).await;
+    node.set_held(&ch, Some(probation())).unwrap();
+    let t = attach(&node, &ch).await;
+    let noted = |held: bool| node.job_context(&t).unwrap()["held"] == held;
+    until("the transcriber sees its input held", || noted(true)).await;
+    let outputs = node.job_outputs(&t);
+    node.set_held(&ch, None).unwrap();
+    until("the transcriber sees the hold lifted", || noted(false)).await;
+    node.set_held(&ch, Some(probation())).unwrap();
+    until("the transcriber sees it held again", || noted(true)).await;
+    assert_eq!(node.job_outputs(&t), outputs, "the same run");
+    assert!(running(&node, &t));
 }

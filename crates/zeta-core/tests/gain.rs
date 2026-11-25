@@ -290,6 +290,7 @@ fn running() -> JobRecord {
         group: None,
         replay: None,
         transient: false,
+        held: None,
     }
 }
 

@@ -73,6 +73,10 @@ pub struct MixInput {
 /// The audio outputs of the jobs a node's `mix` stage may read, asked anew on each poll.
 pub type MixInputs = Arc<dyn Fn() -> Vec<MixInput> + Send + Sync>;
 
+/// Whether the job an attached job reads is held now ([`crate::job::JobRecord::held`]),
+/// asked anew on each call so a lifted hold is seen at once.
+pub type HeldHook = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// What a stage knows of the job it runs in beyond its params and streams:
 /// the job's source, when the node keeps one for it, the source's channel
 /// bank, and the job's [`StageNote`] when it runs in a node.
@@ -105,6 +109,9 @@ pub struct StageContext {
     /// The id of the capture this job replays into a decoder, `Some` only for a replay
     /// job: its events carry it as `replay` ([`crate::modes::summary::mark_replay`]).
     pub replay: Option<String>,
+    /// Whether the job's input is held, `Some` only for an attached job in a node (a
+    /// `transcribe` keeps its lines while it says held).
+    pub held: Option<HeldHook>,
 }
 
 impl StageContext {
@@ -122,6 +129,7 @@ impl StageContext {
             bursts: None,
             packets: None,
             replay: None,
+            held: None,
         }
     }
 
@@ -170,6 +178,19 @@ impl StageContext {
             mix_inputs: Some(f),
             ..self
         }
+    }
+
+    /// This context with the hook `f` saying whether the job's input is held.
+    pub fn with_held(self, f: HeldHook) -> Self {
+        Self {
+            held: Some(f),
+            ..self
+        }
+    }
+
+    /// Whether the job's input is held now; `false` without a hook.
+    pub fn is_held(&self) -> bool {
+        self.held.as_ref().is_some_and(|f| f())
     }
 
     /// Merge `value` into the job's context; nothing without a note.

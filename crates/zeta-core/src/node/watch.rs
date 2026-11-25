@@ -1256,6 +1256,7 @@ impl Inner {
             group: None,
             replay: None,
             transient: false,
+            held: None,
         };
         let id = rec.id.clone();
         w.current = Some((id.clone(), t.signal.center_hz));
@@ -1364,6 +1365,7 @@ impl Inner {
                     group: None,
                     replay: None,
                     transient: false,
+                    held: None,
                 };
                 let id = rec.id.clone();
                 // In its own task, as identify's children: `launch`'s future runs this.

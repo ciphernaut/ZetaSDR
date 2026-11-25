@@ -2106,6 +2106,7 @@ async fn a_scan_stored_before_the_look_resumes_at_the_defaults() {
         group: None,
         replay: None,
         transient: false,
+        held: None,
     };
     let jobs = dir.path().join("state").join("jobs");
     std::fs::create_dir_all(&jobs).unwrap();

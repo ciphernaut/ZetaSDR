@@ -3590,6 +3590,7 @@ mod tests {
             group: None,
             replay: None,
             transient: false,
+            held: None,
         }
     }
 
