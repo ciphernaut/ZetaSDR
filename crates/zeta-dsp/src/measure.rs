@@ -60,15 +60,28 @@ const SILENT_AUDIO: f32 = 0.25;
 const MIN_LINE_HZ: f64 = 50.0;
 /// Below this SNR a block is labelled noise.
 const NOISE_SNR_DB: f32 = 6.0;
-/// FM needs discriminator audio (band-limited to half the occupied band) with
-/// an RMS deviation above this; below it a constant-envelope signal is a carrier.
-/// Measured over the carrier where it is up ([`audio_rms_hz`]): a bare carrier, keyed or
-/// steady, 0-2 Hz at 12-36 dB; the keyed-over generator's quiet passage (audio at a tenth,
-/// 62 Hz RMS as sent at 2.5 kHz deviation) 74-80 Hz at 15 dB in 12.5 kHz.
+/// FM needs discriminator audio (from `FM_MIN_AUDIO_HZ` to half the occupied band, its
+/// drift taken out) whose RMS deviation beyond the envelope's motion is above this
+/// ([`deviation_over_envelope_hz`]); below it a constant-envelope signal is a carrier.
+/// Measured over the carrier where it is up, on generators:
+/// - a bare carrier, keyed or steady, and one drifting linearly by up to 3 kHz in 2 s, or
+///   warming up by 1 kHz with a 0.2 s time constant, at 15 and 36 dB: at most 1 Hz over
+///   the envelope (the phase alone up to 28 Hz at a 3 kHz drift);
+/// - AM at m 0.1 from 3 to 30 dB: 0 Hz over the envelope (the phase alone up to 47 Hz at
+///   6 dB in 12.5 kHz, as the noise drives it in the sidebands' band);
+/// - the keyed-over generator's quiet passage (audio at a tenth, 62 Hz RMS as sent at
+///   2.5 kHz deviation), at 15 dB in 12.5 kHz: 48-63 Hz over the envelope, 48 on a 0.3 s
+///   key-down, the phase alone 74-80 Hz.
+///
+/// A drift faster than that bends above `FM_MIN_AUDIO_HZ` and counts as deviation.
 const FM_MIN_DEV_HZ: f64 = 40.0;
 /// The discriminator's deviation counts a phase step only where the envelope is at least
 /// this fraction of its median ([`audio_rms_hz`]).
 const DISC_MIN_ENVELOPE: f32 = 0.25;
+/// The discriminator's deviation is read from this audio frequency up ([`audio_rms_hz`]):
+/// a carrier's drift bends slower, while sub-audible tone squelch, from 67 Hz, and speech
+/// are above it.
+const FM_MIN_AUDIO_HZ: f64 = 50.0;
 /// FM: envelope coefficient of variation below this ...
 const FM_MAX_CV: f32 = 0.2;
 /// ... and occupied bandwidth at most this.
@@ -285,6 +298,11 @@ fn discriminator(x: &[Complex<f32>]) -> Vec<f32> {
 /// Analytic signal of real `x` band-limited to `max_hz` at `rate_hz`
 /// (negative frequencies and everything above `max_hz` removed by FFT).
 fn analytic(x: &[f32], rate_hz: u64, max_hz: f64) -> Vec<Complex<f32>> {
+    band_analytic(x, rate_hz, 0.0, max_hz)
+}
+
+/// [`analytic`] with everything under `min_hz` removed too (the DC bin is kept).
+fn band_analytic(x: &[f32], rate_hz: u64, min_hz: f64, max_hz: f64) -> Vec<Complex<f32>> {
     let n = x.len();
     if n == 0 {
         return Vec::new();
@@ -293,8 +311,9 @@ fn analytic(x: &[f32], rate_hz: u64, max_hz: f64) -> Vec<Complex<f32>> {
     let mut buf: Vec<Complex<f32>> = x.iter().map(|&v| Complex::new(v, 0.0)).collect();
     planner.plan_fft_forward(n).process(&mut buf);
     let max_bin = (max_hz * n as f64 / rate_hz as f64).floor() as usize;
+    let min_bin = (min_hz * n as f64 / rate_hz as f64).ceil() as usize;
     for (k, b) in buf.iter_mut().enumerate().skip(1) {
-        if k > max_bin {
+        if k > max_bin || k < min_bin {
             *b = Complex::new(0.0, 0.0);
         } else if 2 * k < n {
             *b *= 2.0;
@@ -725,7 +744,8 @@ fn tone_pair(
 ///    off ([`order::two_levels`]): over the view's runs when gated, else over the
 ///    window's burst runs ([`order::envelope_runs`]: the gaps between bursts are not an
 ///    off level), whose envelope CV is still at least 0.25. A window gated into one or
-///    two long runs of a modulated carrier holds one level, so it is never `ook`.
+///    two long runs of a modulated carrier holds one level, so it is never `ook`: tested
+///    on keyed FM and keyed AM (m 1) overs.
 /// 5. `"wfm"` (0.9) when the occupied band is 40–250 kHz and
 ///    [`pilot_line_db`] of the samples finds a 19 kHz pilot at least 10 dB above its
 ///    region, with no envelope or deviation gate (multipath and noise ripple
@@ -749,8 +769,10 @@ fn tone_pair(
 ///    (radians per sample, band-limited as for `fm`) below the CV, so the envelope moves
 ///    more than the phase.
 /// 10. `"fm"` (0.6) when the CV is below 0.2, the band is at most 25 kHz and the
-///     discriminator audio deviates by more than 40 Hz RMS; `"carrier"` (0.7) under the
-///     same gate when it does not: a keyed carrier with no modulation where it is up
+///     discriminator audio, drift taken out, deviates by more than 40 Hz RMS beyond the
+///     envelope's motion in the same band ([`deviation_over_envelope_hz`]: noise moves
+///     both alike, AM only the envelope); `"carrier"` (0.7) under the same gate when it
+///     does not: a keyed carrier with no modulation where it is up, or one that drifts,
 ///     reads `carrier`, its keying in `duty`, `bursts` and `burst_ms`.
 /// 11. Otherwise `"unknown"` (0.5).
 ///
@@ -791,29 +813,89 @@ fn layer1_label_of(f: &FeatureRecord, v: &View, window: usize, rate_hz: u64) -> 
     }
 }
 
-/// RMS frequency deviation, in Hz, of the discriminator audio with its mean
-/// (the carrier's offset from centre) removed, band-limited to half the
-/// occupied band. A phase step where either sample's envelope is under
-/// `DISC_MIN_ENVELOPE` of the median envelope counts as no deviation: there the
-/// phase is the noise's (a key edge, a channel filter's first samples), and a few
-/// such steps of up to pi radians read a bare carrier as FM.
-fn audio_rms_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> f64 {
-    let mut d = discriminator(iq);
+/// RMS frequency deviation, in Hz, of the discriminator audio of `iq`, from
+/// `FM_MIN_AUDIO_HZ` to half the occupied band, with its linear trend removed: the
+/// mean is the carrier's offset from centre and the slope its drift (a transmitter
+/// warming up, a free-running oscillator, a chirping key-down), neither of them
+/// modulation, and what drift is left bends slower than `FM_MIN_AUDIO_HZ`. A phase
+/// step counts as no deviation where either sample's envelope is under
+/// `DISC_MIN_ENVELOPE` of the median envelope (there the phase is the noise's: a key
+/// edge, a channel filter's first samples, and a few such steps of up to pi radians
+/// read a bare carrier as FM), and at each of `joins`, the samples where `iq` joins one
+/// run to the next ([`view_joins`]).
+fn audio_rms_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64, joins: &[usize]) -> f64 {
+    let held = held_steps(iq, joins);
+    steps_rms_hz(discriminator(iq), &held, rate_hz, bandwidth_hz)
+}
+
+/// [`audio_rms_hz`] of `iq` and the same measure of its envelope's motion: the steps of
+/// the log envelope, `ln |x[n+1]| - ln |x[n]|`, read as if they were phase steps, held,
+/// detrended and band-limited alike. Additive noise on a carrier moves its log envelope
+/// and its phase alike, AM moves only the envelope and FM only the phase, so the phase's
+/// deviation beyond the envelope's (in quadrature) is what modulates the frequency.
+fn deviation_over_envelope_hz(
+    iq: &[Complex<f32>],
+    rate_hz: u64,
+    bandwidth_hz: u64,
+    joins: &[usize],
+) -> (f64, f64) {
+    let held = held_steps(iq, joins);
+    let phase = steps_rms_hz(discriminator(iq), &held, rate_hz, bandwidth_hz);
+    let log_env: Vec<f32> = iq
+        .windows(2)
+        .zip(&held)
+        .map(|(w, &h)| {
+            let (a, b) = (w[0].norm(), w[1].norm());
+            if h || a <= 0.0 || b <= 0.0 {
+                0.0
+            } else {
+                (b / a).ln()
+            }
+        })
+        .collect();
+    let envelope = steps_rms_hz(log_env, &held, rate_hz, bandwidth_hz);
+    (phase, (phase * phase - envelope * envelope).max(0.0).sqrt())
+}
+
+/// The phase steps of `iq` that count as no deviation ([`audio_rms_hz`]): where either
+/// sample's envelope is under `DISC_MIN_ENVELOPE` of the median envelope, and the step
+/// into each of `joins`.
+fn held_steps(iq: &[Complex<f32>], joins: &[usize]) -> Vec<bool> {
     let env: Vec<f32> = iq.iter().map(|s| s.norm()).collect();
     let low = DISC_MIN_ENVELOPE * median(&env);
-    let held: Vec<bool> = env.windows(2).map(|w| w[0].min(w[1]) < low).collect();
-    let kept = held.iter().filter(|&&h| !h).count();
-    let mean = d
-        .iter()
-        .zip(&held)
-        .filter(|(_, h)| !**h)
-        .map(|(&v, _)| v as f64)
-        .sum::<f64>()
-        / kept.max(1) as f64;
-    d.iter_mut().zip(&held).for_each(|(v, &h)| {
-        *v = if h { 0.0 } else { *v - mean as f32 };
-    });
-    let audio = analytic(&d, rate_hz, bandwidth_hz as f64 / 2.0);
+    let mut held: Vec<bool> = env.windows(2).map(|w| w[0].min(w[1]) < low).collect();
+    for &j in joins {
+        if let Some(h) = j.checked_sub(1).and_then(|i| held.get_mut(i)) {
+            *h = true;
+        }
+    }
+    held
+}
+
+/// RMS, in Hz, of per-sample steps `d` (radians per sample) with the `held` ones zeroed
+/// and the least-squares line through the others taken out, from `FM_MIN_AUDIO_HZ` to
+/// half of `bandwidth_hz` ([`band_analytic`]).
+fn steps_rms_hz(mut d: Vec<f32>, held: &[bool], rate_hz: u64, bandwidth_hz: u64) -> f64 {
+    let (mut n, mut st, mut sv, mut stt, mut stv) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
+    for (i, (&v, _)) in d.iter().zip(held).enumerate().filter(|(_, (_, h))| !**h) {
+        let (t, v) = (i as f64, v as f64);
+        (n, st, sv, stt, stv) = (n + 1.0, st + t, sv + v, stt + t * t, stv + t * v);
+    }
+    let den = n * stt - st * st;
+    let slope = if den > 0.0 {
+        (n * stv - st * sv) / den
+    } else {
+        0.0
+    };
+    let mean = if n > 0.0 { (sv - slope * st) / n } else { 0.0 };
+    for (i, (v, &h)) in d.iter_mut().zip(held).enumerate() {
+        *v = if h {
+            0.0
+        } else {
+            (*v as f64 - mean - slope * i as f64) as f32
+        };
+    }
+    let audio = band_analytic(&d, rate_hz, FM_MIN_AUDIO_HZ, bandwidth_hz as f64 / 2.0);
     if audio.is_empty() {
         return 0.0;
     }
@@ -930,6 +1012,22 @@ fn ssb_side(
         .map(|(side, p)| (side, p / total))
 }
 
+/// The samples of `v.received` where one run is joined to the next: the start of each
+/// run after the first when gated, none for a whole window.
+fn view_joins(v: &View) -> Vec<usize> {
+    if !v.gated {
+        return Vec::new();
+    }
+    v.runs
+        .iter()
+        .scan(0, |at, r| {
+            *at += r.len();
+            Some(*at)
+        })
+        .take(v.runs.len().saturating_sub(1))
+        .collect()
+}
+
 /// Fill `f`'s measured extras (the 99 % power width from `note`, the discriminator
 /// audio's RMS deviation, the SSB side and dial) for the record `classify` answers,
 /// over the samples of the view `v` its label read. The label's rules are untouched.
@@ -940,7 +1038,7 @@ fn carry_extras(f: &mut FeatureRecord, note: &RateNote, label: &Label, v: &View,
         return;
     }
     f.audio_rms_hz = Some(Hz(
-        audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0).round() as u64
+        audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0, &view_joins(v)).round() as u64,
     ));
     if label.name == "ssb" {
         let db = spectrum(iq);
@@ -963,6 +1061,7 @@ fn carry_extras(f: &mut FeatureRecord, note: &RateNote, label: &Label, v: &View,
 /// its run lengths ([`RateLine::Runs`]) by `f`'s line.
 fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f32, String) {
     let (iq, cv) = (&v.received[..], v.cv);
+    let joins = view_joins(v);
     let runs = f.symbol_rate_line == Some(RateLine::Runs);
     if f.snr_db < NOISE_SNR_DB || iq.is_empty() || rate_hz == 0 {
         return ("noise", 0.5, format!("snr below {NOISE_SNR_DB} dB"));
@@ -1034,7 +1133,7 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
         );
     }
     if (WFM_MIN_BW_HZ..=WFM_MAX_BW_HZ).contains(&bw) && cv < WFM_MAX_CV {
-        let dev = audio_rms_hz(iq, rate_hz, bw);
+        let dev = audio_rms_hz(iq, rate_hz, bw, &joins);
         if dev > WFM_MIN_DEV_HZ {
             return (
                 "wfm",
@@ -1074,7 +1173,7 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
     if cv >= AM_LOW_MIN_CV {
         let carrier_db = centre_line_db(&db, bin_hz);
         if carrier_db >= OCCUPIED_DB {
-            let phase_rms = (audio_rms_hz(iq, rate_hz, bw) * 2.0 * std::f64::consts::PI
+            let phase_rms = (audio_rms_hz(iq, rate_hz, bw, &joins) * 2.0 * std::f64::consts::PI
                 / rate_hz as f64) as f32;
             let band_cv = envelope_band_cv(iq, rate_hz, bw);
             if phase_rms < cv && band_cv >= AM_LOW_MIN_CV {
@@ -1089,20 +1188,22 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
         }
     }
     if cv < FM_MAX_CV && f.bandwidth_hz.0 <= FM_MAX_BW_HZ {
-        let dev = audio_rms_hz(iq, rate_hz, f.bandwidth_hz.0);
-        if dev < FM_MIN_DEV_HZ {
+        let (dev, over) = deviation_over_envelope_hz(iq, rate_hz, f.bandwidth_hz.0, &joins);
+        if over < FM_MIN_DEV_HZ {
             return (
                 "carrier",
                 0.7,
                 format!(
-                    "constant envelope, narrow band, no discriminator audio (rms deviation {dev:.0} Hz)"
+                    "constant envelope, narrow band, no discriminator audio (rms deviation {dev:.0} Hz, {over:.0} Hz over the envelope's)"
                 ),
             );
         }
         return (
             "fm",
             0.6,
-            format!("constant envelope, narrow band, rms deviation {dev:.0} Hz"),
+            format!(
+                "constant envelope, narrow band, rms deviation {dev:.0} Hz ({over:.0} Hz over the envelope's)"
+            ),
         );
     }
     ("unknown", 0.5, "no layer-1 rule matched".into())
@@ -1849,7 +1950,6 @@ mod tests {
         let iq = fx.remote.iq(fx.rate_hz);
         let rate = u64::from(fx.rate_hz);
         let v = gated_view(&iq, rate, fx.band_hz);
-        eprintln!("{}: {:?}", fx.stem, v.bursts);
         assert!(v.bursts.duty >= BURST_DUTY_MAX, "{:?}", v.bursts);
         assert!(
             v.bursts

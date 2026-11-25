@@ -729,3 +729,116 @@ fn every_ook_fixture_still_reads_ook() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// A layer-1 reading of `iq` (48 kS/s) over the whole block and over a 12.5 kHz band about
+/// its centre, as `classify` reads a selection: `(where, features, label)`, each printed with
+/// its answered deviation.
+fn whole_and_channel(
+    what: &str,
+    iq: &[Complex<f32>],
+) -> Vec<(u64, zeta_core::classify::FeatureRecord, Label)> {
+    [48_000u64, 12_500]
+        .into_iter()
+        .map(|hz| {
+            let (f, l) = zeta_dsp::measure::measure_selection(
+                iq,
+                48_000,
+                CENTER,
+                zeta_core::classify::Band {
+                    offset_hz: 0,
+                    bandwidth_hz: zeta_core::types::Hz(hz),
+                },
+            )
+            .expect("a measurement");
+            eprintln!(
+                "{what} in {hz} Hz: {} audio_rms_hz {:?} ({})",
+                l.name,
+                f.audio_rms_hz.map(|h| h.0),
+                l.evidence
+            );
+            (hz, f, l)
+        })
+        .collect()
+}
+
+/// The other side of rule 10's deviation floor: a bare carrier that drifts (a transmitter
+/// warming up, a free-running oscillator, a chirping key-down) is still a carrier, its drift
+/// not read as deviation, from 60 Hz to 3 kHz over a 2 s slice.
+#[test]
+fn a_drifting_bare_carrier_reads_carrier() {
+    let mut failed = Vec::new();
+    for drift_hz in [60.0, 150.0, 300.0, 1_000.0, 3_000.0] {
+        for snr_db in [15.0f32, 36.0] {
+            let what = format!("carrier drifting {drift_hz} Hz in 2 s at {snr_db} dB");
+            let iq = zeta_dsp::fixtures::drifting_carrier(48_000, 2.0, drift_hz, snr_db, 61);
+            for (hz, _, l) in whole_and_channel(&what, &iq) {
+                if l.name != "carrier" {
+                    failed.push(format!("{what} in {hz} Hz: {} ({})", l.name, l.evidence));
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Low-index AM (m 0.1, CV under rule 9's 0.1 at mid SNR) falls through to rule 10: its
+/// noise-driven frequency is not deviation, so it never reads `fm`, from 3 to 30 dB. At
+/// 6-11 dB in 12.5 kHz the phase alone reads 41-47 Hz; its envelope moves as much.
+#[test]
+fn low_index_am_never_reads_fm() {
+    let mut failed = Vec::new();
+    for snr_db in [
+        3.0f32, 6.0, 6.5, 7.0, 8.0, 9.0, 10.0, 12.0, 15.0, 20.0, 30.0,
+    ] {
+        for seed in [71, 72, 73, 74] {
+            let what = format!("am m 0.1 at {snr_db} dB, seed {seed}");
+            let audio = tone(48_000, 96_000, 1_000.0, 1.0);
+            let mut iq = am_modulate(&audio, 48_000, 48_000, 0.1, 0.0);
+            awgn(&mut iq, snr_db, seed);
+            for (hz, _, l) in whole_and_channel(&what, &iq) {
+                if l.name == "fm" {
+                    failed.push(format!("{what} in {hz} Hz: {} ({})", l.name, l.evidence));
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Rule 4 on a keyed AM over: a slice holding noise and then speech-like AM (m 1), keyed up,
+/// keyed down or up for 90 %, is gated to the carrier where it is up and reads `am`, never
+/// `ook`: the modulated on-part is one level, its envelope's motion the speech.
+#[test]
+fn a_keyed_am_over_reads_am_not_ook() {
+    let mut failed = Vec::new();
+    for (kind, on) in [
+        ("up", (0.4, 1.0)),
+        ("down", (0.0, 0.6)),
+        ("up 0.9", (0.1, 1.0)),
+    ] {
+        for snr_db in [20.0f32, 36.0] {
+            let what = format!("keyed am {kind} at {snr_db} dB");
+            let audio = zeta_dsp::fixtures::speech_like(48_000, 2.0);
+            let mut iq = am_modulate(&audio, 48_000, 48_000, 1.0, 0.0);
+            let n = iq.len() as f64;
+            for (i, s) in iq.iter_mut().enumerate() {
+                let t = i as f64 / n;
+                if t < on.0 || t >= on.1 {
+                    *s = Complex::new(0.0, 0.0);
+                }
+            }
+            // The noise under a carrier of power 1, over the whole window.
+            let mut noise = vec![Complex::new(0.0f32, 0.0); iq.len()];
+            awgn(&mut noise, snr_db, 81);
+            iq.iter_mut().zip(noise).for_each(|(s, w)| *s += w);
+            let (hz, f, l) = whole_and_channel(&what, &iq).remove(1);
+            if l.name != "am" {
+                failed.push(format!("{what} in {hz} Hz: {} ({})", l.name, l.evidence));
+            }
+            if !f.burst {
+                failed.push(format!("{what}: not gated ({f:?})"));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

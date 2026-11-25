@@ -381,6 +381,32 @@ pub fn awgn(x: &mut [Complex<f32>], snr_db: f32, seed: u64) {
     }
 }
 
+/// `seconds` of an unmodulated carrier of power 1 at `rate_hz` whose frequency drifts
+/// linearly by `drift_hz` over the window, from `-drift_hz / 2` to `+drift_hz / 2` about
+/// the centre (a transmitter warming up, a free-running oscillator, a chirping key-down),
+/// with complex white noise `snr_db` under it over the whole rate ([`awgn`]).
+pub fn drifting_carrier(
+    rate_hz: u32,
+    seconds: f64,
+    drift_hz: f64,
+    snr_db: f32,
+    seed: u64,
+) -> Vec<Complex<f32>> {
+    let rate = f64::from(rate_hz);
+    let n = (rate * seconds).round() as usize;
+    let mut iq: Vec<Complex<f32>> = (0..n)
+        .map(|i| {
+            let t = i as f64 / rate;
+            // Phase in cycles of f(t) = -drift/2 + drift * t / seconds.
+            let cycles = -drift_hz / 2.0 * t + drift_hz * t * t / (2.0 * seconds);
+            let (sn, cs) = (2.0 * PI * cycles.fract()).sin_cos();
+            Complex::new(cs as f32, sn as f32)
+        })
+        .collect();
+    awgn(&mut iq, snr_db, seed);
+    iq
+}
+
 /// A keyed NBFM over in a window of noise ([`keyed_over`]): the carrier is up over part
 /// of the window, as a slice taken at a key-up, a key-down or across a drop-out holds it.
 #[derive(Clone, Debug, PartialEq)]
