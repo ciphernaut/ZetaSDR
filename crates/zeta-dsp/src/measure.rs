@@ -62,7 +62,13 @@ const MIN_LINE_HZ: f64 = 50.0;
 const NOISE_SNR_DB: f32 = 6.0;
 /// FM needs discriminator audio (band-limited to half the occupied band) with
 /// an RMS deviation above this; below it a constant-envelope signal is a carrier.
-const FM_MIN_DEV_HZ: f64 = 100.0;
+/// Measured over the carrier where it is up ([`audio_rms_hz`]): a bare carrier, keyed or
+/// steady, 0-2 Hz at 12-36 dB; the keyed-over generator's quiet passage (audio at a tenth,
+/// 62 Hz RMS as sent at 2.5 kHz deviation) 74-80 Hz at 15 dB in 12.5 kHz.
+const FM_MIN_DEV_HZ: f64 = 40.0;
+/// The discriminator's deviation counts a phase step only where the envelope is at least
+/// this fraction of its median ([`audio_rms_hz`]).
+const DISC_MIN_ENVELOPE: f32 = 0.25;
 /// FM: envelope coefficient of variation below this ...
 const FM_MAX_CV: f32 = 0.2;
 /// ... and occupied bandwidth at most this.
@@ -429,11 +435,11 @@ pub fn measure_band(
 /// Burst gating: the window's on-runs ([`burst_runs`], the off part found from either
 /// side, so `duty` is the on share) give `duty`, `bursts`, `burst_ms` and `period_ms`.
 /// When the window holds an off part of noise ([`gated_view`]: on under half the window,
-/// or in runs of at least 100 ms at any duty) and the runs repeat no faster than 20 ms
-/// (denser runs are keying), the spectrum, SNR and occupied band are taken over the
-/// on-time ([`on_time`]), the symbol-rate searches over each run as received, and
-/// `burst` is set; otherwise the whole window is measured and `burst` compares 10 ms
-/// chunk powers.
+/// or in runs of at least `BURST_LONG_RUN_MS` at any duty) and the runs repeat no faster
+/// than `BURST_MIN_PERIOD_MS` (denser runs are keying), the spectrum, SNR and occupied
+/// band are taken over the on-time ([`on_time`]), the symbol-rate searches over each run
+/// as received, the label reads those runs ([`layer1_label`]), and `burst` is set;
+/// otherwise the whole window is measured and `burst` compares 10 ms chunk powers.
 /// `symbol_rate_baud` is, when the envelope moves, on-off keying's run-length
 /// unit ([`ook_unit_rate`]: a two-level envelope whose runs are whole chips)
 /// or else the cyclostationary line ([`cyclo_symbol_rate`]); otherwise, or when
@@ -456,14 +462,16 @@ pub fn measure_band_masked(
     measure_band_noted(iq, rate_hz, block_center_hz, bandwidth_hz, dc).0
 }
 
-/// [`measure_band_masked`] with the [`RateNote`] its label's evidence reports.
-pub(crate) fn measure_band_noted(
+/// [`measure_band_masked`] with the [`RateNote`] it measured and the [`View`] it
+/// measured over, which its label reads ([`layer1_label_of`]).
+fn measure_band_noted(
     iq: &[Complex<f32>],
     rate_hz: u64,
     block_center_hz: u64,
     bandwidth_hz: u64,
     dc: Option<(u64, u64)>,
-) -> (FeatureRecord, RateNote) {
+) -> (FeatureRecord, RateNote, View<'_>) {
+    let v = gated_view(iq, rate_hz, bandwidth_hz);
     if iq.is_empty() || rate_hz == 0 {
         let record = FeatureRecord {
             bandwidth_hz: Hz(0),
@@ -482,13 +490,9 @@ pub(crate) fn measure_band_noted(
             audio_rms_hz: None,
             ssb: None,
         };
-        let note = RateNote {
-            cv: 0.0,
-            power99_hz: None,
-        };
-        return (record, note);
+        let note = RateNote { power99_hz: None };
+        return (record, note, v);
     }
-    let v = gated_view(iq, rate_hz, bandwidth_hz);
     let full = iq;
     let iq = &v.on[..];
     let bin_hz = rate_hz as f64 / SIZE as f64;
@@ -589,10 +593,9 @@ pub(crate) fn measure_band_noted(
         ssb: None,
     };
     let note = RateNote {
-        cv: v.cv,
         power99_hz: power_width_hz(db, peak, floor, gap, bin_hz),
     };
-    (record, note)
+    (record, note, v)
 }
 
 /// On-off keying's chip rate from its run lengths ([`ook_unit_rate`]) of the occupied
@@ -666,11 +669,10 @@ fn rate_of(
         })
 }
 
-/// How layer 1 measured a record, for its label's evidence.
+/// What layer 1 measured of a record beyond its fields, for the extras `classify`
+/// answers ([`carry_extras`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct RateNote {
-    /// Envelope CV of the samples the rate was searched over.
-    pub cv: f32,
+struct RateNote {
     /// The width holding [`POWER_SHARE`] of the excess power (over the noise floor) of the
     /// band around the peak: see [`power_width_hz`]. `None` for an empty block.
     pub power99_hz: Option<u64>,
@@ -699,7 +701,14 @@ fn tone_pair(
         .then_some((i1.min(i2) as f64 * bin_hz, i1.max(i2) as f64 * bin_hz))
 }
 
-/// Conservative layer-1 label for a measured block. Rules, first match wins:
+/// Conservative layer-1 label for a measured block, read from the view its record was
+/// measured over (the on-time as received when the window is gated, else the whole
+/// window; [`measure_band_masked`]), so the label and the record describe the same
+/// samples. The view's samples ("the samples" below) give every spectrum, carrier line,
+/// discriminator audio and envelope level, and their envelope CV ("the CV") is the one
+/// CV the rules and the evidence read. A key-up, a key-down or a drop-out is gated to the
+/// carrier where it is up, so the key edge is never read as an envelope level. Rules,
+/// first match wins:
 ///
 /// 1. `"noise"` (0.5) when `snr_db < 6`.
 /// 2. `"ook"` (0.6) when the record's symbol rate is on-off keying's chip from its run
@@ -707,59 +716,55 @@ fn tone_pair(
 ///    tones, runs of whole chips and a flat on level in the band it was fitted in, and
 ///    no PSK order; [`measure_band_masked`]) and it carries no order.
 /// 3. `"fsk"` (0.6) when the record carries an FSK `order` and
-///    `tone_spacing_hz` ([`measure_band_masked`]), or the power spectrum has
-///    exactly two dominant peaks inside the occupied band 500–3000 Hz apart
-///    and within 6 dB of each other, or, for a constant-envelope signal (CV
-///    below 0.2) with a keying line, when its discriminator audio does (AFSK
-///    on FM).
-/// 4. `"ook"` (0.6) when the envelope CV is at least 0.25, the record has a
-///    symbol rate and no PSK order, and over the burst runs
-///    ([`order::envelope_runs`]: the gaps between bursts are not an off
-///    level) the envelope CV is still at least 0.25 and the envelope sits at
-///    two levels, the lower one off ([`order::two_levels`]).
+///    `tone_spacing_hz` ([`measure_band_masked`]), or the samples' power spectrum has
+///    exactly two dominant peaks inside its occupied band 500–3000 Hz apart and within
+///    6 dB of each other, or, for a constant envelope (the CV below 0.2) with a keying
+///    line, when the samples' discriminator audio does (AFSK on FM).
+/// 4. `"ook"` (0.6) when the CV is at least 0.25, the record has a symbol rate and no
+///    PSK order, and inside the samples the envelope sits at two levels, the lower one
+///    off ([`order::two_levels`]): over the view's runs when gated, else over the
+///    window's burst runs ([`order::envelope_runs`]: the gaps between bursts are not an
+///    off level), whose envelope CV is still at least 0.25. A window gated into one or
+///    two long runs of a modulated carrier holds one level, so it is never `ook`.
 /// 5. `"wfm"` (0.9) when the occupied band is 40–250 kHz and
-///    [`pilot_line_db`] finds a 19 kHz pilot at least 10 dB above its
+///    [`pilot_line_db`] of the samples finds a 19 kHz pilot at least 10 dB above its
 ///    region, with no envelope or deviation gate (multipath and noise ripple
 ///    a real station's envelope; the pilot is the stronger evidence).
-///    Otherwise `"wfm"` (0.6) when the occupied band is 60–250 kHz, the
-///    envelope CV is below 0.45 and the discriminator audio deviates by more
-///    than 5 kHz RMS.
+///    Otherwise `"wfm"` (0.6) when the occupied band is 60–250 kHz, the CV is below 0.45
+///    and the discriminator audio deviates by more than 5 kHz RMS.
 /// 6. `"psk"` (0.6) when the record carries a PSK `order` (no tone spacing)
 ///    and a symbol rate. It precedes `am`: the carrier-line test of `am`
 ///    reads a narrow PSK main lobe as a carrier (15.9 dB on 2400 Bd BPSK),
 ///    while the PSK order requires no line in `x` itself.
-/// 7. `"am"` (0.6) when a carrier line sits at the block centre (the
+/// 7. `"am"` (0.6) when a carrier line sits at the centre of the samples' spectrum (the
 ///    strongest of the centre bin and its two neighbours at least 6 dB above
-///    the mean power of the bins 1–5 kHz either side) and the envelope CV is
-///    at least 0.25.
-/// 8. `"ssb"` (0.6) when there is no such centre line, the envelope CV is at
-///    least 0.25, the occupied band is 1.5–4 kHz and at least 80 % of its
-///    power lies on one side of centre; the evidence names `usb` (above) or
-///    `lsb` (below) and the dial frequency [`ssb_dial_hz`] gives.
-/// 9. `"am"` (0.6) for low-index AM: the same centre line, an envelope CV
-///    of at least 0.1 both whole-band and within half the occupied band (so
-///    wideband noise on a bare carrier does not pass), and an RMS phase
-///    deviation of the discriminator audio (radians per sample, band-limited
-///    as for `fm`) below the CV, so the envelope moves more than the phase.
-/// 10. `"fm"` (0.6) when the envelope CV is below 0.2, the band is at most
-///     25 kHz and the discriminator audio deviates by more than 100 Hz RMS;
-///     `"carrier"` (0.7) under the same gate when it does not.
+///    the mean power of the bins 1–5 kHz either side) and the CV is at least 0.25.
+/// 8. `"ssb"` (0.6) when there is no such centre line, the CV is at least 0.25, the
+///    occupied band is 1.5–4 kHz and at least 80 % of the samples' occupied power lies
+///    on one side of centre; the evidence names `usb` (above) or `lsb` (below) and the
+///    dial frequency [`ssb_dial_hz`] gives.
+/// 9. `"am"` (0.6) for low-index AM: the same centre line, a CV of at least 0.1 and an
+///    envelope CV of at least 0.1 within half the occupied band (so wideband noise on a
+///    bare carrier does not pass), and an RMS phase deviation of the discriminator audio
+///    (radians per sample, band-limited as for `fm`) below the CV, so the envelope moves
+///    more than the phase.
+/// 10. `"fm"` (0.6) when the CV is below 0.2, the band is at most 25 kHz and the
+///     discriminator audio deviates by more than 40 Hz RMS; `"carrier"` (0.7) under the
+///     same gate when it does not: a keyed carrier with no modulation where it is up
+///     reads `carrier`, its keying in `duty`, `bursts` and `burst_ms`.
 /// 11. Otherwise `"unknown"` (0.5).
+///
+/// The evidence quotes the CV once and how much was read: `over <on> s of <window> s`.
+/// This builds the view [`measure`] takes of the whole block `iq`; `classify` labels
+/// with the view its own measurement took ([`measure_selection`]).
 pub fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Label {
-    layer1_label_noted(f, None, iq, rate_hz)
+    layer1_label_of(f, &gated_view(iq, rate_hz, rate_hz), iq.len(), rate_hz)
 }
 
-/// [`layer1_label`] whose evidence reports the envelope CV the rate was searched
-/// with, from `note` (the [`measure_band_noted`] that measured `f`); without one the
-/// whole block's CV. The rules are [`layer1_label`]'s: the note changes no name.
-pub(crate) fn layer1_label_noted(
-    f: &FeatureRecord,
-    note: Option<&RateNote>,
-    iq: &[Complex<f32>],
-    rate_hz: u64,
-) -> Label {
-    let cv = envelope_cv(iq);
-    let (name, confidence, reason) = classify_block(f, iq, rate_hz, cv);
+/// [`layer1_label`] of `f` read from `v`, the view of a window of `window` samples that
+/// [`measure_band_noted`] measured `f` over.
+fn layer1_label_of(f: &FeatureRecord, v: &View, window: usize, rate_hz: u64) -> Label {
+    let (name, confidence, reason) = classify_block(f, v, rate_hz);
     let baud = f.symbol_rate_baud.map_or_else(
         || "none".to_string(),
         |b| match f.symbol_rate_line {
@@ -767,28 +772,47 @@ pub(crate) fn layer1_label_noted(
             None => format!("{} Bd", b.0),
         },
     );
-    let cv = note.map_or(cv, |n| n.cv);
     let duty = f
         .duty
         .map_or_else(|| "none".to_string(), |d| format!("{d:.3}"));
+    let secs = |n: usize| n as f64 / rate_hz.max(1) as f64;
     Label {
         layer: 1,
         name: name.into(),
         confidence,
         evidence: format!(
-            "{reason}; snr_db {:.1} dB, bandwidth_hz {} Hz, symbol_rate_baud {baud}, duty {duty}, cv {cv:.3} (envelope std/mean)",
-            f.snr_db, f.bandwidth_hz.0
+            "{reason}; snr_db {:.1} dB, bandwidth_hz {} Hz, symbol_rate_baud {baud}, duty {duty}, cv {:.3} (envelope std/mean) over {:.2} s of {:.2} s",
+            f.snr_db,
+            f.bandwidth_hz.0,
+            v.cv,
+            secs(v.received.len()),
+            secs(window)
         ),
     }
 }
 
 /// RMS frequency deviation, in Hz, of the discriminator audio with its mean
 /// (the carrier's offset from centre) removed, band-limited to half the
-/// occupied band.
+/// occupied band. A phase step where either sample's envelope is under
+/// `DISC_MIN_ENVELOPE` of the median envelope counts as no deviation: there the
+/// phase is the noise's (a key edge, a channel filter's first samples), and a few
+/// such steps of up to pi radians read a bare carrier as FM.
 fn audio_rms_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> f64 {
     let mut d = discriminator(iq);
-    let mean = d.iter().map(|&v| v as f64).sum::<f64>() / d.len().max(1) as f64;
-    d.iter_mut().for_each(|v| *v -= mean as f32);
+    let env: Vec<f32> = iq.iter().map(|s| s.norm()).collect();
+    let low = DISC_MIN_ENVELOPE * median(&env);
+    let held: Vec<bool> = env.windows(2).map(|w| w[0].min(w[1]) < low).collect();
+    let kept = held.iter().filter(|&&h| !h).count();
+    let mean = d
+        .iter()
+        .zip(&held)
+        .filter(|(_, h)| !**h)
+        .map(|(&v, _)| v as f64)
+        .sum::<f64>()
+        / kept.max(1) as f64;
+    d.iter_mut().zip(&held).for_each(|(v, &h)| {
+        *v = if h { 0.0 } else { *v - mean as f32 };
+    });
     let audio = analytic(&d, rate_hz, bandwidth_hz as f64 / 2.0);
     if audio.is_empty() {
         return 0.0;
@@ -907,16 +931,11 @@ fn ssb_side(
 }
 
 /// Fill `f`'s measured extras (the 99 % power width from `note`, the discriminator
-/// audio's RMS deviation, the SSB side and dial) for the record `classify` answers.
-/// The label's rules are untouched.
-fn carry_extras(
-    f: &mut FeatureRecord,
-    note: &RateNote,
-    label: &Label,
-    iq: &[Complex<f32>],
-    rate_hz: u64,
-) {
+/// audio's RMS deviation, the SSB side and dial) for the record `classify` answers,
+/// over the samples of the view `v` its label read. The label's rules are untouched.
+fn carry_extras(f: &mut FeatureRecord, note: &RateNote, label: &Label, v: &View, rate_hz: u64) {
     f.power99_hz = note.power99_hz.map(Hz);
+    let iq = &v.received[..];
     if iq.is_empty() || rate_hz == 0 {
         return;
     }
@@ -939,14 +958,11 @@ fn carry_extras(
     }
 }
 
-/// [`layer1_label`]'s rules over `f` and its block `iq`; `runs` when `f`'s symbol rate
-/// is on-off keying's chip from its run lengths ([`RateLine::Runs`]) by `f`'s line.
-fn classify_block(
-    f: &FeatureRecord,
-    iq: &[Complex<f32>],
-    rate_hz: u64,
-    cv: f32,
-) -> (&'static str, f32, String) {
+/// [`layer1_label`]'s rules over `f` and the view `v` it was measured over (its samples
+/// as received and its CV); `runs` when `f`'s symbol rate is on-off keying's chip from
+/// its run lengths ([`RateLine::Runs`]) by `f`'s line.
+fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f32, String) {
+    let (iq, cv) = (&v.received[..], v.cv);
     let runs = f.symbol_rate_line == Some(RateLine::Runs);
     if f.snr_db < NOISE_SNR_DB || iq.is_empty() || rate_hz == 0 {
         return ("noise", 0.5, format!("snr below {NOISE_SNR_DB} dB"));
@@ -990,7 +1006,12 @@ fn classify_block(
             }
         }
     }
+    // Two levels inside the samples: a gated view's runs are its samples, and its CV
+    // theirs; a whole window's are its burst runs.
     let keyed_runs = || {
+        if v.gated {
+            return two_levels(&v.runs);
+        }
         let runs = envelope_runs(iq, rate_hz);
         let on: Vec<Complex<f32>> = runs.iter().flat_map(|r| r.iter()).copied().collect();
         envelope_cv(&on) >= AM_MIN_CV && two_levels(&runs)
@@ -1035,7 +1056,7 @@ fn classify_block(
             return (
                 "am",
                 0.6,
-                format!("carrier line {carrier_db:.1} dB above the sidebands, cv {cv:.3}"),
+                format!("carrier line {carrier_db:.1} dB above the sidebands"),
             );
         }
         if let Some((side, share)) = ssb_side(f, &db, (lo, hi)) {
@@ -1043,7 +1064,7 @@ fn classify_block(
                 "ssb",
                 0.6,
                 format!(
-                    "{side}: no carrier line ({carrier_db:.1} dB), {:.0} % of the occupied power on one side, cv {cv:.3}, dial \u{2248} {} Hz ({side})",
+                    "{side}: no carrier line ({carrier_db:.1} dB), {:.0} % of the occupied power on one side, dial \u{2248} {} Hz ({side})",
                     100.0 * share,
                     ssb_dial_hz(f.center_hz.0, side == "usb")
                 ),
@@ -1061,7 +1082,7 @@ fn classify_block(
                     "am",
                     0.6,
                     format!(
-                        "carrier line {carrier_db:.1} dB above the sidebands, cv {cv:.3} ({band_cv:.3} in band), phase rms {phase_rms:.4} rad below cv"
+                        "carrier line {carrier_db:.1} dB above the sidebands, envelope {band_cv:.3} in band, phase rms {phase_rms:.4} rad below the cv"
                     ),
                 );
             }
@@ -1281,8 +1302,8 @@ fn window_event(
     dc: Option<(u64, u64)>,
     partial: bool,
 ) -> Result<Frame, StageError> {
-    let (f, note) = measure_band_noted(buf, rate, center, p.bandwidth_hz.unwrap_or(rate), dc);
-    let label = layer1_label_noted(&f, Some(&note), buf, rate);
+    let (f, note, v) = measure_band_noted(buf, rate, center, p.bandwidth_hz.unwrap_or(rate), dc);
+    let label = layer1_label_of(&f, &v, buf.len(), rate);
     let mut ev =
         serde_json::to_value(&f).map_err(|e| StageError::Failed(format!("measure: {e}")))?;
     ev["label"] =
@@ -1314,10 +1335,9 @@ pub fn measure_selection(
     #[cfg(test)]
     MEASURE_SELECTION_CALLS.with(|c| c.set(c.get() + 1));
     if band.is_whole(Hz(rate_hz)) {
-        let (f, note) = measure_band_noted(iq, rate_hz, center_hz, rate_hz, None);
-        let l = layer1_label_noted(&f, Some(&note), iq, rate_hz);
-        let mut f = f;
-        carry_extras(&mut f, &note, &l, iq, rate_hz);
+        let (mut f, note, v) = measure_band_noted(iq, rate_hz, center_hz, rate_hz, None);
+        let l = layer1_label_of(&f, &v, iq.len(), rate_hz);
+        carry_extras(&mut f, &note, &l, &v, rate_hz);
         return Some((f, l));
     }
     let bw = band.bandwidth_hz.0;
@@ -1330,10 +1350,9 @@ pub fn measure_selection(
     )
     .ok()?;
     let band_center = (center_hz as i64).saturating_add(band.offset_hz).max(0) as u64;
-    let (f, note) = measure_band_noted(&chan, out_rate, band_center, bw, None);
-    let l = layer1_label_noted(&f, Some(&note), &chan, out_rate);
-    let mut f = f;
-    carry_extras(&mut f, &note, &l, &chan, out_rate);
+    let (mut f, note, v) = measure_band_noted(&chan, out_rate, band_center, bw, None);
+    let l = layer1_label_of(&f, &v, chan.len(), out_rate);
+    carry_extras(&mut f, &note, &l, &v, out_rate);
     Some((f, l))
 }
 
@@ -1822,6 +1841,28 @@ mod tests {
     }
 
     #[test]
+    fn a_train_of_31_ms_frames_at_duty_0_77_is_not_gated() {
+        // `BURST_LONG_RUN_MS` is for a carrier keyed up or down, whose runs are hundreds
+        // of ms: an OOK remote's train of frames over half the window is keying, measured
+        // whole, so its rate is the run-length chip and not the frames' line.
+        let fx = &crate::fixtures::ev1527_fixtures()[0];
+        let iq = fx.remote.iq(fx.rate_hz);
+        let rate = u64::from(fx.rate_hz);
+        let v = gated_view(&iq, rate, fx.band_hz);
+        eprintln!("{}: {:?}", fx.stem, v.bursts);
+        assert!(v.bursts.duty >= BURST_DUTY_MAX, "{:?}", v.bursts);
+        assert!(
+            v.bursts
+                .burst_ms
+                .is_some_and(|ms| (25.0..super::burst::BURST_LONG_RUN_MS).contains(&ms)),
+            "{:?}",
+            v.bursts
+        );
+        assert!(!v.gated, "{:?}", v.bursts);
+        assert_eq!(v.received.len(), iq.len());
+    }
+
+    #[test]
     fn a_continuous_signal_measures_as_before() {
         // The fixture of measure_nbfm_tone_reports_band_and_fm (a noiseless
         // 5 kHz-deviation tone fills the whole 20 kHz band at floor + 6 dB).
@@ -1959,7 +2000,7 @@ mod tests {
     #[test]
     fn a_weak_voice_signals_power_width_is_its_sidebands_not_its_carrier_line() {
         let iq = weak_fm_voice(0.1, 1.0);
-        let (f, note) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
+        let (f, note, _) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
         assert!(f.bandwidth_hz.0 < 1_000, "occupied {}", f.bandwidth_hz.0);
         let w = note.power99_hz.expect("a power width");
         assert!((4_000..=14_000).contains(&w), "power99_hz {w}");
@@ -1992,7 +2033,7 @@ mod tests {
         // between 6000 Hz and a width as narrow as the occupied band's. Here only the carrier
         // line is counted, so a reader must treat a width under the kind's minimum as untrusted.
         let iq = weak_fm_voice(0.1, -6.0);
-        let (f, note) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
+        let (f, note, _) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
         let w = note.power99_hz.expect("a power width");
         eprintln!("under the gate: occupied {} power99 {w}", f.bandwidth_hz.0);
         assert!(f.bandwidth_hz.0 < 1_000, "occupied {}", f.bandwidth_hz.0);
@@ -2009,7 +2050,7 @@ mod tests {
             })
             .collect();
         awgn(&mut iq, 30.0, 3);
-        let (_, note) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
+        let (_, note, _) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
         let w = note.power99_hz.expect("a power width");
         assert!(w <= 600, "power99_hz {w}");
     }

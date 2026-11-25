@@ -396,8 +396,10 @@ async fn classify_answers_the_measured_features_as_fields() {
     let node = node_over(dir.path(), &iq).await;
     let f = classify_features(&node, CENTER, 20_000).await;
     assert!(f.bandwidth_hz.0 > 0, "{f:?}");
+    // As sent: 2500 Hz x 0.5 x 0.408 (three tones over 3) x 0.770 (the tremolo) x 0.707
+    // (on half the time) is 278 Hz RMS.
     let rms = f.audio_rms_hz.expect("audio_rms_hz");
-    assert!((300..2_500).contains(&rms.0), "{f:?}");
+    assert!((200..2_500).contains(&rms.0), "{f:?}");
     assert!(f.power99_hz.is_some_and(|w| w.0 > 0), "{f:?}");
     assert_eq!(f.ssb, None, "{f:?}");
 }

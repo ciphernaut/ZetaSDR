@@ -212,9 +212,12 @@ pub(super) struct View<'a> {
     pub on: Cow<'a, [Complex<f32>]>,
     /// Whether the window was measured over its on-time.
     pub gated: bool,
-    /// Envelope CV of the measured samples as received (the runs' Hann
-    /// windows would read as amplitude keying).
+    /// Envelope CV of the measured samples as received ([`View::received`]; the runs'
+    /// Hann windows would read as amplitude keying).
     pub cv: f32,
+    /// The measured samples as received, which the label reads: the runs joined in
+    /// order when gated, else the whole window.
+    pub received: Cow<'a, [Complex<f32>]>,
     /// The samples the symbol-rate searches run over: each run as received
     /// when gated, else the whole window.
     pub runs: Vec<&'a [Complex<f32>]>,
@@ -242,6 +245,7 @@ pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -
         let raw: Vec<Complex<f32>> = runs.iter().flat_map(|r| r.iter()).copied().collect();
         View {
             cv: envelope_cv(&raw),
+            received: raw.into(),
             on: on_time(iq, &bursts).into(),
             gated: true,
             runs,
@@ -250,6 +254,7 @@ pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -
     } else {
         View {
             cv: envelope_cv(iq),
+            received: iq.into(),
             on: iq.into(),
             gated: false,
             runs: vec![iq],

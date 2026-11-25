@@ -583,7 +583,6 @@ fn speech_overs() -> Vec<zeta_dsp::fixtures::KeyedOverCase> {
 /// or a drop-out). Whatever share of it the carrier is up, it is FM: `fm`, or `fsk` (both
 /// choose `fm_demod`), never `am`, `ook` or `unknown`.
 #[test]
-#[ignore = "plan 49 A3/A4"]
 fn a_keyed_over_reads_fm_at_every_carrier_up_share() {
     every_keyed_over(&speech_overs(), |_, _, l| {
         (!matches!(l.name.as_str(), "fm" | "fsk")).then(|| format!("{} ({})", l.name, l.evidence))
@@ -604,7 +603,6 @@ fn a_keyed_overs_duty_is_its_carrier_up_share() {
 /// A pause between words: the carrier keyed but unmodulated reads `carrier`, as a steady
 /// one does.
 #[test]
-#[ignore = "plan 49 A3/A4"]
 fn an_unmodulated_keyed_carrier_reads_carrier() {
     let cases = zeta_dsp::fixtures::keyed_over_cases(&[0.0], &[0.9, 0.4], false);
     every_keyed_over(&cases, |_, _, l| {
@@ -637,7 +635,6 @@ fn quoted_cvs(evidence: &str) -> Vec<f32> {
 /// runs as received: the evidence quotes one CV, and it is the envelope CV of those runs
 /// of the channel `measure_selection` cut, not the whole window's.
 #[test]
-#[ignore = "plan 49 A3/A4"]
 fn the_label_and_the_record_describe_the_same_samples() {
     every_keyed_over(&speech_overs(), |c, _, l| {
         let rate = u64::from(c.over.rate_hz);
@@ -662,4 +659,73 @@ fn the_label_and_the_record_describe_the_same_samples() {
         (cvs.is_empty() || cvs.iter().any(|cv| (cv - view).abs() > 0.001))
             .then(|| format!("quotes cv {cvs:?}, the view's {view:.3}"))
     });
+}
+
+/// Spec 49.1: `ook` stays on-off keying once the label reads the measured samples. The
+/// real remotes in `tests/data`, the public synthesised remotes as `gen_ook` builds them,
+/// and the generator's OOK (one frame and a train of three, over the whole block and over
+/// an 8 kHz band) all still read `ook`.
+#[test]
+fn every_ook_fixture_still_reads_ook() {
+    let mut failed = Vec::new();
+    for name in OOK_REMOTES.iter().chain(&OOK_SPARSE_REMOTES) {
+        if let Some((_, l)) = ook_remote(name)
+            && l.name != "ook"
+        {
+            failed.push(format!("{name}: {} ({})", l.name, l.evidence));
+        }
+    }
+    let band = |hz: u64| zeta_core::classify::Band {
+        offset_hz: 0,
+        bandwidth_hz: zeta_core::types::Hz(hz),
+    };
+    for fx in zeta_dsp::fixtures::ev1527_fixtures() {
+        let iq = fx.remote.iq(fx.rate_hz);
+        let (_, l) = zeta_dsp::measure::measure_selection(
+            &iq,
+            u64::from(fx.rate_hz),
+            fx.center_hz,
+            band(fx.band_hz),
+        )
+        .expect("a measurement");
+        eprintln!("{} generated: {} ({})", fx.stem, l.name, l.evidence);
+        if l.name != "ook" {
+            failed.push(format!(
+                "{} generated: {} ({})",
+                fx.stem, l.name, l.evidence
+            ));
+        }
+    }
+    for repeat in [1, 3] {
+        let spec = zeta_dsp::synth::SynthSpec::Ook {
+            symbol_rate_baud: 1200,
+            bits: "c0de1a5f0e93b2d47c18e6a05bd3f2917e4c".into(),
+            repeat,
+            gap_ms: 50,
+        };
+        let iq = zeta_dsp::synth::synthesise(
+            &spec,
+            &zeta_dsp::synth::Impairments {
+                snr_db: Some(20.0),
+                ..Default::default()
+            },
+            48_000,
+            CENTER,
+        );
+        for hz in [48_000, 8_000] {
+            let (_, l) = zeta_dsp::measure::measure_selection(&iq, 48_000, CENTER, band(hz))
+                .expect("a measurement");
+            eprintln!(
+                "synth ook x{repeat} in {hz} Hz: {} ({})",
+                l.name, l.evidence
+            );
+            if l.name != "ook" {
+                failed.push(format!(
+                    "synth ook x{repeat} in {hz} Hz: {} ({})",
+                    l.name, l.evidence
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
