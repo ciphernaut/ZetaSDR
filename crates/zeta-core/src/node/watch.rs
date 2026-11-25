@@ -2989,12 +2989,23 @@ async fn chosen(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Option<bool> {
 /// Take the verdict of each kept job's `choose` child that has ended (the child leaves it
 /// in `Inner::verdicts`, as an owned identify does): only a proof of another row
 /// replaces the job ([`replace`]); anything else lifts its hold and the first answer
-/// stands ([`lift`]): the job's own row, an unproved guess at another (the child
-/// classified a later slice of its own), `cannot_tell`, or no verdict at all (a node
-/// restart: a transient job never resumes). Whether the state changed.
+/// stands ([`lift`]): the job's own row, an unproved guess at another, `cannot_tell`, or
+/// no verdict at all (a node restart: a transient job never resumes). A held job whose
+/// child is past step 2 with no proof ([`Inner::choose_past_two`]) is lifted at once
+/// while the child goes on to step 3, whose proof still replaces it. Whether the state
+/// changed.
 async fn settle(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     if choices_held() {
         return false;
+    }
+    let mut changed = false;
+    for k in 0..w.decoding.len() {
+        let d = &w.decoding[k];
+        if d.held && d.choose.as_ref().is_some_and(|c| inner.choose_past_two(c)) {
+            let why = "its choose's step 2 proved nothing (step 3 goes on)".to_string();
+            lift_with(inner, r, w, k, why);
+            changed = true;
+        }
     }
     let ended: Vec<JobId> = w
         .decoding
@@ -3002,7 +3013,6 @@ async fn settle(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         .filter_map(|d| d.choose.clone())
         .filter(|c| !inner.runs(c))
         .collect();
-    let mut changed = false;
     for c in ended {
         let verdict = inner.verdicts.lock().unwrap().remove(&c);
         let Some(k) = w
@@ -3034,12 +3044,10 @@ async fn settle(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
 /// without a verdict): the job stands and its hold is lifted, so it joins the mix and
 /// its transcriber publishes what it kept. Event `decoding`, only when a hold was lifted.
 fn lift(inner: &Inner, r: &Run, w: &mut State, k: usize, choice: Option<&Choice>) {
-    let d = &mut w.decoding[k];
+    let d = &w.decoding[k];
     if !d.held {
         return;
     }
-    let _ = inner.set_held(&d.job, None);
-    d.held = false;
     let why = match choice {
         None => "its choose ended without a verdict".to_string(),
         Some(c) => match (&c.job, &c.reason) {
@@ -3062,6 +3070,15 @@ fn lift(inner: &Inner, r: &Run, w: &mut State, k: usize, choice: Option<&Choice>
             ),
         },
     };
+    lift_with(inner, r, w, k, why);
+}
+
+/// Lift the hold of the kept job `k` for `why`, so it joins the mix and its transcriber
+/// publishes what it kept. Event `decoding`.
+fn lift_with(inner: &Inner, r: &Run, w: &mut State, k: usize, why: String) {
+    let d = &mut w.decoding[k];
+    let _ = inner.set_held(&d.job, None);
+    d.held = false;
     let summary = format!(
         "decoding {} at {} on {}: {why}; the first answer stands and the hold is lifted",
         d.mode,

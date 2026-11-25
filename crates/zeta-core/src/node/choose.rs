@@ -108,6 +108,27 @@ pub(super) struct Choosing {
     seeds: std::sync::Mutex<HashMap<JobId, StepOne>>,
     /// How many bands a `choose` classified itself (tests).
     classified: AtomicU64,
+    /// The owned chooses now past step 2 with no proof, on to step 3 ([`PastTwo`]): their
+    /// watch lifts its probation then, as only a step-3 proof can still replace the job.
+    past_two: std::sync::Mutex<std::collections::HashSet<JobId>>,
+}
+
+/// An owned `choose` listed as past step 2 with no proof while it lives
+/// ([`Inner::choose_past_two`]); dropped however the job ends.
+struct PastTwo {
+    inner: Arc<Inner>,
+    id: JobId,
+}
+
+impl Drop for PastTwo {
+    fn drop(&mut self) {
+        self.inner
+            .choosing
+            .past_two
+            .lock()
+            .unwrap()
+            .remove(&self.id);
+    }
 }
 
 /// A `choose`'s step 1: the selection, the span's length in ns, its classification,
@@ -517,6 +538,11 @@ impl Inner {
         self.choosing.seeds.lock().unwrap().insert(id.clone(), seed);
     }
 
+    /// Whether the owned `choose` `id` is past step 2 with no proof, trying step 3.
+    pub(super) fn choose_past_two(&self, id: &JobId) -> bool {
+        self.choosing.past_two.lock().unwrap().contains(id)
+    }
+
     /// Drop a step 1 handed to the `choose` `id` that it has not taken (it never started).
     pub(super) fn choosing_unseed(&self, id: &JobId) {
         self.choosing.seeds.lock().unwrap().remove(id);
@@ -775,7 +801,8 @@ fn widen_task(
 /// ([`RING_SHORT`]) or layer 1 measured
 /// nothing ([`UNMEASURED`]); (3) when the job's step reaches 3 and
 /// nothing proved yet, [`Inner::step_three`] on the live band with what is left of the
-/// trials' budget; then the verdict, and with `start` the verdict's job: a step-3
+/// trials' budget (an owned job is listed past step 2 meanwhile,
+/// [`Inner::choose_past_two`]); then the verdict, and with `start` the verdict's job: a step-3
 /// proof's own job, kept running, its lease made an ordinary one and the job disowned
 /// (unless its lease gave way first: then it is stopped and the job started afresh),
 /// else one started.
@@ -865,6 +892,14 @@ async fn choose_loop(
         && choice.settled != Settled::Proved
         && let Some(m) = &classified.measurement
     {
+        // Step 2 proved nothing: an owner (a watch) may stop waiting on it now.
+        let _past_two = r.owned.then(|| {
+            inner.choosing.past_two.lock().unwrap().insert(r.id.clone());
+            PastTwo {
+                inner: inner.clone(),
+                id: r.id.clone(),
+            }
+        });
         let on = (&port, lease);
         let at = (deadline, r.ask.start);
         let (revised, k) = inner.step_three(&mut r, on, &choice, (m, &sel), at).await?;

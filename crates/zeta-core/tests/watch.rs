@@ -5184,13 +5184,65 @@ async fn a_voice_signal_is_held_then_joins_the_mix() {
     })
     .await;
     assert_eq!(got[0]["text"], SCRIBE_TEXT);
-    until("watch.decoding settles", Duration::from_secs(5), || {
+    // Unheld at once; its choose may still be trying step 3, and its verdict is taken later.
+    until("watch.decoding settles", Duration::from_secs(60), || {
         let d = decoding(&node, &watch);
-        d.len() == 1 && d[0].get("held").is_none() && d[0].get("choose").is_none()
+        assert!(d.len() == 1 && d[0].get("held").is_none(), "{d:#?}");
+        d[0].get("choose").is_none()
     })
     .await;
     assert_eq!(state(&node, &job), Some(JobState::Running));
     assert_eq!(state(&node, &scribe), Some(JobState::Running));
+    stop_all(&node).await;
+}
+
+/// How long a held voice job may wait for its choose's step 2 (a 2 s slice replayed
+/// through the digital voice rows) before the hold lifts: well under the step-3 trials'
+/// dwells, which the hold no longer waits for.
+const STEP_TWO_WITHIN: Duration = Duration::from_secs(8);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_lifts_once_step_two_proves_nothing() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    let m = start_mix(&node).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let started = tokio::time::Instant::now();
+    // Held from its start, until its choose's step 2 has proved nothing; the choose goes
+    // on to step 3 unheld.
+    until("the hold lifts", STEP_TWO_WITHIN, || {
+        record(&node, &job).is_some_and(|r| r.held.is_none())
+    })
+    .await;
+    eprintln!("lifted after {:?}", started.elapsed());
+    let d = decoding(&node, &watch);
+    assert!(
+        d[0]["choose"].is_string(),
+        "the choose still tries step 3: {d:#?}"
+    );
+    assert!(d[0].get("held").is_none(), "{d:#?}");
+    until("the mix takes it in", Duration::from_secs(5), || {
+        mix_inputs(&node, &m) == 1
+    })
+    .await;
+    let lifted = events.watch("decoding").into_iter().find(|e| {
+        e["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("step 2 proved nothing"))
+    });
+    assert!(lifted.is_some(), "{:#?}", events.all());
+    // The choose's verdict later (no proof) leaves the job as it is.
+    until("the verdict is taken", Duration::from_secs(60), || {
+        decoding(&node, &watch)
+            .first()
+            .is_some_and(|d| d.get("choose").is_none())
+    })
+    .await;
+    assert_eq!(state(&node, &job), Some(JobState::Running));
     stop_all(&node).await;
 }
 
