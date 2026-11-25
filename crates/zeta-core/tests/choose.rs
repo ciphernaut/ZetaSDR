@@ -703,6 +703,45 @@ fn replays(node: &Node) -> Vec<zeta_core::job::JobRecord> {
         .collect()
 }
 
+// The node's peak count of trials is a test hook.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_chooses_never_run_more_trials_than_the_policy_allows() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &voice_iq(), DMR_HZ, 10.0).await;
+    let mut policy = ChoicePolicy::default();
+    policy.budget.concurrent = 1;
+    let r = node
+        .apply(Op::ChoicePolicySet {
+            policy: Some(policy),
+            lease: None,
+        })
+        .await;
+    assert!(matches!(r, Ok(OpResult::ChoicePolicy(_))), "{r:?}");
+    let op = || choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2}));
+    let (a, b) = (start(&node, op()).await, start(&node, op()).await);
+    let running = |id: &JobId| state(&node, id) == Some(JobState::Running);
+    let deadline = tokio::time::Instant::now() + ENDS_WITHIN;
+    while running(&a) || running(&b) {
+        let replays: Vec<_> = replays(&node)
+            .into_iter()
+            .filter(|r| r.state == JobState::Running)
+            .collect();
+        assert!(replays.len() <= 1, "{replays:#?}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the chooses never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Both tried their rows, one trial at a time between them.
+    for id in [&a, &b] {
+        let ctx = ended(&node, id).await;
+        assert!(!ctx["trials"].as_array().unwrap().is_empty(), "{ctx:#}");
+    }
+    assert_eq!(node.test_trial_peak(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_choose_leaves_no_replay_record() {
     let dir = tempfile::tempdir().unwrap();

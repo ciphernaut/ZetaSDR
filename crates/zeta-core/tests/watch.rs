@@ -5466,6 +5466,49 @@ async fn a_signal_near_the_capture_edge_is_read_inside_the_ring() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choose_watch_child_takes_the_watchs_step_one() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (_job, _scribe) = chosen(&node, &events, &watch).await;
+    until("the watch's choose runs", Duration::from_secs(10), || {
+        decoding(&node, &watch)
+            .first()
+            .is_some_and(|d| d["choose"].is_string())
+    })
+    .await;
+    until("its verdict is taken", Duration::from_secs(60), || {
+        decoding(&node, &watch)
+            .first()
+            .is_some_and(|d| d.get("choose").is_none())
+    })
+    .await;
+    // The child replayed the watch's own slice: no `choose` classified the band again.
+    assert_eq!(node.test_choose_classifications(), 0);
+    // A choose asked by a caller classifies its own.
+    let op = serde_json::from_value(serde_json::json!({
+        "op": "job_start", "kind": "choose", "source": "rx",
+        "center_hz": cb_ch1_hz(), "bandwidth_hz": 12_500,
+        "deviation_hz": null, "sideband": null, "elastic": false, "replace": [],
+        "choose": {"up_to": 1},
+    }))
+    .unwrap();
+    let id = match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("choose: {r:?}"),
+    };
+    until("the caller's choose ends", Duration::from_secs(20), || {
+        state(&node, &id) != Some(JobState::Running)
+    })
+    .await;
+    assert_eq!(node.test_choose_classifications(), 1);
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_signal_nothing_could_prove_starts_unheld() {
     let _one = SERIAL.lock().await;
     zeta_core::node::watch::test_timing(0, 0);

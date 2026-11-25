@@ -75,7 +75,7 @@ use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 
-use super::choose::choose_record;
+use super::choose::{StepOne, choose_record};
 use super::persist::now;
 use super::{ChooseAsk, Inner, Node, source_fault_reason};
 use crate::choice::{Choice, ChoiceJob, Settled, choose_now};
@@ -840,35 +840,39 @@ fn attach_task(
 struct Classifying {
     center_hz: u64,
     band: Tuning,
-    task: tokio::task::JoinHandle<Result<Choice, String>>,
+    task: tokio::task::JoinHandle<Result<StepOne, String>>,
 }
 
 /// Step 1 of the choice for `band` of `source` over the newest `slice_s` of its ring, in
-/// its own task (a plain function, as [`attach_task`]): the answer, or why the band was
-/// not classified.
+/// its own task (a plain function, as [`attach_task`]): the answer with what it read
+/// (handed to the watch's `choose` child, which then classifies nothing again), or why
+/// the band was not classified.
 fn classify_task(
     inner: &Arc<Inner>,
     source: &SourceId,
     band: Tuning,
     slice_s: f32,
-) -> tokio::task::JoinHandle<Result<Choice, String>> {
+) -> tokio::task::JoinHandle<Result<StepOne, String>> {
     let (inner, source) = (inner.clone(), source.clone());
     tokio::spawn(async move {
-        let (sel, _) = inner
+        let (sel, held_ns) = inner
             .newest_selection(&source, band, slice_s)
             .ok_or_else(|| format!("source {} is not capturing", source.0))?;
         let node = Node::handle(&inner);
-        let (c, ..) = crate::ops::classify_samples(&node, &sel)
+        let (classified, samples, rate, ring_center) = crate::ops::classify_samples(&node, &sel)
             .await
             .map_err(|e| e.to_string())?;
         let modes = inner.modes();
-        Ok(choose_now(
-            &modes,
-            modes.weights(),
-            &c,
-            &sel,
-            &inner.region(),
-        ))
+        let choice = choose_now(&modes, modes.weights(), &classified, &sel, &inner.region());
+        Ok(StepOne {
+            sel,
+            held_ns,
+            classified,
+            samples,
+            rate,
+            ring_center,
+            choice,
+        })
     })
 }
 
@@ -1890,12 +1894,14 @@ impl Inner {
     }
 
     /// Start the watch's own `choose` on `band`: owned by the watch, transient, asked by
-    /// the `watch` surface to the policy's step for it, its verdict left in
-    /// `Inner::verdicts` for [`settle`]. `Ok(None)`: cancelled.
+    /// the `watch` surface to the policy's step for it, handed the watch's step 1
+    /// (`seed`, so it classifies nothing again), its verdict left in `Inner::verdicts`
+    /// for [`settle`]. `Ok(None)`: cancelled.
     async fn start_choose(
         self: &Arc<Self>,
         r: &Run,
         band: Tuning,
+        seed: StepOne,
     ) -> Result<Option<JobId>, String> {
         let (step, capped) = self
             .choice_policy
@@ -1912,15 +1918,20 @@ impl Inner {
         };
         let rec = choose_record(r.prov.source.clone(), band, ask, Some(r.id.clone()));
         let id = rec.id.clone();
+        self.choosing_seed(&id, seed);
         let launch = self.launch_task(rec);
+        let child = id.clone();
         let start = tokio::spawn(async move {
             match launch.await {
-                Ok(Ok(())) => Ok(id),
+                Ok(Ok(())) => Ok(child),
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(e) => Err(format!("launch task: {e}")),
             }
         });
-        self.launched(r, start, JobId::clone).await
+        let started = self.launched(r, start, JobId::clone).await;
+        // Taken as the child starts; one that never started leaves nothing behind.
+        self.choosing_unseed(&id);
+        started
     }
 
     /// `on_signal: choose`: begin step 1 for the tracked signal `i`: its
@@ -1954,13 +1965,13 @@ impl Inner {
         r: &Run,
         w: &mut State,
         (i, band): (usize, Tuning),
-        answer: Result<Choice, String>,
+        answer: Result<StepOne, String>,
     ) -> Option<()> {
         let signal = w.signals[i].signal.clone();
-        let choice = match answer {
-            Ok(c) if c.job.is_some() => c,
-            Ok(c) => {
-                let why = c.reason.unwrap_or_else(|| "no job".into());
+        let seed = match answer {
+            Ok(s) if s.choice.job.is_some() => s,
+            Ok(s) => {
+                let why = s.choice.reason.unwrap_or_else(|| "no job".into());
                 self.choice_unknown(r, w, i, format!("can't tell: {why}"))
                     .await;
                 return Some(());
@@ -1971,6 +1982,7 @@ impl Inner {
                 return Some(());
             }
         };
+        let choice = seed.choice.clone();
         let job = choice.job.clone()?;
         let demod = self
             .modes()
@@ -2025,7 +2037,7 @@ impl Inner {
         }
         let mut notes = Vec::new();
         if unproved {
-            match self.start_choose(r, band).await {
+            match self.start_choose(r, band, seed).await {
                 Ok(None) => return None,
                 Ok(Some(c)) => w.decoding[k].choose = Some(c),
                 Err(e) => {
