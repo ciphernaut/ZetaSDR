@@ -6311,8 +6311,13 @@ def scenario_listen_puts_the_chosen_demodulator_first(page, url, secret):
     got = page.evaluate(
         """async () => {
           const a = await import('./actions.js');
+          // A demodulator is told by its row's role (modes_list's rows): the four built-in
+          // ones, and an operator's variant, which has no Listen entry of its own.
+          const rows = ['fm_demod', 'wfm_demod', 'am_demod', 'ssb_demod', 'fm_narrow']
+            .map((id) => ({id, role: 'demodulator'}))
+            .concat([{id: 'dmr_decode', role: 'decoder'}]);
           const ids = (job) => {
-            const ctx = {host: null, rows: [], sets: [], plan: null, src: null,
+            const ctx = {host: null, rows, sets: [], plan: null, src: null,
                          sel: {sourceId: 'x', centerHz: 100e6, bandwidthHz: 12500},
                          choice: job && {job, row: job.kind, step: 1, settled: 'best_guess'}};
             return a.offered('box', ctx).filter((e) => a.groupOf(e, 'box') === 'listen')
@@ -6320,12 +6325,14 @@ def scenario_listen_puts_the_chosen_demodulator_first(page, url, secret):
           };
           const j = (kind, params = {}) => ({kind, center_hz: 100e6, bandwidth_hz: 6000, params});
           return {none: ids(null), am: ids(j('am_demod')), lsb: ids(j('ssb_demod', {sideband: 'lsb'})),
-                  usb: ids(j('ssb_demod', {sideband: 'usb'})), dmr: ids(j('dmr_decode'))};
+                  usb: ids(j('ssb_demod', {sideband: 'usb'})), dmr: ids(j('dmr_decode')),
+                  narrow: ids(j('fm_narrow'))};
         }""")
     base = ["fm_demod", "wfm_demod", "am_demod", "ssb_usb", "ssb_lsb"]
     twins = [i for i in got["none"] if i not in base]
     assert got["none"][:5] == base and len(twins) == 5, got
     assert got["dmr"] == got["none"], got
+    assert got["narrow"] == got["none"], got
     assert got["am"] == ["am_demod", "fm_demod", "wfm_demod", "ssb_usb", "ssb_lsb"] + twins, got
     assert got["lsb"] == ["ssb_lsb", "fm_demod", "wfm_demod", "am_demod", "ssb_usb"] + twins, got
     assert got["usb"] == ["ssb_usb", "fm_demod", "wfm_demod", "am_demod", "ssb_lsb"] + twins, got
