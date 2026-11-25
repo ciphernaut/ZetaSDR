@@ -32,7 +32,11 @@
 //! 1 answers and whenever the answer changes, then `{"protocol": "verdict", "choice"}`;
 //! `context.choose` keeps the ask, `choice` (the latest), `slice`, `trials` and
 //! `verdict`. With `start` the verdict's job is started on the job's source (`started`,
-//! or `start_error`); a step-3 proof's job is kept running as that job instead. The job
+//! or `start_error`), then each row of its `attach` attached to it with `job_attach`
+//! (`attached`, the riders' jobs; `attach_error` for one that does not attach, the job
+//! left running); a step-3 proof's job is kept running as that job instead, when it is
+//! the answer's (a proved rider's trial is not: its answer is its demodulator). Every
+//! proof is answered by [`job_for_proof`]. The job
 //! ends `stopped`, a `cannot_tell` included: a source with no ring answers
 //! `cannot_tell`, its reason that the source is not capturing.
 
@@ -55,7 +59,8 @@ use super::persist::now;
 use super::{Inner, Node, NodeError, REPLAY_SOURCE, source_fault_reason};
 use crate::choice::{
     Alternative, Choice, ChoiceJob, NOT_HELD_LEAD, NotTried, Settled, capture_holds,
-    catalogue_entry, choose_now, inside_capture, job_band, job_for, trial_band, trial_bands,
+    catalogue_entry, choose_now, inside_capture, job_band, job_for, job_for_proof, rides_with,
+    trial_band, trial_bands,
 };
 use crate::choice_policy::{Budget, LeaseSetting, Surface};
 use crate::classify::{Classification, Measurement};
@@ -736,7 +741,8 @@ impl Inner {
 
     /// Step 2: replay the trial `slice` through `choice.could_prove`
     /// ([`replay_trials`]) until `deadline`. The answer: `choice` revised by the first
-    /// proof (step 2, `proved`, the old answer its runner-up), or `choice` with
+    /// proof ([`proved_at`]: step 2, `proved`, the job [`job_for_proof`] answers, the old
+    /// answer its runner-up), or `choice` with
     /// [`OVER_BUDGET`] for the rows the budget left untried. `Cancelled` when the job is.
     async fn step_two(
         self: &Arc<Self>,
@@ -773,13 +779,11 @@ impl Inner {
             .proved
             .and_then(|(row, evidence)| modes.get(&row).map(|m| (m, evidence)));
         if let Some((mode, evidence)) = proved {
-            let job = job_for(mode, m, sel, &self.region());
-            let band = Tuning {
-                center_hz: job.center_hz,
-                bandwidth_hz: job.bandwidth_hz,
-            };
+            let band = job_band(&job_for(mode, m, sel, &region));
             self.supersede_by(&mode.row.id.0, band, now().0);
-            return Ok(proved_at(&next, (2, &mode.row.id.0), job, vec![evidence]));
+            let answer = job_for_proof(&modes, modes.weights(), mode, m, sel, &region);
+            let proof = (2, &mode.row.id.0[..], answer);
+            return Ok(proved_at(&modes, &next, proof, vec![evidence]));
         }
         next.not_tried
             .extend(replays.unstarted.into_iter().map(|row| NotTried {
@@ -883,8 +887,10 @@ impl Inner {
     /// one the budget leaves no time for [`OVER_BUDGET`], one whose trial a foreground
     /// request took the capture from [`GAVE_WAY`] (its job stopped, the next row tried).
     /// Every trial is in `context.choose.trials` (`step: 3`). The answer: `choice` revised
-    /// by the first proof (step 3, `proved`, the old answer its runner-up) with, when
-    /// `keep`, the proved job still running in its guard; else `choice` with the notes.
+    /// by the first proof ([`proved_at`]: step 3, `proved`, the job [`job_for_proof`]
+    /// answers, the old answer its runner-up) with, when `keep` and the answer is the
+    /// trial's own job, the proved job still running in its guard (a rider's trial is
+    /// stopped: its answer is the demodulator); else `choice` with the notes.
     /// Every other trial job is stopped. `Cancelled` when the job is.
     async fn step_three(
         self: &Arc<Self>,
@@ -1025,13 +1031,17 @@ impl Inner {
                 Ok(Attempt::Proved { evidence, .. }) => {
                     let t = trial(started.as_ref(), "proved", evidence.clone());
                     self.add_trials(r, &[t]);
+                    self.supersede_by(row, band, now().0);
+                    let answer = job_for_proof(&modes, modes.weights(), mode, m, sel, &region);
+                    // The trial runs the row's own job: kept only when that is the answer
+                    // (a rider's proof answers its demodulator, started afresh).
+                    let keep = keep && answer.1 == *row;
                     if !keep {
                         guard.stop().await;
                     }
-                    self.supersede_by(row, band, now().0);
                     let lines = widened.into_iter().chain([evidence]).collect();
                     // The notes of the rows before it stand.
-                    let proved = proved_at(&next, (3, row), job, lines);
+                    let proved = proved_at(&modes, &next, (3, row, answer), lines);
                     return Ok((proved, keep.then_some(guard)));
                 }
             }
@@ -1099,7 +1109,8 @@ fn widen_task(
 /// [`Inner::choose_past_two`]); then the verdict, and with `start` the verdict's job: a
 /// step-3 proof's own job, kept running, its lease made an ordinary one and the job
 /// disowned (unless its lease gave way first: then it is stopped and the job started
-/// afresh), else one started.
+/// afresh), else one started and each of its `attach` rows attached to it
+/// ([`note_attach`]).
 async fn choose_loop(
     inner: Arc<Inner>,
     mut r: Run,
@@ -1257,7 +1268,20 @@ async fn choose_loop(
     {
         let started = start_task(&inner, &r.source, job).await;
         let (key, v) = match started {
-            Ok(Ok(OpResult::Job(id))) => ("started", id.0.into()),
+            Ok(Ok(OpResult::Job(id))) => {
+                // Each proved rider, attached once the job runs; one that fails leaves
+                // the job running (its listener keeps the audio).
+                for row in &job.attach {
+                    let attached = match attach_task(&inner, row, &id).await {
+                        Ok(Ok(OpResult::Job(rider))) => Ok(rider),
+                        Ok(Ok(other)) => Err(format!("job_attach answered {other:?}")),
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(e) => Err(format!("attach task: {e}")),
+                    };
+                    note_attach(&mut r.ctx, row, attached);
+                }
+                ("started", id.0.into())
+            }
             Ok(Ok(other)) => (
                 "start_error",
                 format!("job_start answered {other:?}").into(),
@@ -1363,12 +1387,15 @@ fn cannot_tell(reason: String, not_tried: Vec<NotTried>) -> Choice {
 }
 
 /// `prev` settled at `step` by a decode of `row` (`evidence` what the trial noted, its
-/// `decode <row>: ...` line last): `job`, `proved` at `step` with layer 1's line and
-/// `evidence`, `prev`'s answer its runner-up, `row` out of `could_prove`.
+/// `decode <row>: ...` line last), answered `job` of the row `answer` ([`job_for_proof`]:
+/// `row` itself, or the demodulator `row` rides with): `proved` at `step` with layer 1's
+/// line and `evidence`, `row` out of `could_prove`. Its runner-up is `prev`'s answer;
+/// for a rider's proof (`answer` is not `row`), `prev`'s runner-up when `prev` answered
+/// `answer` already, and never `answer` itself nor a row that rides with it.
 fn proved_at(
+    modes: &crate::modes::ModeRegistry,
     prev: &Choice,
-    (step, row): (u8, &str),
-    job: ChoiceJob,
+    (step, row, (job, answer)): (u8, &str, (ChoiceJob, String)),
     evidence: Vec<String>,
 ) -> Choice {
     let layer1 = prev
@@ -1376,7 +1403,7 @@ fn proved_at(
         .iter()
         .filter(|e| e.starts_with("layer 1: "))
         .cloned();
-    let runner_up = prev
+    let before = prev
         .job
         .clone()
         .zip(prev.row.clone())
@@ -1385,9 +1412,25 @@ fn proved_at(
             row,
             evidence: prev.evidence.clone(),
         });
+    let rides = |alt: &str| {
+        let (Some(rider), Some(demod)) = (modes.get(alt), modes.get(&answer)) else {
+            return false;
+        };
+        rides_with(modes, rider, demod)
+    };
+    let runner_up = match answer == row {
+        // The row's own job: the old answer, as for every proof before riding.
+        true => before,
+        // A rider's proof answered its demodulator, often the old answer itself.
+        false => match before {
+            Some(b) if b.row == answer => prev.runner_up.clone(),
+            b => b,
+        }
+        .filter(|b| b.row != answer && !rides(&b.row)),
+    };
     Choice {
         job: Some(job),
-        row: Some(row.to_string()),
+        row: Some(answer),
         step,
         settled: Settled::Proved,
         evidence: layer1.chain(evidence).collect(),
@@ -1427,13 +1470,16 @@ fn with_step(steps: &[u8], step: u8) -> Vec<u8> {
     out
 }
 
-/// A choice's one line: `<kind> at <MHz> MHz, <width> Hz (<settled>, step <n>)`, or
-/// `cannot tell: <reason>`.
+/// A choice's one line: `<kind> at <MHz> MHz, <width> Hz (<settled>, step <n>)`, the
+/// kind followed by ` + <row>` for each row to attach, or `cannot tell: <reason>`.
 fn summary(c: &Choice) -> String {
     match &c.job {
         Some(j) => format!(
             "{} at {:.4} MHz, {} Hz ({}, step {})",
-            j.kind,
+            std::iter::once(j.kind.as_str())
+                .chain(j.attach.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" + "),
             j.center_hz.0 as f64 / 1e6,
             j.bandwidth_hz.0,
             c.settled.name(),
@@ -1464,6 +1510,54 @@ fn start_task(
         })?;
         crate::ops::apply(&node, op, "choose").await
     })
+}
+
+/// A `job_attach` of the rider row `row` to the running job `job` (its channel IQ:
+/// `stream` null), applied as a caller of the node would, in its own task (see
+/// [`start_task`]).
+fn attach_task(
+    inner: &Arc<Inner>,
+    row: &str,
+    job: &JobId,
+) -> JoinHandle<Result<OpResult, OpError>> {
+    let op = serde_json::json!({
+        "op": "job_attach", "kind": row, "job": job.0, "language": null, "stream": null,
+    });
+    let node = Node::handle(inner);
+    tokio::spawn(async move {
+        let op: Op = serde_json::from_value(op).map_err(|e| OpError::Other {
+            message: format!("the choice's rider does not attach: {e}"),
+        })?;
+        crate::ops::apply(&node, op, "choose").await
+    })
+}
+
+/// Note in `context.choose` (`ctx`) what attaching the row `row` to the started job came
+/// to: the rider's job appended to `attached`, or `<row> did not attach: <error>` added to
+/// `attach_error` (`; `-separated). `attached` is there, empty or not, once one is tried.
+fn note_attach(
+    ctx: &mut serde_json::Map<String, Value>,
+    row: &str,
+    attached: Result<JobId, String>,
+) {
+    let list = ctx
+        .entry("attached")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    match attached {
+        Ok(id) => {
+            if let Value::Array(list) = list {
+                list.push(id.0.into());
+            }
+        }
+        Err(e) => {
+            let line = format!("{row} did not attach: {e}");
+            let error = match ctx.get("attach_error").and_then(Value::as_str) {
+                Some(before) => format!("{before}; {line}"),
+                None => line,
+            };
+            ctx.insert("attach_error".into(), error.into());
+        }
+    }
 }
 
 /// A `capture_decode` of the capture `slice` through `row` at `band`, owned by the

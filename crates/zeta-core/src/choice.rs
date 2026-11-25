@@ -47,6 +47,10 @@ pub struct ChoiceJob {
     pub bandwidth_hz: Hz,
     /// The kind's parameters (`deviation_hz`, `sideband`, ...); `{}` for a decoder row.
     pub params: serde_json::Map<String, Value>,
+    /// The rows to attach to the job once it runs (`job_attach`, a rider's row id): a
+    /// proved rider of the demodulator the job runs ([`job_for_proof`]); `[]` otherwise.
+    #[serde(default)]
+    pub attach: Vec<String>,
 }
 
 /// The job the choice would answer next: its row and the evidence for it.
@@ -127,11 +131,17 @@ pub(crate) fn catalogue_entry(label: &Label) -> Option<&str> {
 /// serve the label ([`expected_fits`]), sized as for the expected label, with the
 /// expectation's line in its evidence. Only an expectation some demodulator row fits at
 /// the measured width brings a row. When there is one, and no expectation at the centre
-/// (fitted or not) agrees with the label (the label is contradicted), each demodulator row an expectation fits scores the width
-/// term and `weights.allocation` (a licence at rank 0; a plan's channel the same, never
-/// twice), and each row that serves the label scores its label term at
-/// `weights.contradicted` and no licence term from elsewhere in the band. It ranks, never
-/// proves: the answer stays a best guess, and the decoder rows are ranked as before.
+/// (fitted or not) agrees with the label (the label is contradicted), each demodulator
+/// row an expectation fits scores the width term and `weights.allocation` (a licence at
+/// rank 0; a plan's channel the same, never twice), and each row that serves the label
+/// scores its label term at `weights.contradicted` and no licence term from elsewhere in
+/// the band. It ranks, never proves: the answer stays a best guess, and the decoder rows
+/// are ranked as before.
+///
+/// A quick proof is answered by [`job_for_proof`] (spec 49.3): a proved rider answers
+/// the demodulator it rides with, the rider in the job's `attach` and its decode line in
+/// the evidence. A rider is never the runner-up of the demodulator it rides with; it
+/// stays in `could_prove`.
 ///
 /// A decoder row is tried at its own band ([`job_for`]), not the box's: a box narrower
 /// than the row still lists it. With `capture` (the ring's centre and rate) a ready
@@ -352,6 +362,11 @@ pub fn choose_now(
                 .collect(),
         }
     };
+    // The answer for a row: its job and the evidence lines sizing it added.
+    let guess = |row: &LoadedMode| {
+        let (job, lines) = job_lines(row);
+        (row.row.id.0.clone(), job, lines)
+    };
     let decided = if let Some(row) = proved {
         let decode = format!("decode {}: ", row.row.id.0);
         let summary: Vec<String> = c
@@ -359,21 +374,40 @@ pub fn choose_now(
             .iter()
             .filter(|l| l.evidence.starts_with(&decode))
             .map(|l| l.evidence.clone())
+            .chain(named(row))
             .collect();
-        let runner_up = demods.first().map(|d| alternative(d.mode));
-        Ok((row, Settled::Proved, summary, runner_up))
+        let (job, id, lines) = proof_sized(modes, weights, row, m, sel, region);
+        // The first demodulator that is not the answer itself (a rider's proof answers
+        // one).
+        let runner_up = demods
+            .iter()
+            .find(|d| d.mode.row.id.0 != id)
+            .map(|d| alternative(d.mode));
+        let answer = match id == row.row.id.0 {
+            true => (id, job, lines),
+            false => {
+                let demod = modes
+                    .get(&id)
+                    .expect("job_for_proof answers a row of modes");
+                (id, job, lines.into_iter().chain(named(demod)).collect())
+            }
+        };
+        Ok((answer, Settled::Proved, summary, runner_up))
     } else if label == "noise" {
         Err("the band holds noise only".to_string())
     } else if let Some(top) = demods.first() {
+        // A rider of the top demodulator is never its runner-up: proved, it rides with it.
+        let rider = |d: &&&Scored| rides_with(modes, d.mode, top.mode);
         let runner_up = guessable
-            .first()
+            .iter()
+            .find(|d| !rider(d))
             .filter(|d| top.score - d.score <= weights.runner_up_margin)
             .or_else(|| demods.get(1))
             .map(|d| alternative(d.mode));
-        Ok((top.mode, Settled::BestGuess, vec![], runner_up))
+        Ok((guess(top.mode), Settled::BestGuess, vec![], runner_up))
     } else if let Some(top) = guessable.first() {
         let runner_up = guessable.get(1).map(|d| alternative(d.mode));
-        Ok((top.mode, Settled::BestGuess, vec![], runner_up))
+        Ok((guess(top.mode), Settled::BestGuess, vec![], runner_up))
     } else if outside.iter().any(|s| s.fits_label) {
         // A row serves it, but its band reaches past the capture.
         Err(format!("no row the capture holds serves {label}"))
@@ -381,17 +415,18 @@ pub fn choose_now(
         Err(format!("no row serves {label}"))
     };
     let mut evidence = vec![layer1.clone()];
-    let (row, settled, decode, runner_up) = match decided {
+    let ((row, job, plan), settled, decode, runner_up) = match decided {
         Ok(d) => d,
         Err(reason) => return cannot_tell(reason, evidence, could_prove, not_tried),
     };
-    let (job, plan) = job_lines(row);
     evidence.extend(decode);
     evidence.extend(plan);
-    evidence.extend(named(row));
+    if settled != Settled::Proved {
+        evidence.extend(modes.get(&row).map(named).unwrap_or_default());
+    }
     Choice {
         job: Some(job),
-        row: Some(row.row.id.0.clone()),
+        row: Some(row),
         step: 1,
         settled,
         evidence,
@@ -559,6 +594,92 @@ pub fn job_for(row: &LoadedMode, m: &Measurement, sel: &Selection, region: &str)
     sized(row, m, sel, region).0
 }
 
+/// The job a decode proving `row` answers, for the band `m` measured in `sel`, and the id
+/// of the job's row (spec 49.3). For a row that rides with a demodulator (`rides`), the
+/// best ready demodulator row it rides with (of [`ModeRegistry::ridden_by`], the first in
+/// range in the demodulators' score order at the measurement), sized by its own width
+/// rule on the measured centre ([`job_for`]) and no narrower than the rider's band needs
+/// (its `min_hz`, else its `bandwidth_hz`, as [`crate::modes::Band::fits`] reads it, so
+/// the rider's `job_attach` is not refused), with `attach: [row]`. Otherwise, a rider
+/// with no such demodulator ready included, `row`'s own job ([`job_for`]). The band is
+/// not tested against the capture, as no demodulator's answer is.
+pub fn job_for_proof(
+    modes: &ModeRegistry,
+    weights: &Weights,
+    row: &LoadedMode,
+    m: &Measurement,
+    sel: &Selection,
+    region: &str,
+) -> (ChoiceJob, String) {
+    let (job, id, _) = proof_sized(modes, weights, row, m, sel, region);
+    (job, id)
+}
+
+/// [`job_for_proof`], with the evidence lines sizing the job added (a plan channel's).
+fn proof_sized(
+    modes: &ModeRegistry,
+    weights: &Weights,
+    row: &LoadedMode,
+    m: &Measurement,
+    sel: &Selection,
+    region: &str,
+) -> (ChoiceJob, String, Vec<String>) {
+    let Some(demod) = ridden_demod(modes, weights, row, m) else {
+        let (job, lines) = sized(row, m, sel, region);
+        return (job, row.row.id.0.clone(), lines);
+    };
+    let (mut job, lines) = sized(demod, m, sel, region);
+    let band = &row.row.band;
+    let needs = band.min_hz.unwrap_or(band.bandwidth_hz);
+    job.bandwidth_hz = Hz(job.bandwidth_hz.0.max(needs));
+    job.attach = vec![row.row.id.0.clone()];
+    (job, demod.row.id.0.clone(), lines)
+}
+
+/// The demodulator row a proof of `rider` answers: of the ready rows it rides with
+/// ([`ModeRegistry::ridden_by`]), the first in range in the demodulators' score order at
+/// the measurement `m` ([`score_demodulators`], the catalogue and register left out: they
+/// rank, and the proof is the rider's). `None` for a row that does not ride, or whose
+/// demodulators are none of them ready.
+fn ridden_demod<'a>(
+    modes: &'a ModeRegistry,
+    weights: &Weights,
+    rider: &LoadedMode,
+    m: &Measurement,
+) -> Option<&'a LoadedMode> {
+    let with = modes.ridden_by(rider);
+    if with.is_empty() {
+        return None;
+    }
+    let f = &m.features;
+    let (center_hz, bandwidth_hz) = (f.center_hz.0, f.bandwidth_hz.0);
+    let label = m.label.name.as_str();
+    let none = |_: &str| 0.0;
+    let no_allocation = |_: &LoadedMode| 0.0;
+    score_demodulators(
+        weights,
+        modes,
+        center_hz,
+        bandwidth_hz,
+        label,
+        &none,
+        &no_allocation,
+    )
+    .into_iter()
+    .filter(|s| s.in_range && s.mode.startable())
+    .find(|s| with.iter().any(|w| w.row.id == s.mode.row.id))
+    .map(|s| s.mode)
+}
+
+/// Whether the decoder row `rider` rides with the demodulator row `demod`
+/// ([`ModeRegistry::ridden_by`]).
+pub(crate) fn rides_with(modes: &ModeRegistry, rider: &LoadedMode, demod: &LoadedMode) -> bool {
+    modes
+        .ridden_by(rider)
+        .iter()
+        .any(|d| d.row.id == demod.row.id)
+}
+
 /// [`job_for`], with the evidence lines a plan channel added.
 fn sized(
     row: &LoadedMode,
@@ -611,6 +732,7 @@ fn sized(
         center_hz,
         bandwidth_hz,
         params,
+        attach: Vec::new(),
     };
     (job, lines)
 }

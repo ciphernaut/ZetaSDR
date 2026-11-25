@@ -109,8 +109,21 @@ async fn node_rated(
     dir: &Path,
     iq: &[Complex<f32>],
     rate_hz: u32,
+    at: (u64, f64, u64),
+    tune_range: Option<(Hz, Hz)>,
+) -> Node {
+    node_staged(dir, iq, rate_hz, at, tune_range, false).await
+}
+
+/// [`node_rated`], with the `stream_in` stage the binary registers (an attached job's
+/// input) when `stream_in`.
+async fn node_staged(
+    dir: &Path,
+    iq: &[Complex<f32>],
+    rate_hz: u32,
     (center_hz, ring_seconds, trial_keep_bytes): (u64, f64, u64),
     tune_range: Option<(Hz, Hz)>,
+    stream_in: bool,
 ) -> Node {
     let meta = CaptureMeta {
         sample_rate_hz: Hz(rate_hz as u64),
@@ -129,6 +142,9 @@ async fn node_rated(
     let port: Arc<dyn Port> = src.clone();
     let mut reg = StageRegistry::new();
     zeta_dsp::register_all(&mut reg);
+    if stream_in {
+        reg.register(Arc::new(zeta_core::stream_in::StreamInStage::new()));
+    }
     let mut cfg = common::cfg(dir, true);
     cfg.ring_seconds = ring_seconds;
     if dir.join("modes").is_dir() {
@@ -2526,4 +2542,236 @@ async fn at_the_capture_edge_the_wider_row_is_not_tried_and_the_narrow_one_is() 
     assert_eq!(kinds, ["m17_narrow"], "{ctx:#}");
     let slice = slice_of(&node, &ctx);
     assert_eq!(slice.bandwidth_hz, Hz(8_000), "{slice:?}");
+}
+
+// Spec 49.3: a proof of a row that rides with a demodulator answers the demodulator, and
+// Start gives the demodulator with the rider attached.
+
+/// The RDS station's rate: wide enough that `wfm_demod`'s band fits the capture.
+const RDS_RATE_HZ: u32 = 480_000;
+/// The RDS station's centre.
+const RDS_STATION_HZ: u64 = 100_000_000;
+
+/// A broadcast station with RDS (PI 2AB1) at [`RDS_STATION_HZ`], under 25 dB of noise.
+fn rds_iq() -> Vec<Complex<f32>> {
+    let mut iq =
+        zeta_dsp::synth::rds_station_iq(0x2AB1, "ZETA FM ", "HELLO FROM ZETASDR", RDS_RATE_HZ);
+    awgn(&mut iq, 25.0, 17);
+    iq
+}
+
+/// The embedded `rds_decode` row in `dir/modes` with no quick decode: step 1 does not
+/// prove it, so a trial step must.
+fn rds_without_quick(dir: &Path) {
+    let modes = dir.join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let (_, rds) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("rds_decode.json"))
+        .unwrap();
+    let mut row: Value = serde_json::from_str(rds).unwrap();
+    row["identify"]
+        .as_object_mut()
+        .unwrap()
+        .remove("quick")
+        .expect("the row has a quick decode");
+    std::fs::write(modes.join("rds_decode.json"), row.to_string()).unwrap();
+}
+
+/// A node over [`rds_iq`] in a 10 s ring, with the `stream_in` stage a rider reads its
+/// demodulator's channel by (as the binary has it).
+async fn rds_node(dir: &Path) -> Node {
+    let at = (RDS_STATION_HZ, 10.0, u64::MAX);
+    node_staged(dir, &rds_iq(), RDS_RATE_HZ, at, None, true).await
+}
+
+/// `v`, a proved answer of `wfm_demod` at `step` with `rds_decode` attached: the rider's
+/// decode line in the evidence, and neither the demodulator nor its rider the runner-up.
+fn assert_ridden(v: &Value, step: u64) {
+    assert_eq!(v["row"], "wfm_demod", "{v}");
+    assert_eq!(v["step"], step, "{v}");
+    assert_eq!(v["settled"], "proved", "{v}");
+    assert_eq!(v["job"]["kind"], "wfm_demod", "{v}");
+    assert_eq!(v["job"]["attach"], serde_json::json!(["rds_decode"]), "{v}");
+    assert!(v["job"]["bandwidth_hz"].as_u64().unwrap() >= 150_000, "{v}");
+    assert!(
+        v["evidence"].as_array().unwrap().iter().any(|e| e
+            .as_str()
+            .is_some_and(|e| e.starts_with("decode rds_decode: "))),
+        "{v}"
+    );
+    for row in ["wfm_demod", "rds_decode"] {
+        assert_ne!(v["runner_up"]["row"], row, "{v}");
+    }
+}
+
+/// The running `rds_decode` attached to `demod`, once there is one.
+async fn rider_on(node: &Node, demod: &JobId) -> zeta_core::job::JobRecord {
+    until("the rider runs on the demodulator", ENDS_WITHIN, || {
+        running(node, "rds_decode")
+            .iter()
+            .any(|r| r.input.as_ref() == Some(demod))
+    })
+    .await;
+    running(node, "rds_decode")
+        .into_iter()
+        .find(|r| r.input.as_ref() == Some(demod))
+        .unwrap()
+}
+
+/// A `choose` with `start` whose answer is a demodulator with a rider starts the
+/// demodulator and then attaches the rider to it: both run, the rider reading the
+/// demodulator's channel, and the context names both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choose_that_starts_a_ridden_answer_attaches_the_rider() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = rds_node(dir.path()).await;
+    let id = start(
+        &node,
+        choose_op(
+            RDS_STATION_HZ,
+            240_000,
+            serde_json::json!({"up_to": 1, "start": true}),
+        ),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_ridden(v, 1);
+    let demod = JobId(ctx["started"].as_str().expect("started").into());
+    assert_eq!(state(&node, &demod), Some(JobState::Running));
+    let d = node.job_list().into_iter().find(|r| r.id == demod).unwrap();
+    assert_eq!(d.kind, "wfm_demod", "{d:?}");
+    assert_eq!(d.tuning.center_hz.0, v["job"]["center_hz"], "{d:?}");
+    assert_eq!(d.tuning.bandwidth_hz.0, v["job"]["bandwidth_hz"], "{d:?}");
+    let rider = rider_on(&node, &demod).await;
+    assert_eq!(ctx["attached"], serde_json::json!([rider.id.0]), "{ctx:#}");
+    assert!(ctx["attach_error"].is_null(), "{ctx:#}");
+    assert!(ctx["start_error"].is_null(), "{ctx:#}");
+    // No standalone rds_decode: the rider is the only one.
+    assert_eq!(running(&node, "rds_decode").len(), 1);
+}
+
+/// A rider that does not attach leaves its demodulator running, and the context says
+/// why: here a node without the `stream_in` stage a rider reads its input by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rider_that_does_not_attach_leaves_the_demodulator_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = (RDS_STATION_HZ, 10.0, u64::MAX);
+    let node = node_rated(dir.path(), &rds_iq(), RDS_RATE_HZ, at, None).await;
+    let id = start(
+        &node,
+        choose_op(
+            RDS_STATION_HZ,
+            240_000,
+            serde_json::json!({"up_to": 1, "start": true}),
+        ),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    assert_ridden(&ctx["verdict"], 1);
+    let demod = JobId(ctx["started"].as_str().expect("started").into());
+    assert_eq!(ctx["attached"], serde_json::json!([]), "{ctx:#}");
+    let error = ctx["attach_error"].as_str().expect("an attach_error");
+    assert!(
+        error.starts_with("rds_decode did not attach: ") && error.contains("stream_in"),
+        "{ctx:#}"
+    );
+    assert!(ctx["start_error"].is_null(), "{ctx:#}");
+    // Still running a moment later, and no rider anywhere.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(state(&node, &demod), Some(JobState::Running));
+    assert!(running(&node, "rds_decode").is_empty());
+}
+
+/// A rider proved by step 2's replay revises the answer to its demodulator, the rider
+/// attached; step 1's answer (the same demodulator) is not its own runner-up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_two_proof_of_a_rider_revises_to_the_demodulator() {
+    let dir = tempfile::tempdir().unwrap();
+    rds_without_quick(dir.path());
+    let node = rds_node(dir.path()).await;
+    let mut feed = feed(&node);
+    let id = start(
+        &node,
+        choose_op(RDS_STATION_HZ, 240_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    let ev = events(&mut feed, &id);
+    let first = &ev[0]["choice"];
+    assert_eq!(first["row"], "wfm_demod", "{first}");
+    assert_eq!(first["settled"], "best_guess", "{first}");
+    assert_eq!(first["job"]["attach"], serde_json::json!([]), "{first}");
+    assert!(
+        first["could_prove"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "rds_decode"),
+        "{first}"
+    );
+    let v = &ctx["verdict"];
+    assert_ridden(v, 2);
+    assert_eq!(v["job"]["center_hz"], first["job"]["center_hz"], "{v}");
+    assert!(
+        !v["could_prove"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "rds_decode"),
+        "{v}"
+    );
+    // Without `start` nothing is started or attached.
+    assert!(
+        ctx["started"].is_null() && ctx["attached"].is_null(),
+        "{ctx:#}"
+    );
+}
+
+/// A rider proved by a step-3 trial with `start`: its trial job is not kept (it runs the
+/// rider's own job), the demodulator is started and the rider attached to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_three_proof_of_a_rider_starts_the_demodulator_with_it_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    rds_without_quick(dir.path());
+    let node = rds_node(dir.path()).await;
+    live_only(&node, LeaseSetting::Share).await;
+    // A rigid job holds the capture, which holds the station.
+    let op = serde_json::from_value(serde_json::json!({
+        "op": "job_start", "kind": "am_demod", "source": "rx",
+        "center_hz": RDS_STATION_HZ, "bandwidth_hz": 10_000,
+        "deviation_hz": null, "sideband": null, "elastic": false, "replace": [],
+    }))
+    .unwrap();
+    let holder = start(&node, op).await;
+    let id = start(
+        &node,
+        choose_op(
+            RDS_STATION_HZ,
+            240_000,
+            serde_json::json!({"up_to": 3, "start": true}),
+        ),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_ridden(v, 3);
+    let trial = live_trials(&ctx)
+        .into_iter()
+        .find(|t| t["outcome"] == "proved")
+        .expect("a proved trial");
+    assert_eq!(trial["row"], "rds_decode", "{ctx:#}");
+    let trial = JobId(trial["job"].as_str().unwrap().into());
+    let demod = JobId(ctx["started"].as_str().expect("started").into());
+    assert_ne!(demod, trial);
+    assert_eq!(state(&node, &demod), Some(JobState::Running));
+    let rider = rider_on(&node, &demod).await;
+    assert_eq!(ctx["attached"], serde_json::json!([rider.id.0]), "{ctx:#}");
+    until("the trial job stops and goes", ENDS_WITHIN, || {
+        node.job_list().iter().all(|r| r.id != trial)
+    })
+    .await;
+    assert_eq!(running(&node, "rds_decode").len(), 1);
+    assert_eq!(state(&node, &holder), Some(JobState::Running));
 }

@@ -989,3 +989,153 @@ async fn a_keyed_over_in_a_pause_on_a_plan_channel_chooses_fm_demod() {
         }
     }
 }
+
+// Spec 49.3: a decoder row that rides with a demodulator. Its proof answers the
+// demodulator, with the rider attached.
+
+/// A broadcast centre, off every channel plan.
+const STATION_HZ: u64 = 104_900_000;
+
+/// `c` with a step-1 proof of `row`: its `tried` outcome and its `decode <row>: <summary>`
+/// label, as the quick decode leaves them.
+fn proved_by(mut c: Classification, row: &str, summary: &str) -> Classification {
+    c.tried.push(zeta_core::classify::Tried {
+        mode: row.into(),
+        score: 1.0,
+        outcome: zeta_core::classify::Outcome::Proved,
+    });
+    c.labels.push(Label {
+        layer: 2,
+        name: "RDS".into(),
+        confidence: 1.0,
+        evidence: format!("decode {row}: {summary}"),
+    });
+    c
+}
+
+/// A proved `rds_decode` answers `wfm_demod`, proved, sized by its own width rule on the
+/// measured centre, with the rider attached and the rider's decode line in the evidence.
+/// The translation is `job_for_proof`'s, which leaves a row that rides with nothing as it is.
+#[test]
+fn a_proved_rider_answers_its_demodulator_with_itself_attached() {
+    use zeta_core::choice::{job_for, job_for_proof};
+    let modes = registry(None);
+    // Measured 3 kHz off the box's centre: the job is on the measured one.
+    let c = proved_by(
+        measured("wfm", STATION_HZ + 3_000, 160_000),
+        "rds_decode",
+        "ZETA FM · HELLO",
+    );
+    let choice = choose_for(&modes, &c, 240_000);
+    eprintln!("{choice:?}");
+    let j = job(&choice);
+    assert_eq!(j.kind, "wfm_demod", "{choice:?}");
+    assert_eq!(choice.row.as_deref(), Some("wfm_demod"), "{choice:?}");
+    assert_eq!(choice.settled, Settled::Proved, "{choice:?}");
+    assert_eq!(choice.step, 1, "{choice:?}");
+    assert_eq!(j.attach, ["rds_decode"], "{choice:?}");
+    assert_eq!(j.center_hz, Hz(STATION_HZ + 3_000), "{choice:?}");
+    // The width rule's own: 1.25 times the occupied 160 kHz.
+    assert_eq!(j.bandwidth_hz, Hz(200_000), "{choice:?}");
+    assert_eq!(j.params["deviation_hz"], 75_000, "{choice:?}");
+    assert!(
+        choice
+            .evidence
+            .iter()
+            .any(|e| e == "decode rds_decode: ZETA FM · HELLO"),
+        "{choice:?}"
+    );
+    assert!(
+        !choice.could_prove.iter().any(|r| r == "rds_decode"),
+        "{choice:?}"
+    );
+    // The translation alone: the demodulator for a rider, the row itself otherwise.
+    let m = c.measurement.as_ref().unwrap();
+    let sel = box_at(STATION_HZ, 240_000);
+    let rds = modes.get("rds_decode").unwrap();
+    let (demod, row) = job_for_proof(&modes, modes.weights(), rds, m, &sel, "AU");
+    assert_eq!(row, "wfm_demod");
+    assert_eq!(&demod, j);
+    let dmr = modes.get("dmr_decode").unwrap();
+    let (own, row) = job_for_proof(&modes, modes.weights(), dmr, m, &sel, "AU");
+    assert_eq!(row, "dmr_decode");
+    assert_eq!(own, job_for(dmr, m, &sel, "AU"));
+    assert!(own.attach.is_empty(), "{own:?}");
+}
+
+/// A rider is never the runner-up of the demodulator it rides with: a broadcast station
+/// nothing proved answers `wfm_demod`, and `rds_decode` stays in `could_prove` only. No
+/// unproved answer carries `attach`.
+#[test]
+fn a_rider_is_not_the_runner_up_of_its_demodulator() {
+    let modes = registry(None);
+    let c = measured("wfm", STATION_HZ, 160_000);
+    let choice = choose_for(&modes, &c, 240_000);
+    eprintln!("{choice:?}");
+    assert_eq!(choice.row.as_deref(), Some("wfm_demod"), "{choice:?}");
+    assert_eq!(choice.settled, Settled::BestGuess, "{choice:?}");
+    assert!(job(&choice).attach.is_empty(), "{choice:?}");
+    assert!(
+        choice.could_prove.iter().any(|r| r == "rds_decode"),
+        "{choice:?}"
+    );
+    assert_ne!(
+        choice.runner_up.as_ref().map(|r| r.row.as_str()),
+        Some("rds_decode"),
+        "{choice:?}"
+    );
+    if let Some(r) = &choice.runner_up {
+        assert!(r.job.attach.is_empty(), "{choice:?}");
+    }
+}
+
+/// A rider whose demodulator rows are none of them ready answers its own job, as a
+/// decoder row's proof does.
+#[test]
+fn a_rider_with_no_ready_demodulator_is_its_own_job() {
+    let mut modes = registry(None);
+    modes.set_program("wfm_demod", None, Some("test: not ready".into()));
+    assert!(!modes.get("wfm_demod").unwrap().startable());
+    let c = proved_by(
+        measured("wfm", STATION_HZ, 160_000),
+        "rds_decode",
+        "ZETA FM · HELLO",
+    );
+    let choice = choose_for(&modes, &c, 240_000);
+    eprintln!("{choice:?}");
+    let j = job(&choice);
+    assert_eq!(j.kind, "rds_decode", "{choice:?}");
+    assert_eq!(choice.row.as_deref(), Some("rds_decode"), "{choice:?}");
+    assert_eq!(choice.settled, Settled::Proved, "{choice:?}");
+    assert!(j.attach.is_empty(), "{choice:?}");
+    assert_eq!(j.bandwidth_hz, Hz(200_000), "{choice:?}");
+}
+
+/// The demodulator a rider's proof answers is no narrower than the rider's `min_hz`, so
+/// the rider's attach is not refused: an operator's rider needing 300 kHz on a station
+/// whose width rule gives 200 kHz.
+#[test]
+fn the_demodulators_width_is_no_narrower_than_the_riders_min() {
+    let dir = tempfile::tempdir().unwrap();
+    let embedded = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modes/rds_decode.json");
+    let mut row: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(embedded).unwrap()).unwrap();
+    row["id"] = "rds_wide".into();
+    row["band"]["bandwidth_hz"] = 300_000.into();
+    row["band"]["min_hz"] = 300_000.into();
+    row["catalogue"] = serde_json::json!([]);
+    std::fs::write(dir.path().join("rds_wide.json"), row.to_string()).unwrap();
+    let modes = registry(Some(dir.path()));
+    assert!(modes.get("rds_wide").is_some_and(|m| m.startable()));
+    let c = proved_by(measured("wfm", STATION_HZ, 160_000), "rds_wide", "WIDE");
+    let choice = choose_for(&modes, &c, 400_000);
+    eprintln!("{choice:?}");
+    let j = job(&choice);
+    assert_eq!(j.kind, "wfm_demod", "{choice:?}");
+    assert_eq!(j.attach, ["rds_wide"], "{choice:?}");
+    assert_eq!(j.bandwidth_hz, Hz(300_000), "{choice:?}");
+    // Where the width rule gives more, it stands.
+    let c = proved_by(measured("wfm", STATION_HZ, 280_000), "rds_wide", "WIDE");
+    let choice = choose_for(&modes, &c, 400_000);
+    assert_eq!(job(&choice).bandwidth_hz, Hz(350_000), "{choice:?}");
+}
