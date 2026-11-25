@@ -657,6 +657,46 @@ async fn a_slice_over_the_trial_quota_is_shortened_or_not_tried() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_two_that_ran_and_proved_nothing_is_in_steps_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &voice_iq(), DMR_HZ, 10.0).await;
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(v["row"], "fm_demod", "{v}");
+    assert_eq!(v["step"], 1, "{v}");
+    assert_eq!(v["steps_run"], serde_json::json!([1, 2]), "{v}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_two_the_quota_refused_is_not_in_steps_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_with(dir.path(), &dmr_iq(), DMR_HZ, 10.0, SECOND_BYTES / 2).await;
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(v["steps_run"], serde_json::json!([1]), "{v}");
+    let reasons: Vec<&str> = v["not_tried"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["reason"].as_str())
+        .collect();
+    assert!(
+        reasons.contains(&"not tried: the slice exceeds the trial quota"),
+        "{v}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinned_trial_slices_share_the_trial_quota() {
     // A quota of 3 s: the first choose pins a 2 s slice, so the second, asked while the
     // first's slice is pinned, gets the 1 s left; never more than the quota pinned.

@@ -114,7 +114,8 @@ pub(super) struct Choosing {
     classified: AtomicU64,
     /// The owned chooses now past step 2 with no proof, on to step 3 ([`PastTwo`]): their
     /// watch lifts its probation then, as only a step-3 proof can still replace the job.
-    past_two: std::sync::Mutex<std::collections::HashSet<JobId>>,
+    /// The value is why step 2 did not run (`None`: it ran).
+    past_two: std::sync::Mutex<HashMap<JobId, Option<String>>>,
 }
 
 /// An owned `choose` listed as past step 2 with no proof while it lives
@@ -633,6 +634,9 @@ impl Inner {
         let rows = &choice.could_prove;
         let replays = replay_trials(self, job, &slice.id, rows, (budget, deadline)).await;
         self.add_trials(r, &replays.trials);
+        if replays.trials.iter().any(|t| t.job.is_some()) {
+            next.steps_run = with_step(&next.steps_run, 2);
+        }
         if r.cancel.is_cancelled() {
             return Err(StageError::Cancelled);
         }
@@ -647,7 +651,7 @@ impl Inner {
                 bandwidth_hz: job.bandwidth_hz,
             };
             self.supersede_by(&mode.row.id.0, band, now().0);
-            return Ok(proved_at(choice, (2, &mode.row.id.0), job, vec![evidence]));
+            return Ok(proved_at(&next, (2, &mode.row.id.0), job, vec![evidence]));
         }
         next.not_tried
             .extend(replays.unstarted.into_iter().map(|row| NotTried {
@@ -662,9 +666,11 @@ impl Inner {
         self.choosing.seeds.lock().unwrap().insert(id.clone(), seed);
     }
 
-    /// Whether the owned `choose` `id` is past step 2 with no proof, trying step 3.
-    pub(super) fn choose_past_two(&self, id: &JobId) -> bool {
-        self.choosing.past_two.lock().unwrap().contains(id)
+    /// Whether the owned `choose` `id` is past step 2 with no proof, trying step 3:
+    /// `None` when it is not; `Some(None)` when step 2 ran; `Some(Some(reason))` when it
+    /// did not run (the `not_tried` reason, without its `not tried: ` lead).
+    pub(super) fn choose_past_two(&self, id: &JobId) -> Option<Option<String>> {
+        self.choosing.past_two.lock().unwrap().get(id).cloned()
     }
 
     /// Drop a step 1 handed to the `choose` `id` that it has not taken (it never started).
@@ -843,6 +849,9 @@ impl Inner {
                 return Err(StageError::Cancelled);
             }
             let started = guard.job.clone();
+            if started.is_some() {
+                next.steps_run = with_step(&next.steps_run, 3);
+            }
             // A foreground request changed the capture: the trial's lease went.
             if yielded.is_cancelled() {
                 guard.stop().await;
@@ -1022,8 +1031,13 @@ async fn choose_loop(
         let revised = inner
             .step_two(&mut r, &choice, m, s, (budget, deadline))
             .await?;
-        if revised != choice {
-            choice = revised;
+        // The steps run alone are no new answer: the verdict carries them.
+        let changed = Choice {
+            steps_run: choice.steps_run.clone(),
+            ..revised.clone()
+        } != choice;
+        choice = revised;
+        if changed {
             inner.publish_choice(&mut r, &choice);
         }
     }
@@ -1035,7 +1049,13 @@ async fn choose_loop(
     {
         // Step 2 proved nothing: an owner (a watch) may stop waiting on it now.
         let _past_two = r.owned.then(|| {
-            inner.choosing.past_two.lock().unwrap().insert(r.id.clone());
+            let why = (!choice.steps_run.contains(&2)).then(|| step_two_reason(&choice));
+            inner
+                .choosing
+                .past_two
+                .lock()
+                .unwrap()
+                .insert(r.id.clone(), why);
             PastTwo {
                 inner: inner.clone(),
                 id: r.id.clone(),
@@ -1045,8 +1065,13 @@ async fn choose_loop(
         let at = (deadline, r.ask.start);
         let (revised, k) = inner.step_three(&mut r, on, &choice, (m, &sel), at).await?;
         kept = k;
-        if revised != choice {
-            choice = revised;
+        // The steps run alone are no new answer: the verdict carries them.
+        let changed = Choice {
+            steps_run: choice.steps_run.clone(),
+            ..revised.clone()
+        } != choice;
+        choice = revised;
+        if changed {
             inner.publish_choice(&mut r, &choice);
         }
     }
@@ -1190,6 +1215,7 @@ fn cannot_tell(reason: String, not_tried: Vec<NotTried>) -> Choice {
         could_prove: vec![],
         not_tried,
         reason: Some(reason),
+        steps_run: vec![1],
     }
 }
 
@@ -1231,7 +1257,31 @@ fn proved_at(
             .collect(),
         not_tried: prev.not_tried.clone(),
         reason: None,
+        steps_run: with_step(&prev.steps_run, step),
     }
+}
+
+/// Why step 2 did not run, from the notes in `c`: the first note of no row (the policy,
+/// the span, the ring, layer 1, the slice), else the budget, else nothing to replay.
+fn step_two_reason(c: &Choice) -> String {
+    let lead = |s: &str| s.strip_prefix("not tried: ").unwrap_or(s).to_string();
+    if let Some(n) = c.not_tried.iter().find(|n| n.row.is_none()) {
+        return lead(&n.reason);
+    }
+    if c.could_prove.is_empty() {
+        return "no decoder row fits to replay".into();
+    }
+    lead(OVER_BUDGET)
+}
+
+/// `steps` with `step` added, in order, once.
+fn with_step(steps: &[u8], step: u8) -> Vec<u8> {
+    let mut out = steps.to_vec();
+    if !out.contains(&step) {
+        out.push(step);
+        out.sort_unstable();
+    }
+    out
 }
 
 /// A choice's one line: `<kind> at <MHz> MHz, <width> Hz (<settled>, step <n>)`, or
@@ -1547,6 +1597,7 @@ mod tests {
             could_prove: vec![],
             not_tried: vec![],
             reason: None,
+            steps_run: vec![1, 3],
         };
         let t = training_record(&c, &choice);
         let got: Vec<(&str, &str)> = t["sources"]

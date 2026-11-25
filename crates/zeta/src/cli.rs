@@ -2412,7 +2412,7 @@ pub fn choice_line(result: &zeta_core::ops::OpResult) -> Option<String> {
     else {
         return None;
     };
-    Some(match &c.job {
+    let line = match &c.job {
         Some(j) => format!(
             "choice: {} {} Hz {} Hz ({}, step {})",
             j.kind,
@@ -2425,7 +2425,30 @@ pub fn choice_line(result: &zeta_core::ops::OpResult) -> Option<String> {
             "choice: cannot tell: {}",
             c.reason.as_deref().unwrap_or("no reason given")
         ),
+    };
+    Some(match step_two_line(c) {
+        Some(more) => format!("{line}\n{more}"),
+        None => line,
     })
+}
+
+/// The line under a choice that went past step 1: `step 2: <rows>, no frame` when step 2
+/// ran and did not settle the answer, `step 2 did not run: <reason>` when a later step was
+/// asked for and step 2 did not run; `None` for step 1's own answer (`classify`'s) and a
+/// step 2 that proved.
+fn step_two_line(c: &zeta_core::choice::Choice) -> Option<String> {
+    if c.steps_run.len() < 2 && c.not_tried.iter().all(|n| n.row.is_some()) {
+        return None;
+    }
+    if c.steps_run.contains(&2) {
+        return (c.step != 2).then(|| format!("step 2: {}, no frame", c.could_prove.join(", ")));
+    }
+    let why = c.not_tried.iter().find(|n| n.row.is_none())?;
+    let why = why
+        .reason
+        .strip_prefix("not tried: ")
+        .unwrap_or(&why.reason);
+    Some(format!("step 2 did not run: {why}"))
 }
 
 /// Keep only plan `id` in a `channel_plans` result.

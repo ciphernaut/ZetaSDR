@@ -91,6 +91,11 @@ pub struct Choice {
     /// Why the choice cannot tell; `null` otherwise.
     #[schemars(required, schema_with = "crate::types::nullable::<String>")]
     pub reason: Option<String>,
+    /// The ladder steps of which at least one trial started: `[1]` for what `classify`
+    /// holds, then `[1, 2]`, `[1, 3]` or `[1, 2, 3]`. `step` stays the step that settled
+    /// the answer; a step skipped whole has its reason in `not_tried`.
+    #[serde(default)]
+    pub steps_run: Vec<u8>,
 }
 
 /// The catalogue entry a layer-2 catalogue label names (its evidence `catalogue <id>: ...`).
@@ -262,6 +267,7 @@ pub fn choose_now(
         could_prove,
         not_tried,
         reason: None,
+        steps_run: vec![1],
     }
 }
 
@@ -282,6 +288,7 @@ fn cannot_tell(
         could_prove,
         not_tried,
         reason: Some(reason),
+        steps_run: vec![1],
     }
 }
 

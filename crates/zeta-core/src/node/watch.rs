@@ -2999,8 +2999,16 @@ async fn settle(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     let mut changed = false;
     for k in 0..w.decoding.len() {
         let d = &w.decoding[k];
-        if d.held && d.choose.as_ref().is_some_and(|c| inner.choose_past_two(c)) {
-            let why = "its choose's step 2 proved nothing (step 3 goes on)".to_string();
+        let past = d
+            .held
+            .then(|| d.choose.as_ref().and_then(|c| inner.choose_past_two(c)));
+        if let Some(Some(ran)) = past {
+            let why = match ran {
+                None => "its choose's step 2 proved nothing (step 3 goes on)".to_string(),
+                Some(reason) => {
+                    format!("its choose's step 2 did not run ({reason}); step 3 goes on")
+                }
+            };
             lift_with(inner, r, w, k, why);
             changed = true;
         }

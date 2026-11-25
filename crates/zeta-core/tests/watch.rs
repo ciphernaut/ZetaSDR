@@ -5247,6 +5247,75 @@ async fn a_hold_lifts_once_step_two_proves_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_says_step_two_proved_nothing_only_when_it_ran() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    let _m = start_mix(&node).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    until("the hold lifts", STEP_TWO_WITHIN, || {
+        record(&node, &job).is_some_and(|r| r.held.is_none())
+    })
+    .await;
+    let said: Vec<String> = events
+        .watch("decoding")
+        .into_iter()
+        .filter_map(|e| e["summary"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        said.iter().any(|s| s.contains("step 2 proved nothing")),
+        "{said:#?}"
+    );
+    assert!(
+        !said.iter().any(|s| s.contains("step 2 did not run")),
+        "{said:#?}"
+    );
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_says_step_two_did_not_run_when_it_did_not() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    // A slice under a second: step 2 is skipped whole.
+    let mut policy = zeta_core::choice_policy::ChoicePolicy::default();
+    policy.budget.slice_s = 0.5;
+    let r = node
+        .apply(Op::ChoicePolicySet {
+            policy: Some(policy),
+            lease: None,
+        })
+        .await;
+    assert!(matches!(r, Ok(OpResult::ChoicePolicy(_))), "{r:?}");
+    let _m = start_mix(&node).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    until("the hold lifts", STEP_TWO_WITHIN, || {
+        record(&node, &job).is_some_and(|r| r.held.is_none())
+    })
+    .await;
+    let said: Vec<String> = events
+        .watch("decoding")
+        .into_iter()
+        .filter_map(|e| e["summary"].as_str().map(str::to_string))
+        .collect();
+    let want =
+        "its choose's step 2 did not run (the policy's slice_s is under 1 s); step 3 goes on";
+    assert!(said.iter().any(|s| s.contains(want)), "{said:#?}");
+    assert!(
+        !said.iter().any(|s| s.contains("step 2 proved nothing")),
+        "{said:#?}"
+    );
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dmr_signal_never_reaches_the_mix_and_becomes_dmr_decode() {
     let _one = SERIAL.lock().await;
     zeta_core::node::watch::test_timing(0, 0);
