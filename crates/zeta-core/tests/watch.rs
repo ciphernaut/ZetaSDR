@@ -5260,6 +5260,208 @@ async fn a_dmr_signal_never_reaches_the_mix_and_becomes_dmr_decode() {
         .find(|e| e["mode"] == "dmr_decode")
         .expect("a decoding event for dmr_decode");
     assert_eq!(replaced["via"], "choose", "{replaced}");
+    // The decoder gives audio (its main stream): the transcriber is attached to it.
+    assert!(node.job_audio_stream(&dmr.id).is_ok(), "dmr_decode's audio");
+    until(
+        "a transcriber on the decoder",
+        Duration::from_secs(5),
+        || {
+            attached_to(&node, &dmr.id).is_some_and(|t| {
+                decoding(&node, &watch)
+                    .first()
+                    .is_some_and(|d| d["attached"] == t.0.as_str())
+            })
+        },
+    )
+    .await;
+    stop_all(&node).await;
+}
+
+/// A held job, a line its transcriber kept, and the choose verdicts held: the node, its
+/// muting port, the watch, its events, the job, its transcriber, receivers on the
+/// transcriber's events and the hold of the verdicts.
+async fn held_with_a_kept_line(
+    dir: &Path,
+    iq: &[Complex<f32>],
+) -> (
+    Arc<Node>,
+    JobId,
+    Events,
+    JobId,
+    JobId,
+    Vec<broadcast::Receiver<Frame>>,
+    zeta_core::node::watch::ChoiceHold,
+) {
+    let (node, _port, answered) = choice_node(dir, iq).await;
+    let settle = zeta_core::node::watch::test_hold_choices();
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (job, scribe) = chosen(&node, &events, &watch).await;
+    let lines = event_rxs(&node, &scribe);
+    assert!(record(&node, &job).unwrap().held.is_some(), "held");
+    until("a line answered and kept", Duration::from_secs(10), || {
+        answered.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    // The watch's choose has ended, its verdict waiting.
+    let choose = decoding(&node, &watch)[0]["choose"]
+        .as_str()
+        .map(|c| JobId(c.into()))
+        .expect("a choose child");
+    until("the choose ends", Duration::from_secs(60), || {
+        state(&node, &choose) != Some(JobState::Running)
+    })
+    .await;
+    (node, watch, events, job, scribe, lines, settle)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unproved_verdict_for_another_row_lifts_the_hold() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, watch, events, job, scribe, mut lines, settle) =
+        held_with_a_kept_line(dir.path(), &cb_voice()).await;
+    // The choose's own later slice guessed another row, proving nothing.
+    let _rename = zeta_core::node::watch::test_verdicts_name("am_demod");
+    settle.release();
+    until("the hold lifts", Duration::from_secs(10), || {
+        record(&node, &job).is_some_and(|r| r.held.is_none())
+    })
+    .await;
+    let mut got = Vec::new();
+    until("the kept line is published", Duration::from_secs(5), || {
+        got.extend(transcripts(&mut lines));
+        !got.is_empty()
+    })
+    .await;
+    assert_eq!(got[0]["text"], SCRIBE_TEXT);
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    assert_eq!(state(&node, &scribe), Some(JobState::Running));
+    let d = decoding(&node, &watch);
+    assert_eq!(d.len(), 1, "{d:#?}");
+    assert_eq!(d[0]["job"], job.0.as_str(), "{d:#?}");
+    assert_eq!(d[0]["mode"], "fm_demod", "{d:#?}");
+    assert!(
+        node.job_list().iter().all(|r| r.kind != "am_demod"),
+        "nothing replaced it"
+    );
+    let lifted = events
+        .watch("decoding")
+        .into_iter()
+        .find(|e| {
+            e["summary"]
+                .as_str()
+                .unwrap_or("")
+                .contains("hold is lifted")
+        })
+        .expect("a decoding event for the lift");
+    let summary = lifted["summary"].as_str().unwrap();
+    assert!(summary.contains("proved nothing (am_demod"), "{summary}");
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proved_row_that_does_not_start_leaves_its_signal_unknown() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, watch, events, job, scribe, mut lines, settle) =
+        held_with_a_kept_line(dir.path(), &cb_dmr()).await;
+    // DMR proved, but its row can no longer start.
+    let mut reg = (*node.modes()).clone();
+    reg.set_program("dmr_decode", None, Some("test: unavailable".into()));
+    node.modes_handle().set(Arc::new(reg));
+    settle.release();
+    until("unknown", Duration::from_secs(10), || {
+        !events.watch("unknown").is_empty()
+    })
+    .await;
+    let unknown = &events.watch("unknown")[0];
+    let summary = unknown["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("dmr_decode did not start in place of fm_demod"),
+        "{summary}"
+    );
+    // The held job and its transcriber went, what it kept with them; nothing replaced it.
+    until("the held job is stopped", Duration::from_secs(5), || {
+        state(&node, &job) != Some(JobState::Running)
+            && state(&node, &scribe) != Some(JobState::Running)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(transcripts(&mut lines), Vec::<Value>::new());
+    assert_eq!(logged_lines(dir.path(), &scribe), Vec::<String>::new());
+    assert!(decoding(&node, &watch).is_empty());
+    assert!(
+        node.job_list()
+            .iter()
+            .all(|r| r.kind != "dmr_decode" || r.state != JobState::Running)
+    );
+    // Its signal is retried later, as an unknown.
+    let ctx = node.job_context(&watch).unwrap();
+    let signal = &ctx["watch"]["signals"][0];
+    assert_eq!(signal["tries"], 1, "{ctx}");
+    assert_eq!(signal["handled"], false, "{ctx}");
+    assert!(signal["next_retry_ns"].is_u64(), "{ctx}");
+    stop_all(&node).await;
+}
+
+/// How far below the capture's top edge the edge test's voice sits.
+const EDGE_GAP_HZ: u64 = 6_000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_near_the_capture_edge_is_read_inside_the_ring() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    // The voice EDGE_GAP_HZ under the ring's top edge: twice its width would leave it.
+    let offset = RATE_HZ as u64 / 2 - EDGE_GAP_HZ;
+    let audio = speech_like(48_000, 4.0);
+    let mut iq = zeta_dsp::synth::nbfm_modulate(&audio, 48_000, RATE_HZ, 2_500.0, offset as f64);
+    zeta_dsp::synth::awgn(&mut iq, 25.0, 24);
+    let meta = write(dir.path(), "edge", &iq, cb_ch1_hz() - offset);
+    let src = file_source_with("rx", &meta, false);
+    let answered = Arc::new(AtomicUsize::new(0));
+    let ports = vec![(src.clone() as Arc<dyn Port>, src)];
+    let node = node_over_with(dir.path(), ports, None, choice_registry(answered)).await;
+    let node = Arc::new(node);
+    let band = Tuning {
+        center_hz: Hz(cb_ch1_hz() - offset),
+        bandwidth_hz: Hz(RATE_HZ as u64),
+    };
+    let mut g = JobKind::Watch
+        .expand(
+            &rx(),
+            band,
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    g.nodes
+        .iter_mut()
+        .find(|n| n.kind == "detect")
+        .unwrap()
+        .params = serde_json::json!({
+        "on_signal": "choose", "edge_mask": 0.0, "persist_ms": PERSIST_MS, "gone_ms": GONE_MS,
+    });
+    let watch = node
+        .job_start("watch", rx(), band, g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+        .unwrap();
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    assert!(events.watch("unknown").is_empty(), "{:#?}", events.all());
+    let rec = record(&node, &job).unwrap();
+    let top = band.center_hz.0 + RATE_HZ as u64 / 2;
+    assert!(
+        rec.tuning.center_hz.0 + rec.tuning.bandwidth_hz.0 / 2 <= top,
+        "inside the ring: {:?}",
+        rec.tuning
+    );
     stop_all(&node).await;
 }
 

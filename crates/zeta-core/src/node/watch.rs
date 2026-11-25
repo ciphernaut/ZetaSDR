@@ -325,6 +325,41 @@ pub fn test_hold_choices() -> ChoiceHold {
     ChoiceHold(())
 }
 
+/// Tests only: the row a taken `choose` verdict is made to name (its job's kind and its
+/// row), its `settled` left as it is.
+#[cfg(feature = "test-fixtures")]
+static TEST_VERDICT_ROW: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Tests only: every `choose` verdict a watch takes names `row` from now on, until the
+/// guard goes (an unproved guess at another row, which a test cannot otherwise make).
+#[cfg(feature = "test-fixtures")]
+pub fn test_verdicts_name(row: &str) -> VerdictRename {
+    *TEST_VERDICT_ROW.lock().unwrap() = Some(row.to_string());
+    VerdictRename(())
+}
+
+/// Tests only: while it lives, taken verdicts name the row [`test_verdicts_name`] gave.
+#[cfg(feature = "test-fixtures")]
+pub struct VerdictRename(());
+
+#[cfg(feature = "test-fixtures")]
+impl Drop for VerdictRename {
+    fn drop(&mut self) {
+        *TEST_VERDICT_ROW.lock().unwrap() = None;
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+fn test_rename_verdict(choice: &mut Option<Choice>) {
+    let row = TEST_VERDICT_ROW.lock().unwrap().clone();
+    if let (Some(row), Some(c)) = (row, choice.as_mut())
+        && let Some(job) = c.job.as_mut()
+    {
+        job.kind = row.clone();
+        c.row = Some(row);
+    }
+}
+
 /// Whether a test holds the watches' `choose` verdicts.
 fn choices_held() -> bool {
     #[cfg(feature = "test-fixtures")]
@@ -800,6 +835,55 @@ fn attach_task(
     })
 }
 
+/// A choosing watch's step 1 in progress ([`Inner::start_choice`]): the signal's centre,
+/// the band classified, and the task reading the ring and choosing.
+struct Classifying {
+    center_hz: u64,
+    band: Tuning,
+    task: tokio::task::JoinHandle<Result<Choice, String>>,
+}
+
+/// Step 1 of the choice for `band` of `source` over the newest `slice_s` of its ring, in
+/// its own task (a plain function, as [`attach_task`]): the answer, or why the band was
+/// not classified.
+fn classify_task(
+    inner: &Arc<Inner>,
+    source: &SourceId,
+    band: Tuning,
+    slice_s: f32,
+) -> tokio::task::JoinHandle<Result<Choice, String>> {
+    let (inner, source) = (inner.clone(), source.clone());
+    tokio::spawn(async move {
+        let (sel, _) = inner
+            .newest_selection(&source, band, slice_s)
+            .ok_or_else(|| format!("source {} is not capturing", source.0))?;
+        let node = Node::handle(&inner);
+        let (c, ..) = crate::ops::classify_samples(&node, &sel)
+            .await
+            .map_err(|e| e.to_string())?;
+        let modes = inner.modes();
+        Ok(choose_now(
+            &modes,
+            modes.weights(),
+            &c,
+            &sel,
+            &inner.region(),
+        ))
+    })
+}
+
+/// `width` about `center_hz`, narrowed so the band lies inside a ring centred
+/// `ring_center` that holds `rate` Hz (twice the distance to its nearer edge), but never
+/// under `floor_hz`.
+fn ring_clamped(width: u64, floor_hz: u64, center_hz: u64, (ring_center, rate): (u64, u64)) -> u64 {
+    let (lo, hi) = (ring_center.saturating_sub(rate / 2), ring_center + rate / 2);
+    let room = center_hz
+        .saturating_sub(lo)
+        .min(hi.saturating_sub(center_hz))
+        .saturating_mul(2);
+    width.min(room).max(floor_hz)
+}
+
 /// Why a started decoder runs without the sinks it was asked to have, from `sink`.
 fn sink_error_of(sink: SinkOutcome) -> Option<String> {
     match sink {
@@ -1005,6 +1089,8 @@ struct State {
     register: serde_json::Value,
     /// The identify run in progress and the centre of the signal it is on.
     current: Option<(JobId, u64)>,
+    /// A choosing watch's step 1 in progress (not persisted: a restart asks again).
+    classifying: Option<Classifying>,
     /// The decoders' event streams, by job.
     subs: HashMap<JobId, Vec<Receiver<Frame>>>,
     /// A proved decoder while it is placed: neither `current` nor in `decoding` yet.
@@ -1682,15 +1768,33 @@ impl Inner {
 
     /// The band a choosing watch classifies for the tracked signal `t`: its centre, as
     /// wide as the band its identify run would take or twice its measured width (its
-    /// skirts and the rows a decoder could prove it by), within the watch's band.
+    /// skirts and the rows a decoder could prove it by), within the watch's band and
+    /// inside the ring ([`Inner::inside_ring`]).
     fn choice_band(&self, r: &Run, t: &Tracked) -> Tuning {
         let width = t
             .band_hz
             .max(t.signal.bandwidth_hz.saturating_mul(2))
             .min(r.tuning.bandwidth_hz.0);
+        let center_hz = t.signal.center_hz;
+        let width = self.inside_ring(&r.prov.source, center_hz, width, t.signal.bandwidth_hz);
         Tuning {
-            center_hz: Hz(t.signal.center_hz),
+            center_hz: Hz(center_hz),
             bandwidth_hz: Hz(width),
+        }
+    }
+
+    /// `width` about `center_hz`, narrowed to what `source`'s ring holds around that
+    /// centre ([`ring_clamped`]) but never under `floor_hz` (the signal's measured width):
+    /// a wide signal near the capture's edge is still read and started.
+    fn inside_ring(&self, source: &SourceId, center_hz: u64, width: u64, floor_hz: u64) -> u64 {
+        let ring = self.rings.lock().unwrap().get(source).cloned();
+        let span = ring.and_then(|ring| {
+            let ring = ring.read().unwrap();
+            Some((ring.center_hz()?.0, ring.sample_rate_hz().0))
+        });
+        match span {
+            Some(span) => ring_clamped(width, floor_hz, center_hz, span),
+            None => width,
         }
     }
 
@@ -1723,16 +1827,21 @@ impl Inner {
     }
 
     /// Start the choice's `job` inside the watch's capture with the policy's sinks, under
-    /// `held` from its first sample. `Ok(None)`: cancelled.
+    /// `held` from its first sample, its band kept inside the ring but never under
+    /// `floor_hz` (the signal's measured width) unless the choice's own band is narrower.
+    /// `Ok(None)`: cancelled.
     async fn start_chosen(
         self: &Arc<Self>,
         r: &Run,
         job: &ChoiceJob,
         held: Option<Hold>,
+        floor_hz: u64,
     ) -> Result<Option<(JobId, SinkOutcome)>, String> {
+        let (center, width) = (job.center_hz.0, job.bandwidth_hz.0);
+        let width = self.inside_ring(&r.prov.source, center, width, floor_hz.min(width));
         let tuning = Tuning {
             center_hz: job.center_hz,
-            bandwidth_hz: job.bandwidth_hz,
+            bandwidth_hz: Hz(width),
         };
         let extra = Extra {
             deviation_hz: job
@@ -1813,34 +1922,40 @@ impl Inner {
         self.launched(r, start, JobId::clone).await
     }
 
-    /// `on_signal: choose`: answer step 1 for the tracked signal `i` (its
+    /// `on_signal: choose`: begin step 1 for the tracked signal `i`: its
     /// [`Inner::choice_band`] over the newest `budget.slice_s` of the ring, classified and
-    /// chosen as `classify` does) and start the answer's job inside the capture, kept
-    /// `via: choose`. An answer that is an unproved demodulator with rows in
-    /// `could_prove` starts held ([`PROBATION`]) under `probation`. The policy's `attach`
-    /// kind is attached to it, then, while a decoder could still prove otherwise, the
-    /// watch's own `choose` starts on the band ([`settle`] takes its verdict); one that
-    /// cannot start leaves the first answer standing, its hold lifted. A band nothing
-    /// answers (`cannot_tell`, a read that fails) or a job that does not start counts as
-    /// an unknown try (event `unknown`). Event `decoding`. `None`: cancelled.
-    async fn start_choice(self: &Arc<Self>, r: &Run, w: &mut State, i: usize) -> Option<()> {
-        let tracked = w.signals[i].clone();
-        let signal = tracked.signal.clone();
-        let band = self.choice_band(r, &tracked);
+    /// chosen as `classify` does, in a task of its own ([`classify_task`]), so the loop
+    /// goes on following `detect` and its decoders while the ring is read and the
+    /// register asked. Like an identify run, one at a time: [`chosen`] takes the answer.
+    fn start_choice(self: &Arc<Self>, r: &Run, w: &mut State, i: usize) {
+        let tracked = &mut w.signals[i];
+        tracked.waiting = false;
+        let band = self.choice_band(r, tracked);
         let slice_s = self.choice_policy.lock().unwrap().budget.slice_s;
-        let node = Node::handle(self);
-        let answer = match self.newest_selection(&r.prov.source, band, slice_s) {
-            None => Err(format!("source {} is not capturing", r.prov.source.0)),
-            Some((sel, _)) => tokio::select! {
-                c = crate::ops::classify_samples(&node, &sel) => c
-                    .map(|(c, ..)| {
-                        let modes = self.modes();
-                        choose_now(&modes, modes.weights(), &c, &sel, &self.region())
-                    })
-                    .map_err(|e| e.to_string()),
-                _ = r.cancel.cancelled() => return None,
-            },
-        };
+        w.classifying = Some(Classifying {
+            center_hz: tracked.signal.center_hz,
+            band,
+            task: classify_task(self, &r.prov.source, band, slice_s),
+        });
+    }
+
+    /// Act on the step-1 `answer` for the tracked signal `i` (classified on `band`): start
+    /// the answer's job inside the capture, kept `via: choose`. An answer that is an
+    /// unproved demodulator with rows in `could_prove` starts held ([`PROBATION`]) under
+    /// `probation`. The policy's `attach` kind is attached to it, then, while a decoder
+    /// could still prove otherwise, the watch's own `choose` starts on the band
+    /// ([`settle`] takes its verdict); one that cannot start leaves the first answer
+    /// standing, its hold lifted. A band nothing answers (`cannot_tell`, a read that
+    /// fails) or a job that does not start counts as an unknown try (event `unknown`).
+    /// Event `decoding`. `None`: cancelled.
+    async fn start_answer(
+        self: &Arc<Self>,
+        r: &Run,
+        w: &mut State,
+        (i, band): (usize, Tuning),
+        answer: Result<Choice, String>,
+    ) -> Option<()> {
+        let signal = w.signals[i].signal.clone();
         let choice = match answer {
             Ok(c) if c.job.is_some() => c,
             Ok(c) => {
@@ -1865,7 +1980,8 @@ impl Inner {
             reason: PROBATION.into(),
             since_ns: now().0,
         });
-        let (id, sink) = match self.start_chosen(r, &job, held.clone()).await {
+        let floor_hz = signal.bandwidth_hz;
+        let (id, sink) = match self.start_chosen(r, &job, held.clone(), floor_hz).await {
             Ok(None) => return None,
             Ok(Some(started)) => started,
             Err(e) => {
@@ -2252,6 +2368,7 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
         known: Vec::new(),
         register: serde_json::Value::Null,
         current: None,
+        classifying: None,
         subs: HashMap::new(),
         pending: None,
         capturing: Vec::new(),
@@ -2263,6 +2380,10 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
     };
     let result = run(&inner, &mut r, &mut w).await;
     w.guard = None;
+    // A step 1 still reading the ring has started nothing: it is dropped.
+    if let Some(c) = w.classifying.take() {
+        c.task.abort();
+    }
     // At the node's shutdown everything is left as it is: the records resume, the next
     // run re-adopts the decoders and stops the identify run as stale. A `graph_put`
     // restart keeps the decoders for the next run. A fault of the watch's port leaves
@@ -2384,11 +2505,15 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
         }
         changed |= decoders(inner, r, w).await;
         changed |= settle(inner, r, w).await;
+        match chosen(inner, r, w).await {
+            None => return cancelled(),
+            Some(c) => changed |= c,
+        }
         if r.cancel.is_cancelled() {
             return cancelled();
         }
         changed |= capture::ended(inner, r, w);
-        if w.current.is_none() {
+        if w.current.is_none() && w.classifying.is_none() {
             sweep(inner, r, w).await;
             match next(inner, r, w).await {
                 Next::Idle => {}
@@ -2829,11 +2954,31 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     true
 }
 
+/// When the choosing watch's step 1 has answered, act on it for its signal
+/// ([`Inner::start_answer`]); a signal no longer tracked is let go. Whether the state
+/// changed (`Some(false)`: nothing ended yet); `None`: cancelled.
+async fn chosen(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Option<bool> {
+    if !w.classifying.as_ref().is_some_and(|c| c.task.is_finished()) {
+        return Some(false);
+    }
+    let c = w.classifying.take()?;
+    let answer = c
+        .task
+        .await
+        .unwrap_or_else(|e| Err(format!("classify task: {e}")));
+    let Some(i) = nearest(&w.signals, c.center_hz, 1) else {
+        return Some(true);
+    };
+    inner.start_answer(r, w, (i, c.band), answer).await?;
+    Some(true)
+}
+
 /// Take the verdict of each kept job's `choose` child that has ended (the child leaves it
-/// in `Inner::verdicts`, as an owned identify does): a verdict naming the job's own row
-/// lifts its hold ([`lift`]); one naming another row replaces the job ([`replace`]). A
-/// child that ended without one (a node restart: a transient job never resumes) leaves
-/// the first answer standing, lifted. Whether the state changed.
+/// in `Inner::verdicts`, as an owned identify does): only a proof of another row
+/// replaces the job ([`replace`]); anything else lifts its hold and the first answer
+/// stands ([`lift`]): the job's own row, an unproved guess at another (the child
+/// classified a later slice of its own), `cannot_tell`, or no verdict at all (a node
+/// restart: a transient job never resumes). Whether the state changed.
 async fn settle(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     if choices_held() {
         return false;
@@ -2856,9 +3001,12 @@ async fn settle(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         };
         w.decoding[k].choose = None;
         changed = true;
-        let choice: Option<Choice> = verdict.and_then(|v| serde_json::from_value(v).ok());
+        #[allow(unused_mut)]
+        let mut choice: Option<Choice> = verdict.and_then(|v| serde_json::from_value(v).ok());
+        #[cfg(feature = "test-fixtures")]
+        test_rename_verdict(&mut choice);
         match choice.as_ref().and_then(|c| c.job.as_ref().map(|j| (c, j))) {
-            Some((c, job)) if job.kind != w.decoding[k].mode => {
+            Some((c, job)) if c.settled == Settled::Proved && job.kind != w.decoding[k].mode => {
                 if replace(inner, r, w, k, (c, job)).await.is_none() {
                     return true;
                 }
@@ -2869,33 +3017,44 @@ async fn settle(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     changed
 }
 
-/// The `choose` of the kept job `k` agreed with its row (`choice`), or ended without a
-/// verdict: the job stands, its hold (if any) lifted, so it joins the mix and its
-/// transcriber publishes what it kept. Event `decoding`.
+/// The `choose` of the kept job `k` proved no other row (`choice`, `None` when it ended
+/// without a verdict): the job stands and its hold is lifted, so it joins the mix and
+/// its transcriber publishes what it kept. Event `decoding`, only when a hold was lifted.
 fn lift(inner: &Inner, r: &Run, w: &mut State, k: usize, choice: Option<&Choice>) {
     let d = &mut w.decoding[k];
-    let was_held = d.held;
-    if d.held {
-        let _ = inner.set_held(&d.job, None);
-        d.held = false;
+    if !d.held {
+        return;
     }
-    let mut summary = format!(
-        "decoding {} at {} on {}: ",
+    let _ = inner.set_held(&d.job, None);
+    d.held = false;
+    let why = match choice {
+        None => "its choose ended without a verdict".to_string(),
+        Some(c) => match (&c.job, &c.reason) {
+            (None, reason) => format!(
+                "its choose could not tell ({})",
+                reason.as_deref().unwrap_or("no reason given")
+            ),
+            (Some(j), _) if j.kind == d.mode => {
+                format!(
+                    "the choice stands ({} at step {})",
+                    c.settled.name(),
+                    c.step
+                )
+            }
+            (Some(j), _) => format!(
+                "its choose proved nothing ({} at step {} is {})",
+                j.kind,
+                c.step,
+                c.settled.name()
+            ),
+        },
+    };
+    let summary = format!(
+        "decoding {} at {} on {}: {why}; the first answer stands and the hold is lifted",
         d.mode,
         d.signal.mhz(),
         d.source.0
     );
-    match choice {
-        Some(c) => summary.push_str(&format!(
-            "the choice stands ({} at step {})",
-            c.settled.name(),
-            c.step
-        )),
-        None => summary.push_str("its choose ended without a verdict; the first answer stands"),
-    }
-    if was_held {
-        summary.push_str("; the hold is lifted");
-    }
     let e = Event {
         signal: Some(&d.signal),
         job: Some(&d.job),
@@ -2928,7 +3087,8 @@ async fn replace(
     inner.stop_started(r, &old.job, &old.source).await;
     w.subs.remove(&old.job);
     w.decoding[k].attached = None;
-    let (id, sink) = match inner.start_chosen(r, job, None).await {
+    let floor_hz = old.signal.bandwidth_hz;
+    let (id, sink) = match inner.start_chosen(r, job, None, floor_hz).await {
         Ok(Some(started)) => started,
         Ok(None) => {
             w.decoding.remove(k);
@@ -3099,8 +3259,10 @@ pub(super) fn register_says(allocations: &serde_json::Value) -> String {
 /// signal did not reappear in time, and direct starts that published nothing within
 /// `confirm_ms` while their signal was present (`unproven`). A demodulator row's
 /// liveness is its squelch: it is silent from the moment its last `squelch` event shut it
-/// (an open squelch keeps it alive), and a row that publishes nothing (`protocol: none`)
-/// is alive while its signal is present (neither is ever `unproven`). Stopping one stops
+/// (an open squelch keeps it alive; its squelch opening is what proves it under
+/// `confirm_ms`, so one whose squelch never opens while its signal is present can still
+/// be `unproven`), and a row that publishes nothing (`protocol: none`) is alive while its
+/// signal is present and never `unproven`. Stopping one stops
 /// its `choose` child and its attached job first ([`Decoding::teardown`]). A span watch
 /// cools each lost one's channel for the policy's `cooldown_ms` ([`free_channel`]); any
 /// other watch forgets its signal. Each frees a slot for [`next`]. Whether the state
@@ -3353,11 +3515,8 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
             marked = true;
             continue;
         } else if r.seed.policy.choose {
-            w.signals[i].waiting = false;
-            return match inner.start_choice(r, w, i).await {
-                None => Next::Cancelled,
-                Some(()) => Next::Started,
-            };
+            inner.start_choice(r, w, i);
+            return Next::Started;
         }
         w.signals[i].waiting = false;
         let tracked = w.signals[i].clone();
@@ -3478,6 +3637,22 @@ mod tests {
             fits: Vec::new(),
             waiting: false,
         }
+    }
+
+    /// A choice band keeps inside the ring: narrowed to twice the distance to the nearer
+    /// edge, never under the floor, untouched in the middle.
+    #[test]
+    fn a_choice_band_keeps_inside_the_ring() {
+        // A 2.4 MHz ring about 100 MHz: 98.8 to 101.2 MHz.
+        let ring = (100_000_000, 2_400_000);
+        assert_eq!(ring_clamped(400_000, 180_000, 100_000_000, ring), 400_000);
+        // A WFM signal 120 kHz under the top edge: 240 kHz of room.
+        assert_eq!(ring_clamped(400_000, 180_000, 101_080_000, ring), 240_000);
+        // Nearer still: the measured width stands.
+        assert_eq!(ring_clamped(400_000, 180_000, 101_150_000, ring), 180_000);
+        // The low edge too, and a centre outside the ring keeps only the floor.
+        assert_eq!(ring_clamped(400_000, 180_000, 98_900_000, ring), 200_000);
+        assert_eq!(ring_clamped(400_000, 180_000, 102_000_000, ring), 180_000);
     }
 
     /// The width an identify run takes comes only from rows in range for the signal's
@@ -3653,6 +3828,7 @@ mod tests {
             known: Vec::new(),
             register: serde_json::Value::Null,
             current: None,
+            classifying: None,
             subs: HashMap::new(),
             pending: None,
             capturing: Vec::new(),
