@@ -203,8 +203,9 @@ pub enum NodeError {
     )]
     NoPacketStream(JobId, Option<String>),
     /// A rider's input job runs but no stream leaves a root `channel` node of its graph
-    /// (an operator's graph without one), so there is no channel IQ to ride on.
-    #[error("job {} has no channel stream: its graph has no root channel node", .0.0)]
+    /// in its current run (an operator's graph without one, or a run being relaunched),
+    /// so there is no channel IQ to ride on now.
+    #[error("job {} has no channel stream now", .0.0)]
     NoChannelStream(JobId),
     /// A `job_attach` (or an attached job's relaunch) names a voice `role` its input job
     /// `job` does not have; `voices` are the ones it has (none: it has one voice).
@@ -1300,7 +1301,8 @@ impl Inner {
 
     /// The channel stream a rider reads from `job`: the stream leaving its graph's root
     /// `channel` node in its current run ([`JobEntry::channel`]). `InputNotRunning` as
-    /// [`Inner::audio_stream`], `NoChannelStream` when its graph has no root channel.
+    /// [`Inner::audio_stream`], `NoChannelStream` when its graph has no root channel (or
+    /// its channel is between runs).
     fn channel_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
         let jobs = self.jobs.lock().unwrap();
         let entry = jobs
@@ -3369,7 +3371,8 @@ impl Node {
     /// The channel stream a rider attached to `job` would read: the stream leaving the
     /// root `channel` node of `job`'s graph in its current run (a retune or a relaunch
     /// gives a new one). `InputNotRunning` as [`Node::job_audio_stream`],
-    /// `NoChannelStream` when its graph has no root channel.
+    /// `NoChannelStream` when its graph has no root channel (or its channel is between
+    /// runs).
     pub fn job_channel_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
         self.inner.channel_stream(job)
     }

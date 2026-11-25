@@ -1219,7 +1219,8 @@ impl Inner {
     /// first built again by [`crate::ops::rider_graph`] at the input's band and channel
     /// rate now, so it follows a retune that changed both; it fails, `Other` with the
     /// attach's refusal, when the input's band is now under the row's `min_hz` or the
-    /// row is no longer ready. Then each `stream_in` node is pointed at the input's stream
+    /// row is no longer ready; a record of the attach's (not the operator's graph) that
+    /// reads an `iq` stream but whose row no longer rides fails too. Then each `stream_in` node is pointed at the input's stream
     /// of the node's own `kind` (`packet`: [`Inner::packet_stream`]; `iq`:
     /// [`Inner::channel_stream`]; else audio, the record's voice `rec.stream` or the main
     /// stream), and each `packet_capture` node gets its `job`, `center_hz`, `mode`,
@@ -1230,21 +1231,30 @@ impl Inner {
     /// input's row is now restricted or cannot be read ([`crate::ops::capture_row`]).
     fn point_attached(&self, rec: &mut JobRecord, input: &JobId) -> Result<(), NodeError> {
         let modes = self.modes();
-        if let Some(m) = self
+        let rider = self
             .expandable_kind(&rec.kind)
             .filter(|_| !rec.operator_graph)
-            .and_then(|k| crate::ops::rider_row(&modes, &k))
-        {
-            let stream = self.channel_stream(input)?;
-            let of = self
-                .jobs
-                .lock()
-                .unwrap()
-                .get(input)
-                .map(|e| e.record.clone())
-                .ok_or_else(|| NodeError::InputNotRunning(input.clone()))?;
-            rec.graph =
-                crate::ops::rider_graph(m, &modes, &of, &stream).map_err(NodeError::Other)?;
+            .and_then(|k| crate::ops::rider_row(&modes, &k));
+        if let Some(m) = rider {
+            // The input's record and its channel stream as one run has them.
+            let (of, stream) = {
+                let jobs = self.jobs.lock().unwrap();
+                let e = jobs
+                    .get(input)
+                    .filter(|e| e.record.state == JobState::Running && e.cancel.is_some())
+                    .ok_or_else(|| NodeError::InputNotRunning(input.clone()))?;
+                (e.record.clone(), e.channel.clone())
+            };
+            rec.graph = crate::ops::rider_graph(m, &modes, &of, stream.as_ref())
+                .map_err(NodeError::Other)?;
+        } else if !rec.operator_graph && reads_iq(&rec.graph) {
+            // A rider whose row no longer rides (its `rides` dropped, its file removed)
+            // fails as one whose row was made broken does.
+            return Err(NodeError::Other(format!(
+                "{kind} cannot ride on job {}: mode {kind} no longer rides with a demodulator",
+                input.0,
+                kind = rec.kind
+            )));
         }
         let mut pointed = false;
         for n in rec
@@ -1330,6 +1340,13 @@ impl Inner {
         }
         Ok(())
     }
+}
+
+/// Whether `graph` has a `stream_in` node reading an `iq` stream (a rider's).
+fn reads_iq(graph: &Graph) -> bool {
+    graph.nodes.iter().any(|n| {
+        n.kind == STREAM_IN_KIND && n.params.get("kind").and_then(|k| k.as_str()) == Some("iq")
+    })
 }
 
 /// Point the `stream_in` node `n` of an attached job's graph at `stream` of `input`.

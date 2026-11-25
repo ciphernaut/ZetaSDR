@@ -51,7 +51,8 @@ pub struct StreamInParams {
 /// reset: the frames' timestamps carry the gap (`transcribe` closes an utterance on it;
 /// `rds_decode`, riding a demodulator's channel, loses its sync and finds it again). The
 /// lag is logged to stderr, and the frames lost so far are noted in the job's context as
-/// `stream_in.lagged_frames` (at most once a second).
+/// `stream_in.lagged_frames`: at most once a second while it runs, and once more as it
+/// ends when the count moved since the last note.
 ///
 /// `StageSpec::outputs` is fixed per stage, while this stage's output kind is
 /// `params.kind`: it declares the kinds it carries, `[audio, packet, iq]`, and its one
@@ -135,12 +136,22 @@ impl Stage for StreamInStage {
         let Some(mut rx) = bus.subscribe(&p.stream) else {
             return Ok(());
         };
-        // The frames lost to lags so far, and when the count was last noted.
-        let (mut lagged, mut noted): (u64, Option<std::time::Instant>) = (0, None);
+        // The frames lost to lags so far, the count last noted and when.
+        let mut lagged: u64 = 0;
+        let mut noted: (u64, Option<std::time::Instant>) = (0, None);
+        // The count as the stage ends, when it moved since the last note.
+        let last_note = |lagged: u64, noted: u64| {
+            if lagged != noted {
+                ctx.note(serde_json::json!({"stream_in": {"lagged_frames": lagged}}));
+            }
+        };
         loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                _ = cancel.cancelled() => {
+                    last_note(lagged, noted.0);
+                    return Err(StageError::Cancelled);
+                }
                 r = rx.recv() => match r {
                     Ok(frame) => {
                         let provenance = Provenance {
@@ -155,12 +166,16 @@ impl Stage for StreamInStage {
                             p.job.0
                         );
                         lagged += n;
-                        if noted.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+                        let due = noted.1.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1));
+                        if due {
                             ctx.note(serde_json::json!({"stream_in": {"lagged_frames": lagged}}));
-                            noted = Some(std::time::Instant::now());
+                            noted = (lagged, Some(std::time::Instant::now()));
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    Err(broadcast::error::RecvError::Closed) => {
+                        last_note(lagged, noted.0);
+                        return Ok(());
+                    }
                 },
             }
         }
@@ -376,6 +391,70 @@ mod tests {
         );
         bus.unregister(&input);
         assert!(matches!(h.await.unwrap(), Ok(())));
+    }
+
+    #[tokio::test]
+    async fn a_lag_after_the_last_note_is_noted_as_the_stage_ends() {
+        let bus = Arc::new(StreamBus::new(2));
+        let input = bus.register(StreamKind::Audio, prov("in", 0));
+        let out = bus.register(StreamKind::Audio, prov("me", 0));
+        let mut rx = bus.subscribe(&out).unwrap();
+        let params = serde_json::json!({"job": "in", "kind": "audio", "stream": input.0});
+        let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = notes.clone();
+        let ctx = StageContext::new(SourceId("s".into()))
+            .with_note(Arc::new(move |v| seen.lock().unwrap().push(v)));
+        let (b, o) = (bus.clone(), out.clone());
+        let h = tokio::spawn(async move {
+            StreamInStage::new()
+                .run(params, vec![], vec![o], b, CancellationToken::new(), ctx)
+                .await
+        });
+        while bus.receiver_count(&input) != Some(1) {
+            tokio::task::yield_now().await;
+        }
+        let burst = |from: u64| {
+            for t in 0..5u64 {
+                bus.publish(Frame::new(
+                    input.clone(),
+                    prov("in", from + t),
+                    Payload::Audio {
+                        sample_rate_hz: Hz(48_000),
+                        channels: 1,
+                        samples: Arc::from(vec![0.5f32; 4]),
+                    },
+                ));
+            }
+        };
+        // Two lags of three frames within a second: the first is noted at once, the
+        // second only as the stage ends.
+        burst(1000);
+        assert_eq!(
+            rx.recv().await.unwrap().provenance.span.start_ns,
+            Timestamp(1003)
+        );
+        assert_eq!(
+            rx.recv().await.unwrap().provenance.span.start_ns,
+            Timestamp(1004)
+        );
+        burst(2000);
+        assert_eq!(
+            rx.recv().await.unwrap().provenance.span.start_ns,
+            Timestamp(2003)
+        );
+        assert_eq!(
+            notes.lock().unwrap().as_slice(),
+            [serde_json::json!({"stream_in": {"lagged_frames": 3}})]
+        );
+        bus.unregister(&input);
+        assert!(matches!(h.await.unwrap(), Ok(())));
+        assert_eq!(
+            notes.lock().unwrap().as_slice(),
+            [
+                serde_json::json!({"stream_in": {"lagged_frames": 3}}),
+                serde_json::json!({"stream_in": {"lagged_frames": 6}})
+            ]
+        );
     }
 
     #[tokio::test]

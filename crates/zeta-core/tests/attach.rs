@@ -2019,9 +2019,22 @@ async fn rds_attached_to_a_wfm_demod_gives_rds_events() {
 /// Direct: the demodulator's audio runs on as it was while a rider reads its channel.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_demodulators_audio_is_unchanged_with_a_rider_attached() {
+    audio_unchanged(960_000, false).await;
+}
+
+/// On a bank: the demodulator's audio runs on as it was while a rider reads its channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_demodulators_audio_is_unchanged_with_a_rider_attached_on_a_bank() {
+    audio_unchanged(2_400_000, true).await;
+}
+
+/// The demodulator's audio, on the bank or direct, keeps its stream, loses no frame and
+/// carries as many samples with a rider attached as before it.
+async fn audio_unchanged(rate: u32, bank: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let (_src, node) = rider_node(dir.path(), 960_000, false).await;
-    let demod = start_wfm(&node, "direct").await;
+    let (_src, node) = rider_node(dir.path(), rate, bank).await;
+    let path = if bank { "bank" } else { "direct" };
+    let demod = start_wfm(&node, path).await;
     let (audio0, before, lag0) = audio_window(&node, &demod, 2000).await;
     let rider = attach_rider(&node, "rds_decode", &demod).await;
     assert_rds(&node, &rider).await;
@@ -2147,6 +2160,93 @@ async fn an_attached_rider_stops_with_its_input() {
     assert!(streams_of(&node, &twin).is_empty());
 }
 
+/// A stop of the rider leaves its demodulator running, its audio on the same stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_a_rider_leaves_its_demodulator_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), 960_000, false).await;
+    let demod = start_wfm(&node, "direct").await;
+    let audio = node.job_audio_stream(&demod).unwrap();
+    let rider = attach_rider(&node, "rds_decode", &demod).await;
+    assert!(iq_frame(&node, &rider, 3000).await.is_some());
+    node.job_stop(&rider).await.unwrap();
+    assert_eq!(
+        wait_not_running(&node, &rider, 3000).await,
+        JobState::Stopped
+    );
+    assert_running_for(&node, &demod, 1000).await;
+    assert_eq!(node.job_audio_stream(&demod).unwrap(), audio);
+    assert!(streams_of(&node, &rider).is_empty());
+}
+
+/// A `graph_put` of the demodulator that keeps its root channel relaunches the rider
+/// under its id on the new run's channel; one that drops it fails the rider, naming why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graph_put_on_a_ridden_demodulator_rebuilds_or_fails_its_rider() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), 960_000, false).await;
+    let demod = start_wfm(&node, "direct").await;
+    let rider = attach_rider(&node, "rds_decode", &demod).await;
+    let s1 = assert_reads_channel(&node, &rider, &demod).await;
+    let channel1 = node.job_channel_stream(&demod).unwrap();
+    let graph = record(&node, &demod).graph;
+    node.job_graph_put(&demod, graph).await.unwrap();
+    common::until(
+        "the demodulator on a new run",
+        Duration::from_secs(5),
+        || node.job_channel_stream(&demod).is_ok_and(|s| s != channel1),
+    )
+    .await;
+    assert_running_for(&node, &rider, 1000).await;
+    let s2 = assert_reads_channel(&node, &rider, &demod).await;
+    assert_ne!(s1, s2, "rebuilt on the new run");
+    assert_rds(&node, &rider).await;
+    let put = Op::GraphPut {
+        job: demod.clone(),
+        graph: node_graph("audio_src", serde_json::json!({})),
+    };
+    assert!(node.apply(put).await.is_ok());
+    let want = format!(
+        "rds_decode cannot ride on job {}: its graph has no root channel node",
+        demod.0
+    );
+    assert_eq!(
+        wait_not_running(&node, &rider, 5000).await,
+        JobState::Failed { reason: want }
+    );
+    assert!(streams_of(&node, &rider).is_empty());
+    assert_eq!(record(&node, &demod).state, JobState::Running);
+}
+
+/// A rider whose row was edited so it no longer rides fails at its next relaunch,
+/// naming the row, as one whose row was made broken does; its demodulator runs on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rider_whose_row_no_longer_rides_fails_on_relaunch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), 960_000, false).await;
+    let demod = start_wfm(&node, "direct").await;
+    let twin = attach_rider(&node, TWIN_ROW, &demod).await;
+    assert!(iq_frame(&node, &twin, 3000).await.is_some());
+    let file = dir.path().join("modes").join(format!("{TWIN_ROW}.json"));
+    let mut row: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    row.as_object_mut().unwrap().remove("rides");
+    std::fs::write(&file, row.to_string()).unwrap();
+    node.reload_modes().unwrap();
+    assert!(node.modes().get(TWIN_ROW).unwrap().row.rides.is_none());
+    let graph = record(&node, &demod).graph;
+    node.job_graph_put(&demod, graph).await.unwrap();
+    let want = format!(
+        "{TWIN_ROW} cannot ride on job {}: mode {TWIN_ROW} no longer rides with a demodulator",
+        demod.0
+    );
+    assert_eq!(
+        wait_not_running(&node, &twin, 5000).await,
+        JobState::Failed { reason: want }
+    );
+    assert_eq!(record(&node, &demod).state, JobState::Running);
+}
+
 /// A rider resumes after a node restart, after its input, on the input's new channel.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_rider_resumes_on_its_inputs_new_channel() {
@@ -2254,7 +2354,7 @@ async fn a_rider_is_refused_unready_twice_with_a_stream_or_without_a_channel() {
     .await;
     let r = attach_kind_as(&node, "rds_decode", &bare, None).await;
     let want = format!(
-        "job {} has no channel stream: its graph has no root channel node",
+        "rds_decode cannot ride on job {}: its graph has no root channel node",
         bare.0
     );
     assert_eq!(r, Err(other(&want)));
