@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::row::{
     Demod, FieldPath, Install, ModeRow, ProgramBlock, ProgramInput, ProgramOutput, ProgramPackets,
-    RowError, validate_program,
+    RowError, VersionProbe, validate_program, validate_version,
 };
 
 /// The id a graph or frame row's own decoder goes by; never a handler file's.
@@ -38,6 +38,10 @@ pub struct HandlerFile {
     /// Names tried on `PATH` in order (or an absolute path), the first found used.
     pub programs: Vec<String>,
     pub install: Install,
+    /// The least version its program must report, as a program row's `version`; `null`
+    /// for none (the program is only looked up, never run, at the probe).
+    #[serde(default)]
+    pub version: Option<VersionProbe>,
     /// The modes it serves, by mode id.
     pub modes: BTreeMap<String, HandlerEntry>,
 }
@@ -116,8 +120,8 @@ pub struct HandlerBlockSpec {
 }
 
 impl HandlerEntry {
-    /// The program block that runs this entry: `file`'s `programs` and `install`, the
-    /// entry's `args`, `input`, `output`, `packets` and `demod`.
+    /// The program block that runs this entry: `file`'s `programs`, `install` and
+    /// `version`, the entry's `args`, `input`, `output`, `packets` and `demod`.
     pub fn program_block(&self, file: &HandlerFile) -> ProgramBlock {
         let b = &self.block;
         ProgramBlock {
@@ -128,6 +132,7 @@ impl HandlerEntry {
             install: file.install.clone(),
             demod: b.demod.clone(),
             packets: b.packets.clone(),
+            version: file.version.clone(),
         }
     }
 }
@@ -167,11 +172,13 @@ struct RawFile {
     name: String,
     programs: Vec<String>,
     install: Install,
+    #[serde(default)]
+    version: Option<VersionProbe>,
     modes: BTreeMap<String, serde_json::Value>,
 }
 
-/// Parse one handler file and check what concerns the whole file: its keys, its `id`
-/// and `programs`; a failure there is the file's error. Each mode entry is read on its
+/// Parse one handler file and check what concerns the whole file: its keys, its `id`,
+/// `programs` and `version` block; a failure there is the file's error. Each mode entry is read on its
 /// own: the file comes with the entries that parsed, and beside it, by mode id, why
 /// each other one did not. A serde failure names the unknown or missing field when serde
 /// says which (`handler file`, or `entry` for an entry, otherwise).
@@ -196,6 +203,7 @@ pub fn parse_handler_file(
         name: raw.name,
         programs: raw.programs,
         install: raw.install,
+        version: raw.version,
         modes,
     };
     if file.id == BUILTIN {
@@ -215,6 +223,9 @@ pub fn parse_handler_file(
             "programs",
             "names no program (give at least one name or absolute path)",
         ));
+    }
+    if let Some(v) = &file.version {
+        validate_version(v, "version")?;
     }
     Ok((file, broken))
 }

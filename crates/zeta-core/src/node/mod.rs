@@ -1600,8 +1600,11 @@ impl Node {
     /// read the rows through, so a [`Node::reload_modes`] reaches them too); an empty
     /// handle is filled from `cfg.modes_dir` against `registry`, as `open` does. Either
     /// way, each handler file whose handlers are not probed yet has its program looked up
-    /// ([`crate::modes::handlers::probe_handler_files`], which runs nothing), so a missing
-    /// one is `unavailable` on every node.
+    /// ([`crate::modes::handlers::probe_handler_files`], which runs nothing unless the
+    /// file names a least version: then the program found, once, to ask it), and so has
+    /// each program row with a least version not probed yet
+    /// ([`crate::modes::handlers::probe_row_versions`]), so a missing or too old one is
+    /// `unavailable` on every node.
     pub async fn open_with_handle(
         cfg: NodeConfig,
         registry: StageRegistry,
@@ -1686,14 +1689,18 @@ impl Node {
                 cfg.handlers_dir.as_deref(),
             )));
         }
-        // Every node looks up its handler files' programs (never running them), so a
-        // handler whose program is missing is `unavailable` rather than picked and failed
-        // at launch. A registry the caller already probed (the `zeta` crate's, whose
-        // report lines it prints) is left as it is; this one's lines (one per file looked
-        // up, none when nothing changed) are not printed.
+        // Every node looks up its handler files' programs (running one only to ask the
+        // version its file names, at most `VERSION_TIMEOUT` each), so a handler whose
+        // program is missing or too old is `unavailable` rather than picked and failed
+        // at launch; likewise a program row with a least version. A registry the caller
+        // already probed (the `zeta` crate's, whose report lines it prints) is left as it
+        // is; this one's lines (one per file or row probed, none when nothing changed)
+        // are not printed.
         if let Some(reg) = modes.get() {
             let mut probed = (*reg).clone();
-            if !crate::modes::handlers::probe_handler_files(&mut probed).is_empty() {
+            let mut lines = crate::modes::handlers::probe_row_versions(&mut probed);
+            lines.extend(crate::modes::handlers::probe_handler_files(&mut probed));
+            if !lines.is_empty() {
                 modes.set(Arc::new(probed));
             }
         }
@@ -2115,12 +2122,16 @@ impl Node {
     /// `NodeConfig.modes_dir`, none when it is `None`, as at `open`) and the handler
     /// files (embedded, then `NodeConfig.handlers_dir`) against the node's stages, carry
     /// each program row's and handler file's probed program and state over from the
-    /// registry in force ([`ModeRegistry::carry_programs`]), look up the program of each
-    /// handler file not carried (new or edited:
-    /// [`crate::modes::handlers::probe_handler_files`], which runs nothing), read the
-    /// checked times, and put the new registry in force. Jobs already running keep the
-    /// graphs they were expanded to. The broken rows' and handler files' startup lines
-    /// ([`ModeRegistry::startup_lines`]), then that lookup's report lines, for the caller
+    /// registry in force ([`ModeRegistry::carry_programs`]; a block naming a least
+    /// version only while its program is the one probed), look up the program of each
+    /// handler file not carried (new, edited, or its versioned program replaced:
+    /// [`crate::modes::handlers::probe_handler_files`], which runs nothing unless the
+    /// file names a least version: then the program found, once, to ask it) and probe
+    /// each program row with a least version not carried
+    /// ([`crate::modes::handlers::probe_row_versions`]), read the checked times, and put
+    /// the new registry in force. Jobs already running keep the graphs they were
+    /// expanded to. The broken rows' and handler files' startup lines
+    /// ([`ModeRegistry::startup_lines`]), then those probes' report lines, for the caller
     /// to show.
     pub fn reload_modes(&self) -> Result<Vec<String>, NodeError> {
         let inner = &self.inner;
@@ -2132,8 +2143,10 @@ impl Node {
             inner.handlers_dir.as_deref(),
         );
         modes.carry_programs(&inner.modes());
-        // A handler file new or edited since the last probe: looked up, never run.
-        let probed = crate::modes::handlers::probe_handler_files(&mut modes);
+        // A handler file new or edited since the last probe, or a versioned program
+        // replaced: looked up, and run only to ask the version a block names.
+        let mut probed = crate::modes::handlers::probe_row_versions(&mut modes);
+        probed.extend(crate::modes::handlers::probe_handler_files(&mut modes));
         modes.load_checked(&inner.state_dir.join(MODES_CHECKED_FILE));
         let mut lines = modes.startup_lines();
         lines.extend(probed);

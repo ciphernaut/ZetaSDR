@@ -757,6 +757,61 @@ pub struct ProgramBlock {
     /// stream; `null` when it gives none.
     #[serde(default)]
     pub packets: Option<ProgramPackets>,
+    /// The least version the program must report, asked by running it once at the probe;
+    /// `null` for no floor (the program is only looked up).
+    #[serde(default)]
+    pub version: Option<VersionProbe>,
+}
+
+/// How to ask a program its version, and the least one it must report: the probe runs it
+/// once with `args` (no shell, no input, a 2 s timeout, at most 4096 bytes of its stdout
+/// and of its stderr read) and takes the first group of `match`'s first match, stdout
+/// first, as the version; a program that does not answer, exits non-zero, matches nothing
+/// or reports less than `min` is `unavailable`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = require_all)]
+pub struct VersionProbe {
+    /// The arguments that make the program print its version (`["--version"]`).
+    pub args: Vec<String>,
+    /// A regular expression with exactly one group, the version
+    /// (`^onair-rx (\d+(?:\.\d+)*)`); `^` is the start of the output.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// The least version, dotted numbers (`0.4.0`); compared number by number, a missing
+    /// number read as 0.
+    pub min: String,
+}
+
+/// Check a version block, its fields named under `at` (`decoder.version`, or `version`
+/// in a handler file): `match` a regular expression with exactly one group, `min` dotted
+/// numbers.
+pub(crate) fn validate_version(v: &VersionProbe, at: &str) -> Result<(), RowError> {
+    match regex::Regex::new(&v.pattern) {
+        Err(e) => {
+            return Err(RowError::new(
+                format!("{at}.match"),
+                format!("not a regular expression: {e}"),
+            ));
+        }
+        Ok(re) if re.captures_len() != 2 => {
+            return Err(RowError::new(
+                format!("{at}.match"),
+                format!(
+                    "has {} groups (give exactly one, the version)",
+                    re.captures_len() - 1
+                ),
+            ));
+        }
+        Ok(_) => {}
+    }
+    if super::handlers::dotted_numbers(&v.min).is_none_or(|(_, rest)| !rest.is_empty()) {
+        return Err(RowError::new(
+            format!("{at}.min"),
+            format!("{:?} is not dotted numbers (0.4.0)", v.min),
+        ));
+    }
+    Ok(())
 }
 
 /// A program's second, binary output: whole packets, cut by `parser`.
@@ -1870,6 +1925,9 @@ pub(crate) fn validate_program(p: &ProgramBlock) -> Result<(), RowError> {
             "decoder.args",
             "with input.via: fifo, an argument must name \"$fifo\" (the pipe zeta makes)",
         ));
+    }
+    if let Some(v) = &p.version {
+        validate_version(v, "decoder.version")?;
     }
     match &p.packets {
         Some(packets) => validate_packets(packets, p.output.via, &p.args),

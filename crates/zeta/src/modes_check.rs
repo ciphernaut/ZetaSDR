@@ -239,6 +239,20 @@ fn handler_of(m: &LoadedMode, h: &str) -> Option<ModeHandler> {
         .filter(|_| m.has_decoder() || h != zeta_core::modes::NO_DECODER)
 }
 
+/// Why the probe refused `h`'s program although it found it (older than its block's
+/// least version, or its version not read): the reason without the modes it lists;
+/// `None` for a program not found.
+fn refused(h: &ModeHandler) -> Option<String> {
+    h.stamp.as_ref()?;
+    let reason = h.reason.as_deref()?;
+    Some(
+        reason
+            .split_once(" — modes: ")
+            .map_or(reason, |(why, _)| why)
+            .to_string(),
+    )
+}
+
 /// A skip, or with `strict` a failure.
 fn skipped(strict: bool, why: String) -> Outcome {
     match strict {
@@ -261,6 +275,11 @@ async fn check_row(m: &LoadedMode, ctx: &Ctx, strict: bool) -> Outcome {
         return skip("no test".into());
     };
     if m.state == ModeState::Unavailable {
+        // A program found and refused (older than the row's least version, or its
+        // version not read): the probe's reason.
+        if let Some(why) = m.handlers.first().and_then(refused) {
+            return skip(why);
+        }
         // The first handler list not on this host (the first list when all are found
         // now: the probe said otherwise).
         let blocks = m.row.handler_blocks();
@@ -328,8 +347,8 @@ fn check_demod(m: &LoadedMode, ctx: &Ctx) -> Outcome {
 }
 
 /// The outcome of `m`'s row test run by the handler file's handler `h`: failed when it is
-/// broken, skipped (failed with `strict`) when its program is missing or the row has no
-/// test, else run by a job naming `h`.
+/// broken, skipped (failed with `strict`) when its program is missing or refused (too old,
+/// or its version not read) or the row has no test, else run by a job naming `h`.
 async fn check_handler(
     m: &LoadedMode,
     h: &ModeHandler,
@@ -340,6 +359,9 @@ async fn check_handler(
     match h.state {
         ModeState::Broken => return Outcome::Fail(h.reason.clone().unwrap_or_default()),
         ModeState::Unavailable => {
+            if let Some(why) = refused(h) {
+                return skipped(strict, why);
+            }
             let program = modes
                 .handler_files()
                 .iter()

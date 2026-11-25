@@ -9,6 +9,22 @@ row's own decoder. The node embeds the `*.json` files here and reads the operato
   nor a mode's own program.
 - `name`: its name for people; `programs`, `install`: as a program row's
   [`decoder`](../modes/adsb_decode.json) has them.
+- `version` (optional, as a program row's `decoder.version`): the least version the program
+  must report, `{"args": ["--version"], "match": "^onair-rx (\\d+(?:\\.\\d+)*)", "min":
+  "0.4.0"}`. `match` is a regular expression with exactly one group, the version; `min` is
+  dotted numbers. Either wrong breaks the file at load. With the block, the probe runs the
+  program found once with `args` (no shell, no input, a 2 s timeout, at most 4096 bytes of
+  its stdout and of its stderr read) and takes the group of the first match, in stdout then
+  stderr. Versions compare number by number (`0.10.0` is over `0.4.0`, `0.4` is `0.4.0`), and
+  what follows the numbers is ignored (`0.4.0-rc1` reads `0.4.0`). Lower than `min`, every
+  handler of the file is `unavailable`: `<program> <version> is older than <min> (<hint>;
+  <url>)`. No version read (no answer within the timeout, a non-zero exit, nothing
+  matched): `unavailable`, `<program>: its version could not be read (<what happened>)`.
+  The startup line names the version read (`found <path> (handler <id>, version <v>)`), and
+  `zeta modes check` prints that line and skips a refused handler with its reason. Without
+  the block nothing is run: the program is only looked up. A probe is carried over a modes
+  reload while the program found has the same path, size and modified time, so installing
+  a newer one and reloading the modes is enough.
 - `modes`: by mode id, a program block as a program row's (`args`, `input`, `output`,
   optional `packets` and `demod`), whose `output.fields` maps the row's subject key, and
   `extra`: fields the handler adds that the row's event schema lacks, and
@@ -40,8 +56,8 @@ that as a `const` (OnAir's DMR and P25: `{"audio": false}`); a transcriber attac
 handler job is refused (`job <id> has no audio stream`).
 
 The embedded `onair.json` runs OnAir's receivers through `onair-rx` 0.4.0, a program the
-operator installs (an older one is probed `ready`, and a mode it lacks then fails at launch with
-`onair-rx: no mode <m>`: install it before the node). An entry has no notes field, so what OnAir gives for each mode, how it
+operator installs, and names 0.4.0 as its least version: an older one is `unavailable`
+(`onair-rx 0.2.0 is older than 0.4.0 (...)`), and so is one that does not know `--version`. An entry has no notes field, so what OnAir gives for each mode, how it
 differs from the row's own decoder and what it was measured to cost are in
 [RECIPES.md](../RECIPES.md#a-second-opinion-on-a-decoder); the eleven rows only OnAir decodes, with
 no row decoder behind them, are in

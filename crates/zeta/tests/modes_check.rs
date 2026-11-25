@@ -1018,6 +1018,65 @@ fn a_fifo_rows_run_makes_its_subdirectory_under_the_run_dir() {
     );
 }
 
+/// `zeta modes check` shows the version OnAir's file asks of `onair-rx`: the probe's
+/// line names the version read, and a program older than the file's least version is
+/// skipped (failed with `--strict`) with the probe's reason. A stand-in `onair-rx`
+/// answers `--version`.
+#[test]
+fn modes_check_shows_the_version_a_handler_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("onair-rx");
+    let answer = |version: &str| {
+        let tmp = dir.path().join(".onair-rx.new");
+        std::fs::write(&tmp, format!("#!/bin/sh\necho 'onair-rx {version}'\n")).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&tmp, &program).unwrap();
+    };
+    let run = |strict: bool| {
+        let mut args = vec!["dfm_decode", "--handler", "onair"];
+        if strict {
+            args.push("--strict");
+        }
+        let out = check(dir.path(), &args)
+            .env("ZETA_HANDLER_ONAIR_RX", &program)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+            out.status.code().unwrap(),
+        )
+    };
+    answer("0.2.0");
+    let why = "onair-rx 0.2.0 is older than 0.4.0 (https://github.com/ciphernaut/onair-rx)";
+    let (out, err, code) = run(false);
+    assert_eq!(
+        out.trim(),
+        format!("dfm_decode@onair: skipped: {why}"),
+        "{err}"
+    );
+    assert_eq!(code, 0);
+    assert!(
+        err.lines()
+            .any(|l| l.starts_with(&format!("zeta: handlers: {why} — modes: "))),
+        "{err}"
+    );
+    let (out, _, code) = run(true);
+    assert_eq!(out.trim(), format!("dfm_decode@onair: fail: {why}"));
+    assert_eq!(code, 1);
+
+    answer("0.4.0");
+    let (out, err, code) = run(false);
+    assert_eq!(out.trim(), "dfm_decode@onair: skipped: no test", "{err}");
+    assert_eq!(code, 0);
+    let found = format!(
+        "zeta: handlers: onair-rx: found {} (handler onair, version 0.4.0)",
+        program.display()
+    );
+    assert!(err.lines().any(|l| l == found), "{err}");
+}
+
 /// OnAir's entries for the bus modes and the polled ones that have a check pass
 /// `zeta modes check <id> --handler onair`, each recorded as `<id>@onair`, and analog
 /// video, which OnAir does not serve, is refused. It needs `onair-rx`: the test-only

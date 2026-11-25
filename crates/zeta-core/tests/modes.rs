@@ -1570,10 +1570,11 @@ fn the_embedded_onair_handler_serves_its_modes() {
         let h = reg.handler(id, "onair").unwrap();
         assert_eq!(h.outputs, outputs, "{id}");
         assert!(!h.in_process, "{id}");
-        // Only ever the missing program keeps it from ready.
+        // Only ever the program, missing or older than the file's 0.4.0 (or its version
+        // unread), keeps it from ready.
         if h.state != ModeState::Ready {
             let reason = h.reason.as_deref().unwrap_or_default();
-            assert!(reason.starts_with("onair-rx: missing"), "{id}: {reason}");
+            assert!(onair_program_reason(reason), "{id}: {reason}");
         }
         let block = reg.program_block(id, "onair").unwrap();
         assert_eq!(block.programs, ["onair-rx"], "{id}");
@@ -1610,6 +1611,14 @@ fn the_embedded_onair_handler_serves_its_modes() {
     assert_eq!(handler_ids(&reg, "video_decode"), ["builtin"]);
     assert!(reg.handler("video_decode", "onair").is_none());
     assert_eq!(reg.program_block("video_decode", "onair"), None);
+}
+
+/// Whether `reason` is one the probe of `onair-rx` gives: missing, older than the
+/// embedded file's least version, or its version not read.
+fn onair_program_reason(reason: &str) -> bool {
+    reason.starts_with("onair-rx: missing")
+        || reason.contains(" is older than 0.4.0 (")
+        || reason.contains(": its version could not be read (")
 }
 
 /// OnAir writes Z-Wave MPDUs as link type 148 (USER1), which the node names for Mode S:
@@ -1713,6 +1722,15 @@ fn the_embedded_onair_handler_serves_adsb() {
     assert_eq!(file.file, "handlers/onair.json");
     assert_eq!(file.state, ModeState::Ready, "{:?}", file.reason);
     assert_eq!(file.broken_entries(), Vec::<String>::new());
+    // The version it is written for is its least.
+    assert_eq!(
+        file.handler.as_ref().unwrap().version,
+        Some(zeta_core::modes::VersionProbe {
+            args: vec!["--version".into()],
+            pattern: "^onair-rx (\\d+(?:\\.\\d+)*)".into(),
+            min: "0.4.0".into(),
+        })
+    );
     assert_eq!(handler_ids(&reg, "adsb_decode"), ["dump1090", "onair"]);
     let both = [StreamKind::Event, StreamKind::Packet];
     assert_eq!(
@@ -1726,9 +1744,14 @@ fn the_embedded_onair_handler_serves_adsb() {
     assert_eq!(onair.outputs, both);
     let installed = zeta_core::modes::handlers::find_handler(&["onair-rx".into()]);
     match installed {
-        Some(path) => {
-            assert_eq!(onair.state, ModeState::Ready, "{:?}", onair.reason);
+        // Found, it is ready when it reports 0.4.0 or over.
+        Some(path) if onair.state == ModeState::Ready => {
             assert_eq!(onair.program.as_ref(), Some(&path));
+            assert!(onair.version.is_some(), "{onair:?}");
+        }
+        Some(_) => {
+            let reason = onair.reason.as_deref().unwrap_or_default();
+            assert!(onair_program_reason(reason), "{reason}");
         }
         None => {
             assert_eq!(onair.state, ModeState::Unavailable);
@@ -2932,4 +2955,362 @@ async fn modes_list_filters_by_role() {
     )
     .unwrap();
     assert!(matches!(op, Op::ModesList { role: None, .. }));
+}
+
+/// A stand-in program `dir/<name>`: a shell script running `body`, written beside it and
+/// renamed into place (as an install replaces a program), so it is never run half
+/// written.
+fn stand_in(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    let tmp = dir.join(format!(".{name}.new"));
+    std::fs::write(&tmp, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    path
+}
+
+/// The version block of a stand-in `alt-rx`, its least version `min`.
+fn alt_version(min: &str) -> serde_json::Value {
+    serde_json::json!({"args": ["--version"], "match": "^alt-rx (\\d+(?:\\.\\d+)*)", "min": min})
+}
+
+/// The handler file `alt` (serving `adsb_decode`) whose program is `program`, with
+/// `version` as its version block (`None`: no block).
+fn versioned_alt(program: &Path, version: Option<serde_json::Value>) -> String {
+    adsb_handler_file("alt", |f| {
+        f["programs"] = serde_json::json!([program.display().to_string()]);
+        if let Some(v) = version {
+            f["version"] = v;
+        }
+    })
+}
+
+/// The registry with `alt.json` (see [`versioned_alt`]) probed, and the probe's line for
+/// it.
+fn probed_alt(program: &Path, version: Option<serde_json::Value>) -> (ModeRegistry, String) {
+    let mut reg = with_handler_files(&[("alt.json", &versioned_alt(program, version))]);
+    let lines = zeta_core::modes::handlers::probe_handler_files(&mut reg);
+    let ours: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains(&program.display().to_string()) || l.contains("alt-rx"))
+        .collect();
+    assert_eq!(ours.len(), 1, "{lines:?}");
+    let line = ours[0].clone();
+    (reg, line)
+}
+
+/// A handler file's program reporting less than the file's `min` is unavailable, the
+/// reason naming both versions (and the install URL); so is a program row's whose block
+/// names a higher one. Its program is not recorded as runnable.
+#[test]
+fn a_handler_older_than_its_file_needs_is_unavailable_with_both_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = stand_in(dir.path(), "alt-rx", "echo 'alt-rx 0.2.0'");
+    let (reg, line) = probed_alt(&program, Some(alt_version("0.4.0")));
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    let reason =
+        "alt-rx 0.2.0 is older than 0.4.0 (https://example.invalid/alt) — modes: adsb_decode";
+    assert_eq!(alt.state, ModeState::Unavailable, "{alt:?}");
+    assert_eq!(alt.reason.as_deref(), Some(reason));
+    assert_eq!(alt.program, None);
+    assert_eq!(alt.version, None);
+    assert_eq!(line, format!("zeta: handlers: {reason}"));
+
+    // A program row with a least version is probed on its own, as a handler file is.
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let (_, text) = ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("adsb_decode.json"))
+        .unwrap();
+    let mut row: serde_json::Value = serde_json::from_str(text).unwrap();
+    row["decoder"]["programs"] = serde_json::json!([program.display().to_string()]);
+    row["decoder"]["version"] = alt_version("0.3");
+    // No package named: the hint is the same on every host.
+    row["decoder"]["install"] = serde_json::json!({"url": "https://example.invalid/row"});
+    std::fs::write(modes.join("adsb_decode.json"), row.to_string()).unwrap();
+    let mut reg = ModeRegistry::load(&stages(), Some(&modes));
+    assert_eq!(reg.get("adsb_decode").unwrap().state, ModeState::Ready);
+    let lines = zeta_core::modes::handlers::probe_row_versions(&mut reg);
+    let reason =
+        "alt-rx 0.2.0 is older than 0.3 (https://example.invalid/row) — modes: adsb_decode";
+    let m = reg.get("adsb_decode").unwrap();
+    assert_eq!(m.state, ModeState::Unavailable);
+    assert_eq!(m.reason.as_deref(), Some(reason), "{lines:?}");
+    assert_eq!(m.program, None);
+    assert_eq!(lines, [format!("zeta: handlers: {reason}")]);
+    // Probed, it is not probed again.
+    assert!(zeta_core::modes::handlers::probe_row_versions(&mut reg).is_empty());
+}
+
+/// At its file's `min` or over it (on stdout or stderr), the handler is ready with its
+/// program and the version it reported, which the probe's line names.
+#[test]
+fn a_handler_at_or_over_its_floor_is_ready_and_its_version_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    for (body, read) in [
+        ("echo 'alt-rx 0.4.0'; echo 'built today'", "0.4.0"),
+        ("echo 'alt-rx 0.10.1'", "0.10.1"),
+        ("echo 'alt-rx 1.0' >&2", "1.0"),
+    ] {
+        let program = stand_in(dir.path(), "alt-rx", body);
+        let (reg, line) = probed_alt(&program, Some(alt_version("0.4.0")));
+        let alt = reg.handler("adsb_decode", "alt").unwrap();
+        assert_eq!(alt.state, ModeState::Ready, "{body}: {alt:?}");
+        assert_eq!(alt.reason, None, "{body}");
+        assert_eq!(alt.program.as_deref(), Some(program.as_path()), "{body}");
+        assert_eq!(alt.version.as_deref(), Some(read), "{body}");
+        let path = program.display();
+        assert_eq!(
+            line,
+            format!("zeta: handlers: {path}: found {path} (handler alt, version {read})"),
+            "{body}"
+        );
+    }
+}
+
+/// A program that answers with no version the block reads is unavailable with what
+/// happened: an old one that does not know the argument (its usage on stderr, exit 2),
+/// one that prints nothing, one whose line does not match.
+#[test]
+fn a_handler_whose_version_cannot_be_read_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    for (body, what) in [
+        (
+            "echo 'usage: alt-rx --mode <m>' >&2; exit 2",
+            "it exited with status 2".to_string(),
+        ),
+        ("exit 0", "it printed nothing".to_string()),
+        (
+            "echo 'alt-rx version unknown'",
+            "nothing it printed matched ^alt-rx (\\d+(?:\\.\\d+)*)".to_string(),
+        ),
+    ] {
+        let program = stand_in(dir.path(), "alt-rx", body);
+        let (reg, line) = probed_alt(&program, Some(alt_version("0.4.0")));
+        let alt = reg.handler("adsb_decode", "alt").unwrap();
+        let reason = format!("alt-rx: its version could not be read ({what}) — modes: adsb_decode");
+        assert_eq!(alt.state, ModeState::Unavailable, "{body}");
+        assert_eq!(alt.reason.as_deref(), Some(reason.as_str()), "{body}");
+        assert_eq!(alt.program, None, "{body}");
+        assert_eq!(line, format!("zeta: handlers: {reason}"), "{body}");
+    }
+}
+
+/// A program that never answers is stopped at the timeout: the probe returns within it
+/// (and a little), the handler unavailable.
+#[test]
+fn a_version_probe_that_hangs_is_cut_at_its_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = stand_in(dir.path(), "alt-rx", "sleep 30");
+    let started = std::time::Instant::now();
+    let (reg, _) = probed_alt(&program, Some(alt_version("0.4.0")));
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.state, ModeState::Unavailable);
+    assert_eq!(
+        alt.reason.as_deref(),
+        Some("alt-rx: its version could not be read (no answer within 2 s) — modes: adsb_decode")
+    );
+}
+
+/// The read is capped: a program that prints its version and then megabytes is read
+/// to the cap, stopped there and ready; one whose version comes after the cap is
+/// unavailable. Neither waits for the timeout.
+#[test]
+fn a_version_probe_reads_at_most_its_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let flood = "head -c 4000000 /dev/zero | tr '\\0' x";
+    let program = stand_in(
+        dir.path(),
+        "alt-rx",
+        &format!("echo 'alt-rx 0.4.2'; {flood}; echo"),
+    );
+    let started = std::time::Instant::now();
+    let (reg, _) = probed_alt(&program, Some(alt_version("0.4.0")));
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.state, ModeState::Ready, "{alt:?}");
+    assert_eq!(alt.version.as_deref(), Some("0.4.2"));
+    let program = stand_in(
+        dir.path(),
+        "alt-rx",
+        &format!("{flood}; echo; echo 'alt-rx 0.4.2'"),
+    );
+    let (reg, _) = probed_alt(&program, Some(alt_version("0.4.0")));
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.state, ModeState::Unavailable);
+    assert_eq!(
+        alt.reason.as_deref(),
+        Some(
+            "alt-rx: its version could not be read (nothing in the first 4096 bytes it \
+             printed matched ^alt-rx (\\d+(?:\\.\\d+)*)) — modes: adsb_decode"
+        )
+    );
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+}
+
+/// A handler file without a `version` block is looked up and never run: its program
+/// (which leaves a mark when run) is found and ready, no version read.
+#[test]
+fn a_handler_file_without_a_version_block_runs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mark = dir.path().join("ran");
+    let program = stand_in(
+        dir.path(),
+        "alt-rx",
+        &format!("touch '{}'; echo 'alt-rx 0.1.0'", mark.display()),
+    );
+    let (reg, line) = probed_alt(&program, None);
+    let alt = reg.handler("adsb_decode", "alt").unwrap();
+    assert_eq!(alt.state, ModeState::Ready);
+    assert_eq!(alt.program.as_deref(), Some(program.as_path()));
+    assert_eq!(alt.version, None);
+    let path = program.display();
+    assert_eq!(
+        line,
+        format!("zeta: handlers: {path}: found {path} (handler alt)")
+    );
+    assert!(!mark.exists(), "the program was run");
+}
+
+/// A reload carries the probe of an unchanged program without running it again; the
+/// program replaced (another size and time at the same path), the reload probes it
+/// again: the newer one is ready.
+#[tokio::test]
+async fn a_replaced_program_is_probed_again_on_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (modes, handlers) = (dir.path().join("modes"), dir.path().join("handlers"));
+    std::fs::create_dir_all(&handlers).unwrap();
+    let runs = dir.path().join("runs");
+    let counted =
+        |version: &str| format!("echo run >> '{}'; echo 'alt-rx {version}'", runs.display());
+    let program = stand_in(dir.path(), "alt-rx", &counted("0.2.0"));
+    let file = versioned_alt(&program, Some(alt_version("0.4.0")));
+    std::fs::write(handlers.join("alt.json"), file).unwrap();
+    let cfg = NodeConfig {
+        handlers_dir: Some(handlers.clone()),
+        ..cfg(dir.path(), &modes)
+    };
+    let node = Node::open(cfg, stages(), vec![]).await.unwrap();
+    let times_run = || {
+        std::fs::read_to_string(&runs)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let alt = || node.modes().handler("adsb_decode", "alt").unwrap().clone();
+    assert_eq!(alt().state, ModeState::Unavailable, "{:?}", alt());
+    assert_eq!(times_run(), 1);
+
+    // Unchanged: carried, not run.
+    let lines = node.reload_modes().unwrap();
+    assert!(lines.iter().all(|l| !l.contains("alt-rx")), "{lines:?}");
+    assert_eq!(alt().state, ModeState::Unavailable);
+    assert!(
+        alt()
+            .reason
+            .unwrap()
+            .starts_with("alt-rx 0.2.0 is older than 0.4.0"),
+        "{:?}",
+        alt()
+    );
+    assert_eq!(times_run(), 1);
+
+    // Replaced by a newer one: probed again, ready.
+    stand_in(
+        dir.path(),
+        "alt-rx",
+        &format!("{} # 0.4.1", counted("0.4.1")),
+    );
+    let lines = node.reload_modes().unwrap();
+    let path = program.display();
+    assert!(
+        lines.contains(&format!(
+            "zeta: handlers: {path}: found {path} (handler alt, version 0.4.1)"
+        )),
+        "{lines:?}"
+    );
+    assert_eq!(alt().state, ModeState::Ready, "{:?}", alt());
+    assert_eq!(alt().version.as_deref(), Some("0.4.1"));
+    assert_eq!(times_run(), 2);
+}
+
+/// A version block whose `match` is not a regular expression with one group, or whose
+/// `min` is not dotted numbers, breaks its handler file at load (the other files and the
+/// embedded one load), and a program row's breaks the row.
+#[test]
+fn a_bad_version_block_breaks_the_file_alone() {
+    let program = Path::new("/nonexistent/alt-rx");
+    for (edit, field) in [
+        (("match", "^alt-rx \\d+"), "version.match"),
+        (("match", "^alt-rx (\\d+) (\\d+)"), "version.match"),
+        (("match", "^alt-rx (\\d+"), "version.match"),
+        (("min", "0.4.x"), "version.min"),
+        (("min", ""), "version.min"),
+        (("min", "v0.4"), "version.min"),
+    ] {
+        let mut v = alt_version("0.4.0");
+        v[edit.0] = edit.1.into();
+        let good = adsb_handler_file("other", |_| {});
+        let reg = with_handler_files(&[
+            ("alt.json", &versioned_alt(program, Some(v.clone()))),
+            ("other.json", &good),
+        ]);
+        let bad = reg
+            .handler_files()
+            .iter()
+            .find(|f| f.file.ends_with("alt.json"))
+            .unwrap();
+        assert_eq!(bad.state, ModeState::Broken, "{v}");
+        let reason = bad.reason.as_deref().unwrap();
+        assert!(reason.starts_with(&format!("{field}: ")), "{v}: {reason}");
+        assert_eq!(
+            handler_ids(&reg, "adsb_decode"),
+            ["dump1090", "onair", "other"],
+            "{v}"
+        );
+        let onair = reg
+            .handler_files()
+            .iter()
+            .find(|f| f.id == "onair")
+            .unwrap();
+        assert_eq!(onair.state, ModeState::Ready);
+
+        let mut row: serde_json::Value =
+            serde_json::from_str(include_str!("../../../modes/adsb_decode.json")).unwrap();
+        row["decoder"]["version"] = v.clone();
+        let e = parse(&row.to_string()).and_then(|r| validate(&r, &stages()).map(|_| r));
+        let e = e.expect_err("a bad block breaks the row");
+        assert_eq!(e.field, format!("decoder.{field}"), "{v}: {e}");
+    }
+    // The good block loads in both.
+    let mut row: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/adsb_decode.json")).unwrap();
+    row["decoder"]["version"] = alt_version("0.4.0");
+    let r = parse(&row.to_string()).unwrap();
+    validate(&r, &stages()).unwrap();
+}
+
+/// Versions compare number by number, a missing number read as 0 and what follows the
+/// numbers ignored.
+#[test]
+fn a_dotted_version_compares_by_number() {
+    use zeta_core::modes::handlers::version_at_least;
+    assert!(version_at_least("0.10.0", "0.4.0"));
+    assert!(!version_at_least("0.4.0", "0.10.0"));
+    assert!(version_at_least("0.4", "0.4.0"));
+    assert!(version_at_least("0.4.0", "0.4"));
+    assert!(!version_at_least("0.3.9", "0.4"));
+    assert!(version_at_least("0.4.0-rc1", "0.4.0"));
+    assert!(!version_at_least("0.4.0-rc1", "0.4.1"));
+    assert!(version_at_least("1", "0.99.99"));
+    assert!(version_at_least("0.04.0", "0.4.0"));
+    assert!(version_at_least(
+        "12345678901234567890.1",
+        "12345678901234567890"
+    ));
+    assert!(!version_at_least("v0.4.0", "0.1"));
 }

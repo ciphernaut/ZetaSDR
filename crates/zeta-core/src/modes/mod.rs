@@ -44,8 +44,8 @@ pub use row::{
     Identify, Identity, InputStream, InputVia, Install, ModeId, ModeRow, OutputVia,
     PacketParserKind, Parser, PositionMap, ProgramBlock, ProgramInput, ProgramOutput,
     ProgramPackets, Proof, QUICK_ATTEMPTS, Ranges, Role, RowError, RowTest, SampleFormat, Station,
-    Subject, SubjectColumn, SubjectUnit, SubjectWaterfall, TestSpec, WidthRule, center_khz_text,
-    is_mode_id, parse, validate,
+    Subject, SubjectColumn, SubjectUnit, SubjectWaterfall, TestSpec, VersionProbe, WidthRule,
+    center_khz_text, is_mode_id, parse, validate,
 };
 pub(crate) use row::{FRAME_DECODE_STAGE, require_all};
 
@@ -188,6 +188,12 @@ pub struct ModeHandler {
     pub reason: Option<String>,
     /// The program found for it; `None` until probed, and in process.
     pub program: Option<PathBuf>,
+    /// The version its program reported to the probe, when its block names a least
+    /// version ([`handlers::check_version`]); `None` otherwise, and when it was not read.
+    pub version: Option<String>,
+    /// The program the probe found, when it found one: what a reload compares to carry
+    /// the probe of a block with a least version ([`ModeRegistry::carry_programs`]).
+    pub stamp: Option<handlers::ProgramStamp>,
     /// The optional helper programs not found (the row's own handler only).
     pub missing: Vec<String>,
     /// When `zeta modes check` last passed it: for the row's own handler `modes check
@@ -219,6 +225,8 @@ impl ModeHandler {
             state: ModeState::Ready,
             reason: None,
             program: None,
+            version: None,
+            stamp: None,
             missing: Vec::new(),
             checked: None,
             file: String::new(),
@@ -237,6 +245,8 @@ impl ModeHandler {
             state: ModeState::Unavailable,
             reason: Some(STAND_IN_REASON.into()),
             program: None,
+            version: None,
+            stamp: None,
             missing: Vec::new(),
             checked: None,
             file,
@@ -756,6 +766,8 @@ impl ModeRegistry {
                             state,
                             reason: reason.clone(),
                             program: None,
+                            version: None,
+                            stamp: None,
                             missing: vec![],
                             checked: None,
                             file: f.file.clone(),
@@ -927,15 +939,57 @@ impl ModeRegistry {
         }
     }
 
+    /// Record the version `handler` of `mode` reported to the probe (`None` when its
+    /// block names none, or it was not read) and the program's `stamp` (`None` when
+    /// missing), after [`ModeRegistry::set_handler_program`] (or
+    /// [`ModeRegistry::set_program`] for the row's own handler). A broken handler is left
+    /// as it is.
+    pub fn set_version_read(
+        &mut self,
+        mode: &str,
+        handler: &str,
+        version: Option<String>,
+        stamp: Option<handlers::ProgramStamp>,
+    ) {
+        let Some(m) = self.modes.iter_mut().find(|m| m.row.id.0 == mode) else {
+            return;
+        };
+        if let Some(h) = m
+            .handlers
+            .iter_mut()
+            .find(|h| h.id == handler && h.state != ModeState::Broken)
+        {
+            h.version = version;
+            h.stamp = stamp;
+        }
+    }
+
     /// Carry what probing found from `old` (the registry this one replaces) to each
     /// row with handlers (a program row, a graph row naming `handlers`) of the same id:
-    /// its `program`, `state`, `reason` and `missing`, so a reload keeps the probe's answer
-    /// without probing again. Only where both rows have the same decoder block (an
-    /// edited block's answer may no longer hold: such a row stays as loaded, its
-    /// programs looked up at launch) and neither is broken. Likewise each handler file's
-    /// handler of a mode: its `program`, `state` and `reason`, where `old` has that
-    /// handler for the mode with the same program block and neither is broken.
+    /// its `program`, `state`, `reason` and `missing`, and its own handler's `version`
+    /// and `stamp`, so a reload keeps the probe's answer without probing again. Only where
+    /// both rows have the same decoder block (an edited block's answer may no longer
+    /// hold: such a row stays as loaded, its programs looked up at launch) and neither is
+    /// broken. Likewise each handler file's handler of a mode: its `program`, `state`,
+    /// `reason`, `version` and `stamp`, where `old` has that handler for the mode with the
+    /// same program block and neither is broken. A block naming a least version
+    /// (`version`) is carried only while the program found now is the one probed, by
+    /// path, size and modified time ([`handlers::ProgramStamp`]): another is probed
+    /// again.
     pub fn carry_programs(&mut self, old: &ModeRegistry) {
+        // The stamp found now of each program list with a version floor, looked up once.
+        let mut found: Vec<(Vec<String>, Option<handlers::ProgramStamp>)> = Vec::new();
+        let mut same_program = |programs: &[String], was: &Option<handlers::ProgramStamp>| {
+            let now = match found.iter().find(|(p, _)| p == programs) {
+                Some((_, s)) => s.clone(),
+                None => {
+                    let s = handlers::ProgramStamp::found(programs);
+                    found.push((programs.to_vec(), s.clone()));
+                    s
+                }
+            };
+            now == *was
+        };
         for m in &mut self.modes {
             if m.state == ModeState::Broken || m.row.handler_blocks().is_empty() {
                 continue;
@@ -946,11 +1000,22 @@ impl ModeRegistry {
             if o.state == ModeState::Broken || o.row.decoder != m.row.decoder {
                 continue;
             }
+            let was = o.handlers.first().and_then(|h| h.stamp.clone());
+            if let Some(Decoder::Program(p)) = &m.row.decoder
+                && p.version.is_some()
+                && !same_program(&p.programs, &was)
+            {
+                continue;
+            }
             m.program = o.program.clone();
             m.state = o.state;
             m.reason = o.reason.clone();
             m.missing = o.missing.clone();
             sync_own(m);
+            if let (Some(h), Some(oh)) = (m.handlers.first_mut(), o.handlers.first()) {
+                h.version = oh.version.clone();
+                h.stamp = oh.stamp.clone();
+            }
         }
         // `program_block` is `None` for a broken handler, old or new.
         let mut carried = Vec::new();
@@ -961,9 +1026,16 @@ impl ModeRegistry {
                 if block.is_none() || block != old.program_block(mode, &h.id) {
                     continue;
                 }
-                if let Some(o) = old.handler(mode, &h.id) {
-                    carried.push((mode.clone(), o.clone()));
+                let Some(o) = old.handler(mode, &h.id) else {
+                    continue;
+                };
+                if let Some(b) = &block
+                    && b.version.is_some()
+                    && !same_program(&b.programs, &o.stamp)
+                {
+                    continue;
                 }
+                carried.push((mode.clone(), o.clone()));
             }
         }
         for (mode, o) in carried {
@@ -974,6 +1046,8 @@ impl ModeRegistry {
                 h.program = o.program;
                 h.state = o.state;
                 h.reason = o.reason;
+                h.version = o.version;
+                h.stamp = o.stamp;
             }
             no_decoder_reason(m);
         }
@@ -1057,6 +1131,8 @@ fn own_handler(m: &LoadedMode) -> ModeHandler {
         state: m.state,
         reason: m.reason.clone(),
         program: m.program.clone(),
+        version: None,
+        stamp: None,
         missing: m.missing.clone(),
         checked: m.checked,
         file: m.file.clone(),

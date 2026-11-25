@@ -117,9 +117,13 @@ enum Probed {
 /// <programs[0]>: missing (<hint>; <url>) — modes: <ids>` for the rows that need it and
 /// `zeta: handlers: <programs[0]>: missing (<hint>; <url>) — voice silent: <ids>` for
 /// those that run without it. The hint is [`Install::hint`] (`bash <script>`, else the
-/// first package), left out (with its `; `) when the row names neither. Then each
-/// handler file's program, one line per file
-/// ([`zeta_core::modes::handlers::probe_handler_files`]: looked up, never run).
+/// first package), left out (with its `; `) when the row names neither. A program row
+/// whose block names a least version (`decoder.version`) is not among them: it is probed
+/// on its own, its program run once to ask that version
+/// ([`zeta_core::modes::handlers::probe_row_versions`]: `found <path> (version <v>)`, or
+/// unavailable when too old or its version cannot be read). Then each handler file's
+/// program, one line per file ([`zeta_core::modes::handlers::probe_handler_files`]:
+/// looked up, and run only to ask the version a file's `version` block names).
 pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
     let mut groups: Vec<HandlerGroup> = Vec::new();
     // Each row with its lists in order (as indices into `groups`), and whether it runs
@@ -127,7 +131,7 @@ pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
     let mut rows: Vec<(String, Vec<(usize, bool)>)> = Vec::new();
     for m in modes.all().iter().filter(|m| m.state != ModeState::Broken) {
         let blocks = m.row.handler_blocks();
-        if blocks.is_empty() {
+        if blocks.is_empty() || zeta_core::modes::handlers::row_version(&m.row).is_some() {
             continue;
         }
         let id = m.row.id.0.clone();
@@ -213,6 +217,7 @@ pub async fn probe_handlers(modes: &mut ModeRegistry) -> Vec<String> {
             }
         }
     }
+    lines.extend(zeta_core::modes::handlers::probe_row_versions(modes));
     lines.extend(zeta_core::modes::handlers::probe_handler_files(modes));
     lines
 }

@@ -269,6 +269,8 @@ mod tests {
             },
             reason: (!ready).then(|| format!("{id}: missing")),
             program: None,
+            version: None,
+            stamp: None,
             missing: vec![],
             checked: None,
             file: format!("{id}.json"),

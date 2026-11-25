@@ -3950,6 +3950,7 @@ dependencies = [
  "base64 0.23.1",
  "jsonschema",
  "num-complex",
+ "regex",
  "schemars",
  "serde",
  "serde_json",
