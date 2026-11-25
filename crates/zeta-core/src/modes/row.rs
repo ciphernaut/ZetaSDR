@@ -1716,8 +1716,6 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
     }
 }
 
-/// A frame row's demodulator, parser and framing (checked by `stages`' `frame_decode`,
-/// its error's field under `decoder.framing`).
 /// The rules of a row's `rides`. A demodulator row, a program row (an external handler
 /// does not ride) and a row with no in-process graph cannot ride; the graph's root
 /// `channel` (the one node no edge enters) must have one leaving edge, of kind `iq`, so
@@ -1779,6 +1777,8 @@ fn validate_rides(row: &ModeRow, r: &Rides) -> Result<(), RowError> {
     }
 }
 
+/// A frame row's demodulator, parser and framing (checked by `stages`' `frame_decode`,
+/// its error's field under `decoder.framing`).
 fn validate_frame(b: &FrameBlock, stages: &StageRegistry) -> Result<(), RowError> {
     let d = &b.demod;
     if d.symbol_rate_baud == 0 {

@@ -3397,11 +3397,7 @@ fn rds_decode_rides_with_wfm_demod() {
         .map(|m| m.row.id.0.as_str())
         .collect();
     assert_eq!(riders, vec!["rds_decode"]);
-    // No other embedded row rides, and a demodulator no row rides with has no riders.
-    assert_eq!(
-        reg.all().iter().filter(|m| m.row.rides.is_some()).count(),
-        1
-    );
+    // A demodulator no row rides with has no riders.
     assert!(reg.riders_of(reg.get("fm_demod").unwrap()).is_empty());
     assert!(reg.ridden_by(wfm).is_empty());
 }
@@ -3464,7 +3460,14 @@ fn a_demodulator_or_a_program_row_cannot_ride() {
     let (_d, reg) = ride_load(&[
         ("wfm_rides.json", demod.to_string()),
         ("rs41_rides.json", program.to_string()),
-        // A graph whose root channel feeds two edges, or an audio one, cannot be replaced.
+        // A root channel with two leaving edges, or one that is not iq, cannot be replaced.
+        (
+            "not_iq.json",
+            rds_row("not_iq", |v| {
+                v["decoder"]["edges"] =
+                    serde_json::json!([{ "from": "channel", "to": "decode", "kind": "audio" }]);
+            }),
+        ),
         (
             "two_edges.json",
             rds_row("two_edges", |v| {
@@ -3482,8 +3485,13 @@ fn a_demodulator_or_a_program_row_cannot_ride() {
         r.starts_with("rides:") && r.contains("external program"),
         "{r}"
     );
-    // The edge-count rule is the graph's own or the rides rule: either way it is broken.
-    assert_eq!(reg.get("two_edges").unwrap().state, ModeState::Broken);
+    for id in ["two_edges", "not_iq"] {
+        let r = ride_broken(&reg, id);
+        assert!(
+            r.starts_with("rides:") && r.contains("exactly one leaving edge, of kind iq"),
+            "{id}: {r}"
+        );
+    }
     // The shipped riding row is not touched by the broken ones.
     assert_eq!(reg.get("rds_decode").unwrap().state, ModeState::Ready);
 }
@@ -3497,7 +3505,37 @@ fn a_graph_without_one_iq_root_channel_cannot_ride() {
             v["decoder"]["nodes"][0]["params"] = serde_json::json!({"out_rate_hz": 240000});
         }),
     )]);
-    assert_eq!(reg.get("no_channel").unwrap().state, ModeState::Broken);
+    let r = ride_broken(&reg, "no_channel");
+    assert!(r.starts_with("rides:") && r.contains("root channel"), "{r}");
+}
+
+#[test]
+fn a_riding_row_with_no_in_process_graph_is_broken() {
+    let (_d, reg) = ride_load(&[(
+        "no_decoder.json",
+        rds_row("no_decoder", |v| v["decoder"] = serde_json::Value::Null),
+    )]);
+    let r = ride_broken(&reg, "no_decoder");
+    assert!(
+        r.starts_with("rides:") && r.contains("in-process graph"),
+        "{r}"
+    );
+}
+
+#[test]
+fn riders_of_lists_a_broken_rider_and_the_caller_checks_state() {
+    let (_d, reg) = ride_load(&[(
+        "audio_rider.json",
+        rds_row("audio_rider", |v| v["rides"]["stream"] = "audio".into()),
+    )]);
+    let riders = reg.riders_of(reg.get("wfm_demod").unwrap());
+    let audio = riders.iter().find(|m| m.row.id.0 == "audio_rider").unwrap();
+    assert_eq!(audio.state, ModeState::Broken);
+    assert!(
+        reg.ridden_by(audio)
+            .iter()
+            .any(|m| m.row.id.0 == "wfm_demod")
+    );
 }
 
 #[test]

@@ -882,7 +882,6 @@ impl ModeRegistry {
         }
     }
 
-    /// The row with id `id`.
     /// The demodulator kind `m` runs when it is a demodulator row: a built-in's own row,
     /// or a variant whose decoder is a `builtin` of a demodulator kind.
     fn demod_kind(m: &LoadedMode) -> Option<&str> {
@@ -893,7 +892,8 @@ impl ModeRegistry {
     }
 
     /// The rows that ride with `demod` (a demodulator row, a variant included): every
-    /// row whose `rides.with` names the built-in `demod` runs, ready or not.
+    /// row whose `rides.with` names the built-in `demod` runs, ready or not. A rider
+    /// broken by the rides rule itself is listed too: the caller checks `state`.
     pub fn riders_of(&self, demod: &LoadedMode) -> Vec<&LoadedMode> {
         let Some(kind) = Self::demod_kind(demod) else {
             return Vec::new();
@@ -911,7 +911,8 @@ impl ModeRegistry {
 
     /// The demodulator rows `rider` rides with: every row (the built-in's and each
     /// variant's) whose built-in is in `rider`'s `rides.with`, ready or not. Empty for
-    /// a row that does not ride.
+    /// a row that does not ride. A row broken by the rides rule itself is listed too:
+    /// the caller checks `state`.
     pub fn ridden_by(&self, rider: &LoadedMode) -> Vec<&LoadedMode> {
         let Some(r) = &rider.row.rides else {
             return Vec::new();
@@ -922,6 +923,7 @@ impl ModeRegistry {
             .collect()
     }
 
+    /// The row with id `id`.
     pub fn get(&self, id: &str) -> Option<&LoadedMode> {
         self.modes.iter().find(|m| m.row.id.0 == id)
     }
