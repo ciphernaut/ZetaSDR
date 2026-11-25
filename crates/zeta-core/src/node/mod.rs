@@ -202,6 +202,10 @@ pub enum NodeError {
         .1.as_deref().unwrap_or("its kind's outputs list no packet (modes_list)")
     )]
     NoPacketStream(JobId, Option<String>),
+    /// A rider's input job runs but no stream leaves a root `channel` node of its graph
+    /// (an operator's graph without one), so there is no channel IQ to ride on.
+    #[error("job {} has no channel stream: its graph has no root channel node", .0.0)]
+    NoChannelStream(JobId),
     /// A `job_attach` (or an attached job's relaunch) names a voice `role` its input job
     /// `job` does not have; `voices` are the ones it has (none: it has one voice).
     #[error("{}", no_voice(.job, .role, .voices))]
@@ -260,6 +264,10 @@ struct JobEntry {
     /// (each node's in its stage's output order), set at launch; an attached job reads
     /// one of these.
     outputs: Vec<JobOutput>,
+    /// The stream leaving the graph's root `channel` node (a `channel` node no edge
+    /// enters: its `iq` edge), set at launch; a rider reads it
+    /// ([`Inner::channel_stream`]). `None` for a graph without one.
+    channel: Option<StreamId>,
     /// Set at launch for a run nothing in which polls its port's fault: it has no IQ
     /// forwarder and no controller loop, and is not attached. A fault does not end it, so
     /// a recovery does not wait for it (see [`Inner::wait_ended`]).
@@ -401,6 +409,7 @@ impl JobEntry {
             done: None,
             ended: None,
             outputs: Vec::new(),
+            channel: None,
             blind: false,
             relaunch: false,
             gated_stop: None,
@@ -627,9 +636,10 @@ struct Inner {
     /// Held across a [`Node::capture_decode`], from its duplicate check to its launch,
     /// so two requests for one replay make one job.
     replay_gate: tokio::sync::Mutex<()>,
-    /// Held across a `job_attach` of `packets`, from its "already captured" check to
-    /// its launch, so two attaches to one job make one capture.
-    packets_gate: tokio::sync::Mutex<()>,
+    /// Held across a `job_attach` of `packets` or of a rider, from its "already
+    /// attached" check to its launch, so two attaches to one job make one capture, or
+    /// one rider of a row.
+    attach_gate: tokio::sync::Mutex<()>,
     /// Held across a signature's accept, retract and delete, so the captures they pin
     /// or unpin and the `learned_<id>` row they write or remove always match the store.
     signature_gate: Mutex<()>,
@@ -1288,6 +1298,21 @@ impl Inner {
             })
     }
 
+    /// The channel stream a rider reads from `job`: the stream leaving its graph's root
+    /// `channel` node in its current run ([`JobEntry::channel`]). `InputNotRunning` as
+    /// [`Inner::audio_stream`], `NoChannelStream` when its graph has no root channel.
+    fn channel_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
+        let jobs = self.jobs.lock().unwrap();
+        let entry = jobs
+            .get(job)
+            .filter(|e| e.record.state == JobState::Running && e.cancel.is_some())
+            .ok_or_else(|| NodeError::InputNotRunning(job.clone()))?;
+        entry
+            .channel
+            .clone()
+            .ok_or_else(|| NodeError::NoChannelStream(job.clone()))
+    }
+
     /// The packet stream an attached job reads from `job`: its last packet output stream
     /// in graph order. `InputNotRunning` as [`Inner::audio_stream`], `NoPacketStream`
     /// when it outputs no packets, naming the handlers of its mode that would give them
@@ -1790,7 +1815,7 @@ impl Node {
                 relaunching: tokio::sync::Mutex::new(()),
                 mix_gate: tokio::sync::Mutex::new(()),
                 replay_gate: tokio::sync::Mutex::new(()),
-                packets_gate: tokio::sync::Mutex::new(()),
+                attach_gate: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
                 ops_stream,
                 verdicts: Mutex::new(HashMap::new()),
@@ -2112,10 +2137,10 @@ impl Node {
         self.inner.modes.clone()
     }
 
-    /// The gate a `job_attach` of `packets` holds from its "already captured" check to
-    /// its launch (see `ops::packets_attach`).
-    pub(crate) async fn packets_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.inner.packets_gate.lock().await
+    /// The gate a `job_attach` of `packets` or of a rider holds from its "already
+    /// attached" check to its launch (see `ops::packets_attach`, `ops::rider_attach`).
+    pub(crate) async fn attach_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.attach_gate.lock().await
     }
 
     /// Read the mode rows again (the embedded ones, then the operator directory
@@ -2775,12 +2800,28 @@ impl Node {
     /// the input's `replay`, so its streams are the `replay` source's, nothing of it is
     /// logged as heard (`transcripts.log`), no mix reads it and it never resumes.
     /// `UnknownJob` for an unknown input; `InputNotRunning`, `NoVoice` and
-    /// `NoAudioStream` as [`Node::job_voice_stream`]; on error nothing is recorded.
+    /// `NoAudioStream` as [`Node::job_voice_stream`]; on error nothing is recorded. The
+    /// record names no handler: see [`Node::job_attach_handled`] for one that does.
     pub async fn job_attach(
         &self,
         kind: &str,
         input: &JobId,
         voice: Option<&str>,
+        graph: Graph,
+    ) -> Result<JobId, NodeError> {
+        self.job_attach_handled(kind, input, voice, None, graph)
+            .await
+    }
+
+    /// [`Node::job_attach`] with the record naming `handler`, the handler of its row the
+    /// attached job runs: a rider's row's own (`builtin`), as `crate::ops::rider_attach`
+    /// attaches it.
+    pub async fn job_attach_handled(
+        &self,
+        kind: &str,
+        input: &JobId,
+        voice: Option<&str>,
+        handler: Option<String>,
         graph: Graph,
     ) -> Result<JobId, NodeError> {
         let (source, tuning, replay) = {
@@ -2812,7 +2853,7 @@ impl Node {
             audio_policy: None,
             stream: voice.map(String::from),
             sinks: Vec::new(),
-            handler: None,
+            handler,
             handler_named: false,
             needs: Vec::new(),
             group: None,
@@ -3323,6 +3364,14 @@ impl Node {
         voice: Option<&str>,
     ) -> Result<StreamId, NodeError> {
         self.inner.audio_stream(job, voice)
+    }
+
+    /// The channel stream a rider attached to `job` would read: the stream leaving the
+    /// root `channel` node of `job`'s graph in its current run (a retune or a relaunch
+    /// gives a new one). `InputNotRunning` as [`Node::job_audio_stream`],
+    /// `NoChannelStream` when its graph has no root channel.
+    pub fn job_channel_stream(&self, job: &JobId) -> Result<StreamId, NodeError> {
+        self.inner.channel_stream(job)
     }
 
     /// The packet stream a job attached to `job` would read: the last packet output

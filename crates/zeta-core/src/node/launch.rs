@@ -116,9 +116,10 @@ impl Inner {
     ///
     /// An attached job (`rec.input`) never touches the radio: no port, lease, tune,
     /// bank or IQ stream. Its `stream_in` nodes are first pointed at the input job's
-    /// current stream of their kind, and its `packet_capture` nodes given the input's
-    /// id, centre and mode row ([`Inner::point_attached`]; `InputNotRunning`,
-    /// `NoAudioStream` or `NoPacketStream` otherwise), so a resumed attached job reads
+    /// current stream of their kind (a rider's graph built again for the input's
+    /// channel), and its `packet_capture` nodes given the input's id, centre and mode
+    /// row ([`Inner::point_attached`]; `InputNotRunning`, `NoAudioStream`,
+    /// `NoPacketStream` or `NoChannelStream` otherwise), so a resumed attached job reads
     /// the resumed input. A `mix` has no input and no port
     /// either: its stage finds its audio through [`Inner::mix_inputs`].
     ///
@@ -413,6 +414,8 @@ impl Inner {
         let iq = (roots && port.is_some()).then(|| self.bus.register(StreamKind::Iq, prov.clone()));
         let blind = iq.is_none() && watch.is_none() && !attached;
         let mut streams: Vec<StreamId> = edge_streams.iter().cloned().chain(iq.clone()).collect();
+        // The stream leaving the root `channel` node: what a rider of this job reads.
+        let channel_out = crate::ops::root_channel_edge(&graph).map(|i| edge_streams[i].clone());
         // The job's output streams (no edge consumes them), in graph order: what a job
         // attached to this one can read.
         let mut job_outputs: Vec<JobOutput> = Vec::new();
@@ -565,6 +568,7 @@ impl Inner {
         {
             e.done = Some(h);
             e.outputs = job_outputs;
+            e.channel = channel_out;
             e.blind = blind;
         }
         Ok(())
@@ -1147,6 +1151,7 @@ impl Inner {
                 done: None,
                 ended: Some(ended_rx),
                 outputs: Vec::new(),
+                channel: None,
                 blind: false,
                 relaunch: false,
                 gated_stop: None,
@@ -1209,16 +1214,38 @@ impl Inner {
 }
 
 impl Inner {
-    /// Point the attached record `rec`'s graph at its input job `input` as it runs now:
-    /// each `stream_in` node at the input's stream of the node's own `kind` (`packet`:
-    /// [`Inner::packet_stream`]; else audio, the record's voice `rec.stream` or the
-    /// main stream), and each `packet_capture` node's `job`, `center_hz`, `mode`,
+    /// Point the attached record `rec`'s graph at its input job `input` as it runs now.
+    /// A rider's graph (a record whose kind's row `rides`, not one the operator put) is
+    /// first built again by [`crate::ops::rider_graph`] at the input's band and channel
+    /// rate now, so it follows a retune that changed both; it fails, `Other` with the
+    /// attach's refusal, when the input's band is now under the row's `min_hz` or the
+    /// row is no longer ready. Then each `stream_in` node is pointed at the input's stream
+    /// of the node's own `kind` (`packet`: [`Inner::packet_stream`]; `iq`:
+    /// [`Inner::channel_stream`]; else audio, the record's voice `rec.stream` or the main
+    /// stream), and each `packet_capture` node gets its `job`, `center_hz`, `mode`,
     /// `access` and `handler` from the input's record and its kind's mode row, so a
     /// relaunch after the input's retune captures under its new centre. `InputNotRunning`,
-    /// `NoAudioStream`, `NoVoice` or `NoPacketStream` when a stream is not there; for a
-    /// `packet_capture`, `Other` with the attach's refusal when the input's row is now
-    /// restricted or cannot be read ([`crate::ops::capture_row`]).
+    /// `NoAudioStream`, `NoVoice`, `NoPacketStream` or `NoChannelStream` when a stream is
+    /// not there; for a `packet_capture`, `Other` with the attach's refusal when the
+    /// input's row is now restricted or cannot be read ([`crate::ops::capture_row`]).
     fn point_attached(&self, rec: &mut JobRecord, input: &JobId) -> Result<(), NodeError> {
+        let modes = self.modes();
+        if let Some(m) = self
+            .expandable_kind(&rec.kind)
+            .filter(|_| !rec.operator_graph)
+            .and_then(|k| crate::ops::rider_row(&modes, &k))
+        {
+            let stream = self.channel_stream(input)?;
+            let of = self
+                .jobs
+                .lock()
+                .unwrap()
+                .get(input)
+                .map(|e| e.record.clone())
+                .ok_or_else(|| NodeError::InputNotRunning(input.clone()))?;
+            rec.graph =
+                crate::ops::rider_graph(m, &modes, &of, &stream).map_err(NodeError::Other)?;
+        }
         let mut pointed = false;
         for n in rec
             .graph
@@ -1232,6 +1259,7 @@ impl Inner {
                 .and_then(|k| serde_json::from_value(k.clone()).ok());
             let stream = match kind {
                 Some(StreamKind::Packet) => self.packet_stream(input)?,
+                Some(StreamKind::Iq) => self.channel_stream(input)?,
                 _ => self.audio_stream(input, rec.stream.as_deref())?,
             };
             point_stream_in(n, input, &stream);

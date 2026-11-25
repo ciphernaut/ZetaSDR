@@ -384,7 +384,8 @@ pub enum Op {
         #[schemars(required, schema_with = "crate::types::nullable::<ChooseParams>")]
         choose: Option<ChooseParams>,
     },
-    /// Attach a job of an attachable `kind` (`transcribe` or `packets`) to the running job
+    /// Attach a job of an attachable `kind` (`transcribe`, `packets`, or a decoder row
+    /// that rides with a demodulator) to the running job
     /// `job`. It reads one of that job's output streams instead of the radio, holds no
     /// lease, copies the job's `source` and `tuning`, and records it as its `input`. It
     /// follows its input through a `job_retune` or a `graph_put` restart: it is
@@ -422,6 +423,30 @@ pub enum Op {
     /// capture of a restricted row is never served (`404`, as an unknown id). It
     /// does not resume across a node restart: it is listed `stopped` with the note
     /// `packet capture does not resume: attach again`, its file kept.
+    ///
+    /// A rider, a decoder row whose `rides.with` names the job's demodulator (`rds_decode`
+    /// on a `wfm_demod`, or on a variant row of it; `modes_list` gives each row's
+    /// `rides`), runs the row's own in-process graph on the IQ the demodulator's channel
+    /// already cuts: the stream leaving the root `channel` node of the job's graph, at
+    /// the job's centre, width and channel rate. Its record has kind the row's id,
+    /// `input` the job and `handler` the row's own (`builtin`); its events are the row's.
+    /// The demodulator's audio is untouched. A retune of the job or a capture change that
+    /// relaunches it relaunches the rider under its id on the new channel (at the new
+    /// rate when the width changed); a stop of the job ends it `stopped`; it resumes
+    /// after the job on a node restart. A rider never stops, retunes or replaces its job.
+    /// A rider slower than the job loses the frames it could not read in time (a gap,
+    /// not a reset; the count is in its context as `stream_in.lagged_frames`). A row's
+    /// handler files (an external program) never ride: started as its own job they run
+    /// as before. `language` is ignored and `stream` must be `null` (`<row> reads the
+    /// job's channel IQ: pass stream null`). Refused, nothing started, each `<row> cannot
+    /// ride on job <id>: ...`: the row is not ready (`mode <row> is <state>: <reason>`), the
+    /// job runs a kind it does not ride with (`it rides with <kinds>, and the job runs
+    /// <kind>`), the job's band is under the row's `min_hz` (`it needs a band of at least
+    /// <min> Hz, and the job's is <bw> Hz`), and a running job of the row already rides on
+    /// it (`<row> job <id> already rides on it`); also a job not running and a job whose
+    /// graph has no root channel (`job <id> has no channel stream: its graph has no root
+    /// channel node`). A relaunch after a retune under the row's `min_hz` (or with the
+    /// row no longer ready) ends the rider `failed` with the same words.
     #[schemars(transform = require_attach_stream)]
     JobAttach {
         kind: JobKind,
@@ -5010,7 +5035,9 @@ fn node_error(node: &Node, e: NodeError) -> OpError {
         NodeError::NoAudioStream(j) => OpError::Other {
             message: format!("job {} has no audio stream", j.0),
         },
-        e @ (NodeError::NoVoice { .. } | NodeError::NoPacketStream(..)) => other(e),
+        e @ (NodeError::NoVoice { .. }
+        | NodeError::NoPacketStream(..)
+        | NodeError::NoChannelStream(_)) => other(e),
         NodeError::Expand(e) => e,
         NodeError::Other(message) => OpError::Other { message },
         e @ (NodeError::Io(_) | NodeError::DuplicateSource(_) | NodeError::Stopped(_)) => other(e),
@@ -6792,7 +6819,8 @@ async fn jobs_stop(
 }
 
 /// `job_attach`: check the kind and language, then attach to `job`'s audio stream (its
-/// voice `stream`, when named); `packets` goes to [`packets_attach`].
+/// voice `stream`, when named); `packets` goes to [`packets_attach`], a rider (a row that
+/// `rides`, its `language` unused and `stream` refused) to [`rider_attach`].
 async fn job_attach(
     node: &Node,
     kind: JobKind,
@@ -6801,6 +6829,15 @@ async fn job_attach(
     stream: Option<String>,
 ) -> Result<OpResult, OpError> {
     if !kind.attachable() {
+        if rider_row(&node.modes(), &kind).is_some() {
+            if stream.is_some() {
+                return Err(other(format!(
+                    "{} reads the job's channel IQ: pass stream null",
+                    kind.name()
+                )));
+            }
+            return rider_attach(node, &kind, &job).await.map(OpResult::Job);
+        }
         return Err(other(format!("{} is not attachable", kind.name())));
     }
     if kind == JobKind::Packets {
@@ -8456,7 +8493,7 @@ pub(crate) async fn packets_attach(
             "packets reads the job's packet stream: pass stream null",
         ));
     }
-    let _gate = node.packets_gate().await;
+    let _gate = node.attach_gate().await;
     let Some(input) = node.job_list().into_iter().find(|r| r.id == job) else {
         return Err(unknown_job(node, &job));
     };
@@ -8488,6 +8525,167 @@ pub(crate) async fn packets_attach(
     };
     let graph = JobKind::Packets.expand_attached(&to, ATTACH_LANGUAGE_DEFAULT)?;
     node.job_attach(JobKind::Packets.name(), &job, None, graph)
+        .await
+        .map_err(|e| node_error(node, e))
+}
+
+/// The row `kind` expands from when that row rides with a demodulator (its `rides` is
+/// set), whatever its state; `None` for a kind of no row, an unknown row and a row that
+/// does not ride.
+pub(crate) fn rider_row<'a>(modes: &'a ModeRegistry, kind: &JobKind) -> Option<&'a LoadedMode> {
+    kind.loaded_mode(modes)
+        .ok()
+        .flatten()
+        .filter(|m| m.row.rides.is_some())
+}
+
+/// The index in `graph.edges` of its root channel edge: the first edge of kind `iq`
+/// leaving a `channel` node no edge enters. A demodulator's is the stream a rider reads;
+/// a rider row's own graph has exactly one ([`crate::modes`] validates `rides`).
+pub(crate) fn root_channel_edge(graph: &Graph) -> Option<usize> {
+    graph.edges.iter().position(|e| {
+        e.kind == StreamKind::Iq
+            && graph.nodes.iter().any(|n| {
+                n.id == e.from && n.kind == "channel" && !graph.edges.iter().any(|i| i.to == n.id)
+            })
+    })
+}
+
+/// The root `channel` node of `graph` ([`root_channel_edge`]'s source).
+fn root_channel_node(graph: &Graph) -> Option<&GraphNode> {
+    let e = &graph.edges[root_channel_edge(graph)?];
+    graph.nodes.iter().find(|n| n.id == e.from)
+}
+
+/// Why the rider row `m` cannot ride on the job `input` now, `<rider> cannot ride on job
+/// <id>: <why>`: the row is not ready (`mode <rider> is <state>: <reason>`), the job's
+/// kind is not a demodulator its `rides.with` names (`it rides with <kinds>, and the job
+/// runs <kind>`, a variant row of a named built-in included), or the job's band is under
+/// the row's `min_hz` (`it needs a band of at least <min> Hz, and the job's is <bw>
+/// Hz`). Else the output rate of the job's root channel, which the rider's graph is
+/// expanded at; a job whose graph has none is refused as
+/// [`NodeError::NoChannelStream`].
+fn rider_check(m: &LoadedMode, modes: &ModeRegistry, input: &JobRecord) -> Result<u64, String> {
+    let name = &m.row.id.0;
+    let refuse = |why: String| format!("{name} cannot ride on job {}: {why}", input.id.0);
+    if m.state != ModeState::Ready {
+        let state = match m.state {
+            ModeState::Broken => "broken",
+            _ => "unavailable",
+        };
+        return Err(refuse(format!(
+            "mode {name} is {state}: {}",
+            m.reason.as_deref().unwrap_or_default()
+        )));
+    }
+    let with = m
+        .row
+        .rides
+        .as_ref()
+        .map(|r| r.with.as_slice())
+        .unwrap_or_default();
+    let runs = JobKind::from_name(&input.kind)
+        .and_then(|k| k.demod(modes))
+        .map(|(builtin, _)| builtin);
+    if !runs.is_some_and(|b| with.iter().any(|w| w == b)) {
+        return Err(refuse(format!(
+            "it rides with {}, and the job runs {}",
+            with.join(", "),
+            input.kind
+        )));
+    }
+    let bw = input.tuning.bandwidth_hz.0;
+    if !m.row.band.fits(bw) {
+        let min = m.row.band.min_hz.unwrap_or(m.row.band.bandwidth_hz);
+        return Err(refuse(format!(
+            "it needs a band of at least {min} Hz, and the job's is {bw} Hz"
+        )));
+    }
+    root_channel_node(&input.graph)
+        .and_then(|n| n.params.get("out_rate_hz"))
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| NodeError::NoChannelStream(input.id.clone()).to_string())
+}
+
+/// The graph of the rider row `m` riding on the job `input` and reading its channel
+/// `stream`: the row's own in-process graph (its own handler; a handler file's program
+/// never rides) at the job's band and its channel's output rate, its root `channel`
+/// node replaced, under the same id, by `stream_in {"job", "kind": "iq", "stream"}`. So
+/// the rider reads the IQ the demodulator's channel already cuts, and no second channel
+/// filters the capture. Refused as [`rider_check`] refuses it. The attach builds it, and
+/// so does each launch of the rider (`point_attached`: a relaunch after its input's
+/// retune or capture change, a resume), at the input's band and rate then.
+pub(crate) fn rider_graph(
+    m: &LoadedMode,
+    modes: &ModeRegistry,
+    input: &JobRecord,
+    stream: &StreamId,
+) -> Result<Graph, String> {
+    let out = rider_check(m, modes, input)?;
+    let name = &m.row.id.0;
+    let refuse = |why: String| format!("{name} cannot ride on job {}: {why}", input.id.0);
+    let h = m
+        .handler(None)
+        .filter(|h| h.in_process)
+        .ok_or_else(|| refuse("its own handler is not an in-process graph".into()))?;
+    let mut graph = template::expand(&m.row, &h, None, input.tuning, out, AudioPolicy::default())
+        .map_err(|e| refuse(e.to_string()))?;
+    let root = root_channel_node(&graph)
+        .map(|n| n.id.clone())
+        .ok_or_else(|| refuse("its graph has no root channel node".into()))?;
+    let n = graph
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == root)
+        .expect("the root found above");
+    n.kind = crate::stream_in::STREAM_IN_KIND.into();
+    n.params = serde_json::json!({
+        "job": input.id.0,
+        "kind": StreamKind::Iq,
+        "stream": stream.0,
+    });
+    Ok(graph)
+}
+
+/// `job_attach` of a rider: the row of `rider` (one that `rides`, [`rider_row`]) attached
+/// to the running demodulator `job`, reading the stream that leaves its root `channel`
+/// node ([`rider_graph`]). Its record: kind the row's id, `input` the job, its handler
+/// the row's own. It holds no lease and never stops, retunes or replaces its input: it
+/// follows it (relaunched under its id on the new channel after a retune or a capture
+/// change, `stopped` with its stop) as any attached job does. Refused, nothing started:
+/// an unknown job, [`rider_check`]'s refusals, a job a running job of the row already
+/// rides (`<rider> cannot ride on job <id>: <rider> job <other> already rides on it`),
+/// a job not running and one with no channel stream. The attach gate is held from the
+/// checks to the launch, so two attaches of one row to one job at once make one rider.
+/// The page's start of a choice, a `choose` with `start` and a watch call this for each
+/// of a `ChoiceJob`'s `attach` rows (plan 49.3).
+pub(crate) async fn rider_attach(
+    node: &Node,
+    rider: &JobKind,
+    job: &JobId,
+) -> Result<JobId, OpError> {
+    let _gate = node.attach_gate().await;
+    let Some(input) = node.job_list().into_iter().find(|r| &r.id == job) else {
+        return Err(unknown_job(node, job));
+    };
+    let modes = node.modes();
+    let Some(m) = rider_row(&modes, rider) else {
+        return Err(other(format!("{} is not attachable", rider.name())));
+    };
+    rider_check(m, &modes, &input).map_err(other)?;
+    if let Some(by) = attached_to(node, job, rider) {
+        let name = rider.name();
+        return Err(other(format!(
+            "{name} cannot ride on job {}: {name} job {} already rides on it",
+            job.0, by.0
+        )));
+    }
+    let stream = node
+        .job_channel_stream(job)
+        .map_err(|e| node_error(node, e))?;
+    let graph = rider_graph(m, &modes, &input, &stream).map_err(other)?;
+    let handler = crate::modes::handler_file::own_handler_id(&m.row);
+    node.job_attach_handled(rider.name(), job, None, Some(handler), graph)
         .await
         .map_err(|e| node_error(node, e))
 }

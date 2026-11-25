@@ -1770,3 +1770,493 @@ async fn a_capture_of_an_old_record_names_the_rows_own_handler() {
     let att = attach_packets_ok(&node, &input).await;
     assert_eq!(capture_params(&node, &att)["handler"], "builtin");
 }
+
+// ---- Riders (plan 49.3): a decoder row attached to its demodulator's channel IQ ----
+
+/// The station [`rider_node`] plays: PI 2AB1.
+const STATION_PI: &str = "2AB1";
+
+/// A second row riding with `wfm_demod` ([`rider_node`]'s modes directory).
+const TWIN_ROW: &str = "rds_twin";
+
+/// A row riding with `wfm_demod` whose decode stage is not registered: not ready.
+const GHOST_ROW: &str = "rds_ghost";
+
+/// A copy of the embedded `rds_decode` row as `id` in `modes`, its decode node of stage
+/// `stage`.
+fn rds_row_as(modes: &Path, id: &str, stage: &str) {
+    let (_, rds) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("rds_decode.json"))
+        .unwrap();
+    let mut row: serde_json::Value = serde_json::from_str(rds).unwrap();
+    row["id"] = id.into();
+    row["decoder"]["nodes"][1]["kind"] = stage.into();
+    std::fs::write(modes.join(format!("{id}.json")), row.to_string()).unwrap();
+}
+
+/// A node on a file of an FM station with RDS at 100 MHz, sampled at `rate`, tunable from
+/// 90 to 110 MHz, its channels on a polyphase bank when `bank`; its modes directory holds
+/// [`TWIN_ROW`] and [`GHOST_ROW`]. The file plays while the node runs.
+async fn rider_node(dir: &Path, rate: u32, bank: bool) -> (Arc<FileSource>, Node) {
+    let src = rider_source(dir, rate);
+    let node = rider_open(dir, &src).await;
+    if bank {
+        node.set_bank_factory(Arc::new(zeta_dsp::bank::PfbBankFactory));
+    }
+    src.start();
+    (src, node)
+}
+
+/// [`rider_node`]'s file source (its file and modes directory written once).
+fn rider_source(dir: &Path, rate: u32) -> Arc<FileSource> {
+    use zeta_core::capture::{CaptureMeta, write_cf32};
+    use zeta_core::types::Timestamp;
+    let modes = dir.join("modes");
+    if !modes.exists() {
+        std::fs::create_dir_all(&modes).unwrap();
+        rds_row_as(&modes, TWIN_ROW, "rds_decode");
+        rds_row_as(&modes, GHOST_ROW, "no_such_stage");
+    }
+    let iq = zeta_dsp::synth::rds_station_iq(0x2AB1, "ZETA FM ", "HELLO FROM ZETASDR", rate);
+    let meta = CaptureMeta {
+        sample_rate_hz: Hz(rate as u64),
+        center_hz: Hz(100_000_000),
+        start: Timestamp(0),
+        annotations: Vec::new(),
+    };
+    let meta = write_cf32(dir, "fm", &meta, &iq).unwrap();
+    let opts = FileOpts {
+        realtime: true,
+        block_samples: rate as usize / 100,
+        repeat: true,
+        tune_range: Some((Hz(90_000_000), Hz(110_000_000))),
+    };
+    Arc::new(FileSource::open(file0(), &meta, opts).unwrap())
+}
+
+/// A node on `src` with the DSP stages and [`rider_source`]'s modes directory.
+async fn rider_open(dir: &Path, src: &Arc<FileSource>) -> Node {
+    let port: Arc<dyn Port> = src.clone();
+    let cfg = NodeConfig {
+        modes_dir: Some(dir.join("modes")),
+        handlers_dir: None,
+        ..cfg(dir)
+    };
+    let node = Node::open(cfg, registry_with_dsp(), vec![port])
+        .await
+        .unwrap();
+    assert!(node.modes().get(TWIN_ROW).is_some(), "the twin row loads");
+    node
+}
+
+/// A `job_start` of `kind` at 100 MHz, `bandwidth_hz` wide.
+async fn start_at(node: &Node, kind: JobKind, bandwidth_hz: u64) -> JobId {
+    let mut op = start_op(kind.name(), 100_000_000);
+    if let Op::JobStart {
+        bandwidth_hz: bw, ..
+    } = &mut op
+    {
+        *bw = Hz(bandwidth_hz);
+    }
+    match node.apply(op).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("{} start: {r:?}", kind.name()),
+    }
+}
+
+/// A `wfm_demod` at 100 MHz, 200 kHz wide, once its channel runs on `path`.
+async fn start_wfm(node: &Node, path: &str) -> JobId {
+    let demod = start_at(node, JobKind::WfmDemod, 200_000).await;
+    wait_path(node, &demod, path).await;
+    demod
+}
+
+/// Until `job`'s channel reports `path` (`bank` or `direct`).
+async fn wait_path(node: &Node, job: &JobId, path: &str) {
+    common::until(
+        &format!("channel path {path}"),
+        Duration::from_secs(5),
+        || record(node, job).context["channel"]["path"] == path,
+    )
+    .await;
+}
+
+/// `job_attach` of `kind` to `job` on the wire, with `stream`.
+async fn attach_kind_as(
+    node: &Node,
+    kind: &str,
+    job: &JobId,
+    stream: Option<&str>,
+) -> Result<OpResult, OpError> {
+    node.apply(op(serde_json::json!({
+        "op": "job_attach", "kind": kind, "job": job.0, "language": null, "stream": stream
+    })))
+    .await
+}
+
+async fn attach_rider(node: &Node, kind: &str, job: &JobId) -> JobId {
+    match attach_kind_as(node, kind, job, None).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("attach {kind}: {r:?}"),
+    }
+}
+
+/// The centre and output rate of `job`'s root `channel` node, as its record holds them.
+fn channel_params(node: &Node, job: &JobId) -> (u64, u64) {
+    let g = record(node, job).graph;
+    let n = g
+        .nodes
+        .iter()
+        .find(|n| n.kind == "channel")
+        .expect("a channel");
+    (
+        n.params["center_hz"].as_u64().unwrap(),
+        n.params["out_rate_hz"].as_u64().unwrap(),
+    )
+}
+
+/// The stream `job`'s `stream_in` node reads, as its record holds it.
+fn reads(node: &Node, job: &JobId) -> StreamId {
+    let g = record(node, job).graph;
+    let n = g
+        .nodes
+        .iter()
+        .find(|n| n.kind == "stream_in")
+        .expect("a stream_in");
+    StreamId(n.params["stream"].as_str().unwrap().into())
+}
+
+/// The next IQ frame on one of `job`'s IQ streams within `ms`: (stream, centre, rate).
+async fn iq_frame(node: &Node, job: &JobId, ms: u64) -> Option<(StreamId, u64, u64)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    while tokio::time::Instant::now() < deadline {
+        let mut rxs: Vec<_> = streams_of(node, job)
+            .iter()
+            .filter(|s| s.kind == StreamKind::Iq)
+            .filter_map(|s| node.bus().subscribe(&s.id).map(|rx| (s.id.clone(), rx)))
+            .collect();
+        let until = tokio::time::Instant::now() + Duration::from_millis(300);
+        while tokio::time::Instant::now() < until {
+            for (sid, rx) in &mut rxs {
+                if let Ok(f) = rx.try_recv()
+                    && let Payload::Iq(b) = f.payload
+                {
+                    return Some((sid.clone(), b.center_hz.0, b.sample_rate_hz.0));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    None
+}
+
+/// `job`'s audio stream, the samples it carried and the frames lagged over `ms`.
+async fn audio_window(node: &Node, job: &JobId, ms: u64) -> (StreamId, usize, u64) {
+    let s = streams_of(node, job)
+        .into_iter()
+        .find(|s| s.kind == StreamKind::Audio)
+        .expect("audio stream");
+    let mut rx = node.bus().subscribe(&s.id).unwrap();
+    let (mut n, mut lags) = (0usize, 0u64);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Err(_) => break,
+            Ok(Ok(f)) => {
+                if let Payload::Audio { samples, .. } = f.payload {
+                    n += samples.len();
+                }
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(k))) => lags += k,
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+        }
+    }
+    (s.id, n, lags)
+}
+
+/// The first `rds` event of `rider` names the station.
+async fn assert_rds(node: &Node, rider: &JobId) {
+    let ev = event(node, rider, "rds", 15_000)
+        .await
+        .expect("an rds event");
+    assert_eq!(ev["pi"], STATION_PI, "{ev}");
+}
+
+/// `rider` reads `demod`'s channel stream now, at its channel's centre and rate.
+async fn assert_reads_channel(node: &Node, rider: &JobId, demod: &JobId) -> StreamId {
+    let channel = node.job_channel_stream(demod).expect("a channel stream");
+    assert_eq!(reads(node, rider), channel);
+    let (sid, centre, rate) = iq_frame(node, rider, 3000).await.expect("rider iq");
+    assert_eq!((centre, rate), channel_params(node, demod));
+    sid
+}
+
+/// On a bank: `rds_decode` attached to a running `wfm_demod` is recorded as the row's
+/// job on the demodulator, reads its channel at the channel's centre and rate, and
+/// decodes the station; a second riding row on the same demodulator decodes it too.
+#[tokio::test(flavor = "multi_thread")]
+async fn rds_attached_to_a_wfm_demod_gives_rds_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), 2_400_000, true).await;
+    let demod = start_wfm(&node, "bank").await;
+    let rider = attach_rider(&node, "rds_decode", &demod).await;
+    let rec = record(&node, &rider);
+    assert_eq!(rec.kind, "rds_decode");
+    assert_eq!(rec.input, Some(demod.clone()));
+    assert_eq!(rec.handler.as_deref(), Some("builtin"));
+    assert_eq!(rec.tuning, record(&node, &demod).tuning);
+    // The row's graph, its root channel now the stream_in.
+    assert!(rec.graph.nodes.iter().all(|n| n.kind != "channel"));
+    assert!(rec.graph.nodes.iter().any(|n| n.kind == "rds_decode"));
+    assert_reads_channel(&node, &rider, &demod).await;
+    assert_rds(&node, &rider).await;
+    let twin = attach_rider(&node, TWIN_ROW, &demod).await;
+    assert_rds(&node, &twin).await;
+    assert_eq!(record(&node, &rider).state, JobState::Running);
+}
+
+/// Direct: the demodulator's audio runs on as it was while a rider reads its channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_demodulators_audio_is_unchanged_with_a_rider_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), 960_000, false).await;
+    let demod = start_wfm(&node, "direct").await;
+    let (audio0, before, lag0) = audio_window(&node, &demod, 2000).await;
+    let rider = attach_rider(&node, "rds_decode", &demod).await;
+    assert_rds(&node, &rider).await;
+    let (audio1, during, lag1) = audio_window(&node, &demod, 2000).await;
+    assert_eq!(audio0, audio1, "the attach did not restart the demodulator");
+    assert_eq!((lag0, lag1), (0, 0));
+    assert!(
+        during as f64 > before as f64 * 0.9 && (during as f64) < before as f64 * 1.1,
+        "{before} vs {during}"
+    );
+}
+
+/// Direct: a retune of the demodulator's centre and width relaunches the rider under its
+/// id on the new channel, at the new centre and the new channel rate, and it decodes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_rider_follows_its_inputs_retune() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), 960_000, false).await;
+    let demod = start_wfm(&node, "direct").await;
+    let rider = attach_rider(&node, "rds_decode", &demod).await;
+    let s1 = assert_reads_channel(&node, &rider, &demod).await;
+    let (_, rate1) = channel_params(&node, &demod);
+    let op = Op::JobRetune {
+        job: demod.clone(),
+        center_hz: Hz(100_010_000),
+        bandwidth_hz: Hz(180_000),
+        bin_hz: None,
+        replace: vec![],
+    };
+    assert_eq!(node.apply(op).await, Ok(OpResult::Job(demod.clone())));
+    common::until(
+        "the demodulator's channel at its new centre",
+        Duration::from_secs(5),
+        || channel_params(&node, &demod).0 == 100_010_000,
+    )
+    .await;
+    assert_running_for(&node, &rider, 1000).await;
+    let s2 = assert_reads_channel(&node, &rider, &demod).await;
+    assert_ne!(s1, s2, "a new run's stream");
+    let (centre2, rate2) = channel_params(&node, &demod);
+    assert_eq!(centre2, 100_010_000);
+    assert_ne!(
+        rate1, rate2,
+        "the narrower band has a narrower channel rate"
+    );
+    assert_eq!(record(&node, &rider).tuning, record(&node, &demod).tuning);
+    assert_rds(&node, &rider).await;
+}
+
+/// A retune of the demodulator under the rider's `min_hz` ends the rider `failed` with
+/// the attach's refusal; the demodulator runs on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rider_fails_when_its_input_is_retuned_under_its_min_hz() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), 960_000, false).await;
+    let demod = start_wfm(&node, "direct").await;
+    let rider = attach_rider(&node, "rds_decode", &demod).await;
+    let op = Op::JobRetune {
+        job: demod.clone(),
+        center_hz: Hz(100_000_000),
+        bandwidth_hz: Hz(120_000),
+        bin_hz: None,
+        replace: vec![],
+    };
+    assert_eq!(node.apply(op).await, Ok(OpResult::Job(demod.clone())));
+    let state = wait_not_running(&node, &rider, 5000).await;
+    let want = format!(
+        "rds_decode cannot ride on job {}: it needs a band of at least 150000 Hz, and the job's is 120000 Hz",
+        demod.0
+    );
+    assert_eq!(state, JobState::Failed { reason: want });
+    assert_eq!(record(&node, &demod).state, JobState::Running);
+    assert!(streams_of(&node, &rider).is_empty());
+}
+
+/// On a bank: a capture change that relaunches the demodulator (the source widened past
+/// its capture) brings the rider back under its id on the new run's channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_rider_comes_back_with_its_inputs_relaunch() {
+    let rate = 2_400_000u64;
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), rate as u32, true).await;
+    let demod = start_wfm(&node, "bank").await;
+    let rider = attach_rider(&node, "rds_decode", &demod).await;
+    let s1 = assert_reads_channel(&node, &rider, &demod).await;
+    let channel1 = node.job_channel_stream(&demod).unwrap();
+    let want = Tuning {
+        center_hz: Hz(100_000_000 + rate / 4),
+        bandwidth_hz: Hz(rate),
+    };
+    node.source_widen(&file0(), want, &[]).await.expect("widen");
+    common::until(
+        "the demodulator on a new run",
+        Duration::from_secs(5),
+        || node.job_channel_stream(&demod).is_ok_and(|s| s != channel1),
+    )
+    .await;
+    wait_path(&node, &demod, "bank").await;
+    assert_running_for(&node, &rider, 1000).await;
+    let s2 = assert_reads_channel(&node, &rider, &demod).await;
+    assert_ne!(s1, s2, "relaunched with its input");
+}
+
+/// A stop of the demodulator ends each rider on it `stopped`, with no stream of it left.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_rider_stops_with_its_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), 960_000, false).await;
+    let demod = start_wfm(&node, "direct").await;
+    let rider = attach_rider(&node, "rds_decode", &demod).await;
+    let twin = attach_rider(&node, TWIN_ROW, &demod).await;
+    assert!(iq_frame(&node, &rider, 3000).await.is_some());
+    node.job_stop(&demod).await.unwrap();
+    assert_eq!(
+        wait_not_running(&node, &rider, 3000).await,
+        JobState::Stopped
+    );
+    assert_eq!(
+        wait_not_running(&node, &twin, 3000).await,
+        JobState::Stopped
+    );
+    assert!(streams_of(&node, &rider).is_empty());
+    assert!(streams_of(&node, &twin).is_empty());
+}
+
+/// A rider resumes after a node restart, after its input, on the input's new channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_rider_resumes_on_its_inputs_new_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = rider_source(dir.path(), 960_000);
+    // The file source plays only while subscribed: keep it playing between nodes.
+    std::mem::forget(src.subscribe());
+    src.start();
+    let (demod, rider) = {
+        let node = rider_open(dir.path(), &src).await;
+        let demod = start_wfm(&node, "direct").await;
+        let rider = attach_rider(&node, "rds_decode", &demod).await;
+        assert_rds(&node, &rider).await;
+        (demod, rider)
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let node = rider_open(dir.path(), &src).await;
+    common::until("both resumed", Duration::from_secs(5), || {
+        record(&node, &demod).state == JobState::Running
+            && record(&node, &rider).state == JobState::Running
+    })
+    .await;
+    assert_reads_channel(&node, &rider, &demod).await;
+    assert_rds(&node, &rider).await;
+}
+
+/// `rds_decode` is refused on a demodulator it does not ride with, naming both; nothing
+/// is attached.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rider_is_refused_on_a_job_it_does_not_ride_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), 960_000, false).await;
+    let fm = start_at(&node, JobKind::FmDemod, 12_500).await;
+    let r = attach_kind_as(&node, "rds_decode", &fm, None).await;
+    let want = format!(
+        "rds_decode cannot ride on job {}: it rides with wfm_demod, and the job runs fm_demod",
+        fm.0
+    );
+    assert_eq!(r, Err(other(&want)));
+    assert!(attached_to(&node, &fm).is_empty());
+}
+
+/// `rds_decode` is refused on a `wfm_demod` narrower than its `min_hz`; nothing is
+/// attached.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rider_is_refused_on_a_band_under_its_min_hz() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), 960_000, false).await;
+    let demod = start_at(&node, JobKind::WfmDemod, 120_000).await;
+    let r = attach_kind_as(&node, "rds_decode", &demod, None).await;
+    let want = format!(
+        "rds_decode cannot ride on job {}: it needs a band of at least 150000 Hz, and the job's is 120000 Hz",
+        demod.0
+    );
+    assert_eq!(r, Err(other(&want)));
+    assert!(attached_to(&node, &demod).is_empty());
+}
+
+/// A rider that is not ready, one already riding on the job, a `stream` and a job of the
+/// kind whose graph has no root channel are each refused; nothing more is attached.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rider_is_refused_unready_twice_with_a_stream_or_without_a_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_src, node) = rider_node(dir.path(), 960_000, false).await;
+    let demod = start_wfm(&node, "direct").await;
+    let r = attach_kind_as(&node, GHOST_ROW, &demod, None).await;
+    let Err(OpError::Other { message }) = r else {
+        panic!("{r:?}")
+    };
+    let head = format!(
+        "{GHOST_ROW} cannot ride on job {}: mode {GHOST_ROW} is broken: ",
+        demod.0
+    );
+    assert!(message.starts_with(&head), "{message}");
+    let r = attach_kind_as(&node, "rds_decode", &demod, Some("slot1")).await;
+    assert_eq!(
+        r,
+        Err(other(
+            "rds_decode reads the job's channel IQ: pass stream null"
+        ))
+    );
+    let rider = attach_rider(&node, "rds_decode", &demod).await;
+    let r = attach_kind_as(&node, "rds_decode", &demod, None).await;
+    let want = format!(
+        "rds_decode cannot ride on job {}: rds_decode job {} already rides on it",
+        demod.0, rider.0
+    );
+    assert_eq!(r, Err(other(&want)));
+    assert_eq!(attached_to(&node, &demod), vec![rider]);
+    // A wfm_demod whose graph the operator put without a channel.
+    let bare = start_at(&node, JobKind::WfmDemod, 190_000).await;
+    let put = Op::GraphPut {
+        job: bare.clone(),
+        graph: node_graph("audio_src", serde_json::json!({})),
+    };
+    assert!(node.apply(put).await.is_ok());
+    common::until("the put graph runs", Duration::from_secs(5), || {
+        node.job_audio_stream(&bare).is_ok()
+            && record(&node, &bare)
+                .graph
+                .nodes
+                .iter()
+                .all(|n| n.kind != "channel")
+    })
+    .await;
+    let r = attach_kind_as(&node, "rds_decode", &bare, None).await;
+    let want = format!(
+        "job {} has no channel stream: its graph has no root channel node",
+        bare.0
+    );
+    assert_eq!(r, Err(other(&want)));
+    assert!(attached_to(&node, &bare).is_empty());
+}
