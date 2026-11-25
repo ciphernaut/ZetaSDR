@@ -1639,7 +1639,20 @@ async fn gave_way(node: &Node, id: &JobId, child: &JobId) {
         node.job_list().iter().all(|r| &r.id != child)
     })
     .await;
-    let ctx = ended(node, id).await;
+    // The choose's context is written as it ends: poll for the end state, not read once.
+    let _ = ended(node, id).await;
+    until("the verdict says it gave way", ENDS_WITHIN, || {
+        node.job_context(id).is_some_and(|c| {
+            let ctx = &c["choose"];
+            ctx["verdict"]["not_tried"].is_array()
+                && reasons(&ctx["verdict"]).contains(&GAVE_WAY)
+                && live_trials(ctx)
+                    .iter()
+                    .any(|t| t["job"] == child.0.as_str() && t["outcome"] == "stopped")
+        })
+    })
+    .await;
+    let ctx = node.job_context(id).expect("the job's context")["choose"].clone();
     let v = &ctx["verdict"];
     assert!(reasons(v).contains(&GAVE_WAY), "{v}");
     let stopped = live_trials(&ctx)
