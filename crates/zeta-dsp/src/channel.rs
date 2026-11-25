@@ -492,13 +492,52 @@ fn check_in_band(
     Ok(())
 }
 
+/// The most a cut decimates in one stage: past it [`taps_for`] stops lengthening the
+/// filter, and its transition outgrows a narrow band.
+const CUT_STAGE_MAX: u64 = ((MAX_TAPS - 1) / 8) as u64;
+/// The least the last stage of a staged cut decimates, where a factor allows: decimating by
+/// so little it gets [`MIN_TAPS`], more than [`taps_for`]'s `8 · decim + 1`, so it is
+/// sharper against a neighbour than a single stage is.
+const CUT_LAST_MIN: u64 = 4;
+/// An earlier stage of a staged cut passes this share of its output rate: the band, a
+/// [`CUT_LAST_MIN`]th of that rate or less where the factors allow, stays well inside it.
+const CUT_PASS_NUM: u64 = 1;
+const CUT_PASS_DEN: u64 = 2;
+
+/// The decimations a cut by `decim` runs, first to last, their product `decim`. One stage
+/// up to [`CUT_STAGE_MAX`]; past it the last stage takes the least factor of at least
+/// [`CUT_LAST_MIN`] (else of at least 2) that leaves a staged remainder, and the stages
+/// before it cut the remainder the same way. A `decim` with no such factor is one stage.
+fn cut_stages(decim: u64) -> Vec<u64> {
+    if decim <= CUT_STAGE_MAX {
+        return vec![decim];
+    }
+    let last = (CUT_LAST_MIN..=CUT_STAGE_MAX)
+        .chain(2..CUT_LAST_MIN)
+        .find(|d| decim.is_multiple_of(*d));
+    match last {
+        Some(last) => {
+            let mut stages = cut_stages(decim / last);
+            stages.push(last);
+            stages
+        }
+        None => vec![decim],
+    }
+}
+
 /// The node's band cutter ([`BandCutter`]), installed by the binary with
 /// [`zeta_core::node::Node::set_cutter`].
 ///
-/// A band is cut at [`channel_rate_hz`], the rate a job's channel stage runs it at, and
-/// filtered as that stage filters it ([`extract_offset`]: low-pass at half the band, the
-/// filter's start-up delay of half its length at the block's rate left in). So a slice cut
-/// to a row's band holds what the row's own channel would have read off the radio.
+/// A band is cut at [`channel_rate_hz`], the rate a job's channel runs it at. Up to a
+/// decimation of [`CUT_STAGE_MAX`] that is one [`extract_offset`], a low-pass at half the
+/// band, as a job's channel stage filters it. Past it one stage would stop sharpening (its
+/// filter is at [`MAX_TAPS`]) and let a neighbour tens of kilohertz off fold in only 30
+/// to 50 dB down, so the cut runs in stages ([`cut_stages`]): each earlier one decimates to an
+/// exact divisor with the band well inside its passband, and the last cuts at half the band.
+/// A narrowband cut from a wide block then keeps whatever would fold into the band some
+/// 75 dB down. It is not the live path sample for sample (a job on a wide source reads
+/// through the channel bank first), but it holds the same band with its neighbours as far
+/// down, and its edges where a job's channel puts them.
 ///
 /// Where that rate is the block's own, the cut does not filter: nothing is saved by it, and
 /// a shift without decimation is circular, so nothing outside the band lands inside it (the
@@ -523,8 +562,21 @@ impl BandCutter for Cutter {
         }
         let out_rate = channel_rate_hz(rate, bw);
         if out_rate < rate {
-            let (out, r) = extract_offset(iq, rate, offset_hz, bw, out_rate).ok()?;
-            return Some((out, Hz(r)));
+            let stages = cut_stages(rate / out_rate);
+            let last = stages.len() - 1;
+            let (mut samples, mut at, mut offset) = (None::<Vec<Complex<f32>>>, rate, offset_hz);
+            for (i, d) in stages.into_iter().enumerate() {
+                let next = at / d;
+                let band = if i == last {
+                    bw
+                } else {
+                    next * CUT_PASS_NUM / CUT_PASS_DEN
+                };
+                let input = samples.as_deref().unwrap_or(iq);
+                let (v, _) = extract_offset(input, at, offset, band, next).ok()?;
+                (samples, at, offset) = (Some(v), next, 0);
+            }
+            return Some((samples.unwrap_or_default(), Hz(at)));
         }
         if offset_hz == 0 {
             return Some((iq.to_vec(), rate_hz));
@@ -1634,6 +1686,47 @@ mod tests {
         );
     }
 
+    /// The level of a unit tone `from_band_hz` off a band `bandwidth_hz` wide, cut from a
+    /// block at `rate_hz`, past the filters' start-up (dB, a tone in the band at 0).
+    fn cut_level(rate_hz: u64, bandwidth_hz: u64, from_band_hz: f64) -> f64 {
+        let offset = 1_000_000i64;
+        let iq = crate::util::nco(
+            (rate_hz / 50) as usize,
+            offset as f64 + from_band_hz,
+            rate_hz as f64,
+        );
+        let (out, _) = Cutter
+            .cut(&iq, Hz(rate_hz), offset, Hz(bandwidth_hz))
+            .unwrap();
+        let settled = &out[out.len() / 4..];
+        let power = settled.iter().map(|v| v.norm_sqr() as f64).sum::<f64>() / settled.len() as f64;
+        10.0 * power.log10()
+    }
+
+    #[test]
+    fn a_wide_block_is_cut_in_stages_so_a_neighbour_stays_out() {
+        // 20 MS/s to 50 kS/s is a decimation of 400, past one stage's longest filter.
+        assert_eq!(cut_stages(400), [100, 4]);
+        assert_eq!(cut_stages(1_280), [80, 4, 4]);
+        assert_eq!(cut_stages(128), [128]);
+        // No factor past one stage: one stage, at the longest filter.
+        assert_eq!(cut_stages(131), [131]);
+        const WIDE: u64 = 20_000_000;
+        let (_, rate) = Cutter
+            .cut(&noise_iq(4_000), Hz(WIDE), 0, Hz(12_500))
+            .unwrap();
+        assert_eq!(rate, Hz(50_000));
+        // Tones 40 to 50 kHz off a 12.5 kHz band, folding onto it at 50 kS/s.
+        for from in [40_000.0, 45_000.0, 50_000.0, -45_000.0, -50_000.0] {
+            let db = cut_level(WIDE, 12_500, from);
+            assert!(db < -60.0, "a tone {from} Hz off the band is {db:.1} dB");
+        }
+        // The band itself passes, its edge where a job's channel puts it.
+        assert!(cut_level(WIDE, 12_500, 0.0).abs() < 0.1);
+        let edge = cut_level(WIDE, 12_500, 6_250.0);
+        assert!((-7.0..-5.0).contains(&edge), "the band's edge {edge:.2} dB");
+    }
+
     #[test]
     fn a_cut_as_wide_as_the_block_is_the_block() {
         let iq = noise_iq(4_800);
@@ -1669,6 +1762,10 @@ mod tests {
         assert_eq!(cut(-1_193_751, 12_500), None);
         assert!(cut(1_193_750, 12_500).is_some());
         assert!(cut(-1_193_750, 12_500).is_some());
+        // An odd band, its half-hertz edge exact: 12_501 Hz reaches 6_250.5 Hz each side.
+        assert!(cut(1_193_749, 12_501).is_some());
+        assert_eq!(cut(1_193_750, 12_501), None);
+        assert_eq!(cut(-1_193_750, 12_501), None);
         // Wider than the block, or no band at all.
         assert_eq!(cut(0, CUT_RATE + 1), None);
         assert_eq!(cut(0, 0), None);

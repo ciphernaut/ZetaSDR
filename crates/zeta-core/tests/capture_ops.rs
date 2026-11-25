@@ -325,7 +325,7 @@ async fn a_ring_slice_record_reads_its_selection_not_the_ring() {
 }
 
 #[tokio::test]
-async fn a_node_without_a_cutter_has_none() {
+async fn a_node_without_a_cutter_has_none_and_cuts_with_the_one_installed() {
     let dir = tempfile::tempdir().unwrap();
     let node = open(dir.path()).await;
     assert!(node.debug_cutter().is_none(), "opened with a cutter");
