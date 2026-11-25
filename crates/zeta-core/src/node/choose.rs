@@ -190,6 +190,9 @@ pub(crate) struct ChooseAsk {
     /// newest `budget.slice_s`; `None`, the ring's newest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<Span>,
+    /// Why the surface asked was not taken (the agent transport asks as `agent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_note: Option<String>,
 }
 
 impl Node {
@@ -282,6 +285,7 @@ impl Inner {
                     start: false,
                     transient: false,
                     span: None,
+                    surface_note: None,
                 }
             });
         let ctx = match serde_json::to_value(&ask) {

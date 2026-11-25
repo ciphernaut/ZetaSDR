@@ -11,6 +11,7 @@
       "floor_hz": 5000,
       "fixed_hz": null,
       "distrust_below_floor": [],
+      "voice_max_hz": null,
       "center": "measured"
     }
   },

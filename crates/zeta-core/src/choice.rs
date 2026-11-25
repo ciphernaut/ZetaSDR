@@ -12,10 +12,6 @@ use crate::modes::weights::Weights;
 use crate::modes::{CenterRule, Decoder, LoadedMode, ModeRegistry, WidthRule};
 use crate::types::{Hz, Selection};
 
-/// The widest `fsk` signal a demodulator row serves: under it an `fsk` label is as
-/// likely a weak FM voice whose sidebands layer 1 did not see as a data signal.
-pub const FSK_VOICE_MAX_HZ: u64 = 25_000;
-
 /// How far the choice is settled: `proved` by a decode passing its row's own rule,
 /// `best_guess` from the measurement and the rows, or `cannot_tell`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -170,10 +166,18 @@ pub fn choose_now(
                 && proved.is_none_or(|p| p.row.id != s.mode.row.id)
         })
         .partition(|s| s.mode.startable());
-    // An `fsk` wider than a voice channel is data, not a weak FM voice: `fm_demod` does
-    // not serve it.
-    let fsk_data = label == "fsk" && bandwidth_hz > FSK_VOICE_MAX_HZ;
-    let fm_voice = |row: &LoadedMode| matches!(&row.row.decoder, Some(Decoder::Builtin(b)) if b.builtin == "fm_demod");
+    // An `fsk` wider than a row's `voice_max_hz` is data, not a weak FM voice: the row
+    // (`fm_demod`'s 25 kHz) does not serve it.
+    let fsk_data = |row: &LoadedMode| {
+        label == "fsk"
+            && row
+                .row
+                .band
+                .width_rule
+                .as_ref()
+                .and_then(|w| w.voice_max_hz)
+                .is_some_and(|max| bandwidth_hz > max)
+    };
     let serving = score_demodulators(
         weights,
         modes,
@@ -185,7 +189,7 @@ pub fn choose_now(
     );
     let (demods, unready_demods): (Vec<&Scored>, Vec<&Scored>) = serving
         .iter()
-        .filter(|s| s.in_range && s.fits_label && !(fsk_data && fm_voice(s.mode)))
+        .filter(|s| s.in_range && s.fits_label && !fsk_data(s.mode))
         .partition(|s| s.mode.startable());
     let could_prove: Vec<String> = ready.iter().map(|s| s.mode.row.id.0.clone()).collect();
     let not_tried: Vec<NotTried> = unready
@@ -687,5 +691,26 @@ mod tests {
         ]);
         let demod = choose(&both, "fsk", OFF_PLAN_HZ, 40_000, 100_000);
         assert_eq!(demod.row.as_deref(), Some("fsk_wideband"), "{demod:?}");
+    }
+
+    /// The fsk cap is the row's data: the embedded `fm_demod` carries 25 kHz, and a
+    /// variant of it with no `voice_max_hz` serves a wide fsk as well.
+    #[test]
+    fn the_fsk_voice_cap_is_the_rows_width_rule() {
+        let embedded = ModeRegistry::load(&StageRegistry::new(), None);
+        let rule = embedded
+            .get("fm_demod")
+            .unwrap()
+            .row
+            .band
+            .width_rule
+            .clone();
+        assert_eq!(rule.and_then(|r| r.voice_max_hz), Some(25_000));
+        let uncapped = |row: &mut Value| {
+            row["band"]["width_rule"]["voice_max_hz"] = Value::Null;
+        };
+        let modes = with_rows(&[("fm_demod", "fm_any_fsk", uncapped)]);
+        let wide = choose(&modes, "fsk", OFF_PLAN_HZ, 40_000, 100_000);
+        assert_eq!(wide.row.as_deref(), Some("fm_any_fsk"), "{wide:?}");
     }
 }

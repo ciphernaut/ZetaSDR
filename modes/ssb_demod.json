@@ -11,6 +11,7 @@
       "floor_hz": null,
       "fixed_hz": 6000,
       "distrust_below_floor": [],
+      "voice_max_hz": null,
       "center": "dial"
     }
   },

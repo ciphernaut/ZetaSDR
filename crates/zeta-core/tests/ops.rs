@@ -2286,6 +2286,24 @@ async fn a_variant_row_starts_with_its_own_defaults() {
     }
 }
 
+#[tokio::test]
+async fn a_variant_row_on_a_plan_channel_gets_the_plans_deviation() {
+    let dir = tempfile::tempdir().unwrap();
+    let row = demod_row(
+        "fm_narrow",
+        "fm_demod",
+        serde_json::json!({"deviation_hz": 2000}),
+    );
+    let node = demod_node(dir.path(), &[("fm_narrow", row)], None).await;
+    let kind = JobKind::Mode(zeta_core::modes::ModeId("fm_narrow".into()));
+    let r = node.apply(start_at(kind, cb_centre(), None)).await;
+    assert_eq!(
+        started(&node, r).graph.nodes[1].params["deviation_hz"],
+        2_500,
+        "a builtin fm_demod row takes the plan's, as fm_demod does"
+    );
+}
+
 fn start_with(kind: JobKind, deviation_hz: Option<u64>) -> Op {
     Op::JobStart {
         kind,

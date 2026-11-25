@@ -7,7 +7,10 @@
   of the decoders that could prove the signal, then more of the capture) and ends with a verdict;
   `choice_policy_set` and `choice_policy_get` bound it (trial budget, confidence stop, whether a
   trial may widen a held capture); a watch's `on_signal: choose` starts the choice on each signal,
-  on probation until its `choose` settles; the box menu's first entry is the choice. `fm_demod`,
+  on probation until its `choose`'s step 2 has proved nothing (a step-3 proof still replaces the
+  job); the box menu's first entry is the choice of a `choose` over the box's own `span`
+  (`zeta job start --kind choose` takes `--up-to`, `--start`, `--transient` and a span), and
+  `budget.concurrent` caps the trials of every `choose` on the node together. `fm_demod`,
   `wfm_demod`, `am_demod` and `ssb_demod` are now mode rows (`role: demodulator`,
   `decoder_kind: builtin`), and `modes_list` takes a `role` filter (`zeta modes list --role`).
   Jobs may be held (`job_list` shows `held`) or transient (hidden from `job_list` unless
@@ -16,7 +19,9 @@
 - Compatibility: a strict older client refuses the new shapes: `modes_list`'s builtin
   demodulator rows and their `role`, the classify answer's `features` and `choice`,
   FeatureRecord's new members, `job_list`'s `all` and the new ops. A rollback past this branch
-  leaves stored FeatureRecords (signatures, identify output) that an older node refuses.
+  leaves stored FeatureRecords (signatures, identify output) that an older node refuses, and,
+  since a job record admits no unknown field, an older node refuses the record of a held job
+  (the job is lost) and any transient or `choose` record.
 
 - The two wrappers have public homes, and the install pointers name them: `onair-rx` at
   https://github.com/ciphernaut/onair-rx (OnAir's handler file) and `dvbt-rx` at

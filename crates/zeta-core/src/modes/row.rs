@@ -400,6 +400,10 @@ pub struct WidthRule {
     /// Layer-1 labels whose measured width is not trusted under the floor.
     #[serde(default)]
     pub distrust_below_floor: Vec<String>,
+    /// The widest `fsk` signal the row serves; `null` for no limit. Above it an `fsk`
+    /// label is a data signal, not a weak FM voice whose sidebands layer 1 missed.
+    #[serde(default)]
+    pub voice_max_hz: Option<u64>,
     /// Where the job is centred.
     #[serde(default)]
     pub center: CenterRule,
@@ -413,7 +417,8 @@ pub enum CenterRule {
     /// On the measured centre.
     #[default]
     Measured,
-    /// On the dial (the band's own centre).
+    /// On layer 1's SSB dial (the suppressed carrier it reads off the measured signal
+    /// and its sideband); the measured centre when layer 1 read no sideband.
     Dial,
 }
 
@@ -1306,6 +1311,12 @@ pub fn validate(row: &ModeRow, stages: &StageRegistry) -> Result<(), RowError> {
         }
         if w.fixed_hz == Some(0) {
             return Err(RowError::new("band.width_rule.fixed_hz", "must be above 0"));
+        }
+        if w.voice_max_hz == Some(0) {
+            return Err(RowError::new(
+                "band.width_rule.voice_max_hz",
+                "must be above 0",
+            ));
         }
         if let (Some(floor), Some(fixed)) = (w.floor_hz, w.fixed_hz)
             && floor > fixed

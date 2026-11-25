@@ -531,7 +531,7 @@ function choiceLabel(c) {
   if (ch == null) return CHOOSING;
   if (!ch?.job) return `Can't tell: ${ch?.reason ?? "no job fits"}`;
   const row = (c.rows || []).find((r) => r.id === ch.row);
-  const guess = !ch.job.kind.endsWith("_demod") && ch.settled === "best_guess" ? " (not proved)" : "";
+  const guess = !isDemod(c, ch.job.kind) && ch.settled === "best_guess" ? " (not proved)" : "";
   return `Start ${ch.job.kind} here: ${khzText(ch.job.bandwidth_hz)} kHz ${row?.name ?? ch.row}${guess}`;
 }
 
@@ -541,10 +541,15 @@ function choiceTitle(c) {
   return alt ? `runner-up: ${alt.job.kind} ${khzText(alt.job.bandwidth_hz)} kHz` : null;
 }
 
-// The Listen entry of the chosen demodulator (null: the choice is no demodulator).
-function chosenListenId(choice) {
-  const j = choice?.job;
-  if (!j || !j.kind.endsWith("_demod")) return null;
+// Whether `kind` is a demodulator row (`role: "demodulator"` in modes_list: the four built-in
+// ones and an operator's variant such as fm_narrow).
+const isDemod = (c, kind) => (c.rows || []).some((r) => r.id === kind && r.role === "demodulator");
+
+// The Listen entry of ctx `c`'s chosen demodulator (null: the choice is no demodulator; a
+// variant row has no Listen entry of its own, so none leads).
+function chosenListenId(c) {
+  const j = c.choice?.job;
+  if (!j || !isDemod(c, j.kind)) return null;
   if (j.kind === "ssb_demod") return j.params?.sideband === "lsb" ? "ssb_lsb" : "ssb_usb";
   return j.kind;
 }
@@ -872,7 +877,7 @@ export function offered(surface, ctx) {
   ).filter((a) => isOffered(a, c));
   // The box's Listen group leads with the chosen demodulator (before the first demodulator,
   // ahead of the Transcribe twins).
-  const chosen = surface === "box" ? list.findIndex((e) => e.id === chosenListenId(c.choice)) : -1;
+  const chosen = surface === "box" ? list.findIndex((e) => e.id === chosenListenId(c)) : -1;
   const first = list.findIndex((e) => groupOf(e, surface) === "listen" && !e.twin);
   if (chosen > first && first >= 0) list.splice(first, 0, ...list.splice(chosen, 1));
   return list;

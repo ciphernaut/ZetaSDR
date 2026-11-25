@@ -15,6 +15,7 @@
         "fsk",
         "unknown"
       ],
+      "voice_max_hz": 25000,
       "center": "measured"
     }
   },

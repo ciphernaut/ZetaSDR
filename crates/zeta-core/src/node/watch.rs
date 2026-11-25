@@ -1544,13 +1544,10 @@ impl Inner {
         let bin_rate = self.bank_bin_rate(source, granted);
         // The policy's handler, as a start that names none gets it.
         let modes = self.modes();
-        // An `fm_demod` on a plan channel of the station's region takes the plan's
-        // deviation, as a direct start does, unless the start gives one.
+        // A job running `fm_demod` on a plan channel of the station's region takes the
+        // plan's deviation, as a direct start does, unless the start gives one.
         let deviation = extra.deviation_hz.or_else(|| {
-            (kind == JobKind::FmDemod)
-                .then(|| crate::plans::plan_deviation_at(tuning.center_hz.0, &self.region()))
-                .flatten()
-                .map(Hz)
+            crate::ops::fm_plan_deviation(&kind, &modes, tuning.center_hz.0, &self.region())
         });
         let graph = self.plain_handler(&kind, &modes).and_then(|handler| {
             let graph = kind.expand_voiced(
@@ -1915,6 +1912,7 @@ impl Inner {
             start: false,
             transient: true,
             span: None,
+            surface_note: None,
         };
         let rec = choose_record(r.prov.source.clone(), band, ask, Some(r.id.clone()));
         let id = rec.id.clone();

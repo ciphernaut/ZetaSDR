@@ -1282,7 +1282,8 @@ pub struct ChooseParams {
     #[schemars(required, schema_with = "nullable_choose_step")]
     pub up_to: Option<u8>,
     /// Who asks; `null` is the transport's (`ui` is `menu`, `agent` is `agent`,
-    /// every other caller `client`).
+    /// every other caller `client`). The agent transport always asks as `agent`: a
+    /// surface it names is noted in `job_context.choose.surface_note`, never taken.
     #[serde(default)]
     #[schemars(required, schema_with = "nullable_surface")]
     pub surface: Option<crate::choice_policy::Surface>,
@@ -1318,7 +1319,7 @@ fn nullable_surface(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": ["string", "null"],
         "enum": ["menu", "watch", "agent", "client", null],
-        "description": "Who asks: `menu`, `watch`, `agent` or `client`; `null` is the transport's (`ui` is `menu`, `agent` is `agent`, every other caller `client`)."
+        "description": "Who asks: `menu`, `watch`, `agent` or `client`; `null` is the transport's (`ui` is `menu`, `agent` is `agent`, every other caller `client`). The agent transport always asks as `agent`: a surface it names is noted in `job_context.choose.surface_note`, never taken."
     })
 }
 
@@ -1520,6 +1521,21 @@ pub struct DemodDefaults {
     pub audio_lowpass_hz: Option<u64>,
     pub deemphasis_us: Option<u64>,
     pub audio_bandwidth_hz: Option<u64>,
+}
+
+/// The plan's deviation at `center_hz` on a plan channel of `region`, for a job of `kind`
+/// that runs the built-in `fm_demod` (`fm_demod` itself, or any row whose `builtin` is
+/// `fm_demod`, as a choice sizes one); `None` for any other kind, or off a plan channel.
+pub(crate) fn fm_plan_deviation(
+    kind: &JobKind,
+    modes: &ModeRegistry,
+    center_hz: u64,
+    region: &str,
+) -> Option<Hz> {
+    let fm = kind.demod(modes).is_some_and(|(b, _)| b == "fm_demod");
+    fm.then(|| crate::plans::plan_deviation_at(center_hz, region))
+        .flatten()
+        .map(Hz)
 }
 
 /// The defaults of the demodulator row `row_id` of `modes`: its `params`, each missing
@@ -5407,7 +5423,9 @@ fn check_choose(kind: &JobKind, choose: Option<&ChooseParams>) -> Result<(), OpE
 }
 
 /// Start a `choose` on `source` over `tuning` for the caller `transport`: its surface
-/// is `choose.surface`, else the transport's ([`crate::choice_policy::surface_of`]),
+/// is `choose.surface`, else the transport's ([`crate::choice_policy::surface_of`]); the
+/// agent transport always asks as `agent` (a surface it names is noted as
+/// `surface_note`),
 /// and its step what the choice policy gives that surface for `choose.up_to`
 /// ([`crate::choice_policy::ChoicePolicy::steps`]); both are kept in its context. It
 /// takes no lease, tunes nothing and stops nothing, so `replace` and `beside` are
@@ -5427,9 +5445,19 @@ async fn start_choose(
         return Err(other("choose is sent beside no job: beside must be null"));
     }
     checked_port(node, &source, &tuning)?;
-    let surface = choose
-        .surface
-        .unwrap_or_else(|| crate::choice_policy::surface_of(transport));
+    // The agent asks as the agent: a surface it names is noted, never taken.
+    let own = crate::choice_policy::surface_of(transport);
+    let (surface, surface_note) = match choose.surface {
+        Some(s) if own == crate::choice_policy::Surface::Agent && s != own => (
+            own,
+            Some(format!(
+                "surface {} asked over the agent transport: asked as agent",
+                s.as_str()
+            )),
+        ),
+        Some(s) => (s, None),
+        None => (own, None),
+    };
     let (step, capped) = node.choice_policy().steps(surface, choose.up_to);
     let ask = crate::node::ChooseAsk {
         surface,
@@ -5438,6 +5466,7 @@ async fn start_choose(
         start: choose.start,
         transient: choose.transient,
         span: choose.span,
+        surface_note,
     };
     node.choose_start(source, tuning, ask)
         .await
@@ -5981,13 +6010,9 @@ pub(crate) async fn apply(node: &Node, op: Op, transport: &str) -> Result<OpResu
             let modes = node.modes();
             let deviation = check_start_params(&kind, deviation_hz, sideband, Some(&modes))?;
             // On a plan channel of the station's region, the plan's deviation when none
-            // was asked, as `plan_start` gives it (an `fm_demod` only).
-            let deviation = deviation.or_else(|| {
-                (kind == JobKind::FmDemod)
-                    .then(|| crate::plans::plan_deviation_at(center_hz.0, &node.region()))
-                    .flatten()
-                    .map(Hz)
-            });
+            // was asked, as `plan_start` gives it (a job that runs `fm_demod` only).
+            let deviation =
+                deviation.or_else(|| fm_plan_deviation(&kind, &modes, center_hz.0, &node.region()));
             check_look(&kind, dwell_ms, average, bits, method, bin_hz)?;
             check_dwell_scale(&kind, dwell_scale)?;
             check_choose(&kind, choose.as_ref())?;

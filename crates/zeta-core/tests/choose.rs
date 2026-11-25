@@ -549,6 +549,37 @@ async fn choose_holds_no_lease_and_stops_no_job() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agent_transport_asks_as_the_agent_whatever_surface_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    let op = || {
+        choose_op(
+            DMR_HZ,
+            20_000,
+            serde_json::json!({"up_to": 1, "surface": "watch"}),
+        )
+    };
+    let id = match node.apply_from(op(), "agent").await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("choose: {r:?}"),
+    };
+    let ctx = ended(&node, &id).await;
+    assert_eq!(ctx["surface"], "agent", "{ctx:#}");
+    assert_eq!(
+        ctx["surface_note"], "surface watch asked over the agent transport: asked as agent",
+        "{ctx:#}"
+    );
+    // Any other caller names its own.
+    let id = match node.apply_from(op(), "http").await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("choose: {r:?}"),
+    };
+    let ctx = ended(&node, &id).await;
+    assert_eq!(ctx["surface"], "watch", "{ctx:#}");
+    assert!(ctx.get("surface_note").is_none(), "{ctx:#}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_up_to_outside_one_to_three_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;

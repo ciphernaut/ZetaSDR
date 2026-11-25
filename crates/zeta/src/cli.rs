@@ -1478,6 +1478,9 @@ pub enum JobCmd {
         elastic: bool,
         #[command(flatten)]
         replace: ReplaceArg,
+        // Boxed: the variant is large enough already.
+        #[command(flatten)]
+        choose: Box<ChooseArgs>,
         /// After starting, tail the job's audio output (else its decoder's event) stream,
         /// stop the job and print `[job_result, frames_result, {"stopped": true}]`;
         /// a job that is not running prints `[job_result, job_record]` and
@@ -1801,6 +1804,49 @@ pub struct StartBandArgs {
     bandwidth_hz: Option<u64>,
 }
 
+/// `job start`'s flags for a `choose` (`ChooseParams`); none given is every member's
+/// default. Given on another kind they reach the node, which refuses them.
+#[derive(Debug, Args)]
+pub struct ChooseArgs {
+    /// choose only: the step of the proof ladder to climb to, 1 (classify) to 3 (a trial
+    /// on the live band); absent = the surface's default, cut to its cap
+    #[arg(long, value_name = "N")]
+    up_to: Option<u8>,
+    /// choose only: start the final answer's job on the source when the choose ends
+    #[arg(long)]
+    start: bool,
+    /// choose only: a short-lived ask: never resumed, dropped as soon as it stops, and
+    /// listed only by `job list --all`
+    #[arg(long)]
+    transient: bool,
+    /// choose only: the selection's span start, nanoseconds since the UNIX epoch (with
+    /// --span-end-ns): the choose works on its newest slice the ring still holds;
+    /// absent = the ring's newest
+    #[arg(long, value_name = "NS", requires = "span_end_ns")]
+    span_start_ns: Option<u64>,
+    /// choose only: the selection's span end, nanoseconds since the UNIX epoch
+    #[arg(long, value_name = "NS", requires = "span_start_ns")]
+    span_end_ns: Option<u64>,
+}
+
+impl ChooseArgs {
+    /// The op's `choose`: `None` when no flag is given.
+    fn into_params(self) -> Option<zeta_core::ops::ChooseParams> {
+        let span = self.span_start_ns.zip(self.span_end_ns).map(|(s, e)| Span {
+            start_ns: Timestamp(s),
+            end_ns: Timestamp(e),
+        });
+        let given = self.up_to.is_some() || self.start || self.transient || span.is_some();
+        given.then_some(zeta_core::ops::ChooseParams {
+            up_to: self.up_to,
+            surface: None,
+            start: self.start,
+            transient: self.transient,
+            span,
+        })
+    }
+}
+
 /// What a `job start --beside` left out, filled from the named job's record.
 #[derive(Clone, Debug)]
 pub struct BesideFill {
@@ -2054,6 +2100,7 @@ impl Command {
                 needs,
                 elastic,
                 replace,
+                choose,
                 ..
             }) => Op::JobStart {
                 // With `--beside` a left-out value is filled from the job ([`BesideFill`]).
@@ -2075,7 +2122,7 @@ impl Command {
                 handler,
                 needs: needs.into_iter().map(Into::into).collect(),
                 beside: beside.map(JobId),
-                choose: None,
+                choose: choose.into_params(),
             },
             Command::Job(JobCmd::Attach {
                 kind,
@@ -2966,5 +3013,81 @@ mod cli_choice_policy_tests {
             .command;
         assert!(!get.mutates());
         assert_eq!(get.into_op().unwrap(), Some(Op::ChoicePolicyGet {}));
+    }
+}
+
+#[cfg(test)]
+mod cli_choose_tests {
+    use super::*;
+    use zeta_core::ops::ChooseParams;
+
+    fn choose_of(args: &[&str]) -> Option<ChooseParams> {
+        let base = [
+            "zeta",
+            "job",
+            "start",
+            "--source",
+            "rx",
+            "--center-hz",
+            "439100000",
+            "--bandwidth-hz",
+            "20000",
+        ];
+        let all: Vec<&str> = base.iter().chain(args).copied().collect();
+        let cmd = Cli::try_parse_from(all).unwrap().command;
+        match cmd.into_op().unwrap() {
+            Some(Op::JobStart { choose, .. }) => choose,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn job_start_choose_takes_its_flags() {
+        assert_eq!(
+            choose_of(&[
+                "--kind",
+                "choose",
+                "--up-to",
+                "3",
+                "--start",
+                "--transient",
+                "--span-start-ns",
+                "1000",
+                "--span-end-ns",
+                "3000",
+            ]),
+            Some(ChooseParams {
+                up_to: Some(3),
+                surface: None,
+                start: true,
+                transient: true,
+                span: Some(Span {
+                    start_ns: Timestamp(1000),
+                    end_ns: Timestamp(3000),
+                }),
+            })
+        );
+        // None given: every member's default.
+        assert_eq!(choose_of(&["--kind", "choose"]), None);
+        // On another kind the flags still reach the node, which refuses them.
+        assert!(choose_of(&["--kind", "fm_demod", "--up-to", "2"]).is_some());
+        assert_eq!(choose_of(&["--kind", "fm_demod"]), None);
+        // A span takes both ends.
+        let half = [
+            "zeta",
+            "job",
+            "start",
+            "--kind",
+            "choose",
+            "--source",
+            "rx",
+            "--center-hz",
+            "1",
+            "--bandwidth-hz",
+            "1",
+            "--span-start-ns",
+            "1000",
+        ];
+        assert!(Cli::try_parse_from(half).is_err());
     }
 }

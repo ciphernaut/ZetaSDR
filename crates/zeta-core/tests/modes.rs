@@ -2857,6 +2857,15 @@ fn a_width_rule_floor_may_not_exceed_its_fixed_width() {
 }
 
 #[test]
+fn a_width_rule_voice_cap_must_be_above_zero() {
+    let reason = rule_reason(serde_json::json!({"voice_max_hz": 0}));
+    assert!(
+        reason.starts_with("band.width_rule.voice_max_hz"),
+        "{reason}"
+    );
+}
+
+#[test]
 fn an_absent_width_rule_serialises_as_null() {
     let row = embedded_row("pocsag_decode");
     let parsed = zeta_core::modes::parse(&row.to_string()).unwrap();
