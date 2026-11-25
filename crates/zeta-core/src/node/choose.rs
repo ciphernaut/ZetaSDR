@@ -796,20 +796,19 @@ fn widen_task(
     tokio::spawn(async move { node.source_widen_held(&source, want, &cancel).await })
 }
 
-/// The `choose` job's body: (1) the watch's step 1 its child was handed ([`StepOne`]), else
-/// [`step_one`] (none is a `cannot_tell`), the policy's cap noted; (2) when the job's
-/// step reaches 2 and step 1 proved nothing, the same samples written as the trial
+/// The `choose` job's body: (1) the watch's step 1 its child was handed ([`StepOne`]),
+/// else [`step_one`] (none is a `cannot_tell`), the policy's cap noted; (2) when the
+/// job's step reaches 2 and step 1 proved nothing, the same samples written as the trial
 /// slice ([`Inner::write_slice`], pinned until just before the verdict) and
 /// [`Inner::step_two`] over it, unless the policy's slice is under 1 s
 /// ([`POLICY_SLICE_SHORT`]), the span asked is ([`SPAN_SHORT`]), the selection is
-/// ([`RING_SHORT`]) or layer 1 measured
-/// nothing ([`UNMEASURED`]); (3) when the job's step reaches 3 and
-/// nothing proved yet, [`Inner::step_three`] on the live band with what is left of the
-/// trials' budget (an owned job is listed past step 2 meanwhile,
-/// [`Inner::choose_past_two`]); then the verdict, and with `start` the verdict's job: a step-3
-/// proof's own job, kept running, its lease made an ordinary one and the job disowned
-/// (unless its lease gave way first: then it is stopped and the job started afresh),
-/// else one started.
+/// ([`RING_SHORT`]) or layer 1 measured nothing ([`UNMEASURED`]); (3) when the job's step
+/// reaches 3 and nothing proved yet, [`Inner::step_three`] on the live band with what is
+/// left of the trials' budget (an owned job is listed past step 2 meanwhile,
+/// [`Inner::choose_past_two`]); then the verdict, and with `start` the verdict's job: a
+/// step-3 proof's own job, kept running, its lease made an ordinary one and the job
+/// disowned (unless its lease gave way first: then it is stopped and the job started
+/// afresh), else one started.
 async fn choose_loop(
     inner: Arc<Inner>,
     mut r: Run,
