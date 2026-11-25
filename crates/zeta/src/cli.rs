@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use zeta_core::graph::Graph;
-use zeta_core::modes::{Family, ModeState};
+use zeta_core::modes::{Family, ModeState, Role as ModeRole};
 use zeta_core::ops::{
     AudioPolicy, JobKind, Modulation, Op, OpError, ScanMethod, Sideband, SignalBand,
 };
@@ -945,6 +945,9 @@ pub enum ModesCmd {
         /// Only this state: ready, broken or unavailable
         #[arg(long, value_name = "S", value_parser = parse_mode_state)]
         state: Option<ModeState>,
+        /// Only decoders or only demodulators (the default lists both)
+        #[arg(long, value_name = "R", value_parser = parse_mode_role)]
+        role: Option<ModeRole>,
     },
     /// Print one mode's row as loaded
     Show {
@@ -1046,6 +1049,11 @@ fn parse_family(s: &str) -> Result<Family, String> {
 
 /// `--state`: `ready`, `broken` or `unavailable`.
 fn parse_mode_state(s: &str) -> Result<ModeState, String> {
+    serde_json::from_value(s.into()).map_err(|e| e.to_string())
+}
+
+/// `--role`: `decoder` or `demodulator`.
+fn parse_mode_role(s: &str) -> Result<ModeRole, String> {
     serde_json::from_value(s.into()).map_err(|e| e.to_string())
 }
 
@@ -2263,10 +2271,14 @@ impl Command {
             Command::Register(RegisterCmd::Site { provider, site_id }) => {
                 Op::RegisterSite { provider, site_id }
             }
-            Command::Modes(ModesCmd::List { family, state }) => Op::ModesList {
+            Command::Modes(ModesCmd::List {
                 family,
                 state,
-                role: None,
+                role,
+            }) => Op::ModesList {
+                family,
+                state,
+                role,
             },
             Command::Modes(ModesCmd::Show { id }) => Op::ModesShow { id },
             Command::Choice(ChoiceCmd::Policy(ChoicePolicyCmd::Get)) => Op::ChoicePolicyGet {},

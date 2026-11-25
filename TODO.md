@@ -179,7 +179,9 @@ From the same run. At the 1 Msps UHF CB pin `stats.timeouts` climbs about 8 per 
 
 From plan 15's non-goals, 2026-10-31. A demodulator's or decoder's own capture centre sits on its channel, so the receiver's DC spike lands in the channel (the same problem the scan grid had; a one-off demod read it as a 59 dB carrier on 2026-10-23). Keeping the centre off the channel needs the lease manager to know the capture's minimum width before it tunes, which the capability record does not carry, and the offset depends on the notch width plan 15 measures (`SCAN_NOTCH_HZ`: its live acceptance's figure is this gist's input). Its own small plan after plan 15. Seen live 2026-11-01 on the B210: after `replace` moved the last fm_demod to 477.466 MHz the capture centred on it, putting the DC spike on the channel.
 
-## Audio: the default `deviation_hz` on a 12.5 kHz channel
+## Audio: the default `deviation_hz` on a 12.5 kHz channel (done in plan 48)
+
+Done in plan 48 (task 2): a demodulator started directly on a channel of a plan, in the node's region, takes that channel's deviation. What follows is the history.
 
 The voice low-pass and de-emphasis shipped 2026-11-01 (`fm_demod` carries `audio_lowpass_hz` 3400 and `deemphasis_us` 530; the voice demodulators take `denoise: true`). A channel plan now carries its channels' deviation (`uhf_cb_au` 2500, cleanup round 0), which `plan_start` and a set's plan members use when none is asked. Left: a demod started directly (the page's box menu, a fit, `job_start`) on a CB channel still takes the kind's 5000; it could take the deviation of a plan channel it lands on.
 
@@ -261,7 +263,9 @@ Built (cleanup round 3): both menus and the job row draw from one entry table (`
 - the row's Stop and Mute in mix buttons are still their own code, not the table's `stop` and `mute` entries;
 - `actions.js` and `menu.js` import each other (safe: neither reads the other at load), which a move of the kind constants out of menu.js would end.
 
-## Classify: layers 1 and 2 choose the job, with no agent or model
+## Classify: layers 1 and 2 choose the job, with no agent or model (done in plan 48)
+
+Done in plan 48: `classify` answers `choice`; `choose` is the job that climbs the proof ladder; the choice policy bounds it; the page's first menu entry and a watch's `on_signal: choose` use it. What follows is the original ask; the gists after the plan 48 line are what is left.
 
 From the operator, 2026-11-18: "eventually we want to be able to use the L1/L2 classifier to set the right job type without needing an agent or llm". Today picking the job for a signal is the operator reading a menu, or the agent reasoning over `classify` and `identify`. The classifier already holds what the choice needs: layer 1 gives a signal's width, modulation family, symbol rate and a label; layer 2 adds a decoder row's proof, a learned signature's match and the catalogue's names; and the mode rows say what each decoder and demodulator takes (ranges, widths, proofs).
 
@@ -553,7 +557,9 @@ Items 1-3 of the first list shipped in plan 19.1 (the register and `as_of`, the 
 
 From the operator, 2026-11-17. Asked for a watch on "the 2m band", the node's model sent `source_free` and a `watch` `job_start` at a centre above 1 GHz, 20 MHz wide, and reported it as the 2 m band; nothing checked the guess. The agent has no band table: amateur band names appear only in passing in the field craft (APRS, M17), so a small model resolves "2m", "70cm", "23cm", "CB" or "airband" from its weights. Wanted, as one mechanism for every band name rather than prose per band: band names as data (name, aliases, edges, the region they hold in, chosen by the station's region), served to the agent through an operation such as `knowledge_lookup` by name, and an agent-side check that flags a call whose band falls outside the band the request named, before it is applied. The answer repeats the band's edges ("2 m, 144-148 MHz") so a wrong pick is visible at once.
 
-## Watch: start a voice demodulator and a transcriber on each new signal
+## Watch: start a voice demodulator and a transcriber on each new signal (voice case done in plan 48)
+
+The voice case is done in plan 48: a watch with `on_signal: choose` starts the chosen demodulator and the `attach` transcriber, held on probation until its choose settles. The generic part below (any attachable kind, idle measured by the squelch) is not.
 
 From the operator, 2026-11-17: "auto start fm decode and transcribe job on new activity" for a watch over a voice band. A watch can only run identify or start mode rows from its `modes`; a voice demodulator is a built-in kind and `transcribe` an attached one, so today this is a client loop beside the watch (poll `watch.signals`, start `fm_demod` on the measured centre plus an attached `transcribe` where no job serves the signal, stop it when the signal is gone and the squelch has been shut for a while), as `examples/python/cb_watch.py` does for a channel plan. Wanted, generically for any demodulator and any attachable kind: a detect policy naming the kind (`fm_demod`, `am_demod`, `ssb_demod` and `nbfm`-style rows) and an `attach` to start with it, fitted by width as `modes` rows are, kept under the existing cap, `hold_ms` and `lost` reasons, with idle measured by the demodulator's squelch rather than by the decoder's events (a voice job has none). A named set could then carry "watch this band and transcribe what talks".
 
@@ -1114,3 +1120,12 @@ The other receivers surveyed stay candidates for the later steps, each for the r
 - **OnAir, for its rate of change.** A receiver with tests for frequency offset, lock, quantisation and combined impairments, several releases in the first half of November touching DVB-T and DVB-T2, a headless server its own docs say is untried on a real radio, and no documented pipe form. GPL-3.0-or-later.
 
 A copyleft receiver runs as a separate program the operator builds, never linked into the node, shipped with it or kept in this repository (`docs/licensing.md`).
+
+## Left from plan 48 (2026-11-25)
+
+- **The trial slice is cut at the full ring rate (R29).** Above about 8.4 MS/s the 64 MiB trial quota leaves under 1 s, so step 2 of a `choose` never runs on a wide capture (step 3 still covers it). Cut the slice to the selection before writing it; that needs a channeliser reachable from `zeta-core`.
+- **A released transcript line draws its waterfall ribbon when it arrives, not at its own time.** A held transcriber releases its lines late; the page should place the ribbon at the line's own time.
+- **Plan 48.5, borrow.** A trial on an idle radio under a lease that yields, for a capture no job holds.
+- **The layer-3 fast model.** The slot exists: the shared vocabulary, a weights row and the training records the settled trials keep.
+- **Replay a capture into a demodulator to listen to it.** `capture_decode` replays into a decoder row only.
+- **`transcripts.log` can miss lines a held transcriber releases at a cancel.** The tee drains on the same token as the cancel.

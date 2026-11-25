@@ -112,7 +112,7 @@ jobs:
             every_job_on_the_source_is_watched,menu_entry_table_is_whole,
             a_decode_entry_for_a_row_with_no_ready_handler_is_greyed,wfm_decode_plays_audio,
             a_map_site_can_be_selected,handler_named_on_job_row,
-            send_to_shows_an_unavailable_handler_greyed
+            send_to_shows_an_unavailable_handler_greyed,the_first_box_entry_is_the_choice
         run: |
           echo "runner CPUs: $(nproc)"
           if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then

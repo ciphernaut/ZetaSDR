@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Classify chooses the job. `classify` answers `choice` (the job to start, its evidence and a
+  runner-up) and `features`; `choose` is a job that climbs the proof ladder (classify, a trial
+  of the decoders that could prove the signal, then more of the capture) and ends with a verdict;
+  `choice_policy_set` and `choice_policy_get` bound it (trial budget, confidence stop, whether a
+  trial may widen a held capture); a watch's `on_signal: choose` starts the choice on each signal,
+  on probation until its `choose` settles; the box menu's first entry is the choice. `fm_demod`,
+  `wfm_demod`, `am_demod` and `ssb_demod` are now mode rows (`role: demodulator`,
+  `decoder_kind: builtin`), and `modes_list` takes a `role` filter (`zeta modes list --role`).
+  Jobs may be held (`job_list` shows `held`) or transient (hidden from `job_list` unless
+  `all: true`, never resumed). `iq read` writes its recording into the burst store, where it
+  expires with the others, and is refused beside a running `zeta serve`.
+- Compatibility: a strict older client refuses the new shapes: `modes_list`'s builtin
+  demodulator rows and their `role`, the classify answer's `features` and `choice`,
+  FeatureRecord's new members, `job_list`'s `all` and the new ops. A rollback past this branch
+  leaves stored FeatureRecords (signatures, identify output) that an older node refuses.
+
 - The two wrappers have public homes, and the install pointers name them: `onair-rx` at
   https://github.com/ciphernaut/onair-rx (OnAir's handler file) and `dvbt-rx` at
   https://github.com/ciphernaut/dvbt-rx (the `dvbt_decode` row).

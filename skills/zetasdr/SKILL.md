@@ -658,9 +658,9 @@ The decoder modes the node knows, one row each (`modes/*.json` built in, then th
 
 JSON: `{"op":"modes_list","family":null,"state":null,"role":null}`
 
-CLI: `zeta modes list [--family F] [--state S]`
+CLI: `zeta modes list [--family F] [--state S] [--role decoder|demodulator]`
 
-The decoder modes the node knows, one row each: `id` (the `kind` a decoder job starts with), `name`, `family`, `band` (`bandwidth_hz` the decoder expects, well-known `centers_hz`, `min_hz` the narrowest band it accepts or `null`, `range_hz` where identify and classify try it, one span `[lo, hi]` or a list of spans `[[lo, hi], ...]` (a row of one span is always written `[lo, hi]`), or `null` for anywhere), `modulation` (the layer-1 labels it presents as), `decoder_kind` (`graph`, run in-process, `program`, an external decoder, or `frame`, an in-process frame chain; `null` for a row with no decoder of its own, which only a handler file's entry runs), `file` (`modes/<id>.json` for a built-in row, the path for an operator row), `program`, `checked` (UNIX seconds at which `zeta modes check` last passed the row on this host with every handler found; `null` if never, or for a graph or frame row with no handlers), `subject` (the event field naming what events are about, its table columns and how the page folds it; `null` for none), and `state` ready|broken|unavailable with `reason` (`null` when ready). A broken row's `file` is the file to fix and its `reason` names the field (`<field>: <error>`); an unavailable one names the program it lacks. A ready row may list `missing`: the optional programs it runs without, each `<program>: missing (<hint>; <url>) — <what is lost>` (`voice silent` for a vocoder), `[]` when it lacks none. `outputs` lists the stream kinds a job of the row emits (`event`, `audio`, `packet`; a row listing `audio` gets play and Transcribe on the page, and `job_attach` may attach `transcribe` to its job; a row listing `packet` publishes each frame it decodes as a packet beside its event (an AX.25 frame for `aprs_decode`, the frame's bytes for a frame row), the frames a `job_attach` of `packets` captures; a graph row's are its terminal stages', a program row's `event`, a frame row's `event` and `packet`; empty for a broken row). `handlers` lists every handler of the mode, the row's own first (`builtin` for a graph or frame row, named `built-in`; a program row's first program's file name, `dump1090`; no own handler for a row with no decoder of its own), then each handler file's (`--handlers-dir`) by id: each has `id` (what `job_start`'s `handler` and `handler_policy_set` take), `name`, `in_process`, `outputs`, `state` with `reason`, `missing`, `program`, `checked` (a handler file's from `zeta modes check --handler <id>`), `file` and `extra` (the event fields that handler adds beside the row's). `handler` is the one the policy would pick now (`null` when none is ready). With more than one handler the mode's own fields summarise them: `state` is `ready` when any handler is, `program`, `reason` and `missing` describe the handler `handler` names (the row's own when none is ready), `outputs` is the union over the ready handlers (a capture is possible on the mode, not on every job of it: a job's outputs are its own handler's), and `checked` is the row's own. A row with no decoder of its own (`decoder_kind` `null`) is `ready` while one of its handler files' handlers is, and is otherwise `unavailable` with `reason` `no decoder of its own, and no handler for it is ready` followed by `; <id>: <reason>` for each of its handlers (the missing program, say); its `outputs` are its ready handlers' (`[]` with none), and a start of it always runs, and records, one of them. On the CLI, `zeta handlers list` prints one line per handler of each mode, `<mode> <id> <state> <outputs>`, then `checked=<UNIX seconds>` when a check passed it: this machine's rows and handler files, or with `--node` the serving node's (its programs and checks). `voices` lists the voices a job of the row has beside its main audio stream, each on an audio stream of its own (a DMR row's `slot1` and `slot2`): what `job_attach`'s `stream` may name, and the rows `job_start`'s `audio_policy` applies to; `[]` for a row with one voice. `access` is `'restricted'` on a row whose events carry content a later access control may gate (pager text); such events carry `access: 'restricted'`. `content` is `'network_traffic'` on a row that carries data-network traffic and `null` on the rest: it says what the row carries, nothing reads it yet, and it is not put on events; a job of such a row has `content` in its `job_context` from launch, and a packet capture of its job records it. `family` (and the `family` filter) is one of `tv`, `broadcast`, `aviation`, `maritime`, `satellite`, `two_way`, `cellular_rail`, `pagers`, `iot`, `weather_science`, `amateur_digital`, `amateur_voice`, `hf_utility`, `general`. On the CLI, `--family` and `--state` narrow the list. `zeta modes check [ID] [--strict] [--handler H]` (local only, not with `--node`) runs each row's test on a node over a synthesised capture and prints `<id>: ok`, `<id>: fail: <reason>` or `<id>: skipped: <reason>` (no test, or the program missing: `--strict` makes that a fail); it exits 0 when no row failed. With `--handler H` it runs the test of each mode that has handler `H` (of `ID` only, when given) by a job of that handler, a handler file's printed and recorded as `<id>@<H>`. A row with no decoder of its own is checked by the handler the policy picks, printed and recorded the same way, and is `<id>: skipped: no decoder of its own and no handler ready` when none is ready.
+The decoder modes the node knows, one row each: `id` (the `kind` a decoder job starts with), `name`, `family`, `band` (`bandwidth_hz` the decoder expects, well-known `centers_hz`, `min_hz` the narrowest band it accepts or `null`, `range_hz` where identify and classify try it, one span `[lo, hi]` or a list of spans `[[lo, hi], ...]` (a row of one span is always written `[lo, hi]`), or `null` for anywhere), `modulation` (the layer-1 labels it presents as), `decoder_kind` (`graph`, run in-process, `program`, an external decoder, `frame`, an in-process frame chain, or `builtin`, a demodulator the node runs itself; `null` for a row with no decoder of its own, which only a handler file's entry runs), `file` (`modes/<id>.json` for a built-in row, the path for an operator row), `program`, `checked` (UNIX seconds at which `zeta modes check` last passed the row on this host with every handler found; `null` if never, or for a graph or frame row with no handlers), `subject` (the event field naming what events are about, its table columns and how the page folds it; `null` for none), `role` (`decoder`, or `demodulator` for a built-in `fm_demod`, `wfm_demod`, `am_demod` or `ssb_demod` row, which carries no decoder and a `width_rule`), and `state` ready|broken|unavailable with `reason` (`null` when ready). `modes_list`'s `role` narrows to one role (`null` for both; a request without it reads as `null`). A broken row's `file` is the file to fix and its `reason` names the field (`<field>: <error>`); an unavailable one names the program it lacks. A ready row may list `missing`: the optional programs it runs without, each `<program>: missing (<hint>; <url>) — <what is lost>` (`voice silent` for a vocoder), `[]` when it lacks none. `outputs` lists the stream kinds a job of the row emits (`event`, `audio`, `packet`; a row listing `audio` gets play and Transcribe on the page, and `job_attach` may attach `transcribe` to its job; a row listing `packet` publishes each frame it decodes as a packet beside its event (an AX.25 frame for `aprs_decode`, the frame's bytes for a frame row), the frames a `job_attach` of `packets` captures; a graph row's are its terminal stages', a program row's `event`, a frame row's `event` and `packet`; empty for a broken row). `handlers` lists every handler of the mode, the row's own first (`builtin` for a graph or frame row, named `built-in`; a program row's first program's file name, `dump1090`; no own handler for a row with no decoder of its own), then each handler file's (`--handlers-dir`) by id: each has `id` (what `job_start`'s `handler` and `handler_policy_set` take), `name`, `in_process`, `outputs`, `state` with `reason`, `missing`, `program`, `checked` (a handler file's from `zeta modes check --handler <id>`), `file` and `extra` (the event fields that handler adds beside the row's). `handler` is the one the policy would pick now (`null` when none is ready). With more than one handler the mode's own fields summarise them: `state` is `ready` when any handler is, `program`, `reason` and `missing` describe the handler `handler` names (the row's own when none is ready), `outputs` is the union over the ready handlers (a capture is possible on the mode, not on every job of it: a job's outputs are its own handler's), and `checked` is the row's own. A row with no decoder of its own (`decoder_kind` `null`) is `ready` while one of its handler files' handlers is, and is otherwise `unavailable` with `reason` `no decoder of its own, and no handler for it is ready` followed by `; <id>: <reason>` for each of its handlers (the missing program, say); its `outputs` are its ready handlers' (`[]` with none), and a start of it always runs, and records, one of them. On the CLI, `zeta handlers list` prints one line per handler of each mode, `<mode> <id> <state> <outputs>`, then `checked=<UNIX seconds>` when a check passed it: this machine's rows and handler files, or with `--node` the serving node's (its programs and checks). `voices` lists the voices a job of the row has beside its main audio stream, each on an audio stream of its own (a DMR row's `slot1` and `slot2`): what `job_attach`'s `stream` may name, and the rows `job_start`'s `audio_policy` applies to; `[]` for a row with one voice. `access` is `'restricted'` on a row whose events carry content a later access control may gate (pager text); such events carry `access: 'restricted'`. `content` is `'network_traffic'` on a row that carries data-network traffic and `null` on the rest: it says what the row carries, nothing reads it yet, and it is not put on events; a job of such a row has `content` in its `job_context` from launch, and a packet capture of its job records it. `family` (and the `family` filter) is one of `tv`, `broadcast`, `aviation`, `maritime`, `satellite`, `two_way`, `cellular_rail`, `pagers`, `iot`, `weather_science`, `amateur_digital`, `amateur_voice`, `hf_utility`, `general`. On the CLI, `--family` and `--state` narrow the list. `zeta modes check [ID] [--strict] [--handler H]` (local only, not with `--node`) runs each row's test on a node over a synthesised capture and prints `<id>: ok`, `<id>: fail: <reason>` or `<id>: skipped: <reason>` (no test, or the program missing: `--strict` makes that a fail); it exits 0 when no row failed. With `--handler H` it runs the test of each mode that has handler `H` (of `ID` only, when given) by a job of that handler, a handler file's printed and recorded as `<id>@<H>`. A row with no decoder of its own is checked by the handler the policy picks, printed and recorded the same way, and is `<id>: skipped: no decoder of its own and no handler ready` when none is ready.
 
 Frame rows: a row with `decoder.kind: frame` decodes framed bursts in-process, with no program. Its `decoder` names the demodulator, `demod: {modulation, symbol_rate_baud, order, tone_spacing_hz}` (`modulation` `fsk`, `psk` or `ook`; `order` 2 when left out, 2 or 4 for fsk, 2, 4 or 8 for psk, 2 for ook; `tone_spacing_hz` `null` for the demodulator's own estimate), the `framing` (the `frame_decode` stage's params, under Stage kinds: sync, length, CRC, line code, whitening, bit order) and the `parser` (`opaque`, the default: the frame's bytes as they are). A job of the row runs `channel → resample → <demod> → clock_recover → slicer → frame_decode` on a band no narrower than `band.min_hz` (else `band.bandwidth_hz`) and publishes one event per cut frame (`sync`, `length_bytes`, `bytes` in hex, `crc_ok`, `payload`) under the row's `protocol` and `summary`; `clock_recover`'s `timing` events go on a separate output. With `identify: {proof: field, field: crc_ok, quick: frame}` a CRC-clean frame proves the row: `classify` runs the chain over the span (evidence `frame <n> B, <crc> ok (<ok>/<frames>)`; a framing without a `crc` never proves) and `identify` runs the row as a child job. `quick: frame` is refused on any other row, and a frame row's `quick` is `frame` or `null`. A bad framing leaves the row broken naming `decoder.framing.<field>`. `zeta modes check` checks a frame row over the `framing` synthesiser family (`test: {kind: synth, family: framing, modulation, symbol_rate_baud, deviation_hz, frames, body_bytes, framing, repeat, expect: {crc_ok: true}, within_ms}`).
 
@@ -750,10 +750,10 @@ What `modes_list`'s `handler` is chosen from. A mode with no ranking of its own 
 
 Change the choice policy; give exactly one of `lease` and `policy` (both, or neither, is `other`). `lease` (`share` or `widen`) changes only step 3's lease setting and keeps every other value: the node merges it into its current policy. `policy` replaces the whole value: how far a `choose` goes for each surface (`menu`, `watch`, `agent`, `client`: `default` step when none is asked for, never past `cap`, both 1 to 3 with `default` at most `cap`), whether step 3 may `widen` a held capture or only `share` a running one, the trial `budget` (`trial_s` and `concurrent` at least 1, `slice_s` above 0) and `confidence_stop` (`null` for none, else 0 to 1). A surface left out takes its built-in ceiling. Checked before anything is written: a value that fails is `other`, naming the surface or field. Kept in `choice-policy.json` in the state directory across restarts. The result is the policy as stored.
 
-- policy: any
-- lease: any
+- policy: object (ChoicePolicy: budget{concurrent,slice_s,trial_s}, confidence_stop, lease, surfaces{}) or null
+- lease: string (LeaseSetting: share|widen) or null
 
-JSON: `{"op":"choice_policy_set","policy":null,"lease":null}`
+JSON: `{"op":"choice_policy_set","policy":null,"lease":"widen"}`
 
 CLI: `zeta choice policy set --lease share|widen (the lease alone), or --file policy.json (the whole policy)`
 
@@ -837,7 +837,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.pre_ms: integer (optional, default 20)
 - params.signal: any (optional, default null)
 - params.timeout_ms: integer (optional, default 120000)
-- params.watch: any (optional, default null)
+- params.watch: string or null (optional, default null)
 - params.whole: boolean (optional, default false)
 - params.window_ms: integer (optional, default 2000)
 
@@ -865,7 +865,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: audio
 - outputs: audio, event
 - params.symbol_rate_baud: integer
-- params.algorithm: any (optional, default null)
+- params.algorithm: string (Algorithm: mm|gardner|early_late) or null (optional, default null)
 - params.loop_bw: number (optional, default 0.01)
 - params.max_ppm: integer (optional, default 2000)
 
@@ -912,7 +912,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.prefer: array (optional, default [])
 - params.probation: boolean (optional, default true)
 - params.seed_known: boolean (optional, default false)
-- params.sink: any (optional, default null)
+- params.sink: any or null (optional, default null)
 - params.sondehub: any (optional, default null)
 - params.spurs_hz: array (optional, default [])
 - params.threshold_db: number (optional, default 6.0)
@@ -953,10 +953,10 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.sync: object (Word: hex, bits)
 - params.length: any
 - params.bit_order: string (BitOrder: msb|lsb) (optional, default "msb")
-- params.crc: any (optional, default null)
+- params.crc: any or null (optional, default null)
 - params.encoding: string (LineCode: nrz|nrzi|manchester|differential) (optional, default "nrz")
 - params.max_errors: integer (optional, default 0)
-- params.preamble: any (optional, default null)
+- params.preamble: object (Word: hex, bits) or null (optional, default null)
 - params.whitening: any (optional, default "none")
 
 ### frame_parse
@@ -1025,7 +1025,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.center_hz: integer
 - params.mode: string or null
 - params.access: string or null
-- params.content: any (optional, default null)
+- params.content: string (Content: network_traffic) or null (optional, default null)
 - params.handler: string or null (optional, default null)
 
 ### passthrough
@@ -1075,10 +1075,10 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - inputs: audio
 - outputs: event
 - params.chunk_bits: integer (optional, default 4096)
-- params.constellation: any (optional, default null)
+- params.constellation: string (Constellation: bpsk|qpsk|8psk) or null (optional, default null)
 - params.differential: boolean (optional, default false)
 - params.levels: integer (optional, default 2)
-- params.mapping: any (optional, default "natural")
+- params.mapping: string (Mapping: natural|gray) (optional, default "natural")
 
 ### ssb_demod
 
@@ -1122,7 +1122,7 @@ A graph node's `kind` names one of these; its `params` must match the listed fie
 - params.composite_max_hz: integer (optional, default 16000000)
 - params.deemphasis: string (optional, default "ccir405")
 - params.deviation_hz: integer (optional, default 8000000)
-- params.standard: any (optional, default null)
+- params.standard: string (VideoStandard: pal|ntsc) or null (optional, default null)
 
 ### wfm_demod
 
