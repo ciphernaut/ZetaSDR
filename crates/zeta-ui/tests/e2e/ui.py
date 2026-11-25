@@ -6667,6 +6667,7 @@ def scenario_submenus_stay_inside_the_viewport(page, url, secret):
         page.unroute("**/op", hold)
         for r in held:
             r.continue_()
+    still_menu(menu)
     vw, vh = page.evaluate("[innerWidth, innerHeight]")
     m, o, sb = menu.bounding_box(), opener.bounding_box(), listen.bounding_box()
     assert m["y"] + m["height"] <= vh + 0.5, f"menu {m} past the bottom {vh}"
@@ -6713,6 +6714,7 @@ def scenario_submenus_stay_inside_the_viewport(page, url, secret):
     run_cmd(page, "view set dir rtl")
     expect(page.locator("html")).to_have_attribute("dir", "rtl")
     menu = drag_menu(page)
+    still_menu(menu)
     place_menu(left=500)
     opener.hover()
     expect(listen).to_be_visible()
