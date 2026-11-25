@@ -10,6 +10,7 @@ use crate::classify::{Classification, Label, Measurement, Outcome};
 use crate::modes::score::{Scored, allocation_term, passed_over, score_demodulators, score_rows};
 use crate::modes::weights::Weights;
 use crate::modes::{CenterRule, Decoder, LoadedMode, ModeRegistry, WidthRule};
+use crate::port::Tuning;
 use crate::types::{Hz, Selection};
 
 /// How far the choice is settled: `proved` by a decode passing its row's own rule,
@@ -84,8 +85,8 @@ pub struct Choice {
     pub evidence: Vec<String>,
     #[schemars(required, schema_with = "crate::types::nullable::<Alternative>")]
     pub runner_up: Option<Alternative>,
-    /// The ready decoder rows that fit the label, the band and the width, in score order:
-    /// what a later step could still prove.
+    /// The ready decoder rows that fit the label and the width, and whose own band the
+    /// capture holds, in score order: what a later step could still prove.
     pub could_prove: Vec<String>,
     pub not_tried: Vec<NotTried>,
     /// Why the choice cannot tell; `null` otherwise.
@@ -111,12 +112,18 @@ pub(crate) fn catalogue_entry(label: &Label) -> Option<&str> {
 /// the best ready decoder row that fits; otherwise `cannot_tell`. Ranked by `weights`
 /// (the catalogue only ranks, at `weights.catalogue`); a plan channel of `region` at the
 /// measured centre gives the deviation, and the width when the measured one is distrusted.
+///
+/// A decoder row is tried at its own band ([`job_for`]), not the box's: a box narrower
+/// than the row still lists it. With `capture` (the ring's centre and rate) a ready
+/// decoder row whose band reaches past the capture is not tried ([`not_held`]); `None`
+/// tests no capture.
 pub fn choose_now(
     modes: &ModeRegistry,
     weights: &Weights,
     c: &Classification,
     sel: &Selection,
     region: &str,
+    capture: Option<(Hz, Hz)>,
 ) -> Choice {
     let Some(m) = c.measurement.as_ref() else {
         return cannot_tell(
@@ -148,8 +155,8 @@ pub fn choose_now(
         .iter()
         .find(|t| t.outcome == Outcome::Proved)
         .and_then(|t| modes.get(&t.mode));
-    // The decoder rows a later step could prove: they fit the label, the band and the
-    // width, and are not the row already proved.
+    // The decoder rows a later step could prove: they fit the label and the width, and
+    // are not the row already proved.
     let at = (center_hz, bandwidth_hz, label);
     let decoders = score_rows(
         weights,
@@ -166,11 +173,15 @@ pub fn choose_now(
             s.in_range
                 && s.fits_width
                 && s.fits_label
-                && s.mode.row.band.fits(sel.bandwidth_hz.0)
                 && !passed_over(s.mode, None)
                 && proved.is_none_or(|p| p.row.id != s.mode.row.id)
         })
         .partition(|s| s.mode.startable());
+    // A ready row is tried at its own band: one the capture does not hold is not tried.
+    let held = |s: &&Scored| {
+        capture.is_none_or(|cap| capture_holds(cap, job_band(&job_for(s.mode, m, sel, region))))
+    };
+    let (ready, outside): (Vec<&Scored>, Vec<&Scored>) = ready.into_iter().partition(held);
     // An `fsk` wider than a row's `voice_max_hz` is data, not a weak FM voice: the row
     // (`fm_demod`'s 25 kHz) does not serve it.
     let fsk_data = |row: &LoadedMode| {
@@ -201,6 +212,11 @@ pub fn choose_now(
         .iter()
         .chain(&unready_demods)
         .map(|s| not_ready(s.mode))
+        .chain(
+            outside
+                .iter()
+                .map(|s| not_held(&job_for(s.mode, m, sel, region))),
+        )
         .collect();
     // The catalogue's names for the entries `row` lists: the catalogue is evidence for
     // a row only through them.
@@ -300,6 +316,89 @@ fn not_ready(row: &LoadedMode) -> NotTried {
         row: Some(id.clone()),
         reason: format!("not tried: {id} is not ready: {why}"),
     }
+}
+
+/// How [`not_held`]'s reason starts.
+pub const NOT_HELD_LEAD: &str = "not tried: the capture does not hold ";
+
+/// `not tried: the capture does not hold <row>'s <width> Hz here`, for a decoder row
+/// whose own band `job` reaches past the capture.
+fn not_held(job: &ChoiceJob) -> NotTried {
+    NotTried {
+        row: Some(job.kind.clone()),
+        reason: format!(
+            "{NOT_HELD_LEAD}{}'s {} Hz here",
+            job.kind, job.bandwidth_hz.0
+        ),
+    }
+}
+
+/// A job's band.
+pub(crate) fn job_band(job: &ChoiceJob) -> Tuning {
+    Tuning {
+        center_hz: job.center_hz,
+        bandwidth_hz: job.bandwidth_hz,
+    }
+}
+
+/// Whether `band` lies inside a capture centred `center` holding `rate` Hz, touching an
+/// edge counting as inside (the band cutter's own test, [`crate::cut::BandCutter`]):
+/// worked doubled, so an odd width is exact.
+pub(crate) fn capture_holds((center, rate): (Hz, Hz), band: Tuning) -> bool {
+    let (c, w) = (
+        i128::from(band.center_hz.0),
+        i128::from(band.bandwidth_hz.0),
+    );
+    let (cc, cw) = (i128::from(center.0), i128::from(rate.0));
+    2 * c - w >= 2 * cc - cw && 2 * c + w <= 2 * cc + cw
+}
+
+/// The smallest band holding every band of `bands`; `None` for none. Its centre is
+/// whole Hz, so an odd span is widened by a hertz rather than cut short.
+pub(crate) fn union_band(bands: impl IntoIterator<Item = Tuning>) -> Option<Tuning> {
+    // Doubled edges: a band (c, w) spans [2c - w, 2c + w].
+    let (lo, hi) = bands
+        .into_iter()
+        .fold(None, |acc: Option<(i128, i128)>, b| {
+            let (c, w) = (i128::from(b.center_hz.0), i128::from(b.bandwidth_hz.0));
+            let (l, h) = (2 * c - w, 2 * c + w);
+            Some(acc.map_or((l, h), |(lo, hi)| (lo.min(l), hi.max(h))))
+        })?;
+    let c = (lo + hi).div_euclid(4);
+    let w = (hi - 2 * c).max(2 * c - lo);
+    Some(Tuning {
+        center_hz: Hz(u64::try_from(c).ok()?),
+        bandwidth_hz: Hz(u64::try_from(w).ok()?),
+    })
+}
+
+/// The band step 2's slice is cut to: the smallest band holding every `could_prove`
+/// row's own band ([`job_for`] for the measurement `m` in `sel`); `None` when no row
+/// is listed (or none is in `modes`).
+pub(crate) fn trial_band(
+    modes: &ModeRegistry,
+    choice: &Choice,
+    m: &Measurement,
+    sel: &Selection,
+    region: &str,
+) -> Option<Tuning> {
+    union_band(trial_bands(modes, choice, m, sel, region))
+}
+
+/// Each `could_prove` row's own band ([`job_for`]), in order; rows not in `modes` left out.
+pub(crate) fn trial_bands(
+    modes: &ModeRegistry,
+    choice: &Choice,
+    m: &Measurement,
+    sel: &Selection,
+    region: &str,
+) -> Vec<Tuning> {
+    choice
+        .could_prove
+        .iter()
+        .filter_map(|row| modes.get(row))
+        .map(|row| job_band(&job_for(row, m, sel, region)))
+        .collect()
 }
 
 /// The job of `row` for the band `m` measured in `sel` (design 5.1): a demodulator row
@@ -457,6 +556,45 @@ mod tests {
             .0
     }
 
+    fn band(center_hz: u64, bandwidth_hz: u64) -> Tuning {
+        Tuning {
+            center_hz: Hz(center_hz),
+            bandwidth_hz: Hz(bandwidth_hz),
+        }
+    }
+
+    /// The union of bands holds each whole, at a whole-Hz centre; none is no band.
+    #[test]
+    fn the_trial_band_is_the_smallest_holding_every_band() {
+        assert_eq!(union_band([]), None);
+        assert_eq!(union_band([band(1_000, 100)]), Some(band(1_000, 100)));
+        // 950-1050 and 1000-1200: 950-1200.
+        assert_eq!(
+            union_band([band(1_000, 100), band(1_100, 200)]),
+            Some(band(1_075, 250))
+        );
+        // An odd span (0-3 Hz) cannot be centred on a whole hertz: widened by one.
+        let u = union_band([band(1, 2), band(2, 2)]).unwrap();
+        assert_eq!(u, band(1, 4));
+        for b in [band(1, 2), band(2, 2)] {
+            assert!(
+                capture_holds((u.center_hz, u.bandwidth_hz), b),
+                "{u:?} {b:?}"
+            );
+        }
+    }
+
+    /// A band touching the capture's edge is held; one hertz past it is not.
+    #[test]
+    fn a_capture_holds_a_band_up_to_its_edges() {
+        let cap = (Hz(1_000_000), Hz(48_000));
+        assert!(capture_holds(cap, band(1_000_000, 48_000)));
+        assert!(capture_holds(cap, band(1_024_000 - 6_250, 12_500)));
+        assert!(!capture_holds(cap, band(1_024_000 - 6_249, 12_500)));
+        assert!(!capture_holds(cap, band(976_000 + 6_249, 12_500)));
+        assert!(!capture_holds(cap, band(1_000_000, 48_001)));
+    }
+
     #[test]
     fn a_trusted_width_is_scaled_and_floored() {
         let sel = box_at(OFF_PLAN_HZ, 50_000);
@@ -534,7 +672,8 @@ mod tests {
             ..Classification::default()
         };
         let sel = box_at(VDL2_HZ, 25_000);
-        let choose = |modes: &ModeRegistry| choose_now(modes, modes.weights(), &c, &sel, "AU");
+        let choose =
+            |modes: &ModeRegistry| choose_now(modes, modes.weights(), &c, &sel, "AU", None);
         modes.set_program("vdl2_decode", None, Some("vdl2: missing".into()));
         let onair = Some("onair-rx: missing".into());
         modes.set_handler_program("vdl2_decode", "onair", None, onair);
@@ -566,7 +705,7 @@ mod tests {
             ..Classification::default()
         };
         let sel = box_at(OFF_PLAN_HZ, 12_500);
-        let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU");
+        let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU", None);
         assert_eq!(choice.reason.as_deref(), Some("no row serves carrier"));
         assert!(choice.job.is_none() && choice.row.is_none(), "{choice:?}");
         assert_eq!(choice.evidence, ["layer 1: carrier 50 Hz"]);
@@ -607,7 +746,14 @@ mod tests {
             measurement: Some(measured(label, center_hz, bandwidth_hz, None)),
             ..Classification::default()
         };
-        choose_now(modes, modes.weights(), &c, &box_at(center_hz, box_hz), "AU")
+        choose_now(
+            modes,
+            modes.weights(),
+            &c,
+            &box_at(center_hz, box_hz),
+            "AU",
+            None,
+        )
     }
 
     /// A radiosonde decoder row (fm and fsk, 12500 Hz) moved to 433-435 MHz.

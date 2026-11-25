@@ -78,7 +78,7 @@ use tokio_util::sync::CancellationToken;
 use super::choose::{StepOne, choose_record};
 use super::persist::now;
 use super::{ChooseAsk, Inner, Node, source_fault_reason};
-use crate::choice::{Choice, ChoiceJob, Settled, choose_now};
+use crate::choice::{Choice, ChoiceJob, Settled};
 use crate::choice_policy::Surface;
 use crate::graph::{self, Graph, Node as GraphNode};
 use crate::job::{Hold, JOB_RECORD_FORMAT, JobRecord, JobState};
@@ -844,9 +844,10 @@ struct Classifying {
 }
 
 /// Step 1 of the choice for `band` of `source` over the newest `slice_s` of its ring, in
-/// its own task (a plain function, as [`attach_task`]): the answer with what it read
-/// (handed to the watch's `choose` child, which then classifies nothing again), or why
-/// the band was not classified.
+/// its own task (a plain function, as [`attach_task`]): the answer with what step 2 keeps
+/// of what it read, cut to the trial band ([`StepOne::chosen`]; handed to the watch's
+/// `choose` child, which then classifies nothing again), or why the band was not
+/// classified.
 fn classify_task(
     inner: &Arc<Inner>,
     source: &SourceId,
@@ -862,17 +863,16 @@ fn classify_task(
         let (classified, samples, rate, ring_center) = crate::ops::classify_samples(&node, &sel)
             .await
             .map_err(|e| e.to_string())?;
-        let modes = inner.modes();
-        let choice = choose_now(&modes, modes.weights(), &classified, &sel, &inner.region());
-        Ok(StepOne {
-            sel,
-            held_ns,
-            classified,
-            samples,
-            rate,
-            ring_center,
-            choice,
-        })
+        // The watch's own `choose` climbs to the policy's step for the watch.
+        let climb = inner
+            .choice_policy
+            .lock()
+            .unwrap()
+            .steps(Surface::Watch, None)
+            .0
+            >= 2;
+        let block = (samples, rate, ring_center);
+        Ok(StepOne::chosen(&node, (sel, held_ns, climb), classified, block).await)
     })
 }
 

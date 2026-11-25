@@ -1245,12 +1245,15 @@ async fn capture_decode_replays_a_ring_slice() {
         center_hz: Hz(APRS_CENTER_HZ),
         bandwidth_hz: Hz(APRS_BAND_HZ),
     };
+    let band = zeta_core::port::Tuning {
+        center_hz: sel.center_hz,
+        bandwidth_hz: sel.bandwidth_hz,
+    };
     let rec = zeta_core::ops::write_ring_slice(
         &node.bursts(),
         &sel,
-        &iq,
-        Hz(APRS_RATE_HZ as u64),
-        Hz(APRS_CENTER_HZ + 10_000),
+        band,
+        (&iq, Hz(APRS_RATE_HZ as u64), Hz(APRS_CENTER_HZ + 10_000)),
         None,
     )
     .unwrap();
@@ -1262,4 +1265,59 @@ async fn capture_decode_replays_a_ring_slice() {
         "{}",
         job.context
     );
+}
+
+/// A replay at a band of its own (a `choose`'s step 2 replaying a row at the row's band)
+/// runs at that band when the recording holds it, and is refused, naming both, when the
+/// band reaches past the recording, even by a hertz.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test]
+async fn a_capture_decode_with_a_band_outside_the_recording_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _radio) = open(dir.path()).await;
+    let ids = write_aprs(&node, 1);
+    let at = |center_hz: u64, bandwidth_hz: u64| Tuning {
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(bandwidth_hz),
+    };
+    let half = APRS_BAND_HZ / 2;
+    for band in [
+        at(APRS_CENTER_HZ + 1, APRS_BAND_HZ),
+        at(APRS_CENTER_HZ, APRS_BAND_HZ + 2),
+        at(APRS_CENTER_HZ + half + 10_000, APRS_BAND_HZ),
+    ] {
+        let e = node
+            .debug_capture_decode_at(&ids[0], APRS, band)
+            .await
+            .expect_err("a band past the recording is refused");
+        let lo = band.center_hz.0 - band.bandwidth_hz.0 / 2;
+        let want = format!(
+            "{APRS} at {lo}–{} Hz reaches past the recording's {}–{} Hz",
+            lo + band.bandwidth_hz.0,
+            APRS_CENTER_HZ - half,
+            APRS_CENTER_HZ + half
+        );
+        assert!(e.to_string().contains(&want), "{e} / {want}");
+    }
+    assert!(
+        node.job_list().iter().all(|r| r.replay.is_none()),
+        "a refused replay left a record"
+    );
+    // Inside it (narrower, off the record's centre): the replay runs at that band.
+    let inside = at(APRS_CENTER_HZ + 1_000, 10_000);
+    let id = node
+        .debug_capture_decode_at(&ids[0], APRS, inside)
+        .await
+        .expect("a band inside the recording replays");
+    assert_eq!(record(&node, &id).tuning, inside);
+    let channel = record(&node, &id)
+        .graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "channel")
+        .map(|n| n.params.clone())
+        .expect("the row's channel stage");
+    assert_eq!(channel["center_hz"], inside.center_hz.0, "{channel}");
+    assert_eq!(channel["bandwidth_hz"], inside.bandwidth_hz.0, "{channel}");
+    until_stopped(&node, &id, Duration::from_secs(20)).await;
 }

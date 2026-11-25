@@ -2642,8 +2642,6 @@ impl Node {
     }
 
     /// The band cutter [`Node::set_cutter`] installed; `None` when none was.
-    // Only the tests read it until the trial slice is cut with it (plan 49, task C5).
-    #[cfg_attr(not(any(test, feature = "test-fixtures")), allow(dead_code))]
     pub(crate) fn cutter(&self) -> Option<Arc<dyn BandCutter>> {
         self.inner.cutter.read().unwrap().clone()
     }
@@ -3117,12 +3115,14 @@ impl Node {
         handler: Option<&str>,
         packets: bool,
     ) -> Result<JobId, NodeError> {
-        self.capture_decode_owned(capture, kind, handler, packets, None)
+        self.capture_decode_owned(capture, kind, handler, packets, None, None)
             .await
     }
 
     /// [`Node::capture_decode`] with the record's `owner`: a controller's (a `choose`'s
-    /// trial), so the replay is the owner's to stop and goes once it ends.
+    /// trial), so the replay is the owner's to stop and goes once it ends; and with
+    /// `band`, the row expanded at that band (a trial's row at its own band) instead of
+    /// the first capture's. A band reaching past the first capture's is refused.
     pub(crate) async fn capture_decode_owned(
         &self,
         capture: &str,
@@ -3130,6 +3130,7 @@ impl Node {
         handler: Option<&str>,
         packets: bool,
         owner: Option<JobId>,
+        band: Option<Tuning>,
     ) -> Result<JobId, NodeError> {
         let set = capture_set(&self.bursts(), capture)?;
         let (first, last) = (&set[0], &set[set.len() - 1]);
@@ -3159,10 +3160,26 @@ impl Node {
         let resolved = k
             .start_handler(handler, &needs, &modes, &self.handler_policy())
             .map_err(NodeError::Expand)?;
-        let tuning = Tuning {
+        let recorded = Tuning {
             center_hz: first.center_hz,
             bandwidth_hz: first.bandwidth_hz,
         };
+        let tuning = band.unwrap_or(recorded);
+        if !crate::choice::capture_holds((recorded.center_hz, recorded.bandwidth_hz), tuning) {
+            let edges = |t: Tuning| {
+                let half = t.bandwidth_hz.0 / 2;
+                (
+                    t.center_hz.0.saturating_sub(half),
+                    t.center_hz.0 + (t.bandwidth_hz.0 - half),
+                )
+            };
+            let ((lo, hi), (rlo, rhi)) = (edges(tuning), edges(recorded));
+            return Err(NodeError::Expand(OpError::Other {
+                message: format!(
+                    "{kind} at {lo}–{hi} Hz reaches past the recording's {rlo}–{rhi} Hz"
+                ),
+            }));
+        }
         let mut graph = k
             .expand_voiced(
                 &SourceId(NODE_SOURCE.into()),
@@ -3839,6 +3856,19 @@ impl Node {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub async fn debug_restart_guard(&self, id: &JobId) -> Option<OwnedMutexGuard<()>> {
         self.inner.restart_guard(id).await
+    }
+
+    /// A `capture_decode` of `capture` through `kind` at `band`, as a `choose`'s step 2
+    /// replays a row ([`Node::capture_decode_owned`]), for tests.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub async fn debug_capture_decode_at(
+        &self,
+        capture: &str,
+        kind: &str,
+        band: Tuning,
+    ) -> Result<JobId, NodeError> {
+        self.capture_decode_owned(capture, kind, None, false, None, Some(band))
+            .await
     }
 
     /// [`Node::cutter`], for tests of what the node was given.

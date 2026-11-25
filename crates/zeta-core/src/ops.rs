@@ -8920,10 +8920,16 @@ pub(crate) async fn classify_samples(
 /// choose the band's job from the answer (step 1). A row proved on the band supersedes
 /// the accepted signatures it overlaps.
 async fn classify(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
-    let (classified, ..) = classify_samples(node, &sel).await?;
+    let (classified, _, rate, center) = classify_samples(node, &sel).await?;
     let modes = node.modes();
-    let choice =
-        crate::choice::choose_now(&modes, modes.weights(), &classified, &sel, &node.region());
+    let choice = crate::choice::choose_now(
+        &modes,
+        modes.weights(),
+        &classified,
+        &sel,
+        &node.region(),
+        Some((center, rate)),
+    );
     let Classification {
         labels,
         tried,
@@ -9012,8 +9018,12 @@ async fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     let (rate, center, samples) = ring_samples(node, &sel)?;
     let count = samples.len();
     let store = node.bursts();
+    let band = Tuning {
+        center_hz: sel.center_hz,
+        bandwidth_hz: sel.bandwidth_hz,
+    };
     let rec = tokio::task::spawn_blocking(move || {
-        write_ring_slice(&store, &sel, &samples, rate, center, None)
+        write_ring_slice(&store, &sel, band, (&samples, rate, center), None)
     })
     .await
     .map_err(other)??;
@@ -9028,27 +9038,28 @@ async fn iq_read(node: &Node, sel: Selection) -> Result<OpResult, OpError> {
     })
 }
 
-/// Store the ring's `samples` (at `rate`, centred on `ring_center`) for the selection
-/// `sel` as a capture of the burst store: the record's band is the selection's, the file
-/// keeps the ring's centre, so the reading side extracts the band from it. It has a
-/// fresh `set` and `job` of its own, so replaying it replays this slice alone. A trial
-/// slice, written into its `trial` reservation ([`crate::bursts::BurstStore::write_trial`]),
-/// counts against the burst policy's trial quota instead of the operator's budget and is
-/// stored pinned. It writes files: call it off the runtime's workers.
+/// Store `samples` (at `rate`, centred on `file_center`) read over the selection `sel`
+/// as a capture of the burst store: the record's band is `band` (`iq_read`'s the
+/// selection's, a trial slice's the band its rows are tried at), the file keeps
+/// `file_center` (the ring's, or the band a cut slice was cut to), so the reading side
+/// extracts the band from it. It has a fresh `set` and `job` of its own, so replaying it
+/// replays this slice alone. A trial slice, written into its `trial` reservation
+/// ([`crate::bursts::BurstStore::write_trial`]), counts against the burst policy's trial
+/// quota instead of the operator's budget and is stored pinned. It writes files: call it
+/// off the runtime's workers.
 pub fn write_ring_slice(
     store: &crate::bursts::BurstStore,
     sel: &Selection,
-    samples: &[Complex<f32>],
-    rate: Hz,
-    ring_center: Hz,
+    band: Tuning,
+    (samples, rate, file_center): (&[Complex<f32>], Hz, Hz),
     trial: Option<crate::bursts::TrialReservation>,
 ) -> Result<crate::bursts::CaptureRecord, OpError> {
     let span_ns = samples.len() as u64 * 1_000_000_000 / rate.0.max(1);
     let new = crate::bursts::NewCapture {
         source: sel.source.clone(),
         set: JobId(ulid::Ulid::generate().to_string()),
-        center_hz: sel.center_hz,
-        bandwidth_hz: sel.bandwidth_hz,
+        center_hz: band.center_hz,
+        bandwidth_hz: band.bandwidth_hz,
         sample_rate_hz: rate,
         start_ns: sel.span.start_ns.0,
         end_ns: sel.span.start_ns.0 + span_ns,
@@ -9057,7 +9068,7 @@ pub fn write_ring_slice(
         job: JobId(ulid::Ulid::generate().to_string()),
         watch: None,
         allocations: serde_json::json!([]),
-        file_center_hz: Some(ring_center),
+        file_center_hz: Some(file_center),
         trial: trial.is_some(),
     };
     match trial {

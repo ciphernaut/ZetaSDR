@@ -97,11 +97,22 @@ async fn node_with(
 async fn node_opts(
     dir: &Path,
     iq: &[Complex<f32>],
+    at: (u64, f64, u64),
+    tune_range: Option<(Hz, Hz)>,
+) -> Node {
+    node_rated(dir, iq, RATE_HZ, at, tune_range).await
+}
+
+/// [`node_opts`] over `iq` sampled at `rate_hz`.
+async fn node_rated(
+    dir: &Path,
+    iq: &[Complex<f32>],
+    rate_hz: u32,
     (center_hz, ring_seconds, trial_keep_bytes): (u64, f64, u64),
     tune_range: Option<(Hz, Hz)>,
 ) -> Node {
     let meta = CaptureMeta {
-        sample_rate_hz: Hz(RATE_HZ as u64),
+        sample_rate_hz: Hz(rate_hz as u64),
         center_hz: Hz(center_hz),
         start: Timestamp(0),
         annotations: Vec::new(),
@@ -109,7 +120,7 @@ async fn node_opts(
     let meta = write_cf32(dir, "fixture", &meta, iq).expect("write fixture");
     let opts = FileOpts {
         realtime: true,
-        block_samples: (RATE_HZ / 10) as usize,
+        block_samples: (rate_hz / 10) as usize,
         repeat: true,
         tune_range,
     };
@@ -513,10 +524,11 @@ async fn a_trial_slice_is_unpinned_when_choose_ends() {
     let t = trials(&node);
     assert_eq!(t.len(), 1, "{t:?}");
     assert!(!t[0].pinned, "{t:?}");
-    // The slice is the job's band of the source.
+    // The slice is of the source, its band the band its rows are tried at: the digital
+    // voice rows' 12.5 kHz on the centre layer 1 measured, not the job's box.
     assert_eq!(t[0].source, rx());
-    assert_eq!(t[0].center_hz, Hz(DMR_HZ));
-    assert_eq!(t[0].bandwidth_hz, Hz(20_000));
+    assert!(t[0].center_hz.0.abs_diff(DMR_HZ) < 1_000, "{t:?}");
+    assert_eq!(t[0].bandwidth_hz, Hz(12_500));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1501,20 +1513,16 @@ async fn share_skips_a_band_no_capture_covers() {
     let v = &ctx["verdict"];
     assert_eq!(v["row"], "fm_demod", "{v}");
     assert_eq!(v["settled"], "best_guess", "{v}");
-    let could: Vec<&str> = v["could_prove"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
-    assert!(could.contains(&"dmr_decode"), "{v}");
-    // Each row that could prove otherwise is not tried, and no trial job ran.
-    for row in &could {
+    // The digital voice rows' channel reaches past the capture: step 1 sets them aside,
+    // and under `share` step 3 does not try them; no trial job ran.
+    assert_eq!(v["could_prove"], serde_json::json!([]), "{v}");
+    for row in ["dmr_decode", "p25_decode", "m17_decode"] {
+        let why = format!("not tried: the capture does not hold {row}'s 12500 Hz here");
         let n = v["not_tried"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|n| n["row"] == *row && n["reason"] == NOT_COVERED);
+            .find(|n| n["row"] == row && n["reason"] == why.as_str());
         assert!(n.is_some(), "{row}: {v}");
     }
     assert!(live_trials(&ctx).is_empty(), "{ctx:#}");
@@ -1834,4 +1842,342 @@ async fn a_stopped_transient_choose_leaves_no_history() {
             .join(format!("{}.json", id.0))
             .exists()
     );
+}
+
+/// The trial capture the `choose` context `ctx` names (still in the store, unpinned).
+fn slice_of(node: &Node, ctx: &Value) -> zeta_core::bursts::CaptureRecord {
+    let id = ctx["slice"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no slice: {ctx:#}"));
+    node.bursts()
+        .list()
+        .into_iter()
+        .find(|r| r.id == id)
+        .unwrap_or_else(|| panic!("the slice {id} in the store"))
+}
+
+/// The centre the capture `rec`'s file is sampled about (its SigMF meta's).
+fn file_center(rec: &zeta_core::bursts::CaptureRecord) -> u64 {
+    let meta: Value = serde_json::from_str(&std::fs::read_to_string(&rec.meta_path).unwrap())
+        .expect("the slice's meta reads");
+    meta["captures"][0]["core:frequency"]
+        .as_f64()
+        .expect("a centre") as u64
+}
+
+/// The band cutter the binary installs, on `node`.
+fn cut_on(node: &Node) {
+    node.set_cutter(Arc::new(zeta_dsp::channel::Cutter));
+}
+
+/// The `not_tried` reasons of a choice.
+fn notes(choice: &Value) -> Vec<&str> {
+    choice["not_tried"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["reason"].as_str())
+        .collect()
+}
+
+/// Step 2 replays a row at its own band on the measured centre, not at the box: a 12 kHz
+/// box set 1 kHz off the call replays `dmr_decode` 12.5 kHz wide on the centre layer 1
+/// measured, from a slice whose record is that band and whose file is centred on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_runs_at_its_rows_band_on_the_measured_centre() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    cut_on(&node);
+    let mut feed = feed(&node);
+    let box_hz = DMR_HZ + 1_000;
+    let id = start(
+        &node,
+        choose_op(box_hz, 12_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let mut replay = None;
+    until("the DMR replay runs", ENDS_WITHIN, || {
+        replay = replays(&node).into_iter().find(|r| r.kind == "dmr_decode");
+        replay.is_some()
+    })
+    .await;
+    let replay = replay.unwrap();
+    let ctx = ended(&node, &id).await;
+    let ev = events(&mut feed, &id);
+    let measured = ev[0]["choice"]["job"]["center_hz"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("step 1's job: {ev:#?}"));
+    assert_ne!(measured, box_hz, "{ev:#?}");
+    let channel = replay
+        .graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "channel")
+        .map(|n| n.params.clone())
+        .expect("the row's channel stage");
+    assert_eq!(channel["bandwidth_hz"], 12_500, "{channel}");
+    assert_eq!(channel["center_hz"], measured, "{channel}");
+    assert_eq!(
+        (replay.tuning.center_hz, replay.tuning.bandwidth_hz),
+        (Hz(measured), Hz(12_500))
+    );
+    let slice = slice_of(&node, &ctx);
+    assert_eq!(
+        (slice.center_hz, slice.bandwidth_hz),
+        (Hz(measured), Hz(12_500))
+    );
+    assert_eq!(file_center(&slice), measured);
+    let v = &ctx["verdict"];
+    assert_eq!(
+        (v["row"].as_str(), v["step"].as_u64()),
+        (Some("dmr_decode"), Some(2)),
+        "{v}"
+    );
+    assert_eq!(v["job"]["center_hz"], measured, "{v}");
+}
+
+/// The ring rate of [`a_slice_on_a_wide_capture_is_cut_and_step_two_runs`]: a wide
+/// capture, of which a narrowband trial slice at the full rate would be far over the
+/// trial quota (about 160 MB a second against 64 MiB).
+const WIDE_RATE_HZ: u32 = 20_000_000;
+
+/// At a ring rate of 20 MS/s the trial slice is cut to the DMR row's band: 2 s of it at
+/// 50 kS/s (the lowest exact divisor of the ring's rate holding the band) is under
+/// 1 MiB, so the default trial quota holds it whole and step 2 runs and proves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slice_on_a_wide_capture_is_cut_and_step_two_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    // The call 3 MHz off the capture's centre.
+    let offset_hz = 3_000_000.0;
+    let params = serde_json::json!({
+        "family": "dmr", "color_code": 5, "src": 9990001, "dst": 9990, "superframes": 6,
+        "offset_hz": offset_hz,
+    });
+    let (spec, imp) = zeta_dsp::synth::parse_params(params.as_object().unwrap().clone()).unwrap();
+    let ring_center = DMR_HZ - offset_hz as u64;
+    let mut iq = zeta_dsp::synth::synthesise(&spec, &imp, WIDE_RATE_HZ, ring_center);
+    awgn(&mut iq, 25.0, 13);
+    let node = node_rated(
+        dir.path(),
+        &iq,
+        WIDE_RATE_HZ,
+        (ring_center, 3.0, u64::MAX),
+        None,
+    )
+    .await;
+    drop(iq);
+    cut_on(&node);
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(v["steps_run"], serde_json::json!([1, 2]), "{v}");
+    assert_eq!(
+        (v["row"].as_str(), v["step"].as_u64()),
+        (Some("dmr_decode"), Some(2)),
+        "{v}"
+    );
+    let slice = slice_of(&node, &ctx);
+    assert_eq!(slice.sample_rate_hz, Hz(50_000), "{slice:?}");
+    assert!(slice.bytes < 1 << 20, "{slice:?}");
+    let held_ns = slice.end_ns - slice.start_ns;
+    assert!(
+        (1_900_000_000..=2_000_000_000).contains(&held_ns),
+        "{slice:?}"
+    );
+    assert_eq!(file_center(&slice), slice.center_hz.0, "{slice:?}");
+}
+
+/// A row as wide as the capture gains nothing by the cut: `rds_decode`'s 200 kHz in a
+/// 240 kS/s capture is cut at the capture's own rate, and a trial quota under a second
+/// of it still refuses the slice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_as_wide_as_the_capture_is_still_refused_by_the_quota() {
+    const BROADCAST_RATE_HZ: u32 = 240_000;
+    const STATION_HZ: u64 = 104_900_000;
+    let dir = tempfile::tempdir().unwrap();
+    // A stereo programme with no RDS: nothing proves the RDS row at step 1.
+    let n = BROADCAST_RATE_HZ as usize * 3;
+    let audio = zeta_dsp::synth::tone(BROADCAST_RATE_HZ, n, 1_000.0, 0.9);
+    let mut iq =
+        zeta_dsp::synth::wfm_stereo_modulate(&audio, &audio, BROADCAST_RATE_HZ, 75_000.0, 0.1);
+    awgn(&mut iq, 20.0, 21);
+    let second = BROADCAST_RATE_HZ as u64 * 8;
+    let node = node_rated(
+        dir.path(),
+        &iq,
+        BROADCAST_RATE_HZ,
+        (STATION_HZ, 10.0, second * 9 / 10),
+        None,
+    )
+    .await;
+    cut_on(&node);
+    let id = start(
+        &node,
+        choose_op(STATION_HZ, 200_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    let could: Vec<&str> = v["could_prove"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(could.contains(&"rds_decode"), "{v}");
+    assert!(
+        notes(v).contains(&"not tried: the slice exceeds the trial quota"),
+        "{v}"
+    );
+    assert_eq!(v["steps_run"], serde_json::json!([1]), "{v}");
+    assert!(trials(&node).is_empty(), "{:?}", node.bursts().list());
+}
+
+/// With no cutter installed the slice is the ring's block, at its rate and centre, as
+/// before the cutter; its record is the row's band, and step 2 still proves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_cutter_the_slice_is_at_the_ring_rate() {
+    const RING_RATE_HZ: u32 = 240_000;
+    let dir = tempfile::tempdir().unwrap();
+    let offset_hz = 40_000.0;
+    let params = serde_json::json!({
+        "family": "dmr", "color_code": 5, "src": 9990001, "dst": 9990, "superframes": 6,
+        "offset_hz": offset_hz,
+    });
+    let (spec, imp) = zeta_dsp::synth::parse_params(params.as_object().unwrap().clone()).unwrap();
+    let ring_center = DMR_HZ - offset_hz as u64;
+    let mut iq = zeta_dsp::synth::synthesise(&spec, &imp, RING_RATE_HZ, ring_center);
+    awgn(&mut iq, 25.0, 13);
+    let node = node_rated(
+        dir.path(),
+        &iq,
+        RING_RATE_HZ,
+        (ring_center, 10.0, u64::MAX),
+        None,
+    )
+    .await;
+    assert!(node.debug_cutter().is_none());
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let ctx = ended(&node, &id).await;
+    let v = &ctx["verdict"];
+    assert_eq!(
+        (v["row"].as_str(), v["step"].as_u64()),
+        (Some("dmr_decode"), Some(2)),
+        "{v}"
+    );
+    let slice = slice_of(&node, &ctx);
+    assert_eq!(slice.sample_rate_hz, Hz(RING_RATE_HZ as u64), "{slice:?}");
+    assert_eq!(file_center(&slice), ring_center, "{slice:?}");
+    assert_eq!(slice.bandwidth_hz, Hz(12_500), "{slice:?}");
+    let held_ns = slice.end_ns - slice.start_ns;
+    assert_eq!(
+        slice.bytes,
+        held_ns * RING_RATE_HZ as u64 / 1_000_000_000 * 8,
+        "{slice:?}"
+    );
+}
+
+/// The capture rate of [`every_checked_row_still_proves_through_a_cut_slice`]: 20 times
+/// 48 kS/s, so a narrowband row's slice is cut by decimation, not only moved.
+const CHECK_RATE_HZ: u32 = 960_000;
+
+/// How far off the capture's centre each row's signal is put, so the cut moves it.
+const CHECK_OFFSET_HZ: f64 = 100_000.0;
+
+/// Every built-in row with a synthesised check that the test node can run (an
+/// in-process decoder, its band inside the capture) still proves through a cut slice:
+/// its signal, 100 kHz off the centre of a 960 kS/s capture, is chosen up to step 2 on
+/// a box of the row's width, and the verdict is the row, proved. A row step 1 proves
+/// quickly needs no slice; one it does not is proved by its replay of the cut slice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_checked_row_still_proves_through_a_cut_slice() {
+    use zeta_core::modes::{Decoder, ModeRegistry, Role, TestSpec};
+    let mut reg = StageRegistry::new();
+    zeta_dsp::register_all(&mut reg);
+    let modes = ModeRegistry::load(&reg, None);
+    let mut through_step_two = Vec::new();
+    let mut checked = Vec::new();
+    for mode in modes.all() {
+        let row = &mode.row;
+        let Some(TestSpec::Synth(params)) = row.test.as_ref().map(|t| &t.kind) else {
+            continue;
+        };
+        let width = row
+            .test
+            .as_ref()
+            .and_then(|t| t.bandwidth_hz)
+            .unwrap_or(row.band.bandwidth_hz);
+        // A program row runs through `zeta-ext`, which this test node does not register.
+        let in_process = matches!(row.decoder, Some(Decoder::Graph { .. }));
+        if mode.role() != Role::Decoder
+            || !in_process
+            || !mode.startable()
+            || width * 2 > CHECK_RATE_HZ as u64
+        {
+            continue;
+        }
+        let mut params = params.clone();
+        params.insert("offset_hz".into(), CHECK_OFFSET_HZ.into());
+        let (spec, imp) = zeta_dsp::synth::parse_params(params).unwrap();
+        // The signal on the row's first centre, else inside its first range.
+        let signal_hz = row.band.centers_hz.first().copied().unwrap_or_else(|| {
+            row.band
+                .range_hz
+                .as_ref()
+                .and_then(|r| r.0.first())
+                .map_or(DMR_HZ, |&[lo, hi]| lo + (hi - lo) / 2)
+        });
+        let ring_center = signal_hz - CHECK_OFFSET_HZ as u64;
+        let mut iq = zeta_dsp::synth::synthesise(&spec, &imp, CHECK_RATE_HZ, ring_center);
+        // Loop the signal with a second of quiet between, as the check would see it.
+        iq.extend(std::iter::repeat_n(
+            Complex::new(0.0, 0.0),
+            CHECK_RATE_HZ as usize,
+        ));
+        awgn(&mut iq, 25.0, 13);
+        let dir = tempfile::tempdir().unwrap();
+        let node = node_rated(
+            dir.path(),
+            &iq,
+            CHECK_RATE_HZ,
+            (ring_center, 10.0, u64::MAX),
+            None,
+        )
+        .await;
+        cut_on(&node);
+        let id = start(
+            &node,
+            choose_op(signal_hz, width, serde_json::json!({"up_to": 2})),
+        )
+        .await;
+        let ctx = ended(&node, &id).await;
+        let v = &ctx["verdict"];
+        let id = row.id.0.as_str();
+        assert_eq!(v["row"].as_str(), Some(id), "{id}: {v}");
+        assert_eq!(v["settled"], "proved", "{id}: {v}");
+        if v["step"] == 2 {
+            let slice = slice_of(&node, &ctx);
+            assert!(
+                slice.sample_rate_hz.0 < CHECK_RATE_HZ as u64,
+                "{id}: {slice:?}"
+            );
+            through_step_two.push(id.to_string());
+        }
+        checked.push(id.to_string());
+    }
+    eprintln!("checked {checked:?}; through step 2 {through_step_two:?}");
+    for id in ["dmr_decode", "p25_decode", "m17_decode"] {
+        assert!(
+            through_step_two.iter().any(|r| r == id),
+            "{id}: {through_step_two:?}"
+        );
+    }
 }

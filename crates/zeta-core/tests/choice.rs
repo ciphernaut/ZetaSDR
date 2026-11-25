@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use num_complex::Complex;
 use zeta_core::capture::{CaptureMeta, write_cf32};
-use zeta_core::choice::{Choice, Settled};
-use zeta_core::classify::{FeatureRecord, Label};
+use zeta_core::choice::{Choice, NotTried, Settled, choose_now};
+use zeta_core::classify::{Classification, FeatureRecord, Label, Measurement};
+use zeta_core::modes::ModeRegistry;
 use zeta_core::node::{Node, NodeConfig};
 use zeta_core::ops::{Op, OpResult};
 use zeta_core::port::Port;
@@ -356,5 +357,127 @@ async fn a_range_only_catalogue_match_never_overturns_the_label() {
     assert!(
         !c.evidence.iter().any(|e| e.starts_with("catalogue: ")),
         "{c:?}"
+    );
+}
+
+/// A DMR channel's centre, inside the catalogue's DMR range and off any plan channel.
+const DMR_HZ: u64 = 439_100_000;
+
+/// Layer 1's measurement of a band `label`, `bandwidth_hz` wide at `center_hz`.
+fn measured(label: &str, center_hz: u64, bandwidth_hz: u64) -> Classification {
+    let features = FeatureRecord {
+        bandwidth_hz: Hz(bandwidth_hz),
+        center_hz: Hz(center_hz),
+        symbol_rate_baud: None,
+        snr_db: 20.0,
+        burst: false,
+        duty: None,
+        bursts: None,
+        burst_ms: None,
+        period_ms: None,
+        order: None,
+        tone_spacing_hz: None,
+        symbol_rate_line: None,
+        power99_hz: None,
+        audio_rms_hz: None,
+        ssb: None,
+    };
+    let label = Label {
+        layer: 1,
+        name: label.into(),
+        confidence: 0.6,
+        evidence: String::new(),
+    };
+    Classification {
+        measurement: Some(Measurement { features, label }),
+        ..Classification::default()
+    }
+}
+
+/// A box `bandwidth_hz` wide at `center_hz` on `rx`.
+fn box_at(center_hz: u64, bandwidth_hz: u64) -> Selection {
+    Selection {
+        source: SourceId("rx".into()),
+        span: Span {
+            start_ns: Timestamp(0),
+            end_ns: Timestamp(SPAN_NS),
+        },
+        center_hz: Hz(center_hz),
+        bandwidth_hz: Hz(bandwidth_hz),
+    }
+}
+
+/// The embedded rows, with every DSP stage registered (so the in-process decoders are
+/// ready), and the rows of `modes_dir`.
+fn registry(modes_dir: Option<&Path>) -> ModeRegistry {
+    let mut reg = StageRegistry::new();
+    zeta_dsp::register_all(&mut reg);
+    ModeRegistry::load(&reg, modes_dir)
+}
+
+/// A decoder row is tried at its own band, not the box's: a 12 kHz box on a 9 kHz FM
+/// signal lists the 12.5 kHz DMR row, and is not told the box is too narrow for it.
+#[test]
+fn a_box_narrower_than_a_row_still_lists_it() {
+    let modes = registry(None);
+    let c = measured("fm", DMR_HZ, 9_000);
+    let sel = box_at(DMR_HZ, 12_000);
+    let capture = Some((Hz(DMR_HZ), Hz(RATE_HZ as u64)));
+    let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU", capture);
+    eprintln!("{choice:?}");
+    assert!(
+        choice.could_prove.iter().any(|r| r == "dmr_decode"),
+        "{choice:?}"
+    );
+    assert!(
+        !choice
+            .not_tried
+            .iter()
+            .any(|n| n.row.as_deref() == Some("dmr_decode")),
+        "{choice:?}"
+    );
+}
+
+/// A row whose own band reaches past the capture is not tried, with the capture's
+/// reason; a narrower row on the same centre still is.
+#[test]
+fn a_row_the_capture_does_not_hold_is_not_tried_with_the_reason() {
+    // An operator's copy of the M17 row, 8 kHz wide: inside the capture where the
+    // 12.5 kHz rows are not.
+    let dir = tempfile::tempdir().unwrap();
+    let embedded = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modes/m17_decode.json");
+    let mut row: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(embedded).unwrap()).unwrap();
+    row["id"] = "m17_narrow".into();
+    row["band"]["bandwidth_hz"] = 8_000.into();
+    std::fs::write(dir.path().join("m17_narrow.json"), row.to_string()).unwrap();
+    let modes = registry(Some(dir.path()));
+    assert!(modes.get("m17_narrow").is_some_and(|m| m.startable()));
+    // The signal 5 kHz inside the capture's upper edge.
+    let ring_center = DMR_HZ;
+    let edge = ring_center + RATE_HZ as u64 / 2;
+    let center = edge - 5_000;
+    let c = measured("fm", center, 7_000);
+    let sel = box_at(center, 8_000);
+    let capture = Some((Hz(ring_center), Hz(RATE_HZ as u64)));
+    let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU", capture);
+    eprintln!("{choice:?}");
+    assert!(
+        choice.could_prove.iter().any(|r| r == "m17_narrow"),
+        "{choice:?}"
+    );
+    for wide in ["dmr_decode", "p25_decode", "m17_decode"] {
+        assert!(!choice.could_prove.iter().any(|r| r == wide), "{choice:?}");
+        let note = NotTried {
+            row: Some(wide.into()),
+            reason: format!("not tried: the capture does not hold {wide}'s 12500 Hz here"),
+        };
+        assert!(choice.not_tried.contains(&note), "{wide}: {choice:?}");
+    }
+    // With no capture to test against, every row is listed.
+    let free = choose_now(&modes, modes.weights(), &c, &sel, "AU", None);
+    assert!(
+        free.could_prove.iter().any(|r| r == "dmr_decode"),
+        "{free:?}"
     );
 }

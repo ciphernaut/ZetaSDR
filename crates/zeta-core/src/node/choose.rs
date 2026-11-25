@@ -2,27 +2,31 @@
 //! as far as its context's `choose.step` allows (the choice policy's step for the surface
 //! that asked, [`crate::choice_policy::ChoicePolicy::steps`]), taking no lease.
 //!
-//! Its selection is the job's band over the newest `budget.slice_s` seconds of the span
-//! it was asked (the page's box), else of the source's ring (what the ring holds, when
-//! less; a span the ring no longer holds is a `cannot_tell`). Step 1 classifies it at
-//! once, as `classify` does, and chooses ([`choose_now`]); a watch's own `choose` skips
-//! it, taking the watch's classification of the signal and the samples it read
-//! ([`StepOne`]), so the band is classified once. Step 2 writes the same slice into the
-//! burst store as a trial capture (pinned while the job runs) and replays it through the
-//! `could_prove` rows ([`replay_trials`]), at most `budget.concurrent` trials at once
-//! across every `choose` of the node ([`Inner::trial_slot`]), each judged by its row's
-//! identify rule within `budget.trial_s` in all; the first proof settles the job. A
-//! slice under 1 s, or one the trial quota cannot hold even shortened to 1 s beside the
-//! slices other chooses have pinned, is not tried, and `not_tried` says why. Step 3
-//! tries the rows still in `could_prove` on the live band, one at a time in score order
-//! within what is left of `budget.trial_s` ([`Inner::step_three`]), each holding one of
-//! the node's trial slots. Step 3's trials hold every slot but one between them (with
-//! one slot, that one), and a waiting replay is served before a waiting step-3 trial
-//! ([`TrialClass`]), so a new signal's replay does not queue behind another's dwell.
-//! Each step-3 trial runs as an ordinary job the `choose` owns, started only where
-//! a running capture already holds the row's band (lease setting `share`), or after
-//! growing a held capture to hold it, every holder keeping its band (`widen`). A trial's
-//! lease gives way to any foreground request that changes the capture.
+//! Its selection is the job's band over the newest `budget.slice_s` seconds of the span it
+//! was asked (the page's box), else of the source's ring (what the ring holds, when less; a
+//! span the ring no longer holds is a `cannot_tell`). Step 1 classifies it at once, as
+//! `classify` does, and chooses ([`choose_now`]); a watch's own `choose` skips it, taking
+//! the watch's classification of the signal and the samples it read ([`StepOne`]), so the
+//! band is classified once. Step 1 sets aside a decoder row whose own band reaches past the
+//! capture. Step 2 writes the same slice into the burst store as a trial capture (pinned
+//! while the job runs): its band is the trial band, the smallest holding every
+//! `could_prove` row's own band ([`trial_band`]), and with the node's band cutter the slice
+//! is cut to it at once ([`keep_for_trials`]), so a wide capture's slice is small. It
+//! replays the slice through each `could_prove` row at the row's own band on the measured
+//! centre ([`replay_trials`]), at most `budget.concurrent` trials at once across every
+//! `choose` of the node ([`Inner::trial_slot`]), each judged by its row's identify rule
+//! within `budget.trial_s` in all; the first proof settles the job. A slice under 1 s, or
+//! one the trial quota cannot hold even shortened to 1 s beside the slices other chooses
+//! have pinned, is not tried, and `not_tried` says why. Step 3 tries the rows still in
+//! `could_prove` (under `widen`, then those step 1 set aside) on the live band, one at a
+//! time in score order within what is left of `budget.trial_s` ([`Inner::step_three`]),
+//! each holding one of the node's trial slots. Step 3's trials hold every slot but one
+//! between them (with one slot, that one), and a waiting replay is served before a waiting
+//! step-3 trial ([`TrialClass`]), so a new signal's replay does not queue behind another's
+//! dwell. Each step-3 trial runs as an ordinary job the `choose` owns, started only where a
+//! running capture already holds the row's band (lease setting `share`), or after growing a
+//! held capture to hold it, every holder keeping its band (`widen`). A trial's lease gives
+//! way to any foreground request that changes the capture.
 //!
 //! The job's event stream carries `{"protocol": "choice", "step", "choice"}` when step
 //! 1 answers and whenever the answer changes, then `{"protocol": "verdict", "choice"}`;
@@ -50,10 +54,12 @@ use super::launch::{AfterGate, Ending, StageRunning, supervise};
 use super::persist::now;
 use super::{Inner, Node, NodeError, REPLAY_SOURCE, source_fault_reason};
 use crate::choice::{
-    Alternative, Choice, ChoiceJob, NotTried, Settled, catalogue_entry, choose_now, job_for,
+    Alternative, Choice, ChoiceJob, NOT_HELD_LEAD, NotTried, Settled, capture_holds,
+    catalogue_entry, choose_now, job_band, job_for, trial_band, trial_bands,
 };
 use crate::choice_policy::{Budget, LeaseSetting, Surface};
 use crate::classify::{Classification, Measurement};
+use crate::cut::BandCutter;
 use crate::graph::{Graph, GraphId};
 use crate::job::JobRecord;
 use crate::lease::Uncovered;
@@ -85,6 +91,8 @@ pub const UNMEASURED: &str = "not tried: layer 1 did not measure the band";
 pub const SPAN_SHORT: &str = "not tried: the selection's span is under 1 s";
 /// The `cannot_tell` reason of a span asked that the ring no longer holds.
 pub const SPAN_GONE: &str = "the ring no longer holds the span";
+/// Step 2's note when the cut of its slice failed and took the samples with it.
+pub const UNCUT: &str = "not tried: the slice could not be cut";
 /// The shortest slice step 2 replays.
 const MIN_SLICE_NS: u64 = 1_000_000_000;
 /// How far after a ring's oldest sample a selection of all it holds starts: the next
@@ -137,16 +145,119 @@ impl Drop for PastTwo {
 }
 
 /// A `choose`'s step 1: the selection, the span's length in ns, its classification,
-/// the samples it read (at the ring's `rate`, centred `ring_center`) and the answer.
-/// A watch hands its own to its `choose` child, which then classifies nothing again.
+/// what of the samples it read step 2 keeps ([`Kept`]) and the answer. A watch hands its
+/// own to its `choose` child, which then classifies nothing again.
 pub(super) struct StepOne {
     pub sel: Selection,
     pub held_ns: u64,
     pub classified: Classification,
+    /// `None` when no slice will be written (nothing in `could_prove`, or a proof).
+    pub kept: Option<Kept>,
+    pub choice: Choice,
+}
+
+/// The samples step 2 writes as its slice: the trial band ([`trial_band`], the record's
+/// band), cut to it when the node has a cutter (`rate` the lowest that holds it, the file
+/// centred `file_center` on it), else the ring's block at its rate and centre.
+pub(super) struct Kept {
     pub samples: Vec<Complex<f32>>,
     pub rate: Hz,
-    pub ring_center: Hz,
-    pub choice: Choice,
+    pub file_center: Hz,
+    pub band: Tuning,
+}
+
+/// How much wider than a union of several rows' bands the slice is cut, so what lies
+/// past the union does not fold into a row's band when the cut's rate is the band's own.
+const UNION_GUARD: f64 = 1.25;
+
+impl StepOne {
+    /// Step 1 for `sel` (`held_ns` long), classified `classified` from `samples` of a
+    /// ring at `rate` centred `ring_center`: chosen with the ring as the capture
+    /// ([`choose_now`]), and, when the `choose` may `climb` to step 2, the samples kept
+    /// for it ([`keep_for_trials`]). Nothing is kept for a proof or an empty
+    /// `could_prove`.
+    pub(super) async fn chosen(
+        node: &Node,
+        (sel, held_ns, climb): (Selection, u64, bool),
+        classified: Classification,
+        (samples, rate, ring_center): (Vec<Complex<f32>>, Hz, Hz),
+    ) -> StepOne {
+        let modes = node.inner.modes();
+        let region = node.inner.region();
+        let capture = Some((ring_center, rate));
+        let choice = choose_now(&modes, modes.weights(), &classified, &sel, &region, capture);
+        let kept = match &classified.measurement {
+            Some(m) if climb && choice.settled != Settled::Proved => {
+                match trial_band(&modes, &choice, m, &sel, &region) {
+                    Some(band) => {
+                        // A union of bands that differ: cut with a guard.
+                        let bands = trial_bands(&modes, &choice, m, &sel, &region);
+                        let union = bands.iter().any(|b| *b != band);
+                        let block = (samples, rate, ring_center);
+                        keep_for_trials(node.cutter(), (band, union), block).await
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        StepOne {
+            sel,
+            held_ns,
+            classified,
+            kept,
+            choice,
+        }
+    }
+}
+
+/// What step 2 keeps of a ring block (`samples` at `rate`, centred `ring_center`) for
+/// rows tried inside the trial `band` ([`trial_band`]; `union` when it is the union of
+/// bands that differ): with a `cutter` the block is cut to the band on a blocking thread
+/// and dropped (a union cut [`UNION_GUARD`] times as wide, when the capture holds that),
+/// else kept whole. A cut that fails keeps the block whole; `None` when the cut panicked
+/// and took the block with it.
+async fn keep_for_trials(
+    cutter: Option<Arc<dyn BandCutter>>,
+    (band, union): (Tuning, bool),
+    (samples, rate, ring_center): (Vec<Complex<f32>>, Hz, Hz),
+) -> Option<Kept> {
+    let whole = |samples| Kept {
+        samples,
+        rate,
+        file_center: ring_center,
+        band,
+    };
+    let Some(cutter) = cutter else {
+        return Some(whole(samples));
+    };
+    let guarded = Tuning {
+        bandwidth_hz: Hz((band.bandwidth_hz.0 as f64 * UNION_GUARD).ceil() as u64),
+        ..band
+    };
+    let cut_to = match union {
+        true if capture_holds((ring_center, rate), guarded) => guarded,
+        _ => band,
+    };
+    let offset = cut_to.center_hz.0 as i64 - ring_center.0 as i64;
+    let cut = tokio::task::spawn_blocking(move || {
+        match cutter.cut(&samples, rate, offset, cut_to.bandwidth_hz) {
+            Some(c) => Ok(c),
+            None => Err(samples),
+        }
+    })
+    .await;
+    match cut {
+        Ok(Ok((samples, rate))) => Some(Kept {
+            samples,
+            rate,
+            file_center: band.center_hz,
+            band,
+        }),
+        Ok(Err(samples)) => Some(whole(samples)),
+        // The cut panicked: the block went with it.
+        Err(_) => None,
+    }
 }
 
 /// What a trial slot is for ([`Inner::trial_slot`]). Both classes share the policy's
@@ -555,20 +666,23 @@ impl Inner {
         Ok((sel, to - from))
     }
 
-    /// Write `samples` (the selection `sel` of the ring at `rate`, centred
-    /// `ring_center`) as a trial capture, shortened to the newest the trial quota holds
-    /// beside the trial slices other chooses have pinned or reserved, pinned for the job.
+    /// Write the `kept` samples of the selection `sel` as a trial capture of their band
+    /// ([`Kept`]: cut to it, or the ring's block), shortened to the newest the trial quota
+    /// holds beside the trial slices other chooses have pinned or reserved, pinned for the
+    /// job.
     /// Its bytes are reserved first ([`BurstStore::reserve_trial`], a short lock), then
     /// written on a blocking thread, so no lock is held and no runtime worker waits
     /// across the write. The `not tried: ...` reason when it cannot: the quota holds
     /// under 1 s of it ([`OVER_QUOTA`]), or the write fails.
     ///
     /// [`BurstStore::reserve_trial`]: crate::bursts::BurstStore::reserve_trial
-    async fn write_slice(
-        &self,
-        mut sel: Selection,
-        (mut samples, rate, ring_center): (Vec<Complex<f32>>, Hz, Hz),
-    ) -> Result<TrialSlice, String> {
+    async fn write_slice(&self, mut sel: Selection, kept: Kept) -> Result<TrialSlice, String> {
+        let Kept {
+            mut samples,
+            rate,
+            file_center,
+            band,
+        } = kept;
         let reservation = loop {
             let fits =
                 usize::try_from(self.bursts.trial_room() / SAMPLE_BYTES).unwrap_or(usize::MAX);
@@ -597,9 +711,8 @@ impl Inner {
             let rec = crate::ops::write_ring_slice(
                 &store,
                 &sel,
-                &samples,
-                rate,
-                ring_center,
+                band,
+                (&samples, rate, file_center),
                 Some(reservation),
             )
             .map_err(|e| unwritten(&e))?;
@@ -631,8 +744,19 @@ impl Inner {
         let mut next = choice.clone();
         let sel = &slice.sel;
         let job = (&r.id, &r.cancel);
-        let rows = &choice.could_prove;
-        let replays = replay_trials(self, job, &slice.id, rows, (budget, deadline)).await;
+        // Each row is replayed at its own band, as step 3 and the proved job run it.
+        let (modes, region) = (self.modes(), self.region());
+        let rows: Vec<(String, Option<Tuning>)> = choice
+            .could_prove
+            .iter()
+            .map(|row| {
+                let band = modes
+                    .get(row)
+                    .map(|r| job_band(&job_for(r, m, sel, &region)));
+                (row.clone(), band)
+            })
+            .collect();
+        let replays = replay_trials(self, job, &slice.id, &rows, (budget, deadline)).await;
         self.add_trials(r, &replays.trials);
         if replays.trials.iter().any(|t| t.job.is_some()) {
             next.steps_run = with_step(&next.steps_run, 2);
@@ -640,7 +764,6 @@ impl Inner {
         if r.cancel.is_cancelled() {
             return Err(StageError::Cancelled);
         }
-        let modes = self.modes();
         let proved = replays
             .proved
             .and_then(|(row, evidence)| modes.get(&row).map(|m| (m, evidence)));
@@ -742,21 +865,22 @@ impl Inner {
         self.choose_context(r);
     }
 
-    /// Step 3: try each of `choice.could_prove` (in its order, the score's) on the live
-    /// band, one at a time, until `deadline`: the row's job for the measurement `m` in
-    /// `sel` ([`job_for`]), started on `port` as an ordinary job the `choose` owns
-    /// ([`Inner::trial_row`]) only where a running capture already holds its band
-    /// untuned, and judged by the row's identify rule for its dwell (cut to what is left
-    /// of the budget, its start included). Under [`LeaseSetting::Widen`] a band outside
-    /// the running capture first grows it ([`widen_for`]; `widened the capture to
-    /// <centre>/<width> Hz for a trial` in the answer's evidence when the capture moved);
-    /// a row still uncovered is [`NOT_COVERED`], one the budget leaves no time for
-    /// [`OVER_BUDGET`], one whose trial a foreground request took the capture from
-    /// [`GAVE_WAY`] (its job stopped, the next row tried). Every trial is in
-    /// `context.choose.trials` (`step: 3`). The answer: `choice` revised by the first
-    /// proof (step 3, `proved`, the old answer its runner-up) with, when `keep`, the
-    /// proved job still running in its guard; else `choice` with the notes. Every other
-    /// trial job is stopped. `Cancelled` when the job is.
+    /// Step 3: try each of `choice.could_prove` (in its order, the score's), and under
+    /// [`LeaseSetting::Widen`] then each row step 1 set aside as one the capture does not
+    /// hold ([`NOT_HELD_LEAD`]), on the live band, one at a time, until `deadline`: the
+    /// row's job for the measurement `m` in `sel` ([`job_for`]), started on `port` as an
+    /// ordinary job the `choose` owns ([`Inner::trial_row`]) only where a running capture
+    /// already holds its band untuned, and judged by the row's identify rule for its dwell
+    /// (cut to what is left of the budget, its start included). Under
+    /// [`LeaseSetting::Widen`] a band outside the running capture first grows it
+    /// ([`widen_for`]; `widened the capture to <centre>/<width> Hz for a trial` in the
+    /// answer's evidence when the capture moved); a row still uncovered is [`NOT_COVERED`],
+    /// one the budget leaves no time for [`OVER_BUDGET`], one whose trial a foreground
+    /// request took the capture from [`GAVE_WAY`] (its job stopped, the next row tried).
+    /// Every trial is in `context.choose.trials` (`step: 3`). The answer: `choice` revised
+    /// by the first proof (step 3, `proved`, the old answer its runner-up) with, when
+    /// `keep`, the proved job still running in its guard; else `choice` with the notes.
+    /// Every other trial job is stopped. `Cancelled` when the job is.
     async fn step_three(
         self: &Arc<Self>,
         r: &mut Run,
@@ -781,7 +905,23 @@ impl Inner {
                 reason: reason.into(),
             })
         };
-        for row in &choice.could_prove {
+        // Under `widen` a row whose band the capture did not hold at step 1 is tried
+        // too, after the listed ones: growing the capture may hold it. Its step-1 note
+        // gives way to what step 3 makes of it.
+        let set_aside: Vec<String> = match lease {
+            LeaseSetting::Widen => choice
+                .not_tried
+                .iter()
+                .filter(|n| n.reason.starts_with(NOT_HELD_LEAD))
+                .filter_map(|n| n.row.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        next.not_tried.retain(|n| {
+            !(n.reason.starts_with(NOT_HELD_LEAD)
+                && n.row.as_ref().is_some_and(|r| set_aside.contains(r)))
+        });
+        for row in choice.could_prove.iter().chain(&set_aside) {
             // Step 2 found the budget spent before this row.
             if !budget_left(choice, row) {
                 continue;
@@ -989,9 +1129,7 @@ async fn choose_loop(
         sel,
         held_ns,
         classified,
-        samples,
-        rate,
-        ring_center,
+        kept,
         mut choice,
     } = seed;
     choice.not_tried.extend(capped);
@@ -1013,16 +1151,20 @@ async fn choose_loop(
     } else if step_two && classified.measurement.is_none() {
         note(&mut choice, UNMEASURED.into());
     } else if step_two && !choice.could_prove.is_empty() {
-        match inner
-            .write_slice(sel.clone(), (samples, rate, ring_center))
-            .await
-        {
+        let written = match kept {
+            Some(kept) => inner.write_slice(sel.clone(), kept).await,
+            None => Err(UNCUT.into()),
+        };
+        match written {
             Ok(s) => {
                 r.ctx.insert("slice".into(), s.id.clone().into());
                 slice = Some(s);
             }
             Err(reason) => note(&mut choice, reason),
         }
+    } else {
+        // No slice will be written: the samples go now, not at the verdict.
+        drop(kept);
     }
     inner.publish_choice(&mut r, &choice);
     // Both trial steps share the budget's seconds.
@@ -1148,17 +1290,12 @@ async fn step_one(
         match c {
             Ok((classified, samples, rate, ring_center)) => {
                 node.supersede_proved(&classified.tried, r.tuning);
-                let modes = inner.modes();
-                let choice =
-                    choose_now(&modes, modes.weights(), &classified, &sel, &inner.region());
-                return Ok(Ok(StepOne {
-                    sel,
-                    held_ns,
-                    classified,
-                    samples,
-                    rate,
-                    ring_center,
-                    choice,
+                let block = (samples, rate, ring_center);
+                let at = (sel, held_ns, r.ask.step >= 2);
+                let one = StepOne::chosen(node, at, classified, block);
+                return Ok(Ok(tokio::select! {
+                    one = one => one,
+                    _ = r.cancel.cancelled() => return Err(StageError::Cancelled),
                 }));
             }
             Err(e) => {
@@ -1323,19 +1460,19 @@ fn start_task(
     })
 }
 
-/// A `capture_decode` of the capture `slice` through `row`, owned by the `choose` job
-/// `owner` (so the replay is the job's to stop, and goes once it ends), in its own task
-/// (see [`start_task`]).
+/// A `capture_decode` of the capture `slice` through `row` at `band`, owned by the
+/// `choose` job `owner` (so the replay is the job's to stop, and goes once it ends), in its
+/// own task (see [`start_task`]).
 fn replay_task(
     inner: &Arc<Inner>,
     owner: &JobId,
     slice: &str,
-    row: &str,
+    (row, band): (&str, Tuning),
 ) -> JoinHandle<Result<JobId, NodeError>> {
     let (node, slice, row) = (Node::handle(inner), slice.to_string(), row.to_string());
     let owner = Some(owner.clone());
     tokio::spawn(async move {
-        node.capture_decode_owned(&slice, &row, None, false, owner)
+        node.capture_decode_owned(&slice, &row, None, false, owner, Some(band))
             .await
     })
 }
@@ -1365,17 +1502,17 @@ struct Replays {
     unstarted: Vec<String>,
 }
 
-/// The step-2 trial engine: replay the capture `slice` through each of `rows` in order
-/// ([`replay_trial`]), each replay owned by the job `owner`, at most `budget.concurrent`
-/// at once (and each waiting for a node-wide trial slot), each spawned under `cancel` and
-/// judged until `deadline` (the end of the trials' `budget.trial_s`). The first proof
-/// stops the trials still running and starts no more; a row not started by the deadline
-/// is `unstarted`.
+/// The step-2 trial engine: replay the capture `slice` through each of `rows` (each at its
+/// own band; `None` for a row the registry no longer has) in order ([`replay_trial`]), each
+/// replay owned by the job `owner`, at most `budget.concurrent` at once (and each waiting
+/// for a node-wide trial slot), each spawned under `cancel` and judged until `deadline`
+/// (the end of the trials' `budget.trial_s`). The first proof stops the trials still
+/// running and starts no more; a row not started by the deadline is `unstarted`.
 async fn replay_trials(
     inner: &Arc<Inner>,
     (owner, cancel): (&JobId, &CancellationToken),
     slice: &str,
-    rows: &[String],
+    rows: &[(String, Option<Tuning>)],
     (budget, deadline): (Budget, Instant),
 ) -> Replays {
     let settle = cancel.child_token();
@@ -1412,20 +1549,21 @@ async fn replay_trials(
         out.trials.push(trial);
     }
     if out.proved.is_none() && !cancel.is_cancelled() {
-        out.unstarted = slotless.into_iter().chain(queue.cloned()).collect();
+        let left = queue.map(|(row, _)| row.clone());
+        out.unstarted = slotless.into_iter().chain(left).collect();
     }
     out
 }
 
-/// Replay `slice` through `row`, the replay owned by `owner` ([`replay_task`]), once a
-/// node-wide trial slot is free ([`Inner::trial_slot`]), and wait for the row's proof on
-/// the replay's events ([`Inner::await_proof`] on the replay feed, subscribed before the
-/// replay starts) until `deadline`, or until `settle` is cancelled; the replay is
-/// stopped either way. The trial and, for a proof, its `decode <row>: ...` line; the
-/// row itself when no slot came free before the deadline (or `settle`).
+/// Replay `slice` through `row` at its band, the replay owned by `owner` ([`replay_task`]),
+/// once a node-wide trial slot is free ([`Inner::trial_slot`]), and wait for the row's
+/// proof on the replay's events ([`Inner::await_proof`] on the replay feed, subscribed
+/// before the replay starts) until `deadline`, or until `settle` is cancelled; the replay
+/// is stopped either way. The trial and, for a proof, its `decode <row>: ...` line; the row
+/// itself when no slot came free before the deadline (or `settle`).
 async fn replay_trial(
     (inner, owner, slice): (Arc<Inner>, JobId, String),
-    row: String,
+    (row, band): (String, Option<Tuning>),
     settle: CancellationToken,
     deadline: Instant,
 ) -> Result<(Trial, Option<String>), String> {
@@ -1437,7 +1575,7 @@ async fn replay_trial(
         evidence,
     };
     let modes = inner.modes();
-    let Some(mode) = modes.get(&row) else {
+    let (Some(mode), Some(band)) = (modes.get(&row), band) else {
         return Ok((trial(None, "unavailable", format!("no row {row}")), None));
     };
     let Some(_slot) = inner
@@ -1454,7 +1592,7 @@ async fn replay_trial(
         let why = "the replay feed is not open".to_string();
         return Ok((trial(None, "unavailable", why), None));
     };
-    let job = match replay_task(&inner, &owner, &slice, &row).await {
+    let job = match replay_task(&inner, &owner, &slice, (&row, band)).await {
         Ok(Ok(job)) => job,
         Ok(Err(e)) => return Ok((trial(None, "unavailable", e.to_string()), None)),
         Err(e) => {
@@ -1645,6 +1783,81 @@ mod tests {
         // A policy of 0 slots is read as 1.
         assert!(slots(0, 0, 0).admits(l, 0));
         assert_eq!((live_limit(1), live_limit(2), live_limit(3)), (1, 1, 2));
+    }
+
+    /// A cutter that notes what it was asked and answers `n` samples at 48 kS/s, or
+    /// nothing.
+    struct Noting {
+        asked: std::sync::Mutex<Vec<(i64, Hz)>>,
+        cuts: bool,
+    }
+
+    impl BandCutter for Noting {
+        fn cut(
+            &self,
+            _: &[Complex<f32>],
+            _: Hz,
+            offset_hz: i64,
+            bandwidth_hz: Hz,
+        ) -> Option<(Vec<Complex<f32>>, Hz)> {
+            self.asked.lock().unwrap().push((offset_hz, bandwidth_hz));
+            self.cuts
+                .then(|| (vec![Complex::new(1.0, 0.0); 10], Hz(48_000)))
+        }
+    }
+
+    fn tuning(center_hz: u64, bandwidth_hz: u64) -> Tuning {
+        Tuning {
+            center_hz: Hz(center_hz),
+            bandwidth_hz: Hz(bandwidth_hz),
+        }
+    }
+
+    /// One band is cut as it is; a union of bands that differ is cut with its guard while
+    /// the capture holds that, else bare; the record keeps the bare band and the file is
+    /// centred on it. No cutter, or a cut refused, keeps the block whole.
+    #[tokio::test]
+    async fn the_slice_is_cut_to_its_band_and_a_union_with_a_guard() {
+        let noting = |cuts| {
+            Arc::new(Noting {
+                asked: std::sync::Mutex::new(Vec::new()),
+                cuts,
+            })
+        };
+        let (ring, rate) = (Hz(10_000_000), Hz(1_000_000));
+        let block = || (vec![Complex::new(0.0, 0.0); 100], rate, ring);
+        let one = tuning(10_100_000, 12_500);
+        let c = noting(true);
+        let k = keep_for_trials(Some(c.clone()), (one, false), block())
+            .await
+            .unwrap();
+        assert_eq!(
+            (k.rate, k.file_center, k.band),
+            (Hz(48_000), one.center_hz, one)
+        );
+        assert_eq!(k.samples.len(), 10);
+        assert_eq!(*c.asked.lock().unwrap(), [(100_000, Hz(12_500))]);
+        // A union: 1.25 times as wide, the record's band the bare union.
+        let union = tuning(10_100_000, 40_000);
+        let c = noting(true);
+        let k = keep_for_trials(Some(c.clone()), (union, true), block())
+            .await
+            .unwrap();
+        assert_eq!(k.band, union);
+        assert_eq!(*c.asked.lock().unwrap(), [(100_000, Hz(50_000))]);
+        // A union whose guard reaches past the capture: cut bare.
+        let edge = tuning(10_500_000 - 20_000, 40_000);
+        let c = noting(true);
+        keep_for_trials(Some(c.clone()), (edge, true), block()).await;
+        assert_eq!(*c.asked.lock().unwrap(), [(480_000, Hz(40_000))]);
+        // No cutter, or a cut refused: the ring's block, rate and centre.
+        for cutter in [None, Some(noting(false) as Arc<dyn BandCutter>)] {
+            let k = keep_for_trials(cutter, (one, false), block())
+                .await
+                .unwrap();
+            assert_eq!((k.rate, k.file_center, k.band), (rate, ring, one));
+            assert_eq!(k.samples.len(), 100);
+        }
     }
 
     const S: u64 = 1_000_000_000;

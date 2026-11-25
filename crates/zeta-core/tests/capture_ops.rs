@@ -288,12 +288,15 @@ async fn a_ring_slice_record_reads_its_selection_not_the_ring() {
         center_hz: Hz(433_920_000),
         bandwidth_hz: Hz(6_000),
     };
+    let band = zeta_core::port::Tuning {
+        center_hz: sel.center_hz,
+        bandwidth_hz: sel.bandwidth_hz,
+    };
     let rec = zeta_core::ops::write_ring_slice(
         &node.bursts(),
         &sel,
-        &iq,
-        Hz(rate as u64),
-        ring_center,
+        band,
+        (&iq, Hz(rate as u64), ring_center),
         None,
     )
     .unwrap();
