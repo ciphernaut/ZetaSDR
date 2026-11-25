@@ -1077,6 +1077,53 @@ fn modes_check_shows_the_version_a_handler_reported() {
     assert!(err.lines().any(|l| l == found), "{err}");
 }
 
+/// The version probe runs its program with the cleared environment every external
+/// program gets: the node's credentials never reach it, and `ZETA_PLUGIN_ENV_<NAME>`
+/// does, as `<NAME>`. The stand-in `onair-rx` prints what it was given where OnAir's
+/// pattern reads the version.
+#[test]
+fn the_version_probe_never_sees_the_nodes_secrets() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("onair-rx");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\necho \"onair-rx ${ZETA_SECRET}${ZETA_LLM_KEY}${ONAIR_VERSION}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let run = |pass: Option<&str>| {
+        let mut cmd = check(dir.path(), &["dfm_decode", "--handler", "onair"]);
+        cmd.env("ZETA_HANDLER_ONAIR_RX", &program)
+            .env("ZETA_SECRET", "9.9.9")
+            .env("ZETA_LLM_KEY", "8.8.8");
+        if let Some(v) = pass {
+            cmd.env("ZETA_PLUGIN_ENV_ONAIR_VERSION", v);
+        }
+        let out = cmd.output().unwrap();
+        (
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    };
+    let (out, err) = run(None);
+    let why = "onair-rx: its version could not be read (nothing it printed matched \
+               ^onair-rx (\\d+(?:\\.\\d+)*))";
+    assert_eq!(
+        out.trim(),
+        format!("dfm_decode@onair: skipped: {why}"),
+        "{err}"
+    );
+    assert!(!err.contains("9.9.9") && !err.contains("8.8.8"), "{err}");
+    let (out, err) = run(Some("0.4.1"));
+    assert_eq!(out.trim(), "dfm_decode@onair: skipped: no test", "{err}");
+    let found = format!(
+        "zeta: handlers: onair-rx: found {} (handler onair, version 0.4.1)",
+        program.display()
+    );
+    assert!(err.lines().any(|l| l == found), "{err}");
+}
+
 /// OnAir's entries for the bus modes and the polled ones that have a check pass
 /// `zeta modes check <id> --handler onair`, each recorded as `<id>@onair`, and analog
 /// video, which OnAir does not serve, is refused. It needs `onair-rx`: the test-only

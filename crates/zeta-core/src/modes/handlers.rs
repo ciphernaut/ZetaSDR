@@ -87,7 +87,7 @@ fn probe_one(
     let stamp = ProgramStamp::of(&path);
     let read = match version {
         None => None,
-        Some(v) => match check_version(&path, v, install) {
+        Some(v) => match check_version(&first, &path, v, install) {
             Ok(read) => Some(read),
             Err(why) => {
                 let reason = format!("{why} — modes: {modes}");
@@ -220,13 +220,15 @@ pub fn probe_row_versions(modes: &mut ModeRegistry) -> Vec<String> {
 /// Ask the program at `path` its version (`v`) and hold it to `v.min`: `Ok(<version
 /// read>)` at or over it, else the reason for people: `<name> <version> is older than
 /// <min> (<hint>; <url>)` (the hint left out, with its `; `, when `install` names no
-/// script or package), or `<name>: its version could not be read (<what happened>)`,
-/// `<name>` being the program's file name.
-pub fn check_version(path: &Path, v: &VersionProbe, install: &Install) -> Result<String, String> {
-    let name = path.file_name().map_or_else(
-        || path.display().to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    );
+/// script or package), or `<name>: its version could not be read (<what happened>)`.
+/// `name` is the block's `programs[0]`, as the found and missing lines name it, whatever
+/// path (an override's, say) the program was found at.
+pub fn check_version(
+    name: &str,
+    path: &Path,
+    v: &VersionProbe,
+    install: &Install,
+) -> Result<String, String> {
     let unread = |what: String| format!("{name}: its version could not be read ({what})");
     let read = probe_version(path, v).map_err(unread)?;
     if dotted_numbers(&read).is_none() {
@@ -247,7 +249,8 @@ const READING: u8 = 0;
 const AT_END: u8 = 1;
 const AT_CAP: u8 = 2;
 
-/// Run `program` once with `v.args` (no shell, stdin closed) and read its version: the
+/// Run `program` once with `v.args` (no shell, stdin closed, the cleared environment of
+/// [`crate::child::plugin_env`], its own process group) and read its version: the
 /// first group of `v.pattern`'s first match in its stdout, else its stderr. At most
 /// [`VERSION_READ_CAP`] bytes of each are read: a program that writes more is stopped
 /// there and only what was read is matched. `Err` says what happened: it could not be
@@ -265,13 +268,24 @@ fn probe_version_within(
     use std::process::{Command, Stdio};
     let re = regex::Regex::new(&v.pattern)
         .map_err(|e| format!("its match is not a regular expression: {e}"))?;
-    let mut child = Command::new(program)
-        .args(&v.args)
+    let mut cmd = Command::new(program);
+    cmd.args(&v.args)
+        .env_clear()
+        .envs(crate::child::plugin_env(std::env::vars_os()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("it could not be run: {e}"))?;
+    // The group id is the leader's pid (`process_group(0)`). Killed whole on every way
+    // out, so nothing the program started outlives the probe or holds its pipes.
+    let mut group = crate::child::Group(Some(child.id()));
     let pipes: [Option<Box<dyn Read + Send>>; 2] = [
         child
             .stdout
@@ -284,7 +298,8 @@ fn probe_version_within(
     ];
     // Each pipe read on a thread of its own, what it read kept where the probe can take
     // it whenever it stops waiting: a program that leaves a child of its own holding the
-    // pipe open never holds the probe past its timeout.
+    // pipe open never holds the probe past its timeout (and the group kill ends that
+    // child, so its reader ends too).
     let readers = pipes.map(|pipe| {
         let got = Arc::new(Mutex::new(Vec::new()));
         let state = Arc::new(AtomicU8::new(AT_END));
@@ -316,6 +331,10 @@ fn probe_version_within(
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    // The whole group, before a leader still running is reaped (its id is the group's
+    // until then), and once only: the id is let go so the drop does not send it again.
+    group.kill();
+    group.0 = None;
     if status.is_none() {
         let _ = child.kill();
         let _ = child.wait();

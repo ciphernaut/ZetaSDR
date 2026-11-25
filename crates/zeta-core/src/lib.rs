@@ -5,6 +5,7 @@ pub mod bank;
 pub mod bits;
 pub mod bursts;
 pub mod capture;
+pub mod child;
 pub mod choice;
 pub mod choice_policy;
 pub mod classify;

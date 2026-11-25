@@ -3009,10 +3009,14 @@ fn a_handler_older_than_its_file_needs_is_unavailable_with_both_versions() {
     let program = stand_in(dir.path(), "alt-rx", "echo 'alt-rx 0.2.0'");
     let (reg, line) = probed_alt(&program, Some(alt_version("0.4.0")));
     let alt = reg.handler("adsb_decode", "alt").unwrap();
-    let reason =
-        "alt-rx 0.2.0 is older than 0.4.0 (https://example.invalid/alt) — modes: adsb_decode";
+    // Named by the file's `programs[0]` (here the stand-in's path), as the found and
+    // missing lines are.
+    let path = program.display();
+    let reason = format!(
+        "{path} 0.2.0 is older than 0.4.0 (https://example.invalid/alt) — modes: adsb_decode"
+    );
     assert_eq!(alt.state, ModeState::Unavailable, "{alt:?}");
-    assert_eq!(alt.reason.as_deref(), Some(reason));
+    assert_eq!(alt.reason.as_deref(), Some(reason.as_str()));
     assert_eq!(alt.program, None);
     assert_eq!(alt.version, None);
     assert_eq!(line, format!("zeta: handlers: {reason}"));
@@ -3033,11 +3037,12 @@ fn a_handler_older_than_its_file_needs_is_unavailable_with_both_versions() {
     let mut reg = ModeRegistry::load(&stages(), Some(&modes));
     assert_eq!(reg.get("adsb_decode").unwrap().state, ModeState::Ready);
     let lines = zeta_core::modes::handlers::probe_row_versions(&mut reg);
-    let reason =
-        "alt-rx 0.2.0 is older than 0.3 (https://example.invalid/row) — modes: adsb_decode";
+    let reason = format!(
+        "{path} 0.2.0 is older than 0.3 (https://example.invalid/row) — modes: adsb_decode"
+    );
     let m = reg.get("adsb_decode").unwrap();
     assert_eq!(m.state, ModeState::Unavailable);
-    assert_eq!(m.reason.as_deref(), Some(reason), "{lines:?}");
+    assert_eq!(m.reason.as_deref(), Some(reason.as_str()), "{lines:?}");
     assert_eq!(m.program, None);
     assert_eq!(lines, [format!("zeta: handlers: {reason}")]);
     // Probed, it is not probed again.
@@ -3072,6 +3077,7 @@ fn a_handler_at_or_over_its_floor_is_ready_and_its_version_is_reported() {
 
 /// A program that answers with no version the block reads is unavailable with what
 /// happened: an old one that does not know the argument (its usage on stderr, exit 2),
+/// one that prints its version and then fails (a non-zero exit is never a version read),
 /// one that prints nothing, one whose line does not match.
 #[test]
 fn a_handler_whose_version_cannot_be_read_is_unavailable() {
@@ -3080,6 +3086,10 @@ fn a_handler_whose_version_cannot_be_read_is_unavailable() {
         (
             "echo 'usage: alt-rx --mode <m>' >&2; exit 2",
             "it exited with status 2".to_string(),
+        ),
+        (
+            "echo 'alt-rx 0.4.0'; exit 1",
+            "it exited with status 1".to_string(),
         ),
         ("exit 0", "it printed nothing".to_string()),
         (
@@ -3090,7 +3100,8 @@ fn a_handler_whose_version_cannot_be_read_is_unavailable() {
         let program = stand_in(dir.path(), "alt-rx", body);
         let (reg, line) = probed_alt(&program, Some(alt_version("0.4.0")));
         let alt = reg.handler("adsb_decode", "alt").unwrap();
-        let reason = format!("alt-rx: its version could not be read ({what}) — modes: adsb_decode");
+        let path = program.display();
+        let reason = format!("{path}: its version could not be read ({what}) — modes: adsb_decode");
         assert_eq!(alt.state, ModeState::Unavailable, "{body}");
         assert_eq!(alt.reason.as_deref(), Some(reason.as_str()), "{body}");
         assert_eq!(alt.program, None, "{body}");
@@ -3099,11 +3110,17 @@ fn a_handler_whose_version_cannot_be_read_is_unavailable() {
 }
 
 /// A program that never answers is stopped at the timeout: the probe returns within it
-/// (and a little), the handler unavailable.
+/// (and a little), the handler unavailable, and the process the program started (which
+/// holds its pipes) is killed with it.
 #[test]
 fn a_version_probe_that_hangs_is_cut_at_its_timeout() {
     let dir = tempfile::tempdir().unwrap();
-    let program = stand_in(dir.path(), "alt-rx", "sleep 30");
+    let pid = dir.path().join("pid");
+    let program = stand_in(
+        dir.path(),
+        "alt-rx",
+        &format!("sleep 30 & echo $! > '{}'; wait", pid.display()),
+    );
     let started = std::time::Instant::now();
     let (reg, _) = probed_alt(&program, Some(alt_version("0.4.0")));
     let took = started.elapsed();
@@ -3112,8 +3129,22 @@ fn a_version_probe_that_hangs_is_cut_at_its_timeout() {
     assert_eq!(alt.state, ModeState::Unavailable);
     assert_eq!(
         alt.reason.as_deref(),
-        Some("alt-rx: its version could not be read (no answer within 2 s) — modes: adsb_decode")
+        Some(
+            format!(
+                "{}: its version could not be read (no answer within 2 s) — modes: adsb_decode",
+                program.display()
+            )
+            .as_str()
+        )
     );
+    // The program's own child went with its group (polled: the kill is asynchronous).
+    let sleeper = std::fs::read_to_string(&pid).unwrap();
+    let proc_dir = Path::new("/proc").join(sleeper.trim());
+    let gone = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while proc_dir.exists() && std::time::Instant::now() < gone {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!proc_dir.exists(), "pid {} still runs", sleeper.trim());
 }
 
 /// The read is capped: a program that prints its version and then megabytes is read
@@ -3144,8 +3175,12 @@ fn a_version_probe_reads_at_most_its_cap() {
     assert_eq!(
         alt.reason.as_deref(),
         Some(
-            "alt-rx: its version could not be read (nothing in the first 4096 bytes it \
-             printed matched ^alt-rx (\\d+(?:\\.\\d+)*)) — modes: adsb_decode"
+            format!(
+                "{}: its version could not be read (nothing in the first 4096 bytes it \
+                 printed matched ^alt-rx (\\d+(?:\\.\\d+)*)) — modes: adsb_decode",
+                program.display()
+            )
+            .as_str()
         )
     );
     let took = started.elapsed();
@@ -3213,7 +3248,7 @@ async fn a_replaced_program_is_probed_again_on_reload() {
         alt()
             .reason
             .unwrap()
-            .starts_with("alt-rx 0.2.0 is older than 0.4.0"),
+            .starts_with(&format!("{} 0.2.0 is older than 0.4.0", program.display())),
         "{:?}",
         alt()
     );

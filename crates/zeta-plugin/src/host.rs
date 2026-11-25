@@ -46,6 +46,10 @@ use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, StreamBus};
 use zeta_core::types::{JobId, Provenance, SourceId, StreamId, StreamKind};
 
+// The child environment and process group every external program the node starts gets
+// live in `zeta-core` (its handler probe needs them too), and are re-exported here.
+pub use zeta_core::child::{Group, PASS_ENV, PLUGIN_ENV_PREFIX, plugin_env};
+
 use crate::wire::{
     Control, Hello, MAX_CONTROL, Message, OutPort, PROTOCOL_MAX, PROTOCOL_MIN, PortKind, Run,
     WireError, check_strict_schema, encode_control, encode_frame, kind_name, read_message,
@@ -59,18 +63,6 @@ pub const STOP_GRACE: Duration = Duration::from_millis(2000);
 pub const OUT_QUEUE: usize = 64;
 /// Encoded messages buffered between the run loop and the stdin writer.
 pub const IN_QUEUE: usize = 16;
-/// Host variables passed through to a plugin unchanged, when set.
-pub const PASS_ENV: [&str; 7] = [
-    "PATH",
-    "HOME",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TERM",
-    "PYTHONPATH",
-];
-/// Host variables `ZETA_PLUGIN_ENV_<NAME>` reach the plugin as `<NAME>`.
-pub const PLUGIN_ENV_PREFIX: &str = "ZETA_PLUGIN_ENV_";
 /// Longest stderr line copied to the host's stderr in one piece.
 const STDERR_LINE: usize = 4096;
 
@@ -318,71 +310,6 @@ pub fn status_text(s: ExitStatus) -> String {
         }
     }
     s.to_string()
-}
-
-/// The environment a plugin gets from the host's `vars`: [`PASS_ENV`] as is,
-/// `ZETA_PLUGIN_ENV_<NAME>` as `<NAME>`, and `PYTHONUNBUFFERED=1` (so a Python plugin's
-/// frames are not held in its stdout buffer). Nothing else.
-pub fn plugin_env(
-    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    let mut env: Vec<_> = vars
-        .filter_map(|(k, v)| {
-            let name = k.to_str()?;
-            if PASS_ENV.contains(&name) {
-                Some((k, v))
-            } else {
-                let rest = name.strip_prefix(PLUGIN_ENV_PREFIX)?;
-                (!rest.is_empty()).then(|| (rest.into(), v))
-            }
-        })
-        .collect();
-    env.push(("PYTHONUNBUFFERED".into(), "1".into()));
-    env
-}
-
-/// The plugin's process group; `SIGKILL`ed whole when dropped, so nothing the plugin
-/// started outlives the `probe` or `run` that spawned it. `None` if the plugin had exited
-/// before its id was read.
-pub struct Group(pub Option<u32>);
-
-#[cfg(unix)]
-mod sys {
-    // `killpg(2)`, declared here rather than taking a `libc` dependency for one call.
-    unsafe extern "C" {
-        fn killpg(pgrp: i32, sig: i32) -> i32;
-    }
-    /// `SIGKILL` is 9 on every Unix.
-    const SIGKILL: i32 = 9;
-
-    /// `SIGKILL` every process in group `pgrp`; a group already gone is not an error.
-    pub(super) fn kill_group(pgrp: u32) {
-        // A pid fits i32; 0 or less would mean "my own group" or "everything".
-        if let Ok(g) = i32::try_from(pgrp)
-            && g > 1
-        {
-            // SAFETY: killpg takes two integers and touches no memory of ours.
-            unsafe {
-                killpg(g, SIGKILL);
-            }
-        }
-    }
-}
-
-impl Group {
-    /// `SIGKILL` the whole group (nothing when its id was never read).
-    pub fn kill(&self) {
-        #[cfg(unix)]
-        if let Some(g) = self.0 {
-            sys::kill_group(g);
-        }
-    }
-}
-
-impl Drop for Group {
-    fn drop(&mut self) {
-        self.kill();
-    }
 }
 
 /// A plugin process and its process group.
