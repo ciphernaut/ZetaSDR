@@ -5895,6 +5895,10 @@ def scenario_box_menu_groups_open_by_hover_click_and_keys(page, url, secret):
     # Enter; Escape or the other arrow closes one level); its entries carry no `Decode ›` or
     # `Transcribe ›` prefix, the Transcribe twins under their own heading.
     menu = open_menu_on_tone(page, url, secret)
+    # Each answer of the menu's choose draws it again (and places it again): the geometry
+    # below wants a still menu, so wait for the choose's last answer.
+    expect(menu.locator('.ctx-item[data-action="choice_start"]')).not_to_have_class(
+        re.compile("revising"), timeout=20_000)
     first = menu.evaluate(FIRST_LEVEL_JS)
     assert len(first) <= 8, f"first level {first}"
     assert first[:2] == ["choice_start", "classify"] and first[-1] == "ask", f"first level {first}"
