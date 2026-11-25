@@ -5144,7 +5144,11 @@ async fn a_choose_watch_starts_fm_demod_and_a_transcriber_on_voice() {
     assert_eq!(demod.params["deviation_hz"], 2_500, "the plan's: {rec:?}");
     assert_eq!(record(&node, &scribe).unwrap().kind, "transcribe");
     let listed = decoding(&node, &watch);
-    assert_eq!(listed[0]["attached"], scribe.0.as_str(), "{listed:#?}");
+    assert_eq!(
+        listed[0]["attached"],
+        serde_json::json!([scribe.0]),
+        "{listed:#?}"
+    );
     assert_eq!(listed[0]["via"], "choose", "{listed:#?}");
     stop_all(&node).await;
     assert_ne!(state(&node, &scribe), Some(JobState::Running));
@@ -5410,7 +5414,7 @@ async fn a_dmr_signal_never_reaches_the_mix_and_becomes_dmr_decode() {
             attached_to(&node, &dmr.id).is_some_and(|t| {
                 decoding(&node, &watch)
                     .first()
-                    .is_some_and(|d| d["attached"] == t.0.as_str())
+                    .is_some_and(|d| d["attached"] == serde_json::json!([t.0]))
             })
         },
     )
@@ -5752,7 +5756,7 @@ async fn a_restart_lifts_a_hold_whose_choose_is_gone() {
         || {
             decoding(&node, &watch)
                 .first()
-                .is_some_and(|d| d["choose"].is_string() && d["attached"].is_string())
+                .is_some_and(|d| d["choose"].is_string() && d["attached"].is_array())
         },
     )
     .await;
@@ -5920,9 +5924,9 @@ async fn a_watch_tries_an_unknown_signal_and_starts_what_proves() {
         Duration::from_secs(10),
         || {
             attached_to(&node, &job).is_some_and(|t| {
-                decoding(&node, &watch)
-                    .first()
-                    .is_some_and(|d| d["attached"] == t.0.as_str() && d["via"] == "choose")
+                decoding(&node, &watch).first().is_some_and(|d| {
+                    d["attached"] == serde_json::json!([t.0]) && d["via"] == "choose"
+                })
             })
         },
     )
@@ -6209,4 +6213,537 @@ async fn a_signal_beside_one_being_tried_starts_no_second_choose() {
     assert_eq!(choosing[0]["choose"], child.0.as_str(), "{ctx}");
     assert_eq!(state(&node, &child), Some(JobState::Running));
     stop_all(&node).await;
+}
+
+// A watch attaches riders (plan 49.3): `attach` takes `transcribe` and rows that ride with
+// a demodulator, each attached where it applies; a proof of a rider of the kept job's row
+// attaches it and lifts the hold, the job kept under its id; stopping the watch stops each
+// attached job before its job.
+
+/// The broadcast band the rider tests watch: the capture's centre.
+const RDS_CAPTURE_HZ: u64 = 99_750_000;
+/// A station's offset from [`RDS_CAPTURE_HZ`]: inside the capture, clear of its DC mask.
+const RDS_OFFSET_HZ: i64 = 250_000;
+
+/// A broadcast station with RDS (PI `pi`) `offset_hz` from the capture's centre, at the
+/// watch suite's rate, `seconds` long (the station's groups repeated).
+fn rds_station(pi: u16, offset_hz: i64, seconds: f32) -> Vec<Complex<f32>> {
+    let one = zeta_dsp::synth::rds_station_iq(pi, "ZETA FM ", "HELLO FROM ZETASDR", RATE_HZ);
+    let len = (RATE_HZ as f32 * seconds) as usize;
+    let mut iq: Vec<Complex<f32>> = one
+        .iter()
+        .cycle()
+        .take(len.max(one.len()))
+        .copied()
+        .collect();
+    mix(&mut iq, offset_hz as f64);
+    iq
+}
+
+/// Narrowband FM voice at 2500 Hz deviation `offset_hz` from the capture's centre,
+/// `seconds` long.
+fn voice_at(offset_hz: i64, seconds: f32) -> Vec<Complex<f32>> {
+    let audio = speech_like(48_000, seconds);
+    let mut iq = zeta_dsp::synth::nbfm_modulate(&audio, 48_000, RATE_HZ, 2_500.0, 0.0);
+    mix(&mut iq, offset_hz as f64);
+    iq
+}
+
+/// The sum of `parts` (cut to the shortest) under 25 dB of noise.
+fn band_of(parts: &[Vec<Complex<f32>>], seed: u64) -> Vec<Complex<f32>> {
+    let len = parts.iter().map(Vec::len).min().unwrap();
+    let mut iq: Vec<Complex<f32>> = (0..len).map(|n| parts.iter().map(|p| p[n]).sum()).collect();
+    zeta_dsp::synth::awgn(&mut iq, 25.0, seed);
+    iq
+}
+
+/// The embedded `rds_decode` row in `dir/modes` with no quick decode: step 1 does not
+/// prove it, so the watch's own `choose` must (as `tests/choose.rs` makes it).
+fn rds_without_quick(dir: &Path) -> PathBuf {
+    let modes = dir.join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let (_, rds) = zeta_core::modes::ModeRegistry::embedded()
+        .into_iter()
+        .find(|(f, _)| f.ends_with("rds_decode.json"))
+        .unwrap();
+    let mut row: Value = serde_json::from_str(rds).unwrap();
+    row["identify"]
+        .as_object_mut()
+        .unwrap()
+        .remove("quick")
+        .expect("the row has a quick decode");
+    std::fs::write(modes.join("rds_decode.json"), row.to_string()).unwrap();
+    modes
+}
+
+/// A node over one source `rx` of `iq` centred on [`RDS_CAPTURE_HZ`], its operator rows
+/// `modes`, its stages `stages` (the choice suite's when `None`: `stream_in`, a `vad` and
+/// the [`Scribe`]).
+async fn rds_node(
+    dir: &Path,
+    iq: &[Complex<f32>],
+    modes: Option<&Path>,
+    stages: Option<StageRegistry>,
+) -> Arc<Node> {
+    let meta = write(dir, "fm", iq, RDS_CAPTURE_HZ);
+    let src = file_source_with("rx", &meta, false);
+    let port = Muting::new(src.clone(), false);
+    let ports = vec![(port as Arc<dyn Port>, src)];
+    let stages = stages.unwrap_or_else(|| choice_registry(Arc::new(AtomicUsize::new(0))));
+    Arc::new(node_over_with(dir, ports, modes, stages).await)
+}
+
+/// The capture of [`rds_node`]'s source.
+fn rds_capture() -> Tuning {
+    Tuning {
+        center_hz: Hz(RDS_CAPTURE_HZ),
+        bandwidth_hz: Hz(RATE_HZ as u64),
+    }
+}
+
+/// The `detect` params of a choosing watch over broadcast stations, `extra` beside: a
+/// detector that sees a station whole, the suite's timing.
+fn rds_watch_params(extra: Value) -> Value {
+    let mut p = serde_json::json!({
+        "on_signal": "choose", "width_hz": [4_000, 400_000],
+        "persist_ms": PERSIST_MS, "gone_ms": GONE_MS,
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        p[k] = v.clone();
+    }
+    p
+}
+
+/// A choosing watch over [`rds_capture`] with [`rds_watch_params`]`(extra)`.
+async fn start_rds_watch(node: &Node, extra: Value) -> Result<JobId, NodeError> {
+    let band = rds_capture();
+    let mut g = JobKind::Watch
+        .expand(
+            &rx(),
+            band,
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    g.nodes
+        .iter_mut()
+        .find(|n| n.kind == "detect")
+        .unwrap()
+        .params = rds_watch_params(extra);
+    node.job_start("watch", rx(), band, g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+}
+
+/// The running jobs attached to `input`, by kind, sorted.
+fn attached_kinds(node: &Node, input: &JobId) -> Vec<(String, JobId)> {
+    let mut v: Vec<(String, JobId)> = node
+        .job_list()
+        .into_iter()
+        .filter(|r| r.input.as_ref() == Some(input) && r.state == JobState::Running)
+        .map(|r| (r.kind, r.id))
+        .collect();
+    v.sort();
+    v
+}
+
+/// The `watch.decoding` entry of `job`.
+fn decoding_of(node: &Node, watch: &JobId, job: &JobId) -> Option<Value> {
+    decoding(node, watch)
+        .into_iter()
+        .find(|d| d["job"] == job.0.as_str())
+}
+
+/// The ids `watch.decoding` lists as attached to `job`.
+fn listed_attached(node: &Node, watch: &JobId, job: &JobId) -> Vec<String> {
+    decoding_of(node, watch, job)
+        .and_then(|d| d["attached"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect()
+}
+
+/// The watch's kept jobs of `kind`, once `n` are listed in `watch.decoding`.
+async fn kept_of(node: &Node, watch: &JobId, kind: &str, n: usize) -> Vec<JobId> {
+    let of = || -> Vec<JobId> {
+        decoding(node, watch)
+            .iter()
+            .filter(|d| d["mode"] == kind)
+            .map(|d| JobId(d["job"].as_str().unwrap().into()))
+            .collect()
+    };
+    until(&format!("{n} kept {kind}"), Duration::from_secs(60), || {
+        of().len() >= n
+    })
+    .await;
+    of()
+}
+
+/// The summaries of the watch's `decoding` events about `job`.
+fn summaries_of(events: &Events, job: &JobId) -> Vec<String> {
+    events
+        .watch("decoding")
+        .iter()
+        .filter(|e| e["job"] == job.0.as_str())
+        .filter_map(|e| e["summary"].as_str().map(String::from))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_attaches_a_proved_rider_and_lifts_the_hold() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let modes = rds_without_quick(dir.path());
+    let iq = band_of(&[rds_station(0x2AB1, RDS_OFFSET_HZ, 2.0)], 31);
+    let node = rds_node(dir.path(), &iq, Some(&modes), None).await;
+    let watch = start_rds_watch(&node, serde_json::json!({"attach": []}))
+        .await
+        .unwrap();
+    let events = Events::of(&node, &watch);
+    let demod = decoded(&node, &events, &watch).await;
+    assert_eq!(record(&node, &demod).unwrap().kind, "wfm_demod");
+    let first = &events.watch("decoding")[0];
+    let summary = first["summary"].as_str().unwrap();
+    assert!(summary.contains("held on probation"), "{summary}");
+    // The choose proves the rider: it is attached to the kept job, whose hold lifts.
+    until(
+        "the rider attached and the hold lifted",
+        Duration::from_secs(60),
+        || {
+            decoding_of(&node, &watch, &demod).is_some_and(|d| d.get("held").is_none())
+                && listed_attached(&node, &watch, &demod).len() == 1
+        },
+    )
+    .await;
+    let rider = JobId(listed_attached(&node, &watch, &demod)[0].clone());
+    let rec = record(&node, &rider).unwrap();
+    assert_eq!(rec.kind, "rds_decode");
+    assert_eq!(rec.input, Some(demod.clone()));
+    assert_eq!(rec.state, JobState::Running);
+    let d = record(&node, &demod).unwrap();
+    assert_eq!((d.state, d.held), (JobState::Running, None));
+    let lifted = summaries_of(&events, &demod);
+    assert!(
+        lifted.iter().any(|s| s
+            .contains("its choose proved rds_decode riding on it (proved at step")
+            && s.contains("; rds_decode attached; the first answer stands and the hold is lifted")),
+        "{lifted:#?}"
+    );
+    // The job was kept, never replaced: one wfm_demod, one decoder listed.
+    assert!(
+        lifted.iter().all(|s| !s.contains("in place of")),
+        "{lifted:#?}"
+    );
+    let kinds: Vec<String> = node.job_list().into_iter().map(|r| r.kind).collect();
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "wfm_demod").count(),
+        1,
+        "{kinds:?}"
+    );
+    assert_eq!(decoding(&node, &watch).len(), 1);
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_that_names_a_rider_attaches_it_to_each_job_it_rides_with() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let modes = rds_without_quick(dir.path());
+    let iq = band_of(
+        &[
+            rds_station(0x2AB1, RDS_OFFSET_HZ, 2.0),
+            rds_station(0x2AB2, -RDS_OFFSET_HZ, 2.0),
+        ],
+        32,
+    );
+    let node = rds_node(dir.path(), &iq, Some(&modes), None).await;
+    let watch = start_rds_watch(&node, serde_json::json!({"attach": ["rds_decode"]}))
+        .await
+        .unwrap();
+    let events = Events::of(&node, &watch);
+    let demods = kept_of(&node, &watch, "wfm_demod", 2).await;
+    // Named, the rider is attached to each as it starts, before any proof (step 1 proves
+    // nothing here); the proof that follows finds it riding and attaches no second.
+    for demod in &demods {
+        until("its rider", Duration::from_secs(10), || {
+            listed_attached(&node, &watch, demod).len() == 1
+        })
+        .await;
+        let kinds = attached_kinds(&node, demod);
+        assert_eq!(kinds.len(), 1, "{kinds:?}");
+        assert_eq!(kinds[0].0, "rds_decode");
+        assert_eq!(
+            listed_attached(&node, &watch, demod),
+            [kinds[0].1.0.clone()]
+        );
+    }
+    for demod in &demods {
+        until("the hold lifted", Duration::from_secs(60), || {
+            decoding_of(&node, &watch, demod).is_some_and(|d| d.get("held").is_none())
+        })
+        .await;
+        assert_eq!(attached_kinds(&node, demod).len(), 1, "no second rider");
+        let s = summaries_of(&events, demod);
+        assert!(
+            s.iter()
+                .any(|s| s.contains("; rds_decode already rides on it;")),
+            "{s:#?}"
+        );
+    }
+    assert_eq!(decoding(&node, &watch).len(), 2);
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_with_transcribe_and_a_rider_attaches_both_where_they_apply() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let iq = band_of(
+        &[
+            rds_station(0x2AB1, RDS_OFFSET_HZ, 4.0),
+            voice_at(-RDS_OFFSET_HZ, 4.0),
+        ],
+        33,
+    );
+    let node = rds_node(dir.path(), &iq, None, None).await;
+    let attach = serde_json::json!({"attach": ["transcribe", "rds_decode"]});
+    let watch = start_rds_watch(&node, attach).await.unwrap();
+    let wfm = kept_of(&node, &watch, "wfm_demod", 1).await.remove(0);
+    let fm = kept_of(&node, &watch, "fm_demod", 1).await.remove(0);
+    until(
+        "both attached to wfm_demod",
+        Duration::from_secs(10),
+        || listed_attached(&node, &watch, &wfm).len() == 2,
+    )
+    .await;
+    let kinds: Vec<String> = attached_kinds(&node, &wfm)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(kinds, ["rds_decode", "transcribe"]);
+    let listed = listed_attached(&node, &watch, &wfm);
+    assert_eq!(
+        record(&node, &JobId(listed[0].clone())).unwrap().kind,
+        "transcribe"
+    );
+    assert_eq!(
+        record(&node, &JobId(listed[1].clone())).unwrap().kind,
+        "rds_decode"
+    );
+    // The rider does not ride with fm_demod: its job gets the transcriber alone.
+    until("a transcriber on fm_demod", Duration::from_secs(10), || {
+        listed_attached(&node, &watch, &fm).len() == 1
+    })
+    .await;
+    let kinds: Vec<String> = attached_kinds(&node, &fm)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(kinds, ["transcribe"]);
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_refuses_an_attach_that_is_neither() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    for bad in ["fm_demod", "dmr_decode", "packets", "no_such_row"] {
+        let attach = serde_json::json!({"on_signal": "choose", "attach": ["transcribe", bad]});
+        match start_watch_over(&node, attach).await {
+            Err(e) => assert!(
+                e.to_string().ends_with(&format!(
+                    ": attach[1]: {bad} is not attached by a watch (only transcribe and rows that ride with a demodulator)"
+                )),
+                "{e}"
+            ),
+            Ok(id) => panic!("started {id:?} with {bad}"),
+        }
+    }
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+    // `transcribe` and a rider start; a graph put naming neither is refused, the watch
+    // running on as it was.
+    let ok = serde_json::json!({"on_signal": "choose", "attach": ["transcribe", "rds_decode"]});
+    let watch = start_watch_over(&node, ok)
+        .await
+        .expect("transcribe and a rider");
+    let mut g = record(&node, &watch).unwrap().graph;
+    g.nodes
+        .iter_mut()
+        .find(|n| n.kind == "detect")
+        .unwrap()
+        .params["attach"] = serde_json::json!(["fm_demod"]);
+    let e = node.job_graph_put(&watch, g).await.unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("attach[0]: fm_demod is not attached by a watch"),
+        "{e}"
+    );
+    assert_eq!(state(&node, &watch), Some(JobState::Running));
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_the_watch_stops_every_attached_job_first() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let iq = band_of(&[rds_station(0x2AB1, RDS_OFFSET_HZ, 2.0)], 34);
+    let node = rds_node(dir.path(), &iq, None, None).await;
+    let watch = start_rds_watch(&node, serde_json::json!({"attach": ["transcribe"]}))
+        .await
+        .unwrap();
+    // Step 1 proves the rider: the job starts with the transcriber and the proved rider.
+    let demod = kept_of(&node, &watch, "wfm_demod", 1).await.remove(0);
+    until("both attached", Duration::from_secs(10), || {
+        listed_attached(&node, &watch, &demod).len() == 2
+    })
+    .await;
+    let attached = attached_kinds(&node, &demod);
+    let kinds: Vec<&str> = attached.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(kinds, ["rds_decode", "transcribe"]);
+    node.job_stop(&watch).await.unwrap();
+    for (_, id) in &attached {
+        until("the attached job stopped", Duration::from_secs(5), || {
+            state(&node, id) == Some(JobState::Stopped)
+        })
+        .await;
+        assert!(
+            node.job_outputs(id).is_empty(),
+            "no stream of {id:?} is left"
+        );
+    }
+    until("the job stopped", Duration::from_secs(5), || {
+        state(&node, &demod) == Some(JobState::Stopped)
+    })
+    .await;
+    assert!(running(&node).is_empty(), "{:?}", running(&node));
+    stop_all(&node).await;
+}
+
+/// A choosing watch on a node without `stream_in` over one RDS station, its rows in
+/// `modes`: the kept `wfm_demod`, once its rider has been tried, and the watch's events.
+async fn a_refused_rider(dir: &Path, modes: Option<&Path>) -> (Arc<Node>, JobId, JobId, Events) {
+    let iq = band_of(&[rds_station(0x2AB1, RDS_OFFSET_HZ, 2.0)], 35);
+    let node = rds_node(dir, &iq, modes, Some(registry())).await;
+    let watch = start_rds_watch(&node, serde_json::json!({})).await.unwrap();
+    let events = Events::of(&node, &watch);
+    let demod = kept_of(&node, &watch, "wfm_demod", 1).await.remove(0);
+    until("the rider tried", Duration::from_secs(60), || {
+        summaries_of(&events, &demod)
+            .iter()
+            .any(|s| s.contains("rds_decode did not attach: "))
+    })
+    .await;
+    (node, watch, demod, events)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rider_that_does_not_attach_at_the_start_leaves_the_job_running() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, watch, demod, events) = a_refused_rider(dir.path(), None).await;
+    // Step 1 proved the rider: the job starts unheld, the refusal noted, nothing riding.
+    let s = summaries_of(&events, &demod);
+    assert!(
+        s[0].contains("(capture, choice: proved at step 1); rds_decode did not attach: "),
+        "{s:#?}"
+    );
+    assert!(s[0].contains("stream_in"), "{s:#?}");
+    assert_running_unheld(&node, &watch, &demod).await;
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rider_that_does_not_attach_at_its_proof_still_lifts_the_hold() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let modes = rds_without_quick(dir.path());
+    let (node, watch, demod, events) = a_refused_rider(dir.path(), Some(&modes)).await;
+    let s = summaries_of(&events, &demod);
+    assert!(s[0].contains("held on probation"), "{s:#?}");
+    let lifted = s.iter().find(|s| s.contains("did not attach")).unwrap();
+    assert!(
+        lifted.contains("its choose proved rds_decode riding on it"),
+        "{lifted}"
+    );
+    assert!(
+        lifted.ends_with("the first answer stands and the hold is lifted"),
+        "{lifted}"
+    );
+    assert_running_unheld(&node, &watch, &demod).await;
+    stop_all(&node).await;
+}
+
+/// `demod` runs on unheld, kept by `watch` with nothing attached, and stays so.
+async fn assert_running_unheld(node: &Node, watch: &JobId, demod: &JobId) {
+    until("unheld", Duration::from_secs(5), || {
+        decoding_of(node, watch, demod).is_some_and(|d| d.get("held").is_none())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let rec = record(node, demod).unwrap();
+    assert_eq!((rec.state, rec.held), (JobState::Running, None));
+    assert!(attached_kinds(node, demod).is_empty());
+    assert!(listed_attached(node, watch, demod).is_empty());
+}
+
+// Spec 49.2 on a watch: an `unknown` or `am` read on an FM channel plan's channel answers
+// `fm_demod`, held while a decoder could still prove otherwise (for `unknown`, the rows
+// its width fits; none serves `am` on the channel), and an `unknown` there is no longer
+// tried with nothing kept (no `choosing`).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_and_am_on_a_plan_channel_start_fm_demod() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    for label in ["unknown", "am"] {
+        let _label = zeta_core::node::watch::test_labels_read(label);
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+        assert!(zeta_core::plans::plan_channel_at(cb_ch1_hz(), &node.region()).is_some());
+        let watch = start_choice_watch(&node, serde_json::json!({})).await;
+        let events = Events::of(&node, &watch);
+        let job = decoded(&node, &events, &watch).await;
+        let d = &events.watch("decoding")[0];
+        assert_eq!(d["mode"], "fm_demod", "{label}: {d}");
+        let summary = d["summary"].as_str().unwrap();
+        let listed = decoding_of(&node, &watch, &job).unwrap();
+        assert!(
+            summary.contains("(capture, choice: best_guess at step 1)"),
+            "{label}: {summary}"
+        );
+        if label == "unknown" {
+            // The rows its width fits could still prove it: held while its choose tries.
+            assert!(
+                summary.contains("; held on probation while its choose tries dmr_decode"),
+                "{summary}"
+            );
+            assert_eq!(listed["held"], true, "{listed}");
+            assert!(listed["choose"].is_string(), "{listed}");
+        } else {
+            // No decoder row serves `am` here: nothing could prove otherwise.
+            assert!(!summary.contains("held on"), "{summary}");
+            assert!(listed.get("held").is_none(), "{listed}");
+        }
+        assert!(
+            events.watch("choosing").is_empty(),
+            "{label}: {:#?}",
+            events.all()
+        );
+        assert!(
+            events.watch("unknown").is_empty(),
+            "{label}: {:#?}",
+            events.all()
+        );
+        stop_all(&node).await;
+    }
 }

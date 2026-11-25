@@ -101,8 +101,11 @@ pub struct DetectParams {
     /// Watch policy, ignored by the stage: what a `watch` with `modes: null` does with
     /// each new signal, `identify` it or start the node's `choose` answer for it.
     pub on_signal: OnSignal,
-    /// Watch policy, ignored by the stage: with `on_signal: choose`, the kinds a `watch`
-    /// attaches to each job it starts (only `transcribe`).
+    /// Watch policy, ignored by the stage: with `on_signal: choose`, what a `watch`
+    /// attaches to each job it starts, each where it applies: `transcribe` to a job with
+    /// audio, a row that rides with a demodulator (`rds_decode`; `modes_list` gives each
+    /// row's `rides`) to a job whose row it rides with. The node refuses any other entry
+    /// at `job_start` and `graph put`, naming it.
     pub attach: Vec<String>,
     /// Watch policy, ignored by the stage: with `on_signal: choose`, whether an unproved
     /// demodulator that a decoder row could still prove otherwise starts held (out of
@@ -137,16 +140,6 @@ impl DetectParams {
             return Err(
                 "on_signal: choose answers each signal's job itself: pass modes null".into(),
             );
-        }
-        if let Some((i, kind)) = self
-            .attach
-            .iter()
-            .enumerate()
-            .find(|(_, k)| k.as_str() != "transcribe")
-        {
-            return Err(format!(
-                "attach[{i}]: {kind} is not attached by a watch (only transcribe)"
-            ));
         }
         Ok(())
     }

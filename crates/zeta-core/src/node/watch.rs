@@ -36,17 +36,22 @@
 //! With `on_signal: choose` (and `modes: null`, plan 48), each new signal starts the
 //! node's choice for it instead ([`Inner::start_choice`]): step 1 of the choice over the
 //! signal's band of the ring, its job started at once inside the capture (`via: choose`)
-//! with the `attach` kind (`transcribe`) attached. An unproved demodulator that a decoder
-//! row could still prove otherwise starts held ([`PROBATION`], under `probation`: out of
-//! the mix, its transcript kept) while the watch's own transient `choose` child climbs
-//! the ladder; its verdict ([`settle`]) lifts the hold or replaces the job, its attached
-//! job stopped first. A demodulator's silence is its squelch staying shut. A signal step 1
+//! with what applies of `attach` attached ([`Inner::attach_to`]: `transcribe` to a job
+//! with audio, a row that rides to a job whose row it rides with) and the riders a proof
+//! named (a `wfm_demod` proved by `rds_decode` gets `rds_decode`). An unproved
+//! demodulator that a decoder row could still prove otherwise starts held ([`PROBATION`],
+//! under `probation`: out of the mix, its transcript kept) while the watch's own
+//! transient `choose` child climbs the ladder; its verdict ([`settle`]) lifts the hold,
+//! attaches the riders it proved of the job's row (the job kept under its id), or
+//! replaces the job with another row's, its attached jobs stopped first. A watch only
+//! ever adds to or replaces its own job. A demodulator's silence is its squelch staying
+//! shut. A signal step 1
 //! cannot tell (no job) that decoder rows could still prove (for `unknown`, the rows its
 //! width fits) keeps nothing: when the policy's step for the watch reaches step 2, the
 //! watch's own `choose` tries them ([`Inner::start_choosing`], event `choosing` naming them
 //! in `rows`, listed in `job_context.watch.choosing`), one per signal, holding a decoder
 //! slot, and stopped when its signal goes or the watch stops. Its proof starts the proved
-//! job `via: choose` with the `attach` kind ([`choosing_ended`]); anything else is the unknown try
+//! job `via: choose`, attached as above ([`choosing_ended`]); anything else is the unknown try
 //! step 1 would have made. A row listed for `unknown` is never started on a guess.
 //!
 //! Every watch keeps at most the `detect` node's `max_decoders` decoders (spec 4.4),
@@ -540,8 +545,12 @@ pub(super) struct Policy {
     /// With `on_signal: choose` (and `modes: null`), each new signal starts the node's
     /// choice for it ([`Inner::start_choice`]) instead of an identify run.
     choose: bool,
-    /// The kind attached to each job a choosing watch starts (`attach`: `transcribe`).
-    attach: Option<JobKind>,
+    /// What a choosing watch attaches to each job it starts (`attach`), each entry where
+    /// it applies ([`Inner::attach_to`]): `transcribe` to a job with audio, a row that
+    /// rides to a job whose row it rides with. Listed once each, in order; a name the
+    /// node has no such row for (refused at the start, [`Node::check_watch_policy`]) is
+    /// skipped when it applies.
+    attach: Vec<JobKind>,
     /// Whether an unproved demodulator a decoder row could still prove otherwise starts
     /// held until the watch's `choose` settles (`probation`, default true).
     probation: bool,
@@ -603,7 +612,12 @@ impl Policy {
                 .into_iter()
                 .flatten()
                 .filter_map(|k| k.as_str().and_then(JobKind::from_name))
-                .find(|k| *k == JobKind::Transcribe),
+                .fold(Vec::new(), |mut kinds, k| {
+                    if !kinds.contains(&k) {
+                        kinds.push(k);
+                    }
+                    kinds
+                }),
             probation: p["probation"].as_bool().unwrap_or(true),
         }
     }
@@ -712,6 +726,29 @@ pub(crate) fn check_modes_list(
             return Err(format!("modes[{i}]: {id} is {state} ({reason})"));
         }
         check_mode_width(i, m, band_hz)?;
+    }
+    Ok(())
+}
+
+/// Check a watch's `attach` (in its `detect` params `p`) against `modes`: each entry
+/// `transcribe` or a row that rides with a demodulator ([`crate::ops::rider_row`],
+/// whatever its state: one not ready is noted when it would attach). The reason names
+/// the entry: `attach[<i>]: <kind> is not attached by a watch (only transcribe and rows
+/// that ride with a demodulator)`.
+pub(crate) fn check_attach(modes: &ModeRegistry, p: &serde_json::Value) -> Result<(), String> {
+    let list = p.get("attach").and_then(|a| a.as_array());
+    for (i, kind) in list.into_iter().flatten().enumerate() {
+        let name = kind.as_str().unwrap_or_default();
+        let fits = match JobKind::from_name(name) {
+            Some(JobKind::Transcribe) => true,
+            Some(k) => crate::ops::rider_row(modes, &k).is_some(),
+            None => false,
+        };
+        if !fits {
+            return Err(format!(
+                "attach[{i}]: {name} is not attached by a watch (only transcribe and rows that ride with a demodulator)"
+            ));
+        }
     }
     Ok(())
 }
@@ -864,9 +901,10 @@ enum SinkOutcome {
     Cancelled,
 }
 
-/// Attach a job of `kind` to `job`'s main audio, as `job_attach` does, in its own task (a
-/// plain function: the watch's loop holds only the handle, so its future does not
-/// contain the launch's).
+/// Attach a job of `kind` to `job` as `job_attach` does, in its own task (a plain
+/// function: the watch's loop holds only the handle, so its future does not contain the
+/// launch's): a transcriber on its main audio, any other kind as a rider on its channel
+/// ([`crate::ops::rider_attach`], which takes the node's attach gate itself).
 fn attach_task(
     inner: &Arc<Inner>,
     kind: JobKind,
@@ -874,10 +912,42 @@ fn attach_task(
 ) -> tokio::task::JoinHandle<Result<JobId, String>> {
     let node = Node::handle(inner);
     tokio::spawn(async move {
-        crate::ops::attach_one(&node, &kind, &job, ATTACH_LANGUAGE_DEFAULT, None)
-            .await
-            .map_err(|e| e.to_string())
+        let attached = match kind {
+            JobKind::Transcribe => {
+                crate::ops::attach_one(&node, &kind, &job, ATTACH_LANGUAGE_DEFAULT, None).await
+            }
+            _ => crate::ops::rider_attach(&node, &kind, &job).await,
+        };
+        attached.map_err(|e| e.to_string())
     })
+}
+
+/// A persisted `attached`: a list, or the one job a watch persisted before plan 49 kept.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<JobId>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(JobId),
+        Many(Vec<JobId>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(d)? {
+        None => Vec::new(),
+        Some(OneOrMany::One(j)) => vec![j],
+        Some(OneOrMany::Many(v)) => v,
+    })
+}
+
+/// What came of attaching a rider to a kept job ([`Inner::ride`]).
+enum Ride {
+    /// It rides on the job now.
+    Attached(JobId),
+    /// A running job of the row already rides on it: `Ok` the watch's own, `Err`
+    /// another's (the operator's, or a page's).
+    Riding(Result<JobId, JobId>),
+    /// It did not attach: `<row> did not attach: <why>`.
+    Refused(String),
+    /// The watch was stopped meanwhile.
+    Cancelled,
 }
 
 /// A choosing watch's step 1 in progress ([`Inner::start_choice`]): the signal's centre,
@@ -980,9 +1050,14 @@ struct Decoding {
     /// Why the decoder runs without the sinks it was asked to have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sink_error: Option<String>,
-    /// The job the watch attached to it (`attach`), stopped before it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    attached: Option<JobId>,
+    /// The jobs the watch attached to it (`attach`, and the riders its choice proved),
+    /// in order, each stopped before it.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "one_or_many"
+    )]
+    attached: Vec<JobId>,
     /// Whether it is held on probation ([`PROBATION`]) while `choose` settles.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     held: bool,
@@ -1268,14 +1343,15 @@ async fn release(
 }
 
 impl Decoding {
-    /// What stopping it stops, in order: its `choose` child (no trial outlives it), the
+    /// What stopping it stops, in order: its `choose` child (no trial outlives it), each
     /// job attached to it (so a transcriber ends while its input is still held, dropping
-    /// what it kept), then the job, each with the source it runs on.
+    /// what it kept, and no rider is left on a channel that is gone), then the job, each
+    /// with the source it runs on.
     fn teardown(self) -> Vec<(JobId, SourceId)> {
         let on = self.source;
-        [self.choose, self.attached, Some(self.job)]
-            .into_iter()
-            .flatten()
+        (self.choose.into_iter())
+            .chain(self.attached)
+            .chain([self.job])
             .map(|j| (j, on.clone()))
             .collect()
     }
@@ -1824,7 +1900,7 @@ impl Inner {
             placed,
             via: Via::Modes,
             sink_error: sink_error.clone(),
-            attached: None,
+            attached: Vec::new(),
             held: false,
             choose: None,
             last_event_ns: t,
@@ -1955,14 +2031,60 @@ impl Inner {
         self.launched(r, start, |(id, _)| id.clone()).await
     }
 
-    /// Attach the policy's `attach` kind to `job`'s main audio: the attached job, or why
-    /// it is not attached. Nothing when the policy attaches nothing or `job` gives no
-    /// audio (a decoder row with no voice); nothing either when the watch is stopped
-    /// meanwhile (the attached job is then stopped from a task).
-    async fn attach_to(self: &Arc<Self>, r: &Run, job: &JobId) -> (Option<JobId>, Option<String>) {
-        let Some(kind) = r.seed.policy.attach.clone() else {
-            return (None, None);
-        };
+    /// Attach to `job`, a job of the row `mode` the watch keeps, what applies of the
+    /// policy's `attach` and of `proved` (the riders its choice proved, the `ChoiceJob`'s
+    /// `attach`; spec 49.3), in that order: a transcriber on its main audio (none for a
+    /// job that gives no audio, a decoder row with no voice), then each rider the policy
+    /// names whose row rides with `mode`, then each proved rider not named
+    /// ([`Inner::ride`]). The jobs attached, in order, and a note for each that did not
+    /// attach: `not attached: <why>` for the transcriber, `<row> did not attach: <why>`
+    /// for a rider. Nothing more once the watch is stopped (an attach under way is then
+    /// stopped from a task).
+    async fn attach_to(
+        self: &Arc<Self>,
+        r: &Run,
+        job: &JobId,
+        mode: &str,
+        proved: &[String],
+    ) -> (Vec<JobId>, Vec<String>) {
+        let mut out = (Vec::new(), Vec::new());
+        let policy = &r.seed.policy.attach;
+        if policy.contains(&JobKind::Transcribe) {
+            let (id, why) = self.attach_transcriber(r, job).await;
+            out.0.extend(id);
+            out.1.extend(why.map(|why| format!("not attached: {why}")));
+        }
+        let named = (policy.iter())
+            .filter(|k| **k != JobKind::Transcribe && self.rides_with(k, mode))
+            .map(|k| k.name().to_string());
+        let mut riders: Vec<String> = named.collect();
+        for row in proved {
+            if !riders.contains(row) {
+                riders.push(row.clone());
+            }
+        }
+        for row in riders {
+            if r.cancel.is_cancelled() {
+                break;
+            }
+            match self.ride(r, job, &row, &[]).await {
+                Ride::Attached(id) => out.0.push(id),
+                Ride::Refused(why) => out.1.push(why),
+                Ride::Riding(_) | Ride::Cancelled => {}
+            }
+        }
+        out
+    }
+
+    /// Attach a transcriber to `job`'s main audio: the attached job, or why it is not
+    /// attached. Nothing when `job` gives no audio; nothing either when the watch is
+    /// stopped meanwhile (the attached job is then stopped from a task).
+    async fn attach_transcriber(
+        self: &Arc<Self>,
+        r: &Run,
+        job: &JobId,
+    ) -> (Option<JobId>, Option<String>) {
+        let kind = JobKind::Transcribe;
         if self.audio_stream(job, None).is_err() {
             return (None, None);
         }
@@ -1977,6 +2099,38 @@ impl Inner {
             Ok(Some(id)) => (Some(id), None),
             Ok(None) => (None, None),
             Err(e) => (None, Some(e)),
+        }
+    }
+
+    /// Whether the rider `kind` (a row that `rides`, whatever its state) rides with the
+    /// row `mode` (by its `rides.with`, a variant row of a named demodulator included).
+    fn rides_with(&self, kind: &JobKind, mode: &str) -> bool {
+        let modes = self.modes();
+        let (Some(rider), Some(demod)) = (crate::ops::rider_row(&modes, kind), modes.get(mode))
+        else {
+            return false;
+        };
+        crate::choice::rides_with(&modes, rider, demod)
+    }
+
+    /// Attach the rider row `row` to `job` ([`crate::ops::rider_attach`]), unless a running
+    /// job of that row already rides on it: [`Ride::Riding`] names it (the watch's own
+    /// when it is in `own`). A refusal or a failed launch is [`Ride::Refused`], `<row> did
+    /// not attach: <why>`; the job runs on either way.
+    async fn ride(self: &Arc<Self>, r: &Run, job: &JobId, row: &str, own: &[JobId]) -> Ride {
+        let Some(kind) = JobKind::from_name(row) else {
+            return Ride::Refused(format!("{row} did not attach: no row {row}"));
+        };
+        if let Some(by) = crate::ops::attached_to(&Node::handle(self), job, &kind) {
+            return Ride::Riding(if own.contains(&by) { Ok(by) } else { Err(by) });
+        }
+        match self
+            .launched(r, attach_task(self, kind, job.clone()), JobId::clone)
+            .await
+        {
+            Ok(Some(id)) => Ride::Attached(id),
+            Ok(None) => Ride::Cancelled,
+            Err(e) => Ride::Refused(format!("{row} did not attach: {e}")),
         }
     }
 
@@ -2086,7 +2240,7 @@ impl Inner {
             reason: PROBATION.into(),
             since_ns: now().0,
         });
-        let (k, attach_error, sink_error) =
+        let (k, attach_notes, sink_error) =
             match self.keep_chosen(r, w, i, &job, held.clone()).await? {
                 Ok(kept) => kept,
                 Err(e) => {
@@ -2118,7 +2272,7 @@ impl Inner {
                 choice.could_prove.join(", ")
             ));
         }
-        notes.extend(kept_notes(attach_error, sink_error));
+        notes.extend(kept_notes(attach_notes, sink_error));
         for n in notes {
             summary.push_str(&format!("; {n}"));
         }
@@ -2127,9 +2281,10 @@ impl Inner {
     }
 
     /// Start the choice's `job` for the tracked signal `i` inside the capture under `held`
-    /// ([`Inner::start_chosen`]), keep it `via: choose`, then attach the policy's `attach`
-    /// kind to it ([`Inner::attach_to`]): its index in `decoding`, why it is not attached
-    /// and why its sink was refused. `Some(Err)`: it did not start; `None`: cancelled.
+    /// ([`Inner::start_chosen`]), keep it `via: choose`, then attach what applies of the
+    /// policy's `attach` and the job's proved riders to it ([`Inner::attach_to`]): its
+    /// index in `decoding`, the notes of what did not attach and why its sink was
+    /// refused. `Some(Err)`: it did not start; `None`: cancelled.
     async fn keep_chosen(
         self: &Arc<Self>,
         r: &Run,
@@ -2137,7 +2292,7 @@ impl Inner {
         i: usize,
         job: &ChoiceJob,
         held: Option<Hold>,
-    ) -> Option<Result<(usize, Option<String>, Option<String>), String>> {
+    ) -> Option<Result<(usize, Vec<String>, Option<String>), String>> {
         let signal = w.signals[i].signal.clone();
         let floor_hz = signal.bandwidth_hz;
         let (id, sink) = match self.start_chosen(r, job, held.clone(), floor_hz).await {
@@ -2162,7 +2317,7 @@ impl Inner {
             placed: Placed::Capture,
             via: Via::Choose,
             sink_error: sink_error.clone(),
-            attached: None,
+            attached: Vec::new(),
             held: held.is_some(),
             choose: None,
             last_event_ns: t,
@@ -2172,12 +2327,12 @@ impl Inner {
             unproven_by_ns: None,
         });
         let k = w.decoding.len() - 1;
-        let (attached, attach_error) = self.attach_to(r, &id).await;
+        let (attached, attach_notes) = self.attach_to(r, &id, &job.kind, &job.attach).await;
         w.decoding[k].attached = attached;
         if r.cancel.is_cancelled() {
             return None;
         }
-        Some(Ok((k, attach_error, sink_error)))
+        Some(Ok((k, attach_notes, sink_error)))
     }
 
     /// Event `decoding` for the kept job `d`, started by the choice.
@@ -2255,7 +2410,7 @@ impl Inner {
         i: usize,
         (choice, job): (&Choice, &ChoiceJob),
     ) -> Option<()> {
-        let (k, attach_error, sink_error) = match self.keep_chosen(r, w, i, job, None).await? {
+        let (k, attach_notes, sink_error) = match self.keep_chosen(r, w, i, job, None).await? {
             Ok(kept) => kept,
             Err(e) => {
                 let why = format!("{} did not start: {e}", job.kind);
@@ -2265,7 +2420,7 @@ impl Inner {
         };
         let d = &w.decoding[k];
         let mut summary = chosen_summary(&d.mode, &d.signal, &r.prov.source, choice);
-        for n in kept_notes(attach_error, sink_error) {
+        for n in kept_notes(attach_notes, sink_error) {
             summary.push_str(&format!("; {n}"));
         }
         self.decoding_event(r, d, summary);
@@ -3093,7 +3248,7 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             placed,
             via: Via::Identify,
             sink_error: sink_error.clone(),
-            attached: None,
+            attached: Vec::new(),
             held: false,
             choose: None,
             last_event_ns: t,
@@ -3195,10 +3350,12 @@ async fn chosen(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Option<bool> {
 }
 
 /// Take the verdict of each kept job's `choose` child that has ended (the child leaves it
-/// in `Inner::verdicts`, as an owned identify does): only a proof of another row
-/// replaces the job ([`replace`]); anything else lifts its hold and the first answer
-/// stands ([`lift`]): the job's own row, an unproved guess at another, `cannot_tell`, or
-/// no verdict at all (a node restart: a transient job never resumes). A held job whose
+/// in `Inner::verdicts`, as an owned identify does): a proof of riders of the job's row
+/// (a `wfm_demod` with `rds_decode` attached) attaches them and lifts its hold, the job
+/// kept ([`ride_on_kept`]); only a proof of another row replaces the job ([`replace`]);
+/// anything else lifts its hold and the first answer stands ([`lift`]): the job's own
+/// row, an unproved guess at another, `cannot_tell`, or no verdict at all (a node
+/// restart: a transient job never resumes). A held job whose
 /// child is past step 2 with no proof ([`Inner::choose_past_two`]) is lifted at once
 /// while the child goes on to step 3, whose proof still replaces it. Whether the state
 /// changed.
@@ -3245,6 +3402,13 @@ async fn settle(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
         #[cfg(feature = "test-fixtures")]
         test_rename_verdict(&mut choice);
         match choice.as_ref().and_then(|c| c.job.as_ref().map(|j| (c, j))) {
+            Some((c, job))
+                if c.settled == Settled::Proved && rides_on(inner, job, &w.decoding[k].mode) =>
+            {
+                if ride_on_kept(inner, r, w, k, (c, job)).await.is_none() {
+                    return true;
+                }
+            }
             Some((c, job)) if c.settled == Settled::Proved && job.kind != w.decoding[k].mode => {
                 if replace(inner, r, w, k, (c, job)).await.is_none() {
                     return true;
@@ -3301,6 +3465,74 @@ fn lift_with(inner: &Inner, r: &Run, w: &mut State, k: usize, why: String) {
         d.signal.mhz(),
         d.source.0
     );
+    kept_event(inner, r, d, summary);
+}
+
+/// Whether every row of the proved `job`'s `attach` is a rider of the kept job's row
+/// `mode` ([`Inner::rides_with`]): its proof confirms the kept job (spec 49.3), so it
+/// is kept and the riders attached to it rather than replaced. `false` for a job with
+/// nothing to attach.
+fn rides_on(inner: &Inner, job: &ChoiceJob, mode: &str) -> bool {
+    !job.attach.is_empty()
+        && (job.attach.iter())
+            .all(|row| JobKind::from_name(row).is_some_and(|k| inner.rides_with(&k, mode)))
+}
+
+/// The `choose` of the kept job `k` proved riders of its row (`choice`, its `job`'s
+/// `attach`, [`rides_on`]): the job is not replaced and keeps its id. Each rider is
+/// attached to it ([`Inner::ride`]): one of that row already riding is left as it is
+/// (`<row> already rides on it (job <id>)` when it is not the watch's own), and one that
+/// does not attach is noted (`<row> did not attach: <why>`) while the job runs on. Its
+/// hold is lifted whatever came of the attach: the proof confirms the demodulator. Event
+/// `decoding`, `its choose proved <rows> riding on it (<settled> at step <n>)` then the
+/// notes. `None`: cancelled.
+async fn ride_on_kept(
+    inner: &Arc<Inner>,
+    r: &Run,
+    w: &mut State,
+    k: usize,
+    (choice, job): (&Choice, &ChoiceJob),
+) -> Option<()> {
+    let (id, own) = (w.decoding[k].job.clone(), w.decoding[k].attached.clone());
+    let mut why = format!(
+        "its choose proved {} riding on it ({} at step {})",
+        job.attach.join(", "),
+        choice.settled.name(),
+        choice.step
+    );
+    for row in &job.attach {
+        let note = match inner.ride(r, &id, row, &own).await {
+            Ride::Cancelled => return None,
+            Ride::Attached(a) => {
+                w.decoding[k].attached.push(a);
+                format!("{row} attached")
+            }
+            Ride::Riding(Ok(_)) => format!("{row} already rides on it"),
+            Ride::Riding(Err(by)) => format!("{row} already rides on it (job {})", by.0),
+            Ride::Refused(why) => why,
+        };
+        why.push_str(&format!("; {note}"));
+    }
+    if r.cancel.is_cancelled() {
+        return None;
+    }
+    if w.decoding[k].held {
+        lift_with(inner, r, w, k, why);
+    } else {
+        let d = &w.decoding[k];
+        let summary = format!(
+            "decoding {} at {} on {}: {why}",
+            d.mode,
+            d.signal.mhz(),
+            d.source.0
+        );
+        kept_event(inner, r, d, summary);
+    }
+    Some(())
+}
+
+/// Event `decoding` for the kept job `d`, started by the choice, with `summary`.
+fn kept_event(inner: &Inner, r: &Run, d: &Decoding, summary: String) {
     let e = Event {
         signal: Some(&d.signal),
         job: Some(&d.job),
@@ -3314,11 +3546,11 @@ fn lift_with(inner: &Inner, r: &Run, w: &mut State, k: usize, why: String) {
 }
 
 /// The `choose` of the kept job `k` settled on another row (`choice`, its `job`): stop
-/// the job's attached transcriber first, then the job (still held: what the transcriber
-/// kept is dropped, and the mix never had it), then start the verdict's job unheld in its
-/// place, with the policy's `attach` on its audio when it has any. A job that does not
-/// start drops the entry and counts an unknown try of its signal. Event `decoding` (or
-/// `unknown`). `None`: cancelled.
+/// the job's attached jobs first, then the job (still held: what the transcriber kept is
+/// dropped, and the mix never had it), then start the verdict's job unheld in its place,
+/// with what applies of the policy's `attach` and the verdict's proved riders attached
+/// ([`Inner::attach_to`]). A job that does not start drops the entry and counts an
+/// unknown try of its signal. Event `decoding` (or `unknown`). `None`: cancelled.
 async fn replace(
     inner: &Arc<Inner>,
     r: &Run,
@@ -3327,12 +3559,12 @@ async fn replace(
     (choice, job): (&Choice, &ChoiceJob),
 ) -> Option<()> {
     let old = w.decoding[k].clone();
-    if let Some(a) = &old.attached {
+    for a in &old.attached {
         inner.stop_started(r, a, &old.source).await;
     }
     inner.stop_started(r, &old.job, &old.source).await;
     w.subs.remove(&old.job);
-    w.decoding[k].attached = None;
+    w.decoding[k].attached.clear();
     let floor_hz = old.signal.bandwidth_hz;
     let (id, sink) = match inner.start_chosen(r, job, None, floor_hz).await {
         Ok(Some(started)) => started,
@@ -3361,7 +3593,7 @@ async fn replace(
     d.squelch_open = None;
     d.unproven_by_ns = None;
     d.sink_error = sink_error.clone();
-    let (attached, attach_error) = inner.attach_to(r, &id).await;
+    let (attached, attach_notes) = inner.attach_to(r, &id, &job.kind, &job.attach).await;
     w.decoding[k].attached = attached;
     if r.cancel.is_cancelled() {
         return None;
@@ -3376,11 +3608,8 @@ async fn replace(
         choice.step,
         old.mode
     );
-    if let Some(why) = attach_error {
-        summary.push_str(&format!("; not attached: {why}"));
-    }
-    if let Some(why) = sink_error {
-        summary.push_str(&format!("; sink refused: {why}"));
+    for n in kept_notes(attach_notes, sink_error) {
+        summary.push_str(&format!("; {n}"));
     }
     let e = Event {
         signal: Some(&d.signal),
@@ -3406,11 +3635,11 @@ fn chosen_summary(kind: &str, signal: &Signal, source: &SourceId, choice: &Choic
     )
 }
 
-/// The notes of a kept job that runs without its attached job or its sink.
-fn kept_notes(attach_error: Option<String>, sink_error: Option<String>) -> Vec<String> {
-    let attach = attach_error.map(|why| format!("not attached: {why}"));
+/// The notes of a kept job that runs without some of its attached jobs (`attach_notes`,
+/// [`Inner::attach_to`]'s) or without its sink.
+fn kept_notes(attach_notes: Vec<String>, sink_error: Option<String>) -> Vec<String> {
     let sink = sink_error.map(|why| format!("sink refused: {why}"));
-    attach.into_iter().chain(sink).collect()
+    attach_notes.into_iter().chain(sink).collect()
 }
 
 /// Take the verdict of each `choose` the watch runs on a signal it keeps nothing for
@@ -4203,5 +4432,82 @@ mod tests {
         assert_eq!(nearest(&signals, 404_028_540, 1), Some(1));
         assert_eq!(nearest(&signals, 404_025_400, 1), Some(0));
         assert_eq!(nearest(&signals, 404_100_000, 1), None);
+    }
+
+    /// A kept job's teardown stops its `choose` child, then every job attached to it in
+    /// order, then the job.
+    #[test]
+    fn a_teardown_stops_each_attached_job_before_the_job() {
+        let v = serde_json::json!({
+            "mode": "wfm_demod", "job": "demod", "source": "rx",
+            "signal": {"center_hz": 1, "bandwidth_hz": 1, "snr_db": 1.0, "first_ns": 0,
+                "last_ns": 0},
+            "since_ns": 0, "placed": "capture", "via": "choose",
+            "attached": ["scribe", "rider"], "choose": "child"
+        });
+        let d: Decoding = serde_json::from_value(v).unwrap();
+        let order: Vec<String> = d.teardown().into_iter().map(|(j, _)| j.0).collect();
+        assert_eq!(order, ["child", "scribe", "rider", "demod"]);
+    }
+
+    /// A decoder persisted before plan 49 with one `attached` job reads as a list of it;
+    /// one with none is empty and persists without the key.
+    #[test]
+    fn a_persisted_attached_job_reads_as_a_list() {
+        let mut v = serde_json::json!({
+            "mode": "fm_demod", "job": "demod", "source": "rx",
+            "signal": {"center_hz": 1, "bandwidth_hz": 1, "snr_db": 1.0, "first_ns": 0,
+                "last_ns": 0},
+            "since_ns": 0, "placed": "capture", "via": "choose", "attached": "scribe"
+        });
+        let d: Decoding = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(d.attached, [JobId("scribe".into())]);
+        assert_eq!(
+            serde_json::to_value(&d).unwrap()["attached"],
+            serde_json::json!(["scribe"])
+        );
+        v.as_object_mut().unwrap().remove("attached");
+        let d: Decoding = serde_json::from_value(v).unwrap();
+        assert!(d.attached.is_empty());
+        assert!(serde_json::to_value(&d).unwrap().get("attached").is_none());
+    }
+
+    /// `attach` keeps its entries once each in order; the start refuses an entry that is
+    /// neither `transcribe` nor a row that rides, naming it.
+    #[test]
+    fn attach_takes_transcribe_and_riders_once_each() {
+        let modes = ModeRegistry::load(&crate::stage::StageRegistry::new(), None);
+        let p = serde_json::json!({"attach": ["transcribe", "rds_decode", "transcribe"]});
+        check_attach(&modes, &p).unwrap();
+        let g = Graph {
+            id: crate::graph::GraphId("watch".into()),
+            nodes: vec![GraphNode {
+                id: crate::graph::NodeId("detect".into()),
+                kind: DETECT_STAGE.into(),
+                params: p,
+            }],
+            edges: vec![],
+        };
+        let kinds: Vec<String> = Policy::of(&g)
+            .attach
+            .iter()
+            .map(|k| k.name().into())
+            .collect();
+        assert_eq!(kinds, ["transcribe", "rds_decode"]);
+        for (bad, i) in [
+            ("packets", 1),
+            ("fm_demod", 1),
+            ("dmr_decode", 1),
+            ("no_such_row", 1),
+        ] {
+            let p = serde_json::json!({"attach": ["transcribe", bad]});
+            let e = check_attach(&modes, &p).unwrap_err();
+            assert_eq!(
+                e,
+                format!(
+                    "attach[{i}]: {bad} is not attached by a watch (only transcribe and rows that ride with a demodulator)"
+                )
+            );
+        }
     }
 }

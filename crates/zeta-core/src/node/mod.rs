@@ -3562,11 +3562,12 @@ impl Node {
     }
 
     /// A watch's `detect` node names only this node's sources in `prefer`
-    /// (`bad params on node <id>: prefer[<i>]: unknown source <id>` otherwise), and its
+    /// (`bad params on node <id>: prefer[<i>]: unknown source <id>` otherwise), its
     /// `modes`, when not `null`, only loaded, ready rows no wider than the watch's band
-    /// `tuning` (see [`watch::check_modes_list`]). Checked at `job_start` and `graph_put`
-    /// only, so a resume on a node started without one of them still runs (the watch
-    /// then skips it).
+    /// `tuning` (see [`watch::check_modes_list`]), and in `attach` only `transcribe` and
+    /// rows that ride with a demodulator, whatever their state ([`watch::check_attach`]).
+    /// Checked at `job_start` and `graph_put` only, so a resume on a node started without
+    /// one of them still runs (the watch then skips it).
     pub(crate) fn check_watch_policy(
         &self,
         graph: &Graph,
@@ -3586,6 +3587,15 @@ impl Node {
                 .filter_map(|s| s.as_str().map(str::to_string))
                 .collect();
             if let Err(reason) = watch::check_modes_list(&modes, &list, tuning.bandwidth_hz.0) {
+                return Err(GraphError::BadParams {
+                    node: n.id.clone(),
+                    reason,
+                }
+                .into());
+            }
+        }
+        for n in detects.clone() {
+            if let Err(reason) = watch::check_attach(&modes, &n.params) {
                 return Err(GraphError::BadParams {
                     node: n.id.clone(),
                     reason,
