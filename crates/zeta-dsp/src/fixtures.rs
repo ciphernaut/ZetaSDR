@@ -318,6 +318,147 @@ pub fn keyed_over_cases(audios: &[f32], shares: &[f64], hole: bool) -> Vec<Keyed
     out
 }
 
+/// What a weak-signal case of layer 1 holds ([`weak_cases`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WeakSignal {
+    /// An NBFM over ([`keyed_over`]) at this peak deviation, Hz, and audio level (1.0
+    /// speech, 0.0 a bare carrier), the carrier up over `on` of the window.
+    Fm {
+        deviation_hz: f64,
+        audio: f32,
+        on: (f64, f64),
+    },
+    /// Full-carrier AM at this index, up for the whole window: of a 1 kHz tone, or with
+    /// `speech` of [`speech_like`] audio brought to a peak of 1.
+    Am { index: f32, speech: bool },
+}
+
+/// One weak-signal window of layer 1's tests and sweep: a signal whose power stands only
+/// `snr_db` over the noise inside the channel `band_hz` it is read through.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WeakCase {
+    /// `weak-<fm|carrier|am>-<what>-<snr>dB-<band>Hz-s<seed>`.
+    pub name: String,
+    pub signal: WeakSignal,
+    pub band_hz: u64,
+    /// The signal's mean power (an FM carrier's while up) over the noise's within
+    /// `band_hz`, dB.
+    pub snr_db: f32,
+    /// The share of the window the signal is up.
+    pub share: f64,
+    pub seed: u64,
+}
+
+/// The in-channel SNRs of the weak FM cases, dB.
+pub const WEAK_FM_SNRS_DB: [f32; 5] = [0.0, 3.0, 6.0, 9.0, 12.0];
+/// The in-channel SNRs of the weak AM cases, dB.
+pub const WEAK_AM_SNRS_DB: [f32; 4] = [3.0, 6.0, 9.0, 12.0];
+/// The channels of the weak FM cases, `(band, peak deviation)` in Hz: 12.5 and 25 kHz FM,
+/// and a 12.5 kHz transmission read through a 25 kHz box.
+pub const WEAK_FM_CHANNELS: [(u64, f64); 3] =
+    [(12_500, 2_500.0), (25_000, 5_000.0), (25_000, 2_500.0)];
+/// The noise seeds of every weak case.
+pub const WEAK_SEEDS: [u64; 3] = [1, 2, 3];
+
+/// The weak-signal cases, at [`KEYED_OVER_RATE_HZ`] over [`KEYED_OVER_SECONDS`], each seed
+/// of [`WEAK_SEEDS`]:
+/// - FM speech and a bare carrier, each whole, keyed up at 40 % of the window, keyed down
+///   at 40 % and keyed up at 6 %, at each SNR of [`WEAK_FM_SNRS_DB`] in each channel of
+///   [`WEAK_FM_CHANNELS`];
+/// - AM of a tone at index 0.2, 0.5 and 0.9 and of speech at 0.9, at each SNR of
+///   [`WEAK_AM_SNRS_DB`] in 12.5 and 25 kHz.
+pub fn weak_cases() -> Vec<WeakCase> {
+    let mut out = Vec::new();
+    for &seed in &WEAK_SEEDS {
+        for &snr_db in &WEAK_FM_SNRS_DB {
+            for &(band_hz, deviation_hz) in &WEAK_FM_CHANNELS {
+                for (what, audio) in [("fm", 1.0f32), ("carrier", 0.0)] {
+                    for (keying, on) in [
+                        ("whole", (0.0, 1.0)),
+                        ("up-d0.60", (0.4, 1.0)),
+                        ("down-d0.40", (0.0, 0.4)),
+                        ("up-d0.94", (0.06, 1.0)),
+                    ] {
+                        out.push(WeakCase {
+                            name: format!(
+                                "weak-{what}-{keying}-dev{deviation_hz:.0}-{snr_db:.0}dB-{band_hz}Hz-s{seed}"
+                            ),
+                            signal: WeakSignal::Fm {
+                                deviation_hz,
+                                audio,
+                                on,
+                            },
+                            band_hz,
+                            snr_db,
+                            share: on.1 - on.0,
+                            seed,
+                        });
+                    }
+                }
+            }
+        }
+        for &snr_db in &WEAK_AM_SNRS_DB {
+            for band_hz in [12_500u64, 25_000] {
+                for (what, index, speech) in [
+                    ("tone-m0.2", 0.2f32, false),
+                    ("tone-m0.5", 0.5, false),
+                    ("tone-m0.9", 0.9, false),
+                    ("speech-m0.9", 0.9, true),
+                ] {
+                    out.push(WeakCase {
+                        name: format!("weak-am-{what}-{snr_db:.0}dB-{band_hz}Hz-s{seed}"),
+                        signal: WeakSignal::Am { index, speech },
+                        band_hz,
+                        snr_db,
+                        share: 1.0,
+                        seed,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The window of `case`, centred: its signal at a mean power (an FM carrier's while up) of
+/// `snr_db` over the white noise within `band_hz`, so `snr_db - 10 log10(rate / band)`
+/// over the whole rate.
+pub fn weak_case_iq(case: &WeakCase) -> Vec<Complex<f32>> {
+    let rate = KEYED_OVER_RATE_HZ;
+    let over_rate_db = case.snr_db - 10.0 * (f64::from(rate) / case.band_hz as f64).log10() as f32;
+    match case.signal {
+        WeakSignal::Fm {
+            deviation_hz,
+            audio,
+            on,
+        } => keyed_over(&KeyedOver {
+            rate_hz: rate,
+            seconds: KEYED_OVER_SECONDS,
+            deviation_hz,
+            audio,
+            on,
+            snr_db: over_rate_db,
+            seed: case.seed,
+        }),
+        WeakSignal::Am { index, speech } => {
+            let audio = if speech {
+                // `speech_like` peaks at 0.5.
+                speech_like(rate, KEYED_OVER_SECONDS)
+                    .iter()
+                    .map(|a| 2.0 * a)
+                    .collect()
+            } else {
+                let n = (f64::from(rate) * f64::from(KEYED_OVER_SECONDS)) as usize;
+                tone(rate, n, 1_000.0, 1.0)
+            };
+            let mut iq = am_modulate(&audio, rate, rate, index, 0.0);
+            // `awgn` sets the noise against the mean power, the sidebands included.
+            awgn(&mut iq, over_rate_db, case.seed);
+            iq
+        }
+    }
+}
+
 /// Add real white Gaussian noise at `snr_db` below the mean power of real `x`
 /// (taken as 1.0 if zero). Same deterministic LCG plus Box-Muller as [`awgn`].
 pub fn awgn_real(x: &mut [f32], snr_db: f32, seed: u64) {

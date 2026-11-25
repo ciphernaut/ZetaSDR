@@ -1,7 +1,8 @@
 //! The layer-1 sweep: one line per input, `<name> <label> duty=<d> occ=<hz> snr=<db>`,
 //! each measured and labelled through `measure_selection`, as `classify` reads it. The
 //! inputs are every fixture `tests/layer1.rs` builds (the keyed overs at every case
-//! `fixtures::keyed_over_cases` lists, the whole over too), every capture in
+//! `fixtures::keyed_over_cases` lists, the whole over too, and the weak signals of
+//! `fixtures::weak_cases`), every capture in
 //! `crates/zeta-dsp/tests/data/`, and each `*.sigmf-meta` in the directories given as
 //! arguments. A capture is read over its first annotation's band when it has one, else
 //! whole.
@@ -17,7 +18,7 @@ use zeta_core::classify::Band;
 use zeta_core::types::Hz;
 use zeta_dsp::fixtures::{
     Impairments, KEYED_OVER_SHARES, SynthSpec, am_modulate, awgn, keyed_over, keyed_over_cases,
-    nbfm_modulate, ssb_modulate, synthesise, tone, wfm_modulate,
+    nbfm_modulate, ssb_modulate, synthesise, tone, weak_case_iq, weak_cases, wfm_modulate,
 };
 use zeta_dsp::measure::measure_selection;
 
@@ -261,6 +262,19 @@ fn built(emit: &mut impl FnMut(Input)) {
             name: c.name.clone(),
             iq: keyed_over(&c.over),
             rate_hz: u64::from(c.over.rate_hz),
+            center_hz: CENTER,
+            band: Band {
+                offset_hz: 0,
+                bandwidth_hz: Hz(c.band_hz),
+            },
+        });
+    }
+    // The weak signals: FM overs, bare carriers and AM a few dB over the channel's noise.
+    for c in weak_cases() {
+        emit(Input {
+            name: c.name.clone(),
+            iq: weak_case_iq(&c),
+            rate_hz: u64::from(zeta_dsp::fixtures::KEYED_OVER_RATE_HZ),
             center_hz: CENTER,
             band: Band {
                 offset_hz: 0,
