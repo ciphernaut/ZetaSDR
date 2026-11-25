@@ -2444,6 +2444,7 @@ async fn rows_of_two_widths_replay_each_at_its_own_from_one_cut() {
     // 15 625 Hz (the union's guard) at 240 kS/s: cut at 48 kS/s.
     assert_eq!(slice.sample_rate_hz, Hz(48_000), "{slice:?}");
     let trials = ctx["trials"].as_array().expect("the choose's trials");
+    let mut checked = Vec::new();
     for (kind, width) in [("m17_narrow", 12_000), ("dmr_decode", 12_500)] {
         let trial = trials
             .iter()
@@ -2455,11 +2456,22 @@ async fn rows_of_two_widths_replay_each_at_its_own_from_one_cut() {
         if let Some(r) = seen.iter().find(|r| r.id.0 == job) {
             assert_eq!(r.kind, kind, "{trial}");
             assert_eq!(channel_band(r), (measured, width), "{kind}");
+            checked.push(kind);
+        }
+        // The proving replay runs until its proof: the poll always sees that job.
+        if trial["outcome"] == "proved" {
+            assert!(
+                checked.contains(&kind),
+                "{kind}'s proving replay {job} unseen: {first}"
+            );
         }
     }
-    // The proved row's replay runs until its proof: it is always seen.
-    let dmr = seen.iter().find(|r| r.kind == "dmr_decode");
-    assert!(dmr.is_some(), "no dmr_decode replay seen: {first}");
+    assert!(
+        trials
+            .iter()
+            .any(|t| t["row"] == "dmr_decode" && t["step"] == 2 && t["outcome"] == "proved"),
+        "{ctx:#}"
+    );
 }
 
 /// Near the capture's edge a 12.5 kHz row is not tried, with the capture's reason, while

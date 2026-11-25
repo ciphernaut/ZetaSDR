@@ -125,11 +125,13 @@ pub(crate) fn catalogue_entry(label: &Label) -> Option<&str> {
 /// licences there, an FM plan's channel) weighs against the label (spec 49.2): a
 /// demodulator row that serves an expected emission is a candidate though it does not
 /// serve the label ([`expected_fits`]), sized as for the expected label, with the
-/// expectation's line in its evidence. When every expected emission is incompatible with
-/// the label, the label's term counts `weights.contradicted` of itself, and an FM plan
-/// counts for the rows it fits as a licence does (`weights.allocation`, not on top of the
-/// register's own term). It ranks, never proves: the answer stays a best guess, and the
-/// decoder rows are ranked as before.
+/// expectation's line in its evidence. Only an expectation some demodulator row fits at
+/// the measured width counts. When every such expectation is incompatible with the label
+/// (the label is contradicted), each demodulator row an expectation fits scores the width
+/// term and `weights.allocation` (a licence at rank 0; a plan's channel the same, never
+/// twice), and each row that serves the label scores its label term at
+/// `weights.contradicted` and no licence term from elsewhere in the band. It ranks, never
+/// proves: the answer stays a best guess, and the decoder rows are ranked as before.
 ///
 /// A decoder row is tried at its own band ([`job_for`]), not the box's: a box narrower
 /// than the row still lists it. With `capture` (the ring's centre and rate) a ready
@@ -217,20 +219,6 @@ pub fn choose_now(
         capture.is_none_or(|cap| capture_holds(cap, job_band(&job_for(s.mode, m, sel, region))))
     };
     let (ready, outside): (Vec<&Scored>, Vec<&Scored>) = ready.into_iter().partition(held);
-    // What the register and the plans expect at the centre, and whether all of it
-    // contradicts the label.
-    let expected = expected_labels(&c.allocations, center_hz, region);
-    let contradicted = !expected.is_empty() && expected.iter().all(|(_, l)| !l.contains(&label));
-    // The expectations that bring a demodulator row the label does not serve.
-    let brought = |row: &LoadedMode| -> Vec<&(Expected, Vec<&'static str>)> {
-        if row.role() != Role::Demodulator || row.row.modulation.iter().any(|l| l == label) {
-            return vec![];
-        }
-        expected
-            .iter()
-            .filter(|x| expected_fits(row, x, bandwidth_hz))
-            .collect()
-    };
     // An `fsk` wider than a row's `voice_max_hz` is data, not a weak FM voice: the row
     // (`fm_demod`'s 25 kHz) does not serve it.
     let fsk_data = |row: &LoadedMode| {
@@ -252,21 +240,50 @@ pub fn choose_now(
         &catalogue_term,
         &allocation,
     );
+    // What the register and the plans expect at the centre: only an expectation some
+    // demodulator row fits at the measured width speaks for or against the label.
+    let mut expected = expected_labels(&c.allocations, center_hz, region);
+    expected.retain(|x| {
+        serving
+            .iter()
+            .any(|s| expected_fits(s.mode, x, bandwidth_hz))
+    });
+    let contradicted = !expected.is_empty() && expected.iter().all(|(_, l)| !l.contains(&label));
     if contradicted {
         for s in &mut serving {
+            let own = allocation(s.mode);
+            if expected
+                .iter()
+                .any(|x| expected_fits(s.mode, x, bandwidth_hz))
+            {
+                // The expected width fits the row, and a misread's measured width is what
+                // is in doubt: the width term counts. The expectation holding the centre
+                // counts as a licence at rank 0 (a plan's too), never twice.
+                if !s.fits_width {
+                    s.score += weights.bandwidth;
+                }
+                s.score += (weights.allocation - own).max(0.0);
+            } else if s.fits_label {
+                // A licence elsewhere in the band does not speak for the label against
+                // the ones that hold the centre.
+                s.score -= own;
+            }
             if s.fits_label {
                 s.score -= weights.modulation * (1.0 - weights.contradicted);
-            }
-            // An FM plan counts as a licence does, not on top of the register's term.
-            let planned = expected.iter().any(|x| {
-                matches!(x.0, Expected::Plan { .. }) && expected_fits(s.mode, x, bandwidth_hz)
-            });
-            if planned {
-                s.score += (weights.allocation - allocation(s.mode)).max(0.0);
             }
         }
         rank_scored(&mut serving);
     }
+    // The expectations that bring a demodulator row the label does not serve.
+    let brought = |row: &LoadedMode| -> Vec<&(Expected, Vec<&'static str>)> {
+        if row.role() != Role::Demodulator || row.row.modulation.iter().any(|l| l == label) {
+            return vec![];
+        }
+        expected
+            .iter()
+            .filter(|x| expected_fits(row, x, bandwidth_hz))
+            .collect()
+    };
     let (demods, unready_demods): (Vec<&Scored>, Vec<&Scored>) = serving
         .iter()
         .filter(|s| {

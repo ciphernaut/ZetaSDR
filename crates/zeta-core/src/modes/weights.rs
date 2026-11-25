@@ -38,8 +38,14 @@ pub struct Weights {
     pub contradicted: f32,
 }
 
-/// The embedded `contradicted`, and the value of a file that leaves it out.
-pub(crate) const CONTRADICTED: f32 = 0.25;
+/// The embedded `contradicted`, and the value of a file that leaves it out. When the label
+/// is contradicted, a demodulator row the expectation fits scores `center + bandwidth +
+/// allocation` (0.9) at any width and rank, and a row serving the label at most `center +
+/// bandwidth + contradicted * modulation`. For the expected row to lead clearly
+/// (`runner_up_margin`), `allocation - contradicted * modulation >= runner_up_margin`:
+/// `contradicted <= (0.2 - 0.15) / 0.3 = 1/6`. 0.15 leads by 0.155. When some expectation
+/// agrees with the label nothing is adjusted, so the value does not reach that case.
+pub(crate) const CONTRADICTED: f32 = 0.15;
 
 fn contradicted() -> f32 {
     CONTRADICTED
@@ -73,6 +79,10 @@ mod tests {
     use crate::modes::{ModeRegistry, ModeState};
     use crate::stage::StageRegistry;
 
+    /// An operator's file from before plan 49 (no `contradicted`), its margin 0.3.
+    const BEFORE_PLAN_49: &str = r#"{"center":0.4,"bandwidth":0.3,"modulation":0.3,"allocation":0.2,
+        "catalogue":0.25,"learned":0.3,"layer3":0.0,"runner_up_margin":0.3}"#;
+
     fn dir_with(text: &str) -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join(WEIGHTS_FILE), text).unwrap();
@@ -91,7 +101,7 @@ mod tests {
             (0.25, 0.3, 0.0, 0.15)
         );
         // Plan 49's key, and the value a file without it takes.
-        assert_eq!(w.contradicted, 0.25);
+        assert_eq!(w.contradicted, 0.15);
         assert_eq!(w.contradicted, CONTRADICTED);
     }
 
@@ -99,10 +109,7 @@ mod tests {
     /// the embedded value.
     #[test]
     fn a_weights_file_without_contradicted_still_loads() {
-        let d = dir_with(
-            r#"{"center":0.4,"bandwidth":0.3,"modulation":0.3,"allocation":0.2,
-                "catalogue":0.25,"learned":0.3,"layer3":0.0,"runner_up_margin":0.3}"#,
-        );
+        let d = dir_with(BEFORE_PLAN_49);
         let reg = ModeRegistry::load(&StageRegistry::new(), Some(d.path()));
         assert!(
             reg.handler_files().iter().all(|f| f.id != "weights"),
@@ -134,10 +141,7 @@ mod tests {
 
     #[test]
     fn an_operator_weights_file_overrides_one_value() {
-        let d = dir_with(
-            r#"{"center":0.4,"bandwidth":0.3,"modulation":0.3,"allocation":0.2,
-                "catalogue":0.25,"learned":0.3,"layer3":0.0,"runner_up_margin":0.3}"#,
-        );
+        let d = dir_with(BEFORE_PLAN_49);
         let reg = ModeRegistry::load(&StageRegistry::new(), Some(d.path()));
         assert_eq!(reg.weights().runner_up_margin, 0.3);
         assert_eq!(reg.weights().center, 0.4);

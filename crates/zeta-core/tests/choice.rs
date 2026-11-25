@@ -697,6 +697,75 @@ fn am_on_a_plan_fm_channel_answers_fm_demod() {
     );
 }
 
+/// An `am` read only 5.5 kHz wide (inside `am_demod`'s width window, under `fm_demod`'s)
+/// on an FM plan's channel or an FM licence: the expected width fits `fm_demod`, and the
+/// measured width of a misread is what is in doubt, so the expectation still outweighs it.
+#[test]
+fn a_narrow_am_on_an_fm_channel_still_answers_fm_demod() {
+    let modes = registry(None);
+    let channel = cb_channel_hz();
+    let cases = [
+        measured("am", channel + 300, 5_500),
+        measured_with("am", DMR_HZ, 5_500, vec![licence("11K0F3E", DMR_HZ)]),
+    ];
+    for c in cases {
+        let choice = choose_for(&modes, &c, 12_500);
+        assert_eq!(choice.row.as_deref(), Some("fm_demod"), "{choice:?}");
+        assert_eq!(
+            choice.runner_up.as_ref().map(|r| r.row.as_str()),
+            Some("am_demod"),
+            "{choice:?}"
+        );
+    }
+}
+
+/// The FM licence at the centre listed third: behind two transmitters elsewhere in the
+/// band, of a letter no demodulator serves (`N`) or of AM, which give `am_demod` a licence
+/// term of its own. Neither outweighs the licence that holds the centre.
+#[test]
+fn an_fm_licence_listed_behind_others_still_outweighs_am() {
+    let modes = registry(None);
+    for other in ["1K00N0N", "6K00A3E"] {
+        let allocs = vec![
+            licence(other, DMR_HZ + 50_000),
+            licence(other, DMR_HZ + 75_000),
+            licence("11K0F3E", DMR_HZ),
+        ];
+        let c = measured_with("am", DMR_HZ, 9_000, allocs);
+        let choice = choose_for(&modes, &c, 12_500);
+        assert_eq!(
+            choice.row.as_deref(),
+            Some("fm_demod"),
+            "{other}: {choice:?}"
+        );
+        assert_eq!(
+            choice.runner_up.as_ref().map(|r| r.row.as_str()),
+            Some("am_demod"),
+            "{other}: {choice:?}"
+        );
+    }
+}
+
+/// A licence at the centre that no demodulator's width fits (an FM emission 50 kHz wide)
+/// brings nothing and discounts nothing: whatever `contradicted` is, the answer is the one
+/// with no licence at all (where `acars_decode` is not within the margin of `am_demod`).
+#[test]
+fn an_expectation_no_demodulator_fits_leaves_the_label_whole() {
+    let modes = registry(None);
+    let sel = box_at(AIRBAND_HZ, 20_000);
+    let plain = measured("am", AIRBAND_HZ, 9_000);
+    let before = choose_now(&modes, modes.weights(), &plain, &sel, "AU", None);
+    assert_eq!(before.row.as_deref(), Some("am_demod"), "{before:?}");
+    let wide = vec![licence("50K0F3E", AIRBAND_HZ)];
+    let c = measured_with("am", AIRBAND_HZ, 9_000, wide);
+    for k in [0.0, 0.15, 1.0] {
+        let mut w = modes.weights().clone();
+        w.contradicted = k;
+        let choice = choose_now(&modes, &w, &c, &sel, "AU", None);
+        assert_eq!(choice, before, "contradicted {k}");
+    }
+}
+
 /// An `am` read where the licence is for AM answers `am_demod`, as it did; and where one
 /// licence at the centre is AM and another FM, not every expected emission contradicts
 /// the label, so the label holds.
@@ -781,7 +850,7 @@ fn with_no_expectation_every_answer_is_as_before() {
         for allocations in [vec![], away(center)] {
             let c = measured_with(label, center, width, allocations);
             let sel = box_at(center, box_hz);
-            let answers: Vec<Choice> = [0.0, 0.25, 1.0]
+            let answers: Vec<Choice> = [0.0, 0.15, 1.0]
                 .into_iter()
                 .map(|k| {
                     let mut w = modes.weights().clone();
@@ -831,8 +900,8 @@ fn identify_ranks_the_decoders_as_before() {
         ranked(&w, &am, false)
     };
     assert!(!weighed(0.0).is_empty());
-    assert_eq!(weighed(0.0), weighed(0.25));
-    assert_eq!(weighed(0.25), weighed(1.0));
+    assert_eq!(weighed(0.0), weighed(0.15));
+    assert_eq!(weighed(0.15), weighed(1.0));
     let w = modes.weights();
     assert!(!ranked(w, &[], true).is_empty());
     assert_eq!(ranked(w, &[], true), ranked(w, &am, true));

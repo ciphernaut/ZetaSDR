@@ -6095,6 +6095,7 @@ async fn a_tried_signal_holds_its_slot_and_the_watch_says_so() {
     let _unknown = zeta_core::node::watch::test_labels_read("unknown");
     let dir = tempfile::tempdir().unwrap();
     let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    no_channel_plan(&node).await;
     set_trial_s(&node, 60).await;
     let watch = start_choice_watch(&node, serde_json::json!({"max_decoders": 1})).await;
     let events = Events::of(&node, &watch);
@@ -6127,6 +6128,7 @@ async fn a_tried_signal_that_goes_stops_its_choose_and_is_let_go() {
     let _unknown = zeta_core::node::watch::test_labels_read("unknown");
     let dir = tempfile::tempdir().unwrap();
     let (node, port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    no_channel_plan(&node).await;
     // Long enough that the choose is still trying when its signal goes.
     set_trial_s(&node, 60).await;
     let watch = start_choice_watch(&node, serde_json::json!({})).await;
@@ -6173,6 +6175,7 @@ async fn a_signal_beside_one_being_tried_starts_no_second_choose() {
     let _unknown = zeta_core::node::watch::test_labels_read("unknown");
     let dir = tempfile::tempdir().unwrap();
     let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    no_channel_plan(&node).await;
     set_trial_s(&node, 60).await;
     let watch = start_choice_watch(&node, serde_json::json!({})).await;
     let events = Events::of(&node, &watch);

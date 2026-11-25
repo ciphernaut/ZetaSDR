@@ -111,7 +111,8 @@ impl Expected {
         }
     }
 
-    /// Its evidence line, for a layer-1 `label` it overturned:
+    /// Its evidence line, on a demodulator row it brought though layer 1's `label` does
+    /// not serve the row (whether or not the label was contradicted, as admission is):
     /// `register: <designator> expected here (layer 1 read <label>)` or
     /// `plan: <id> is an FM plan (layer 1 read <label>)`.
     pub(crate) fn line(&self, label: &str) -> String {
