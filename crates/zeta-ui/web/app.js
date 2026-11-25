@@ -1571,6 +1571,8 @@ function start(api) {
     },
   });
   armClearAll($("#jobs-clear"));
+  // The Jobs pane's Clear stale: drops the finished rows as `view clear` does, stopping nothing.
+  $("#jobs-clear-stale")?.addEventListener("click", () => state.view?.clear());
   state.mic = mountMic($("#mic"), api, (text) => {
     $("#cmd").value = text;
     submitCommand();

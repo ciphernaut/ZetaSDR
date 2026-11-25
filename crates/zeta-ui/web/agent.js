@@ -159,8 +159,9 @@
 //       of them stood, its summary a `.group-text` reading `<set name> · <n> on <shown
 //       source>, +<m> on <other source>` (shownSource(), the source the page shows; null:
 //       `<n> on <source>` for each) and a `button.stop` that reads `Stop set?` on a first
-//       click and sends `set_stop` on a second within SET_STOP_CONFIRM_MS. Only the rows on
-//       the shown source are listed under it; a plan member's channels sit there directly,
+//       click and sends `set_stop` on a second within SET_STOP_CONFIRM_MS. Every member's row is
+//       listed under it, whichever source is shown (each row names its own source; the
+//       summary still counts them per source); a plan member's channels sit there directly,
 //       a watch member's group (the watch's row and its decoders) nests inside it: two
 //       levels at most. A watch row's Stop is the watch's job_stop, a member row's its own.
 //       Jobs sent from one another (plan 43 Send to: a record's `group`, one id for the lot) fold
@@ -1377,12 +1378,12 @@ export function startJobs(
     const inside = new Map(); // plan -> its rows, in list order
     const watchRows = new Map(); // watch id -> {watch, row}: its own row
     const decoderRows = new Map(); // watch id -> its decoders' rows, in list order
-    const setRows = new Map(); // set id -> its rows on the shown source, in list order
+    const setRows = new Map(); // set id -> its rows, on every source, in list order
     const sibRows = new Map(); // group id -> {member id -> its row and the rows attached to it}
     const here = shownSource ? shownSource() ?? null : null;
     const out = [];
     // `node` (j's row, or a watch member's group) under j's set when j (or its input) is one
-    // of a set's jobs: listed when on the shown source, else only counted. Whether it was.
+    // of a set's jobs, whichever source it is on. Whether it was.
     const intoSet = (j, node) => {
       const set = setOf.get(j.input ?? j.id);
       if (!set) return false;
@@ -1392,7 +1393,7 @@ export function startJobs(
         setRows.set(set, []);
         out.push(groupEls.get(key));
       }
-      if (here === null || j.source === here) setRows.get(set).push(node);
+      setRows.get(set).push(node);
       return true;
     };
     shown.forEach((j, i) => {

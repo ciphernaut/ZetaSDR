@@ -6908,8 +6908,9 @@ def set_running(url, secret, set_id):
 
 def scenario_set_menu_starts_a_set_and_groups_its_jobs(page, url, secret):
     # Plan 31 spec 5.5, 7.3: "Start set…" opens a role → source picker and sends set_start;
-    # the set's jobs fold under one group titled by the set's name, the members on the shown
-    # source listed and the others counted; the group's Stop is set_stop after a confirm.
+    # the set's jobs fold under one group titled by the set's name, every member listed
+    # whichever source is shown, counted per source in the summary; the group's Stop is
+    # set_stop after a confirm.
     menu = open_menu_on_tone(page, url, secret)
     entry = menu_item(page, "set")
     expect(entry).to_have_text("Start set…")
@@ -6948,9 +6949,8 @@ def scenario_set_menu_starts_a_set_and_groups_its_jobs(page, url, secret):
         expect(group.locator("> summary .group-text")).to_have_text(
             re.compile(r"Two sources \(UI tests\) · 1 on tone, \+1 on cb"))
         expect(group.locator(f'.job[data-id="{job_of["m"]}"]')).to_have_count(1)
-        expect(group.locator(f'.job[data-id="{job_of["cb20"]}"]')).to_have_count(0)
-        expect(page.locator(f'#jobs .job[data-id="{job_of["cb20"]}"]')).to_have_count(0)
-        # On cb the same group lists the CB channel and counts the measure.
+        expect(group.locator(f'.job[data-id="{job_of["cb20"]}"]')).to_have_count(1)
+        # On cb the same group lists both, counting the CB channel first.
         page.click('.src-tab[data-id="cb"]')
         expect(page.locator('.src-tab[data-id="cb"]')).to_have_attribute("aria-selected", "true")
         page.evaluate("window.zetaTest.poll()")
@@ -6958,7 +6958,7 @@ def scenario_set_menu_starts_a_set_and_groups_its_jobs(page, url, secret):
         expect(group.locator("> summary .group-text")).to_have_text(
             re.compile(r"Two sources \(UI tests\) · 1 on cb, \+1 on tone"))
         expect(group.locator(f'.job[data-id="{job_of["cb20"]}"]')).to_have_count(1)
-        expect(group.locator(f'.job[data-id="{job_of["m"]}"]')).to_have_count(0)
+        expect(group.locator(f'.job[data-id="{job_of["m"]}"]')).to_have_count(1)
         # The group's Stop asks first, then sends set_stop.
         stop = group.locator("> summary button.stop")
         expect(stop).to_have_text("Stop")
@@ -12626,6 +12626,32 @@ def scenario_jobs_clear_all_stops_and_drops_the_rows(page, url, secret):
         # Its finished row is dropped at once, not after finished_rows_s.
         expect(row).to_have_count(0)
         expect(btn).to_have_text("Clear all")
+    finally:
+        for j in jobs("measure"):
+            stop_job(url, secret, j)
+
+
+def scenario_jobs_clear_stale_drops_finished_rows_and_stops_nothing(page, url, secret):
+    url = llm_url()
+    select_source(page, url, secret, "cb")
+    jobs = lambda kind: running_kind(url, secret, kind, "cb")
+    # Both inside the cb fixture's 48 kHz.
+    done = start_job(url, secret, "measure", "cb", 476_890_000, 10_000)
+    live = start_job(url, secret, "measure", "cb", 476_910_000, 10_000)
+    try:
+        stop_job(url, secret, done)
+        page.evaluate("window.zetaTest.poll()")
+        gone = page.locator(f'#jobs .job[data-job="{done}"]')
+        kept = page.locator(f'#jobs .job[data-job="{live}"]')
+        # The stopped job's row stays for finished_rows_s; Clear stale drops it at once.
+        expect(gone).to_have_count(1, timeout=10000)
+        expect(kept).to_have_count(1)
+        page.locator("#jobs-clear-stale").click()
+        expect(gone).to_have_count(0)
+        expect(kept).to_have_count(1)
+        assert jobs("measure") == [live], "Clear stale stopped nothing"
+        assert page.locator("#transcript .line.op", has_text="jobs_stop").count() == 0, \
+            "Clear stale sent no jobs_stop"
     finally:
         for j in jobs("measure"):
             stop_job(url, secret, j)
