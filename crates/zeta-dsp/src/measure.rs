@@ -63,7 +63,8 @@ const NOISE_SNR_DB: f32 = 6.0;
 /// FM needs discriminator audio (from `FM_MIN_AUDIO_HZ` to half the occupied band, its
 /// drift taken out) whose RMS deviation beyond the envelope's motion is above this
 /// ([`Motion::over_hz`]); below it a constant-envelope signal is a carrier. Where the noise
-/// could click, the floor is higher (`CLICK_MARGIN`).
+/// could click, FM needs more (`CLICK_MARGIN`, `WEAK_FM_MOTION`), and what lies between is
+/// `unknown`.
 /// Measured over the carrier where it is up, on generators:
 /// - a bare carrier, keyed or steady, and one drifting linearly by up to 3 kHz in 2 s, or
 ///   warming up by 1 kHz with a 0.2 s time constant, at 15 and 36 dB: at most 1 Hz over
@@ -723,7 +724,7 @@ fn click_hz2(snr: f64, width_hz: f64, audio_max_hz: f64) -> f64 {
 /// under it: the Rice distribution's. With `K = snr`, the envelope's mean square is
 /// `N (1 + K)` and its mean `sqrt(pi N / 4) L(K)`, where
 /// `L(K) = exp(-K/2) ((1 + K) I0(K/2) + K I1(K/2))`, so
-/// `cv^2 = 4 (1 + K) / (pi L(K)^2) - 1`: 0.523 for noise alone (Rayleigh), 0.36 at 6 dB,
+/// `cv^2 = 4 (1 + K) / (pi L(K)^2) - 1`: 0.523 for noise alone (Rayleigh), 0.32 at 6 dB,
 /// `1 / sqrt(2 K)` when the carrier is strong.
 fn rice_cv(snr: f64) -> f64 {
     let k = snr.max(0.0);
@@ -748,11 +749,12 @@ fn rice_cv(snr: f64) -> f64 {
         .sqrt()
 }
 
-/// The envelope CV `cv` of samples with the share a steady carrier's noise at `snr` gives it
-/// taken out, in quadrature ([`rice_cv`]): how far the envelope moves beyond what the noise
-/// in the samples explains. `cv` itself without an `snr`.
+/// The envelope CV `cv` of samples with the share a steady carrier's noise gives it taken
+/// out, in quadrature ([`rice_cv`], at `NOISE_SLACK_DB` over `snr`, so sooner too little
+/// than too much): how far the envelope moves beyond what the noise in the samples
+/// explains. `cv` itself without an `snr`.
 fn cv_over_noise(cv: f32, snr: Option<f64>) -> f32 {
-    let noise = snr.map_or(0.0, rice_cv);
+    let noise = snr.map_or(0.0, |snr| rice_cv(snr * 10f64.powf(NOISE_SLACK_DB / 10.0)));
     (f64::from(cv).powi(2) - noise * noise).max(0.0).sqrt() as f32
 }
 
@@ -869,7 +871,7 @@ fn tone_pair(
 /// "The CV" the rules read is the samples' envelope CV with the noise's share taken out
 /// ([`cv_over_noise`]): the measurement finds the signal's power over the noise's in the
 /// samples ([`noise_beside`]), a steady carrier in that noise has a known envelope CV
-/// ([`rice_cv`]: 0.36 at 6 dB, 0.18 at 12), and what the envelope moves beyond it, in
+/// ([`rice_cv`]: 0.32 at 6 dB, 0.17 at 12), and what the envelope moves beyond it, in
 /// quadrature, is the signal's own. So a weak FM over or bare carrier has a constant
 /// envelope, as a strong one has, and weak AM still moves it. With no noise seen beside
 /// the signal (its occupied run fills the band) the CV is the samples' as it is.
@@ -925,18 +927,23 @@ fn tone_pair(
 ///     envelope's motion in the same band ([`Motion::over_hz`]: noise moves both alike,
 ///     AM only the envelope) by more than a floor: 40 Hz RMS, raised in quadrature by
 ///     `CLICK_MARGIN` times what the noise's clicks could leave there ([`click_hz2`]:
-///     nothing from about 10 dB up). `"carrier"` (0.7) under the same gate when it does
-///     not: a keyed carrier with no modulation where it is up, or one that drifts, reads
-///     `carrier`, its keying in `duty`, `bursts` and `burst_ms`; so does an over too weak
-///     for its deviation to stand clear of the clicks.
+///     nothing from about 10 dB up), and, where the band the phase is read from holds the
+///     carrier under 10 dB over its noise, the phase moves at least `WEAK_FM_MOTION` (1.6)
+///     times as far as the envelope. `"carrier"` (0.7) under the same gate when the
+///     deviation beyond the envelope's motion is under the 40 Hz: a keyed carrier with no
+///     modulation where it is up, or one that drifts, reads `carrier`, its keying in
+///     `duty`, `bursts` and `burst_ms`. Deviation over the 40 Hz that does not stand clear
+///     of the noise is not decided: `"unknown"`.
 /// 11. Otherwise `"unknown"` (0.5).
 ///
-/// What that decides on generators (`fixtures::weak_cases`, 2 s, three noise seeds): FM
-/// speech reads `fm` or `fsk`, and a bare carrier `carrier`, from 3 dB over the noise
-/// inside a 12.5 or 25 kHz channel, whole or keyed; under 3 dB they read `carrier` or
-/// `unknown` (speech still `fm` in a channel twice as wide as it needs, whose noise beside
-/// it the phase is not read from). AM reads `am` from 6 dB (a tone at index 0.2 or 0.5,
-/// speech at 0.9), at index 0.5 from 3 dB.
+/// What that decides on generators (`fixtures::weak_cases`, 2 s, three noise seeds, the
+/// SNR inside a 12.5 or 25 kHz channel):
+/// - FM of voice-like audio (rule 10) and of the keyed-over generator's speech (`fm` or,
+///   by rule 3, `fsk`) reads so from 3 dB, whole or keyed; at 0 dB `unknown`;
+/// - a bare carrier reads `carrier` from 3 dB, at 0 dB `carrier` or `unknown`;
+/// - AM reads `am` from 6 dB (a tone at index 0.2 or 0.5, speech at 0.9, over flat noise
+///   and over noise sloping 6 dB across the channel), at index 0.5 from 1 dB; under 6 dB
+///   the others read `am`, `carrier` or `unknown`, and none reads `fm` down to 1 dB.
 ///
 /// The evidence quotes the samples' envelope CV once, what of it is beyond the noise's at
 /// the SNR found, and how much was read: `over <on> s of <window> s`.
@@ -1016,8 +1023,9 @@ fn audio_rms_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64, joins: &[u
 /// this many times the occupied width about its centre. The channel's noise beside the
 /// signal is then not in the phase it reads: under about 10 dB of it a discriminator's
 /// output is the noise's (its clicks, each a whole turn, put a flat floor under the audio
-/// that the envelope does not share), and a bare carrier 3 dB over the noise of a 25 kHz
-/// channel read 73 Hz over the envelope. A band twice the occupied one keeps the sidebands
+/// that the envelope does not share), and a bare carrier 2.8 dB over the noise of a 25 kHz
+/// channel (the keyed-over generator at 0 dB over its whole 48 kS/s) read 73 Hz over the
+/// envelope. A band twice the occupied one keeps the sidebands
 /// under the occupied threshold either side.
 const MOTION_BAND: f64 = 2.0;
 /// The steps within this many periods of [`MOTION_BAND`]'s width of a cut in the samples
@@ -1041,12 +1049,45 @@ const ENVELOPE_MIN_SNR: f64 = 1.0;
 ///   not told from a carrier;
 /// - a bare carrier: 0.76 to 1.02 (the phase a little ahead); FM speech: 0.24 to 0.42.
 const MOTION_MARGIN: f64 = 1.25;
+/// The noise's share of the envelope CV is taken at an SNR this many dB over the one found
+/// ([`cv_over_noise`]), so the share errs toward too little: [`noise_beside`] reads noise
+/// that is not there (a signal's tail under the threshold) sooner than it misses some, and
+/// a floor that is not flat (a neighbour's skirt) is not the same under the carrier as
+/// beside it. Taking too much erases weak AM (an index of 0.2 is a CV of 0.14 over a noise
+/// share of 0.4 at 3 dB), taking too little leaves a constant envelope some CV:
+/// - at 1 dB a steady carrier is left 0.14 at 3 dB, 0.13 at 6 and 0.08 at 12, under rule
+///   10's 0.2 with the SNR read another 0.5 dB over, and an index of 0.2 keeps rule 9's 0.1
+///   from 3 dB with the SNR read 1 dB under (`rice_cv`'s unit test);
+/// - on generators (`fixtures::weak_cases`): at 0 dB of slack a tone at index 0.2 over
+///   noise sloping 6 dB across the channel reads `carrier` 3 times of 6 at 3 dB, at 1 dB
+///   none; at 2 dB FM speech at 3 dB reads `unknown` 4 times of 36.
+const NOISE_SLACK_DB: f64 = 1.0;
+/// The FM threshold, as a ratio of the carrier to the noise in the band its phase is read
+/// from (10 dB): from here up the noise's clicks are a few a minute or none.
+const FM_THRESHOLD_SNR: f64 = 10.0;
+/// Under the FM threshold rule 10 reads `fm` only when the phase moves at least this many
+/// times as far as the envelope, in Hz. There the envelope is no longer a faithful witness
+/// of the noise: AM whose troughs dip into the noise clicks at them, more than a steady
+/// carrier's model says. On generators 1 to 12 dB over the channel's noise
+/// (`fixtures::weak_cases`), the phase's motion over the envelope's where rule 10 reads
+/// them: AM (a tone, speech, flat and sloping noise) at most 1.34 and a bare carrier at
+/// most 1.3; FM of voice-like audio at least 2.6 and of the keyed-over generator's speech
+/// at least 2.4, but for 1.98 on an over with a drop-out at 3 dB in a channel twice its
+/// width. 1.6 lies midway between 1.34 and 1.98.
+const WEAK_FM_MOTION: f64 = 1.6;
 /// Rule 10's deviation floor rises by this many times the mean square the noise's clicks
 /// could leave over the envelope ([`click_hz2`]): deviation counts when it is at least
-/// twice that, in Hz. On generators (`fixtures::weak_cases`), FM speech at 2.5 kHz
-/// deviation in a 12.5 kHz channel: at 12 dB the floor is the 40 Hz and the speech reads
-/// 600 to 640 Hz over the envelope; at 0 dB the floor is 600 to 650 Hz and the speech
-/// reads 500, so it is not `fm`. A bare carrier reads 0 to 2 Hz at every level.
+/// twice that, in Hz. On generators (`fixtures::weak_cases`):
+/// - FM of voice-like audio at 3 dB reads 3.6 to 38 times the clicks' RMS over the
+///   envelope (213 to 1134 Hz against 9 to 315), so it clears a margin of up to 9, and at
+///   16 one case of 18 is lost;
+/// - a bare carrier reads 0 to 2 Hz at every level, the clicks' share nothing in the
+///   narrow band its phase is read from;
+/// - weak AM is kept out of `fm` by `WEAK_FM_MOTION`, at a margin of 0, 1 or 4 alike;
+///   without that rule a margin of 4 lets one case read `fm` (speech at index 0.9 over
+///   sloping noise at 1 dB, 2.4 times the clicks' RMS) and 9 lets none.
+///
+/// So 4 is a second guard, not the one the generators lean on.
 const CLICK_MARGIN: f64 = 4.0;
 
 /// How much the phase and the envelope of the samples move, both in Hz ([`motion_hz`]).
@@ -1481,30 +1522,41 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
         let (dev, over) = (m.phase_hz, m.over_hz());
         // What the noise's clicks alone would put over the envelope, in the band the
         // phase was read in.
-        let clicks = noise.map_or(0.0, |n| {
+        // The noise in the band the phase was read in, and what its clicks alone would
+        // put over the envelope there.
+        let read = noise.map(|n| {
             let width = (MOTION_BAND * bw as f64).min(n.width_hz);
-            click_hz2(n.snr * n.width_hz / width, width, bw as f64 / 2.0)
+            (n.snr * n.width_hz / width, width)
         });
+        let clicks = read.map_or(0.0, |(snr, width)| click_hz2(snr, width, bw as f64 / 2.0));
         let floor = (FM_MIN_DEV_HZ.powi(2) + CLICK_MARGIN * clicks).sqrt();
-        if over < floor {
-            let weak = if clicks > 0.5 {
-                format!(", under the {floor:.0} Hz this noise's clicks leave it to show")
-            } else {
-                String::new()
-            };
+        if over < FM_MIN_DEV_HZ {
             return (
                 "carrier",
                 0.7,
                 format!(
-                    "constant envelope, narrow band, no discriminator audio (rms deviation {dev:.0} Hz, {over:.0} Hz over the envelope's{weak})"
+                    "constant envelope, narrow band, no discriminator audio (rms deviation {dev:.0} Hz, {over:.0} Hz over the envelope's)"
+                ),
+            );
+        }
+        // Under the FM threshold the phase must also out-move the envelope clearly.
+        let under_threshold = read.is_some_and(|(snr, _)| snr < FM_THRESHOLD_SNR);
+        let clear = !under_threshold || m.phase_hz >= WEAK_FM_MOTION * m.envelope_hz;
+        if over >= floor && clear {
+            return (
+                "fm",
+                0.6,
+                format!(
+                    "constant envelope, narrow band, rms deviation {dev:.0} Hz ({over:.0} Hz over the envelope's)"
                 ),
             );
         }
         return (
-            "fm",
-            0.6,
+            "unknown",
+            0.5,
             format!(
-                "constant envelope, narrow band, rms deviation {dev:.0} Hz ({over:.0} Hz over the envelope's)"
+                "no layer-1 rule matched: constant envelope, narrow band, rms deviation {dev:.0} Hz, but its {over:.0} Hz over the envelope's {:.0} Hz does not stand clear of this noise (a floor of {floor:.0} Hz)",
+                m.envelope_hz
             ),
         );
     }
@@ -3152,9 +3204,20 @@ mod tests {
             );
             eprintln!("{snr_db} dB: measured {measured:.4}, rice {model:.4}");
             assert!((measured - model).abs() < 0.005, "{snr_db} dB");
-            // What is left beyond the noise's share is nothing.
-            let left = cv_over_noise(measured as f32, Some(10f64.powf(f64::from(snr_db) / 10.0)));
-            assert!(left < 0.08, "{snr_db} dB: {left}");
+            // The share is taken `NOISE_SLACK_DB` short, so a little is left: under rule
+            // 10's 0.2 at every level, with the SNR read 0.5 dB over too (`noise_beside`
+            // reads it within 0.3 dB, and errs the other way).
+            let snr = 10f64.powf(f64::from(snr_db) / 10.0);
+            let left = cv_over_noise(measured as f32, Some(snr));
+            let low = cv_over_noise(measured as f32, Some(snr * 10f64.powf(0.05)));
+            eprintln!("{snr_db} dB: {left:.3} left, {low:.3} with the SNR read 0.5 dB over");
+            assert!(left < 0.16 && low < FM_MAX_CV, "{snr_db} dB: {left} {low}");
+            // From 3 dB, an AM tone at index 0.2 (0.141, of which about snr / (1 + snr)
+            // shows in variance) on top keeps rule 9's 0.1 with the SNR read 1 dB under.
+            let am = (measured.powi(2) + 0.141f64.powi(2) * snr / (1.0 + snr)).sqrt();
+            let kept = cv_over_noise(am as f32, Some(snr * 10f64.powf(-0.1)));
+            eprintln!("{snr_db} dB: an index of 0.2 keeps {kept:.3} with the SNR read 1 dB under");
+            assert!(snr_db < 3.0 || kept >= AM_LOW_MIN_CV, "{snr_db} dB: {kept}");
         }
         // Without an SNR the CV is as it is.
         assert_eq!(cv_over_noise(0.3, None), 0.3);
@@ -3186,7 +3249,7 @@ mod tests {
     }
 
     /// The noise is read beside the signal: a carrier in white noise through a channel
-    /// reads its SNR within 1 dB from 0 to 20 dB, whole or channelised; a signal filling its
+    /// reads its SNR within 0.3 dB from 0 to 20 dB, whole or channelised; a signal filling its
     /// band shows no noise, so nothing is taken from its CV.
     #[test]
     fn noise_beside_reads_the_snr_of_the_measured_samples() {
@@ -3196,7 +3259,7 @@ mod tests {
             let (_, _, v) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
             let got = 10.0 * v.band.unwrap().noise.unwrap().snr.log10();
             eprintln!("whole {snr_db} dB: {got:.2} dB");
-            assert!((got - f64::from(snr_db)).abs() < 1.0, "{snr_db} dB: {got}");
+            assert!((got - f64::from(snr_db)).abs() < 0.3, "{snr_db} dB: {got}");
             // In a 12.5 kHz channel the noise is 5.8 dB less.
             let (chan, rate) = extract_offset(&iq, RATE, 0, 12_500, RATE).unwrap();
             let (_, _, v) = measure_band_noted(&chan, rate, CENTER, 12_500, None);
@@ -3207,7 +3270,7 @@ mod tests {
                 noise.width_hz
             );
             assert!(
-                (got - f64::from(snr_db) - 5.84).abs() < 1.0,
+                (got - f64::from(snr_db) - 5.84).abs() < 0.3,
                 "{snr_db} dB: {got}"
             );
             assert!(
@@ -3244,8 +3307,8 @@ mod tests {
 
     /// The slow gate: a carrier 3 dB over a 12.5 kHz channel's noise, up for 60 % of the
     /// window, is found to within 10 ms an edge where single chunks give a duty of 0.2;
-    /// noise alone, a steady weak carrier and a train of 30 ms frames 9 ms apart are left
-    /// as the fast gate has them.
+    /// noise alone and a steady weak carrier are one level, and a train of 30 ms frames
+    /// 9 ms apart stays a train of short runs, ungated.
     #[test]
     fn the_slow_gate_finds_a_weak_keyed_carrier_and_leaves_a_frame_train() {
         use super::burst::level_runs;
@@ -3266,7 +3329,7 @@ mod tests {
         for seed in [1, 2, 3] {
             let iq = weak((0.4, 1.0), 3.0, seed);
             let fast = burst_runs(&iq, RATE);
-            let slow = level_runs(&iq, RATE, &fast).expect("two levels");
+            let slow = level_runs(&iq, RATE).expect("two levels");
             eprintln!(
                 "seed {seed}: fast duty {:.2}, slow {:?}",
                 fast.duty, slow.runs
@@ -3283,12 +3346,13 @@ mod tests {
             );
             // One level: nothing to split.
             let steady = weak((0.0, 1.0), 3.0, seed);
-            assert_eq!(level_runs(&steady, RATE, &burst_runs(&steady, RATE)), None);
+            assert_eq!(level_runs(&steady, RATE), None);
             let noise = weak((0.0, 0.0), 3.0, seed);
-            assert_eq!(level_runs(&noise, RATE, &burst_runs(&noise, RATE)), None);
+            assert_eq!(level_runs(&noise, RATE), None);
         }
         // 30 ms frames of a carrier 9 ms apart, 6 dB over the noise: the average joins
-        // them, the chunks between them are at the off level, and the runs do not stand.
+        // them, half an average between them is under the split, and they are cut apart
+        // again: no long run, no gate.
         let mut train = vec![Complex::new(0.0f32, 0.0); 96_000];
         awgn(&mut train, 0.0, 4);
         let frame = (RATE as usize * 39) / 1_000;
@@ -3304,6 +3368,70 @@ mod tests {
             fast.duty,
             fast.runs.len()
         );
-        assert_eq!(level_runs(&train, RATE, &fast), None);
+        let slow = level_runs(&train, RATE);
+        assert!(
+            slow.as_ref()
+                .is_none_or(|b| b.burst_ms.is_some_and(|ms| ms < 40.0)),
+            "{slow:?}"
+        );
+        assert!(!gated_view(&train, RATE, 12_500).gated);
+    }
+
+    /// The slow gate where only it can gate, 3 to 6 dB inside a 12.5 kHz channel:
+    /// - a train of 30 ms frames 9 ms apart is not joined into one long run (its gaps
+    ///   are at the off level), so no long run gates the window;
+    /// - a steady carrier with a 30 ms fade to the noise every 250 ms is cut at its
+    ///   fades into runs of over 100 ms: gated to where it is up, duty about 0.88.
+    #[test]
+    fn the_slow_gate_at_3_to_6_db_leaves_a_frame_train_and_cuts_at_deep_fades() {
+        use super::burst::level_runs;
+        for snr_db in [3.0f64, 4.5, 6.0] {
+            // A carrier `snr_db` over the noise of 12.5 kHz: the noise of the whole rate
+            // is 5.84 dB more.
+            let amp = 10f64.powf((snr_db - 5.84) / 20.0) as f32;
+            let shaped = |up: &dyn Fn(usize) -> bool, seed: u64| {
+                let mut iq = vec![Complex::new(0.0f32, 0.0); 96_000];
+                awgn(&mut iq, 0.0, seed);
+                for (_, s) in iq.iter_mut().enumerate().filter(|&(i, _)| up(i)) {
+                    *s += Complex::new(amp, 0.0);
+                }
+                extract_offset(&iq, RATE, 0, 12_500, RATE).unwrap().0
+            };
+            let ms = |i: usize| i * 1_000 / RATE as usize;
+            for seed in [4, 5, 6] {
+                let train = shaped(
+                    &|i| (4_800..91_200).contains(&i) && ms(i - 4_800) % 39 < 30,
+                    seed,
+                );
+                let fast = burst_runs(&train, RATE);
+                let slow = level_runs(&train, RATE);
+                let v = gated_view(&train, RATE, 12_500);
+                eprintln!(
+                    "train {snr_db} dB seed {seed}: fast duty {:.2} in {} runs, slow {:?}, gated {} duty {:.2}",
+                    fast.duty,
+                    fast.runs.len(),
+                    slow.as_ref().map(|b| (b.duty, b.runs.len(), b.burst_ms)),
+                    v.gated,
+                    v.bursts.duty
+                );
+                assert!(
+                    !v.gated || v.bursts.burst_ms.is_some_and(|ms| ms < 100.0),
+                    "{snr_db} dB seed {seed}: {:?}",
+                    v.bursts
+                );
+                let fading = shaped(&|i| ms(i) % 250 >= 30, seed);
+                let v = gated_view(&fading, RATE, 12_500);
+                eprintln!(
+                    "fading {snr_db} dB seed {seed}: gated {}, duty {:.2}, {} runs of {:?} ms",
+                    v.gated,
+                    v.bursts.duty,
+                    v.bursts.runs.len(),
+                    v.bursts.burst_ms
+                );
+                assert!(v.gated, "{snr_db} dB seed {seed}: {:?}", v.bursts);
+                assert!((v.bursts.duty - 0.88).abs() < 0.05, "{:?}", v.bursts.duty);
+                assert!(v.bursts.runs.len() >= 7, "{:?}", v.bursts.runs.len());
+            }
+        }
     }
 }

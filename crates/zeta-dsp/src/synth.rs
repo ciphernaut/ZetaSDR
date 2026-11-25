@@ -455,7 +455,16 @@ pub fn keyed_over(spec: &KeyedOver) -> Vec<Complex<f32>> {
             (f64::from(spec.audio) * syllable * tones) as f32
         })
         .collect();
-    let carrier = nbfm_modulate(&audio, spec.rate_hz, spec.rate_hz, spec.deviation_hz, 0.0);
+    keyed_fm(&audio, spec)
+}
+
+/// [`keyed_over`] with the carrier frequency-modulated by `audio` (within ±1, at
+/// `spec.rate_hz`, a sample for each of the window's; `spec.audio` is not read): the same
+/// noise, keying and edges.
+pub fn keyed_fm(audio: &[f32], spec: &KeyedOver) -> Vec<Complex<f32>> {
+    let rate = f64::from(spec.rate_hz);
+    let n = (rate * f64::from(spec.seconds)).round() as usize;
+    let carrier = nbfm_modulate(audio, spec.rate_hz, spec.rate_hz, spec.deviation_hz, 0.0);
     // The up spans as sample ranges, wrapped into two when `from` is after `to`.
     let at = |x: f64| (x.clamp(0.0, 1.0) * n as f64).round() as usize;
     let (from, to) = (at(spec.on.0), at(spec.on.1));

@@ -158,14 +158,15 @@ pub fn burst_runs(iq: &[Complex<f32>], rate_hz: u64) -> Bursts {
 /// half of it.
 ///
 /// The average hides an off part shorter than itself (the 9 ms between an OOK remote's
-/// frames, the off chips inside them), so the runs stand only when they hold none: what
-/// `fast` ([`burst_runs`] of the same window) leaves off inside them must be on-level
-/// chunks that fell short of its threshold (their mean power over the split), not gaps at
-/// the off level.
+/// frames), so each run is then cut wherever the mean over half of `BURST_LEVEL_MS` lies
+/// under the split, and pieces shorter than `BURST_LEVEL_MS` are dropped: a train of
+/// frames stays a train of short runs, and a carrier with a short hole loses the hole.
+/// Half an average of a carrier 3 dB over a 12.5 kHz channel's noise stands 4.5 of its
+/// spreads over the split.
 ///
-/// `None` when the levels are under `BURST_LEVEL_RATIO` apart (one level), the runs hold
-/// an off part, or the window is shorter than two averages.
-pub(super) fn level_runs(iq: &[Complex<f32>], rate_hz: u64, fast: &Bursts) -> Option<Bursts> {
+/// `None` when the levels are under `BURST_LEVEL_RATIO` apart (one level), no run is
+/// left, or the window is shorter than two averages.
+pub(super) fn level_runs(iq: &[Complex<f32>], rate_hz: u64) -> Option<Bursts> {
     let ms = |samples: usize| (samples as f64 * 1_000.0 / rate_hz.max(1) as f64) as f32;
     let chunk = ((rate_hz * BURST_ENVELOPE_MS / 1_000) as usize).max(1);
     let power: Vec<f64> = iq
@@ -228,14 +229,33 @@ pub(super) fn level_runs(iq: &[Complex<f32>], rate_hz: u64, fast: &Bursts) -> Op
     if runs.is_empty() {
         return None;
     }
-    // What the fast gate leaves off inside these runs: on-level chunks, or an off part?
-    let in_any = |runs: &[(usize, usize)], at: usize| runs.iter().any(|&(s, e)| s <= at && at < e);
-    let (left, n) = power
-        .iter()
-        .enumerate()
-        .filter(|&(i, _)| in_any(&runs, i * chunk) && !in_any(&fast.runs, i * chunk))
-        .fold((0.0, 0usize), |(s, n), (_, &p)| (s + p, n + 1));
-    if n > 0 && left / n as f64 <= split {
+    // An off part the average hid: cut the runs wherever half an average lies under the
+    // split.
+    let half = (span / 2).max(1);
+    let mut cut: Vec<(usize, usize)> = Vec::new();
+    for &(s, e) in &runs {
+        let (first, last) = (s / chunk, e.div_ceil(chunk).min(power.len()));
+        let mut off = vec![false; last - first];
+        for i in first..(last + 1).saturating_sub(half).max(first) {
+            if (acc[i + half] - acc[i]) / half as f64 <= split {
+                off[i - first..i - first + half].fill(true);
+            }
+        }
+        let mut start = None;
+        for (i, &o) in off.iter().chain(std::iter::once(&true)).enumerate() {
+            match (start, o) {
+                (None, false) => start = Some(i),
+                (Some(a), true) => {
+                    cut.push(((first + a) * chunk, ((first + i) * chunk).min(e)));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    cut.retain(|&(s, e)| e - s >= span * chunk);
+    let runs = cut;
+    if runs.is_empty() {
         return None;
     }
     let on_samples: usize = runs.iter().map(|&(s, e)| e - s).sum();
@@ -367,7 +387,7 @@ pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -
     // slow ones must leave out more than the half average either end of each could be.
     let on = |b: &Bursts| b.runs.iter().map(|&(s, e)| e - s).sum::<usize>();
     let slack = |b: &Bursts| b.runs.len() * (rate_hz as usize * BURST_LEVEL_MS / 1_000);
-    if let Some(slow) = level_runs(iq, rate_hz, &bursts).filter(|b| {
+    if let Some(slow) = level_runs(iq, rate_hz).filter(|b| {
         long(b)
             && !(gated && long(&bursts) && on(b) + slack(b) >= on(&bursts))
             && off_is_noise(iq, rate_hz, bandwidth_hz, b)

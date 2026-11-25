@@ -980,16 +980,32 @@ const WEAK_DECIDED_DB: f32 = 3.0;
 /// channel reads `fm` (or `fsk`; both choose `fm_demod`), whole, keyed up or keyed down,
 /// in 12.5 and in 25 kHz. At these levels the noise alone puts the envelope CV at 0.18 to
 /// 0.42, which read `am` (a carrier line and a CV of 0.25) or `unknown`. Weaker than that
-/// it is not decided, and the answer is `unknown` or `carrier`: never a wrong demodulator.
+/// it is not decided, and the answer is `unknown`: never a wrong demodulator.
 #[test]
 fn a_weak_fm_over_reads_fm_and_is_never_am() {
     every_weak_case(&weak_fm(1.0), |c, _, l| {
         let fm = matches!(l.name.as_str(), "fm" | "fsk");
-        let ok = if c.snr_db >= WEAK_DECIDED_DB {
-            fm
-        } else {
-            fm || matches!(l.name.as_str(), "unknown" | "carrier")
-        };
+        // Under the limit its deviation shows but is not clear of the noise's clicks:
+        // that is not decided, and it is not an unmodulated `carrier` either.
+        let ok = fm || (c.snr_db < WEAK_DECIDED_DB && l.name == "unknown");
+        (!ok).then(|| format!("{} ({})", l.name, l.evidence))
+    });
+}
+
+/// Rule 10 on audio no tone or keying rule can take ([`zeta_dsp::fixtures::voice_like`]:
+/// noise in the speech band under syllables, 625 Hz RMS of a 2.5 kHz peak deviation): an FM
+/// over of it reads `fm` from 3 dB over the noise inside its channel, whole or keyed up,
+/// in 12.5 and in 25 kHz. Weaker, it reads `fm` or `unknown`: never `am`, and never
+/// `carrier`, since its deviation shows.
+#[test]
+fn a_weak_fm_over_of_voice_like_audio_reads_fm() {
+    use zeta_dsp::fixtures::WeakSignal;
+    let voice: Vec<_> = zeta_dsp::fixtures::weak_cases()
+        .into_iter()
+        .filter(|c| matches!(c.signal, WeakSignal::Voice { .. }))
+        .collect();
+    every_weak_case(&voice, |c, _, l| {
+        let ok = l.name == "fm" || (c.snr_db < WEAK_DECIDED_DB && l.name == "unknown");
         (!ok).then(|| format!("{} ({})", l.name, l.evidence))
     });
 }
@@ -1065,7 +1081,10 @@ fn a_weak_keyed_overs_duty_is_its_carrier_up_share() {
 ///   the phase's.
 /// - A tone at index 0.9 reads `am` or, as it did before, `ook` (its envelope's troughs a
 ///   tenth of its crests, every millisecond, fit a chip).
-/// - None reads `fm`.
+/// - The same holds over noise that slopes by 6 dB across the channel, as under a
+///   neighbour's skirt, where the noise beside the carrier is not the noise under it.
+/// - None reads `fm` or `fsk`, down to 1 dB: weak AM whose envelope the noise has taken
+///   is never handed to an FM demodulator.
 #[test]
 fn weak_am_reads_am() {
     use zeta_dsp::fixtures::{WeakCase, WeakSignal};
@@ -1074,15 +1093,15 @@ fn weak_am_reads_am() {
         .filter(|c| matches!(c.signal, WeakSignal::Am { .. }))
         .collect();
     every_weak_case(&am, |c, _, l| {
-        let WeakSignal::Am { index, speech } = c.signal else {
+        let WeakSignal::Am { index, speech, .. } = c.signal else {
             return None;
         };
         let ok = if index == 0.9 && !speech {
             matches!(l.name.as_str(), "am" | "ook")
-        } else if c.snr_db >= 6.0 || index == 0.5 {
+        } else if c.snr_db >= 6.0 || (index == 0.5 && c.snr_db >= 3.0) {
             l.name == "am"
         } else {
-            matches!(l.name.as_str(), "am" | "carrier")
+            matches!(l.name.as_str(), "am" | "carrier" | "unknown")
         };
         (!ok).then(|| format!("{} ({})", l.name, l.evidence))
     });

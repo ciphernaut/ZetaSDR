@@ -328,9 +328,92 @@ pub enum WeakSignal {
         audio: f32,
         on: (f64, f64),
     },
+    /// An NBFM over of voice-like audio ([`voice_like`]: noise in the speech band under a
+    /// syllable envelope, no steady tone for a keying or tone rule to find) at this peak
+    /// deviation, Hz, the carrier up over `on` of the window.
+    Voice { deviation_hz: f64, on: (f64, f64) },
     /// Full-carrier AM at this index, up for the whole window: of a 1 kHz tone, or with
-    /// `speech` of [`speech_like`] audio brought to a peak of 1.
-    Am { index: f32, speech: bool },
+    /// `speech` of [`speech_like`] audio brought to a peak of 1. With `tilt_db`, the noise
+    /// is not flat: its density rises by that many dB across the channel
+    /// ([`tilted_noise`]), as under a neighbour's skirt.
+    Am {
+        index: f32,
+        speech: bool,
+        tilt_db: f32,
+    },
+}
+
+/// The RMS of [`voice_like`] audio against its peak of 1: with it a 2.5 kHz peak deviation
+/// is 625 Hz RMS, as [`KeyedOver`]'s speech at full level is.
+pub const VOICE_RMS: f64 = 0.25;
+
+/// Voice-like audio for FM, `seconds` at `rate_hz`: Gaussian noise band-limited to 300 to
+/// 3000 Hz under a raised-cosine syllable envelope at [`KeyedOver::SYLLABLE_HZ`], scaled to
+/// an RMS of [`VOICE_RMS`] and clipped at ±1 (a limiter). It has no steady tone and no
+/// keying line.
+pub fn voice_like(rate_hz: u32, seconds: f32, seed: u64) -> Vec<f32> {
+    let n = (f64::from(rate_hz) * f64::from(seconds)).round() as usize;
+    let mut x = vec![Complex::new(0.0f32, 0.0); n];
+    awgn(&mut x, 0.0, seed ^ 0x5eed_701c);
+    let mut planner = rustfft::FftPlanner::<f32>::new();
+    planner.plan_fft_forward(n).process(&mut x);
+    let bin_hz = f64::from(rate_hz) / n as f64;
+    for (k, b) in x.iter_mut().enumerate() {
+        let f = if 2 * k <= n { k as f64 } else { (n - k) as f64 } * bin_hz;
+        if !(300.0..=3_000.0).contains(&f) {
+            *b = Complex::new(0.0, 0.0);
+        }
+    }
+    planner.plan_fft_inverse(n).process(&mut x);
+    let mut audio: Vec<f64> = x
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let t = i as f64 / f64::from(rate_hz);
+            f64::from(s.re) * (0.5 - 0.5 * (2.0 * PI * KeyedOver::SYLLABLE_HZ * t).cos())
+        })
+        .collect();
+    let rms = (audio.iter().map(|a| a * a).sum::<f64>() / n.max(1) as f64).sqrt();
+    if rms > 0.0 {
+        audio.iter_mut().for_each(|a| *a *= VOICE_RMS / rms);
+    }
+    audio.iter().map(|a| a.clamp(-1.0, 1.0) as f32).collect()
+}
+
+/// `n` samples of complex Gaussian noise at `rate_hz` whose density rises by `tilt_db`,
+/// evenly in dB, from the lower to the upper edge of the band `band_hz` wide about the
+/// centre (and stays at the edges' levels beyond them), with a mean power of `power`
+/// inside that band.
+pub fn tilted_noise(
+    n: usize,
+    rate_hz: u32,
+    band_hz: u64,
+    tilt_db: f32,
+    power: f64,
+    seed: u64,
+) -> Vec<Complex<f32>> {
+    let mut x = vec![Complex::new(0.0f32, 0.0); n];
+    awgn(&mut x, 0.0, seed);
+    let mut planner = rustfft::FftPlanner::<f32>::new();
+    planner.plan_fft_forward(n).process(&mut x);
+    let (bin_hz, half) = (f64::from(rate_hz) / n as f64, band_hz as f64 / 2.0);
+    let mut inside = 0.0f64;
+    for (k, b) in x.iter_mut().enumerate() {
+        let f = if 2 * k <= n {
+            k as f64
+        } else {
+            k as f64 - n as f64
+        } * bin_hz;
+        let db = f64::from(tilt_db) * f.clamp(-half, half) / band_hz as f64;
+        *b *= 10f64.powf(db / 20.0) as f32;
+        if f.abs() <= half {
+            inside += f64::from(b.norm_sqr());
+        }
+    }
+    planner.plan_fft_inverse(n).process(&mut x);
+    // Parseval: the band's mean power per sample is its bins' over n squared.
+    let scale = (power * (n as f64).powi(2) / inside.max(f64::MIN_POSITIVE)).sqrt() / n as f64;
+    x.iter().map(|s| s * scale as f32).collect()
 }
 
 /// One weak-signal window of layer 1's tests and sweep: a signal whose power stands only
@@ -352,7 +435,9 @@ pub struct WeakCase {
 /// The in-channel SNRs of the weak FM cases, dB.
 pub const WEAK_FM_SNRS_DB: [f32; 5] = [0.0, 3.0, 6.0, 9.0, 12.0];
 /// The in-channel SNRs of the weak AM cases, dB.
-pub const WEAK_AM_SNRS_DB: [f32; 4] = [3.0, 6.0, 9.0, 12.0];
+pub const WEAK_AM_SNRS_DB: [f32; 6] = [1.0, 2.0, 3.0, 6.0, 9.0, 12.0];
+/// The slope of the noise under the weak AM cases that have one, dB across the channel.
+pub const WEAK_AM_TILT_DB: f32 = 6.0;
 /// The channels of the weak FM cases, `(band, peak deviation)` in Hz: 12.5 and 25 kHz FM,
 /// and a 12.5 kHz transmission read through a 25 kHz box.
 pub const WEAK_FM_CHANNELS: [(u64, f64); 3] =
@@ -365,8 +450,11 @@ pub const WEAK_SEEDS: [u64; 3] = [1, 2, 3];
 /// - FM speech and a bare carrier, each whole, keyed up at 40 % of the window, keyed down
 ///   at 40 % and keyed up at 6 %, at each SNR of [`WEAK_FM_SNRS_DB`] in each channel of
 ///   [`WEAK_FM_CHANNELS`];
+/// - FM of voice-like audio, whole and keyed up at 40 % of the window, at the same SNRs and
+///   channels;
 /// - AM of a tone at index 0.2, 0.5 and 0.9 and of speech at 0.9, at each SNR of
-///   [`WEAK_AM_SNRS_DB`] in 12.5 and 25 kHz.
+///   [`WEAK_AM_SNRS_DB`] in 12.5 and 25 kHz, and the tone at 0.2 and 0.5 and the speech
+///   again over noise sloping by [`WEAK_AM_TILT_DB`] across the channel.
 pub fn weak_cases() -> Vec<WeakCase> {
     let mut out = Vec::new();
     for &seed in &WEAK_SEEDS {
@@ -395,19 +483,38 @@ pub fn weak_cases() -> Vec<WeakCase> {
                         });
                     }
                 }
+                for (keying, on) in [("whole", (0.0, 1.0)), ("up-d0.60", (0.4, 1.0))] {
+                    out.push(WeakCase {
+                        name: format!(
+                            "weak-voice-{keying}-dev{deviation_hz:.0}-{snr_db:.0}dB-{band_hz}Hz-s{seed}"
+                        ),
+                        signal: WeakSignal::Voice { deviation_hz, on },
+                        band_hz,
+                        snr_db,
+                        share: on.1 - on.0,
+                        seed,
+                    });
+                }
             }
         }
         for &snr_db in &WEAK_AM_SNRS_DB {
             for band_hz in [12_500u64, 25_000] {
-                for (what, index, speech) in [
-                    ("tone-m0.2", 0.2f32, false),
-                    ("tone-m0.5", 0.5, false),
-                    ("tone-m0.9", 0.9, false),
-                    ("speech-m0.9", 0.9, true),
+                for (what, index, speech, tilt_db) in [
+                    ("tone-m0.2", 0.2f32, false, 0.0f32),
+                    ("tone-m0.5", 0.5, false, 0.0),
+                    ("tone-m0.9", 0.9, false, 0.0),
+                    ("speech-m0.9", 0.9, true, 0.0),
+                    ("tilt-tone-m0.2", 0.2, false, WEAK_AM_TILT_DB),
+                    ("tilt-tone-m0.5", 0.5, false, WEAK_AM_TILT_DB),
+                    ("tilt-speech-m0.9", 0.9, true, WEAK_AM_TILT_DB),
                 ] {
                     out.push(WeakCase {
                         name: format!("weak-am-{what}-{snr_db:.0}dB-{band_hz}Hz-s{seed}"),
-                        signal: WeakSignal::Am { index, speech },
+                        signal: WeakSignal::Am {
+                            index,
+                            speech,
+                            tilt_db,
+                        },
                         band_hz,
                         snr_db,
                         share: 1.0,
@@ -440,7 +547,23 @@ pub fn weak_case_iq(case: &WeakCase) -> Vec<Complex<f32>> {
             snr_db: over_rate_db,
             seed: case.seed,
         }),
-        WeakSignal::Am { index, speech } => {
+        WeakSignal::Voice { deviation_hz, on } => keyed_fm(
+            &voice_like(rate, KEYED_OVER_SECONDS, case.seed),
+            &KeyedOver {
+                rate_hz: rate,
+                seconds: KEYED_OVER_SECONDS,
+                deviation_hz,
+                audio: 1.0,
+                on,
+                snr_db: over_rate_db,
+                seed: case.seed,
+            },
+        ),
+        WeakSignal::Am {
+            index,
+            speech,
+            tilt_db,
+        } => {
             let audio = if speech {
                 // `speech_like` peaks at 0.5.
                 speech_like(rate, KEYED_OVER_SECONDS)
@@ -452,8 +575,16 @@ pub fn weak_case_iq(case: &WeakCase) -> Vec<Complex<f32>> {
                 tone(rate, n, 1_000.0, 1.0)
             };
             let mut iq = am_modulate(&audio, rate, rate, index, 0.0);
-            // `awgn` sets the noise against the mean power, the sidebands included.
-            awgn(&mut iq, over_rate_db, case.seed);
+            if tilt_db == 0.0 {
+                // `awgn` sets the noise against the mean power, the sidebands included.
+                awgn(&mut iq, over_rate_db, case.seed);
+            } else {
+                let mean = iq.iter().map(|s| f64::from(s.norm_sqr())).sum::<f64>()
+                    / iq.len().max(1) as f64;
+                let power = mean / 10f64.powf(f64::from(case.snr_db) / 10.0);
+                let noise = tilted_noise(iq.len(), rate, case.band_hz, tilt_db, power, case.seed);
+                iq.iter_mut().zip(noise).for_each(|(s, w)| *s += w);
+            }
             iq
         }
     }
