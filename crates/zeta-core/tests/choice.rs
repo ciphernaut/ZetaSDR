@@ -578,3 +578,334 @@ fn unknown_lists_a_row_only_the_selections_width_fits() {
         "{wide:?}"
     );
 }
+
+// Spec 49.2: the expected emission weighs against the label. A test fixture's licences
+// and the embedded UHF CB plan, never a real licence.
+
+/// A UHF CB channel (`uhf_cb_au` ch 10): an FM plan, with a `deviation_hz`.
+fn cb_channel_hz() -> u64 {
+    zeta_core::plans::channels(&zeta_core::plans::UHF_CB_AU)
+        .into_iter()
+        .find(|&(n, _)| n == 10)
+        .unwrap()
+        .1
+}
+
+/// An airband centre, off every channel plan.
+const AIRBAND_HZ: u64 = 127_000_000;
+
+/// A test register's transmitter licensed for `designator` at `center_hz`.
+fn licence(designator: &str, center_hz: u64) -> zeta_core::knowledge::Allocation {
+    let emission = zeta_core::emission::parse_emission(designator).expect("a designator");
+    let half = emission.bandwidth_hz.0 / 2;
+    zeta_core::knowledge::Allocation {
+        provider: "register".into(),
+        region: "AU".into(),
+        min_hz: Hz(center_hz - half),
+        max_hz: Hz(center_hz + half),
+        service: "assignment".into(),
+        kind: Some("assignment".into()),
+        licensee: Some("Test Licensee".into()),
+        site: Some("Test site".into()),
+        center_hz: Some(Hz(center_hz)),
+        bandwidth_hz: Some(emission.bandwidth_hz),
+        role: Some("tx".into()),
+        emission: Some(designator.into()),
+        emission_decoded: Some(emission),
+        ..Default::default()
+    }
+}
+
+/// [`measured`] with the register's `allocations` for the band.
+fn measured_with(
+    label: &str,
+    center_hz: u64,
+    bandwidth_hz: u64,
+    allocations: Vec<zeta_core::knowledge::Allocation>,
+) -> Classification {
+    let mut c = measured(label, center_hz, bandwidth_hz);
+    c.allocations = allocations;
+    c
+}
+
+/// The choice for `c` in a `box_hz` box on its measured centre, with no capture.
+fn choose_for(modes: &ModeRegistry, c: &Classification, box_hz: u64) -> Choice {
+    let center = c.measurement.as_ref().unwrap().features.center_hz.0;
+    choose_now(
+        modes,
+        modes.weights(),
+        c,
+        &box_at(center, box_hz),
+        "AU",
+        None,
+    )
+}
+
+/// An `am` read on a channel licensed for FM: the licence outweighs the label, and the
+/// label's own demodulator is the runner-up. Still a best guess, never a proof.
+#[test]
+fn am_on_a_channel_licensed_fm_answers_fm_demod_with_am_its_runner_up() {
+    let modes = registry(None);
+    // Measured 400 Hz off the licence's centre: the job is on the measured one.
+    let c = measured_with("am", DMR_HZ + 400, 9_000, vec![licence("11K0F3E", DMR_HZ)]);
+    let choice = choose_for(&modes, &c, 12_500);
+    assert_eq!(choice.row.as_deref(), Some("fm_demod"), "{choice:?}");
+    assert_eq!(choice.settled, Settled::BestGuess, "{choice:?}");
+    assert_eq!(job(&choice).center_hz, Hz(DMR_HZ + 400), "{choice:?}");
+    let runner_up = choice.runner_up.as_ref().expect("a runner-up");
+    assert_eq!(runner_up.row, "am_demod", "{choice:?}");
+    assert!(
+        choice
+            .evidence
+            .iter()
+            .any(|e| e == "register: 11K0F3E expected here (layer 1 read am)"),
+        "{choice:?}"
+    );
+    // The runner-up is the label's own: nothing expected brought it.
+    assert!(
+        !runner_up
+            .evidence
+            .iter()
+            .any(|e| e.starts_with("register: ")),
+        "{runner_up:?}"
+    );
+}
+
+/// An `am` read on an FM plan's channel with no register: the plan outweighs the label.
+#[test]
+fn am_on_a_plan_fm_channel_answers_fm_demod() {
+    let modes = registry(None);
+    let channel = cb_channel_hz();
+    let c = measured("am", channel + 300, 9_000);
+    let choice = choose_for(&modes, &c, 12_500);
+    assert_eq!(choice.row.as_deref(), Some("fm_demod"), "{choice:?}");
+    assert_eq!(choice.settled, Settled::BestGuess, "{choice:?}");
+    let j = job(&choice);
+    assert_eq!(j.center_hz, Hz(channel + 300), "{choice:?}");
+    assert_eq!(j.params["deviation_hz"], 2_500, "{choice:?}");
+    assert!(
+        choice
+            .evidence
+            .iter()
+            .any(|e| e == "plan: uhf_cb_au is an FM plan (layer 1 read am)"),
+        "{choice:?}"
+    );
+    assert_eq!(
+        choice.runner_up.as_ref().map(|r| r.row.as_str()),
+        Some("am_demod"),
+        "{choice:?}"
+    );
+}
+
+/// An `am` read where the licence is for AM answers `am_demod`, as it did; and where one
+/// licence at the centre is AM and another FM, not every expected emission contradicts
+/// the label, so the label holds.
+#[test]
+fn am_on_a_channel_licensed_am_answers_am_demod() {
+    let modes = registry(None);
+    let am = measured_with(
+        "am",
+        AIRBAND_HZ,
+        9_000,
+        vec![licence("6K00A3E", AIRBAND_HZ)],
+    );
+    let choice = choose_for(&modes, &am, 12_500);
+    assert_eq!(choice.row.as_deref(), Some("am_demod"), "{choice:?}");
+    assert!(
+        !choice.evidence.iter().any(|e| e.starts_with("register: ")),
+        "{choice:?}"
+    );
+    let both = vec![
+        licence("11K0F3E", AIRBAND_HZ),
+        licence("6K00A3E", AIRBAND_HZ),
+    ];
+    let mixed = measured_with("am", AIRBAND_HZ, 9_000, both);
+    let choice = choose_for(&modes, &mixed, 12_500);
+    assert_eq!(choice.row.as_deref(), Some("am_demod"), "{choice:?}");
+}
+
+/// A pause (`carrier`) or a weak read (`unknown`) on an FM channel, licensed or planned,
+/// answers `fm_demod` where it could not tell, sized as FM: the plan's width on the plan
+/// channel, the box's on the licensed one.
+#[test]
+fn carrier_and_unknown_on_an_fm_channel_answer_fm_demod() {
+    let modes = registry(None);
+    let channel = cb_channel_hz();
+    for label in ["carrier", "unknown"] {
+        let cases = [
+            (
+                measured(label, channel + 300, 50),
+                format!("plan: uhf_cb_au is an FM plan (layer 1 read {label})"),
+            ),
+            (
+                measured_with(label, DMR_HZ, 50, vec![licence("11K0F3E", DMR_HZ)]),
+                format!("register: 11K0F3E expected here (layer 1 read {label})"),
+            ),
+        ];
+        for (c, line) in cases {
+            let choice = choose_for(&modes, &c, 12_500);
+            assert_eq!(choice.row.as_deref(), Some("fm_demod"), "{choice:?}");
+            assert_eq!(choice.settled, Settled::BestGuess, "{choice:?}");
+            assert!(choice.reason.is_none(), "{choice:?}");
+            assert_eq!(job(&choice).bandwidth_hz, Hz(12_500), "{choice:?}");
+            assert!(choice.evidence.contains(&line), "{line}: {choice:?}");
+        }
+    }
+    // With no expectation they still cannot tell; nor can a signal wider than the
+    // channel expected there (30 kHz on a 12.5 kHz channel).
+    for label in ["carrier", "unknown"] {
+        let choice = choose_for(&modes, &measured(label, DMR_HZ, 50), 12_500);
+        assert_eq!(choice.settled, Settled::CannotTell, "{choice:?}");
+        let wide = choose_for(&modes, &measured(label, channel + 300, 30_000), 40_000);
+        assert_eq!(wide.settled, Settled::CannotTell, "{wide:?}");
+    }
+}
+
+/// With nothing expected at the centre (no register, no plan, or a licence whose band
+/// does not hold the centre) the new weight changes nothing: each of the earlier tests'
+/// inputs answers what it did, whatever `contradicted` is.
+#[test]
+fn with_no_expectation_every_answer_is_as_before() {
+    let modes = registry(None);
+    let cases: [(&str, u64, u64, u64, Option<&str>); 6] = [
+        ("fm", DMR_HZ, 9_000, 12_000, Some("fm_demod")),
+        ("am", AIRBAND_HZ, 9_000, 20_000, Some("am_demod")),
+        ("ssb", AIRBAND_HZ, 2_200, 20_000, Some("ssb_demod")),
+        ("carrier", DMR_HZ, 50, 12_500, None),
+        ("unknown", DMR_HZ, 3_000, 3_000, None),
+        ("noise", DMR_HZ, 3_000, 12_500, None),
+    ];
+    // A licence 50 kHz away: its band does not hold the centre.
+    let away = |center: u64| vec![licence("11K0F3E", center + 50_000)];
+    for (label, center, width, box_hz, row) in cases {
+        for allocations in [vec![], away(center)] {
+            let c = measured_with(label, center, width, allocations);
+            let sel = box_at(center, box_hz);
+            let answers: Vec<Choice> = [0.0, 0.25, 1.0]
+                .into_iter()
+                .map(|k| {
+                    let mut w = modes.weights().clone();
+                    w.contradicted = k;
+                    choose_now(&modes, &w, &c, &sel, "AU", None)
+                })
+                .collect();
+            assert_eq!(answers[0].row.as_deref(), row, "{label}: {:?}", answers[0]);
+            assert_eq!(answers[0], answers[1], "{label}");
+            assert_eq!(answers[1], answers[2], "{label}");
+            assert!(
+                !answers[0]
+                    .evidence
+                    .iter()
+                    .any(|e| e.starts_with("register: ") || e.ends_with(&format!("read {label})"))),
+                "{label}: {:?}",
+                answers[0]
+            );
+        }
+    }
+}
+
+/// Identify's ranking (`score_rows`) does not read `contradicted`, and the rows that serve
+/// the label rank the same with and without a licence of another letter (one that
+/// contradicts the label); so does the choice's `could_prove`. The expectation moves only
+/// the demodulators.
+#[test]
+fn identify_ranks_the_decoders_as_before() {
+    use zeta_core::modes::score::{allocation_term, score_rows};
+    let modes = registry(None);
+    let am = vec![licence("6K00A3E", DMR_HZ)];
+    let ranked = |w: &zeta_core::modes::weights::Weights,
+                  allocs: &[zeta_core::knowledge::Allocation],
+                  serving_fm: bool|
+     -> Vec<(String, f32)> {
+        score_rows(w, &modes, DMR_HZ, 12_000, "fm", &|_| 0.0, &|row| {
+            allocation_term(row, allocs, w)
+        })
+        .iter()
+        .filter(|s| !serving_fm || s.fits_label)
+        .map(|s| (s.mode.row.id.0.clone(), s.score))
+        .collect()
+    };
+    let weighed = |k: f32| {
+        let mut w = modes.weights().clone();
+        w.contradicted = k;
+        ranked(&w, &am, false)
+    };
+    assert!(!weighed(0.0).is_empty());
+    assert_eq!(weighed(0.0), weighed(0.25));
+    assert_eq!(weighed(0.25), weighed(1.0));
+    let w = modes.weights();
+    assert!(!ranked(w, &[], true).is_empty());
+    assert_eq!(ranked(w, &[], true), ranked(w, &am, true));
+    let none = choose_for(&modes, &measured("fm", DMR_HZ, 12_000), 12_500);
+    let licensed = choose_for(&modes, &measured_with("fm", DMR_HZ, 12_000, am), 12_500);
+    assert!(!none.could_prove.is_empty(), "{none:?}");
+    assert_eq!(none.could_prove, licensed.could_prove, "{licensed:?}");
+}
+
+/// Placeholder for track A's keyed-over generator (`zeta_dsp::synth::{KeyedOver,
+/// keyed_over}`), which has not landed on this branch: the same fields, a carrier keyed
+/// up over the whole window only. PLAN 49: delete this module, and the `use` of it in
+/// the test below, when the tracks merge.
+mod keyed_over_placeholder {
+    use num_complex::Complex;
+    use zeta_dsp::synth::{awgn, nbfm_modulate};
+
+    pub struct KeyedOver {
+        pub rate_hz: u32,
+        pub seconds: f32,
+        pub deviation_hz: f64,
+        pub audio: f32,
+        pub on: (f64, f64),
+        pub snr_db: f32,
+        pub seed: u64,
+    }
+
+    pub fn keyed_over(spec: &KeyedOver) -> Vec<Complex<f32>> {
+        assert_eq!(
+            spec.on,
+            (0.0, 1.0),
+            "the placeholder keys the whole window only"
+        );
+        assert_eq!(spec.audio, 0.0, "the placeholder holds a pause only");
+        let n = (f64::from(spec.rate_hz) * f64::from(spec.seconds)).round() as usize;
+        let audio = vec![0.0_f32; n];
+        let mut iq = nbfm_modulate(&audio, spec.rate_hz, spec.rate_hz, spec.deviation_hz, 0.0);
+        awgn(&mut iq, spec.snr_db, spec.seed);
+        iq
+    }
+}
+
+/// UAT 48.6 through the operation: a pause in a keyed over (the carrier up, no audio) on
+/// a plan channel, in noise, chooses `fm_demod` whatever layer 1 reads it as.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "plan 49: needs track A's keyed-over generator"]
+async fn a_keyed_over_in_a_pause_on_a_plan_channel_chooses_fm_demod() {
+    use keyed_over_placeholder::{KeyedOver, keyed_over};
+    let channel = cb_channel_hz();
+    for snr_db in [36.0, 15.0] {
+        let dir = tempfile::tempdir().unwrap();
+        let iq = keyed_over(&KeyedOver {
+            rate_hz: RATE_HZ,
+            seconds: 3.0,
+            deviation_hz: 2_500.0,
+            audio: 0.0,
+            on: (0.0, 1.0),
+            snr_db,
+            seed: 49,
+        });
+        // The file's centre 300 Hz off the channel's: the carrier sits there.
+        let node = node_over(dir.path(), &iq, RATE_HZ, channel + 300).await;
+        let a = classify(&node, channel, 12_500).await;
+        let c = &a.choice;
+        assert_eq!(job(c).kind, "fm_demod", "{snr_db} dB: {c:?}");
+        assert_eq!(c.settled, Settled::BestGuess, "{snr_db} dB: {c:?}");
+        let label = c.evidence[0]
+            .strip_prefix("layer 1: ")
+            .and_then(|l| l.split(' ').next())
+            .expect("layer 1's line first");
+        if !["fm", "fsk"].contains(&label) {
+            let line = format!("plan: uhf_cb_au is an FM plan (layer 1 read {label})");
+            assert!(c.evidence.contains(&line), "{snr_db} dB: {c:?}");
+        }
+    }
+}

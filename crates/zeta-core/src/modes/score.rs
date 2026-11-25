@@ -76,6 +76,119 @@ pub(crate) fn designator_fits(letter: char, labels: &[String]) -> bool {
         .any(|l| labels.iter().any(|m| m == l))
 }
 
+/// The layer-1 labels a designator's modulation `letter` is compatible with
+/// ([`DESIGNATOR_LABELS`]); none for a letter the table lacks.
+fn letter_labels(letter: char) -> Vec<&'static str> {
+    DESIGNATOR_LABELS
+        .iter()
+        .filter(|(c, _)| *c == letter)
+        .flat_map(|(_, labels)| labels.iter().copied())
+        .collect()
+}
+
+/// An emission expected at a measured centre (spec 49.2): what the register or a channel
+/// plan says the channel carries. It ranks a demodulator; it never proves one.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Expected {
+    /// A `tx` assignment whose band holds the centre: its designator as the register
+    /// stores it, and the designator's width.
+    Register {
+        designator: String,
+        bandwidth_hz: u64,
+    },
+    /// A channel at the centre of a plan with a `deviation_hz` (an FM plan), and the
+    /// plan's channel width.
+    Plan { id: &'static str, bandwidth_hz: u64 },
+}
+
+impl Expected {
+    /// The expected emission's width.
+    pub(crate) fn bandwidth_hz(&self) -> u64 {
+        match self {
+            Expected::Register { bandwidth_hz, .. } | Expected::Plan { bandwidth_hz, .. } => {
+                *bandwidth_hz
+            }
+        }
+    }
+
+    /// Its evidence line, for a layer-1 `label` it overturned:
+    /// `register: <designator> expected here (layer 1 read <label>)` or
+    /// `plan: <id> is an FM plan (layer 1 read <label>)`.
+    pub(crate) fn line(&self, label: &str) -> String {
+        match self {
+            Expected::Register { designator, .. } => {
+                format!("register: {designator} expected here (layer 1 read {label})")
+            }
+            Expected::Plan { id, .. } => format!("plan: {id} is an FM plan (layer 1 read {label})"),
+        }
+    }
+}
+
+/// The emissions expected at `center_hz`, each with the layer-1 labels it is compatible
+/// with ([`DESIGNATOR_LABELS`]): every `tx` assignment of `allocs` (receivers and plan
+/// rows left out) with a decoded designator whose band holds the centre (its designator's
+/// width about its centre, each designator once), then a channel of an FM plan of
+/// `region` at the centre ([`crate::plans::plan_channel_at`]; a plan with a
+/// `deviation_hz`), compatible as an `F` designator is. A designator whose letter no
+/// label fits is left out: it says nothing either way.
+pub(crate) fn expected_labels(
+    allocs: &[Allocation],
+    center_hz: u64,
+    region: &str,
+) -> Vec<(Expected, Vec<&'static str>)> {
+    let mut out: Vec<(Expected, Vec<&'static str>)> = Vec::new();
+    for a in allocs.iter().filter(|a| is_tx(a)) {
+        let (Some(e), Some(designator)) = (&a.emission_decoded, &a.emission) else {
+            continue;
+        };
+        let labels = letter_labels(e.modulation);
+        let center = a.center_hz.map_or(
+            a.min_hz.0 + a.max_hz.0.saturating_sub(a.min_hz.0) / 2,
+            |c| c.0,
+        );
+        if labels.is_empty() || center.abs_diff(center_hz) > e.bandwidth_hz.0 / 2 {
+            continue;
+        }
+        let expected = Expected::Register {
+            designator: designator.clone(),
+            bandwidth_hz: e.bandwidth_hz.0,
+        };
+        if !out.iter().any(|(x, _)| *x == expected) {
+            out.push((expected, labels));
+        }
+    }
+    let plan = crate::plans::plan_channel_at(center_hz, region).map(|(p, _)| p);
+    if let Some(plan) = plan.filter(|p| p.deviation_hz.is_some()) {
+        let expected = Expected::Plan {
+            id: plan.id,
+            bandwidth_hz: plan.bandwidth_hz,
+        };
+        out.push((expected, letter_labels('F')));
+    }
+    out
+}
+
+/// Whether the expected emission `(expected, labels)` fits `row` for a signal measured
+/// `bandwidth_hz` wide: one of the row's `modulation` labels is compatible with it, its
+/// width lies within 0.5-1.5 times the row's `band.bandwidth_hz` (as [`allocation_match`]
+/// fits an assignment), and the signal is no wider than 1.5 times it (a signal wider than
+/// what is expected there is something else; a narrower one may be a pause in it).
+pub(crate) fn expected_fits(
+    row: &LoadedMode,
+    (expected, labels): &(Expected, Vec<&str>),
+    bandwidth_hz: u64,
+) -> bool {
+    let bw = row.row.band.bandwidth_hz as f64;
+    let (lo, hi) = ALLOCATION_WIDTH;
+    let width = expected.bandwidth_hz() as f64;
+    row.row
+        .modulation
+        .iter()
+        .any(|m| labels.contains(&m.as_str()))
+        && (bw * lo..=bw * hi).contains(&width)
+        && bandwidth_hz as f64 <= width * hi
+}
+
 /// `weights.allocation` divided by `1 + rank` when [`allocation_match`] finds a `tx`
 /// assignment that fits `row`, else 0. `rank` counts the `tx` assignments (receivers and
 /// plan rows left out) before the one that fits, in `allocs` order: a provider lists the
@@ -241,6 +354,13 @@ fn score_role<'a>(
             }
         })
         .collect();
+    rank_scored(&mut scored);
+    scored
+}
+
+/// Order `scored` as [`score_rows`] does: highest score first; equal scores by
+/// `identify.priority` (highest first), then `family`, then `id`.
+pub(crate) fn rank_scored(scored: &mut [Scored]) {
     scored.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
@@ -254,7 +374,6 @@ fn score_role<'a>(
             .then(a.mode.row.family.cmp(&b.mode.row.family))
             .then(a.mode.row.id.cmp(&b.mode.row.id))
     });
-    scored
 }
 
 #[cfg(test)]

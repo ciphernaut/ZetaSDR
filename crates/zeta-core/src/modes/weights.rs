@@ -30,12 +30,33 @@ pub struct Weights {
     pub layer3: f32,
     /// How far the best candidate must lead the runner-up to be called clear.
     pub runner_up_margin: f32,
+    /// A factor from 0 to 1 the label's term (`modulation`) is multiplied by in the
+    /// choice of a demodulator when every emission expected at the measured centre (the
+    /// register's licences, an FM plan's channel) is incompatible with layer 1's label.
+    /// Optional in a file: one without it takes [`CONTRADICTED`], the embedded value.
+    #[serde(default = "contradicted")]
+    pub contradicted: f32,
+}
+
+/// The embedded `contradicted`, and the value of a file that leaves it out.
+pub(crate) const CONTRADICTED: f32 = 0.25;
+
+fn contradicted() -> f32 {
+    CONTRADICTED
 }
 
 impl Weights {
-    /// Parse a weights file; every key is required and none may be unknown.
+    /// Parse a weights file; every key but `contradicted` is required, none may be
+    /// unknown, and `contradicted` lies from 0 to 1.
     pub fn parse(text: &str) -> Result<Weights, String> {
-        serde_json::from_str(text).map_err(|e| e.to_string())
+        let w: Weights = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        if !(0.0..=1.0).contains(&w.contradicted) {
+            return Err(format!(
+                "contradicted is a factor from 0 to 1, not {}",
+                w.contradicted
+            ));
+        }
+        Ok(w)
     }
 }
 
@@ -69,6 +90,46 @@ mod tests {
             (w.catalogue, w.learned, w.layer3, w.runner_up_margin),
             (0.25, 0.3, 0.0, 0.15)
         );
+        // Plan 49's key, and the value a file without it takes.
+        assert_eq!(w.contradicted, 0.25);
+        assert_eq!(w.contradicted, CONTRADICTED);
+    }
+
+    /// An operator's file from before plan 49 has no `contradicted`: it still loads, with
+    /// the embedded value.
+    #[test]
+    fn a_weights_file_without_contradicted_still_loads() {
+        let d = dir_with(
+            r#"{"center":0.4,"bandwidth":0.3,"modulation":0.3,"allocation":0.2,
+                "catalogue":0.25,"learned":0.3,"layer3":0.0,"runner_up_margin":0.3}"#,
+        );
+        let reg = ModeRegistry::load(&StageRegistry::new(), Some(d.path()));
+        assert!(
+            reg.handler_files().iter().all(|f| f.id != "weights"),
+            "{:?}",
+            reg.handler_files()
+        );
+        assert_eq!(reg.weights().runner_up_margin, 0.3);
+        assert_eq!(reg.weights().contradicted, Weights::default().contradicted);
+    }
+
+    /// `contradicted` is a factor from 0 to 1: a file outside that is a load error.
+    #[test]
+    fn a_contradicted_factor_outside_0_to_1_is_a_load_error() {
+        let base = r#""center":0.4,"bandwidth":0.3,"modulation":0.3,"allocation":0.2,
+                "catalogue":0.25,"learned":0.3,"layer3":0.0,"runner_up_margin":0.15"#;
+        for (v, ok) in [
+            ("0.0", true),
+            ("1.0", true),
+            ("1.5", false),
+            ("-0.1", false),
+        ] {
+            let got = Weights::parse(&format!("{{{base},\"contradicted\":{v}}}"));
+            assert_eq!(got.is_ok(), ok, "{v}: {got:?}");
+            if let Err(e) = got {
+                assert!(e.contains("contradicted"), "{e}");
+            }
+        }
     }
 
     #[test]

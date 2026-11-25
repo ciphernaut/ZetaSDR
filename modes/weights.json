@@ -6,5 +6,6 @@
   "catalogue": 0.25,
   "learned": 0.3,
   "layer3": 0.0,
-  "runner_up_margin": 0.15
+  "runner_up_margin": 0.15,
+  "contradicted": 0.25
 }

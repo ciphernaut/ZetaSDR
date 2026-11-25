@@ -7,9 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::classify::{Classification, Label, Measurement, Outcome};
-use crate::modes::score::{Scored, allocation_term, passed_over, score_demodulators, score_rows};
+use crate::modes::score::{
+    Expected, Scored, allocation_term, expected_fits, expected_labels, passed_over, rank_scored,
+    score_demodulators, score_rows,
+};
 use crate::modes::weights::Weights;
-use crate::modes::{CenterRule, Decoder, LoadedMode, ModeRegistry, WidthRule};
+use crate::modes::{CenterRule, Decoder, LoadedMode, ModeRegistry, Role, WidthRule};
 use crate::port::Tuning;
 use crate::types::{Hz, Selection};
 
@@ -81,7 +84,9 @@ pub struct Choice {
     pub step: u8,
     pub settled: Settled,
     /// `<source>: <line>`: `layer 1: <label> <width> Hz`, `plan: <id> deviation <d>`,
-    /// `decode <row>: <summary>`, `catalogue: <name>`.
+    /// `register: <designator> expected here (layer 1 read <label>)` or `plan: <id> is
+    /// an FM plan (layer 1 read <label>)` (a demodulator the label does not serve, brought
+    /// by the emission expected there), `decode <row>: <summary>`, `catalogue: <name>`.
     pub evidence: Vec<String>,
     #[schemars(required, schema_with = "crate::types::nullable::<Alternative>")]
     pub runner_up: Option<Alternative>,
@@ -115,6 +120,16 @@ pub(crate) fn catalogue_entry(label: &Label) -> Option<&str> {
 /// for (in `could_prove`, to be tried, never a best guess). Ranked by `weights`
 /// (the catalogue only ranks, at `weights.catalogue`); a plan channel of `region` at the
 /// measured centre gives the deviation, and the width when the measured one is distrusted.
+///
+/// The emission expected at the measured centre ([`expected_labels`]: the register's
+/// licences there, an FM plan's channel) weighs against the label (spec 49.2): a
+/// demodulator row that serves an expected emission is a candidate though it does not
+/// serve the label ([`expected_fits`]), sized as for the expected label, with the
+/// expectation's line in its evidence. When every expected emission is incompatible with
+/// the label, the label's term counts `weights.contradicted` of itself, and an FM plan
+/// counts for the rows it fits as a licence does (`weights.allocation`, not on top of the
+/// register's own term). It ranks, never proves: the answer stays a best guess, and the
+/// decoder rows are ranked as before.
 ///
 /// A decoder row is tried at its own band ([`job_for`]), not the box's: a box narrower
 /// than the row still lists it. With `capture` (the ring's centre and rate) a ready
@@ -202,6 +217,20 @@ pub fn choose_now(
         capture.is_none_or(|cap| capture_holds(cap, job_band(&job_for(s.mode, m, sel, region))))
     };
     let (ready, outside): (Vec<&Scored>, Vec<&Scored>) = ready.into_iter().partition(held);
+    // What the register and the plans expect at the centre, and whether all of it
+    // contradicts the label.
+    let expected = expected_labels(&c.allocations, center_hz, region);
+    let contradicted = !expected.is_empty() && expected.iter().all(|(_, l)| !l.contains(&label));
+    // The expectations that bring a demodulator row the label does not serve.
+    let brought = |row: &LoadedMode| -> Vec<&(Expected, Vec<&'static str>)> {
+        if row.role() != Role::Demodulator || row.row.modulation.iter().any(|l| l == label) {
+            return vec![];
+        }
+        expected
+            .iter()
+            .filter(|x| expected_fits(row, x, bandwidth_hz))
+            .collect()
+    };
     // An `fsk` wider than a row's `voice_max_hz` is data, not a weak FM voice: the row
     // (`fm_demod`'s 25 kHz) does not serve it.
     let fsk_data = |row: &LoadedMode| {
@@ -214,7 +243,7 @@ pub fn choose_now(
                 .and_then(|w| w.voice_max_hz)
                 .is_some_and(|max| bandwidth_hz > max)
     };
-    let serving = score_demodulators(
+    let mut serving = score_demodulators(
         weights,
         modes,
         at.0,
@@ -223,9 +252,26 @@ pub fn choose_now(
         &catalogue_term,
         &allocation,
     );
+    if contradicted {
+        for s in &mut serving {
+            if s.fits_label {
+                s.score -= weights.modulation * (1.0 - weights.contradicted);
+            }
+            // An FM plan counts as a licence does, not on top of the register's term.
+            let planned = expected.iter().any(|x| {
+                matches!(x.0, Expected::Plan { .. }) && expected_fits(s.mode, x, bandwidth_hz)
+            });
+            if planned {
+                s.score += (weights.allocation - allocation(s.mode)).max(0.0);
+            }
+        }
+        rank_scored(&mut serving);
+    }
     let (demods, unready_demods): (Vec<&Scored>, Vec<&Scored>) = serving
         .iter()
-        .filter(|s| s.in_range && s.fits_label && !fsk_data(s.mode))
+        .filter(|s| {
+            s.in_range && (s.fits_label || !brought(s.mode).is_empty()) && !fsk_data(s.mode)
+        })
         .partition(|s| s.mode.startable());
     // The rows a best guess may name: those that fit the label. A row listed for `unknown`
     // alone is tried, never started on this evidence.
@@ -250,9 +296,27 @@ pub fn choose_now(
             .map(|(_, l)| format!("catalogue: {}", l.name))
             .collect()
     };
+    // A row's job and its evidence lines: a demodulator the expectation brought is sized
+    // as for the expected label it serves (an FM channel's width, not a carrier's), and
+    // says what was expected.
+    let job_lines = |row: &LoadedMode| -> (ChoiceJob, Vec<String>) {
+        let by = brought(row);
+        let as_label = by
+            .iter()
+            .flat_map(|(_, labels)| labels.iter())
+            .find(|l| row.row.modulation.iter().any(|m| m == *l));
+        let Some(as_label) = as_label else {
+            return sized(row, m, sel, region);
+        };
+        let mut relabelled = m.clone();
+        relabelled.label.name = (*as_label).to_string();
+        let (job, mut lines) = sized(row, &relabelled, sel, region);
+        lines.extend(by.iter().map(|(x, _)| x.line(label)));
+        (job, lines)
+    };
     // An alternative's evidence: layer 1, its plan lines and its row's catalogue names.
     let alternative = |row: &LoadedMode| {
-        let (job, lines) = sized(row, m, sel, region);
+        let (job, lines) = job_lines(row);
         Alternative {
             job,
             row: row.row.id.0.clone(),
@@ -295,7 +359,7 @@ pub fn choose_now(
         Ok(d) => d,
         Err(reason) => return cannot_tell(reason, evidence, could_prove, not_tried),
     };
-    let (job, plan) = sized(row, m, sel, region);
+    let (job, plan) = job_lines(row);
     evidence.extend(decode);
     evidence.extend(plan);
     evidence.extend(named(row));

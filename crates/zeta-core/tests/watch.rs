@@ -4969,6 +4969,22 @@ async fn choice_node(
     (Arc::new(node), port, answered)
 }
 
+/// Give `node` a station in a region no channel plan is of: the CB channel the choice
+/// fixtures sit on is then no FM plan's channel, so layer 1's label alone chooses, as these
+/// tests of the watch need (spec 49.2 would answer `fm_demod` for an `am` or `unknown`
+/// read on an FM plan's channel). The demo station's position.
+async fn no_channel_plan(node: &Node) {
+    let station = zeta_core::station::Station {
+        lat: -27.3842,
+        lon: 153.1175,
+        alt_m: 4.0,
+        region: "ZZ".into(),
+        antennas: zeta_core::station::Station::default_antennas(4.0),
+    };
+    node.set_station(station).await.expect("the station is set");
+    assert!(zeta_core::plans::plan_channel_at(cb_ch1_hz(), &node.region()).is_none());
+}
+
 /// The capture of [`choice_node`]'s source.
 fn choice_capture() -> Tuning {
     Tuning {
@@ -5635,6 +5651,7 @@ async fn a_signal_nothing_could_prove_starts_unheld() {
     zeta_core::node::watch::test_timing(0, 0);
     let dir = tempfile::tempdir().unwrap();
     let (node, _port, _answered) = choice_node(dir.path(), &cb_am()).await;
+    no_channel_plan(&node).await;
     let watch = start_choice_watch(&node, serde_json::json!({})).await;
     let events = Events::of(&node, &watch);
     let job = decoded(&node, &events, &watch).await;
@@ -5871,6 +5888,7 @@ async fn a_watch_tries_an_unknown_signal_and_starts_what_proves() {
     let _unknown = zeta_core::node::watch::test_labels_read("unknown");
     let dir = tempfile::tempdir().unwrap();
     let (node, _port, _answered) = choice_node(dir.path(), &cb_dmr()).await;
+    no_channel_plan(&node).await;
     let watch = start_choice_watch(&node, serde_json::json!({})).await;
     let events = Events::of(&node, &watch);
     let (e, child) = choosing(&events).await;
@@ -5930,6 +5948,7 @@ async fn a_watch_whose_unknown_proves_nothing_counts_an_unknown_try() {
     let _unknown = zeta_core::node::watch::test_labels_read("unknown");
     let dir = tempfile::tempdir().unwrap();
     let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    no_channel_plan(&node).await;
     set_trial_s(&node, 3).await;
     let watch = start_choice_watch(&node, serde_json::json!({})).await;
     let events = Events::of(&node, &watch);
@@ -6019,6 +6038,7 @@ async fn a_watch_stopped_while_choosing_starts_nothing_and_leaves_no_slice_pinne
     // Stopped mid-trial: voice no row proves, so the choose is still trying.
     let dir = tempfile::tempdir().unwrap();
     let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    no_channel_plan(&node).await;
     let watch = start_choice_watch(&node, serde_json::json!({})).await;
     let events = Events::of(&node, &watch);
     let (_e, child) = choosing(&events).await;
@@ -6044,6 +6064,7 @@ async fn a_watch_stopped_while_choosing_starts_nothing_and_leaves_no_slice_pinne
     let dir = tempfile::tempdir().unwrap();
     let settle = zeta_core::node::watch::test_hold_choices();
     let (node, _port, _answered) = choice_node(dir.path(), &cb_dmr()).await;
+    no_channel_plan(&node).await;
     let watch = start_choice_watch(&node, serde_json::json!({})).await;
     let events = Events::of(&node, &watch);
     let (_e, child) = choosing(&events).await;
