@@ -527,6 +527,7 @@ async fn remote_codes_from(
         pinned: false,
         written_ns: 0,
         trial: false,
+        training: None,
     };
     let plan = zeta_core::bits::bits_plan(
         &[record],

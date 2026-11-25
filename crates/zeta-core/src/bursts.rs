@@ -98,6 +98,10 @@ pub struct CaptureRecord {
     /// operator's budget.
     #[serde(default)]
     pub trial: bool,
+    /// What a settled `choose` trial slice keeps: each source's guess and the answer
+    /// ([`BurstStore::annotate`]); `null` for any other capture.
+    #[serde(default)]
+    pub training: Option<Value>,
 }
 
 impl CaptureRecord {
@@ -264,6 +268,7 @@ impl BurstStore {
             pinned: false,
             written_ns: now_ns(),
             trial: rec.trial,
+            training: None,
         };
         index.push(record.clone());
         if let Err(e) = self.persist(&index) {
@@ -328,6 +333,23 @@ impl BurstStore {
         self.persist(&index).map_err(|e| {
             if let Some(r) = index.iter_mut().find(|r| r.id == id) {
                 r.pinned = false;
+            }
+            StoreError::Io(e.to_string())
+        })
+    }
+
+    /// Set the training record of the capture `id`: its index entry is rewritten
+    /// atomically, as [`pin`](Self::pin) does. The capture's expiry is unchanged.
+    pub fn annotate(&self, id: &str, training: Value) -> Result<(), StoreError> {
+        let mut index = self.index.lock().unwrap();
+        let rec = index
+            .iter_mut()
+            .find(|r| r.id == id)
+            .ok_or_else(|| StoreError::Unknown(id.into()))?;
+        let before = rec.training.replace(training);
+        self.persist(&index).map_err(|e| {
+            if let Some(r) = index.iter_mut().find(|r| r.id == id) {
+                r.training = before;
             }
             StoreError::Io(e.to_string())
         })
@@ -509,6 +531,7 @@ fn record_from_meta(meta_path: &Path) -> Option<CaptureRecord> {
         pinned: false,
         written_ns,
         trial: ann["zeta:trial"].as_bool().unwrap_or(false),
+        training: None,
     })
 }
 

@@ -536,6 +536,7 @@ mod tests {
             pinned: false,
             written_ns: 0,
             trial: false,
+            training: None,
         }
     }
 

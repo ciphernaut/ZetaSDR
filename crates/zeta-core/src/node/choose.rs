@@ -41,7 +41,7 @@ use super::persist::now;
 use super::{Inner, Node, NodeError, REPLAY_SOURCE, source_fault_reason};
 use crate::choice::{Alternative, Choice, ChoiceJob, NotTried, Settled, choose_now, job_for};
 use crate::choice_policy::{Budget, LeaseSetting, Surface};
-use crate::classify::Measurement;
+use crate::classify::{Classification, Measurement};
 use crate::graph::{Graph, GraphId};
 use crate::job::JobRecord;
 use crate::lease::Uncovered;
@@ -712,6 +712,15 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
             inner.publish_choice(&mut r, &choice);
         }
     }
+    // A proof at step 2 or 3 leaves its slice a training record.
+    if let Some(s) = &slice
+        && choice.settled == Settled::Proved
+        && (2..=3).contains(&choice.step)
+    {
+        let _ = inner
+            .bursts
+            .annotate(&s.id, training_record(&classified, &choice));
+    }
     // Unpinned before the verdict's job starts and the verdict is published.
     drop(slice);
     let kept = match kept.as_mut().and_then(|k| k.job.take()) {
@@ -748,6 +757,29 @@ async fn choose_loop(inner: Arc<Inner>, mut r: Run, port: Arc<dyn Port>) -> Resu
     }
     inner.choose_verdict(&mut r, &choice);
     Ok(())
+}
+
+/// The training record of a slice a trial settled: each source's guess (layer 1's
+/// label, the catalogue's, a learned signature's, layer 3's) and the answer.
+fn training_record(c: &Classification, choice: &Choice) -> Value {
+    let layer1 = c.measurement.iter().map(|m| ("layer1", &m.label));
+    let others = c.labels.iter().filter_map(|l| match l.layer {
+        1 => None,
+        3 => Some(("layer3", l)),
+        2 if l.evidence.starts_with("catalogue ") => Some(("catalogue", l)),
+        2 if l.name.starts_with(crate::learned::LEARNED) => Some(("learned", l)),
+        _ => None,
+    });
+    let sources: Vec<Value> = layer1
+        .chain(others)
+        .map(|(source, l)| {
+            serde_json::json!({"source": source, "guess": l.name, "confidence": l.confidence})
+        })
+        .collect();
+    serde_json::json!({
+        "sources": sources,
+        "settled": {"row": choice.row, "step": choice.step, "settled": choice.settled.name()},
+    })
 }
 
 /// A choice with no job, for `reason`, at step 1.

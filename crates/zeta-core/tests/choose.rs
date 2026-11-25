@@ -257,6 +257,33 @@ async fn choose_revises_fm_to_dmr_at_step_two() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slice_settled_at_step_two_carries_its_training_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = node_over(dir.path(), &dmr_iq(), DMR_HZ, 10.0).await;
+    let id = start(
+        &node,
+        choose_op(DMR_HZ, 20_000, serde_json::json!({"up_to": 2})),
+    )
+    .await;
+    let _ = ended(&node, &id).await;
+    let t = trials(&node);
+    assert_eq!(t.len(), 1, "{t:?}");
+    let training = t[0].training.as_ref().expect("a training record");
+    assert_eq!(training["settled"]["row"], "dmr_decode", "{training}");
+    assert_eq!(training["settled"]["step"], 2, "{training}");
+    assert_eq!(training["settled"]["settled"], "proved", "{training}");
+    let sources = training["sources"].as_array().unwrap();
+    assert!(
+        sources
+            .iter()
+            .any(|s| s["source"] == "layer1" && s["guess"] == "fsk" && s["confidence"].is_number()),
+        "{training}"
+    );
+    // The record is no pin: the slice is still an unpinned trial under its quota.
+    assert!(!t[0].pinned, "{t:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn choose_on_voice_stays_fm_demod() {
     let dir = tempfile::tempdir().unwrap();
     // As wide as the digital voice rows, so step 2 has rows to try.
