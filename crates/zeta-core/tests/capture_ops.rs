@@ -320,3 +320,16 @@ async fn a_ring_slice_record_reads_its_selection_not_the_ring() {
         (Hz(433_920_000), Hz(6_000))
     );
 }
+
+#[tokio::test]
+async fn a_node_without_a_cutter_has_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = open(dir.path()).await;
+    assert!(node.debug_cutter().is_none(), "opened with a cutter");
+    node.set_cutter(Arc::new(zeta_dsp::channel::Cutter));
+    let cutter = node.debug_cutter().expect("the cutter set on the node");
+    let (out, rate) = cutter
+        .cut(&tone(48_000), Hz(RATE_HZ as u64), 0, Hz(12_500))
+        .expect("a band inside the block");
+    assert_eq!((out.len(), rate), (48_000, Hz(RATE_HZ as u64)));
+}

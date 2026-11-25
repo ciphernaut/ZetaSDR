@@ -8,6 +8,7 @@ pub mod capture;
 pub mod choice;
 pub mod choice_policy;
 pub mod classify;
+pub mod cut;
 pub mod emission;
 pub mod graph;
 pub mod job;

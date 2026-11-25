@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bank::{BankFactory, ChannelBank, PFB_MIN_RATE_HZ};
 use crate::classify::{Classifier, ClassifierSet};
+use crate::cut::BandCutter;
 use crate::graph::{self, Graph, GraphError};
 use crate::job::{Hold, JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::KnowledgeProvider;
@@ -596,6 +597,8 @@ struct Inner {
     jobs: Mutex<HashMap<JobId, JobEntry>>,
     knowledge: RwLock<Vec<Arc<dyn KnowledgeProvider>>>,
     classifiers: RwLock<ClassifierSet>,
+    /// The band cutter the binary installed ([`Node::set_cutter`]); `None` until then.
+    cutter: RwLock<Option<Arc<dyn BandCutter>>>,
     /// Failures to persist a job's natural end; memory and disk disagree for these.
     persist_errors: Mutex<Vec<String>>,
     /// Every applied op, one JSON line each; see [`jsonlog`].
@@ -1764,6 +1767,7 @@ impl Node {
                 jobs: Mutex::new(HashMap::new()),
                 knowledge: RwLock::new(vec![learned_knowledge]),
                 classifiers: RwLock::new(classifiers),
+                cutter: RwLock::new(None),
                 persist_errors: Mutex::new(instance_errors),
                 signature_gate: Mutex::new(()),
                 ops_log: jsonlog::JsonLog::new(cfg.state_dir.join("ops.log")),
@@ -2075,6 +2079,12 @@ impl Node {
     /// Register a classifier; `Classify` runs all of them in layer order.
     pub fn add_classifier(&self, c: Arc<dyn Classifier>) {
         self.inner.classifiers.write().unwrap().register(c);
+    }
+
+    /// Install the band cutter (`zeta_dsp::channel::Cutter` in the binary), replacing any
+    /// before it. A node without one cuts nothing.
+    pub fn set_cutter(&self, c: Arc<dyn BandCutter>) {
+        *self.inner.cutter.write().unwrap() = Some(c);
     }
 
     /// The decoder modes as they stand now (see [`crate::modes`]): loaded at `open`,
@@ -2616,6 +2626,13 @@ impl Node {
 
     pub(crate) fn classifiers(&self) -> ClassifierSet {
         self.inner.classifiers.read().unwrap().clone()
+    }
+
+    /// The band cutter [`Node::set_cutter`] installed; `None` when none was.
+    // Only the tests read it until the trial slice is cut with it (plan 49, task C5).
+    #[cfg_attr(not(any(test, feature = "test-fixtures")), allow(dead_code))]
+    pub(crate) fn cutter(&self) -> Option<Arc<dyn BandCutter>> {
+        self.inner.cutter.read().unwrap().clone()
     }
 
     pub(crate) fn port(&self, id: &SourceId) -> Option<Arc<dyn Port>> {
@@ -3809,6 +3826,12 @@ impl Node {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub async fn debug_restart_guard(&self, id: &JobId) -> Option<OwnedMutexGuard<()>> {
         self.inner.restart_guard(id).await
+    }
+
+    /// [`Node::cutter`], for tests of what the node was given.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn debug_cutter(&self) -> Option<Arc<dyn BandCutter>> {
+        self.cutter()
     }
 
     /// Hold `source`'s gate, for tests of what waits on it.

@@ -10,6 +10,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use zeta_core::cut::BandCutter;
+use zeta_core::ops::channel_rate_hz;
 use zeta_core::port::{IqBlock, IqReceiver, Tuning};
 use zeta_core::stage::{Backend, Stage, StageContext, StageError, StageSpec};
 use zeta_core::stream::{Frame, Payload, StreamBus};
@@ -488,6 +490,50 @@ fn check_in_band(
         });
     }
     Ok(())
+}
+
+/// The node's band cutter ([`BandCutter`]), installed by the binary with
+/// [`zeta_core::node::Node::set_cutter`].
+///
+/// A band is cut at [`channel_rate_hz`], the rate a job's channel stage runs it at, and
+/// filtered as that stage filters it ([`extract_offset`]: low-pass at half the band, the
+/// filter's start-up delay of half its length at the block's rate left in). So a slice cut
+/// to a row's band holds what the row's own channel would have read off the radio.
+///
+/// Where that rate is the block's own, the cut does not filter: nothing is saved by it, and
+/// a shift without decimation is circular, so nothing outside the band lands inside it (the
+/// reasoning of [`skips_filter`]). The band centred is then the block itself; one off
+/// centre is the block shifted to it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cutter;
+
+impl BandCutter for Cutter {
+    fn cut(
+        &self,
+        iq: &[Complex<f32>],
+        rate_hz: Hz,
+        offset_hz: i64,
+        bandwidth_hz: Hz,
+    ) -> Option<(Vec<Complex<f32>>, Hz)> {
+        let (rate, bw) = (rate_hz.0, bandwidth_hz.0);
+        // `offset ± bw/2` inside `± rate/2`, doubled in i128 so odd values are exact.
+        let reach = 2 * i128::from(offset_hz).abs() + i128::from(bw);
+        if rate == 0 || bw == 0 || reach > i128::from(rate) {
+            return None;
+        }
+        let out_rate = channel_rate_hz(rate, bw);
+        if out_rate < rate {
+            let (out, r) = extract_offset(iq, rate, offset_hz, bw, out_rate).ok()?;
+            return Some((out, Hz(r)));
+        }
+        if offset_hz == 0 {
+            return Some((iq.to_vec(), rate_hz));
+        }
+        let mut out = vec![Complex::new(0.0, 0.0); iq.len()];
+        let mut phase = 0.0;
+        shift_into(iq, &mut phase, -(offset_hz as f64) / rate as f64, &mut out);
+        Some((out, rate_hz))
+    }
 }
 
 #[derive(JsonSchema, Serialize, Deserialize)]
@@ -1559,5 +1605,73 @@ mod tests {
             Err(StageError::Failed(m)) => assert!(m.contains("center_hz"), "{m}"),
             r => panic!("expected Failed, got {r:?}"),
         }
+    }
+
+    const CUT_RATE: u64 = 2_400_000;
+
+    #[test]
+    fn a_cut_holds_the_band_at_the_lowest_divisor_rate() {
+        // A tone in the band, and one 40 kHz above it: at 48 kS/s unfiltered it would fold
+        // to -8 kHz, inside the band.
+        let n = 240_000;
+        let inside = crate::util::nco(n, 300_000.0, CUT_RATE as f64);
+        let above = crate::util::nco(n, 340_000.0, CUT_RATE as f64);
+        let iq: Vec<_> = inside.iter().zip(&above).map(|(a, b)| a + b).collect();
+        let (out, rate) = Cutter.cut(&iq, Hz(CUT_RATE), 300_000, Hz(12_500)).unwrap();
+        assert_eq!(rate, Hz(48_000));
+        assert_eq!(out.len(), n / 50);
+        // Past the filter's start-up the tone is at 0 Hz, at its own level, alone.
+        let settled = &out[50..];
+        let mean = settled.iter().sum::<Complex<f32>>() / settled.len() as f32;
+        assert!((mean.norm() - 1.0).abs() < 0.01, "the tone's level {mean}");
+        let worst = settled
+            .iter()
+            .map(|v| (v - mean).norm())
+            .fold(0.0, f32::max);
+        assert!(
+            worst < 0.01,
+            "the tone moves, or the one above folds in: {worst}"
+        );
+    }
+
+    #[test]
+    fn a_cut_as_wide_as_the_block_is_the_block() {
+        let iq = noise_iq(4_800);
+        let got = Cutter.cut(&iq, Hz(CUT_RATE), 0, Hz(CUT_RATE)).unwrap();
+        assert_eq!(got, (iq, Hz(CUT_RATE)));
+    }
+
+    #[test]
+    fn a_cut_at_the_blocks_own_rate_moves_the_band_to_the_centre() {
+        // 48 kS/s is the lowest rate a band is cut at: a 12.5 kHz band 10 kHz off centre
+        // stays at it, shifted to 0 Hz sample for sample.
+        let iq = tone(4_800, 10_000.0);
+        let (out, rate) = Cutter.cut(&iq, Hz(RATE), 10_000, Hz(12_500)).unwrap();
+        assert_eq!((out.len(), rate), (iq.len(), Hz(RATE)));
+        let worst = out
+            .iter()
+            .map(|v| (v - Complex::new(1.0, 0.0)).norm())
+            .fold(0.0, f32::max);
+        assert!(worst < 1e-3, "the tone is not at 0 Hz: {worst}");
+    }
+
+    #[test]
+    fn a_band_outside_the_block_cannot_be_cut() {
+        let iq = noise_iq(4_800);
+        let cut = |offset_hz: i64, bandwidth_hz: u64| {
+            Cutter.cut(&iq, Hz(CUT_RATE), offset_hz, Hz(bandwidth_hz))
+        };
+        // Wholly outside, on either side.
+        assert_eq!(cut(1_300_000, 12_500), None);
+        assert_eq!(cut(-1_300_000, 12_500), None);
+        // Reaching past an edge by one hertz; touching it is inside.
+        assert_eq!(cut(1_193_751, 12_500), None);
+        assert_eq!(cut(-1_193_751, 12_500), None);
+        assert!(cut(1_193_750, 12_500).is_some());
+        assert!(cut(-1_193_750, 12_500).is_some());
+        // Wider than the block, or no band at all.
+        assert_eq!(cut(0, CUT_RATE + 1), None);
+        assert_eq!(cut(0, 0), None);
+        assert_eq!(Cutter.cut(&iq, Hz(0), 0, Hz(12_500)), None);
     }
 }

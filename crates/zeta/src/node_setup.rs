@@ -700,6 +700,7 @@ async fn open_into(
     for c in zeta_dsp::classifiers(node.modes_handle()) {
         node.add_classifier(c);
     }
+    node.set_cutter(Arc::new(zeta_dsp::channel::Cutter));
     Ok(node)
 }
 
