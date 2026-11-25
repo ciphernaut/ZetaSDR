@@ -275,6 +275,12 @@ Spec first: it is a feature, not cleanup. The menu grouping above is the part th
 
 - **Plan 48** (2026-11-24): spec `docs/superpowers/specs/2026-11-24-classify-chooses-the-job-design.md`, plan `docs/superpowers/plans/2026-11-24-classify-chooses-the-job.md`. Approved, not built. Demodulators as mode rows, one ranked choice in `classify`, a `choose` job climbing the proof ladder (free, off air, on air) under a per-surface policy, the watch on probation, and the layer-3 slot. Part 48.5 (`borrow`, a trial on an idle radio under a lease that yields) is its own plan, later.
 
+## UI: the Jobs pane lists every radio's jobs, and Clear stale (2026-11-25)
+
+From the operator, after running a set across several radios:
+- **Every running job is listed, whichever radio tab is shown.** Today a set's group in the Jobs pane holds only its rows on the shown radio, with a count per radio in its summary (`agent.js`, the set-group placement in `render`). When a set spans radios, finding the member to mute means switching tabs. Each row already names its radio, so list them all. A row on another radio could link to its tab rather than open its menu there.
+- **Clear stale beside Clear all.** Clear all stops every job and then drops the finished rows. Clear stale would only drop the stopped and failed rows (the `view clear` command, which has no button) and leave every running job alone.
+
 ## UI: a selected job lit on the waterfall
 
 From the operator, 2026-11-01 (after the B210 day). Built in cleanup round 3: a running job's next steps (listen, transcribe, What is this?, identify, measure, watch on its band) in its outline menu's Next and behind its row's ⋯, from the one entry table. Left: selecting a job (a click on its row, tag or outline) should light it on the waterfall as a sticky selection, not only on hover (`hot` from plan 18 is hover-only), so the operator can see which job the next action applies to; and the wide footprint's tag has no menu of its own (the narrow one's long press opens the outline menu).
@@ -1122,6 +1128,14 @@ The other receivers surveyed stay candidates for the later steps, each for the r
 A copyleft receiver runs as a separate program the operator builds, never linked into the node, shipped with it or kept in this repository (`docs/licensing.md`).
 
 ## Left from plan 48 (2026-11-25)
+
+From UAT 48, run live 2026-11-25 (`UAT.md`):
+- **RDS rides with `wfm_demod` (the operator's idea).** On a broadcast station the quick RDS proof wins, and the menu offers `rds_decode` where the operator wants to listen. A decoder row should be able to name the demodulator it rides with (`rds_decode` with `wfm_demod`, as `transcribe` attaches to a voice job). Its proof then confirms the demodulator, its fields go into the evidence, and Start gives the demodulator with the decoder attached. The same mechanism serves other pairs, such as a subtone or selcall decoder on `fm_demod`.
+- **Layer 1 reads a keyed FM channel as `am`, `ook` or `unknown`.** This is 48.6's failure, seen on UHF CB and on a 400 MHz FM channel. It happened between overs and also mid-over on a CB repeater (`am` at duty 1.00, 36 dB). A watch with `on_signal: choose` then starts `am_demod` on a licensed FM channel. The register's emission could weigh against the label, and an envelope that drops out within the slice could be measured on the part where the carrier is up.
+- **A weak digital carrier reads `unknown`, and nothing tries it.** A DMR carrier at 7 to 10 dB SNR matches no layer-1 rule, so `could_prove` is empty and a `choose` watch never tries DMR, where an identify watch would have. Let `unknown` pass ready decoder rows that fit its width into `could_prove`.
+- **The first entry names no deviation.** `choiceLabel` gives the kind, the width and the row's name; Start sends `deviation_hz`. UAT 48.1 asks for the deviation on an FM entry.
+- **A narrow box drops the decoders.** `could_prove` needs the selection to be at least a row's channel width (`band.fits(sel.bandwidth_hz)`), so a 12 kHz box on a DMR signal offers no proof.
+- **"Step 2 proved nothing" when step 2 never ran.** At 20 MS/s the watch's event says so although the verdict reads `not_tried: the slice exceeds the trial quota`. A verdict also reads `step 1` whether step 2 ran and proved nothing or never ran; say which.
 
 - **The trial slice is cut at the full ring rate (R29).** Above about 8.4 MS/s the 64 MiB trial quota leaves under 1 s, so step 2 of a `choose` never runs on a wide capture (step 3 still covers it). Cut the slice to the selection before writing it; that needs a channeliser reachable from `zeta-core`.
 - **A released transcript line draws its waterfall ribbon when it arrives, not at its own time.** A held transcriber releases its lines late; the page should place the ribbon at the line's own time.
