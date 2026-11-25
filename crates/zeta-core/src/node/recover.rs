@@ -86,13 +86,17 @@ pub(super) struct Resumed {
 /// Whether `e`'s record failed with its source's fault during that source's episode in
 /// `episodes`: a job on the radio whose reason carries the `source <id>: ` prefix, or an
 /// attached job that failed because its input stopped running, whose input runs again
-/// or is itself recoverable (so it comes back once the input does).
+/// or is itself recoverable (so it comes back once the input does). A `choose` never
+/// comes back: it is asked again.
 fn recoverable_entry(
     jobs: &HashMap<JobId, JobEntry>,
     episodes: &HashMap<SourceId, Episode>,
     e: &JobEntry,
 ) -> bool {
     let rec = &e.record;
+    if rec.kind == JobKind::Choose.name() {
+        return false;
+    }
     let Some(ep) = episodes.get(&rec.source) else {
         return false;
     };
@@ -315,9 +319,13 @@ impl Inner {
     /// Whether `open` relaunches `rec`: it is `Running`, or it `Failed` only
     /// because its source was absent and that source is now attached, or (an
     /// attached job) only because its input job was not running and it now runs. A
-    /// `packets` attachment or a replay never resumes (`open` stops one left running).
+    /// `packets` attachment, a replay or a `choose` never resumes (`open` stops one left
+    /// running).
     pub(super) fn resumable(&self, rec: &JobRecord) -> bool {
-        if rec.kind == JobKind::Packets.name() || rec.replay.is_some() {
+        if rec.kind == JobKind::Packets.name()
+            || rec.replay.is_some()
+            || rec.kind == JobKind::Choose.name()
+        {
             return false;
         }
         match (&rec.state, &rec.input) {
@@ -480,10 +488,11 @@ impl Inner {
                 .iter()
                 .filter(|r| &r.source == source && r.input.is_none() && relaunch(self, r))
                 .collect();
-            // A scan resumes after the others and takes no part of their capture.
+            // A scan resumes after the others and takes no part of their capture; a
+            // `choose` holds no lease and never resumes.
             let mine: Vec<&JobRecord> = mine
                 .into_iter()
-                .filter(|r| r.kind != JobKind::Scan.name())
+                .filter(|r| r.kind != JobKind::Scan.name() && r.kind != JobKind::Choose.name())
                 .collect();
             let rigid: Vec<Tuning> = mine
                 .iter()

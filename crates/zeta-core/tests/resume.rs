@@ -1175,3 +1175,37 @@ async fn a_node_that_does_not_own_the_state_leaves_a_transient_record_in_place()
         drop(node);
     }
 }
+
+/// A `choose` (not transient) never resumes: `open` stops it with a note, and forgets the
+/// records it owns (a live trial), so neither runs nor holds a lease.
+#[tokio::test]
+async fn a_choose_and_its_trial_never_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let (parent, child) = (JobId::new(), JobId::new());
+    let p = running(&parent, "choose", band(48_000), 1);
+    let mut c = running(&child, "passthrough", band(9_600), 2);
+    c.owner = Some(parent.clone());
+    write_records(dir.path(), &[p, c]);
+    let node = Node::open(cfg(dir.path()), registry(), vec![Radio::new()])
+        .await
+        .unwrap();
+    let listed = node.job_list();
+    assert!(
+        listed.iter().all(|r| r.state != JobState::Running),
+        "{listed:?}"
+    );
+    let rec = record(&node, &parent);
+    assert_eq!(rec.state, JobState::Stopped);
+    assert_eq!(
+        rec.context["note"], "a choose does not resume: ask again",
+        "{rec:?}"
+    );
+    assert_eq!(on_disk(dir.path(), &parent).state, JobState::Stopped);
+    assert!(!listed.iter().any(|r| r.id == child), "{listed:?}");
+    assert!(!job_file(dir.path(), &child).exists());
+    assert!(
+        node.lease_holders(&SourceId("radio0".into())).is_empty(),
+        "{:?}",
+        node.lease_holders(&SourceId("radio0".into()))
+    );
+}

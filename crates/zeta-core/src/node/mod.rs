@@ -1399,17 +1399,24 @@ const PACKETS_NO_RESUME_NOTE: &str = "packet capture does not resume: attach aga
 /// The note a replay record left running by the last node carries once `open` stops it.
 pub(crate) const REPLAY_NO_RESUME_NOTE: &str = "a replay does not resume: run it again";
 
-/// A `packets` attachment and a replay do not resume across a restart: each such record
-/// that was `Running` is set `Stopped` with [`PACKETS_NO_RESUME_NOTE`] or
-/// [`REPLAY_NO_RESUME_NOTE`] as its context's `note` (the rest of its context kept: a
-/// capture's `capture`, `packets` and `bytes`, a replay's `replay`) and persisted, so
-/// `open` loads it as it is; a packet capture's file stays in the packet store, closed.
+/// The note a `choose` record left running by the last node carries once `open` stops it.
+const CHOOSE_NO_RESUME_NOTE: &str = "a choose does not resume: ask again";
+
+/// A `packets` attachment, a replay and a `choose` do not resume across a restart: each
+/// such record that was `Running` is set `Stopped` with [`PACKETS_NO_RESUME_NOTE`],
+/// [`REPLAY_NO_RESUME_NOTE`] or [`CHOOSE_NO_RESUME_NOTE`] as its context's `note` (the
+/// rest of its context kept: a capture's `capture`, `packets` and `bytes`, a replay's
+/// `replay`, a choose's `choose`) and persisted, so `open` loads it as it is; a packet
+/// capture's file stays in the packet store, closed.
 fn stop_unresumable(dir: &Path, records: &mut [JobRecord]) -> Result<(), NodeError> {
     for rec in records.iter_mut().filter(|r| r.state == JobState::Running) {
         let note = if rec.kind == JobKind::Packets.name() {
             PACKETS_NO_RESUME_NOTE
         } else if rec.replay.is_some() {
             REPLAY_NO_RESUME_NOTE
+        } else if rec.kind == JobKind::Choose.name() && !rec.transient {
+            // A transient one is the owner's to forget (above), never stopped here.
+            CHOOSE_NO_RESUME_NOTE
         } else {
             continue;
         };
@@ -1553,7 +1560,9 @@ impl Node {
     /// `packets` attachment never resumes: one left `Running` is set `Stopped` with
     /// the note `packet capture does not resume: attach again`; its input resumes as any
     /// job does. Nor does a replay: one left `Running` is set `Stopped` with the note
-    /// `a replay does not resume: run it again` (see [`stop_unresumable`]).
+    /// `a replay does not resume: run it again`; nor a `choose`: `a choose does not
+    /// resume: ask again`, the records it owns (its live trials) forgotten (see
+    /// [`stop_unresumable`]).
     /// Without `cfg.resume` every record is loaded as persisted, untouched.
     /// Either way, before any of that, each attached source pinned in its record
     /// (`state_dir/sources`) is held at its pin (see [`Node::source_pin`]), so a
@@ -1599,17 +1608,26 @@ impl Node {
         let (mut records, mut load_errors) = load(&jobs_dir)?;
         let job_load_errors = load_errors.len();
         // A transient job is never resumed nor kept: a record left by the last node goes,
-        // with the records it owns (a live trial). Only the node that owns the state and
-        // resumes touches it: a read-only one-shot beside a running `serve` must not
-        // delete a live job's file.
+        // with the records it owns (a live trial). Nor does a `choose` resume (its record
+        // is stopped below, `stop_unresumable`), and the records it owns go as well. Only
+        // the node that owns the state and resumes touches it: a read-only one-shot
+        // beside a running `serve` must not delete a live job's file.
         if cfg.owns_state_dir && cfg.resume {
             let gone: std::collections::HashSet<JobId> = records
                 .iter()
                 .filter(|r| r.transient)
                 .map(|r| r.id.clone())
                 .collect();
+            let chooses: std::collections::HashSet<JobId> = records
+                .iter()
+                .filter(|r| r.kind == JobKind::Choose.name())
+                .map(|r| r.id.clone())
+                .collect();
             records.retain(|r| {
-                let keep = !r.transient && !r.owner.as_ref().is_some_and(|o| gone.contains(o));
+                let owned_by = |set: &std::collections::HashSet<JobId>| {
+                    r.owner.as_ref().is_some_and(|o| set.contains(o))
+                };
+                let keep = !r.transient && !owned_by(&gone) && !owned_by(&chooses);
                 if !keep {
                     let _ = std::fs::remove_file(jobs_dir.join(format!("{}.json", r.id.0)));
                 }
