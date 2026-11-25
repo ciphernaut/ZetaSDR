@@ -756,6 +756,14 @@ def menu_item(page, action, menu="#ctx", force=False):
     return item
 
 
+def still_menu(menu):
+    """Wait until the open box `menu`'s choose has given its last answer: each answer draws the
+    menu again and places it again, which a scenario measuring the menu's geometry (or placing
+    it by hand) must not race."""
+    expect(menu.locator('.ctx-item[data-action="choice_start"]')).not_to_have_class(
+        re.compile("revising"), timeout=20_000)
+
+
 def menu_click(page, action, menu="#ctx", force=False):
     """Opens the group (and submenus) holding `action` in the open `menu` and clicks it."""
     menu_item(page, action, menu, force).click(force=force)
@@ -5895,10 +5903,7 @@ def scenario_box_menu_groups_open_by_hover_click_and_keys(page, url, secret):
     # Enter; Escape or the other arrow closes one level); its entries carry no `Decode ›` or
     # `Transcribe ›` prefix, the Transcribe twins under their own heading.
     menu = open_menu_on_tone(page, url, secret)
-    # Each answer of the menu's choose draws it again (and places it again): the geometry
-    # below wants a still menu, so wait for the choose's last answer.
-    expect(menu.locator('.ctx-item[data-action="choice_start"]')).not_to_have_class(
-        re.compile("revising"), timeout=20_000)
+    still_menu(menu)
     first = menu.evaluate(FIRST_LEVEL_JS)
     assert len(first) <= 8, f"first level {first}"
     assert first[:2] == ["choice_start", "classify"] and first[-1] == "ask", f"first level {first}"
@@ -6459,6 +6464,7 @@ def scenario_submenus_wait_for_the_pointer_to_rest(page, url, secret):
     # last entry) is dispatched in one page task, so no dwell can fire between its steps however
     # slow the runner; one left pending would fire within the wait after it.
     menu = open_menu_on_tone(page, url, secret)
+    still_menu(menu)
     page.evaluate("() => { const m = document.getElementById('ctx'); m.style.left = '100px';"
                   " m.style.top = '120px'; }")
     listen = menu.locator('.ctx-sub[data-group="listen"]')
@@ -6523,6 +6529,7 @@ def scenario_submenus_beside_their_opener_in_every_theme(page, url, secret):
               && (!l || ((l.getAttribute('href') || '').includes('/' + t + '/') && !!l.sheet)); }""",
                                arg=theme)
         drag_menu(page)
+        still_menu(menu)
         place(left=40)
         opener.click()
         expect(listen).to_be_visible()
@@ -6531,6 +6538,7 @@ def scenario_submenus_beside_their_opener_in_every_theme(page, url, secret):
         assert abs(sb["y"] - o["y"]) <= 12, f"{theme}: {sb} level with {o}"
         close_menu(page)
         drag_menu(page)
+        still_menu(menu)
         place(right=2, bottom=True)
         opener.click()
         expect(listen).to_be_visible()
@@ -6541,6 +6549,7 @@ def scenario_submenus_beside_their_opener_in_every_theme(page, url, secret):
         close_menu(page)
     # A viewport shorter than the panel: it scrolls, and the keys bring the focus into view.
     drag_menu(page)
+    still_menu(menu)
     place(left=100)
     page.set_viewport_size({"width": WIDE["width"], "height": 240})
     opener.click()
