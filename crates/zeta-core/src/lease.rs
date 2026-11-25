@@ -512,7 +512,8 @@ impl LeaseManager {
     /// gives way on the whole `span` of `port`, under the source's gate the caller
     /// holds: granted (the lease's token, fired when it gives way again, and `holder`
     /// no longer waiting) only when no rigid lease, no pin and no other time-shared
-    /// lease holds the source (elastic leases never do: the caller stops them); else
+    /// lease holds the source (elastic leases never do: the caller stops them; nor do
+    /// trials' leases, which give way to it, [`LeaseManager::yield_trials`]); else
     /// the conflict naming the holders, as [`LeaseManager::acquire_shared_locked`]
     /// words it, and `holder` still waiting. It never takes another lease away.
     pub(crate) fn resume_shared_locked(
@@ -527,11 +528,13 @@ impl LeaseManager {
         let mut leases = self.leases.lock().unwrap();
         let v = leases.entry(source.clone()).or_default();
         v.retain(|l| l.job != holder);
-        if let Some(first) = v.iter().find(|l| !l.elastic) {
+        // A trial's lease never keeps the scan waiting, nor is it named.
+        let held: Vec<Lease> = v.iter().filter(|l| !l.trial).cloned().collect();
+        if let Some(first) = held.iter().find(|l| !l.elastic) {
             let cur = port.current().unwrap_or(first.band);
-            let shared = v.iter().any(|l| l.time_shared);
-            let holders = rigid(v);
-            let pinned = pinned_in(v, &source);
+            let shared = held.iter().any(|l| l.time_shared);
+            let holders = rigid(&held);
+            let pinned = pinned_in(&held, &source);
             let options = conflict_options(port, Some(&span), &cur, shared, &holders, pinned);
             return Err(LeaseError::Conflict {
                 options,
@@ -543,6 +546,8 @@ impl LeaseManager {
         if v.is_empty() {
             leases.remove(&source);
         }
+        // The scan sweeps the whole source: no trial outlasts its steps.
+        self.yield_trials(&mut leases, &source);
         let token = CancellationToken::new();
         leases.entry(source.clone()).or_default().push(Lease {
             job: holder.clone(),
@@ -2583,6 +2588,43 @@ mod tests {
         assert!(m.resume_shared_locked(&p, scan.clone(), span, &g).is_err());
         drop(g);
         assert_eq!(m.holders(p.id()), vec![(second, span)]);
+    }
+
+    /// A trial's lease never keeps a waiting scan from its source: a conflict with a
+    /// rigid job names that job, never the trial; with the trial alone the scan resumes
+    /// and the trial gives way (the scan sweeps the whole source).
+    #[tokio::test]
+    async fn a_trial_never_blocks_a_waiting_scan() {
+        let (p, m) = (FakePort::new(), LeaseManager::new());
+        let scan = JobId::new();
+        let span = t(100_000_000, 40_000_000);
+        m.acquire_shared(&p, scan.clone(), span, true)
+            .await
+            .unwrap();
+        let job = JobId::new();
+        let want = t(433_000_000, 1_000_000);
+        m.ensure(&p, job.clone(), want, false).await.unwrap();
+        assert_eq!(m.waiting(p.id()), vec![scan.clone()]);
+        let (trial, token) = (JobId::new(), CancellationToken::new());
+        m.mark_trial(trial.clone(), token.clone());
+        m.ensure(&p, trial.clone(), t(433_100_000, 12_500), false)
+            .await
+            .unwrap();
+        let g = m.gate_guard(p.id()).await;
+        match m.resume_shared_locked(&p, scan.clone(), span, &g) {
+            Err(LeaseError::Conflict { holders, .. }) => assert_eq!(holders, vec![job.clone()]),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        drop(g);
+        assert!(!token.is_cancelled());
+        m.release(&job);
+        let g = m.gate_guard(p.id()).await;
+        let resumed = m.resume_shared_locked(&p, scan.clone(), span, &g);
+        drop(g);
+        assert!(resumed.is_ok(), "{resumed:?}");
+        assert!(token.is_cancelled(), "the trial gave way");
+        assert_eq!(m.holders(p.id()), vec![(scan, span)]);
+        assert!(m.waiting(p.id()).is_empty());
     }
 
     /// A time-shared lease that does not give way (a scan at another depth) is a
