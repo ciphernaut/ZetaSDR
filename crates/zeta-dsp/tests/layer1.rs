@@ -1,4 +1,5 @@
-//! Layer-1 rules for wideband FM (with 19 kHz pilot evidence), AM and SSB.
+//! Layer-1 rules for wideband FM (with 19 kHz pilot evidence), AM and SSB, and for a
+//! keyed NBFM over whatever share of the window it is up.
 #![cfg(feature = "test-fixtures")]
 
 use num_complex::Complex;
@@ -528,4 +529,138 @@ fn bursty_fsk_at_2m4_measures_within_twice_base_time() {
     if cfg!(debug_assertions) {
         assert!(ms <= 2 * BURSTY_FSK_2M4_BASE_MS, "{ms} ms");
     }
+}
+
+/// A keyed-over case measured as `classify` reads a channel: `measure_selection` of its
+/// band about the window's centre.
+fn keyed(c: &zeta_dsp::fixtures::KeyedOverCase) -> (zeta_core::classify::FeatureRecord, Label) {
+    let iq = zeta_dsp::fixtures::keyed_over(&c.over);
+    zeta_dsp::measure::measure_selection(
+        &iq,
+        u64::from(c.over.rate_hz),
+        CENTER,
+        zeta_core::classify::Band {
+            offset_hz: 0,
+            bandwidth_hz: zeta_core::types::Hz(c.band_hz),
+        },
+    )
+    .expect("a measurement")
+}
+
+/// Fails with every case that broke `check`, one per line, after printing each case.
+fn every_keyed_over(
+    cases: &[zeta_dsp::fixtures::KeyedOverCase],
+    check: impl Fn(
+        &zeta_dsp::fixtures::KeyedOverCase,
+        &zeta_core::classify::FeatureRecord,
+        &Label,
+    ) -> Option<String>,
+) {
+    let mut failed = Vec::new();
+    for c in cases {
+        let (f, l) = keyed(c);
+        eprintln!("{}: {} duty {:?} ({})", c.name, l.name, f.duty, l.evidence);
+        if let Some(why) = check(c, &f, &l) {
+            failed.push(format!("{}: {why}", c.name));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} of {} cases:\n{}",
+        failed.len(),
+        cases.len(),
+        failed.join("\n")
+    );
+}
+
+/// The keyed overs the label and duty tests read: speech and a quiet passage, keyed up
+/// and down at every share of `KEYED_OVER_SHARES`, and the over with a hole in it.
+fn speech_overs() -> Vec<zeta_dsp::fixtures::KeyedOverCase> {
+    zeta_dsp::fixtures::keyed_over_cases(&[1.0, 0.1], &zeta_dsp::fixtures::KEYED_OVER_SHARES, true)
+}
+
+/// Spec 3.1: a slice of a keyed FM channel holds noise, then the key-up (or the key-down,
+/// or a drop-out). Whatever share of it the carrier is up, it is FM: `fm`, or `fsk` (both
+/// choose `fm_demod`), never `am`, `ook` or `unknown`.
+#[test]
+#[ignore = "plan 49 A3/A4"]
+fn a_keyed_over_reads_fm_at_every_carrier_up_share() {
+    every_keyed_over(&speech_overs(), |_, _, l| {
+        (!matches!(l.name.as_str(), "fm" | "fsk")).then(|| format!("{} ({})", l.name, l.evidence))
+    });
+}
+
+/// The gate finds the off part from either side: `duty` is the share the carrier is up,
+/// within 0.05, a hole of 100 ms in 2 s included.
+#[test]
+#[ignore = "plan 49 A3/A4"]
+fn a_keyed_overs_duty_is_its_carrier_up_share() {
+    // 0.05 and a rounding's slack: an f32 duty of exactly 0.05 off is within it.
+    every_keyed_over(&speech_overs(), |c, f, _| match f.duty {
+        Some(d) if (f64::from(d) - c.share).abs() <= 0.05 + 1e-6 => None,
+        d => Some(format!("duty {d:?}, the carrier up {:.2}", c.share)),
+    });
+}
+
+/// A pause between words: the carrier keyed but unmodulated reads `carrier`, as a steady
+/// one does.
+#[test]
+#[ignore = "plan 49 A3/A4"]
+fn an_unmodulated_keyed_carrier_reads_carrier() {
+    let cases = zeta_dsp::fixtures::keyed_over_cases(&[0.0], &[0.9, 0.4], false);
+    every_keyed_over(&cases, |_, _, l| {
+        (l.name != "carrier").then(|| format!("{} ({})", l.name, l.evidence))
+    });
+}
+
+/// Every envelope CV a label's evidence quotes (`cv <n>`), in order.
+fn quoted_cvs(evidence: &str) -> Vec<f32> {
+    evidence
+        .match_indices("cv ")
+        .filter(|&(i, _)| {
+            evidence[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        })
+        .filter_map(|(i, m)| {
+            let rest = &evidence[i + m.len()..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit() && c != '.')
+                .unwrap_or(rest.len());
+            rest[..end].trim_end_matches('.').parse().ok()
+        })
+        .collect()
+}
+
+/// Spec 3.1, first bullet: the label is read from the samples the record measured. A
+/// keyed over is gated (its off part is noise, its runs sparse), so its view is its on
+/// runs as received: the evidence quotes one CV, and it is the envelope CV of those runs
+/// of the channel `measure_selection` cut, not the whole window's.
+#[test]
+#[ignore = "plan 49 A3/A4"]
+fn the_label_and_the_record_describe_the_same_samples() {
+    every_keyed_over(&speech_overs(), |c, _, l| {
+        let rate = u64::from(c.over.rate_hz);
+        let iq = zeta_dsp::fixtures::keyed_over(&c.over);
+        let (chan, out_rate) = zeta_dsp::channel::extract_offset(
+            &iq,
+            rate,
+            0,
+            c.band_hz,
+            zeta_core::ops::channel_rate_hz(rate, c.band_hz),
+        )
+        .expect("the channel");
+        let b = zeta_dsp::measure::burst_runs(&chan, out_rate);
+        let on: Vec<Complex<f32>> = b
+            .runs
+            .iter()
+            .flat_map(|&(s, e)| chan[s..e].iter().copied())
+            .collect();
+        let view = envelope_cv(&on);
+        // Quoted to three places: one value, however often it is quoted.
+        let cvs = quoted_cvs(&l.evidence);
+        (cvs.is_empty() || cvs.iter().any(|cv| (cv - view).abs() > 0.001))
+            .then(|| format!("quotes cv {cvs:?}, the view's {view:.3}"))
+    });
 }

@@ -242,6 +242,82 @@ pub fn write_ev1527_fixture(dir: &Path, f: &Ev1527Fixture) -> PathBuf {
     write_cf32(dir, f.stem, &meta, &iq).expect("write fixture")
 }
 
+/// One keyed-over window of layer 1's tests and sweep (`tests/layer1.rs`,
+/// `examples/l1_sweep.rs`): its name, the share of the window the carrier is up, the
+/// channel `measure_selection` reads it through (centred) and the window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyedOverCase {
+    /// `keyed-<up|down|hole|whole>-d<share>-a<audio>-<snr>dB-<band>Hz`.
+    pub name: String,
+    pub share: f64,
+    pub band_hz: u64,
+    pub over: KeyedOver,
+}
+
+/// The rate of every keyed-over case, Hz.
+pub const KEYED_OVER_RATE_HZ: u32 = 48_000;
+/// The window of every keyed-over case, s.
+pub const KEYED_OVER_SECONDS: f32 = 2.0;
+/// The carrier-up shares of the key-up and key-down cases.
+pub const KEYED_OVER_SHARES: [f64; 7] = [0.97, 0.95, 0.9, 0.75, 0.6, 0.4, 0.15];
+/// The hole of the drop-out case, as a share of the window: the carrier is up but for it.
+pub const KEYED_OVER_HOLE: (f64, f64) = (0.45, 0.55);
+/// The carrier-to-noise ratios of the cases, dB.
+pub const KEYED_OVER_SNRS_DB: [f32; 2] = [36.0, 15.0];
+/// The channels, `(band, peak deviation)` in Hz: 12.5 and 25 kHz FM.
+pub const KEYED_OVER_CHANNELS: [(u64, f64); 2] = [(12_500, 2_500.0), (25_000, 5_000.0)];
+
+/// The keyed-over cases at each audio level of `audios`, each SNR of
+/// [`KEYED_OVER_SNRS_DB`] and each channel of [`KEYED_OVER_CHANNELS`]: for each share `d`
+/// of `shares` a key-up (the carrier up over `(1 - d, 1)`) and a key-down (`(0, d)`), or
+/// one whole over for `d` of 1; and, with `hole`, the carrier up but for
+/// [`KEYED_OVER_HOLE`]. A case's noise seed comes from its name.
+pub fn keyed_over_cases(audios: &[f32], shares: &[f64], hole: bool) -> Vec<KeyedOverCase> {
+    let mut keyings: Vec<(&str, f64, (f64, f64))> = Vec::new();
+    for &d in shares {
+        if d >= 1.0 {
+            keyings.push(("whole", 1.0, (0.0, 1.0)));
+        } else {
+            keyings.push(("up", d, (1.0 - d, 1.0)));
+            keyings.push(("down", d, (0.0, d)));
+        }
+    }
+    if hole {
+        let (a, b) = KEYED_OVER_HOLE;
+        keyings.push(("hole", 1.0 - (b - a), (b, a)));
+    }
+    let mut out = Vec::new();
+    for &audio in audios {
+        for &snr_db in &KEYED_OVER_SNRS_DB {
+            for &(band_hz, deviation_hz) in &KEYED_OVER_CHANNELS {
+                for &(kind, share, on) in &keyings {
+                    let name =
+                        format!("keyed-{kind}-d{share:.2}-a{audio:.1}-{snr_db:.0}dB-{band_hz}Hz");
+                    // FNV-1a of the name: a case's noise is the same in every list it is in.
+                    let seed = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+                    });
+                    out.push(KeyedOverCase {
+                        name,
+                        share,
+                        band_hz,
+                        over: KeyedOver {
+                            rate_hz: KEYED_OVER_RATE_HZ,
+                            seconds: KEYED_OVER_SECONDS,
+                            deviation_hz,
+                            audio,
+                            on,
+                            snr_db,
+                            seed,
+                        },
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Add real white Gaussian noise at `snr_db` below the mean power of real `x`
 /// (taken as 1.0 if zero). Same deterministic LCG plus Box-Muller as [`awgn`].
 pub fn awgn_real(x: &mut [f32], snr_db: f32, seed: u64) {

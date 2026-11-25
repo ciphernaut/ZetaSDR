@@ -1,4 +1,4 @@
-//! Signal generators: NBFM, WFM, AM, SSB, AFSK1200 / AX.25 / APRS, POCSAG, RDS, Mode S,
+//! Signal generators: NBFM (and a keyed NBFM over in noise), WFM, AM, SSB, AFSK1200 / AX.25 / APRS, POCSAG, RDS, Mode S,
 //! ACARS, AIS, FLEX, M17, C4FM and P25, DMR, AWGN, and the registry's synthesiser ([`SynthSpec`], [`synthesise`]). Ungated:
 //! `zeta modes check` runs the rows' tests on them. The test-only helpers stay in
 //! `fixtures`, behind feature `test-fixtures`.
@@ -379,6 +379,86 @@ pub fn awgn(x: &mut [Complex<f32>], snr_db: f32, seed: u64) {
         let (sn, cs) = (2.0 * PI * u2).sin_cos();
         *s += Complex::new((r * cs) as f32, (r * sn) as f32);
     }
+}
+
+/// A keyed NBFM over in a window of noise ([`keyed_over`]): the carrier is up over part
+/// of the window, as a slice taken at a key-up, a key-down or across a drop-out holds it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyedOver {
+    pub rate_hz: u32,
+    pub seconds: f32,
+    /// Peak deviation, Hz, of audio at full level.
+    pub deviation_hz: f64,
+    /// 1.0: speech at full deviation; 0.1: a quiet passage; 0.0: an unmodulated carrier.
+    pub audio: f32,
+    /// The carrier is up over this share of the window, `(from, to)` in 0..=1. With `from`
+    /// after `to` the share wraps: the carrier is up but for a hole from `to` to `from`.
+    pub on: (f64, f64),
+    /// The carrier's power (1) over the noise's, dB, the noise over the whole rate.
+    pub snr_db: f32,
+    pub seed: u64,
+}
+
+impl KeyedOver {
+    /// The speech-like audio's tones, Hz, each at a third of full level.
+    pub const TONES_HZ: [f64; 3] = [430.0, 1_130.0, 2_210.0];
+    /// The syllable rate of the audio's envelope, Hz.
+    pub const SYLLABLE_HZ: f64 = 4.0;
+    /// A key edge inside the window rises or falls over this many ms (a raised cosine), as
+    /// a transmitter's power ramps.
+    pub const EDGE_MS: f64 = 2.0;
+}
+
+/// The window [`KeyedOver`] describes: complex white noise `snr_db` under the carrier
+/// everywhere, and over `on` the carrier, frequency-modulated ([`nbfm_modulate`]) by
+/// `audio` times three tones ([`KeyedOver::TONES_HZ`]) under a raised-cosine syllable
+/// envelope at [`KeyedOver::SYLLABLE_HZ`]. The carrier is centred and its phase runs on
+/// through the window, so a hole cuts one transmission rather than joining two.
+pub fn keyed_over(spec: &KeyedOver) -> Vec<Complex<f32>> {
+    let rate = f64::from(spec.rate_hz);
+    let n = (rate * f64::from(spec.seconds)).round() as usize;
+    let audio: Vec<f32> = (0..n)
+        .map(|k| {
+            let t = k as f64 / rate;
+            let tones = KeyedOver::TONES_HZ
+                .iter()
+                .map(|f| (2.0 * PI * f * t).sin())
+                .sum::<f64>()
+                / KeyedOver::TONES_HZ.len() as f64;
+            let syllable = 0.5 - 0.5 * (2.0 * PI * KeyedOver::SYLLABLE_HZ * t).cos();
+            (f64::from(spec.audio) * syllable * tones) as f32
+        })
+        .collect();
+    let carrier = nbfm_modulate(&audio, spec.rate_hz, spec.rate_hz, spec.deviation_hz, 0.0);
+    // The up spans as sample ranges, wrapped into two when `from` is after `to`.
+    let at = |x: f64| (x.clamp(0.0, 1.0) * n as f64).round() as usize;
+    let (from, to) = (at(spec.on.0), at(spec.on.1));
+    let spans = if from <= to {
+        vec![(from, to)]
+    } else {
+        vec![(0, to), (from, n)]
+    };
+    let ramp = (KeyedOver::EDGE_MS * rate / 1_000.0).max(1.0);
+    let mut iq = vec![Complex::new(0.0f32, 0.0); n];
+    // Noise against a carrier of power 1: `awgn` over silence takes the signal as 1.
+    awgn(&mut iq, spec.snr_db, spec.seed);
+    for &(a, b) in &spans {
+        for (k, s) in iq.iter_mut().enumerate().take(b).skip(a) {
+            // Distance to the nearer edge inside the window; the window's own ends are
+            // not edges.
+            let x = k as f64 + 0.5;
+            let rise = if a > 0 { x - a as f64 } else { f64::INFINITY };
+            let fall = if b < n { b as f64 - x } else { f64::INFINITY };
+            let into = rise.min(fall) / ramp;
+            let gain = if into >= 1.0 {
+                1.0
+            } else {
+                0.5 - 0.5 * (PI * into).cos()
+            };
+            *s += carrier[k] * gain as f32;
+        }
+    }
+    iq
 }
 
 /// Message codewords' 20-bit payloads for `text`: numeric (function 0) as

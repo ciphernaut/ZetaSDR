@@ -56,3 +56,7 @@ required-features = ["test-fixtures"]
 [[example]]
 name = "gen_voice_wav"
 required-features = ["test-fixtures"]
+
+[[example]]
+name = "l1_sweep"
+required-features = ["test-fixtures"]
