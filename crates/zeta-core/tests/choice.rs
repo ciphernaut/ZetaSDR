@@ -788,9 +788,20 @@ fn am_on_a_channel_licensed_am_answers_am_demod() {
         licence("11K0F3E", AIRBAND_HZ),
         licence("6K00A3E", AIRBAND_HZ),
     ];
-    let mixed = measured_with("am", AIRBAND_HZ, 9_000, both);
+    let mixed = measured_with("am", AIRBAND_HZ, 9_000, both.clone());
     let choice = choose_for(&modes, &mixed, 12_500);
     assert_eq!(choice.row.as_deref(), Some("am_demod"), "{choice:?}");
+    // Wider than 1.5 times the AM licence's 6 kHz, inside the FM one's guard: the AM
+    // licence still agrees, so the label holds whatever the measured width.
+    for width in [9_500, 12_000] {
+        let mixed = measured_with("am", AIRBAND_HZ, width, both.clone());
+        let choice = choose_for(&modes, &mixed, 20_000);
+        assert_eq!(
+            choice.row.as_deref(),
+            Some("am_demod"),
+            "{width}: {choice:?}"
+        );
+    }
 }
 
 /// A pause (`carrier`) or a weak read (`unknown`) on an FM channel, licensed or planned,

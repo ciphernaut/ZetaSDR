@@ -45,6 +45,13 @@ pub struct Weights {
 /// (`runner_up_margin`), `allocation - contradicted * modulation >= runner_up_margin`:
 /// `contradicted <= (0.2 - 0.15) / 0.3 = 1/6`. 0.15 leads by 0.155. When some expectation
 /// agrees with the label nothing is adjusted, so the value does not reach that case.
+///
+/// The bound holds for the embedded weights. An operator's `weights.json` outside it (a
+/// `contradicted` over `(allocation - runner_up_margin) / modulation` for its own
+/// values) still loads as written, and nothing warns: the expected row then leads by less
+/// than the margin, and once `contradicted * modulation` reaches `allocation` (for the
+/// embedded others, `contradicted` of 2/3 or more) the label's own row stays first when
+/// its width fits, so a contradicted label is no longer overturned.
 pub(crate) const CONTRADICTED: f32 = 0.15;
 
 fn contradicted() -> f32 {

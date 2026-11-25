@@ -126,8 +126,8 @@ pub(crate) fn catalogue_entry(label: &Label) -> Option<&str> {
 /// demodulator row that serves an expected emission is a candidate though it does not
 /// serve the label ([`expected_fits`]), sized as for the expected label, with the
 /// expectation's line in its evidence. Only an expectation some demodulator row fits at
-/// the measured width counts. When every such expectation is incompatible with the label
-/// (the label is contradicted), each demodulator row an expectation fits scores the width
+/// the measured width brings a row. When there is one, and no expectation at the centre
+/// (fitted or not) agrees with the label (the label is contradicted), each demodulator row an expectation fits scores the width
 /// term and `weights.allocation` (a licence at rank 0; a plan's channel the same, never
 /// twice), and each row that serves the label scores its label term at
 /// `weights.contradicted` and no licence term from elsewhere in the band. It ranks, never
@@ -240,15 +240,22 @@ pub fn choose_now(
         &catalogue_term,
         &allocation,
     );
-    // What the register and the plans expect at the centre: only an expectation some
-    // demodulator row fits at the measured width speaks for or against the label.
-    let mut expected = expected_labels(&c.allocations, center_hz, region);
-    expected.retain(|x| {
-        serving
-            .iter()
-            .any(|s| expected_fits(s.mode, x, bandwidth_hz))
-    });
-    let contradicted = !expected.is_empty() && expected.iter().all(|(_, l)| !l.contains(&label));
+    // What the register and the plans expect at the centre. Only an expectation some
+    // demodulator row fits at the measured width brings a row or can overturn the label;
+    // any expectation at the centre that agrees with the label keeps it (ruling 2: the
+    // label is overturned only when every expected emission contradicts it), whatever
+    // the measured width.
+    let at_centre = expected_labels(&c.allocations, center_hz, region);
+    let agrees = at_centre.iter().any(|(_, l)| l.contains(&label));
+    let expected: Vec<(Expected, Vec<&'static str>)> = at_centre
+        .into_iter()
+        .filter(|x| {
+            serving
+                .iter()
+                .any(|s| expected_fits(s.mode, x, bandwidth_hz))
+        })
+        .collect();
+    let contradicted = !expected.is_empty() && !agrees;
     if contradicted {
         for s in &mut serving {
             let own = allocation(s.mode);
@@ -264,8 +271,10 @@ pub fn choose_now(
                 }
                 s.score += (weights.allocation - own).max(0.0);
             } else if s.fits_label {
-                // A licence elsewhere in the band does not speak for the label against
-                // the ones that hold the centre.
+                // No expectation at the centre agrees with the label, so this row's own
+                // licence term is from a licence elsewhere in the band (or one at the
+                // centre with no designator to say what it carries): it does not speak
+                // for the label against the expectations that hold the centre.
                 s.score -= own;
             }
             if s.fits_label {
