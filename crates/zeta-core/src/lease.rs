@@ -152,6 +152,10 @@ pub struct LeaseManager {
     /// The holders whose rigid lease is a trial's, with the token fired when it gives
     /// way ([`LeaseManager::mark_trial`]).
     trials: Mutex<HashMap<JobId, CancellationToken>>,
+    /// Per source, the capture its last tune here granted ([`LeaseManager::tune`]),
+    /// until the port is idled or sweeps for itself (either may move the device): what
+    /// a trial's give-way compares the next grant with, never a fresh read of the port.
+    granted: Mutex<HashMap<SourceId, Tuning>>,
 }
 
 /// Why a trial's band is not covered by a running capture
@@ -361,6 +365,7 @@ impl LeaseManager {
         let waited = self.waiting.lock().unwrap().contains_key(port.id());
         if !leased && !waited && !self.sweeps.lock().unwrap().contains_key(port.id()) {
             self.primed.lock().unwrap().remove(port.id());
+            self.granted.lock().unwrap().remove(port.id());
             port.idle().await;
         }
     }
@@ -371,8 +376,11 @@ impl LeaseManager {
     /// scan's time-shared lease is granted beside it. A second claim by the same
     /// holder is the same claim; [`LeaseManager::release`] drops it.
     pub fn claim_sweep(&self, source: &SourceId, holder: JobId) {
-        // The source's own sweep may move the device: a later lease tunes afresh.
+        // The source's own sweep may move the device: a later lease tunes afresh, and
+        // no trial outlasts it.
         self.primed.lock().unwrap().remove(source);
+        self.granted.lock().unwrap().remove(source);
+        self.yield_trials(&mut self.leases.lock().unwrap(), source);
         let mut sweeps = self.sweeps.lock().unwrap();
         let v = sweeps.entry(source.clone()).or_default();
         if !v.contains(&holder) {
@@ -664,6 +672,8 @@ impl LeaseManager {
                     let scanned = v.iter().any(|l| l.time_shared);
                     (scanned, !standing(v).is_empty())
                 });
+        // A scan the source sweeps for itself moves the device too.
+        let scanned = scanned || self.sweeps.lock().unwrap().contains_key(port.id());
         match self.decide(port, band, guard) {
             _ if scanned => Err(Uncovered::Scanned),
             Decision::Fits(_) => Ok(()),
@@ -731,13 +741,15 @@ impl LeaseManager {
         self.changed(source);
     }
 
-    /// Tune `port` to `want`, then, when the granted capture is not the one before (a
-    /// trial's job runs a pipeline built for that one, even where its band is still
-    /// inside), take away the trials' leases ([`LeaseManager::yield_trials`]). Every
-    /// tune of a port here goes through it.
+    /// Tune `port` to `want` and record the capture granted; when it is not the one the
+    /// last tune here granted (a trial's job runs a pipeline built for that one, even
+    /// where its band is still inside), take away the trials' leases
+    /// ([`LeaseManager::yield_trials`]). Every tune of a port goes through it, so the
+    /// record is the port's capture (none since an idle or a sweep of its own, which
+    /// any trial then gives way to); the port is not read again for it.
     async fn tune(&self, port: &dyn Port, want: Tuning) -> Result<Tuning, PortError> {
-        let before = port.current();
         let got = port.tune(want).await?;
+        let before = self.granted.lock().unwrap().insert(port.id().clone(), got);
         if before != Some(got) {
             self.yield_trials(&mut self.leases.lock().unwrap(), port.id());
         }
@@ -2452,6 +2464,32 @@ mod tests {
         assert!(fits(&band, &moved));
         assert!(token.is_cancelled());
         assert!(!m.holders(p.id()).iter().any(|(j, _)| j == &trial));
+    }
+
+    /// A tune that runs and grants the capture the last one granted leaves a trial
+    /// running (a pin of the capture an elastic job follows always tunes, R13); a sweep
+    /// the source makes for itself takes every trial away and covers no trial after.
+    #[tokio::test]
+    async fn a_tune_granting_the_same_capture_leaves_a_trial_and_a_sweep_takes_it() {
+        let (p, m) = (FakePort::new(), LeaseManager::new());
+        let cur = t(100_000_000, 1_000_000);
+        m.ensure(&p, JobId::new(), cur, true).await.unwrap();
+        let (trial, token) = (JobId::new(), CancellationToken::new());
+        m.mark_trial(trial.clone(), token.clone());
+        let band = t(100_100_000, 12_500);
+        m.ensure(&p, trial.clone(), band, false).await.unwrap();
+        let tunes = p.tunes.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(m.pin(&p, cur).await.unwrap(), (cur, true));
+        assert_eq!(p.tunes.load(std::sync::atomic::Ordering::SeqCst), tunes + 1);
+        assert!(!token.is_cancelled());
+        assert!(m.holders(p.id()).iter().any(|(j, _)| j == &trial));
+        // The source sweeps for a scan by its own means: the trial goes.
+        let scan = JobId::new();
+        m.claim_sweep(p.id(), scan.clone());
+        assert!(token.is_cancelled());
+        assert!(!m.holders(p.id()).iter().any(|(j, _)| j == &trial));
+        let guard = m.gate_guard(p.id()).await;
+        assert_eq!(m.covers_untuned(&p, band, &guard), Err(Uncovered::Scanned));
     }
 
     /// A time-shared lease that gives way is taken away by a request granted, under the
