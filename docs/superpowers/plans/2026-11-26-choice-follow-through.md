@@ -7,7 +7,7 @@
 The runner updates this section after every task and commits it with the task. A fresh session
 reads it first.
 
-- **Branch and worktree:** (fill in when the run starts)
+- **Branch and worktree:** trunk `worktree-agent-a5dfd60975f4d81eb`; tracks A and B on `plan49-a`, `plan49-b`. The run ledger is `.superpowers/sdd/2026-11-26-choice-follow-through/progress.md` in the trunk worktree.
 - **Private target dir:** (fill in; delete it when the gates are done)
 - **Ledger of findings:** `scratch/plan49/ledger.md` in the main checkout (ignored by git): the
   capture list, both sweeps, both UI profiles, A1's and C9's findings.
