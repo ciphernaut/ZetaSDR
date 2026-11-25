@@ -720,6 +720,8 @@ def drag_menu(page, lo=0.40, hi=0.60):
 # `.ctx-item[data-action]` its `data-for` names).
 MENU_PATH_JS = """(el) => {
   const root = el.closest('#ctx, #ctx-outline');
+  // Drawn again under us (the menu repaints on each answer of its choose): try again.
+  if (!root) return null;
   const path = [];
   for (let p = el.closest('.ctx-sub'); p; ) {
     const sel = p.dataset.group ? `.ctx-item[data-group="${p.dataset.group}"]`
@@ -740,11 +742,14 @@ def menu_item(page, action, menu="#ctx", force=False):
     root = page.locator(menu)
     expect(root).to_be_visible()
     item = root.locator(f'.ctx-item[data-action="{action}"]')
-    # The menu is drawn again once modes_list answers: open the path, then resolve the entry,
-    # and open it again if a repaint closed it meanwhile.
+    # The menu is drawn again once modes_list answers and on each answer of its choose: open
+    # the path, then resolve the entry, and open it again if a repaint closed it meanwhile.
     for _ in range(3):
         expect(item).to_have_count(1)
-        for sel in item.evaluate(MENU_PATH_JS):
+        path = item.evaluate(MENU_PATH_JS)
+        if path is None:
+            continue
+        for sel in path:
             root.locator(sel).click(force=force)
         if item.is_visible():
             break
@@ -5883,15 +5888,16 @@ def focused_key(page):
 
 
 def scenario_box_menu_groups_open_by_hover_click_and_keys(page, url, secret):
-    # The box menu's first level is short (at most 8 lines on the default box): What is this?,
-    # the groups in their order, Send to agent. A group opens as a submenu at its side on the
+    # The box menu's first level is short (at most 8 lines on the default box): the choice entry
+    # (shown from the opening, pending until its choose answers), What is this?, the groups in
+    # their order, Send to agent. A group opens as a submenu at its side on the
     # pointer reaching it, on a click, and by keyboard (the arrow towards the inline end or
     # Enter; Escape or the other arrow closes one level); its entries carry no `Decode ›` or
     # `Transcribe ›` prefix, the Transcribe twins under their own heading.
     menu = open_menu_on_tone(page, url, secret)
     first = menu.evaluate(FIRST_LEVEL_JS)
     assert len(first) <= 8, f"first level {first}"
-    assert first[0] == "classify" and first[-1] == "ask", f"first level {first}"
+    assert first[:2] == ["choice_start", "classify"] and first[-1] == "ask", f"first level {first}"
     order = ["group:listen", "group:decode", "group:measure", "group:plans", "group:capture"]
     groups = [g for g in first if g.startswith("group:")]
     assert groups == [g for g in order if g in groups] and "group:listen" in groups, first
