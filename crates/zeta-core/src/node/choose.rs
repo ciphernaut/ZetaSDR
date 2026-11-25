@@ -97,7 +97,7 @@ pub(crate) struct ChooseAsk {
 impl Node {
     /// A `Node` over `inner` for a controller job's own task, so the job applies what a
     /// caller of the node would: it shares the node, and its drop shuts nothing down.
-    fn handle(inner: &Arc<Inner>) -> Node {
+    pub(super) fn handle(inner: &Arc<Inner>) -> Node {
         Node {
             inner: inner.clone(),
             load_errors: Vec::new(),
@@ -114,19 +114,32 @@ impl Node {
         tuning: Tuning,
         ask: ChooseAsk,
     ) -> Result<JobId, NodeError> {
-        let graph = Graph {
-            id: GraphId::new(),
-            nodes: vec![],
-            edges: vec![],
-        };
-        let rec = JobRecord {
-            context: serde_json::json!({ "choose": ask }),
-            transient: ask.transient,
-            ..super::running_record(JobKind::Choose.name(), source, tuning, graph, None, false)
-        };
+        let rec = choose_record(source, tuning, ask, None);
         let id = rec.id.clone();
         self.inner.launch(rec).await?;
         Ok(id)
+    }
+}
+
+/// The record of a `choose` on `source` over `tuning` asked `ask`: no graph, `ask` in its
+/// context, owned by `owner` (a watch, which then takes its verdict from
+/// `Inner::verdicts` as it takes an owned identify's).
+pub(super) fn choose_record(
+    source: SourceId,
+    tuning: Tuning,
+    ask: ChooseAsk,
+    owner: Option<JobId>,
+) -> JobRecord {
+    let graph = Graph {
+        id: GraphId::new(),
+        nodes: vec![],
+        edges: vec![],
+    };
+    JobRecord {
+        context: serde_json::json!({ "choose": ask }),
+        transient: ask.transient,
+        owner,
+        ..super::running_record(JobKind::Choose.name(), source, tuning, graph, None, false)
     }
 }
 
@@ -139,6 +152,9 @@ struct Run {
     out: StreamId,
     cancel: CancellationToken,
     ask: ChooseAsk,
+    /// Whether a controller owns the job: its verdict is then also kept for the owner in
+    /// `Inner::verdicts`, since an owned record is forgotten as it stops.
+    owned: bool,
     /// `context.choose` as last written: the ask, then what the run adds.
     ctx: serde_json::Map<String, Value>,
 }
@@ -174,6 +190,7 @@ impl Inner {
             _ => serde_json::Map::new(),
         };
         let (id, source, tuning) = (rec.id.clone(), rec.source.clone(), rec.tuning);
+        let owned = rec.owner.is_some();
         let token = self.shutdown.child_token();
         let (prov, run, ended) = self.record_running(rec, &token)?;
         let out = self.bus.register(StreamKind::Event, prov.clone());
@@ -185,6 +202,7 @@ impl Inner {
             out: out.clone(),
             cancel: token.clone(),
             ask,
+            owned,
             ctx,
         };
         let mut set = JoinSet::new();
@@ -258,6 +276,12 @@ impl Inner {
         r.ctx.insert("choice".into(), choice.clone());
         r.ctx.insert("verdict".into(), choice.clone());
         self.choose_context(r);
+        if r.owned {
+            self.verdicts
+                .lock()
+                .unwrap()
+                .insert(r.id.clone(), choice.clone());
+        }
         let payload = serde_json::json!({
             "protocol": "verdict",
             "choice": choice,
@@ -270,18 +294,30 @@ impl Inner {
     /// ring, or the newest contiguous run when that is shorter, with the span's length
     /// in ns. `None` while the ring holds nothing.
     fn newest_slice(&self, r: &Run, slice_s: f32) -> Option<(Selection, u64)> {
-        let ring = self.rings.lock().unwrap().get(&r.source).cloned()?;
+        self.newest_selection(&r.source, r.tuning, slice_s)
+    }
+
+    /// The band `band` of `source` over the newest `slice_s` seconds of its ring, or the
+    /// newest contiguous run when that is shorter, with the span's length in ns. `None`
+    /// while the ring holds nothing. What a `choose` (and a watch's step 1) classifies.
+    pub(super) fn newest_selection(
+        &self,
+        source: &SourceId,
+        band: Tuning,
+        slice_s: f32,
+    ) -> Option<(Selection, u64)> {
+        let ring = self.rings.lock().unwrap().get(source).cloned()?;
         let ring = ring.read().unwrap();
         let (start, latest) = (ring.latest_run_start()?, ring.latest()?);
         let (from, held_ns) = slice_span(start.0, latest.0, slice_s)?;
         let sel = Selection {
-            source: r.source.clone(),
+            source: source.clone(),
             span: Span {
                 start_ns: crate::types::Timestamp(from),
                 end_ns: latest,
             },
-            center_hz: r.tuning.center_hz,
-            bandwidth_hz: r.tuning.bandwidth_hz,
+            center_hz: band.center_hz,
+            bandwidth_hz: band.bandwidth_hz,
         };
         Some((sel, held_ns))
     }

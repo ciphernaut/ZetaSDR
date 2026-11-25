@@ -33,6 +33,15 @@
 //! `lost` `not seen again` unless a `new` on its channel comes within `hold_ms`. A known
 //! channel never moves a decoder.
 //!
+//! With `on_signal: choose` (and `modes: null`, plan 48), each new signal starts the
+//! node's choice for it instead ([`Inner::start_choice`]): step 1 of the choice over the
+//! signal's band of the ring, its job started at once inside the capture (`via: choose`)
+//! with the `attach` kind (`transcribe`) attached. An unproved demodulator that a decoder
+//! row could still prove otherwise starts held ([`PROBATION`], under `probation`: out of
+//! the mix, its transcript kept) while the watch's own transient `choose` child climbs
+//! the ladder; its verdict ([`settle`]) lifts the hold or replaces the job, its attached
+//! job stopped first. A demodulator's silence is its squelch staying shut.
+//!
 //! Every watch keeps at most the `detect` node's `max_decoders` decoders (spec 4.4),
 //! counting those on free sources: over the cap a signal that would take one is
 //! `waiting` (one event per signal), and when a slot frees the present waiting signal
@@ -52,9 +61,9 @@
 //! events: `state` `identifying | decoding | waiting | unknown | lost | capturing |
 //! captured`, with `signal`, `job`, `mode`, `source`, `placed` (`capture | free`),
 //! `features` and `allocations` and `origins` (for `unknown`), `captures` (for
-//! `captured`), `via` (for `decoding`: `identify | modes`), `why` (for `lost`: `gone and
-//! silent | not seen again | unproven | relaunch failed`), `summary` and `t_ns` (fields
-//! that do not apply are `null`).
+//! `captured`), `via` (for `decoding`: `identify | modes | choose`), `why` (for `lost`:
+//! `gone and silent | not seen again | unproven | relaunch failed`), `summary` and `t_ns`
+//! (fields that do not apply are `null`).
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -66,18 +75,21 @@ use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 
+use super::choose::choose_record;
 use super::persist::now;
-use super::{Inner, source_fault_reason};
+use super::{ChooseAsk, Inner, Node, source_fault_reason};
+use crate::choice::{Choice, ChoiceJob, Settled, choose_now};
+use crate::choice_policy::Surface;
 use crate::graph::{self, Graph, Node as GraphNode};
-use crate::job::{JOB_RECORD_FORMAT, JobRecord, JobState};
+use crate::job::{Hold, JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::{Allocation, DEFAULT_REGION, band_assignments};
-use crate::modes::ModeRegistry;
-use crate::modes::ModeState;
 use crate::modes::score::{passed_over, score_rows};
+use crate::modes::{ModeRegistry, ModeState, Role};
 use crate::ops::{
-    DETECT_GONE_MS_DEFAULT, DETECT_STAGE, DETECT_WIDTH_HZ_DEFAULT, IDENTIFY_DWELL_SCALES, JobKind,
-    SONDEHUB_STAGE, WATCH_CONFIRM_MS_DEFAULT, WATCH_COOLDOWN_MS_DEFAULT, WATCH_HOLD_MS_DEFAULT,
-    WATCH_MAX_DECODERS_DEFAULT, WATCH_MODES_EMPTY,
+    ATTACH_LANGUAGE_DEFAULT, DETECT_GONE_MS_DEFAULT, DETECT_STAGE, DETECT_WIDTH_HZ_DEFAULT,
+    IDENTIFY_DWELL_SCALES, JobKind, SONDEHUB_STAGE, Sideband, WATCH_CONFIRM_MS_DEFAULT,
+    WATCH_COOLDOWN_MS_DEFAULT, WATCH_HOLD_MS_DEFAULT, WATCH_MAX_DECODERS_DEFAULT,
+    WATCH_MODES_EMPTY,
 };
 use crate::port::{Port, Tuning};
 use crate::stage::StageError;
@@ -282,6 +294,49 @@ pub fn test_hold_sink_restarts() -> SinkHold {
     SinkHold(())
 }
 
+/// Tests only: while set, a watch leaves the verdicts of its `choose` children untaken.
+#[cfg(feature = "test-fixtures")]
+static TEST_HOLD_CHOICES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tests only: the watches' `choose` verdicts wait while this lives; dropped (a test that
+/// panicked included) or [`ChoiceHold::release`]d, they are taken.
+#[cfg(feature = "test-fixtures")]
+pub struct ChoiceHold(());
+
+#[cfg(feature = "test-fixtures")]
+impl ChoiceHold {
+    /// Let the watches take their `choose` verdicts.
+    pub fn release(&self) {
+        TEST_HOLD_CHOICES.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+impl Drop for ChoiceHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Tests only: hold every watch's `choose` verdicts from now on, until the guard goes.
+#[cfg(feature = "test-fixtures")]
+pub fn test_hold_choices() -> ChoiceHold {
+    TEST_HOLD_CHOICES.store(true, std::sync::atomic::Ordering::SeqCst);
+    ChoiceHold(())
+}
+
+/// Whether a test holds the watches' `choose` verdicts.
+fn choices_held() -> bool {
+    #[cfg(feature = "test-fixtures")]
+    {
+        TEST_HOLD_CHOICES.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(feature = "test-fixtures"))]
+    {
+        false
+    }
+}
+
 /// Tests only: how many sink restarts wait on the hold now.
 #[cfg(feature = "test-fixtures")]
 pub fn test_sink_restarts_held() -> u32 {
@@ -402,6 +457,14 @@ pub(super) struct Policy {
     confirm_ms: u64,
     /// With `modes`, start a decoder on every known channel in the band at once.
     seed_known: bool,
+    /// With `on_signal: choose` (and `modes: null`), each new signal starts the node's
+    /// choice for it ([`Inner::start_choice`]) instead of an identify run.
+    choose: bool,
+    /// The kind attached to each job a choosing watch starts (`attach`: `transcribe`).
+    attach: Option<JobKind>,
+    /// Whether an unproved demodulator a decoder row could still prove otherwise starts
+    /// held until the watch's `choose` settles (`probation`, default true).
+    probation: bool,
 }
 
 /// The sinks the policy `p` (a `detect` node's params) gives every kept decoder
@@ -416,8 +479,8 @@ impl Policy {
     /// The policy in `graph`'s `detect` node: `decode_on` (`capture`, default, or
     /// `free`), `prefer` (source ids), the detector's `gone_ms`, `sink` (or `sondehub`),
     /// `on_unknown`/`capture`, `modes`, `max_decoders`, `hold_ms` (left out: the
-    /// silence constant, or a test's override of it), `cooldown_ms`, `confirm_ms` and
-    /// `seed_known`.
+    /// silence constant, or a test's override of it), `cooldown_ms`, `confirm_ms`,
+    /// `seed_known`, `on_signal`, `attach` and `probation`.
     fn of(graph: &Graph) -> Policy {
         let p = policy_of(graph);
         Policy {
@@ -454,6 +517,14 @@ impl Policy {
                 .unwrap_or(WATCH_COOLDOWN_MS_DEFAULT),
             confirm_ms: p["confirm_ms"].as_u64().unwrap_or(WATCH_CONFIRM_MS_DEFAULT),
             seed_known: p["seed_known"].as_bool().unwrap_or(false),
+            choose: p["on_signal"] == "choose" && p["modes"].is_null(),
+            attach: p["attach"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|k| k.as_str().and_then(JobKind::from_name))
+                .find(|k| *k == JobKind::Transcribe),
+            probation: p["probation"].as_bool().unwrap_or(true),
         }
     }
 }
@@ -523,6 +594,8 @@ pub enum Via {
     Identify,
     /// Started directly from the watch's `modes`.
     Modes,
+    /// The node's choice for the signal (`on_signal: choose`).
+    Choose,
 }
 
 impl Via {
@@ -681,6 +754,21 @@ struct Tracked {
     waiting: bool,
 }
 
+/// What a start of a row by the watch carries beyond the row, its band and its sinks.
+#[derive(Default)]
+struct Extra {
+    /// The deviation a choice gives an `fm_demod` (else the plan's at its centre).
+    deviation_hz: Option<Hz>,
+    /// The sideband a choice gives an `ssb_demod`.
+    sideband: Option<Sideband>,
+    /// The hold the job starts under.
+    held: Option<Hold>,
+}
+
+/// The reason of a hold the watch puts on an unproved demodulator while its `choose`
+/// settles.
+pub const PROBATION: &str = "probation";
+
 /// What came of giving a kept decoder the watch's sinks (as one set: they restart and
 /// fall back together).
 enum SinkOutcome {
@@ -694,6 +782,30 @@ enum SinkOutcome {
     Lost(String),
     /// The watch was stopped meanwhile.
     Cancelled,
+}
+
+/// Attach a job of `kind` to `job`'s main audio, as `job_attach` does, in its own task (a
+/// plain function: the watch's loop holds only the handle, so its future does not
+/// contain the launch's).
+fn attach_task(
+    inner: &Arc<Inner>,
+    kind: JobKind,
+    job: JobId,
+) -> tokio::task::JoinHandle<Result<JobId, String>> {
+    let node = Node::handle(inner);
+    tokio::spawn(async move {
+        crate::ops::attach_one(&node, &kind, &job, ATTACH_LANGUAGE_DEFAULT, None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Why a started decoder runs without the sinks it was asked to have, from `sink`.
+fn sink_error_of(sink: SinkOutcome) -> Option<String> {
+    match sink {
+        SinkOutcome::Refused(why) | SinkOutcome::Lost(why) => Some(why),
+        SinkOutcome::Off | SinkOutcome::On | SinkOutcome::Cancelled => None,
+    }
 }
 
 /// Where a decoder was placed and what the sink made of it.
@@ -721,9 +833,22 @@ struct Decoding {
     /// Why the decoder runs without the sinks it was asked to have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sink_error: Option<String>,
-    /// The last event of the decoder this run saw (else `since_ns`).
+    /// The job the watch attached to it (`attach`), stopped before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attached: Option<JobId>,
+    /// Whether it is held on probation ([`PROBATION`]) while `choose` settles.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    held: bool,
+    /// The watch's `choose` child for its signal, until its verdict is taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    choose: Option<JobId>,
+    /// The last event of the decoder this run saw (else `since_ns`); for a demodulator,
+    /// the last moment its squelch was open.
     #[serde(skip)]
     last_event_ns: u64,
+    /// A demodulator's squelch as its last `squelch` event said (`None` before one).
+    #[serde(skip)]
+    squelch_open: Option<bool>,
     /// When `detect` reported its signal `gone` (cleared when it is seen again).
     #[serde(skip)]
     gone_since_ns: Option<u64>,
@@ -912,7 +1037,7 @@ impl Drop for State {
         let pending = self.pending.take();
         let decoders = std::mem::take(&mut self.decoding)
             .into_iter()
-            .map(|d| (d.job, d.source))
+            .flat_map(Decoding::teardown)
             .collect();
         let captures = std::mem::take(&mut self.capturing)
             .into_iter()
@@ -928,9 +1053,10 @@ impl Drop for State {
 
 /// Stop what a run of the watch on `source` started: the identify run `current` (and the
 /// decoder a proof it landed left, never adopted), a proved decoder being placed,
-/// `decoders` and the capture children `captures`. Gated on `source` (the watch's lease
-/// is held meanwhile, so there is nothing to idle, and a `replace` holding the gate never
-/// waits on it), plainly on another source.
+/// `decoders` (in order: each kept job's `choose` child, its attached job, then the job
+/// itself, [`Decoding::teardown`]) and the capture children `captures`. Gated on `source`
+/// (the watch's lease is held meanwhile, so there is nothing to idle, and a `replace`
+/// holding the gate never waits on it), plainly on another source.
 async fn release(
     inner: &Arc<Inner>,
     source: &SourceId,
@@ -962,6 +1088,22 @@ async fn release(
             true => inner.stop_gated(&job).await,
             false => inner.stop(&job).await,
         };
+        // A `choose` child's verdict, when it ended meanwhile, is nobody's to take.
+        inner.verdicts.lock().unwrap().remove(&job);
+    }
+}
+
+impl Decoding {
+    /// What stopping it stops, in order: its `choose` child (no trial outlives it), the
+    /// job attached to it (so a transcriber ends while its input is still held, dropping
+    /// what it kept), then the job, each with the source it runs on.
+    fn teardown(self) -> Vec<(JobId, SourceId)> {
+        let on = self.source;
+        [self.choose, self.attached, Some(self.job)]
+            .into_iter()
+            .flatten()
+            .map(|j| (j, on.clone()))
+            .collect()
     }
 }
 
@@ -1286,13 +1428,15 @@ impl Inner {
     }
 
     /// Start `mode` on `source` at `tuning` as an ordinary job: tuned there unless a job
-    /// holds the source (the elastic jobs there follow), expanded for the capture.
+    /// holds the source (the elastic jobs there follow), expanded for the capture, with
+    /// what `extra` carries (a choice's parameters, a hold from its start).
     async fn start_on(
         self: &Arc<Self>,
         source: &SourceId,
         mode: &str,
         tuning: Tuning,
         sinks: &[GraphNode],
+        extra: Extra,
     ) -> Result<(JobId, SinkOutcome), String> {
         let port = self
             .ports
@@ -1311,18 +1455,20 @@ impl Inner {
         // The policy's handler, as a start that names none gets it.
         let modes = self.modes();
         // An `fm_demod` on a plan channel of the station's region takes the plan's
-        // deviation, as a direct start does.
-        let deviation = (kind == JobKind::FmDemod)
-            .then(|| crate::plans::plan_deviation_at(tuning.center_hz.0, &self.region()))
-            .flatten()
-            .map(Hz);
+        // deviation, as a direct start does, unless the start gives one.
+        let deviation = extra.deviation_hz.or_else(|| {
+            (kind == JobKind::FmDemod)
+                .then(|| crate::plans::plan_deviation_at(tuning.center_hz.0, &self.region()))
+                .flatten()
+                .map(Hz)
+        });
         let graph = self.plain_handler(&kind, &modes).and_then(|handler| {
             let graph = kind.expand_voiced(
                 source,
                 tuning,
                 granted.bandwidth_hz,
                 bin_rate,
-                (deviation, None, None),
+                (deviation, extra.sideband, None),
                 handler.as_deref(),
                 &modes,
             )?;
@@ -1365,7 +1511,8 @@ impl Inner {
                     group: None,
                     replay: None,
                     transient: false,
-                    held: None,
+                    // A new record: the hold is on it from its first sample.
+                    held: extra.held,
                 };
                 let id = rec.id.clone();
                 // In its own task, as identify's children: `launch`'s future runs this.
@@ -1423,8 +1570,10 @@ impl Inner {
         };
         let (inner, source, m) = (self.clone(), r.prov.source.clone(), mode.to_string());
         let sinks = r.seed.policy.sinks.clone();
-        let mut launch =
-            tokio::spawn(async move { inner.start_on(&source, &m, tuning, &sinks).await });
+        let mut launch = tokio::spawn(async move {
+            let extra = Extra::default();
+            inner.start_on(&source, &m, tuning, &sinks, extra).await
+        });
         let started = tokio::select! {
             res = &mut launch => res.unwrap_or_else(|e| Err(format!("launch task: {e}"))),
             _ = r.cancel.cancelled() => {
@@ -1475,10 +1624,7 @@ impl Inner {
         (source, placed, why): (SourceId, Placed, Option<String>),
         sink: SinkOutcome,
     ) {
-        let sink_error = match sink {
-            SinkOutcome::Refused(why) | SinkOutcome::Lost(why) => Some(why),
-            SinkOutcome::Off | SinkOutcome::On | SinkOutcome::Cancelled => None,
-        };
+        let sink_error = sink_error_of(sink);
         let t = now().0;
         let tracked = &mut w.signals[i];
         tracked.handled = true;
@@ -1501,7 +1647,11 @@ impl Inner {
             placed,
             via: Via::Modes,
             sink_error: sink_error.clone(),
+            attached: None,
+            held: false,
+            choose: None,
             last_event_ns: t,
+            squelch_open: None,
             gone_since_ns,
             confirm_by_ns: None,
             unproven_by_ns,
@@ -1528,6 +1678,300 @@ impl Inner {
             ..Event::default()
         };
         self.watch_event(r, "decoding", summary, e);
+    }
+
+    /// The band a choosing watch classifies for the tracked signal `t`: its centre, as
+    /// wide as the band its identify run would take or twice its measured width (its
+    /// skirts and the rows a decoder could prove it by), within the watch's band.
+    fn choice_band(&self, r: &Run, t: &Tracked) -> Tuning {
+        let width = t
+            .band_hz
+            .max(t.signal.bandwidth_hz.saturating_mul(2))
+            .min(r.tuning.bandwidth_hz.0);
+        Tuning {
+            center_hz: Hz(t.signal.center_hz),
+            bandwidth_hz: Hz(width),
+        }
+    }
+
+    /// Wait for the start `launch` (in its own task), cancellable as identify's launches
+    /// are: when the watch is stopped first, the start is finished and the job it started
+    /// (`job` names it) stopped from a task, and the answer is `Ok(None)`.
+    async fn launched<T: Send + 'static>(
+        self: &Arc<Self>,
+        r: &Run,
+        mut launch: tokio::task::JoinHandle<Result<T, String>>,
+        job: fn(&T) -> JobId,
+    ) -> Result<Option<T>, String> {
+        tokio::select! {
+            res = &mut launch => res.unwrap_or_else(|e| Err(format!("launch task: {e}"))).map(Some),
+            _ = r.cancel.cancelled() => {
+                if self.gated(&r.id) {
+                    // The gate of the radio is not ours: finish and stop it from a task.
+                    let inner = self.clone();
+                    tokio::spawn(async move {
+                        if let Ok(Ok(t)) = launch.await {
+                            let _ = inner.stop(&job(&t)).await;
+                        }
+                    });
+                } else if let Ok(Ok(t)) = launch.await {
+                    let _ = self.stop_gated(&job(&t)).await;
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Start the choice's `job` inside the watch's capture with the policy's sinks, under
+    /// `held` from its first sample. `Ok(None)`: cancelled.
+    async fn start_chosen(
+        self: &Arc<Self>,
+        r: &Run,
+        job: &ChoiceJob,
+        held: Option<Hold>,
+    ) -> Result<Option<(JobId, SinkOutcome)>, String> {
+        let tuning = Tuning {
+            center_hz: job.center_hz,
+            bandwidth_hz: job.bandwidth_hz,
+        };
+        let extra = Extra {
+            deviation_hz: job
+                .params
+                .get("deviation_hz")
+                .and_then(|v| v.as_u64())
+                .map(Hz),
+            sideband: job
+                .params
+                .get("sideband")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            held,
+        };
+        let (inner, source, kind) = (self.clone(), r.prov.source.clone(), job.kind.clone());
+        let sinks = r.seed.policy.sinks.clone();
+        let start =
+            tokio::spawn(
+                async move { inner.start_on(&source, &kind, tuning, &sinks, extra).await },
+            );
+        self.launched(r, start, |(id, _)| id.clone()).await
+    }
+
+    /// Attach the policy's `attach` kind to `job`'s main audio: the attached job, or why
+    /// it is not attached. Nothing when the policy attaches nothing or `job` gives no
+    /// audio (a decoder row with no voice); nothing either when the watch is stopped
+    /// meanwhile (the attached job is then stopped from a task).
+    async fn attach_to(self: &Arc<Self>, r: &Run, job: &JobId) -> (Option<JobId>, Option<String>) {
+        let Some(kind) = r.seed.policy.attach.clone() else {
+            return (None, None);
+        };
+        if self.audio_stream(job, None).is_err() {
+            return (None, None);
+        }
+        if let Some(ready) = self.registry.readiness(kind.name())
+            && !ready.ready
+        {
+            let why = ready.reason.unwrap_or_else(|| "not ready".into());
+            return (None, Some(format!("{}: {why}", kind.name())));
+        }
+        let attach = attach_task(self, kind, job.clone());
+        match self.launched(r, attach, JobId::clone).await {
+            Ok(Some(id)) => (Some(id), None),
+            Ok(None) => (None, None),
+            Err(e) => (None, Some(e)),
+        }
+    }
+
+    /// Start the watch's own `choose` on `band`: owned by the watch, transient, asked by
+    /// the `watch` surface to the policy's step for it, its verdict left in
+    /// `Inner::verdicts` for [`settle`]. `Ok(None)`: cancelled.
+    async fn start_choose(
+        self: &Arc<Self>,
+        r: &Run,
+        band: Tuning,
+    ) -> Result<Option<JobId>, String> {
+        let (step, capped) = self
+            .choice_policy
+            .lock()
+            .unwrap()
+            .steps(Surface::Watch, None);
+        let ask = ChooseAsk {
+            surface: Surface::Watch,
+            step,
+            capped,
+            start: false,
+            transient: true,
+        };
+        let rec = choose_record(r.prov.source.clone(), band, ask, Some(r.id.clone()));
+        let id = rec.id.clone();
+        let launch = self.launch_task(rec);
+        let start = tokio::spawn(async move {
+            match launch.await {
+                Ok(Ok(())) => Ok(id),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("launch task: {e}")),
+            }
+        });
+        self.launched(r, start, JobId::clone).await
+    }
+
+    /// `on_signal: choose`: answer step 1 for the tracked signal `i` (its
+    /// [`Inner::choice_band`] over the newest `budget.slice_s` of the ring, classified and
+    /// chosen as `classify` does) and start the answer's job inside the capture, kept
+    /// `via: choose`. An answer that is an unproved demodulator with rows in
+    /// `could_prove` starts held ([`PROBATION`]) under `probation`. The policy's `attach`
+    /// kind is attached to it, then, while a decoder could still prove otherwise, the
+    /// watch's own `choose` starts on the band ([`settle`] takes its verdict); one that
+    /// cannot start leaves the first answer standing, its hold lifted. A band nothing
+    /// answers (`cannot_tell`, a read that fails) or a job that does not start counts as
+    /// an unknown try (event `unknown`). Event `decoding`. `None`: cancelled.
+    async fn start_choice(self: &Arc<Self>, r: &Run, w: &mut State, i: usize) -> Option<()> {
+        let tracked = w.signals[i].clone();
+        let signal = tracked.signal.clone();
+        let band = self.choice_band(r, &tracked);
+        let slice_s = self.choice_policy.lock().unwrap().budget.slice_s;
+        let node = Node::handle(self);
+        let answer = match self.newest_selection(&r.prov.source, band, slice_s) {
+            None => Err(format!("source {} is not capturing", r.prov.source.0)),
+            Some((sel, _)) => tokio::select! {
+                c = crate::ops::classify_samples(&node, &sel) => c
+                    .map(|(c, ..)| {
+                        let modes = self.modes();
+                        choose_now(&modes, modes.weights(), &c, &sel, &self.region())
+                    })
+                    .map_err(|e| e.to_string()),
+                _ = r.cancel.cancelled() => return None,
+            },
+        };
+        let choice = match answer {
+            Ok(c) if c.job.is_some() => c,
+            Ok(c) => {
+                let why = c.reason.unwrap_or_else(|| "no job".into());
+                self.choice_unknown(r, w, i, format!("can't tell: {why}"))
+                    .await;
+                return Some(());
+            }
+            Err(e) => {
+                self.choice_unknown(r, w, i, format!("not classified: {e}"))
+                    .await;
+                return Some(());
+            }
+        };
+        let job = choice.job.clone()?;
+        let demod = self
+            .modes()
+            .get(&job.kind)
+            .is_some_and(|m| m.role() == Role::Demodulator);
+        let unproved = choice.settled != Settled::Proved && !choice.could_prove.is_empty();
+        let held = (r.seed.policy.probation && demod && unproved).then(|| Hold {
+            reason: PROBATION.into(),
+            since_ns: now().0,
+        });
+        let (id, sink) = match self.start_chosen(r, &job, held.clone()).await {
+            Ok(None) => return None,
+            Ok(Some(started)) => started,
+            Err(e) => {
+                let why = format!("{} did not start: {e}", job.kind);
+                self.choice_unknown(r, w, i, why).await;
+                return Some(());
+            }
+        };
+        let t = now().0;
+        let tracked = &mut w.signals[i];
+        tracked.handled = true;
+        tracked.waiting = false;
+        let gone_since_ns = (!tracked.present).then_some(t);
+        let sink_error = sink_error_of(sink);
+        w.subs.insert(id.clone(), self.decoder_subs(&id));
+        // Kept before anything is attached: a stop of the watch now tears it all down.
+        w.decoding.push(Decoding {
+            mode: job.kind.clone(),
+            job: id.clone(),
+            source: r.prov.source.clone(),
+            signal: signal.clone(),
+            since_ns: t,
+            placed: Placed::Capture,
+            via: Via::Choose,
+            sink_error: sink_error.clone(),
+            attached: None,
+            held: held.is_some(),
+            choose: None,
+            last_event_ns: t,
+            squelch_open: None,
+            gone_since_ns,
+            confirm_by_ns: None,
+            unproven_by_ns: None,
+        });
+        let k = w.decoding.len() - 1;
+        let (attached, attach_error) = self.attach_to(r, &id).await;
+        w.decoding[k].attached = attached;
+        if r.cancel.is_cancelled() {
+            return None;
+        }
+        let mut notes = Vec::new();
+        if unproved {
+            match self.start_choose(r, band).await {
+                Ok(None) => return None,
+                Ok(Some(c)) => w.decoding[k].choose = Some(c),
+                Err(e) => {
+                    // Nothing will settle it: the first answer stands.
+                    if held.is_some() {
+                        let _ = self.set_held(&id, None);
+                        w.decoding[k].held = false;
+                    }
+                    notes.push(format!("choose did not start: {e}"));
+                }
+            }
+        }
+        let mut summary = format!(
+            "decoding {} at {} on {} (capture, choice: {} at step {})",
+            job.kind,
+            signal.mhz(),
+            r.prov.source.0,
+            choice.settled.name(),
+            choice.step,
+        );
+        if w.decoding[k].held {
+            summary.push_str(&format!(
+                "; held on {PROBATION} while its choose tries {}",
+                choice.could_prove.join(", ")
+            ));
+        }
+        if let Some(why) = attach_error {
+            notes.push(format!("not attached: {why}"));
+        }
+        if let Some(why) = sink_error {
+            notes.push(format!("sink refused: {why}"));
+        }
+        for n in notes {
+            summary.push_str(&format!("; {n}"));
+        }
+        let e = Event {
+            signal: Some(&signal),
+            job: Some(&id),
+            mode: Some(&job.kind),
+            source: Some(&r.prov.source),
+            placed: Some(Placed::Capture),
+            via: Some(Via::Choose),
+            ..Event::default()
+        };
+        self.watch_event(r, "decoding", summary, e);
+        Some(())
+    }
+
+    /// A choosing watch's tracked signal `i` got no job (`why`): `unknown` at once,
+    /// counted as a try and retried after [`RETRY_MS`] as an identify's unknown, and
+    /// captured under `on_unknown: capture`.
+    async fn choice_unknown(self: &Arc<Self>, r: &Run, w: &mut State, i: usize, why: String) {
+        let tracked = &mut w.signals[i];
+        tracked.handled = false;
+        count_try(tracked, now().0);
+        let signal = tracked.signal.clone();
+        let summary = format!("unknown at {}: {why}", signal.mhz());
+        let e = Event {
+            signal: Some(&signal),
+            ..Event::default()
+        };
+        self.watch_event(r, "unknown", summary, e);
+        capture::on_unknown(self, r, w, i).await;
     }
 
     /// `mode`'s row width, else the signal's own.
@@ -1575,7 +2019,13 @@ impl Inner {
         let mut refused = Vec::new();
         for source in free {
             match self
-                .start_on(&source, mode, tuning, &r.seed.policy.sinks)
+                .start_on(
+                    &source,
+                    mode,
+                    tuning,
+                    &r.seed.policy.sinks,
+                    Extra::default(),
+                )
                 .await
             {
                 Ok((job, sink)) => return Ok((job, source, sink)),
@@ -1838,7 +2288,7 @@ pub(super) async fn watch_loop(inner: Arc<Inner>, mut r: Run) -> Result<(), Stag
     let decoders = match teardown {
         true => std::mem::take(&mut w.decoding)
             .into_iter()
-            .map(|d| (d.job, d.source))
+            .flat_map(Decoding::teardown)
             .collect(),
         false => Vec::new(),
     };
@@ -1933,6 +2383,10 @@ async fn run(inner: &Arc<Inner>, r: &mut Run, w: &mut State) -> Result<(), Stage
             return cancelled();
         }
         changed |= decoders(inner, r, w).await;
+        changed |= settle(inner, r, w).await;
+        if r.cancel.is_cancelled() {
+            return cancelled();
+        }
         changed |= capture::ended(inner, r, w);
         if w.current.is_none() {
             sweep(inner, r, w).await;
@@ -2293,7 +2747,11 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             placed,
             via: Via::Identify,
             sink_error: sink_error.clone(),
+            attached: None,
+            held: false,
+            choose: None,
             last_event_ns: t,
+            squelch_open: None,
             gone_since_ns,
             confirm_by_ns: None,
             unproven_by_ns: None,
@@ -2369,6 +2827,166 @@ async fn verdict(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     inner.watch_event(r, "unknown", summary, e);
     capture::on_unknown(inner, r, w, i).await;
     true
+}
+
+/// Take the verdict of each kept job's `choose` child that has ended (the child leaves it
+/// in `Inner::verdicts`, as an owned identify does): a verdict naming the job's own row
+/// lifts its hold ([`lift`]); one naming another row replaces the job ([`replace`]). A
+/// child that ended without one (a node restart: a transient job never resumes) leaves
+/// the first answer standing, lifted. Whether the state changed.
+async fn settle(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
+    if choices_held() {
+        return false;
+    }
+    let ended: Vec<JobId> = w
+        .decoding
+        .iter()
+        .filter_map(|d| d.choose.clone())
+        .filter(|c| !inner.runs(c))
+        .collect();
+    let mut changed = false;
+    for c in ended {
+        let verdict = inner.verdicts.lock().unwrap().remove(&c);
+        let Some(k) = w
+            .decoding
+            .iter()
+            .position(|d| d.choose.as_ref() == Some(&c))
+        else {
+            continue;
+        };
+        w.decoding[k].choose = None;
+        changed = true;
+        let choice: Option<Choice> = verdict.and_then(|v| serde_json::from_value(v).ok());
+        match choice.as_ref().and_then(|c| c.job.as_ref().map(|j| (c, j))) {
+            Some((c, job)) if job.kind != w.decoding[k].mode => {
+                if replace(inner, r, w, k, (c, job)).await.is_none() {
+                    return true;
+                }
+            }
+            _ => lift(inner, r, w, k, choice.as_ref()),
+        }
+    }
+    changed
+}
+
+/// The `choose` of the kept job `k` agreed with its row (`choice`), or ended without a
+/// verdict: the job stands, its hold (if any) lifted, so it joins the mix and its
+/// transcriber publishes what it kept. Event `decoding`.
+fn lift(inner: &Inner, r: &Run, w: &mut State, k: usize, choice: Option<&Choice>) {
+    let d = &mut w.decoding[k];
+    let was_held = d.held;
+    if d.held {
+        let _ = inner.set_held(&d.job, None);
+        d.held = false;
+    }
+    let mut summary = format!(
+        "decoding {} at {} on {}: ",
+        d.mode,
+        d.signal.mhz(),
+        d.source.0
+    );
+    match choice {
+        Some(c) => summary.push_str(&format!(
+            "the choice stands ({} at step {})",
+            c.settled.name(),
+            c.step
+        )),
+        None => summary.push_str("its choose ended without a verdict; the first answer stands"),
+    }
+    if was_held {
+        summary.push_str("; the hold is lifted");
+    }
+    let e = Event {
+        signal: Some(&d.signal),
+        job: Some(&d.job),
+        mode: Some(&d.mode),
+        source: Some(&d.source),
+        placed: Some(d.placed),
+        via: Some(Via::Choose),
+        ..Event::default()
+    };
+    inner.watch_event(r, "decoding", summary, e);
+}
+
+/// The `choose` of the kept job `k` settled on another row (`choice`, its `job`): stop
+/// the job's attached transcriber first, then the job (still held: what the transcriber
+/// kept is dropped, and the mix never had it), then start the verdict's job unheld in its
+/// place, with the policy's `attach` on its audio when it has any. A job that does not
+/// start drops the entry and counts an unknown try of its signal. Event `decoding` (or
+/// `unknown`). `None`: cancelled.
+async fn replace(
+    inner: &Arc<Inner>,
+    r: &Run,
+    w: &mut State,
+    k: usize,
+    (choice, job): (&Choice, &ChoiceJob),
+) -> Option<()> {
+    let old = w.decoding[k].clone();
+    if let Some(a) = &old.attached {
+        inner.stop_started(r, a, &old.source).await;
+    }
+    inner.stop_started(r, &old.job, &old.source).await;
+    w.subs.remove(&old.job);
+    w.decoding[k].attached = None;
+    let (id, sink) = match inner.start_chosen(r, job, None).await {
+        Ok(Some(started)) => started,
+        Ok(None) => {
+            w.decoding.remove(k);
+            return None;
+        }
+        Err(e) => {
+            w.decoding.remove(k);
+            if let Some(i) = nearest(&w.signals, old.signal.center_hz, old.signal.bandwidth_hz) {
+                let why = format!("{} did not start in place of {}: {e}", job.kind, old.mode);
+                inner.choice_unknown(r, w, i, why).await;
+            }
+            return Some(());
+        }
+    };
+    let t = now().0;
+    let sink_error = sink_error_of(sink);
+    w.subs.insert(id.clone(), inner.decoder_subs(&id));
+    let d = &mut w.decoding[k];
+    d.mode = job.kind.clone();
+    d.job = id.clone();
+    d.held = false;
+    d.since_ns = t;
+    d.last_event_ns = t;
+    d.squelch_open = None;
+    d.unproven_by_ns = None;
+    d.sink_error = sink_error.clone();
+    let (attached, attach_error) = inner.attach_to(r, &id).await;
+    w.decoding[k].attached = attached;
+    if r.cancel.is_cancelled() {
+        return None;
+    }
+    let d = &w.decoding[k];
+    let mut summary = format!(
+        "decoding {} at {} on {} (capture, choice: {} at step {}) in place of {}",
+        d.mode,
+        d.signal.mhz(),
+        d.source.0,
+        choice.settled.name(),
+        choice.step,
+        old.mode
+    );
+    if let Some(why) = attach_error {
+        summary.push_str(&format!("; not attached: {why}"));
+    }
+    if let Some(why) = sink_error {
+        summary.push_str(&format!("; sink refused: {why}"));
+    }
+    let e = Event {
+        signal: Some(&d.signal),
+        job: Some(&d.job),
+        mode: Some(&d.mode),
+        source: Some(&d.source),
+        placed: Some(d.placed),
+        via: Some(Via::Choose),
+        ..Event::default()
+    };
+    inner.watch_event(r, "decoding", summary, e);
+    Some(())
 }
 
 /// `<n>` kHz from `hz`: whole kHz bare, else to one decimal.
@@ -2479,15 +3097,23 @@ pub(super) fn register_says(allocations: &serde_json::Value) -> String {
 /// when it ended `Failed`); stop (`lost`) those whose signal
 /// has gone and that stayed silent for the policy's `hold_ms`, re-adopted ones whose
 /// signal did not reappear in time, and direct starts that published nothing within
-/// `confirm_ms` while their signal was present (`unproven`). A span watch cools each
-/// lost one's channel for the policy's `cooldown_ms` ([`free_channel`]); any other watch
-/// forgets its signal. Each frees a slot for [`next`]. Whether the state changed.
+/// `confirm_ms` while their signal was present (`unproven`). A demodulator row's
+/// liveness is its squelch: it is silent from the moment its last `squelch` event shut it
+/// (an open squelch keeps it alive), and a row that publishes nothing (`protocol: none`)
+/// is alive while its signal is present (neither is ever `unproven`). Stopping one stops
+/// its `choose` child and its attached job first ([`Decoding::teardown`]). A span watch
+/// cools each lost one's channel for the policy's `cooldown_ms` ([`free_channel`]); any
+/// other watch forgets its signal. Each frees a slot for [`next`]. Whether the state
+/// changed.
 async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
     let t = now().0;
+    let modes = inner.modes();
     for d in &mut w.decoding {
         // Only the row's own events are its signal: a frame row's `timing` and forwarded
         // `bits` flow on noise too. A mode no longer loaded counts every event.
-        let protocol = inner.modes().get(&d.mode).map(|m| m.row.protocol.clone());
+        let row = modes.get(&d.mode);
+        let protocol = row.map(|m| m.row.protocol.clone());
+        let demod = row.is_some_and(|m| m.role() == Role::Demodulator);
         let counts = |v: &serde_json::Value| {
             protocol
                 .as_deref()
@@ -2500,14 +3126,25 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
                         if let Payload::Event(v) = &f.payload
                             && counts(v)
                         {
-                            d.last_event_ns = t;
-                            d.unproven_by_ns = None;
+                            if demod && v["protocol"] == "squelch" {
+                                d.squelch_open = Some(v["open"] == true);
+                            } else {
+                                d.last_event_ns = t;
+                                d.unproven_by_ns = None;
+                            }
                         }
                     }
                     Err(TryRecvError::Lagged(_)) => {}
                     Err(_) => break,
                 }
             }
+        }
+        let quiet_row = protocol.as_deref() == Some("none");
+        if demod && (d.squelch_open == Some(true) || quiet_row && d.gone_since_ns.is_none()) {
+            d.last_event_ns = t;
+        }
+        if demod && (d.squelch_open == Some(true) || quiet_row) {
+            d.unproven_by_ns = None;
         }
     }
     let silence_ns = r.seed.policy.hold_ms.saturating_mul(1_000_000);
@@ -2527,8 +3164,13 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
             // watch's channel rests for the cooldown before the watch starts it again;
             // any other watch leaves its signal alone until it goes and comes back. A
             // decoder that failed counts a try, so one that keeps failing stops being
-            // restarted after [`RETRY_MAX`]; an operator stop counts none.
+            // restarted after [`RETRY_MAX`]; an operator stop counts none. Its `choose`
+            // child goes with it (its attached job ends with its input).
             w.subs.remove(&d.job);
+            if let Some(c) = &d.choose {
+                inner.stop_started(r, c, &r.prov.source).await;
+                inner.verdicts.lock().unwrap().remove(c);
+            }
             if span {
                 match inner.failed(&d.job) {
                     true => free_channel(inner, w, &d, until_ns, WHY_FAILED, Some(t)),
@@ -2552,7 +3194,10 @@ async fn decoders(inner: &Arc<Inner>, r: &Run, w: &mut State) -> bool {
                 continue;
             }
         };
-        inner.stop_started(r, &d.job, &d.source).await;
+        for (job, on) in d.clone().teardown() {
+            inner.stop_started(r, &job, &on).await;
+            inner.verdicts.lock().unwrap().remove(&job);
+        }
         w.subs.remove(&d.job);
         match span {
             true => free_channel(inner, w, &d, until_ns, why, Some(t)),
@@ -2614,7 +3259,8 @@ fn free_channel(
 }
 
 /// With no identify in progress, stop any running job this watch owns that it does not
-/// keep (a stale identify run or its child resumed after a restart).
+/// keep (a stale identify run or its child resumed after a restart; a kept job's `choose`
+/// child is kept with it).
 async fn sweep(inner: &Arc<Inner>, r: &Run, w: &State) {
     let strays: Vec<JobId> = inner
         .jobs
@@ -2624,6 +3270,11 @@ async fn sweep(inner: &Arc<Inner>, r: &Run, w: &State) {
         .filter(|e| e.record.owner.as_ref() == Some(&r.id))
         .filter(|e| e.record.state == JobState::Running && e.cancel.is_some())
         .filter(|e| !w.decoding.iter().any(|d| d.job == e.record.id))
+        .filter(|e| {
+            !w.decoding
+                .iter()
+                .any(|d| d.choose.as_ref() == Some(&e.record.id))
+        })
         .filter(|e| !w.capturing.iter().any(|(j, _)| *j == e.record.id))
         .map(|e| e.record.id.clone())
         .collect();
@@ -2643,7 +3294,8 @@ enum Next {
 /// Act on the queued signal that is due and ranks highest ([`rank`]), unless another
 /// job's band now overlaps it (it is then dropped). A signal on a cooled channel is not
 /// due until its cooldown passes. With `modes: null`, start an identify run on it (event
-/// `identifying`). With `modes`, by the listed rows its width fits ([`SPAN_WIDTH_FIT`]):
+/// `identifying`), or under `on_signal: choose` the node's choice for it
+/// ([`Inner::start_choice`]). With `modes`, by the listed rows its width fits ([`SPAN_WIDTH_FIT`]):
 /// none, it is `unknown` at once (a try, retried and captured as an identify's unknown);
 /// else the fitting row whose width lies nearest the signal's starts directly
 /// ([`Inner::start_direct`]), and rows tied for nearest (one channel width) run an
@@ -2700,6 +3352,12 @@ async fn next(inner: &Arc<Inner>, r: &Run, w: &mut State) -> Next {
             wait(inner, r, w, i);
             marked = true;
             continue;
+        } else if r.seed.policy.choose {
+            w.signals[i].waiting = false;
+            return match inner.start_choice(r, w, i).await {
+                None => Next::Cancelled,
+                Some(()) => Next::Started,
+            };
         }
         w.signals[i].waiting = false;
         let tracked = w.signals[i].clone();

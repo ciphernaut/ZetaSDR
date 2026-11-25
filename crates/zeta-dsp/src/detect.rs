@@ -98,6 +98,16 @@ pub struct DetectParams {
     /// Watch policy, ignored by the stage: with `modes`, whether a `watch` starts a
     /// decoder on every known channel in its band at once, up to `max_decoders`.
     pub seed_known: bool,
+    /// Watch policy, ignored by the stage: what a `watch` with `modes: null` does with
+    /// each new signal, `identify` it or start the node's `choose` answer for it.
+    pub on_signal: OnSignal,
+    /// Watch policy, ignored by the stage: with `on_signal: choose`, the kinds a `watch`
+    /// attaches to each job it starts (only `transcribe`).
+    pub attach: Vec<String>,
+    /// Watch policy, ignored by the stage: with `on_signal: choose`, whether an unproved
+    /// demodulator that a decoder row could still prove otherwise starts held (out of
+    /// the mix, its transcript kept) until the watch's `choose` settles.
+    pub probation: bool,
 }
 
 impl DetectParams {
@@ -122,6 +132,21 @@ impl DetectParams {
         }
         if self.max_decoders == 0 {
             return Err("max_decoders: at least 1".into());
+        }
+        if self.on_signal == OnSignal::Choose && self.modes.is_some() {
+            return Err(
+                "on_signal: choose answers each signal's job itself: pass modes null".into(),
+            );
+        }
+        if let Some((i, kind)) = self
+            .attach
+            .iter()
+            .enumerate()
+            .find(|(_, k)| k.as_str() != "transcribe")
+        {
+            return Err(format!(
+                "attach[{i}]: {kind} is not attached by a watch (only transcribe)"
+            ));
         }
         Ok(())
     }
@@ -170,6 +195,15 @@ pub enum OnUnknown {
     Capture,
 }
 
+/// What a `watch` does with a new signal (see [`DetectParams::on_signal`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnSignal {
+    #[default]
+    Identify,
+    Choose,
+}
+
 /// The schema's `edge_mask` default, written as the decimal it is (the `f32` 0.05
 /// would print as 0.05000000074505806).
 fn edge_mask_default() -> f64 {
@@ -199,6 +233,9 @@ impl Default for DetectParams {
             cooldown_ms: zeta_core::ops::WATCH_COOLDOWN_MS_DEFAULT,
             confirm_ms: zeta_core::ops::WATCH_CONFIRM_MS_DEFAULT,
             seed_known: false,
+            on_signal: OnSignal::Identify,
+            attach: Vec::new(),
+            probation: true,
         }
     }
 }

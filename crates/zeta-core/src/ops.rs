@@ -8369,7 +8369,7 @@ fn attached_to(node: &Node, job: &JobId, kind: &JobKind) -> Option<JobId> {
 
 /// `job_attach`'s tail: attach a job of `kind` to `job`'s audio stream, the
 /// language and kind already checked.
-async fn attach_one(
+pub(crate) async fn attach_one(
     node: &Node,
     kind: &JobKind,
     job: &JobId,

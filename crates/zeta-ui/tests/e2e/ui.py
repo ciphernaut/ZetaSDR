@@ -6207,6 +6207,63 @@ def scenario_closing_the_menu_stops_its_choose(page, url, secret):
     wait_until(lambda: not choose_jobs(url, secret), 3, "no choose job after the menu closed")
 
 
+def start_choose_watch(url, secret, source):
+    """A watch over `source`'s capture that starts the node's choice on each signal, with a
+    transcriber attached: `on_signal: choose` and `attach` put on its `detect` node, the
+    DC mask off (the `cbvoice` signal sits 700 Hz off the centre). The watch's id."""
+    cur = current_capture(url, secret, source)
+    watch = start_job(url, secret, "watch", source, cur["center_hz"], cur["bandwidth_hz"])
+    graph = http_json(url, secret, "/op", {"op": "graph_get", "job": watch})["value"]
+    detect = [n for n in graph["nodes"] if n["kind"] == "detect"][0]
+    detect["params"].update({"on_signal": "choose", "attach": ["transcribe"], "dc_mask_hz": 0,
+                             "persist_ms": 1000})
+    http_json(url, secret, "/op", {"op": "graph_put", "job": watch, "graph": graph})
+    return watch
+
+
+def chosen_jobs(url, secret, source):
+    """The running demodulators on `source` that no job owns: what a choosing watch started."""
+    return [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            if j["source"] == source and j["kind"].endswith("_demod")
+            and j["state"]["status"] == "running" and not j.get("owner")]
+
+
+def scenario_a_choose_watch_lists_held_then_live(page, url, secret):
+    # The `cbvoice` source loops voice on CB channel 20: the watch's choice is fm_demod, held on
+    # probation (its row reads `held`) while its own choose tries the digital voice rows, then
+    # lifted (the row joins the mix) once the choose settles on the demodulator. A slice that
+    # lands on a keyed-off period may read otherwise (R4): the watch is started afresh then.
+    select_source(page, url, secret, "cbvoice")
+    started = []
+    try:
+        job = None
+        deadline = time.monotonic() + 120
+        while job is None:
+            assert time.monotonic() < deadline, "no held fm_demod from a choosing watch"
+            started.append(start_choose_watch(url, secret, "cbvoice"))
+            jobs = wait_until(lambda: chosen_jobs(url, secret, "cbvoice"), 30,
+                              "a job the watch chose")
+            if jobs[0]["kind"] == "fm_demod" and jobs[0].get("held"):
+                job = jobs[0]
+            else:
+                stop_job(url, secret, started[-1])
+                wait_until(lambda: not chosen_jobs(url, secret, "cbvoice"), 10,
+                           "the watch's job stopped with it")
+        assert job["held"]["reason"] == "probation", job
+        row = page.locator(f'#jobs .job[data-id="{job["id"]}"]')
+        expect(row.locator(".kind .tag.held")).to_have_text("held", timeout=10_000)
+        expect(page.locator("#jobs .job.attached .kind", has_text="transcribe")
+               ).not_to_have_count(0)
+        # The choose settles on the demodulator: the hold lifts and the row joins the mix.
+        expect(row.locator(".kind .tag.held")).to_have_count(0, timeout=90_000)
+        expect(row).to_have_attribute("data-state", "running")
+        live = [j for j in chosen_jobs(url, secret, "cbvoice") if j["id"] == job["id"]]
+        assert live and not live[0].get("held"), live
+    finally:
+        for w in started:
+            stop_job(url, secret, w)
+
+
 def scenario_listen_puts_the_chosen_demodulator_first(page, url, secret):
     login(page, url, secret)
     got = page.evaluate(

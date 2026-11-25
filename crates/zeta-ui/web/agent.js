@@ -75,8 +75,11 @@
 //       is not counted) carries a `.tag.handler` in its `.kind` cell reading the `name` of the
 //       handler it runs
 //       (actions.js jobHandler: `built-in`, a program, a handler file's `name`; titled
-//       `handler <id> (named)` or `(the policy's choice)`); an attached row has none. Each
-//       row shows kind, source,
+//       `handler <id> (named)` or `(the policy's choice)`); an attached row has none.
+//       A running job whose record carries `held` (a watch's job on probation, plan 48) has a
+//       `.tag.held` reading `held` in its `.kind` cell, titled with the hold's reason; it goes
+//       when the hold lifts.
+//       Each row shows kind, source,
 //       state, id, an `.events` cell (filled by overlays.js: a count of the job's events seen on its source's feed), on rows of an AUDIO_KINDS kind a
 //       `button.play` (▶, or ■ while playing(id) is true) calling onPlay(job, {role}) and, while
 //       running, a `button.transcribe` (Transcribe) calling onTranscribe(job, {role}) (ruling
@@ -785,6 +788,14 @@ function jobRow(
       tag.dir = "auto";
       tag.textContent = handler.name;
       tag.title = `handler ${handler.id}${job.handler_named ? " (named)" : " (the policy's choice)"}`;
+      span.append(" ", tag);
+    }
+    if (cls === "kind" && job.held && status === "running") {
+      const tag = document.createElement("span");
+      tag.className = "tag held";
+      tag.dir = "auto";
+      tag.textContent = "held";
+      tag.title = `held: ${job.held.reason}; out of the mix, its transcript kept until the hold lifts`;
       span.append(" ", tag);
     }
     if (cls === "kind" && job.kind === "scan" && job.id === autoScanId()) {

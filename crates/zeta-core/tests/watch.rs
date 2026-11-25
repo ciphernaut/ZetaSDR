@@ -5,7 +5,7 @@
 //! 300 kHz above the capture's centre and repeating every 2 s.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -17,14 +17,16 @@ use zeta_core::capture::{CaptureMeta, write_cf32};
 use zeta_core::graph::{Edge, Graph, Node as GraphNode, NodeId};
 use zeta_core::job::JobState;
 use zeta_core::knowledge::{Allocation, KnowledgeProvider, Signature};
-use zeta_core::node::{Node, NodeConfig};
+use zeta_core::node::{Node, NodeConfig, NodeError};
 use zeta_core::ops::{JobKind, Op, OpResult};
 use zeta_core::port::{IqBlock, IqReceiver, Port, PortError, Tuning};
 use zeta_core::stage::{
     Backend, PassthroughStage, Stage, StageContext, StageError, StageRegistry, StageSpec,
 };
 use zeta_core::stream::{Frame, Payload, StreamBus};
-use zeta_core::types::{Capabilities, Hz, JobId, SourceId, StreamKind, Timestamp};
+use zeta_core::types::{
+    Capabilities, Hz, JobId, Provenance, SourceId, StreamId, StreamKind, Timestamp,
+};
 use zeta_source_file::{FileOpts, FileSource};
 
 mod common;
@@ -4775,5 +4777,654 @@ async fn a_watch_started_fm_demod_on_a_plan_channel_gets_the_plans_deviation() {
         .unwrap();
     assert_eq!(demod.params["deviation_hz"], 2_500, "{rec:?}");
     assert!(state(&node, &watch).is_some());
+    stop_all(&node).await;
+}
+
+// A watch with `on_signal: choose` (plan 48): each new signal starts the node's choice for
+// it, with a transcriber attached; an unproved demodulator a decoder could still prove
+// otherwise starts held on probation (out of the mix, its transcript kept) until the
+// watch's own `choose` settles: lifted when the choice stands, replaced when it does not.
+
+/// What the [`Scribe`] stand-in answers for each line.
+const SCRIBE_TEXT: &str = "a line the scribe heard";
+/// The scribe answers a line for every this much audio it is given.
+const SCRIBE_LINE_S: f64 = 0.5;
+
+/// Stands in for `zeta-speech`'s `transcribe`: a line for every [`SCRIBE_LINE_S`] of audio
+/// (counted in `answered`), kept while its input is held and published, in order, once
+/// the hold lifts; dropped when it is stopped (or its input ends) still held.
+struct Scribe {
+    spec: StageSpec,
+    answered: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Stage for Scribe {
+    fn spec(&self) -> &StageSpec {
+        &self.spec
+    }
+    fn backend(&self) -> Backend {
+        Backend::Cpu
+    }
+    async fn run(
+        &self,
+        _params: Value,
+        mut inputs: Vec<broadcast::Receiver<Frame>>,
+        outputs: Vec<StreamId>,
+        bus: Arc<StreamBus>,
+        cancel: tokio_util::sync::CancellationToken,
+        ctx: StageContext,
+    ) -> Result<(), StageError> {
+        let (Some(rx), Some(out)) = (inputs.first_mut(), outputs.first().cloned()) else {
+            return Err(StageError::Failed("expected 1 input and 1 output".into()));
+        };
+        let mut kept: Vec<Provenance> = Vec::new();
+        let mut heard_s = 0.0;
+        let publish = |kept: &mut Vec<Provenance>| {
+            for prov in kept.drain(..) {
+                let line = serde_json::json!({"protocol": "transcript", "text": SCRIBE_TEXT,
+                    "language": "en"});
+                bus.publish(Frame::new(out.clone(), prov, Payload::Event(line)));
+            }
+        };
+        loop {
+            if !ctx.is_held() {
+                publish(&mut kept);
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                r = rx.recv() => match r {
+                    Ok(f) => {
+                        if let Payload::Audio { sample_rate_hz, channels, samples } = &f.payload {
+                            let per = f64::from(*channels).max(1.0) * sample_rate_hz.0.max(1) as f64;
+                            heard_s += samples.len() as f64 / per;
+                            if heard_s >= SCRIBE_LINE_S {
+                                heard_s = 0.0;
+                                self.answered.fetch_add(1, Ordering::SeqCst);
+                                kept.push(f.provenance.clone());
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        if !ctx.is_held() {
+                            publish(&mut kept);
+                        }
+                        return Ok(());
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// The suite's stages with the attached chain's: the real `stream_in`, a `vad` passing
+/// its audio on, and the [`Scribe`] counting its lines in `answered`.
+fn choice_registry(answered: Arc<AtomicUsize>) -> StageRegistry {
+    let mut r = StageRegistry::new();
+    r.register(Arc::new(zeta_core::stream_in::StreamInStage::new()));
+    r.register(common::MapStage::new(
+        "vad",
+        StreamKind::Audio,
+        &[StreamKind::Audio, StreamKind::Event],
+        |f| vec![(0, f.payload.clone())],
+    ));
+    r.register(Arc::new(Scribe {
+        spec: StageSpec {
+            kind: "transcribe",
+            inputs: vec![StreamKind::Audio],
+            outputs: vec![StreamKind::Event],
+            params_schema: schemars::json_schema!({"type": "object"}),
+        },
+        answered,
+    }));
+    registry_into(r)
+}
+
+/// `uhf_cb_au` channel 1, a voice channel whose plan deviation is 2500 Hz: the choose
+/// tests' signals sit on it, [`OFFSET_HZ`] above the capture's centre.
+fn cb_ch1_hz() -> u64 {
+    let plan = zeta_core::plans::plan("uhf_cb_au").unwrap();
+    zeta_core::plans::channels(plan)[0].1
+}
+
+/// One 300 ms burst of three tones under a tremolo every 600 ms: voice enough for layer
+/// 1 (as `tests/choose.rs` makes it).
+fn speech_like(rate_hz: u32, seconds: f32) -> Vec<f32> {
+    use std::f64::consts::PI;
+    let len = (rate_hz as f64 * seconds as f64) as usize;
+    let period = rate_hz as usize * 600 / 1000;
+    let burst = rate_hz as usize * 300 / 1000;
+    (0..len)
+        .map(|n| {
+            if n % period >= burst {
+                return 0.0;
+            }
+            let t = n as f64 / rate_hz as f64;
+            let tones: f64 = [220.0, 440.0, 1320.0]
+                .iter()
+                .map(|f| (2.0 * PI * f * t).sin())
+                .sum::<f64>()
+                / 3.0;
+            let tremolo = 0.75 + 0.25 * (2.0 * PI * 4.0 * t).sin();
+            (0.5 * tremolo * tones) as f32
+        })
+        .collect()
+}
+
+/// Voice frequency modulated at 2500 Hz deviation [`OFFSET_HZ`] above the centre, its
+/// carrier always up, under 25 dB of noise; 4 s, looped by the source.
+fn cb_voice() -> Vec<Complex<f32>> {
+    let audio = speech_like(48_000, 4.0);
+    let mut iq = zeta_dsp::synth::nbfm_modulate(&audio, 48_000, RATE_HZ, 2_500.0, OFFSET_HZ as f64);
+    zeta_dsp::synth::awgn(&mut iq, 25.0, 21);
+    iq
+}
+
+/// Six superframes of a DMR call [`OFFSET_HZ`] above the centre, under 25 dB of noise:
+/// layer 1 reads it as FM, and only the DMR decoder proves it. Looped, the call goes on.
+fn cb_dmr() -> Vec<Complex<f32>> {
+    let params = serde_json::json!({
+        "family": "dmr", "color_code": 5, "src": 9990001, "dst": 9990, "superframes": 6
+    });
+    let (spec, imp) = zeta_dsp::synth::parse_params(params.as_object().unwrap().clone()).unwrap();
+    let mut iq = zeta_dsp::synth::synthesise(&spec, &imp, RATE_HZ, cb_ch1_hz());
+    mix(&mut iq, OFFSET_HZ as f64);
+    zeta_dsp::synth::awgn(&mut iq, 25.0, 22);
+    iq
+}
+
+/// Six tones (400 Hz to 2.4 kHz) amplitude modulated at index 0.8 on a carrier
+/// [`OFFSET_HZ`] above the centre, under 25 dB of noise (as `tests/choice.rs` makes AM):
+/// `am_demod`, which no decoder row could prove otherwise on a UHF channel.
+fn cb_am() -> Vec<Complex<f32>> {
+    let n = 48_000 * 2;
+    let mut audio = vec![0.0_f32; n];
+    for k in 1..=6 {
+        let f = 400.0 * k as f64;
+        for (i, a) in audio.iter_mut().enumerate() {
+            let t = i as f64 / 48_000.0;
+            *a += ((2.0 * std::f64::consts::PI * f * t).sin() / 6.0) as f32;
+        }
+    }
+    let mut iq = zeta_dsp::synth::am_modulate(&audio, 48_000, RATE_HZ, 0.8, OFFSET_HZ as f64);
+    zeta_dsp::synth::awgn(&mut iq, 25.0, 23);
+    iq
+}
+
+/// A node over one source `rx` of `iq` (centred [`OFFSET_HZ`] under [`cb_ch1_hz`]), the
+/// muting port, and the count of the lines its scribes answered.
+async fn choice_node(
+    dir: &Path,
+    iq: &[Complex<f32>],
+) -> (Arc<Node>, Arc<Muting>, Arc<AtomicUsize>) {
+    let meta = write(dir, "choice", iq, cb_ch1_hz() - OFFSET_HZ);
+    let src = file_source_with("rx", &meta, false);
+    let port = Muting::new(src.clone(), false);
+    let answered = Arc::new(AtomicUsize::new(0));
+    let ports = vec![(port.clone() as Arc<dyn Port>, src)];
+    let node = node_over_with(dir, ports, None, choice_registry(answered.clone())).await;
+    (Arc::new(node), port, answered)
+}
+
+/// The capture of [`choice_node`]'s source.
+fn choice_capture() -> Tuning {
+    Tuning {
+        center_hz: Hz(cb_ch1_hz() - OFFSET_HZ),
+        bandwidth_hz: Hz(RATE_HZ as u64),
+    }
+}
+
+/// A watch over [`choice_capture`] whose `detect` params are `params` (the suite's
+/// detector timing unless given).
+async fn start_watch_over(node: &Node, mut params: Value) -> Result<JobId, NodeError> {
+    for (k, v) in [("persist_ms", PERSIST_MS), ("gone_ms", GONE_MS)] {
+        if params.get(k).is_none() {
+            params[k] = v.into();
+        }
+    }
+    let band = choice_capture();
+    let mut g = JobKind::Watch
+        .expand(
+            &rx(),
+            band,
+            Hz(RATE_HZ as u64),
+            None,
+            None,
+            None,
+            &node.modes(),
+        )
+        .unwrap();
+    g.nodes
+        .iter_mut()
+        .find(|n| n.kind == "detect")
+        .unwrap()
+        .params = params;
+    node.job_start("watch", rx(), band, g, Some(Hz(RATE_HZ as u64)), false)
+        .await
+}
+
+/// A watch over [`choice_capture`] with `on_signal: choose`, a transcriber attached, and
+/// `extra` beside.
+async fn start_choice_watch(node: &Node, extra: Value) -> JobId {
+    let mut params = serde_json::json!({"on_signal": "choose", "attach": ["transcribe"]});
+    for (k, v) in extra.as_object().unwrap() {
+        params[k] = v.clone();
+    }
+    start_watch_over(node, params).await.unwrap()
+}
+
+/// The job attached to `input`, running.
+fn attached_to(node: &Node, input: &JobId) -> Option<JobId> {
+    node.job_list()
+        .into_iter()
+        .find(|r| r.input.as_ref() == Some(input) && r.state == JobState::Running)
+        .map(|r| r.id)
+}
+
+/// Receivers on `job`'s event outputs, subscribed now.
+fn event_rxs(node: &Node, job: &JobId) -> Vec<broadcast::Receiver<Frame>> {
+    node.job_outputs(job)
+        .into_iter()
+        .filter(|(k, _)| *k == StreamKind::Event)
+        .filter_map(|(_, s)| node.bus().subscribe(&s))
+        .collect()
+}
+
+/// The `transcript` events left on `rxs`.
+fn transcripts(rxs: &mut [broadcast::Receiver<Frame>]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for rx in rxs {
+        loop {
+            match rx.try_recv() {
+                Ok(f) => {
+                    if let Payload::Event(v) = f.payload
+                        && v["protocol"] == "transcript"
+                    {
+                        out.push(v);
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    }
+    out
+}
+
+/// The lines of `transcripts.log` naming `job`.
+fn logged_lines(dir: &Path, job: &JobId) -> Vec<String> {
+    std::fs::read_to_string(dir.join("state/transcripts.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains(&job.0))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A mix over every source.
+async fn start_mix(node: &Node) -> JobId {
+    match node.apply(Op::MixStart { sources: None }).await {
+        Ok(OpResult::Job(id)) => id,
+        r => panic!("mix_start: {r:?}"),
+    }
+}
+
+/// How many jobs the mix `m` takes in now.
+fn mix_inputs(node: &Node, m: &JobId) -> u64 {
+    node.job_context(m)
+        .and_then(|c| c["mix"]["inputs"].as_u64())
+        .unwrap_or(0)
+}
+
+/// The watch's first `decoding` job, once listed with its transcriber attached: the job
+/// and the transcriber.
+async fn chosen(node: &Node, events: &Events, watch: &JobId) -> (JobId, JobId) {
+    let job = decoded(node, events, watch).await;
+    until(
+        "the transcriber is attached",
+        Duration::from_secs(10),
+        || attached_to(node, &job).is_some(),
+    )
+    .await;
+    let scribe = attached_to(node, &job).unwrap();
+    (job, scribe)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choose_watch_starts_fm_demod_and_a_transcriber_on_voice() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (job, scribe) = chosen(&node, &events, &watch).await;
+    let all = events.all();
+    assert!(events.watch("identifying").is_empty(), "{all:#?}");
+    let d = &events.watch("decoding")[0];
+    assert_eq!(d["mode"], "fm_demod", "{d}");
+    assert_eq!(d["via"], "choose", "{d}");
+    let rec = record(&node, &job).unwrap();
+    assert_eq!(rec.kind, "fm_demod");
+    assert_eq!(rec.owner, None, "a kept job is an ordinary one");
+    assert!(
+        rec.tuning.center_hz.0.abs_diff(cb_ch1_hz()) <= 1_000,
+        "the measured centre: {:?}",
+        rec.tuning
+    );
+    let demod = rec
+        .graph
+        .nodes
+        .iter()
+        .find(|n| n.kind == "nbfm_demod")
+        .unwrap();
+    assert_eq!(demod.params["deviation_hz"], 2_500, "the plan's: {rec:?}");
+    assert_eq!(record(&node, &scribe).unwrap().kind, "transcribe");
+    let listed = decoding(&node, &watch);
+    assert_eq!(listed[0]["attached"], scribe.0.as_str(), "{listed:#?}");
+    assert_eq!(listed[0]["via"], "choose", "{listed:#?}");
+    stop_all(&node).await;
+    assert_ne!(state(&node, &scribe), Some(JobState::Running));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_signal_is_held_then_joins_the_mix() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, answered) = choice_node(dir.path(), &cb_voice()).await;
+    let m = start_mix(&node).await;
+    let settle = zeta_core::node::watch::test_hold_choices();
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (job, scribe) = chosen(&node, &events, &watch).await;
+    let mut lines = event_rxs(&node, &scribe);
+    // Held on probation from its start, its choose child running.
+    let held = record(&node, &job)
+        .unwrap()
+        .held
+        .expect("held on probation");
+    assert_eq!(held.reason, "probation");
+    let listed = decoding(&node, &watch);
+    assert_eq!(listed[0]["held"], true, "{listed:#?}");
+    assert!(listed[0]["choose"].is_string(), "{listed:#?}");
+    // A line answered while held is kept, and the mix leaves the job out.
+    until("a line answered", Duration::from_secs(10), || {
+        answered.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    for _ in 0..5 {
+        assert_eq!(mix_inputs(&node, &m), 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        transcripts(&mut lines),
+        Vec::<Value>::new(),
+        "kept while held"
+    );
+
+    // The choose settles on the demodulator: the hold lifts, the job joins the mix and the
+    // kept line is published.
+    settle.release();
+    until("the hold lifts", Duration::from_secs(60), || {
+        record(&node, &job).is_some_and(|r| r.held.is_none())
+    })
+    .await;
+    until("the mix takes it in", Duration::from_secs(5), || {
+        mix_inputs(&node, &m) == 1
+    })
+    .await;
+    let mut got = Vec::new();
+    until("the kept line is published", Duration::from_secs(5), || {
+        got.extend(transcripts(&mut lines));
+        !got.is_empty()
+    })
+    .await;
+    assert_eq!(got[0]["text"], SCRIBE_TEXT);
+    until("watch.decoding settles", Duration::from_secs(5), || {
+        let d = decoding(&node, &watch);
+        d.len() == 1 && d[0].get("held").is_none() && d[0].get("choose").is_none()
+    })
+    .await;
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    assert_eq!(state(&node, &scribe), Some(JobState::Running));
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dmr_signal_never_reaches_the_mix_and_becomes_dmr_decode() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, answered) = choice_node(dir.path(), &cb_dmr()).await;
+    let m = start_mix(&node).await;
+    let settle = zeta_core::node::watch::test_hold_choices();
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (job, scribe) = chosen(&node, &events, &watch).await;
+    let mut lines = event_rxs(&node, &scribe);
+    assert_eq!(record(&node, &job).unwrap().kind, "fm_demod");
+    assert!(record(&node, &job).unwrap().held.is_some(), "held");
+    until("a line answered and kept", Duration::from_secs(10), || {
+        answered.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    for _ in 0..5 {
+        assert_eq!(mix_inputs(&node, &m), 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The choose proves DMR: the transcriber and the held job go, the decoder starts.
+    settle.release();
+    let dmr = || {
+        node.job_list()
+            .into_iter()
+            .find(|r| r.kind == "dmr_decode" && r.state == JobState::Running)
+    };
+    until("dmr_decode runs", Duration::from_secs(60), || {
+        // Never lifted, so never in the mix, while it runs.
+        if let Some(r) = record(&node, &job)
+            && r.state == JobState::Running
+        {
+            assert!(r.held.is_some(), "fm_demod was lifted");
+            assert_eq!(mix_inputs(&node, &m), 0);
+        }
+        dmr().is_some()
+    })
+    .await;
+    until("the held job is stopped", Duration::from_secs(5), || {
+        state(&node, &job) != Some(JobState::Running)
+            && state(&node, &scribe) != Some(JobState::Running)
+    })
+    .await;
+    let dmr = dmr().unwrap();
+    until(
+        "watch.decoding names the decoder",
+        Duration::from_secs(5),
+        || {
+            let d = decoding(&node, &watch);
+            d.len() == 1 && d[0]["job"] == dmr.id.0.as_str() && d[0]["mode"] == "dmr_decode"
+        },
+    )
+    .await;
+    // What the held job's transcriber kept never reaches the bus or the log.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(transcripts(&mut lines), Vec::<Value>::new());
+    assert_eq!(logged_lines(dir.path(), &scribe), Vec::<String>::new());
+    let replaced = events
+        .watch("decoding")
+        .into_iter()
+        .find(|e| e["mode"] == "dmr_decode")
+        .expect("a decoding event for dmr_decode");
+    assert_eq!(replaced["via"], "choose", "{replaced}");
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_nothing_could_prove_starts_unheld() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_am()).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let job = decoded(&node, &events, &watch).await;
+    let rec = record(&node, &job).unwrap();
+    assert_eq!(rec.kind, "am_demod", "{:#?}", events.all());
+    assert_eq!(rec.held, None, "unheld from its start");
+    let listed = decoding(&node, &watch);
+    assert!(listed[0].get("held").is_none(), "{listed:#?}");
+    assert!(
+        listed[0].get("choose").is_none(),
+        "no choose to wait for: {listed:#?}"
+    );
+    stop_all(&node).await;
+}
+
+/// The squelch hold of the gone-signal test, and its detector's quicker `gone_ms`: the
+/// hold, not the detector, decides when the demodulator stops.
+const SQUELCH_HOLD_MS: u64 = 3_000;
+const QUICK_GONE_MS: u64 = 1_000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gone_voice_signal_is_stopped_after_the_squelch_hold() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (node, port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    let policy = serde_json::json!({"hold_ms": SQUELCH_HOLD_MS, "gone_ms": QUICK_GONE_MS});
+    let watch = start_choice_watch(&node, policy).await;
+    let events = Events::of(&node, &watch);
+    let (job, scribe) = chosen(&node, &events, &watch).await;
+    let open = |want: bool| {
+        node.job_context(&job)
+            .is_some_and(|c| c["squelch"]["open"] == want)
+    };
+    until(
+        "the squelch opens on the voice",
+        Duration::from_secs(10),
+        || open(true),
+    )
+    .await;
+    port.mute();
+    // Polled closely: when the squelch shut, and the transcriber stopped before its
+    // demodulator.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut shut = None;
+    let stopped = loop {
+        let now = tokio::time::Instant::now();
+        if shut.is_none() && open(false) {
+            shut = Some(now);
+        }
+        let demod_runs = state(&node, &job) == Some(JobState::Running);
+        let scribe_runs = state(&node, &scribe) == Some(JobState::Running);
+        if !demod_runs {
+            assert!(
+                !scribe_runs,
+                "the demodulator stopped before its transcriber"
+            );
+            break now;
+        }
+        assert!(now < deadline, "never stopped");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    };
+    let waited = stopped - shut.expect("the squelch shut before the stop");
+    // The detector called it gone well before: the shut squelch's hold kept it running.
+    assert!(
+        waited >= Duration::from_millis(SQUELCH_HOLD_MS - 300),
+        "stopped {waited:?} after the squelch shut"
+    );
+    until("lost", Duration::from_secs(5), || {
+        !events.watch("lost").is_empty()
+    })
+    .await;
+    let lost = &events.watch("lost")[0];
+    assert_eq!(lost["job"], job.0.as_str(), "{lost}");
+    assert_eq!(lost["why"], "gone and silent", "{lost}");
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_lifts_a_hold_whose_choose_is_gone() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let jobs = dir.path().join("state").join("jobs");
+    let file = |id: &JobId| jobs.join(format!("{}.json", id.0));
+    let settle = zeta_core::node::watch::test_hold_choices();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    let watch = start_choice_watch(&node, serde_json::json!({})).await;
+    let events = Events::of(&node, &watch);
+    let (job, scribe) = chosen(&node, &events, &watch).await;
+    until(
+        "watch.decoding names its choose",
+        Duration::from_secs(5),
+        || {
+            decoding(&node, &watch)
+                .first()
+                .is_some_and(|d| d["choose"].is_string() && d["attached"].is_string())
+        },
+    )
+    .await;
+    assert!(record(&node, &job).unwrap().held.is_some());
+    drop(events);
+    // The records as a kill mid-probation leaves them.
+    let saved: Vec<(JobId, String)> = [&watch, &job, &scribe]
+        .into_iter()
+        .map(|id| (id.clone(), std::fs::read_to_string(file(id)).unwrap()))
+        .collect();
+    drop(node);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for (id, text) in &saved {
+        std::fs::write(file(id), text).unwrap();
+    }
+    settle.release();
+
+    // The held job resumes held; its choose does not; the watch lifts the hold.
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    assert_eq!(state(&node, &job), Some(JobState::Running));
+    until("the hold lifts", Duration::from_secs(15), || {
+        record(&node, &job).is_some_and(|r| r.held.is_none())
+    })
+    .await;
+    until(
+        "watch.decoding keeps it unheld",
+        Duration::from_secs(5),
+        || {
+            let d = decoding(&node, &watch);
+            d.len() == 1
+                && d[0]["job"] == job.0.as_str()
+                && d[0].get("held").is_none()
+                && d[0].get("choose").is_none()
+        },
+    )
+    .await;
+    assert_eq!(state(&node, &scribe), Some(JobState::Running));
+    stop_all(&node).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn check_modes_list_accepts_a_demodulator_row() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (node, _port, _answered) = choice_node(dir.path(), &cb_voice()).await;
+    let listed = serde_json::json!({"modes": ["fm_demod", "am_demod", "pocsag_decode"]});
+    let ok = start_watch_over(&node, listed)
+        .await
+        .expect("demodulator rows are listed rows");
+    node.job_stop(&ok).await.unwrap();
+    let refused = |r: Result<JobId, NodeError>| match r {
+        Err(e) => e.to_string(),
+        Ok(id) => panic!("started {id:?}"),
+    };
+    let both = serde_json::json!({"on_signal": "choose", "modes": ["fm_demod"]});
+    let both = refused(start_watch_over(&node, both).await);
+    assert!(both.contains("on_signal: choose"), "{both}");
+    let packets = serde_json::json!({"on_signal": "choose", "attach": ["packets"]});
+    let packets = refused(start_watch_over(&node, packets).await);
+    assert!(packets.contains("attach[0]: packets"), "{packets}");
     stop_all(&node).await;
 }
