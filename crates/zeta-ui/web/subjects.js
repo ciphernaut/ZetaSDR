@@ -484,7 +484,9 @@ class SubjectStore {
               ? {
                   ...mode.row,
                   outputs: mode.outputs ?? [],
-                  voices: mode.voices ?? [],
+                  // A demodulator row lists its one `audio` stream there: that is its main
+                  // stream, not a voice to pick.
+                  voices: mode.row.decoder?.kind === "builtin" ? [] : (mode.voices ?? []),
                   handlers: mode.handlers ?? [],
                 }
               : null;

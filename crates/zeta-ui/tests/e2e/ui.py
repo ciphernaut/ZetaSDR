@@ -133,7 +133,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (15 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (16 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -226,7 +226,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 4, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (15 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (16 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -592,7 +592,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (15 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (16 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -4645,7 +4645,9 @@ def scenario_job_rows_fold_only_on_evidence(page, url, secret):
 # A running rigid job the node can retune is dragged by its outline: an edge handle resizes,
 # the body moves, release sends `job_retune`. `retune` shows its 48 kHz capture.
 
-def is_op(name):
+def is_op(name, not_kind=None):
+    """A POST /op of `name`; `not_kind` leaves out an op of that kind (the box menu starts a
+    transient `choose` each time it opens, before the entry the scenario clicks)."""
     def pred(r):
         if r.method != "POST" or not r.url.endswith("/op"):
             return False
@@ -4653,7 +4655,7 @@ def is_op(name):
             body = json.loads(r.post_data or "")
         except ValueError:
             return False
-        return body.get("op") == name
+        return body.get("op") == name and (not_kind is None or body.get("kind") != not_kind)
     return pred
 
 
@@ -6062,7 +6064,7 @@ def scenario_box_menu_offers_only_what_fits(page, url, secret):
     try:
         # APRS has two ready handlers: its entry opens a panel, the policy's pick starts.
         menu_click(page, "aprs_decode")
-        with page.expect_request(is_op("job_start")) as req:
+        with page.expect_request(is_op("job_start", not_kind="choose")) as req:
             page.locator('#ctx .ctx-sub[data-for="aprs_decode"] .ctx-item[data-mode="policy"]').click()
         body = json.loads(req.value.post_data)
         assert (body["kind"], body["source"]) == ("aprs_decode", "tone"), f"start {body}"
@@ -12405,7 +12407,8 @@ def scenario_explore_send_to_lists_the_modes_that_fit(page, url, secret):
     capture = two_captures_of(url, secret, "aprs", centre, width)[0]
     assert (capture["center_hz"], capture["bandwidth_hz"]) == (centre, width), capture
     rows = mode_rows(url, secret)
-    ready = {i: r for i, r in rows.items() if r["state"] == "ready"}
+    # A demodulator row is no decoder: a replay (capture_decode) refuses it, so Send to omits it.
+    ready = {i: r for i, r in rows.items() if r["state"] == "ready" and r["role"] != "demodulator"}
     narrow = {i for i, r in ready.items()
               if width < (r["band"].get("min_hz") or r["band"]["bandwidth_hz"])}
     away = {i for i, r in ready.items()
