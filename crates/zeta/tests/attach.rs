@@ -1135,3 +1135,118 @@ async fn a_program_row_has_a_packet_stream_only_with_a_packets_block() {
     node.job_packet_stream(packets)
         .expect("the packets row's job has a packet stream");
 }
+
+/// A `wfm_demod` job held on probation, with `transcribe` attached; the node, the demod,
+/// the transcriber, receivers on the transcriber's event streams and the fake backend.
+async fn held_transcriber(
+    dir: &Path,
+    fake: Arc<FakeBackend>,
+) -> (
+    Node,
+    JobId,
+    JobId,
+    Vec<tokio::sync::broadcast::Receiver<zeta_core::stream::Frame>>,
+) {
+    let (src, port) = speech_port(dir);
+    let node = Node::open(cfg(dir), registry(fake), vec![port])
+        .await
+        .unwrap();
+    src.start();
+    let wfm = start(&node, JobKind::WfmDemod, 200_000).await;
+    let hold = zeta_core::job::Hold {
+        reason: "probation".into(),
+        since_ns: 1,
+    };
+    node.set_held(&wfm, Some(hold)).unwrap();
+    let Ok(OpResult::Job(id)) = attach(&node, &wfm).await else {
+        panic!("attach")
+    };
+    let rxs = streams_of(&node, &id)
+        .iter()
+        .filter(|s| s.kind == StreamKind::Event)
+        .filter_map(|s| node.bus().subscribe(&s.id))
+        .collect();
+    (node, wfm, id, rxs)
+}
+
+/// The `transcript` events left on `rxs`.
+fn transcripts_on(
+    rxs: &mut [tokio::sync::broadcast::Receiver<zeta_core::stream::Frame>],
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for rx in rxs {
+        while let Ok(f) = rx.try_recv() {
+            if let Payload::Event(v) = f.payload
+                && v["protocol"] == "transcript"
+            {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// The lines of `transcripts.log` naming `job`.
+fn logged(dir: &Path, job: &JobId) -> Vec<String> {
+    std::fs::read_to_string(dir.join("state/transcripts.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains(&job.0))
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_input_stopped_mid_utterance_publishes_no_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    // No line is answered before the stop: the backend takes longer than the test.
+    let fake = Arc::new(FakeBackend::new(TEXT));
+    fake.set_delay(Duration::from_secs(30));
+    let (node, wfm, id, mut rxs) = held_transcriber(dir.path(), fake).await;
+    // Into the fixture's speech (2 s of silence, then 3 s of speech, looping).
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    node.apply(Op::JobStop { job: wfm.clone() }).await.unwrap();
+    until(
+        "the transcriber ends with its input",
+        Duration::from_secs(2),
+        || record(&node, &id).state != JobState::Running && streams_of(&node, &id).is_empty(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(transcripts_on(&mut rxs), Vec::<serde_json::Value>::new());
+    assert_eq!(logged(dir.path(), &id), Vec::<String>::new());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_lifted_just_before_the_input_stops_publishes_the_kept_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeBackend::new(TEXT));
+    let (node, wfm, id, mut rxs) = held_transcriber(dir.path(), fake.clone()).await;
+    until("a line answered", Duration::from_secs(20), || {
+        !fake.calls().is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        transcripts_on(&mut rxs),
+        Vec::<serde_json::Value>::new(),
+        "kept"
+    );
+    // Lifted, then the input stopped at once: well inside the transcriber's next look.
+    node.set_held(&wfm, None).unwrap();
+    node.apply(Op::JobStop { job: wfm.clone() }).await.unwrap();
+    let mut got = Vec::new();
+    until("the kept line is published", Duration::from_secs(2), || {
+        got.extend(transcripts_on(&mut rxs));
+        !got.is_empty()
+    })
+    .await;
+    assert_eq!(got[0]["text"], TEXT, "{:?}", got);
+    assert!(got[0]["end_ns"].as_u64() > got[0]["start_ns"].as_u64());
+    until(
+        "the transcriber ends with its input",
+        Duration::from_secs(2),
+        || record(&node, &id).state != JobState::Running,
+    )
+    .await;
+}

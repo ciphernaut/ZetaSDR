@@ -15,7 +15,8 @@ pub use backend::{DEFAULT_LANGUAGE, SpeechBackend, SpeechError, Transcript};
 pub use node::NodeBackend;
 pub use socket::SocketBackend;
 pub use transcribe::{
-    Accumulator, NO_BACKEND, NO_BACKEND_REASON, TranscribeParams, TranscribeStage, Utterance,
+    Accumulator, HELD_KEPT_MAX, NO_BACKEND, NO_BACKEND_REASON, TranscribeParams, TranscribeStage,
+    Utterance,
 };
 pub use url::UrlBackend;
 pub use wav::wav_s16_mono;

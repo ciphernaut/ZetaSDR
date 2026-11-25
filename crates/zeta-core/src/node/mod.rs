@@ -30,6 +30,7 @@ pub mod watch;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::OwnedMutexGuard;
@@ -290,6 +291,12 @@ struct JobEntry {
     /// Set at launch for a scan its source sweeps for itself: where `job_retune` hands
     /// its re-aims ([`self_sweep::Reaim`]) to the run's task.
     reaim: Option<tokio::sync::mpsc::Sender<self_sweep::Reaim>>,
+    /// Whether the job is held ([`JobRecord::held`]), set with it by [`Inner::set_held`].
+    /// A job attached to this one reads it through its [`crate::stage::HeldHook`]: the
+    /// flag outlives the record (an owned job is forgotten as it stops), so a held job
+    /// dropped stays held for the lines its transcriber kept, and it takes no lock. One
+    /// flag per id: each launch's entry takes over the last entry's.
+    held: Arc<AtomicBool>,
 }
 
 /// The tokens of gated stops ([`JobEntry::gated_stop`]): each takes the next.
@@ -386,6 +393,7 @@ impl JobEntry {
         JobEntry {
             ended_ns,
             stations: origin::StationTally::seeded(&record.context),
+            held: Arc::new(AtomicBool::new(record.held.is_some())),
             record,
             run: 0,
             cancel: None,
@@ -1209,17 +1217,17 @@ impl Inner {
         if entry.record.held == held {
             return Ok(());
         }
+        entry
+            .held
+            .store(held.is_some(), std::sync::atomic::Ordering::SeqCst);
         entry.record.held = held;
         persist(&self.jobs_dir, &entry.record)
     }
 
-    /// Whether the job `id` is held; `None` for a job the node does not know (any more).
-    fn held_now(&self, id: &JobId) -> Option<bool> {
-        self.jobs
-            .lock()
-            .unwrap()
-            .get(id)
-            .map(|e| e.record.held.is_some())
+    /// The held flag of the job `id` ([`JobEntry::held`]), for a job attached to it;
+    /// `None` for a job the node does not know.
+    fn held_flag(&self, id: &JobId) -> Option<Arc<AtomicBool>> {
+        self.jobs.lock().unwrap().get(id).map(|e| e.held.clone())
     }
 
     /// Put the job `id` in the Send to group `group` (its record's `group`) and persist
@@ -4391,6 +4399,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(on_disk.group, Some(run_id));
+    }
+
+    #[tokio::test]
+    async fn a_held_flag_outlives_its_owned_record_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = NodeConfig {
+            source_positions: Default::default(),
+            burst_policy: Default::default(),
+            state_dir: dir.path().join("state"),
+            ring_seconds: 1.0,
+            ring_budget_bytes: u64::MAX,
+            scan_dwell_ms: 20,
+            backends: vec![crate::stage::Backend::Cpu],
+            resume: false,
+            owns_state_dir: true,
+            bank_factory: None,
+            modes_dir: None,
+            handlers_dir: None,
+            sets_dir: None,
+        };
+        let node = Node::open(cfg, crate::stage::StageRegistry::new(), vec![])
+            .await
+            .unwrap();
+        let hold = Hold {
+            reason: "probation".into(),
+            since_ns: 1,
+        };
+        // A watch's two demods, each read by a transcriber's flag (as `launch` builds its
+        // hook), then stopped and forgotten as an owned record is at its run's end.
+        let ids: Vec<JobId> = (0..2)
+            .map(|_| {
+                let r = rec("fm_demod", None, Some(JobId("watch".into())));
+                let id = r.id.clone();
+                let entry = JobEntry::loaded(r, Timestamp(0));
+                node.inner.jobs.lock().unwrap().insert(id.clone(), entry);
+                node.set_held(&id, Some(hold.clone())).unwrap();
+                id
+            })
+            .collect();
+        let flags: Vec<_> = ids
+            .iter()
+            .map(|id| node.inner.held_flag(id).unwrap())
+            .collect();
+        // The second's hold lifts just before it is forgotten.
+        node.set_held(&ids[1], None).unwrap();
+        {
+            let mut jobs = node.inner.jobs.lock().unwrap();
+            for id in &ids {
+                jobs.get_mut(id).unwrap().record.state = JobState::Stopped;
+            }
+            node.inner.prune_history(&mut jobs);
+            assert!(ids.iter().all(|id| !jobs.contains_key(id)), "forgotten");
+        }
+        let read = |i: usize| flags[i].load(std::sync::atomic::Ordering::SeqCst);
+        assert!(read(0), "a held job dropped stays held for its transcriber");
+        assert!(!read(1), "a hold lifted is seen lifted");
     }
 
     #[test]

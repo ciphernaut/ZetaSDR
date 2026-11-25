@@ -44,6 +44,9 @@ const MAX_ERRORS: u32 = 2;
 const OUTER_SLACK: Duration = Duration::from_secs(1);
 /// How often a run keeping events looks whether its input's hold has lifted.
 const HELD_POLL: Duration = Duration::from_millis(100);
+/// The most events a run keeps while its input is held: past it the oldest is dropped. A
+/// hold is a probation of a few seconds, so this only bounds a hold never lifted.
+pub const HELD_KEPT_MAX: usize = 64;
 
 fn en() -> String {
     DEFAULT_LANGUAGE.to_string()
@@ -305,8 +308,11 @@ struct Worker {
     errors: u32,
     /// Whether the input is held now (the job's [`StageContext::held`] hook).
     held: Option<HeldHook>,
-    /// The events made while the input was held, oldest first, for [`Self::release`].
-    kept: Vec<Frame>,
+    /// The events made while the input was held, oldest first, for [`Self::release`]; at
+    /// most [`HELD_KEPT_MAX`].
+    kept: VecDeque<Frame>,
+    /// Whether an event kept was dropped for the bound (logged once a run).
+    kept_overflowed: bool,
 }
 
 impl Worker {
@@ -319,7 +325,16 @@ impl Worker {
         event["stream"] = serde_json::json!(self.stream);
         let frame = Frame::new(self.out.clone(), prov, Payload::Event(event));
         if self.is_held() {
-            self.kept.push(frame);
+            if self.kept.len() == HELD_KEPT_MAX {
+                self.kept.pop_front();
+                if !std::mem::replace(&mut self.kept_overflowed, true) {
+                    eprintln!(
+                        "zeta: transcribe: its input held past {HELD_KEPT_MAX} lines, \
+                         the oldest kept are dropped"
+                    );
+                }
+            }
+            self.kept.push_back(frame);
         } else {
             self.release();
             self.bus.publish(frame);
@@ -338,6 +353,13 @@ impl Worker {
         for frame in std::mem::take(&mut self.kept) {
             self.bus.publish(frame);
         }
+    }
+
+    /// The run is cancelled: what was kept is published if the hold has lifted since the
+    /// last look (a lift then a stop within one [`HELD_POLL`]), and dropped if it has not.
+    fn cancelled(&mut self) -> StageError {
+        self.release();
+        StageError::Cancelled
     }
 
     /// Hand `u` to the backend now, queue it, or drop it when the queue is full.
@@ -519,7 +541,8 @@ impl Stage for TranscribeStage {
             in_flight: None,
             errors: 0,
             held: ctx.held.clone(),
-            kept: Vec::new(),
+            kept: VecDeque::new(),
+            kept_overflowed: false,
         };
         let rx = &mut inputs[0];
         // Wall-clock silence after the last frame closes the open utterance; armed only
@@ -535,7 +558,7 @@ impl Stage for TranscribeStage {
         loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                _ = cancel.cancelled() => return Err(w.cancelled()),
                 a = w.next_answer() => w.answered(a)?,
                 r = rx.recv() => match r {
                     Ok(frame) => {
@@ -599,7 +622,7 @@ impl Stage for TranscribeStage {
         while w.in_flight.is_some() {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Err(StageError::Cancelled),
+                _ = cancel.cancelled() => return Err(w.cancelled()),
                 a = w.next_answer() => w.answered(a)?,
             }
         }

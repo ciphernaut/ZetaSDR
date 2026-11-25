@@ -12,7 +12,7 @@ use zeta_core::stream::{Frame, Payload, StreamBus};
 use zeta_core::types::{Hz, Provenance, SourceId, Span, StreamId, StreamKind, Timestamp};
 use zeta_dsp::fixtures::speech_like;
 use zeta_speech::testing::{FakeBackend, FakeDaemon};
-use zeta_speech::{SocketBackend, SpeechBackend, TranscribeStage};
+use zeta_speech::{HELD_KEPT_MAX, SocketBackend, SpeechBackend, TranscribeStage};
 
 const RATE: u64 = 48_000;
 /// Input frames are 100 ms long.
@@ -797,4 +797,61 @@ async fn a_held_transcriber_whose_input_closes_publishes_nothing() {
     let (res, events) = finish(rig).await;
     assert!(res.is_ok(), "{res:?}");
     assert!(events.is_empty(), "{events:?}");
+}
+
+#[tokio::test]
+async fn a_hold_lifted_just_before_a_cancel_publishes_what_it_kept() {
+    let fake = Arc::new(FakeBackend::new("held"));
+    let held = Arc::new(AtomicBool::new(true));
+    let mut rig = start_held(&fake, &held);
+    let spans = two_utterances(&rig, &fake).await;
+    // Lifted, and cancelled before the stage's next look.
+    held.store(false, Ordering::SeqCst);
+    rig.cancel.cancel();
+    let res = tokio::time::timeout(Duration::from_secs(2), rig.run)
+        .await
+        .expect("cancel is prompt")
+        .unwrap();
+    assert!(matches!(res, Err(StageError::Cancelled)), "{res:?}");
+    let mut got = Vec::new();
+    while let Ok(f) = rig.events.try_recv() {
+        let v = event(f);
+        got.push((u(&v, "start_ns"), u(&v, "end_ns")));
+    }
+    assert_eq!(got, spans);
+}
+
+#[tokio::test]
+async fn a_hold_never_lifted_keeps_only_the_newest_lines() {
+    let fake = Arc::new(FakeBackend::new("held"));
+    let held = Arc::new(AtomicBool::new(true));
+    let mut rig = start_held(&fake, &held);
+    let n = HELD_KEPT_MAX + 6;
+    let burst = speech_like(RATE as u32, 1.0);
+    let mut spans = Vec::new();
+    let mut t = T_BASE;
+    for i in 0..n {
+        // One at a time: each utterance closes on the next one's first frame, and is
+        // answered before the next is sent, so none is dropped for the queue.
+        let end = send(&rig.tx, &burst, 1, t);
+        spans.push((t, end));
+        t = end + 500_000_000;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.calls().len() < i {
+            assert!(Instant::now() < deadline, "{i} backend calls");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+    until_calls(&fake, n).await;
+    assert!(rig.events.try_recv().is_err(), "nothing while held");
+    held.store(false, Ordering::SeqCst);
+    let mut got = Vec::new();
+    for _ in 0..HELD_KEPT_MAX {
+        let v = next_event(&mut rig.events).await;
+        got.push((u(&v, "start_ns"), u(&v, "end_ns")));
+    }
+    assert_eq!(got, spans[n - HELD_KEPT_MAX..], "the newest, in order");
+    let (res, rest) = finish(rig).await;
+    assert!(res.is_ok(), "{res:?}");
+    assert!(rest.is_empty(), "{rest:?}");
 }
