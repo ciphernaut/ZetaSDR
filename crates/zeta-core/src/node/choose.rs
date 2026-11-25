@@ -104,7 +104,8 @@ pub(super) struct Choosing {
     peak: AtomicU32,
     /// The most step-3 trials ever running at once (tests).
     live_peak: AtomicU32,
-    /// Woken whenever a trial ends, for the trials waiting for a slot.
+    /// Woken whenever a trial ends or a waiting replay's wait ends, for the trials waiting
+    /// for a slot.
     freed: tokio::sync::Notify,
     /// The step 1 a watch hands its `choose` child ([`StepOne`]), by the child's id, until
     /// the child takes it as it starts.

@@ -897,7 +897,7 @@ async fn a_replay_starts_while_live_trials_hold_every_slot_but_one() {
         let slot = node.test_live_trial_slot(SLOT_WITHIN).await;
         dwells.push(slot.expect("a step-3 trial takes a free slot"));
     }
-    let third = node.test_live_trial_slot(ENDS_WITHIN);
+    let third = node.test_live_trial_slot(2 * ENDS_WITHIN);
     tokio::pin!(third);
     tokio::select! {
         _ = &mut third => panic!("a third step-3 trial took the replays' slot"),
@@ -934,7 +934,7 @@ async fn a_waiting_replay_is_served_before_a_waiting_live_trial() {
     // One step-3 dwell holds the only slot; a second step-3 trial waits for it first.
     let first = node.test_live_trial_slot(SLOT_WITHIN).await;
     let first = first.expect("a step-3 trial takes the free slot");
-    let second = node.test_live_trial_slot(ENDS_WITHIN);
+    let second = node.test_live_trial_slot(2 * ENDS_WITHIN);
     tokio::pin!(second);
     tokio::select! {
         _ = &mut second => panic!("a step-3 trial was served while the slot is held"),
@@ -1007,11 +1007,17 @@ async fn with_one_slot_live_and_replay_share_it() {
     let running = |id: &JobId| state(&node, id) == Some(JobState::Running);
     let deadline = tokio::time::Instant::now() + ENDS_WITHIN;
     while running(&a) || running(&b) {
-        let replaying = replays(&node)
-            .into_iter()
-            .filter(|r| r.state == JobState::Running)
+        let snapshot = node.job_list();
+        let replaying = snapshot
+            .iter()
+            .filter(|r| r.replay.is_some() && r.state == JobState::Running)
             .count();
-        let dwelling = live_trial_jobs(&node, &a).len();
+        let dwelling = snapshot
+            .iter()
+            .filter(|r| {
+                r.state == JobState::Running && r.owner.as_ref() == Some(&a) && r.replay.is_none()
+            })
+            .count();
         assert!(replaying + dwelling <= 1, "{replaying} + {dwelling}");
         assert!(
             tokio::time::Instant::now() < deadline,
