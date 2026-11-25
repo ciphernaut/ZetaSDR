@@ -881,7 +881,9 @@ def scenario_fit_start_conflict_offers_replace(page, url, secret):
                         "current": {"center_hz": 100_000_000, "bandwidth_hz": 48_000},
                         "options": []}))
                 return r.continue_(post_data=json.dumps(dict(op, replace=[])))
-            if op.get("kind") != "spectrum":  # the page's own spectrum jobs
+            # The page's own spectrum jobs, and the box menu's transient choose (started as
+            # the menu opens).
+            if op.get("kind") not in ("spectrum", "choose"):
                 starts.append(op)
         return r.continue_()
 
