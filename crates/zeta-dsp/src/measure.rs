@@ -62,7 +62,8 @@ const MIN_LINE_HZ: f64 = 50.0;
 const NOISE_SNR_DB: f32 = 6.0;
 /// FM needs discriminator audio (from `FM_MIN_AUDIO_HZ` to half the occupied band, its
 /// drift taken out) whose RMS deviation beyond the envelope's motion is above this
-/// ([`Motion::over_hz`]); below it a constant-envelope signal is a carrier.
+/// ([`Motion::over_hz`]); below it a constant-envelope signal is a carrier. Where the noise
+/// could click, the floor is higher (`CLICK_MARGIN`).
 /// Measured over the carrier where it is up, on generators:
 /// - a bare carrier, keyed or steady, and one drifting linearly by up to 3 kHz in 2 s, or
 ///   warming up by 1 kHz with a 0.2 s time constant, at 15 and 36 dB: at most 1 Hz over
@@ -109,7 +110,8 @@ const PILOT_REGION_HZ: (f64, f64) = (15_000.0, 23_000.0);
 /// AM and SSB: envelope coefficient of variation at least this.
 const AM_MIN_CV: f32 = 0.25;
 /// Low-index AM (below `AM_MIN_CV`): envelope coefficient of variation at
-/// least this, with a carrier line and the phase moving less than the envelope, in Hz.
+/// least this, with a carrier line and the envelope moving more than the phase, in Hz
+/// (`MOTION_MARGIN`).
 const AM_LOW_MIN_CV: f32 = 0.1;
 /// AM carrier line: the sideband level is the mean power of the bins this far
 /// from the centre, either side.
@@ -453,6 +455,9 @@ pub fn measure_band(
 ///
 /// Burst gating: the window's on-runs ([`burst_runs`], the off part found from either
 /// side, so `duty` is the on share) give `duty`, `bursts`, `burst_ms` and `period_ms`.
+/// A carrier only a few dB over the noise, which single chunks do not split from it, is
+/// found by its two levels over `BURST_LEVEL_MS` (`level_runs`), and the runs
+/// are then those.
 /// When the window holds an off part of noise ([`gated_view`]: on under half the window,
 /// or in runs of at least `BURST_LONG_RUN_MS` at any duty) and the runs repeat no faster
 /// than `BURST_MIN_PERIOD_MS` (denser runs are keying), the spectrum, SNR and occupied
@@ -517,7 +522,8 @@ fn measure_band_noted(
     let bin_hz = rate_hz as f64 / SIZE as f64;
     let half_bins = ((bandwidth_hz as f64 / 2.0 / bin_hz).floor() as usize).min(SIZE / 2);
     let first = SIZE / 2 - half_bins;
-    let mut db = spectrum(iq)[first..(SIZE / 2 + half_bins + 1).min(SIZE)].to_vec();
+    let all_db = spectrum(iq);
+    let mut db = all_db[first..(SIZE / 2 + half_bins + 1).min(SIZE)].to_vec();
     // The in-band bins within the mask of the DC's offset in the block, when the
     // DC lies inside the band and off its centre (a capture centred on the band
     // holds the measured signal on the DC).
@@ -557,6 +563,7 @@ fn measure_band_noted(
     let peak = argmax(db);
     let gap = (GAP_HZ / bin_hz).floor() as usize;
     let (lo, hi) = occupied(db, peak, floor + OCCUPIED_DB, gap);
+    let noise = noise_beside(&all_db, first, db, (lo, hi), floor + OCCUPIED_DB, bin_hz);
     let (lo, hi) = (lo + first, hi + first);
     let bins = (hi - lo + 1) as f64;
     let offset = ((lo + hi) as f64 / 2.0 - (SIZE / 2) as f64) * bin_hz;
@@ -614,7 +621,139 @@ fn measure_band_noted(
     let note = RateNote {
         power99_hz: power_width_hz(db, peak, floor, gap, bin_hz),
     };
+    let mut v = v;
+    v.band = Some(OccupiedBand {
+        offset_hz: offset,
+        noise,
+    });
     (record, note, v)
+}
+
+/// What a measurement found of the occupied band in the samples it measured, for the
+/// label read from them ([`View::band`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OccupiedBand {
+    /// The occupied band's centre, Hz from the stream's.
+    offset_hz: f64,
+    /// The noise beside it in the samples ([`noise_beside`]).
+    noise: Option<Noise>,
+}
+
+/// The noise of measured samples, as seen beside their signal ([`noise_beside`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Noise {
+    /// The signal's power over the noise's in the samples, a ratio.
+    snr: f64,
+    /// The width the noise would fill at its level beside the signal, Hz: its power over
+    /// its density there.
+    width_hz: f64,
+}
+
+/// The noise in the samples whose `SIZE`-bin spectrum is `all` (dB, `bin_hz` a bin) and the
+/// signal's power over it: what the label takes the noise's share of the envelope's motion
+/// ([`rice_cv`]) and of the phase's ([`click_hz2`]) from. `band` is the measured band's
+/// bins, `all[first..]` with any mask applied, `run` its occupied run in it and `threshold`
+/// the level a bin is occupied from.
+/// - The noise bins are the band's bins outside the run and under the threshold: noise
+///   seen beside the signal. Their mean power stands for every bin of the band, the ones
+///   the signal covers too.
+/// - The bins outside the band (a channel filter's skirts and stopband) count as they
+///   are, as the samples hold them.
+/// - The signal is what the spectrum holds beyond that.
+///
+/// So a line or sideband standing clear of the run is not counted as noise, and a signal's
+/// tail under the threshold is: the noise is never understated by the signal's own
+/// spectrum. `None` when the band holds no noise bin (a signal filling it: its own
+/// spectrum is not a noise floor) or no signal is left.
+fn noise_beside(
+    all: &[f32],
+    first: usize,
+    band: &[f32],
+    run: (usize, usize),
+    threshold: f32,
+    bin_hz: f64,
+) -> Option<Noise> {
+    let power = |db: f32| 10f64.powf(f64::from(db) / 10.0);
+    let (sum, n) = band
+        .iter()
+        .enumerate()
+        .filter(|&(k, &db)| (k < run.0 || k > run.1) && db < threshold)
+        .fold((0.0f64, 0usize), |(s, n), (_, &db)| (s + power(db), n + 1));
+    if n == 0 {
+        return None;
+    }
+    let outside: f64 = all[..first]
+        .iter()
+        .chain(&all[first + band.len()..])
+        .map(|&db| power(db))
+        .sum();
+    let noise = sum / n as f64 * band.len() as f64 + outside;
+    let total: f64 = band.iter().map(|&db| power(db)).sum::<f64>() + outside;
+    (sum > 0.0 && total > noise).then(|| Noise {
+        snr: (total - noise) / noise,
+        width_hz: noise / (sum / n as f64) * bin_hz,
+    })
+}
+
+/// The complementary error function, to 1.5e-7 (Abramowitz and Stegun 7.1.26), for `x` of 0
+/// or more.
+fn erfc(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    poly * (-x * x).exp()
+}
+
+/// The mean square, Hz^2, that the noise's clicks alone put into a discriminator's audio
+/// from `FM_MIN_AUDIO_HZ` to `audio_max_hz`, for a carrier `snr` (a ratio) over flat noise
+/// `width_hz` wide (Rice's click model). Under about 10 dB the noise now and then carries
+/// the carrier's phasor round the origin: a step of a whole turn, an impulse of one cycle
+/// in the frequency. They come `r erfc(sqrt(snr))` times a second, `r = width / sqrt(12)`
+/// the band's radius of gyration, so they lay a flat `2 r erfc(sqrt(snr))` Hz^2 per Hz under
+/// the audio, which the envelope's motion does not share. Counting every click, it is an
+/// upper bound: [`held_steps`] takes out the ones through a deep fade.
+fn click_hz2(snr: f64, width_hz: f64, audio_max_hz: f64) -> f64 {
+    let rate = width_hz / 12f64.sqrt() * erfc(snr.max(0.0).sqrt());
+    2.0 * rate * (audio_max_hz - FM_MIN_AUDIO_HZ).max(0.0)
+}
+
+/// The envelope CV of a steady carrier in complex Gaussian noise `snr` (a power ratio)
+/// under it: the Rice distribution's. With `K = snr`, the envelope's mean square is
+/// `N (1 + K)` and its mean `sqrt(pi N / 4) L(K)`, where
+/// `L(K) = exp(-K/2) ((1 + K) I0(K/2) + K I1(K/2))`, so
+/// `cv^2 = 4 (1 + K) / (pi L(K)^2) - 1`: 0.523 for noise alone (Rayleigh), 0.36 at 6 dB,
+/// `1 / sqrt(2 K)` when the carrier is strong.
+fn rice_cv(snr: f64) -> f64 {
+    let k = snr.max(0.0);
+    if k > 40.0 {
+        return (1.0 / (2.0 * k)).sqrt();
+    }
+    // I0 and I1 at x = K/2 by their power series, which converge for every x.
+    let q = k * k / 16.0;
+    let (mut i0, mut i1, mut term) = (1.0f64, 1.0f64, 1.0f64);
+    for j in 1..200 {
+        term *= q / (j * j) as f64;
+        i0 += term;
+        i1 += term / (j + 1) as f64;
+        if term < 1e-17 * i0 {
+            break;
+        }
+    }
+    let i1 = i1 * k / 4.0;
+    let l = (-k / 2.0).exp() * ((1.0 + k) * i0 + k * i1);
+    (4.0 * (1.0 + k) / (std::f64::consts::PI * l * l) - 1.0)
+        .max(0.0)
+        .sqrt()
+}
+
+/// The envelope CV `cv` of samples with the share a steady carrier's noise at `snr` gives it
+/// taken out, in quadrature ([`rice_cv`]): how far the envelope moves beyond what the noise
+/// in the samples explains. `cv` itself without an `snr`.
+fn cv_over_noise(cv: f32, snr: Option<f64>) -> f32 {
+    let noise = snr.map_or(0.0, rice_cv);
+    (f64::from(cv).powi(2) - noise * noise).max(0.0).sqrt() as f32
 }
 
 /// On-off keying's chip rate from its run lengths ([`ook_unit_rate`]) of the occupied
@@ -724,10 +863,18 @@ fn tone_pair(
 /// measured over (the on-time as received when the window is gated, else the whole
 /// window; [`measure_band_masked`]), so the label and the record describe the same
 /// samples. The view's samples ("the samples" below) give every spectrum, carrier line,
-/// discriminator audio and envelope level, and their envelope CV ("the CV") is the one
-/// CV the rules and the evidence read. A key-up, a key-down or a drop-out is gated to the
-/// carrier where it is up, so the key edge is never read as an envelope level. Rules,
-/// first match wins:
+/// discriminator audio and envelope level. A key-up, a key-down or a drop-out is gated to
+/// the carrier where it is up, so the key edge is never read as an envelope level.
+///
+/// "The CV" the rules read is the samples' envelope CV with the noise's share taken out
+/// ([`cv_over_noise`]): the measurement finds the signal's power over the noise's in the
+/// samples ([`noise_beside`]), a steady carrier in that noise has a known envelope CV
+/// ([`rice_cv`]: 0.36 at 6 dB, 0.18 at 12), and what the envelope moves beyond it, in
+/// quadrature, is the signal's own. So a weak FM over or bare carrier has a constant
+/// envelope, as a strong one has, and weak AM still moves it. With no noise seen beside
+/// the signal (its occupied run fills the band) the CV is the samples' as it is.
+///
+/// Rules, first match wins:
 ///
 /// 1. `"noise"` (0.5) when `snr_db < 6`.
 /// 2. `"ook"` (0.6) when the record's symbol rate is on-off keying's chip from its run
@@ -739,6 +886,11 @@ fn tone_pair(
 ///    exactly two dominant peaks inside its occupied band 500–3000 Hz apart and within
 ///    6 dB of each other, or, for a constant envelope (the CV below 0.2) with a keying
 ///    line, when the samples' discriminator audio does (AFSK on FM).
+///
+/// A signal weaker than the noise in its samples has the noise's envelope
+/// (`ENVELOPE_MIN_SNR`): rules 4 and 7 to 10 do not read it, and what rules 5 and 6 leave is
+/// `"unknown"`.
+///
 /// 4. `"ook"` (0.6) when the CV is at least 0.25, the record has a symbol rate and no
 ///    PSK order, and inside the samples the envelope sits at two levels, the lower one
 ///    off ([`order::two_levels`]): over the view's runs when gated, else over the
@@ -765,22 +917,46 @@ fn tone_pair(
 ///    dial frequency [`ssb_dial_hz`] gives.
 /// 9. `"am"` (0.6) for low-index AM: the same centre line, a CV of at least 0.1 and an
 ///    envelope CV of at least 0.1 within half the occupied band (so wideband noise on a
-///    bare carrier does not pass), and the discriminator audio's RMS deviation below the
-///    envelope's motion measured alike, both in Hz ([`motion_hz`]), so the envelope moves
-///    more than the phase whatever the rate.
+///    bare carrier does not pass), and the envelope's motion at least `MOTION_MARGIN`
+///    (1.25) times the discriminator audio's RMS deviation measured alike, both in Hz
+///    ([`motion_hz`]), so the envelope moves more than the phase whatever the rate.
 /// 10. `"fm"` (0.6) when the CV is below 0.2, the band is at most 25 kHz and the
-///     discriminator audio, drift taken out, deviates by more than 40 Hz RMS beyond the
-///     envelope's motion in the same band ([`Motion::over_hz`]: noise moves
-///     both alike, AM only the envelope); `"carrier"` (0.7) under the same gate when it
-///     does not: a keyed carrier with no modulation where it is up, or one that drifts,
-///     reads `carrier`, its keying in `duty`, `bursts` and `burst_ms`.
+///     discriminator audio of the occupied band, drift taken out, deviates beyond the
+///     envelope's motion in the same band ([`Motion::over_hz`]: noise moves both alike,
+///     AM only the envelope) by more than a floor: 40 Hz RMS, raised in quadrature by
+///     `CLICK_MARGIN` times what the noise's clicks could leave there ([`click_hz2`]:
+///     nothing from about 10 dB up). `"carrier"` (0.7) under the same gate when it does
+///     not: a keyed carrier with no modulation where it is up, or one that drifts, reads
+///     `carrier`, its keying in `duty`, `bursts` and `burst_ms`; so does an over too weak
+///     for its deviation to stand clear of the clicks.
 /// 11. Otherwise `"unknown"` (0.5).
 ///
-/// The evidence quotes the CV once and how much was read: `over <on> s of <window> s`.
+/// What that decides on generators (`fixtures::weak_cases`, 2 s, three noise seeds): FM
+/// speech reads `fm` or `fsk`, and a bare carrier `carrier`, from 3 dB over the noise
+/// inside a 12.5 or 25 kHz channel, whole or keyed; under 3 dB they read `carrier` or
+/// `unknown` (speech still `fm` in a channel twice as wide as it needs, whose noise beside
+/// it the phase is not read from). AM reads `am` from 6 dB (a tone at index 0.2 or 0.5,
+/// speech at 0.9), at index 0.5 from 3 dB.
+///
+/// The evidence quotes the samples' envelope CV once, what of it is beyond the noise's at
+/// the SNR found, and how much was read: `over <on> s of <window> s`.
 /// This builds the view [`measure`] takes of the whole block `iq`; `classify` labels
 /// with the view its own measurement took ([`measure_selection`]).
 pub fn layer1_label(f: &FeatureRecord, iq: &[Complex<f32>], rate_hz: u64) -> Label {
-    layer1_label_of(f, &gated_view(iq, rate_hz, rate_hz), iq.len(), rate_hz)
+    let mut v = gated_view(iq, rate_hz, rate_hz);
+    if !iq.is_empty() && rate_hz > 0 {
+        // The occupied band as `measure` finds it over the whole block.
+        let db = spectrum(&v.on);
+        let floor = percentile(&db, FLOOR_PERCENTILE);
+        let bin_hz = rate_hz as f64 / SIZE as f64;
+        let gap = (GAP_HZ / bin_hz).floor() as usize;
+        let (lo, hi) = occupied(&db, argmax(&db), floor + OCCUPIED_DB, gap);
+        v.band = Some(OccupiedBand {
+            offset_hz: ((lo + hi) as f64 / 2.0 - (SIZE / 2) as f64) * bin_hz,
+            noise: noise_beside(&db, 0, &db, (lo, hi), floor + OCCUPIED_DB, bin_hz),
+        });
+    }
+    layer1_label_of(f, &v, iq.len(), rate_hz)
 }
 
 /// [`layer1_label`] of `f` read from `v`, the view of a window of `window` samples that
@@ -803,10 +979,18 @@ fn layer1_label_of(f: &FeatureRecord, v: &View, window: usize, rate_hz: u64) -> 
         name: name.into(),
         confidence,
         evidence: format!(
-            "{reason}; snr_db {:.1} dB, bandwidth_hz {} Hz, symbol_rate_baud {baud}, duty {duty}, cv {:.3} (envelope std/mean) over {:.2} s of {:.2} s",
+            "{reason}; snr_db {:.1} dB, bandwidth_hz {} Hz, symbol_rate_baud {baud}, duty {duty}, cv {:.3} (envelope std/mean{}) over {:.2} s of {:.2} s",
             f.snr_db,
             f.bandwidth_hz.0,
             v.cv,
+            match v.band.and_then(|b| b.noise) {
+                Some(Noise { snr, .. }) => format!(
+                    ", {:.3} beyond the noise's at {:.1} dB",
+                    cv_over_noise(v.cv, Some(snr)),
+                    10.0 * snr.log10()
+                ),
+                None => String::new(),
+            },
             secs(v.received.len()),
             secs(window)
         ),
@@ -828,7 +1012,45 @@ fn audio_rms_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64, joins: &[u
     steps_rms_hz(discriminator(iq), &held, rate_hz, bandwidth_hz)
 }
 
+/// [`motion_hz`] reads the phase and the envelope of the occupied band's samples: of a band
+/// this many times the occupied width about its centre. The channel's noise beside the
+/// signal is then not in the phase it reads: under about 10 dB of it a discriminator's
+/// output is the noise's (its clicks, each a whole turn, put a flat floor under the audio
+/// that the envelope does not share), and a bare carrier 3 dB over the noise of a 25 kHz
+/// channel read 73 Hz over the envelope. A band twice the occupied one keeps the sidebands
+/// under the occupied threshold either side.
+const MOTION_BAND: f64 = 2.0;
+/// The steps within this many periods of [`MOTION_BAND`]'s width of a cut in the samples
+/// (the window's ends, a join of two runs) count as no motion: the band's edge rings there.
+const MOTION_RING: f64 = 4.0;
+
+/// The rules that read the envelope (4 and 7 to 10) need the signal at least this many
+/// times the noise in its samples, in power. As the signal sinks under the noise the
+/// envelope's CV goes to the noise's 0.523 whatever the signal is, and what it holds beyond
+/// the noise's share shrinks by about `snr / (1 + snr)` in variance: at 0 dB half is left,
+/// and under it "no more than the noise explains" says nothing about the signal.
+const ENVELOPE_MIN_SNR: f64 = 1.0;
+/// Rule 9 takes the envelope to move more than the phase only when it moves at least this
+/// many times as far, in Hz. Noise alone moves both alike, and the ratio of the two as
+/// measured spreads by `1 / sqrt(2 W T)` of itself over a band `W` and a time `T`: 4 % over
+/// the 1 kHz and 0.3 s of a narrow, short read, so 1.25 is six of those spreads. On
+/// generators 3 to 12 dB over the noise of a 12.5 or 25 kHz channel
+/// (`fixtures::weak_cases`), the envelope's motion over the phase's:
+/// - AM of a tone at index 0.2: 1.37 to 4.5; at 0.5 and 3 dB: 1.85 to 3.0;
+/// - AM of speech at 0.9: 1.41 to 3.65, but 1.0 to 1.07 at 3 dB in 12.5 kHz, where it is
+///   not told from a carrier;
+/// - a bare carrier: 0.76 to 1.02 (the phase a little ahead); FM speech: 0.24 to 0.42.
+const MOTION_MARGIN: f64 = 1.25;
+/// Rule 10's deviation floor rises by this many times the mean square the noise's clicks
+/// could leave over the envelope ([`click_hz2`]): deviation counts when it is at least
+/// twice that, in Hz. On generators (`fixtures::weak_cases`), FM speech at 2.5 kHz
+/// deviation in a 12.5 kHz channel: at 12 dB the floor is the 40 Hz and the speech reads
+/// 600 to 640 Hz over the envelope; at 0 dB the floor is 600 to 650 Hz and the speech
+/// reads 500, so it is not `fm`. A bare carrier reads 0 to 2 Hz at every level.
+const CLICK_MARGIN: f64 = 4.0;
+
 /// How much the phase and the envelope of the samples move, both in Hz ([`motion_hz`]).
+#[derive(Clone, Copy)]
 struct Motion {
     /// [`audio_rms_hz`]: the discriminator audio's RMS deviation, Hz.
     phase_hz: f64,
@@ -851,8 +1073,36 @@ impl Motion {
 /// detrended and band-limited alike. Additive noise on a carrier moves its log envelope
 /// and its phase alike, AM moves only the envelope and FM only the phase. Both are in
 /// Hz, so comparing them does not depend on the rate.
-fn motion_hz(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64, joins: &[usize]) -> Motion {
-    let held = held_steps(iq, joins);
+///
+/// With `offset_hz`, the occupied band's centre from the stream's, both are read from the
+/// samples band-passed to `MOTION_BAND` times `bandwidth_hz` about it (when that is
+/// narrower than the stream), and the steps the band's edge rings in count as none
+/// (`MOTION_RING`).
+fn motion_hz(
+    iq: &[Complex<f32>],
+    rate_hz: u64,
+    bandwidth_hz: u64,
+    joins: &[usize],
+    offset_hz: Option<f64>,
+) -> Motion {
+    // The pre-detection band: the occupied band and half as much again either side.
+    let width = MOTION_BAND * bandwidth_hz as f64;
+    let narrowed = offset_hz
+        .filter(|_| width < rate_hz as f64)
+        .map(|off| bandpass(iq, rate_hz, off, width));
+    let mut held = held_steps(narrowed.as_deref().unwrap_or(iq), joins);
+    if let Some(x) = &narrowed {
+        // The band's edge rings for a few of its periods about every cut in the samples:
+        // the window's ends (the transform is circular) and each join.
+        let ring = (MOTION_RING * rate_hz as f64 / width).ceil() as usize;
+        let n = held.len();
+        for &j in [0, x.len()].iter().chain(joins) {
+            for h in &mut held[j.saturating_sub(ring).min(n)..(j + ring).min(n)] {
+                *h = true;
+            }
+        }
+    }
+    let iq = narrowed.as_deref().unwrap_or(iq);
     let phase_hz = steps_rms_hz(discriminator(iq), &held, rate_hz, bandwidth_hz);
     let log_env: Vec<f32> = iq
         .windows(2)
@@ -1075,7 +1325,10 @@ fn carry_extras(f: &mut FeatureRecord, note: &RateNote, label: &Label, v: &View,
 /// as received and its CV); `runs` when `f`'s symbol rate is on-off keying's chip from
 /// its run lengths ([`RateLine::Runs`]) by `f`'s line.
 fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f32, String) {
-    let (iq, cv) = (&v.received[..], v.cv);
+    let iq = &v.received[..];
+    // The CV the rules read: the envelope's motion beyond the noise's share of it.
+    let noise = v.band.and_then(|b| b.noise);
+    let cv = cv_over_noise(v.cv, noise.map(|n| n.snr));
     let joins = view_joins(v);
     let runs = f.symbol_rate_line == Some(RateLine::Runs);
     if f.snr_db < NOISE_SNR_DB || iq.is_empty() || rate_hz == 0 {
@@ -1120,6 +1373,8 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
             }
         }
     }
+    // Under the noise in its samples a signal has the noise's envelope.
+    let faint = noise.is_some_and(|n| n.snr < ENVELOPE_MIN_SNR);
     // Two levels inside the samples: a gated view's runs are its samples, and its CV
     // theirs; a whole window's are its burst runs.
     let keyed_runs = || {
@@ -1130,7 +1385,12 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
         let on: Vec<Complex<f32>> = runs.iter().flat_map(|r| r.iter()).copied().collect();
         envelope_cv(&on) >= AM_MIN_CV && two_levels(&runs)
     };
-    if cv >= AM_MIN_CV && f.order.is_none() && f.symbol_rate_baud.is_some() && keyed_runs() {
+    if !faint
+        && cv >= AM_MIN_CV
+        && f.order.is_none()
+        && f.symbol_rate_baud.is_some()
+        && keyed_runs()
+    {
         return (
             "ook",
             0.6,
@@ -1164,6 +1424,14 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
             format!("a line at {m}\u{d7} the centre in x^{m}, none in x"),
         );
     }
+    if faint {
+        return (
+            "unknown",
+            0.5,
+            "no layer-1 rule matched: weaker than the noise in its samples, whose envelope it has"
+                .into(),
+        );
+    }
     if cv >= AM_MIN_CV {
         let carrier_db = centre_line_db(&db, bin_hz);
         if carrier_db >= OCCUPIED_DB {
@@ -1185,12 +1453,18 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
             );
         }
     }
+    // The phase's motion against the envelope's, once for rules 9 and 10.
+    let mut motion = None;
+    let mut motion = || {
+        *motion
+            .get_or_insert_with(|| motion_hz(iq, rate_hz, bw, &joins, v.band.map(|b| b.offset_hz)))
+    };
     if cv >= AM_LOW_MIN_CV {
         let carrier_db = centre_line_db(&db, bin_hz);
         if carrier_db >= OCCUPIED_DB {
-            let m = motion_hz(iq, rate_hz, bw, &joins);
+            let m = motion();
             let band_cv = envelope_band_cv(iq, rate_hz, bw);
-            if m.phase_hz < m.envelope_hz && band_cv >= AM_LOW_MIN_CV {
+            if MOTION_MARGIN * m.phase_hz < m.envelope_hz && band_cv >= AM_LOW_MIN_CV {
                 return (
                     "am",
                     0.6,
@@ -1203,14 +1477,26 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
         }
     }
     if cv < FM_MAX_CV && f.bandwidth_hz.0 <= FM_MAX_BW_HZ {
-        let m = motion_hz(iq, rate_hz, f.bandwidth_hz.0, &joins);
+        let m = motion();
         let (dev, over) = (m.phase_hz, m.over_hz());
-        if over < FM_MIN_DEV_HZ {
+        // What the noise's clicks alone would put over the envelope, in the band the
+        // phase was read in.
+        let clicks = noise.map_or(0.0, |n| {
+            let width = (MOTION_BAND * bw as f64).min(n.width_hz);
+            click_hz2(n.snr * n.width_hz / width, width, bw as f64 / 2.0)
+        });
+        let floor = (FM_MIN_DEV_HZ.powi(2) + CLICK_MARGIN * clicks).sqrt();
+        if over < floor {
+            let weak = if clicks > 0.5 {
+                format!(", under the {floor:.0} Hz this noise's clicks leave it to show")
+            } else {
+                String::new()
+            };
             return (
                 "carrier",
                 0.7,
                 format!(
-                    "constant envelope, narrow band, no discriminator audio (rms deviation {dev:.0} Hz, {over:.0} Hz over the envelope's)"
+                    "constant envelope, narrow band, no discriminator audio (rms deviation {dev:.0} Hz, {over:.0} Hz over the envelope's{weak})"
                 ),
             );
         }
@@ -2844,5 +3130,180 @@ mod tests {
             eprintln!("{what}: {fit:?}");
             assert!(ook_veto(&fit, &v, RATE, band), "{what}: {fit:?}");
         }
+    }
+    /// The Rice envelope's CV: Rayleigh's `sqrt(4 / pi - 1)` with no carrier, falling to
+    /// `1 / sqrt(2 snr)` under a strong one, and between them a value checked against a
+    /// carrier in generated noise.
+    #[test]
+    fn rice_cv_is_the_envelope_cv_of_a_carrier_in_noise() {
+        let rayleigh = (4.0 / std::f64::consts::PI - 1.0).sqrt();
+        assert!((rice_cv(0.0) - rayleigh).abs() < 1e-9, "{}", rice_cv(0.0));
+        for k in [30.0f64, 39.9, 40.1, 100.0, 1_000.0] {
+            let asymptote = (1.0 / (2.0 * k)).sqrt();
+            let got = rice_cv(k);
+            assert!((got / asymptote - 1.0).abs() < 0.02, "snr {k}: {got}");
+        }
+        for snr_db in [0.0f32, 3.0, 6.0, 9.0, 12.0, 20.0] {
+            let mut iq = vec![Complex::new(1.0f32, 0.0); 400_000];
+            awgn(&mut iq, snr_db, 5);
+            let (measured, model) = (
+                f64::from(envelope_cv(&iq)),
+                rice_cv(10f64.powf(f64::from(snr_db) / 10.0)),
+            );
+            eprintln!("{snr_db} dB: measured {measured:.4}, rice {model:.4}");
+            assert!((measured - model).abs() < 0.005, "{snr_db} dB");
+            // What is left beyond the noise's share is nothing.
+            let left = cv_over_noise(measured as f32, Some(10f64.powf(f64::from(snr_db) / 10.0)));
+            assert!(left < 0.08, "{snr_db} dB: {left}");
+        }
+        // Without an SNR the CV is as it is.
+        assert_eq!(cv_over_noise(0.3, None), 0.3);
+    }
+
+    #[test]
+    fn erfc_matches_known_values() {
+        for (x, want) in [
+            (0.0, 1.0),
+            (0.5, 0.479_500_1),
+            (1.0, 0.157_299_2),
+            (2.0, 0.004_677_73),
+        ] {
+            assert!((erfc(x) - want).abs() < 2e-7, "erfc({x}) = {}", erfc(x));
+        }
+    }
+
+    /// Rice's click rate: a 12.5 kHz band's radius of gyration is 3.6 kHz, so at 6 dB the
+    /// noise clicks 17 times a second and at 12 dB once in two hours.
+    #[test]
+    fn clicks_fall_away_above_the_fm_threshold() {
+        let per_hz =
+            |snr_db: f64| click_hz2(10f64.powf(snr_db / 10.0), 12_500.0, 1_050.0) / 2_000.0;
+        assert!((per_hz(6.0) - 17.2).abs() < 0.5, "{}", per_hz(6.0));
+        assert!(per_hz(12.0) < 1.0 / 7_000.0, "{}", per_hz(12.0));
+        assert!(per_hz(3.0) > 100.0, "{}", per_hz(3.0));
+        // No audio band, no clicks counted.
+        assert_eq!(click_hz2(1.0, 12_500.0, 40.0), 0.0);
+    }
+
+    /// The noise is read beside the signal: a carrier in white noise through a channel
+    /// reads its SNR within 1 dB from 0 to 20 dB, whole or channelised; a signal filling its
+    /// band shows no noise, so nothing is taken from its CV.
+    #[test]
+    fn noise_beside_reads_the_snr_of_the_measured_samples() {
+        for snr_db in [0.0f32, 3.0, 6.0, 12.0, 20.0] {
+            let mut iq = vec![Complex::new(1.0f32, 0.0); 96_000];
+            awgn(&mut iq, snr_db, 9);
+            let (_, _, v) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
+            let got = 10.0 * v.band.unwrap().noise.unwrap().snr.log10();
+            eprintln!("whole {snr_db} dB: {got:.2} dB");
+            assert!((got - f64::from(snr_db)).abs() < 1.0, "{snr_db} dB: {got}");
+            // In a 12.5 kHz channel the noise is 5.8 dB less.
+            let (chan, rate) = extract_offset(&iq, RATE, 0, 12_500, RATE).unwrap();
+            let (_, _, v) = measure_band_noted(&chan, rate, CENTER, 12_500, None);
+            let noise = v.band.unwrap().noise.unwrap();
+            let got = 10.0 * noise.snr.log10();
+            eprintln!(
+                "channel {snr_db} dB: {got:.2} dB, noise {:.0} Hz wide",
+                noise.width_hz
+            );
+            assert!(
+                (got - f64::from(snr_db) - 5.84).abs() < 1.0,
+                "{snr_db} dB: {got}"
+            );
+            assert!(
+                (11_000.0..15_000.0).contains(&noise.width_hz),
+                "{}",
+                noise.width_hz
+            );
+        }
+        // Tones every 400 Hz across the 3 kHz band they are read through, 40 dB over the
+        // noise: the occupied run is the band, the bins between its tones are not noise
+        // beside it, and its CV is left as it is.
+        let mut comb: Vec<Complex<f32>> = (0..96_000)
+            .map(|i| {
+                (-3..=3)
+                    .map(|k| {
+                        let turns = f64::from(k) * 400.0 * i as f64 / RATE as f64;
+                        let (sn, cs) = (2.0 * std::f64::consts::PI * turns.fract()).sin_cos();
+                        Complex::new(cs as f32, sn as f32) * (1.0 + 0.1 * k as f32)
+                    })
+                    .sum()
+            })
+            .collect();
+        awgn(&mut comb, 40.0, 3);
+        let (chan, rate) = extract_offset(&comb, RATE, 0, 3_000, RATE).unwrap();
+        let (f, _, v) = measure_band_noted(&chan, rate, CENTER, 3_000, None);
+        let noise = v.band.unwrap().noise;
+        eprintln!("comb: {f:?}, cv {:.3}, {noise:?}", v.cv);
+        assert!(v.cv > 0.4, "{}", v.cv);
+        assert!(
+            cv_over_noise(v.cv, noise.map(|n| n.snr)) > v.cv - 0.005,
+            "{noise:?}"
+        );
+    }
+
+    /// The slow gate: a carrier 3 dB over a 12.5 kHz channel's noise, up for 60 % of the
+    /// window, is found to within 10 ms an edge where single chunks give a duty of 0.2;
+    /// noise alone, a steady weak carrier and a train of 30 ms frames 9 ms apart are left
+    /// as the fast gate has them.
+    #[test]
+    fn the_slow_gate_finds_a_weak_keyed_carrier_and_leaves_a_frame_train() {
+        use super::burst::level_runs;
+        use crate::fixtures::{KeyedOver, keyed_over};
+        let weak = |on: (f64, f64), snr_db: f32, seed: u64| {
+            let iq = keyed_over(&KeyedOver {
+                rate_hz: RATE as u32,
+                seconds: 2.0,
+                deviation_hz: 2_500.0,
+                audio: 0.0,
+                on,
+                // 3 dB in 12.5 kHz is 2.8 dB under the noise of the whole rate.
+                snr_db: snr_db - 5.84,
+                seed,
+            });
+            extract_offset(&iq, RATE, 0, 12_500, RATE).unwrap().0
+        };
+        for seed in [1, 2, 3] {
+            let iq = weak((0.4, 1.0), 3.0, seed);
+            let fast = burst_runs(&iq, RATE);
+            let slow = level_runs(&iq, RATE, &fast).expect("two levels");
+            eprintln!(
+                "seed {seed}: fast duty {:.2}, slow {:?}",
+                fast.duty, slow.runs
+            );
+            assert!(fast.duty < 0.4, "{}", fast.duty);
+            assert_eq!(slow.runs.len(), 1, "{slow:?}");
+            let (start, end) = slow.runs[0];
+            assert!(start.abs_diff(38_400) <= 480 && end == iq.len(), "{slow:?}");
+            let v = gated_view(&iq, RATE, 12_500);
+            assert!(
+                v.gated && (v.bursts.duty - 0.6).abs() < 0.01,
+                "{:?}",
+                v.bursts
+            );
+            // One level: nothing to split.
+            let steady = weak((0.0, 1.0), 3.0, seed);
+            assert_eq!(level_runs(&steady, RATE, &burst_runs(&steady, RATE)), None);
+            let noise = weak((0.0, 0.0), 3.0, seed);
+            assert_eq!(level_runs(&noise, RATE, &burst_runs(&noise, RATE)), None);
+        }
+        // 30 ms frames of a carrier 9 ms apart, 6 dB over the noise: the average joins
+        // them, the chunks between them are at the off level, and the runs do not stand.
+        let mut train = vec![Complex::new(0.0f32, 0.0); 96_000];
+        awgn(&mut train, 0.0, 4);
+        let frame = (RATE as usize * 39) / 1_000;
+        for (i, s) in train.iter_mut().enumerate().skip(4_800).take(86_400) {
+            if (i - 4_800) % frame < RATE as usize * 30 / 1_000 {
+                *s += Complex::new(2.0, 0.0);
+            }
+        }
+        let (train, _) = extract_offset(&train, RATE, 0, 12_500, RATE).unwrap();
+        let fast = burst_runs(&train, RATE);
+        eprintln!(
+            "train: fast duty {:.2}, {} runs",
+            fast.duty,
+            fast.runs.len()
+        );
+        assert_eq!(level_runs(&train, RATE, &fast), None);
     }
 }

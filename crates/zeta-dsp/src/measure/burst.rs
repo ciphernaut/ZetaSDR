@@ -43,6 +43,19 @@ const BURST_MIN_SINGLE_MS: f32 = 3.0;
 /// `FLOOR_PERCENTILE`th-percentile bin of its spectrum, as a per-sample power), so two
 /// clicks over a continuous signal, whose off chunks are the signal, never gate it.
 pub(crate) const BURST_OFF_NEAR_FLOOR_DB: f64 = 6.0;
+/// The slow gate ([`level_runs`]) compares the mean power over this many ms about each
+/// chunk. The mean of `n` independent noise samples spreads by `1 / sqrt(n)` of itself, and a
+/// band `B` wide holds `B` of them a second: at 10 ms a 12.5 kHz channel's noise level
+/// spreads by 9 %, and a carrier no stronger than that noise (twice the power while it is
+/// up, spreading by 16 % of the noise) stands about 4 of its own spreads over the split
+/// between the two levels.
+pub(super) const BURST_LEVEL_MS: usize = 10;
+/// The slow gate needs the on level at least this many times the off level in power: a
+/// carrier as strong as the noise in the stream. Under it the two levels may be one
+/// level's spread (the halves of noise spreading by 9 % lie 1.15 apart) or a modulated
+/// carrier's (AM at full index has at most 1.5 times its carrier's power), and the window
+/// is not split.
+pub(super) const BURST_LEVEL_RATIO: f64 = 2.0;
 /// FFT size of the cyclostationary line search: a line grows with the
 /// transform length and the noise continuum does not.
 const CYCLO_SIZE: usize = 4096;
@@ -136,6 +149,107 @@ pub fn burst_runs(iq: &[Complex<f32>], rate_hz: u64) -> Bursts {
     }
 }
 
+/// The on-runs of `iq` when its power sits at two levels too close for [`burst_runs`]'s
+/// `BURST_ON_DB` (a carrier only a few dB over the noise in the stream, keyed up, keyed
+/// down or cut by a drop-out): the chunk powers are averaged over `BURST_LEVEL_MS` about
+/// each chunk and split at the geometric mean of the two levels that split leaves (two
+/// means, iterated), wherever the levels lie. A chunk over the split is on; runs closer
+/// than `BURST_LEVEL_MS` are merged and shorter ones dropped, so an edge is found to about
+/// half of it.
+///
+/// The average hides an off part shorter than itself (the 9 ms between an OOK remote's
+/// frames, the off chips inside them), so the runs stand only when they hold none: what
+/// `fast` ([`burst_runs`] of the same window) leaves off inside them must be on-level
+/// chunks that fell short of its threshold (their mean power over the split), not gaps at
+/// the off level.
+///
+/// `None` when the levels are under `BURST_LEVEL_RATIO` apart (one level), the runs hold
+/// an off part, or the window is shorter than two averages.
+pub(super) fn level_runs(iq: &[Complex<f32>], rate_hz: u64, fast: &Bursts) -> Option<Bursts> {
+    let ms = |samples: usize| (samples as f64 * 1_000.0 / rate_hz.max(1) as f64) as f32;
+    let chunk = ((rate_hz * BURST_ENVELOPE_MS / 1_000) as usize).max(1);
+    let power: Vec<f64> = iq
+        .chunks(chunk)
+        .map(|c| c.iter().map(|s| s.norm_sqr() as f64).sum::<f64>() / c.len() as f64)
+        .collect();
+    let span = BURST_LEVEL_MS / BURST_ENVELOPE_MS as usize;
+    if power.len() < 2 * span {
+        return None;
+    }
+    // The mean over `span` chunks centred on each (fewer at the window's ends).
+    let mut acc = vec![0.0f64; power.len() + 1];
+    for (i, &p) in power.iter().enumerate() {
+        acc[i + 1] = acc[i] + p;
+    }
+    let level: Vec<f64> = (0..power.len())
+        .map(|i| {
+            let (a, b) = (
+                i.saturating_sub(span / 2),
+                (i + span - span / 2).min(power.len()),
+            );
+            (acc[b] - acc[a]) / (b - a) as f64
+        })
+        .collect();
+    let (min, max) = level
+        .iter()
+        .fold((f64::INFINITY, 0.0f64), |(a, b), &v| (a.min(v), b.max(v)));
+    if min <= 0.0 || !max.is_finite() {
+        return None;
+    }
+    let mut split = (min * max).sqrt();
+    let (mut off, mut on) = (min, max);
+    for _ in 0..32 {
+        let mean = |keep: &dyn Fn(f64) -> bool| {
+            let (s, n) = level
+                .iter()
+                .filter(|&&v| keep(v))
+                .fold((0.0, 0usize), |(s, n), &v| (s + v, n + 1));
+            (n > 0).then(|| s / n as f64)
+        };
+        (off, on) = (mean(&|v| v <= split)?, mean(&|v| v > split)?);
+        let next = (off * on).sqrt();
+        if (next - split).abs() <= 1e-6 * split {
+            break;
+        }
+        split = next;
+    }
+    if on < BURST_LEVEL_RATIO * off {
+        return None;
+    }
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (i, _) in level.iter().enumerate().filter(|&(_, &v)| v > split) {
+        let (start, end) = (i * chunk, ((i + 1) * chunk).min(iq.len()));
+        match runs.last_mut() {
+            Some(last) if start - last.1 < span * chunk => last.1 = end,
+            _ => runs.push((start, end)),
+        }
+    }
+    runs.retain(|&(s, e)| e - s >= span * chunk);
+    if runs.is_empty() {
+        return None;
+    }
+    // What the fast gate leaves off inside these runs: on-level chunks, or an off part?
+    let in_any = |runs: &[(usize, usize)], at: usize| runs.iter().any(|&(s, e)| s <= at && at < e);
+    let (left, n) = power
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| in_any(&runs, i * chunk) && !in_any(&fast.runs, i * chunk))
+        .fold((0.0, 0usize), |(s, n), (_, &p)| (s + p, n + 1));
+    if n > 0 && left / n as f64 <= split {
+        return None;
+    }
+    let on_samples: usize = runs.iter().map(|&(s, e)| e - s).sum();
+    let lengths: Vec<f32> = runs.iter().map(|&(s, e)| ms(e - s)).collect();
+    let periods: Vec<f32> = runs.windows(2).map(|w| ms(w[1].0 - w[0].0)).collect();
+    Some(Bursts {
+        duty: on_samples as f32 / iq.len() as f32,
+        burst_ms: Some(median(&lengths)),
+        period_ms: (!periods.is_empty()).then(|| median(&periods)),
+        off_power: off,
+        runs,
+    })
+}
+
 /// The noise floor of `iq` as a per-sample power, from the band `bandwidth_hz` wide about
 /// the stream's centre (offset 0: a channelised stream, as `measure_band` reads it): the
 /// `FLOOR_PERCENTILE`th-percentile in-band bin of a `SIZE`-point spectrum stands for every
@@ -221,6 +335,9 @@ pub(super) struct View<'a> {
     /// The samples the symbol-rate searches run over: each run as received
     /// when gated, else the whole window.
     pub runs: Vec<&'a [Complex<f32>]>,
+    /// What the measurement found of the occupied band in these samples, which the label
+    /// reads; `None` until they are measured.
+    pub band: Option<super::OccupiedBand>,
 }
 
 /// What layer 1 measures of `iq`: its runs ([`burst_runs`]); the on-time
@@ -232,15 +349,32 @@ pub(super) struct View<'a> {
 /// (a lone shorter run is an outlier chunk), and the off chunks are noise
 /// (within `BURST_OFF_NEAR_FLOOR_DB` of the floor in the `bandwidth_hz` band
 /// about the centre, [`noise_floor_power`]: impulses over a continuous signal
-/// are not bursts); else the whole window.
+/// are not bursts); else the whole window. The window is also tried for two levels closer
+/// than `BURST_ON_DB` ([`level_runs`]: a carrier a few dB over the noise, where single
+/// chunks do not tell on from off): when it holds them in runs of at least
+/// `BURST_LONG_RUN_MS` with an off part of noise, and those are not the long runs the
+/// chunks already gave, they are the window's runs, its `duty` theirs, and the view its
+/// on-time over them.
 pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> View<'_> {
-    let bursts = burst_runs(iq, rate_hz);
+    let mut bursts = burst_runs(iq, rate_hz);
     let sparse = bursts.period_ms.is_none_or(|p| p >= BURST_MIN_PERIOD_MS);
     let enough = bursts.runs.len() >= BURST_MIN_BURSTS
         || (bursts.runs.len() == 1 && bursts.burst_ms.is_some_and(|ms| ms >= BURST_MIN_SINGLE_MS));
-    let bursty = bursts.duty < BURST_DUTY_MAX
-        || (bursts.duty < 1.0 && bursts.burst_ms.is_some_and(|ms| ms >= BURST_LONG_RUN_MS));
-    if bursty && sparse && enough && off_is_noise(iq, rate_hz, bandwidth_hz, &bursts) {
+    let long = |b: &Bursts| b.duty < 1.0 && b.burst_ms.is_some_and(|ms| ms >= BURST_LONG_RUN_MS);
+    let bursty = bursts.duty < BURST_DUTY_MAX || long(&bursts);
+    let mut gated = bursty && sparse && enough && off_is_noise(iq, rate_hz, bandwidth_hz, &bursts);
+    // The slow gate's runs, unless the fast gate's long runs already are those runs: the
+    // slow ones must leave out more than the half average either end of each could be.
+    let on = |b: &Bursts| b.runs.iter().map(|&(s, e)| e - s).sum::<usize>();
+    let slack = |b: &Bursts| b.runs.len() * (rate_hz as usize * BURST_LEVEL_MS / 1_000);
+    if let Some(slow) = level_runs(iq, rate_hz, &bursts).filter(|b| {
+        long(b)
+            && !(gated && long(&bursts) && on(b) + slack(b) >= on(&bursts))
+            && off_is_noise(iq, rate_hz, bandwidth_hz, b)
+    }) {
+        (bursts, gated) = (slow, true);
+    }
+    if gated {
         let runs: Vec<&[Complex<f32>]> = bursts.runs.iter().map(|&(s, e)| &iq[s..e]).collect();
         let raw: Vec<Complex<f32>> = runs.iter().flat_map(|r| r.iter()).copied().collect();
         View {
@@ -250,6 +384,7 @@ pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -
             gated: true,
             runs,
             bursts,
+            band: None,
         }
     } else {
         View {
@@ -259,6 +394,7 @@ pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -
             gated: false,
             runs: vec![iq],
             bursts,
+            band: None,
         }
     }
 }

@@ -401,7 +401,7 @@ fn production(iq: &[Complex<f32>], rate: u64) -> (zeta_core::classify::FeatureRe
 /// overrode every rule. A fit whose off runs are signal (PSK's envelope dips: 15-29 dB
 /// over the noise against a remote's 1-5), whose twice-wider band holds FSK tones
 /// (POCSAG: the other tone) or whose band carries a PSK order is vetoed, and the label and
-/// order are the base's again.
+/// order are the other rules'.
 #[test]
 fn a_vetoed_run_fit_leaves_psk_bursts_and_nbfm_pocsag_to_the_other_rules() {
     use zeta_core::classify::RateLine;
@@ -438,7 +438,9 @@ fn a_vetoed_run_fit_leaves_psk_bursts_and_nbfm_pocsag_to_the_other_rules() {
             "pocsag 2400 Bd over nbfm 8 dB",
             probe_signal(pocsag, Some(8.0), 0.0, 48_000),
             48_000,
-            "am",
+            // Constant-envelope FSK 7.5 dB over the noise in its samples: its envelope CV
+            // (0.26) is the noise's, which read `am` until the rules took that share out.
+            "fm",
             None,
         ),
     ] {
@@ -883,7 +885,7 @@ fn rule_9_weighs_the_phase_against_the_envelope_at_48_and_192_ks() {
             let (_, l) = keyed(&c);
             eprintln!("{}: {} ({})", c.name, l.name, l.evidence);
             let cvs = quoted_cvs(&l.evidence);
-            if !cvs.iter().all(|cv| (0.1..0.2).contains(cv)) {
+            if cvs.len() != 1 || !cvs.iter().all(|cv| (0.1..0.2).contains(cv)) {
                 failed.push(format!("{}: cv {cvs:?} outside rule 9's range", c.name));
             }
             if !matches!(l.name.as_str(), "fm" | "fsk") {
@@ -914,4 +916,174 @@ fn rule_9_weighs_the_phase_against_the_envelope_at_48_and_192_ks() {
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A weak case measured as `classify` reads a channel: `measure_selection` of its band
+/// about the window's centre.
+fn weak(c: &zeta_dsp::fixtures::WeakCase) -> (zeta_core::classify::FeatureRecord, Label) {
+    let iq = zeta_dsp::fixtures::weak_case_iq(c);
+    zeta_dsp::measure::measure_selection(
+        &iq,
+        u64::from(zeta_dsp::fixtures::KEYED_OVER_RATE_HZ),
+        CENTER,
+        zeta_core::classify::Band {
+            offset_hz: 0,
+            bandwidth_hz: zeta_core::types::Hz(c.band_hz),
+        },
+    )
+    .expect("a measurement")
+}
+
+/// Fails with every weak case of `cases` that broke `check`, one per line, after printing
+/// each case.
+fn every_weak_case(
+    cases: &[zeta_dsp::fixtures::WeakCase],
+    check: impl Fn(
+        &zeta_dsp::fixtures::WeakCase,
+        &zeta_core::classify::FeatureRecord,
+        &Label,
+    ) -> Option<String>,
+) {
+    let mut failed = Vec::new();
+    for c in cases {
+        let (f, l) = weak(c);
+        eprintln!("{}: {} duty {:?} ({})", c.name, l.name, f.duty, l.evidence);
+        if let Some(why) = check(c, &f, &l) {
+            failed.push(format!("{}: {why}", c.name));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} of {} cases:\n{}",
+        failed.len(),
+        cases.len(),
+        failed.join("\n")
+    );
+}
+
+/// The weak cases holding FM at this audio level (1.0 speech, 0.0 a bare carrier).
+fn weak_fm(audio: f32) -> Vec<zeta_dsp::fixtures::WeakCase> {
+    use zeta_dsp::fixtures::WeakSignal;
+    zeta_dsp::fixtures::weak_cases()
+        .into_iter()
+        .filter(|c| matches!(c.signal, WeakSignal::Fm { audio: a, .. } if a == audio))
+        .collect()
+}
+
+/// From this SNR inside the channel a weak FM over is told from AM and from a bare
+/// carrier, dB: at 3 dB the speech's deviation stands clear of what the noise's clicks
+/// leave in the discriminator's audio, and the signal is stronger than the noise its
+/// envelope is read through. At 0 dB neither holds.
+const WEAK_DECIDED_DB: f32 = 3.0;
+
+/// UAT 48.6 on a weak channel: an FM voice over only 3 to 12 dB over the noise inside its
+/// channel reads `fm` (or `fsk`; both choose `fm_demod`), whole, keyed up or keyed down,
+/// in 12.5 and in 25 kHz. At these levels the noise alone puts the envelope CV at 0.18 to
+/// 0.42, which read `am` (a carrier line and a CV of 0.25) or `unknown`. Weaker than that
+/// it is not decided, and the answer is `unknown` or `carrier`: never a wrong demodulator.
+#[test]
+fn a_weak_fm_over_reads_fm_and_is_never_am() {
+    every_weak_case(&weak_fm(1.0), |c, _, l| {
+        let fm = matches!(l.name.as_str(), "fm" | "fsk");
+        let ok = if c.snr_db >= WEAK_DECIDED_DB {
+            fm
+        } else {
+            fm || matches!(l.name.as_str(), "unknown" | "carrier")
+        };
+        (!ok).then(|| format!("{} ({})", l.name, l.evidence))
+    });
+}
+
+/// The other side: a bare carrier as weak reads `carrier`, not `fm` on the noise's phase
+/// (under about 10 dB a discriminator's output is the noise's clicks) and not `am` on the
+/// noise's envelope. Under 3 dB it may be `unknown`.
+#[test]
+fn a_weak_bare_carrier_reads_carrier() {
+    every_weak_case(&weak_fm(0.0), |c, _, l| {
+        let ok = l.name == "carrier" || (c.snr_db < WEAK_DECIDED_DB && l.name == "unknown");
+        (!ok).then(|| format!("{} ({})", l.name, l.evidence))
+    });
+}
+
+/// The slow gate: a carrier 3 dB or more over the channel's noise, keyed up or down, is
+/// gated to where it is up, and `duty` is that share within 0.05. Single 1 ms chunks do
+/// not tell the two levels apart there: the fast gate read a duty of 0.02 to 0.2, or 1.
+/// Levels between the cases' are read too: the fast gate's runs are ragged from 4 to 6 dB.
+#[test]
+fn a_weak_keyed_overs_duty_is_its_carrier_up_share() {
+    use zeta_dsp::fixtures::{WeakCase, WeakSignal};
+    let mut cases: Vec<WeakCase> = [weak_fm(1.0), weak_fm(0.0)]
+        .concat()
+        .into_iter()
+        .filter(|c| c.snr_db >= WEAK_DECIDED_DB)
+        .collect();
+    for snr_db in [3.0f32, 4.0, 5.0, 7.5, 10.0] {
+        for band_hz in [12_500u64, 25_000] {
+            // Keyed up, keyed down, up late, and a drop-out of a fifth of the window.
+            for (audio, on, share) in [
+                (1.0f32, (0.4, 1.0), 0.6),
+                (0.0, (0.0, 0.4), 0.4),
+                (1.0, (0.06, 1.0), 0.94),
+                (1.0, (0.6, 0.4), 0.8),
+            ] {
+                cases.push(WeakCase {
+                    name: format!("between a{audio} on {on:?} {snr_db} dB {band_hz} Hz"),
+                    signal: WeakSignal::Fm {
+                        deviation_hz: 2_500.0,
+                        audio,
+                        on,
+                    },
+                    band_hz,
+                    snr_db,
+                    share,
+                    seed: 5,
+                });
+            }
+        }
+    }
+    every_weak_case(&cases, |c, f, l| {
+        let duty = match f.duty {
+            Some(d) if (f64::from(d) - c.share).abs() <= 0.05 + 1e-6 => None,
+            d => Some(format!("duty {d:?}, the carrier up {:.2}", c.share)),
+        };
+        // The cases between the list's levels hold their labels too.
+        let audio = matches!(c.signal, WeakSignal::Fm { audio, .. } if audio > 0.0);
+        let label = match (audio, l.name.as_str()) {
+            (true, "fm" | "fsk") | (false, "carrier") => None,
+            _ => Some(format!("{} ({})", l.name, l.evidence)),
+        };
+        duty.or(label)
+    });
+}
+
+/// Real AM is still `am` when it is weak: its envelope moves more than the noise explains
+/// (rule 7) or more than its phase does (rule 9).
+/// - A tone at index 0.5 and at 0.2, and speech at 0.9, read `am` from 6 dB in the channel,
+///   and the tone at 0.5 from 3 dB.
+/// - At 3 dB the index-0.2 tone and the speech (an envelope CV of 0.14 to 0.2 under a
+///   noise share of 0.4) may read `carrier`: the envelope's motion is within the margin of
+///   the phase's.
+/// - A tone at index 0.9 reads `am` or, as it did before, `ook` (its envelope's troughs a
+///   tenth of its crests, every millisecond, fit a chip).
+/// - None reads `fm`.
+#[test]
+fn weak_am_reads_am() {
+    use zeta_dsp::fixtures::{WeakCase, WeakSignal};
+    let am: Vec<WeakCase> = zeta_dsp::fixtures::weak_cases()
+        .into_iter()
+        .filter(|c| matches!(c.signal, WeakSignal::Am { .. }))
+        .collect();
+    every_weak_case(&am, |c, _, l| {
+        let WeakSignal::Am { index, speech } = c.signal else {
+            return None;
+        };
+        let ok = if index == 0.9 && !speech {
+            matches!(l.name.as_str(), "am" | "ook")
+        } else if c.snr_db >= 6.0 || index == 0.5 {
+            l.name == "am"
+        } else {
+            matches!(l.name.as_str(), "am" | "carrier")
+        };
+        (!ok).then(|| format!("{} ({})", l.name, l.evidence))
+    });
 }

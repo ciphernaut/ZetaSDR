@@ -1127,6 +1127,14 @@ async fn classify_on_a_keyed_over_chooses_fm_demod() {
         let a = classify(&node, OVER_HZ, 12_500).await;
         let c = &a.choice;
         assert_eq!(job(c).kind, "fm_demod", "share {share}: {c:?}");
+        // Chosen on layer 1's own FM label, not on a register or plan line.
+        assert!(
+            c.evidence
+                .iter()
+                .any(|e| e.starts_with("layer 1: fm ") || e.starts_with("layer 1: fsk ")),
+            "share {share}: {:?}",
+            c.evidence
+        );
         let duty = a.features.and_then(|f| f.duty).expect("a duty");
         assert!(
             (f64::from(duty) - share).abs() <= 0.05,
