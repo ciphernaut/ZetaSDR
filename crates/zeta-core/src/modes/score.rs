@@ -130,8 +130,9 @@ impl Expected {
 /// rows left out) with a decoded designator whose band holds the centre (its designator's
 /// width about its centre, each designator once), then a channel of an FM plan of
 /// `region` at the centre ([`crate::plans::plan_channel_at`]; a plan with a
-/// `deviation_hz`), compatible as an `F` designator is. A designator whose letter no
-/// label fits is left out: it says nothing either way.
+/// `deviation_hz`, and not one of its `no_voice` data channels), compatible as an `F`
+/// designator is. A designator whose letter no label fits is left out: it says nothing
+/// either way.
 pub(crate) fn expected_labels(
     allocs: &[Allocation],
     center_hz: u64,
@@ -158,7 +159,10 @@ pub(crate) fn expected_labels(
             out.push((expected, labels));
         }
     }
-    let plan = crate::plans::plan_channel_at(center_hz, region).map(|(p, _)| p);
+    // A data channel of the plan (`no_voice`) expects no FM voice.
+    let plan = crate::plans::plan_channel_at(center_hz, region)
+        .filter(|(p, n)| !p.no_voice.contains(n))
+        .map(|(p, _)| p);
     if let Some(plan) = plan.filter(|p| p.deviation_hz.is_some()) {
         let expected = Expected::Plan {
             id: plan.id,

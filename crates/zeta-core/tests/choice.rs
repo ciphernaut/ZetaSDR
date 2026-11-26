@@ -805,6 +805,34 @@ fn am_on_a_channel_licensed_am_answers_am_demod() {
     }
 }
 
+/// A plan's data channel (`no_voice`: `uhf_cb_au` ch 22) expects no FM voice: a burst
+/// read there as `am`, `carrier` or `unknown` is not answered `fm_demod` by the plan.
+#[test]
+fn a_plan_data_channel_expects_no_fm_voice() {
+    let modes = registry(None);
+    let data = zeta_core::plans::channels(&zeta_core::plans::UHF_CB_AU)
+        .into_iter()
+        .find(|&(n, _)| n == 22)
+        .unwrap()
+        .1;
+    assert!(zeta_core::plans::UHF_CB_AU.no_voice.contains(&22));
+    for (label, width) in [("am", 9_000), ("carrier", 50), ("unknown", 50)] {
+        let choice = choose_for(&modes, &measured(label, data + 300, width), 12_500);
+        assert_ne!(
+            choice.row.as_deref(),
+            Some("fm_demod"),
+            "{label}: {choice:?}"
+        );
+        assert!(
+            !choice
+                .evidence
+                .iter()
+                .any(|e| e.starts_with("plan: uhf_cb_au is an FM plan")),
+            "{label}: {choice:?}"
+        );
+    }
+}
+
 /// A pause (`carrier`) or a weak read (`unknown`) on an FM channel, licensed or planned,
 /// answers `fm_demod` where it could not tell, sized as FM: the plan's width on the plan
 /// channel, the box's on the licensed one.
