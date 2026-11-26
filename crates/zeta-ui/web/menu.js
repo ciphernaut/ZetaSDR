@@ -174,7 +174,8 @@
 // 2) over the box's own span (the node classifies, and replays, its newest slice), quietly
 // (not the transcript). The first entry (`choice_start`) reads `Choosing a job here…`, greyed,
 // until the job's step-1 answer, then `Start <kind> here: <width> kHz[, <parameters>] · <row>`
-// (actions.js choiceLabel) or `Can't tell: <reason>` greyed (`; trying <rows>` while it tries
+// with ` + <rider> (<summary>)` per row its job attaches (actions.js choiceLabel) or
+// `Can't tell: <reason>` greyed (`; trying <rows>` while it tries
 // them; `the node did not choose` for a job that ended without an answer), its hover what
 // step 2 did, revised by its later answers, the entry carrying the
 // class `revising` while the job runs. The answers come from the source's feed when it is open
@@ -1382,10 +1383,12 @@ class Menu {
     }, CHOOSE_POLL_MS);
   }
 
-  // The choice entry: its job as the node chose it (a measured centre, width and parameters).
-  startChoice(choice, s) {
+  // The choice entry: its job as the node chose it (a measured centre, width and parameters),
+  // then each row its `attach` lists (a rider its choose proved, spec 49.3) attached to the
+  // job started, in order (job_attach; a refusal is the transcript's, the job runs on).
+  async startChoice(choice, s) {
     const j = choice.job;
-    return this.applyOp({
+    const r = await this.applyOp({
       op: "job_start",
       kind: j.kind,
       source: s.sourceId,
@@ -1396,6 +1399,16 @@ class Menu {
       elastic: false,
       replace: [],
     });
+    if (r && r.result === "job" && r.value) {
+      for (const kind of j.attach ?? []) await this.attachRider({ id: r.value }, kind);
+    }
+    return r;
+  }
+
+  // Attaches rider row `kind` (one that rides with `job`'s kind) to running `job`: job_attach
+  // on the job's channel IQ (stream and language null; the node names its refusal).
+  attachRider(job, kind) {
+    return this.applyOp({ op: "job_attach", kind, job: job.id, language: null, stream: null });
   }
 
   // Draws the open box menu again (the rows came after it opened), keeping its open submenus

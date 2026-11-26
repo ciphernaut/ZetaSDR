@@ -11,7 +11,8 @@
 //! relabelled at 476.9 MHz, channel 20 of the CB plan), `quiet` (1 s of low complex noise at
 //! 20 MHz, which `measure` labels `noise`; see [`quiet_fixture`]), `fsk` (framed 2-FSK at
 //! 433.92 MHz, the Bits pane's; see [`fsk_fixture`]), `dmr` (a DMR repeater with a call on
-//! each slot, at 450 MHz; see [`dmr_fixture`]), and `--modes-dir` holding the
+//! each slot, at 450 MHz; see [`dmr_fixture`]), `rds` (a broadcast station with RDS at
+//! 106.1 MHz, 480 kHz; see [`rds_fixture`]), and `--modes-dir` holding the
 //! `fake_pos` program row (zeta-ext's `fake_lines`, printing two fixes of one sonde 2 s into a
 //! job; see [`fake_pos_row`]), `--handlers-dir` holding `alt`, a second handler of
 //! `aprs_decode` with no packet output (see [`fake_handlers`]), and `--sets-dir` holding
@@ -351,6 +352,22 @@ fn cbvoice_fixture(dir: &Path) -> PathBuf {
     }
     let iq = zeta_dsp::synth::nbfm_modulate(&audio, RATE, RATE, 2500.0, 700.0);
     zeta_dsp::fixtures::write_fixture(dir, "cbvoice", &iq, RATE, CBVOICE_CENTER_HZ)
+}
+
+/// The `rds` fixture's centre, its station's, and its IQ rate (wide enough that
+/// `wfm_demod`'s band fits the capture).
+const RDS_CENTER_HZ: u64 = 106_100_000;
+const RDS_RATE: u32 = 480_000;
+
+/// A broadcast station with RDS as the synthesiser makes it
+/// ([`rds_station_iq`](zeta_dsp::synth::rds_station_iq): PI 2AB1, PS `ZETA FM`, a 1 kHz tone
+/// in the audio), 25 dB over noise, at [`RDS_CENTER_HZ`]: 5.25 s at [`RDS_RATE`] (about
+/// 20 MB in `dir`), looped by the file source; the meta path.
+fn rds_fixture(dir: &Path) -> PathBuf {
+    let mut iq =
+        zeta_dsp::synth::rds_station_iq(0x2AB1, "ZETA FM ", "HELLO FROM ZETASDR", RDS_RATE);
+    zeta_dsp::synth::awgn(&mut iq, 25.0, 17);
+    zeta_dsp::fixtures::write_fixture(dir, "rds", &iq, RDS_RATE, RDS_CENTER_HZ)
 }
 
 /// Recording `meta` (a `<name>.sigmf-meta` written by `write_fixture`) labelled at
@@ -1290,6 +1307,8 @@ impl Nodes {
         let dmr = format!("dmr={}", dmr_fixture(dir.path()).display());
         // Voice on CB channel 20 (+700 Hz), keyed on 2 s and off 2 s: the box menu's choice.
         let cbvoice = format!("cbvoice={}", cbvoice_fixture(dir.path()).display());
+        // A broadcast station with RDS: the box menu's choice of wfm_demod with its rider.
+        let rds = format!("rds={}", rds_fixture(dir.path()).display());
         // Two sources carry the same analog video recording (the video scenarios).
         let video_meta = video_fixture(dir.path());
         let video = format!("video={}", video_meta.display());
@@ -1357,6 +1376,8 @@ impl Nodes {
                 &dmr,
                 "--source-file",
                 &cbvoice,
+                "--source-file",
+                &rds,
                 "--source-file",
                 &video,
                 "--source-file",

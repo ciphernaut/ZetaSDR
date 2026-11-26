@@ -40,9 +40,10 @@
 //               entry whose sub is empty is not offered, and one whose sub answers
 //               null is a plain entry (a decoder with one ready handler); subOf(entry, ctx)
 //               reads it
-//     each(ctx) -> [{key, label, sub, run}]   the entry stands once per element instead, each
-//               `.ctx-item[data-action=<id>][data-mode=<key>]` with the element's label, `sub`
-//               (the elements its submenu would answer; null: a plain entry) and `run`; such a
+//     each(ctx) -> [{key, label, sub, run, disabled}]   the entry stands once per element
+//               instead, each `.ctx-item[data-action=<id>][data-mode=<key>]` with the element's
+//               label, `sub` (the elements its submenu would answer; null: a plain entry), `run`
+//               and `disabled` (a reason greys it, as the entry's own `disabled`); such a
 //               submenu's panel is `.ctx-sub[data-for=<id>][data-mode=<key>]` (offered expands it)
 //     run(ctx)  what choosing it does
 //   GROUPS   per surface, its groups in menu order: [{id, label, direct, prefix}]. A group's
@@ -273,6 +274,14 @@
 //                          attached one
 //   transcribe Transcribe  (Next) the row's Transcribe: transcribe(job, {role}), job_attach
 //                          kind=transcribe; a running job with audio
+//   ride   Decode: <row name>  (Next, after Transcribe) one per modes_list row whose `rides`
+//                          names the job's kind (rds_decode on a wfm_demod; no entry is written
+//                          per rider) and that is not attached to it (no running record of the
+//                          row with the job as its `input`): host.attachRider, job_attach
+//                          kind=<row> job=<id> language null stream null, the rider drawn under
+//                          its input in the Jobs pane; greyed with the row's reason while it is
+//                          not ready, or `needs <w> kHz, the job's band is <bw> kHz` under the
+//                          row's narrowest; a running job that is not itself attached
 //   packets Capture packets  (Next, after Transcribe) job_attach kind=packets on a running job
 //                          whose own outputs list `packet` (jobOutputs: the `outputs` of the
 //                          handler it runs, from its modes_list row's `handlers`, never the
@@ -528,7 +537,9 @@ const CHOOSING = "Choosing a job here…";
 // <params> the parameters Start sends, as the answer's job holds them (`, <d> kHz deviation`
 // for `deviation_hz`, `, USB` or `, LSB` for `sideband`, nothing else), or `Can't tell:
 // <reason>`, followed by `; trying <rows>` while the menu's choose runs with rows in
-// `could_prove` (an `unknown` box's rows, spec 49.4).
+// `could_prove` (an `unknown` box's rows, spec 49.4). A job that attaches riders (its
+// `attach`: a demodulator its rider proved, spec 49.3) adds ` + <row name> (<summary>)` for
+// each (ridersText).
 function choiceLabel(c) {
   const ch = c.choice;
   if (ch == null) return CHOOSING;
@@ -540,7 +551,19 @@ function choiceLabel(c) {
   const row = (c.rows || []).find((r) => r.id === ch.row);
   const guess = !isDemod(c, ch.job.kind) && ch.settled === "best_guess" ? " (not proved)" : "";
   return `Start ${ch.job.kind} here: ${khzText(ch.job.bandwidth_hz)} kHz${paramsText(ch.job)} · `
-    + `${row?.name ?? ch.row}${guess}`;
+    + `${row?.name ?? ch.row}${guess}${ridersText(c, ch)}`;
+}
+
+// The riders a choice's job attaches (its `attach`, spec 49.3), as the label words them: ` +
+// <row name> (<summary>)` each, the summary from the answer's `decode <row>: <summary>`
+// evidence line (none: no parentheses); "" for none.
+function ridersText(c, ch) {
+  return (ch.job.attach ?? []).map((id) => {
+    const name = (c.rows || []).find((r) => r.id === id)?.name ?? id;
+    const lead = `decode ${id}: `;
+    const line = (ch.evidence ?? []).find((e) => typeof e === "string" && e.startsWith(lead));
+    return ` + ${name}${line ? ` (${line.slice(lead.length)})` : ""}`;
+  }).join("");
 }
 
 // The parameters of a choice's job that Start sends (menu.js startChoice), as the label words
@@ -599,6 +622,32 @@ function chosenListenId(c) {
   if (!j || !isDemod(c, j.kind)) return null;
   if (j.kind === "ssb_demod") return j.params?.sideband === "lsb" ? "ssb_lsb" : "ssb_usb";
   return j.kind;
+}
+
+// The riders a running job's menu offers (spec 49.3): modes_list's rows whose `rides.with`
+// names the job's kind, not already attached to it (a running record of the row whose
+// `input` is the job), each `Decode: <row name>`, attached by host.attachRider; greyed with
+// the row's reason while it is not ready, or with the width when the job's band is under the
+// row's narrowest (`min_hz`, else `bandwidth_hz`: the node refuses it).
+function riders(c) {
+  const job = c.job;
+  const on = (r) => (c.jobs || []).some(
+    (j) => j.kind === r.id && j.input === job.id && j.state?.status === "running",
+  );
+  const bw = job.tuning?.bandwidth_hz;
+  return (c.rows || [])
+    .filter((r) => (r.rides?.with ?? []).includes(job.kind) && !on(r))
+    .map((r) => {
+      const need = r.band?.min_hz ?? r.band?.bandwidth_hz;
+      const narrow = Number.isFinite(need) && Number.isFinite(bw) && bw < need
+        ? `needs ${khzText(need)} kHz, the job's band is ${khzText(bw)} kHz` : null;
+      return {
+        key: r.id,
+        label: `Decode: ${r.name}`,
+        disabled: r.state !== "ready" ? (r.reason ?? r.state) : narrow,
+        run: (k) => k.host.attachRider(k.job, r.id),
+      };
+    });
 }
 
 const start = (id) => (c) => c.host.startJob(id, c.sel);
@@ -710,6 +759,11 @@ export const ACTIONS = [
     id: "transcribe", label: "Transcribe", group: "next", on: ["job"],
     applies: (c) => c.audio && c.running,
     run: (c) => c.transcribe(c.job, { role: c.role }),
+  },
+  // The rows that ride with the job's kind and are not attached to it (riders).
+  {
+    id: "ride", group: "next", on: ["job"],
+    each: (c) => (c.running && !c.job.input ? riders(c) : []),
   },
   // On a job: its band over the newest span of its source, which the page has only for the
   // shown source (menu.js jobCtx).
@@ -912,8 +966,10 @@ export function subOf(entry, ctx) {
 
 // An entry with `each` as its element `x`: x's label, submenu and run, marked with x's key as
 // `mode`.
+// An element's `disabled` (a reason) greys it, as an entry's `disabled` does.
 const expand = (entry, x) => ({
   ...entry, each: undefined, mode: x.key, label: x.label, sub: () => x.sub ?? null, run: x.run,
+  ...(x.disabled != null ? { disabled: () => x.disabled } : {}),
 });
 
 export function offered(surface, ctx) {

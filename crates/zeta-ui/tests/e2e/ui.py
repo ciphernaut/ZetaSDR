@@ -252,7 +252,7 @@ def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
     for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2",
-                   "ism", "dmr", "cbvoice", "kiwi"):
+                   "ism", "dmr", "cbvoice", "rds", "kiwi"):
         stop_spectrum_jobs(url, secret, source)
 
 
@@ -5806,7 +5806,7 @@ MENU_ACTION_IDS = [
     "ssb_usb", "ssb_lsb", "wfm_transcribe", "fm_transcribe", "am_transcribe",
     "ssb_usb_transcribe", "ssb_lsb_transcribe", "measure", "plan", "set", "scan", "iq_read",
     "ask", "fit", "w2500", "w5000", "w6250", "w12500", "w25000", "denoise", "stereo", "mute",
-    "send_to", "packets", "stop", "replay", "replay_elsewhere",
+    "send_to", "packets", "stop", "replay", "replay_elsewhere", "ride",
 ]
 
 
@@ -6748,6 +6748,192 @@ def scenario_an_unknown_box_says_what_it_is_trying(page, url, secret):
     wait_until(lambda: left() == ([], []), 10, "the choose, its replays and its pin gone")
     page.wait_for_timeout(2_000)
     assert left() == ([], []), f"after the stop: {left()}"
+
+
+# The `rds` source: a broadcast station with RDS (PI 2AB1) at its centre, 480 kHz wide (ui.rs
+# `rds_fixture`).
+RDS_CENTER_HZ = 106_100_000
+
+
+def rider_summary(c, rider):
+    """What answer `c`'s `decode <rider>: <summary>` evidence line says, or None."""
+    lead = f"decode {rider}: "
+    return next((e[len(lead):] for e in c["evidence"] if e.startswith(lead)), None)
+
+
+def riders_on(url, secret, demod, kind="rds_decode"):
+    """The running `kind` jobs attached to job `demod`."""
+    return [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+            if j["kind"] == kind and j.get("input") == demod
+            and j["state"]["status"] == "running"]
+
+
+# The ids of the Jobs pane's rows in their order, each with whether it is an attached row.
+JOB_ROWS_JS = """() => [...document.querySelectorAll('#jobs .job')]
+  .map((r) => [r.dataset.id, r.classList.contains('attached')])"""
+
+
+def drawn_under(page, rider, demod):
+    """Wait until the Jobs pane draws `rider` as an attached row right after `demod`'s."""
+    page.evaluate("window.zetaTest.poll()")
+
+    def under():
+        rows = page.evaluate(JOB_ROWS_JS)
+        ids = [r[0] for r in rows]
+        return (demod in ids and rider in ids and ids.index(rider) == ids.index(demod) + 1
+                and rows[ids.index(rider)][1])
+
+    wait_on_page(page, under, 10, f"{rider} drawn under {demod}")
+
+
+def scenario_the_first_entry_on_a_station_with_rds_starts_wfm_with_rds_attached(
+        page, url, secret):
+    # Spec 49.3: a box on a broadcast station with RDS answers wfm_demod, proved by its rider
+    # rds_decode, its job attaching [rds_decode]; the first entry names the rider and what it
+    # decoded (`... · <row> + <rider row> (<summary>)`). Start sends job_start, then
+    # job_attach of the rider to the job it started; the rider rides on the demodulator (one
+    # rds_decode on the station, no job of its own) and is drawn under it in the Jobs pane.
+    answers = choice_answers(page)
+    since = box_on_source(page, url, secret, "rds", 200_000, answers)
+    item, c = settled_entry(page, answers, since, within_s=30)
+    j = c["job"]
+    assert c["row"] == "wfm_demod" and c["settled"] == "proved" and j \
+        and j["attach"] == ["rds_decode"], c
+    summary = rider_summary(c, "rds_decode")
+    assert summary, c
+    dev = j["params"].get("deviation_hz")
+    params = f", {khz_short(dev)} kHz deviation" if dev is not None else ""
+    want = (f"Start wfm_demod here: {khz1(j['bandwidth_hz'])} kHz{params} · "
+            f"{row_name(url, secret, 'wfm_demod')} + {row_name(url, secret, 'rds_decode')} "
+            f"({summary})")
+    expect(item).to_have_text(want)
+    ops = []
+
+    def on_request(r):
+        if is_op("job_start", not_kind="choose")(r) or is_op("job_attach")(r):
+            ops.append(json.loads(r.post_data))
+
+    page.on("request", on_request)
+    demod = None
+    try:
+        item.click()
+        wait_on_page(page, lambda: any(o["op"] == "job_attach" for o in ops), 15,
+                     "Start's job_attach")
+        starts = [o for o in ops if o["op"] == "job_start"]
+        assert len(starts) == 1 and starts[0]["kind"] == "wfm_demod" \
+            and starts[0]["source"] == "rds" and starts[0]["center_hz"] == j["center_hz"] \
+            and starts[0]["bandwidth_hz"] == j["bandwidth_hz"], ops
+        jobs = wait_until(lambda: running_jobs(url, secret, "wfm_demod", "rds"), 15,
+                          "a running wfm_demod on rds")
+        demod = jobs[0]["id"]
+        attach = [o for o in ops if o["op"] == "job_attach"]
+        assert attach == [{"op": "job_attach", "kind": "rds_decode", "job": demod,
+                           "language": None, "stream": None}], attach
+        rider = wait_until(lambda: riders_on(url, secret, demod), 15,
+                           "rds_decode riding on the wfm_demod")[0]["id"]
+        assert [x["id"] for x in running_jobs(url, secret, "rds_decode", "rds")] == [rider], \
+            running_jobs(url, secret, "rds_decode", "rds")
+        drawn_under(page, rider, demod)
+    finally:
+        page.remove_listener("request", on_request)
+        if demod:
+            stop_job(url, secret, demod)
+
+
+def open_job_menu(page, job):
+    """Right-click `job`'s outline on the shown source; the #ctx-outline locator."""
+    ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
+    page.evaluate("window.zetaTest.poll()")
+    expect(ol).to_have_count(1)
+    ol.click(button="right")
+    menu = page.locator("#ctx-outline")
+    expect(menu).to_be_visible()
+    return menu
+
+
+def scenario_a_running_wfm_demod_offers_its_riders(page, url, secret):
+    # Spec 49.3: a running demodulator's menu offers, under Next, each row that rides with its
+    # kind (modes_list's `rides`) and is not attached to it: `Decode: <row name>`. Choosing it
+    # attaches the rider (job_attach, stream and language null), drawn under its input; once
+    # it rides, the entry is gone. A rider that is not ready is offered greyed with its reason
+    # (here modes_list's answer altered on its way to the page), and one under the job's band
+    # with the widths.
+    name = row_name(url, secret, "rds_decode")
+    reason = "rds_stage: not built on this host"
+
+    def unready(route):
+        body = json.loads(route.request.post_data or "{}")
+        if body.get("op") != "modes_list":
+            route.fallback()
+            return
+        # The node's own answer, read here, with the row marked unavailable.
+        v = http_json(url, secret, "/op", body)
+        for r in v["value"]["modes"]:
+            if r["id"] == "rds_decode":
+                r["state"], r["reason"] = "unavailable", reason
+        route.fulfill(status=200, json=v)
+
+    demod = start_job(url, secret, "wfm_demod", "rds", RDS_CENTER_HZ, 200_000,
+                      deviation_hz=75_000)
+    narrow = None
+    try:
+        # Not ready: greyed with the row's reason, attaching nothing.
+        page.route("**/op", unready)
+        rows = rows_answered(page)
+        select_source(page, url, secret, "rds")
+        wait_on_page(page, rows, 10, "the page's modes_list answered")
+        menu = open_job_menu(page, demod)
+        item = menu_item(page, "ride", "#ctx-outline")
+        expect(item).to_have_attribute("data-mode", "rds_decode")
+        expect(item).to_have_text(f"Decode: {name}")
+        expect(item).to_have_attribute("aria-disabled", "true")
+        expect(item).to_have_attribute("title", reason)
+        close_menu(page, "#ctx-outline")
+        page.unroute("**/op", unready)
+        # Ready: the page loaded afresh reads the rows as they are.
+        rows = rows_answered(page)
+        page.goto(url + "/ui/")
+        page.click('.src-tab[data-id="rds"]')
+        wait_on_page(page, rows, 10, "the page's modes_list answered")
+        # Under the rider's narrowest: greyed with the widths.
+        narrow = start_job(url, secret, "wfm_demod", "rds", RDS_CENTER_HZ, 120_000,
+                           deviation_hz=75_000)
+        # Its row's ⋯ (its outline lies inside the other's).
+        job_row(page, narrow).locator("button.more").click()
+        menu = page.locator("#ctx-outline")
+        expect(menu).to_be_visible()
+        item = menu_item(page, "ride", "#ctx-outline")
+        expect(item).to_have_attribute("aria-disabled", "true")
+        expect(item).to_have_attribute("title", "needs 150.0 kHz, the job's band is 120.0 kHz")
+        close_menu(page, "#ctx-outline")
+        stop_job(url, secret, narrow)
+        narrow = None
+        menu = open_job_menu(page, demod)
+        nxt = menu.locator('.ctx-sub[data-group="next"]')
+        item = menu_item(page, "ride", "#ctx-outline")
+        expect(item).to_have_text(f"Decode: {name}")
+        expect(item).not_to_have_attribute("aria-disabled", "true")
+        seq = nxt.evaluate(NEXT_SEQ_JS)
+        assert seq.index("ride") == seq.index("transcribe") + 1, f"Next {seq}"
+        with page.expect_request(is_op("job_attach")) as req:
+            item.click()
+        body = json.loads(req.value.post_data)
+        assert body == {"op": "job_attach", "kind": "rds_decode", "job": demod,
+                        "language": None, "stream": None}, body
+        expect(menu).to_be_hidden()
+        rider = wait_until(lambda: riders_on(url, secret, demod), 15,
+                           "rds_decode riding on the wfm_demod")[0]["id"]
+        drawn_under(page, rider, demod)
+        # It rides: the entry is gone.
+        menu = open_job_menu(page, demod)
+        menu_item(page, "transcribe", "#ctx-outline")
+        expect(menu.locator('.ctx-item[data-action="ride"]')).to_have_count(0)
+        close_menu(page, "#ctx-outline")
+    finally:
+        page.unroute("**/op", unready)
+        for j in (narrow, demod):
+            if j:
+                stop_job(url, secret, j)
 
 
 def start_choose_watch(url, secret, source):
