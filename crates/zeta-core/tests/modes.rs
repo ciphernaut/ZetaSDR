@@ -3577,3 +3577,40 @@ async fn modes_list_carries_rides() {
     let old: ModeInfo = serde_json::from_value(old).unwrap();
     assert!(old.rides.is_none());
 }
+
+/// `modes_list` names each row's short label and, for a demodulator row, the built-in kind
+/// it runs: the built-in row's own and an operator variant's alike (what a rider's
+/// `rides.with` is matched against); a decoder row has none. An older node's answer reads
+/// as none.
+#[tokio::test]
+async fn modes_list_carries_label_and_builtin() {
+    let dir = tempfile::tempdir().unwrap();
+    let modes = dir.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    let mut wide: serde_json::Value =
+        serde_json::from_str(include_str!("../../../modes/wfm_demod.json")).unwrap();
+    wide["id"] = "wfm_wide".into();
+    wide["name"] = "Wide FM (a variant)".into();
+    std::fs::write(modes.join("wfm_wide.json"), wide.to_string()).unwrap();
+    let node = Node::open(cfg(dir.path(), &modes), stages(), vec![])
+        .await
+        .unwrap();
+    let rds = serde_json::to_value(listed_one(&node, "rds_decode").await).unwrap();
+    assert_eq!(
+        (&rds["label"], &rds["builtin"]),
+        (&"RDS".into(), &serde_json::Value::Null)
+    );
+    let wfm = listed_one(&node, "wfm_demod").await;
+    assert_eq!(
+        (wfm.label.as_str(), wfm.builtin.as_deref()),
+        ("wfm", Some("wfm_demod"))
+    );
+    let variant = listed_one(&node, "wfm_wide").await;
+    assert_eq!(variant.state, ModeState::Ready, "{variant:?}");
+    assert_eq!(variant.builtin.as_deref(), Some("wfm_demod"));
+    let mut old = serde_json::to_value(listed_one(&node, "rds_decode").await).unwrap();
+    old.as_object_mut().unwrap().remove("label");
+    old.as_object_mut().unwrap().remove("builtin");
+    let old: ModeInfo = serde_json::from_value(old).unwrap();
+    assert_eq!((old.label.as_str(), old.builtin), ("", None));
+}

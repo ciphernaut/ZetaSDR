@@ -3827,6 +3827,17 @@ impl From<&crate::plans::ChannelPlan> for PlanInfo {
 pub struct ModeInfo {
     pub id: ModeId,
     pub name: String,
+    /// The row's short label (`RDS`, `APRS`: the layer-2 label its proof produces; a
+    /// demodulator row's is its layer-1 label, `wfm`), which the page names a rider by.
+    /// Read as `""` from an older node.
+    #[serde(default)]
+    pub label: String,
+    /// The built-in demodulator kind a demodulator row runs: `wfm_demod` for the built-in
+    /// row and for every operator variant of it, the kind a rider's `rides.with` names;
+    /// `null` for a decoder row, and read as `null` from an older node.
+    #[schemars(required, schema_with = "crate::types::nullable::<String>")]
+    #[serde(default, deserialize_with = "crate::modes::nullable")]
+    pub builtin: Option<String>,
     pub family: Family,
     /// `demodulator` for a `builtin` row (it turns the signal to audio and proves
     /// nothing), `decoder` for the rest.
@@ -3909,6 +3920,11 @@ impl ModeInfo {
         ModeInfo {
             id: m.row.id.clone(),
             name: m.row.name.clone(),
+            label: m.row.label.clone(),
+            builtin: match &m.row.decoder {
+                Some(crate::modes::Decoder::Builtin(b)) => Some(b.builtin.clone()),
+                _ => None,
+            },
             family: m.row.family,
             role: m.row.role(),
             band: m.row.band.clone(),
