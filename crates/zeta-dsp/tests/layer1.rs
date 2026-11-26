@@ -1026,7 +1026,21 @@ fn a_weak_fading_fm_over_stays_gated_and_is_never_am() {
         .filter(|c| matches!(c.signal, WeakSignal::Voice { flutter_hz, .. } if flutter_hz > 0.0))
         .collect();
     every_weak_case(&fading, |c, f, l| {
-        let gated = f.duty.is_some_and(|d| (0.3..=0.65).contains(&f64::from(d)));
+        // Gated: the label read less than the window ("over <on> s of <window> s"), and
+        // the duty is the carrier's share of it less its fades.
+        let read: Vec<f64> = l
+            .evidence
+            .rsplit(" over ")
+            .next()
+            .map(|t| {
+                t.split(" s")
+                    .filter_map(|x| x.trim_start_matches(" of ").trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let gated = f.burst
+            && matches!(read[..], [on, window] if on < window)
+            && f.duty.is_some_and(|d| (0.3..=0.65).contains(&f64::from(d)));
         let label = matches!(l.name.as_str(), "fm" | "fsk" | "unknown");
         (!(gated && label)).then(|| {
             format!(

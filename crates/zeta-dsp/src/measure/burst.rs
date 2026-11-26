@@ -441,7 +441,9 @@ pub(super) struct View<'a> {
 /// than `BURST_ON_DB` ([`level_runs`]: a carrier a few dB over the noise, where single
 /// chunks do not tell on from off): when it holds them in runs of at least
 /// `BURST_LONG_RUN_MS` (or in shorter runs of uneven length that hold no off part, a
-/// carrier's between its fades: [`fading`]) with an off part of noise, and those are not the long runs the
+/// carrier's between its fades: [`fading`]; these replace runs the chunks already gated,
+/// a train of packets or slots, only when they hold more of the window than those by
+/// more than their edges could be) with an off part of noise, and those are not the long runs the
 /// chunks already gave, they are the window's runs, its `duty` theirs, and the view its
 /// on-time over them.
 pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> View<'_> {
@@ -457,7 +459,7 @@ pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -
     let on = |b: &Bursts| b.runs.iter().map(|&(s, e)| e - s).sum::<usize>();
     let slack = |b: &Bursts| b.runs.len() * (rate_hz as usize * BURST_LEVEL_MS / 1_000);
     if let Some(slow) = level_runs(iq, rate_hz).filter(|b| {
-        (long(b) || fading(iq, rate_hz, b))
+        (long(b) || (fading(iq, rate_hz, b) && (!gated || on(b) > on(&bursts) + slack(b))))
             && !(gated && long(&bursts) && on(b) + slack(b) >= on(&bursts))
             && off_is_noise(iq, rate_hz, bandwidth_hz, b)
     }) {

@@ -3436,11 +3436,7 @@ mod tests {
                     v.gated,
                     v.bursts.duty
                 );
-                assert!(
-                    !v.gated || v.bursts.burst_ms.is_some_and(|ms| ms < 100.0),
-                    "{snr_db} dB seed {seed}: {:?}",
-                    v.bursts
-                );
+                assert!(!v.gated, "{snr_db} dB seed {seed}: {:?}", v.bursts);
                 let fading = shaped(&|i| ms(i) % 250 >= 30, seed);
                 let v = gated_view(&fading, RATE, 12_500);
                 eprintln!(
