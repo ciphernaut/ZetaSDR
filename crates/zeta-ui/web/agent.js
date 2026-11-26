@@ -1107,6 +1107,10 @@ export function startJobs(
   // this page's own graph_put or when the context's asked look no longer matches the node's:
   // a restart by someone else).
   const scans = new Map();
+  // Scan ids whose stored graph this page has just put: the next readScan reads it again. A
+  // flag rather than a delete from `scans`, so a refresh already past its look-up cannot put
+  // the old params back unflagged.
+  const reread = new Set();
   const readScan = async (id) => {
     const c = await api.op({ op: "job_context", job: id }).catch(() => null);
     const ctx = c?.value?.scan ?? {};
@@ -1117,7 +1121,8 @@ export function startJobs(
         (params.average ?? 1) !== (ctx.average_asked ?? ctx.average ?? 1) ||
         // the depth in force is in the context whether or not the node stores one
         (params.bits != null && params.bits !== ctx.bits));
-    if (!params || stale) {
+    if (!params || stale || reread.has(id)) {
+      reread.delete(id); // before the read: a put flagged during it is read next time
       const g = await api.op({ op: "graph_get", job: id }).catch(() => null);
       params = g?.value?.nodes?.find((n) => n.kind === "fft")?.params ?? null;
     }
@@ -1137,7 +1142,7 @@ export function startJobs(
     } catch (e) {
       transcript.note(`graph_put: ${e.message}`, true);
     }
-    scans.delete(job.id);
+    reread.add(job.id);
     refresh();
   };
   let sets = []; // set_list's entries, read with each job_list
@@ -1540,7 +1545,29 @@ export function startJobs(
     }
     if (onJobs) onJobs(jobs);
   };
-  const refresh = async () => {
+  // One refresh at a time: the poll loop and the page's other callers (an applied op, a held
+  // feed frame) would otherwise overlap, each reading a new scan's graph before the other's
+  // read returns, and an older job_list landing last could drop a scan the newer one read.
+  // A call made while one runs shares a single follow-up, which starts when that one ends, so
+  // every caller's promise settles after a refresh begun after its call.
+  let inFlight = null;
+  let queued = null;
+  const refresh = () => {
+    if (!inFlight) {
+      inFlight = refreshOnce().finally(() => {
+        inFlight = null;
+      });
+      return inFlight;
+    }
+    if (!queued) {
+      queued = inFlight.then(() => {
+        queued = null;
+        return refresh();
+      });
+    }
+    return queued;
+  };
+  const refreshOnce = async () => {
     try {
       const [r, s] = await Promise.all([
         api.op({ op: "job_list" }),
@@ -1550,6 +1577,7 @@ export function startJobs(
       const running = (r.value || []).filter((j) => j.kind === "scan" && !isFinished(j));
       await Promise.all(running.map((j) => readScan(j.id)));
       for (const id of [...scans.keys()]) if (!running.some((j) => j.id === id)) scans.delete(id);
+      for (const id of [...reread]) if (!running.some((j) => j.id === id)) reread.delete(id);
       if (!stopped) render(r.value || []);
     } catch {
       /* the next poll retries; op errors appear through the ops stream */
