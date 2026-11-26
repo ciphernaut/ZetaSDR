@@ -183,9 +183,11 @@
 // ends; the frames heard before job_start answers are kept and filtered by its id), else from
 // the job's event stream. The job's record's context.choose is read (job_list --all) every
 // CHOOSE_POLL_MS only while that stream is not attached, once when it attaches (what came
-// before it) and once when it closes, only the newest read applying; with the feed, a read
-// only tells that the job is gone (its answers are the feed's), and the entry then waits
-// FEED_GRACE_MS for the feed's verdict before it says the node did not choose. Closing or
+// before it) and once when it closes, only the newest read applying (one that an event
+// overtook is dropped); with the feed, a read that finds the job gone does not settle it: the
+// entry waits FEED_GRACE_MS for the feed's verdict before it says the node did not choose. A
+// hole in the feed while the job runs (`lagged`, or the feed opened again after a drop) hands
+// the job over to its own stream and record, read at once. Closing or
 // reopening the menu stops the job. The Listen group leads with the chosen demodulator
 // (actions.js offered).
 // An answer revises the entry in place (reviseChoice): its label, title, greyed state and
@@ -1220,12 +1222,21 @@ class Menu {
     const { span } = this.selection(this.current());
     // The source's feed, open now, carries every answer of the job about to start: a tap
     // keeps its choice frames until the job's id is known (`hear` set), then hears the job's.
-    const fed = this.ov.feedOpen?.(at.sourceId) === true;
+    // A hole in the feed (it lagged, or opened again after a drop) ends that (`hole`, or
+    // `holed` before the job's id is known): the job's own stream and record serve the rest.
+    let fed = this.ov.feedOpen?.(at.sourceId) === true;
     let early = [];
     let hear = null;
+    let hole = null;
+    let holed = false;
     let id;
     const untap = fed
       ? this.ov.tap((msg) => {
+        if (msg.type === "lagged" || msg.type === "reopened") {
+          if (hole) hole();
+          else holed = true;
+          return;
+        }
         const p = msg.payload;
         if (!p || (p.protocol !== "choice" && p.protocol !== "verdict")) return;
         if (hear) {
@@ -1312,7 +1323,8 @@ class Menu {
     // moment it stops, so one missing from the list has ended and the last choice stands;
     // job_context would answer an unknown job: a 422 the browser logs as an error). Again
     // every CHOOSE_POLL_MS while the stream is not attached. A read that an event overtook is
-    // dropped: the event is newer. With the feed, a read only tells that the job is gone.
+    // dropped: the event is newer. With the feed, a read that finds the job gone waits for
+    // the feed's verdict (settleLater).
     const read = async () => {
       const mine = ++reads;
       const before = heard;
@@ -1329,7 +1341,7 @@ class Menu {
         settleLater();
         return;
       }
-      if (!fed && ctx !== undefined && heard === before) {
+      if (ctx !== undefined && heard === before) {
         take(ctx?.choice, ctx === null || ctx.verdict != null);
       }
       if (this.chooseJob === id && !attached && this.chooseTimer === null) {
@@ -1348,6 +1360,14 @@ class Menu {
       this.chooseTimer = null;
       read();
     };
+    // The feed lost frames: from now on the job's stream and record answer, read at once for
+    // what the feed lost.
+    hole = () => {
+      if (!fed || this.chooseJob !== id) return;
+      fed = false;
+      now();
+    };
+    if (holed) hole();
     this.ov.api
       .streams()
       .then((all) => {
@@ -1356,8 +1376,8 @@ class Menu {
         this.chooseSub = this.ov.api.streamText(
           sid,
           (msg) => {
-            // With the feed its frames are the feed's, heard there: only its opening and
-            // closing count here.
+            // With the feed its frames are the feed's, heard there (until a hole in the feed):
+            // only its opening and closing count here.
             const p = msg.type === "frame" && !fed ? msg.payload : null;
             if (p && (p.protocol === "choice" || p.protocol === "verdict")) heardOne(p);
           },

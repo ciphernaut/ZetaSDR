@@ -274,10 +274,12 @@
 //                          attached one
 //   transcribe Transcribe  (Next) the row's Transcribe: transcribe(job, {role}), job_attach
 //                          kind=transcribe; a running job with audio
-//   ride   Decode: <row name>  (Next, after Transcribe) one per modes_list row whose `rides`
-//                          names the job's kind (rds_decode on a wfm_demod; no entry is written
-//                          per rider) and that is not attached to it (no running record of the
-//                          row with the job as its `input`): host.attachRider, job_attach
+//   ride   Decode: <rider>  (Next, after Transcribe; the rider row's `label`, else its name)
+//                          one per modes_list row whose `rides` names the job's kind or its
+//                          row's `builtin` (rds_decode on a wfm_demod or a variant of it; no
+//                          entry is written per rider) and that is not attached to it (no record
+//                          of the row, stopped or failed aside, with the job as its `input`):
+//                          host.attachRider, job_attach
 //                          kind=<row> job=<id> language null stream null, the rider drawn under
 //                          its input in the Jobs pane; greyed with the row's reason while it is
 //                          not ready, or `needs <w> kHz, the job's band is <bw> kHz` under the
@@ -538,8 +540,8 @@ const CHOOSING = "Choosing a job here…";
 // for `deviation_hz`, `, USB` or `, LSB` for `sideband`, nothing else), or `Can't tell:
 // <reason>`, followed by `; trying <rows>` while the menu's choose runs with rows in
 // `could_prove` (an `unknown` box's rows, spec 49.4). A job that attaches riders (its
-// `attach`: a demodulator its rider proved, spec 49.3) adds ` + <row name> (<summary>)` for
-// each (ridersText).
+// `attach`: a demodulator its rider proved, spec 49.3) adds ` + <rider> (<summary>)` for
+// each (ridersText: the rider row's `label`, else its name).
 function choiceLabel(c) {
   const ch = c.choice;
   if (ch == null) return CHOOSING;
@@ -554,12 +556,17 @@ function choiceLabel(c) {
     + `${row?.name ?? ch.row}${guess}${ridersText(c, ch)}`;
 }
 
+// A rider row's name on the page: its short `label` (`RDS`), else its `name` (an older node's
+// rows have no label).
+const riderName = (r) => (r.label ? r.label : r.name);
+
 // The riders a choice's job attaches (its `attach`, spec 49.3), as the label words them: ` +
-// <row name> (<summary>)` each, the summary from the answer's `decode <row>: <summary>`
-// evidence line (none: no parentheses); "" for none.
+// <rider name> (<summary>)` each (riderName), the summary from the answer's `decode <row>:
+// <summary>` evidence line (none: no parentheses); "" for none.
 function ridersText(c, ch) {
   return (ch.job.attach ?? []).map((id) => {
-    const name = (c.rows || []).find((r) => r.id === id)?.name ?? id;
+    const row = (c.rows || []).find((r) => r.id === id);
+    const name = row ? riderName(row) : id;
     const lead = `decode ${id}: `;
     const line = (ch.evidence ?? []).find((e) => typeof e === "string" && e.startsWith(lead));
     return ` + ${name}${line ? ` (${line.slice(lead.length)})` : ""}`;
@@ -625,25 +632,28 @@ function chosenListenId(c) {
 }
 
 // The riders a running job's menu offers (spec 49.3): modes_list's rows whose `rides.with`
-// names the job's kind, not already attached to it (a running record of the row whose
-// `input` is the job), each `Decode: <row name>`, attached by host.attachRider; greyed with
-// the row's reason while it is not ready, or with the width when the job's band is under the
-// row's narrowest (`min_hz`, else `bandwidth_hz`: the node refuses it).
+// names the job's kind or the built-in kind its row runs (its `builtin`: a variant of
+// wfm_demod is ridden as wfm_demod is), not already attached to it (a record of the row whose
+// `input` is the job, in any state but stopped or failed), each `Decode: <rider name>`
+// (riderName), attached by host.attachRider; greyed with the row's reason while it is not
+// ready, or with the width when the job's band is under the row's narrowest (`min_hz`, else
+// `bandwidth_hz`: the node refuses it).
 function riders(c) {
   const job = c.job;
-  const on = (r) => (c.jobs || []).some(
-    (j) => j.kind === r.id && j.input === job.id && j.state?.status === "running",
-  );
+  const ended = (j) => j.state?.status === "stopped" || j.state?.status === "failed";
+  const on = (r) => (c.jobs || []).some((j) => j.kind === r.id && j.input === job.id && !ended(j));
+  const kinds = [job.kind, (c.rows || []).find((r) => r.id === job.kind)?.builtin]
+    .filter((k) => typeof k === "string");
   const bw = job.tuning?.bandwidth_hz;
   return (c.rows || [])
-    .filter((r) => (r.rides?.with ?? []).includes(job.kind) && !on(r))
+    .filter((r) => (r.rides?.with ?? []).some((k) => kinds.includes(k)) && !on(r))
     .map((r) => {
       const need = r.band?.min_hz ?? r.band?.bandwidth_hz;
       const narrow = Number.isFinite(need) && Number.isFinite(bw) && bw < need
         ? `needs ${khzText(need)} kHz, the job's band is ${khzText(bw)} kHz` : null;
       return {
         key: r.id,
-        label: `Decode: ${r.name}`,
+        label: `Decode: ${riderName(r)}`,
         disabled: r.state !== "ready" ? (r.reason ?? r.state) : narrow,
         run: (k) => k.host.attachRider(k.job, r.id),
       };

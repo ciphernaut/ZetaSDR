@@ -6481,7 +6481,9 @@ def scenario_the_menus_choose_is_not_polled_once_its_events_flow(page, url, secr
 def choice_answers(page):
     """The `choice` the menu's choose jobs answer, each as its event stream carries it (a
     `choice` frame, or a `verdict` one's), in the order heard: the list, appended to as
-    Playwright delivers the frames (inside its own calls). Call it before the menu opens."""
+    Playwright delivers the frames (inside its own calls). Call it before the menu opens.
+    Each answer is heard twice when both carry it: on the source's feed and on the job's own
+    stream."""
     got = []
 
     def on_ws(ws):
@@ -6644,36 +6646,133 @@ def scenario_the_first_entrys_hover_says_what_step_two_did(page, url, secret):
                                        "lease": None})
 
 
-def scenario_the_menu_keeps_a_fast_chooses_answer(page, url, secret):
-    # A choose that skips step 2 (a policy slice under 1 s) ends within moments of its start,
-    # often before the menu's own subscription to the job's stream opens and before the job's
-    # record is read: its answer reaches the page on the source's feed, which is open before
-    # the job starts, so the entry never reads `the node did not choose` for a job that
-    # answered. The box is opened FAST_CHOOSE_TRIES times, each on a page loaded afresh (the
-    # race is lost most often while the page's own first reads are in flight).
-    answers = choice_answers(page)
+def short_slices(url, secret):
+    """Sets the choice policy's `budget.slice_s` to 0.5 (step 2 is then skipped and a choose
+    ends within moments); the policy it held, for choice_policy_set to put back."""
     held = http_json(url, secret, "/op", {"op": "choice_policy_get"})["value"]
     short = json.loads(json.dumps(held))
     short["budget"]["slice_s"] = 0.5
     http_json(url, secret, "/op", {"op": "choice_policy_set", "policy": short, "lease": None})
+    return held
+
+
+def fsk_view(page, url, secret):
+    """Shows `fsk` with a span of MENU_SPAN_S and its feed open; its view's width in Hz."""
+    select_source(page, url, secret, "fsk")
+    wait_span(page, MENU_SPAN_S)
+    drag_menu(page, 0.0, 1.0)
+    view_hz = box_of(page)[1]
+    close_menu(page)
+    page.wait_for_function("""(s) => { const f = window.zetaTest.overlays?.feed;
+        return !!f && f.opened && f.source === s; }""", arg="fsk")
+    page.wait_for_timeout(200)
+    return view_hz
+
+
+def scenario_the_menu_keeps_a_fast_chooses_answer(page, url, secret):
+    # A choose that skips step 2 (a policy slice under 1 s) ends within moments of its start:
+    # the menu's own look-up of its stream (GET /streams) and its read of its record
+    # (job_list --all) can come after the transient job is forgotten. Both are held here until
+    # it has gone, then let through: the entry still has the node's answer, heard on the
+    # source's feed (open before the job started), and never reads `the node did not choose`.
+    answers = choice_answers(page)
+    policy = short_slices(url, secret)
+    state = {"holding": False, "routed": False}
+    held = []
+
+    def hold(route):
+        r = route.request
+        try:
+            body = json.loads(r.post_data or "") if r.method == "POST" else {}
+        except ValueError:
+            body = {}
+        menus = r.method == "GET" or (body.get("op") == "job_list" and body.get("all") is True)
+        if state["holding"] and menus:
+            held.append(route)
+        else:
+            route.fallback()
+
+    def release():
+        state["holding"] = False
+        # The held ones first: an unroute would settle them itself.
+        while held:
+            held.pop(0).fallback()
+        if state["routed"]:
+            state["routed"] = False
+            page.unroute("**/streams", hold)
+            page.unroute("**/op", hold)
+
     try:
-        got = []
-        for _ in range(FAST_CHOOSE_TRIES):
-            since = box_on_source(page, url, secret, "fsk", 12_500, answers)
-            item, c = settled_entry(page, answers, since)
-            assert step_two_line(c) == \
-                "step 2 did not run: the policy's slice_s is under 1 s", c
-            got.append(item.text_content())
-            close_menu(page)
-        lost = [t for t in got if t == f"Can't tell: {NO_CHOICE}"]
-        assert not lost, f"the menu lost {len(lost)} of {len(got)} answers: {got}"
+        view_hz = fsk_view(page, url, secret)
+        page.route("**/streams", hold)
+        page.route("**/op", hold)
+        state.update(holding=True, routed=True)
+        since = len(answers)
+        with page.expect_response(lambda r: is_op("job_start")(r.request)
+                                  and json.loads(r.request.post_data)["kind"] == "choose"):
+            drag_hz(page, 12_500, view_hz)
+        wait_on_page(page, lambda: held and not choose_jobs(url, secret), 10,
+                     "the menu's look-ups held and the transient choose gone")
+        release()
+        item, c = settled_entry(page, answers, since)
+        assert c["job"] and step_two_line(c) == \
+            "step 2 did not run: the policy's slice_s is under 1 s", c
+        expect(item).to_have_text(re.compile(r"^Start "))
+        close_menu(page)
     finally:
-        http_json(url, secret, "/op", {"op": "choice_policy_set", "policy": held,
+        release()
+        http_json(url, secret, "/op", {"op": "choice_policy_set", "policy": policy,
                                        "lease": None})
 
 
-# How often the_menu_keeps_a_fast_chooses_answer opens its box (P3 saw 1 in 4 lost).
-FAST_CHOOSE_TRIES = 8
+def scenario_a_hole_in_the_feed_hands_the_choose_to_its_own_stream(page, url, secret):
+    # The menu hears its choose on the source's feed; when the feed loses frames while the
+    # choose runs (a `lagged` message: on a busy radio the shared feed is the stream likelier
+    # to lag), the job's own stream and record answer instead. Here the feed's choice and
+    # verdict frames are dropped, the first replaced by `lagged`: the entry still settles on
+    # the node's answer, never `the node did not choose`.
+    feed = next(x["id"] for x in http_json(url, secret, "/streams")
+                if x["kind"] == "event" and x["provenance"].get("job") is None
+                and x["provenance"].get("source") == "fsk")
+    state = {"drop": False, "dropped": 0}
+
+    def on_ws(ws):
+        server = ws.connect_to_server()
+
+        def from_server(m):
+            if state["drop"] and isinstance(m, str):
+                try:
+                    p = json.loads(m).get("payload")
+                except (TypeError, ValueError, AttributeError):
+                    p = None
+                if isinstance(p, dict) and p.get("protocol") in ("choice", "verdict"):
+                    if state["dropped"] == 0:
+                        ws.send(json.dumps({"type": "lagged", "missed": 1}))
+                    state["dropped"] += 1
+                    return
+            ws.send(m)
+
+        server.on_message(from_server)
+
+    page.route_web_socket(re.compile(rf"/stream/{feed}$"), on_ws)
+    answers = choice_answers(page)
+    try:
+        view_hz = fsk_view(page, url, secret)
+        state["drop"] = True
+        since = len(answers)
+        drag_hz(page, 12_500, view_hz)
+        item, c = settled_entry(page, answers, since)
+        assert state["dropped"], "no choice frame came on the feed to drop"
+        line = step_two_line(c)
+        assert c["job"] and line, c
+        expect(item).to_have_text(re.compile(r"^Start "))
+        # The last answer, not an earlier one: its step-2 line is in the hover.
+        assert line in title_lines(item), (item.get_attribute("title"), c)
+        close_menu(page)
+    finally:
+        state["drop"] = False
+
+
 # menu.js NO_CHOICE: the entry's reason for a choose that ended with no answer.
 NO_CHOICE = "the node did not choose"
 
@@ -6776,6 +6875,12 @@ def rider_summary(c, rider):
     return next((e[len(lead):] for e in c["evidence"] if e.startswith(lead)), None)
 
 
+def rider_name(url, secret, row):
+    """A rider row's name on the page: its `label`, else its `name` (actions.js riderName)."""
+    r = mode_rows(url, secret)[row]
+    return r.get("label") or r["name"]
+
+
 def riders_on(url, secret, demod, kind="rds_decode"):
     """The running `kind` jobs attached to job `demod`."""
     return [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
@@ -6819,8 +6924,9 @@ def scenario_the_first_entry_on_a_station_with_rds_starts_wfm_with_rds_attached(
     dev = j["params"].get("deviation_hz")
     params = f", {khz_short(dev)} kHz deviation" if dev is not None else ""
     want = (f"Start wfm_demod here: {khz1(j['bandwidth_hz'])} kHz{params} · "
-            f"{row_name(url, secret, 'wfm_demod')} + {row_name(url, secret, 'rds_decode')} "
+            f"{row_name(url, secret, 'wfm_demod')} + {rider_name(url, secret, 'rds_decode')} "
             f"({summary})")
+    assert " + RDS (" in want, want
     expect(item).to_have_text(want)
     ops = []
 
@@ -6834,6 +6940,8 @@ def scenario_the_first_entry_on_a_station_with_rds_starts_wfm_with_rds_attached(
         item.click()
         wait_on_page(page, lambda: any(o["op"] == "job_attach" for o in ops), 15,
                      "Start's job_attach")
+        # Long enough for a second attach, were one sent.
+        page.wait_for_timeout(500)
         starts = [o for o in ops if o["op"] == "job_start"]
         assert len(starts) == 1 and starts[0]["kind"] == "wfm_demod" \
             and starts[0]["source"] == "rds" and starts[0]["center_hz"] == j["center_hz"] \
@@ -6855,6 +6963,35 @@ def scenario_the_first_entry_on_a_station_with_rds_starts_wfm_with_rds_attached(
             stop_job(url, secret, demod)
 
 
+# actions.js's `ride` elements on a job of `wfm_wide`, a variant row of wfm_demod: with its
+# row's `builtin` (`variant`), without (an older node: `no_builtin`), with an rds_decode
+# attached to it still `created`, and with one `stopped`; [mode, label, greyed] each.
+RIDE_VARIANTS_JS = """async () => {
+  const a = await import('./actions.js');
+  const rds = {id: 'rds_decode', name: 'RDS broadcast data', label: 'RDS', role: 'decoder',
+    state: 'ready', reason: null, rides: {with: ['wfm_demod'], stream: 'iq'},
+    band: {bandwidth_hz: 200000, min_hz: 150000}, handlers: []};
+  const wide = {id: 'wfm_wide', name: 'Wide FM', label: 'wfm', role: 'demodulator',
+    builtin: 'wfm_demod', state: 'ready', reason: null, rides: null,
+    band: {bandwidth_hz: 200000, min_hz: null}, handlers: []};
+  const job = {id: 'j1', kind: 'wfm_wide', source: 's', state: {status: 'running'},
+    tuning: {center_hz: 100e6, bandwidth_hz: 200000}, graph: {nodes: [], edges: []}};
+  const rider = (status) => ({id: 'r1', kind: 'rds_decode', input: 'j1', state: {status}});
+  const ride = (rows, jobs) => {
+    const c = {surface: 'job', host: null, job, sel: null, mute: null, packets: null, jobs,
+      rows, audio: false, running: true, playing: false, role: null};
+    return a.offered('job', c).filter((e) => e.id === 'ride')
+      .map((e) => [e.mode, e.label, e.disabled ? e.disabled(c) : null]);
+  };
+  return {
+    variant: ride([rds, wide], []),
+    no_builtin: ride([rds, {...wide, builtin: undefined}], []),
+    created: ride([rds, wide], [rider('created')]),
+    stopped: ride([rds, wide], [rider('stopped')]),
+  };
+}"""
+
+
 def open_job_menu(page, job):
     """Right-click `job`'s outline on the shown source; the #ctx-outline locator."""
     ol = page.locator(f'#waterfall .outline[data-key="{job}"]')
@@ -6872,8 +7009,11 @@ def scenario_a_running_wfm_demod_offers_its_riders(page, url, secret):
     # attaches the rider (job_attach, stream and language null), drawn under its input; once
     # it rides, the entry is gone. A rider that is not ready is offered greyed with its reason
     # (here modes_list's answer altered on its way to the page), and one under the job's band
-    # with the widths.
-    name = row_name(url, secret, "rds_decode")
+    # with the widths. A variant row of wfm_demod (its `builtin`) is ridden as wfm_demod is,
+    # and a rider still being created counts as attached (actions.js, on rows of its own: a
+    # variant demodulator row on the page test node would take part in its every choose).
+    name = rider_name(url, secret, "rds_decode")
+    assert name == "RDS", name
     reason = "rds_stage: not built on this host"
 
     def unready(route):
@@ -6897,6 +7037,13 @@ def scenario_a_running_wfm_demod_offers_its_riders(page, url, secret):
         rows = rows_answered(page)
         select_source(page, url, secret, "rds")
         wait_on_page(page, rows, 10, "the page's modes_list answered")
+        rides = page.evaluate(RIDE_VARIANTS_JS)
+        assert rides == {
+            "variant": [["rds_decode", "Decode: RDS", None]],
+            "no_builtin": [],
+            "created": [],
+            "stopped": [["rds_decode", "Decode: RDS", None]],
+        }, rides
         menu = open_job_menu(page, demod)
         item = menu_item(page, "ride", "#ctx-outline")
         expect(item).to_have_attribute("data-mode", "rds_decode")

@@ -130,9 +130,10 @@
 //                            its row settled; until then they are held (PENDING_MAX), a poll
 //                            is asked for (one in flight) and the row looked up, and a frame
 //                            whose job two fresh polls do not list is dropped.
-//     ov.tap(fn) -> untap    `fn(frame)` hears every frame of the shown source's feed (any
-//                            job's, a transient one's too), before it is drawn or held;
-//                            `untap()` ends it. ov.feedOpen(source) -> bool: whether the
+//     ov.tap(fn) -> untap    `fn(msg)` hears every frame of the shown source's feed (any
+//                            job's, a transient one's too), before it is drawn or held, and
+//                            each hole in it: a `lagged` message, and `{type: "reopened"}`
+//                            when the feed opens again after a drop; `untap()` ends it. ov.feedOpen(source) -> bool: whether the
 //                            feed of `source` is the shown one and has opened, so a job
 //                            started on it now has every event heard by a tap (menu.js's
 //                            choose: its answers whatever becomes of the job's own stream)
@@ -641,6 +642,7 @@ class Overlays {
       onOpen: () => {
         if (this.feed !== feed) return;
         if (feed.opened) {
+          for (const fn of [...this.taps]) fn({ type: "reopened" });
           this.reseedAll();
           return;
         }
@@ -656,7 +658,8 @@ class Overlays {
     this.feed = null;
   }
 
-  // `fn(frame)` hears every frame of the shown source's feed until the answer is called.
+  // `fn(msg)` hears every frame of the shown source's feed, and its holes (`lagged`,
+  // `reopened`), until the answer is called.
   tap(fn) {
     this.taps.add(fn);
     return () => this.taps.delete(fn);
@@ -675,6 +678,7 @@ class Overlays {
       if (job) this.render(job, msg.payload);
       else this.hold(msg);
     } else if (msg.type === "lagged") {
+      for (const fn of [...this.taps]) fn(msg);
       this.reseedAll();
     }
   }
