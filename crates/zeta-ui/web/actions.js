@@ -583,15 +583,30 @@ function paramsText(j) {
   return out;
 }
 
+// The node's note for a row the trial budget left unstarted (choose.rs OVER_BUDGET).
+const OVER_BUDGET = "not tried: budget";
+
+// The rows a step 2 that ran replayed, as cli.rs step_two_rows: `could_prove` but those
+// noted OVER_BUDGET; all of them when step 3 ran (it had budget left, so step 2 left none
+// unstarted) or when every row has the note (step 3 noted those step 2 replayed).
+function stepTwoRows(ch) {
+  const all = ch.could_prove ?? [];
+  if ((ch.steps_run ?? []).includes(3)) return all;
+  const over = (row) => (ch.not_tried ?? []).some((n) => n.row === row && n.reason === OVER_BUDGET);
+  const started = all.filter((row) => !over(row));
+  return started.length > 0 ? started : all;
+}
+
 // What a choice's step 2 did, as `zeta classify` words it (cli.rs step_two_line): `step 2:
-// <rows>, no frame` when it ran and did not settle the answer, `step 2 did not run: <reason>`
-// when it did not and `not_tried` says why (its row-less note); null otherwise, and first null
-// when under two steps ran and every `not_tried` entry names a row, as the CLI's guard.
+// <rows>, no frame` (the rows it replayed, stepTwoRows) when it ran and did not settle the
+// answer, `step 2 did not run: <reason>` when it did not and `not_tried` says why (its
+// row-less note); null otherwise, and first null when under two steps ran and every
+// `not_tried` entry names a row, as the CLI's guard.
 function stepTwoLine(ch) {
   const steps = ch.steps_run ?? [];
   if (steps.length < 2 && (ch.not_tried ?? []).every((n) => n.row != null)) return null;
   if (steps.includes(2)) {
-    return ch.step !== 2 ? `step 2: ${(ch.could_prove ?? []).join(", ")}, no frame` : null;
+    return ch.step !== 2 ? `step 2: ${stepTwoRows(ch).join(", ")}, no frame` : null;
   }
   const why = (ch.not_tried ?? []).find((n) => n.row == null);
   return why ? `step 2 did not run: ${why.reason.replace(/^not tried: /, "")}` : null;

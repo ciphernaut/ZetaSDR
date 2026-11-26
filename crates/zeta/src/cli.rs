@@ -2440,15 +2440,15 @@ pub fn choice_line(result: &zeta_core::ops::OpResult) -> Option<String> {
 }
 
 /// The line under a choice that went past step 1: `step 2: <rows>, no frame` when step 2
-/// ran and did not settle the answer, `step 2 did not run: <reason>` when a later step was
-/// asked for and step 2 did not run; `None` for step 1's own answer (`classify`'s) and a
-/// step 2 that proved.
+/// ran and did not settle the answer (the rows it replayed, [`step_two_rows`]), `step 2 did
+/// not run: <reason>` when a later step was asked for and step 2 did not run; `None` for
+/// step 1's own answer (`classify`'s) and a step 2 that proved.
 fn step_two_line(c: &zeta_core::choice::Choice) -> Option<String> {
     if c.steps_run.len() < 2 && c.not_tried.iter().all(|n| n.row.is_some()) {
         return None;
     }
     if c.steps_run.contains(&2) {
-        return (c.step != 2).then(|| format!("step 2: {}, no frame", c.could_prove.join(", ")));
+        return (c.step != 2).then(|| format!("step 2: {}, no frame", step_two_rows(c).join(", ")));
     }
     let why = c.not_tried.iter().find(|n| n.row.is_none())?;
     let why = why
@@ -2456,6 +2456,26 @@ fn step_two_line(c: &zeta_core::choice::Choice) -> Option<String> {
         .strip_prefix("not tried: ")
         .unwrap_or(&why.reason);
     Some(format!("step 2 did not run: {why}"))
+}
+
+/// The rows a step 2 that ran replayed: `could_prove` but the rows the budget left
+/// unstarted (`not tried: budget`, [`zeta_core::node::OVER_BUDGET`]). A step 3 that started a trial had
+/// budget left, so step 2 left none unstarted and the notes are step 3's: all of
+/// `could_prove`. When every row has the note, step 3 noted the rows step 2 replayed after
+/// step 2 spent the budget, and the answer does not say which they were: all of
+/// `could_prove`, as before.
+fn step_two_rows(c: &zeta_core::choice::Choice) -> Vec<&str> {
+    let all: Vec<&str> = c.could_prove.iter().map(String::as_str).collect();
+    if c.steps_run.contains(&3) {
+        return all;
+    }
+    let over = |row: &str| {
+        c.not_tried
+            .iter()
+            .any(|n| n.row.as_deref() == Some(row) && n.reason == zeta_core::node::OVER_BUDGET)
+    };
+    let started: Vec<&str> = all.iter().copied().filter(|r| !over(r)).collect();
+    if started.is_empty() { all } else { started }
 }
 
 /// Keep only plan `id` in a `channel_plans` result.
@@ -3236,5 +3256,45 @@ mod cli_attach_tests {
             choice_line(&classification(choice_of("wfm_demod", &[]))).as_deref(),
             Some("choice: wfm_demod 106100000 Hz 200000 Hz (proved, step 1)")
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_step_two_tests {
+    use super::*;
+    use zeta_core::choice::{Choice, NotTried, Settled};
+
+    fn tried(could: &[&str], steps: &[u8], over: &[&str]) -> Choice {
+        Choice {
+            job: None,
+            row: None,
+            step: 1,
+            settled: Settled::CannotTell,
+            evidence: vec![],
+            runner_up: None,
+            could_prove: could.iter().map(|s| s.to_string()).collect(),
+            not_tried: over
+                .iter()
+                .map(|r| NotTried {
+                    row: Some(r.to_string()),
+                    reason: zeta_core::node::OVER_BUDGET.into(),
+                })
+                .collect(),
+            reason: Some("no row serves unknown".into()),
+            steps_run: steps.to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_step_two_line_names_only_the_rows_step_two_replayed() {
+        // The budget left two rows unstarted: they are not named.
+        let c = tried(&["a", "b", "c"], &[1, 2], &["b", "c"]);
+        assert_eq!(step_two_line(&c).as_deref(), Some("step 2: a, no frame"));
+        // Nothing left unstarted: every row.
+        let c = tried(&["a", "b"], &[1, 2], &[]);
+        assert_eq!(step_two_line(&c).as_deref(), Some("step 2: a, b, no frame"));
+        // A step 3 that ran had budget left: its notes are its own.
+        let c = tried(&["a", "b"], &[1, 2, 3], &["b"]);
+        assert_eq!(step_two_line(&c).as_deref(), Some("step 2: a, b, no frame"));
     }
 }

@@ -6527,13 +6527,25 @@ def title_lines(item):
     return (item.get_attribute("title") or "").split("\n")
 
 
+def step_two_rows(c):
+    """The rows a step 2 that ran replayed in answer `c` (cli.rs step_two_rows):
+    `could_prove` but those the budget left unstarted (`not tried: budget`); all of them when
+    step 3 ran or every row has the note."""
+    rows = c["could_prove"]
+    if 3 in c["steps_run"]:
+        return rows
+    over = {n["row"] for n in c["not_tried"] if n["reason"] == "not tried: budget"}
+    started = [r for r in rows if r not in over]
+    return started or rows
+
+
 def step_two_line(c):
     """The hover's step-2 line for answer `c`, as `zeta classify` words it (cli.rs
     step_two_line), or None."""
     if len(c["steps_run"]) < 2 and all(n["row"] is not None for n in c["not_tried"]):
         return None
     if 2 in c["steps_run"]:
-        return f"step 2: {', '.join(c['could_prove'])}, no frame" if c["step"] != 2 else None
+        return f"step 2: {', '.join(step_two_rows(c))}, no frame" if c["step"] != 2 else None
     why = next((n["reason"] for n in c["not_tried"] if n["row"] is None), None)
     return None if why is None else f"step 2 did not run: {why.removeprefix('not tried: ')}"
 

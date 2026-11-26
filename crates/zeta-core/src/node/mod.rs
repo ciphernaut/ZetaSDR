@@ -7,6 +7,7 @@ pub(crate) use choose::ChooseAsk;
 mod identify;
 mod jsonlog;
 mod launch;
+pub use choose::OVER_BUDGET;
 pub use launch::{DRAIN_TIMEOUT_MS, REPLAY_DRAIN_TIMEOUT_MS};
 mod origin;
 pub use origin::{
