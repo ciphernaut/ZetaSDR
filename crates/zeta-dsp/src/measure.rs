@@ -2247,7 +2247,6 @@ mod tests {
         for snr_db in [36.0, 15.0] {
             let iq = over((0.525, 0.475), 1.0, snr_db);
             let b = burst_runs(&iq, RATE);
-            eprintln!("hole at {snr_db} dB: {b:?}");
             assert_eq!(b.runs.len(), 2, "{b:?}");
             assert!((b.duty - 0.95).abs() <= 0.005, "duty {}", b.duty);
             let n = iq.len() as f64;
@@ -2273,8 +2272,7 @@ mod tests {
             ("short", short),
         ] {
             let b = burst_runs(iq, RATE);
-            eprintln!("{what}: {b:?}");
-            assert_eq!(b.runs, vec![(0, iq.len())], "{what}");
+            assert_eq!(b.runs, vec![(0, iq.len())], "{what}: {b:?}");
             assert_eq!(b.duty, 1.0, "{what}");
             let v = gated_view(iq, RATE, 12_500);
             assert!(!v.gated, "{what}");
@@ -2292,7 +2290,6 @@ mod tests {
                     let iq = over(on, 1.0, snr_db);
                     let v = gated_view(&iq, RATE, 12_500);
                     let what = format!("key-{kind} d {d} at {snr_db} dB");
-                    eprintln!("{what}: {:?}", v.bursts);
                     assert!(v.gated, "{what}: {:?}", v.bursts);
                     assert!(
                         (f64::from(v.bursts.duty) - d).abs() <= 0.005,
@@ -3224,21 +3221,21 @@ mod tests {
                 f64::from(envelope_cv(&iq)),
                 rice_cv(10f64.powf(f64::from(snr_db) / 10.0)),
             );
-            eprintln!("{snr_db} dB: measured {measured:.4}, rice {model:.4}");
-            assert!((measured - model).abs() < 0.005, "{snr_db} dB");
+            assert!(
+                (measured - model).abs() < 0.005,
+                "{snr_db} dB: measured {measured:.4}, rice {model:.4}"
+            );
             // The share is taken `NOISE_SLACK_DB` short, so a little is left: under rule
             // 10's 0.2 at every level, with the SNR read 0.5 dB over too (`noise_beside`
             // reads it within 0.3 dB, and errs the other way).
             let snr = 10f64.powf(f64::from(snr_db) / 10.0);
             let left = cv_over_noise(measured as f32, Some(snr));
             let low = cv_over_noise(measured as f32, Some(snr * 10f64.powf(0.05)));
-            eprintln!("{snr_db} dB: {left:.3} left, {low:.3} with the SNR read 0.5 dB over");
             assert!(left < 0.16 && low < FM_MAX_CV, "{snr_db} dB: {left} {low}");
             // From 3 dB, an AM tone at index 0.2 (0.141, of which about snr / (1 + snr)
             // shows in variance) on top keeps rule 9's 0.1 with the SNR read 1 dB under.
             let am = (measured.powi(2) + 0.141f64.powi(2) * snr / (1.0 + snr)).sqrt();
             let kept = cv_over_noise(am as f32, Some(snr * 10f64.powf(-0.1)));
-            eprintln!("{snr_db} dB: an index of 0.2 keeps {kept:.3} with the SNR read 1 dB under");
             assert!(snr_db < 3.0 || kept >= AM_LOW_MIN_CV, "{snr_db} dB: {kept}");
         }
         // Without an SNR the CV is as it is.
@@ -3280,17 +3277,12 @@ mod tests {
             awgn(&mut iq, snr_db, 9);
             let (_, _, v) = measure_band_noted(&iq, RATE, CENTER, RATE, None);
             let got = 10.0 * v.band.unwrap().noise.unwrap().snr.log10();
-            eprintln!("whole {snr_db} dB: {got:.2} dB");
             assert!((got - f64::from(snr_db)).abs() < 0.3, "{snr_db} dB: {got}");
             // In a 12.5 kHz channel the noise is 5.8 dB less.
             let (chan, rate) = extract_offset(&iq, RATE, 0, 12_500, RATE).unwrap();
             let (_, _, v) = measure_band_noted(&chan, rate, CENTER, 12_500, None);
             let noise = v.band.unwrap().noise.unwrap();
             let got = 10.0 * noise.snr.log10();
-            eprintln!(
-                "channel {snr_db} dB: {got:.2} dB, noise {:.0} Hz wide",
-                noise.width_hz
-            );
             assert!(
                 (got - f64::from(snr_db) - 5.84).abs() < 0.3,
                 "{snr_db} dB: {got}"
@@ -3319,8 +3311,7 @@ mod tests {
         let (chan, rate) = extract_offset(&comb, RATE, 0, 3_000, RATE).unwrap();
         let (f, _, v) = measure_band_noted(&chan, rate, CENTER, 3_000, None);
         let noise = v.band.unwrap().noise;
-        eprintln!("comb: {f:?}, cv {:.3}, {noise:?}", v.cv);
-        assert!(v.cv > 0.4, "{}", v.cv);
+        assert!(v.cv > 0.4, "comb: {f:?}, cv {:.3}, {noise:?}", v.cv);
         assert!(
             cv_over_noise(v.cv, noise.map(|n| n.snr)) > v.cv - 0.005,
             "{noise:?}"
@@ -3352,10 +3343,6 @@ mod tests {
             let iq = weak((0.4, 1.0), 3.0, seed);
             let fast = burst_runs(&iq, RATE);
             let slow = level_runs(&iq, RATE).expect("two levels");
-            eprintln!(
-                "seed {seed}: fast duty {:.2}, slow {:?}",
-                fast.duty, slow.runs
-            );
             assert!(fast.duty < 0.4, "{}", fast.duty);
             assert_eq!(slow.runs.len(), 1, "{slow:?}");
             let (start, end) = slow.runs[0];
@@ -3384,12 +3371,6 @@ mod tests {
             }
         }
         let (train, _) = extract_offset(&train, RATE, 0, 12_500, RATE).unwrap();
-        let fast = burst_runs(&train, RATE);
-        eprintln!(
-            "train: fast duty {:.2}, {} runs",
-            fast.duty,
-            fast.runs.len()
-        );
         let slow = level_runs(&train, RATE);
         assert!(
             slow.as_ref()
@@ -3428,24 +3409,16 @@ mod tests {
                 let fast = burst_runs(&train, RATE);
                 let slow = level_runs(&train, RATE);
                 let v = gated_view(&train, RATE, 12_500);
-                eprintln!(
-                    "train {snr_db} dB seed {seed}: fast duty {:.2} in {} runs, slow {:?}, gated {} duty {:.2}",
+                assert!(
+                    !v.gated,
+                    "{snr_db} dB seed {seed}: {:?}; fast duty {:.2} in {} runs, slow {:?}",
+                    v.bursts,
                     fast.duty,
                     fast.runs.len(),
-                    slow.as_ref().map(|b| (b.duty, b.runs.len(), b.burst_ms)),
-                    v.gated,
-                    v.bursts.duty
+                    slow.as_ref().map(|b| (b.duty, b.runs.len(), b.burst_ms))
                 );
-                assert!(!v.gated, "{snr_db} dB seed {seed}: {:?}", v.bursts);
                 let fading = shaped(&|i| ms(i) % 250 >= 30, seed);
                 let v = gated_view(&fading, RATE, 12_500);
-                eprintln!(
-                    "fading {snr_db} dB seed {seed}: gated {}, duty {:.2}, {} runs of {:?} ms",
-                    v.gated,
-                    v.bursts.duty,
-                    v.bursts.runs.len(),
-                    v.bursts.burst_ms
-                );
                 assert!(v.gated, "{snr_db} dB seed {seed}: {:?}", v.bursts);
                 assert!((v.bursts.duty - 0.88).abs() < 0.05, "{:?}", v.bursts.duty);
                 assert!(v.bursts.runs.len() >= 7, "{:?}", v.bursts.runs.len());

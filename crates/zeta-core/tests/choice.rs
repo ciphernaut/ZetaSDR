@@ -131,7 +131,6 @@ async fn classify(node: &Node, center_hz: u64, bandwidth_hz: u64) -> Answer {
             ..
         }) => {
             let choice = *choice.expect("classify answers a choice");
-            eprintln!("labels {labels:?}\nfeatures {features:?}\nchoice {choice:?}");
             Answer {
                 labels,
                 features: features.map(|f| *f),
@@ -425,7 +424,6 @@ fn a_box_narrower_than_a_row_still_lists_it() {
     let sel = box_at(DMR_HZ, 12_000);
     let capture = Some((Hz(DMR_HZ), Hz(RATE_HZ as u64)));
     let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU", capture);
-    eprintln!("{choice:?}");
     assert!(
         choice.could_prove.iter().any(|r| r == "dmr_decode"),
         "{choice:?}"
@@ -462,7 +460,6 @@ fn a_row_the_capture_does_not_hold_is_not_tried_with_the_reason() {
     let sel = box_at(center, 8_000);
     let capture = Some((Hz(ring_center), Hz(RATE_HZ as u64)));
     let choice = choose_now(&modes, modes.weights(), &c, &sel, "AU", capture);
-    eprintln!("{choice:?}");
     assert!(
         choice.could_prove.iter().any(|r| r == "m17_narrow"),
         "{choice:?}"
@@ -1021,7 +1018,6 @@ fn a_proved_rider_answers_its_demodulator_with_itself_attached() {
         "ZETA FM · HELLO",
     );
     let choice = choose_for(&modes, &c, 240_000);
-    eprintln!("{choice:?}");
     let j = job(&choice);
     assert_eq!(j.kind, "wfm_demod", "{choice:?}");
     assert_eq!(choice.row.as_deref(), Some("wfm_demod"), "{choice:?}");
@@ -1065,7 +1061,6 @@ fn a_rider_is_not_the_runner_up_of_its_demodulator() {
     let modes = registry(None);
     let c = measured("wfm", STATION_HZ, 160_000);
     let choice = choose_for(&modes, &c, 240_000);
-    eprintln!("{choice:?}");
     assert_eq!(choice.row.as_deref(), Some("wfm_demod"), "{choice:?}");
     assert_eq!(choice.settled, Settled::BestGuess, "{choice:?}");
     assert!(job(&choice).attach.is_empty(), "{choice:?}");
@@ -1096,7 +1091,6 @@ fn a_rider_with_no_ready_demodulator_is_its_own_job() {
         "ZETA FM · HELLO",
     );
     let choice = choose_for(&modes, &c, 240_000);
-    eprintln!("{choice:?}");
     let j = job(&choice);
     assert_eq!(j.kind, "rds_decode", "{choice:?}");
     assert_eq!(choice.row.as_deref(), Some("rds_decode"), "{choice:?}");
@@ -1123,7 +1117,6 @@ fn the_demodulators_width_is_no_narrower_than_the_riders_min() {
     assert!(modes.get("rds_wide").is_some_and(|m| m.startable()));
     let c = proved_by(measured("wfm", STATION_HZ, 160_000), "rds_wide", "WIDE");
     let choice = choose_for(&modes, &c, 400_000);
-    eprintln!("{choice:?}");
     let j = job(&choice);
     assert_eq!(j.kind, "wfm_demod", "{choice:?}");
     assert_eq!(j.attach, ["rds_wide"], "{choice:?}");
