@@ -133,7 +133,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (16 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (17 sources)")
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -226,7 +226,7 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 4, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (16 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (17 sources)")
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
@@ -251,9 +251,18 @@ BRIGHT_AT_RIGHT_JS = """() => {
 def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
-    for source in ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2",
-                   "ism", "dmr", "cbvoice", "rds", "kiwi"):
-        stop_spectrum_jobs(url, secret, source)
+    sources = ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2",
+               "ism", "dmr", "cbvoice", "rds", "kiwi")
+
+    def running():
+        # One job_list for every source, not one per source.
+        return [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
+                if j["kind"] == "spectrum" and j["source"] in sources
+                and j["state"]["status"] == "running"]
+
+    for j in running():
+        http_json(url, secret, "/op", {"op": "job_stop", "job": j["id"]})
+    assert running() == [], "spectrum jobs survive job_stop"
 
 
 def show_tone_waterfall(page, url, secret):
@@ -592,7 +601,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (16 sources)")
+    expect(page.locator("#transcript")).to_contain_text("source_list → ok (17 sources)")
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -682,12 +691,18 @@ def wait_span(page, s, timeout=15_000):
 MENU_SPAN_S = 2.0
 
 
-def open_menu_on_tone(page, url, secret):
-    """Log in, show the tone and open the menu on a selection (see drag_menu)."""
+# The span a menu scenario waits for when it never classifies or fits the box (drag_menu asks
+# for 1 s).
+MENU_SPAN_PLAIN_S = 1.2
+
+
+def open_menu_on_tone(page, url, secret, span_s=MENU_SPAN_S):
+    """Log in, show the tone and open the menu on a selection (see drag_menu). `span_s`: the
+    signal waited for first; MENU_SPAN_PLAIN_S for a scenario that classifies nothing."""
     show_tone_waterfall(page, url, secret)
     # The layer-1 classifier needs about a second of a pure tone to call it a carrier
     # (shorter spans read the discriminator's edge transients as FM deviation).
-    wait_span(page, MENU_SPAN_S)
+    wait_span(page, span_s)
     return drag_menu(page)
 
 
@@ -964,7 +979,7 @@ def scenario_fit_first_without_a_signal_starts_at_the_box(page, url, secret):
 
 
 def scenario_save_sigmf(page, url, secret):
-    menu = open_menu_on_tone(page, url, secret)
+    menu = open_menu_on_tone(page, url, secret, MENU_SPAN_PLAIN_S)
     # A click elsewhere closes it.
     page.mouse.click(5, 5)
     expect(menu).to_be_hidden()
@@ -989,7 +1004,7 @@ def scenario_plan_menu_offers_the_plans_groups(page, url, secret):
     # line, and Enter sends plan_start with the group in place of channels. No source of the
     # test node captures the CB channels, so the node's answer is its refusal of the band
     # and nothing starts.
-    menu = open_menu_on_tone(page, url, secret)
+    menu = open_menu_on_tone(page, url, secret, MENU_SPAN_PLAIN_S)
     menu_item(page, "plan")
     groups = menu.locator(".ctx-plan-groups .ctx-item")
     expect(groups).to_have_text([
@@ -5904,7 +5919,7 @@ def scenario_box_menu_groups_open_by_hover_click_and_keys(page, url, secret):
     # pointer reaching it, on a click, and by keyboard (the arrow towards the inline end or
     # Enter; Escape or the other arrow closes one level); its entries carry no `Decode ›` or
     # `Transcribe ›` prefix, the Transcribe twins under their own heading.
-    menu = open_menu_on_tone(page, url, secret)
+    menu = open_menu_on_tone(page, url, secret, MENU_SPAN_PLAIN_S)
     still_menu(menu)
     first = menu.evaluate(FIRST_LEVEL_JS)
     assert len(first) <= 8, f"first level {first}"
@@ -7145,7 +7160,7 @@ def scenario_submenus_wait_for_the_pointer_to_rest(page, url, secret):
     # The crossing (the pointer entering and leaving Measure and Plans, then entering Listen's
     # last entry) is dispatched in one page task, so no dwell can fire between its steps however
     # slow the runner; one left pending would fire within the wait after it.
-    menu = open_menu_on_tone(page, url, secret)
+    menu = open_menu_on_tone(page, url, secret, MENU_SPAN_PLAIN_S)
     still_menu(menu)
     page.evaluate("() => { const m = document.getElementById('ctx'); m.style.left = '100px';"
                   " m.style.top = '120px'; }")
@@ -7331,7 +7346,7 @@ def scenario_submenus_stay_inside_the_viewport(page, url, secret):
 
     page.route("**/op", hold)
     try:
-        menu = open_menu_on_tone(page, url, secret)
+        menu = open_menu_on_tone(page, url, secret, MENU_SPAN_PLAIN_S)
         listen = menu.locator('.ctx-sub[data-group="listen"]')
         opener = menu.locator('.ctx-item[data-group="listen"]')
         assert held, "modes_list was not asked"
@@ -13989,8 +14004,11 @@ SHARD_STARTS = {
     2: ["menu_entry_table_is_whole"],
     3: ["coarse_layer_paints_outside_the_capture",
         "subjects_follow_every_job_on_another_source"],
-    4: ["wide_view_zoom_is_anchored_on_the_pointer", "wfm_stereo_toggle_plays_two_channels",
-        "a_chosen_sort_survives_its_section_going"],
+    4: ["kiwi_zoom_is_anchored_on_the_pointer", "job_menu_offers_next_steps_from_outline_and_row",
+        "a_dimmed_subject_relights"],
+    5: ["wide_view_moves_on_every_drag",
+        "the_first_box_entry_is_the_choice", "mix_active_before_the_socket_opens_still_lights",
+        "explore_what_is_this_and_delete"],
 }
 
 
