@@ -40,7 +40,7 @@ impl Settled {
 /// A job as `job_start` takes it: the kind (a row's id), its band and its parameters.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, transform = crate::knowledge::require_all)]
 pub struct ChoiceJob {
     pub kind: String,
     pub center_hz: Hz,
