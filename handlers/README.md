@@ -23,8 +23,9 @@ row's own decoder. The node embeds the `*.json` files here and reads the operato
   The startup line names the version read (`found <path> (handler <id>, version <v>)`), and
   `zeta modes check` prints that line and skips a refused handler with its reason. Without
   the block nothing is run: the program is only looked up. A probe is carried over a modes
-  reload while the program found has the same path, size and modified time, so installing
-  a newer one and reloading the modes is enough.
+  reload while the program found has the same path, size and modified time, so a newer one
+  installed is probed again at the next reload. No operation asks for a reload (an accepted
+  or retracted signature brings one), so after installing a program restart the node.
 - `modes`: by mode id, a program block as a program row's (`args`, `input`, `output`,
   optional `packets` and `demod`), whose `output.fields` maps the row's subject key, and
   `extra`: fields the handler adds that the row's event schema lacks, and

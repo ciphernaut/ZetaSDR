@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- Choice follow-through (plan 49). Layer 1 labels a window over the samples where its carrier
+  is up, and its gate finds an off part of noise at any duty, so a keyed FM over reads `fm` (or
+  `fsk`), a pause `carrier`, and `duty` is the on share (a 100 ms hole in 2 s reads 0.95); the
+  channel noise's share is taken out of the envelope, so a weak or fading FM over reads `fm` or
+  `unknown`, not `am`; the evidence says `over <on> s of <window> s`. The emission the register
+  or an FM channel plan expects at the measured centre can outweigh a contradicted label
+  (`weights.json` `contradicted`, 0.15), with `register: ...` and `plan: ...` evidence lines. A
+  decoder row may ride with a demodulator (`rides`; `rds_decode` with `wfm_demod`): its proof
+  answers the demodulator with the rider in `job.attach`, `job_attach` takes a rider row on a
+  running demodulator (`zeta job attach --kind <row>`; `zeta classify`'s `choice:` line ends
+  ` + <row>` for each), and the page's Start, a `choose` with `start` and a watch attach it. An
+  `unknown` signal's fitting decoder rows are tried (on a watch, event `choosing`). A trial runs
+  at its row's own band on a slice cut to the band its rows need, so step 2 runs on a wide
+  capture and a narrow box keeps its decoders. The answer lists the steps that ran
+  (`steps_run`), the page's entry names the deviation and what step 2 did, and is revised in
+  place. Replays go before live trials, and no trial slice is written under a blocking lock. A
+  handler file may name its program's least version (`version`; `onair.json` names `onair-rx`
+  0.4.0): an older program, or one whose version cannot be read, is `unavailable` (an unread
+  version is probed again at the next reload). A plan's `no_voice` data channel expects no FM
+  voice. A trial slice left pinned by a crash is unpinned when `zeta serve` starts. The UI
+  suite runs in five shards.
+- Compatibility: a strict older client refuses the new members: `Choice.steps_run`,
+  `ChoiceJob.attach`, `ModeInfo.rides`, `ModeInfo.label` and `ModeInfo.builtin`, the watch
+  context's `cap.choosing` and `choosing`, `watch.decoding[].attached` (now a list of job ids,
+  where it was one id), the `choosing` watch event, the `stream_in` stage's `iq` output and the
+  `stream_in.lagged_frames` context key. An operator's file still loads: `weights.json` without
+  `contradicted` takes 0.15, and a handler file or program block without `version` is probed as
+  before, with nothing run. A row or handler file written for this build (`rides`, `version`)
+  is refused by an older node.
+- Deploy: no rollback past this build without clearing each watch job whose
+  `watch.decoding[].attached` is not empty: an older node reads that stored list as one id,
+  fails, and drops every decoder that watch had adopted (an empty `attached` is not written, so
+  such a watch rolls back). A rider job (`rds_decode` attached to a `wfm_demod`) fails at
+  resume on an older node, whose `stream_in` refuses `iq`. The embedded `onair.json` names
+  `onair-rx` 0.4.0 as its least version, so on an install with an older wrapper the OnAir
+  handlers are `unavailable` until it is upgraded.
+
 - Classify chooses the job. `classify` answers `choice` (the job to start, its evidence and a
   runner-up) and `features`; `choose` is a job that climbs the proof ladder (classify, a trial
   of the decoders that could prove the signal, then more of the capture) and ends with a verdict;

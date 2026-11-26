@@ -216,6 +216,28 @@ sonde. `measure.snr_db` is a per-bin peak and reads 20 dB where the channel SNR 
 
 **On the page.** The watch is outlined on the waterfall and its decoder's rail tag shows the centre; `view set side jobs` gives the jobs list the whole side column, and if the watch keeps several decoders **Listen to all** lets the idle ones fold.
 
+## RDS with the station you listen to
+
+Not run live when written (plan 49; `UAT.md` 49.4 and 49.5): a broadcast FM station played by `wfm_demod`, with `rds_decode` riding on the same channel, so the station's name and text come with its audio from one job's channel. Needs a source whose capture holds the station.
+
+**Check.** `source_list` and `job_list`: the source is capturing and no job plays the station yet. `modes_show rds_decode`: `state` `ready`, `rides` `{"with": ["wfm_demod"], "stream": "iq"}`.
+
+**Choose.** Draw a box on the station on the page (the menu's first entry is the choice), or `classify` the station's band: its measured carrier as the centre, about 200 kHz, over the newest 2 s of the ring. When a quick RDS decode proved, the answer is `wfm_demod`, `settled: proved`, with `job.attach: ["rds_decode"]` and the station's name in the `decode rds_decode: ...` evidence line; on the page the entry reads `Start wfm_demod here: ... + RDS (<summary>)`. A station whose RDS did not decode in the span answers `wfm_demod` as a best guess with `attach: []`: attach the rider by hand below all the same.
+
+**Start.** `job_start` the answer's `choice.job` as it stands (its kind, centre, width and `params`), then attach each `attach` row to the job it started:
+
+```json
+{"op":"job_attach","kind":"rds_decode","job":"<wfm_demod job id>","language":null,"stream":null}
+```
+
+On the CLI, `zeta job attach --kind rds_decode --job <id>`. On the page, the choice entry's Start does both, and a running `wfm_demod`'s menu offers Next, Decode: RDS.
+
+**Verify.** `job_list`: an `rds_decode` record whose `input` is the `wfm_demod` job, `running`; its events carry `pi`, `ps` (the station's name) and `rt` once the station sends them, and the audio plays as before. On the page the rider is drawn under its demodulator in the Jobs pane.
+
+**Stop.** `job_stop` on the `wfm_demod`: the rider ends `stopped` with it. To keep the audio without RDS, `job_stop` the `rds_decode` job alone.
+
+**Gotchas.** The rider reads the demodulator's channel: a retune moves it, and a retune under the row's `min_hz` (150 kHz) fails it while the audio runs on. `rds_decode` started on its own (`job_start`, the Decode entry, Send to) is a second job with its own channel, as before. A row's handler files (OnAir's RDS) never ride. A rider slower than its job loses frames, counted in its context as `stream_in.lagged_frames`. A node built before plan 49 knows no riders.
+
 ## Packet capture for Wireshark
 
 Not run live when written: a stored pcapng of the APRS row's frames, opened in Wireshark. Needs a running `aprs_decode` job (144.8 MHz is the row's own centre).
@@ -323,7 +345,7 @@ On the CLI: `zeta capture decode --capture <id> --kind <mode> [--handler <h>] [-
 
 Not run live when written: a mode's other handler (OnAir, through `onair-rx` 0.3.0 installed by the operator) run beside a job of the same mode, and its frames read in Wireshark for the modes that give them. The modes OnAir serves are `adsb_decode`, `pocsag_decode`, `flex_decode`, `acars_decode`, `aprs_decode`, `ais_decode`, `vdl2_decode`, `hfdl_decode`, `rs41_decode`, `dfm_decode` and `m20_decode`, and, events only, `rds_decode`, `dmr_decode`, `p25_decode`, `m17_decode` and `dvbt_decode`. `video_decode` has no OnAir handler: no one input rate both locked a full FPV swing and kept real time on an empty channel (`TODO.md`, plan 46).
 
-**Check.** `modes_show <mode>` (CLI `zeta modes show <mode>`, or `zeta handlers list`): `handlers` lists `onair` with its `state`, and its `outputs`. `ready` needs `onair-rx` 0.3.0 on `PATH` or named by `ZETA_HANDLER_ONAIR_RX`. An older wrapper is still `ready` in `handlers list`, but a job it cannot serve ends at launch with exit 2: 0.2.0 has none of RDS, DMR, P25, M17 and DVB-T (`onair-rx: no mode rds`), and 0.1.0 has no `--freq`, which every entry but ADS-B's passes, so it ends with the wrapper's usage text; both were read from the wrappers' source, not run. For RDS and DVB-T OnAir gives as much as the row's own decoder, so a node-wide ranking naming `onair` picks it: on a host so ranked, a node deployed before 0.3.0 is installed fails every policy-chosen RDS and DVB-T job, a watch's and an identify's children included; install 0.3.0 before the node, or clear the node-wide ranking first. Only ADS-B, APRS and AIS list `packet`.
+**Check.** `modes_show <mode>` (CLI `zeta modes show <mode>`, or `zeta handlers list`): `handlers` lists `onair` with its `state`, and its `outputs`. `ready` needs `onair-rx` 0.4.0 (the least version `handlers/onair.json` names) on `PATH` or named by `ZETA_HANDLER_ONAIR_RX`. The node asks the wrapper its version at startup: an older one is `unavailable` with `onair-rx <version> is older than 0.4.0`, and one whose version cannot be read with `onair-rx: its version could not be read (<what happened>)`, so the policy passes over it and no job by it ends at launch with `onair-rx: no mode <m>`. For RDS and DVB-T OnAir gives as much as the row's own decoder, so a node-wide ranking naming `onair` picks it once the wrapper is ready; install the wrapper, then restart the node, which probes it again. Only ADS-B, APRS and AIS list `packet`.
 
 **Start** by OnAir beside a running job of the mode, which leaves the radio where it is:
 
@@ -357,7 +379,7 @@ Verified on the plan 47 build against generated signals only; no live traffic wa
 
 Eleven rows have no decoder of their own (`decoder: null`): `zigbee_decode`, `thread_decode`, `wisun_decode`, `ble_decode`, `lorawan_decode`, `zwave_decode`, `wifi_decode`, `tetra_decode`, `gsmr_decode`, `lte_decode` and `dvbs_ip_decode`. Only OnAir, through `onair-rx` 0.4.0, runs them, so each reads `ready` while the wrapper is there and `unavailable` otherwise, with the reason `no decoder of its own, and no handler for it is ready` and the missing program's line. Each carries `content: network_traffic`, a fact about the row that nothing reads yet (a policy will; see `TODO.md`, "Policies"); it shows on `modes_list`, in a job's context and in a packet capture's record. Their point is the packets: a capture job writes them for Wireshark.
 
-**Install first.** Put `onair-rx` 0.4.0 on the operator's `PATH` (or name it with `ZETA_HANDLER_ONAIR_RX`) before deploying a node build with these rows. An older wrapper is probed `ready`, and a job then ends at launch with `onair-rx: no mode <m>` and exit 2. It needs no FFmpeg at run time; for DVB-S it sets `DECT2_NOGPU`, and OnAir prints one stderr line saying its GPU decoder is off.
+**Install first.** Put `onair-rx` 0.4.0 on the operator's `PATH` (or name it with `ZETA_HANDLER_ONAIR_RX`) before deploying a node build with these rows. An older wrapper, or one whose version cannot be read, leaves these rows `unavailable` with that reason (`onair-rx <version> is older than 0.4.0`), and their Decode entries are greyed with it; install 0.4.0 and restart the node. It needs no FFmpeg at run time; for DVB-S it sets `DECT2_NOGPU`, and OnAir prints one stderr line saying its GPU decoder is off.
 
 **Check.** `zeta handlers list`: `onair` is `ready`, and `zeta modes show ble_decode` lists it under `handlers` with `packet` among its `outputs`; a row that is not ready says why in `reason`. `zeta modes check <id> --strict` runs the row's check through the handler the policy picks (`<id>@onair: ok`) on a generated pair (`scripts/onair-fixtures.sh`, which needs `onair-gen` and `jq`; the pairs are megabytes and never committed).
 

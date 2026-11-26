@@ -46,7 +46,7 @@ From the operator, 2026-11-20 and 2026-11-21. Spec: `docs/superpowers/specs/2026
   - Analog video (`video_decode`) is left out of `handlers/onair.json`: no single input rate both locks a full FPV swing and keeps real time on an empty channel. Measured through a scratch node for 30 s each: at 8 MHz the check passes and noise costs 0.79 of a core, but a full 8 MHz swing never locks; at 16 MHz the full swing (without a sound subcarrier) locks only weakly, 9 to 17 dB with dropouts, and noise costs 0.94 of a core; at 20 MHz it locks at 46 dB, but on noise OnAir's FM search needs more than a core and the node skipped about 21000 input frames. It needs a way to bound the receiver's search on an empty channel, or a narrower contract (the check's low swing only).
   - `dvbt_decode` has no check on the node (its row has no synthesised capture): a test pins its field map against two recorded lines of the wrapper, and `onair-rx`'s own test locks it on OnAir's generator; a real multiplex is UAT 46.4.
   - DVB-T's margin was measured on a 12-core host only (`onair-rx` 0.87 s a second locked, the node 0.24 beside it); on two cores it is unmeasured.
-  - A handler's program has no minimum-version probe: a 0.2.0 `onair-rx` is probed `ready` for these modes and each job then ends with `onair-rx: no mode <m>` (exit 2), so with `onair` ranked node-wide every policy-chosen RDS and DVB-T job fails until 0.3.0 is installed; a handler file could name the least version its probe accepts.
+  - Done in plan 49: a handler's program has a minimum-version probe. A handler file (or a program row's block) may carry `version` (`args`, `match`, `min`); `handlers/onair.json` names `onair-rx` 0.4.0, so an older wrapper, or one whose version cannot be read, is `unavailable` with the reason instead of `ready` (`handlers/README.md`).
   - DMR by OnAir on live traffic (UAT 46.2): a call's first event trails the row's own by about 2 s, so a call of a second or two gives its two events together at its end; and in six minutes OnAir gave three short calls the row's own decoder did not, by radios both had heard. Not looked into: whether those are real short transmissions the row's own misses, or pieces of a call OnAir's log splits; and whether the wrapper can write the first event sooner than OnAir's call log names the radio.
   - Nothing tells the operator that the node-wide ranking passed over a handler that gives less (`handler_policy_set` answers the policy as stored, `modes_list`'s `handler` shows `builtin`); a note in the job's context or in `handlers list` would.
   - The order of two handlers that give less, both named in the node-wide ranking, is not total (`modes/policy.rs`, `pick`): the better-ranked of them takes the other's place, so it can go ahead of an unnamed handler that gives as much as the row's own when the other sits earlier in the list (handler files are listed by id). It needs three handler files to arise, never excludes a handler and leaves the mode's own ranking alone. Gist: put "gives as much" in the ordering key, after in-process first, and the ranking's position of a named lesser one after that; the prose then says named lesser handlers follow the full ones in the ranking's order.
@@ -85,7 +85,7 @@ From the operator, 2026-11-20 and 2026-11-21. Spec: `docs/superpowers/specs/2026
   - **No test of LTE's pci-only line** (a cell whose MIB is not read yet): only the whole cell is checked.
   - **GSM-R lists 921 to 925 MHz only** (R-GSM's downlink); ER-GSM's downlink begins lower, and the row's ranges and notes do not have it.
   - **OnAir's TETRA subject key on a carrier that is not the cell's main one** is the measured frequency, so one cell can show as two subjects (UAT 47.6 watches for it).
-  - **A minimum-version probe for handler programs** would catch an older wrapper here too: an `onair-rx` before 0.4.0 is probed `ready` for the eleven rows and each job then ends with `onair-rx: no mode <m>` (the line beside plan 46's above).
+  - **A minimum-version probe for handler programs**: done in plan 49 (the line beside plan 46's above): an `onair-rx` before 0.4.0 is `unavailable` for the eleven rows, `onair-rx <version> is older than 0.4.0`.
   - **UAT 47 findings (2026-11-24, live on the field host):**
     - **LTE's summary prints labels with no value:** while a cell's MCC, MNC and TAC are unknown its first lines read `PCI <n> MCC MNC TAC <snr> dB`. The row's summary should leave a label out with its field (the `{field?}` form other rows use, with the label inside it).
     - **Bluetooth LE's `rssi_db` has about 13 decimals:** the wrapper writes the receiver's double as it is; one decimal is the level's real precision.
@@ -244,7 +244,9 @@ Done in plan 30 (`docs/superpowers/specs/2026-11-06-aircraft-links-design.md`, `
 - The fake-program checks assert no `summary`, and HFDL's only the uplink.
 - No scenario covers a merged group's member dropped by `subject_drop_s` (Review Focus 4).
 
-## Fit: the layer-1 label of a weak voice carrier
+## Fit: the layer-1 label of a weak voice carrier (partly done in plan 49)
+
+Partly done in plan 49 (task A6): layer 1 is burst-aware and takes the channel noise's share out of the envelope, so a weak FM voice over reads `fm` on the generators from 3 dB, and on the field host's captures of real overs no read is `am` any more (16 of 38 `fm`, the rest `unknown` or `carrier`); those answer `fm_demod` only where an FM licence or an FM channel plan holds the centre (in "Left from plan 49"). An `fsk` read of a weak voice over is still possible by rule 3 (speech with two strong lines), and picks `fm_demod` as `fm` does; a fading over reads `unknown`, left in "Left from plan 49". What follows is the history.
 
 A weak FM voice carrier (9-12 dB) is also mislabelled `fsk` by the same 1 s window (the carrier plus one modulation line); the fit's width rule no longer trusts the width of such a label, but a burst-aware layer 1 would label it right.
 
@@ -274,7 +276,7 @@ Wanted: a deterministic mapping from that answer to a job, as data and not code:
 Spec first: it is a feature, not cleanup. The menu grouping above is the part that can land now and leaves the first line free for it.
 
 - **Plan 48** (2026-11-24): spec `docs/superpowers/specs/2026-11-24-classify-chooses-the-job-design.md`, plan `docs/superpowers/plans/2026-11-24-classify-chooses-the-job.md`. Approved, not built. Demodulators as mode rows, one ranked choice in `classify`, a `choose` job climbing the proof ladder (free, off air, on air) under a per-surface policy, the watch on probation, and the layer-3 slot. Part 48.5 (`borrow`, a trial on an idle radio under a lease that yields) is its own plan, later.
-- **Plan 49** (2026-11-26): spec `docs/superpowers/specs/2026-11-25-choice-follow-through-design.md`, plan `docs/superpowers/plans/2026-11-26-choice-follow-through.md`. Approved, not built. The follow-through on plan 48's live run, taking most of "Left from plan 48" below: layer 1 labels a keyed FM channel where its carrier is up (UAT 48.6), a register's or a plan's emission can outweigh a contradicted label, a decoder row rides with a demodulator (`rds_decode` with `wfm_demod`), `unknown` is tried, a trial runs at its row's band on a slice cut to it, the answer says which steps ran, replays go before dwells, the UI suite's time, and a handler program's least version. Left out: plan 48.5 (`borrow`), the layer-3 model, replaying a capture into a demodulator, and the ribbon's timing.
+- **Plan 49** (2026-11-26): spec `docs/superpowers/specs/2026-11-25-choice-follow-through-design.md`, plan `docs/superpowers/plans/2026-11-26-choice-follow-through.md`. Built 2026-11-26; live acceptance open (`UAT.md`, plan 49). The follow-through on plan 48's live run, taking most of "Left from plan 48" below: layer 1 labels a keyed FM channel where its carrier is up (UAT 48.6), a register's or a plan's emission can outweigh a contradicted label, a decoder row rides with a demodulator (`rds_decode` with `wfm_demod`), `unknown` is tried, a trial runs at its row's band on a slice cut to it, the answer says which steps ran, replays go before dwells, the UI suite's time, and a handler program's least version. Left out: plan 48.5 (`borrow`), the layer-3 model, replaying a capture into a demodulator, and the ribbon's timing.
 
 ## UI: the Jobs pane lists every radio's jobs, and Clear stale (2026-11-25)
 
@@ -1131,20 +1133,76 @@ A copyleft receiver runs as a separate program the operator builds, never linked
 ## Left from plan 48 (2026-11-25)
 
 From UAT 48, run live 2026-11-25 (`UAT.md`):
-- **RDS rides with `wfm_demod` (the operator's idea).** On a broadcast station the quick RDS proof wins, and the menu offers `rds_decode` where the operator wants to listen. A decoder row should be able to name the demodulator it rides with (`rds_decode` with `wfm_demod`, as `transcribe` attaches to a voice job). Its proof then confirms the demodulator, its fields go into the evidence, and Start gives the demodulator with the decoder attached. The same mechanism serves other pairs, such as a subtone or selcall decoder on `fm_demod`.
-- **Layer 1 reads a keyed FM channel as `am`, `ook` or `unknown`.** This is 48.6's failure, seen on UHF CB and on a 400 MHz FM channel. It happened between overs and also mid-over on a CB repeater (`am` at duty 1.00, 36 dB). A watch with `on_signal: choose` then starts `am_demod` on a licensed FM channel. The register's emission could weigh against the label, and an envelope that drops out within the slice could be measured on the part where the carrier is up.
-- **A weak digital carrier reads `unknown`, and nothing tries it.** A DMR carrier at 7 to 10 dB SNR matches no layer-1 rule, so `could_prove` is empty and a `choose` watch never tries DMR, where an identify watch would have. Let `unknown` pass ready decoder rows that fit its width into `could_prove`.
-- **The first entry names no deviation.** `choiceLabel` gives the kind, the width and the row's name; Start sends `deviation_hz`. UAT 48.1 asks for the deviation on an FM entry.
-- **A narrow box drops the decoders.** `could_prove` needs the selection to be at least a row's channel width (`band.fits(sel.bandwidth_hz)`), so a 12 kHz box on a DMR signal offers no proof.
-- **"Step 2 proved nothing" when step 2 never ran.** At 20 MS/s the watch's event says so although the verdict reads `not_tried: the slice exceeds the trial quota`. A verdict also reads `step 1` whether step 2 ran and proved nothing or never ran; say which.
+- **RDS rides with `wfm_demod` (the operator's idea):** done in plan 49 (a row's `rides`; the proof answers `wfm_demod` with `rds_decode` in `job.attach`, and Start, a `choose` and a watch attach it).
+- **Layer 1 reads a keyed FM channel as `am`, `ook` or `unknown`:** `am` no longer (plan 49: the label is read over the on-time, the gate finds a drop-out, the noise's share is taken out of the envelope); `fm` at layer 1 on 16 of 38 real reads; the rest answer `fm_demod` only where a licence or an FM channel plan holds the centre (an FM licence or plan outweighs a contradicted label), and otherwise still `cannot_tell` (in "Left from plan 49"). UAT 49.1, 49.2 and 49.12 check it live.
+- **A weak digital carrier reads `unknown`, and nothing tries it:** done in plan 49 (`unknown` lists the ready rows its width fits in `could_prove`; a watch tries them, event `choosing`).
+- **The first entry names no deviation:** done in plan 49 (`, <d> kHz deviation`, or the sideband).
+- **A narrow box drops the decoders:** done in plan 49 (a row is tried at its own band; the box no longer filters).
+- **"Step 2 proved nothing" when step 2 never ran:** done in plan 49 (`steps_run`, and the watch's two sentences).
 
-- **The trial slice is cut at the full ring rate (R29).** Above about 8.4 MS/s the 64 MiB trial quota leaves under 1 s, so step 2 of a `choose` never runs on a wide capture (step 3 still covers it). Cut the slice to the selection before writing it; that needs a channeliser reachable from `zeta-core`.
+- **The trial slice is cut at the full ring rate (R29):** done in plan 49 (a cutter in `zeta-dsp` cuts the slice to its rows' band before it is written).
 - **A released transcript line draws its waterfall ribbon when it arrives, not at its own time.** A held transcriber releases its lines late; the page should place the ribbon at the line's own time.
 - **Plan 48.5, borrow.** A trial on an idle radio under a lease that yields, for a capture no job holds.
 - **The layer-3 fast model.** The slot exists: the shared vocabulary, a weights row and the training records the settled trials keep.
 - **Replay a capture into a demodulator to listen to it.** `capture_decode` replays into a decoder row only.
 - **`transcripts.log` can miss lines a held transcriber releases at a cancel.** The tee drains on the same token as the cancel.
-- **Trial slots have no priority.** `budget.concurrent` caps trials node-wide, and a step-3 live trial holds its slot for its whole dwell, so on a busy watch a new signal's step-2 replays (which its probation waits for) can queue up to `trial_s` behind other signals' step 3. Let step-2 replays go first, or leave the owned step 3 out of the cap.
-- **A trial slice is written under a blocking lock.** `write_slice` holds a `std::sync::Mutex` across the synchronous slice write (up to 64 MiB), so a second `choose` blocks a runtime worker meanwhile; on a two-core host that can stall the node briefly. Write it on a blocking thread, or gate it with an async lock.
+- **Trial slots have no priority:** done in plan 49 (a live trial holds at most every slot but one, and a waiting replay goes first).
+- **A trial slice is written under a blocking lock:** done in plan 49 (the data file is written before the index lock, on a blocking thread).
 - **A watch's child `choose` skips superseding signatures.** A seeded child takes the watch's step 1 and so never calls `supersede_proved`; a step-1 proof on the watch path does not supersede an overlapping accepted signature (rare: a proved step 1 starts no child).
-- **The UI suite grew to about 343 s locally** (longest shard 327 s against the 450 s `DEADLINE`), mostly from the box menu's choose repainting; `still_menu` gives a menu's choose 20 s, which a loaded host can exceed.
+- **The UI suite grew to about 343 s locally:** done in plan 49 (the entry is revised in place, five shards; the longest shard 280 s against the 450 s `DEADLINE`).
+
+## Left from plan 49 (2026-11-26)
+
+From the plan's run (spec `docs/superpowers/specs/2026-11-25-choice-follow-through-design.md`), one line each:
+- **Riding for a row's external handlers:** an attached rider runs the row's in-process graph only; OnAir's RDS, say, rides once the external adaptor can take a `stream_in`.
+- **`rides.stream: audio`:** reserved and refused; a subtone or selcall row reading what the listener hears needs it built.
+- **A capability probe for handlers:** the version floor stands in for asking a program which modes it serves (spec 49 ruling 4, not chosen).
+- **A channel plan's own emission field:** a plan says only `deviation_hz`, so only an FM plan weighs against the label; an emission per plan or channel would let an AM or digital plan weigh too.
+- **`iq_read` cut to its selection:** it still records at the ring's rate; the cutter could serve it as it serves a trial slice.
+- **A fading FM over reads `unknown` at layer 1:** its envelope moves beyond the noise's, so rule 10 cannot answer `fm`; letting the phase-against-envelope motion decide `fm` whatever the CV is the next step, once a fixture shows what else would then read `fm`.
+- **A window whose off part is a second, weaker signal stays ungated:** gating only on an off part of noise leaves it read whole (it now reads `unknown`, no longer `am`); gating onto the stronger of two levels would read the over.
+- **Weak AM speech reads `carrier` or `unknown` under about 6 dB** in a 12.5 kHz channel; from 6 dB it reads `am`.
+- **A 1 kHz AM tone at index 0.9 reads `ook`** (rules 2 and 4 fit its troughs as chips), at base and after plan 49.
+- **A real FM over with dips of 5 ms or more is not gated by the slow gate** (it looks like a frame train); the fast gate's reading stands.
+- **The layer-1 thresholds rest on few generator families:** the fading rule on one Doppler (30 Hz) and one keying family; `WEAK_FM_MOTION` (1.6) about 20 % from each side (AM with incidental FM or overmodulation under 10 dB has no generator); rule 10's 10 dB step; `CLICK_MARGIN` exercised by no generator.
+- **No generator for a noise floor higher under the carrier than beside it**, which uses up the noise correction's budget on the FM side.
+- **Detrending over joined runs:** two runs with a 1 to 1.5 kHz offset between them leak 29 to 44 Hz of deviation and could read `fm`; untested.
+- **The receiver's LO phase noise is unmeasured** against rule 10's 40 Hz floor.
+- **The `choose` gives the capture string for other causes too:** rows that left the registry, or a climb that disagrees with the step after a policy change, read `not tried: the capture does not hold ...`; and the cut re-reads the policy's `slice_s` where the caller's value would avoid a race.
+- **A watch waits for the cut before its step-1 job starts:** at 20 MS/s that is time on every new signal.
+- **Program rows (FLEX, M20, RS41, ADS-B) are not proved through a cut slice** in the tests: the test node registers no programs; `zeta modes check` covers them otherwise.
+- **The cutter's last stage:** a last decimation of 2 or 3 loses more than 6 dB at a full-rate band's edge, and only one stage plan is tested.
+- **A proved rider near the capture's edge** may answer a demodulator whose band (1.25 times the occupied width, at least the rider's `min_hz`) the capture does not hold; nothing tests the demodulator's band against the capture.
+- **A step-3 proof of a rider stops its trial job before the demodulator starts:** a short gap in RDS, and under `widen` the capture may give way meanwhile; start before stop.
+- **A plain decoder proved at step 2 or 3 that step 1 named as its best guess becomes its own runner-up** (an old quirk; a one-line fix).
+- **The training record of a slice a rider proved names the demodulator,** not the rider that proved it: which a classifier should learn is the operator's call.
+- **`context.choose.attach_error` is one joined string,** not a list.
+- **A set file's watch member `attach` is checked only at the start,** no longer at load; and the `detect` stage alone no longer refuses an `attach` entry, so a graph checked offline passes any.
+- **A rider attached to a watch's job by someone else** is not in `watch.decoding[].attached` and is not stopped by the watch (it ends with its input).
+- **A running step 2 can finish after the signal is `gone`,** and a choosing watch's try ends at `gone`, so a repeater idle longer than `gone_ms` loses its try.
+- **A `choose`'s step-3 trial hides an overlapping new signal** (it is skipped as another job's); a transitive owner check would let the watch see it.
+- **The version probe blocks a runtime worker** up to 2 s per file (`spawn_blocking`), runs once per row that names it, keeps no inode in its stamp, and sits beside `zeta-ext`'s own way of asking a program its version.
+- **No operation reloads the modes:** a newer handler program is seen after a restart (or the next accepted or retracted signature).
+- **The trial slice write's failure branches are untested.**
+- **The step-2 line (`zeta classify`, the page's hover) can still misstate what step 2 replayed** when step 3 was asked: it overstates when step 2 spent the budget and step 3 noted `not tried: budget` on every row, and understates when step 3 starts no trial but notes it on only some rows. The answer does not say which step noted it; mainly `zeta classify` with step 3, since the menu stops at step 2.
+- **Small index and meta rewrites of the burst store** still take the index lock on the runtime.
+- **The menu's choose after a hole in its feed:** the tap stays and answers are applied twice (harmless), and a hole after the choose's record has gone cannot be recovered unless the job's own stream delivered the verdict.
+- **Page scenarios wanted:** a refused rider attach on Start, the greyed no-choice entry, the `, USB` and `, LSB` forms, and a click between two answers (it starts the newer answer's job); the `trying` wording can show briefly when step 2 is about to be skipped.
+- **The broadcast page fixture's cost on the suite is unmeasured.**
+- **UI suite flakes:** `wide_view_keeps_the_view_while_its_scan_takes_the_radio` races: after the held hand-over is released, the page's own scan is replaced or stopped before `wait_own_scan_over` sees it as the only scan. It fails at base too under load; plan 49 moved it within shard 0 and did not fix it.
+- **`scan_look_on_a_source_with_depths` (`graph_get re-read 2 times in the steady state`):** fixed in plan 49. A job row's overlapping refreshes both read `graph_get`; the page now refreshes one at a time (12 of 12 runs on two CPUs, where the old code failed 6 of 12).
+- **UI suite flakes:** `ribbons_keep_the_newest_strip_clear` failed once.
+- **The whole five-shard suite ran 284 of 284 green on the reviewed tree,** after earlier whole runs each had a flake.
+- **Core tests seen to flake once:** `ops::too_old_carries_the_rings_earliest_ns` (passed 3 of 3 alone), and the choose suite's trial-gives-way test under load; the choose suite's 20 MS/s case peaks at about 1.5 GB and added about 70 s on a two-CPU runner.
+- **A P25 decoder on what looked like FM voice:** a test watch over a voice band (an identify watch) kept `p25_decode` on a signal that was likely FM voice; a mis-proof or a real P25 user, not looked into.
+- **A choosing watch on a voice band with no plan tries the digital rows on `unknown` voice reads,** `p25_decode` among them, and a P25 false proof on FM voice was seen once live (above). A false proof starts a decoder `via: choose`, which UAT 49.2 would count as a pass: look into it before reading 49.2's result.
+- **A weak real over with no licence and no plan at its centre still answers `cannot_tell`:** layer 1 reads `fm` on 16 of 38 real overs, and the rest answer `fm_demod` only where an FM licence or an FM channel plan holds the centre. The choice was not run end to end on the captures: only layer 1 was swept.
+- **A `steps_run`-only change publishes no `choice` event,** and `context.choose.choice` keeps the old `steps_run` until the verdict.
+- **An operator row serving both the label and the expected emission** gets both the expectation's credit and the contradicted label's discount.
+- **A 6 kHz AM licence keeps the label** for a 30 kHz `am` read against a fitting FM plan.
+- **An FM licence on an ACARS centre gives `acars_decode` as the runner-up,** rather than `am_demod`.
+- **Riders are visible to code that looks for "a running job of row X":** a rider is a running job of its row, attached to a demodulator.
+- **`rides_on` ignores the proved job's kind.**
+- **The evidence can print equal numbers** (`451 Hz below 451 Hz`).
+- **One page op that never answers holds every queued job-row refresh:** the refreshes now run one at a time, and `api.op` has no timeout.
+- **A read-only open can still rewrite the burst-store index:** `BurstStore::open` persists the index when it is corrupt or a record's files are missing, also in a one-shot beside `serve`, through the same `index.json.tmp` name (older than plan 49). Open it read-only when the process does not own the state directory, as the packet store is.

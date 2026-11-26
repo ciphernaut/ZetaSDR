@@ -39,7 +39,7 @@ The test runs the first `python3` on `PATH` with Playwright: `uv venv && . .venv
 
 When it can't run, it **passes** and prints `ui e2e skipped: <reason>`, so check for that line.
 
-It runs the scenarios in four shards at once, each with its own nodes (ui.py's `SHARD_STARTS`;
+It runs the scenarios in five shards at once, each with its own nodes (ui.py's `SHARD_STARTS`;
 `ZETA_UI_SHARDS=<n>` overrides, `ZETA_UI_ONLY=a,b` runs those in one shard).
 `ZETA_UI_PROFILE=<file>` writes the slowest lines of each scenario there.
 A shard is killed after ui.rs's `DEADLINE`, or `ZETA_UI_DEADLINE_S` seconds.
