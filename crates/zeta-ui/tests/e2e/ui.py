@@ -14154,8 +14154,9 @@ def scenarios():
 # its own set of nodes: shard i runs the i-th contiguous block of `scenarios()` (definition
 # order), the blocks starting at these scenarios. A block's first scenario runs on a fresh
 # node, so it must pass alone (as with `ZETA_UI_ONLY`). Rebalance from the `PASS <name>
-# (<s> s)` times so each block takes about the same time. 4: rebalanced from a profile, not
-# run whole since; 5 is the default (ui.rs SHARDS).
+# (<s> s)` times so each block takes about the same time. 4: rebalanced from a profile of a
+# five-shard run and never run whole as four; 5 is the default (ui.rs SHARDS), the layout the
+# whole suite last ran green in.
 SHARD_STARTS = {
     1: [],
     2: ["menu_entry_table_is_whole"],
