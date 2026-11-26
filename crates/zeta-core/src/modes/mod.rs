@@ -1016,8 +1016,14 @@ impl ModeRegistry {
     /// same program block and neither is broken. A block naming a least version
     /// (`version`) is carried only while the program found now is the one probed, by
     /// path, size and modified time ([`handlers::ProgramStamp`]): another is probed
-    /// again.
+    /// again, and so is one whose version could not be read ([`handlers::VERSION_UNREAD`]:
+    /// it may answer now).
     pub fn carry_programs(&mut self, old: &ModeRegistry) {
+        let unread = |reason: &Option<String>| {
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains(handlers::VERSION_UNREAD))
+        };
         // The stamp found now of each program list with a version floor, looked up once.
         let mut found: Vec<(Vec<String>, Option<handlers::ProgramStamp>)> = Vec::new();
         let mut same_program = |programs: &[String], was: &Option<handlers::ProgramStamp>| {
@@ -1044,7 +1050,7 @@ impl ModeRegistry {
             let was = o.handlers.first().and_then(|h| h.stamp.clone());
             if let Some(Decoder::Program(p)) = &m.row.decoder
                 && p.version.is_some()
-                && !same_program(&p.programs, &was)
+                && (unread(&o.reason) || !same_program(&p.programs, &was))
             {
                 continue;
             }
@@ -1072,7 +1078,7 @@ impl ModeRegistry {
                 };
                 if let Some(b) = &block
                     && b.version.is_some()
-                    && !same_program(&b.programs, &o.stamp)
+                    && (unread(&o.reason) || !same_program(&b.programs, &o.stamp))
                 {
                     continue;
                 }

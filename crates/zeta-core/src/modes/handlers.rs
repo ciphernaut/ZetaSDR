@@ -217,6 +217,11 @@ pub fn probe_row_versions(modes: &mut ModeRegistry) -> Vec<String> {
     lines
 }
 
+/// The words of [`check_version`]'s reason when the program's version could not be read:
+/// a failure that may pass (no answer at a loaded start), so a reload probes again
+/// ([`super::ModeRegistry::carry_programs`]) rather than carry it.
+pub const VERSION_UNREAD: &str = "its version could not be read";
+
 /// Ask the program at `path` its version (`v`) and hold it to `v.min`: `Ok(<version
 /// read>)` at or over it, else the reason for people: `<name> <version> is older than
 /// <min> (<hint>; <url>)` (the hint left out, with its `; `, when `install` names no
@@ -229,7 +234,7 @@ pub fn check_version(
     v: &VersionProbe,
     install: &Install,
 ) -> Result<String, String> {
-    let unread = |what: String| format!("{name}: its version could not be read ({what})");
+    let unread = |what: String| format!("{name}: {VERSION_UNREAD} ({what})");
     let read = probe_version(path, v).map_err(unread)?;
     if dotted_numbers(&read).is_none() {
         return Err(unread(format!("it reported {read:?}, not dotted numbers")));

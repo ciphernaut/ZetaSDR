@@ -3273,6 +3273,51 @@ async fn a_replaced_program_is_probed_again_on_reload() {
     assert_eq!(times_run(), 2);
 }
 
+/// A probe that could not read the version (here the program fails once, as one that
+/// gave no answer at a loaded start) is not carried: the reload probes the unchanged
+/// program again, and it is ready.
+#[tokio::test]
+async fn an_unread_version_is_probed_again_on_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (modes, handlers) = (dir.path().join("modes"), dir.path().join("handlers"));
+    std::fs::create_dir_all(&handlers).unwrap();
+    let (runs, settled) = (dir.path().join("runs"), dir.path().join("settled"));
+    let script = format!(
+        "echo run >> '{}'; [ -e '{}' ] || exit 1; echo 'alt-rx 0.4.1'",
+        runs.display(),
+        settled.display()
+    );
+    let program = stand_in(dir.path(), "alt-rx", &script);
+    let file = versioned_alt(&program, Some(alt_version("0.4.0")));
+    std::fs::write(handlers.join("alt.json"), file).unwrap();
+    let cfg = NodeConfig {
+        handlers_dir: Some(handlers.clone()),
+        ..cfg(dir.path(), &modes)
+    };
+    let node = Node::open(cfg, stages(), vec![]).await.unwrap();
+    let times_run = || {
+        std::fs::read_to_string(&runs)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let alt = || node.modes().handler("adsb_decode", "alt").unwrap().clone();
+    assert_eq!(alt().state, ModeState::Unavailable, "{:?}", alt());
+    let reason = alt().reason.unwrap();
+    assert!(
+        reason.contains(": its version could not be read ("),
+        "{reason}"
+    );
+    assert_eq!(times_run(), 1);
+
+    // The program unchanged, its next run answers: the reload runs it again.
+    std::fs::write(&settled, "").unwrap();
+    node.reload_modes().unwrap();
+    assert_eq!(times_run(), 2);
+    assert_eq!(alt().state, ModeState::Ready, "{:?}", alt());
+    assert_eq!(alt().version.as_deref(), Some("0.4.1"));
+}
+
 /// A version block whose `match` is not a regular expression with one group, or whose
 /// `min` is not dotted numbers, breaks its handler file at load (the other files and the
 /// embedded one load), and a program row's breaks the row.
