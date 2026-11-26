@@ -173,11 +173,19 @@
 // The choice: opening the box menu starts a transient `choose` job (surface `menu`, up to step
 // 2) over the box's own span (the node classifies, and replays, its newest slice), quietly
 // (not the transcript). The first entry (`choice_start`) reads `Choosing a job here…`, greyed,
-// until the job's step-1 answer (its event stream, and its record's context.choose.choice each
-// CHOOSE_POLL_MS), then `Start <kind> here: <width> kHz <row>` (` (not proved)` for a
-// best-guess decoder) or `Can't tell: <reason>` greyed, revised in place by its later events,
-// the entry carrying the class `revising` while the job runs. Closing or reopening the menu
-// stops the job. The Listen group leads with the chosen demodulator (actions.js offered).
+// until the job's step-1 answer, then `Start <kind> here: <width> kHz <row>` (` (not proved)`
+// for a best-guess decoder) or `Can't tell: <reason>` greyed (`the node did not choose` for a
+// job that ended without an answer), revised by its later answers, the entry carrying the
+// class `revising` while the job runs. The answers come from the job's event stream; its
+// record's context.choose is read (job_list --all) every CHOOSE_POLL_MS only while that
+// stream is not attached, once when it attaches (what came before it) and once when it
+// closes. Closing or reopening the menu stops the job. The Listen group leads with the chosen
+// demodulator (actions.js offered).
+// An answer revises the entry in place (reviseChoice): its label, title, greyed state and
+// `revising` class, and the Listen group's order only when the chosen demodulator changed.
+// Nothing else is drawn again, so the open submenus, the focus and a scrolled panel stay where
+// they are; the menu is clamped to the viewport (and its open submenus placed again beside
+// their openers) only when it grew, and holds its width when the entry gets shorter.
 //
 // Closing: Escape, a pointer press outside the menu, or choosing an entry. Up/Down move the
 // focus between the entries of one level; Enter or Space chooses one.
@@ -206,7 +214,8 @@
 // starts a `.ctx-sep` heading, unless nothing precedes it in its level (a heading that does
 // stand first, `elsewhere` over no fitting entry, has no rule above it). A menu drawn again when
 // modes_list answers is kept inside the viewport first and then keeps its open submenus, placed
-// again beside their openers, and its focus (repaint).
+// again beside their openers, and its focus (repaint); the choice's answers do not draw it
+// again (see The choice).
 //
 // The job's menu (#ctx-outline, role menu): overlays.js opens it by right-click on a retunable
 // outline, or a long press on its label in the narrow footprint; the job row's ⋯ opens it too
@@ -226,7 +235,10 @@ import { capHz } from "./waterfall.js";
 
 // How far past the ring's earliest sample a `too_old` retry starts, as the front moves on.
 const RING_FRONT_MARGIN_NS = 300_000_000;
-// How often the box's transient `choose` job's context is read for a revision.
+// The choice entry's reason when the node gave no answer.
+const NO_CHOICE = "the node did not choose";
+// How often the box's transient `choose` job's context is read for a revision while its event
+// stream is not attached.
 const CHOOSE_POLL_MS = 500;
 export const SPAN_LIMIT_NS = 8_000_000_000;
 export const LABEL_STEP_PX = 18;
@@ -1146,6 +1158,8 @@ class Menu {
     this.stopChoose();
     this.choice = null;
     this.choosing = true;
+    // The width an earlier box's revisions held (reviseChoice).
+    this.el.style.minWidth = "";
     this.paint(this.el, this.footer, this.boxCtx());
     this.showFooter(this.current());
     // The rows' first answer draws the menu again (Decode across's rows).
@@ -1179,13 +1193,13 @@ class Menu {
   }
 
   // The box menu's first entry: a transient `choose` (menu surface, up to step 2) over the box's
-  // span, whose answers (its events, and its context read every CHOOSE_POLL_MS) are drawn in
-  // place, the first one ending the pending entry. `gen` is chooseGen at the opening: a close
-  // or a new box ends it all.
+  // span, whose answers (its events; its context read while they are not attached, see The
+  // choice in the header) revise the entry in place, the first one ending the pending entry.
+  // `gen` is chooseGen at the opening: a close or a new box ends it all.
   async pursueChoice(at, gen) {
     const live = () => gen === this.chooseGen && this.sel === at && !this.el.hidden;
     const show = () => {
-      if (live() && this.fitting === null) this.repaint();
+      if (live() && this.fitting === null) this.reviseChoice();
     };
     const { span } = this.selection(this.current());
     let id;
@@ -1206,7 +1220,7 @@ class Menu {
     } catch (e) {
       if (!live()) return;
       this.choosing = false;
-      this.choice = { job: null, reason: e?.message ?? "the node did not choose" };
+      this.choice = { job: null, reason: e?.message ?? NO_CHOICE };
       show();
       return;
     }
@@ -1216,23 +1230,60 @@ class Menu {
     }
     this.chooseJob = id;
     show();
+    // Whether the job's event stream is attached, and how many of its answers came by it.
+    let attached = false;
+    let heard = 0;
     // A revision: the answer `c` (null: none new) and whether the job is done. Only the
     // job this opening started, while its menu is open.
     const take = (c, done) => {
       if (!live() || this.chooseJob !== id) return;
       const changed = c != null && JSON.stringify(c) !== JSON.stringify(this.choice);
       if (changed) this.choice = c;
-      // A done job ended by itself: nothing to stop, only the poll and the subscription.
+      // A done job ended by itself: nothing to stop, only the poll and the subscription. One
+      // that never answered leaves the entry greyed, where it stands.
       if (done) {
         this.chooseJob = null;
         this.choosing = false;
+        if (this.choice == null) this.choice = { job: null, reason: NO_CHOICE };
       }
       if (changed || done) show();
       if (done) this.stopChoose();
     };
+    // The job's record, read once: its context's answer (a transient job is forgotten the
+    // moment it stops, so one missing from the list has ended and the last choice stands;
+    // job_context would answer an unknown job: a 422 the browser logs as an error). Again
+    // every CHOOSE_POLL_MS while the stream is not attached. A read that an event overtook is
+    // dropped: the event is newer.
+    const read = async () => {
+      const before = heard;
+      let ctx = null;
+      try {
+        const jobs = (await this.ov.api.op({ op: "job_list", all: true })).value ?? [];
+        ctx = jobs.find((j) => j.id === id)?.context?.choose ?? null;
+      } catch {
+        // The node did not answer: the next read tries again.
+        ctx = undefined;
+      }
+      if (!live() || this.chooseJob !== id) return;
+      if (ctx !== undefined && heard === before) {
+        take(ctx?.choice, ctx === null || ctx.verdict != null);
+      }
+      if (this.chooseJob === id && !attached && this.chooseTimer === null) {
+        this.chooseTimer = setTimeout(() => {
+          this.chooseTimer = null;
+          read();
+        }, CHOOSE_POLL_MS);
+      }
+    };
     // The job's own events carry every revision, the last one with its verdict just before the
-    // job (a transient one) is forgotten, which a poll can miss; the poll covers what came
-    // before the subscription.
+    // job (a transient one) is forgotten, which a poll can miss. Attached, the poll stops after
+    // one read for what came before the subscription; closed, the record is read again (and
+    // polled while the job still runs).
+    const now = () => {
+      clearTimeout(this.chooseTimer);
+      this.chooseTimer = null;
+      read();
+    };
     this.ov.api
       .streams()
       .then((all) => {
@@ -1243,31 +1294,30 @@ class Menu {
           (msg) => {
             const p = msg.type === "frame" ? msg.payload : null;
             if (p && (p.protocol === "choice" || p.protocol === "verdict")) {
+              heard += 1;
               take(p.choice, p.protocol === "verdict");
             }
           },
-          null,
-          { reconnect: false },
+          () => {
+            if (!live() || this.chooseJob !== id) return;
+            attached = false;
+            now();
+          },
+          {
+            reconnect: false,
+            onOpen: () => {
+              if (!live() || this.chooseJob !== id) return;
+              attached = true;
+              now();
+            },
+          },
         );
       })
       .catch(() => {});
-    const tick = async () => {
-      // A transient job is forgotten the moment it stops, so one missing from the list has
-      // ended and the last choice stands (job_context would answer an unknown job: a 422 the
-      // browser logs as an error).
-      let ctx = null;
-      try {
-        const jobs = (await this.ov.api.op({ op: "job_list", all: true })).value ?? [];
-        ctx = jobs.find((j) => j.id === id)?.context?.choose ?? null;
-      } catch {
-        // The node did not answer: try again.
-        ctx = undefined;
-      }
-      if (!live() || this.chooseJob !== id) return;
-      if (ctx !== undefined) take(ctx?.choice, ctx === null || ctx.verdict != null);
-      if (this.chooseJob === id) this.chooseTimer = setTimeout(tick, CHOOSE_POLL_MS);
-    };
-    this.chooseTimer = setTimeout(tick, CHOOSE_POLL_MS);
+    this.chooseTimer = setTimeout(() => {
+      this.chooseTimer = null;
+      read();
+    }, CHOOSE_POLL_MS);
   }
 
   // The choice entry: its job as the node chose it (a measured centre, width and parameters).
@@ -1310,6 +1360,76 @@ class Menu {
       const level = focusIn ? panelOf(focusIn) : this.el;
       const again = level && this.levelItems(level).find((i) => key(i) === focusKey);
       (again || this.levelItems(this.el)[0])?.focus({ preventScroll: true });
+    }
+  }
+
+  // Revises the open box menu's first entry (`choice_start`) in place for the choose's newest
+  // answer (see The choice in the header): its label, title, greyed state and `revising` class,
+  // and the Listen group's order (leadListen). Drawn again (repaint) only when the entry is
+  // not there to revise.
+  reviseChoice() {
+    const ctx = this.boxCtx();
+    const entry = entryOf("choice_start");
+    const item = this.el.querySelector(':scope > .ctx-item[data-action="choice_start"]');
+    if (!item || (entry.applies && !entry.applies(ctx))) {
+      this.repaint();
+      return;
+    }
+    const before = this.el.getBoundingClientRect();
+    item.textContent = entry.label(ctx);
+    const refused = entry.disabled ? entry.disabled(ctx) : null;
+    const title = refused || (entry.title ? entry.title(ctx) : null);
+    if (title) item.title = title;
+    else item.removeAttribute("title");
+    if (refused) {
+      item.setAttribute("aria-disabled", "true");
+      item.dataset.refused = "true";
+    } else {
+      item.removeAttribute("aria-disabled");
+      delete item.dataset.refused;
+    }
+    item.classList.toggle("revising", entry.revising?.(ctx) === true);
+    this.leadListen(ctx);
+    const after = this.el.getBoundingClientRect();
+    if (after.width > before.width + 0.5 || after.height > before.height + 0.5) {
+      this.clamp(this.el);
+      this.placeOpenSubs(this.el);
+    } else if (after.width < before.width - 0.5) {
+      // Shorter: the menu keeps its width, so nothing under the pointer moves.
+      const cs = getComputedStyle(this.el);
+      const pad = cs.boxSizing === "border-box" ? 0
+        : parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight)
+          + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth);
+      this.el.style.minWidth = `${before.width - pad}px`;
+    }
+  }
+
+  // Moves the box's Listen demodulator items into the order offered gives them for `ctx` (led
+  // by the chosen demodulator), when it differs from theirs: moved, not drawn again, the focus
+  // kept on the item that had it.
+  leadListen(ctx) {
+    const ids = offered("box", ctx)
+      .filter((e) => groupOf(e, "box") === "listen" && !e.twin)
+      .map((e) => e.id);
+    const items = ids.map((id) => this.el.querySelector(`.ctx-item[data-action="${id}"]`));
+    if (items.length < 2 || items.some((i) => !i || i.parentNode !== items[0].parentNode)) return;
+    const parent = items[0].parentNode;
+    const now = [...parent.children].filter((n) => items.includes(n));
+    if (now.every((n, i) => n === items[i])) return;
+    const active = document.activeElement;
+    const anchor = now[now.length - 1].nextSibling;
+    for (const i of items) parent.insertBefore(i, anchor);
+    if (items.includes(active)) active.focus({ preventScroll: true });
+  }
+
+  // Places menu `root`'s open submenus again beside their openers, outermost first (the menu
+  // moved or changed its width under them).
+  placeOpenSubs(root, container = root) {
+    const rtl = getComputedStyle(root).direction === "rtl";
+    for (const p of this.openSubs(root)) {
+      if (p.ctxParent !== container) continue;
+      placeSub(p, p.ctxOpener, p.ctxParent, rtl, root);
+      this.placeOpenSubs(root, p);
     }
   }
 

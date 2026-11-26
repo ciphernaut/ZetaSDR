@@ -720,7 +720,7 @@ def drag_menu(page, lo=0.40, hi=0.60):
 # `.ctx-item[data-action]` its `data-for` names).
 MENU_PATH_JS = """(el) => {
   const root = el.closest('#ctx, #ctx-outline');
-  // Drawn again under us (the menu repaints on each answer of its choose): try again.
+  // Drawn again under us (the menu repaints when modes_list first answers): try again.
   if (!root) return null;
   const path = [];
   for (let p = el.closest('.ctx-sub'); p; ) {
@@ -742,8 +742,9 @@ def menu_item(page, action, menu="#ctx", force=False):
     root = page.locator(menu)
     expect(root).to_be_visible()
     item = root.locator(f'.ctx-item[data-action="{action}"]')
-    # The menu is drawn again once modes_list answers and on each answer of its choose: open
-    # the path, then resolve the entry, and open it again if a repaint closed it meanwhile.
+    # The menu is drawn again once modes_list answers (its choose's answers revise only its
+    # first entry): open the path, then resolve the entry, and open it again if a repaint
+    # closed it meanwhile.
     for _ in range(3):
         expect(item).to_have_count(1)
         path = item.evaluate(MENU_PATH_JS)
@@ -757,9 +758,10 @@ def menu_item(page, action, menu="#ctx", force=False):
 
 
 def still_menu(menu):
-    """Wait until the open box `menu`'s choose has given its last answer: each answer draws the
-    menu again and places it again, which a scenario measuring the menu's geometry (or placing
-    it by hand) must not race."""
+    """Wait until the open box `menu`'s choose has given its last answer: an answer that widens
+    the first entry widens the menu, clamps it to the viewport again and places its open
+    submenus again, which a scenario measuring the menu's geometry (or placing it by hand)
+    must not race."""
     expect(menu.locator('.ctx-item[data-action="choice_start"]')).not_to_have_class(
         re.compile("revising"), timeout=20_000)
 
@@ -5951,7 +5953,11 @@ def scenario_box_menu_groups_open_by_hover_click_and_keys(page, url, secret):
     menu.locator('.ctx-item[data-group="listen"]').focus()
     page.keyboard.press("Enter")
     expect(listen).to_be_visible()
-    assert focused_key(page) == "fm_demod", focused_key(page)
+    # Its first entry: the chosen demodulator leads the group (on the tone's channel the test
+    # register expects FM data and AM voice, so a carrier answers am_demod).
+    lead = listen.locator(".ctx-item").first.get_attribute("data-action")
+    assert lead in ("fm_demod", "am_demod") and focused_key(page) == lead, \
+        (lead, focused_key(page))
     page.keyboard.press("Escape")
     page.keyboard.press("Escape")
     expect(menu).to_be_hidden()
@@ -6252,6 +6258,184 @@ def scenario_closing_the_menu_stops_its_choose(page, url, secret):
     expect(item).to_be_visible()
     close_menu(page)
     wait_until(lambda: not choose_jobs(url, secret), 3, "no choose job after the menu closed")
+
+
+def held_choose(page):
+    """Holds the box menu's transient `choose` job_start (each one the page sends) until
+    `release()`, so its first entry stays pending meanwhile; `release(stop=True)` also lifts
+    the hold. Every other op goes through. Returns (held, release)."""
+    held, state = [], {"holding": True, "routed": True}
+
+    def hold(r):
+        try:
+            body = json.loads(r.request.post_data or "")
+        except ValueError:
+            body = {}
+        if state["holding"] and body.get("op") == "job_start" and body.get("kind") == "choose":
+            held.append(r)
+        else:
+            r.continue_()
+
+    def release(stop=False):
+        if stop:
+            state["holding"] = False
+        # The held ones first: an unroute would settle them itself.
+        while held:
+            held.pop(0).continue_()
+        if stop and state["routed"]:
+            state["routed"] = False
+            page.unroute("**/op", hold)
+
+    page.route("**/op", hold)
+    return held, release
+
+
+def rows_answered(page):
+    """A predicate: whether every modes_list the page asked since this call has been answered
+    (the box menu reads the rows once, at its mount, and draws itself again on their answer).
+    Call it before the page loads."""
+    asked, answered = [], []
+    page.on("request", lambda r: is_op("modes_list")(r) and asked.append(r))
+    page.on("requestfinished", lambda r: is_op("modes_list")(r) and answered.append(r))
+    return lambda: asked and len(answered) >= len(asked)
+
+
+def open_decode_while_choosing(page, url, secret):
+    """The tone shown with its rows read, a box menu opened while its choose's job_start is held
+    (held_choose), its first entry pending, and its Decode submenu opened by a click. Returns
+    (menu, entry, panel, release)."""
+    rows = rows_answered(page)
+    show_tone_waterfall(page, url, secret)
+    wait_span(page, MENU_SPAN_S)
+    wait_until(rows, 10, "the page's modes_list answered")
+    held, release = held_choose(page)
+    menu = drag_menu(page)
+    entry = menu.locator('.ctx-item[data-action="choice_start"]')
+    wait_until(lambda: held, 5, "the menu's choose asked")
+    expect(entry).to_have_text("Choosing a job here…")
+    expect(entry).to_have_class(re.compile("revising"))
+    menu.locator('.ctx-item[data-group="decode"]').click()
+    panel = menu.locator('.ctx-sub[data-group="decode"]')
+    expect(panel).to_be_visible()
+    return menu, entry, panel, release
+
+
+def scenario_an_open_submenu_stays_open_when_the_choice_arrives(page, url, secret):
+    # Acceptance 49.10: the Decode submenu opened before the first entry settles stays open when
+    # the entry's answers arrive: the same panel, entries and focus (the entry is revised in
+    # place, the menu is not drawn again).
+    menu, entry, panel, release = open_decode_while_choosing(page, url, secret)
+    try:
+        panel.evaluate("""(p) => { p.dataset.kept = '1';
+            for (const i of p.querySelectorAll('.ctx-item')) i.dataset.kept = '1'; }""")
+        assert page.evaluate("() => document.activeElement?.dataset.kept === '1'"), \
+            "the click did not focus the Decode panel's first entry"
+        release(stop=True)
+        expect(entry).to_have_text(re.compile(r"^(Start |Can't tell: )"), timeout=15_000)
+        expect(entry).not_to_have_class(re.compile("revising"), timeout=20_000)
+        expect(panel).to_be_visible()
+        kept = panel.evaluate("""(p) => ({panel: p.dataset.kept === '1',
+            items: [...p.querySelectorAll('.ctx-item')].every((i) => i.dataset.kept === '1'),
+            focus: document.activeElement?.dataset.kept === '1'
+              && p.contains(document.activeElement)})""")
+        assert kept == {"panel": True, "items": True, "focus": True}, \
+            f"the Decode submenu was drawn again under the answer: {kept}"
+    finally:
+        release(stop=True)
+    close_menu(page)
+
+
+def scenario_the_menu_does_not_move_when_its_choice_is_revised(page, url, secret):
+    # Acceptance 49.10: nothing under the pointer moves when the first entry's answer arrives.
+    # The menu keeps its place (its box only grows, by the entry's longer label); its Decode
+    # submenu, opened and scrolled to its end in a short viewport with the pointer on its last
+    # entry, keeps its scroll and its entries their height (shifted sideways by what the menu
+    # grew, no more).
+    menu, entry, panel, release = open_decode_while_choosing(page, url, secret)
+    try:
+        page.set_viewport_size({"width": WIDE["width"], "height": 300})
+        page.evaluate("() => { const m = document.getElementById('ctx'); m.style.left = '40px';"
+                      " m.style.top = '0px'; }")
+        menu.locator('.ctx-item[data-group="decode"]').click()
+        expect(panel).to_be_visible()
+        assert panel.evaluate("p => p.scrollHeight > p.clientHeight"), "the panel does not scroll"
+        panel.evaluate("p => { p.scrollTop = p.scrollHeight; }")
+        last = panel.locator(".ctx-item").last
+        lb = last.bounding_box()
+        page.mouse.move(lb["x"] + lb["width"] / 2, lb["y"] + lb["height"] / 2)
+
+        def geometry():
+            return {"menu": menu.bounding_box(), "panel": panel.bounding_box(),
+                    "last": last.bounding_box(), "scroll": panel.evaluate("p => p.scrollTop")}
+
+        before = geometry()
+        release(stop=True)
+        expect(entry).to_have_text(re.compile(r"^(Start |Can't tell: )"), timeout=15_000)
+        expect(entry).not_to_have_class(re.compile("revising"), timeout=20_000)
+        expect(panel).to_be_visible()
+        after = geometry()
+        m0, m1 = before["menu"], after["menu"]
+        grew = m1["width"] - m0["width"]
+        assert abs(m1["x"] - m0["x"]) <= 0.5 and abs(m1["y"] - m0["y"]) <= 0.5 \
+            and grew >= -0.5 and abs(m1["height"] - m0["height"]) <= 0.5, \
+            f"the menu moved or shrank: {m0} -> {m1}"
+        for k in ("panel", "last"):
+            b0, b1 = before[k], after[k]
+            assert abs(b1["y"] - b0["y"]) <= 0.5 and abs(b1["height"] - b0["height"]) <= 0.5 \
+                and abs((b1["x"] - b0["x"]) - max(0.0, grew)) <= 1, \
+                f"{k} moved: {b0} -> {b1} (the menu grew {grew})"
+        assert abs(after["scroll"] - before["scroll"]) <= 1, \
+            f"the panel's scroll {before['scroll']} -> {after['scroll']}"
+    finally:
+        release(stop=True)
+        page.set_viewport_size(WIDE)
+    close_menu(page)
+
+
+def scenario_the_menus_choose_is_not_polled_once_its_events_flow(page, url, secret):
+    # The menu's choose answers by its event stream: once its events flow the page reads the
+    # job's record (job_list --all) at most twice in 3 s (when the stream attached, when it
+    # closed), not every CHOOSE_POLL_MS.
+    reads, heard = [], []
+
+    def on_request(r):
+        if is_op("job_list")(r) and json.loads(r.post_data).get("all") is True:
+            reads.append(time.monotonic())
+
+    def on_ws(ws):
+        def on_frame(payload):
+            try:
+                p = json.loads(payload).get("payload")
+            except (TypeError, ValueError, AttributeError):
+                return
+            if isinstance(p, dict) and p.get("protocol") in ("choice", "verdict"):
+                heard.append(time.monotonic())
+        ws.on("framereceived", on_frame)
+
+    select_source(page, url, secret, "cbvoice")
+    wait_span(page, MENU_SPAN_S)
+    drag_menu(page, 0.0, 1.0)
+    view_hz = box_of(page)[1]
+    close_menu(page)
+    page.on("request", on_request)
+    page.on("websocket", on_ws)
+    try:
+        drag_hz(page, 12_500, view_hz)
+        # Playwright delivers the page's events to these listeners only inside its own calls.
+        deadline = time.monotonic() + 15
+        while not heard:
+            assert time.monotonic() < deadline, \
+                "an answer on the menu's choose's event stream within 15 s"
+            page.wait_for_timeout(100)
+        page.wait_for_timeout(3_000)
+        t0 = heard[0]
+        got = [round(t - t0, 2) for t in reads if t0 <= t <= t0 + 3]
+        assert len(got) <= 2, f"job_list --all {len(got)} times in the 3 s after its events " \
+            f"flowed: {got}"
+    finally:
+        page.remove_listener("request", on_request)
+        page.remove_listener("websocket", on_ws)
+    close_menu(page)
 
 
 def start_choose_watch(url, secret, source):
