@@ -4,44 +4,13 @@
 
 ## RESUME HERE
 
-The runner updates this section after every task and commits it with the task. A fresh session
-reads it first.
-
-- **Branch and worktree:** trunk `worktree-agent-a5dfd60975f4d81eb`; tracks A and B on `plan49-a`, `plan49-b`. The run ledger is `.superpowers/sdd/2026-11-26-choice-follow-through/progress.md` in the trunk worktree.
-- **Private target dir:** (fill in; delete it when the gates are done)
-- **Ledger of findings:** `scratch/plan49/ledger.md` in the main checkout (ignored by git): the
-  capture list, both sweeps, both UI profiles, A1's and C9's findings.
-- **Next task:** P1 first; then A1, A2, B1 and C1 can all start.
-- **Waiting on the operator:** nothing yet. A1 may need a go-ahead (see the task).
-
-| Task | State | Commit | Note |
-|---|---|---|---|
-| P1 | todo | | |
-| A1 | todo | | |
-| A2 | todo | | |
-| A3 | todo | | |
-| A4 | todo | | |
-| A5 | todo | | |
-| B1 | todo | | |
-| C1 | todo | | |
-| C2 | todo | | |
-| C3 | todo | | |
-| C4 | todo | | |
-| C5 | todo | | |
-| C6 | todo | | |
-| C7 | todo | | |
-| C8 | todo | | |
-| C9 | todo | | which branch C11 takes: |
-| C10 | todo | | |
-| C11 | todo | | |
-| C12 | todo | | |
-| C13 | todo | | |
-| P2 | todo | | |
-| P3 | todo | | |
-| P4 | todo | | |
-| P5 | todo | | |
-| F1 | todo | | |
-| F2 | todo | | |
+- **State:** built and landed on `main` 2026-11-26. Every task, A1 to A6, B1, C1 to C13, P1 to P6
+  and F1 to F2, is done and reviewed; A6 (layer 1 and the channel's noise) and P6 (a job row's
+  overlapping refreshes) were added during the run. Gates at the landing: workspace tests,
+  clippy, fmt, both `agents-md --check` runs, `public-check.sh`, `check-doc-links.sh`, and the
+  whole UI suite in five shards (284 scenarios).
+- **Live acceptance:** UAT.md, plan 49 (49.1 to 49.15), not yet run.
+- **What it left:** TODO.md, "Left from plan 49".
 
 ---
 
