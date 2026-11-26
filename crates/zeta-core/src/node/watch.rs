@@ -1112,7 +1112,8 @@ struct ChoosingSignal {
     signal: Signal,
     /// The `choose` child.
     choose: JobId,
-    /// The rows it tries: step 1's `could_prove`.
+    /// The rows it tries ([`rows_to_try`]): step 1's `could_prove`, and under `widen` the
+    /// rows step 1 set aside at the capture's edge.
     rows: Vec<String>,
     /// Why step 1 could not tell.
     reason: String,

@@ -16,6 +16,11 @@ const RATE_HZ: u32 = 48_000;
 const POCSAG_HZ: u64 = 148_637_500;
 
 async fn open(dir: &Path) -> Node {
+    open_as(dir, true).await
+}
+
+/// A node over `dir`'s state, its owner (`serve`) or not (a one-shot beside it).
+async fn open_as(dir: &Path, owns_state_dir: bool) -> Node {
     let cfg = NodeConfig {
         source_positions: Default::default(),
         sets_dir: None,
@@ -26,7 +31,7 @@ async fn open(dir: &Path) -> Node {
         scan_dwell_ms: 20,
         backends: vec![Backend::Cpu],
         resume: true,
-        owns_state_dir: true,
+        owns_state_dir,
         bank_factory: None,
         modes_dir: None,
         handlers_dir: None,
@@ -335,4 +340,52 @@ async fn a_node_without_a_cutter_has_none_and_cuts_with_the_one_installed() {
         .cut(&tone(48_000), Hz(RATE_HZ as u64), 0, Hz(12_500))
         .expect("a band inside the block");
     assert_eq!((out.len(), rate), (48_000, Hz(RATE_HZ as u64)));
+}
+
+/// A trial slice a `choose` still holds pinned: a one-shot beside the running node leaves
+/// it pinned and does not write the store's index; the owner's next start, which no
+/// `choose` survives, unpins it.
+#[tokio::test]
+async fn only_the_owner_unpins_a_trial_slice_at_start() {
+    use zeta_core::bursts::{BurstPolicy, BurstStore};
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let store = BurstStore::open(&state, BurstPolicy::default()).unwrap();
+    let samples = tone(RATE_HZ as usize);
+    let held = store.reserve_trial(samples.len() as u64 * 8).unwrap();
+    let trial = NewCapture {
+        trial: true,
+        ..new_capture(POCSAG_HZ, 12_500, 1)
+    };
+    let slice = store.write_trial(trial, &samples, held).unwrap();
+    assert!(slice.pinned);
+    let index = state.join("bursts").join("index.json");
+    let before = (
+        std::fs::read(&index).unwrap(),
+        std::fs::metadata(&index).unwrap().modified().unwrap(),
+    );
+
+    // A one-shot: the pin stands, and the index is as the owner wrote it.
+    let one_shot = open_as(dir.path(), false).await;
+    assert!(one_shot.bursts().get(&slice.id).unwrap().pinned);
+    drop(one_shot);
+    let after = (
+        std::fs::read(&index).unwrap(),
+        std::fs::metadata(&index).unwrap().modified().unwrap(),
+    );
+    assert!(after == before, "the one-shot rewrote the index");
+
+    // The owner's start: no choose survived it, so the slice is let go.
+    let owner = open(dir.path()).await;
+    assert!(!owner.bursts().get(&slice.id).unwrap().pinned);
+    drop(owner);
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+    let rec = on_disk
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == slice.id.as_str())
+        .unwrap();
+    assert_eq!(rec["pinned"], false, "{rec}");
 }

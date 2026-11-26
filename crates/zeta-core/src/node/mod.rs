@@ -1688,6 +1688,14 @@ impl Node {
         if cfg.burst_policy.expire_at_open {
             bursts.expire();
         }
+        // No `choose` survives a restart, so its trial slices' pins go; only the node that
+        // owns the state and resumes writes the index (as the transient records above).
+        if cfg.owns_state_dir
+            && cfg.resume
+            && let Err(e) = bursts.unpin_trials()
+        {
+            eprintln!("zeta: bursts: trial slices left pinned: {e}");
+        }
         // Only the state dir's owner recovers the store; a one-shot beside serve reads it.
         // The store keeps its own byte budget, and the burst store's `keep_days`.
         let packet_policy = crate::packets::packet_policy(cfg.burst_policy);
