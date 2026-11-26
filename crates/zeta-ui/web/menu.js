@@ -173,9 +173,10 @@
 // The choice: opening the box menu starts a transient `choose` job (surface `menu`, up to step
 // 2) over the box's own span (the node classifies, and replays, its newest slice), quietly
 // (not the transcript). The first entry (`choice_start`) reads `Choosing a job here…`, greyed,
-// until the job's step-1 answer, then `Start <kind> here: <width> kHz <row>` (` (not proved)`
-// for a best-guess decoder) or `Can't tell: <reason>` greyed (`the node did not choose` for a
-// job that ended without an answer), revised by its later answers, the entry carrying the
+// until the job's step-1 answer, then `Start <kind> here: <width> kHz[, <parameters>] · <row>`
+// (actions.js choiceLabel) or `Can't tell: <reason>` greyed (`; trying <rows>` while it tries
+// them; `the node did not choose` for a job that ended without an answer), its hover what
+// step 2 did, revised by its later answers, the entry carrying the
 // class `revising` while the job runs. The answers come from the job's event stream; its
 // record's context.choose is read (job_list --all) every CHOOSE_POLL_MS only while that
 // stream is not attached, once when it attaches (what came before it) and once when it

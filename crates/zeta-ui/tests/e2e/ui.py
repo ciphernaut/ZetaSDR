@@ -6182,7 +6182,8 @@ def scenario_the_first_box_entry_is_the_choice(page, url, secret):
     item = choice_entry(page, url, secret, "cbvoice", 12_500, "Start fm_demod here:")
     first = page.locator("#ctx .ctx-item").first
     expect(first).to_have_attribute("data-action", "choice_start")
-    expect(item).to_have_text(re.compile(r"^Start fm_demod here: \d+\.\d kHz \S"))
+    expect(item).to_have_text(
+        re.compile(r"^Start fm_demod here: \d+\.\d kHz, \d+(\.\d+)? kHz deviation · \S"))
     # The Listen group leads with the chosen demodulator.
     listen = page.locator('#ctx .ctx-item[data-group="listen"]')
     listen.click()
@@ -6436,6 +6437,264 @@ def scenario_the_menus_choose_is_not_polled_once_its_events_flow(page, url, secr
         page.remove_listener("request", on_request)
         page.remove_listener("websocket", on_ws)
     close_menu(page)
+
+
+def choice_answers(page):
+    """The `choice` the menu's choose jobs answer, each as its event stream carries it (a
+    `choice` frame, or a `verdict` one's), in the order heard: the list, appended to as
+    Playwright delivers the frames (inside its own calls). Call it before the menu opens."""
+    got = []
+
+    def on_ws(ws):
+        def on_frame(payload):
+            try:
+                p = json.loads(payload).get("payload")
+            except (TypeError, ValueError, AttributeError):
+                return
+            if isinstance(p, dict) and p.get("protocol") in ("choice", "verdict"):
+                got.append(p["choice"])
+        ws.on("framereceived", on_frame)
+
+    page.on("websocket", on_ws)
+    return got
+
+
+def settled_entry(page, answers, since=0, within_s=20):
+    """The open box menu's first entry once its choose has ended (no `revising` class) and
+    an answer past `answers[since]` has been heard; (item, the last answer)."""
+    item = page.locator('#ctx > .ctx-item[data-action="choice_start"]')
+    expect(item).not_to_have_class(re.compile("revising"), timeout=within_s * 1000)
+    deadline = time.monotonic() + 5
+    while len(answers) <= since:
+        assert time.monotonic() < deadline, "no answer heard on the menu's choose's stream"
+        page.wait_for_timeout(100)
+    return item, answers[-1]
+
+
+def khz1(hz):
+    """khzText's kHz: one decimal."""
+    return f"{hz / 1e3:.1f}"
+
+
+def khz_short(hz):
+    """kHz to at most two decimals, no trailing zeros (2500 -> 2.5, 5000 -> 5)."""
+    return f"{hz / 1e3:.2f}".rstrip("0").rstrip(".")
+
+
+def row_name(url, secret, row):
+    return mode_rows(url, secret)[row]["name"]
+
+
+def title_lines(item):
+    return (item.get_attribute("title") or "").split("\n")
+
+
+def step_two_line(c):
+    """The hover's step-2 line for answer `c`, as `zeta classify` words it (cli.rs
+    step_two_line), or None."""
+    if 2 in c["steps_run"]:
+        return f"step 2: {', '.join(c['could_prove'])}, no frame" if c["step"] != 2 else None
+    why = next((n["reason"] for n in c["not_tried"] if n["row"] is None), None)
+    return None if why is None else f"step 2 did not run: {why.removeprefix('not tried: ')}"
+
+
+def values_of(v, key):
+    """Every value under `key` anywhere in JSON value `v`."""
+    if isinstance(v, dict):
+        return [x for k, x in v.items() if k == key] + \
+            [y for x in v.values() for y in values_of(x, key)]
+    if isinstance(v, list):
+        return [y for x in v for y in values_of(x, key)]
+    return []
+
+
+def scenario_the_first_entry_names_the_deviation(page, url, secret):
+    # Spec 49.6: the first entry names the parameters Start sends, read from the node's answer
+    # (its job's params), here the CB plan's 2.5 kHz deviation (cbvoice is CB channel 20); the
+    # job Start starts has the same deviation.
+    answers = choice_answers(page)
+    choice_entry(page, url, secret, "cbvoice", 12_500, "Start fm_demod here:")
+    item, c = settled_entry(page, answers)
+    j = c["job"]
+    assert j and j["kind"] == "fm_demod", c
+    dev = j["params"]["deviation_hz"]
+    assert dev == 2500, f"not the plan's deviation: {c}"
+    want = (f"Start fm_demod here: {khz1(j['bandwidth_hz'])} kHz, {khz_short(dev)} kHz "
+            f"deviation · {row_name(url, secret, 'fm_demod')}")
+    expect(item).to_have_text(want)
+    job = None
+    try:
+        with page.expect_request(is_op("job_start")) as req:
+            item.click()
+        body = json.loads(req.value.post_data)
+        assert body["kind"] == "fm_demod" and body["deviation_hz"] == dev, body
+        jobs = wait_until(lambda: running_jobs(url, secret, "fm_demod", "cbvoice"), 15,
+                          "a running fm_demod on cbvoice")
+        job = jobs[0]["id"]
+        devs = set(values_of(jobs[0]["graph"], "deviation_hz"))
+        assert devs == {dev}, f"the started job's deviation_hz: {devs}"
+    finally:
+        if job:
+            stop_job(url, secret, job)
+
+
+def box_on_source(page, url, secret, source, hz, answers):
+    """Show `source` and open the box menu on about `hz` about the middle of its view (its
+    span about MENU_SPAN_S); how many of `answers` (choice_answers) came before it. A page
+    already logged in keeps its session: only the page and its waterfall start afresh."""
+    if page.url.startswith(url):
+        fresh_spectrum_jobs(url, secret)
+        page.goto(url + "/ui/")
+        page.click(f'.src-tab[data-id="{source}"]')
+        expect(page.locator(f'.src-tab[data-id="{source}"]')).to_have_attribute(
+            "aria-selected", "true")
+    else:
+        select_source(page, url, secret, source)
+    wait_span(page, MENU_SPAN_S)
+    drag_menu(page, 0.0, 1.0)
+    view_hz = box_of(page)[1]
+    close_menu(page)
+    page.wait_for_timeout(200)
+    since = len(answers)
+    drag_hz(page, hz, view_hz)
+    return since
+
+
+def scenario_the_first_entrys_hover_says_what_step_two_did(page, url, secret):
+    # Spec 49.6: the first entry's hover adds, beside the runner-up, what step 2 did, in the
+    # words of `zeta classify`'s step-2 line.
+    answers = choice_answers(page)
+    # Framed 2-FSK: step 1 answers fm_demod, step 2 replays the decoder rows it could prove,
+    # and none frames.
+    since = box_on_source(page, url, secret, "fsk", 12_500, answers)
+    item, c = settled_entry(page, answers, since)
+    assert c["job"] and 2 in c["steps_run"] and c["step"] != 2 and c["could_prove"], c
+    alt = c["runner_up"]["job"]
+    assert title_lines(item) == [
+        f"runner-up: {alt['kind']} {khz1(alt['bandwidth_hz'])} kHz",
+        f"step 2: {', '.join(c['could_prove'])}, no frame"], (item.get_attribute("title"), c)
+    close_menu(page)
+    # A DMR repeater: step 2 proves dmr_decode, so the hover says no "no frame".
+    since = box_on_source(page, url, secret, "dmr", 12_500, answers)
+    item, c = settled_entry(page, answers, since)
+    expect(item).to_have_text(re.compile(r"^Start dmr_decode here: "))
+    assert c["step"] == 2 and c["settled"] == "proved", c
+    lines = title_lines(item)
+    assert not any(x.startswith("step 2") for x in lines), (lines, c)
+    close_menu(page)
+    # A policy slice under 1 s: step 2 is skipped whole, and the hover says why. (No fixture
+    # here is too wide for step 2; the node's own tests use this policy too.)
+    held = http_json(url, secret, "/op", {"op": "choice_policy_get"})["value"]
+    short = json.loads(json.dumps(held))
+    short["budget"]["slice_s"] = 0.5
+    http_json(url, secret, "/op", {"op": "choice_policy_set", "policy": short, "lease": None})
+    try:
+        # Such a choose ends within moments of its start, and the menu can miss its answer (it
+        # finds the transient job gone before its own stream is attached: `Can't tell: the
+        # node did not choose`), so the box is drawn again until the entry has the answer.
+        for lost in range(4):
+            since = box_on_source(page, url, secret, "fsk", 12_500, answers)
+            item, c = settled_entry(page, answers, since)
+            if item.text_content() != "Can't tell: the node did not choose":
+                break
+            close_menu(page)
+        if lost:
+            print(f"  the menu missed a fast choose's answer {lost} time(s)")
+        assert step_two_line(c) == "step 2 did not run: the policy's slice_s is under 1 s", c
+        lines = title_lines(item)
+        assert "step 2 did not run: the policy's slice_s is under 1 s" in lines, (lines, c)
+        assert not any(x.startswith("step 2:") for x in lines), (lines, c)
+        close_menu(page)
+    finally:
+        http_json(url, secret, "/op", {"op": "choice_policy_set", "policy": held,
+                                       "lease": None})
+
+
+# Records the open box menu's first entry each time it changes ({text, revising, title, t}),
+# in window.__entrySeen.
+ENTRY_SEEN_JS = """() => {
+  const item = document.querySelector('#ctx > .ctx-item[data-action="choice_start"]');
+  window.__entrySeen = [];
+  const note = () => window.__entrySeen.push({text: item.textContent, title: item.title,
+    revising: item.classList.contains('revising'), t: performance.now()});
+  note();
+  new MutationObserver(note).observe(item, {childList: true, characterData: true,
+    subtree: true, attributes: true, attributeFilter: ['class', 'title']});
+}"""
+
+
+def scenario_an_unknown_box_says_what_it_is_trying(page, url, secret):
+    # Spec 49.4: a box layer 1 reads `unknown` (the `quiet` noise read at about 6 kHz) answers
+    # `cannot_tell` with the rows its width fits to be tried; while the menu's choose tries
+    # them the entry says so, and once it has ended it says only why it cannot tell, its hover
+    # what step 2 did. Review focus (C7, P3): the menu closed while it is trying stops the
+    # choose and its replays, leaves no trial slice pinned, and starts no job.
+    answers = choice_answers(page)
+    select_source(page, url, secret, "quiet")
+    wait_span(page, MENU_SPAN_S)
+    drag_menu(page, 0.0, 1.0)
+    view_hz = box_of(page)[1]
+    close_menu(page)
+    page.wait_for_timeout(200)
+    since = len(answers)
+    held, release = held_choose(page)
+    try:
+        drag_hz(page, 6_250, view_hz)
+        wait_until(lambda: held, 5, "the menu's choose asked")
+        page.evaluate(ENTRY_SEEN_JS)
+        release(stop=True)
+        item, c = settled_entry(page, answers, since)
+    finally:
+        release(stop=True)
+    first = answers[since]
+    assert first["job"] is None and first["reason"] == "no row serves unknown" \
+        and first["could_prove"], f"not an unknown box with rows to try: {first}"
+    seen = page.evaluate("() => window.__entrySeen")
+    trying = f"Can't tell: no row serves unknown; trying {', '.join(first['could_prove'])}"
+    assert any(s["text"] == trying and s["revising"] for s in seen), (trying, seen)
+    assert c["job"] is None, c
+    expect(item).to_have_text(f"Can't tell: {c['reason']}")
+    expect(item).to_have_attribute("aria-disabled", "true")
+    line = step_two_line(c)
+    assert line and title_lines(item) == [c["reason"], line], (item.get_attribute("title"), c)
+    close_menu(page)
+
+    # Closed while trying: once the choose's trial slice is pinned (its step 2 under way).
+    def pinned():
+        return [x for x in capture_ops(url, secret, "capture_list", signal=None)
+                if x.get("trial") and x.get("pinned")]
+
+    wait_until(lambda: not pinned(), 5, "no trial slice pinned before the second box")
+    others = {j["id"] for j in http_json(url, secret, "/op", {"op": "job_list", "all": True}
+                                         )["value"]}
+    stops = []
+    on_request = lambda r: is_op("job_stop")(r) and stops.append(json.loads(r.post_data)["job"])
+    page.on("request", on_request)
+    try:
+        wait_span(page, MENU_SPAN_S)
+        drag_hz(page, 6_250, view_hz)
+        expect(item).to_have_text(re.compile("; trying "), timeout=15_000)
+        wait_until(pinned, 5, "the choose's trial slice pinned", step_s=0.05)
+        page.keyboard.press("Escape")
+        expect(page.locator("#ctx")).to_be_hidden()
+        deadline = time.monotonic() + 5
+        while not stops:
+            assert time.monotonic() < deadline, \
+                "no job_stop: the menu closed with its choose already ended"
+            page.wait_for_timeout(100)
+    finally:
+        page.remove_listener("request", on_request)
+    choose = stops[0]
+
+    def left():
+        jobs = http_json(url, secret, "/op", {"op": "job_list", "all": True})["value"]
+        mine = [j for j in jobs if j["id"] == choose or j.get("owner") == choose
+                or (j["id"] not in others and j["kind"] != "spectrum")]
+        return mine, pinned()
+
+    wait_until(lambda: left() == ([], []), 10, "the choose, its replays and its pin gone")
+    page.wait_for_timeout(2_000)
+    assert left() == ([], []), f"after the stop: {left()}"
 
 
 def start_choose_watch(url, secret, source):

@@ -317,7 +317,7 @@
 //            (each of the row's ranges, comma-separated); not offered when every ready row fits
 
 import { DENOISE_KINDS, FIT_KINDS, jobTuning, videoRefusal } from "./menu.js";
-import { khzText, mhzText } from "./units.js";
+import { khzShort, khzText, mhzText } from "./units.js";
 
 // The width presets of a running demodulator's menu, in Hz.
 const WIDTHS = [2500, 5000, 6250, 12500, 25000];
@@ -524,21 +524,65 @@ const banded = (c) => {
 // The choice entry's label while the node has not answered yet.
 const CHOOSING = "Choosing a job here…";
 // The choice entry's label: `Choosing a job here…` until the node's first answer, then `Start
-// <kind> here: <width> kHz <row label>` (` (not proved)` for a best-guess decoder), or `Can't
-// tell: <reason>`.
+// <kind> here: <width> kHz<params> · <row name>` (` (not proved)` for a best-guess decoder),
+// <params> the parameters Start sends, as the answer's job holds them (`, <d> kHz deviation`
+// for `deviation_hz`, `, USB` or `, LSB` for `sideband`, nothing else), or `Can't tell:
+// <reason>`, followed by `; trying <rows>` while the menu's choose runs with rows in
+// `could_prove` (an `unknown` box's rows, spec 49.4).
 function choiceLabel(c) {
   const ch = c.choice;
   if (ch == null) return CHOOSING;
-  if (!ch?.job) return `Can't tell: ${ch?.reason ?? "no job fits"}`;
+  if (!ch?.job) {
+    const why = `Can't tell: ${ch?.reason ?? "no job fits"}`;
+    const rows = ch?.could_prove ?? [];
+    return c.revising === true && rows.length > 0 ? `${why}; trying ${rows.join(", ")}` : why;
+  }
   const row = (c.rows || []).find((r) => r.id === ch.row);
   const guess = !isDemod(c, ch.job.kind) && ch.settled === "best_guess" ? " (not proved)" : "";
-  return `Start ${ch.job.kind} here: ${khzText(ch.job.bandwidth_hz)} kHz ${row?.name ?? ch.row}${guess}`;
+  return `Start ${ch.job.kind} here: ${khzText(ch.job.bandwidth_hz)} kHz${paramsText(ch.job)} · `
+    + `${row?.name ?? ch.row}${guess}`;
 }
 
-// The choice entry's hover title: the runner-up.
+// The parameters of a choice's job that Start sends (menu.js startChoice), as the label words
+// them: `, <d> kHz deviation`, `, USB` or `, LSB`; "" for none.
+function paramsText(j) {
+  const p = j.params ?? {};
+  let out = "";
+  if (Number.isFinite(p.deviation_hz)) out += `, ${khzShort(p.deviation_hz)} kHz deviation`;
+  if (typeof p.sideband === "string") out += `, ${p.sideband.toUpperCase()}`;
+  return out;
+}
+
+// What a choice's step 2 did, as `zeta classify` words it (cli.rs step_two_line): `step 2:
+// <rows>, no frame` when it ran and did not settle the answer, `step 2 did not run: <reason>`
+// when it did not and `not_tried` says why (its row-less note); null otherwise.
+function stepTwoLine(ch) {
+  if ((ch.steps_run ?? []).includes(2)) {
+    return ch.step !== 2 ? `step 2: ${(ch.could_prove ?? []).join(", ")}, no frame` : null;
+  }
+  const why = (ch.not_tried ?? []).find((n) => n.row == null);
+  return why ? `step 2 did not run: ${why.reason.replace(/^not tried: /, "")}` : null;
+}
+
+// The choice entry's hover title: the runner-up, then what step 2 did, a line each.
 function choiceTitle(c) {
-  const alt = c.choice?.runner_up;
-  return alt ? `runner-up: ${alt.job.kind} ${khzText(alt.job.bandwidth_hz)} kHz` : null;
+  const ch = c.choice;
+  if (ch == null) return null;
+  const alt = ch.runner_up;
+  const lines = [
+    alt ? `runner-up: ${alt.job.kind} ${khzText(alt.job.bandwidth_hz)} kHz` : null,
+    stepTwoLine(ch),
+  ].filter((x) => x !== null);
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
+// Why the choice entry is greyed: still choosing, or the reason the node cannot tell, then
+// what step 2 did (stepTwoLine), a line each (the greyed reason is the entry's hover title).
+function choiceRefusal(c) {
+  const ch = c.choice;
+  if (ch == null) return "the node is still choosing";
+  if (ch.job) return null;
+  return [ch.reason ?? "no job fits", stepTwoLine(ch)].filter((x) => x !== null).join("\n");
 }
 
 // Whether `kind` is a demodulator row (`role: "demodulator"` in modes_list: the four built-in
@@ -673,8 +717,7 @@ export const ACTIONS = [
     title: choiceTitle,
     revising: (c) => c.revising === true,
     applies: (c) => c.choice != null || c.revising === true,
-    disabled: (c) => (c.choice == null ? "the node is still choosing"
-      : c.choice.job ? null : c.choice.reason ?? "no job fits"),
+    disabled: choiceRefusal,
     run: (c) => c.host.startChoice(c.choice, c.sel),
   },
   {

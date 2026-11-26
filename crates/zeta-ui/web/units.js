@@ -4,6 +4,8 @@
 // Exports:
 //   mhzText(hz) -> "<MHz to 4 decimals>"        e.g. 100001000 -> "100.0010"
 //   khzText(hz) -> "<kHz to 1 decimal>"         e.g. 5000 -> "5.0"
+//   khzShort(hz) -> "<kHz to at most 2 decimals, no trailing zeros>"   e.g. 2500 -> "2.5",
+//       5000 -> "5", 1750 -> "1.75"
 //   bandText(centerHz, bandwidthHz) -> "<mhzText(centerHz)> MHz, <khzText(bandwidthHz)> kHz"
 //   metricText(value, unit) -> a mode row's value in metres and km/h, rounded: `ft`, `m` ->
 //       "6401 m", `kt`, `km_h` -> "780 km/h", `m_s` -> "+5.0 m/s" (a climb rate stays a climb
@@ -247,6 +249,10 @@ export function mhzText(hz) {
 
 export function khzText(hz) {
   return (hz / 1e3).toFixed(1);
+}
+
+export function khzShort(hz) {
+  return String(Number((hz / 1e3).toFixed(2)));
 }
 
 export function bandText(centerHz, bandwidthHz) {
