@@ -6092,6 +6092,49 @@ async fn a_watch_stopped_while_choosing_starts_nothing_and_leaves_no_slice_pinne
     assert!(events.watch("decoding").is_empty(), "{:#?}", events.all());
 }
 
+/// Under the lease setting `widen`, a signal whose rows reach past the capture's edge is
+/// still tried: step 1 sets those rows aside (the capture does not hold them there) and
+/// could prove nothing, and the watch's `choose` still starts on them, for its step 3 to
+/// try by growing the capture (`tests/choose.rs` has that step; a file source cannot grow).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn under_widen_a_signal_at_the_capture_edge_is_still_tried() {
+    let _one = SERIAL.lock().await;
+    zeta_core::node::watch::test_timing(0, 0);
+    let _unknown = zeta_core::node::watch::test_labels_read("unknown");
+    let dir = tempfile::tempdir().unwrap();
+    // A narrow voice 4 kHz inside the capture's top edge: past the half width of every
+    // row it fits (8 kHz and wider).
+    let audio = speech_like(48_000, 4.0);
+    let offset = (RATE_HZ / 2) as f64 - 4_000.0;
+    let mut iq = zeta_dsp::synth::nbfm_modulate(&audio, 48_000, RATE_HZ, 1_000.0, offset);
+    zeta_dsp::synth::awgn(&mut iq, 25.0, 25);
+    let (node, _port, _answered) = choice_node(dir.path(), &iq).await;
+    no_channel_plan(&node).await;
+    set_trial_s(&node, 5).await;
+    let r = node
+        .apply(Op::ChoicePolicySet {
+            policy: None,
+            lease: Some(zeta_core::choice_policy::LeaseSetting::Widen),
+        })
+        .await;
+    assert!(matches!(r, Ok(OpResult::ChoicePolicy(_))), "{r:?}");
+    let watch = start_choice_watch(&node, serde_json::json!({"edge_mask": 0.0})).await;
+    let events = Events::of(&node, &watch);
+    let (e, _child) = choosing(&events).await;
+    let rows = rows_of(&e);
+    assert!(rows.iter().any(|r| r == "dmr_decode"), "{e}");
+    // The choose ends with nothing proved: an unknown try naming the rows it had.
+    until("an unknown", Duration::from_secs(40), || {
+        !events.watch("unknown").is_empty()
+    })
+    .await;
+    let unknown = &events.watch("unknown")[0];
+    let summary = unknown["summary"].as_str().unwrap();
+    assert!(summary.contains("its choose proved none of"), "{summary}");
+    assert!(summary.contains("dmr_decode"), "{summary}");
+    stop_all(&node).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tried_signal_holds_its_slot_and_the_watch_says_so() {
     let _one = SERIAL.lock().await;

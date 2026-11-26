@@ -91,8 +91,8 @@ use tokio_util::sync::CancellationToken;
 use super::choose::{StepOne, choose_record};
 use super::persist::now;
 use super::{ChooseAsk, Inner, Node, source_fault_reason};
-use crate::choice::{Choice, ChoiceJob, Settled};
-use crate::choice_policy::Surface;
+use crate::choice::{Choice, ChoiceJob, NOT_HELD_LEAD, Settled};
+use crate::choice_policy::{LeaseSetting, Surface};
 use crate::graph::{self, Graph, Node as GraphNode};
 use crate::job::{Hold, JOB_RECORD_FORMAT, JobRecord, JobState};
 use crate::knowledge::{Allocation, DEFAULT_REGION, band_assignments};
@@ -958,12 +958,33 @@ struct Classifying {
     task: tokio::task::JoinHandle<Result<Classified, String>>,
 }
 
-/// A choosing watch's step 1 for one signal: the answer, and whether the watch's own
+/// A choosing watch's step 1 for one signal: the answer, whether the watch's own
 /// `choose` may climb to step 2 (the policy's step for the watch, read once, so the answer
-/// is kept for trials exactly when the watch will try it).
+/// is kept for trials exactly when the watch will try it), and whether it may widen: the
+/// lease setting `widen` with that step reaching 3, so step 3 also tries the rows step 1
+/// set aside at the capture's edge ([`rows_to_try`]).
 struct Classified {
     step: StepOne,
     climb: bool,
+    widen: bool,
+}
+
+/// The rows the watch's `choose` would try for `choice`: its `could_prove`, then, when it
+/// may `widen` ([`Classified`]), each row step 1 set aside as one the capture does not hold
+/// there ([`NOT_HELD_LEAD`]), which step 3 tries by growing the capture.
+fn rows_to_try(choice: &Choice, widen: bool) -> Vec<String> {
+    let set_aside = choice
+        .not_tried
+        .iter()
+        .filter(|n| widen && n.reason.starts_with(NOT_HELD_LEAD))
+        .filter_map(|n| n.row.clone());
+    let mut rows = choice.could_prove.clone();
+    for row in set_aside {
+        if !rows.contains(&row) {
+            rows.push(row);
+        }
+    }
+    rows
 }
 
 /// Step 1 of the choice for `band` of `source` over the newest `slice_s` of its ring, in
@@ -991,17 +1012,16 @@ fn classify_task(
         #[cfg(feature = "test-fixtures")]
         test_force_label(&mut classified);
         // The watch's own `choose` climbs to the policy's step for the watch.
-        let climb = inner
-            .choice_policy
-            .lock()
-            .unwrap()
-            .steps(Surface::Watch, None)
-            .0
-            >= 2;
+        let (to, lease) = {
+            let policy = inner.choice_policy.lock().unwrap();
+            (policy.steps(Surface::Watch, None).0, policy.lease)
+        };
+        let climb = to >= 2;
+        let widen = to >= 3 && lease == LeaseSetting::Widen;
         let block = (samples, rate, ring_center);
         let at = (sel, held_ns, climb, slice_s);
         let step = StepOne::chosen(&node, at, classified, block).await;
-        Ok(Classified { step, climb })
+        Ok(Classified { step, climb, widen })
     })
 }
 
@@ -2195,15 +2215,15 @@ impl Inner {
 
     /// Act on the step-1 `answer` for the tracked signal `i` (classified on `band`): start
     /// the answer's job inside the capture, kept `via: choose`. An answer that is an
-    /// unproved demodulator with rows in `could_prove` starts held ([`PROBATION`]) under
-    /// `probation`. The policy's `attach` kind is attached to it, then, while a decoder
-    /// could still prove otherwise, the watch's own `choose` starts on the band
+    /// unproved demodulator with rows to try ([`rows_to_try`]) starts held ([`PROBATION`])
+    /// under `probation`. The policy's `attach` kind is attached to it, then, while a
+    /// decoder could still prove otherwise, the watch's own `choose` starts on the band
     /// ([`settle`] takes its verdict); one that cannot start leaves the first answer
-    /// standing, its hold lifted. An answer with no job but rows in `could_prove` keeps
-    /// nothing and has them tried ([`Inner::start_choosing`]) when the policy's step for the
-    /// watch, as step 1 read it ([`Classified`]), reaches step 2. A band nothing answers (`cannot_tell` with nothing to try, a
-    /// read that fails) or a job that does not start counts as an unknown try (event
-    /// `unknown`). Event `decoding`. `None`: cancelled.
+    /// standing, its hold lifted. An answer with no job but rows to try keeps nothing and
+    /// has them tried ([`Inner::start_choosing`]) when the policy's step for the watch, as
+    /// step 1 read it ([`Classified`]), reaches step 2. A band nothing answers
+    /// (`cannot_tell` with nothing to try, a read that fails) or a job that does not start
+    /// counts as an unknown try (event `unknown`). Event `decoding`. `None`: cancelled.
     async fn start_answer(
         self: &Arc<Self>,
         r: &Run,
@@ -2212,10 +2232,18 @@ impl Inner {
         answer: Result<Classified, String>,
     ) -> Option<()> {
         let signal = w.signals[i].signal.clone();
-        let seed = match answer {
-            Ok(Classified { step: s, .. }) if s.choice.job.is_some() => s,
-            Ok(Classified { step: s, climb }) if climb && !s.choice.could_prove.is_empty() => {
-                return self.start_choosing(r, w, (i, band), s).await;
+        let (seed, rows) = match answer {
+            Ok(Classified { step: s, widen, .. }) if s.choice.job.is_some() => {
+                let rows = rows_to_try(&s.choice, widen);
+                (s, rows)
+            }
+            Ok(Classified {
+                step: s,
+                climb,
+                widen,
+            }) if climb && !rows_to_try(&s.choice, widen).is_empty() => {
+                let rows = rows_to_try(&s.choice, widen);
+                return self.start_choosing(r, w, (i, band), s, rows).await;
             }
             Ok(Classified { step: s, .. }) => {
                 let why = s.choice.reason.unwrap_or_else(|| "no job".into());
@@ -2235,7 +2263,7 @@ impl Inner {
             .modes()
             .get(&job.kind)
             .is_some_and(|m| m.role() == Role::Demodulator);
-        let unproved = choice.settled != Settled::Proved && !choice.could_prove.is_empty();
+        let unproved = choice.settled != Settled::Proved && !rows.is_empty();
         let held = (r.seed.policy.probation && demod && unproved).then(|| Hold {
             reason: PROBATION.into(),
             since_ns: now().0,
@@ -2269,7 +2297,7 @@ impl Inner {
         if w.decoding[k].held {
             summary.push_str(&format!(
                 "; held on {PROBATION} while its choose tries {}",
-                choice.could_prove.join(", ")
+                rows.join(", ")
             ));
         }
         notes.extend(kept_notes(attach_notes, sink_error));
@@ -2350,7 +2378,8 @@ impl Inner {
     }
 
     /// Step 1's answer `seed` for the tracked signal `i` has no job, but decoder rows could
-    /// still prove it (`could_prove`; for `unknown`, the rows its width fits): nothing is
+    /// still prove it (`rows`, [`rows_to_try`]: `could_prove`, for `unknown` the rows its
+    /// width fits, and under `widen` the rows set aside at the capture's edge): nothing is
     /// kept, and the watch's own `choose` starts on `band` to try them, handed the seed
     /// ([`Inner::start_choose`]; [`choosing_ended`] takes its verdict). The signal is handled while
     /// it runs. Event `choosing`, naming the rows (`rows`). A `choose` that does not start
@@ -2361,8 +2390,8 @@ impl Inner {
         w: &mut State,
         (i, band): (usize, Tuning),
         seed: StepOne,
+        rows: Vec<String>,
     ) -> Option<()> {
-        let rows = seed.choice.could_prove.clone();
         let reason = (seed.choice.reason.clone()).unwrap_or_else(|| "no job".into());
         let choose = match self.start_choose(r, band, seed).await {
             Ok(None) => return None,
