@@ -190,8 +190,10 @@ impl BurstStore {
     /// Open (making it if missing) `state_dir/bursts`, reading `index.json`; a record
     /// whose data or meta file is gone is dropped (and the index rewritten). A missing index
     /// reads as empty; an unreadable one is moved aside as `index.json.broken-<ulid>` and
-    /// rebuilt from the `.sigmf-meta` files present (pins are lost). Nothing is expired here: the node calls
-    /// [`BurstStore::expire`] once it is open.
+    /// rebuilt from the `.sigmf-meta` files present (pins are lost). A pinned trial slice is
+    /// unpinned (and the index rewritten): its pin is a running `choose`'s, and none
+    /// survives a restart, so a slice left pinned by a crash would hold trial quota for
+    /// good. Nothing is expired here: the node calls [`BurstStore::expire`] once it is open.
     pub fn open(state_dir: &Path, policy: BurstPolicy) -> std::io::Result<Arc<Self>> {
         let dir = state_dir.join(BURSTS_DIR);
         std::fs::create_dir_all(&dir)?;
@@ -209,11 +211,16 @@ impl BurstStore {
             },
         };
         let n = read.len();
+        let mut unpinned = false;
         let kept: Vec<CaptureRecord> = read
             .into_iter()
             .map(|mut r| {
                 r.meta_path = resolve(&dir, &r.meta_path);
                 r.data_path = resolve(&dir, &r.data_path);
+                if r.trial && r.pinned {
+                    r.pinned = false;
+                    unpinned = true;
+                }
                 r
             })
             .filter(|r| r.data_path.is_file() && r.meta_path.is_file())
@@ -224,7 +231,7 @@ impl BurstStore {
             index: Mutex::new(kept),
             reserved: Arc::new(AtomicU64::new(0)),
         };
-        if rebuilt || store.index.lock().unwrap().len() != n {
+        if rebuilt || unpinned || store.index.lock().unwrap().len() != n {
             store.persist(&store.index.lock().unwrap())?;
         }
         Ok(Arc::new(store))
@@ -983,6 +990,32 @@ mod tests {
         );
         assert_eq!(s.trial_room(), w * 2);
         assert_eq!(s.list().len(), 1);
+    }
+
+    #[test]
+    fn a_trial_slice_left_pinned_is_unpinned_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WINDOW as u64 * 8;
+        let s = two_budgets(dir.path(), u64::MAX, w * 2);
+        // A choose's slice, pinned, and an operator's pinned capture: then a crash.
+        let r = s.reserve_trial(w).unwrap();
+        let slice = s.write_trial(trial_capture(t(0)), &samples(), r).unwrap();
+        let operator = s.write(new_capture(t(1)), &samples()).unwrap();
+        s.pin(&operator.id).unwrap();
+        assert_eq!(s.trial_room(), w);
+        drop(s);
+        let s = two_budgets(dir.path(), u64::MAX, w * 2);
+        assert!(!s.get(&slice.id).unwrap().pinned);
+        assert!(s.get(&operator.id).unwrap().pinned);
+        assert_eq!(s.trial_room(), w * 2);
+        // Written back: a second open reads it unpinned from the index.
+        drop(s);
+        let index: Vec<CaptureRecord> = serde_json::from_slice(
+            &std::fs::read(dir.path().join(BURSTS_DIR).join(INDEX_FILE)).unwrap(),
+        )
+        .unwrap();
+        let rec = index.iter().find(|r| r.id == slice.id).unwrap();
+        assert!(!rec.pinned, "{rec:?}");
     }
 
     #[test]
