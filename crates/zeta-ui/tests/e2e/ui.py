@@ -5950,14 +5950,25 @@ def scenario_box_menu_groups_open_by_hover_click_and_keys(page, url, secret):
     page.keyboard.press("ArrowUp")
     up = focused_key(page)
     assert up == first[first.index("group:measure") - 1], f"ArrowUp to {up} in {first}"
+    # The choice settled first, so the Listen group's order is its last.
+    entry = page.locator('#ctx > .ctx-item[data-action="choice_start"]')
+    expect(entry).not_to_have_class(re.compile("revising"), timeout=20_000)
     menu.locator('.ctx-item[data-group="listen"]').focus()
     page.keyboard.press("Enter")
     expect(listen).to_be_visible()
-    # Its first entry: the chosen demodulator leads the group (on the tone's channel the test
-    # register expects FM data and AM voice, so a carrier answers am_demod).
+    # Its first entry: the demodulator the choice entry names leads the group (on the tone's
+    # channel the test register expects FM data and AM voice, so a carrier answers am_demod);
+    # with no demodulator named, the table's first.
+    text = entry.text_content() or ""
+    named = re.match(r"^Start (\w+) here: ", text)
+    kind = named.group(1) if named else None
+    if kind == "ssb_demod":
+        want = "ssb_lsb" if ", LSB" in text else "ssb_usb"
+    else:
+        want = kind if kind in ("fm_demod", "wfm_demod", "am_demod") else "fm_demod"
     lead = listen.locator(".ctx-item").first.get_attribute("data-action")
-    assert lead in ("fm_demod", "am_demod") and focused_key(page) == lead, \
-        (lead, focused_key(page))
+    assert lead == want and focused_key(page) == lead, \
+        (lead, want, text, focused_key(page))
     page.keyboard.press("Escape")
     page.keyboard.press("Escape")
     expect(menu).to_be_hidden()
@@ -6301,6 +6312,19 @@ def rows_answered(page):
     return lambda: asked and len(answered) >= len(asked)
 
 
+def wait_on_page(page, pred, within_s, what, step_ms=100):
+    """wait_until for a `pred` that reads what Playwright's event handlers collect (a route,
+    a request or a websocket frame): it waits with `page.wait_for_timeout`, inside which
+    Playwright delivers them (time.sleep does not)."""
+    deadline = time.monotonic() + within_s
+    while True:
+        v = pred()
+        if v or time.monotonic() > deadline:
+            assert v, f"{what} within {within_s} s"
+            return v
+        page.wait_for_timeout(step_ms)
+
+
 def open_decode_while_choosing(page, url, secret):
     """The tone shown with its rows read, a box menu opened while its choose's job_start is held
     (held_choose), its first entry pending, and its Decode submenu opened by a click. Returns
@@ -6308,11 +6332,11 @@ def open_decode_while_choosing(page, url, secret):
     rows = rows_answered(page)
     show_tone_waterfall(page, url, secret)
     wait_span(page, MENU_SPAN_S)
-    wait_until(rows, 10, "the page's modes_list answered")
+    wait_on_page(page, rows, 10, "the page's modes_list answered")
     held, release = held_choose(page)
     menu = drag_menu(page)
     entry = menu.locator('.ctx-item[data-action="choice_start"]')
-    wait_until(lambda: held, 5, "the menu's choose asked")
+    wait_on_page(page, lambda: held, 5, "the menu's choose asked")
     expect(entry).to_have_text("Choosing a job here…")
     expect(entry).to_have_class(re.compile("revising"))
     menu.locator('.ctx-item[data-group="decode"]').click()
@@ -6492,6 +6516,8 @@ def title_lines(item):
 def step_two_line(c):
     """The hover's step-2 line for answer `c`, as `zeta classify` words it (cli.rs
     step_two_line), or None."""
+    if len(c["steps_run"]) < 2 and all(n["row"] is not None for n in c["not_tried"]):
+        return None
     if 2 in c["steps_run"]:
         return f"step 2: {', '.join(c['could_prove'])}, no frame" if c["step"] != 2 else None
     why = next((n["reason"] for n in c["not_tried"] if n["row"] is None), None)
@@ -6589,17 +6615,10 @@ def scenario_the_first_entrys_hover_says_what_step_two_did(page, url, secret):
     short["budget"]["slice_s"] = 0.5
     http_json(url, secret, "/op", {"op": "choice_policy_set", "policy": short, "lease": None})
     try:
-        # Such a choose ends within moments of its start, and the menu can miss its answer (it
-        # finds the transient job gone before its own stream is attached: `Can't tell: the
-        # node did not choose`), so the box is drawn again until the entry has the answer.
-        for lost in range(4):
-            since = box_on_source(page, url, secret, "fsk", 12_500, answers)
-            item, c = settled_entry(page, answers, since)
-            if item.text_content() != "Can't tell: the node did not choose":
-                break
-            close_menu(page)
-        if lost:
-            print(f"  the menu missed a fast choose's answer {lost} time(s)")
+        # Such a choose ends within moments of its start; the menu keeps its answer
+        # (the_menu_keeps_a_fast_chooses_answer).
+        since = box_on_source(page, url, secret, "fsk", 12_500, answers)
+        item, c = settled_entry(page, answers, since)
         assert step_two_line(c) == "step 2 did not run: the policy's slice_s is under 1 s", c
         lines = title_lines(item)
         assert "step 2 did not run: the policy's slice_s is under 1 s" in lines, (lines, c)
@@ -6608,6 +6627,40 @@ def scenario_the_first_entrys_hover_says_what_step_two_did(page, url, secret):
     finally:
         http_json(url, secret, "/op", {"op": "choice_policy_set", "policy": held,
                                        "lease": None})
+
+
+def scenario_the_menu_keeps_a_fast_chooses_answer(page, url, secret):
+    # A choose that skips step 2 (a policy slice under 1 s) ends within moments of its start,
+    # often before the menu's own subscription to the job's stream opens and before the job's
+    # record is read: its answer reaches the page on the source's feed, which is open before
+    # the job starts, so the entry never reads `the node did not choose` for a job that
+    # answered. The box is opened FAST_CHOOSE_TRIES times, each on a page loaded afresh (the
+    # race is lost most often while the page's own first reads are in flight).
+    answers = choice_answers(page)
+    held = http_json(url, secret, "/op", {"op": "choice_policy_get"})["value"]
+    short = json.loads(json.dumps(held))
+    short["budget"]["slice_s"] = 0.5
+    http_json(url, secret, "/op", {"op": "choice_policy_set", "policy": short, "lease": None})
+    try:
+        got = []
+        for _ in range(FAST_CHOOSE_TRIES):
+            since = box_on_source(page, url, secret, "fsk", 12_500, answers)
+            item, c = settled_entry(page, answers, since)
+            assert step_two_line(c) == \
+                "step 2 did not run: the policy's slice_s is under 1 s", c
+            got.append(item.text_content())
+            close_menu(page)
+        lost = [t for t in got if t == f"Can't tell: {NO_CHOICE}"]
+        assert not lost, f"the menu lost {len(lost)} of {len(got)} answers: {got}"
+    finally:
+        http_json(url, secret, "/op", {"op": "choice_policy_set", "policy": held,
+                                       "lease": None})
+
+
+# How often the_menu_keeps_a_fast_chooses_answer opens its box (P3 saw 1 in 4 lost).
+FAST_CHOOSE_TRIES = 8
+# menu.js NO_CHOICE: the entry's reason for a choose that ended with no answer.
+NO_CHOICE = "the node did not choose"
 
 
 # Records the open box menu's first entry each time it changes ({text, revising, title, t}),
@@ -6640,7 +6693,7 @@ def scenario_an_unknown_box_says_what_it_is_trying(page, url, secret):
     held, release = held_choose(page)
     try:
         drag_hz(page, 6_250, view_hz)
-        wait_until(lambda: held, 5, "the menu's choose asked")
+        wait_on_page(page, lambda: held, 5, "the menu's choose asked")
         page.evaluate(ENTRY_SEEN_JS)
         release(stop=True)
         item, c = settled_entry(page, answers, since)

@@ -130,6 +130,12 @@
 //                            its row settled; until then they are held (PENDING_MAX), a poll
 //                            is asked for (one in flight) and the row looked up, and a frame
 //                            whose job two fresh polls do not list is dropped.
+//     ov.tap(fn) -> untap    `fn(frame)` hears every frame of the shown source's feed (any
+//                            job's, a transient one's too), before it is drawn or held;
+//                            `untap()` ends it. ov.feedOpen(source) -> bool: whether the
+//                            feed of `source` is the shown one and has opened, so a job
+//                            started on it now has every event heard by a tap (menu.js's
+//                            choose: its answers whatever becomes of the job's own stream)
 //     ov.follows(jobId) -> bool  whether the job's events reach ov.onEvent: a running job on
 //                            the selected source (the feed), or a positioned job on another
 //                            source whose feed is subscribed here; false for any other (a
@@ -445,6 +451,7 @@ class Overlays {
     this.feedNoted = new Set(); // sources noted as having no feed
     this.hideFeeds = false; // zetaTest.hideFeeds: resolve as if no feed were listed
     this.pending = []; // feed frames held until their job is known (ov.hold)
+    this.taps = new Set(); // ov.tap's listeners: every frame of the shown source's feed
     this.pollAsked = false; // a poll requested by ov.hold is in flight
     this.pollAgain = false; // another is wanted once it ends
     this.seeding = new Set(); // job ids whose `job_context` squelch read is in flight
@@ -649,9 +656,21 @@ class Overlays {
     this.feed = null;
   }
 
+  // `fn(frame)` hears every frame of the shown source's feed until the answer is called.
+  tap(fn) {
+    this.taps.add(fn);
+    return () => this.taps.delete(fn);
+  }
+
+  // Whether `source`'s feed is the shown one and has opened.
+  feedOpen(source) {
+    return !this.destroyed && !!this.feed && this.feed.opened && this.feed.source === source;
+  }
+
   onFeedMessage(feed, msg) {
     if (this.destroyed || this.feed !== feed) return;
     if (msg.type === "frame") {
+      for (const fn of [...this.taps]) fn(msg);
       const job = this.feedJob(msg.job);
       if (job) this.render(job, msg.payload);
       else this.hold(msg);

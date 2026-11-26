@@ -177,11 +177,16 @@
 // (actions.js choiceLabel) or `Can't tell: <reason>` greyed (`; trying <rows>` while it tries
 // them; `the node did not choose` for a job that ended without an answer), its hover what
 // step 2 did, revised by its later answers, the entry carrying the
-// class `revising` while the job runs. The answers come from the job's event stream; its
-// record's context.choose is read (job_list --all) every CHOOSE_POLL_MS only while that
-// stream is not attached, once when it attaches (what came before it) and once when it
-// closes. Closing or reopening the menu stops the job. The Listen group leads with the chosen
-// demodulator (actions.js offered).
+// class `revising` while the job runs. The answers come from the source's feed when it is open
+// as the job starts (overlays.js ov.tap: it hears every frame of the job, however soon the job
+// ends; the frames heard before job_start answers are kept and filtered by its id), else from
+// the job's event stream. The job's record's context.choose is read (job_list --all) every
+// CHOOSE_POLL_MS only while that stream is not attached, once when it attaches (what came
+// before it) and once when it closes, only the newest read applying; with the feed, a read
+// only tells that the job is gone (its answers are the feed's), and the entry then waits
+// FEED_GRACE_MS for the feed's verdict before it says the node did not choose. Closing or
+// reopening the menu stops the job. The Listen group leads with the chosen demodulator
+// (actions.js offered).
 // An answer revises the entry in place (reviseChoice): its label, title, greyed state and
 // `revising` class, and the Listen group's order only when the chosen demodulator changed.
 // Nothing else is drawn again, so the open submenus, the focus and a scrolled panel stay where
@@ -241,6 +246,12 @@ const NO_CHOICE = "the node did not choose";
 // How often the box's transient `choose` job's context is read for a revision while its event
 // stream is not attached.
 const CHOOSE_POLL_MS = 500;
+// How long the entry waits for a choose's verdict on the source's feed once its record is
+// gone, before it reads `the node did not choose`.
+const FEED_GRACE_MS = 1500;
+// At most this many of the feed's choice frames are kept while the choose's job_start has
+// not answered.
+const FEED_EARLY_MAX = 64;
 export const SPAN_LIMIT_NS = 8_000_000_000;
 export const LABEL_STEP_PX = 18;
 // The label spacing in Hz while the waterfall cannot map Hz to pixels (band not known yet).
@@ -689,6 +700,7 @@ class Menu {
     this.chooseGen = 0;
     this.chooseTimer = null;
     this.chooseSub = null;
+    this.chooseUntap = null;
     this.labelKeys = [];
     this.pointer = { x: 0, y: 0 };
     // modes_list's rows (a promise), read once per page; `rows` once it answered.
@@ -1188,6 +1200,8 @@ class Menu {
     this.chooseTimer = null;
     this.chooseSub?.close();
     this.chooseSub = null;
+    this.chooseUntap?.();
+    this.chooseUntap = null;
     const id = this.chooseJob;
     this.chooseJob = null;
     if (id !== null) this.ov.api.op({ op: "job_stop", job: id }).catch(() => {});
@@ -1203,7 +1217,24 @@ class Menu {
       if (live() && this.fitting === null) this.reviseChoice();
     };
     const { span } = this.selection(this.current());
+    // The source's feed, open now, carries every answer of the job about to start: a tap
+    // keeps its choice frames until the job's id is known (`hear` set), then hears the job's.
+    const fed = this.ov.feedOpen?.(at.sourceId) === true;
+    let early = [];
+    let hear = null;
     let id;
+    const untap = fed
+      ? this.ov.tap((msg) => {
+        const p = msg.payload;
+        if (!p || (p.protocol !== "choice" && p.protocol !== "verdict")) return;
+        if (hear) {
+          if (msg.job === id) hear(p);
+        } else if (early.length < FEED_EARLY_MAX) {
+          early.push(msg);
+        }
+      })
+      : () => {};
+    this.chooseUntap = untap;
     try {
       const r = await this.ov.api.op({
         op: "job_start",
@@ -1219,6 +1250,7 @@ class Menu {
       });
       id = r.value;
     } catch (e) {
+      untap();
       if (!live()) return;
       this.choosing = false;
       this.choice = { job: null, reason: e?.message ?? NO_CHOICE };
@@ -1226,6 +1258,7 @@ class Menu {
       return;
     }
     if (!live()) {
+      untap();
       this.ov.api.op({ op: "job_stop", job: id }).catch(() => {});
       return;
     }
@@ -1250,12 +1283,37 @@ class Menu {
       if (changed || done) show();
       if (done) this.stopChoose();
     };
+    // An answer heard (the feed's, or without it the job's stream's).
+    const heardOne = (p) => {
+      heard += 1;
+      take(p.choice, p.protocol === "verdict");
+    };
+    if (fed) {
+      hear = heardOne;
+      const kept = early.filter((m) => m.job === id);
+      early = [];
+      for (const m of kept) hear(m.payload);
+      if (this.chooseJob !== id) return;
+    }
+    // With the feed: the job's record is gone, so it has ended. Its verdict is on the feed,
+    // or soon will be; without one in FEED_GRACE_MS the last answer (or none) stands.
+    const settleLater = () => {
+      clearTimeout(this.chooseTimer);
+      this.chooseTimer = setTimeout(() => {
+        this.chooseTimer = null;
+        take(null, true);
+      }, FEED_GRACE_MS);
+    };
+    // Only the newest read of the record applies (a timer's read still in flight when the
+    // stream attaches would otherwise answer after the attach's read).
+    let reads = 0;
     // The job's record, read once: its context's answer (a transient job is forgotten the
     // moment it stops, so one missing from the list has ended and the last choice stands;
     // job_context would answer an unknown job: a 422 the browser logs as an error). Again
     // every CHOOSE_POLL_MS while the stream is not attached. A read that an event overtook is
-    // dropped: the event is newer.
+    // dropped: the event is newer. With the feed, a read only tells that the job is gone.
     const read = async () => {
+      const mine = ++reads;
       const before = heard;
       let ctx = null;
       try {
@@ -1265,8 +1323,12 @@ class Menu {
         // The node did not answer: the next read tries again.
         ctx = undefined;
       }
-      if (!live() || this.chooseJob !== id) return;
-      if (ctx !== undefined && heard === before) {
+      if (mine !== reads || !live() || this.chooseJob !== id) return;
+      if (fed && ctx === null) {
+        settleLater();
+        return;
+      }
+      if (!fed && ctx !== undefined && heard === before) {
         take(ctx?.choice, ctx === null || ctx.verdict != null);
       }
       if (this.chooseJob === id && !attached && this.chooseTimer === null) {
@@ -1293,11 +1355,10 @@ class Menu {
         this.chooseSub = this.ov.api.streamText(
           sid,
           (msg) => {
-            const p = msg.type === "frame" ? msg.payload : null;
-            if (p && (p.protocol === "choice" || p.protocol === "verdict")) {
-              heard += 1;
-              take(p.choice, p.protocol === "verdict");
-            }
+            // With the feed its frames are the feed's, heard there: only its opening and
+            // closing count here.
+            const p = msg.type === "frame" && !fed ? msg.payload : null;
+            if (p && (p.protocol === "choice" || p.protocol === "verdict")) heardOne(p);
           },
           () => {
             if (!live() || this.chooseJob !== id) return;

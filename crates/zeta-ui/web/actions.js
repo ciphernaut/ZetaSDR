@@ -555,9 +555,12 @@ function paramsText(j) {
 
 // What a choice's step 2 did, as `zeta classify` words it (cli.rs step_two_line): `step 2:
 // <rows>, no frame` when it ran and did not settle the answer, `step 2 did not run: <reason>`
-// when it did not and `not_tried` says why (its row-less note); null otherwise.
+// when it did not and `not_tried` says why (its row-less note); null otherwise, and first null
+// when under two steps ran and every `not_tried` entry names a row, as the CLI's guard.
 function stepTwoLine(ch) {
-  if ((ch.steps_run ?? []).includes(2)) {
+  const steps = ch.steps_run ?? [];
+  if (steps.length < 2 && (ch.not_tried ?? []).every((n) => n.row != null)) return null;
+  if (steps.includes(2)) {
     return ch.step !== 2 ? `step 2: ${(ch.could_prove ?? []).join(", ")}, no frame` : null;
   }
   const why = (ch.not_tried ?? []).find((n) => n.row == null);
