@@ -1002,11 +1002,38 @@ fn a_weak_fm_over_of_voice_like_audio_reads_fm() {
     use zeta_dsp::fixtures::WeakSignal;
     let voice: Vec<_> = zeta_dsp::fixtures::weak_cases()
         .into_iter()
-        .filter(|c| matches!(c.signal, WeakSignal::Voice { .. }))
+        .filter(|c| matches!(c.signal, WeakSignal::Voice { flutter_hz, .. } if flutter_hz == 0.0))
         .collect();
     every_weak_case(&voice, |c, _, l| {
         let ok = l.name == "fm" || (c.snr_db < WEAK_DECIDED_DB && l.name == "unknown");
         (!ok).then(|| format!("{} ({})", l.name, l.evidence))
+    });
+}
+
+/// A mobile's over flutters: its carrier fades as a Rayleigh path does at 30 Hz of Doppler
+/// (4.4 dB or more under its mean 30 % of the time, 10 ms at a time), keyed up 40 % into
+/// the window, its mean power 3 to 12 dB over the channel's noise. Its deep fades do reach
+/// the noise, 14 to 28 times in its 1.2 s, so the gate's runs are short, but of uneven
+/// length, as fades are and frames are not: the window is still gated to them (duty 0.35
+/// to 0.54 of a carrier keyed for 0.6), the noise before the key-up is not read with it,
+/// and it is never `am`: `fm`, or `unknown` when its fading envelope is more than the
+/// noise explains.
+#[test]
+fn a_weak_fading_fm_over_stays_gated_and_is_never_am() {
+    use zeta_dsp::fixtures::WeakSignal;
+    let fading: Vec<_> = zeta_dsp::fixtures::weak_cases()
+        .into_iter()
+        .filter(|c| matches!(c.signal, WeakSignal::Voice { flutter_hz, .. } if flutter_hz > 0.0))
+        .collect();
+    every_weak_case(&fading, |c, f, l| {
+        let gated = f.duty.is_some_and(|d| (0.3..=0.65).contains(&f64::from(d)));
+        let label = matches!(l.name.as_str(), "fm" | "fsk" | "unknown");
+        (!(gated && label)).then(|| {
+            format!(
+                "{} duty {:?}, the carrier up {:.2} ({})",
+                l.name, f.duty, c.share, l.evidence
+            )
+        })
     });
 }
 
@@ -1074,11 +1101,10 @@ fn a_weak_keyed_overs_duty_is_its_carrier_up_share() {
 
 /// Real AM is still `am` when it is weak: its envelope moves more than the noise explains
 /// (rule 7) or more than its phase does (rule 9).
-/// - A tone at index 0.5 and at 0.2, and speech at 0.9, read `am` from 6 dB in the channel,
-///   and the tone at 0.5 from 3 dB.
-/// - At 3 dB the index-0.2 tone and the speech (an envelope CV of 0.14 to 0.2 under a
-///   noise share of 0.4) may read `carrier`: the envelope's motion is within the margin of
-///   the phase's.
+/// - A tone at index 0.5 reads `am` at every level, from 1 dB.
+/// - A tone at index 0.2 and speech at 0.9 read `am` from 6 dB in the channel. Under 6 dB
+///   (an envelope CV of 0.14 to 0.2 under a noise share of 0.4 and more) they may read
+///   `carrier` or `unknown`: the envelope's motion is within the margin of the phase's.
 /// - A tone at index 0.9 reads `am` or, as it did before, `ook` (its envelope's troughs a
 ///   tenth of its crests, every millisecond, fit a chip).
 /// - The same holds over noise that slopes by 6 dB across the channel, as under a
@@ -1098,7 +1124,7 @@ fn weak_am_reads_am() {
         };
         let ok = if index == 0.9 && !speech {
             matches!(l.name.as_str(), "am" | "ook")
-        } else if c.snr_db >= 6.0 || (index == 0.5 && c.snr_db >= 3.0) {
+        } else if c.snr_db >= 6.0 || index == 0.5 {
             l.name == "am"
         } else {
             matches!(l.name.as_str(), "am" | "carrier" | "unknown")

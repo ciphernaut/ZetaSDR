@@ -56,6 +56,20 @@ pub(super) const BURST_LEVEL_MS: usize = 10;
 /// carrier's (AM at full index has at most 1.5 times its carrier's power), and the window
 /// is not split.
 pub(super) const BURST_LEVEL_RATIO: f64 = 2.0;
+/// The slow gate's runs shorter than `BURST_LONG_RUN_MS` still gate the window when they
+/// are a carrier's between its fades ([`fading`]): at least this many runs ...
+const BURST_FADE_MIN_RUNS: usize = 4;
+/// ... whose lengths' standard deviation is at least this share of their mean. On
+/// generators 3 to 12 dB over a 12.5 or 25 kHz channel's noise: an over fading as a
+/// Rayleigh path at 30 Hz of Doppler leaves 14 to 28 runs in 1.2 s spreading by 0.44 to
+/// 1.1 of their mean; a train of 30 ms frames 9 ms apart leaves runs of 28 ms spreading
+/// by 0.015 to 0.035.
+const BURST_FADE_SPREAD: f64 = 0.25;
+/// ... and under this share of the 1 ms chunks inside them at the off level. On the same
+/// generators the fading over has 0.01 to 0.06 of them there (the noise's scatter at 3 dB);
+/// on-off keyed data at 300 and 1200 Bd, 3 to 20 dB, whose runs are as uneven as fades,
+/// has 0.17 to 0.26 (its zeros).
+const BURST_FADE_MAX_OFF: f64 = 0.1;
 /// FFT size of the cyclostationary line search: a line grows with the
 /// transform length and the noise continuum does not.
 const CYCLO_SIZE: usize = 4096;
@@ -153,16 +167,18 @@ pub fn burst_runs(iq: &[Complex<f32>], rate_hz: u64) -> Bursts {
 /// `BURST_ON_DB` (a carrier only a few dB over the noise in the stream, keyed up, keyed
 /// down or cut by a drop-out): the chunk powers are averaged over `BURST_LEVEL_MS` about
 /// each chunk and split at the geometric mean of the two levels that split leaves (two
-/// means, iterated), wherever the levels lie. A chunk over the split is on; runs closer
-/// than `BURST_LEVEL_MS` are merged and shorter ones dropped, so an edge is found to about
-/// half of it.
+/// means, iterated), wherever the levels lie. A run starts where the average is over the
+/// split and lasts while it is over the off level, taken as the geometric mean of the
+/// off level and the split (at 3 dB in the channel 1.3 times the noise, 3.4 of the
+/// noise's spreads over it and 1.2 dB under the noise plus a carrier 4.4 dB down): a
+/// carrier that fades without reaching the noise stays one run. Runs closer than
+/// `BURST_LEVEL_MS` are merged and shorter ones dropped, so an edge is found to about half
+/// of it.
 ///
 /// The average hides an off part shorter than itself (the 9 ms between an OOK remote's
 /// frames), so each run is then cut wherever the mean over half of `BURST_LEVEL_MS` lies
-/// under the split, and pieces shorter than `BURST_LEVEL_MS` are dropped: a train of
+/// at that off level, and pieces shorter than `BURST_LEVEL_MS` are dropped: a train of
 /// frames stays a train of short runs, and a carrier with a short hole loses the hole.
-/// Half an average of a carrier 3 dB over a 12.5 kHz channel's noise stands 4.5 of its
-/// spreads over the split.
 ///
 /// `None` when the levels are under `BURST_LEVEL_RATIO` apart (one level), no run is
 /// left, or the window is shorter than two averages.
@@ -217,9 +233,26 @@ pub(super) fn level_runs(iq: &[Complex<f32>], rate_hz: u64) -> Option<Bursts> {
     if on < BURST_LEVEL_RATIO * off {
         return None;
     }
+    // A run starts over the split and lasts until the off level: a fade that does not
+    // reach the noise is still the carrier.
+    let low = (off * split).sqrt();
     let mut runs: Vec<(usize, usize)> = Vec::new();
-    for (i, _) in level.iter().enumerate().filter(|&(_, &v)| v > split) {
-        let (start, end) = (i * chunk, ((i + 1) * chunk).min(iq.len()));
+    let mut i = 0;
+    while i < level.len() {
+        if level[i] <= low {
+            i += 1;
+            continue;
+        }
+        let first = i;
+        let mut over = false;
+        while i < level.len() && level[i] > low {
+            over |= level[i] > split;
+            i += 1;
+        }
+        if !over {
+            continue;
+        }
+        let (start, end) = (first * chunk, (i * chunk).min(iq.len()));
         match runs.last_mut() {
             Some(last) if start - last.1 < span * chunk => last.1 = end,
             _ => runs.push((start, end)),
@@ -229,15 +262,15 @@ pub(super) fn level_runs(iq: &[Complex<f32>], rate_hz: u64) -> Option<Bursts> {
     if runs.is_empty() {
         return None;
     }
-    // An off part the average hid: cut the runs wherever half an average lies under the
-    // split.
+    // An off part the average hid: cut the runs wherever half an average lies at the off
+    // level.
     let half = (span / 2).max(1);
     let mut cut: Vec<(usize, usize)> = Vec::new();
     for &(s, e) in &runs {
         let (first, last) = (s / chunk, e.div_ceil(chunk).min(power.len()));
         let mut off = vec![false; last - first];
         for i in first..(last + 1).saturating_sub(half).max(first) {
-            if (acc[i + half] - acc[i]) / half as f64 <= split {
+            if (acc[i + half] - acc[i]) / half as f64 <= low {
                 off[i - first..i - first + half].fill(true);
             }
         }
@@ -337,6 +370,41 @@ pub fn on_time(iq: &[Complex<f32>], b: &Bursts) -> Vec<Complex<f32>> {
     out
 }
 
+/// Whether the slow gate's short runs `b` of the window `iq` are one carrier cut by fades
+/// rather than frames or keyed data:
+/// - at least `BURST_FADE_MIN_RUNS` runs, on for `BURST_LONG_RUN_MS` between them;
+/// - their lengths spread by at least `BURST_FADE_SPREAD` of their mean: fades come when
+///   the path sends them, frames are cut to a length;
+/// - under `BURST_FADE_MAX_OFF` of the chunks inside them at the off level (under the
+///   geometric mean of the off level and the split, as [`level_runs`] cuts): a carrier
+///   between its fades is up, keyed data is off for its zeros.
+fn fading(iq: &[Complex<f32>], rate_hz: u64, b: &Bursts) -> bool {
+    let lengths: Vec<f64> = b.runs.iter().map(|&(s, e)| (e - s) as f64).collect();
+    let total: f64 = lengths.iter().sum();
+    if lengths.len() < BURST_FADE_MIN_RUNS || total >= iq.len() as f64 {
+        return false;
+    }
+    let mean = total / lengths.len() as f64;
+    let var = lengths.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / lengths.len() as f64;
+    if total * 1_000.0 / (rate_hz.max(1) as f64) < f64::from(BURST_LONG_RUN_MS)
+        || var.sqrt() < BURST_FADE_SPREAD * mean
+    {
+        return false;
+    }
+    let chunk = ((rate_hz * BURST_ENVELOPE_MS / 1_000) as usize).max(1);
+    let power: Vec<f64> = b
+        .runs
+        .iter()
+        .flat_map(|&(s, e)| iq[s..e].chunks(chunk))
+        .map(|c| c.iter().map(|x| x.norm_sqr() as f64).sum::<f64>() / c.len() as f64)
+        .collect();
+    let on = power.iter().sum::<f64>() / power.len().max(1) as f64;
+    // The off level's bound as `level_runs` has it: sqrt(off * split), split = sqrt(off * on).
+    let low = b.off_power.powf(0.75) * on.powf(0.25);
+    let off = power.iter().filter(|&&p| p <= low).count();
+    (off as f64) < BURST_FADE_MAX_OFF * power.len() as f64
+}
+
 /// What layer 1 measures of a window ([`gated_view`]).
 pub(super) struct View<'a> {
     /// The window's runs.
@@ -372,7 +440,8 @@ pub(super) struct View<'a> {
 /// are not bursts); else the whole window. The window is also tried for two levels closer
 /// than `BURST_ON_DB` ([`level_runs`]: a carrier a few dB over the noise, where single
 /// chunks do not tell on from off): when it holds them in runs of at least
-/// `BURST_LONG_RUN_MS` with an off part of noise, and those are not the long runs the
+/// `BURST_LONG_RUN_MS` (or in shorter runs of uneven length that hold no off part, a
+/// carrier's between its fades: [`fading`]) with an off part of noise, and those are not the long runs the
 /// chunks already gave, they are the window's runs, its `duty` theirs, and the view its
 /// on-time over them.
 pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -> View<'_> {
@@ -388,7 +457,7 @@ pub(super) fn gated_view(iq: &[Complex<f32>], rate_hz: u64, bandwidth_hz: u64) -
     let on = |b: &Bursts| b.runs.iter().map(|&(s, e)| e - s).sum::<usize>();
     let slack = |b: &Bursts| b.runs.len() * (rate_hz as usize * BURST_LEVEL_MS / 1_000);
     if let Some(slow) = level_runs(iq, rate_hz).filter(|b| {
-        long(b)
+        (long(b) || fading(iq, rate_hz, b))
             && !(gated && long(&bursts) && on(b) + slack(b) >= on(&bursts))
             && off_is_noise(iq, rate_hz, bandwidth_hz, b)
     }) {

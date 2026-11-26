@@ -912,7 +912,12 @@ fn tone_pair(
 ///    while the PSK order requires no line in `x` itself.
 /// 7. `"am"` (0.6) when a carrier line sits at the centre of the samples' spectrum (the
 ///    strongest of the centre bin and its two neighbours at least 6 dB above
-///    the mean power of the bins 1–5 kHz either side) and the CV is at least 0.25.
+///    the mean power of the bins 1–5 kHz either side) and the CV is at least 0.25. But
+///    when the discriminator audio moves `WEAK_FM_MOTION` times as far as the envelope
+///    and 40 Hz beyond it ([`motion_hz`]), the moving envelope is a fading
+///    angle-modulated carrier's, its audio in the phase: `"unknown"`, not AM. (An FM over
+///    fading as a Rayleigh path at 30 Hz of Doppler has a CV of 0.3 to 0.4 beyond the
+///    noise's where it is up.)
 /// 8. `"ssb"` (0.6) when there is no such centre line, the CV is at least 0.25, the
 ///    occupied band is 1.5–4 kHz and at least 80 % of the samples' occupied power lies
 ///    on one side of centre; the evidence names `usb` (above) or `lsb` (below) and the
@@ -1087,7 +1092,11 @@ const WEAK_FM_MOTION: f64 = 1.6;
 ///   without that rule a margin of 4 lets one case read `fm` (speech at index 0.9 over
 ///   sloping noise at 1 dB, 2.4 times the clicks' RMS) and 9 lets none.
 ///
-/// So 4 is a second guard, not the one the generators lean on.
+/// No generator case distinguishes a margin from 0 to 4 once `WEAK_FM_MOTION` is in
+/// force. It is kept as the click model's bound: the motion rule compares the phase with
+/// the envelope, and clicks are the one part of the noise's phase the envelope does not
+/// show, so without the bound a carrier whose noise clicks under a still envelope has
+/// nothing against it but the 40 Hz.
 const CLICK_MARGIN: f64 = 4.0;
 
 /// How much the phase and the envelope of the samples move, both in Hz ([`motion_hz`]).
@@ -1473,9 +1482,28 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
                 .into(),
         );
     }
+    // The phase's motion against the envelope's, once for rules 7, 9 and 10.
+    let mut motion = None;
+    let mut motion = || {
+        *motion
+            .get_or_insert_with(|| motion_hz(iq, rate_hz, bw, &joins, v.band.map(|b| b.offset_hz)))
+    };
     if cv >= AM_MIN_CV {
         let carrier_db = centre_line_db(&db, bin_hz);
         if carrier_db >= OCCUPIED_DB {
+            // An envelope that moves under a phase moving far more is a fading or keyed
+            // angle-modulated carrier, not AM: its audio is in the phase.
+            let m = motion();
+            if m.over_hz() >= FM_MIN_DEV_HZ && m.phase_hz >= WEAK_FM_MOTION * m.envelope_hz {
+                return (
+                    "unknown",
+                    0.5,
+                    format!(
+                        "no layer-1 rule matched: carrier line {carrier_db:.1} dB above the sidebands and a moving envelope, but the phase's {:.0} Hz moves over {WEAK_FM_MOTION} times the envelope's {:.0} Hz",
+                        m.phase_hz, m.envelope_hz
+                    ),
+                );
+            }
             return (
                 "am",
                 0.6,
@@ -1494,12 +1522,6 @@ fn classify_block(f: &FeatureRecord, v: &View, rate_hz: u64) -> (&'static str, f
             );
         }
     }
-    // The phase's motion against the envelope's, once for rules 9 and 10.
-    let mut motion = None;
-    let mut motion = || {
-        *motion
-            .get_or_insert_with(|| motion_hz(iq, rate_hz, bw, &joins, v.band.map(|b| b.offset_hz)))
-    };
     if cv >= AM_LOW_MIN_CV {
         let carrier_db = centre_line_db(&db, bin_hz);
         if carrier_db >= OCCUPIED_DB {

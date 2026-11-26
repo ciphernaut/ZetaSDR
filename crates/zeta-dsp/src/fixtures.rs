@@ -330,8 +330,14 @@ pub enum WeakSignal {
     },
     /// An NBFM over of voice-like audio ([`voice_like`]: noise in the speech band under a
     /// syllable envelope, no steady tone for a keying or tone rule to find) at this peak
-    /// deviation, Hz, the carrier up over `on` of the window.
-    Voice { deviation_hz: f64, on: (f64, f64) },
+    /// deviation, Hz, the carrier up over `on` of the window. With `flutter_hz` over 0 the
+    /// carrier fades as a mobile's does ([`flutter`]) at that Doppler spread, Hz, its mean
+    /// power still the case's.
+    Voice {
+        deviation_hz: f64,
+        on: (f64, f64),
+        flutter_hz: f64,
+    },
     /// Full-carrier AM at this index, up for the whole window: of a 1 kHz tone, or with
     /// `speech` of [`speech_like`] audio brought to a peak of 1. With `tilt_db`, the noise
     /// is not flat: its density rises by that many dB across the channel
@@ -378,6 +384,29 @@ pub fn voice_like(rate_hz: u32, seconds: f32, seed: u64) -> Vec<f32> {
         audio.iter_mut().for_each(|a| *a *= VOICE_RMS / rms);
     }
     audio.iter().map(|a| a.clamp(-1.0, 1.0) as f32).collect()
+}
+
+/// The complex gain of a Rayleigh-fading path, `n` samples at `rate_hz`: complex Gaussian
+/// noise band-limited to `doppler_hz` either side of zero, at a mean power of 1. Its
+/// envelope is 4.4 dB or more under its mean 30 % of the time and 10 dB under 10 %; at a
+/// Doppler of 30 Hz it crosses down through the 4.4 dB about 30 times a second, for 10 ms
+/// at a time on average.
+pub fn flutter(n: usize, rate_hz: u32, doppler_hz: f64, seed: u64) -> Vec<Complex<f32>> {
+    let mut x = vec![Complex::new(0.0f32, 0.0); n];
+    awgn(&mut x, 0.0, seed ^ 0xf1a7_7e12);
+    let mut planner = rustfft::FftPlanner::<f32>::new();
+    planner.plan_fft_forward(n).process(&mut x);
+    let bin_hz = f64::from(rate_hz) / n as f64;
+    for (k, b) in x.iter_mut().enumerate() {
+        let f = if 2 * k <= n { k as f64 } else { (n - k) as f64 } * bin_hz;
+        if f > doppler_hz {
+            *b = Complex::new(0.0, 0.0);
+        }
+    }
+    planner.plan_fft_inverse(n).process(&mut x);
+    let mean = x.iter().map(|s| f64::from(s.norm_sqr())).sum::<f64>() / n.max(1) as f64;
+    let scale = if mean > 0.0 { mean.sqrt().recip() } else { 0.0 } as f32;
+    x.iter().map(|s| s * scale).collect()
 }
 
 /// `n` samples of complex Gaussian noise at `rate_hz` whose density rises by `tilt_db`,
@@ -436,6 +465,8 @@ pub struct WeakCase {
 pub const WEAK_FM_SNRS_DB: [f32; 5] = [0.0, 3.0, 6.0, 9.0, 12.0];
 /// The in-channel SNRs of the weak AM cases, dB.
 pub const WEAK_AM_SNRS_DB: [f32; 6] = [1.0, 2.0, 3.0, 6.0, 9.0, 12.0];
+/// The Doppler spread of the weak FM cases that fade, Hz.
+pub const WEAK_FLUTTER_HZ: f64 = 30.0;
 /// The slope of the noise under the weak AM cases that have one, dB across the channel.
 pub const WEAK_AM_TILT_DB: f32 = 6.0;
 /// The channels of the weak FM cases, `(band, peak deviation)` in Hz: 12.5 and 25 kHz FM,
@@ -451,7 +482,8 @@ pub const WEAK_SEEDS: [u64; 3] = [1, 2, 3];
 ///   at 40 % and keyed up at 6 %, at each SNR of [`WEAK_FM_SNRS_DB`] in each channel of
 ///   [`WEAK_FM_CHANNELS`];
 /// - FM of voice-like audio, whole and keyed up at 40 % of the window, at the same SNRs and
-///   channels;
+///   channels; and, from 3 dB, keyed up at 40 % and fading at [`WEAK_FLUTTER_HZ`]
+///   (`weak-flutter-...`), the SNR its mean power's;
 /// - AM of a tone at index 0.2, 0.5 and 0.9 and of speech at 0.9, at each SNR of
 ///   [`WEAK_AM_SNRS_DB`] in 12.5 and 25 kHz, and the tone at 0.2 and 0.5 and the speech
 ///   again over noise sloping by [`WEAK_AM_TILT_DB`] across the channel.
@@ -488,10 +520,30 @@ pub fn weak_cases() -> Vec<WeakCase> {
                         name: format!(
                             "weak-voice-{keying}-dev{deviation_hz:.0}-{snr_db:.0}dB-{band_hz}Hz-s{seed}"
                         ),
-                        signal: WeakSignal::Voice { deviation_hz, on },
+                        signal: WeakSignal::Voice {
+                            deviation_hz,
+                            on,
+                            flutter_hz: 0.0,
+                        },
                         band_hz,
                         snr_db,
                         share: on.1 - on.0,
+                        seed,
+                    });
+                }
+                if snr_db >= 3.0 {
+                    out.push(WeakCase {
+                        name: format!(
+                            "weak-flutter-up-d0.60-dev{deviation_hz:.0}-{snr_db:.0}dB-{band_hz}Hz-s{seed}"
+                        ),
+                        signal: WeakSignal::Voice {
+                            deviation_hz,
+                            on: (0.4, 1.0),
+                            flutter_hz: WEAK_FLUTTER_HZ,
+                        },
+                        band_hz,
+                        snr_db,
+                        share: 0.6,
                         seed,
                     });
                 }
@@ -547,9 +599,12 @@ pub fn weak_case_iq(case: &WeakCase) -> Vec<Complex<f32>> {
             snr_db: over_rate_db,
             seed: case.seed,
         }),
-        WeakSignal::Voice { deviation_hz, on } => keyed_fm(
-            &voice_like(rate, KEYED_OVER_SECONDS, case.seed),
-            &KeyedOver {
+        WeakSignal::Voice {
+            deviation_hz,
+            on,
+            flutter_hz,
+        } => {
+            let over = KeyedOver {
                 rate_hz: rate,
                 seconds: KEYED_OVER_SECONDS,
                 deviation_hz,
@@ -557,8 +612,27 @@ pub fn weak_case_iq(case: &WeakCase) -> Vec<Complex<f32>> {
                 on,
                 snr_db: over_rate_db,
                 seed: case.seed,
-            },
-        ),
+            };
+            let audio = voice_like(rate, KEYED_OVER_SECONDS, case.seed);
+            if flutter_hz <= 0.0 {
+                return keyed_fm(&audio, &over);
+            }
+            // The over with next to no noise, through the fading path, then the noise.
+            let clean = keyed_fm(
+                &audio,
+                &KeyedOver {
+                    snr_db: 120.0,
+                    ..over.clone()
+                },
+            );
+            let mut iq = vec![Complex::new(0.0f32, 0.0); clean.len()];
+            awgn(&mut iq, over_rate_db, case.seed);
+            let gain = flutter(clean.len(), rate, flutter_hz, case.seed);
+            for ((s, c), g) in iq.iter_mut().zip(clean).zip(gain) {
+                *s += c * g;
+            }
+            iq
+        }
         WeakSignal::Am {
             index,
             speech,
