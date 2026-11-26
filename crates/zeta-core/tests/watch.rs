@@ -5270,6 +5270,25 @@ async fn a_hold_lifts_once_step_two_proves_nothing() {
     stop_all(&node).await;
 }
 
+/// The summaries of the watch's `decoding` events once `job`'s hold has lifted and the
+/// lift's own event (`its choose's step 2 ...`) has arrived: the hold is lifted before that
+/// event is published, so reading the events once at the lift can miss it.
+async fn lifted_saying(node: &Node, events: &Events, job: &JobId) -> Vec<String> {
+    let said = || -> Vec<String> {
+        events
+            .watch("decoding")
+            .into_iter()
+            .filter_map(|e| e["summary"].as_str().map(str::to_string))
+            .collect()
+    };
+    until("the hold lifts, saying why", STEP_TWO_WITHIN, || {
+        record(node, job).is_some_and(|r| r.held.is_none())
+            && said().iter().any(|s| s.contains("its choose's step 2"))
+    })
+    .await;
+    said()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_watch_says_step_two_proved_nothing_only_when_it_ran() {
     let _one = SERIAL.lock().await;
@@ -5280,15 +5299,7 @@ async fn a_watch_says_step_two_proved_nothing_only_when_it_ran() {
     let watch = start_choice_watch(&node, serde_json::json!({})).await;
     let events = Events::of(&node, &watch);
     let job = decoded(&node, &events, &watch).await;
-    until("the hold lifts", STEP_TWO_WITHIN, || {
-        record(&node, &job).is_some_and(|r| r.held.is_none())
-    })
-    .await;
-    let said: Vec<String> = events
-        .watch("decoding")
-        .into_iter()
-        .filter_map(|e| e["summary"].as_str().map(str::to_string))
-        .collect();
+    let said = lifted_saying(&node, &events, &job).await;
     assert!(
         said.iter().any(|s| s.contains("step 2 proved nothing")),
         "{said:#?}"
@@ -5320,15 +5331,7 @@ async fn a_watch_says_step_two_did_not_run_when_it_did_not() {
     let watch = start_choice_watch(&node, serde_json::json!({})).await;
     let events = Events::of(&node, &watch);
     let job = decoded(&node, &events, &watch).await;
-    until("the hold lifts", STEP_TWO_WITHIN, || {
-        record(&node, &job).is_some_and(|r| r.held.is_none())
-    })
-    .await;
-    let said: Vec<String> = events
-        .watch("decoding")
-        .into_iter()
-        .filter_map(|e| e["summary"].as_str().map(str::to_string))
-        .collect();
+    let said = lifted_saying(&node, &events, &job).await;
     let want =
         "its choose's step 2 did not run (the policy's slice_s is under 1 s); step 3 goes on";
     assert!(said.iter().any(|s| s.contains(want)), "{said:#?}");
