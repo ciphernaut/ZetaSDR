@@ -1495,9 +1495,11 @@ pub enum JobCmd {
     /// Attach a processing chain to a running job's output instead of the radio (needs
     /// that job running in the same node: use it against `zeta serve` with --node)
     Attach {
-        /// Attached job kind
-        #[arg(long, value_enum)]
-        kind: AttachKind,
+        /// Attached job kind: `transcribe`, `packets`, or a row that rides with the job's
+        /// demodulator (`modes list`'s `rides`: `rds_decode` on a `wfm_demod`); the node
+        /// refuses a kind that does not attach to the job
+        #[arg(long, value_name = "KIND", value_parser = parse_job_kind)]
+        kind: JobKind,
         /// The running job to attach to (an id from `job list`)
         #[arg(long, value_name = "ID")]
         job: String,
@@ -1710,7 +1712,7 @@ fn parse_job_kind(s: &str) -> Result<JobKind, String> {
     })
 }
 
-/// Attachable job kinds (`JobKind::attachable`), for `job attach`.
+/// Attachable built-in kinds (`JobKind::attachable`), for `plan start --attach`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum AttachKind {
     Transcribe,
@@ -2130,7 +2132,7 @@ impl Command {
                 language,
                 stream,
             }) => Op::JobAttach {
-                kind: kind.into(),
+                kind,
                 job: JobId(job),
                 language,
                 stream,
@@ -2403,7 +2405,8 @@ impl Command {
 }
 
 /// The line `zeta classify` prints before its answer: `choice: <kind> <center> Hz <width>
-/// Hz (<settled>, step <n>)`, or `choice: cannot tell: <reason>`; `None` for any other
+/// Hz (<settled>, step <n>)`, followed by ` + <row>` for each row the job attaches (its
+/// `attach`: a proved rider), or `choice: cannot tell: <reason>`; `None` for any other
 /// result, and for an answer without a choice (an older node's).
 pub fn choice_line(result: &zeta_core::ops::OpResult) -> Option<String> {
     let zeta_core::ops::OpResult::Classification {
@@ -2414,12 +2417,16 @@ pub fn choice_line(result: &zeta_core::ops::OpResult) -> Option<String> {
     };
     let line = match &c.job {
         Some(j) => format!(
-            "choice: {} {} Hz {} Hz ({}, step {})",
+            "choice: {} {} Hz {} Hz ({}, step {}){}",
             j.kind,
             j.center_hz.0,
             j.bandwidth_hz.0,
             c.settled.name(),
-            c.step
+            c.step,
+            j.attach
+                .iter()
+                .map(|row| format!(" + {row}"))
+                .collect::<String>()
         ),
         None => format!(
             "choice: cannot tell: {}",
@@ -3112,5 +3119,122 @@ mod cli_choose_tests {
             "1000",
         ];
         assert!(Cli::try_parse_from(half).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cli_attach_tests {
+    use super::*;
+    use zeta_core::choice::{Choice, ChoiceJob, Settled};
+    use zeta_core::ops::OpResult;
+
+    fn attach_op(args: &[&str]) -> Op {
+        let all: Vec<&str> = ["zeta", "job", "attach"]
+            .iter()
+            .chain(args)
+            .copied()
+            .collect();
+        let cmd = Cli::try_parse_from(all).unwrap().command;
+        assert!(cmd.mutates());
+        cmd.into_op().unwrap().expect("an op")
+    }
+
+    #[test]
+    fn job_attach_takes_a_rider_row_as_its_kind() {
+        assert_eq!(
+            attach_op(&["--kind", "rds_decode", "--job", "J1"]),
+            Op::JobAttach {
+                kind: JobKind::from_name("rds_decode").unwrap(),
+                job: JobId("J1".into()),
+                language: None,
+                stream: None,
+            }
+        );
+        // The built-in attachable kinds keep their flags.
+        assert_eq!(
+            attach_op(&[
+                "--kind",
+                "transcribe",
+                "--job",
+                "J1",
+                "--language",
+                "de",
+                "--stream",
+                "slot2",
+            ]),
+            Op::JobAttach {
+                kind: JobKind::Transcribe,
+                job: JobId("J1".into()),
+                language: Some("de".into()),
+                stream: Some("slot2".into()),
+            }
+        );
+        assert_eq!(
+            attach_op(&["--kind", "packets", "--job", "J1"]),
+            Op::JobAttach {
+                kind: JobKind::Packets,
+                job: JobId("J1".into()),
+                language: None,
+                stream: None,
+            }
+        );
+        // Not a kind name at all: refused before an op is built.
+        assert!(
+            Cli::try_parse_from(["zeta", "job", "attach", "--kind", "Bad-Kind", "--job", "J1"])
+                .is_err()
+        );
+    }
+
+    fn classification(choice: Choice) -> OpResult {
+        OpResult::Classification {
+            labels: vec![],
+            tried: vec![],
+            allocations: vec![],
+            origins: None,
+            register: None,
+            features: None,
+            choice: Some(Box::new(choice)),
+        }
+    }
+
+    fn choice_of(kind: &str, attach: &[&str]) -> Choice {
+        Choice {
+            job: Some(ChoiceJob {
+                kind: kind.into(),
+                center_hz: Hz(106_100_000),
+                bandwidth_hz: Hz(200_000),
+                params: Default::default(),
+                attach: attach.iter().map(|s| s.to_string()).collect(),
+            }),
+            row: Some(kind.into()),
+            step: 1,
+            settled: Settled::Proved,
+            evidence: vec![],
+            runner_up: None,
+            could_prove: vec![],
+            not_tried: vec![],
+            reason: None,
+            steps_run: vec![1],
+        }
+    }
+
+    #[test]
+    fn the_choice_line_names_each_rider_the_job_attaches() {
+        assert_eq!(
+            choice_line(&classification(choice_of("wfm_demod", &["rds_decode"]))).as_deref(),
+            Some("choice: wfm_demod 106100000 Hz 200000 Hz (proved, step 1) + rds_decode")
+        );
+        assert_eq!(
+            choice_line(&classification(choice_of(
+                "wfm_demod",
+                &["a_rider", "b_rider"]
+            )))
+            .as_deref(),
+            Some("choice: wfm_demod 106100000 Hz 200000 Hz (proved, step 1) + a_rider + b_rider")
+        );
+        assert_eq!(
+            choice_line(&classification(choice_of("wfm_demod", &[]))).as_deref(),
+            Some("choice: wfm_demod 106100000 Hz 200000 Hz (proved, step 1)")
+        );
     }
 }
