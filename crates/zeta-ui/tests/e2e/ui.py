@@ -6624,7 +6624,7 @@ def scenario_the_first_entrys_hover_says_what_step_two_did(page, url, secret):
     alt = c["runner_up"]["job"]
     assert title_lines(item) == [
         f"runner-up: {alt['kind']} {khz1(alt['bandwidth_hz'])} kHz",
-        f"step 2: {', '.join(c['could_prove'])}, no frame"], (item.get_attribute("title"), c)
+        f"step 2: {', '.join(step_two_rows(c))}, no frame"], (item.get_attribute("title"), c)
     close_menu(page)
     # A DMR repeater: step 2 proves dmr_decode, so the hover says no "no frame".
     since = box_on_source(page, url, secret, "dmr", 12_500, answers)
