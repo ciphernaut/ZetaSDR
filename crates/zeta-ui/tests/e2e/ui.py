@@ -133,7 +133,7 @@ def scenario_command_line_applies_op(page, url, secret):
     expect(page.locator("#cmd")).to_be_focused()
     page.keyboard.type('{"op":"source_list"}')
     page.keyboard.press("Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (17 sources)")
+    expect(page.locator("#transcript")).to_contain_text(SOURCE_LIST_OK)
     # An op error shows its name and field, marked as an error.
     page.fill("#cmd", json.dumps({"op": "job_start", "kind": "measure", "source": "tone",
                                   "center_hz": 1, "bandwidth_hz": 10000,
@@ -226,15 +226,21 @@ def scenario_double_connect_starts_one_shell(page, url, secret):
     assert health["ws_connections"] <= 4, f"duplicate sockets: {health}"
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (17 sources)")
+    expect(page.locator("#transcript")).to_contain_text(SOURCE_LIST_OK)
     page.wait_for_timeout(300)
     expect(page.locator("#transcript .line", has_text="source_list → ok")).to_have_count(1)
     expect(page.locator("#transcript .line.user")).to_have_count(1)
 
 
+# The transcript's line for a `source_list` answer, whatever the number of sources.
+SOURCE_LIST_OK = re.compile(r"source_list → ok \(\d+ sources\)")
+
+
 def running_spectrum_jobs(url, secret, source):
+    """The running spectrum jobs on `source` (an id, or a tuple of them), from one job_list."""
+    sources = (source,) if isinstance(source, str) else source
     jobs = http_json(url, secret, "/op", {"op": "job_list"})["value"]
-    return [j for j in jobs if j["kind"] == "spectrum" and j["source"] == source
+    return [j for j in jobs if j["kind"] == "spectrum" and j["source"] in sources
             and j["state"]["status"] == "running"]
 
 
@@ -251,18 +257,9 @@ BRIGHT_AT_RIGHT_JS = """() => {
 def fresh_spectrum_jobs(url, secret):
     """Start a waterfall scenario with no spectrum job left over from an earlier one, so the
     page starts (and owns) its own."""
-    sources = ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb", "quiet", "video", "video2",
-               "ism", "dmr", "cbvoice", "rds", "kiwi")
-
-    def running():
-        # One job_list for every source, not one per source.
-        return [j for j in http_json(url, secret, "/op", {"op": "job_list"})["value"]
-                if j["kind"] == "spectrum" and j["source"] in sources
-                and j["state"]["status"] == "running"]
-
-    for j in running():
-        http_json(url, secret, "/op", {"op": "job_stop", "job": j["id"]})
-    assert running() == [], "spectrum jobs survive job_stop"
+    stop_spectrum_jobs(url, secret, ("tone", "aprs", "wfm", "speech", "retune", "scanner", "cb",
+                                     "quiet", "video", "video2", "ism", "dmr", "cbvoice", "rds",
+                                     "kiwi"))
 
 
 def show_tone_waterfall(page, url, secret):
@@ -315,7 +312,7 @@ def scenario_waterfall_decodes_quantised_rows(page, url, secret):
 
 
 def stop_spectrum_jobs(url, secret, source):
-    """Stop every running spectrum job on `source` through the API."""
+    """Stop every running spectrum job on `source` (an id, or a tuple of them) through the API."""
     for j in running_spectrum_jobs(url, secret, source):
         http_json(url, secret, "/op", {"op": "job_stop", "job": j["id"]})
     assert running_spectrum_jobs(url, secret, source) == [], "spectrum jobs survive job_stop"
@@ -601,7 +598,7 @@ def scenario_narrow_answer_is_ribbon(page, url, secret):
     page.click("#drawer-toggle")
     page.fill("#cmd", '{"op":"source_list"}')
     page.press("#cmd", "Enter")
-    expect(page.locator("#transcript")).to_contain_text("source_list → ok (17 sources)")
+    expect(page.locator("#transcript")).to_contain_text(SOURCE_LIST_OK)
     expect(page.locator("#side")).to_be_visible()
 
 
@@ -5919,7 +5916,7 @@ def scenario_box_menu_groups_open_by_hover_click_and_keys(page, url, secret):
     # pointer reaching it, on a click, and by keyboard (the arrow towards the inline end or
     # Enter; Escape or the other arrow closes one level); its entries carry no `Decode ›` or
     # `Transcribe ›` prefix, the Transcribe twins under their own heading.
-    menu = open_menu_on_tone(page, url, secret, MENU_SPAN_PLAIN_S)
+    menu = open_menu_on_tone(page, url, secret)
     still_menu(menu)
     first = menu.evaluate(FIRST_LEVEL_JS)
     assert len(first) <= 8, f"first level {first}"
@@ -14145,7 +14142,8 @@ def scenarios():
 # its own set of nodes: shard i runs the i-th contiguous block of `scenarios()` (definition
 # order), the blocks starting at these scenarios. A block's first scenario runs on a fresh
 # node, so it must pass alone (as with `ZETA_UI_ONLY`). Rebalance from the `PASS <name>
-# (<s> s)` times so each block takes about the same time.
+# (<s> s)` times so each block takes about the same time. 4: rebalanced from a profile, not
+# run whole since; 5 is the default (ui.rs SHARDS).
 SHARD_STARTS = {
     1: [],
     2: ["menu_entry_table_is_whole"],

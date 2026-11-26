@@ -421,7 +421,8 @@ fn video_fixture(dir: &Path) -> PathBuf {
 /// at most pinned to four CPUs (`taskset -c 0-3`); pinned to two, the suite is CPU-bound and
 /// a shard passes this whether there are three or four. On 2026-11-26, 283 scenarios summed
 /// about 1215 s (plan 49 added about 20, and the `rds` source): four shards came to 304-334 s
-/// on a loaded host (load average 18-23), so there are five (SHARDS), 232-280 s each. Each shard prints its own time: move
+/// on a loaded host (load average 18-23), so there are five (SHARDS), 232-280 s each. Each
+/// shard prints its own time: move
 /// SHARD_STARTS from a `ZETA_UI_PROFILE` run, or add a shard, before raising this. CI's hosted
 /// runner takes about 1.8 times as long per scenario (2026-11-22: shards at 426-450 s), so
 /// `ci.yml` sets its own `ZETA_UI_DEADLINE_S` instead of moving this.
